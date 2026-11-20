@@ -318,17 +318,33 @@ func freezeResponse(freeze *storage.EnvironmentFreeze, now time.Time) apitypes.F
 // refused before any gate runs. Only a verified caller may ask: a request
 // recorded as "unverified" names nobody, so its asker could approve it.
 func (s *Service) overrideReasonFromRequest(w http.ResponseWriter, r *http.Request, raw string) (string, bool) {
-	reason := strings.TrimSpace(raw)
-	if n := len([]rune(reason)); n > storage.FreezeOverrideReasonMax {
-		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest,
-			fmt.Sprintf("override reason is %d characters; the limit is %d", n, storage.FreezeOverrideReasonMax))
+	if strings.TrimSpace(raw) == "" {
+		return "", true
+	}
+	reason, err := ValidateOverrideReason(raw)
+	if err != nil {
+		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
 		return "", false
 	}
-	if _, verified := auth.VerifiedSubject(r.Context()); reason != "" && !verified {
+	if _, verified := auth.VerifiedSubject(r.Context()); !verified {
 		s.writeError(w, http.StatusForbidden, "asking for an override needs a verified caller")
 		return "", false
 	}
 	return reason, true
+}
+
+// ValidateOverrideReason trims the reason a caller gave for a freeze override
+// and refuses one that is blank or longer than storage keeps. The pull request
+// commands share it, so the rule lives here.
+func ValidateOverrideReason(raw string) (string, error) {
+	reason := strings.TrimSpace(raw)
+	if reason == "" {
+		return "", errors.New("override reason is empty")
+	}
+	if n := len([]rune(reason)); n > storage.FreezeOverrideReasonMax {
+		return "", fmt.Errorf("override reason is %d characters; the limit is %d", n, storage.FreezeOverrideReasonMax)
+	}
+	return reason, nil
 }
 
 // handleFreezeOverrideGet returns one freeze override request.
@@ -366,6 +382,28 @@ func (s *Service) handleFreezeOverrideApprove(w http.ResponseWriter, r *http.Req
 		return
 	}
 	id := r.PathValue("id")
+	// A request from a pull request is approved there: its requester is a
+	// GitHub login, which storage cannot compare with this approver's subject,
+	// so the self-approval check would pass for the same person (AZ-10). Read
+	// failures refuse too: the domain is unknown.
+	request, err := s.storage.FreezeOverrides().Get(r.Context(), id)
+	switch {
+	case errors.Is(err, storage.ErrFreezeOverrideNotFound):
+		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeNotFound, fmt.Sprintf("override request %q not found", id))
+		return
+	case err != nil:
+		s.logger.Error("get freeze override request failed", "override_request", id, "error", err)
+		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "approve override request failed")
+		return
+	case request.FromPullRequest() && request.PullRequest > 0:
+		s.writeError(w, http.StatusConflict, fmt.Sprintf("override request %s was asked for on pull request %s#%d; approve it there with \"schemabot freeze approve %s\"", id, request.Repository, request.PullRequest, id))
+		return
+	case request.FromPullRequest():
+		// A GitHub requester with no pull request to approve it on, such as a
+		// row recorded before the prefix was reserved: nowhere can approve it.
+		s.writeError(w, http.StatusConflict, fmt.Sprintf("override request %s has a GitHub requester but no pull request, so nothing can approve it; ask for a new override", id))
+		return
+	}
 	approved, err := s.storage.FreezeOverrides().Approve(r.Context(), id, approver)
 	switch {
 	case errors.Is(err, storage.ErrFreezeOverrideNotFound):

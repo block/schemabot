@@ -700,7 +700,7 @@ func (s *Service) ExecuteCutover(ctx context.Context, req apitypes.ControlReques
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, err
 	}
-	resp, _, err := s.executeCutoverForApply(ctx, client, apply, ternApplyID, req.Caller, "")
+	resp, _, err := s.executeCutoverForApply(ctx, client, apply, ternApplyID, req.Caller, strings.TrimSpace(req.Override))
 	return resp, err
 }
 
@@ -1997,7 +1997,7 @@ func (s *Service) ExecuteStart(ctx context.Context, req apitypes.ControlRequest)
 	if err != nil {
 		return nil, err
 	}
-	resp, _, err := s.executeStartForApply(ctx, client, apply, req.Caller, "")
+	resp, _, err := s.executeStartForApply(ctx, client, apply, req.Caller, strings.TrimSpace(req.Override))
 	return resp, err
 }
 

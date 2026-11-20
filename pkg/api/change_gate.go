@@ -304,7 +304,7 @@ func (s *Service) approvedOverride(ctx context.Context, in changeGateInput, bloc
 	}
 	ids := changeGateBlockerIDs(blockers)
 	for _, request := range approved {
-		if request.Covers(ids) && storage.CanonicalKey(request.RequestedBy) == storage.CanonicalKey(caller) {
+		if request.Covers(ids) && storage.CanonicalKey(request.RequestedBy) == storage.CanonicalKey(caller) && sameOverrideOrigin(ctx, request) {
 			return request, nil
 		}
 	}
@@ -312,20 +312,26 @@ func (s *Service) approvedOverride(ctx context.Context, in changeGateInput, bloc
 }
 
 // requestOverride records a request for an approver to override the blockers
-// of this change, for the caller who asked. Repository, pull request and
-// author stay empty: the plan does not store its pull request's author, and
-// storage needs the author of a request from a pull request. The pull request
-// command fills them from the webhook.
+// of this change, for the caller who asked, and returns nil when it may not
+// record one. A pull request command records the commenter, the pull request
+// and its author, all in the "github:" identity domain (see
+// storage.FreezeOverrideRequest.FromPullRequest); any other request records the verified caller's
+// subject, with no pull request. The plan does not store its pull request's
+// author, so the pull request comes from the webhook's context, never from
+// the plan.
 func (s *Service) requestOverride(ctx context.Context, in changeGateInput, blockers []apitypes.ChangeGateBlocker) (*storage.FreezeOverrideRequest, error) {
 	overrides := s.storage.FreezeOverrides()
 	freezes := s.storage.Freezes()
 	if overrides == nil || freezes == nil {
 		return nil, nil
 	}
-	// Only a verified caller may ask. A request recorded as "unverified"
-	// names nobody, so its asker could approve it under their own name.
 	requester, verified := overrideCaller(ctx)
 	if !verified {
+		return nil, nil
+	}
+	pr, fromPullRequest := pullRequestOverrideRequester(ctx)
+	if fromPullRequest && !pr.complete() {
+		// Without the author the approver check could not refuse them.
 		return nil, nil
 	}
 	// A requester who repeats the command before approval keeps the one
@@ -337,15 +343,11 @@ func (s *Service) requestOverride(ctx context.Context, in changeGateInput, block
 	ids := changeGateBlockerIDs(blockers)
 	for _, request := range pending {
 		if storage.CanonicalKey(request.RequestedBy) == storage.CanonicalKey(requester) &&
-			len(request.Blockers) == len(ids) && request.Covers(ids) {
+			len(request.Blockers) == len(ids) && request.Covers(ids) && sameOverrideOrigin(ctx, request) {
 			return request, nil
 		}
 	}
-	now, err := freezes.Now(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("read the database clock for an override request: %w", err)
-	}
-	return overrides.Create(ctx, &storage.FreezeOverrideRequest{
+	request := &storage.FreezeOverrideRequest{
 		Identifier:  engine.NewFreezeOverrideID(),
 		Environment: in.Environment,
 		Action:      in.Action,
@@ -354,14 +356,47 @@ func (s *Service) requestOverride(ctx context.Context, in changeGateInput, block
 		Blockers:    ids,
 		Reason:      in.Override,
 		RequestedBy: requester,
-		ExpiresAt:   now.Add(storage.FreezeOverrideMaxLifetime),
-	})
+	}
+	if fromPullRequest {
+		request.PRAuthor = storage.GitHubIdentity(pr.Author)
+		request.Repository = pr.Repository
+		request.PullRequest = pr.PullRequest
+	}
+	now, err := freezes.Now(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read the database clock for an override request: %w", err)
+	}
+	request.ExpiresAt = now.Add(storage.FreezeOverrideMaxLifetime)
+	return overrides.Create(ctx, request)
+}
+
+// sameOverrideOrigin reports whether request was asked for where this change
+// comes from: on the same pull request for a pull request command, or outside
+// any pull request otherwise. The target names only the schema, so the same
+// change on two pull requests shares it, and without this a request asked for
+// on one, approved by the other's author, would admit the other (AZ-10). A
+// pull request's number fixes its author, so matching it matches the author.
+func sameOverrideOrigin(ctx context.Context, request *storage.FreezeOverrideRequest) bool {
+	if pr, ok := pullRequestOverrideRequester(ctx); ok {
+		return request.PullRequest == pr.PullRequest && strings.EqualFold(request.Repository, pr.Repository)
+	}
+	return !request.FromPullRequest()
 }
 
 // overrideCaller is the verified caller who asks for an override and
 // runs on its approval.
 func overrideCaller(ctx context.Context) (string, bool) {
-	return auth.VerifiedSubject(ctx)
+	if pr, ok := pullRequestOverrideRequester(ctx); ok {
+		// The login came from a signed webhook, so it is verified.
+		return storage.GitHubIdentity(pr.Login), pr.Login != ""
+	}
+	// A subject in the pull request domain is refused: it would pass for a
+	// GitHub login.
+	subject, verified := auth.VerifiedSubject(ctx)
+	if !verified || storage.IsGitHubIdentity(subject) {
+		return "", false
+	}
+	return subject, true
 }
 
 // applyOverrideTarget names what an override of an apply covers: the
@@ -464,21 +499,13 @@ type ChangeGateRefusedError struct {
 	// first reason, which is the one the approver sees.
 	OverrideReasonKept bool
 	// OverrideUnrecorded reports an override reason given by a caller who
-	// is not verified, or to a server with no override storage: no request
-	// was recorded.
+	// is not verified, by a pull request command with no known author, or
+	// to a server with no override storage: no request was recorded.
 	OverrideUnrecorded bool
 }
 
 func (e *ChangeGateRefusedError) Error() string {
-	parts := make([]string, 0, len(e.Blockers))
-	for _, blocker := range e.Blockers {
-		until := "until lifted"
-		if blocker.EndsAt != nil {
-			until = "until " + blocker.EndsAt.UTC().Format(time.RFC3339)
-		}
-		parts = append(parts, fmt.Sprintf("%s %s (%s, %s)", blocker.Gate, blocker.ID, blocker.Reason, until))
-	}
-	message := fmt.Sprintf("blocked in %s by %s; try again after it ends or is lifted", e.Environment, strings.Join(parts, "; "))
+	message := e.Blocked()
 	if e.OverrideRequest != nil {
 		message += fmt.Sprintf("; override request %s needs a freeze approver other than you", e.OverrideRequest.Identifier)
 		if e.OverrideReasonKept {
@@ -489,6 +516,20 @@ func (e *ChangeGateRefusedError) Error() string {
 		message += "; no override was requested, because asking for one needs a verified caller"
 	}
 	return message
+}
+
+// Blocked is the refusal without what it says about an override request: what
+// blocks the change, and that it clears when the blockers end.
+func (e *ChangeGateRefusedError) Blocked() string {
+	parts := make([]string, 0, len(e.Blockers))
+	for _, blocker := range e.Blockers {
+		until := "until lifted"
+		if blocker.EndsAt != nil {
+			until = "until " + blocker.EndsAt.UTC().Format(time.RFC3339)
+		}
+		parts = append(parts, fmt.Sprintf("%s %s (%s, %s)", blocker.Gate, blocker.ID, blocker.Reason, until))
+	}
+	return fmt.Sprintf("blocked in %s by %s; try again after it ends or is lifted", e.Environment, strings.Join(parts, "; "))
 }
 
 // ChangeGateUnavailableError reports a change gate that could not decide. The

@@ -199,7 +199,7 @@ func TestFreezeGroupAdmittedThroughServerHandler(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, post("/api/freezes"))
 	assert.Equal(t, http.StatusForbidden, post("/api/settings"))
 	// Approving an override is the third freeze write: the middleware admits
-	// ida, the handler verifies her and reaches storage, which knows no ovr-1.
+	// ida, the handler verifies her and reaches storage's approval.
 	assert.Equal(t, http.StatusNotFound, post("/api/freezes/overrides/ovr-1/approve"))
 	assert.Equal(t, "ida", overrides.approver)
 }
@@ -213,10 +213,15 @@ type overrideStorage struct {
 
 func (s overrideStorage) FreezeOverrides() storage.FreezeOverrideStore { return s.overrides }
 
-// approverRecordingOverrides records who approved and knows no request.
+// approverRecordingOverrides holds one request asked for outside a pull
+// request, records who approved it and then reports it gone.
 type approverRecordingOverrides struct {
 	storage.FreezeOverrideStore
 	approver string
+}
+
+func (o *approverRecordingOverrides) Get(_ context.Context, identifier string) (*storage.FreezeOverrideRequest, error) {
+	return &storage.FreezeOverrideRequest{Identifier: identifier, RequestedBy: "rita"}, nil
 }
 
 func (o *approverRecordingOverrides) Approve(_ context.Context, _, approver string) (*storage.FreezeOverrideRequest, error) {
