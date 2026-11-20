@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	smtypes "github.com/aws/aws-sdk-go-v2/service/secretsmanager/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -696,4 +697,38 @@ func TestNewValidatesSecretsManagerEndpoints(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `secrets manager endpoint for region "us-east-1": the region is neither the home region nor a reachable region`)
 	require.NoError(t, ValidateSecretsManagerEndpoints("us-west-2", []string{"us-east-1"}, map[string]string{"us-east-1": "https://secretsmanager.example.internal"}))
+}
+
+// Secrets Manager rejects a custom endpoint in FIPS or dual-stack mode only when
+// a request is made, so New refuses the combination instead of starting a data
+// plane whose every read in an overridden region would fail.
+func TestNewRefusesEndpointsWithFIPSOrDualStack(t *testing.T) {
+	base := Config{
+		Region:                  "us-west-2",
+		SecretsManagerEndpoints: map[string]string{"us-west-2": "https://secretsmanager.example.internal"},
+		SecretName:              "secret",
+	}
+	cases := []struct {
+		name   string
+		source awsconfig.EnvConfig
+		want   string
+	}{
+		{"fips", awsconfig.EnvConfig{UseFIPSEndpoint: aws.FIPSEndpointStateEnabled}, "cannot be combined with FIPS endpoints"},
+		{"dual-stack", awsconfig.EnvConfig{UseDualStackEndpoint: aws.DualStackEndpointStateEnabled}, "cannot be combined with dual-stack endpoints"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			cfg.AWSConfig = aws.Config{ConfigSources: []any{tc.source}}
+			_, err := New(cfg)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+
+			// Without an override the SDK resolves its own FIPS or dual-stack
+			// endpoint, so the same AWS config is accepted.
+			cfg.SecretsManagerEndpoints = nil
+			_, err = New(cfg)
+			require.NoError(t, err)
+		})
+	}
 }

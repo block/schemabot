@@ -169,7 +169,34 @@ func New(cfg Config) (*Resolver, error) {
 			clients:    make(map[accountRegion]*secretsmanager.Client),
 		}
 	}
-	return newResolver(cfg, fetch)
+	r, err := newResolver(cfg, fetch)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkEndpointsCompatible(awsCfg, cfg.SecretsManagerEndpoints); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// checkEndpointsCompatible refuses endpoint overrides on an AWS config that
+// asks for FIPS or dual-stack endpoints. Secrets Manager's endpoint rules reject
+// a custom endpoint combined with either, but only when a request is made, so
+// without this check the data plane would start and then fail every read in
+// each overridden region. The modes come from the same config sources (such as
+// AWS_USE_FIPS_ENDPOINT) the SDK reads when it builds a client.
+func checkEndpointsCompatible(awsCfg aws.Config, endpoints map[string]string) error {
+	if len(endpoints) == 0 {
+		return nil
+	}
+	modes := secretsmanager.NewFromConfig(awsCfg).Options().EndpointOptions
+	switch {
+	case modes.UseFIPSEndpoint == aws.FIPSEndpointStateEnabled:
+		return fmt.Errorf("secrets manager endpoints cannot be combined with FIPS endpoints, which the AWS config enables; Secrets Manager rejects a custom endpoint in FIPS mode")
+	case modes.UseDualStackEndpoint == aws.DualStackEndpointStateEnabled:
+		return fmt.Errorf("secrets manager endpoints cannot be combined with dual-stack endpoints, which the AWS config enables; Secrets Manager rejects a custom endpoint in dual-stack mode")
+	}
+	return nil
 }
 
 // newResolver validates cfg and constructs a Resolver over a given fetcher, so

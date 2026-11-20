@@ -528,7 +528,10 @@ otherwise, rather than ignore an entry for a region no secret is read in.
 Reads are still signed for the region, so an entry changes where a read is
 sent and never which region's secret it reads. A region without an entry
 uses its public endpoint. Roles are assumed through STS in `region` as before,
-so this setting does not change how STS is reached.
+so this setting does not change how STS is reached. Secrets Manager rejects a
+custom endpoint in FIPS or dual-stack mode, so the resolver also refuses to
+start with this setting when the AWS config enables either (for example through
+`AWS_USE_FIPS_ENDPOINT`).
 
 #### What each target account provides
 
