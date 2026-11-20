@@ -5,7 +5,7 @@ CREATE TABLE `environment_freezes` (
   `scope_deployments` json NOT NULL,
   `scope_databases` json NOT NULL,
   `kind` varchar(32) NOT NULL,
-  `override_rule` varchar(32) NOT NULL,
+  `running_policy` varchar(32) NOT NULL,
   `starts_at` datetime(6) NOT NULL,
   `ends_at` datetime(6) DEFAULT NULL,
   `reason` text NOT NULL,

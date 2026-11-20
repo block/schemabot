@@ -15,7 +15,7 @@ import (
 )
 
 // freezeColumns lists all columns for SELECT queries.
-const freezeColumns = `id, freeze_identifier, environment, scope_deployments, scope_databases, kind, override_rule,
+const freezeColumns = `id, freeze_identifier, environment, scope_deployments, scope_databases, kind, running_policy,
 	starts_at, ends_at, reason, created_by, source, external_id, lifted_by, lift_reason, lifted_at, created_at`
 
 // freezeStore implements storage.FreezeStore. A freeze is in effect while it
@@ -45,10 +45,10 @@ func (s *freezeStore) Create(ctx context.Context, freeze *storage.EnvironmentFre
 	environment := storage.CanonicalKey(freeze.Environment)
 	id, err := s.identity.InsertID(ctx, s.db, `
 		INSERT INTO environment_freezes (
-			freeze_identifier, environment, scope_deployments, scope_databases, kind, override_rule,
+			freeze_identifier, environment, scope_deployments, scope_databases, kind, running_policy,
 			starts_at, ends_at, reason, created_by, source, external_id
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, freeze.Identifier, environment, deployments, databases, freeze.Kind, freeze.Override,
+	`, freeze.Identifier, environment, deployments, databases, freeze.Kind, freeze.Running,
 		freezeTime(freeze.StartsAt), nullTimePtr(freezeTimePtr(freeze.EndsAt)), freeze.Reason, freeze.CreatedBy,
 		freeze.Source, nullString(freeze.ExternalID))
 	if err != nil {
@@ -82,18 +82,18 @@ func (s *freezeStore) Get(ctx context.Context, identifier string) (*storage.Envi
 
 // Lift ends a freeze early. The update only matches a freeze that is neither
 // lifted nor past its end time, so two concurrent lifts end it once; when it
-// matches nothing, the row is read back to say why.
-func (s *freezeStore) Lift(ctx context.Context, identifier, liftedBy, reason string, at time.Time) (*storage.EnvironmentFreeze, error) {
+// matches nothing, the row is read back to say why. The lift time is the
+// database's clock, the same clock ListInEffect reads.
+func (s *freezeStore) Lift(ctx context.Context, identifier, liftedBy, reason string) (*storage.EnvironmentFreeze, error) {
 	if strings.TrimSpace(liftedBy) == "" {
 		return nil, fmt.Errorf("lift freeze %s: the caller who lifts it is required", identifier)
 	}
-	at = freezeTime(at)
-	now := s.dialect.CurrentTimestamp(TimestampPrecisionDefault)
+	now := s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE environment_freezes
-		SET lifted_by = ?, lift_reason = ?, lifted_at = ?, updated_at = `+now+`
-		WHERE freeze_identifier = ? AND lifted_at IS NULL AND (ends_at IS NULL OR ends_at > ?)
-	`, liftedBy, nullString(reason), at, identifier, at)
+		SET lifted_by = ?, lift_reason = ?, lifted_at = `+now+`, updated_at = `+now+`
+		WHERE freeze_identifier = ? AND lifted_at IS NULL AND (ends_at IS NULL OR ends_at > `+now+`)
+	`, liftedBy, nullString(reason), identifier)
 	if err != nil {
 		return nil, fmt.Errorf("lift freeze %s: %w", identifier, err)
 	}
@@ -115,16 +115,17 @@ func (s *freezeStore) Lift(ctx context.Context, identifier, liftedBy, reason str
 	return nil, fmt.Errorf("lift freeze %s: %w", identifier, storage.ErrFreezeEnded)
 }
 
-// ListInEffect returns the freezes in effect at at, oldest start first.
-func (s *freezeStore) ListInEffect(ctx context.Context, environment string, at time.Time) ([]*storage.EnvironmentFreeze, error) {
-	at = freezeTime(at)
+// ListInEffect returns the freezes in effect now, by the database's clock,
+// oldest start first.
+func (s *freezeStore) ListInEffect(ctx context.Context, environment string) ([]*storage.EnvironmentFreeze, error) {
+	now := s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)
 	where, args := freezeEnvironmentFilter(environment)
 	freezes, err := s.list(ctx, `
 		SELECT `+freezeColumns+`
 		FROM environment_freezes
-		WHERE `+where+`lifted_at IS NULL AND starts_at <= ? AND (ends_at IS NULL OR ends_at > ?)
+		WHERE `+where+`lifted_at IS NULL AND starts_at <= `+now+` AND (ends_at IS NULL OR ends_at > `+now+`)
 		ORDER BY starts_at, id
-	`, append(args, at, at)...)
+	`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list freezes in effect (environment %q): %w", environment, err)
 	}
@@ -210,7 +211,7 @@ func scanFreeze(row interface{ Scan(dest ...any) error }) (*storage.EnvironmentF
 		liftedAt    sql.NullTime
 	)
 	if err := row.Scan(&freeze.ID, &freeze.Identifier, &freeze.Environment, &deployments, &databases,
-		&freeze.Kind, &freeze.Override, &freeze.StartsAt, &endsAt, &freeze.Reason, &freeze.CreatedBy,
+		&freeze.Kind, &freeze.Running, &freeze.StartsAt, &endsAt, &freeze.Reason, &freeze.CreatedBy,
 		&freeze.Source, &externalID, &liftedBy, &liftReason, &liftedAt, &freeze.CreatedAt); err != nil {
 		return nil, err
 	}

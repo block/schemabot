@@ -379,13 +379,14 @@ type FreezeStore interface {
 	// Lift ends a freeze early and returns it as lifted. The update is
 	// conditional, so two concurrent lifts end it once. It returns
 	// ErrFreezeNotFound when there is no such freeze, ErrFreezeAlreadyLifted
-	// when someone lifted it first, and ErrFreezeEnded when it reached its
-	// end time before at.
-	Lift(ctx context.Context, identifier, liftedBy, reason string, at time.Time) (*EnvironmentFreeze, error)
+	// when someone lifted it first, and ErrFreezeEnded when it already
+	// reached its end time. The lift time is the database's clock.
+	Lift(ctx context.Context, identifier, liftedBy, reason string) (*EnvironmentFreeze, error)
 
-	// ListInEffect returns the freezes in effect at at, oldest start first.
-	// An empty environment returns every environment's freezes.
-	ListInEffect(ctx context.Context, environment string, at time.Time) ([]*EnvironmentFreeze, error)
+	// ListInEffect returns the freezes in effect now, oldest start first.
+	// An empty environment returns every environment's freezes. "Now" is the
+	// database's clock, so every pod agrees at the edges of a freeze.
+	ListInEffect(ctx context.Context, environment string) ([]*EnvironmentFreeze, error)
 }
 
 // SettingsStore manages admin-level SchemaBot settings (global config).

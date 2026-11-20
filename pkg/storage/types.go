@@ -409,14 +409,17 @@ const (
 	FreezeKindPlanned = "planned"
 )
 
-// Freeze override rules say who may run a change during a freeze. Every
-// override carries a reason, whichever rule applies.
+// Freeze running policies say what happens to applies admitted before a
+// freeze started. A freeze always refuses new applies; the policy decides
+// whether admitted ones finish or stop.
 const (
-	// FreezeOverrideAnyone lets anyone allowed to apply override the freeze.
-	FreezeOverrideAnyone = "anyone"
+	// FreezeRunningContinue lets admitted applies run to the end, every
+	// operation and the cutover included. It suits a calendar freeze.
+	FreezeRunningContinue = "continue"
 
-	// FreezeOverrideAdmins lets only freeze admins override the freeze.
-	FreezeOverrideAdmins = "admins"
+	// FreezeRunningStop stops admitted applies, and keeps an admitted apply
+	// from starting an operation it has not started. It suits an incident.
+	FreezeRunningStop = "stop"
 )
 
 // FreezeSourceManual is the source of a freeze set by a person or a direct
@@ -426,7 +429,7 @@ const FreezeSourceManual = "manual"
 
 // EnvironmentFreeze is one freeze of an environment, or of part of it.
 // While a freeze is in effect, SchemaBot refuses new changes in its scope
-// unless they carry an override. The row stays after the freeze ends or is
+// unless a second person approved an override. The row stays after the freeze ends or is
 // lifted, as the audit trail.
 type EnvironmentFreeze struct {
 	ID         int64  // internal; Identifier is the handle users and logs see
@@ -438,8 +441,8 @@ type EnvironmentFreeze struct {
 	Deployments []string
 	Databases   []string
 
-	Kind     string // FreezeKindOnDemand or FreezeKindPlanned
-	Override string // FreezeOverrideAnyone or FreezeOverrideAdmins
+	Kind    string // FreezeKindOnDemand or FreezeKindPlanned
+	Running string // FreezeRunningContinue or FreezeRunningStop
 
 	// StartsAt is when the freeze takes effect. EndsAt is when it ends on
 	// its own; nil means it lasts until someone lifts it.
@@ -522,8 +525,8 @@ func (f *EnvironmentFreeze) Validate() error {
 		return errors.New("freeze environment is required")
 	case f.Kind != FreezeKindOnDemand && f.Kind != FreezeKindPlanned:
 		return fmt.Errorf("freeze kind %q is not %q or %q", f.Kind, FreezeKindOnDemand, FreezeKindPlanned)
-	case f.Override != FreezeOverrideAnyone && f.Override != FreezeOverrideAdmins:
-		return fmt.Errorf("freeze override %q is not %q or %q", f.Override, FreezeOverrideAnyone, FreezeOverrideAdmins)
+	case f.Running != FreezeRunningContinue && f.Running != FreezeRunningStop:
+		return fmt.Errorf("freeze running policy %q is not %q or %q", f.Running, FreezeRunningContinue, FreezeRunningStop)
 	case f.StartsAt.IsZero():
 		return errors.New("freeze start time is required")
 	case f.EndsAt != nil && !f.EndsAt.After(f.StartsAt):

@@ -34,7 +34,7 @@ func TestFreezes(t *testing.T, h Harness) {
 		assert.Equal(t, []string{"cash", "square"}, got.Deployments, "deployments are stored canonical")
 		assert.Equal(t, []string{"orders"}, got.Databases, "databases are stored canonical")
 		assert.Equal(t, storage.FreezeKindOnDemand, got.Kind)
-		assert.Equal(t, storage.FreezeOverrideAdmins, got.Override)
+		assert.Equal(t, storage.FreezeRunningStop, got.Running)
 		assert.WithinDuration(t, want.StartsAt, got.StartsAt, time.Millisecond)
 		assert.Nil(t, got.EndsAt, "an on-demand freeze may be open-ended")
 		assert.Equal(t, want.Reason, got.Reason)
@@ -80,7 +80,7 @@ func TestFreezes(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, created.EndsAt)
 		assert.WithinDuration(t, *freeze.EndsAt, *created.EndsAt, time.Millisecond)
-		assert.Equal(t, storage.FreezeOverrideAnyone, created.Override)
+		assert.Equal(t, storage.FreezeRunningContinue, created.Running)
 		assert.Equal(t, "event-1", created.ExternalID)
 
 		_, err = store.Freezes().Create(ctx, plannedFreeze("staging", start, start.Add(time.Hour), "chill-calendar", "event-1"))
@@ -106,7 +106,7 @@ func TestFreezes(t *testing.T, h Harness) {
 			created := createFreeze(t, store, onDemandFreeze("production", now))
 			assert.Nil(t, created.Deployments, "a whole-environment scope reads back nil")
 		}
-		inEffect, err := store.Freezes().ListInEffect(ctx, "production", now.Add(time.Second))
+		inEffect, err := store.Freezes().ListInEffect(ctx, "production")
 		require.NoError(t, err)
 		assert.Len(t, inEffect, 3)
 	})
@@ -121,22 +121,20 @@ func TestFreezes(t *testing.T, h Harness) {
 		createFreeze(t, store, plannedFreeze("production", now.Add(time.Hour), now.Add(2*time.Hour), "chill-calendar", "later"))
 		createFreeze(t, store, plannedFreeze("production", now.Add(-2*time.Hour), now.Add(-time.Hour), "chill-calendar", "ended"))
 		lifted := createFreeze(t, store, onDemandFreeze("production", now.Add(-time.Hour)))
-		_, err := store.Freezes().Lift(ctx, lifted.Identifier, "alice", "resolved", now.Add(-time.Minute))
+		_, err := store.Freezes().Lift(ctx, lifted.Identifier, "alice", "resolved")
 		require.NoError(t, err)
 		staging := createFreeze(t, store, onDemandFreeze("staging", now.Add(-time.Hour)))
 
-		inEffect, err := store.Freezes().ListInEffect(ctx, "Production", now)
+		// "Now" is the database's clock; the freezes sit an hour or more
+		// from it, so the result does not depend on clock skew.
+		inEffect, err := store.Freezes().ListInEffect(ctx, "Production")
 		require.NoError(t, err)
 		assert.Equal(t, []string{active.Identifier, windowed.Identifier}, freezeIdentifiers(inEffect),
 			"only started, unended, unlifted freezes of the environment, oldest start first")
 
-		all, err := store.Freezes().ListInEffect(ctx, "", now)
+		all, err := store.Freezes().ListInEffect(ctx, "")
 		require.NoError(t, err)
 		assert.ElementsMatch(t, []string{active.Identifier, windowed.Identifier, staging.Identifier}, freezeIdentifiers(all))
-
-		later, err := store.Freezes().ListInEffect(ctx, "production", now.Add(90*time.Minute))
-		require.NoError(t, err)
-		assert.Len(t, later, 2, "the windowed freeze ends and the later one starts on their own")
 	})
 
 	t.Run("Lift", func(t *testing.T) {
@@ -145,13 +143,16 @@ func TestFreezes(t *testing.T, h Harness) {
 		now := time.Now().UTC()
 
 		freeze := createFreeze(t, store, onDemandFreeze("production", now.Add(-time.Hour)))
-		lifted, err := store.Freezes().Lift(ctx, freeze.Identifier, "bob", "SEV resolved", now)
+		lifted, err := store.Freezes().Lift(ctx, freeze.Identifier, "bob", "SEV resolved")
 		require.NoError(t, err)
 		assert.Equal(t, "bob", lifted.LiftedBy)
 		assert.Equal(t, "SEV resolved", lifted.LiftReason)
 		require.NotNil(t, lifted.LiftedAt)
-		assert.WithinDuration(t, now, *lifted.LiftedAt, time.Millisecond)
-		assert.False(t, lifted.InEffectAt(now.Add(time.Second)))
+		assert.WithinDuration(t, now, *lifted.LiftedAt, time.Minute, "the lift time is the database's clock")
+
+		inEffect, err := store.Freezes().ListInEffect(ctx, "production")
+		require.NoError(t, err)
+		assert.Empty(t, inEffect, "a lifted freeze is no longer in effect")
 
 		got, err := store.Freezes().Get(ctx, freeze.Identifier)
 		require.NoError(t, err)
@@ -164,13 +165,13 @@ func TestFreezes(t *testing.T, h Harness) {
 		now := time.Now().UTC()
 
 		freeze := createFreeze(t, store, onDemandFreeze("production", now.Add(-time.Hour)))
-		_, err := store.Freezes().Lift(ctx, freeze.Identifier, " ", "", now)
+		_, err := store.Freezes().Lift(ctx, freeze.Identifier, " ", "")
 		require.Error(t, err)
 		got, err := store.Freezes().Get(ctx, freeze.Identifier)
 		require.NoError(t, err)
 		assert.Nil(t, got.LiftedAt)
 
-		lifted, err := store.Freezes().Lift(ctx, freeze.Identifier, "bob", "", now)
+		lifted, err := store.Freezes().Lift(ctx, freeze.Identifier, "bob", "")
 		require.NoError(t, err, "the lift reason is optional")
 		assert.Empty(t, lifted.LiftReason)
 	})
@@ -179,7 +180,7 @@ func TestFreezes(t *testing.T, h Harness) {
 		store := h.NewStorage(t)
 		_, err := store.Freezes().Get(t.Context(), "freeze-missing")
 		require.ErrorIs(t, err, storage.ErrFreezeNotFound)
-		_, err = store.Freezes().Lift(t.Context(), "freeze-missing", "bob", "", time.Now().UTC())
+		_, err = store.Freezes().Lift(t.Context(), "freeze-missing", "bob", "")
 		require.ErrorIs(t, err, storage.ErrFreezeNotFound)
 	})
 
@@ -189,9 +190,9 @@ func TestFreezes(t *testing.T, h Harness) {
 		now := time.Now().UTC()
 
 		freeze := createFreeze(t, store, onDemandFreeze("production", now.Add(-time.Hour)))
-		_, err := store.Freezes().Lift(ctx, freeze.Identifier, "alice", "first", now)
+		_, err := store.Freezes().Lift(ctx, freeze.Identifier, "alice", "first")
 		require.NoError(t, err)
-		_, err = store.Freezes().Lift(ctx, freeze.Identifier, "bob", "second", now.Add(time.Second))
+		_, err = store.Freezes().Lift(ctx, freeze.Identifier, "bob", "second")
 		require.ErrorIs(t, err, storage.ErrFreezeAlreadyLifted)
 
 		got, err := store.Freezes().Get(ctx, freeze.Identifier)
@@ -206,7 +207,7 @@ func TestFreezes(t *testing.T, h Harness) {
 		now := time.Now().UTC()
 
 		freeze := createFreeze(t, store, plannedFreeze("production", now.Add(-2*time.Hour), now.Add(-time.Hour), "chill-calendar", "ended"))
-		_, err := store.Freezes().Lift(ctx, freeze.Identifier, "bob", "", now)
+		_, err := store.Freezes().Lift(ctx, freeze.Identifier, "bob", "")
 		require.ErrorIs(t, err, storage.ErrFreezeEnded)
 	})
 
@@ -217,12 +218,10 @@ func TestFreezes(t *testing.T, h Harness) {
 
 		// Lifting a freeze before it starts cancels it.
 		freeze := createFreeze(t, store, plannedFreeze("production", now.Add(time.Hour), now.Add(2*time.Hour), "chill-calendar", "later"))
-		_, err := store.Freezes().Lift(ctx, freeze.Identifier, "bob", "launch moved", now)
+		lifted, err := store.Freezes().Lift(ctx, freeze.Identifier, "bob", "launch moved")
 		require.NoError(t, err)
-
-		inEffect, err := store.Freezes().ListInEffect(ctx, "production", now.Add(90*time.Minute))
-		require.NoError(t, err)
-		assert.Empty(t, inEffect, "a freeze lifted before it starts never takes effect")
+		require.NotNil(t, lifted.LiftedAt)
+		assert.False(t, lifted.InEffectAt(freeze.StartsAt.Add(time.Minute)), "a freeze lifted before it starts never takes effect")
 	})
 
 	t.Run("Lift_ConcurrentLiftsEndItOnce", func(t *testing.T) {
@@ -236,7 +235,7 @@ func TestFreezes(t *testing.T, h Harness) {
 		var wg sync.WaitGroup
 		for i := range lifters {
 			wg.Go(func() {
-				_, errs[i] = store.Freezes().Lift(ctx, freeze.Identifier, "lifter", "", now)
+				_, errs[i] = store.Freezes().Lift(ctx, freeze.Identifier, "lifter", "")
 			})
 		}
 		wg.Wait()
@@ -262,9 +261,9 @@ func TestFreezes(t *testing.T, h Harness) {
 		_, err = store.Freezes().Get(ctx, "freeze-any")
 		require.Error(t, err)
 		require.NotErrorIs(t, err, storage.ErrFreezeNotFound, "a connection failure is not a missing freeze")
-		_, err = store.Freezes().Lift(ctx, "freeze-any", "bob", "", now)
+		_, err = store.Freezes().Lift(ctx, "freeze-any", "bob", "")
 		require.Error(t, err)
-		_, err = store.Freezes().ListInEffect(ctx, "production", now)
+		_, err = store.Freezes().ListInEffect(ctx, "production")
 		require.Error(t, err)
 	})
 }
@@ -274,7 +273,7 @@ func onDemandFreeze(environment string, startsAt time.Time) *storage.Environment
 		Identifier:  engine.NewFreezeID(),
 		Environment: environment,
 		Kind:        storage.FreezeKindOnDemand,
-		Override:    storage.FreezeOverrideAdmins,
+		Running:     storage.FreezeRunningStop,
 		StartsAt:    startsAt,
 		Reason:      "SEV-1234 payments latency",
 		CreatedBy:   "alice",
@@ -287,7 +286,7 @@ func plannedFreeze(environment string, startsAt, endsAt time.Time, source, exter
 		Identifier:  engine.NewFreezeID(),
 		Environment: environment,
 		Kind:        storage.FreezeKindPlanned,
-		Override:    storage.FreezeOverrideAnyone,
+		Running:     storage.FreezeRunningContinue,
 		StartsAt:    startsAt,
 		EndsAt:      &endsAt,
 		Reason:      "Planned code freeze",

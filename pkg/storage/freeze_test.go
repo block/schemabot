@@ -59,7 +59,7 @@ func TestEnvironmentFreezeValidate(t *testing.T) {
 			Identifier:  "freeze-0123456789abcdef",
 			Environment: "production",
 			Kind:        FreezeKindOnDemand,
-			Override:    FreezeOverrideAdmins,
+			Running:     FreezeRunningStop,
 			StartsAt:    start,
 			Reason:      "incident",
 			CreatedBy:   "alice",
@@ -70,7 +70,7 @@ func TestEnvironmentFreezeValidate(t *testing.T) {
 
 	planned := valid()
 	planned.Kind = FreezeKindPlanned
-	planned.Override = FreezeOverrideAnyone
+	planned.Running = FreezeRunningContinue
 	planned.EndsAt = &end
 	planned.Source = "calendar"
 	planned.ExternalID = "event-1"
@@ -84,7 +84,7 @@ func TestEnvironmentFreezeValidate(t *testing.T) {
 		{name: "identifier", mutate: func(f *EnvironmentFreeze) { f.Identifier = " " }, want: "identifier is required"},
 		{name: "environment", mutate: func(f *EnvironmentFreeze) { f.Environment = "" }, want: "environment is required"},
 		{name: "kind", mutate: func(f *EnvironmentFreeze) { f.Kind = "sometimes" }, want: "freeze kind"},
-		{name: "override", mutate: func(f *EnvironmentFreeze) { f.Override = "reason" }, want: "freeze override"},
+		{name: "running", mutate: func(f *EnvironmentFreeze) { f.Running = "throttle" }, want: "freeze running policy"},
 		{name: "start", mutate: func(f *EnvironmentFreeze) { f.StartsAt = time.Time{} }, want: "start time is required"},
 		{name: "end before start", mutate: func(f *EnvironmentFreeze) { f.EndsAt = &before }, want: "end time must be after"},
 		{name: "planned without end", mutate: func(f *EnvironmentFreeze) { f.Kind = FreezeKindPlanned }, want: "planned freeze needs an end time"},
