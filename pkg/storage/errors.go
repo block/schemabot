@@ -76,6 +76,16 @@ var (
 	// its end time.
 	ErrFreezeEnded = errors.New("freeze already ended")
 
+	// ErrFreezeEpochChanged is returned by an admission write when a freeze
+	// was created in its environment after the change gate checked. The
+	// change was not recorded; checking the freezes again decides it.
+	ErrFreezeEpochChanged = errors.New("a freeze was created after the freeze check")
+
+	// ErrFreezeEpochUnreadable is returned by an admission write when it
+	// could not read the freeze epoch the change gate checked. The change
+	// was not recorded. The error also wraps the cause.
+	ErrFreezeEpochUnreadable = errors.New("the freeze epoch could not be read")
+
 	// ErrApplyNotFound is returned when an apply does not exist.
 	ErrApplyNotFound = errors.New("apply not found")
 

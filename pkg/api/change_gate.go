@@ -126,9 +126,11 @@ func (s *Service) changeGateDeployments(database, environment, deployment string
 // the configured rollout added for an apply not narrowed to one member: an
 // operation keeps running on a deployment later dropped from the rollout
 // configuration. If the operations cannot be read, the change is refused.
-func (s *Service) checkChangeGatesForApply(ctx context.Context, checkpoint changeGateCheckpoint, apply *storage.Apply, caller string) error {
+// The returned context is for the write that records the start or cutover;
+// see checkChangeGates.
+func (s *Service) checkChangeGatesForApply(ctx context.Context, checkpoint changeGateCheckpoint, apply *storage.Apply, caller string) (context.Context, error) {
 	if apply.GetOptions().PinnedRollback {
-		return nil
+		return ctx, nil
 	}
 	deployments := s.changeGateDeployments(apply.Database, apply.Environment, apply.Deployment, apply.GetOptions().NarrowedTo != "")
 	if operations := s.storage.ApplyOperations(); operations != nil {
@@ -137,7 +139,7 @@ func (s *Service) checkChangeGatesForApply(ctx context.Context, checkpoint chang
 			metrics.RecordChangeGateError(ctx, apply.Environment, string(checkpoint))
 			s.logger.Error("change gate could not read the apply's operations, so the change was refused",
 				append(apply.LogAttrs(), "checkpoint", string(checkpoint), "caller", caller, "error", err)...)
-			return &ChangeGateUnavailableError{Checkpoint: checkpoint, Gate: "operations", Err: fmt.Errorf("list operations of apply %s: %w", apply.ApplyIdentifier, err)}
+			return ctx, &ChangeGateUnavailableError{Checkpoint: checkpoint, Gate: "operations", Err: fmt.Errorf("list operations of apply %s: %w", apply.ApplyIdentifier, err)}
 		}
 		for _, operation := range stored {
 			if operation.Deployment != "" && !slices.Contains(deployments, operation.Deployment) {
@@ -157,7 +159,14 @@ func (s *Service) checkChangeGatesForApply(ctx context.Context, checkpoint chang
 // checkChangeGates runs every change gate. It returns nil when nothing
 // blocks, *ChangeGateRefusedError when something does, and
 // *ChangeGateUnavailableError when a gate could not decide.
-func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, caller string) error {
+//
+// When nothing blocks, it also returns the context for the write that admits
+// the change. The context carries the freeze epoch read before the freezes
+// were listed, and that write refuses with storage.ErrFreezeEpochChanged if a
+// freeze was created since, or storage.ErrFreezeEpochUnreadable if it could
+// not read the epoch; changeGateAdmissionError maps both refusals. Use
+// the context for that write only.
+func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, caller string) (context.Context, error) {
 	attrs := []any{
 		"checkpoint", string(in.Checkpoint),
 		"environment", in.Environment,
@@ -166,24 +175,62 @@ func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, call
 		"repository", in.Repository,
 		"caller", caller,
 	}
+	admitCtx := ctx
+	if s.storage != nil {
+		if freezes := s.storage.Freezes(); freezes != nil {
+			// Read before the freezes are listed: a freeze created after
+			// this read moves the epoch, and the admission write sees it.
+			epoch, err := freezes.Epoch(ctx, in.Environment)
+			if err != nil {
+				metrics.RecordChangeGateError(ctx, in.Environment, string(in.Checkpoint))
+				s.logger.Error("change gate could not read the freeze epoch, so the change was refused", append(attrs, "error", err)...)
+				return ctx, &ChangeGateUnavailableError{Checkpoint: in.Checkpoint, Gate: "freeze", Err: err}
+			}
+			admitCtx = storage.WithFreezeEpochGuard(ctx, storage.FreezeEpochGuard{Environment: in.Environment, Epoch: epoch})
+		}
+	}
 	var blockers []apitypes.ChangeGateBlocker
 	for _, gate := range s.changeGates() {
 		found, err := gate.Blockers(ctx, in)
 		if err != nil {
 			metrics.RecordChangeGateError(ctx, in.Environment, string(in.Checkpoint))
 			s.logger.Error("change gate check failed, so the change was refused", append(attrs, "gate", gate.Name(), "error", err)...)
-			return &ChangeGateUnavailableError{Checkpoint: in.Checkpoint, Gate: gate.Name(), Err: err}
+			return ctx, &ChangeGateUnavailableError{Checkpoint: in.Checkpoint, Gate: gate.Name(), Err: err}
 		}
 		blockers = append(blockers, found...)
 	}
 	if len(blockers) == 0 {
-		return nil
+		return admitCtx, nil
 	}
 	for _, gate := range distinctChangeGateNames(blockers) {
 		metrics.RecordChangeGateRefusal(ctx, in.Environment, gate, string(in.Checkpoint))
 	}
 	s.logger.Warn("change gate refused the change", append(attrs, "blockers", changeGateBlockerIDs(blockers))...)
-	return &ChangeGateRefusedError{Checkpoint: in.Checkpoint, Environment: in.Environment, Blockers: blockers}
+	return ctx, &ChangeGateRefusedError{Checkpoint: in.Checkpoint, Environment: in.Environment, Blockers: blockers}
+}
+
+// isFreezeAdmissionRefusal reports whether the admission write refused the
+// change over its freeze check: the epoch moved, or could not be read.
+func isFreezeAdmissionRefusal(err error) bool {
+	return errors.Is(err, storage.ErrFreezeEpochChanged) || errors.Is(err, storage.ErrFreezeEpochUnreadable)
+}
+
+// changeGateAdmissionError maps the admission write's refusal over its freeze
+// check to *ChangeGateUnavailableError, which asks the caller to try again.
+// After a stale check, the retry checks the freezes afresh and sees the new
+// freeze. After an unreadable epoch, the gate fails closed, as it does when
+// it cannot list the freezes. Any other error is returned as it is.
+func (s *Service) changeGateAdmissionError(ctx context.Context, checkpoint changeGateCheckpoint, environment string, err error) error {
+	if !isFreezeAdmissionRefusal(err) {
+		return err
+	}
+	metrics.RecordChangeGateError(ctx, environment, string(checkpoint))
+	message := "a freeze was created while the change was being admitted, so the change was refused"
+	if !errors.Is(err, storage.ErrFreezeEpochChanged) {
+		message = "the freeze epoch could not be read while the change was being admitted, so the change was refused"
+	}
+	s.logger.Warn(message, "checkpoint", string(checkpoint), "environment", environment, "error", err)
+	return &ChangeGateUnavailableError{Checkpoint: checkpoint, Gate: "freeze", Err: err}
 }
 
 func changeGateBlockerIDs(blockers []apitypes.ChangeGateBlocker) []string {

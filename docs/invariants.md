@@ -2198,14 +2198,23 @@ never letting it through unchecked. Nobody overrides a freeze in this version, a
 A PR rollback is known by a `pinned_rollback` option the server records when it creates the apply.
 A rollback created by an earlier version has none, so a freeze holds its later start or cutover;
 lifting the freeze lets it through.
-*Known gap:* the gate reads the freezes in one step and writes the apply, start or cutover in
-another. A freeze created between the two does not hold that change. #2119 closes this window.
+A freeze created while a change is being admitted is not missed. Creating a freeze bumps its
+environment's freeze epoch in the same transaction. The gate reads the epoch before it lists the
+freezes, and the transaction that writes the apply, start or cutover locks the epoch row and
+refuses the change with a retryable error if the epoch moved or could not be read. The lock makes
+a freeze being created wait for that write, so the freeze is acknowledged only after any change it
+did not see. One edge stays open: a planned freeze whose start time passes between the check and
+the write does not move the epoch, so a change admitted in that moment runs. The window is one
+request long.
 *Breaks if violated:* a schema change starts, or its cutover runs, during an incident or a code freeze.
 *Enforced:* the change gates and their evaluator (`checkChangeGates`, `pkg/api/change_gate.go`),
 run before apply creation in `queueValidatedApply` (`pkg/api/plan_handlers.go`), before a start is
 recorded in `executeStartForApply` and before a cutover is recorded in `executeCutoverForApply`
 (`pkg/api/control_handlers.go`), with the freeze query `ListInEffect`
-(`pkg/storage/internal/sqlstore/freezes.go`). A call-graph test
+(`pkg/storage/internal/sqlstore/freezes.go`). The epoch check is `checkFreezeEpochGuard`
+(`pkg/storage/internal/sqlstore/freezes.go`), called in apply creation
+(`pkg/storage/internal/sqlstore/applies.go`) and in `requestPending` for a start or cutover
+(`pkg/storage/internal/sqlstore/control_requests.go`). A call-graph test
 (`pkg/api/change_gate_completeness_test.go`) fails on any path that creates an apply or records a
 start or cutover without passing a function that runs the gates.
 

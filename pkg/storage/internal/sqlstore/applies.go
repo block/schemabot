@@ -930,6 +930,9 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	if err := verifyExpectedLockIntent(ctx, writeTx.tx, apply); err != nil {
 		return 0, err
 	}
+	if err := checkFreezeEpochGuard(ctx, writeTx.tx); err != nil {
+		return 0, fmt.Errorf("create apply %s: %w", apply.ApplyIdentifier, err)
+	}
 
 	if lockTarget {
 		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, s.dialect, apply.Database, apply.DatabaseType, apply.Environment, []string{apply.Deployment}, 0); err != nil {
@@ -1213,6 +1216,9 @@ func (s *applyStore) createWithRowsOnce(ctx context.Context, apply *storage.Appl
 	defer writeTx.close(ctx, opName)
 	if err := verifyExpectedLockIntent(ctx, writeTx.tx, apply); err != nil {
 		return 0, err
+	}
+	if err := checkFreezeEpochGuard(ctx, writeTx.tx); err != nil {
+		return 0, fmt.Errorf("%s %s: %w", opName, apply.ApplyIdentifier, err)
 	}
 
 	var admittedPast []activeApplyHolder

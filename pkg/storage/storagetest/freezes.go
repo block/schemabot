@@ -300,6 +300,8 @@ func TestFreezes(t *testing.T, h Harness) {
 		require.Error(t, err)
 	})
 
+	t.Run("Epochs", func(t *testing.T) { testFreezeEpochs(t, h) })
+
 	t.Run("UnreachableStorageSurfacesErrors", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewUnreachableStorage(t)
@@ -317,6 +319,8 @@ func TestFreezes(t *testing.T, h Harness) {
 		_, err = store.Freezes().Now(ctx)
 		require.Error(t, err)
 		_, err = store.Freezes().List(ctx, "production", 10)
+		require.Error(t, err)
+		_, err = store.Freezes().Epoch(ctx, "production")
 		require.Error(t, err)
 	})
 }

@@ -2147,6 +2147,7 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 	// Recovery remains available after the PR closes or its exception is revoked.
 	// Both guards are internal. Storage verifies the owner and exact rollback pin
 	// in the transaction that creates the apply, including after a concurrent repin.
+	admitCtx := ctx
 	if !isPinnedRollback(plan, req) {
 		if err := s.admitPRSchemaWork(ctx, plan.Repository, plan.PullRequest, plan.HeadSHA); err != nil {
 			return nil, 0, err
@@ -2154,19 +2155,22 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		// A rollback undoes a change, so the change gates never hold it. Only
 		// the webhook's pinned rollback is known to be one: the rollback
 		// option is the caller's to set.
-		if err := s.checkChangeGates(ctx, changeGateInput{
+		gatedCtx, err := s.checkChangeGates(ctx, changeGateInput{
 			Checkpoint:  changeGateCheckpointStart,
 			Environment: req.Environment,
 			Deployments: s.changeGateDeployments(plan.Database, req.Environment, plan.Deployment, req.Target != ""),
 			Database:    plan.Database,
 			Repository:  plan.Repository,
-		}, resolveCaller(ctx, req.Caller)); err != nil {
+		}, resolveCaller(ctx, req.Caller))
+		if err != nil {
 			recordApplyError("change gate", err)
 			return nil, 0, err
 		}
+		admitCtx = gatedCtx
 	}
-	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, options, attachObserver)
+	applyIdentifier, storedApplyID, err := s.enqueueApply(admitCtx, plan, req, options, attachObserver)
 	if err != nil {
+		err = s.changeGateAdmissionError(ctx, changeGateCheckpointStart, req.Environment, err)
 		recordApplyError("enqueue apply", err)
 		return nil, 0, err
 	}
