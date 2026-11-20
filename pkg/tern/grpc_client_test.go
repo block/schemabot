@@ -300,6 +300,48 @@ func TestGRPCClientHealthRetriesFailFast(t *testing.T) {
 	assert.Equal(t, 3, healths, "fast polls must stop after the small attempt budget so outages surface promptly")
 }
 
+// A data-plane pod that is replaced mid-drive can leave the client's connection
+// hanging instead of failing: the TCP connection opens but the server never
+// sends its HTTP/2 preface. A drive delivers pending control requests between
+// progress polls, so a poll stuck on that connection holds up an operator's
+// stop. The poll must give up within the client's connect timeout, not gRPC's
+// much longer default, so the next connection reaches the replacement pod.
+func TestGRPCClientProgressGivesUpOnSilentDataPlane(t *testing.T) {
+	// The listener completes TCP handshakes from its backlog but never accepts,
+	// so the client connects and then waits on a preface that never comes.
+	lis, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "localhost:0")
+	require.NoError(t, err)
+	client, err := NewGRPCClient(Config{Address: lis.Addr().String()})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		utils.CloseAndLog(client)
+		utils.CloseAndLog(lis)
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err = client.client.Progress(ctx, &ternv1.ProgressRequest{ApplyId: "apply-1"})
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Equal(t, codes.Unavailable, status.Code(err), "a silent data plane must surface as unavailable, not as the caller's deadline")
+	assert.Less(t, elapsed, 2*grpcMinConnectTimeout, "the poll must give up within the connect timeout")
+}
+
+// Every reconnect attempt after a run of failures is bounded the same way as
+// the first: gRPC gives an attempt the larger of the connect timeout and the
+// current backoff, so the backoff at its jittered worst must not exceed the
+// connect timeout, or a poll during a long data-plane rollout could hang far
+// past it.
+func TestGRPCClientLaterReconnectAttemptsKeepTheConnectTimeout(t *testing.T) {
+	worstBackoff := time.Duration(float64(grpcConnectBackoff.MaxDelay) * (1 + grpcConnectBackoff.Jitter))
+	assert.LessOrEqual(t, worstBackoff, grpcMinConnectTimeout,
+		"the longest jittered backoff must not extend a connection attempt past the connect timeout")
+	assert.Greater(t, grpcConnectBackoff.MaxDelay, grpcConnectBackoff.BaseDelay,
+		"backoff must still grow between consecutive failures")
+}
+
 // Apply is state-changing, so the client surfaces a transient UNAVAILABLE
 // instead of re-sending the request; the operator's durable queue owns
 // redelivery for dispatch failures.
