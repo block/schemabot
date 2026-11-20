@@ -115,6 +115,17 @@ type DatabaseNotFoundError struct {
 	// repository, which by the ConfigDirHints contract is a database that does
 	// not accept changes from the repository.
 	SearchScoped bool
+	// UnreadableConfigs lists the configs the search found but could not
+	// read or parse. Any one of them may be the database's, so a miss with
+	// unreadable configs does not establish that the database's config is
+	// absent.
+	UnreadableConfigs []string
+}
+
+// Conclusive reports whether the miss establishes that the searched locations
+// hold no config for the database: every config the search found was read.
+func (e *DatabaseNotFoundError) Conclusive() bool {
+	return len(e.UnreadableConfigs) == 0
 }
 
 // RepositoryNotAccepted reports whether the miss is a policy answer rather than
@@ -144,7 +155,25 @@ func (e *DatabaseNotFoundError) Error() string {
 type InvalidConfigInfo struct {
 	Path  string
 	Error string
+	// Err is the error that made the config unusable. A *ConfigReadError
+	// means GitHub could not return the file, which a retry can fix; anything
+	// else is a config that was read and failed to parse or validate.
+	Err error
 }
+
+// ConfigReadError reports that a schemabot.yaml could not be read from GitHub,
+// as opposed to read and found invalid. A retry can succeed, so a caller must
+// not report it as a rejected config.
+type ConfigReadError struct {
+	Path string
+	Err  error
+}
+
+func (e *ConfigReadError) Error() string {
+	return fmt.Sprintf("fetch config at %s: %v", e.Path, e.Err)
+}
+
+func (e *ConfigReadError) Unwrap() error { return e.Err }
 
 // FetchConfig fetches and parses the schemabot.yaml config file from a specific path.
 func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath, ref string) (*SchemabotConfig, error) {
@@ -153,7 +182,7 @@ func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath,
 		if IsNotFoundError(err) {
 			return nil, ErrNoConfig
 		}
-		return nil, fmt.Errorf("fetch config at %s: %w", configPath, err)
+		return nil, &ConfigReadError{Path: configPath, Err: err}
 	}
 
 	var config SchemabotConfig
@@ -236,7 +265,7 @@ func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref stri
 func (ic *InstallationClient) collectConfigsFromTree(ctx context.Context, repo, ref string, entries []TreeEntry) *FindAllConfigsResult {
 	result := &FindAllConfigsResult{}
 	for _, entry := range entries {
-		if entry.Type != "blob" || !strings.HasSuffix(entry.Path, ConfigFileName) {
+		if entry.Type != "blob" || !isConfigFile(entry.Path) {
 			continue
 		}
 		config, err := ic.FetchConfig(ctx, repo, entry.Path, ref)
@@ -245,6 +274,7 @@ func (ic *InstallationClient) collectConfigsFromTree(ctx context.Context, repo, 
 			result.InvalidConfigs = append(result.InvalidConfigs, InvalidConfigInfo{
 				Path:  entry.Path,
 				Error: err.Error(),
+				Err:   err,
 			})
 			continue
 		}
@@ -395,6 +425,7 @@ func (ic *InstallationClient) scanHintDirsForConfigs(ctx context.Context, repo, 
 				result.InvalidConfigs = append(result.InvalidConfigs, InvalidConfigInfo{
 					Path:  configPath,
 					Error: err.Error(),
+					Err:   err,
 				})
 				continue
 			}
@@ -406,6 +437,56 @@ func (ic *InstallationClient) scanHintDirsForConfigs(ctx context.Context, repo, 
 		}
 	}
 	return result, nil
+}
+
+// FindConfigByDatabaseNameInItsDirs finds the named database's schemabot.yaml
+// at ref by scanning only the directories the server allows that database's
+// config in, so its cost does not grow with the other configs the repository
+// holds. scoped is false when those directories cannot bound where the config
+// may live (the database allows configs anywhere in the repository), and the
+// caller has to search the repository instead. Because the directories belong
+// to this database, a config there that cannot be read is an error rather
+// than a miss. A miss is a *DatabaseNotFoundError naming the directories.
+func (ic *InstallationClient) FindConfigByDatabaseNameInItsDirs(ctx context.Context, repo, ref, databaseName string) (config *SchemabotConfig, configDir string, scoped bool, err error) {
+	if ic.configDirHints == nil {
+		ic.logger.Debug("no config dir hints configured; the database's config directories cannot be scanned on their own",
+			"repo", repo, "ref", ref, "database", databaseName)
+		return nil, "", false, nil
+	}
+	dirs, exhaustive := ic.configDirHints.SchemaDirHintsForDatabase(repo, databaseName)
+	if !exhaustive {
+		ic.logger.Debug("the database's allowed directories do not bound where its config may live; the caller searches the repository",
+			"repo", repo, "ref", ref, "database", databaseName)
+		return nil, "", false, nil
+	}
+	result, err := ic.scanHintDirsForConfigs(ctx, repo, ref, dirs)
+	if err != nil {
+		return nil, "", true, fmt.Errorf("scan the configured schema dirs of database %s in repo %s ref %s: %w", databaseName, repo, ref, err)
+	}
+	for _, invalid := range result.InvalidConfigs {
+		if readErr, ok := errors.AsType[*ConfigReadError](invalid.Err); ok {
+			return nil, "", true, fmt.Errorf("read the configs in the schema dirs of database %s in repo %s ref %s: %w", databaseName, repo, ref, readErr)
+		}
+	}
+	if len(result.InvalidConfigs) > 0 {
+		return nil, "", true, fmt.Errorf("%w at %s", ErrInvalidConfig, strings.Join(invalidConfigPaths(result.InvalidConfigs), ", "))
+	}
+	config, configDir, found, err := selectConfigByDatabaseName(databaseName, result.ValidConfigs)
+	if err != nil {
+		return nil, "", true, err
+	}
+	if !found {
+		return nil, "", true, &DatabaseNotFoundError{DatabaseName: databaseName, SearchedDirs: dirs, SearchScoped: true}
+	}
+	return config, configDir, true, nil
+}
+
+func invalidConfigPaths(invalid []InvalidConfigInfo) []string {
+	paths := make([]string, 0, len(invalid))
+	for _, info := range invalid {
+		paths = append(paths, info.Path)
+	}
+	return paths
 }
 
 // FindConfigByDatabaseName finds a schemabot.yaml config by database name:
@@ -488,7 +569,7 @@ func (ic *InstallationClient) FindConfigByDatabaseNameInRepo(ctx context.Context
 			// names those directories, since the rest of the repository was
 			// never searched. Other databases were not enumerated, so no
 			// available-databases list is offered.
-			return nil, "", &DatabaseNotFoundError{DatabaseName: databaseName, SearchedDirs: searchedDirs, SearchScoped: true}
+			return nil, "", &DatabaseNotFoundError{DatabaseName: databaseName, SearchedDirs: searchedDirs, SearchScoped: true, UnreadableConfigs: invalidConfigPaths(result.InvalidConfigs)}
 		}
 		ic.logger.Debug("found config for database via scoped truncated-tree probe", "database", databaseName, "path", configDir)
 		return config, configDir, nil
@@ -507,7 +588,7 @@ func (ic *InstallationClient) FindConfigByDatabaseNameInRepo(ctx context.Context
 		for _, dc := range result.ValidConfigs {
 			available = append(available, dc.Config.Database)
 		}
-		return nil, "", &DatabaseNotFoundError{DatabaseName: databaseName, AvailableDatabases: available}
+		return nil, "", &DatabaseNotFoundError{DatabaseName: databaseName, AvailableDatabases: available, UnreadableConfigs: invalidConfigPaths(result.InvalidConfigs)}
 	}
 
 	ic.logger.Debug("found config for database", "database", databaseName, "path", configDir)
