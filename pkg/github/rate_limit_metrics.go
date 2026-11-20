@@ -199,6 +199,16 @@ type githubRoutePattern struct {
 }
 
 var githubRoutePatterns = []githubRoutePattern{
+	{method: http.MethodGet, path: "/repos/{owner}/{repo}", operation: metrics.GitHubOperationFetchRepository},
+	{method: http.MethodGet, path: "/repos/{owner}/{repo}/installation", operation: metrics.GitHubOperationFetchRepositoryInstallation},
+	{method: http.MethodGet, path: "/repos/{owner}/{repo}/issues/comments/{comment_id}", operation: metrics.GitHubOperationFetchIssueComment},
+	{method: http.MethodGet, path: "/repos/{owner}/{repo}/issues/{issue_number}/timeline", operation: metrics.GitHubOperationListIssueTimeline},
+	{method: http.MethodDelete, path: "/repos/{owner}/{repo}/issues/{issue_number}/labels/{name...}", operation: metrics.GitHubOperationRemoveIssueLabel},
+	{method: http.MethodGet, path: "/repos/{owner}/{repo}/pulls", operation: metrics.GitHubOperationListPullRequests},
+	{method: http.MethodGet, path: "/repos/{owner}/{repo}/commits/{commit_sha}/pulls", operation: metrics.GitHubOperationListPullRequestsForCommit},
+	{method: http.MethodGet, path: "/repos/{owner}/{repo}/compare/{basehead...}", operation: metrics.GitHubOperationCompareCommits},
+	{method: http.MethodGet, path: "/repos/{owner}/{repo}/git/ref/{ref...}", operation: metrics.GitHubOperationFetchRef},
+	{method: http.MethodGet, path: "/repos/{owner}/{repo}/git/matching-refs/{ref...}", operation: metrics.GitHubOperationListMatchingRefs},
 	{method: http.MethodGet, path: "/repos/{owner}/{repo}/rules/branches/{branch...}", operation: metrics.GitHubOperationFetchBranchRules},
 	{
 		method:    http.MethodGet,
@@ -436,12 +446,22 @@ func gitHubRequestCategory(operation string) string {
 		metrics.GitHubOperationDeleteIssueComment,
 		metrics.GitHubOperationEditIssueComment,
 		metrics.GitHubOperationGraphQLMinimizeComment,
+		metrics.GitHubOperationRemoveIssueLabel,
 		metrics.GitHubOperationRequestReviewers,
 		metrics.GitHubOperationUpdateCheckRun:
 		return metrics.GitHubRequestCategoryWrite
 	case metrics.GitHubOperationCreateInstallationAccessToken:
 		return metrics.GitHubRequestCategoryAuth
 	case metrics.GitHubOperationFetchAppSlug,
+		metrics.GitHubOperationFetchRepository,
+		metrics.GitHubOperationFetchRepositoryInstallation,
+		metrics.GitHubOperationFetchIssueComment,
+		metrics.GitHubOperationListIssueTimeline,
+		metrics.GitHubOperationListPullRequests,
+		metrics.GitHubOperationListPullRequestsForCommit,
+		metrics.GitHubOperationCompareCommits,
+		metrics.GitHubOperationFetchRef,
+		metrics.GitHubOperationListMatchingRefs,
 		metrics.GitHubOperationFetchBlob,
 		metrics.GitHubOperationFetchDiff,
 		metrics.GitHubOperationFetchFileContent,
@@ -453,6 +473,7 @@ func gitHubRequestCategory(operation string) string {
 		metrics.GitHubOperationGetCombinedStatus,
 		metrics.GitHubOperationGetTeam,
 		metrics.GitHubOperationGetTeamMembership,
+		metrics.GitHubOperationGraphQLMergeQueueEntries,
 		metrics.GitHubOperationGraphQLStatusCheckRollup,
 		metrics.GitHubOperationGraphQLTreeEntries,
 		metrics.GitHubOperationListAppInstallations,
