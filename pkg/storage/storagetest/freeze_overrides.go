@@ -212,6 +212,15 @@ func TestFreezeOverrides(t *testing.T, h Harness) {
 		require.Len(t, approved, 2, "only approved requests for this environment, action and target")
 		assert.Equal(t, second.Identifier, approved[0].Identifier, "most recently approved first")
 		assert.Equal(t, first.Identifier, approved[1].Identifier)
+
+		waiting, err := store.FreezeOverrides().ListPending(ctx, storage.FreezeOverrideTarget{
+			Environment: "PRODUCTION",
+			Action:      storage.FreezeOverrideActionApply,
+			TargetID:    "plan-1",
+		})
+		require.NoError(t, err)
+		require.Len(t, waiting, 1, "only the unapproved request for this environment, action and target")
+		assert.Equal(t, pending.Identifier, waiting[0].Identifier)
 	})
 
 	t.Run("ListApproved_LeavesOutExpiredRequests", func(t *testing.T) {
@@ -248,6 +257,8 @@ func TestFreezeOverrides(t *testing.T, h Harness) {
 		_, err = store.Approve(ctx, "ovr-1", "bob")
 		require.Error(t, err)
 		_, err = store.ListApproved(ctx, storage.FreezeOverrideTarget{Environment: "production", Action: storage.FreezeOverrideActionApply, TargetID: "plan-1"})
+		require.Error(t, err)
+		_, err = store.ListPending(ctx, storage.FreezeOverrideTarget{Environment: "production", Action: storage.FreezeOverrideActionApply, TargetID: "plan-1"})
 		require.Error(t, err)
 	})
 }

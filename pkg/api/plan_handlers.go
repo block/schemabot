@@ -2173,8 +2173,10 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 			Database:    plan.Database,
 			Repository:  plan.Repository,
 			Action:      storage.FreezeOverrideActionApply,
-			TargetID:    applyOverrideTarget(plan, req.Target),
-			Override:    strings.TrimSpace(req.Override),
+			ResolveTargetID: func(ctx context.Context) (string, error) {
+				return s.applyOverrideTargetFor(ctx, plan, req)
+			},
+			Override: strings.TrimSpace(req.Override),
 		}, resolveCaller(ctx, req.Caller))
 		if err != nil {
 			recordApplyError("change gate", err)

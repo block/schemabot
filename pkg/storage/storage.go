@@ -431,6 +431,10 @@ type FreezeOverrideStore interface {
 	// ListApproved returns the approved requests for one change that have
 	// not expired by the database clock, most recently approved first.
 	ListApproved(ctx context.Context, target FreezeOverrideTarget) ([]*FreezeOverrideRequest, error)
+
+	// ListPending returns the requests for one change that are not yet
+	// approved and have not expired by the database clock, newest first.
+	ListPending(ctx context.Context, target FreezeOverrideTarget) ([]*FreezeOverrideRequest, error)
 }
 
 // FreezeOverrideTarget names the change an override request is for.

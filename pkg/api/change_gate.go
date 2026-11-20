@@ -39,10 +39,15 @@ type changeGateInput struct {
 	Deployments []string
 	Database    string
 	Repository  string
-	// Action and TargetID name the change an override request covers: the
-	// plan an apply would run, or the apply a start or cutover acts on.
+	// Action and TargetID name the change an override request covers: what
+	// each member of an apply would run, or the apply a start or cutover acts
+	// on.
 	Action   string
 	TargetID string
+	// ResolveTargetID names an apply's target when something blocks it.
+	// Resolving reads the rollout's member plans, so an apply nothing blocks
+	// does not pay for it here.
+	ResolveTargetID func(context.Context) (string, error)
 	// Override is the requester's trimmed reason for asking an approver to
 	// override the blockers. Empty when none was given.
 	Override string
@@ -229,6 +234,14 @@ func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, call
 	if len(blockers) == 0 {
 		return admitCtx, nil, nil
 	}
+	if in.TargetID == "" && in.ResolveTargetID != nil {
+		// A change whose members do not resolve fails as its creation would.
+		targetID, err := in.ResolveTargetID(ctx)
+		if err != nil {
+			return ctx, nil, err
+		}
+		in.TargetID = targetID
+	}
 	approved, err := s.approvedOverride(ctx, in, blockers)
 	if err != nil {
 		metrics.RecordChangeGateError(ctx, in.Environment, string(in.Checkpoint))
@@ -259,6 +272,7 @@ func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, call
 			s.logger.Info("override requested for a change a gate refused", append(attrs,
 				"override_request", requested.Identifier, "reason", requested.Reason, "blockers", requested.Blockers)...)
 			refusal.OverrideRequest = requested
+			refusal.OverrideReasonKept = requested.Reason != in.Override
 		} else {
 			refusal.OverrideUnrecorded = true
 		}
@@ -314,6 +328,19 @@ func (s *Service) requestOverride(ctx context.Context, in changeGateInput, block
 	if !verified {
 		return nil, nil
 	}
+	// A requester who repeats the command before approval keeps the one
+	// request, so the approver sees one thread per change.
+	pending, err := overrides.ListPending(ctx, storage.FreezeOverrideTarget{Environment: in.Environment, Action: in.Action, TargetID: in.TargetID})
+	if err != nil {
+		return nil, fmt.Errorf("list pending override requests for %s %s in %s: %w", in.Action, in.TargetID, in.Environment, err)
+	}
+	ids := changeGateBlockerIDs(blockers)
+	for _, request := range pending {
+		if storage.CanonicalKey(request.RequestedBy) == storage.CanonicalKey(requester) &&
+			len(request.Blockers) == len(ids) && request.Covers(ids) {
+			return request, nil
+		}
+	}
 	now, err := freezes.Now(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("read the database clock for an override request: %w", err)
@@ -324,7 +351,7 @@ func (s *Service) requestOverride(ctx context.Context, in changeGateInput, block
 		Action:      in.Action,
 		TargetID:    in.TargetID,
 		Database:    in.Database,
-		Blockers:    changeGateBlockerIDs(blockers),
+		Blockers:    ids,
 		Reason:      in.Override,
 		RequestedBy: requester,
 		ExpiresAt:   now.Add(storage.FreezeOverrideMaxLifetime),
@@ -338,18 +365,47 @@ func overrideCaller(ctx context.Context) (string, bool) {
 }
 
 // applyOverrideTarget names what an override of an apply covers: the
-// database, the rollout member it is narrowed to, and the schema it asks
-// for. It is not the plan's identifier, because each apply from a pull
-// request or the CLI plans afresh, and a repeated command would never find
-// its approval. A changed schema is a new target and needs a new approval.
-func applyOverrideTarget(plan *storage.Plan, target string) string {
-	files, err := json.Marshal(plan.SchemaFiles) // map keys marshal sorted
+// database, the rollout member it is narrowed to, and for each member it runs
+// on, the schema and the ignore_tables and drop_tables that member's plan was
+// reviewed under. It is not the plan's identifier, because each apply from a
+// pull request or the CLI plans afresh, and a repeated command would never
+// find its approval. Any change to what a member would run, or a rollout that
+// gained or lost a member, is a new target and needs a new approval.
+func applyOverrideTarget(database, target string, members []applyMember) string {
+	type coveredMember struct {
+		Member string   `json:"member"`
+		Files  any      `json:"files"` // map keys marshal sorted
+		Ignore []string `json:"ignore_tables"`
+		Drop   []string `json:"drop_tables"`
+	}
+	covered := make([]coveredMember, 0, len(members))
+	for _, m := range members {
+		covered = append(covered, coveredMember{Member: m.MemberID(), Files: m.Plan.SchemaFiles, Ignore: m.Plan.IgnoreTables(), Drop: m.Plan.DropTables()})
+	}
+	slices.SortFunc(covered, func(a, b coveredMember) int { return strings.Compare(a.Member, b.Member) })
+	encoded, err := json.Marshal(covered)
 	if err != nil {
 		// Fail safe: a target no approval names.
-		return plan.PlanIdentifier
+		return engine.NewFreezeOverrideID()
 	}
-	sum := sha256.Sum256(files)
-	return fmt.Sprintf("%s/%s@%x", plan.Database, target, sum[:8])
+	sum := sha256.Sum256(encoded)
+	return fmt.Sprintf("%s/%s@%x", database, target, sum[:8])
+}
+
+// applyOverrideTargetFor resolves the members an apply would run and the plan
+// each runs, the same way apply creation does, and names them as an override
+// target. An apply whose members do not resolve fails here with the error its
+// creation would return.
+func (s *Service) applyOverrideTargetFor(ctx context.Context, plan *storage.Plan, req ApplyRequest) (string, error) {
+	targets, _, err := s.applyTargets(plan, req)
+	if err != nil {
+		return "", err
+	}
+	members, err := s.resolveApplyMembers(ctx, plan, req.Environment, targets)
+	if err != nil {
+		return "", err
+	}
+	return applyOverrideTarget(plan.Database, req.Target, members), nil
 }
 
 // isFreezeAdmissionRefusal reports whether the admission write refused the
@@ -403,6 +459,10 @@ type ChangeGateRefusedError struct {
 	// OverrideRequest is the request recorded for a caller who gave an
 	// override reason, awaiting an approver other than the requester.
 	OverrideRequest *storage.FreezeOverrideRequest
+	// OverrideReasonKept reports a repeat that found the requester's
+	// pending request with a different reason. The request keeps its
+	// first reason, which is the one the approver sees.
+	OverrideReasonKept bool
 	// OverrideUnrecorded reports an override reason given by a caller who
 	// is not verified, or to a server with no override storage: no request
 	// was recorded.
@@ -421,6 +481,9 @@ func (e *ChangeGateRefusedError) Error() string {
 	message := fmt.Sprintf("blocked in %s by %s; try again after it ends or is lifted", e.Environment, strings.Join(parts, "; "))
 	if e.OverrideRequest != nil {
 		message += fmt.Sprintf("; override request %s needs a freeze approver other than you", e.OverrideRequest.Identifier)
+		if e.OverrideReasonKept {
+			message += fmt.Sprintf(" (you asked for it earlier, and it keeps that reason: %q)", e.OverrideRequest.Reason)
+		}
 	}
 	if e.OverrideUnrecorded {
 		message += "; no override was requested, because asking for one needs a verified caller"
