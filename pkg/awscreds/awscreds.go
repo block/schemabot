@@ -22,7 +22,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -76,6 +79,15 @@ type Config struct {
 	// secret read in Region, so the secret must be replicated there. Requires
 	// RegionAttribute.
 	ReachableRegions []string
+	// SecretsManagerEndpoints sets the Secrets Manager endpoint URL to call in
+	// a region, for a data plane that reaches Secrets Manager there through a
+	// private endpoint (such as an interface VPC endpoint) instead of the public
+	// regional one. Each key must be Region or one of ReachableRegions, and each
+	// value an https URL naming a host, with no path, query, or credentials. A
+	// region without an entry uses the SDK's default endpoint. Requests are
+	// still signed for the region, so an entry changes only where a read is
+	// sent, never which region's secret it reads.
+	SecretsManagerEndpoints map[string]string
 	// RoleARN is the IAM role assumed in the target account. When empty, secrets
 	// are read from the caller's own account without assuming a role. When set, it
 	// may contain an "{account}" placeholder, replaced with the target's AWS
@@ -143,12 +155,14 @@ func New(cfg Config) (*Resolver, error) {
 	// The base config carries the home region, which is where roles are assumed.
 	awsCfg := cfg.AWSConfig
 	awsCfg.Region = cfg.Region
+	endpoints := maps.Clone(cfg.SecretsManagerEndpoints)
 	var fetch secretFetcher
 	if cfg.RoleARN == "" {
-		fetch = &ownAccountFetcher{awsCfg: awsCfg, clients: make(map[string]*secretsmanager.Client)}
+		fetch = &ownAccountFetcher{awsCfg: awsCfg, endpoints: endpoints, clients: make(map[string]*secretsmanager.Client)}
 	} else {
 		fetch = &assumeRoleFetcher{
 			awsCfg:     awsCfg,
+			endpoints:  endpoints,
 			roleARN:    cfg.RoleARN,
 			externalID: cfg.ExternalID,
 			creds:      make(map[string]aws.CredentialsProvider),
@@ -174,6 +188,9 @@ func newResolver(cfg Config, fetch secretFetcher) (*Resolver, error) {
 	}
 	reachable, err := reachableRegions(cfg.Region, cfg.ReachableRegions)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateEndpoints(reachable, cfg.SecretsManagerEndpoints); err != nil {
 		return nil, err
 	}
 	accountAttr := cfg.AccountAttribute
@@ -263,6 +280,66 @@ func reachableRegions(home string, listed []string) (map[string]bool, error) {
 		reachable[region] = true
 	}
 	return reachable, nil
+}
+
+// ValidateSecretsManagerEndpoints checks per-region Secrets Manager endpoint
+// overrides against the home region and the reachable regions listed beside
+// it, so a misconfiguration fails at startup before AWS config is loaded.
+func ValidateSecretsManagerEndpoints(home string, reachable []string, endpoints map[string]string) error {
+	regions, err := reachableRegions(home, reachable)
+	if err != nil {
+		return err
+	}
+	return validateEndpoints(regions, endpoints)
+}
+
+// validateEndpoints checks each endpoint override, in region order so the
+// error a misconfiguration produces is stable. An override for a region no
+// secret is ever read in is refused rather than ignored: it is a typo or a
+// stale entry, and accepting it would leave the operator believing reads in
+// that region go through the endpoint.
+func validateEndpoints(reachable map[string]bool, endpoints map[string]string) error {
+	for _, region := range slices.Sorted(maps.Keys(endpoints)) {
+		if !reachable[region] {
+			return fmt.Errorf("secrets manager endpoint for region %q: the region is neither the home region nor a reachable region, so no secret is read there", region)
+		}
+		if err := validateEndpointURL(endpoints[region]); err != nil {
+			return fmt.Errorf("secrets manager endpoint for region %q: %w", region, err)
+		}
+	}
+	return nil
+}
+
+// validateEndpointURL requires an https URL that names only a host (and
+// optionally a port). The SDK appends nothing a path could usefully prefix, and
+// credentials in the URL would end up in logs and errors.
+func validateEndpointURL(raw string) error {
+	u, err := url.Parse(raw)
+	switch {
+	case err != nil:
+		return fmt.Errorf("%q is not a URL: %w", raw, err)
+	case u.User != nil:
+		return fmt.Errorf("endpoint URL must not carry credentials")
+	case u.Scheme != "https":
+		return fmt.Errorf("%q must use https", raw)
+	case u.Hostname() == "":
+		return fmt.Errorf("%q names no host", raw)
+	case u.Path != "" && u.Path != "/":
+		return fmt.Errorf("%q must not have a path", raw)
+	case u.RawQuery != "" || u.Fragment != "":
+		return fmt.Errorf("%q must not have a query or fragment", raw)
+	}
+	return nil
+}
+
+// endpointOption points a Secrets Manager client at the region's configured
+// endpoint, and leaves the SDK's default endpoint for a region without one.
+func endpointOption(endpoints map[string]string, region string) func(*secretsmanager.Options) {
+	return func(o *secretsmanager.Options) {
+		if endpoint, ok := endpoints[region]; ok {
+			o.BaseEndpoint = aws.String(endpoint)
+		}
+	}
 }
 
 // TemplateAttributes returns the entity attribute names referenced by a template
@@ -506,6 +583,9 @@ func getSecretValue(ctx context.Context, client *secretsmanager.Client, secretNa
 // ignored.
 type ownAccountFetcher struct {
 	awsCfg aws.Config
+	// endpoints maps a region to the Secrets Manager endpoint URL its client
+	// calls; a region without an entry uses the SDK's default endpoint.
+	endpoints map[string]string
 
 	mu      sync.Mutex
 	clients map[string]*secretsmanager.Client
@@ -525,7 +605,7 @@ func (f *ownAccountFetcher) clientForRegion(region string) *secretsmanager.Clien
 	}
 	regionalCfg := f.awsCfg
 	regionalCfg.Region = region
-	c := secretsmanager.NewFromConfig(regionalCfg)
+	c := secretsmanager.NewFromConfig(regionalCfg, endpointOption(f.endpoints, region))
 	f.clients[region] = c
 	return c
 }
@@ -547,7 +627,12 @@ type assumeRoleFetcher struct {
 	// partition, and reachable regions are confined to the home region's
 	// partition, so reading a secret in another region needs that region's
 	// Secrets Manager but not its STS.
-	awsCfg     aws.Config
+	awsCfg aws.Config
+	// endpoints maps a region to the Secrets Manager endpoint URL its clients
+	// call; a region without an entry uses the SDK's default endpoint. STS is
+	// not overridden: roles are assumed in the home region, through whatever
+	// endpoint the base config resolves there.
+	endpoints  map[string]string
 	roleARN    string
 	externalID string
 
@@ -585,7 +670,7 @@ func (f *assumeRoleFetcher) clientFor(accountID, region string) *secretsmanager.
 
 	regionalCfg := f.awsCfg
 	regionalCfg.Region = region
-	c := secretsmanager.NewFromConfig(regionalCfg, func(o *secretsmanager.Options) {
+	c := secretsmanager.NewFromConfig(regionalCfg, endpointOption(f.endpoints, region), func(o *secretsmanager.Options) {
 		o.Credentials = creds
 	})
 	f.clients[key] = c

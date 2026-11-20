@@ -186,6 +186,13 @@ func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
 	_, err = buildCredentialResolver(t.Context(), crossRegion, nil)
 	require.NoError(t, err)
 
+	// A private Secrets Manager endpoint can be set for any region a secret is
+	// read in.
+	privateEndpoint := crossRegion
+	privateEndpoint.SecretsManagerEndpoints = map[string]string{"us-west-2": "https://secretsmanager.us-west-2.example.internal"}
+	_, err = buildCredentialResolver(t.Context(), privateEndpoint, nil)
+	require.NoError(t, err)
+
 	cases := map[string]func(*EtreCredentialsConfig){
 		"region is required for the awssm backend": func(c *EtreCredentialsConfig) { c.Region = "" },
 		"reachable_regions requires region_attribute": func(c *EtreCredentialsConfig) {
@@ -197,6 +204,9 @@ func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
 			c.ReachableRegions = []string{"us-west"}
 		},
 		"secret_name": func(c *EtreCredentialsConfig) { c.SecretName = "" },
+		`target_resolver.etre.credentials.secrets_manager_endpoints: secrets manager endpoint for region "us-west-2": the region is neither the home region nor a reachable region`: func(c *EtreCredentialsConfig) {
+			c.SecretsManagerEndpoints = map[string]string{"us-west-2": "https://secretsmanager.us-west-2.example.internal"}
+		},
 	}
 	for field, mutate := range cases {
 		cfg := base
@@ -238,6 +248,13 @@ func TestBuildCredentialResolverAWSSMValidatesRegionsBeforeLoadingAWSConfig(t *t
 	_, err = buildCredentialResolver(t.Context(), cfg, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `target_resolver.etre.credentials: reachable region "eu-west" at index 1 is not an AWS region name`)
+	assert.NotContains(t, err.Error(), "load AWS config")
+
+	cfg.ReachableRegions = []string{"us-west-2"}
+	cfg.SecretsManagerEndpoints = map[string]string{"us-west-2": "http://secretsmanager.us-west-2.example.internal"}
+	_, err = buildCredentialResolver(t.Context(), cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `target_resolver.etre.credentials.secrets_manager_endpoints: secrets manager endpoint for region "us-west-2": "http://secretsmanager.us-west-2.example.internal" must use https`)
 	assert.NotContains(t, err.Error(), "load AWS config")
 }
 
