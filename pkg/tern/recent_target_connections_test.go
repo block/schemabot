@@ -152,6 +152,40 @@ func TestRecentTargetConnectionsReportsTheTargetsItCannotResolve(t *testing.T) {
 	}, result)
 }
 
+// A PostgreSQL target verified against a private CA carries the CA reference
+// in its record's metadata, not in its DSN. The connection returns that
+// metadata, so a caller dials under the trust an apply uses, and returns its
+// own copy, so a caller cannot change the resolver's record.
+func TestRecentTargetConnectionsCarryTheMetadataATargetIsDialedWith(t *testing.T) {
+	operations := &recentTargetsOperationStore{recent: map[string][]storage.AppliedTarget{
+		storage.DatabaseTypePostgres: {{Database: "ledger", Environment: "production", Target: "ledger-cluster"}},
+	}}
+	record := &inventory.Target{
+		Target:       "ledger-cluster",
+		DatabaseType: storage.DatabaseTypePostgres,
+		DSN:          "postgres://ddl:secret@ledger-cluster.db.test:5432/ledger?sslmode=verify-full",
+		Metadata:     map[string]string{inventory.MetadataPostgresCARef: "file:/etc/ssl/private-ca.pem"},
+	}
+	resolver := targetRouterResolverFunc(func(context.Context, inventory.Request) (*inventory.Target, error) {
+		return record, nil
+	})
+	router := newRecentTargetsRouter(t, resolver, operations)
+
+	result, err := router.RecentTargetConnections(t.Context(), storage.DatabaseTypePostgres, time.Hour)
+
+	require.NoError(t, err)
+	require.Equal(t, []RecentTargetConnection{{
+		Target:      "ledger-cluster",
+		Environment: "production",
+		DSN:         "postgres://ddl:secret@ledger-cluster.db.test:5432/ledger?sslmode=verify-full",
+		Metadata:    map[string]string{inventory.MetadataPostgresCARef: "file:/etc/ssl/private-ca.pem"},
+	}}, result.Connections)
+
+	result.Connections[0].Metadata[inventory.MetadataPostgresCARef] = "file:/tmp/another-ca.pem"
+	assert.Equal(t, "file:/etc/ssl/private-ca.pem", record.Metadata[inventory.MetadataPostgresCARef],
+		"the connection holds a copy of the record's metadata")
+}
+
 // A type that is reached without a DSN resolves as connectable and has no
 // connection string, so its targets are failures, not empty connections.
 func TestRecentTargetConnectionsRefusesATargetReachedWithoutADSN(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -23,6 +24,12 @@ type RecentTargetConnection struct {
 	// DSN is the target's resolved connection string. It carries a credential,
 	// so it must never be logged.
 	DSN string
+	// Metadata is the resolved record's metadata. For some database types
+	// part of how a target is dialed lives here and not in the DSN, such as
+	// the CA a PostgreSQL target is verified against, so a caller that opens
+	// the target passes it on to connect under the trust an apply uses. It
+	// can carry credentials, so it must never be logged.
+	Metadata map[string]string
 }
 
 // RecentTargetConnections is what one listing of recently applied targets
@@ -90,6 +97,7 @@ func (r *TargetRouter) RecentTargetConnections(ctx context.Context, databaseType
 				Target:      target.Target,
 				Environment: target.Environment,
 				DSN:         resolved.DSN,
+				Metadata:    maps.Clone(resolved.Metadata),
 			})
 		}
 	}
