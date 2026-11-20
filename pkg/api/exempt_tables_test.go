@@ -198,7 +198,15 @@ func TestExecutePlanKeepsPlanningWhenAnUnmatchedEntryIsNotDropped(t *testing.T) 
 
 // withheldDropService wires a service whose staging plan for payments is
 // answered by client, so a test can hand it the plan a data plane returned.
+// No apply is unsettled on the database.
 func withheldDropService(plans storage.PlanStore, client tern.Client) *Service {
+	return dropTablesService(plans, &unsettledApplyStore{}, nil, client)
+}
+
+// dropTablesService is withheldDropService with the applies that have not
+// settled and their operations, which a plan or apply carrying drop_tables
+// reads to protect their working tables.
+func dropTablesService(plans storage.PlanStore, applies storage.ApplyStore, operations storage.ApplyOperationStore, client tern.Client) *Service {
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
 			"payments": {
@@ -208,9 +216,33 @@ func withheldDropService(plans storage.PlanStore, client tern.Client) *Service {
 		},
 		TernDeployments: TernConfig{DefaultDeployment: {"staging": "localhost:9090"}},
 	}
-	return New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
+	return New(&dropTablesStorage{
+		mockStorageWithPlanLookup: mockStorageWithPlanLookup{plans: plans, operations: operations},
+		applies:                   applies,
+	}, cfg, map[string]tern.Client{
 		DefaultDeployment + "/staging": client,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// dropTablesStorage serves the plans and operations of
+// mockStorageWithPlanLookup and the applies a test sets.
+type dropTablesStorage struct {
+	mockStorageWithPlanLookup
+	applies storage.ApplyStore
+}
+
+func (m *dropTablesStorage) Applies() storage.ApplyStore { return m.applies }
+
+// unsettledApplyStore answers GetUnsettled with the applies a test sets, or
+// with err.
+type unsettledApplyStore struct {
+	storage.ApplyStore
+	unsettled []*storage.Apply
+	err       error
+}
+
+func (s *unsettledApplyStore) GetUnsettled(context.Context) ([]*storage.Apply, error) {
+	return s.unsettled, s.err
 }
 
 // A data plane built before pattern entries reads "/^relay_\d+_feed$/" as the

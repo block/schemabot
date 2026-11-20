@@ -128,6 +128,11 @@ var prFileCapExceededBlock = checkBlockReason{
 		"Split this PR so GitHub reports the full changed-file list — if it carries schema changes, move them into their own smaller PR and SchemaBot will plan them there.",
 }
 
+var prSchemaCapBlock = checkBlockReason{
+	blockingReason: checkstate.BlockPRSchemaCapExceeded,
+	message:        prSchemaCapTitle,
+}
+
 // managedDirMissingConfigBlock is used when a PR changes schema files under a
 // directory the server config manages (databases.<db>.allowed_dirs) but no
 // schemabot.yaml resolves for them — for example because the PR removed the
@@ -227,6 +232,7 @@ var allCheckBlockReasons = []checkBlockReason{
 	configDiscoveryFailedBlock,
 	planPublishVerificationFailedBlock,
 	prFileCapExceededBlock,
+	prSchemaCapBlock,
 	managedDirMissingConfigBlock,
 	reviewTimeDeploymentDriftBlock,
 	namespacePlacementRefusedBlock,

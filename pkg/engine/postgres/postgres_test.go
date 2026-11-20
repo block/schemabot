@@ -1758,3 +1758,16 @@ func TestPullSchemaRejectsDetailedCatalog(t *testing.T) {
 	assert.Contains(t, err.Error(), "catalog detail")
 	assert.Contains(t, err.Error(), "unsupported; use basic")
 }
+
+// PostgreSQL does not honor drop_tables, so a plan that carries the list is
+// refused before the engine connects to the target, rather than planned as if
+// the list were empty and the listed tables silently left in place.
+func TestPlanRefusesDropTablesBeforeConnecting(t *testing.T) {
+	result, err := New().Plan(t.Context(), &engine.PlanRequest{
+		Database:    "app",
+		Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},
+		DropTables:  []string{"_orders_old"},
+	})
+	require.EqualError(t, err, `plan PostgreSQL database "app": drop_tables is supported only on MySQL, and this is a PostgreSQL target. Remove drop_tables from schemabot.yaml`)
+	assert.Nil(t, result)
+}

@@ -87,6 +87,25 @@ func alterUsersDiff(ddl string) *ternv1.PlanDiffResponse {
 	}
 }
 
+// Every rollout member's diff is asked for the drops the primary planned.
+// A member asked without the list would not plan them, and the rollup would
+// read the gap as drift.
+func TestPlanDeploymentDiffs_CarriesDropTablesToEveryMember(t *testing.T) {
+	eu := &mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
+	us := &mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
+	svc := twoDeploymentService(t, eu, us)
+	req := planDiffReq(t)
+	req.DropTables = []string{"_users_old"}
+
+	_, err := svc.PlanDeploymentDiffs(t.Context(), req, nil, routing.ExecutionTarget{}, productionTargets(t, svc))
+
+	require.NoError(t, err)
+	require.NotNil(t, eu.planDiffReq)
+	require.NotNil(t, us.planDiffReq)
+	assert.Equal(t, []string{"_users_old"}, eu.planDiffReq.GetDropTables())
+	assert.Equal(t, []string{"_users_old"}, us.planDiffReq.GetDropTables())
+}
+
 // With the primary plan supplied, the primary member of the rollup is
 // the primary plan itself (no redundant live-schema read of the primary), and
 // only the non-primary deployments run PlanDiff. Results stay in rollout order.

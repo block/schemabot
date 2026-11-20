@@ -542,11 +542,28 @@ invalid request or authentication failure before retrying it.
 
 ## What changed in this database?
 
-`GET /api/history/{database}` lists every apply ever run against a database,
+`GET /api/history/{database}` lists the applies run against a database,
 newest first, optionally filtered to one environment. Each entry names the
 apply, its state, engine, environment, caller, error and error code if it
 failed, and when it started and completed. The caller is the stored identity,
 with `cli` or `owner/repo#N` as a fallback when it was not recorded.
+
+| Parameter | Meaning |
+|---|---|
+| `environment` | Scope to one environment |
+| `limit` | Page size: default and maximum 1,000 |
+| `starting_after` | The ID of the last apply the previous page listed |
+
+The history is paged the same way as the status list. A database whose history
+fits in one page is listed whole. When more applies match, the response sets
+`has_more`; request the next page with the same `environment` and
+`starting_after` set to the last apply's ID, and repeat until `has_more` is
+false. Every apply created before the walk began is listed exactly once.
+`starting_after` must name an apply of the same database and environment;
+anything else returns `400` naming the mismatch. The response echoes `limit`,
+`max_limit`, and `starting_after`. `schemabot status -d` follows every page,
+so it always lists the whole history.
+
 Start with the database and environment you inspected:
 
 ```sh
@@ -576,6 +593,9 @@ Response excerpt (illustrative values):
 ```json
 {
   "database": "shop",
+  "limit": 1000,
+  "max_limit": 1000,
+  "has_more": false,
   "applies": [
     {
       "apply_id": "apply-example-42",

@@ -1085,6 +1085,30 @@ plan, cleanup, or aggregate state, it verifies the PR's current head SHA when it
 can. If the work belongs to an older head, SchemaBot skips the write instead of
 publishing a misleading check on the current commit.
 
+#### A burst of pushes
+
+With durable webhook dispatch, SchemaBot holds each push to a PR back for a
+quiet period before it plans it, 15 seconds by default. If another push to the
+same PR arrives in that time, SchemaBot reads the PR from GitHub when the
+earlier push's turn comes. If the PR's head has moved on, the earlier push is
+skipped without a plan, so a rebase or a quick series of commits is planned
+once, on its newest head. A push whose head is still the PR's current head is
+always planned, even when later webhooks are queued behind it.
+
+The wait applies to every push, including a lone one: its plan and its
+SchemaBot Check Run start once the quiet period has passed. Opened and reopened
+PRs, commands in PR comments, and recovery work are not held back.
+
+Set `WEBHOOK_SYNCHRONIZE_QUIET_PERIOD` on the server to change the wait, as a
+duration such as `30s`. `0` turns it off, so every push is planned as soon as it
+arrives. The maximum is `2m`; a value above it, a negative value, or one that
+is not a duration is logged as an error and the 15-second default is used.
+
+A push only replaces one that SchemaBot received strictly earlier. With MySQL
+storage, the inbox records when it received each push to the second, so two
+pushes received in the same clock second are both planned. PostgreSQL storage
+records the time to the microsecond.
+
 ### PR closed
 
 A `closed` webhook releases locks held by that PR and deletes SchemaBot's stored

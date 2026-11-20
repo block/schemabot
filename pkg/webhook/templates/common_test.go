@@ -16,6 +16,16 @@ func TestSanitizeCommentError(t *testing.T) {
 		assert.Equal(t, msg, sanitizeCommentError(msg))
 	})
 
+	t.Run("gRPC status prefix is dropped", func(t *testing.T) {
+		assert.Equal(t, "engine plan: keyspace \"orders\" drops table(s) users_seq",
+			sanitizeCommentError("rpc error: code = FailedPrecondition desc = engine plan: keyspace \"orders\" drops table(s) users_seq"))
+	})
+
+	t.Run("gRPC status prefix inside a wrapped error is dropped", func(t *testing.T) {
+		assert.Equal(t, "plan failed: engine plan: no shards",
+			sanitizeCommentError("plan failed: rpc error: code = Internal desc = engine plan: no shards"))
+	})
+
 	t.Run("surrounding whitespace is trimmed", func(t *testing.T) {
 		assert.Equal(t, "boom", sanitizeCommentError("  boom \n"))
 	})

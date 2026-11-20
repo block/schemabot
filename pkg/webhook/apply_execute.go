@@ -8,6 +8,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -48,6 +49,27 @@ func (h *Handler) executeApply(
 ) {
 	database := schemaResult.Database
 	dbType := schemaResult.Type
+	actionName := action.ApplyConfirm
+	if storedPlan != nil {
+		actionName = action.Apply
+	}
+
+	// A refused automatic apply has no pending confirmation to resume.
+	// Admission runs before acceptance, so only this attempt's pin can be released.
+	handleAdmissionError := func(err error) bool {
+		if _, refused := errors.AsType[*api.PRSchemaAdmissionError](err); !refused {
+			return false
+		}
+		if storedPlan != nil {
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			h.releaseApplyLockIfIntentUnchanged(releaseCtx, repo, pr, database, dbType, environment, expectedPendingPlanID, "PR schema admission refused")
+		}
+		if !isPRSchemaRefusal(err) {
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, "Could not verify the PR database limit. Retry the command.")
+		}
+		return true
+	}
 
 	// apply-confirm names no target: it confirms the plan its apply posted, so
 	// a plan narrowed to one rollout member narrows the re-plan and the apply
@@ -81,9 +103,13 @@ func (h *Handler) executeApply(
 	}
 
 	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
+	if handleAdmissionError(err) {
+		return
+	}
+
 	if err != nil {
 		h.logger.Error("plan execution failed on confirm", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, userFacingError(err))
 		return
 	}
 
@@ -93,10 +119,6 @@ func (h *Handler) executeApply(
 	// be rejected before any plan-derived response — the "no changes" release,
 	// the drift downgrade, and especially the unsafe-change prompt would all
 	// misread DDL that is only an artifact of the stale branch.
-	actionName := action.ApplyConfirm
-	if storedPlan != nil {
-		actionName = action.Apply
-	}
 	// What a refusal tells the operator when the lock changed under the apply:
 	// re-run the apply they sent, narrowed as its confirmed plan was, with the
 	// options they typed.
@@ -192,6 +214,10 @@ func (h *Handler) executeApply(
 	// posted with every target's plan just before this re-plan. Work that comment
 	// did not show stops for a fresh confirmation or is refused.
 	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
+	if handleAdmissionError(rollout.admissionErr) {
+		return
+	}
+
 	primaryTargetConverged := !planResp.HasChanges()
 	refuseRollout := func(reason string) {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, reason)
@@ -571,6 +597,9 @@ func (h *Handler) executeApply(
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
 		h.service.ClearPendingObserver(pendingObserver)
+		if handleAdmissionError(err) {
+			return
+		}
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
 		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(actionName, environment, h.deploymentTenant(), err))
 		return
@@ -890,6 +919,11 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 			parts = append(parts, msgs.afterRefusal)
 		}
 		return strings.Join(parts, " ")
+	}
+	if inUse, ok := errors.AsType[*api.DropTablesInUseError](err); ok {
+		// Built from the config entry, the apply's identifier and state, and
+		// the table its plan changes, never from storage error text.
+		return inUse.Error()
 	}
 	if missing, ok := errors.AsType[*api.PlanNotFoundError](err); ok {
 		return templates.PlanNotFoundDetail(missing.PlanID, msgs.replan)

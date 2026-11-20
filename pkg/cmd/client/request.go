@@ -756,8 +756,8 @@ func failedRequest(err error) (method, path string) {
 // failedBeforeSending reports whether the request failed before any of it was
 // sent, so the server cannot have acted on it: while opening the connection to
 // the server or to a proxy, or during the TLS handshake. The HTTP client
-// replaces the handshake error with its own text when a plain HTTP server
-// answers, so that case is matched by text.
+// replaces the handshake error with http.ErrSchemeMismatch when a plain HTTP
+// server answers.
 func failedBeforeSending(err error) bool {
 	var opErr *net.OpError
 	if errors.As(err, &opErr) && (opErr.Op == "dial" || opErr.Op == "proxyconnect") {
@@ -771,7 +771,7 @@ func failedBeforeSending(err error) bool {
 	if errors.As(err, &recordErr) {
 		return true
 	}
-	return strings.Contains(err.Error(), "server gave HTTP response to HTTPS client")
+	return errors.Is(err, http.ErrSchemeMismatch)
 }
 
 // isConnectionRefused reports whether the server's host refused the

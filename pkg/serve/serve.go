@@ -1476,7 +1476,8 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	ghClient := ghclient.NewClient(creds.AppID, []byte(creds.PrivateKey), logger,
 		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs),
 		ghclient.WithConfigDirHints(serverConfig),
-		ghclient.WithListenOnlyRepos(serverConfig))
+		ghclient.WithListenOnlyRepos(serverConfig),
+		ghclient.WithQuotaReserve(serverConfig.GitHub.QuotaReserve))
 	handlerOpts := append([]webhook.HandlerOption{
 		webhook.WithRepoWebhookSecret([]byte(repoWebhookSecret)),
 		webhook.WithDurableWebhookDispatch(),
@@ -1484,10 +1485,12 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	}, webhookReconcileSynthesisOptions(logger)...)
 	handlerOpts = append(handlerOpts, checkSuiteRecoveryOptions(logger)...)
 	handlerOpts = append(handlerOpts, webhookReconcileScanBoundsOptions(logger)...)
+	handlerOpts = append(handlerOpts, synchronizeQuietPeriodOptions(logger)...)
 	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger, handlerOpts...)
 	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub webhook endpoint registered",
 		"app_id", creds.AppID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs,
+		"quota_reserve", serverConfig.GitHub.QuotaReserve,
 		"repo_webhook_dispatch", repoWebhookSecret != "")
 	return webhookRuntime{
 		startDurableWebhookDispatch:    handler.StartDurableWebhookDispatch,
@@ -1563,14 +1566,16 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 		appClient := ghclient.NewClient(e.id, []byte(privateKey), logger,
 			ghclient.WithTrustedCheckAppSlugs(e.cfg.TrustedCheckAppSlugs),
 			ghclient.WithConfigDirHints(serverConfig),
-			ghclient.WithListenOnlyRepos(serverConfig))
+			ghclient.WithListenOnlyRepos(serverConfig),
+			ghclient.WithQuotaReserve(e.cfg.QuotaReserve))
 		clients[e.name] = appClient
 		quotaProbes = append(quotaProbes, appClient.NewQuotaProbe())
 		secretsByApp[e.name] = []byte(secret)
 		appByID[e.id] = e.name
 
 		logger.Info("registered GitHub App",
-			"app_name", e.name, "app_id", e.id, "trusted_check_app_slugs", e.cfg.TrustedCheckAppSlugs)
+			"app_name", e.name, "app_id", e.id, "trusted_check_app_slugs", e.cfg.TrustedCheckAppSlugs,
+			"quota_reserve", e.cfg.QuotaReserve)
 	}
 
 	handlerOpts := append([]webhook.HandlerOption{
@@ -1579,6 +1584,7 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 	}, webhookReconcileSynthesisOptions(logger)...)
 	handlerOpts = append(handlerOpts, checkSuiteRecoveryOptions(logger)...)
 	handlerOpts = append(handlerOpts, webhookReconcileScanBoundsOptions(logger)...)
+	handlerOpts = append(handlerOpts, synchronizeQuietPeriodOptions(logger)...)
 	handler := webhook.NewHandlerWithDispatch(
 		svc,
 		ghclient.NewClientSet(clients),
@@ -1679,6 +1685,56 @@ func parseWebhookReconcileScanBounds(logger *slog.Logger) (maxPages int, lookbac
 		}
 	}
 	return maxPages, lookback
+}
+
+// maxSynchronizeQuietPeriod caps WEBHOOK_SYNCHRONIZE_QUIET_PERIOD. Every push
+// waits this long for its plan and its Check Run, so a value such as 15m
+// typed for 15s would hold every PR's required check back for a quarter of
+// an hour.
+const maxSynchronizeQuietPeriod = 2 * time.Minute
+
+// synchronizeQuietPeriodOptions returns the handler option that defers durable
+// synchronize deliveries by WEBHOOK_SYNCHRONIZE_QUIET_PERIOD (a Go duration
+// such as 15s), so a burst of pushes to one PR plans only its newest head.
+// Unset keeps webhook.DefaultSynchronizeQuietPeriod; 0 turns the deferral
+// off and plans every push as soon as it arrives. Like the scan bounds, this
+// is tuning with no safe direction to fail in, so a malformed, negative, or
+// above-ceiling value is logged and ignored and the default stays in force.
+func synchronizeQuietPeriodOptions(logger *slog.Logger) []webhook.HandlerOption {
+	period := parseSynchronizeQuietPeriod(logger)
+	if period == 0 {
+		logger.Info("synchronize quiet period disabled by WEBHOOK_SYNCHRONIZE_QUIET_PERIOD; every push will be planned as soon as it arrives")
+		return nil
+	}
+	logger.Info("synchronize deliveries will wait out a quiet period before planning, so a later push in the same burst supersedes them",
+		"quiet_period", period)
+	return []webhook.HandlerOption{webhook.WithSynchronizeQuietPeriod(period)}
+}
+
+// parseSynchronizeQuietPeriod reads WEBHOOK_SYNCHRONIZE_QUIET_PERIOD,
+// returning the default when it is unset or rejected and zero when the
+// operator turned the quiet period off.
+func parseSynchronizeQuietPeriod(logger *slog.Logger) time.Duration {
+	value := os.Getenv("WEBHOOK_SYNCHRONIZE_QUIET_PERIOD")
+	if value == "" {
+		return webhook.DefaultSynchronizeQuietPeriod
+	}
+	switch parsed, err := time.ParseDuration(value); {
+	case err != nil:
+		logger.Error("invalid WEBHOOK_SYNCHRONIZE_QUIET_PERIOD value; the default synchronize quiet period stays in force",
+			"value", value, "default", webhook.DefaultSynchronizeQuietPeriod, "error", err)
+		return webhook.DefaultSynchronizeQuietPeriod
+	case parsed < 0:
+		logger.Error("WEBHOOK_SYNCHRONIZE_QUIET_PERIOD must not be negative; the default synchronize quiet period stays in force",
+			"value", value, "default", webhook.DefaultSynchronizeQuietPeriod)
+		return webhook.DefaultSynchronizeQuietPeriod
+	case parsed > maxSynchronizeQuietPeriod:
+		logger.Error("WEBHOOK_SYNCHRONIZE_QUIET_PERIOD is above its ceiling; the default synchronize quiet period stays in force",
+			"value", value, "max", maxSynchronizeQuietPeriod, "default", webhook.DefaultSynchronizeQuietPeriod)
+		return webhook.DefaultSynchronizeQuietPeriod
+	default:
+		return parsed
+	}
 }
 
 // checkSuiteRecoveryOptions returns the handler option enabling durable

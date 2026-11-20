@@ -72,6 +72,15 @@ func (c pullSchemaErrorClient) PullSchema(context.Context, *ternv1.PullSchemaReq
 	return nil, c.err
 }
 
+type planErrorClient struct {
+	Client
+	err error
+}
+
+func (c planErrorClient) Plan(context.Context, *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
+	return nil, c.err
+}
+
 type noopControlClient struct {
 	Client
 }
@@ -207,6 +216,39 @@ func TestServerPullSchemaMapsKnownErrorsToStatusCode(t *testing.T) {
 			_, err := server.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
 			require.Error(t, err)
 			assert.Equal(t, tc.want, status.Code(err))
+		})
+	}
+}
+
+// A plan the engine refuses is the schema files' to fix, so the server answers
+// FailedPrecondition, which callers do not alert on. Any other plan failure is
+// the server's and stays Internal.
+func TestServerPlanMapsRefusalToFailedPrecondition(t *testing.T) {
+	testCases := []struct {
+		name string
+		err  error
+		want codes.Code
+	}{
+		{
+			name: "engine refused the plan",
+			err:  fmt.Errorf("plan keyspace orders: %w", &engine.PlanRefusedError{Err: errors.New("keyspace orders has no schema file for 1 sequence table(s)")}),
+			want: codes.FailedPrecondition,
+		},
+		{
+			name: "engine failed",
+			err:  errors.New("connect to topology: connection refused"),
+			want: codes.Internal,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := NewServer(planErrorClient{err: tc.err}, slog.Default())
+
+			_, err := server.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders"})
+			require.Error(t, err)
+			assert.Equal(t, tc.want, status.Code(err))
+			assert.Equal(t, tc.err.Error(), status.Convert(err).Message())
 		})
 	}
 }
@@ -514,7 +556,7 @@ type conflictReadFailureTaskStore struct {
 	storage.TaskStore
 }
 
-func (conflictReadFailureTaskStore) GetByDatabase(context.Context, string) ([]*storage.Task, error) {
+func (conflictReadFailureTaskStore) GetNonTerminalByDatabase(context.Context, string) ([]*storage.Task, error) {
 	return nil, errors.New("tasks storage unavailable")
 }
 

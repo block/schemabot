@@ -427,6 +427,11 @@ func (ic *InstallationClient) FindConfigByDatabaseName(ctx context.Context, repo
 // requires the repository-wide search (FindConfigByDatabaseNameInRepo),
 // which callers may want to gate or avoid.
 func (ic *InstallationClient) FindConfigByDatabaseNameInPR(ctx context.Context, repo string, pr int, databaseName string) (*SchemabotConfig, string, bool, error) {
+	if cache := prInfoCacheFromContext(ctx); cache != nil {
+		if configs, ok := cache.configs[cacheKey(repo, pr)]; ok {
+			return selectConfigByDatabaseName(databaseName, configs)
+		}
+	}
 	prInfo, err := ic.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
 		return nil, "", false, fmt.Errorf("fetch PR info: %w", err)
@@ -543,6 +548,11 @@ func SingleDiscoveredConfig(configs []DiscoveredConfig) (*SchemabotConfig, strin
 
 // FindAllConfigsForPR finds ALL schemabot.yaml configs that apply to the changed files in a PR.
 func (ic *InstallationClient) FindAllConfigsForPR(ctx context.Context, repo string, pr int) ([]DiscoveredConfig, error) {
+	if cache := prInfoCacheFromContext(ctx); cache != nil {
+		if configs, ok := cache.configs[cacheKey(repo, pr)]; ok {
+			return slices.Clone(configs), nil
+		}
+	}
 	prInfo, err := ic.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
 		return nil, fmt.Errorf("fetch PR info: %w", err)

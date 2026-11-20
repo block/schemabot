@@ -239,12 +239,12 @@ func TestInstallationBaseTransportKeepsRateLimitIdentity(t *testing.T) {
 func TestInstallationTransportOrder(t *testing.T) {
 	key := testInstallationPrivateKey(t)
 
-	withoutListenOnly, err := newInstallationTransport(1, 42, key, nil, listenOnlyRepoSet{})
+	withoutListenOnly, err := newInstallationTransport(1, 42, key, nil, listenOnlyRepoSet{}, 0)
 	require.NoError(t, err)
 	_, ok := withoutListenOnly.(*ghinstallation.Transport)
 	assert.True(t, ok, "without listen-only repositories the token transport is outermost, got %T", withoutListenOnly)
 
-	withListenOnly, err := newInstallationTransport(1, 42, key, nil, listenOnlyRepoSet{listenOnlyTestRepo: true})
+	withListenOnly, err := newInstallationTransport(1, 42, key, nil, listenOnlyRepoSet{listenOnlyTestRepo: true}, 0)
 	require.NoError(t, err)
 	guard, ok := withListenOnly.(*listenOnlyTransport)
 	require.True(t, ok, "the listen-only guard is outermost, got %T", withListenOnly)
@@ -276,7 +276,7 @@ func TestListenOnlyInstallationClientExchangesTokenForRead(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	transport, err := newInstallationTransport(1, 42, testInstallationPrivateKey(t), nil, listenOnlyRepoSet{listenOnlyTestRepo: true})
+	transport, err := newInstallationTransport(1, 42, testInstallationPrivateKey(t), nil, listenOnlyRepoSet{listenOnlyTestRepo: true}, 0)
 	require.NoError(t, err)
 	guard, ok := transport.(*listenOnlyTransport)
 	require.True(t, ok)

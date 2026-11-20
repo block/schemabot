@@ -178,6 +178,9 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			results[i].DirectExecution = directExecution
 
 			resp, err := s.planDeploymentDiff(gctx, req, target, schemaFiles, directExecution)
+			if _, refused := errors.AsType[*PRSchemaAdmissionError](err); refused {
+				return err
+			}
 			if err != nil {
 				s.logger.Warn("plan deployment diff failed; deployment will block the review rollup",
 					"database", req.Database,
@@ -312,6 +315,10 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 		ternReq.HeadSha = *req.HeadSHA
 	}
 
+	ctx, err = s.withPRSchemaPlanAdmission(ctx, client, req.Repository, int(ternReq.PullRequest), ternReq.HeadSha)
+	if err != nil {
+		return nil, err
+	}
 	resp, err := client.PlanDiff(ctx, ternReq)
 	if err != nil {
 		return nil, fmt.Errorf("plan diff on deployment %q target %q: %w", target.Deployment, target.Target, err)

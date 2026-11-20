@@ -77,6 +77,14 @@ type Client struct {
 	// be written to.
 	listenOnlyRepos ListenOnlyRepos
 
+	// quotaReserve is the number of core REST requests each installation
+	// holds back for check runs and other merge-gating work: once GitHub
+	// reports no more than this many remaining, schema file and tree reads are
+	// refused with ErrGitHubQuotaReserved until the quota resets. Zero
+	// disables the reserve. Static configuration set at construction; never
+	// mutated afterwards.
+	quotaReserve int64
+
 	// appTransportBase is the transport requests signed with the App JWT go
 	// out on (the slug fetch, installation lookups, the installation list).
 	// Nil means http.DefaultTransport; tests set it to answer without GitHub.
@@ -169,6 +177,19 @@ type ConfigDirHints interface {
 func WithConfigDirHints(hints ConfigDirHints) ClientOption {
 	return func(c *Client) {
 		c.configDirHints = hints
+	}
+}
+
+// WithQuotaReserve holds back the given number of core REST requests per
+// installation for check runs, pull request reads, comments, and other work
+// that is not a schema input read. Once GitHub reports that many or fewer
+// remaining, less the requests in flight, schema file, blob, and tree reads are
+// refused before they are sent with an error matching ErrGitHubQuotaReserved,
+// until the quota resets. Reads made under WithCheckPublicationReads are always
+// sent. Zero disables the reserve.
+func WithQuotaReserve(requests int64) ClientOption {
+	return func(c *Client) {
+		c.quotaReserve = requests
 	}
 }
 
@@ -294,12 +315,19 @@ func newInstallationBaseTransport(installationID int64, appSlug func() string) h
 // triggered it, which names that request's repository, so a guard under it
 // would refuse the exchange and with it every read of a listen-only
 // repository.
-func newInstallationTransport(appID, installationID int64, privateKey []byte, appSlug func() string, listenOnlyRepos ListenOnlyRepos) (http.RoundTripper, error) {
+//
+// The quota reserve also wraps the installation token transport, for a
+// different reason: token exchanges are App-authenticated and report the
+// App's quota, not the installation's, so the reserve must only see the API
+// responses above the token transport. A refused read then never mints a
+// token either.
+func newInstallationTransport(appID, installationID int64, privateKey []byte, appSlug func() string, listenOnlyRepos ListenOnlyRepos, quotaReserve int64) (http.RoundTripper, error) {
 	installationTransport, err := ghinstallation.New(newInstallationBaseTransport(installationID, appSlug), appID, installationID, privateKey)
 	if err != nil {
 		return nil, fmt.Errorf("create installation transport for installation %d: %w", installationID, err)
 	}
-	return newListenOnlyTransport(installationTransport, listenOnlyRepos, installationID, appSlug), nil
+	reserved := newQuotaReserveTransport(installationTransport, quotaReserve, installationID, appSlug)
+	return newListenOnlyTransport(reserved, listenOnlyRepos, installationID, appSlug), nil
 }
 
 // ForInstallation returns a GitHub client scoped to a specific installation,
@@ -350,7 +378,7 @@ func (c *Client) forInstallation(ctx context.Context, installationID int64) (*In
 		return existing, nil
 	}
 
-	installationTransport, err := newInstallationTransport(c.appID, installationID, c.privateKey, c.loadAppSlug, c.listenOnlyRepos)
+	installationTransport, err := newInstallationTransport(c.appID, installationID, c.privateKey, c.loadAppSlug, c.listenOnlyRepos, c.quotaReserve)
 	if err != nil {
 		return nil, err
 	}
@@ -371,7 +399,7 @@ func (c *Client) forInstallation(ctx context.Context, installationID int64) (*In
 	ic.storeAppSlug(slug)
 	c.installations[installationID] = ic
 	c.logger.Info("constructed installation client",
-		"installation_id", installationID, "app_slug", slug)
+		"installation_id", installationID, "app_slug", slug, "quota_reserve", c.quotaReserve)
 	return ic, nil
 }
 
@@ -976,6 +1004,7 @@ type PullRequestInfo struct {
 	// read from the same response as BaseRef.
 	DefaultBranch string
 	User          string
+	labels        []string
 	// State is the PR's lifecycle state as GitHub reports it: "open" or
 	// "closed" (a merged PR reads as closed).
 	State string
@@ -1438,6 +1467,9 @@ func pullRequestInfoFromGitHub(ghPR *pullRequestWithStack) PullRequestInfo {
 		State:         ghPR.GetState(),
 		Merged:        ghPR.GetMerged(),
 		BaseSHA:       ghPR.GetBase().GetSHA(),
+	}
+	for _, label := range ghPR.Labels {
+		info.labels = append(info.labels, label.GetName())
 	}
 	if ghPR.Stack != nil {
 		info.NativeStack = true
@@ -2782,6 +2814,35 @@ func pathInsideAny(p string, dirs []string) bool {
 	return false
 }
 
+// ResolveDefaultBranchTip reads the exact commit used to scope proposed files.
+func (ic *InstallationClient) ResolveDefaultBranchTip(ctx context.Context, repo string) (string, error) {
+	owner, repoName := splitRepo(repo)
+	defaultBranch, err := ic.repositoryDefaultBranch(ctx, repo)
+	if err != nil {
+		return "", err
+	}
+
+	// Pin the tip up front so a commit landing on the default branch mid-pass
+	// cannot leave some files compared against one commit and some against the
+	// next.
+	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve default branch tip", []any{"repo", repo, "default_branch", defaultBranch}, func(ctx context.Context) (*gh.Reference, error) {
+		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+defaultBranch)
+		if err != nil {
+			return nil, fmt.Errorf("get ref heads/%s: %w", defaultBranch, classifyGitHubAPIError(err))
+		}
+		return ref, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	defaultTipSHA := tip.GetObject().GetSHA()
+	if defaultTipSHA == "" {
+		return "", fmt.Errorf("ref heads/%s for %s resolved to no commit", defaultBranch, repo)
+	}
+
+	return defaultTipSHA, nil
+}
+
 // PRFilesProposedAgainstDefaultBranch narrows a pull request's changed files to
 // the ones it actually proposes, and returns the pinned default branch tip the
 // narrowing was measured against for operator logs.
@@ -2815,28 +2876,9 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 		return files, "", nil
 	}
 
-	owner, repoName := splitRepo(repo)
-	defaultBranch, err := ic.repositoryDefaultBranch(ctx, repo)
+	defaultTipSHA, err = ic.ResolveDefaultBranchTip(ctx, repo)
 	if err != nil {
 		return nil, "", err
-	}
-
-	// Pin the tip up front so a commit landing on the default branch mid-pass
-	// cannot leave some files compared against one commit and some against the
-	// next.
-	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve default branch tip", []any{"repo", repo, "default_branch", defaultBranch}, func(ctx context.Context) (*gh.Reference, error) {
-		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+defaultBranch)
-		if err != nil {
-			return nil, fmt.Errorf("get ref heads/%s: %w", defaultBranch, classifyGitHubAPIError(err))
-		}
-		return ref, nil
-	})
-	if err != nil {
-		return nil, "", err
-	}
-	defaultTipSHA = tip.GetObject().GetSHA()
-	if defaultTipSHA == "" {
-		return nil, "", fmt.Errorf("ref heads/%s for %s resolved to no commit", defaultBranch, repo)
 	}
 
 	// One cache serves both refs: it is keyed by tree SHA, and the two refs
@@ -3774,7 +3816,7 @@ func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, rep
 		if IsNotFoundError(err) {
 			return ic.fetchSchemaFilesFromTree(ctx, repo, headSHA, schemaPath)
 		}
-		return nil, err
+		return nil, fmt.Errorf("list schema files under %s in repo %s ref %s: %w", schemaPath, repo, headSHA, err)
 	}
 
 	var filesToFetch []schemaFileLocator

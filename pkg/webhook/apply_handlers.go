@@ -90,6 +90,18 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
+	admission, err := h.admitPRSchemaCommand(ctx, client, repo, pr, prPlanDiscoveryKey{})
+	if err != nil {
+		if isPRSchemaRefusal(err) {
+			return false, nil
+		}
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Could not verify the PR database limit. Retry the command.")
+		}
+		return true, fmt.Errorf("verify PR database limit for %s#%d: %w", repo, pr, err)
+	}
+	ctx = withPRSchemaAdmission(ctx, admission)
+
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Apply, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether apply command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 		if !result.SuppressRetryComments {
@@ -352,6 +364,13 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	}
 
 	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
+	if isPRSchemaRefusal(err) {
+		return false, nil
+	}
+	if _, refused := errors.AsType[*api.PRSchemaAdmissionError](err); refused {
+		return true, err
+	}
+
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "error", err)
 		if isTransientRemotePlanError(err) {
@@ -360,7 +379,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			}
 			return true, fmt.Errorf("apply command plan %s#%d: %w", repo, pr, err)
 		}
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, userFacingError(err))
 		// Failures other than remote-deployment unavailability are treated
 		// as deterministic: the posted error is the command's answer. Some
 		// of them are not truly deterministic (planning runs against a live
@@ -384,6 +403,13 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// as it runs the primary plan: every gate below reads each target's plan,
 	// and the comment the apply posts renders every target's plan.
 	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
+	if rollout.admissionErr != nil {
+		if isPRSchemaRefusal(rollout.admissionErr) {
+			return false, nil
+		}
+		return true, rollout.admissionErr
+	}
+
 	primaryTargetConverged := !planResp.HasChanges()
 	runsMemberWork := rolloutRunsMemberWork(rollout, rolloutPreview)
 	switch {
@@ -855,6 +881,18 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	} else if blocked {
 		return false, nil
 	}
+
+	admission, err := h.admitPRSchemaCommand(ctx, client, repo, pr, prPlanDiscoveryKey{})
+	if err != nil {
+		if isPRSchemaRefusal(err) {
+			return false, nil
+		}
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Could not verify the PR database limit. Retry the command.")
+		}
+		return true, fmt.Errorf("verify PR database limit for %s#%d: %w", repo, pr, err)
+	}
+	ctx = withPRSchemaAdmission(ctx, admission)
 
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether apply-confirm command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
@@ -1526,11 +1564,11 @@ func isLockAcquiredSinceVetting(err error) bool {
 }
 
 // isVettedLockGone reports whether a row-pinned release found that the lock
-// row unlock vetted no longer holds the lock: no lock is held at all
-// (ErrLockNotFound), or the row is held under another owner (ErrLockNotOwned).
-// Each means the lock the command targeted is gone and nothing this command
-// vetted is left to release; the caller logs the specific error so the cause
-// stays distinguishable.
+// row the caller (unlock, or PR close cleanup) vetted no longer holds the
+// lock: no lock is held at all (ErrLockNotFound), or the row is held under
+// another owner (ErrLockNotOwned). Each means the lock the caller targeted is
+// gone and nothing it vetted is left to release; the caller logs the specific
+// error so the cause stays distinguishable.
 func isVettedLockGone(err error) bool {
 	return errors.Is(err, storage.ErrLockNotFound) ||
 		errors.Is(err, storage.ErrLockNotOwned)

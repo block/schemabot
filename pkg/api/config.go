@@ -678,6 +678,16 @@ type GitHubConfig struct {
 	// listed in trusted-check-app-slugs, or the gate rejects its Check Run and
 	// blocks every apply.
 	PromotionCheckName string `yaml:"promotion-check-name,omitempty"`
+
+	// QuotaReserve is the number of core REST API requests each App
+	// installation holds back for check runs, pull request reads, comments,
+	// and other merge-gating work. One installation's hourly quota is shared
+	// by every pull request in every repository it serves, so once GitHub
+	// reports this many or fewer requests remaining, SchemaBot stops reading
+	// schema files and trees for plans until the quota resets, and keeps the
+	// rest for Check Runs. Zero (the default) disables the reserve. Must not
+	// be negative.
+	QuotaReserve int64 `yaml:"quota-reserve,omitempty"`
 }
 
 // CheckRunNameBase returns the configured aggregate GitHub Check Run base name.
@@ -1888,6 +1898,9 @@ func (c *PlanetScaleConfig) validate() error {
 
 // RepoConfig holds configuration for a specific repository.
 type RepoConfig struct {
+	// PRSchemaCap limits planning fan-out for pull requests in this repository.
+	PRSchemaCap *PRSchemaCapConfig `yaml:"pr_schema_cap,omitempty"`
+
 	// EnableChecks controls whether SchemaBot publishes GitHub Check Runs for
 	// this repository. Stored check state is still maintained for SchemaBot's
 	// own safety gates. Defaults to true when not configured.
@@ -2651,6 +2664,9 @@ func (c *ServerConfig) Validate() error {
 		if repo != storage.CanonicalKey(repo) {
 			return fmt.Errorf("repos repository key %q must be canonical", repo)
 		}
+		if err := c.validatePRSchemaCap(repo, repoConfig); err != nil {
+			return err
+		}
 		if err := validateAggregateConfig(repo, repoConfig.Aggregate); err != nil {
 			return err
 		}
@@ -3072,7 +3088,7 @@ func (c *ServerConfig) validateNoLocalRemoteRouteCollision() error {
 //   - If apps: is NOT set, repos must not declare github_app (it would be a
 //     silently ignored field, which we want to fail closed on).
 func (c *ServerConfig) validateGitHubAppsConfig() error {
-	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != "" || c.GitHub.CheckName != "" || len(c.GitHub.TrustedCheckAppSlugs) > 0 || c.GitHub.PromotionCheckName != ""
+	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != "" || c.GitHub.CheckName != "" || len(c.GitHub.TrustedCheckAppSlugs) > 0 || c.GitHub.PromotionCheckName != "" || c.GitHub.QuotaReserve != 0
 	hasApps := c.Apps != nil
 
 	if hasGitHub && hasApps {
@@ -3084,6 +3100,9 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 			return err
 		}
 		if err := c.GitHub.validatePromotionCheckName("github"); err != nil {
+			return err
+		}
+		if err := c.GitHub.validateQuotaReserve("github"); err != nil {
 			return err
 		}
 	}
@@ -3111,6 +3130,9 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 			if err := app.validatePromotionCheckName(fmt.Sprintf("app %q", name)); err != nil {
 				return err
 			}
+			if err := app.validateQuotaReserve(fmt.Sprintf("app %q", name)); err != nil {
+				return err
+			}
 		}
 		for repo, repoConfig := range c.Repos {
 			if repoConfig.GitHubApp == "" {
@@ -3129,6 +3151,15 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 		if repoConfig.GitHubApp != "" {
 			return fmt.Errorf("repository %q sets github_app %q but apps: is not configured", repo, repoConfig.GitHubApp)
 		}
+	}
+	return nil
+}
+
+// validateQuotaReserve rejects a negative quota-reserve, which could only be a
+// typo: a reserve below zero would hold nothing back.
+func (g GitHubConfig) validateQuotaReserve(context string) error {
+	if g.QuotaReserve < 0 {
+		return fmt.Errorf("%s quota-reserve must not be negative, got %d; set 0 to disable the reserve", context, g.QuotaReserve)
 	}
 	return nil
 }

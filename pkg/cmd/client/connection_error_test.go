@@ -519,6 +519,38 @@ func TestPlainHTTPServerBehindAnHTTPSEndpointCarriesNoWarning(t *testing.T) {
 	assert.Equal(t, "connection failed: "+endpoint+": http: server gave HTTP response to HTTPS client", msg)
 }
 
+// A plain HTTP server answering an https request is recognized by the error
+// value the HTTP client returns, however deep it sits in the chain: the apply
+// was never sent, so the message carries no warning. An error that only
+// carries the same words says nothing about this request's own handshake, so
+// it gets the warning like any other failure the client cannot place.
+func TestPlainHTTPServerIsRecognizedByErrorValueNotByItsWords(t *testing.T) {
+	const endpoint = "https://schemabot.test"
+	const words = "http: server gave HTTP response to HTTPS client"
+	tests := []struct {
+		name        string
+		cause       error
+		wantMessage string
+	}{
+		{
+			name:        "the client's own error value, wrapped again on the way up",
+			cause:       fmt.Errorf("round trip: %w", http.ErrSchemeMismatch),
+			wantMessage: "connection failed: " + endpoint + ": round trip: " + words,
+		},
+		{
+			name:        "another error with the same words",
+			cause:       errors.New(words),
+			wantMessage: "connection failed: " + endpoint + ": " + words + "\n" + mayHaveActed + " " + statusHint,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := &url.Error{Op: "Post", URL: endpoint + "/api/apply", Err: tc.cause}
+			assert.Equal(t, tc.wantMessage, FormatConnectionError(endpoint, err).Error())
+		})
+	}
+}
+
 // An https endpoint that reaches something that speaks neither TLS nor HTTP,
 // such as a database port, fails the TLS handshake as well.
 func TestNonTLSServerBehindAnHTTPSEndpointCarriesNoWarning(t *testing.T) {

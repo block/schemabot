@@ -31,6 +31,7 @@ type requestPRInfoCache struct {
 	m           map[string]*PullRequestInfo
 	files       map[string][]PRFile
 	memberships map[string]bool
+	configs     map[string][]DiscoveredConfig
 }
 
 type prInfoCacheCtxKey struct{}
@@ -46,6 +47,7 @@ func WithPRInfoCache(ctx context.Context) context.Context {
 		m:           make(map[string]*PullRequestInfo),
 		files:       make(map[string][]PRFile),
 		memberships: make(map[string]bool),
+		configs:     make(map[string][]DiscoveredConfig),
 	})
 }
 
@@ -63,6 +65,18 @@ func WithPRInfoCache(ctx context.Context) context.Context {
 func WithPRInfo(ctx context.Context, repo string, pr int, info *PullRequestInfo) context.Context {
 	ctx = WithPRInfoCache(ctx)
 	prInfoCacheFromContext(ctx).set(repo, pr, info)
+	return ctx
+}
+
+// WithPRDiscovery pins verified PR metadata and files for command discovery.
+// Configs may be supplied when they were discovered from exactly these files.
+func WithPRDiscovery(ctx context.Context, repo string, pr int, info *PullRequestInfo, files []PRFile, configs []DiscoveredConfig) context.Context {
+	ctx = WithPRInfo(ctx, repo, pr, info)
+	cache := prInfoCacheFromContext(ctx)
+	cache.setFiles(repo, pr, files)
+	if configs != nil {
+		cache.configs[cacheKey(repo, pr)] = configs
+	}
 	return ctx
 }
 

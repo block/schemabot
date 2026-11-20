@@ -1124,6 +1124,42 @@ refusal is the same `429` with `error_code: rate_limited` and `Retry-After`, and
 it is returned before any GitHub call is made. Set `enabled: false` to turn
 enforcement off.
 
+### GitHub quota reserve
+
+One GitHub App installation's hourly REST quota is shared by every pull request
+in every repository it serves. Planning a pull request reads its schema files
+and repository trees, and a burst of plans can spend the whole quota. Once it
+is gone, GitHub refuses SchemaBot's Check Run writes too, so required checks
+stop posting on every pull request the installation serves.
+
+`quota-reserve` holds back that many requests per installation for the work
+that gates merges. Once GitHub reports that many or fewer requests remaining,
+SchemaBot stops sending the schema file, blob, and tree reads a plan makes until
+the quota resets. Check Run writes and reads, pull request reads, changed-file
+lists, and comments still go out, and so do the same file and tree reads when
+SchemaBot makes them to decide what a Check Run says, such as which
+environments a pull request's configs cover. A plan that needs a refused read
+fails closed: the pull request's SchemaBot check does not pass until a plan
+succeeds after the reset. A refused plan is retried on the usual schedule, not
+at the reset, so push or re-run the check after the reset if it is still
+failing.
+
+```yaml
+github:
+  quota-reserve: 1500  # default: 0 (disabled)
+```
+
+Under `apps:`, each App takes its own `quota-reserve`, since each App has its
+own installations and quotas. The value must not be negative. SchemaBot tracks
+the remaining quota from GitHub's response headers per installation and per
+server process, less the requests that process has sent and not yet had
+answered, so each replica reaches the reserve on its own reading of the shared
+quota; size the reserve to cover the Check Run traffic of every replica until
+the reset. Each refused read increments
+`schemabot.github.primary_rate_limit_rejections_total` with `origin=reserve`,
+and the first refusal in each reset window logs a warning naming the
+installation, App, remaining quota, reserve, and reset time.
+
 ## Pending Drops
 
 For MySQL databases executed by the Spirit engine, `DROP TABLE` statements can
@@ -2000,6 +2036,46 @@ unlisted repository:
   so operators can detect unexpected webhook delivery or missing configuration.
 
 If `repos` is not configured or empty, all repositories are allowed.
+
+### Pull request database limit
+
+Set `pr_schema_cap` under a repository to pause planning and new applies when
+a pull request changes more than five logical databases managed by this control
+plane. The count covers the full pull request, including when a command names
+one database or target. Environments, keyspaces, and shards of the same
+database count once. Each control plane evaluates its own registrations.
+
+```yaml
+repos:
+  example-org/service:
+    pr_schema_cap:
+      control_plane: payments
+      limit: 5
+      observe: true
+      label: "schemabot: allow-large-plan"
+```
+
+Use `observe: true` to record decisions and projected database planning fan-out
+before enforcement. Omit it to enforce the limit. Omit `limit` for the default of
+five. On shared repositories, give each deployment a distinct `control_plane`
+for the comment and Check Run summary. It defaults to the deployment's
+`tenant`, or the GitHub Check Run name when the deployment has no tenant.
+
+Provision the configured label in the repository before enabling enforcement.
+Applying it acknowledges the current head and base. SchemaBot holds new work
+when the label is removed or the revision changes. On shared repositories,
+designate one deployment to remove stale labels with `manage_label: true` and
+set it to `false` on the others. By default, standalone deployments and aggregate
+leaders remove stale labels. If a stale label remains visible, remove it and
+add it again to acknowledge the new revision.
+
+At or below the limit, admission skips label verification. Above the limit,
+SchemaBot verifies an exception using at most one page of 100 PR timeline
+events. If GitHub reports another page, the PR stays held. Split the changes
+into smaller PRs to proceed.
+
+The exception enables planning and new work on that revision. Existing apply
+approval policies are evaluated independently.
 
 ### Listen-only repositories
 

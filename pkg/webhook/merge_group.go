@@ -480,6 +480,9 @@ func (h *Handler) passingAggregateCheckTargets(ctx context.Context, client *ghcl
 	if !ok || len(config.AllowedEnvironments) == 0 {
 		return h.aggregateCheckTargetsForRepo(repo), nil
 	}
+	// Resolving the environments reads config files at headSHA, which decide
+	// which checks to post, so the quota reserve sends those reads.
+	ctx = ghclient.WithCheckPublicationReads(ctx)
 	environments, err := config.CheckEnvironmentsForRepo(ctx, client, repo, headSHA)
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s coverage: %w", operation, err)

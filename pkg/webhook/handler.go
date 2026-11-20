@@ -76,8 +76,9 @@ const (
 
 // Handler processes GitHub webhook events.
 type Handler struct {
-	service   *api.Service
-	ghClients github.ClientSet
+	service         *api.Service
+	ghClients       github.ClientSet
+	prPlanDiscovery prPlanDiscoveryCache
 
 	// shardedPlans is the sharded plan cache every comment render this
 	// handler starts shares; see shardedPlanCache. Nil (a Handler built
@@ -194,6 +195,11 @@ type Handler struct {
 	checkSuiteRecovery      bool
 	checkSuiteRecoveryGrace time.Duration
 
+	// synchronizeQuietPeriod defers each durable synchronize delivery by this
+	// long after receipt, so a later push in the same burst supersedes it
+	// before it plans. Zero dispatches synchronize deliveries immediately.
+	synchronizeQuietPeriod time.Duration
+
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
 	priorEnvCheckRetryInterval time.Duration
@@ -278,6 +284,28 @@ func WithWebhookReconcileScanBounds(maxPages int, lookback time.Duration) Handle
 func WithCheckSuiteRecovery() HandlerOption {
 	return func(h *Handler) {
 		h.checkSuiteRecovery = true
+	}
+}
+
+// DefaultSynchronizeQuietPeriod is the quiet period the server gives a
+// durable synchronize delivery when the operator does not set one. It is long
+// enough to cover the pushes of one stacked-branch rebase or a quick series of
+// fix-up commits, and short enough that a lone push is planned promptly.
+const DefaultSynchronizeQuietPeriod = 15 * time.Second
+
+// WithSynchronizeQuietPeriod defers every durable pull_request synchronize
+// delivery until the quiet period after its receipt has passed. A push that
+// follows within the window is in the inbox by the time the earlier delivery
+// is claimed, so the earlier delivery is superseded at claim time, once the
+// live PR confirms its head is no longer current, and only the newest head of
+// a burst is planned. Opened and reopened deliveries are never deferred. A
+// non-positive period is a no-op, leaving synchronize deliveries immediately
+// claimable. It takes effect only alongside WithDurableWebhookDispatch.
+func WithSynchronizeQuietPeriod(period time.Duration) HandlerOption {
+	return func(h *Handler) {
+		if period > 0 {
+			h.synchronizeQuietPeriod = period
+		}
 	}
 }
 
@@ -383,6 +411,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 
 		// A stop that withdraws a queued start leaves the apply stopped, so no
 		// drive runs to update the PR; tell it the start was withdrawn.
+		service.OnPRSchemaAdmission = h.admitPRSchemaDispatch
 		service.OnQueuedStartWithdrawn = h.reportQueuedStartWithdrawn
 
 		// Register the aggregate terminal-summary callback, invoked by the
@@ -669,6 +698,18 @@ func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Chec
 		return
 	}
 
+	var expected prPlanDiscoveryKey
+	if h.config().PRSchemaCapForRepo(a.Repository).Limit > 0 {
+		expected = h.prPlanDiscoveryKey(a.Repository, a.PullRequest, prInfo)
+	}
+	admission, err := h.admitPRSchemaBeforeQueue(context.Background(), a.Repository, a.PullRequest, a.InstallationID, expected)
+	if err != nil {
+		if !isPRSchemaRefusal(err) {
+			h.logger.Warn("could not verify PR database limit after apply", "repo", a.Repository, "pr", a.PullRequest, "error", err)
+		}
+		return
+	}
+
 	tenant := ""
 	if config := h.service.Config(); config != nil {
 		tenant = config.Tenant
@@ -681,7 +722,7 @@ func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Chec
 		// for an apply, not for a plan. The stored check state it writes is the
 		// whole point. It re-plans the one database the settled apply held the
 		// check for.
-		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, nil)
+		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, nil, admission)
 	})
 }
 

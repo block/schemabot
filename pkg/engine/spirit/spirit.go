@@ -117,6 +117,11 @@ type Engine struct {
 	// sends, given the probe's context, so tests can make the server slow to
 	// answer and prove every statement runs under the probe's budget.
 	sizeProbeSQL func(ctx context.Context, stmt string) string
+
+	// dropTablesQuietPeriod is how long a drop_tables entry must have gone
+	// without a write before a plan proposes dropping it. New sets it to
+	// defaultDropTablesQuietPeriod; it is a field so tests can shorten it.
+	dropTablesQuietPeriod time.Duration
 }
 
 // runningSchemaChange tracks the state of an in-progress schema change.
@@ -254,6 +259,8 @@ func New(cfg Config) *Engine {
 		lockWaitTimeout:     lockWaitTimeout,
 		disablePendingDrops: cfg.DisablePendingDrops,
 		checkpointMaxAge:    checkpointMaxAge,
+
+		dropTablesQuietPeriod: defaultDropTablesQuietPeriod,
 	}
 	eng.debugLogs.Store(cfg.DebugLogs)
 
@@ -789,6 +796,20 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		}, nil
 	}
 
+	// A drop_tables entry is dropped only once the target shows it has gone
+	// the quiet period without a write. The check comes after the config's own
+	// contradictions are refused above, so an entry that should not be listed
+	// at all is reported as that, whatever the target says about its writes.
+	if !drops.Empty() {
+		db, err := target.get(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("plan database %s: check when drop_tables entries were last written: %w", database, err)
+		}
+		if err := e.requireQuietDropTables(ctx, db, database, drops); err != nil {
+			return nil, fmt.Errorf("plan database %s: %w", database, err)
+		}
+	}
+
 	// The engine's refusal checks compare a redeclared column against its
 	// current type, so each ALTER is classified alongside the table's current
 	// definition. The diff only emits an ALTER for a table present in
@@ -886,7 +907,13 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		lintViolations = append(lintViolations, lint.PlannedChangeViolations(pc)...)
 	}
 
-	schemaChanges, err := groupChangesByNamespace(changes, currentSchema, namespaceByTable, req.SchemaFiles, database)
+	// A drop_tables entry the naming conventions skip is in currentSchema only
+	// so it can be dropped. A rollback restores the recorded definitions, so
+	// recording one would have the rollback recreate an empty leftover that its
+	// own resume, planning without the list, then refuses as a declared table
+	// it never manages. A listed table with an ordinary name is one the plan
+	// would drop anyway, and its definition is recorded as any other's.
+	schemaChanges, err := groupChangesByNamespace(changes, withoutTables(currentSchema, current.reclaimed), namespaceByTable, req.SchemaFiles, database)
 	if err != nil {
 		return nil, err
 	}
@@ -1379,6 +1406,9 @@ type liveSchema struct {
 	// the config is matched.
 	underscore []string
 	archive    []string
+	// reclaimed is the drop_tables entries in tables only because the list
+	// named them: the naming conventions would otherwise have kept them out.
+	reclaimed []string
 	// lowerCaseTableNames is the target's @@lower_case_table_names, which
 	// decides whether the diff compares table names case-insensitively.
 	lowerCaseTableNames int
@@ -1437,8 +1467,15 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		tables = append(tables, ts)
 	}
 	if !drops.Empty() {
-		if err := refuseRecentlyWrittenDrops(ctx, db, database, drops); err != nil {
-			return nil, err
+		// Every listed table that exists is in tables by now: the loader
+		// returned it, or it was read back in above.
+		liveNames := make([]string, 0, len(tables))
+		for _, ts := range tables {
+			liveNames = append(liveNames, ts.Name)
+		}
+		if unmatched := drops.Unmatched(liveNames); len(unmatched) > 0 {
+			e.logger.Info("drop_tables entries name no table on the target, so the plan drops nothing for them",
+				"database", database, "entries", unmatched)
 		}
 	}
 
@@ -1456,9 +1493,14 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 			withheld = append(withheld, ts.Name)
 			continue
 		}
-		if table.IsArchiveTable(ts.Name) && !drops.Names(ts.Name) {
-			archive = append(archive, ts.Name)
-			continue
+		if table.IsArchiveTable(ts.Name) {
+			if !drops.Names(ts.Name) {
+				archive = append(archive, ts.Name)
+				continue
+			}
+			if !slices.Contains(reclaimed, ts.Name) {
+				reclaimed = append(reclaimed, ts.Name)
+			}
 		}
 		kept = append(kept, ts)
 	}
@@ -1481,6 +1523,7 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		withheld:            withheld,
 		underscore:          underscore,
 		archive:             archive,
+		reclaimed:           reclaimed,
 		lowerCaseTableNames: lowerCaseTableNames,
 	}, nil
 }

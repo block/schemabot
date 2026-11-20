@@ -2017,10 +2017,21 @@ type ApplyHistoryResponse struct {
 	State       string `json:"state"`
 }
 
-// DatabaseHistoryResponse is the response for GET /api/history/{database}.
+// DatabaseHistoryResponse is the response for GET /api/history/{database}:
+// one page of the database's applies, newest first.
 type DatabaseHistoryResponse struct {
-	Database string                  `json:"database"`
-	Applies  []*ApplyHistoryResponse `json:"applies"`
+	Database string `json:"database"`
+	Limit    int    `json:"limit,omitempty"`
+	MaxLimit int    `json:"max_limit,omitempty"`
+	// HasMore reports that more applies match than this page holds. Request
+	// the next page with the same environment and starting_after set to the
+	// last apply's ID.
+	HasMore bool `json:"has_more"`
+	// StartingAfter echoes the starting_after apply the page continues from,
+	// so a client can tell this page apart from a first page served by a
+	// server that ignores the parameter.
+	StartingAfter string                  `json:"starting_after,omitempty"`
+	Applies       []*ApplyHistoryResponse `json:"applies"`
 }
 
 // ActiveApplyResponse represents a schema change in the status list.

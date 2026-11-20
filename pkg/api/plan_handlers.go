@@ -665,6 +665,10 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := refuseDropTablesAlsoIgnored(req.DropTables, req.IgnoreTables); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// Planning stages a change against a specific database and reads its live
 	// schema, so it takes the same per-database authorization as apply.
@@ -692,6 +696,10 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 
 	primaryPlan, resp, err := s.ExecutePlanProto(r.Context(), req)
 	if err != nil {
+		if _, refused := errors.AsType[*PRSchemaAdmissionError](err); refused {
+			s.writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		if typeMismatchErr, ok := errors.AsType[*databaseTypeMismatchError](err); ok {
 			s.logger.Warn("plan rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
 			s.writeError(w, http.StatusBadRequest, err.Error())
@@ -726,6 +734,10 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
 			s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeSourcePolicyDenied, "plan failed: "+err.Error())
+			return
+		}
+		if _, ok := errors.AsType[*DropTablesInUseError](err); ok {
+			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "plan rejected: "+err.Error())
 			return
 		}
 		s.logger.Error("plan failed", "database", req.Database, "error", err)
@@ -976,12 +988,26 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			"drop_tables", req.DropTables,
 		)
 	}
+	if err := refuseDropTablesAlsoIgnored(req.DropTables, req.IgnoreTables); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "drop_tables entry also ignored")
+		return nil, nil, err
+	}
+	if err := s.refuseDropsOfUnsettledApplyWorkTables(ctx, req.Database, resolvedTarget.DatabaseType, req.Environment, req.DropTables); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "drop_tables working table in use")
+		return nil, nil, err
+	}
 
+	ctx, err = s.withPRSchemaPlanAdmission(ctx, client, req.Repository, int(ternReq.PullRequest), ternReq.HeadSha)
+	if err != nil {
+		return nil, nil, err
+	}
 	resp, err := client.Plan(ctx, ternReq)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "plan failed")
-		s.logger.Error("ExecutePlan: client.Plan failed",
+		planFailureAttrs := []any{
 			"database", req.Database,
 			"type", resolvedTarget.DatabaseType,
 			"deployment", deployment,
@@ -992,7 +1018,12 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			"endpoint", client.Endpoint(),
 			"is_remote", client.IsRemote(),
 			"error", err,
-		)
+		}
+		if isPlanRefusal(err) {
+			s.logger.Warn("ExecutePlan: engine refused the plan; the PR's schema files must change before it can plan", planFailureAttrs...)
+		} else {
+			s.logger.Error("ExecutePlan: client.Plan failed", planFailureAttrs...)
+		}
 		if client.IsRemote() && grpcstatus.Code(err) == grpccodes.Unavailable {
 			return nil, nil, &RemoteDeploymentUnavailableError{
 				Deployment: deployment,
@@ -1519,6 +1550,10 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 	req.viaHTTP = true
 	resp, applyID, err := s.ExecuteApply(r.Context(), req)
 	if err != nil {
+		if _, refused := errors.AsType[*PRSchemaAdmissionError](err); refused {
+			s.writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		if errors.Is(err, errPlanLookupFailed) {
 			s.logger.Error("apply failed to load the stored plan", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, storedPlanLookupFailedMessage("apply", req.PlanID))
@@ -1543,6 +1578,10 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, storage.ErrActiveApplyExists) {
 			s.logger.Warn("apply blocked by active apply", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, activeApplyConflictMessage(err))
+			return
+		}
+		if _, ok := errors.AsType[*DropTablesInUseError](err); ok {
+			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "apply rejected: "+err.Error())
 			return
 		}
 		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
@@ -1639,6 +1678,10 @@ func applyMetricStatusForError(err error) string {
 	}
 	// So is a deferred cutover wider than the drivers that can run it.
 	if _, ok := errors.AsType[*DeferredCutoverCapacityError](err); ok {
+		return applyMetricStatusRejected
+	}
+	// So is a drop of another apply's working table, until that apply settles.
+	if _, ok := errors.AsType[*DropTablesInUseError](err); ok {
 		return applyMetricStatusRejected
 	}
 	return "error"
@@ -2093,6 +2136,16 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		s.rememberResumeObserver(storedApplyID, 0)
 	}
 
+	// Recovery remains available after the PR closes or its exception is revoked.
+	// Both guards are internal. Storage verifies the owner and exact rollback pin
+	// in the transaction that creates the apply, including after a concurrent repin.
+	pinnedRollback := req.ExpectedLockOwner != "" && plan.PlanIdentifier != "" &&
+		req.ExpectedPendingPlanID == storage.RollbackPendingPlanPrefix+plan.PlanIdentifier
+	if !pinnedRollback {
+		if err := s.admitPRSchemaWork(ctx, plan.Repository, plan.PullRequest, plan.HeadSHA); err != nil {
+			return nil, 0, err
+		}
+	}
 	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, options, attachObserver)
 	if err != nil {
 		recordApplyError("enqueue apply", err)
@@ -2177,6 +2230,11 @@ func (s *Service) createStoredApply(
 		return nil, 0, err
 	}
 	if err := rejectUnsafeStoredPlanWithoutOptIn(plan, applyOpts); err != nil {
+		return nil, 0, err
+	}
+	// An apply stopped after this plan was made is checked here: storage
+	// admits a new apply past a stopped one.
+	if err := s.refuseDropsOfUnsettledApplyWorkTables(ctx, plan.Database, plan.DatabaseType, req.Environment, plan.DropTables()); err != nil {
 		return nil, 0, err
 	}
 
@@ -3789,4 +3847,15 @@ func validateSchemaFiles(schemaFiles map[string]*ternv1.SchemaFiles) (warning st
 		}
 	}
 	return warning, nil
+}
+
+// isPlanRefusal reports whether a Plan failure is the engine declining the
+// declared schema as written, from a local engine or from a remote data plane
+// that answered FailedPrecondition. The PR author fixes it by changing the
+// schema files, so it is not a SchemaBot fault and is not logged as an error.
+func isPlanRefusal(err error) bool {
+	if engine.IsPlanRefused(err) {
+		return true
+	}
+	return grpcstatus.Code(err) == grpccodes.FailedPrecondition
 }
