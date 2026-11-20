@@ -80,7 +80,7 @@ func TestE2EApplyConfirmIsRefusedDuringAFreeze(t *testing.T) {
 
 	result := sendApplyConfirm(t, svc, dbName, "schemabot apply-confirm -e staging")
 	refusal := awaitCommentContaining(t, result, "This change did not start: it is blocked in staging by freeze "+freezeID+" (incident 43, until lifted)")
-	assert.NotContains(t, refusal, "--override", "apply-confirm does not take --override")
+	assert.Contains(t, refusal, "run the same command again with `--override` followed by your reason in quotes")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)

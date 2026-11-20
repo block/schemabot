@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,9 +41,11 @@ func freezeForOverride(t *testing.T, st storage.Storage, environment, database s
 		Kind:        storage.FreezeKindOnDemand,
 		Running:     storage.FreezeRunningContinue,
 		StartsAt:    time.Now().Add(-time.Hour),
-		Reason:      "incident 44",
-		CreatedBy:   "alice",
-		Source:      storage.FreezeSourceManual,
+		// A long reason: the refusal must still end with the approval
+		// instructions, which the default error bound would cut off.
+		Reason:    "incident 44: " + strings.Repeat("payments latency ", 30),
+		CreatedBy: "alice",
+		Source:    storage.FreezeSourceManual,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {

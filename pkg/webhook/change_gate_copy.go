@@ -20,13 +20,30 @@ import (
 // request's author, and then the commenter runs the command again: an approved
 // override admits only the person who asked for it.
 func changeGateRefusalDetail(refused *api.ChangeGateRefusedError, command, tenant string) string {
-	detail := refused.BlockedWith(templates.ErrorDetailReason) + "."
+	// Reasons are clamped and at most maxListedBlockers are named, so the
+	// detail stays inside templates.MaxChangeGateRefusalLen and the request
+	// and its instructions at the end are never cut off.
+	listed := *refused
+	unlisted := 0
+	if len(listed.Blockers) > maxListedBlockers {
+		unlisted = len(listed.Blockers) - maxListedBlockers
+		listed.Blockers = listed.Blockers[:maxListedBlockers]
+	}
+	detail := listed.BlockedWith(func(reason string) string {
+		return templates.ErrorDetailReason(clampReason(reason, maxListedFreezeReason))
+	}) + "."
+	switch {
+	case unlisted == 1:
+		detail += " 1 more freeze also blocks it."
+	case unlisted > 1:
+		detail += fmt.Sprintf(" %d more freezes also block it.", unlisted)
+	}
 	switch request := refused.OverrideRequest; {
 	case request != nil:
 		requester := strings.TrimPrefix(request.RequestedBy, storage.GitHubIdentityPrefix)
 		author := strings.TrimPrefix(request.PRAuthor, storage.GitHubIdentityPrefix)
 		detail += fmt.Sprintf(" Override request `%s` was recorded.", request.Identifier)
-		if reason := strings.TrimSpace(request.Reason); reason != "" {
+		if reason := clampReason(strings.TrimSpace(request.Reason), maxShownOverrideReason); reason != "" {
 			detail += " Reason the approver sees: " + templates.ErrorDetailReason(reason)
 			if !strings.HasSuffix(reason, ".") {
 				detail += "."
@@ -49,4 +66,24 @@ func changeGateRefusalDetail(refused *api.ChangeGateRefusedError, command, tenan
 		detail += " To ask a freeze approver to let it through, run the same command again with `--override` followed by your reason in quotes."
 	}
 	return detail
+}
+
+const (
+	// maxListedBlockers is how many blockers a refusal names; the rest are
+	// counted.
+	maxListedBlockers = 3
+	// maxListedFreezeReason and maxShownOverrideReason bound, in runes, the
+	// reasons a refusal quotes. The full reasons are on the freeze and the
+	// request.
+	maxListedFreezeReason  = 150
+	maxShownOverrideReason = 300
+)
+
+// clampReason cuts reason to at most limit runes, marking a cut with "…".
+func clampReason(reason string, limit int) string {
+	runes := []rune(reason)
+	if len(runes) <= limit {
+		return reason
+	}
+	return strings.TrimSpace(string(runes[:limit-1])) + "…"
 }

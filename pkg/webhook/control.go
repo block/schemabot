@@ -206,7 +206,11 @@ func runControlCommand[R any](
 	resp, err := execute(ctx, request)
 	if err != nil {
 		h.logControlCommandError(actionName, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
-		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, controlErrorMessage(err, actionName, h.deploymentTenant()))
+		post := h.postCommandError
+		if isChangeGateError(err) {
+			post = h.postChangeGateRefusal
+		}
+		post(repo, pr, installationID, actionName, result.Environment, requestedBy, controlErrorMessage(err, actionName, h.deploymentTenant()))
 		return nil
 	}
 	if resp == nil {
