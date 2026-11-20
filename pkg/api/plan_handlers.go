@@ -1554,6 +1554,9 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusConflict, err.Error())
 			return
 		}
+		if s.writeChangeGateError(w, "apply", err) {
+			return
+		}
 		if errors.Is(err, errPlanLookupFailed) {
 			s.logger.Error("apply failed to load the stored plan", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, storedPlanLookupFailedMessage("apply", req.PlanID))
@@ -1682,6 +1685,11 @@ func applyMetricStatusForError(err error) string {
 	}
 	// So is a drop of another apply's working table, until that apply settles.
 	if _, ok := errors.AsType[*DropTablesInUseError](err); ok {
+		return applyMetricStatusRejected
+	}
+	// So is a change gate refusal. A gate that could not decide is a server
+	// failure.
+	if status, _, ok := changeGateErrorStatus(err); ok && status < http.StatusInternalServerError {
 		return applyMetricStatusRejected
 	}
 	return "error"
@@ -2139,10 +2147,21 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 	// Recovery remains available after the PR closes or its exception is revoked.
 	// Both guards are internal. Storage verifies the owner and exact rollback pin
 	// in the transaction that creates the apply, including after a concurrent repin.
-	pinnedRollback := req.ExpectedLockOwner != "" && plan.PlanIdentifier != "" &&
-		req.ExpectedPendingPlanID == storage.RollbackPendingPlanPrefix+plan.PlanIdentifier
-	if !pinnedRollback {
+	if !isPinnedRollback(plan, req) {
 		if err := s.admitPRSchemaWork(ctx, plan.Repository, plan.PullRequest, plan.HeadSHA); err != nil {
+			return nil, 0, err
+		}
+		// A rollback undoes a change, so the change gates never hold it. Only
+		// the webhook's pinned rollback is known to be one: the rollback
+		// option is the caller's to set.
+		if err := s.checkChangeGates(ctx, changeGateInput{
+			Checkpoint:  changeGateCheckpointStart,
+			Environment: req.Environment,
+			Deployments: s.changeGateDeployments(plan.Database, req.Environment, plan.Deployment, req.Target != ""),
+			Database:    plan.Database,
+			Repository:  plan.Repository,
+		}, resolveCaller(ctx, req.Caller)); err != nil {
+			recordApplyError("change gate", err)
 			return nil, 0, err
 		}
 	}
@@ -2166,6 +2185,14 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		Accepted: true,
 		ApplyID:  applyIdentifier,
 	}, storedApplyID, nil
+}
+
+// isPinnedRollback reports whether req is the webhook's pinned PR rollback of
+// plan. Storage verifies the owner and the exact rollback pin in the
+// transaction that creates the apply, so the request cannot claim it falsely.
+func isPinnedRollback(plan *storage.Plan, req ApplyRequest) bool {
+	return req.ExpectedLockOwner != "" && plan.PlanIdentifier != "" &&
+		req.ExpectedPendingPlanID == storage.RollbackPendingPlanPrefix+plan.PlanIdentifier
 }
 
 func (s *Service) enqueueApply(
@@ -2251,6 +2278,9 @@ func (s *Service) createStoredApply(
 	// A narrowed apply records the member it ran on, so a later rollback can
 	// tell it changed that member alone and not the whole rollout.
 	applyOpts.NarrowedTo = narrowedTo
+	// A pinned rollback is recorded so its later start or cutover passes the
+	// change gates as its creation did.
+	applyOpts.PinnedRollback = isPinnedRollback(plan, req)
 
 	// Attribute the apply to the authenticated caller when the request carried a
 	// real identity (API auth enabled); see resolveCaller.

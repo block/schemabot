@@ -600,6 +600,18 @@ func (h *Handler) executeApply(
 		if handleAdmissionError(err) {
 			return
 		}
+		if isChangeGateError(err) {
+			// The gate refused before the apply was created, so the pending
+			// lock this attempt pinned, by an apply or an apply-confirm,
+			// would otherwise stay held. The release is conditional on that
+			// pin, so a lock repinned meanwhile stays.
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			h.releaseApplyLockIfIntentUnchanged(releaseCtx, repo, pr, database, dbType, environment, expectedPendingPlanID, "change gate refused")
+			cancel()
+			h.logger.Info("apply refused by a change gate", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(actionName, environment, h.deploymentTenant(), err))
+			return
+		}
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
 		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(actionName, environment, h.deploymentTenant(), err))
 		return
@@ -853,6 +865,16 @@ func applyExecutionErrorMessage(command, environment, tenant string, err error) 
 	})
 }
 
+// isChangeGateError reports whether a change gate refused the change or could
+// not check it. Either way the change was refused before it was created.
+func isChangeGateError(err error) bool {
+	if _, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
+		return true
+	}
+	_, ok := errors.AsType[*api.ChangeGateUnavailableError](err)
+	return ok
+}
+
 // dispatchMessages carries the command-specific words dispatchErrorMessage
 // renders around the shared classification of a failed dispatch.
 type dispatchMessages struct {
@@ -892,6 +914,12 @@ type dispatchMessages struct {
 func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 	if errors.Is(err, storage.ErrLockIntentChanged) {
 		return msgs.lockIntentChanged
+	}
+	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
+		return "This change did not start: it is " + refused.Error() + "."
+	}
+	if unavailable, ok := errors.AsType[*api.ChangeGateUnavailableError](err); ok {
+		return unavailable.UserMessage()
 	}
 	var featureErr *api.UnsupportedFeatureError
 	if errors.As(err, &featureErr) {

@@ -1937,6 +1937,13 @@ type ApplyOptions struct {
 	// and must not merge as-is), not success.
 	Rollback bool `json:"rollback,omitempty"`
 
+	// PinnedRollback marks a rollback the PR rollback command pinned, which
+	// storage verified against the lock when it created the apply. The
+	// change gates never hold one, at creation or at a later start or
+	// cutover. It is recorded at creation and never read from caller
+	// options: the rollback option above is the caller's to set.
+	PinnedRollback bool `json:"pinned_rollback,omitempty"`
+
 	// NarrowedTo is the MemberID (deployment/target) of the one rollout member
 	// a narrowed apply ran on. Empty for an apply of the whole rollout. It is
 	// recorded at creation and never read from caller options, so a rollback
