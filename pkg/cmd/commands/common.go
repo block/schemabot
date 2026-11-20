@@ -522,7 +522,7 @@ func writeNarrowedTo(planResult *apitypes.PlanResponse) {
 // rollout-wide apply (apitypes.ApplyRequest.RendersRollout). Each caller
 // decides it for its own output, so a new caller has to decide it rather than
 // inherit it.
-func applyAndWatch(ctx context.Context, ep string, planResult *apitypes.PlanResponse, rendersRollout bool, database, environment, caller, operation string,
+func applyAndWatch(ctx context.Context, ep string, planResult *apitypes.PlanResponse, rendersRollout bool, database, environment, caller, override, operation string,
 	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) (string, error) {
 
 	if planResult.PlanID == "" {
@@ -539,9 +539,10 @@ func applyAndWatch(ctx context.Context, ep string, planResult *apitypes.PlanResp
 		var applyErr error
 		// A narrowed plan is applied to the member it was made for and nowhere
 		// else; the server refuses to run it rollout-wide.
-		applyResult, applyErr = client.CallApplyAPIForTarget(ep, planResult.PlanID, environment, caller, planResult.NarrowedTo, rendersRollout, options)
+		applyResult, applyErr = client.CallApplyAPIWithOverride(ep, planResult.PlanID, environment, caller, planResult.NarrowedTo, rendersRollout, override, options)
 		return applyErr
 	})
+	err = reportChangeGate(err, environment, operation, strings.TrimSpace(override) != "", format == OutputFormatJSON)
 	if submitRefusedByServer(err) {
 		return "", &notSubmittedError{err: err}
 	}
@@ -617,10 +618,14 @@ func neverSubmitted(err error) bool {
 // submitRefusedByServer reports whether err is the apply API refusing the
 // request with a client error. The server answers every refusal of an apply
 // before it creates one, so a 4xx means nothing was queued; a 5xx can come
-// after the apply was stored, so it is not a refusal.
+// after the apply was stored, so it is not a refusal, except the one the
+// server sends when it could not check the change gates and so started nothing.
 func submitRefusedByServer(err error) bool {
 	apiErr, ok := errors.AsType[*client.APIError](err)
-	return ok && apiErr.Status >= 400 && apiErr.Status < 500
+	if !ok {
+		return false
+	}
+	return apiErr.Status >= 400 && apiErr.Status < 500 || apiErr.ErrorCode == apitypes.ErrCodeChangeGateUnavailable
 }
 
 // releaseUnsubmittedLock releases the database lock this command took for a
