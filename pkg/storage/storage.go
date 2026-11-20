@@ -387,6 +387,28 @@ type FreezeStore interface {
 	// An empty environment returns every environment's freezes. "Now" is the
 	// database's clock, so every pod agrees at the edges of a freeze.
 	ListInEffect(ctx context.Context, environment string) ([]*EnvironmentFreeze, error)
+
+	// List reads one consistent view of the freezes: the ones in effect or
+	// scheduled at the database's clock, and up to recent freezes of any
+	// state. An empty environment returns every environment's freezes.
+	List(ctx context.Context, environment string, recent int) (*FreezeListing, error)
+
+	// Now returns the database's clock, the one ListInEffect compares
+	// against. A caller that labels a freeze as in effect or scheduled uses
+	// it, so the label agrees with the query.
+	Now(ctx context.Context) (time.Time, error)
+}
+
+// FreezeListing is what FreezeStore.List read. Both lists come from one
+// snapshot of the store, and Now is the database clock they were filtered
+// by, so a caller that labels them by Now never contradicts itself.
+type FreezeListing struct {
+	Now time.Time
+	// Current holds the freezes in effect or scheduled at Now, oldest start
+	// first.
+	Current []*EnvironmentFreeze
+	// Recent holds the most recent freezes of any state, newest start first.
+	Recent []*EnvironmentFreeze
 }
 
 // SettingsStore manages admin-level SchemaBot settings (global config).

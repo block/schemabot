@@ -549,7 +549,7 @@ Reason values:
 
 | Reason | Meaning |
 |---|---|
-| `scoped_lane_disabled` | No database has `operator_groups`; the decision is the plain admin gate. |
+| `scoped_lane_disabled` | No database has `operator_groups` and `freeze.groups` is empty; the decision is the plain admin gate. |
 | `target_unresolved` | The stored plan named by the request failed to load or does not exist, so no target database was available to authorize against. |
 | `admin_allow` | Allowed via deployment `write_groups` membership. |
 | `scoped_allow` | Allowed via the target database's `operator_groups` grant. |
@@ -558,10 +558,12 @@ Reason values:
 | `not_database_operator` | Caller's groups do not match the target database's `operator_groups`. |
 | `environment_not_allowed` | Target environment is outside `operator_environments`. |
 | `missing_database_config` | The target database is not configured. |
+| `freeze_allow` | Freeze write allowed via `freeze.groups` membership. |
+| `not_freeze_admin` | Freeze write denied: caller is in neither `write_groups` nor `freeze.groups`. |
 
 Operation names mirror the mutating endpoints (`plan`, `apply`, control
 operations, `lock_acquire`/`lock_release`/`lock_force_release`, and the
-admin-only `checks_*`, `settings_set`). Unrecognized
+admin-only `checks_*`, `settings_set`, and the freeze writes `freeze_create`/`freeze_lift`). Unrecognized
 operation, status, or reason values are recorded as `unknown` to keep
 cardinality bounded. `database` and `environment` use the `unknown` sentinel
 when the operation has no such dimension (admin-only operations have no single

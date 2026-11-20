@@ -100,6 +100,10 @@ type ServerConfig struct {
 	// behavior is preserved.
 	PRCommandAuthorization PRCommandAuthorizationConfig `yaml:"pr_command_authorization,omitempty"`
 
+	// Freeze configures environment freezes: who besides the deployment
+	// write groups may set and lift them.
+	Freeze FreezeConfig `yaml:"freeze,omitempty"`
+
 	// ReviewPolicy controls whose PR approvals satisfy the review gate before
 	// apply/apply-confirm proceeds.
 	ReviewPolicy ReviewPolicyConfig `yaml:"review_policy,omitempty"`
@@ -2665,6 +2669,9 @@ func (c *ServerConfig) Validate() error {
 	}
 
 	if err := c.validateOperatorScoping(); err != nil {
+		return err
+	}
+	if err := c.validateFreeze(); err != nil {
 		return err
 	}
 

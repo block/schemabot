@@ -1785,12 +1785,13 @@ func checkSuiteRecoveryOptions(logger *slog.Logger) []webhook.HandlerOption {
 }
 
 // buildServerAuthorizer constructs the API authorizer exactly as the server
-// wires it: admin teams from PR command authorization, and the operator-group
-// union that widens forward-auth write admission. Hosted server builds and tests of their configured authorization use this
+// wires it: admin teams from PR command authorization, and the scoped groups
+// (database operator groups and freeze groups) that widen forward-auth write
+// admission. Hosted server builds and tests of their configured authorization use this
 // function. The local host injects its private-token authorizer separately and
 // rejects service authentication configuration before Build.
 func buildServerAuthorizer(ctx context.Context, cfg *api.ServerConfig, logger *slog.Logger) (auth.Authorizer, error) {
-	return buildAuthorizer(ctx, cfg.Auth, cfg.PRCommandAuthorization.AdminTeams, cfg.OperatorGroupUnion(), logger)
+	return buildAuthorizer(ctx, cfg.Auth, cfg.PRCommandAuthorization.AdminTeams, cfg.ScopedWriteGroupUnion(), logger)
 }
 
 // buildAuthorizer selects the API authorizer from config. The default
