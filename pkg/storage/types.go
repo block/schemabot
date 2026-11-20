@@ -662,9 +662,11 @@ const GitHubIdentityPrefix = "github:"
 // domain.
 func GitHubIdentity(login string) string { return GitHubIdentityPrefix + login }
 
-// IsGitHubIdentity reports whether who is in the pull request domain.
+// IsGitHubIdentity reports whether who is in the pull request domain. The
+// prefix matches in any case, as people do (IsPersonOf), so "GitHub:dave" is
+// in the domain too.
 func IsGitHubIdentity(who string) bool {
-	return strings.HasPrefix(strings.TrimSpace(who), GitHubIdentityPrefix)
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(who)), GitHubIdentityPrefix)
 }
 
 // FromPullRequest reports whether the request was asked for on a pull request,
