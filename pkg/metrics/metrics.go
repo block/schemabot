@@ -1594,41 +1594,41 @@ const (
 
 	GitHubOperationAddCommentReaction            = "add_comment_reaction"
 	GitHubOperationCompareCommits                = "compare_commits"
-	GitHubOperationFetchIssueComment             = "fetch_issue_comment"
-	GitHubOperationFetchRef                      = "fetch_ref"
-	GitHubOperationFetchRepository               = "fetch_repository"
-	GitHubOperationFetchRepositoryInstallation   = "fetch_repository_installation"
-	GitHubOperationListIssueTimeline             = "list_issue_timeline"
-	GitHubOperationListMatchingRefs              = "list_matching_refs"
-	GitHubOperationListPullRequests              = "list_pull_requests"
-	GitHubOperationListPullRequestsForCommit     = "list_pull_requests_for_commit"
-	GitHubOperationRemoveIssueLabel              = "remove_issue_label"
 	GitHubOperationCreateCheckRun                = "create_check_run"
-	GitHubOperationCreateIssueComment            = "create_issue_comment"
 	GitHubOperationCreateInstallationAccessToken = "create_installation_access_token"
+	GitHubOperationCreateIssueComment            = "create_issue_comment"
 	GitHubOperationDeleteIssueComment            = "delete_issue_comment"
 	GitHubOperationEditIssueComment              = "edit_issue_comment"
 	GitHubOperationFetchAppSlug                  = "fetch_app_slug"
 	GitHubOperationFetchBlob                     = "fetch_blob"
+	GitHubOperationFetchBranchRules              = "fetch_branch_rules"
 	GitHubOperationFetchDiff                     = "fetch_diff"
 	GitHubOperationFetchFileContent              = "fetch_file_content"
 	GitHubOperationFetchGitTree                  = "fetch_git_tree"
-	GitHubOperationFetchBranchRules              = "fetch_branch_rules"
-	GitHubOperationGraphQLBranchProtection       = "graphql_branch_protection"
+	GitHubOperationFetchIssueComment             = "fetch_issue_comment"
 	GitHubOperationFetchPullRequest              = "fetch_pull_request"
 	GitHubOperationFetchRateLimit                = "fetch_rate_limit"
+	GitHubOperationFetchRef                      = "fetch_ref"
+	GitHubOperationFetchRepository               = "fetch_repository"
+	GitHubOperationFetchRepositoryInstallation   = "fetch_repository_installation"
 	GitHubOperationGetCombinedStatus             = "get_combined_status"
 	GitHubOperationGetTeam                       = "get_team"
 	GitHubOperationGetTeamMembership             = "get_team_membership"
+	GitHubOperationGraphQLBranchProtection       = "graphql_branch_protection"
 	GitHubOperationGraphQLMergeQueueEntries      = "graphql_merge_queue_entries"
 	GitHubOperationGraphQLMinimizeComment        = "graphql_minimize_comment"
 	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
 	GitHubOperationGraphQLTreeEntries            = "graphql_tree_entries"
 	GitHubOperationListAppInstallations          = "list_app_installations"
 	GitHubOperationListCheckRunsForRef           = "list_check_runs_for_ref"
+	GitHubOperationListIssueTimeline             = "list_issue_timeline"
+	GitHubOperationListMatchingRefs              = "list_matching_refs"
 	GitHubOperationListPRFiles                   = "list_pr_files"
+	GitHubOperationListPullRequests              = "list_pull_requests"
+	GitHubOperationListPullRequestsForCommit     = "list_pull_requests_for_commit"
 	GitHubOperationListReviews                   = "list_reviews"
 	GitHubOperationListTeamMembers               = "list_team_members"
+	GitHubOperationRemoveIssueLabel              = "remove_issue_label"
 	GitHubOperationRequestReviewers              = "request_reviewers"
 	GitHubOperationUnknown                       = gitHubMetricValueUnknown
 	GitHubOperationUpdateCheckRun                = "update_check_run"
@@ -1818,41 +1818,41 @@ func isKnownGitHubOperation(operation string) bool {
 	switch operation {
 	case GitHubOperationAddCommentReaction,
 		GitHubOperationCompareCommits,
-		GitHubOperationFetchIssueComment,
-		GitHubOperationFetchRef,
-		GitHubOperationFetchRepository,
-		GitHubOperationFetchRepositoryInstallation,
-		GitHubOperationListIssueTimeline,
-		GitHubOperationListMatchingRefs,
-		GitHubOperationListPullRequests,
-		GitHubOperationListPullRequestsForCommit,
-		GitHubOperationRemoveIssueLabel,
 		GitHubOperationCreateCheckRun,
-		GitHubOperationCreateIssueComment,
 		GitHubOperationCreateInstallationAccessToken,
+		GitHubOperationCreateIssueComment,
 		GitHubOperationDeleteIssueComment,
 		GitHubOperationEditIssueComment,
 		GitHubOperationFetchAppSlug,
 		GitHubOperationFetchBlob,
+		GitHubOperationFetchBranchRules,
 		GitHubOperationFetchDiff,
 		GitHubOperationFetchFileContent,
 		GitHubOperationFetchGitTree,
-		GitHubOperationFetchBranchRules,
-		GitHubOperationGraphQLBranchProtection,
+		GitHubOperationFetchIssueComment,
 		GitHubOperationFetchPullRequest,
 		GitHubOperationFetchRateLimit,
+		GitHubOperationFetchRef,
+		GitHubOperationFetchRepository,
+		GitHubOperationFetchRepositoryInstallation,
 		GitHubOperationGetCombinedStatus,
 		GitHubOperationGetTeam,
 		GitHubOperationGetTeamMembership,
+		GitHubOperationGraphQLBranchProtection,
 		GitHubOperationGraphQLMergeQueueEntries,
 		GitHubOperationGraphQLMinimizeComment,
 		GitHubOperationGraphQLStatusCheckRollup,
 		GitHubOperationGraphQLTreeEntries,
 		GitHubOperationListAppInstallations,
 		GitHubOperationListCheckRunsForRef,
+		GitHubOperationListIssueTimeline,
+		GitHubOperationListMatchingRefs,
 		GitHubOperationListPRFiles,
+		GitHubOperationListPullRequests,
+		GitHubOperationListPullRequestsForCommit,
 		GitHubOperationListReviews,
 		GitHubOperationListTeamMembers,
+		GitHubOperationRemoveIssueLabel,
 		GitHubOperationRequestReviewers,
 		GitHubOperationUnknown,
 		GitHubOperationUpdateCheckRun:
