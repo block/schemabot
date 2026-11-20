@@ -64,7 +64,7 @@ func (h *Handler) verifySharedSchemaIgnoreLists(ctx context.Context, client *ghc
 		peerInputs = append(peerInputs, sharedSchemaPeerInputsOf(peerResult))
 	}
 
-	err = config.CheckSharedSchemaIgnoreLists(environment, sharedSchemaSideOf(schemaResult), peerSides)
+	err = config.CheckSharedSchemaIgnoreLists(ctx, environment, sharedSchemaSideOf(schemaResult), peerSides, h.service)
 	var mismatch *api.SharedSchemaIgnoreListsError
 	if errors.As(err, &mismatch) {
 		h.logger.Warn("schema files and ignore_tables disagree with a database sharing the same schema; the environment is refused until they agree",
