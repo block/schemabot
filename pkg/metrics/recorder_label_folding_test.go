@@ -2,11 +2,11 @@ package metrics
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/stretchr/testify/assert"
@@ -183,6 +183,14 @@ func TestRecordersFoldUnrecognizedLabelValues(t *testing.T) {
 			want:    map[string]string{"operation": "unknown"},
 		},
 		{
+			name: "webhook event type and action",
+			record: func(ctx context.Context) {
+				RecordWebhookEvent(ctx, "default", notARealValue, notARealValue, "octo/app", "ignored")
+			},
+			metrics: []string{"schemabot.webhook.events_total"},
+			want:    map[string]string{"event_type": "unknown", "action": "unknown"},
+		},
+		{
 			name: "webhook permanent failure reason",
 			record: func(ctx context.Context) {
 				RecordWebhookPermanentFailure(ctx, "", "pull_request", "opened", "octo/app",
@@ -190,6 +198,38 @@ func TestRecordersFoldUnrecognizedLabelValues(t *testing.T) {
 			},
 			metrics: []string{"schemabot.webhook.events_total"},
 			want:    map[string]string{"failure_reason": string(WebhookFailureOther)},
+		},
+		{
+			name: "unregistered repository webhook event type and action",
+			record: func(ctx context.Context) {
+				RecordUnregisteredRepositoryWebhook(ctx, "default", notARealValue, notARealValue)
+			},
+			metrics: []string{"schemabot.webhook.unregistered_repository_ignored_total"},
+			want:    map[string]string{"event_type": "unknown", "action": "unknown"},
+		},
+		{
+			name: "webhook inbox depth state",
+			record: func(ctx context.Context) {
+				RecordWebhookInboxDepth(ctx, notARealValue, 1)
+			},
+			metrics: []string{"schemabot.webhook.inbox_depth"},
+			want:    map[string]string{"state": "unknown"},
+		},
+		{
+			name: "webhook inbox dispatch lag event type",
+			record: func(ctx context.Context) {
+				RecordWebhookInboxDispatchLag(ctx, "default", notARealValue, "octo/app", time.Second)
+			},
+			metrics: []string{"schemabot.webhook.inbox_dispatch_lag_seconds"},
+			want:    map[string]string{"event_type": "unknown"},
+		},
+		{
+			name: "webhook dispatch duration event type and outcome",
+			record: func(ctx context.Context) {
+				RecordWebhookDispatchDuration(ctx, "default", notARealValue, "octo/app", notARealValue, time.Second)
+			},
+			metrics: []string{"schemabot.webhook.dispatch_duration_seconds"},
+			want:    map[string]string{"event_type": "unknown", "outcome": "unknown"},
 		},
 		{
 			name: "status check operation and status",
@@ -217,20 +257,18 @@ func TestRecordersFoldUnrecognizedLabelValues(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reader := useManualReader(t)
+			reader := newWebhookMetricsReader(t)
 
 			tt.record(t.Context())
 
 			var rm metricdata.ResourceMetrics
 			require.NoError(t, reader.Collect(t.Context(), &rm))
 			for _, name := range tt.metrics {
-				points := counterAttributeSets(t, rm, name)
+				points := dataPointAttributeSets(t, rm, name)
 				require.Len(t, points, 1, "metric %s should have one data point", name)
 				attrs := points[0]
 				for key, want := range tt.want {
-					got, ok := attrs.Value(attribute.Key(key))
-					require.True(t, ok, "metric %s has no %q label", name, key)
-					assert.Equal(t, want, got.AsString(), "metric %s label %q", name, key)
+					assert.Equal(t, want, metricAttributeString(t, attrs, key), "metric %s label %q", name, key)
 				}
 				for _, kv := range attrs.ToSlice() {
 					assert.NotEqual(t, notARealValue, kv.Value.AsString(),
@@ -241,27 +279,10 @@ func TestRecordersFoldUnrecognizedLabelValues(t *testing.T) {
 	}
 }
 
-// useManualReader installs a fresh meter provider for the test and restores
-// the previous one when the test ends.
-func useManualReader(t *testing.T) *metric.ManualReader {
-	t.Helper()
-	reader := metric.NewManualReader()
-	mp := metric.NewMeterProvider(metric.WithReader(reader))
-	previousProvider := otel.GetMeterProvider()
-	otel.SetMeterProvider(mp)
-	// t.Context() is canceled before cleanups run, so shut down on a context
-	// that outlives it.
-	shutdownCtx := context.WithoutCancel(t.Context())
-	t.Cleanup(func() {
-		otel.SetMeterProvider(previousProvider)
-		require.NoError(t, mp.Shutdown(shutdownCtx))
-	})
-	return reader
-}
-
-// counterAttributeSets returns the attribute set of every data point the named
-// int64 counter collected.
-func counterAttributeSets(t *testing.T, rm metricdata.ResourceMetrics, name string) []attribute.Set {
+// dataPointAttributeSets returns the attribute set of every data point the
+// named instrument collected. The instrument must be one of the kinds the
+// recorders use: an int64 counter, an int64 gauge, or a float64 histogram.
+func dataPointAttributeSets(t *testing.T, rm metricdata.ResourceMetrics, name string) []attribute.Set {
 	t.Helper()
 	var sets []attribute.Set
 	for _, sm := range rm.ScopeMetrics {
@@ -269,10 +290,22 @@ func counterAttributeSets(t *testing.T, rm metricdata.ResourceMetrics, name stri
 			if m.Name != name {
 				continue
 			}
-			sum, ok := m.Data.(metricdata.Sum[int64])
-			require.True(t, ok, "metric %s is not an int64 counter", name)
-			for _, dp := range sum.DataPoints {
-				sets = append(sets, dp.Attributes)
+			switch data := m.Data.(type) {
+			case metricdata.Sum[int64]:
+				require.True(t, data.IsMonotonic, "metric %s is a sum that can decrease, not a counter", name)
+				for _, dp := range data.DataPoints {
+					sets = append(sets, dp.Attributes)
+				}
+			case metricdata.Gauge[int64]:
+				for _, dp := range data.DataPoints {
+					sets = append(sets, dp.Attributes)
+				}
+			case metricdata.Histogram[float64]:
+				for _, dp := range data.DataPoints {
+					sets = append(sets, dp.Attributes)
+				}
+			default:
+				require.FailNow(t, fmt.Sprintf("metric %s has the unexpected data type %T", name, m.Data))
 			}
 		}
 	}
