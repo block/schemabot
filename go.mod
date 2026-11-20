@@ -12,7 +12,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3
 	github.com/block/mysql v0.0.0-20261117230711-208b4ce0ea9a
 	github.com/block/pg-sprite v0.4.1
-	github.com/block/spirit v0.20.1-0.20261120114429-66d4e4cf017d
+	github.com/block/spirit v0.20.1-0.20261120125036-a8927e786486
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10

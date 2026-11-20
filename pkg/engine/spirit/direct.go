@@ -685,7 +685,7 @@ func classifyRefusal(ctx context.Context, logger *slog.Logger, target *lazyTarge
 	if err != nil {
 		return "", notRefused, tableCheckReadError(table, fmt.Errorf("connect to the target: %w", err))
 	}
-	reason, refused, err = check.TableRefusal(ctx, db, database, table, logger)
+	reason, refused, err = check.TableRefusal(ctx, db, database, table, check.Options{}, logger)
 	if err != nil {
 		return "", notRefused, tableCheckReadError(table, err)
 	}
