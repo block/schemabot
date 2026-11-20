@@ -1593,6 +1593,16 @@ const (
 	gitHubMetricValueUnknown = "unknown"
 
 	GitHubOperationAddCommentReaction            = "add_comment_reaction"
+	GitHubOperationCompareCommits                = "compare_commits"
+	GitHubOperationFetchIssueComment             = "fetch_issue_comment"
+	GitHubOperationFetchRef                      = "fetch_ref"
+	GitHubOperationFetchRepository               = "fetch_repository"
+	GitHubOperationFetchRepositoryInstallation   = "fetch_repository_installation"
+	GitHubOperationListIssueTimeline             = "list_issue_timeline"
+	GitHubOperationListMatchingRefs              = "list_matching_refs"
+	GitHubOperationListPullRequests              = "list_pull_requests"
+	GitHubOperationListPullRequestsForCommit     = "list_pull_requests_for_commit"
+	GitHubOperationRemoveIssueLabel              = "remove_issue_label"
 	GitHubOperationCreateCheckRun                = "create_check_run"
 	GitHubOperationCreateIssueComment            = "create_issue_comment"
 	GitHubOperationCreateInstallationAccessToken = "create_installation_access_token"
@@ -1610,6 +1620,7 @@ const (
 	GitHubOperationGetCombinedStatus             = "get_combined_status"
 	GitHubOperationGetTeam                       = "get_team"
 	GitHubOperationGetTeamMembership             = "get_team_membership"
+	GitHubOperationGraphQLMergeQueueEntries      = "graphql_merge_queue_entries"
 	GitHubOperationGraphQLMinimizeComment        = "graphql_minimize_comment"
 	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
 	GitHubOperationGraphQLTreeEntries            = "graphql_tree_entries"
@@ -1806,6 +1817,16 @@ func logUnknownGitHubMetricLabel(label, value string) {
 func isKnownGitHubOperation(operation string) bool {
 	switch operation {
 	case GitHubOperationAddCommentReaction,
+		GitHubOperationCompareCommits,
+		GitHubOperationFetchIssueComment,
+		GitHubOperationFetchRef,
+		GitHubOperationFetchRepository,
+		GitHubOperationFetchRepositoryInstallation,
+		GitHubOperationListIssueTimeline,
+		GitHubOperationListMatchingRefs,
+		GitHubOperationListPullRequests,
+		GitHubOperationListPullRequestsForCommit,
+		GitHubOperationRemoveIssueLabel,
 		GitHubOperationCreateCheckRun,
 		GitHubOperationCreateIssueComment,
 		GitHubOperationCreateInstallationAccessToken,
@@ -1823,6 +1844,7 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationGetCombinedStatus,
 		GitHubOperationGetTeam,
 		GitHubOperationGetTeamMembership,
+		GitHubOperationGraphQLMergeQueueEntries,
 		GitHubOperationGraphQLMinimizeComment,
 		GitHubOperationGraphQLStatusCheckRollup,
 		GitHubOperationGraphQLTreeEntries,

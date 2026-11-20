@@ -188,7 +188,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `superseded`, `released`, `lease_lost`, `finish_error`, `unknown`
 
-**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_combined_status`, `get_team`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
+**operation** (GitHub API): `add_comment_reaction`, `compare_commits`, `create_check_run`, `create_installation_access_token`, `create_issue_comment`, `delete_issue_comment`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_branch_rules`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_issue_comment`, `fetch_pull_request`, `fetch_rate_limit`, `fetch_ref`, `fetch_repository`, `fetch_repository_installation`, `get_combined_status`, `get_team`, `get_team_membership`, `graphql_branch_protection`, `graphql_merge_queue_entries`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_app_installations`, `list_check_runs_for_ref`, `list_issue_timeline`, `list_matching_refs`, `list_pr_files`, `list_pull_requests`, `list_pull_requests_for_commit`, `list_reviews`, `list_team_members`, `remove_issue_label`, `request_reviewers`, `unknown`, `update_check_run`
 
 **category** (GitHub API): `auth`, `read`, `write`, `unknown`
 

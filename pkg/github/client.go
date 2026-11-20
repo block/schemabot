@@ -876,7 +876,7 @@ func (ic *InstallationClient) CreateIssueComment(ctx context.Context, repo strin
 // GetIssueComment returns the current body of an existing PR/issue comment.
 func (ic *InstallationClient) GetIssueComment(ctx context.Context, repo string, commentID int64) (string, error) {
 	owner, repoName := splitRepo(repo)
-	comment, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "get issue comment", []any{"repo", repo, "comment_id", commentID}, func(ctx context.Context) (*gh.IssueComment, error) {
+	comment, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchIssueComment, "get issue comment", []any{"repo", repo, "comment_id", commentID}, func(ctx context.Context) (*gh.IssueComment, error) {
 		c, _, callErr := ic.client.Issues.GetComment(ctx, owner, repoName, commentID)
 		if callErr != nil {
 			return nil, classifyGitHubAPIError(callErr)
@@ -1071,7 +1071,7 @@ func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo
 		},
 	}
 	var resp *gh.Response
-	ghPRs, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "list open pull requests", []any{"repo", repo, "page", page}, func(ctx context.Context) ([]*pullRequestWithStack, error) {
+	ghPRs, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationListPullRequests, "list open pull requests", []any{"repo", repo, "page", page}, func(ctx context.Context) ([]*pullRequestWithStack, error) {
 		endpoint := fmt.Sprintf("repos/%s/%s/pulls?state=open&sort=updated&direction=desc&per_page=%d&page=%d", owner, repoName, opts.PerPage, opts.Page)
 		req, reqErr := ic.client.NewRequest(ctx, http.MethodGet, endpoint, nil)
 		if reqErr != nil {
@@ -1152,7 +1152,7 @@ type MergeQueueHead struct {
 // branch that has a queued group.
 func (ic *InstallationClient) ListMergeQueueHeads(ctx context.Context, repo string) ([]MergeQueueHead, error) {
 	owner, repoName := splitRepo(repo)
-	refs, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "list merge queue refs", []any{"repo", repo}, func(ctx context.Context) ([]*gh.Reference, error) {
+	refs, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationListMatchingRefs, "list merge queue refs", []any{"repo", repo}, func(ctx context.Context) ([]*gh.Reference, error) {
 		listed, _, listErr := ic.client.Git.ListMatchingRefs(ctx, owner, repoName, mergeQueueRefPrefix)
 		if listErr != nil {
 			return nil, classifyGitHubAPIError(listErr)
@@ -1200,6 +1200,7 @@ func (ic *InstallationClient) warnMergeQueueHeadLeftOut(repo string, head MergeQ
 // merge queue for a base branch that has queue branches, so a caller cannot
 // mistake a queue it could not read for an empty one.
 func (ic *InstallationClient) mergeQueueEntryHeads(ctx context.Context, repo, base string) (map[string]bool, error) {
+	ctx = withGitHubRateLimitContext(ctx, metrics.GitHubOperationGraphQLMergeQueueEntries, repo)
 	owner, name := splitRepo(repo)
 	heads := make(map[string]bool)
 	cursor := ""
@@ -1290,7 +1291,7 @@ func (ic *InstallationClient) OpenPullRequestHeadedAt(ctx context.Context, repo,
 	opts := &gh.ListOptions{PerPage: 100}
 	for {
 		var resp *gh.Response
-		prs, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "list pull requests for commit", []any{"repo", repo, "sha", sha}, func(ctx context.Context) ([]*gh.PullRequest, error) {
+		prs, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationListPullRequestsForCommit, "list pull requests for commit", []any{"repo", repo, "sha", sha}, func(ctx context.Context) ([]*gh.PullRequest, error) {
 			listed, listResp, listErr := ic.client.PullRequests.ListPullRequestsWithCommit(ctx, owner, repoName, sha, opts)
 			if listErr != nil {
 				return nil, classifyGitHubAPIError(listErr)
@@ -1635,7 +1636,7 @@ func (ic *InstallationClient) fetchPRFiles(ctx context.Context, repo string, pr 
 // FetchChangedFilesBetween gets the files changed between two refs.
 func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo string, base, head string) ([]PRFile, error) {
 	owner, repoName := splitRepo(repo)
-	readResult, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "compare commits", []any{"repo", repo, "base", base, "head", head}, func(ctx context.Context) (*gh.CommitsComparison, error) {
+	readResult, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationCompareCommits, "compare commits", []any{"repo", repo, "base", base, "head", head}, func(ctx context.Context) (*gh.CommitsComparison, error) {
 		comparison, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, base, head, nil)
 		if err != nil {
 			return nil, fmt.Errorf("compare commits %s...%s: %w", base, head, classifyGitHubAPIError(err))
@@ -2704,7 +2705,7 @@ func (c *schemaChangeComparer) resolveSymlinks(ctx context.Context, links []Tree
 // repositoryDefaultBranch returns the name of repo's default branch.
 func (ic *InstallationClient) repositoryDefaultBranch(ctx context.Context, repo string) (string, error) {
 	owner, repoName := splitRepo(repo)
-	repository, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve repository default branch", []any{"repo", repo}, func(ctx context.Context) (*gh.Repository, error) {
+	repository, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchRepository, "resolve repository default branch", []any{"repo", repo}, func(ctx context.Context) (*gh.Repository, error) {
 		repository, _, err := ic.client.Repositories.Get(ctx, owner, repoName)
 		if err != nil {
 			return nil, fmt.Errorf("get repository: %w", classifyGitHubAPIError(err))
@@ -2724,7 +2725,7 @@ func (ic *InstallationClient) repositoryDefaultBranch(ctx context.Context, repo 
 // branchTipSHA resolves branch to the commit it points at now.
 func (ic *InstallationClient) branchTipSHA(ctx context.Context, repo, branch string) (string, error) {
 	owner, repoName := splitRepo(repo)
-	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve branch tip", []any{"repo", repo, "branch", branch}, func(ctx context.Context) (*gh.Reference, error) {
+	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchRef, "resolve branch tip", []any{"repo", repo, "branch", branch}, func(ctx context.Context) (*gh.Reference, error) {
 		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+branch)
 		if err != nil {
 			return nil, fmt.Errorf("get ref heads/%s: %w", branch, classifyGitHubAPIError(err))
@@ -2757,7 +2758,7 @@ func (ic *InstallationClient) isAncestorOrSame(ctx context.Context, repo, ancest
 // mergeBaseSHA returns the merge base of baseSHA and headSHA.
 func (ic *InstallationClient) mergeBaseSHA(ctx context.Context, repo, baseSHA, headSHA string) (string, error) {
 	owner, repoName := splitRepo(repo)
-	comparison, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "find merge base", []any{"repo", repo, "base_sha", baseSHA, "head_sha", headSHA}, func(ctx context.Context) (*gh.CommitsComparison, error) {
+	comparison, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationCompareCommits, "find merge base", []any{"repo", repo, "base_sha", baseSHA, "head_sha", headSHA}, func(ctx context.Context) (*gh.CommitsComparison, error) {
 		comparison, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, baseSHA, headSHA, &gh.ListOptions{PerPage: 1})
 		if err != nil {
 			return nil, fmt.Errorf("compare commits %s...%s: %w", baseSHA, headSHA, classifyGitHubAPIError(err))
@@ -2834,7 +2835,7 @@ func (ic *InstallationClient) ResolveDefaultBranchTip(ctx context.Context, repo 
 	// Pin the tip up front so a commit landing on the default branch mid-pass
 	// cannot leave some files compared against one commit and some against the
 	// next.
-	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve default branch tip", []any{"repo", repo, "default_branch", defaultBranch}, func(ctx context.Context) (*gh.Reference, error) {
+	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchRef, "resolve default branch tip", []any{"repo", repo, "default_branch", defaultBranch}, func(ctx context.Context) (*gh.Reference, error) {
 		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+defaultBranch)
 		if err != nil {
 			return nil, fmt.Errorf("get ref heads/%s: %w", defaultBranch, classifyGitHubAPIError(err))
