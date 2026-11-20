@@ -1572,7 +1572,11 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 
 	result, err := c.planWithEngine(ctx, req, c.config.Database, schemaFiles)
 	if err != nil {
-		c.logger.Error("plan failed", "error", err, "database", c.config.Database)
+		if engine.IsPlanRefused(err) {
+			c.logger.Warn("plan refused: the schema files must change before this database can plan", "error", err, "database", c.config.Database)
+		} else {
+			c.logger.Error("plan failed", "error", err, "database", c.config.Database)
+		}
 		return nil, err // Error already has clear prefix (SQL syntax/usage error)
 	}
 
