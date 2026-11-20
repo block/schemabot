@@ -265,6 +265,14 @@ func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.A
 			"apply_id", req.ApplyID, "operation", req.Operation, "command_id", commandID, "status", existing.Status)
 		return existing, false, nil
 	}
+	// A start or cutover this call records is admitted here, so it is
+	// checked against the freeze epoch the change gate read. A request
+	// already pending or settled was admitted before and returned above.
+	if req.Operation == storage.ControlOperationStart || req.Operation == storage.ControlOperationCutover {
+		if err := checkFreezeEpochGuard(ctx, tx); err != nil {
+			return nil, false, fmt.Errorf("record %s control request for apply %d: %w", req.Operation, req.ApplyID, err)
+		}
+	}
 	if err := markResumed(ctx, tx, req); err != nil {
 		return nil, false, err
 	}

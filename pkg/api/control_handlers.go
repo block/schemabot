@@ -790,7 +790,8 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 	}
 	// The change gates run only for a cutover this command would start: a
 	// request already pending or a cutover in progress was answered above.
-	if err := s.checkChangeGatesForApply(ctx, changeGateCheckpointCutover, apply, caller); err != nil {
+	admitCtx, err := s.checkChangeGatesForApply(ctx, changeGateCheckpointCutover, apply, caller)
+	if err != nil {
 		status := "rejected"
 		if controlOperationHTTPStatus(err) >= http.StatusInternalServerError {
 			status = "error"
@@ -816,7 +817,12 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		}
 		cutoverReq.Metadata = metadata
 	}
-	recorded, alreadyPending, err := controlStore.RequestPending(ctx, cutoverReq)
+	recorded, alreadyPending, err := controlStore.RequestPending(admitCtx, cutoverReq)
+	if errors.Is(err, storage.ErrFreezeEpochChanged) {
+		err := s.changeGateAdmissionError(ctx, changeGateCheckpointCutover, apply.Environment, err)
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, 0, err
+	}
 	if err != nil {
 		err := fmt.Errorf("record cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
@@ -2002,8 +2008,13 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 	// The change gates run only for a start this command would record: a
 	// start already pending is an idempotent duplicate and is answered
 	// without them.
+	// The gate's context goes to the write that records the start, which
+	// refuses it if a freeze was created since the check.
+	admitCtx := ctx
 	resumeGate := func() error {
-		return s.checkChangeGatesForApply(ctx, changeGateCheckpointResume, apply, caller)
+		gatedCtx, err := s.checkChangeGatesForApply(ctx, changeGateCheckpointResume, apply, caller)
+		admitCtx = gatedCtx
+		return err
 	}
 	switch {
 	case state.IsState(apply.State, state.Apply.WaitingForDeploy):
@@ -2011,7 +2022,7 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 		resp, responseStatus, foundPendingStart, err = s.pendingStartResponseIfPresent(ctx, apply)
 		if err == nil && !foundPendingStart {
 			if err = resumeGate(); err == nil {
-				resp, responseStatus, err = s.persistStartRequestForOperator(ctx, apply, caller, 1, 0)
+				resp, responseStatus, err = s.persistStartRequestForOperator(admitCtx, apply, caller, 1, 0)
 			}
 		}
 		queuedForOperator = err == nil && resp.Accepted
@@ -2030,14 +2041,15 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 			err = resumeGate()
 		}
 		if err == nil && !foundPendingStart && client.IsRemote() && apply.ExternalID != "" {
-			resp, responseStatus, err = s.queueRemoteStoppedApplyForOperator(ctx, client, apply, caller)
+			resp, responseStatus, err = s.queueRemoteStoppedApplyForOperator(admitCtx, client, apply, caller)
 		} else if err == nil && !foundPendingStart {
-			resp, responseStatus, err = s.queueStoppedApplyForOperator(ctx, apply, caller)
+			resp, responseStatus, err = s.queueStoppedApplyForOperator(admitCtx, apply, caller)
 		}
 		queuedForOperator = queuedForOperator || (err == nil && resp.Accepted)
 	default:
 		err = startNotAllowedForState(apply)
 	}
+	err = s.changeGateAdmissionError(ctx, changeGateCheckpointResume, apply.Environment, err)
 	if err != nil {
 		status := "error"
 		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {

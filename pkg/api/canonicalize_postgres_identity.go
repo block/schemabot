@@ -41,6 +41,7 @@ var postgresIdentityKeyColumns = map[string][]string{
 	"apply_target_locks":       {"database_name", "database_type", "deployment", "environment"},
 	"checks":                   {"database_name", "database_type", "environment", "repository"},
 	"environment_freezes":      {"environment"},
+	"freeze_epochs":            {"environment"},
 	"freeze_override_requests": {"database_name", "environment", "repository"},
 	"locks":                    {"database_name", "database_type", "owner", "repository"},
 	"plan_comments":            {"database_name", "database_type", "repository"},

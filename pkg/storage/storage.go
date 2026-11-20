@@ -400,6 +400,13 @@ type FreezeStore interface {
 	// against. A caller that labels a freeze as in effect or scheduled uses
 	// it, so the label agrees with the query.
 	Now(ctx context.Context) (time.Time, error)
+
+	// Epoch returns the environment's freeze epoch, which Create bumps in
+	// the transaction that inserts a freeze. The change gate reads it
+	// before ListInEffect and passes it to the admission write in a
+	// FreezeEpochGuard. Epoch records the environment with epoch 0 if it has
+	// no row yet, so the admission write always has a row to lock.
+	Epoch(ctx context.Context, environment string) (int64, error)
 }
 
 // FreezeOverrideStore records requests to let one change through the freezes

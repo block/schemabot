@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -400,6 +401,101 @@ func TestChangeGateHoldsStartOfAStoppedApply(t *testing.T) {
 			pending, err = svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
 			require.NoError(t, err)
 			assert.NotNil(t, pending)
+		})
+	}
+}
+
+// epochCheckingApplyStore checks the freeze epoch guard where the SQL store
+// does: in the write that creates the apply.
+type epochCheckingApplyStore struct {
+	storage.ApplyStore
+	freezes *memoryFreezeStore
+}
+
+func (s epochCheckingApplyStore) CreateWithGroupedOperations(ctx context.Context, apply *storage.Apply, groups []*storage.ApplyOperationWithTasks) (int64, error) {
+	if err := s.freezes.checkEpochGuard(ctx); err != nil {
+		return 0, err
+	}
+	return s.ApplyStore.CreateWithGroupedOperations(ctx, apply, groups)
+}
+
+// epochCheckingControlStore checks the freeze epoch guard where the SQL store
+// does: in the write that records a start or cutover request.
+type epochCheckingControlStore struct {
+	storage.ControlRequestStore
+	freezes *memoryFreezeStore
+}
+
+func (s epochCheckingControlStore) RequestPending(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
+	if err := s.freezes.checkEpochGuard(ctx); err != nil {
+		return nil, false, err
+	}
+	return s.ControlRequestStore.RequestPending(ctx, req)
+}
+
+// A freeze created after the gate listed the freezes, but before the change
+// was written, refuses the change with a retryable 503 and records nothing.
+// The retry sees the freeze and is held by it.
+func TestChangeGateRefusesAChangeAFreezeLandsBeforeItIsWritten(t *testing.T) {
+	landFreezeDuringCheck := func(t *testing.T, freezes *memoryFreezeStore) {
+		freezes.afterListInEffect = func() {
+			_, err := freezes.Create(t.Context(), gateTestFreeze("freeze-late"))
+			require.NoError(t, err)
+		}
+	}
+
+	t.Run("apply", func(t *testing.T) {
+		reader := newFreezeMetricsReader(t)
+		svc, applies := newGateApplyTestService(t)
+		mock := svc.storage.(*mockStorageWithApplyStores)
+		freezes := mock.freezes.(*memoryFreezeStore)
+		mock.applies = epochCheckingApplyStore{ApplyStore: applies, freezes: freezes}
+		landFreezeDuringCheck(t, freezes)
+
+		_, _, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+
+		unavailable, ok := errors.AsType[*ChangeGateUnavailableError](err)
+		require.True(t, ok, "got %v", err)
+		assert.Equal(t, "SchemaBot could not check for freezes, so this did not start. Try again.", unavailable.Error())
+		require.ErrorIs(t, err, storage.ErrFreezeEpochChanged)
+		assert.Nil(t, applies.apply, "the apply must not be stored")
+		assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging": 1}, changeGateCounters(t, reader, "schemabot.change_gate.errors"))
+
+		_, _, err = svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+		require.ErrorAs(t, err, new(*ChangeGateRefusedError))
+		assert.Nil(t, applies.apply)
+	})
+
+	for _, tc := range []struct {
+		name, path, state, message string
+		operation                  storage.ControlOperation
+	}{
+		{"start", "/api/start", state.Apply.WaitingForDeploy, "SchemaBot could not check for freezes, so the schema change was not started. Try again.", storage.ControlOperationStart},
+		{"cutover", "/api/cutover", state.Apply.WaitingForCutover, "SchemaBot could not check for freezes, so the cutover did not start. Try again.", storage.ControlOperationCutover},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := activeTestApply("apply-late")
+			apply.State = tc.state
+			freezes := newGateFreezeStore(t)
+			svc, mux := newGateControlTestService(t, apply, freezes)
+			mock := svc.storage.(*mockStorageWithApplyStores)
+			mock.controls = epochCheckingControlStore{ControlRequestStore: mock.controls, freezes: freezes}
+			landFreezeDuringCheck(t, freezes)
+			body := `{"environment": "staging", "apply_id": "apply-late", "caller": "cli:bob"}`
+
+			rec := postGateControl(t, mux, tc.path, body)
+
+			require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+			resp := decodeGateError(t, rec)
+			assert.Equal(t, apitypes.ErrCodeChangeGateUnavailable, resp.ErrorCode)
+			assert.Equal(t, tc.message, resp.Error)
+			pending, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, tc.operation)
+			require.NoError(t, err)
+			assert.Nil(t, pending, "the request must not be recorded")
+
+			rec = postGateControl(t, mux, tc.path, body)
+			require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+			assert.Equal(t, "freeze-late", decodeGateError(t, rec).Blockers[0].ID)
 		})
 	}
 }

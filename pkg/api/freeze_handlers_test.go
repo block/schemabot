@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -24,12 +25,18 @@ import (
 )
 
 // memoryFreezeStore is an in-memory storage.FreezeStore with the SQL store's
-// lift semantics. clock stands in for the database clock.
+// lift semantics. clock stands in for the database clock. Create bumps the
+// environment's epoch, as the SQL store does; checkEpochGuard stands in for
+// the admission write's check of it.
 type memoryFreezeStore struct {
 	mu      sync.Mutex
 	clock   clock.Clock
 	freezes []*storage.EnvironmentFreeze
+	epochs  map[string]int64
 	nowErr  error
+	// afterListInEffect runs after ListInEffect has read the freezes, as a
+	// freeze committed between the check and the admission write would.
+	afterListInEffect func()
 }
 
 func (m *memoryFreezeStore) Create(_ context.Context, freeze *storage.EnvironmentFreeze) (*storage.EnvironmentFreeze, error) {
@@ -41,6 +48,10 @@ func (m *memoryFreezeStore) Create(_ context.Context, freeze *storage.Environmen
 	stored := *freeze
 	stored.CreatedAt = time.Now().UTC()
 	m.freezes = append(m.freezes, &stored)
+	if m.epochs == nil {
+		m.epochs = make(map[string]int64)
+	}
+	m.epochs[storage.CanonicalKey(stored.Environment)]++
 	copied := stored
 	return &copied, nil
 }
@@ -80,7 +91,33 @@ func (m *memoryFreezeStore) Lift(_ context.Context, identifier, liftedBy, reason
 
 func (m *memoryFreezeStore) ListInEffect(_ context.Context, environment string) ([]*storage.EnvironmentFreeze, error) {
 	at := m.clock.Now().UTC()
-	return m.filter(environment, func(f *storage.EnvironmentFreeze) bool { return f.InEffectAt(at) }), nil
+	inEffect := m.filter(environment, func(f *storage.EnvironmentFreeze) bool { return f.InEffectAt(at) })
+	if hook := m.afterListInEffect; hook != nil {
+		m.afterListInEffect = nil
+		hook()
+	}
+	return inEffect, nil
+}
+
+func (m *memoryFreezeStore) Epoch(_ context.Context, environment string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.epochs[storage.CanonicalKey(environment)], nil
+}
+
+// checkEpochGuard refuses, as the SQL admission write does, when ctx carries
+// a guard whose epoch is no longer current.
+func (m *memoryFreezeStore) checkEpochGuard(ctx context.Context) error {
+	guard, ok := storage.FreezeEpochGuardFrom(ctx)
+	if !ok {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.epochs[guard.Environment] != guard.Epoch {
+		return fmt.Errorf("check freeze epoch of %s: %w", guard.Environment, storage.ErrFreezeEpochChanged)
+	}
+	return nil
 }
 
 func (m *memoryFreezeStore) List(_ context.Context, environment string, recent int) (*storage.FreezeListing, error) {

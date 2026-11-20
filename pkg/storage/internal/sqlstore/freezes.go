@@ -44,7 +44,16 @@ func (s *freezeStore) Create(ctx context.Context, freeze *storage.EnvironmentFre
 		return nil, fmt.Errorf("encode databases of freeze %s: %w", freeze.Identifier, err)
 	}
 	environment := storage.CanonicalKey(freeze.Environment)
-	id, err := s.identity.InsertID(ctx, s.db, `
+	// The freeze and the epoch bump commit together. The bump waits for any
+	// admission write that holds the epoch row, so a change that checked
+	// before this freeze is recorded before the freeze is acknowledged, and
+	// one that checks after it sees the new epoch.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin create freeze %s of %s: %w", freeze.Identifier, environment, err)
+	}
+	defer rollbackTx(ctx, tx, "create freeze")
+	id, err := s.identity.InsertID(ctx, tx, `
 		INSERT INTO environment_freezes (
 			freeze_identifier, environment, scope_deployments, scope_databases, kind, running_policy,
 			starts_at, ends_at, reason, created_by, source, external_id
@@ -57,6 +66,16 @@ func (s *freezeStore) Create(ctx context.Context, freeze *storage.EnvironmentFre
 			return nil, fmt.Errorf("create freeze %s of %s: %w", freeze.Identifier, environment, storage.ErrFreezeExists)
 		}
 		return nil, fmt.Errorf("create freeze %s of %s: %w", freeze.Identifier, environment, err)
+	}
+	upsert := s.dialect.UpsertClause([]string{"environment"}, []UpsertAssignment{
+		{Column: "epoch", Expr: "freeze_epochs.epoch + 1"},
+		{Column: "updated_at", Expr: s.dialect.CurrentTimestamp(TimestampPrecisionDefault)},
+	})
+	if _, err := tx.ExecContext(ctx, `INSERT INTO freeze_epochs (environment, epoch) VALUES (?, 1) `+upsert, environment); err != nil {
+		return nil, fmt.Errorf("bump freeze epoch of %s for freeze %s: %w", environment, freeze.Identifier, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit freeze %s of %s: %w", freeze.Identifier, environment, err)
 	}
 	created, err := s.getByID(ctx, id)
 	if err != nil {
@@ -183,6 +202,51 @@ func (s *freezeStore) List(ctx context.Context, environment string, recent int) 
 // Now returns the database's clock.
 func (s *freezeStore) Now(ctx context.Context) (time.Time, error) {
 	return readFreezeClock(ctx, s.db, s.dialect)
+}
+
+// Epoch returns the environment's freeze epoch. It first records the
+// environment at epoch 0 if it has no row, outside any transaction, so the
+// admission write that checks the guard finds a row to lock.
+func (s *freezeStore) Epoch(ctx context.Context, environment string) (int64, error) {
+	environment = storage.CanonicalKey(environment)
+	insertIfAbsent := s.dialect.InsertIfAbsent([]string{"environment"})
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT`+insertIfAbsent.Modifier+` INTO freeze_epochs (environment, epoch)
+		VALUES (?, 0)
+		`+insertIfAbsent.Suffix+`
+	`, environment); err != nil {
+		return 0, fmt.Errorf("record freeze epoch of %s: %w", environment, err)
+	}
+	var epoch int64
+	if err := s.db.QueryRowContext(ctx, `SELECT epoch FROM freeze_epochs WHERE environment = ?`, environment).Scan(&epoch); err != nil {
+		return 0, fmt.Errorf("read freeze epoch of %s: %w", environment, err)
+	}
+	return epoch, nil
+}
+
+// checkFreezeEpochGuard refuses an admission write with
+// storage.ErrFreezeEpochChanged when ctx carries a FreezeEpochGuard whose
+// epoch is no longer current. It share-locks the epoch row in tx, so a freeze
+// being created in the environment waits until tx ends. A missing row means
+// the guard was not read through Epoch, and is refused the same way. Without
+// a guard there is nothing to check: the caller ran no change gate.
+func checkFreezeEpochGuard(ctx context.Context, tx queryExecer) error {
+	guard, ok := storage.FreezeEpochGuardFrom(ctx)
+	if !ok {
+		return nil
+	}
+	var epoch int64
+	err := tx.QueryRowContext(ctx, `SELECT epoch FROM freeze_epochs WHERE environment = ? FOR SHARE`, guard.Environment).Scan(&epoch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("check freeze epoch of %s: no epoch recorded: %w", guard.Environment, storage.ErrFreezeEpochChanged)
+	}
+	if err != nil {
+		return fmt.Errorf("check freeze epoch of %s: %w", guard.Environment, err)
+	}
+	if epoch != guard.Epoch {
+		return fmt.Errorf("check freeze epoch of %s: checked at %d, now %d: %w", guard.Environment, guard.Epoch, epoch, storage.ErrFreezeEpochChanged)
+	}
+	return nil
 }
 
 // readFreezeClock reads the database clock through q.
