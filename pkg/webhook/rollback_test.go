@@ -90,7 +90,7 @@ func TestWebhookRollbackMissingEnv(t *testing.T) {
 		assert.Contains(t, body, "Missing Environment")
 		assert.Contains(t, body, "-e")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for comment")
+		require.FailNow(t, "timed out waiting for comment")
 	}
 }
 
@@ -143,7 +143,7 @@ func TestWebhookRollbackConfirmMissingEnv(t *testing.T) {
 		assert.Contains(t, body, "Missing Environment")
 		assert.Contains(t, body, "-e")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for comment")
+		require.FailNow(t, "timed out waiting for comment")
 	}
 }
 
@@ -165,7 +165,7 @@ func TestWebhookRollbackRejectsDatabaseFlag(t *testing.T) {
 	case body := <-comments:
 		assert.Contains(t, body, "`-d` flag is not supported")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for comment")
+		require.FailNow(t, "timed out waiting for comment")
 	}
 }
 
@@ -187,7 +187,7 @@ func TestWebhookRollbackConfirmRejectsDatabaseFlag(t *testing.T) {
 	case body := <-comments:
 		assert.Contains(t, body, "`-d` flag is not supported")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for comment")
+		require.FailNow(t, "timed out waiting for comment")
 	}
 }
 
@@ -210,7 +210,7 @@ func TestWebhookRejectsDatabaseFlagForAnyCommandThatDoesNotSupportIt(t *testing.
 		assert.Contains(t, body, "`-d` flag is not supported")
 		assert.Contains(t, body, "`stop`")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for comment")
+		require.FailNow(t, "timed out waiting for comment")
 	}
 }
 
@@ -232,7 +232,7 @@ func TestWebhookRollbackMissingApplyID(t *testing.T) {
 		assert.Contains(t, body, "Missing Apply ID")
 		assert.Contains(t, body, "schemabot rollback <apply-id> -e <environment>")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for comment")
+		require.FailNow(t, "timed out waiting for comment")
 	}
 }
 
@@ -255,7 +255,7 @@ func TestWebhookRollbackMissingApplyIDAndEnv(t *testing.T) {
 		assert.Contains(t, body, "Missing Arguments")
 		assert.Contains(t, body, "schemabot rollback <apply-id> -e <environment>")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for comment")
+		require.FailNow(t, "timed out waiting for comment")
 	}
 }
 
@@ -300,7 +300,7 @@ func TestWebhookRollbackRejectsDeferCutoverOnPlanningCommand(t *testing.T) {
 		assert.Contains(t, body, "--defer-cutover")
 		assert.Contains(t, body, "rollback-confirm")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for comment")
+		require.FailNow(t, "timed out waiting for comment")
 	}
 }
 

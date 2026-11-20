@@ -276,7 +276,7 @@ func TestRoundCoversWork(t *testing.T) {
 	}
 
 	unnamed := func() string {
-		t.Error("a round that covers the work never names the primary target")
+		assert.Fail(t, "a round that covers the work never names the primary target")
 		return ""
 	}
 	covered, reason := roundCoversWork(unnamed, plan(region), plan(region), members(region), members(region))

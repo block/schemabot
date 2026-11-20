@@ -1022,7 +1022,7 @@ func TestPlanForResolvedDatabaseAllowsDatabaseOperator(t *testing.T) {
 	assert.False(t, blocked)
 	select {
 	case body := <-comments:
-		t.Fatalf("no comment should be posted for an authorized operator, got %q", body)
+		require.FailNow(t, fmt.Sprintf("no comment should be posted for an authorized operator, got %q", body))
 	default:
 	}
 }

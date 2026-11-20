@@ -555,7 +555,7 @@ func TestNewTestHandlerDeliversDispatchedWorkBeforeTheServerCloses(t *testing.T)
 	case body := <-comments:
 		assert.Contains(t, body, "apply_abc123")
 	default:
-		t.Fatal("the dispatched rollback's comment never reached the dispatching test's server")
+		require.FailNow(t, "the dispatched rollback's comment never reached the dispatching test's server")
 	}
 }
 
@@ -580,14 +580,14 @@ func TestWebhookHelpCommand(t *testing.T) {
 		assert.Contains(t, body, "SchemaBot Help")
 		assert.Contains(t, body, "schemabot plan")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for comment")
+		require.FailNow(t, "timed out waiting for comment")
 	}
 
 	select {
 	case reaction := <-reactions:
 		assert.Equal(t, "eyes", reaction)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the acknowledgment reaction")
+		require.FailNow(t, "timed out waiting for the acknowledgment reaction")
 	}
 }
 
@@ -609,7 +609,7 @@ func TestWebhookInvalidCommand(t *testing.T) {
 	case body := <-comments:
 		assert.Contains(t, body, "Invalid Command")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for comment")
+		require.FailNow(t, "timed out waiting for comment")
 	}
 }
 
@@ -632,7 +632,7 @@ func TestWebhookMissingEnvForApply(t *testing.T) {
 		assert.Contains(t, body, "Missing Argument")
 		assert.Contains(t, body, "-e")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for comment")
+		require.FailNow(t, "timed out waiting for comment")
 	}
 }
 
@@ -660,14 +660,14 @@ func TestWebhookInvalidEnvValue(t *testing.T) {
 		assert.Contains(t, body, "**Available environments**: `production`, `staging`")
 		assert.Contains(t, body, "schemabot apply -e <environment>")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the invalid environment comment")
+		require.FailNow(t, "timed out waiting for the invalid environment comment")
 	}
 
 	select {
 	case reaction := <-reactions:
 		assert.Equal(t, "eyes", reaction)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the acknowledgment reaction")
+		require.FailNow(t, "timed out waiting for the acknowledgment reaction")
 	}
 }
 
@@ -694,14 +694,14 @@ func TestWebhookInvalidCommandAcknowledged(t *testing.T) {
 	case body := <-comments:
 		assert.Contains(t, body, "Invalid Command")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the invalid command comment")
+		require.FailNow(t, "timed out waiting for the invalid command comment")
 	}
 
 	select {
 	case reaction := <-reactions:
 		assert.Equal(t, "eyes", reaction)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the acknowledgment reaction")
+		require.FailNow(t, "timed out waiting for the acknowledgment reaction")
 	}
 }
 
@@ -730,14 +730,14 @@ func TestWebhookUnknownEnvironmentRejected(t *testing.T) {
 		assert.Contains(t, body, "`staging`")
 		assert.Contains(t, body, "`production`")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the invalid environment comment")
+		require.FailNow(t, "timed out waiting for the invalid environment comment")
 	}
 
 	select {
 	case reaction := <-reactions:
 		assert.Equal(t, "eyes", reaction)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the acknowledgment reaction")
+		require.FailNow(t, "timed out waiting for the acknowledgment reaction")
 	}
 }
 
@@ -761,9 +761,9 @@ func TestWebhookPeerEnvironmentStaysSilent(t *testing.T) {
 
 	select {
 	case body := <-comments:
-		t.Fatalf("unexpected comment posted for a peer-owned environment: %s", body)
+		require.FailNow(t, fmt.Sprintf("unexpected comment posted for a peer-owned environment: %s", body))
 	case reaction := <-reactions:
-		t.Fatalf("unexpected reaction for a peer-owned environment: %s", reaction)
+		require.FailNow(t, fmt.Sprintf("unexpected reaction for a peer-owned environment: %s", reaction))
 	default:
 	}
 }
@@ -792,7 +792,7 @@ func TestWebhookYesFlagRejectedOnNonApply(t *testing.T) {
 				assert.Contains(t, body, "-y")
 				assert.Contains(t, body, "not supported for")
 			case <-time.After(2 * time.Second):
-				t.Fatal("timed out waiting for error comment")
+				require.FailNow(t, "timed out waiting for error comment")
 			}
 		})
 	}
@@ -830,7 +830,7 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 				assert.Contains(t, body, "Missing Apply ID")
 				assert.Contains(t, body, "schemabot "+tt.action+" <apply-id> -e <environment>")
 			case <-time.After(2 * time.Second):
-				t.Fatal("timed out waiting for missing apply ID comment")
+				require.FailNow(t, "timed out waiting for missing apply ID comment")
 			}
 		})
 	}
@@ -854,7 +854,7 @@ func TestWebhookBotCommentIgnored(t *testing.T) {
 	// Bot path returns before launching any goroutines, so channel is guaranteed empty.
 	select {
 	case <-comments:
-		t.Fatal("should not post a comment for bot users")
+		require.FailNow(t, "should not post a comment for bot users")
 	default:
 	}
 }
@@ -876,7 +876,7 @@ func TestWebhookNotAPRComment(t *testing.T) {
 	// Non-PR path returns before launching any goroutines, so channel is guaranteed empty.
 	select {
 	case <-comments:
-		t.Fatal("should not post a comment for non-PR issues")
+		require.FailNow(t, "should not post a comment for non-PR issues")
 	default:
 	}
 }
@@ -898,7 +898,7 @@ func TestWebhookNoMention(t *testing.T) {
 	// No-mention path returns before launching any goroutines, so channel is guaranteed empty.
 	select {
 	case <-comments:
-		t.Fatal("should not post a comment when not mentioned")
+		require.FailNow(t, "should not post a comment when not mentioned")
 	default:
 	}
 }
@@ -1121,7 +1121,7 @@ func TestWebhookIgnoresSchemaBotProse(t *testing.T) {
 
 		select {
 		case <-comments:
-			t.Fatal("should not post a comment for prose or examples that mention SchemaBot")
+			require.FailNow(t, "should not post a comment for prose or examples that mention SchemaBot")
 		default:
 		}
 	}
@@ -1147,7 +1147,7 @@ func TestWebhookEyesReactionAtDispatchForSingleDeploymentRepo(t *testing.T) {
 	case reaction := <-reactions:
 		assert.Equal(t, "eyes", reaction)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the dispatch acknowledgment reaction")
+		require.FailNow(t, "timed out waiting for the dispatch acknowledgment reaction")
 	}
 }
 
@@ -1172,7 +1172,7 @@ func TestWebhookEyesReactionAtDispatchForBareMultiEnvPlan(t *testing.T) {
 	case reaction := <-reactions:
 		assert.Equal(t, "eyes", reaction)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the bare-plan dispatch acknowledgment")
+		require.FailNow(t, "timed out waiting for the bare-plan dispatch acknowledgment")
 	}
 }
 
@@ -1204,7 +1204,7 @@ func TestWebhookEyesReactionAtDispatchForTenantScopedCommand(t *testing.T) {
 	case reaction := <-reactions:
 		assert.Equal(t, "eyes", reaction)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the scoped-command dispatch acknowledgment")
+		require.FailNow(t, "timed out waiting for the scoped-command dispatch acknowledgment")
 	}
 }
 
@@ -1227,7 +1227,7 @@ func TestWebhookSignatureValidation(t *testing.T) {
 		case body := <-comments:
 			assert.Contains(t, body, "SchemaBot Help")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for comment")
+			require.FailNow(t, "timed out waiting for comment")
 		}
 	})
 
@@ -1269,7 +1269,7 @@ func TestWebhookMultipleCommandsSequential(t *testing.T) {
 		case body := <-comments:
 			assert.Contains(t, body, cmd.contains)
 		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for comment for %q", cmd.comment)
+			require.FailNow(t, fmt.Sprintf("timed out waiting for comment for %q", cmd.comment))
 		}
 	}
 }
@@ -1385,7 +1385,7 @@ func TestWebhookConcurrentRequests(t *testing.T) {
 				return
 			}
 		case <-time.After(5 * time.Second):
-			t.Fatalf("only received %d/%d comments", received, n)
+			require.FailNow(t, fmt.Sprintf("only received %d/%d comments", received, n))
 		}
 	}
 }
@@ -1432,7 +1432,7 @@ func TestWebhookRepoAllowlistRejectsUnregisteredRepo(t *testing.T) {
 
 	select {
 	case body := <-comments:
-		t.Fatalf("unexpected rejection comment: %s", body)
+		require.FailNow(t, fmt.Sprintf("unexpected rejection comment: %s", body))
 	case <-time.After(100 * time.Millisecond):
 	}
 	requireUnregisteredRepositoryCounted(t, reader, "issue_comment", "created")
@@ -1644,7 +1644,7 @@ func TestWebhookTargetFlagRejectedOnApplyConfirm(t *testing.T) {
 	case body := <-comments:
 		assert.Equal(t, "The `--target` flag is not supported for `apply-confirm`. Only `plan` and `apply` take it.", body)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for error comment")
+		require.FailNow(t, "timed out waiting for error comment")
 	}
 }
 
@@ -1670,6 +1670,6 @@ func TestWebhookNarrowedPlanWithoutEnvironmentAsksForIt(t *testing.T) {
 		assert.Contains(t, body, "needs `-e` too")
 		assert.Contains(t, body, "`schemabot plan -e <environment> --target payments-002`")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for error comment")
+		require.FailNow(t, "timed out waiting for error comment")
 	}
 }

@@ -3,6 +3,7 @@ package webhook
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -51,7 +52,7 @@ func TestWebhookIssueCommentIgnoresCommandOnListenOnlyRepository(t *testing.T) {
 
 	select {
 	case req := <-requests:
-		t.Fatalf("unexpected GitHub request for a command on a listen-only repository: %s", req)
+		require.FailNow(t, fmt.Sprintf("unexpected GitHub request for a command on a listen-only repository: %s", req))
 	case <-time.After(100 * time.Millisecond):
 	}
 }

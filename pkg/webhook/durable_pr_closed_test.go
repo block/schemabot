@@ -108,7 +108,7 @@ func TestDurablePRClosedDriverRunsCleanup(t *testing.T) {
 	select {
 	case <-scripted.completed:
 	default:
-		t.Fatal("expected the close delivery to be marked completed")
+		require.FailNow(t, "expected the close delivery to be marked completed")
 	}
 	require.Empty(t, scripted.failed)
 }
@@ -139,7 +139,7 @@ func TestDurablePRClosedDriverCleansMergedCloseWithoutInstallation(t *testing.T)
 	select {
 	case <-scripted.completed:
 	default:
-		t.Fatal("expected the merged close delivery to be marked completed")
+		require.FailNow(t, "expected the merged close delivery to be marked completed")
 	}
 	require.Empty(t, scripted.failed)
 }
@@ -169,7 +169,7 @@ func TestDurablePRClosedDriverRetriesOnApplyLookupFailure(t *testing.T) {
 	case failure := <-scripted.failed:
 		require.NotNil(t, failure.retryAfter, "a failed apply lookup must stay retryable")
 	default:
-		t.Fatal("expected the close delivery to be marked failed and retryable")
+		require.FailNow(t, "expected the close delivery to be marked failed and retryable")
 	}
 	require.Empty(t, scripted.completed)
 }
@@ -203,7 +203,7 @@ func TestDurablePRClosedDriverSkipsCleanupForReopenedPR(t *testing.T) {
 	select {
 	case <-scripted.completed:
 	default:
-		t.Fatal("expected the stale close delivery to be marked completed")
+		require.FailNow(t, "expected the stale close delivery to be marked completed")
 	}
 	require.Empty(t, scripted.failed)
 	require.Contains(t, logs.String(), "completed without cleanup because the PR is open again",
@@ -238,7 +238,7 @@ func TestDurablePRClosedDriverRetriesWhenLivePRReadFails(t *testing.T) {
 	case failure := <-scripted.failed:
 		require.NotNil(t, failure.retryAfter, "a failed live PR read must stay retryable")
 	default:
-		t.Fatal("expected the close delivery to be marked failed and retryable")
+		require.FailNow(t, "expected the close delivery to be marked failed and retryable")
 	}
 	require.Empty(t, scripted.completed)
 }

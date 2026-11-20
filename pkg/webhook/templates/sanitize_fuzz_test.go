@@ -1,9 +1,12 @@
 package templates
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"unicode"
+
+	"github.com/stretchr/testify/require"
 )
 
 // sanitizerSeeds are shared starting points for both sanitizer fuzz targets:
@@ -28,9 +31,8 @@ var sanitizerSeeds = []string{
 // redaction was cut apart and could read as a leaked value.
 func requireNoPartialMarker(t *testing.T, got string) {
 	t.Helper()
-	if strings.Count(got, "[endpoint") != strings.Count(got, redactionMarker) {
-		t.Fatalf("partial redaction marker in %q", got)
-	}
+	require.Equal(t, strings.Count(got, redactionMarker), strings.Count(got, "[endpoint"),
+		"partial redaction marker in %q", got)
 }
 
 // FuzzSanitizeCommentError checks the structural guarantees the comment
@@ -46,15 +48,13 @@ func FuzzSanitizeCommentError(f *testing.F) {
 			return // marker integrity is only guaranteed when the input carries no marker fragments of its own
 		}
 		got := sanitizeCommentError(in)
-		if n := len([]rune(got)); n > maxCommentErrorLen {
-			t.Fatalf("output length %d exceeds limit %d", n, maxCommentErrorLen)
-		}
+		require.LessOrEqual(t, len([]rune(got)), maxCommentErrorLen, "output length in runes")
 		for _, r := range got {
 			if r == '\n' || r == '\t' {
 				continue
 			}
 			if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-				t.Fatalf("control or format character %q in %q", r, got)
+				require.FailNow(t, fmt.Sprintf("control or format character %q in %q", r, got))
 			}
 		}
 		requireNoPartialMarker(t, got)
@@ -75,18 +75,14 @@ func FuzzSanitizeLogText(f *testing.F) {
 			return // marker integrity is only guaranteed when the input carries no marker fragments of its own
 		}
 		got := sanitizeLogText(in)
-		if strings.Contains(got, "```") {
-			t.Fatalf("fence marker in %q", got)
-		}
-		if strings.ContainsAny(got, "\n\r") {
-			t.Fatalf("line break in %q", got)
-		}
+		require.NotContains(t, got, "```", "fence marker")
+		require.False(t, strings.ContainsAny(got, "\n\r"), "line break in %q", got)
 		for _, r := range got {
 			if r == '\t' {
 				continue
 			}
 			if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-				t.Fatalf("control or format character %q in %q", r, got)
+				require.FailNow(t, fmt.Sprintf("control or format character %q in %q", r, got))
 			}
 		}
 		requireNoPartialMarker(t, got)

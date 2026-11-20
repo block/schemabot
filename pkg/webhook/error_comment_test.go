@@ -57,7 +57,7 @@ func TestPostCommandError_RendersTimestamp(t *testing.T) {
 		assert.Contains(t, body, "`staging`")
 		assert.Contains(t, body, "> boom")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for posted comment")
+		require.FailNow(t, "timed out waiting for posted comment")
 	}
 }
 
@@ -92,6 +92,6 @@ func TestPostCommandErrorExplainsRemoteUnavailable(t *testing.T) {
 		assert.Contains(t, body, "Raw error: no healthy upstream")
 		assert.NotContains(t, body, "rpc error: code =")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for posted comment")
+		require.FailNow(t, "timed out waiting for posted comment")
 	}
 }
