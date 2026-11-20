@@ -547,8 +547,10 @@ the retention period ends.
   server logs the entry, so an operator can tell a stale or misspelled entry
   from a drop that ran.
 - A rollback never drops a listed table. It restores the schema the apply
-  started from, so a listed table still on the target is left in place, and a
-  listed table the apply dropped stays dropped.
+  started from, so a listed table still on the target is left in place. A
+  listed table the naming conventions skip stays dropped, since the planner
+  never manages it. A listed table with an ordinary name is recreated, as it
+  would be without the list.
 - A plan records the entries, and an apply, resume or drift check of that plan
   proposes the same drops.
 
