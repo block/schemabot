@@ -74,6 +74,10 @@ func TestResolve_LiteralWithColon(t *testing.T) {
 	assert.Equal(t, "host:port:path", result)
 }
 
+// errFakeSecretNotFound is the cause fakeSecretsManager reports for a secret
+// it does not hold.
+var errFakeSecretNotFound = errors.New("not found")
+
 // fakeSecretsManager serves secret strings by name.
 type fakeSecretsManager struct {
 	values map[string]string
@@ -82,7 +86,7 @@ type fakeSecretsManager struct {
 func (f *fakeSecretsManager) GetSecretValue(_ context.Context, in *secretsmanager.GetSecretValueInput, _ ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
 	value, ok := f.values[aws.ToString(in.SecretId)]
 	if !ok {
-		return nil, fmt.Errorf("secret %s not found", aws.ToString(in.SecretId))
+		return nil, fmt.Errorf("secret %s %w", aws.ToString(in.SecretId), errFakeSecretNotFound)
 	}
 	return &secretsmanager.GetSecretValueOutput{SecretString: aws.String(value)}, nil
 }
@@ -322,14 +326,16 @@ func registerResolver(t *testing.T, prefix string, resolver ResolverFunc) {
 	t.Cleanup(func() { Unregister(prefix) })
 }
 
-// A registered resolver receives the reference with its prefix stripped, and
-// its value and its error reach the caller unchanged.
+// A registered resolver receives the reference with its prefix stripped. Its
+// value reaches the caller unchanged, and its error stays the cause of the
+// error the caller gets, so a caller can still match it with errors.Is.
 func TestResolve_CustomResolverReceivesTheReferenceWithoutItsPrefix(t *testing.T) {
+	errVaultSecretNotFound := errors.New("vault: secret not found")
 	var refs []string
 	registerResolver(t, "vault", func(ref string) (string, error) {
 		refs = append(refs, ref)
 		if ref == "secret/data/missing" {
-			return "", errors.New("vault: secret not found")
+			return "", errVaultSecretNotFound
 		}
 		return "vault-password", nil
 	})
@@ -339,7 +345,7 @@ func TestResolve_CustomResolverReceivesTheReferenceWithoutItsPrefix(t *testing.T
 	assert.Equal(t, "vault-password", value)
 
 	_, err = Resolve("vault:secret/data/missing", "")
-	require.EqualError(t, err, "vault: secret not found")
+	require.ErrorIs(t, err, errVaultSecretNotFound)
 
 	assert.Equal(t, []string{"secret/data/myapp#password", "secret/data/missing"}, refs)
 }
@@ -363,23 +369,47 @@ func TestResolve_CustomResolverOverridesABuiltInPrefixUntilUnregistered(t *testi
 }
 
 // deadlineRecordingSecretsManager records the deadline of the context each
-// fetch runs under.
+// fetch runs under, and fails a fetch whose context has already ended.
 type deadlineRecordingSecretsManager struct {
-	deadline    time.Time
-	hasDeadline bool
+	deadlines []time.Time // one per fetch; the zero time for a fetch with no deadline
 }
 
 func (f *deadlineRecordingSecretsManager) GetSecretValue(ctx context.Context, _ *secretsmanager.GetSecretValueInput, _ ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
-	f.deadline, f.hasDeadline = ctx.Deadline()
+	deadline, _ := ctx.Deadline()
+	f.deadlines = append(f.deadlines, deadline)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return &secretsmanager.GetSecretValueOutput{SecretString: aws.String("s3cret")}, nil
+}
+
+// blockingSecretsManager never answers: each fetch waits for its context to
+// end, like a call to an unreachable endpoint.
+type blockingSecretsManager struct{}
+
+func (blockingSecretsManager) GetSecretValue(ctx context.Context, _ *secretsmanager.GetSecretValueInput, _ ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// secretsManagerLookupCap is the longest a Secrets Manager lookup may run
+// when its caller's deadline is later, or the caller has none.
+const secretsManagerLookupCap = 10 * time.Second
+
+// assertCappedDeadline checks that deadline is exactly the lookup cap after
+// the moment the lookup started, which lies between before and after.
+func assertCappedDeadline(t *testing.T, before, after, deadline time.Time) {
+	t.Helper()
+	assert.False(t, deadline.Before(before.Add(secretsManagerLookupCap)),
+		"the lookup deadline is sooner than %s after the lookup started", secretsManagerLookupCap)
+	assert.False(t, deadline.After(after.Add(secretsManagerLookupCap)),
+		"the lookup deadline is later than %s after the lookup started", secretsManagerLookupCap)
 }
 
 // A Secrets Manager lookup, the client build included, is bounded by the
 // caller's deadline or a ten-second cap, whichever comes first. A caller with
 // no deadline, such as Resolve, still cannot hang on an unreachable endpoint.
 func TestResolve_SecretsManagerLookupIsBoundedByTheCallerOrTenSeconds(t *testing.T) {
-	const lookupCap = 10 * time.Second
-
 	tests := []struct {
 		name           string
 		callerDeadline time.Duration // zero means the caller sets no deadline
@@ -408,26 +438,71 @@ func TestResolve_SecretsManagerLookupIsBoundedByTheCallerOrTenSeconds(t *testing
 			}
 			callerDeadline, callerHasDeadline := ctx.Deadline()
 
-			start := time.Now()
+			before := time.Now()
 			value, err := ResolveContext(ctx, "secretsmanager:/example/orders", "")
+			after := time.Now()
 			require.NoError(t, err)
 			assert.Equal(t, "s3cret", value)
 
-			require.True(t, fake.hasDeadline, "the fetch must run under a deadline")
+			require.Len(t, fake.deadlines, 1)
+			fetchDeadline := fake.deadlines[0]
+			require.False(t, fetchDeadline.IsZero(), "the fetch must run under a deadline")
 			require.True(t, buildHasDeadline, "the client build must run under a deadline")
-			assert.Equal(t, fake.deadline, buildDeadline, "the build and the fetch share one deadline")
+			assert.Equal(t, fetchDeadline, buildDeadline, "the build and the fetch share one deadline")
 			if tt.wantCapped {
-				assert.WithinDuration(t, start.Add(lookupCap), fake.deadline, time.Second)
+				assertCappedDeadline(t, before, after, fetchDeadline)
 			} else {
 				require.True(t, callerHasDeadline)
-				assert.Equal(t, callerDeadline, fake.deadline)
+				assert.Equal(t, callerDeadline, fetchDeadline)
 			}
 		})
 	}
 }
 
+// Lookups share one client but not one context: each fetch runs under its
+// own caller's deadline, so a lookup whose caller has gone away does not
+// cancel or shorten the lookups that follow it.
+func TestResolve_SecretsManagerEachLookupRunsUnderItsOwnCallersDeadline(t *testing.T) {
+	fake := &deadlineRecordingSecretsManager{}
+	builds := 0
+	useSecretsManagerBuilder(t, func(context.Context) (secretGetter, error) {
+		builds++
+		return fake, nil
+	})
+
+	firstCtx, cancelFirst := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancelFirst()
+	firstDeadline, _ := firstCtx.Deadline()
+	value, err := ResolveContext(firstCtx, "secretsmanager:/example/orders", "")
+	require.NoError(t, err)
+	assert.Equal(t, "s3cret", value)
+
+	// The first caller is done. Its context must not reach a later lookup.
+	cancelFirst()
+
+	secondCtx, cancelSecond := context.WithTimeout(t.Context(), 4*time.Second)
+	defer cancelSecond()
+	secondDeadline, _ := secondCtx.Deadline()
+	value, err = ResolveContext(secondCtx, "secretsmanager:/example/orders", "")
+	require.NoError(t, err, "a lookup must not run under an earlier caller's cancelled context")
+	assert.Equal(t, "s3cret", value)
+
+	before := time.Now()
+	value, err = ResolveContext(t.Context(), "secretsmanager:/example/orders", "")
+	after := time.Now()
+	require.NoError(t, err)
+	assert.Equal(t, "s3cret", value)
+
+	require.Len(t, fake.deadlines, 3)
+	assert.Equal(t, firstDeadline, fake.deadlines[0], "the first fetch runs under the first caller's deadline")
+	assert.Equal(t, secondDeadline, fake.deadlines[1], "the second fetch runs under the second caller's deadline")
+	assertCappedDeadline(t, before, after, fake.deadlines[2])
+	assert.Equal(t, 1, builds, "every lookup uses the one shared client")
+}
+
 // A failed fetch names the secret, so an operator can tell which reference
-// is wrong from the error alone.
+// is wrong from the error alone, and keeps the client's error as its cause,
+// so a caller can still match it with errors.Is.
 func TestResolve_SecretsManagerFetchErrorNamesTheSecret(t *testing.T) {
 	fake := &fakeSecretsManager{values: map[string]string{}}
 	useSecretsManagerBuilder(t, func(context.Context) (secretGetter, error) {
@@ -436,6 +511,28 @@ func TestResolve_SecretsManagerFetchErrorNamesTheSecret(t *testing.T) {
 
 	_, err := ResolveContext(t.Context(), "secretsmanager:/example/missing#password", "")
 	require.EqualError(t, err, `get secret "/example/missing": secret /example/missing not found`)
+	require.ErrorIs(t, err, errFakeSecretNotFound)
+}
+
+// A fetch that outlives its caller's deadline fails with that deadline as
+// the cause and names the secret. The caller gets no value, and can tell a
+// timeout from a wrong reference with errors.Is.
+func TestResolve_SecretsManagerFetchThatOutlivesTheDeadlineFails(t *testing.T) {
+	useSecretsManagerBuilder(t, func(context.Context) (secretGetter, error) {
+		return blockingSecretsManager{}, nil
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	value, err := ResolveContext(ctx, "secretsmanager:/example/orders#password", "")
+	elapsed := time.Since(start)
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorContains(t, err, `get secret "/example/orders"`)
+	assert.Empty(t, value)
+	assert.Less(t, elapsed, secretsManagerLookupCap, "the fetch ends at the caller's deadline, not at the cap")
 }
 
 func TestValueFromGetSecretOutput(t *testing.T) {
