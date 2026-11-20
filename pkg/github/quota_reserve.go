@@ -1,6 +1,7 @@
 package github
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -43,12 +44,40 @@ func (e *QuotaReservedError) Unwrap() error {
 	return ErrGitHubQuotaReserved
 }
 
+// quotaResetHorizon bounds how far ahead a reported reset time is believed.
+// GitHub's core quota resets every hour, so a reset further out than this is
+// a garbled header, and accepting it would hold the reserve until that time.
+const quotaResetHorizon = 2 * time.Hour
+
+// checkPublicationReadsKey marks a context whose GitHub reads decide which
+// Check Run to post.
+type checkPublicationReadsKey struct{}
+
+// WithCheckPublicationReads marks ctx as the context of a check publication.
+// The schema file, blob and tree reads made under it decide what the Check Run
+// says, such as which files a pull request proposes and which environments its
+// configs cover, so the quota reserve sends them: the reserve exists so that
+// checks keep posting. Their number per publication is bounded by the pull
+// request's schema and config files (AV-15).
+func WithCheckPublicationReads(ctx context.Context) context.Context {
+	return context.WithValue(ctx, checkPublicationReadsKey{}, true)
+}
+
+// CheckPublicationReads reports whether ctx was marked by
+// WithCheckPublicationReads.
+func CheckPublicationReads(ctx context.Context) bool {
+	marked, _ := ctx.Value(checkPublicationReadsKey{}).(bool)
+	return marked
+}
+
 // isDeferrablePlanInputRead reports whether a request only reads schema or
 // plan inputs, so it can wait for the quota to reset without blocking a merge.
 // Directory listings use the same Contents API route as file reads and so
 // share fetch_file_content. Everything else — check runs, pull request reads,
 // changed-file lists, comments, token exchanges, and unattributed requests —
-// is never refused, because check publication depends on it.
+// is never refused, because check publication depends on it. The same reads
+// made for a check publication are never refused either; see
+// WithCheckPublicationReads.
 func isDeferrablePlanInputRead(operation string) bool {
 	switch operation {
 	case metrics.GitHubOperationFetchFileContent,
@@ -73,12 +102,14 @@ type quotaReserveTransport struct {
 	appSlug        func() string
 	now            func() time.Time
 
-	// mu guards the latest core quota GitHub reported for the installation
-	// and the reset window already warned about.
+	// mu guards the latest core quota GitHub reported for the installation,
+	// the requests sent and not yet answered, and the reset window already
+	// warned about.
 	mu          sync.Mutex
 	observed    bool
 	remaining   int64
 	resetAt     time.Time
+	inFlight    int64
 	warnedReset time.Time
 }
 
@@ -102,29 +133,60 @@ func (t *quotaReserveTransport) RoundTrip(req *http.Request) (*http.Response, er
 	if !ok {
 		metricCtx = githubRateLimitContextFromRequest(req)
 	}
-	if isDeferrablePlanInputRead(metricCtx.operation) {
-		if refusal, firstInWindow := t.refusal(metricCtx.operation); refusal != nil {
-			t.reportRefusal(req, metricCtx, refusal, firstInWindow)
-			if req.Body != nil {
-				if err := req.Body.Close(); err != nil {
-					slog.WarnContext(req.Context(), "failed to close body of GitHub request refused by quota reserve",
-						"operation", metricCtx.operation, "installation_id", t.installationID, "error", err)
-				}
+	deferrable := isDeferrablePlanInputRead(metricCtx.operation) && !CheckPublicationReads(req.Context())
+	if refusal, firstInWindow := t.admit(metricCtx.operation, deferrable); refusal != nil {
+		t.reportRefusal(req, metricCtx, refusal, firstInWindow)
+		if req.Body != nil {
+			if err := req.Body.Close(); err != nil {
+				slog.WarnContext(req.Context(), "failed to close body of GitHub request refused by quota reserve",
+					"operation", metricCtx.operation, "installation_id", t.installationID, "error", err)
 			}
-			return nil, refusal
 		}
+		return nil, refusal
 	}
 	resp, err := t.base.RoundTrip(req)
+	t.settle(req, resp)
+	return resp, err
+}
+
+// admit decides whether a request may be sent and, when it may, counts it as
+// in flight in the same critical section, so concurrent requests cannot all
+// pass on one stale reading of the quota. Only a deferrable request is
+// refused; every admitted request counts, because each one spends quota.
+func (t *quotaReserveTransport) admit(operation string, deferrable bool) (*QuotaReservedError, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if deferrable && t.quotaAtReserveLocked() {
+		firstInWindow := !t.warnedReset.Equal(t.resetAt)
+		t.warnedReset = t.resetAt
+		return &QuotaReservedError{
+			Operation: operation,
+			Remaining: t.remaining,
+			Reserve:   t.reserve,
+			ResetAt:   t.resetAt,
+		}, firstInWindow
+	}
+	t.inFlight++
+	return nil, false
+}
+
+// settle stops counting an admitted request as in flight and records the core
+// quota its response reports. A request that got no response spent quota or
+// did not; either way the next response reports the count.
+func (t *quotaReserveTransport) settle(req *http.Request, resp *http.Response) {
 	if resp != nil {
 		t.observe(req, resp)
 	}
-	return resp, err
+	t.mu.Lock()
+	t.inFlight--
+	t.mu.Unlock()
 }
 
 // observe records the core quota a response reports. Responses can arrive out
 // of order, so a later reset window replaces the state, the same window keeps
 // the lowest remaining count (it only falls within a window), and an earlier
-// window is ignored.
+// window is ignored. A reset further out than quotaResetHorizon is ignored as
+// a garbled header.
 func (t *quotaReserveTransport) observe(req *http.Request, resp *http.Response) {
 	if gitHubRateLimitResource(githubRateLimitResourceFromHeaders(req, resp)) != metrics.GitHubRateLimitResourceCore {
 		return
@@ -135,6 +197,12 @@ func (t *quotaReserveTransport) observe(req *http.Request, resp *http.Response) 
 		return
 	}
 	resetAt := time.Unix(reset, 0)
+	if horizon := t.now().Add(quotaResetHorizon); resetAt.After(horizon) {
+		slog.WarnContext(req.Context(), "ignoring a GitHub core quota report whose reset time is further out than GitHub's hourly window; the quota reserve keeps its previous reading",
+			"installation_id", t.installationID, "remaining", remaining,
+			"reset_time", resetAt.UTC().Format(time.RFC3339), "horizon", horizon.UTC().Format(time.RFC3339))
+		return
+	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -148,29 +216,11 @@ func (t *quotaReserveTransport) observe(req *http.Request, resp *http.Response) 
 	}
 }
 
-// refusal returns the error for a deferrable request when the quota is at its
-// reserve, and whether this is the first refusal of the current reset window.
-func (t *quotaReserveTransport) refusal(operation string) (*QuotaReservedError, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if !t.quotaAtReserveLocked() {
-		return nil, false
-	}
-	firstInWindow := !t.warnedReset.Equal(t.resetAt)
-	t.warnedReset = t.resetAt
-	return &QuotaReservedError{
-		Operation: operation,
-		Remaining: t.remaining,
-		Reserve:   t.reserve,
-		ResetAt:   t.resetAt,
-	}, firstInWindow
-}
-
-// quotaAtReserveLocked reports whether GitHub's last report puts the core
-// quota at or below the reserve in a window that has not reset yet. Callers
-// hold t.mu.
+// quotaAtReserveLocked reports whether GitHub's last report, less the requests
+// already sent and not yet answered, puts the core quota at or below the
+// reserve in a window that has not reset yet. Callers hold t.mu.
 func (t *quotaReserveTransport) quotaAtReserveLocked() bool {
-	return t.observed && t.remaining <= t.reserve && t.now().Before(t.resetAt)
+	return t.observed && t.remaining-t.inFlight <= t.reserve && t.now().Before(t.resetAt)
 }
 
 // reportRefusal counts every refusal and warns once per installation per reset
@@ -194,7 +244,7 @@ func (t *quotaReserveTransport) reportRefusal(req *http.Request, metricCtx githu
 	if repository == "" {
 		repository = "unknown"
 	}
-	slog.WarnContext(req.Context(), "GitHub core quota is at its reserve; schema file and tree reads are refused until the quota resets, and check runs, pull request reads, and comments still go through",
+	slog.WarnContext(req.Context(), "GitHub core quota is at its reserve; plan reads of schema files and trees are refused until the quota resets, and check runs, the reads that decide them, pull request reads, and comments still go through",
 		"installation_id", t.installationID, "github_app", app,
 		"remaining", refusal.Remaining, "reserve", refusal.Reserve,
 		"reset_time", refusal.ResetAt.UTC().Format(time.RFC3339),

@@ -203,6 +203,10 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
 		return aggregateFoldNoFollowUp, nil
 	}
+	// The fold reads trees and config files to decide what the aggregate says,
+	// so the quota reserve, which is held back for check publication, sends
+	// those reads instead of deferring them like a plan's.
+	ctx = ghclient.WithCheckPublicationReads(ctx)
 
 	ctx, snapshotErr := snapshotPublicationTarget(ctx, client, repo, pr)
 	if snapshotErr != nil {

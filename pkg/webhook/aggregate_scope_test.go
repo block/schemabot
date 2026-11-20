@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
@@ -169,6 +171,94 @@ func TestAggregateApplicableEnvironmentScope(t *testing.T) {
 			}
 		})
 	}
+}
+
+// refuseSchemaReadsOutsidePublication stands in for an installation whose quota
+// is down to its reserve: it refuses every schema file, blob and tree read the
+// way the reserve does, except reads made for a check publication.
+type refuseSchemaReadsOutsidePublication struct {
+	refused atomic.Int64
+}
+
+func (rt *refuseSchemaReadsOutsidePublication) RoundTrip(req *http.Request) (*http.Response, error) {
+	schemaRead := req.Method == http.MethodGet &&
+		(strings.Contains(req.URL.Path, "/contents/") || strings.Contains(req.URL.Path, "/git/trees/") || strings.Contains(req.URL.Path, "/git/blobs/"))
+	if schemaRead && !ghclient.CheckPublicationReads(req.Context()) {
+		rt.refused.Add(1)
+		return nil, &ghclient.QuotaReservedError{Operation: req.URL.Path, Remaining: 50, Reserve: 100, ResetAt: time.Now().Add(time.Hour)}
+	}
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+// newQuotaReserveFoldHandler builds a fold handler for an environment-scoped
+// deployment whose orders database does not pin its repositories, so
+// resolving coverage reads the repository's configs, served at head abc123
+// through refuseSchemaReadsOutsidePublication.
+func newQuotaReserveFoldHandler(t *testing.T, store *foldCheckStore) (*Handler, *http.ServeMux, *ghclient.InstallationClient, *refuseSchemaReadsOutsidePublication) {
+	t.Helper()
+	cfg := &api.ServerConfig{
+		AllowedEnvironments: []string{"sandbox", "production"},
+		Repos:               map[string]api.RepoConfig{"octocat/hello-world": {}},
+		Databases:           map[string]api.DatabaseConfig{"orders": {Type: "mysql", Environments: map[string]api.EnvironmentConfig{"production": {}}}},
+	}
+	plain, mux := setupGitHubServer(t)
+	reserve := &refuseSchemaReadsOutsidePublication{}
+	client := gh.NewClient(&http.Client{Transport: reserve})
+	client.BaseURL = plain.BaseURL
+	installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
+	h := &Handler{
+		service:   api.New(&foldStorage{checks: store}, cfg, nil, testLogger()),
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:    testLogger(),
+	}
+	serveHeadSHA(t, mux, "abc123")
+	serveAggregateScopeInputs(t, mux, []string{"schemabot.yaml"}, "database: orders\ntype: mysql\n")
+
+	_, err := installClient.FetchFileContent(t.Context(), "octocat/hello-world", "schemabot.yaml", "abc123")
+	require.ErrorIs(t, err, ghclient.ErrGitHubQuotaReserved, "a plan's read of the same file is refused")
+	reserve.refused.Store(0)
+	return h, mux, installClient, reserve
+}
+
+// An environment-scoped deployment whose production plan has succeeded folds
+// its aggregate while the installation's quota is down to its reserve. The
+// fold reads the PR's trees and its schemabot.yaml to decide what the
+// aggregate says, and those reads go out, so the aggregate is published as
+// passing instead of failing on "coverage could not be verified".
+func TestAggregateFoldPublishesAtTheQuotaReserve(t *testing.T) {
+	store := &foldCheckStore{byPR: []*storage.Check{{
+		DatabaseName: "orders", DatabaseType: "mysql", Environment: "production",
+		HeadSHA: "abc123", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess,
+	}}}
+	h, mux, client, reserve := newQuotaReserveFoldHandler(t, store)
+	serveCheckRunCreate(t, mux)
+
+	_, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
+	require.NoError(t, err)
+	assert.Zero(t, reserve.refused.Load(), "the fold's reads are sent at the reserve")
+	require.Len(t, store.upserted, 1)
+	assert.Equal(t, "production", store.upserted[0].Environment)
+	assert.Equal(t, checkStatusCompleted, store.upserted[0].Status)
+	assert.Equal(t, checkConclusionSuccess, store.upserted[0].Conclusion)
+}
+
+// A merge-queue head gets its passing aggregate while the installation's quota
+// is down to its reserve: the config reads that decide which environments it
+// covers go out, so the queue entry is not left waiting on a required check.
+func TestMergeGroupPublishesAtTheQuotaReserve(t *testing.T) {
+	h, mux, client, reserve := newQuotaReserveFoldHandler(t, &foldCheckStore{})
+	var names []string
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var opts ghclient.CheckRunOptions
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&opts))
+		names = append(names, opts.Name)
+		w.WriteHeader(http.StatusCreated)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 555}))
+	})
+
+	require.NoError(t, h.postPassingAggregateChecks(t.Context(), client, "octocat/hello-world", "abc123", mergeGroupCheckContent()))
+	assert.Zero(t, reserve.refused.Load(), "the coverage reads are sent at the reserve")
+	assert.Equal(t, []string{"SchemaBot (production)"}, names)
 }
 
 // Participant path selection and environment coverage are independent: a

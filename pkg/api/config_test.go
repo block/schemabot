@@ -4989,6 +4989,13 @@ func TestServerConfig_AppsValidation(t *testing.T) {
 			wantErrSub: "github: and apps: are mutually exclusive",
 		},
 		{
+			name:       "github: with only a quota reserve and apps: together is rejected",
+			github:     GitHubConfig{QuotaReserve: 1500},
+			apps:       map[string]GitHubAppConfig{"app-a": validApp},
+			repos:      map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+			wantErrSub: "github: and apps: are mutually exclusive",
+		},
+		{
 			name:       "apps: present but empty is rejected",
 			apps:       map[string]GitHubAppConfig{},
 			wantErrSub: "apps: is configured but contains no entries",

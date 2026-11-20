@@ -293,6 +293,9 @@ type passingAggregateCheckContent struct {
 // names as the PR-head aggregates so branch protection's required checks
 // always match.
 func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA string, content passingAggregateCheckContent) error {
+	// Resolving the environments reads config files at headSHA, which decide
+	// which checks to post, so the quota reserve sends those reads.
+	ctx = ghclient.WithCheckPublicationReads(ctx)
 	targets := h.aggregateCheckTargetsForRepo(repo)
 	if config, ok := h.serverConfig(); ok && len(config.AllowedEnvironments) > 0 {
 		environments, err := config.CheckEnvironmentsForRepo(ctx, client, repo, headSHA)

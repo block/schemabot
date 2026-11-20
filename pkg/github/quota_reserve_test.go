@@ -27,7 +27,7 @@ import (
 const (
 	quotaReserveTestRepo    = "octocat/hello-world"
 	quotaReserveTestHeadSHA = "head-sha"
-	quotaReserveWarning     = "GitHub core quota is at its reserve; schema file and tree reads are refused until the quota resets, and check runs, pull request reads, and comments still go through"
+	quotaReserveWarning     = "GitHub core quota is at its reserve; plan reads of schema files and trees are refused until the quota resets, and check runs, the reads that decide them, pull request reads, and comments still go through"
 )
 
 // quotaReserveTestServer is a GitHub stand-in whose every response reports the
@@ -268,9 +268,10 @@ func TestQuotaReserveZeroNeverRefuses(t *testing.T) {
 	assert.Empty(t, reserveRejectionsByOperation(t, throttlingData(t, reader)))
 }
 
-// Responses arrive out of order. A late response from an earlier reset window,
-// or one about another rate-limit resource, must not lift a reserve the
-// current window has reached.
+// Responses arrive out of order. A late response from an earlier reset window
+// must not lift a reserve the current window has reached or lower the current
+// window's count, and a response about another rate-limit resource must not
+// count at all.
 func TestQuotaReserveIgnoresEarlierWindowsAndOtherResources(t *testing.T) {
 	now := time.Now()
 	rt, ok := newQuotaReserveTransport(http.DefaultTransport, 100, 42, nil).(*quotaReserveTransport)
@@ -289,10 +290,11 @@ func TestQuotaReserveIgnoresEarlierWindowsAndOtherResources(t *testing.T) {
 
 	observe("core", 80, reset)
 	observe("core", 4000, reset.Add(-time.Hour))
+	observe("core", 10, reset.Add(-time.Hour))
 	observe("core", 120, reset)
 	observe("graphql", 4000, reset.Add(time.Hour))
 
-	refusal, _ := rt.refusal(metrics.GitHubOperationFetchFileContent)
+	refusal, _ := rt.admit(metrics.GitHubOperationFetchFileContent, true)
 	require.NotNil(t, refusal)
 	assert.Equal(t, int64(80), refusal.Remaining, "the lowest report in the current window holds")
 	assert.True(t, reset.Equal(refusal.ResetAt))
@@ -366,4 +368,188 @@ func TestQuotaReserveRefusalPropagatesFromSchemaRequest(t *testing.T) {
 	require.ErrorAs(t, err, &reserved)
 	assert.Equal(t, metrics.GitHubOperationFetchFileContent, reserved.Operation)
 	assert.Equal(t, 1, s.hitCount("GET /repos/octocat/hello-world/pulls/1"), "the pull request read still goes out")
+}
+
+// The schema file, blob and tree reads a check publication makes decide what
+// the Check Run says, so they go out at the reserve while the same reads made
+// for a plan are refused.
+func TestQuotaReserveSendsCheckPublicationReads(t *testing.T) {
+	reader := newGitHubMetricsTestReader(t)
+	s := newQuotaReserveTestServer(t, 100)
+	s.resetUnix.Store(time.Unix(0, s.clock.Load()).Add(10 * time.Minute).Unix())
+	s.remaining.Store(50)
+	require.NoError(t, s.createCheckRun(t))
+
+	require.ErrorIs(t, s.fetchFileContent(t), ErrGitHubQuotaReserved)
+
+	publication := WithCheckPublicationReads(t.Context())
+	_, err := s.ic.FetchFileContent(publication, quotaReserveTestRepo, "schema/t.sql", quotaReserveTestHeadSHA)
+	require.NoError(t, err)
+	_, _, err = s.ic.FetchGitTree(publication, quotaReserveTestRepo, "tree-sha")
+	require.NoError(t, err)
+	_, err = s.ic.FetchBlobContent(publication, quotaReserveTestRepo, "blob-sha")
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, s.hitCount("GET /repos/octocat/hello-world/contents/schema/t.sql"))
+	assert.Equal(t, 1, s.hitCount("GET /repos/octocat/hello-world/git/trees/tree-sha"))
+	assert.Equal(t, 1, s.hitCount("GET /repos/octocat/hello-world/git/blobs/blob-sha"))
+	assert.Equal(t, map[string]int64{metrics.GitHubOperationFetchFileContent: 1},
+		reserveRejectionsByOperation(t, throttlingData(t, reader)), "only the plan read is refused")
+}
+
+// quotaReserveObserve feeds rt a core quota report with the given header
+// values; an empty value leaves that header out.
+func quotaReserveObserve(t *testing.T, rt *quotaReserveTransport, remaining, reset string) {
+	t.Helper()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.github.com/repos/octocat/hello-world/pulls/1", nil)
+	resp := &http.Response{Header: http.Header{}}
+	resp.Header.Set(headerRateLimitResource, "core")
+	if remaining != "" {
+		resp.Header.Set(headerRateLimitRemaining, remaining)
+	}
+	if reset != "" {
+		resp.Header.Set(headerRateLimitReset, reset)
+	}
+	rt.observe(req, resp)
+}
+
+// A report the reserve cannot place in GitHub's hourly window refuses nothing:
+// a missing or garbled count or reset, and a reset further out than any real
+// window. A reset that far out would otherwise hold the reserve until then,
+// and every correct report, which names an earlier window, would be ignored.
+func TestQuotaReserveIgnoresUnusableQuotaReports(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	inWindow := strconv.FormatInt(now.Add(30*time.Minute).Unix(), 10)
+	for _, tc := range []struct {
+		name, remaining, reset string
+	}{
+		{name: "no remaining count", reset: inWindow},
+		{name: "no reset time", remaining: "50"},
+		{name: "garbled remaining count", remaining: "fifty", reset: inWindow},
+		{name: "garbled reset time", remaining: "50", reset: "soon"},
+		{name: "reset ten years out", remaining: "50", reset: strconv.FormatInt(now.Add(10*365*24*time.Hour).Unix(), 10)},
+		{name: "reset just past the horizon", remaining: "50", reset: strconv.FormatInt(now.Add(quotaResetHorizon+time.Second).Unix(), 10)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt, ok := newQuotaReserveTransport(http.DefaultTransport, 100, 42, nil).(*quotaReserveTransport)
+			require.True(t, ok)
+			rt.now = func() time.Time { return now }
+
+			quotaReserveObserve(t, rt, tc.remaining, tc.reset)
+			refusal, _ := rt.admit(metrics.GitHubOperationFetchFileContent, true)
+			assert.Nil(t, refusal)
+
+			// A correct report in the current window still takes effect.
+			quotaReserveObserve(t, rt, "50", inWindow)
+			refusal, _ = rt.admit(metrics.GitHubOperationFetchFileContent, true)
+			assert.NotNil(t, refusal)
+		})
+	}
+
+	t.Run("reset at the horizon is believed", func(t *testing.T) {
+		rt, ok := newQuotaReserveTransport(http.DefaultTransport, 100, 42, nil).(*quotaReserveTransport)
+		require.True(t, ok)
+		rt.now = func() time.Time { return now }
+		quotaReserveObserve(t, rt, "50", strconv.FormatInt(now.Add(quotaResetHorizon).Unix(), 10))
+		refusal, _ := rt.admit(metrics.GitHubOperationFetchFileContent, true)
+		assert.NotNil(t, refusal)
+	})
+}
+
+// Concurrent reads that start before any of them is answered all see the same
+// reported count, so the reserve also subtracts the requests in flight. Two
+// requests above the reserve, eight concurrent tree reads send two and refuse
+// six, and once those two are answered the next read goes out again.
+func TestQuotaReserveCountsRequestsInFlight(t *testing.T) {
+	now := time.Now()
+	reset := strconv.FormatInt(now.Add(10*time.Minute).Unix(), 10)
+	started := make(chan struct{}, 8)
+	release := make(chan struct{})
+	base := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+		resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader([]byte(`{}`))), Request: r}
+		resp.Header.Set(headerRateLimitResource, "core")
+		resp.Header.Set(headerRateLimitRemaining, "102")
+		resp.Header.Set(headerRateLimitReset, reset)
+		return resp, nil
+	})
+	rt, ok := newQuotaReserveTransport(base, 100, 42, nil).(*quotaReserveTransport)
+	require.True(t, ok)
+	rt.now = func() time.Time { return now }
+	quotaReserveObserve(t, rt, "102", reset)
+
+	treeRead := func() error {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.github.com/repos/octocat/hello-world/git/trees/tree-sha", nil)
+		resp, err := rt.RoundTrip(req)
+		if resp != nil {
+			assert.NoError(t, resp.Body.Close())
+		}
+		return err
+	}
+	results := make(chan error, 8)
+	for range 8 {
+		go func() { results <- treeRead() }()
+	}
+
+	timeout := time.After(10 * time.Second)
+	for range 2 {
+		select {
+		case <-started:
+		case <-timeout:
+			require.FailNow(t, "two reads above the reserve were not sent")
+		}
+	}
+	for range 6 {
+		select {
+		case err := <-results:
+			require.ErrorIs(t, err, ErrGitHubQuotaReserved)
+		case <-timeout:
+			require.FailNow(t, "the reads past the reserve were not refused")
+		}
+	}
+	close(release)
+	for range 2 {
+		select {
+		case err := <-results:
+			require.NoError(t, err)
+		case <-timeout:
+			require.FailNow(t, "the sent reads did not finish")
+		}
+	}
+	assert.Empty(t, started, "only two reads reached GitHub")
+
+	require.NoError(t, treeRead(), "answered requests no longer count against the reserve")
+}
+
+// A refused request never reaches GitHub, so the transport closes its body.
+func TestQuotaReserveClosesTheBodyOfARefusedRequest(t *testing.T) {
+	now := time.Now()
+	rt, ok := newQuotaReserveTransport(http.DefaultTransport, 100, 42, nil).(*quotaReserveTransport)
+	require.True(t, ok)
+	rt.now = func() time.Time { return now }
+	quotaReserveObserve(t, rt, "50", strconv.FormatInt(now.Add(10*time.Minute).Unix(), 10))
+
+	body := &closeRecorder{Reader: bytes.NewReader([]byte("{}"))}
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.github.com/repos/octocat/hello-world/git/trees/tree-sha", body)
+	resp, err := rt.RoundTrip(req)
+	if resp != nil {
+		require.NoError(t, resp.Body.Close())
+	}
+	require.ErrorIs(t, err, ErrGitHubQuotaReserved)
+	assert.True(t, body.closed.Load())
+}
+
+type closeRecorder struct {
+	io.Reader
+	closed atomic.Bool
+}
+
+func (c *closeRecorder) Close() error {
+	c.closed.Store(true)
+	return nil
 }

@@ -168,9 +168,10 @@ func WithConfigDirHints(hints ConfigDirHints) ClientOption {
 // WithQuotaReserve holds back the given number of core REST requests per
 // installation for check runs, pull request reads, comments, and other work
 // that is not a schema input read. Once GitHub reports that many or fewer
-// remaining, schema file, blob, and tree reads are refused before they are sent
-// with an error matching ErrGitHubQuotaReserved, until the quota resets. Zero
-// disables the reserve.
+// remaining, less the requests in flight, schema file, blob, and tree reads are
+// refused before they are sent with an error matching ErrGitHubQuotaReserved,
+// until the quota resets. Reads made under WithCheckPublicationReads are always
+// sent. Zero disables the reserve.
 func WithQuotaReserve(requests int64) ClientOption {
 	return func(c *Client) {
 		c.quotaReserve = requests
