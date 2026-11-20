@@ -536,14 +536,22 @@ func verdictApplies(stmtType ddl.StatementType) bool {
 // definition.
 func (v *ExecutionVerdicts) record(ctx context.Context, change *engine.TableChange, currentCreateTable string) error {
 	logger := v.engine.logger
-	reason, refused, err := check.StatementRefusal(ctx, change.DDL, currentCreateTable, logger)
+	reason, kind, err := classifyRefusal(ctx, logger, v.target, v.policy, v.database, change.Table, change.DDL, currentCreateTable)
 	if err != nil {
 		return fmt.Errorf("execution verdict for table %q in database %q: %w", change.Table, v.database, err)
 	}
-	if !refused {
+	if kind == notRefused {
 		return nil
 	}
 	decision := v.engine.resolveRefusedMode(ctx, v.target, v.policy, v.database, change.Table, reason)
+	if kind == tableRefused && decision.mode != engine.ExecutionModeDirect {
+		// Not a verdict: the engine may still complete the statement with
+		// MySQL's native DDL, so the plan leaves it on the default path, as
+		// the apply's routing does.
+		logger.Info("plan leaves a statement on a table the copy process refuses on the schema change engine's default path",
+			"database", v.database, "table", change.Table, "reason", reason, "direct_execution", decision.modeReason)
+		return nil
+	}
 	change.ExecutionMode = decision.mode
 	change.ModeReason = decision.modeReason
 	if decision.mode == engine.ExecutionModeDirect {
@@ -632,6 +640,58 @@ type alterRouting struct {
 	direct       []directRouted
 }
 
+// refusalKind says which of the engine's checks refuses a statement, which
+// decides what SchemaBot may conclude from the refusal.
+type refusalKind int
+
+const (
+	// notRefused: the engine runs the statement on its default path.
+	notRefused refusalKind = iota
+	// statementRefused: the engine refuses the statement itself, whatever
+	// MySQL could do with it (check.StatementRefusal). It runs directly when
+	// the policy permits, and is blocked otherwise.
+	statementRefused
+	// tableRefused: the copy process refuses the table as it stands on the
+	// target, because it is either end of a foreign key or has triggers
+	// (check.TableRefusal). For a single-table change the engine first tries
+	// MySQL's native DDL, which can still complete the statement, so this is
+	// not a certain refusal: the statement runs directly when the policy
+	// permits, and otherwise stays on the default path, as it would without
+	// the check.
+	tableRefused
+)
+
+// classifyRefusal judges stmt on table against the target. The statement
+// checks run first, against currentCreateTable; a statement they accept is
+// then judged by the table checks, which read the target's foreign keys and
+// triggers. The table checks run only under an enabled policy, since a table
+// refusal changes nothing without one. An error says the statement could not
+// be judged and is never a refusal.
+func classifyRefusal(ctx context.Context, logger *slog.Logger, target *lazyTargetDB, policy directPolicy, database, table, stmt, currentCreateTable string) (string, refusalKind, error) {
+	reason, refused, err := check.StatementRefusal(ctx, stmt, currentCreateTable, logger)
+	if err != nil {
+		return "", notRefused, err
+	}
+	if refused {
+		return reason, statementRefused, nil
+	}
+	if !policy.Enabled {
+		return "", notRefused, nil
+	}
+	db, err := target.get(ctx)
+	if err != nil {
+		return "", notRefused, fmt.Errorf("connect to read the foreign keys and triggers of table %q: %w", table, err)
+	}
+	reason, refused, err = check.TableRefusal(ctx, db, database, table, logger)
+	if err != nil {
+		return "", notRefused, fmt.Errorf("read the foreign keys and triggers of table %q: %w", table, err)
+	}
+	if refused {
+		return reason, tableRefused, nil
+	}
+	return "", notRefused, nil
+}
+
 // routeAlterStatements re-evaluates the plan-time refusal predicate per
 // statement at apply time, so a schema or policy change between plan and
 // apply can never smuggle a refused statement past the policy: statements
@@ -675,22 +735,37 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 				"database", database, "table", table, "error", err)
 			return alterRouting{}, engine.OperatorErrorf(err, "SchemaBot could not read the current definition of table %q on the target; see the server logs for the reason.", table)
 		}
-		reason, refused, err := check.StatementRefusal(ctx, stmt, currentCreateTable, logger)
+		reason, kind, err := classifyRefusal(ctx, logger, target, policy, database, table, stmt, currentCreateTable)
 		if err != nil {
+			if ctx.Err() != nil {
+				return alterRouting{}, fmt.Errorf("route ALTER statement for table %q: %w", table, err)
+			}
 			// The engine could not judge the statement — typically the current
-			// definition no longer describes a column the statement redeclares.
-			// That is not a refusal, so it must not be routed as one.
-			logger.Error("routing failed: the engine cannot classify the statement against the current table definition",
+			// definition no longer describes a column the statement redeclares,
+			// or the target could not be read. That is not a refusal, so it
+			// must not be routed as one.
+			logger.Error("routing failed: the engine cannot classify the statement against the target",
 				"database", database, "table", table, "error", err)
 			return alterRouting{}, fmt.Errorf("route ALTER statement for table %q: %w", table, err)
 		}
-		if !refused {
+		if kind == notRefused {
 			routing.spiritAlters = append(routing.spiritAlters, stmt)
 			routing.spiritTables = append(routing.spiritTables, table)
 			continue
 		}
 
 		decision := e.resolveRefusedMode(ctx, target, policy, database, table, reason)
+		if kind == tableRefused && decision.mode != engine.ExecutionModeDirect {
+			// The copy process refuses the table, but the engine may still
+			// complete the statement with MySQL's native DDL, so a table
+			// direct execution cannot take stays on the engine's default
+			// path, exactly as it would without the check.
+			logger.Info("statement on a table the copy process refuses stays on the schema change engine; direct execution cannot take it",
+				"database", database, "table", table, "reason", reason, "direct_execution", decision.modeReason)
+			routing.spiritAlters = append(routing.spiritAlters, stmt)
+			routing.spiritTables = append(routing.spiritTables, table)
+			continue
+		}
 		if decision.mode != engine.ExecutionModeDirect {
 			metrics.RecordDirectExecution(ctx, database, decision.outcome)
 			// A refusal reason is the schema change engine's own account of why

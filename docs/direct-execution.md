@@ -101,6 +101,33 @@ the bound after planning is blocked at apply, not run. Statements the policy
 does not route stay blocked and keep the blocked-apply gate behavior: the
 apply is rejected up front with the engine's refusal reason.
 
+### Tables the online copy refuses
+
+The engine's online copy also refuses a table because of what the table is
+linked to on the server, whatever the statement: a table at either end of a
+foreign key, or one with triggers. This is common in a declarative onboarding,
+where one environment still has a foreign key the schema files dropped long
+ago, and the plan both changes the parent table and drops the key on the child.
+
+This refusal is not certain. For a single-table change the engine first tries
+MySQL's own DDL, and a change MySQL can make that way, such as an instant
+`ADD COLUMN`, succeeds on a table the copy refuses. So a statement on such a
+table runs directly when the policy would run it, and otherwise stays on the
+engine's default path rather than blocking:
+
+```diagram
+engine accepts the statement, but the copy refuses the table
+(either end of a foreign key, or triggers)
+        │ direct_execution policy in force?
+        ├─ disabled ─────────────────────────────► engine's default path
+        ├─ size unavailable or above the bound ──► engine's default path
+        └─ within it ────────────────────────────► direct
+```
+
+When both ends of a foreign key run directly, the plan's own `DROP FOREIGN
+KEY` runs before any statement the engine copies, because every direct
+statement runs first.
+
 ### The policy travels with the request
 
 The server that runs the statement is not always the one whose configuration
