@@ -1,13 +1,17 @@
 package api
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // sharedSchemaConfig splits one schema between two databases: shop owns the
@@ -153,11 +157,11 @@ func TestCheckSharedSchemaIgnoreLists_AgreeingListsPass(t *testing.T) {
 
 	shop := shopSide([]string{"orders", "order_items"}, "sequences")
 	sharded := shopShardedSide([]string{"sequences"}, "orders", "order_items")
-	require.NoError(t, cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded}))
-	require.NoError(t, cfg.CheckSharedSchemaIgnoreLists("production", sharded, []SharedSchemaDatabase{shop}))
+	require.NoError(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, &targetSchemas{}))
+	require.NoError(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", sharded, []SharedSchemaDatabase{shop}, &targetSchemas{}))
 
 	byPattern := shopSide([]string{"/order.*/"}, "sequences")
-	require.NoError(t, cfg.CheckSharedSchemaIgnoreLists("production", byPattern, []SharedSchemaDatabase{sharded}))
+	require.NoError(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", byPattern, []SharedSchemaDatabase{sharded}, &targetSchemas{}))
 }
 
 // A pull request adds a sharded table without listing it in shop's
@@ -172,10 +176,10 @@ func TestCheckSharedSchemaIgnoreLists_MissingEntryIsRefusedFromEitherSide(t *tes
 
 	for name, check := range map[string]func() error{
 		"planning shop": func() error {
-			return cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded})
+			return cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, &targetSchemas{})
 		},
 		"planning shop_sharded": func() error {
-			return cfg.CheckSharedSchemaIgnoreLists("production", sharded, []SharedSchemaDatabase{shop})
+			return cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", sharded, []SharedSchemaDatabase{shop}, &targetSchemas{})
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -188,6 +192,7 @@ func TestCheckSharedSchemaIgnoreLists_MissingEntryIsRefusedFromEitherSide(t *tes
 				DeclaredBy:     "shop_sharded",
 				Namespace:      "shop_0",
 				OwnerNamespace: "shop_0",
+				Schema:         "shop_0",
 				Target:         "shop-001",
 				Tables:         []string{"refunds"},
 				Entries:        []string{"refunds"},
@@ -207,7 +212,7 @@ func TestCheckSharedSchemaIgnoreLists_MissingEntriesOnBothSides(t *testing.T) {
 	shop := shopSide([]string{"orders"}, "sequences", "settings")
 	sharded := shopShardedSide(nil, "orders", "refunds")
 
-	err := cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded})
+	err := cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, &targetSchemas{})
 	var mismatch *SharedSchemaIgnoreListsError
 	require.True(t, errors.As(err, &mismatch), "want a SharedSchemaIgnoreListsError, got %v", err)
 	require.Len(t, mismatch.Missing, 2)
@@ -228,15 +233,16 @@ func TestCheckSharedSchemaIgnoreLists_TableDeclaredByBoth(t *testing.T) {
 	shop := shopSide([]string{"orders"}, "sequences", "Orders")
 	sharded := shopShardedSide([]string{"sequences"}, "orders")
 
-	err := cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded})
+	err := cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, &targetSchemas{})
 	var mismatch *SharedSchemaIgnoreListsError
 	require.True(t, errors.As(err, &mismatch), "want a SharedSchemaIgnoreListsError, got %v", err)
 	assert.Empty(t, mismatch.Missing)
 	assert.Equal(t, []DoublyDeclaredTables{{
-		Databases: [2]string{"shop", "shop_sharded"},
-		Namespace: "shop_0",
-		Target:    "shop-001",
-		Tables:    []string{"Orders"},
+		Databases:  [2]string{"shop", "shop_sharded"},
+		Namespaces: [2]string{"shop_0", "shop_0"},
+		Schema:     "shop_0",
+		Target:     "shop-001",
+		Tables:     []string{"Orders"},
 	}}, mismatch.Doubled)
 	assert.Contains(t, err.Error(), `"shop" and "shop_sharded" both declare "Orders" in namespace "shop_0" on target "shop-001"`)
 }
@@ -251,7 +257,7 @@ func TestCheckSharedSchemaIgnoreLists_UnsharedNamespacesAreNotCompared(t *testin
 	sharded := shopShardedSide([]string{"sequences"}, "orders")
 	sharded.SchemaFiles["shop_1"] = createTables("orders", "shard_one_only")
 
-	require.NoError(t, cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded}))
+	require.NoError(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, &targetSchemas{}))
 }
 
 // A schema file the parser cannot read fails the check instead of being
@@ -263,7 +269,7 @@ func TestCheckSharedSchemaIgnoreLists_UnparseableFileFails(t *testing.T) {
 	sharded := shopShardedSide([]string{"sequences"}, "orders")
 	sharded.SchemaFiles["shop_0"].Files["broken.sql"] = "CREATE TABLE ("
 
-	err := cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded})
+	err := cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, &targetSchemas{})
 	require.Error(t, err)
 	var mismatch *SharedSchemaIgnoreListsError
 	assert.False(t, errors.As(err, &mismatch), "a parse failure is not a list mismatch: %v", err)
@@ -329,7 +335,7 @@ func TestCheckSharedSchemaIgnoreLists_SameSchemaNameOnEveryCluster(t *testing.T)
 	ledger := ledgerSide("ledger", []string{"entries"}, "accounts")
 	sharded := ledgerSide("ledger_sharded", []string{"accounts"}, "entries", "holds")
 
-	err = cfg.CheckSharedSchemaIgnoreLists("production", ledger, []SharedSchemaDatabase{sharded})
+	err = cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", ledger, []SharedSchemaDatabase{sharded}, &targetSchemas{})
 	var mismatch *SharedSchemaIgnoreListsError
 	require.True(t, errors.As(err, &mismatch), "want a SharedSchemaIgnoreListsError, got %v", err)
 	assert.Equal(t, []MissingIgnoreEntry{{
@@ -338,6 +344,7 @@ func TestCheckSharedSchemaIgnoreLists_SameSchemaNameOnEveryCluster(t *testing.T)
 		DeclaredBy:     "ledger_sharded",
 		Namespace:      "ledger_production",
 		OwnerNamespace: "ledger_production",
+		Schema:         "ledger_production",
 		Target:         "ledger-001",
 		Tables:         []string{"holds"},
 		Entries:        []string{"holds"},
@@ -345,7 +352,7 @@ func TestCheckSharedSchemaIgnoreLists_SameSchemaNameOnEveryCluster(t *testing.T)
 
 	sharded.IgnoreTables = []string{"accounts"}
 	ledger.IgnoreTables = []string{"entries", "holds"}
-	require.NoError(t, cfg.CheckSharedSchemaIgnoreLists("production", ledger, []SharedSchemaDatabase{sharded}))
+	require.NoError(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", ledger, []SharedSchemaDatabase{sharded}, &targetSchemas{}))
 }
 
 // A target that folds table names stores a table declared as Refunds under
@@ -367,7 +374,7 @@ func TestCheckSharedSchemaIgnoreLists_EntryMustCoverTheLowerCaseSpelling(t *test
 		"lower-case spelling only": {ignore: []string{"orders", "refunds"}, entries: []string{"Refunds"}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			err := cfg.CheckSharedSchemaIgnoreLists("production", shopSide(tc.ignore, "sequences"), []SharedSchemaDatabase{sharded})
+			err := cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shopSide(tc.ignore, "sequences"), []SharedSchemaDatabase{sharded}, &targetSchemas{})
 			var mismatch *SharedSchemaIgnoreListsError
 			require.True(t, errors.As(err, &mismatch), "want a SharedSchemaIgnoreListsError, got %v", err)
 			require.Len(t, mismatch.Missing, 1)
@@ -382,7 +389,7 @@ func TestCheckSharedSchemaIgnoreLists_EntryMustCoverTheLowerCaseSpelling(t *test
 		"case-insensitive pattern": {"orders", "/(?i)refunds/"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			require.NoError(t, cfg.CheckSharedSchemaIgnoreLists("production", shopSide(ignore, "sequences"), []SharedSchemaDatabase{sharded}))
+			require.NoError(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shopSide(ignore, "sequences"), []SharedSchemaDatabase{sharded}, &targetSchemas{}))
 		})
 	}
 }
@@ -437,27 +444,93 @@ func namespacedSide(database, namespace string, ignore []string, tables ...strin
 	}
 }
 
-// A MySQL target whose connection names a database plans every namespace it
-// is sent as that one database, so two databases on the same target collide
-// even when their namespace keys differ, and only the data plane knows which
-// kind of connection the target uses. The check therefore compares a MySQL
-// pair across namespaces: each needs the other's tables in its ignore_tables.
-// A table both declare under different namespaces is not refused, because on
-// a target whose connection names no database those are two separate tables
-// and neither database could act on the refusal. A PostgreSQL target plans
-// each schema on its own, so the same pair under different keys shares
-// nothing.
-func TestCheckSharedSchemaIgnoreLists_MySQLComparesAcrossNamespaces(t *testing.T) {
+// targetSchemas stands in for the data planes. A member listed in pinned has
+// a connection that names one database, which every namespace sent to it
+// addresses. Any other namespace addresses a schema of its own name.
+type targetSchemas struct {
+	pinned map[string]string
+	err    error
+	// omit names a namespace the resolution leaves out of its answer.
+	omit  string
+	calls []string
+}
+
+func (r *targetSchemas) ResolveNamespaces(_ context.Context, database, _ string, target routing.ExecutionTarget, namespaces []string) (map[string]string, error) {
+	r.calls = append(r.calls, fmt.Sprintf("%s@%s:%v", database, target.MemberID(), namespaces))
+	if r.err != nil {
+		return nil, r.err
+	}
+	schemas := make(map[string]string, len(namespaces))
+	for _, namespace := range namespaces {
+		switch {
+		case namespace == r.omit:
+		case r.pinned[target.MemberID()] != "":
+			schemas[namespace] = r.pinned[target.MemberID()]
+		default:
+			schemas[namespace] = namespace
+		}
+	}
+	return schemas, nil
+}
+
+func pinnedTo(schemaName string) *targetSchemas {
+	return &targetSchemas{pinned: map[string]string{"us/shop-001": schemaName}}
+}
+
+func requireListsMismatch(t *testing.T, err error) *SharedSchemaIgnoreListsError {
+	t.Helper()
+	var mismatch *SharedSchemaIgnoreListsError
+	require.True(t, errors.As(err, &mismatch), "want a SharedSchemaIgnoreListsError, got %v", err)
+	return mismatch
+}
+
+// Two MySQL databases on one target keep their tables under different
+// namespace keys, shop and shop_sharded. Whether those keys are one schema is
+// the target's answer: a connection that names a database stores both in it,
+// and one that names none stores each in a schema of its own name. The check
+// asks the data plane and compares by the answer. On the pinned target a
+// table both declare has two owners and a table only one declares needs an
+// entry in the other's ignore_tables. On the unpinned target the same files
+// are two separate sets of tables and pass as they are.
+func TestCheckSharedSchemaIgnoreLists_ComparesTheSchemaTheTargetResolves(t *testing.T) {
 	cfg, err := ParseServerConfig([]byte(sharedTargetConfig))
 	require.NoError(t, err)
 
-	t.Run("missing entries are refused", func(t *testing.T) {
+	t.Run("a pinned schema refuses a table both declare under different keys", func(t *testing.T) {
+		shop := namespacedSide("shop", "shop", nil, "users")
+		sharded := namespacedSide("shop_sharded", "shop_sharded", nil, "users")
+		resolver := pinnedTo("shop_main")
+
+		err := cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, resolver)
+		mismatch := requireListsMismatch(t, err)
+		assert.Empty(t, mismatch.Missing)
+		assert.Equal(t, []DoublyDeclaredTables{{
+			Databases:  [2]string{"shop", "shop_sharded"},
+			Namespaces: [2]string{"shop", "shop_sharded"},
+			Schema:     "shop_main",
+			Target:     "shop-001",
+			Tables:     []string{"users"},
+		}}, mismatch.Doubled)
+		assert.Equal(t,
+			`"shop" and "shop_sharded" both declare "users" on target "shop-001", in namespaces "shop" and "shop_sharded", which the target stores in one schema "shop_main". Keep each table's schema file in one of them and list the table in the other's ignore_tables`,
+			err.Error())
+		assert.Equal(t, []string{"shop@us/shop-001:[shop]", "shop_sharded@us/shop-001:[shop_sharded]"}, resolver.calls,
+			"each database's namespaces are resolved once, on its own target")
+	})
+
+	t.Run("an unpinned target allows a table each declares under its own key", func(t *testing.T) {
+		shop := namespacedSide("shop", "shop", nil, "users")
+		sharded := namespacedSide("shop_sharded", "shop_sharded", nil, "users")
+
+		require.NoError(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, &targetSchemas{}))
+	})
+
+	t.Run("a pinned schema refuses missing entries under different keys", func(t *testing.T) {
 		shop := namespacedSide("shop", "shop", nil, "settings")
 		sharded := namespacedSide("shop_sharded", "shop_sharded", nil, "orders")
 
-		err := cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded})
-		var mismatch *SharedSchemaIgnoreListsError
-		require.True(t, errors.As(err, &mismatch), "want a SharedSchemaIgnoreListsError, got %v", err)
+		err := cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, pinnedTo("shop_main"))
+		mismatch := requireListsMismatch(t, err)
 		assert.Equal(t, []MissingIgnoreEntry{
 			{
 				Database:       "shop",
@@ -465,6 +538,7 @@ func TestCheckSharedSchemaIgnoreLists_MySQLComparesAcrossNamespaces(t *testing.T
 				DeclaredBy:     "shop_sharded",
 				Namespace:      "shop_sharded",
 				OwnerNamespace: "shop",
+				Schema:         "shop_main",
 				Target:         "shop-001",
 				Tables:         []string{"orders"},
 				Entries:        []string{"orders"},
@@ -475,44 +549,25 @@ func TestCheckSharedSchemaIgnoreLists_MySQLComparesAcrossNamespaces(t *testing.T
 				DeclaredBy:     "shop",
 				Namespace:      "shop",
 				OwnerNamespace: "shop_sharded",
+				Schema:         "shop_main",
 				Target:         "shop-001",
 				Tables:         []string{"settings"},
 				Entries:        []string{"settings"},
 			},
 		}, mismatch.Missing)
 		assert.Contains(t, err.Error(),
-			`"shop_sharded" declares "orders" in namespace "shop_sharded" on target "shop-001", where "shop" plans namespace "shop", and a target whose connection names one database plans both as that database. db/shop/schemabot.yaml does not ignore it, so a plan of "shop" would drop it. Add "orders" to ignore_tables in db/shop/schemabot.yaml`)
+			`"shop_sharded" declares "orders" in namespace "shop_sharded" on target "shop-001", where "shop" plans namespace "shop", and the target stores both namespaces in schema "shop_main", but db/shop/schemabot.yaml does not ignore it, so a plan of "shop" would drop it. Add "orders" to ignore_tables in db/shop/schemabot.yaml`)
 
 		shop.IgnoreTables = []string{"orders"}
 		sharded.IgnoreTables = []string{"settings"}
-		require.NoError(t, cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded}))
+		require.NoError(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, pinnedTo("shop_main")))
 	})
 
-	t.Run("a table both declare under different namespaces passes", func(t *testing.T) {
-		shop := namespacedSide("shop", "shop", nil, "users")
-		sharded := namespacedSide("shop_sharded", "shop_sharded", nil, "users")
+	t.Run("an unpinned target needs no entries across different keys", func(t *testing.T) {
+		shop := namespacedSide("shop", "shop", nil, "settings")
+		sharded := namespacedSide("shop_sharded", "shop_sharded", nil, "orders")
 
-		require.NoError(t, cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded}))
-	})
-
-	t.Run("a doubly declared table does not hide a missing entry beside it", func(t *testing.T) {
-		shop := namespacedSide("shop", "shop", nil, "users")
-		sharded := namespacedSide("shop_sharded", "shop_sharded", nil, "users", "orders")
-
-		err := cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded})
-		var mismatch *SharedSchemaIgnoreListsError
-		require.True(t, errors.As(err, &mismatch), "want a SharedSchemaIgnoreListsError, got %v", err)
-		assert.Empty(t, mismatch.Doubled)
-		assert.Equal(t, []MissingIgnoreEntry{{
-			Database:       "shop",
-			ConfigPath:     "db/shop/schemabot.yaml",
-			DeclaredBy:     "shop_sharded",
-			Namespace:      "shop_sharded",
-			OwnerNamespace: "shop",
-			Target:         "shop-001",
-			Tables:         []string{"orders"},
-			Entries:        []string{"orders"},
-		}}, mismatch.Missing)
+		require.NoError(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, &targetSchemas{}))
 	})
 
 	t.Run("postgres schemas under different keys share nothing", func(t *testing.T) {
@@ -521,6 +576,143 @@ func TestCheckSharedSchemaIgnoreLists_MySQLComparesAcrossNamespaces(t *testing.T
 		search := namespacedSide("catalog_search", "search", nil)
 		search.SchemaFiles["search"] = postgresCreateTables("products", "terms")
 
-		require.NoError(t, cfg.CheckSharedSchemaIgnoreLists("production", catalog, []SharedSchemaDatabase{search}))
+		require.NoError(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", catalog, []SharedSchemaDatabase{search}, &targetSchemas{}))
+	})
+}
+
+// shop declares users in its north namespace and settings in south, and
+// shop_sharded declares its own users in east, all on one target. When the
+// target stores each namespace in a schema of its own name, the three are
+// separate and the pair passes: shop is never asked to ignore users, an entry
+// its own north declaration would refuse. When the target's connection names
+// one database, all three are that database, so users has two owners and
+// shop_sharded's plan would drop settings.
+func TestCheckSharedSchemaIgnoreLists_NamespacesThatMayOrMayNotBeOneSchema(t *testing.T) {
+	cfg, err := ParseServerConfig([]byte(sharedTargetConfig))
+	require.NoError(t, err)
+	shop := SharedSchemaDatabase{
+		Database:   "shop",
+		ConfigPath: "db/shop/schemabot.yaml",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"north": createTables("users"),
+			"south": createTables("settings"),
+		},
+	}
+	sharded := namespacedSide("shop_sharded", "east", nil, "users")
+
+	t.Run("unpinned", func(t *testing.T) {
+		require.NoError(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, &targetSchemas{}))
+		require.NoError(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", sharded, []SharedSchemaDatabase{shop}, &targetSchemas{}))
+	})
+
+	t.Run("pinned", func(t *testing.T) {
+		err := cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, pinnedTo("shop_main"))
+		mismatch := requireListsMismatch(t, err)
+		assert.Equal(t, []DoublyDeclaredTables{{
+			Databases:  [2]string{"shop", "shop_sharded"},
+			Namespaces: [2]string{"north", "east"},
+			Schema:     "shop_main",
+			Target:     "shop-001",
+			Tables:     []string{"users"},
+		}}, mismatch.Doubled)
+		require.Len(t, mismatch.Missing, 1)
+		assert.Equal(t, "shop_sharded", mismatch.Missing[0].Database)
+		assert.Equal(t, "south", mismatch.Missing[0].Namespace)
+		assert.Equal(t, []string{"settings"}, mismatch.Missing[0].Tables)
+		assert.Empty(t, mismatch.DeclaredElsewhere)
+	})
+}
+
+// shop and shop_sharded both keep tables in namespace shop on one target,
+// which stores it in a schema of that name, and shop also has an archive
+// namespace there, stored in a schema of its own. shop_sharded declares users
+// in shop, and shop declares a users table of its own in the archive. A plan
+// of shop's namespace shop would drop shop_sharded's users, and no
+// ignore_tables entry can stop it: an entry naming users would also withhold
+// the archive's users, which the planner refuses. The check says so and names
+// the remedy instead of asking for an entry the planner would reject.
+func TestCheckSharedSchemaIgnoreLists_TableDeclaredInAnotherSchemaCannotBeIgnored(t *testing.T) {
+	cfg, err := ParseServerConfig([]byte(sharedTargetConfig))
+	require.NoError(t, err)
+	shop := SharedSchemaDatabase{
+		Database:   "shop",
+		ConfigPath: "db/shop/schemabot.yaml",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"shop":    createTables("settings"),
+			"archive": createTables("users"),
+		},
+	}
+	sharded := namespacedSide("shop_sharded", "shop", []string{"settings"}, "users")
+
+	err = cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, &targetSchemas{})
+	mismatch := requireListsMismatch(t, err)
+	assert.Empty(t, mismatch.Missing)
+	assert.Empty(t, mismatch.Doubled)
+	assert.Equal(t, []TableDeclaredElsewhere{{
+		Database:        "shop",
+		OwnerDeclaredIn: "archive",
+		DeclaredBy:      "shop_sharded",
+		Namespace:       "shop",
+		OwnerNamespace:  "shop",
+		Schema:          "shop",
+		Target:          "shop-001",
+		Table:           "users",
+	}}, mismatch.DeclaredElsewhere)
+	assert.Equal(t,
+		`"shop_sharded" declares "users" in namespace "shop", which "shop" shares on target "shop-001". "shop" also declares "users" in namespace "archive", and ignore_tables applies to every namespace of a database, so no entry can keep the table out of a plan of namespace "shop". Rename one of the two tables, or store the two namespaces in different schemas`,
+		err.Error())
+}
+
+// The check cannot compare a pair without knowing which schemas their
+// namespaces are, so a resolution that fails, including the refusal of a data
+// plane too old to answer, and one that leaves a namespace out, fail the
+// check. Neither is a list mismatch: the operator fixes the data plane, not
+// the schema files.
+func TestCheckSharedSchemaIgnoreLists_UnresolvedNamespacesFailClosed(t *testing.T) {
+	cfg, err := ParseServerConfig([]byte(sharedTargetConfig))
+	require.NoError(t, err)
+	shop := namespacedSide("shop", "shop", []string{"orders"}, "settings")
+	sharded := namespacedSide("shop_sharded", "shop_sharded", []string{"settings"}, "orders")
+
+	for name, tc := range map[string]struct {
+		resolver *targetSchemas
+		database string
+		want     string
+		tooOld   bool
+	}{
+		"a data plane too old to answer": {
+			resolver: &targetSchemas{err: fmt.Errorf("upgrade it: %w", tern.ErrResolveNamespacesUnsupported)},
+			database: "shop",
+			want:     `resolve the schemas that namespaces [shop] of database "shop" address on target "shop-001" of deployment "us" in environment "production": upgrade it: namespace resolution unsupported`,
+			tooOld:   true,
+		},
+		"a resolution that fails": {
+			resolver: &targetSchemas{err: errors.New("connection refused")},
+			database: "shop",
+			want:     `resolve the schemas that namespaces [shop] of database "shop" address on target "shop-001" of deployment "us" in environment "production": connection refused`,
+		},
+		"a namespace left unresolved": {
+			resolver: &targetSchemas{omit: "shop_sharded"},
+			database: "shop_sharded",
+			want:     `resolve the schemas that namespaces [shop_sharded] of database "shop_sharded" address on target "shop-001" of deployment "us" in environment "production": data plane resolved no schema for namespace "shop_sharded"`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, tc.resolver)
+			require.EqualError(t, err, tc.want)
+			var mismatch *SharedSchemaIgnoreListsError
+			assert.False(t, errors.As(err, &mismatch), "an unresolved namespace is not a list mismatch: %v", err)
+			resolution, ok := errors.AsType[*NamespaceResolutionError](err)
+			require.True(t, ok, "want a NamespaceResolutionError, got %v", err)
+			assert.Equal(t, tc.database, resolution.Database)
+			assert.Equal(t, "us", resolution.Deployment)
+			assert.Equal(t, "shop-001", resolution.Target)
+			assert.Equal(t, tc.tooOld, resolution.DataPlaneTooOld())
+		})
+	}
+
+	t.Run("no resolver", func(t *testing.T) {
+		err := cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, nil)
+		require.ErrorContains(t, err, `namespace resolver is required to compare database "shop"`)
 	})
 }
