@@ -53,7 +53,7 @@ func TestClassifyRefusal(t *testing.T) {
 			}),
 			wantReason: "insufficient-privileges",
 			wantDetail: []string{
-				"in-place ALTER TABLE",
+				"in-place changes that need ownership",
 				`table "users"`,
 				`GRANT "app_owner" TO "limited" WITH INHERIT TRUE`,
 				"pg_has_role(limited, app_owner, 'USAGE')",
@@ -1087,6 +1087,9 @@ func TestCatalogAndRowRefusalsNameTheirRemedies(t *testing.T) {
 			remedy: "re-plan against the current schema"},
 		{code: executor.CodeRenamedIndexDrift, reason: "planned-object-drift",
 			cause:  `the index or constraint the planned statement for "users" names changed after planning`,
+			remedy: "re-plan against the current schema"},
+		{code: executor.CodeEnumTypeDrift, reason: "planned-object-drift",
+			cause:  `the enum type the planned statement for "users" names is a different type than the one checked`,
 			remedy: "re-plan against the current schema"},
 		{code: executor.CodeDataFault, reason: "data-fault",
 			cause:  `the rows of "users" do not fit the shape the planned statement gives them`,

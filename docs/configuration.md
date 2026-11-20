@@ -429,6 +429,7 @@ secret it reads:
 | `secret_name` | the secret, templated over `{target}` and any `{attribute}` | required |
 | `role_arn`, `account_attribute`, `external_id` | the AWS account, by assuming `role_arn` in the account `account_attribute` names | the data plane's own account |
 | `region`, `region_attribute`, `reachable_regions` | the region the secret is read in | required: `region` |
+| `secrets_manager_endpoints` | the Secrets Manager endpoint each region's reads are sent to | each region's public endpoint |
 
 #### Which region a secret is read in
 
@@ -502,6 +503,36 @@ Shapes can mix: a cluster in a region that is not listed still has its secret
 read in `region`, so it needs a replica there while the clusters in listed
 regions do not.
 
+**The data plane reaches Secrets Manager in a region only through a private
+endpoint.** A data plane with no route to the public internet can often still
+call Secrets Manager in another region through an interface VPC endpoint in
+that region, reached over private networking. The SDK sends each read to the
+region's public endpoint unless told otherwise, so name the private one in
+`secrets_manager_endpoints`:
+
+```yaml
+credentials:
+  type: awssm
+  region: us-west-2
+  region_attribute: aws_region
+  reachable_regions: [us-east-1]
+  secrets_manager_endpoints:
+    us-east-1: https://vpce-0example.secretsmanager.us-east-1.vpce.amazonaws.com
+  role_arn: "arn:aws:iam::{account}:role/schemabot-reader"
+  secret_name: "{target}/schemabot"
+```
+
+Each key must be `region` or a region listed in `reachable_regions`, and each
+value an `https` URL that names only a host. The resolver refuses to start
+otherwise, rather than ignore an entry for a region no secret is read in.
+Reads are still signed for the region, so an entry changes where a read is
+sent and never which region's secret it reads. A region without an entry
+uses its public endpoint. Roles are assumed through STS in `region` as before,
+so this setting does not change how STS is reached. Secrets Manager rejects a
+custom endpoint in FIPS or dual-stack mode, so the resolver also refuses to
+start with this setting when the AWS config enables either (for example through
+`AWS_USE_FIPS_ENDPOINT`).
+
 #### What each target account provides
 
 In the account and region a target's secret is read in, the read needs:
@@ -558,7 +589,10 @@ resolver matches and confirm each one carries a region name in
 listing a region there, also confirm that the data plane can
 call Secrets Manager there and that every target in that region has its secret
 there: a listed region the data plane cannot reach turns each of those reads
-into a connection failure.
+into a connection failure. The same holds for an entry in
+`secrets_manager_endpoints`: confirm from the data plane that the endpoint
+resolves and accepts a connection, and that its endpoint policy allows the
+reading identity, before pointing a region's reads at it.
 
 ## gRPC Mode
 
@@ -2599,6 +2633,19 @@ tern_deployments:
 ```
 
 Do not require the staging ConfigMap to contain production targets, or the production ConfigMap to contain staging targets. Each instance resolves only the environments it owns.
+
+### Freeze groups (forward-auth)
+
+An environment freeze marks an environment, or some of its deployments and databases, as frozen until it ends or someone lifts it. In this release SchemaBot records and lists freezes; refusing applies and cutovers during a freeze arrives with the change gate in a later release. Each freeze records a running policy: `continue`, the default, lets applies that started before the freeze finish, and `stop` asks SchemaBot to stop them; acting on `stop` also arrives later. Whether a freeze is in effect is decided by the database clock, so every pod agrees. A freeze is stored by the instance that serves its environment. `write_groups` members may set and lift freezes. To let others, such as incident commanders, do so without any other write, list their forwarded groups in `freeze.groups`:
+
+```yaml
+auth:
+  type: forward_auth
+freeze:
+  groups: [incident-commanders]
+```
+
+The middleware admits `freeze.groups` members to write-tier endpoints, and the freeze handlers (`POST /api/freezes`, `POST /api/freezes/{id}/lift`) allow them. Every other mutating handler still requires `write_groups` or a database's `operator_groups`, and database operator grants do not cover freezes, which reach past any one database. Members also get the read tier, deployment-wide. `freeze.groups` requires `auth.type: forward_auth`, and its entries must be unique; either mistake is a startup error. Under other auth types, freezes follow the plain admin write gate.
 
 ### Tenant-scoped command routing
 

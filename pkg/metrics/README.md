@@ -77,6 +77,11 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.webhook.inbox_oldest_claimable_age_seconds` | Gauge | environment | Age of the oldest ready-to-claim durable webhook inbox row |
 | `schemabot.webhook.inbox_stuck_processing` | Gauge | environment | Durable webhook inbox rows stuck in processing past the attempt cap |
 | `schemabot.webhook.inbox_stats_collection_failures` | Counter | environment | Failed durable webhook inbox metric snapshots (liveness signal for the inbox gauges) |
+| `schemabot.environment.frozen` | Gauge | environment, scope | `1` while a freeze of this scope is in effect in the environment, else `0`. `scope` is `environment` for a whole-environment freeze and `partial` for one narrowed to some deployments or databases; both are reported for every environment the instance serves, from one snapshot taken every 30s by the database clock, so a scrape never mixes two snapshots. Exported as `schemabot_environment_frozen`. |
+| `schemabot.environment.freeze_open_seconds` | Gauge | environment | Age in seconds of the oldest open-ended freeze in effect, `0` when none is. Planned freezes have an end time and are not counted. Alert on it to catch a forgotten incident freeze. |
+| `schemabot.environment.frozen_collection_failures` | Counter | environment | Failed freeze snapshots (liveness signal for the frozen gauge) |
+| `schemabot.change_gate.refusals` | Counter | environment, gate, checkpoint | Applies, starts and cutovers refused by a change gate, once per blocking gate (`freeze`) |
+| `schemabot.change_gate.errors` | Counter | environment, checkpoint | Change gate checks that failed, refusing the change with a retryable 503 (`start`, `resume`, `cutover`) |
 | `schemabot.webhook.check_suite_recovery_total` | Counter | environment, repository, outcome | Durable check_suite recovery outcomes (`covered`, `synthesized`, `resynthesized`, `already_queued` per candidate PR; `no_pr_at_ingress`, `no_open_pr`, `truncated` per delivery) |
 | `schemabot.webhook.inbox_dispatch_lag_seconds` | Histogram | environment, event_type, repository | Time from webhook receipt to the delivery's first dispatch claim |
 | `schemabot.webhook.dispatch_duration_seconds` | Histogram | environment, event_type, outcome | Duration of one durable webhook dispatch claim by outcome (deliberately no repository label — see the ledger note below) |
@@ -549,7 +554,7 @@ Reason values:
 
 | Reason | Meaning |
 |---|---|
-| `scoped_lane_disabled` | No database has `operator_groups`; the decision is the plain admin gate. |
+| `scoped_lane_disabled` | No database has `operator_groups` and `freeze.groups` is empty; the decision is the plain admin gate. |
 | `target_unresolved` | The stored plan named by the request failed to load or does not exist, so no target database was available to authorize against. |
 | `admin_allow` | Allowed via deployment `write_groups` membership. |
 | `scoped_allow` | Allowed via the target database's `operator_groups` grant. |
@@ -558,10 +563,12 @@ Reason values:
 | `not_database_operator` | Caller's groups do not match the target database's `operator_groups`. |
 | `environment_not_allowed` | Target environment is outside `operator_environments`. |
 | `missing_database_config` | The target database is not configured. |
+| `freeze_allow` | Freeze write allowed via `freeze.groups` membership. |
+| `not_freeze_admin` | Freeze write denied: caller is in neither `write_groups` nor `freeze.groups`. |
 
 Operation names mirror the mutating endpoints (`plan`, `apply`, control
 operations, `lock_acquire`/`lock_release`/`lock_force_release`, and the
-admin-only `checks_*`, `settings_set`). Unrecognized
+admin-only `checks_*`, `settings_set`, and the freeze writes `freeze_create`/`freeze_lift`). Unrecognized
 operation, status, or reason values are recorded as `unknown` to keep
 cardinality bounded. `database` and `environment` use the `unknown` sentinel
 when the operation has no such dimension (admin-only operations have no single

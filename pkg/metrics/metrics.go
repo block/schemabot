@@ -602,6 +602,8 @@ var knownDirectWriteAuthOperations = map[string]bool{
 	"checks_synthesize":  true,
 	"checks_repos":       true,
 	"settings_set":       true,
+	"freeze_create":      true,
+	"freeze_lift":        true,
 
 	"storage_schema_plan":  true,
 	"storage_schema_apply": true,
@@ -623,6 +625,8 @@ var knownDirectWriteAuthReasons = map[string]bool{
 	"not_database_operator":   true,
 	"environment_not_allowed": true,
 	"missing_database_config": true,
+	"freeze_allow":            true,
+	"not_freeze_admin":        true,
 	"unknown":                 true,
 }
 
@@ -2079,6 +2083,65 @@ func RecordWebhookInboxStuckProcessing(ctx context.Context, count int64) {
 	recordGauge(ctx, "schemabot.webhook.inbox_stuck_processing", count,
 		"Number of durable webhook inbox rows stuck in processing past the attempt cap", "{row}",
 		EnvironmentAttribute(""),
+	)
+}
+
+// Freeze scopes for schemabot.environment.frozen.
+const (
+	// FreezeScopeEnvironment is a freeze of the whole environment.
+	FreezeScopeEnvironment = "environment"
+	// FreezeScopePartial is a freeze narrowed to some deployments or
+	// databases.
+	FreezeScopePartial = "partial"
+)
+
+// RecordEnvironmentFreezeCollectionFailure counts failed freeze snapshots. The
+// frozen gauge is last-value, so a failed snapshot leaves it at its last
+// values; a nonzero rate means the gauge is stale.
+func RecordEnvironmentFreezeCollectionFailure(ctx context.Context) {
+	addCounterN(ctx, 1, environmentFreezeCollectionFailures, environmentFreezeCollectionFailuresDescription, "{failure}",
+		EnvironmentAttribute(""),
+	)
+}
+
+// InitEnvironmentFreezeCollectionFailures exports the freeze collection
+// failure counter at 0, so a rate or increase alert sees the first failure.
+func InitEnvironmentFreezeCollectionFailures(ctx context.Context) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter(environmentFreezeCollectionFailures,
+		otelmetric.WithDescription(environmentFreezeCollectionFailuresDescription),
+		otelmetric.WithUnit("{failure}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create counter", "metric", environmentFreezeCollectionFailures, "error", err)
+		return
+	}
+	counter.Add(ctx, 0, otelmetric.WithAttributes(EnvironmentAttribute("")))
+}
+
+const (
+	environmentFreezeCollectionFailures            = "schemabot.environment.frozen_collection_failures"
+	environmentFreezeCollectionFailuresDescription = "Total number of failed environment freeze metric snapshots"
+)
+
+// RecordChangeGateRefusal counts applies, starts and cutovers a change gate
+// refused, once per gate that blocked the attempt.
+func RecordChangeGateRefusal(ctx context.Context, environment, gate, checkpoint string) {
+	addCounter(ctx, "schemabot.change_gate.refusals",
+		"Total number of applies, starts and cutovers refused by a change gate", "{refusal}",
+		EnvironmentAttribute(environment),
+		attribute.String("gate", gate),
+		attribute.String("checkpoint", checkpoint),
+	)
+}
+
+// RecordChangeGateError counts change gate checks that failed, so the apply,
+// start or cutover was refused without knowing whether a gate blocks it.
+func RecordChangeGateError(ctx context.Context, environment, checkpoint string) {
+	addCounter(ctx, "schemabot.change_gate.errors",
+		"Total number of change gate checks that failed and refused the change", "{error}",
+		EnvironmentAttribute(environment),
+		attribute.String("checkpoint", checkpoint),
 	)
 }
 

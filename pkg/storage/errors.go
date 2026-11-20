@@ -37,6 +37,21 @@ var (
 	// ErrSettingNotFound is returned when a setting does not exist.
 	ErrSettingNotFound = errors.New("setting not found")
 
+	// ErrFreezeNotFound is returned when a freeze does not exist.
+	ErrFreezeNotFound = errors.New("freeze not found")
+
+	// ErrFreezeExists is returned when a freeze's identifier, or its source
+	// and external id, is already taken.
+	ErrFreezeExists = errors.New("freeze already exists")
+
+	// ErrFreezeAlreadyLifted is returned when lifting a freeze someone else
+	// already lifted.
+	ErrFreezeAlreadyLifted = errors.New("freeze already lifted")
+
+	// ErrFreezeEnded is returned when lifting a freeze that already reached
+	// its end time.
+	ErrFreezeEnded = errors.New("freeze already ended")
+
 	// ErrApplyNotFound is returned when an apply does not exist.
 	ErrApplyNotFound = errors.New("apply not found")
 

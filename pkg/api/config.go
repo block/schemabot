@@ -100,6 +100,10 @@ type ServerConfig struct {
 	// behavior is preserved.
 	PRCommandAuthorization PRCommandAuthorizationConfig `yaml:"pr_command_authorization,omitempty"`
 
+	// Freeze configures environment freezes: who besides the deployment
+	// write groups may set and lift them.
+	Freeze FreezeConfig `yaml:"freeze,omitempty"`
+
 	// ReviewPolicy controls whose PR approvals satisfy the review gate before
 	// apply/apply-confirm proceeds.
 	ReviewPolicy ReviewPolicyConfig `yaml:"review_policy,omitempty"`
@@ -1251,13 +1255,21 @@ type EtreCredentialsConfig struct {
 	// RegionAttribute: a target whose cluster is in one of them has its secret
 	// read there, and every other target's secret is read in Region, so it must
 	// be replicated there.
-	Region           string   `yaml:"region,omitempty"`
-	RegionAttribute  string   `yaml:"region_attribute,omitempty"`
-	ReachableRegions []string `yaml:"reachable_regions,omitempty"`
-	RoleARN          string   `yaml:"role_arn,omitempty"`
-	ExternalID       string   `yaml:"external_id,omitempty"`
-	SecretName       string   `yaml:"secret_name,omitempty"`
-	AccountAttribute string   `yaml:"account_attribute,omitempty"`
+	//
+	// SecretsManagerEndpoints maps a region to the Secrets Manager endpoint URL
+	// to call there, for a data plane that reaches Secrets Manager through a
+	// private endpoint (such as an interface VPC endpoint) instead of the public
+	// regional one. Each key must be Region or one of ReachableRegions, and each
+	// value an https URL naming only a host. A region without an entry uses the
+	// default endpoint.
+	Region                  string            `yaml:"region,omitempty"`
+	RegionAttribute         string            `yaml:"region_attribute,omitempty"`
+	ReachableRegions        []string          `yaml:"reachable_regions,omitempty"`
+	SecretsManagerEndpoints map[string]string `yaml:"secrets_manager_endpoints,omitempty"`
+	RoleARN                 string            `yaml:"role_arn,omitempty"`
+	ExternalID              string            `yaml:"external_id,omitempty"`
+	SecretName              string            `yaml:"secret_name,omitempty"`
+	AccountAttribute        string            `yaml:"account_attribute,omitempty"`
 }
 
 // DatabaseConfig holds configuration for a registered database.
@@ -2657,6 +2669,9 @@ func (c *ServerConfig) Validate() error {
 	}
 
 	if err := c.validateOperatorScoping(); err != nil {
+		return err
+	}
+	if err := c.validateFreeze(); err != nil {
 		return err
 	}
 

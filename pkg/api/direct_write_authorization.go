@@ -50,11 +50,16 @@ type DirectWriteAuthorizationResult struct {
 	MatchedPrincipal string
 }
 
-// scopedWriteEnabled reports whether any database opts into scoped direct
-// write. When false, the middleware write gate (write groups only) is the
-// whole decision and the handler-level check is a pass-through, preserving
-// the semantics of deployments that never configure operator groups.
+// scopedWriteEnabled reports whether any caller outside the write groups can
+// pass the middleware write gate: a database opts into scoped direct write,
+// or freeze groups are configured. When false, the middleware write gate
+// (write groups only) is the whole decision and the handler-level check is a
+// pass-through, preserving the semantics of deployments that configure
+// neither.
 func (c *ServerConfig) scopedWriteEnabled() bool {
+	if len(trimmedNonEmpty(c.Freeze.Groups)) > 0 {
+		return true
+	}
 	for _, dbConfig := range c.DatabaseConfigs() {
 		if len(trimmedNonEmpty(dbConfig.OperatorGroups)) > 0 {
 			return true
@@ -418,6 +423,8 @@ func (s *Service) directWriteDenialMessage(operation, database, environment stri
 			operation, strings.Join(writeGroups, ", "))
 	case DirectWriteReasonMissingIdentity:
 		return fmt.Sprintf("%s requires an authenticated caller identity", operation)
+	case DirectWriteReasonNotFreezeAdmin:
+		return s.freezeDenialMessage(operation)
 	default:
 		grantingGroups := writeGroups
 		if dbConfig, ok := s.config.DatabaseConfigs()[database]; ok {

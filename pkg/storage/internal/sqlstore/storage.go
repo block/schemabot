@@ -27,6 +27,7 @@ type Storage struct {
 	applyOperations *applyOperationStore
 	checks          *checkStore
 	settings        *settingsStore
+	freezes         *freezeStore
 	webhookEvents   *webhookEventStore
 	driverPools     *driverPoolStore
 }
@@ -97,6 +98,7 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier, maxDriversPerApply: maxDriversPerApply},
 		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		settings:        &settingsStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
+		freezes:         &freezeStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 		webhookEvents:   &webhookEventStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 		driverPools:     &driverPoolStore{db: rdb, dialect: deps.Dialect},
 	}
@@ -155,6 +157,11 @@ func (s *Storage) Checks() storage.CheckStore {
 // Settings returns the settings store.
 func (s *Storage) Settings() storage.SettingsStore {
 	return s.settings
+}
+
+// Freezes returns the environment freeze store.
+func (s *Storage) Freezes() storage.FreezeStore {
+	return s.freezes
 }
 
 // WebhookEvents returns the durable webhook event inbox store.

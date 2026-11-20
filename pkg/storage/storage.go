@@ -121,6 +121,9 @@ type Storage interface {
 	// Settings returns the settings store.
 	Settings() SettingsStore
 
+	// Freezes returns the environment freeze store.
+	Freezes() FreezeStore
+
 	// WebhookEvents returns the durable webhook event inbox store.
 	WebhookEvents() WebhookEventStore
 
@@ -355,6 +358,57 @@ type CheckStore interface {
 	//     it to action_required when the schema change is gone from the PR,
 	//     or a fresh plan result replaces it when the change is still present.
 	DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int, merged bool) error
+}
+
+// FreezeStore records environment freezes. While a freeze is in effect,
+// SchemaBot refuses new changes in its scope unless they carry an override.
+// Freezes may overlap, and each is lifted by its own identifier. A row stays
+// after its freeze ends or is lifted, as the audit trail.
+//
+// Environments, deployments and databases are identity strings: the store
+// passes them through CanonicalKey.
+type FreezeStore interface {
+	// Create records a freeze and returns it as stored. It returns
+	// ErrFreezeExists when the identifier, or the source and external id, is
+	// already taken.
+	Create(ctx context.Context, freeze *EnvironmentFreeze) (*EnvironmentFreeze, error)
+
+	// Get returns the freeze with this identifier, or ErrFreezeNotFound.
+	Get(ctx context.Context, identifier string) (*EnvironmentFreeze, error)
+
+	// Lift ends a freeze early and returns it as lifted. The update is
+	// conditional, so two concurrent lifts end it once. It returns
+	// ErrFreezeNotFound when there is no such freeze, ErrFreezeAlreadyLifted
+	// when someone lifted it first, and ErrFreezeEnded when it already
+	// reached its end time. The lift time is the database's clock.
+	Lift(ctx context.Context, identifier, liftedBy, reason string) (*EnvironmentFreeze, error)
+
+	// ListInEffect returns the freezes in effect now, oldest start first.
+	// An empty environment returns every environment's freezes. "Now" is the
+	// database's clock, so every pod agrees at the edges of a freeze.
+	ListInEffect(ctx context.Context, environment string) ([]*EnvironmentFreeze, error)
+
+	// List reads one consistent view of the freezes: the ones in effect or
+	// scheduled at the database's clock, and up to recent freezes of any
+	// state. An empty environment returns every environment's freezes.
+	List(ctx context.Context, environment string, recent int) (*FreezeListing, error)
+
+	// Now returns the database's clock, the one ListInEffect compares
+	// against. A caller that labels a freeze as in effect or scheduled uses
+	// it, so the label agrees with the query.
+	Now(ctx context.Context) (time.Time, error)
+}
+
+// FreezeListing is what FreezeStore.List read. Both lists come from one
+// snapshot of the store, and Now is the database clock they were filtered
+// by, so a caller that labels them by Now never contradicts itself.
+type FreezeListing struct {
+	Now time.Time
+	// Current holds the freezes in effect or scheduled at Now, oldest start
+	// first.
+	Current []*EnvironmentFreeze
+	// Recent holds the most recent freezes of any state, newest start first.
+	Recent []*EnvironmentFreeze
 }
 
 // SettingsStore manages admin-level SchemaBot settings (global config).

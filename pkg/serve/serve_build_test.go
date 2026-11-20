@@ -163,6 +163,42 @@ func TestForwardAuthEnforcedThroughServerHandler(t *testing.T) {
 	})
 }
 
+// A freeze.groups member passes the forward-auth write gate and reaches the
+// freeze handler, which rejects this empty body with 400, while every other
+// admin write still refuses them with 403 in its handler.
+func TestFreezeGroupAdmittedThroughServerHandler(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	cfg := &api.ServerConfig{
+		Auth: api.AuthConfig{
+			Type: "forward_auth",
+			ForwardAuth: api.ForwardAuthSettings{
+				TrustedProxyCIDRs: []string{"192.0.2.0/24"},
+				GroupsHeader:      "X-Forwarded-Capabilities",
+				WriteGroups:       []string{"owners"},
+			},
+		},
+		Freeze: api.FreezeConfig{Groups: []string{"incident-commanders"}},
+	}
+	svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
+	webhook, err := buildWebhookRuntime(cfg, svc, logger)
+	require.NoError(t, err)
+	authz, err := buildServerAuthorizer(t.Context(), cfg, logger)
+	require.NoError(t, err)
+	handler := (&Server{cfg: cfg, svc: svc, logger: logger, webhook: webhook, authz: authz}).Handler()
+
+	post := func(path string) int {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, nil)
+		req.RemoteAddr = "192.0.2.1:1234"
+		req.Header.Set("X-Forwarded-User", "ida")
+		req.Header.Set("X-Forwarded-Capabilities", "incident-commanders")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	assert.Equal(t, http.StatusBadRequest, post("/api/freezes"))
+	assert.Equal(t, http.StatusForbidden, post("/api/settings"))
+}
+
 // Configuring the service-caller lane (trusted_gateway_spiffe +
 // read_service_spiffe + caller_spiffe_header) wires all three settings through
 // buildAuthorizer into the real HTTP handler: a listed caller arriving through

@@ -103,14 +103,17 @@ const (
 	ErrCodePlanBlocked             = "plan_blocked"              // Plan carries a change the engine refuses; no retry or option can apply it
 	ErrCodeAlreadyStopped          = "already_stopped"           // Stop refused: the schema change is already stopped and no start is queued behind it
 	ErrCodeDeferredCutoverCapacity = "deferred_cutover_capacity" // --defer-cutover refused: the apply would hold more drivers at its cutover than are left for deferred work; apply without the flag
+	ErrCodeChangeGateRefused       = "change_gate_refused"       // Apply, start or cutover refused by a change gate, such as a freeze; the blockers say why
+	ErrCodeChangeGateUnavailable   = "change_gate_unavailable"   // SchemaBot could not check the change gates, so nothing started; retry
 )
 
 var retryableErrorCodes = map[string]bool{
-	ErrCodeEngineErrorRetryable: true,
-	ErrCodeStorageError:         true,
-	ErrCodeEngineUnavailable:    true,
-	ErrCodeStateSyncFailed:      true,
-	ErrCodeRateLimited:          true,
+	ErrCodeEngineErrorRetryable:  true,
+	ErrCodeStorageError:          true,
+	ErrCodeEngineUnavailable:     true,
+	ErrCodeStateSyncFailed:       true,
+	ErrCodeRateLimited:           true,
+	ErrCodeChangeGateUnavailable: true,
 }
 
 // IsRetryableErrorCode reports whether the given API error code represents a
@@ -135,6 +138,24 @@ type ErrorResponse struct {
 	// header in the body so a client that reads only the error body, such as
 	// an older CLI, still sees the wait.
 	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
+
+	// Blockers lists what refused a change_gate_refused apply, start or
+	// cutover.
+	Blockers []ChangeGateBlocker `json:"blockers,omitempty"`
+}
+
+// ChangeGateBlocker is one reason a change gate refused an apply, start or
+// cutover.
+type ChangeGateBlocker struct {
+	// Gate names the gate that refused, such as "freeze".
+	Gate string `json:"gate"`
+	// ID identifies what blocks, such as the freeze identifier.
+	ID string `json:"id"`
+	// Reason is the blocker's own explanation, such as the freeze reason.
+	Reason string `json:"reason"`
+	// EndsAt is when the blocker ends on its own. Empty when it ends only
+	// when someone lifts it.
+	EndsAt *time.Time `json:"ends_at,omitempty"`
 }
 
 // RetryAfter reports whether a client should retry this error and how long it

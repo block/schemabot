@@ -290,9 +290,33 @@ func TestEngineRowSecurityMissingTableRefuses(t *testing.T) {
 	assert.True(t, absent)
 }
 
-// Unsupported relation dependencies must refuse the whole pull, not omit a policy.
+// A policy that reads another table through a CTE names a relation the
+// baseline cannot render schema-qualified, so the whole pull is refused
+// rather than written without the policy.
 func TestEnginePullRefusesPolicyRelationDependency(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "rls_dependency")
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.accounts (id bigint PRIMARY KEY);
+  CREATE TABLE public.documents (id bigint PRIMARY KEY);
+  ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON public.documents FOR SELECT
+   USING (EXISTS (WITH member AS (SELECT id FROM public.accounts)
+                  SELECT 1 FROM member WHERE member.id = documents.id));
+ `)
+	require.NoError(t, err)
+	eng := NewForTarget(0, 0, "rls_dependency", &engine.Credentials{DSN: dsn})
+	result, err := eng.PullSchema(ctx, &ternv1.PullSchemaRequest{Namespace: "public"})
+	require.ErrorIs(t, err, statement.ErrPolicyRelationDependency)
+	assert.Nil(t, result)
+}
+
+// A membership-check policy that reads another table by its schema-qualified
+// name is part of the baseline: the pull writes the policy with the table
+// still named schema-qualified, so a later plan compares against it.
+func TestEnginePullKeepsAPolicyThatReadsAQualifiedTable(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "rls_qualified_read")
 	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
 	defer cancel()
 	_, err := db.ExecContext(ctx, `
@@ -303,8 +327,10 @@ func TestEnginePullRefusesPolicyRelationDependency(t *testing.T) {
    USING (EXISTS (SELECT 1 FROM public.accounts WHERE accounts.id = documents.id));
  `)
 	require.NoError(t, err)
-	eng := NewForTarget(0, 0, "rls_dependency", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "rls_qualified_read", &engine.Credentials{DSN: dsn})
 	result, err := eng.PullSchema(ctx, &ternv1.PullSchemaRequest{Namespace: "public"})
-	require.ErrorIs(t, err, statement.ErrPolicyRelationDependency)
-	assert.Nil(t, result)
+	require.NoError(t, err)
+	documents := result.GetNamespaces()["public"].GetTables()["documents"]
+	assert.Contains(t, documents, `CREATE POLICY "readers" ON "documents"`)
+	assert.Contains(t, documents, "FROM public.accounts", "the table the policy reads stays schema-qualified")
 }
