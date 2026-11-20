@@ -2602,7 +2602,7 @@ Do not require the staging ConfigMap to contain production targets, or the produ
 
 ### Freeze groups (forward-auth)
 
-An environment freeze stops new schema changes in an environment, or in some of its deployments and databases, until it ends or someone lifts it. `write_groups` members may set and lift freezes. To let others, such as incident commanders, do so without any other write, list their forwarded groups in `freeze.groups`:
+An environment freeze marks an environment, or some of its deployments and databases, as frozen until it ends or someone lifts it. In this release SchemaBot records and lists freezes; refusing applies and cutovers during a freeze arrives with the change gate in a later release. A freeze is stored by the instance that serves its environment. `write_groups` members may set and lift freezes. To let others, such as incident commanders, do so without any other write, list their forwarded groups in `freeze.groups`:
 
 ```yaml
 auth:

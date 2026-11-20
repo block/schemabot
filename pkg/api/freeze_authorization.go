@@ -39,6 +39,14 @@ func (c *ServerConfig) validateFreeze() error {
 	return validateUniqueNames("freeze.groups", groups)
 }
 
+// ServesEnvironment reports whether this instance stores and acts on freezes
+// of env: the environment is allowed here and at least one configured
+// database routes it. A peer instance's environment is not served, even when
+// the fleet-wide promotion order names it (AZ-2).
+func (c *ServerConfig) ServesEnvironment(env string) bool {
+	return c.IsEnvironmentAllowed(env) && c.environmentConfiguredOnAnyDatabase(env)
+}
+
 // ScopedWriteGroupUnion returns the sorted, deduplicated union of the database
 // operator groups and the freeze groups. The forward-auth middleware widens
 // write-tier admission to this union; each handler then decides what the

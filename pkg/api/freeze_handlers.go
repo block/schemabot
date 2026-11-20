@@ -64,8 +64,8 @@ func (s *Service) freezeFromRequest(ctx context.Context, req *apitypes.CreateFre
 	if environment == "" {
 		return nil, errors.New("environment is required")
 	}
-	if !config.IsEnvironmentKnown(environment) {
-		return nil, fmt.Errorf("environment %q is not configured", environment)
+	if !config.ServesEnvironment(environment) {
+		return nil, fmt.Errorf("environment %q is not served by this instance", environment)
 	}
 	databases := canonicalFreezeScope(req.Databases)
 	for _, database := range databases {
@@ -230,18 +230,23 @@ func (s *Service) freezeStorageReady(w http.ResponseWriter) bool {
 	return true
 }
 
-// freezeCaller names the caller who sets or lifts a freeze: the verified
-// subject when the request came through a verified lane, else the
-// authenticated subject, else "anonymous" (auth type none).
+// freezeCaller names the caller who sets or lifts a freeze. Only a subject
+// from a verified lane is recorded (AZ-3): a direct-to-pod request admitted
+// with caller-supplied identity headers is recorded as "unverified", and a
+// request with no identity (auth type none) as "anonymous".
 func freezeCaller(ctx context.Context) string {
 	if subject, ok := auth.VerifiedSubject(ctx); ok {
 		return subject
 	}
-	if subject, ok := auth.AuthenticatedSubject(ctx); ok {
-		return subject
+	if _, ok := auth.AuthenticatedSubject(ctx); ok {
+		return unverifiedFreezeCaller
 	}
 	return "anonymous"
 }
+
+// unverifiedFreezeCaller records a freeze action whose caller is admitted but
+// not verified.
+const unverifiedFreezeCaller = "unverified"
 
 // canonicalFreezeScope folds scope entries. A blank entry stays, so
 // Validate refuses it instead of the freeze silently widening.

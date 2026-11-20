@@ -187,7 +187,7 @@ func TestFreezeCreateRejectsInvalidRequests(t *testing.T) {
 	_, mux := newFreezeTestService(t, freezeConfig())
 
 	tests := map[string]struct{ body, want string }{
-		"unknown environment":  {`{"environment":"qa","reason":"x"}`, `environment "qa" is not configured`},
+		"unknown environment":  {`{"environment":"qa","reason":"x"}`, `environment "qa" is not served by this instance`},
 		"unknown database":     {`{"environment":"staging","databases":["ledger"],"reason":"x"}`, `database "ledger" is not configured`},
 		"database without env": {`{"environment":"production","databases":["orders"],"reason":"x"}`, `database "orders" has no environment "production"`},
 		"missing reason":       {`{"environment":"staging"}`, "reason is required"},
@@ -320,4 +320,32 @@ func TestServerConfig_ValidateFreeze(t *testing.T) {
 	config = testServerConfig()
 	config.Freeze.Groups = []string{"incident-commanders"}
 	require.ErrorContains(t, config.Validate(), "freeze.groups requires auth type forward_auth")
+}
+
+// A staging-only instance names production in its promotion order but does
+// not serve it, so it refuses a production freeze instead of recording it in
+// its own store, where the production instance would never see it.
+func TestFreezeCreateRefusesPeerEnvironment(t *testing.T) {
+	config := freezeConfig()
+	config.AllowedEnvironments = []string{"staging"}
+	config.EnvironmentOrder = []string{"staging", "production"}
+	_, mux := newFreezeTestService(t, config)
+
+	w := doFreezeRequest(t, mux, freezeAdmin, http.MethodPost, "/api/freezes", `{"environment":"production","reason":"incident"}`)
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `environment \"production\" is not served by this instance`)
+}
+
+// A direct-to-pod request admitted with caller-supplied identity headers may
+// still freeze, but the freeze never names the asserted subject (AZ-3).
+func TestFreezeCreateRecordsUnverifiedCaller(t *testing.T) {
+	_, mux := newFreezeTestService(t, freezeConfig())
+
+	ctx := auth.WithUser(t.Context(), &auth.User{Subject: "mallory", Groups: []string{"schema-admins"}})
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/freezes", strings.NewReader(`{"environment":"staging","reason":"incident"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	assert.Equal(t, unverifiedFreezeCaller, decodeFreeze(t, w).CreatedBy)
 }
