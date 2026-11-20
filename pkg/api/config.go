@@ -1888,6 +1888,9 @@ func (c *PlanetScaleConfig) validate() error {
 
 // RepoConfig holds configuration for a specific repository.
 type RepoConfig struct {
+	// PRSchemaCap limits planning fan-out for pull requests in this repository.
+	PRSchemaCap *PRSchemaCapConfig `yaml:"pr_schema_cap,omitempty"`
+
 	// EnableChecks controls whether SchemaBot publishes GitHub Check Runs for
 	// this repository. Stored check state is still maintained for SchemaBot's
 	// own safety gates. Defaults to true when not configured.
@@ -2650,6 +2653,9 @@ func (c *ServerConfig) Validate() error {
 	for repo, repoConfig := range c.Repos {
 		if repo != storage.CanonicalKey(repo) {
 			return fmt.Errorf("repos repository key %q must be canonical", repo)
+		}
+		if err := c.validatePRSchemaCap(repo, repoConfig); err != nil {
+			return err
 		}
 		if err := validateAggregateConfig(repo, repoConfig.Aggregate); err != nil {
 			return err

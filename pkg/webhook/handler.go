@@ -76,8 +76,9 @@ const (
 
 // Handler processes GitHub webhook events.
 type Handler struct {
-	service   *api.Service
-	ghClients github.ClientSet
+	service         *api.Service
+	ghClients       github.ClientSet
+	prPlanDiscovery prPlanDiscoveryCache
 
 	// shardedPlans is the sharded plan cache every comment render this
 	// handler starts shares; see shardedPlanCache. Nil (a Handler built
@@ -410,6 +411,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 
 		// A stop that withdraws a queued start leaves the apply stopped, so no
 		// drive runs to update the PR; tell it the start was withdrawn.
+		service.OnPRSchemaAdmission = h.admitPRSchemaDispatch
 		service.OnQueuedStartWithdrawn = h.reportQueuedStartWithdrawn
 
 		// Register the aggregate terminal-summary callback, invoked by the
@@ -696,6 +698,18 @@ func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Chec
 		return
 	}
 
+	var expected prPlanDiscoveryKey
+	if h.config().PRSchemaCapForRepo(a.Repository).Limit > 0 {
+		expected = h.prPlanDiscoveryKey(a.Repository, a.PullRequest, prInfo)
+	}
+	admission, err := h.admitPRSchemaBeforeQueue(context.Background(), a.Repository, a.PullRequest, a.InstallationID, expected)
+	if err != nil {
+		if !isPRSchemaRefusal(err) {
+			h.logger.Warn("could not verify PR database limit after apply", "repo", a.Repository, "pr", a.PullRequest, "error", err)
+		}
+		return
+	}
+
 	tenant := ""
 	if config := h.service.Config(); config != nil {
 		tenant = config.Tenant
@@ -708,7 +722,7 @@ func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Chec
 		// for an apply, not for a plan. The stored check state it writes is the
 		// whole point. It re-plans the one database the settled apply held the
 		// check for.
-		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, nil)
+		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, nil, admission)
 	})
 }
 

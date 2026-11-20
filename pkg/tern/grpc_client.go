@@ -142,11 +142,13 @@ var grpcStoppedAfterStartGracePeriod = 30 * time.Second
 //
 // See package-level documentation for details on gRPC mode architecture.
 type GRPCClient struct {
-	conn    *grpc.ClientConn
-	client  ternv1.TernClient
-	address string          // dial address for logging/debugging
-	storage storage.Storage // SchemaBot's storage for apply/task management
-	logger  *slog.Logger    // base logger; drives bind apply identity via applyLogger
+	conn              *grpc.ClientConn
+	client            ternv1.TernClient
+	guardedPlanConn   *grpc.ClientConn
+	guardedPlanClient ternv1.TernClient
+	address           string          // dial address for logging/debugging
+	storage           storage.Storage // SchemaBot's storage for apply/task management
+	logger            *slog.Logger    // base logger; drives bind apply identity via applyLogger
 
 	// Observer support — same pattern as LocalClient.
 	// For GRPCClient, the observer is notified by the local progress poller,
@@ -364,24 +366,31 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 		maxRecvMsgBytes = DefaultMaxRecvMsgBytes
 	}
 
-	conn, err := grpc.NewClient(
-		config.Address,
+	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithAuthority(host),
-		grpc.WithDefaultServiceConfig(retryServiceConfig),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxRecvMsgBytes)),
 		grpc.WithUnaryInterceptor(defaultRPCDeadlineInterceptor(grpcMethodDeadline)),
-	)
+	}
+	conn, err := grpc.NewClient(config.Address, append(opts, grpc.WithDefaultServiceConfig(retryServiceConfig))...)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", config.Address, err)
 	}
+	// Connections dial lazily. A separate transport avoids hidden retries
+	// for plans whose PR authorization can be revoked between attempts.
+	guardedPlanConn, err := grpc.NewClient(config.Address, append(opts, grpc.WithDisableRetry())...)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("dial guarded planner %s: %w", config.Address, err), conn.Close())
+	}
 
 	return &GRPCClient{
-		conn:    conn,
-		client:  ternv1.NewTernClient(conn),
-		address: config.Address,
-		storage: config.Storage,
-		logger:  config.Logger,
+		conn:              conn,
+		client:            ternv1.NewTernClient(conn),
+		guardedPlanConn:   guardedPlanConn,
+		guardedPlanClient: ternv1.NewTernClient(guardedPlanConn),
+		address:           config.Address,
+		storage:           config.Storage,
+		logger:            config.Logger,
 	}, nil
 }
 
@@ -451,14 +460,24 @@ func (c *GRPCClient) SetObserver(applyID int64, observer ProgressObserver) {
 // Close stops batching progress polls and closes the gRPC connection.
 func (c *GRPCClient) Close() error {
 	c.progressBatches.close()
-	return c.conn.Close()
+	err := c.conn.Close()
+	if c.guardedPlanConn != nil {
+		err = errors.Join(err, c.guardedPlanConn.Close())
+	}
+	return err
 }
 
 func (c *GRPCClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
+	if admit, ok := ctx.Value(planAdmissionKey{}).(func(context.Context) error); ok {
+		return guardedPlanRPC(ctx, admit, c.guardedPlanClient.Plan, req)
+	}
 	return c.client.Plan(ctx, req)
 }
 
 func (c *GRPCClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	if admit, ok := ctx.Value(planAdmissionKey{}).(func(context.Context) error); ok {
+		return guardedPlanRPC(ctx, admit, c.guardedPlanClient.PlanDiff, req)
+	}
 	return c.client.PlanDiff(ctx, req)
 }
 

@@ -4875,6 +4875,30 @@ func TestProgressByApplyIDAnswers503WhenEngineProgressFails(t *testing.T) {
 	assert.NotContains(t, w.Body.String(), connectionFragment)
 }
 
+func TestExecuteApplySchemaCapAllowsOnlyPinnedRollback(t *testing.T) {
+	plan := executeApplyTestPlan()
+	plan.Repository, plan.PullRequest = "org/repo", 42
+	applies := &capturingApplyStore{}
+	svc, _ := newQueueApplyTestService(plan, &mockTernClient{}, applies)
+	svc.config.Repos = map[string]RepoConfig{plan.Repository: {PRSchemaCap: &PRSchemaCapConfig{Limit: 5}}}
+	held := errors.New("closed pull request exceeds the schema cap")
+	svc.OnPRSchemaAdmission = func(context.Context, string, int, string) error { return held }
+
+	req := ApplyRequest{PlanID: plan.PlanIdentifier, Environment: plan.Environment, ExpectedLockOwner: "org/repo#42"}
+	for _, pin := range []string{"", plan.PlanIdentifier, storage.RollbackPendingPlanPrefix + "other-plan"} {
+		req.ExpectedPendingPlanID = pin
+		_, _, err := svc.ExecuteApply(t.Context(), req)
+		require.ErrorIs(t, err, held)
+		require.Nil(t, applies.apply)
+	}
+	req.ExpectedPendingPlanID = storage.RollbackPendingPlanPrefix + plan.PlanIdentifier
+	resp, _, err := svc.ExecuteApply(t.Context(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Accepted)
+	require.Equal(t, req.ExpectedPendingPlanID, applies.apply.ExpectedPendingPlanID)
+	require.Equal(t, req.ExpectedLockOwner, applies.apply.ExpectedLockOwner)
+}
+
 func TestExecuteApplyQueuesLocalApplyForOperator(t *testing.T) {
 	applies := &capturingApplyStore{}
 	mock := &mockTernClient{}

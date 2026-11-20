@@ -678,6 +678,10 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 
 	primaryPlan, resp, err := s.ExecutePlanProto(r.Context(), req)
 	if err != nil {
+		if _, refused := errors.AsType[*PRSchemaAdmissionError](err); refused {
+			s.writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		if typeMismatchErr, ok := errors.AsType[*databaseTypeMismatchError](err); ok {
 			s.logger.Warn("plan rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
 			s.writeError(w, http.StatusBadRequest, err.Error())
@@ -953,6 +957,10 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		)
 	}
 
+	ctx, err = s.withPRSchemaPlanAdmission(ctx, client, req.Repository, int(ternReq.PullRequest), ternReq.HeadSha)
+	if err != nil {
+		return nil, nil, err
+	}
 	resp, err := client.Plan(ctx, ternReq)
 	if err != nil {
 		span.RecordError(err)
@@ -1452,6 +1460,10 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 	req.viaHTTP = true
 	resp, applyID, err := s.ExecuteApply(r.Context(), req)
 	if err != nil {
+		if _, refused := errors.AsType[*PRSchemaAdmissionError](err); refused {
+			s.writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		if errors.Is(err, errPlanLookupFailed) {
 			s.logger.Error("apply failed to load the stored plan", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, storedPlanLookupFailedMessage("apply", req.PlanID))
@@ -2026,6 +2038,16 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		s.rememberResumeObserver(storedApplyID, 0)
 	}
 
+	// Recovery remains available after the PR closes or its exception is revoked.
+	// Both guards are internal. Storage verifies the owner and exact rollback pin
+	// in the transaction that creates the apply, including after a concurrent repin.
+	pinnedRollback := req.ExpectedLockOwner != "" && plan.PlanIdentifier != "" &&
+		req.ExpectedPendingPlanID == storage.RollbackPendingPlanPrefix+plan.PlanIdentifier
+	if !pinnedRollback {
+		if err := s.admitPRSchemaWork(ctx, plan.Repository, plan.PullRequest, plan.HeadSHA); err != nil {
+			return nil, 0, err
+		}
+	}
 	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, options, attachObserver)
 	if err != nil {
 		recordApplyError("enqueue apply", err)

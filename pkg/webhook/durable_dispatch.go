@@ -758,6 +758,8 @@ func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.
 	}
 
 	switch {
+	case h.isPRSchemaExceptionEvent(payload):
+		return h.processDurablePRSchemaException(ctx, event, payload)
 	case isAutoPlannablePullRequest(payload):
 		return h.processDurablePullRequestAutoPlan(ctx, event, payload)
 	case payload.Action == storage.PullRequestClosedAction:

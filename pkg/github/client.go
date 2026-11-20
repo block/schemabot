@@ -976,6 +976,7 @@ type PullRequestInfo struct {
 	// read from the same response as BaseRef.
 	DefaultBranch string
 	User          string
+	labels        []string
 	// State is the PR's lifecycle state as GitHub reports it: "open" or
 	// "closed" (a merged PR reads as closed).
 	State string
@@ -1438,6 +1439,9 @@ func pullRequestInfoFromGitHub(ghPR *pullRequestWithStack) PullRequestInfo {
 		State:         ghPR.GetState(),
 		Merged:        ghPR.GetMerged(),
 		BaseSHA:       ghPR.GetBase().GetSHA(),
+	}
+	for _, label := range ghPR.Labels {
+		info.labels = append(info.labels, label.GetName())
 	}
 	if ghPR.Stack != nil {
 		info.NativeStack = true
@@ -2782,6 +2786,35 @@ func pathInsideAny(p string, dirs []string) bool {
 	return false
 }
 
+// ResolveDefaultBranchTip reads the exact commit used to scope proposed files.
+func (ic *InstallationClient) ResolveDefaultBranchTip(ctx context.Context, repo string) (string, error) {
+	owner, repoName := splitRepo(repo)
+	defaultBranch, err := ic.repositoryDefaultBranch(ctx, repo)
+	if err != nil {
+		return "", err
+	}
+
+	// Pin the tip up front so a commit landing on the default branch mid-pass
+	// cannot leave some files compared against one commit and some against the
+	// next.
+	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve default branch tip", []any{"repo", repo, "default_branch", defaultBranch}, func(ctx context.Context) (*gh.Reference, error) {
+		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+defaultBranch)
+		if err != nil {
+			return nil, fmt.Errorf("get ref heads/%s: %w", defaultBranch, classifyGitHubAPIError(err))
+		}
+		return ref, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	defaultTipSHA := tip.GetObject().GetSHA()
+	if defaultTipSHA == "" {
+		return "", fmt.Errorf("ref heads/%s for %s resolved to no commit", defaultBranch, repo)
+	}
+
+	return defaultTipSHA, nil
+}
+
 // PRFilesProposedAgainstDefaultBranch narrows a pull request's changed files to
 // the ones it actually proposes, and returns the pinned default branch tip the
 // narrowing was measured against for operator logs.
@@ -2815,28 +2848,9 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 		return files, "", nil
 	}
 
-	owner, repoName := splitRepo(repo)
-	defaultBranch, err := ic.repositoryDefaultBranch(ctx, repo)
+	defaultTipSHA, err = ic.ResolveDefaultBranchTip(ctx, repo)
 	if err != nil {
 		return nil, "", err
-	}
-
-	// Pin the tip up front so a commit landing on the default branch mid-pass
-	// cannot leave some files compared against one commit and some against the
-	// next.
-	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve default branch tip", []any{"repo", repo, "default_branch", defaultBranch}, func(ctx context.Context) (*gh.Reference, error) {
-		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+defaultBranch)
-		if err != nil {
-			return nil, fmt.Errorf("get ref heads/%s: %w", defaultBranch, classifyGitHubAPIError(err))
-		}
-		return ref, nil
-	})
-	if err != nil {
-		return nil, "", err
-	}
-	defaultTipSHA = tip.GetObject().GetSHA()
-	if defaultTipSHA == "" {
-		return nil, "", fmt.Errorf("ref heads/%s for %s resolved to no commit", defaultBranch, repo)
 	}
 
 	// One cache serves both refs: it is keyed by tree SHA, and the two refs

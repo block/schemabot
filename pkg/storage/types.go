@@ -112,6 +112,9 @@ const (
 	OnFailurePause = "pause"
 )
 
+// RollbackPendingPlanPrefix tags a lock pin created for rollback confirmation.
+const RollbackPendingPlanPrefix = "rollback:"
+
 // Lock represents a database-level deployment lock.
 // Locks prevent concurrent schema changes to the same database across
 // all environments and PRs. Lock key is database:type (no environment).
