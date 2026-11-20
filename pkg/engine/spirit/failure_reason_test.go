@@ -89,6 +89,23 @@ func TestFailureReason(t *testing.T) {
 		assert.Contains(t, got, "dropping a primary key is not supported")
 		assert.NotContains(t, got, "1062")
 	})
+
+	// Routing reads the table's foreign keys and triggers before any statement
+	// runs. A connection lost during that read is reported as the routing read
+	// that failed, naming the table, not as a failure of a running change.
+	t.Run("a failed routing read names the table and says nothing ran", func(t *testing.T) {
+		err := fmt.Errorf("route ALTER statement for table %q: %w", "orders",
+			tableCheckReadError("orders", &net.OpError{
+				Op: "dial", Net: "tcp",
+				Addr: &net.TCPAddr{IP: net.ParseIP("10.4.2.19"), Port: 3306},
+				Err:  errors.New("connect: connection refused"),
+			}))
+
+		got := failureReason(err)
+		assert.Equal(t, `SchemaBot could not read the foreign keys and triggers of table "orders" on the target to choose how to run its statement, so no statement ran; see the server logs for the reason.`, got)
+		assert.NotContains(t, got, "10.4.2.19")
+		assert.Contains(t, err.Error(), "10.4.2.19", "the cause stays on the error for the server log")
+	})
 }
 
 // The state a progress poll reports has to carry the rendered reason, not the
