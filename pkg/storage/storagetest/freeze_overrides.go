@@ -19,7 +19,7 @@ func TestFreezeOverrides(t *testing.T, h Harness) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 
-		want := overrideRequest("Production", "plan-Ab12", time.Now().UTC().Add(24*time.Hour))
+		want := overrideRequest("Production", "plan-Ab12", time.Now().UTC().Add(12*time.Hour))
 		want.Reason = "  SEV-1234 hotfix index  "
 		created, err := store.FreezeOverrides().Create(ctx, want)
 		require.NoError(t, err)
@@ -65,6 +65,22 @@ func TestFreezeOverrides(t *testing.T, h Harness) {
 		require.ErrorContains(t, err, "needs its author")
 		_, err = store.FreezeOverrides().Get(ctx, authorless.Identifier)
 		require.ErrorIs(t, err, storage.ErrFreezeOverrideNotFound)
+	})
+
+	t.Run("Create_RefusesAnExpiryPastTheMaximumLifetime", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		now, err := store.Freezes().Now(ctx)
+		require.NoError(t, err)
+
+		tooLate := overrideRequest("production", "plan-1", now.Add(storage.FreezeOverrideMaxLifetime+time.Hour))
+		_, err = store.FreezeOverrides().Create(ctx, tooLate)
+		require.ErrorIs(t, err, storage.ErrFreezeOverrideLifetime)
+		_, err = store.FreezeOverrides().Get(ctx, tooLate.Identifier)
+		require.ErrorIs(t, err, storage.ErrFreezeOverrideNotFound, "a refused request is never stored")
+
+		_, err = store.FreezeOverrides().Create(ctx, overrideRequest("production", "plan-1", now.Add(storage.FreezeOverrideMaxLifetime-time.Minute)))
+		require.NoError(t, err, "a request inside the lifetime is stored")
 	})
 
 	t.Run("Create_DuplicateIdentifier", func(t *testing.T) {
@@ -203,10 +219,11 @@ func TestFreezeOverrides(t *testing.T, h Harness) {
 		store := h.NewStorage(t)
 
 		// Approve while unexpired, then let it lapse: a request created
-		// already expired cannot be approved at all.
+		// already expired cannot be approved at all. Five seconds leaves
+		// Create and Approve time to finish on a loaded runner.
 		now, err := store.Freezes().Now(ctx)
 		require.NoError(t, err)
-		request := overrideRequest("production", "plan-1", now.Add(2*time.Second))
+		request := overrideRequest("production", "plan-1", now.Add(5*time.Second))
 		_, err = store.FreezeOverrides().Create(ctx, request)
 		require.NoError(t, err)
 		_, err = store.FreezeOverrides().Approve(ctx, request.Identifier, "bob")

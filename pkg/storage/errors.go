@@ -68,6 +68,10 @@ var (
 	// pull request's author tries to approve a request.
 	ErrFreezeOverrideSelfApproval = errors.New("freeze override request needs a second person")
 
+	// ErrFreezeOverrideLifetime is returned when creating a request that
+	// expires more than FreezeOverrideMaxLifetime after the database clock.
+	ErrFreezeOverrideLifetime = errors.New("freeze override request expires too late")
+
 	// ErrFreezeEnded is returned when lifting a freeze that already reached
 	// its end time.
 	ErrFreezeEnded = errors.New("freeze already ended")

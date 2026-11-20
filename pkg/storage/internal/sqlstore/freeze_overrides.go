@@ -33,6 +33,14 @@ func (s *freezeOverrideStore) Create(ctx context.Context, request *storage.Freez
 	if err := request.Validate(); err != nil {
 		return nil, fmt.Errorf("create freeze override request: %w", err)
 	}
+	now, err := readFreezeClock(ctx, s.db, s.dialect)
+	if err != nil {
+		return nil, fmt.Errorf("create freeze override request %s: %w", request.Identifier, err)
+	}
+	if latest := now.Add(storage.FreezeOverrideMaxLifetime); request.ExpiresAt.After(latest) {
+		return nil, fmt.Errorf("create freeze override request %s: expiry %s is after %s: %w",
+			request.Identifier, request.ExpiresAt.UTC().Format(time.RFC3339), latest.Format(time.RFC3339), storage.ErrFreezeOverrideLifetime)
+	}
 	blockers, err := json.Marshal(request.Blockers)
 	if err != nil {
 		return nil, fmt.Errorf("encode blockers of freeze override request %s: %w", request.Identifier, err)

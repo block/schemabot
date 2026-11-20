@@ -566,6 +566,12 @@ const (
 // request.
 const FreezeOverrideReasonMax = 500
 
+// FreezeOverrideMaxLifetime caps how long after its creation, by the
+// database clock, an override request may expire. The request is the only
+// record that an override exists, so storage refuses one meant to outlive
+// any incident, whatever its caller.
+const FreezeOverrideMaxLifetime = 24 * time.Hour
+
 // FreezeOverrideRequest asks to let one change through the freezes that hold
 // it. Nobody overrides alone: a second person approves the request, and the
 // change goes ahead only while every blocker it meets is one the request
@@ -636,7 +642,8 @@ func (r *FreezeOverrideRequest) Validate() error {
 	return nil
 }
 
-// Covers reports whether the request names every one of blockers.
+// Covers reports whether the request names every one of blockers. An empty
+// blockers is covered: a change with no blockers is not held.
 func (r *FreezeOverrideRequest) Covers(blockers []string) bool {
 	for _, blocker := range blockers {
 		if !slices.Contains(r.Blockers, blocker) {
