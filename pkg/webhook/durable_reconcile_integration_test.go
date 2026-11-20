@@ -84,13 +84,13 @@ func TestE2EDurableDispatchPlansSynthesizedRecoveryDelivery(t *testing.T) {
 		assert.Contains(t, body, "## Schema Change Plan")
 		assert.Contains(t, body, dbName)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the synthesized recovery delivery's plan comment")
+		require.FailNow(t, "timed out waiting for the synthesized recovery delivery's plan comment")
 	}
 	select {
 	case cr := <-result.checkRuns:
 		assert.Contains(t, cr.Name, "SchemaBot")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the synthesized recovery delivery's check run")
+		require.FailNow(t, "timed out waiting for the synthesized recovery delivery's check run")
 	}
 }
 
@@ -121,11 +121,11 @@ func TestE2EDurableDispatchSynthesizedDeliverySkipsCommentWhenPlanCurrent(t *tes
 	case cr := <-result.checkRuns:
 		assert.Contains(t, cr.Name, "SchemaBot")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the recovery delivery's refreshed check run")
+		require.FailNow(t, "timed out waiting for the recovery delivery's refreshed check run")
 	}
 	select {
 	case body := <-result.comments:
-		t.Fatalf("expected no duplicate plan comment for an already-planned head, got: %s", body)
+		require.FailNow(t, fmt.Sprintf("expected no duplicate plan comment for an already-planned head, got: %s", body))
 	case <-time.After(3 * time.Second):
 	}
 }

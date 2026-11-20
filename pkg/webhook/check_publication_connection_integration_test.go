@@ -12,12 +12,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // A slow GitHub request must leave storage capacity available to other work,
@@ -110,9 +111,9 @@ func TestCheckPublicationLeavesStorageConnectionAvailable(t *testing.T) {
 			select {
 			case <-entered:
 			case err := <-result:
-				t.Fatalf("publication returned before GitHub request paused: %v", err)
+				require.FailNow(t, fmt.Sprintf("publication returned before GitHub request paused: %v", err))
 			case <-ctx.Done():
-				t.Fatal("publication did not reach GitHub")
+				require.FailNow(t, "publication did not reach GitHub")
 			}
 			assert.Zero(t, db.Stats().InUse, "GitHub waits must not reserve a storage connection")
 			queryCtx, queryCancel := context.WithTimeout(ctx, time.Second)
@@ -125,7 +126,7 @@ func TestCheckPublicationLeavesStorageConnectionAvailable(t *testing.T) {
 			case err := <-result:
 				require.NoError(t, err)
 			case <-ctx.Done():
-				t.Fatal("publication did not finish")
+				require.FailNow(t, "publication did not finish")
 			}
 		})
 	}

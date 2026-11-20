@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -185,7 +186,7 @@ func collectAggregate(t *testing.T, checkRuns chan checkRunCapture, wantName str
 				return cr
 			}
 		case <-deadline:
-			t.Fatalf("timed out waiting for aggregate check run %q", wantName)
+			require.FailNow(t, fmt.Sprintf("timed out waiting for aggregate check run %q", wantName))
 		}
 	}
 }
@@ -577,7 +578,7 @@ func TestE2ELeaderPlanCommandExpectsNoParticipantForADeletionTheDefaultBranchHol
 		assert.Contains(t, body, "were refreshed as passing")
 		assert.NotContains(t, body, "tenant deployments")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for the checks-refreshed comment")
+		require.FailNow(t, "timed out waiting for the checks-refreshed comment")
 	}
 	require.NotEmpty(t, checkRuns)
 	for len(checkRuns) > 0 {
@@ -666,7 +667,7 @@ func TestE2ELeaderPlanCommandKeepsFoldingAParticipantRunOnTheHead(t *testing.T) 
 			case body := <-comments:
 				assert.NotContains(t, body, "were refreshed as passing")
 			case <-time.After(30 * time.Second):
-				t.Fatal("timed out waiting for the checks-refreshed comment")
+				require.FailNow(t, "timed out waiting for the checks-refreshed comment")
 			}
 			agg := collectAggregate(t, checkRuns, "SchemaBot")
 			assert.Equal(t, tt.wantStatus, agg.Status)
@@ -815,7 +816,7 @@ func TestE2ELeaderNoManagedSchemaPathReadsUnscopedParticipantRunOnlyWhenUnscoped
 						assert.NotContains(t, body, "tenant deployments")
 					}
 				case <-time.After(webhookIntegrationCheckRunDeadline):
-					t.Fatal("timed out waiting for the checks-refreshed comment")
+					require.FailNow(t, "timed out waiting for the checks-refreshed comment")
 				}
 			} else {
 				req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "opened", headSHA: headSHA, headRef: "feature-branch"}, nil)
@@ -932,7 +933,7 @@ func TestE2EPlanCommandWithoutAggregateRoleSkipsTheDefaultBranchComparison(t *te
 	case body := <-comments:
 		assert.Contains(t, body, "were refreshed as passing")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for the checks-refreshed comment")
+		require.FailNow(t, "timed out waiting for the checks-refreshed comment")
 	}
 	agg := collectAggregate(t, checkRuns, "SchemaBot")
 	assert.Equal(t, checkStatusCompleted, agg.Status)
@@ -1335,7 +1336,7 @@ func TestE2EScopedLeaderKeepsFoldingAParticipantRunOnTheHeadAfterTheDefaultBranc
 				case cr := <-checkRuns:
 					got[cr.Name] = cr
 				case <-time.After(webhookIntegrationCheckRunDeadline):
-					t.Fatalf("timed out waiting for both aggregates, got %v", got)
+					require.FailNow(t, fmt.Sprintf("timed out waiting for both aggregates, got %v", got))
 				}
 			}
 			for name, want := range tt.want {
@@ -1470,7 +1471,7 @@ func TestE2ELeaderRefoldSkippedForNonLeaderRepo(t *testing.T) {
 
 	select {
 	case cr := <-checkRuns:
-		t.Fatalf("non-leader repo published an aggregate check on participant completion: %+v", cr)
+		require.FailNow(t, fmt.Sprintf("non-leader repo published an aggregate check on participant completion: %+v", cr))
 	case <-time.After(time.Second):
 	}
 }
@@ -1501,7 +1502,7 @@ func TestE2ELeaderRefoldSkippedForOwnAggregateCheck(t *testing.T) {
 
 	select {
 	case cr := <-checkRuns:
-		t.Fatalf("leader re-folded on its own aggregate completion: %+v", cr)
+		require.FailNow(t, fmt.Sprintf("leader re-folded on its own aggregate completion: %+v", cr))
 	case <-time.After(time.Second):
 	}
 }
@@ -1645,7 +1646,7 @@ func TestE2ELeaderRefoldsWhenParticipantReportsAfterFirstFold(t *testing.T) {
 		select {
 		case cr = <-checkRuns:
 		case <-deadline:
-			t.Fatalf("timed out waiting for the production aggregate to converge (saw blocked first: %v)", sawBlocked)
+			require.FailNow(t, fmt.Sprintf("timed out waiting for the production aggregate to converge (saw blocked first: %v)", sawBlocked))
 		}
 		if cr.Name != aggregateCheckNameForEnv("SchemaBot", "production") {
 			continue
@@ -1753,7 +1754,7 @@ func TestE2ELeaderBrokenRefoldArmsAnotherAttempt(t *testing.T) {
 
 	select {
 	case cr := <-checkRuns:
-		t.Fatalf("a re-fold that cannot read the PR head must not publish an aggregate: %+v", cr)
+		require.FailNow(t, fmt.Sprintf("a re-fold that cannot read the PR head must not publish an aggregate: %+v", cr))
 	default:
 	}
 }
@@ -1788,7 +1789,7 @@ func TestE2ELeaderRefoldSkipsClosedPR(t *testing.T) {
 
 	select {
 	case cr := <-checkRuns:
-		t.Fatalf("a re-fold must not publish an aggregate on a closed PR: %+v", cr)
+		require.FailNow(t, fmt.Sprintf("a re-fold must not publish an aggregate on a closed PR: %+v", cr))
 	default:
 	}
 }
@@ -1858,7 +1859,7 @@ func TestE2ELeaderParticipantSchemaWithDiscoverableConfigFoldsInsteadOfPlanning(
 
 	select {
 	case body := <-comments:
-		t.Fatalf("leader posted a comment for participant-owned schema: %s", body)
+		require.FailNow(t, fmt.Sprintf("leader posted a comment for participant-owned schema: %s", body))
 	case <-time.After(500 * time.Millisecond):
 	}
 }

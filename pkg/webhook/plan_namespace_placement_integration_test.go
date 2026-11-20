@@ -163,7 +163,7 @@ func (p *namespacePlacementHarness) comment(t *testing.T, command string) string
 		// The comment renders a refusal HTML-escaped.
 		return html.UnescapeString(body)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatalf("timed out waiting for the reply to %q", command)
+		require.FailNow(t, fmt.Sprintf("timed out waiting for the reply to %q", command))
 		return ""
 	}
 }

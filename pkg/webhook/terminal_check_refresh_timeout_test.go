@@ -225,7 +225,7 @@ func (f *terminalRefreshTimeoutFixture) refresh(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("terminal refresh did not give up on a call that never answers")
+		require.FailNow(t, "terminal refresh did not give up on a call that never answers")
 	}
 }
 

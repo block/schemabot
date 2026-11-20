@@ -15,17 +15,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/checkpoint"
+	"github.com/block/spirit/pkg/utils"
+	gh "github.com/google/go-github/v86/github"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
-	"github.com/block/spirit/pkg/checkpoint"
-	"github.com/block/spirit/pkg/utils"
-	gh "github.com/google/go-github/v86/github"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // indexAddSchema declares an index the target's `events` table does not have,
@@ -301,7 +302,7 @@ func TestE2EDeferCutoverApplyDisclosesTheJoinedBatchVerdict(t *testing.T) {
 		assert.NotContains(t, body, "the schema change differs from the one that started it",
 			"a per-table verdict here means the prediction ran the shape this apply will not use")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the downgraded plan comment")
+		require.FailNow(t, "timed out waiting for the downgraded plan comment")
 	}
 }
 
@@ -343,7 +344,7 @@ func TestE2EDeferCutoverConfirmRechecksAgainstTheJoinedBatch(t *testing.T) {
 		assert.NotContains(t, body, "the schema change differs from the one that started it",
 			"a per-table verdict here means the re-plan ran the shape this confirm will not use")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the stopped apply-confirm comment")
+		require.FailNow(t, "timed out waiting for the stopped apply-confirm comment")
 	}
 }
 
@@ -373,7 +374,7 @@ func TestE2EDiscardingCopyDowngradesToConfirm(t *testing.T) {
 		assert.Contains(t, body, "schemabot apply-confirm -e staging",
 			"the paused comment carries the confirm command copy-pasteably rather than describing it")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the downgraded plan comment")
+		require.FailNow(t, "timed out waiting for the downgraded plan comment")
 	}
 
 	// The pause is only real if nothing was spent making it: the copy is still
@@ -416,7 +417,7 @@ func TestE2EDiscardingCopyLeavesNoConfirmationWhenTheDisclosureCannotBePosted(t 
 	case body := <-f.result.comments:
 		assert.Contains(t, body, "⚠️ **Applying destroys work in progress**")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the disclosure post attempt")
+		require.FailNow(t, "timed out waiting for the disclosure post attempt")
 	}
 
 	require.Eventually(t, func() bool {
@@ -511,7 +512,7 @@ func TestE2EReplanDiscardingCopyDowngradesToConfirm(t *testing.T) {
 		assert.Equal(t, 1, strings.Count(body, glyph.Attention))
 		assert.Contains(t, body, "schemabot apply-confirm -e staging")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the downgraded plan comment")
+		require.FailNow(t, "timed out waiting for the downgraded plan comment")
 	}
 
 	// The downgrade spends nothing: the copy is untouched and no apply was
@@ -571,7 +572,7 @@ func TestE2EApplyConfirmStopsWhenCopyAppearedAfterDisclosure(t *testing.T) {
 		assert.Contains(t, body, "schemabot apply-confirm -e staging")
 		assert.NotContains(t, body, "Schema Change Status", "the apply must not have started")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the stopped apply-confirm comment")
+		require.FailNow(t, "timed out waiting for the stopped apply-confirm comment")
 	}
 
 	// The pending confirmation moved onto the plan behind the comment just
@@ -911,7 +912,7 @@ func TestE2EApplyConfirmRecordsNoConsentWhenTheDisclosureCannotBePosted(t *testi
 	case body := <-f.result.comments:
 		assert.Contains(t, body, "⚠️ **Applying destroys work in progress**")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the disclosure post attempt")
+		require.FailNow(t, "timed out waiting for the disclosure post attempt")
 	}
 
 	// Consent the operator never saw must not be on the lock, and the copy the

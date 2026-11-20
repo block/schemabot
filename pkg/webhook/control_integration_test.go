@@ -14,6 +14,10 @@ import (
 	"time"
 
 	_ "github.com/block/mysql"
+	"github.com/block/spirit/pkg/utils"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -22,9 +26,6 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
-	"github.com/block/spirit/pkg/utils"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // TestE2EStopCommandRecordsDurableRequest verifies that a PR comment stop
@@ -1057,7 +1058,7 @@ func readComment(t *testing.T, comments chan string) string {
 	case body := <-comments:
 		return body
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for control command comment")
+		require.FailNow(t, "timed out waiting for control command comment")
 		return ""
 	}
 }
@@ -1068,7 +1069,7 @@ func assertReactionEventually(t *testing.T, reactions chan string) {
 	case reaction := <-reactions:
 		assert.Equal(t, "eyes", reaction)
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for acknowledgment reaction")
+		require.FailNow(t, "timed out waiting for acknowledgment reaction")
 	}
 }
 

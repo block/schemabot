@@ -108,7 +108,7 @@ func TestE2EDirectPlanAppliesInOneStep(t *testing.T) {
 				sawApplied = true
 			}
 		case <-deadline:
-			t.Fatal("timed out waiting for the direct apply to complete")
+			require.FailNow(t, "timed out waiting for the direct apply to complete")
 		}
 	}
 	assert.True(t, sawDisclosure, "the apply's locked comment discloses the direct change")
@@ -172,7 +172,7 @@ func TestE2EDeferCutoverRejectedOnAllDirectPlan(t *testing.T) {
 		assert.Contains(t, body, "`--defer-cutover` has no effect on this plan")
 		assert.Contains(t, body, "Re-run without the flag")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the defer-cutover rejection comment")
+		require.FailNow(t, "timed out waiting for the defer-cutover rejection comment")
 	}
 
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
@@ -302,7 +302,7 @@ func (f *newlyDirectFixture) awaitComment(t *testing.T, want string) string {
 				return body
 			}
 		case <-deadline:
-			t.Fatalf("timed out waiting for a comment containing %q", want)
+			require.FailNow(t, fmt.Sprintf("timed out waiting for a comment containing %q", want))
 		}
 	}
 }
@@ -478,7 +478,7 @@ func TestE2EAutomaticApplyDoesNotDispatchWhenCheckStateCannotBeStored(t *testing
 		assert.Contains(t, body, "SchemaBot could not record the check state for this apply. Nothing was applied.")
 		assert.NotContains(t, body, "Applying automatically", "no plan comment announces an apply that never dispatches")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the check state error comment")
+		require.FailNow(t, "timed out waiting for the check state error comment")
 	}
 
 	requireNoApplies(t, svc, dbName)

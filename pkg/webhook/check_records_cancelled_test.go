@@ -243,7 +243,7 @@ func TestE2EPlanCancelledApplyWithEarlierFailedApplyCompletedTaskStaysBlocked(t 
 		assert.Contains(t, body, "Schema Change Reconciliation Required")
 		assert.NotContains(t, body, "refreshed as passing")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for reconciliation comment")
+		require.FailNow(t, "timed out waiting for reconciliation comment")
 	}
 
 	check := loadCancelledCheck(t, svc, database)
@@ -375,7 +375,7 @@ func TestE2EPlanCancelledApplyWithNoManagedFilesConvergesPassing(t *testing.T) {
 		assert.Contains(t, body, "No Schema Files Changed")
 		assert.Contains(t, body, "refreshed as passing")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for passing convergence comment")
+		require.FailNow(t, "timed out waiting for passing convergence comment")
 	}
 
 	check := loadCancelledCheck(t, svc, database)
