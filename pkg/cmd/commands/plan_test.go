@@ -1021,3 +1021,29 @@ func TestPlanFingerprint_FinalizeBesideDDLRendersTheSame(t *testing.T) {
 		})
 	}
 }
+
+// A repository names a leftover table from an earlier online schema change in
+// drop_tables, so the plan drops `_jobs_old`. Its name matches the tables an
+// online schema change works in, and the plan still shows the statement in
+// both the plan and apply layouts, and lists the drop as unsafe in the plan
+// layout (apply shows its own unsafe warning).
+func TestWritePlanBody_ShowsDropOfUnderscoreTable(t *testing.T) {
+	plan := planWithTablesAndEngine("spirit", &apitypes.TableChangeResponse{
+		TableName:    "_jobs_old",
+		DDL:          "DROP TABLE `_jobs_old`;",
+		ChangeType:   "drop",
+		IsUnsafe:     true,
+		UnsafeReason: "DROP TABLE removes all data",
+	})
+
+	for name, isApply := range map[string]bool{"plan": false, "apply": true} {
+		t.Run(name, func(t *testing.T) {
+			out := stripAnsi(captureStdout(func() { writePlanBody(plan, isApply) }))
+			assert.Contains(t, out, "- _jobs_old\n       DROP TABLE `_jobs_old`;", "the statement is shown under its table:\n%s", out)
+			assert.Contains(t, out, "📋 Plan: 1 table to drop", "the summary counts the drop:\n%s", out)
+			if !isApply {
+				assert.Contains(t, out, "1. _jobs_old: DROP TABLE removes all data", "the drop is listed as unsafe:\n%s", out)
+			}
+		})
+	}
+}

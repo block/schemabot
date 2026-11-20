@@ -200,9 +200,10 @@ func TestBuildOnboardWritePlanWritesVitessKeyspaceArtifacts(t *testing.T) {
 }
 
 // Re-onboarding over an existing schema root must not drop the exclusions an
-// operator configured: the rewritten schemabot.yaml carries both lists forward,
-// and the plan verification excludes the same namespaces and withholds the same
-// tables a real plan would.
+// operator configured: the rewritten schemabot.yaml carries every list forward,
+// drop_tables included, and the plan verification excludes the same namespaces
+// and withholds the same tables a real plan would, without asking for the
+// drops.
 func TestBuildOnboardWritePlanPreservesExclusions(t *testing.T) {
 	root := t.TempDir()
 	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
@@ -216,15 +217,19 @@ func TestBuildOnboardWritePlanPreservesExclusions(t *testing.T) {
 	}, client.PlanExclusions{
 		Namespaces: []string{"local_fixtures", "fixtures_$ENV"},
 		Tables:     []string{"flyway_schema_history"},
+		DropTables: []string{"_users_old"},
 	})
 	require.NoError(t, err)
 	require.NoError(t, plan.write())
 
 	config, err := os.ReadFile(filepath.Join(root, "schemabot.yaml"))
 	require.NoError(t, err)
-	assert.Equal(t, "database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\n  - fixtures_$ENV\nignore_tables:\n  - flyway_schema_history\n", string(config))
+	assert.Equal(t, "database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\n  - fixtures_$ENV\nignore_tables:\n  - flyway_schema_history\ndrop_tables:\n  - _users_old\n", string(config))
 	assert.Equal(t, []string{"local_fixtures", "fixtures_$ENV"}, plan.exclusions.Namespaces)
 	assert.Equal(t, []string{"flyway_schema_history"}, plan.exclusions.Tables)
+	assert.Empty(t, plan.exclusions.WithoutDropTables().DropTables,
+		"verification checks the files mirror the target, so it does not ask for the drops")
+	assert.Equal(t, []string{"flyway_schema_history"}, plan.exclusions.WithoutDropTables().Tables)
 }
 
 // A pull returns the target's whole catalog, the tables ignore_tables withholds
@@ -295,6 +300,45 @@ func TestBuildOnboardWritePlanRefusesACaseDifferingEntry(t *testing.T) {
 	}
 }
 
+// Re-onboarding a repository whose drop_tables names a table the target still
+// has would write that table's file beside the entry, a config every later plan
+// refuses, while the verification plan, which runs without drop_tables, passes.
+// Onboarding refuses before anything reaches disk instead.
+func TestBuildOnboardWritePlanRefusesToDeclareAListedDrop(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		entry string
+		live  string
+	}{
+		{"entry names the live table exactly", "legacy_orders", "legacy_orders"},
+		{"entry differs from the live table only in case", "Legacy_Orders", "legacy_orders"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			_, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+				Database:    "orders",
+				Type:        "mysql",
+				Environment: "production",
+				TableCount:  2,
+				Namespaces: map[string]*apitypes.PulledNamespace{
+					"orders": {Tables: map[string]string{
+						"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
+						tc.live: "CREATE TABLE `" + tc.live + "` (`id` bigint NOT NULL);\n",
+					}},
+				},
+			}, client.PlanExclusions{DropTables: []string{"_users_old", tc.entry}})
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "drop_tables entry \""+tc.entry+"\"")
+			assert.Contains(t, err.Error(), "names a table the target still has in namespace \"orders\"")
+			assert.NotContains(t, err.Error(), "_users_old", "an entry naming no pulled table is not a conflict")
+			assert.NoFileExists(t, filepath.Join(root, "schemabot.yaml"),
+				"the refusal lands before anything reaches disk")
+			assert.NoDirExists(t, filepath.Join(root, "orders"))
+		})
+	}
+}
+
 // A namespace whose every table is withheld still belongs to the plan, so it
 // keeps its comment-only declaration rather than vanishing from the repository.
 func TestBuildOnboardWritePlanKeepsAFullyWithheldNamespaceExplicit(t *testing.T) {
@@ -350,12 +394,13 @@ func TestPreservedExclusions(t *testing.T) {
 	t.Run("existing config's entries are preserved", func(t *testing.T) {
 		root := t.TempDir()
 		require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"),
-			[]byte("database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\nignore_tables:\n  - flyway_schema_history\n"), 0o644))
+			[]byte("database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\nignore_tables:\n  - flyway_schema_history\ndrop_tables:\n  - _users_old\n"), 0o644))
 
 		exclusions, err := preservedExclusions(root)
 		require.NoError(t, err)
 		assert.Equal(t, []string{"local_fixtures"}, exclusions.Namespaces)
 		assert.Equal(t, []string{"flyway_schema_history"}, exclusions.Tables)
+		assert.Equal(t, []string{"_users_old"}, exclusions.DropTables)
 	})
 
 	t.Run("unreadable config is an error, not a silent drop", func(t *testing.T) {
@@ -365,7 +410,7 @@ func TestPreservedExclusions(t *testing.T) {
 
 		_, err := preservedExclusions(root)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "preserve ignore_namespaces and ignore_tables")
+		assert.Contains(t, err.Error(), "preserve ignore_namespaces, ignore_tables and drop_tables")
 	})
 }
 
@@ -450,7 +495,9 @@ func TestOnboardRejectsDiscoveredNamespacePlaceholders(t *testing.T) {
 // Onboarding verifies the pulled files on every rollout member's plan, so its
 // plan says it reads the rollout, and the server answers it with every
 // member's plan rather than refusing a caller that would see only the
-// primary's.
+// primary's. It checks that the files mirror the target, so it plans without
+// the config's drop_tables: a listed table still on the target is a drop the
+// repository asked for, not a file the pull got wrong.
 func TestVerifyOnboardPlan_SaysItReadsTheRollout(t *testing.T) {
 	var got apitypes.PlanRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -469,13 +516,15 @@ func TestVerifyOnboardPlan_SaysItReadsTheRollout(t *testing.T) {
 		Namespaces: map[string]*apitypes.PulledNamespace{
 			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
-	}, client.PlanExclusions{})
+	}, client.PlanExclusions{Tables: []string{"flyway_schema_history"}, DropTables: []string{"_users_old"}})
 	require.NoError(t, err)
 	require.NoError(t, plan.write())
 
 	require.NoError(t, verifyOnboardPlan(server.URL, "orders", "production", plan))
 	assert.Equal(t, "orders", got.Database)
 	assert.True(t, got.RendersRollout, "onboarding's verification reads every rollout member's plan")
+	assert.Empty(t, got.DropTables, "the verification checks the files against the target, not the drops the config asks for")
+	assert.Equal(t, []string{"flyway_schema_history"}, got.IgnoreTables, "the verification still withholds what the config withholds")
 }
 
 func TestOnboardWritePlanRefusesExistingFilesWithoutForce(t *testing.T) {

@@ -242,8 +242,10 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 	}
 	cmd.reportProgress("Checking that your schema files match...")
 	// The baseline is verified on every rollout member's plan, the way
-	// onboarding verifies it (validateOnboardPlanResult).
-	baseline, _, err := client.CallPlanAPIWithContext(ctx, connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, exclusions, false, true)
+	// onboarding verifies it (validateOnboardPlanResult), and like onboarding
+	// without the config's drop_tables, since it checks that the files mirror
+	// the target.
+	baseline, _, err := client.CallPlanAPIWithContext(ctx, connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, exclusions.WithoutDropTables(), false, true)
 	if err != nil {
 		return nil, fmt.Errorf("verify baseline: %w", err)
 	}

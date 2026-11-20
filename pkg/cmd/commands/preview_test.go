@@ -23,6 +23,7 @@ func TestPreviewPlanDisclosuresSelectIndividually(t *testing.T) {
 		// The reason is engine prose, so it is escaped like any other. An
 		// underscore inside a word cannot start emphasis, so it is left as written.
 		{templates.PreviewCommentPlanIgnoreTables, "(ignore_tables): `flyway_schema_history`"},
+		{templates.PreviewCommentPlanDropTables, "DROP TABLE `_events_old`;"},
 		{templates.PreviewCommentPlanWhoCanApply, "- Operators: `acme/testapp-operators`"},
 	}
 	for _, tt := range tests {

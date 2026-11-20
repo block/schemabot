@@ -4,7 +4,6 @@ import (
 	"log/slog"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
@@ -222,7 +221,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		data.ErrorMessage = firstOperationError(data.Operations)
 	}
 
-	for _, tbl := range ddl.FilterInternalTablesTyped(result.Tables) {
+	for _, tbl := range result.Tables {
 		tp := TableProgress{
 			TableName:           tbl.TableName,
 			Deployment:          tbl.Deployment,

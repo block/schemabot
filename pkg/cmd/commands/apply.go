@@ -14,7 +14,6 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
@@ -515,7 +514,7 @@ func watchAfterCutover(poller *progressPoller) error {
 		}
 
 		// Get tables for display
-		tables := ddl.FilterInternalTablesTyped(result.Tables)
+		tables := result.Tables
 		if len(tables) > 0 && !headerPrinted {
 			// Calculate max table name length for alignment
 			for _, tbl := range tables {
@@ -969,7 +968,7 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 			return noActiveChangeError(poller.applyID, poller.environment)
 		}
 
-		tables := ddl.FilterInternalTablesTyped(result.Tables)
+		tables := result.Tables
 
 		// Emit per-table events
 		for _, tbl := range tables {

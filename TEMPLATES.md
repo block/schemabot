@@ -615,6 +615,39 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-drop-tables"></a><strong>MySQL Plan (Drop Tables)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+DROP TABLE `_events_old`;
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `_events_old`: DROP TABLE removes all data
+
+📋 **Plan**: **1** table to drop
+
+ℹ️ Ignored tables in namespace `testapp` (leading underscore): `_orders_old`
+
+
+---
+
+▶️ **To apply**:
+1. Deploy application code that no longer reads from or writes to the dropped table.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `_events_old`:
+   ```
+   schemabot apply -e staging
+   ```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-many-lint-warnings"></a><strong>MySQL Plan (Many Lint Warnings)</strong></summary>
 
 

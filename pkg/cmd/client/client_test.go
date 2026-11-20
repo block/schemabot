@@ -396,6 +396,31 @@ func TestCallPlanAPI_SendsIgnoreTables(t *testing.T) {
 		"withholding a live table removes nothing from the declared schema")
 }
 
+// drop_tables reaches the server only on the request: the planner skips the
+// listed tables by name, so a request without the entries prints a clean plan
+// for a config that asks for a drop. A drop is not an exclusion, so the
+// entries never spill into ignore_tables.
+func TestCallPlanAPI_SendsDropTables(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "payments"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "payments", "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
+
+	var gotReq apitypes.PlanRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotReq))
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.PlanResponse{}))
+	}))
+	t.Cleanup(server.Close)
+
+	_, _, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0,
+		PlanExclusions{DropTables: []string{"_users_old"}}, false)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"_users_old"}, gotReq.DropTables)
+	assert.Empty(t, gotReq.IgnoreTables, "a drop is not an exclusion")
+}
+
 // A plan made for an apply that will hand the engine every ALTER at once has
 // to say so on the request. The grouping decides what the engine predicts
 // about a copy already on the target, so a plan that leaves it off describes a

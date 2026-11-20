@@ -174,6 +174,32 @@ func TestLoadCLIConfig_ParsesIgnoreTables(t *testing.T) {
 	assert.Nil(t, cfg.PlanExclusions().Namespaces)
 }
 
+// drop_tables travels to the plan request with the exclusions read from the
+// same file, entry by entry as written.
+func TestLoadCLIConfig_ParsesDropTables(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: mydb\ntype: mysql\ndrop_tables:\n  - _jobs_old\n  - jobs_archive_2023\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"_jobs_old", "jobs_archive_2023"}, cfg.PlanExclusions().DropTables)
+	assert.Nil(t, cfg.PlanExclusions().Tables, "a drop is not an exclusion")
+}
+
+// A drop_tables entry is one exact table name, so a pattern is refused where
+// the config is read rather than dropping a table nobody named.
+func TestLoadCLIConfig_RejectsDropTablesPattern(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: mydb\ntype: mysql\ndrop_tables:\n  - '/^_.*_old$/'\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.Error(t, err)
+	assert.Nil(t, cfg)
+	assert.Contains(t, err.Error(), `schemabot.yaml: drop_tables entry "/^_.*_old$/" must be an exact table name`)
+}
+
 func TestLoadCLIConfig_RejectsIgnoreTablePaths(t *testing.T) {
 	dir := t.TempDir()
 	content := "database: mydb\ntype: mysql\nignore_tables:\n  - app/flyway_schema_history\n"

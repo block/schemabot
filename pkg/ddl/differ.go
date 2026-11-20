@@ -115,7 +115,9 @@ func (d *Differ) DiffTable(sourceStmt, targetStmt string) ([]string, error) {
 // IsSpiritInternalTable checks if a table name is a Spirit internal table.
 // Spirit uses tables like _spirit_sentinel, _spirit_checkpoint, _tablename_new,
 // _tablename_old, _tablename_chkpnt. These are engine artifacts that should not
-// be included in schema diffs or user-facing output.
+// be included in schema diffs. A planned change is never hidden by this test:
+// a repository can name such a table in drop_tables, and the plan and the
+// apply's progress show that drop like any other change.
 func IsSpiritInternalTable(table string) bool {
 	if table == "_spirit_sentinel" || table == "_spirit_checkpoint" {
 		return true
@@ -126,34 +128,4 @@ func IsSpiritInternalTable(table string) bool {
 		return true
 	}
 	return false
-}
-
-// FilterInternalTables filters out Spirit internal tables from a list.
-func FilterInternalTables(tables []any) []any {
-	var filtered []any
-	for _, t := range tables {
-		if tbl, ok := t.(map[string]any); ok {
-			name, _ := tbl["table_name"].(string)
-			if !IsSpiritInternalTable(name) {
-				filtered = append(filtered, t)
-			}
-		}
-	}
-	return filtered
-}
-
-// TableWithName is an interface for typed table responses that have a table name.
-type TableWithName interface {
-	GetTableName() string
-}
-
-// FilterInternalTablesTyped filters out Spirit internal tables from a typed slice.
-func FilterInternalTablesTyped[T TableWithName](tables []T) []T {
-	var filtered []T
-	for _, t := range tables {
-		if !IsSpiritInternalTable(t.GetTableName()) {
-			filtered = append(filtered, t)
-		}
-	}
-	return filtered
 }

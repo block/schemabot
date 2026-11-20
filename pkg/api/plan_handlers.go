@@ -1057,7 +1057,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		span.SetStatus(otelcodes.Error, "withheld table drops")
 		return nil, nil, err
 	}
-	s.warnDropTablesIgnored(req, resp, deployment)
+	s.reportDropTablesNotPlanned(req, resp, deployment)
 	if err := s.refuseDropsOfUnselectedTables(req, declaredSchemaFiles, unselected, resolvedTarget, resp.Changes, resp.Shards); err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "unselected namespace drops")
@@ -1311,21 +1311,36 @@ func (s *Service) refuseWithheldDrops(req PlanRequest, ignored engine.IgnoredTab
 		deployment, quotedTableList(dropped), upgrade)
 }
 
-// warnDropTablesIgnored logs when the data plane planned as if the request
+// reportDropTablesNotPlanned logs when the data plane planned as if the request
 // carried no drop_tables: an entry the plan does not drop is still disclosed
 // as a table the planner skips by its name, which a planner that read the list
 // would have dropped instead. That is a build that predates the field and
 // discarded it. The plan is not refused, because the table is left in place
 // and stays disclosed, the outcome the repository had before it asked for the
 // drop; the warning tells an operator why the drop is missing.
-func (s *Service) warnDropTablesIgnored(req PlanRequest, resp *ternv1.PlanResponse, deployment string) {
+//
+// An entry the plan neither drops nor skips names no live table, ordinarily
+// because the drop already landed and the entry is stale, or because of a
+// typo. It plans nothing, so it is logged at Info for an operator tracing why
+// a listed table was not dropped.
+func (s *Service) reportDropTablesNotPlanned(req PlanRequest, resp *ternv1.PlanResponse, deployment string) {
 	ignored := dropTablesEntriesStillSkipped(req.DropTables, resp.Changes, resp.Shards, resp.ExemptTables)
-	if len(ignored) == 0 {
-		return
-	}
 	var prInt int
 	if req.PullRequest != nil {
 		prInt = int(*req.PullRequest)
+	}
+	if unmatched := dropTablesEntriesUnmatched(req.DropTables, ignored, resp.Changes, resp.Shards); len(unmatched) > 0 {
+		s.logger.Info("drop_tables entries name no live table, so the plan drops nothing for them; remove the entries once their drops have landed",
+			"database", req.Database,
+			"environment", req.Environment,
+			"deployment", deployment,
+			"repository", req.Repository,
+			"pull_request", prInt,
+			"unmatched_entries", unmatched,
+		)
+	}
+	if len(ignored) == 0 {
+		return
 	}
 	s.logger.Warn("plan does not drop drop_tables entries that the planner still skips by their names; the deployment's planner did not apply drop_tables, so those tables stay in place",
 		"database", req.Database,

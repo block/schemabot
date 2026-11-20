@@ -324,6 +324,9 @@ for the environment too. Without one, `onboard` refuses a namespace named for
 the environment, because writing it would create the environment's root and
 hide the other namespaces. It also refuses namespaces whose directories are
 symlinks to one directory unless the pull returns the same schema for each.
+It also refuses when an existing `drop_tables` entry names a table the target
+still has, because writing that table's file would make every later plan
+refuse the repository. Apply the drop first, or remove the entry.
 
 The command's PR hint is for GitHub automation. You can also use the generated
 files directly with the CLI, as shown below.
@@ -366,7 +369,7 @@ database: shop
 type: mysql
 ```
 
-Preserve any existing `ignore_namespaces` and `ignore_tables` settings. For
+Preserve any existing `ignore_namespaces`, `ignore_tables` and `drop_tables` settings. For
 each managed table, copy its decoded SQL string to
 `schema/<namespace>/<table>.sql`, adding line breaks outside quoted content
 without changing options, comments, or statements. The example becomes

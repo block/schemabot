@@ -1810,6 +1810,14 @@ planner skips by their names are reported with the naming convention as the
 names start with `_` without reporting them. The PR comment and CLI name the
 first 50 tables of a group and count the rest; the response lists them all.
 
+A table the repository lists under `drop_tables` (see
+[Dropping Tables](namespaces.md#dropping-tables)) is not in those groups when
+the plan drops it: its `DROP TABLE` is in `changes` instead. A deployment whose
+planner predates `drop_tables` still skips the table, so it stays in its group
+and the server logs a warning naming the entry. The plan request carries the
+entries as `drop_tables`, and they are persisted with the plan, so a resume or
+drift check of that plan proposes the same drops.
+
 Response excerpt from the plan request (illustrative values):
 
 ```json

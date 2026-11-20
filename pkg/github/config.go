@@ -11,6 +11,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -51,6 +52,13 @@ type SchemabotConfig struct {
 	// over the whole name, for a family of tables created at runtime. Every
 	// plan discloses what it withheld.
 	IgnoreTables []string `yaml:"ignore_tables,omitempty" json:"ignore_tables,omitempty"`
+	// DropTables lists live tables no schema file declares that SchemaBot
+	// should drop — for example an online schema change's leftover "_" table,
+	// which every plan otherwise skips by its name. Each entry is one exact,
+	// case-sensitive table name; there are no patterns, so the config diff
+	// shows every table a plan will drop. MySQL only. Each drop is an unsafe
+	// change and goes through the usual review.
+	DropTables []string `yaml:"drop_tables,omitempty" json:"drop_tables,omitempty"`
 }
 
 // GetType returns the database type. Type is always set — FetchConfig rejects empty values.
@@ -173,6 +181,9 @@ func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath,
 		return nil, fmt.Errorf("invalid schemabot.yaml at %s: %w", configPath, err)
 	}
 	if err := schema.ValidateIgnoreTables(config.IgnoreTables); err != nil {
+		return nil, fmt.Errorf("invalid schemabot.yaml at %s: %w", configPath, err)
+	}
+	if _, err := engine.NewDroppedTables(config.DropTables); err != nil {
 		return nil, fmt.Errorf("invalid schemabot.yaml at %s: %w", configPath, err)
 	}
 

@@ -781,8 +781,8 @@ func TestCreateSchemaRequestFromPRSurfacesEmptiedNamespace(t *testing.T) {
 // schemabot.yaml, and the plan request is what carries that statement to the
 // server. The entries travel with the schema files read from the same commit,
 // so a reviewer reading the config on the pull request knows what the planner
-// was asked to leave alone.
-func TestCreateSchemaRequestFromPRCarriesIgnoreTables(t *testing.T) {
+// was asked to leave alone. Its drop_tables travels the same way.
+func TestCreateSchemaRequestFromPRCarriesIgnoreAndDropTables(t *testing.T) {
 	client, mux := setupConfigTestGitHubServer(t)
 	registerPullRequest(t, mux, "head-sha")
 	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
@@ -790,7 +790,7 @@ func TestCreateSchemaRequestFromPRCarriesIgnoreTables(t *testing.T) {
 		Status:   new("modified"),
 	}})
 	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/schemabot.yaml",
-		"database: orders\ntype: mysql\nignore_tables:\n  - flyway_schema_history\n  - legacy_audit\n")
+		"database: orders\ntype: mysql\nignore_tables:\n  - flyway_schema_history\n  - legacy_audit\ndrop_tables:\n  - _users_old\n")
 	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/schema", []*gh.RepositoryContent{
 		{Type: new("file"), Name: new("schemabot.yaml"), Path: new("schema/schemabot.yaml")},
 		{Type: new("dir"), Name: new("surviving"), Path: new("schema/surviving")},
@@ -806,6 +806,8 @@ func TestCreateSchemaRequestFromPRCarriesIgnoreTables(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit"}, result.IgnoreTables,
 		"the plan request carries the configured entries: without them the planner reads the withheld tables from the target and, finding no declaration, proposes dropping them")
+	assert.Equal(t, []string{"_users_old"}, result.DropTables,
+		"the plan request carries drop_tables from the same commit, so the plan proposes the drops the config names")
 }
 
 // TestCreateSchemaRequestFromPRIgnoresInheritedDeletion covers a pull request
@@ -1511,6 +1513,10 @@ func TestFetchConfigRejectsUnusableExclusionEntries(t *testing.T) {
 		"ignore_tables pattern that does not compile": {
 			yaml: "database: payments\ntype: mysql\nignore_tables:\n  - /^relay_(\\d+_feed$/\n",
 			want: `ignore_tables entry "/^relay_(\d+_feed$/" is not a valid regular expression`,
+		},
+		"drop_tables pattern": {
+			yaml: "database: payments\ntype: mysql\ndrop_tables:\n  - /^_.*_old$/\n",
+			want: `drop_tables entry "/^_.*_old$/" must be an exact table name`,
 		},
 		"padded ignore_namespaces entry": {
 			yaml: "database: payments\ntype: mysql\nignore_namespaces:\n  - \" local_fixtures\"\n",

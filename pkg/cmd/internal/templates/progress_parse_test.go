@@ -13,6 +13,27 @@ import (
 	"github.com/block/schemabot/pkg/state"
 )
 
+// An apply drops `_jobs_old`, a leftover table a repository named in
+// drop_tables. Every progress row is one of the apply's own changes, named by
+// the table it changes, so the CLI shows this one the way the PR comment does,
+// although the name matches the tables an online schema change works in.
+func TestParseProgressResponseKeepsDropOfUnderscoreTable(t *testing.T) {
+	data := ParseProgressResponse(&apitypes.ProgressResponse{
+		State: state.Apply.Running,
+		Tables: []*apitypes.TableProgressResponse{{
+			TableName:  "_jobs_old",
+			Keyspace:   "jobs",
+			ChangeType: "drop",
+			DDL:        "DROP TABLE `_jobs_old`;",
+			Status:     "STATE_RUNNING",
+		}},
+	})
+
+	require.Len(t, data.Tables, 1)
+	assert.Equal(t, "_jobs_old", data.Tables[0].TableName)
+	assert.Equal(t, "DROP TABLE `_jobs_old`;", data.Tables[0].DDL)
+}
+
 func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T) {
 	result := &apitypes.ProgressResponse{
 		State:       state.Apply.Running,
@@ -175,24 +196,6 @@ func TestParseProgressResponsePromotesSlowestShardETAAndDerivesShardPercent(t *t
 	// A server-sent percent that exceeds 100 is clamped the same way as a
 	// derived one.
 	assert.Equal(t, 100, data.Tables[0].Shards[3].PercentComplete)
-}
-
-// Spirit internal tables (shadow, checkpoint, sentinel) are working artifacts
-// of the copy, not schema changes: they never reach the rendered table list.
-func TestParseProgressResponseFiltersSpiritInternalTables(t *testing.T) {
-	result := &apitypes.ProgressResponse{
-		State: state.Apply.Running,
-		Tables: []*apitypes.TableProgressResponse{
-			{TableName: "users", Status: state.Task.Running},
-			{TableName: "_users_new", Status: state.Task.Running},
-			{TableName: "_spirit_sentinel", Status: state.Task.Running},
-		},
-	}
-
-	data := ParseProgressResponse(result)
-
-	require.Len(t, data.Tables, 1)
-	assert.Equal(t, "users", data.Tables[0].TableName)
 }
 
 // The structured copy fields pass through untouched, and a raw engine phase

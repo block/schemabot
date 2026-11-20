@@ -374,6 +374,30 @@ func dropTablesEntriesStillSkipped(entries []string, changes []*ternv1.SchemaCha
 	return stillSkipped
 }
 
+// dropTablesEntriesUnmatched returns, in the order the config lists them, the
+// drop_tables entries the plan neither drops nor still skips by a naming
+// convention: entries naming no live table on the target, ordinarily because
+// the drop already landed or the entry has a typo. stillSkipped is what
+// dropTablesEntriesStillSkipped reported, which is a different answer and is
+// left out here.
+func dropTablesEntriesUnmatched(entries, stillSkipped []string, changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	dropped := make(map[string]bool)
+	for _, drop := range plannedTableDrops(changes, shards) {
+		dropped[drop.table] = true
+	}
+	var unmatched []string
+	for _, entry := range entries {
+		if dropped[entry] || slices.Contains(stillSkipped, entry) || slices.Contains(unmatched, entry) {
+			continue
+		}
+		unmatched = append(unmatched, entry)
+	}
+	return unmatched
+}
+
 // existingCopiesFromProto carries the target's unfinished copies through to the
 // plan response so the operator is told, before applying, whether the apply
 // resumes an existing copy or throws it away and starts over.

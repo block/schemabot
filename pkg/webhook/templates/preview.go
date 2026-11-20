@@ -160,6 +160,36 @@ func PreviewCommentPlanIgnoreTables() string {
 	})
 }
 
+// PreviewCommentPlanDropTables renders the plan a repository gets once its
+// config names a leftover table from an earlier online schema change under
+// drop_tables. The MySQL planner otherwise skips the table by its leading
+// underscore; the entry turns it into a DROP TABLE that is listed with the
+// unsafe changes like any other drop, while the leftover the config does not
+// name stays disclosed as skipped.
+func PreviewCommentPlanDropTables() string {
+	const drop = "DROP TABLE `_events_old`;"
+	return RenderPlanComment(PlanCommentData{
+		Database:         "testapp",
+		SchemaName:       "testapp",
+		Environment:      "staging",
+		HeadSHA:          previewHeadSHA,
+		Repository:       previewRepository,
+		RequestedBy:      previewRequestedBy,
+		IsMySQL:          true,
+		DatabaseType:     "mysql",
+		Changes:          []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{drop}}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "_events_old", Reason: "DROP TABLE removes all data", ChangeType: "drop", DDL: drop},
+		},
+		ExemptTables: []ExemptTablesData{{
+			Namespace: "testapp",
+			Tables:    []string{"_orders_old"},
+			Reason:    engine.ExemptReasonLeadingUnderscore,
+		}},
+	})
+}
+
 // previewBytes returns a pointer to a sample byte estimate.
 //
 //go:fix inline
