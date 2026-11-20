@@ -102,8 +102,10 @@ func TestPlanWithChangesDisclosesExemptTables(t *testing.T) {
 // whole config the plan was planned under rather than the subset that matched a
 // live table here: an entry that withheld nothing on this target still names a
 // table a member holds, and a member re-planning without it proposes dropping
-// that table and then refuses an apply of the plan it was handed.
-func TestPlanRecordsTheWholeIgnoreTablesConfigItWasPlannedUnder(t *testing.T) {
+// that table and then refuses an apply of the plan it was handed. The
+// drop_tables config is recorded whole for the same reason, so a member's
+// re-plan proposes the drops the reviewed plan carries.
+func TestPlanRecordsTheWholeIgnoreAndDropTablesConfigItWasPlannedUnder(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 12}
 	client := exemptTablesClient(store, exemptTablesEngine{
 		exempt: map[string][]*engine.ExemptTables{"app": {{
@@ -117,12 +119,15 @@ func TestPlanRecordsTheWholeIgnoreTablesConfigItWasPlannedUnder(t *testing.T) {
 	_, err := client.Plan(t.Context(), &ternv1.PlanRequest{
 		SchemaFiles:  appSchemaFiles(),
 		IgnoreTables: []string{"legacy_audit", "reporting_snapshots"},
+		DropTables:   []string{"_users_old", "_orders_old"},
 	})
 	require.NoError(t, err)
 
 	require.NotNil(t, store.created)
 	assert.Equal(t, []string{"legacy_audit", "reporting_snapshots"}, store.created.IgnoreTables(),
 		"the entry that matched no live table here is recorded too: a member that holds it must still withhold it")
+	assert.Equal(t, []string{"_orders_old", "_users_old"}, store.created.DropTables(),
+		"every drop_tables entry is recorded, whether or not it named a live table here")
 }
 
 // TestPlanMySQLNamespacesKeepsEveryNamespacesExemptTables verifies a

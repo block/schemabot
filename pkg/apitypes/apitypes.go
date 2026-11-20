@@ -833,6 +833,12 @@ type PlanRequest struct {
 	// target, not in the repository — so the data plane applies it and reports
 	// what it actually withheld through ExemptTables on the response.
 	IgnoreTables []string `json:"ignore_tables,omitempty"`
+	// DropTables lists live tables the config's drop_tables asks the planner
+	// to drop although no schema file declares them, including tables the
+	// engine otherwise skips by their names. Each entry is one exact table
+	// name. The stored plan records the list, so every re-plan of the plan
+	// proposes the same drops.
+	DropTables []string `json:"drop_tables,omitempty"`
 	// GroupedExecution reports whether an apply of this plan will hand the
 	// engine every ALTER at once or one table at a time. Engines predicting what
 	// an apply will do to unfinished work already on the target need the

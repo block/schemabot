@@ -3204,6 +3204,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
 			GenerationOperationKeys: scope.generationOperationKeys(),
 			IgnoreTables:            plan.IgnoreTables(),
+			DropTables:              plan.DropTables(),
 			DirectExecution:         DirectExecutionPolicyProto(driveOptions.DirectExecution),
 		}
 		scope.stampMemberTarget(req, plan)
@@ -4162,6 +4163,7 @@ func (c *GRPCClient) dispatchRemoteApply(ctx context.Context, apply *storage.App
 		IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
 		GenerationOperationKeys: scope.generationOperationKeys(),
 		IgnoreTables:            plan.IgnoreTables(),
+		DropTables:              plan.DropTables(),
 		// Restated as a field rather than left to ride in Options: the data
 		// plane admits the policy only from the field, so an option map that
 		// reached the control plane from anywhere else cannot grant one.

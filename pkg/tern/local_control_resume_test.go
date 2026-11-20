@@ -1820,6 +1820,49 @@ func TestReplanAndFilterTasks_WithheldTablesTravelToTheReplan(t *testing.T) {
 	assert.Zero(t, rp.CompletedCount)
 }
 
+// Both resume re-plans are asked to drop what the reviewed plan's drop_tables
+// named. The table is one the engine skips by its name, so a re-plan without
+// the list leaves the reviewed DROP TABLE out of the delta, and a resume would
+// read a drop the apply has not run yet as one that already landed.
+func TestResumeReplans_DropTablesTravelToTheReplan(t *testing.T) {
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+		"testapp": {Tables: []storage.TableChange{{Namespace: "testapp", Table: "_users_old", Operation: "drop"}}},
+	}}
+	plan.RecordDropTables([]string{"_users_old"})
+	newClient := func(shown *[]string) *LocalClient {
+		c := newPlanMaterializeClient(&fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }})
+		c.config.TargetDSN = "user:pass@tcp(127.0.0.1:3306)/testapp"
+		c.spiritEngine = fakePlanEngine{
+			planFn: func(_ context.Context, req *engine.PlanRequest) (*engine.PlanResult, error) {
+				*shown = req.DropTables
+				return alterUsersEmailPlan(), nil
+			},
+		}
+		return c
+	}
+
+	t.Run("replanTargetSchema", func(t *testing.T) {
+		var shown []string
+		_, err := newClient(&shown).replanTargetSchema(t.Context(), &storage.Apply{Database: "testapp"}, plan)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"_users_old"}, shown, "the re-plan is asked for the drops the plan was reviewed with")
+	})
+
+	t.Run("replanAndFilterTasks", func(t *testing.T) {
+		var shown []string
+		tasks := []*storage.Task{{
+			TaskIdentifier: "task_1",
+			Namespace:      "testapp",
+			TableName:      "users",
+			DDLAction:      "alter",
+			DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		}}
+		_, err := newClient(&shown).replanAndFilterTasks(t.Context(), &storage.Apply{Database: "testapp"}, tasks, plan)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"_users_old"}, shown, "the re-plan is asked for the drops the plan was reviewed with")
+	})
+}
+
 // The local drive resolves the plan from the operation it drives, so a rollout
 // member planned against its own live schema runs its own DDL rather than the
 // reviewed primary's.

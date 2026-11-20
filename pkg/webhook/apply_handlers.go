@@ -378,7 +378,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			}
 			return true, fmt.Errorf("apply command plan %s#%d: %w", repo, pr, err)
 		}
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, userFacingError(err))
 		// Failures other than remote-deployment unavailability are treated
 		// as deterministic: the posted error is the command's answer. Some
 		// of them are not truly deterministic (planning runs against a live

@@ -23,6 +23,7 @@ func TestNamespacesWithShardPlansKeepsEveryNamespaceField(t *testing.T) {
 		Artifacts:             map[string]string{storage.VSchemaArtifactName: `{"tables":{}}`},
 		Metadata:              map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
 		IgnoreTables:          []string{"_archive"},
+		DropTables:            []string{"_refunds_old"},
 		Finalize:              true,
 	}
 	fields := reflect.ValueOf(nsData).Elem()

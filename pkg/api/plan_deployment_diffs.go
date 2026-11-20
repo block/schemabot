@@ -296,6 +296,10 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 		// target, so a member asked without the list would diff tables the
 		// primary withheld and report them as drift the primary does not have.
 		IgnoreTables: req.IgnoreTables,
+		// The drop list travels for the same reason: a member asked without it
+		// would not plan the drops the primary planned and would report the
+		// difference as drift the primary does not have.
+		DropTables: req.DropTables,
 		// Always stated, never left absent: absence tells the data plane the
 		// caller predates the grouping choice, and this caller has made one.
 		GroupedExecution: new(req.GroupedExecution),

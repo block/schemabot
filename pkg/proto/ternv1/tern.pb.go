@@ -1328,8 +1328,17 @@ type PlanRequest struct {
 	// as one unit (a database-scoped MySQL DSN), where an unselected namespace's
 	// live tables would otherwise be planned as drops.
 	UnselectedNamespaces []string `protobuf:"bytes,15,rep,name=unselected_namespaces,json=unselectedNamespaces,proto3" json:"unselected_namespaces,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Live tables the repository's drop_tables config asks the planner to drop
+	// although no schema file declares them, including tables the engine
+	// otherwise leaves out of every plan by their names. Each entry is one exact,
+	// case-sensitive table name, matched against the target's own catalog in
+	// every namespace the plan covers; an entry that names no live table plans
+	// nothing. An engine that does not support the list refuses a plan that
+	// carries it, and the engine refuses an entry that ignore_tables also
+	// withholds or that a schema file declares.
+	DropTables    []string `protobuf:"bytes,16,rep,name=drop_tables,json=dropTables,proto3" json:"drop_tables,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PlanRequest) Reset() {
@@ -1456,6 +1465,13 @@ func (x *PlanRequest) GetDirectExecution() *DirectExecutionPolicy {
 func (x *PlanRequest) GetUnselectedNamespaces() []string {
 	if x != nil {
 		return x.UnselectedNamespaces
+	}
+	return nil
+}
+
+func (x *PlanRequest) GetDropTables() []string {
+	if x != nil {
+		return x.DropTables
 	}
 	return nil
 }
@@ -2519,8 +2535,17 @@ type ApplyRequest struct {
 	// planned with. Empty on a dispatch that is not a table step, whose
 	// ddl_changes already carry its whole plan.
 	PlanDdlChanges []*TableChange `protobuf:"bytes,15,rep,name=plan_ddl_changes,json=planDdlChanges,proto3" json:"plan_ddl_changes,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// The drop_tables config the reviewed plan was planned under, as the plan
+	// recorded it, carried for the same reason as ignore_tables: a deployment
+	// that materializes this dispatch re-plans against its own live schema to
+	// prove the reviewed DDL is what it would independently produce, and a
+	// re-plan without these entries would not propose the reviewed DROP TABLE
+	// statements and would refuse an apply that matches the plan exactly. The
+	// plan's own record travels rather than the current config, so the
+	// comparison is against what was reviewed.
+	DropTables    []string `protobuf:"bytes,16,rep,name=drop_tables,json=dropTables,proto3" json:"drop_tables,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ApplyRequest) Reset() {
@@ -2654,6 +2679,13 @@ func (x *ApplyRequest) GetDirectExecution() *DirectExecutionPolicy {
 func (x *ApplyRequest) GetPlanDdlChanges() []*TableChange {
 	if x != nil {
 		return x.PlanDdlChanges
+	}
+	return nil
+}
+
+func (x *ApplyRequest) GetDropTables() []string {
+	if x != nil {
+		return x.DropTables
 	}
 	return nil
 }
@@ -5613,7 +5645,7 @@ const file_tern_proto_rawDesc = "" +
 	"tableCount\x1aW\n" +
 	"\x0fNamespacesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12.\n" +
-	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\xb8\x05\n" +
+	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\xd9\x05\n" +
 	"\vPlanRequest\x12\x1a\n" +
 	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12H\n" +
@@ -5632,7 +5664,9 @@ const file_tern_proto_rawDesc = "" +
 	"\x11grouped_execution\x18\f \x01(\bH\x00R\x10groupedExecution\x88\x01\x01\x12#\n" +
 	"\rignore_tables\x18\r \x03(\tR\fignoreTables\x12I\n" +
 	"\x10direct_execution\x18\x0e \x01(\v2\x1e.tern.v1.DirectExecutionPolicyR\x0fdirectExecution\x123\n" +
-	"\x15unselected_namespaces\x18\x0f \x03(\tR\x14unselectedNamespaces\x1aT\n" +
+	"\x15unselected_namespaces\x18\x0f \x03(\tR\x14unselectedNamespaces\x12\x1f\n" +
+	"\vdrop_tables\x18\x10 \x03(\tR\n" +
+	"dropTables\x1aT\n" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
 	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01B\x14\n" +
@@ -5728,7 +5762,7 @@ const file_tern_proto_rawDesc = "" +
 	"\x06errors\x18\x04 \x03(\tR\x06errors\x12*\n" +
 	"\x06shards\x18\x05 \x03(\v2\x12.tern.v1.ShardPlanR\x06shards\x12>\n" +
 	"\x0fexisting_copies\x18\x06 \x03(\v2\x15.tern.v1.ExistingCopyR\x0eexistingCopies\x128\n" +
-	"\x18existing_copies_reported\x18\a \x01(\bR\x16existingCopiesReported\"\xb5\x06\n" +
+	"\x18existing_copies_reported\x18\a \x01(\bR\x16existingCopiesReported\"\xd6\x06\n" +
 	"\fApplyRequest\x12\x17\n" +
 	"\aplan_id\x18\x01 \x01(\tR\x06planId\x12<\n" +
 	"\aoptions\x18\x02 \x03(\v2\".tern.v1.ApplyRequest.OptionsEntryR\aoptions\x12I\n" +
@@ -5746,7 +5780,9 @@ const file_tern_proto_rawDesc = "" +
 	"\x19generation_operation_keys\x18\f \x03(\tR\x17generationOperationKeys\x12#\n" +
 	"\rignore_tables\x18\r \x03(\tR\fignoreTables\x12I\n" +
 	"\x10direct_execution\x18\x0e \x01(\v2\x1e.tern.v1.DirectExecutionPolicyR\x0fdirectExecution\x12>\n" +
-	"\x10plan_ddl_changes\x18\x0f \x03(\v2\x14.tern.v1.TableChangeR\x0eplanDdlChanges\x1a:\n" +
+	"\x10plan_ddl_changes\x18\x0f \x03(\v2\x14.tern.v1.TableChangeR\x0eplanDdlChanges\x12\x1f\n" +
+	"\vdrop_tables\x18\x10 \x03(\tR\n" +
+	"dropTables\x1a:\n" +
 	"\fOptionsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aT\n" +

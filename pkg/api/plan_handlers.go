@@ -65,6 +65,13 @@ type PlanRequest struct {
 	// in the repository — so the data plane applies it and reports what it
 	// actually withheld through exempt_tables on the response.
 	IgnoreTables []string `json:"ignore_tables,omitempty"`
+	// DropTables lists live tables the config's drop_tables asks the planner
+	// to drop although no schema file declares them, including tables the
+	// engine otherwise skips by their names. Each entry is one exact table
+	// name. Like IgnoreTables the tables are on the target, not in the
+	// repository, so the data plane applies the list, and the stored plan
+	// records it so every re-plan of the plan proposes the same drops.
+	DropTables []string `json:"drop_tables,omitempty"`
 
 	// SourceTrusted is set by the GitHub webhook path after SchemaBot has
 	// discovered the PR source itself. It is deliberately not JSON-decodable:
@@ -651,6 +658,17 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// drop_tables entries are exact table names only, checked by the same
+	// rule the engine indexes them with, so a malformed entry fails here
+	// rather than at a data plane that may read it differently.
+	if _, err := engine.NewDroppedTables(req.DropTables); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := refuseDropTablesAlsoIgnored(req.DropTables, req.IgnoreTables); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// Planning stages a change against a specific database and reads its live
 	// schema, so it takes the same per-database authorization as apply.
@@ -716,6 +734,10 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
 			s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeSourcePolicyDenied, "plan failed: "+err.Error())
+			return
+		}
+		if _, ok := errors.AsType[*DropTablesInUseError](err); ok {
+			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "plan rejected: "+err.Error())
 			return
 		}
 		s.logger.Error("plan failed", "database", req.Database, "error", err)
@@ -907,6 +929,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		// planning their live tables as drops.
 		UnselectedNamespaces: unselected,
 		IgnoreTables:         req.IgnoreTables,
+		DropTables:           req.DropTables,
 		// Always stated, never left absent: absence tells the data plane the
 		// caller predates the grouping choice, and this caller has made one.
 		GroupedExecution: new(req.GroupedExecution),
@@ -955,6 +978,25 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			"repository", req.Repository,
 			"ignore_tables", req.IgnoreTables,
 		)
+	}
+	if len(req.DropTables) > 0 {
+		s.logger.Info("plan request asks to drop live tables named by drop_tables",
+			"database", req.Database,
+			"environment", req.Environment,
+			"deployment", deployment,
+			"repository", req.Repository,
+			"drop_tables", req.DropTables,
+		)
+	}
+	if err := refuseDropTablesAlsoIgnored(req.DropTables, req.IgnoreTables); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "drop_tables entry also ignored")
+		return nil, nil, err
+	}
+	if err := s.refuseDropsOfUnsettledApplyWorkTables(ctx, req.Database, resolvedTarget.DatabaseType, req.Environment, req.DropTables); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "drop_tables working table in use")
+		return nil, nil, err
 	}
 
 	ctx, err = s.withPRSchemaPlanAdmission(ctx, client, req.Repository, int(ternReq.PullRequest), ternReq.HeadSha)
@@ -1015,6 +1057,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		span.SetStatus(otelcodes.Error, "withheld table drops")
 		return nil, nil, err
 	}
+	s.warnDropTablesIgnored(req, resp, deployment)
 	if err := s.refuseDropsOfUnselectedTables(req, declaredSchemaFiles, unselected, resolvedTarget, resp.Changes, resp.Shards); err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "unselected namespace drops")
@@ -1268,6 +1311,32 @@ func (s *Service) refuseWithheldDrops(req PlanRequest, ignored engine.IgnoredTab
 		deployment, quotedTableList(dropped), upgrade)
 }
 
+// warnDropTablesIgnored logs when the data plane planned as if the request
+// carried no drop_tables: an entry the plan does not drop is still disclosed
+// as a table the planner skips by its name, which a planner that read the list
+// would have dropped instead. That is a build that predates the field and
+// discarded it. The plan is not refused, because the table is left in place
+// and stays disclosed, the outcome the repository had before it asked for the
+// drop; the warning tells an operator why the drop is missing.
+func (s *Service) warnDropTablesIgnored(req PlanRequest, resp *ternv1.PlanResponse, deployment string) {
+	ignored := dropTablesEntriesStillSkipped(req.DropTables, resp.Changes, resp.Shards, resp.ExemptTables)
+	if len(ignored) == 0 {
+		return
+	}
+	var prInt int
+	if req.PullRequest != nil {
+		prInt = int(*req.PullRequest)
+	}
+	s.logger.Warn("plan does not drop drop_tables entries that the planner still skips by their names; the deployment's planner did not apply drop_tables, so those tables stay in place",
+		"database", req.Database,
+		"environment", req.Environment,
+		"deployment", deployment,
+		"repository", req.Repository,
+		"pull_request", prInt,
+		"ignored_entries", ignored,
+	)
+}
+
 // quotedTableList renders table names for an operator-facing message, quoted
 // so a name with a space or a trailing character reads as one name.
 func quotedTableList(names []string) string {
@@ -1357,6 +1426,7 @@ func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier
 		CreatedAt:             time.Now(),
 	}
 	storedPlan.RecordIgnoreTables(req.IgnoreTables)
+	storedPlan.RecordDropTables(req.DropTables)
 	// An identifier the planner supplied can already name a stored row when a
 	// plan is delivered twice, or when the planner stored the row itself, and
 	// re-storing it keeps that row rather than failing. A member's identifier is
@@ -1495,6 +1565,10 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, activeApplyConflictMessage(err))
 			return
 		}
+		if _, ok := errors.AsType[*DropTablesInUseError](err); ok {
+			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "apply rejected: "+err.Error())
+			return
+		}
 		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
 			s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeSourcePolicyDenied, "apply failed: "+err.Error())
 			return
@@ -1589,6 +1663,10 @@ func applyMetricStatusForError(err error) string {
 	}
 	// So is a deferred cutover wider than the drivers that can run it.
 	if _, ok := errors.AsType[*DeferredCutoverCapacityError](err); ok {
+		return applyMetricStatusRejected
+	}
+	// So is a drop of another apply's working table, until that apply settles.
+	if _, ok := errors.AsType[*DropTablesInUseError](err); ok {
 		return applyMetricStatusRejected
 	}
 	return "error"
@@ -2137,6 +2215,11 @@ func (s *Service) createStoredApply(
 		return nil, 0, err
 	}
 	if err := rejectUnsafeStoredPlanWithoutOptIn(plan, applyOpts); err != nil {
+		return nil, 0, err
+	}
+	// An apply stopped after this plan was made is checked here: storage
+	// admits a new apply past a stopped one.
+	if err := s.refuseDropsOfUnsettledApplyWorkTables(ctx, plan.Database, plan.DatabaseType, req.Environment, plan.DropTables()); err != nil {
 		return nil, 0, err
 	}
 
@@ -3493,6 +3576,10 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 		// carrying them on the request is what puts them on the rollback's own
 		// stored plan, so a re-plan of *that* plan withholds them too.
 		IgnoreTables: plan.IgnoreTables(),
+		// The plan's drop_tables is deliberately not carried. A rollback
+		// restores the schema the apply started from and never drops a table
+		// of its own accord: a listed table that is still on the target is
+		// left in place, skipped by its name as before the list existed.
 	}
 	resp, err := client.Plan(ctx, &ternv1.PlanRequest{
 		Database:     req.Database,

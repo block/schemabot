@@ -1062,6 +1062,22 @@ func TestUserFacingErrorPreservesNonGRPCErrors(t *testing.T) {
 	assert.Equal(t, "invalid DDL", got)
 }
 
+// A plan refused because SchemaBot could not read whether an apply still
+// needs a drop_tables entry shows a fixed line on the PR. The storage error
+// behind it, with its hosts and driver text, stays in the server log.
+func TestUserFacingErrorHidesTheCauseOfAFailedDropTablesCheck(t *testing.T) {
+	err := fmt.Errorf("plan orders/staging: %w", &api.DropTablesCheckError{
+		Database:    "orders",
+		Environment: "staging",
+		Err:         errors.New("dial tcp 10.1.2.3:3306: connect: connection refused"),
+	})
+
+	got := userFacingError(err)
+
+	assert.Equal(t, dropTablesCheckFailedMessage, got)
+	assert.NotContains(t, got, "10.1.2.3")
+}
+
 func TestUserFacingErrorExplainsConfigOutsideAllowedDirs(t *testing.T) {
 	err := &schemaConfigOutsideAllowedDirsError{
 		Database:     "orders",

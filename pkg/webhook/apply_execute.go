@@ -108,7 +108,7 @@ func (h *Handler) executeApply(
 
 	if err != nil {
 		h.logger.Error("plan execution failed on confirm", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, userFacingError(err))
 		return
 	}
 
@@ -918,6 +918,11 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 			parts = append(parts, msgs.afterRefusal)
 		}
 		return strings.Join(parts, " ")
+	}
+	if inUse, ok := errors.AsType[*api.DropTablesInUseError](err); ok {
+		// Built from the config entry, the apply's identifier and state, and
+		// the table its plan changes, never from storage error text.
+		return inUse.Error()
 	}
 	if missing, ok := errors.AsType[*api.PlanNotFoundError](err); ok {
 		return templates.PlanNotFoundDetail(missing.PlanID, msgs.replan)

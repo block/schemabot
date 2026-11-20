@@ -247,6 +247,12 @@ func (c *LocalClient) replanForDispatch(ctx context.Context, req *ternv1.ApplyRe
 		// where it was planned, so an entry naming a table only this
 		// deployment holds withholds it here too.
 		IgnoreTables: req.GetIgnoreTables(),
+		// Likewise the re-plan must be asked to drop what the reviewed plan
+		// was asked to drop. A table no schema file declares that the engine
+		// skips by its name is dropped only when drop_tables names it, so a
+		// re-plan without the list leaves out the reviewed DROP TABLE and
+		// this guard reads the difference as drift.
+		DropTables: req.GetDropTables(),
 		// The guard compares the reviewed DDL against this re-plan, so the
 		// re-plan has to be judged under the dispatch's own policy. Under a
 		// different one a statement the reviewed plan routed directly comes

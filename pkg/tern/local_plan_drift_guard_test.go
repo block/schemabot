@@ -136,6 +136,51 @@ func TestDriftGuard_MaterializedPlanRecordsIgnoreTables(t *testing.T) {
 		"a later re-plan on this deployment withholds what the reviewed plan withheld")
 }
 
+// A plan that dropped a table its drop_tables named was reviewed with that
+// DROP TABLE, and the drift guard's re-plan has to be asked to drop the same
+// table to reproduce it: the table is one the engine skips by its name, so a
+// re-plan without the list leaves the drop out and the guard would refuse the
+// apply as drift. The materialized row records the list too, so a later
+// rollback or resume on this deployment re-plans the same drop.
+func TestDriftGuard_DropTablesTravelToTheReplanAndTheMaterializedPlan(t *testing.T) {
+	const leftover = "_users_old"
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 12}
+	c := newPlanMaterializeClient(store)
+	c.config.TargetDSN = "user:pass@tcp(127.0.0.1:3306)/testapp"
+	var shown []string
+	c.spiritEngine = fakePlanEngine{
+		planFn: func(_ context.Context, req *engine.PlanRequest) (*engine.PlanResult, error) {
+			shown = req.DropTables
+			result := alterUsersEmailPlan()
+			if slices.Contains(req.DropTables, leftover) {
+				result.Changes[0].TableChanges = append(result.Changes[0].TableChanges, engine.TableChange{
+					Table:     leftover,
+					Operation: ddl.StatementDropTable,
+					DDL:       "DROP TABLE `" + leftover + "`",
+				})
+			}
+			return result, nil
+		},
+	}
+
+	got, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+		PlanId:     "plan_drops",
+		DropTables: []string{leftover},
+		DdlChanges: []*ternv1.TableChange{
+			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
+			{TableName: leftover, Ddl: "DROP TABLE `" + leftover + "`", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP, Namespace: "testapp"},
+		},
+	})
+
+	require.NoError(t, err, "the re-plan proposes the reviewed drop, so there is no drift")
+	require.NotNil(t, got)
+	assert.Equal(t, int64(12), got.ID)
+	assert.Equal(t, []string{leftover}, shown, "the re-plan is shown the plan's own drop list")
+	require.NotNil(t, store.created)
+	assert.Equal(t, []string{leftover}, store.created.DropTables(),
+		"a later re-plan on this deployment drops what the reviewed plan dropped")
+}
+
 // The exclusion comes from the dispatched plan's record and from nowhere else: a
 // dispatch that withheld nothing gets a re-plan that sees the whole live schema,
 // so the drop the reviewed DDL does not carry is drift and fails closed.
