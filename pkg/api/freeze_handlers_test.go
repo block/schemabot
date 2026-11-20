@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -23,10 +24,12 @@ import (
 )
 
 // memoryFreezeStore is an in-memory storage.FreezeStore with the SQL store's
-// lift semantics.
+// lift semantics. clock stands in for the database clock.
 type memoryFreezeStore struct {
 	mu      sync.Mutex
+	clock   clock.Clock
 	freezes []*storage.EnvironmentFreeze
+	nowErr  error
 }
 
 func (m *memoryFreezeStore) Create(_ context.Context, freeze *storage.EnvironmentFreeze) (*storage.EnvironmentFreeze, error) {
@@ -54,7 +57,8 @@ func (m *memoryFreezeStore) Get(_ context.Context, identifier string) (*storage.
 	return nil, storage.ErrFreezeNotFound
 }
 
-func (m *memoryFreezeStore) Lift(_ context.Context, identifier, liftedBy, reason string, at time.Time) (*storage.EnvironmentFreeze, error) {
+func (m *memoryFreezeStore) Lift(_ context.Context, identifier, liftedBy, reason string) (*storage.EnvironmentFreeze, error) {
+	at := m.clock.Now().UTC()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, freeze := range m.freezes {
@@ -74,11 +78,13 @@ func (m *memoryFreezeStore) Lift(_ context.Context, identifier, liftedBy, reason
 	return nil, storage.ErrFreezeNotFound
 }
 
-func (m *memoryFreezeStore) ListInEffect(_ context.Context, environment string, at time.Time) ([]*storage.EnvironmentFreeze, error) {
+func (m *memoryFreezeStore) ListInEffect(_ context.Context, environment string) ([]*storage.EnvironmentFreeze, error) {
+	at := m.clock.Now().UTC()
 	return m.filter(environment, func(f *storage.EnvironmentFreeze) bool { return f.InEffectAt(at) }), nil
 }
 
-func (m *memoryFreezeStore) ListCurrent(_ context.Context, environment string, at time.Time) ([]*storage.EnvironmentFreeze, error) {
+func (m *memoryFreezeStore) ListCurrent(_ context.Context, environment string) ([]*storage.EnvironmentFreeze, error) {
+	at := m.clock.Now().UTC()
 	return m.filter(environment, func(f *storage.EnvironmentFreeze) bool {
 		return f.LiftedAt == nil && (f.EndsAt == nil || at.Before(*f.EndsAt))
 	}), nil
@@ -88,6 +94,13 @@ func (m *memoryFreezeStore) History(_ context.Context, environment string, limit
 	all := m.filter(environment, func(*storage.EnvironmentFreeze) bool { return true })
 	slices.Reverse(all)
 	return all[:min(limit, len(all))], nil
+}
+
+func (m *memoryFreezeStore) Now(context.Context) (time.Time, error) {
+	if m.nowErr != nil {
+		return time.Time{}, m.nowErr
+	}
+	return m.clock.Now().UTC(), nil
 }
 
 func (m *memoryFreezeStore) filter(environment string, keep func(*storage.EnvironmentFreeze) bool) []*storage.EnvironmentFreeze {
@@ -114,8 +127,11 @@ var freezeTestNow = time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
 
 func newFreezeTestService(t *testing.T, config *ServerConfig) (*Service, *http.ServeMux) {
 	t.Helper()
-	service := New(&mockStorageWithFreezes{freezes: &memoryFreezeStore{}}, config, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	require.NoError(t, service.SetClock(clock.NewFake(freezeTestNow)))
+	// The store and the service share one fake clock, so advancing it moves
+	// the stand-in database clock too.
+	fake := clock.NewFake(freezeTestNow)
+	service := New(&mockStorageWithFreezes{freezes: &memoryFreezeStore{clock: fake}}, config, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, service.SetClock(fake))
 	mux := http.NewServeMux()
 	service.ConfigureRoutes(mux)
 	return service, mux
@@ -154,9 +170,9 @@ var (
 	freezeOperator = &auth.User{Subject: "olga", Groups: []string{"payments-team"}}
 )
 
-// An on-demand freeze set with only an environment and a reason starts now,
-// has no end, and only freeze admins may override it. A planned freeze lets
-// anyone override by default.
+// A freeze set with only an environment and a reason starts now by the
+// database clock, has no end, and lets running applies continue. A freeze
+// may ask to stop them instead.
 func TestFreezeCreateDefaults(t *testing.T) {
 	_, mux := newFreezeTestService(t, freezeConfig())
 
@@ -166,7 +182,7 @@ func TestFreezeCreateDefaults(t *testing.T) {
 	assert.True(t, strings.HasPrefix(onDemand.ID, "freeze-"))
 	assert.Equal(t, "staging", onDemand.Environment)
 	assert.Equal(t, storage.FreezeKindOnDemand, onDemand.Kind)
-	assert.Equal(t, storage.FreezeOverrideAdmins, onDemand.Override)
+	assert.Equal(t, storage.FreezeRunningContinue, onDemand.Running)
 	assert.True(t, onDemand.StartsAt.Equal(freezeTestNow))
 	assert.Nil(t, onDemand.EndsAt)
 	assert.Equal(t, "alice", onDemand.CreatedBy)
@@ -177,8 +193,24 @@ func TestFreezeCreateDefaults(t *testing.T) {
 		`{"environment":"production","kind":"planned","starts_at":"2026-11-25T08:00:00Z","ends_at":"2026-11-30T08:00:00Z","reason":"holiday"}`)
 	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 	planned := decodeFreeze(t, w)
-	assert.Equal(t, storage.FreezeOverrideAnyone, planned.Override)
+	assert.Equal(t, storage.FreezeRunningContinue, planned.Running)
 	assert.False(t, planned.InEffect, "a planned freeze takes effect at its start")
+
+	w = doFreezeRequest(t, mux, freezeAdmin, http.MethodPost, "/api/freezes", `{"environment":"staging","running":"stop","reason":"bad ddl"}`)
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	assert.Equal(t, storage.FreezeRunningStop, decodeFreeze(t, w).Running)
+}
+
+// When the database clock cannot be read, a freeze call fails with 503
+// rather than labeling freezes by a pod's own clock.
+func TestFreezeDatabaseClockUnavailable(t *testing.T) {
+	service, mux := newFreezeTestService(t, freezeConfig())
+	service.storage.Freezes().(*memoryFreezeStore).nowErr = errors.New("connection refused")
+
+	w := doFreezeRequest(t, mux, freezeAdmin, http.MethodPost, "/api/freezes", `{"environment":"staging","reason":"incident"}`)
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
+	w = doFreezeRequest(t, mux, freezeAdmin, http.MethodGet, "/api/freezes", "")
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
 }
 
 // A freeze request that names something SchemaBot does not know, or that
@@ -192,7 +224,7 @@ func TestFreezeCreateRejectsInvalidRequests(t *testing.T) {
 		"database without env": {`{"environment":"production","databases":["orders"],"reason":"x"}`, `database "orders" has no environment "production"`},
 		"missing reason":       {`{"environment":"staging"}`, "reason is required"},
 		"planned without end":  {`{"environment":"staging","kind":"planned","reason":"x"}`, "planned freeze needs an end time"},
-		"bad override":         {`{"environment":"staging","override":"everyone","reason":"x"}`, "freeze override"},
+		"bad running policy":   {`{"environment":"staging","running":"pause","reason":"x"}`, "freeze running policy"},
 		"end in the past":      {`{"environment":"staging","ends_at":"2026-11-19T00:00:00Z","reason":"x"}`, "end time must be in the future"},
 		"unknown field":        {`{"environment":"staging","reason":"x","scope":"all"}`, "unknown field"},
 	}
@@ -254,7 +286,7 @@ func TestFreezeLiftConflicts(t *testing.T) {
 	end := freezeTestNow.Add(time.Hour)
 	ended, err := service.storage.Freezes().Create(t.Context(), &storage.EnvironmentFreeze{
 		Identifier: "freeze-ended", Environment: "staging", Kind: storage.FreezeKindPlanned,
-		Override: storage.FreezeOverrideAnyone, StartsAt: freezeTestNow.Add(-time.Hour), EndsAt: &end,
+		Running: storage.FreezeRunningContinue, StartsAt: freezeTestNow.Add(-time.Hour), EndsAt: &end,
 		Reason: "window", CreatedBy: "alice", Source: storage.FreezeSourceManual,
 	})
 	require.NoError(t, err)

@@ -16,10 +16,9 @@ type CreateFreezeRequest struct {
 	// EndsAt.
 	Kind string `json:"kind,omitempty"`
 
-	// Override is "anyone" or "admins": who may run a change during the
-	// freeze. It defaults to "admins" for an on-demand freeze and "anyone"
-	// for a planned one.
-	Override string `json:"override,omitempty"`
+	// Running is "continue" (the default) or "stop": what happens to applies
+	// already running in scope when the freeze starts.
+	Running string `json:"running,omitempty"`
 
 	// StartsAt defaults to now. EndsAt may be empty for an on-demand freeze,
 	// which then lasts until someone lifts it.
@@ -43,7 +42,7 @@ type Freeze struct {
 	Deployments []string   `json:"deployments,omitempty"`
 	Databases   []string   `json:"databases,omitempty"`
 	Kind        string     `json:"kind"`
-	Override    string     `json:"override"`
+	Running     string     `json:"running"`
 	StartsAt    time.Time  `json:"starts_at"`
 	EndsAt      *time.Time `json:"ends_at,omitempty"`
 	Reason      string     `json:"reason"`

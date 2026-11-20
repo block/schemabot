@@ -24,7 +24,7 @@ const (
 )
 
 // handleFreezeCreate sets an environment freeze. While it is in effect,
-// SchemaBot refuses new changes in its scope unless they carry an override.
+// SchemaBot refuses changes in its scope.
 func (s *Service) handleFreezeCreate(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeFreezeWrite(w, r, "freeze_create") {
 		return
@@ -37,7 +37,10 @@ func (s *Service) handleFreezeCreate(w http.ResponseWriter, r *http.Request) {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
-	now := s.clock.Now().UTC()
+	now, ok := s.freezeNow(r.Context(), w)
+	if !ok {
+		return
+	}
 	freeze, err := s.freezeFromRequest(r.Context(), &req, now)
 	if err != nil {
 		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
@@ -82,13 +85,6 @@ func (s *Service) freezeFromRequest(ctx context.Context, req *apitypes.CreateFre
 	}
 
 	kind := cmp.Or(req.Kind, storage.FreezeKindOnDemand)
-	override := req.Override
-	if override == "" {
-		override = storage.FreezeOverrideAdmins
-		if kind == storage.FreezeKindPlanned {
-			override = storage.FreezeOverrideAnyone
-		}
-	}
 	startsAt := now
 	if req.StartsAt != nil {
 		startsAt = req.StartsAt.UTC()
@@ -103,7 +99,7 @@ func (s *Service) freezeFromRequest(ctx context.Context, req *apitypes.CreateFre
 		Deployments: canonicalFreezeScope(req.Deployments),
 		Databases:   databases,
 		Kind:        kind,
-		Override:    override,
+		Running:     cmp.Or(req.Running, storage.FreezeRunningContinue),
 		StartsAt:    startsAt,
 		EndsAt:      req.EndsAt,
 		Reason:      strings.TrimSpace(req.Reason),
@@ -134,8 +130,11 @@ func (s *Service) handleFreezeList(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
-	now := s.clock.Now().UTC()
-	current, err := s.storage.Freezes().ListCurrent(r.Context(), environment, now)
+	now, ok := s.freezeNow(r.Context(), w)
+	if !ok {
+		return
+	}
+	current, err := s.storage.Freezes().ListCurrent(r.Context(), environment)
 	if err != nil {
 		s.logger.Error("list current freezes failed", "environment", environment, "error", err)
 		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "list freezes failed")
@@ -181,7 +180,11 @@ func (s *Service) handleFreezeGet(w http.ResponseWriter, r *http.Request) {
 		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "get freeze failed")
 		return
 	}
-	s.writeJSON(w, http.StatusOK, freezeResponse(freeze, s.clock.Now().UTC()))
+	now, ok := s.freezeNow(r.Context(), w)
+	if !ok {
+		return
+	}
+	s.writeJSON(w, http.StatusOK, freezeResponse(freeze, now))
 }
 
 // handleFreezeLift ends a freeze early. The row stays as the audit trail.
@@ -198,8 +201,7 @@ func (s *Service) handleFreezeLift(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	now := s.clock.Now().UTC()
-	lifted, err := s.storage.Freezes().Lift(r.Context(), id, freezeCaller(r.Context()), strings.TrimSpace(req.Reason), now)
+	lifted, err := s.storage.Freezes().Lift(r.Context(), id, freezeCaller(r.Context()), strings.TrimSpace(req.Reason))
 	switch {
 	case errors.Is(err, storage.ErrFreezeNotFound):
 		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeNotFound, fmt.Sprintf("freeze %q not found", id))
@@ -217,7 +219,21 @@ func (s *Service) handleFreezeLift(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logger.Info("environment freeze lifted", append(freezeLogArgs(lifted),
 		"lifted_by", lifted.LiftedBy, "lift_reason", lifted.LiftReason)...)
-	s.writeJSON(w, http.StatusOK, freezeResponse(lifted, now))
+	// A lifted freeze is never in effect, so the response needs no clock read.
+	s.writeJSON(w, http.StatusOK, freezeResponse(lifted, time.Time{}))
+}
+
+// freezeNow reads the database clock, the one the freeze store compares
+// against, so a response labels a freeze in effect exactly when the change
+// gate would refuse under it. It writes a 503 when the clock cannot be read.
+func (s *Service) freezeNow(ctx context.Context, w http.ResponseWriter) (time.Time, bool) {
+	now, err := s.storage.Freezes().Now(ctx)
+	if err != nil {
+		s.logger.Error("read database clock for freezes failed", "error", err)
+		s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeStorageError, "freeze storage is not available")
+		return time.Time{}, false
+	}
+	return now, true
 }
 
 // freezeStorageReady writes a 503 when the service has no freeze store, as a
@@ -267,7 +283,7 @@ func freezeLogArgs(freeze *storage.EnvironmentFreeze) []any {
 		"deployments", freeze.Deployments,
 		"databases", freeze.Databases,
 		"kind", freeze.Kind,
-		"override", freeze.Override,
+		"running", freeze.Running,
 		"starts_at", freeze.StartsAt,
 		"reason", freeze.Reason,
 		"caller", freeze.CreatedBy,
@@ -285,7 +301,7 @@ func freezeResponse(freeze *storage.EnvironmentFreeze, now time.Time) apitypes.F
 		Deployments: freeze.Deployments,
 		Databases:   freeze.Databases,
 		Kind:        freeze.Kind,
-		Override:    freeze.Override,
+		Running:     freeze.Running,
 		StartsAt:    freeze.StartsAt,
 		EndsAt:      freeze.EndsAt,
 		Reason:      freeze.Reason,
