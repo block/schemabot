@@ -324,35 +324,75 @@ func counterTotal(t *testing.T, reader *sdkmetric.ManualReader, name string) int
 	return total
 }
 
+// cleanerTestDeadline bounds a cleanup pass and the lock calls around it in a
+// test, so a target that stops answering fails the test with a deadline error
+// instead of holding the package until the test binary's own timeout.
+const cleanerTestDeadline = 30 * time.Second
+
+// boundedContext returns the test's context with cleanerTestDeadline on it.
+func boundedContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), cleanerTestDeadline)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+// waitRecordingLocker is the real MySQL locker that also records how long each
+// Acquire was told to wait for the lock.
+type waitRecordingLocker struct {
+	namedlock.MySQL
+	waits []time.Duration
+}
+
+func (l *waitRecordingLocker) Acquire(ctx context.Context, conn *sql.Conn, name string, wait time.Duration) (bool, error) {
+	l.waits = append(l.waits, wait)
+	return l.MySQL.Acquire(ctx, conn, name, wait)
+}
+
 // Two SchemaBot instances clean the same target. While one holds the cleanup
-// lock, the other skips the target for this pass: it drops nothing, reports
-// no error, and counts the skip, so two passes never race to drop the same
-// copies. Once the lock is free, the next pass drops the expired copy.
+// lock, the other skips the target for this pass without waiting for the lock:
+// it drops no copy, deletes no quarantine log record, reports no error, and
+// logs and counts the skip, so two passes never race to clean the same target.
+// Once the lock is free, the next pass drops the expired copy and deletes the
+// record of a copy that is gone.
 func TestCleaner_SkipsATargetAnotherInstanceIsCleaning(t *testing.T) {
 	db := setupCleanerTest(t)
-	expired := createQuarantinedTable(t, db, "old_orders", time.Now().Add(-8*24*time.Hour))
+	ctx := boundedContext(t)
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	expired := createQuarantinedTable(t, db, "old_orders", old)
+	gone := recordQuarantine(t, db, "apply-a", "never_moved", old)
 
-	cleaner := testCleaner(t, DefaultRetention, false)
-	lockName := targetLockName(cleaner.targets[0])
-	otherInstance, err := db.Conn(t.Context())
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	locker := &waitRecordingLocker{}
+	target := Target{Database: "testdb", Environment: "staging", DSN: sharedDSN, Locker: locker}
+	cleaner := NewCleaner([]Target{target}, DefaultRetention, false, logger)
+	lockName := targetLockName(target)
+
+	otherInstance, err := db.Conn(ctx)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(otherInstance)
-	acquired, err := namedlock.MySQL{}.Acquire(t.Context(), otherInstance, lockName, 0)
+	acquired, err := namedlock.MySQL{}.Acquire(ctx, otherInstance, lockName, 0)
 	require.NoError(t, err)
 	require.True(t, acquired, "the other instance must hold the cleanup lock")
 
 	reader := newManualMetricReader(t)
-	require.NoError(t, cleaner.Run(t.Context()))
+	require.NoError(t, cleaner.Run(ctx))
 
 	assert.Contains(t, quarantinedTables(t, db), expired, "a skipped pass drops nothing")
+	assert.Equal(t, []string{gone}, recordedNames(t, db, "apply-a", "never_moved"), "a skipped pass deletes no log record")
 	assert.Equal(t, int64(1), counterTotal(t, reader, "schemabot.pending_drops.cleanup_lock_skipped_total"))
 	assert.Empty(t, cleanupErrorReasonsByDatabase(t, reader), "a skipped pass is not a failure")
+	assert.Contains(t, logs.String(), "pending drops cleanup skipped: another instance holds the cleanup lock")
+	assert.Contains(t, logs.String(), "lock_name="+lockName)
 
-	released, err := namedlock.MySQL{}.Release(t.Context(), otherInstance, lockName)
+	released, err := namedlock.MySQL{}.Release(ctx, otherInstance, lockName)
 	require.NoError(t, err)
 	require.True(t, released)
-	require.NoError(t, cleaner.Run(t.Context()))
+	require.NoError(t, cleaner.Run(ctx))
 	assert.NotContains(t, quarantinedTables(t, db), expired, "the next pass with the lock free drops the expired copy")
+	assert.Empty(t, recordedNames(t, db, "apply-a", "never_moved"), "the next pass with the lock free deletes the record of the copy that is gone")
+	assert.Equal(t, []time.Duration{0, 0}, locker.waits, "a pass never waits for the cleanup lock")
 }
 
 // failingAcquireLocker is the real MySQL locker except that taking the lock
@@ -377,7 +417,7 @@ func TestCleaner_FailsATargetWhoseLockCannotBeTaken(t *testing.T) {
 	cleaner := NewCleaner([]Target{target}, DefaultRetention, false, logger)
 	reader := newManualMetricReader(t)
 
-	err := cleaner.Run(t.Context())
+	err := cleaner.Run(boundedContext(t))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "acquire advisory lock on testdb/staging")
 	assert.Contains(t, err.Error(), "lock call rejected by the target")

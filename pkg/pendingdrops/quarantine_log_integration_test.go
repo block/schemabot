@@ -231,28 +231,63 @@ func makeQuarantineLogReadOnly(t *testing.T, db *sql.DB, records ...string) {
 	}
 }
 
-// A pass that can read the quarantine log but cannot delete a record of a copy
-// that is gone fails under log_error, naming the record, after the expired
-// copies have still been dropped. The record stays for a later pass to delete.
+// makeQuarantineLogWritable replaces the read-only quarantine log built by
+// makeQuarantineLogReadOnly with a view over the same records that accepts
+// deletes, as when the account is given write access to the log.
+func makeQuarantineLogWritable(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(),
+		fmt.Sprintf("CREATE OR REPLACE VIEW `%s`.`%s` AS SELECT quarantine_table FROM `%s`.`log_base`", Database, LogTable, Database))
+	require.NoError(t, err, "make the quarantine log writable")
+}
+
+// quarantineLogRecords returns the copies the quarantine log lists.
+func quarantineLogRecords(t *testing.T, db *sql.DB) []string {
+	t.Helper()
+	rows, err := db.QueryContext(t.Context(),
+		fmt.Sprintf("SELECT quarantine_table FROM `%s`.`%s` ORDER BY quarantine_table", Database, LogTable))
+	require.NoError(t, err, "read the quarantine log")
+	defer utils.CloseAndLog(rows)
+
+	var names []string
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name), "scan quarantine log record")
+		names = append(names, name)
+	}
+	require.NoError(t, rows.Err(), "iterate quarantine log records")
+	return names
+}
+
+// A pass drops an expired copy and then cannot delete that copy's quarantine
+// log record, because it can read the log but not write it. The pass fails
+// under log_error, naming the record in its error and in its log, and the
+// record stays. Once the log can be written, the next pass deletes the record
+// and drops nothing more.
 func TestCleaner_ReportsALogRecordItCannotDelete(t *testing.T) {
 	db := setupCleanerTest(t)
-	old := time.Now().Add(-8 * 24 * time.Hour)
-	expired := createQuarantinedTable(t, db, "old_orders", old)
-	gone := TableName("testdb", "never_moved", old)
-	makeQuarantineLogReadOnly(t, db, gone)
+	ctx := boundedContext(t)
+	expired := createQuarantinedTable(t, db, "old_orders", time.Now().Add(-8*24*time.Hour))
+	makeQuarantineLogReadOnly(t, db, expired)
 	reader := newManualMetricReader(t)
+	var logs bytes.Buffer
+	cleaner := testCleanerLoggingTo(t, &logs, DefaultRetention, false)
 
-	err := testCleaner(t, DefaultRetention, false).Run(t.Context())
+	err := cleaner.Run(ctx)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "prune "+Database+"."+LogTable)
-	assert.Contains(t, err.Error(), "delete log record of "+gone)
+	assert.Contains(t, err.Error(), "delete log record of "+expired)
 	assert.Equal(t, map[string]string{"testdb": "log_error"}, cleanupErrorReasonsByDatabase(t, reader))
-	assert.NotContains(t, quarantinedTables(t, db), expired, "the copies are still dropped")
+	assert.NotContains(t, quarantinedTables(t, db), expired, "the copy is still dropped")
+	assert.Equal(t, int64(1), counterTotal(t, reader, "schemabot.pending_drops.cleanup_dropped_total"))
+	assert.Equal(t, []string{expired}, quarantineLogRecords(t, db), "the record the pass could not delete is still there")
+	assert.Contains(t, logs.String(), "could not delete the quarantine log record of a copy that is gone")
+	assert.Contains(t, logs.String(), "quarantine_table="+expired)
 
-	var kept int
-	require.NoError(t, db.QueryRowContext(t.Context(),
-		fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`log_base` WHERE quarantine_table = ?", Database), gone).Scan(&kept))
-	assert.Equal(t, 1, kept, "the record the pass could not delete is still there")
+	makeQuarantineLogWritable(t, db)
+	require.NoError(t, cleaner.Run(ctx))
+	assert.Empty(t, quarantineLogRecords(t, db), "a later pass that can write the log deletes the record")
+	assert.Equal(t, int64(1), counterTotal(t, reader, "schemabot.pending_drops.cleanup_dropped_total"), "the later pass drops nothing more")
 }
 
 // The quarantine log lives in the pending drops database beside the copies it
