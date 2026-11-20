@@ -174,8 +174,9 @@ func (r *githubRateLimitRecorder) record(sample GitHubRateLimitSample) {
 		r.windows[key] = windows
 	}
 	reset := sample.ResetAt.UnixNano()
-	if previous, ok := windows[reset]; ok {
-		merged, changed := sameWindowGitHubRateLimitSnapshot(previous, sample)
+	previousWindow, seenWindow := windows[reset]
+	if seenWindow {
+		merged, changed := sameWindowGitHubRateLimitSnapshot(previousWindow, sample)
 		if !changed {
 			slog.Debug("Ignoring GitHub quota observation that is neither lower nor newer", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource)
 			return
@@ -193,6 +194,10 @@ func (r *githubRateLimitRecorder) record(sample GitHubRateLimitSample) {
 	switch {
 	case !current.ResetAt.Equal(sample.ResetAt):
 		slog.Debug("Recorded GitHub quota window from an earlier response; a newer response's window stays current", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource, "reset_at", sample.ResetAt, "current_reset_at", current.ResetAt)
+	case hadPrevious && current.ResetAt.Before(previous.ResetAt) && seenWindow:
+		// GitHub can alternate between two reset times; the switch was logged
+		// at Info the first time this reset time was seen.
+		slog.Debug("GitHub quota window moved back to an earlier reset already seen; following the newer response", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource, "reset_at", current.ResetAt, "previous_reset_at", previous.ResetAt, "remaining", current.Remaining, "previous_remaining", previous.Remaining)
 	case hadPrevious && current.ResetAt.Before(previous.ResetAt):
 		slog.Info("GitHub reported an earlier quota reset than the last response; following the newer response", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource, "reset_at", current.ResetAt, "previous_reset_at", previous.ResetAt, "remaining", current.Remaining, "previous_remaining", previous.Remaining)
 	}

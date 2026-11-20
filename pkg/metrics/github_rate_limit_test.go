@@ -1,8 +1,11 @@
 package metrics
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -495,4 +498,36 @@ func TestGitHubQuotaSnapshotDropsWindowsThatHaveReset(t *testing.T) {
 	key := githubRateLimitIdentity{"example-app", 42, "core"}
 	assert.Equal(t, next, recorder.snapshots[key])
 	assert.Equal(t, map[int64]GitHubRateLimitSample{next.ResetAt.UnixNano(): next}, recorder.windows[key])
+}
+
+// GitHub can keep alternating between two reset times for one installation.
+// The first switch to the earlier reset is logged at Info, so an operator can
+// see GitHub doing it; switching back to that reset again is not, so an
+// alternating installation does not log on every response.
+func TestGitHubQuotaEarlierResetLogsOncePerResetTime(t *testing.T) {
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(previousLogger)
+	})
+	newQuotaRegistry(t)
+
+	start := time.Date(2026, 1, 1, 0, 30, 0, 0, time.UTC)
+	for i, remaining := range []int64{4990, 3100, 4980, 3090, 4970, 3080} {
+		sample := quotaSample(start.Add(time.Duration(i)*time.Second), remaining)
+		if i%2 == 0 {
+			sample.ResetAt = sample.ResetAt.Add(18 * time.Minute)
+		}
+		RecordGitHubRateLimit(t.Context(), sample)
+	}
+
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	require.Len(t, lines, 1, logs.String())
+	var entry map[string]any
+	require.NoError(t, json.Unmarshal([]byte(lines[0]), &entry))
+	assert.Equal(t, "INFO", entry["level"])
+	assert.Equal(t, "GitHub reported an earlier quota reset than the last response; following the newer response", entry["msg"])
+	assert.Equal(t, float64(3100), entry["remaining"])
+	assert.Equal(t, float64(4990), entry["previous_remaining"])
 }
