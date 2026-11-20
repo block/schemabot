@@ -36,6 +36,9 @@ func TestFreezeOverrideRequestValidate(t *testing.T) {
 	atLimit := validOverrideRequest()
 	atLimit.Reason = "  " + strings.Repeat("é", FreezeOverrideReasonMax) + "  "
 	require.NoError(t, atLimit.Validate(), "the limit counts characters of the trimmed reason")
+	notFromAPR := validOverrideRequest()
+	notFromAPR.Repository, notFromAPR.PullRequest, notFromAPR.PRAuthor = "", 0, ""
+	require.NoError(t, notFromAPR.Validate(), "a request with no pull request needs no author")
 
 	tests := []struct {
 		name   string
@@ -47,6 +50,9 @@ func TestFreezeOverrideRequestValidate(t *testing.T) {
 		{"unknown action", func(r *FreezeOverrideRequest) { r.Action = "stop" }, `action "stop"`},
 		{"no target", func(r *FreezeOverrideRequest) { r.TargetID = "" }, "target is required"},
 		{"no database", func(r *FreezeOverrideRequest) { r.Database = "" }, "database is required"},
+		{"negative pull request", func(r *FreezeOverrideRequest) { r.PullRequest = -1 }, "not a PR number"},
+		{"pull request without repository", func(r *FreezeOverrideRequest) { r.Repository = " " }, "needs its repository"},
+		{"pull request without author", func(r *FreezeOverrideRequest) { r.PRAuthor = " " }, "needs its author"},
 		{"no blockers", func(r *FreezeOverrideRequest) { r.Blockers = nil }, "at least one blocker"},
 		{"blank blocker", func(r *FreezeOverrideRequest) { r.Blockers = []string{"freeze frz-1", " "} }, "empty entry"},
 		{"blank reason", func(r *FreezeOverrideRequest) { r.Reason = "  " }, "reason is required"},

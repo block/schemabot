@@ -56,6 +56,15 @@ func TestFreezeOverrides(t *testing.T, h Harness) {
 
 		_, err = store.FreezeOverrides().Get(ctx, request.Identifier)
 		require.ErrorIs(t, err, storage.ErrFreezeOverrideNotFound, "an invalid request is never stored")
+
+		// A request from a pull request with no author could otherwise be
+		// approved by that author.
+		authorless := overrideRequest("production", "plan-1", time.Now().UTC().Add(time.Hour))
+		authorless.PRAuthor = ""
+		_, err = store.FreezeOverrides().Create(ctx, authorless)
+		require.ErrorContains(t, err, "needs its author")
+		_, err = store.FreezeOverrides().Get(ctx, authorless.Identifier)
+		require.ErrorIs(t, err, storage.ErrFreezeOverrideNotFound)
 	})
 
 	t.Run("Create_DuplicateIdentifier", func(t *testing.T) {

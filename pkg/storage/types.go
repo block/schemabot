@@ -580,7 +580,8 @@ type FreezeOverrideRequest struct {
 	TargetID string
 	Database string
 	// Repository and PullRequest name the pull request the change came
-	// from, when it came from one.
+	// from, when it came from one. A request from a pull request must name
+	// its repository and author; a request with no pull request has neither.
 	Repository  string
 	PullRequest int
 	// PRAuthor is that pull request's author, who may not approve.
@@ -612,6 +613,13 @@ func (r *FreezeOverrideRequest) Validate() error {
 		return errors.New("freeze override request target is required")
 	case strings.TrimSpace(r.Database) == "":
 		return errors.New("freeze override request database is required")
+	case r.PullRequest < 0:
+		return fmt.Errorf("freeze override pull request %d is not a PR number", r.PullRequest)
+	case r.PullRequest > 0 && strings.TrimSpace(r.Repository) == "":
+		return errors.New("freeze override request from a pull request needs its repository")
+	case r.PullRequest > 0 && strings.TrimSpace(r.PRAuthor) == "":
+		// Without the author, Approve could not refuse them.
+		return errors.New("freeze override request from a pull request needs its author")
 	case len(r.Blockers) == 0:
 		return errors.New("a freeze override request covers at least one blocker")
 	case hasBlankEntry(r.Blockers):
