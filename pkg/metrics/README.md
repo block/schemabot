@@ -350,7 +350,8 @@ installation of the App instead (`operation="list_app_installations"`).
 `schemabot.github.rate_limit.unobserved_installations` makes a missing budget
 visible. It counts the probe's installations with no exportable snapshot, plus
 each configured owner whose installation the probe could not resolve on its
-last pass. A 404, meaning the App is not installed on that repository, is not
+last pass, plus one when the last pass could not list the App's installations
+at all. A 404, meaning the App is not installed on that repository, is not
 counted: no installation serves it. Neither is an installation its owner has
 suspended, which cannot mint the token a budget read needs and serves no work
 until it is unsuspended. Because a missing series cannot lower a

@@ -292,15 +292,28 @@ func TestQuotaProbeIsUnresolvedUntilItsFirstPass(t *testing.T) {
 	assert.Equal(t, []quotaTargets{{unresolved: 1}, {installations: []int64{11}}}, reported)
 }
 
-// A pass that cannot list installations reports nothing, so the targets from
-// the last good pass stay in place and their budgets age out to unobserved.
-func TestQuotaProbeKeepsPreviousTargetsWhenListingFails(t *testing.T) {
-	probe, _, _ := recordingQuotaProbe(t, errors.New("GitHub returned 502"))
-	probe.reportTargets = func(targets quotaTargets) {
-		assert.Failf(t, "unexpected target report", "targets %+v were reported although listing failed", targets)
-	}
+// A pass that cannot list installations keeps the targets from the last good
+// pass and adds one unresolved, so a quota gate fails while the App's
+// installation set is unknown, even if webhook traffic keeps the known
+// installations' snapshots fresh.
+func TestQuotaProbeCountsAFailedListAsUnobserved(t *testing.T) {
+	probe, reads, _ := recordingQuotaProbe(t, nil, 11)
+	var reported []quotaTargets
+	probe.reportTargets = func(targets quotaTargets) { reported = append(reported, targets) }
 
 	probe.probeOnce(t.Context())
+	assert.Equal(t, int64(11), receiveRead(t, reads))
+
+	probe.listInstallations = func(context.Context) (quotaTargets, error) {
+		return quotaTargets{}, errors.New("GitHub returned 502")
+	}
+	probe.probeOnce(t.Context())
+
+	assert.Equal(t, []quotaTargets{
+		{installations: []int64{11}},
+		{installations: []int64{11}, unresolved: 1},
+	}, reported)
+	assert.Empty(t, reads, "a pass that cannot list installations reads no budget")
 }
 
 // An App installed on an account the server serves no repository of has a

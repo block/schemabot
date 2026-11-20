@@ -56,6 +56,9 @@ type QuotaProbe struct {
 	// probe is responsible for counts as unobserved while it has no fresh
 	// budget reading.
 	reportTargets func(quotaTargets)
+	// lastTargets is the last set of targets the probe listed. Only the
+	// probe's own pass touches it, and passes run one at a time.
+	lastTargets quotaTargets
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -179,10 +182,12 @@ func (p *QuotaProbe) Stop() {
 func (p *QuotaProbe) probeOnce(ctx context.Context) {
 	targets, err := p.listContained(ctx)
 	if err != nil {
-		p.logger.Warn("GitHub quota probe could not list App installations; installation budgets will age out to unknown until a later pass succeeds",
+		p.logger.Warn("GitHub quota probe could not list App installations; counting the App's installation set as unobserved until a later pass lists it",
 			"error", err)
+		p.reportTargets(listFailedTargets(p.lastTargets))
 		return
 	}
+	p.lastTargets = targets
 	// Report the targets once the reads are done, not before: the App slug
 	// that labels them can be learned during the first pass's reads, and the
 	// targets must carry the same label as the snapshots those reads record.
@@ -208,6 +213,19 @@ func (p *QuotaProbe) probeOnce(ctx context.Context) {
 			defer func() { <-slots }()
 			p.readInstallation(ctx, id)
 		})
+	}
+}
+
+// listFailedTargets is what a pass reports when it cannot list the App's
+// installations: the last listed installations, still observed while their
+// snapshots stay fresh, plus one unresolved. Webhook traffic keeps refreshing
+// the snapshots of installations already known, so without the unresolved
+// count an installation added since the last successful list would go
+// unseen and a quota gate could pass on a partial set.
+func listFailedTargets(last quotaTargets) quotaTargets {
+	return quotaTargets{
+		installations: last.installations,
+		unresolved:    last.unresolved + 1,
 	}
 }
 
