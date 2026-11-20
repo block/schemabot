@@ -37,7 +37,7 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/block/mysql v0.0.0-20261117230711-208b4ce0ea9a // indirect
 	github.com/block/pg-sprite v0.5.3 // indirect
-	github.com/block/spirit v0.20.1-0.20261117183342-2fae808ab16b // indirect
+	github.com/block/spirit v0.20.1-0.20261120155727-bd7200b551bd // indirect
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

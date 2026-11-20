@@ -180,7 +180,10 @@ func (h *Handler) silentUnresolvedDatabaseOnParticipantFanOut(repo string, err e
 		return false
 	}
 	var notFound *ghclient.DatabaseNotFoundError
-	return errors.As(err, &notFound)
+	if !errors.As(err, &notFound) {
+		return false
+	}
+	return notFound.Conclusive()
 }
 
 // isSchemaUnownedByDeploymentError reports whether err means the command
