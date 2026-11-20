@@ -137,7 +137,7 @@ func TestRefreshChecksForTerminalApplyPublishesOnPRHead(t *testing.T) {
 		assert.Equal(t, headSHA, got.HeadSHA,
 			"the aggregate must be published on the commit the PR is gated on, not the apply's")
 	default:
-		t.Fatal("terminal refresh published no aggregate Check Run")
+		require.FailNow(t, "terminal refresh published no aggregate Check Run")
 	}
 
 	assert.Equal(t, int64(2), prFetches.Load(),

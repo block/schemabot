@@ -74,7 +74,7 @@ func TestE2EApplyWithChanges(t *testing.T) {
 		assert.Contains(t, body, "Lock acquired by")
 		assert.Contains(t, body, "Applying automatically")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for apply plan comment")
+		require.FailNow(t, "timed out waiting for apply plan comment")
 	}
 
 	// Clean up the lock so it doesn't leak to other tests sharing the same PR
@@ -89,7 +89,7 @@ func TestE2EApplyWithChanges(t *testing.T) {
 		assert.Equal(t, "completed", cr.Status)
 		assert.Equal(t, "action_required", cr.Conclusion)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for check run")
+		require.FailNow(t, "timed out waiting for check run")
 	}
 }
 
@@ -139,7 +139,7 @@ func TestE2EApplyRejectedOnClosedPR(t *testing.T) {
 		assert.Contains(t, body, "open PRs")
 		assert.NotContains(t, body, "Applying automatically")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for closed-PR rejection comment")
+		require.FailNow(t, "timed out waiting for closed-PR rejection comment")
 	}
 
 	// The rejected apply must not have acquired the database lock.
@@ -192,7 +192,7 @@ func TestE2EApplyConfirmRejectedOnClosedPR(t *testing.T) {
 		assert.Contains(t, body, "PR Is Closed")
 		assert.Contains(t, body, "open PRs")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for closed-PR rejection comment")
+		require.FailNow(t, "timed out waiting for closed-PR rejection comment")
 	}
 
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
@@ -248,7 +248,7 @@ func TestE2EApplyRejectedOnMergedPR(t *testing.T) {
 		assert.NotContains(t, body, "Reopen this PR")
 		assert.NotContains(t, body, "can never merge")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for merged-PR rejection comment")
+		require.FailNow(t, "timed out waiting for merged-PR rejection comment")
 	}
 
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
@@ -300,7 +300,7 @@ func TestE2EApplyNoChanges(t *testing.T) {
 		assert.Contains(t, body, "No schema changes detected")
 		assert.NotContains(t, body, "Lock acquired")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for comment")
+		require.FailNow(t, "timed out waiting for comment")
 	}
 
 	// Verify no lock was acquired
@@ -395,7 +395,7 @@ func TestE2EApplyNoOpPreservesApplyOwnedInProgressCheck(t *testing.T) {
 		assert.Contains(t, body, "No schema changes detected")
 		assert.NotContains(t, body, "Apply Blocked")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for no-op plan comment")
+		require.FailNow(t, "timed out waiting for no-op plan comment")
 	}
 
 	// The apply-owned in_progress row survived the no-changes check write
@@ -527,7 +527,7 @@ func TestE2EApplyLockConflictDifferentPR(t *testing.T) {
 					assert.NotContains(t, body, tc.notInComment)
 				}
 			case <-time.After(webhookIntegrationPollDeadline):
-				t.Fatal("timed out waiting for blocked comment")
+				require.FailNow(t, "timed out waiting for blocked comment")
 			}
 		})
 	}
@@ -574,7 +574,7 @@ func TestE2EApplyConfirmNoLock(t *testing.T) {
 		assert.Contains(t, body, "No Lock Found")
 		assert.Contains(t, body, "schemabot apply -e staging")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for no-lock comment")
+		require.FailNow(t, "timed out waiting for no-lock comment")
 	}
 }
 
@@ -672,7 +672,7 @@ func TestE2EUnlock(t *testing.T) {
 		assert.Contains(t, body, dbName)
 		assert.Contains(t, body, "@testuser")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for unlock comment")
+		require.FailNow(t, "timed out waiting for unlock comment")
 	}
 
 	// Verify lock was released
@@ -765,7 +765,7 @@ func TestE2EUnlockForceInfersDatabaseForCLILock(t *testing.T) {
 		assert.Contains(t, body, "Lock Released")
 		assert.Contains(t, body, dbName)
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for unlock comment")
+		require.FailNow(t, "timed out waiting for unlock comment")
 	}
 
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
@@ -868,7 +868,7 @@ func TestE2EUnlockDoesNotPassAggregateWithPendingChanges(t *testing.T) {
 	case body := <-comments:
 		assert.Contains(t, body, "Lock Released")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for unlock comment")
+		require.FailNow(t, "timed out waiting for unlock comment")
 	}
 
 	lock, err := svc.Storage().Locks().Get(ctx, dbName, "mysql")
@@ -881,7 +881,7 @@ func TestE2EUnlockDoesNotPassAggregateWithPendingChanges(t *testing.T) {
 	// happened.
 	select {
 	case cr := <-checkRuns:
-		t.Fatalf("unlock unexpectedly wrote a check run: %+v", cr)
+		require.FailNow(t, fmt.Sprintf("unlock unexpectedly wrote a check run: %+v", cr))
 	default:
 	}
 
@@ -961,11 +961,11 @@ func TestE2EApplyConfirmExecutesApply(t *testing.T) {
 					strings.Contains(summary, "Schema Change Applied") || strings.Contains(summary, "Schema Change Failed"),
 					"expected summary comment")
 			case <-time.After(60 * time.Second):
-				t.Fatal("timed out waiting for summary comment")
+				require.FailNow(t, "timed out waiting for summary comment")
 			}
 		}
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for any apply comment")
+		require.FailNow(t, "timed out waiting for any apply comment")
 	}
 
 	// Verify apply was created in storage
@@ -1048,7 +1048,7 @@ func TestE2EUnlockNoLocks(t *testing.T) {
 	case body := <-comments:
 		assert.Contains(t, body, "No Locks Found")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for no-locks comment")
+		require.FailNow(t, "timed out waiting for no-locks comment")
 	}
 }
 
@@ -1175,7 +1175,7 @@ func commentApplyWhileThisPRApplies(t *testing.T, dbName, planHeadSHA string, sh
 	case body := <-result.comments:
 		return body
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for active-apply comment")
+		require.FailNow(t, "timed out waiting for active-apply comment")
 		return ""
 	}
 }
@@ -1232,7 +1232,7 @@ func TestE2EApplyConfirmLockConflict(t *testing.T) {
 		assert.Contains(t, body, "Apply Blocked")
 		assert.Contains(t, body, "other-org/other-repo#42")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for blocked comment")
+		require.FailNow(t, "timed out waiting for blocked comment")
 	}
 }
 
@@ -1285,7 +1285,7 @@ func TestE2EApplyConfirmNoChanges(t *testing.T) {
 		assert.Contains(t, body, "No Changes Detected")
 		assert.Contains(t, body, "already up to date")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for no-changes comment")
+		require.FailNow(t, "timed out waiting for no-changes comment")
 	}
 
 	// Lock release happens asynchronously after the comment is posted —
@@ -1396,7 +1396,7 @@ func TestE2EUnlockBlockedByActiveApply(t *testing.T) {
 		assert.Contains(t, body, "apply-blocked-unlock-001")
 		assert.Contains(t, body, "running")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for cannot-unlock comment")
+		require.FailNow(t, "timed out waiting for cannot-unlock comment")
 	}
 
 	// Lock should still be held
@@ -1459,7 +1459,7 @@ func TestE2EApplyStaleLockReacquire(t *testing.T) {
 		assert.Contains(t, body, "Lock acquired by")
 		assert.Contains(t, body, "Applying automatically")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for apply plan comment")
+		require.FailNow(t, "timed out waiting for apply plan comment")
 	}
 }
 
@@ -1508,7 +1508,7 @@ func TestE2EApplyProductionBlockedByStagingFirst(t *testing.T) {
 		assert.Contains(t, body, "Staging")
 		assert.Contains(t, body, "schemabot apply -e staging")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for blocked comment")
+		require.FailNow(t, "timed out waiting for blocked comment")
 	}
 }
 
@@ -1554,7 +1554,7 @@ func TestE2EApplyUsesCustomServerEnvironmentOrder(t *testing.T) {
 		assert.Contains(t, body, "Production")
 		assert.Contains(t, body, "Apply production first")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for custom-order blocked comment")
+		require.FailNow(t, "timed out waiting for custom-order blocked comment")
 	}
 }
 
@@ -1604,7 +1604,7 @@ func TestE2EApplyProductionAllowedWhenStagingSuccess(t *testing.T) {
 		assert.NotContains(t, body, "Apply Blocked",
 			"production apply should not be blocked when staging is success")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for comment")
+		require.FailNow(t, "timed out waiting for comment")
 	}
 
 	// Clean up lock
@@ -1669,7 +1669,7 @@ func TestE2EApplyProductionBlockedWhenStagingSuccessIsForEarlierCommit(t *testin
 		assert.Contains(t, body, "The `staging` check for this PR was recorded on commit `fedcba9`, but this apply read the schema at commit `abc123`.")
 		assert.Contains(t, body, "schemabot plan -e staging")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for earlier-commit blocked comment")
+		require.FailNow(t, "timed out waiting for earlier-commit blocked comment")
 	}
 
 	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
@@ -1723,7 +1723,7 @@ func TestE2EApplyNoOpUnblocksPriorEnvironmentGate(t *testing.T) {
 		assert.Contains(t, body, "Apply Blocked")
 		assert.Contains(t, body, "Staging")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for blocked production comment")
+		require.FailNow(t, "timed out waiting for blocked production comment")
 	}
 
 	// A staging apply finds no changes and records the passing staging check.
@@ -1739,7 +1739,7 @@ func TestE2EApplyNoOpUnblocksPriorEnvironmentGate(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "No schema changes detected")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for no-op staging plan comment")
+		require.FailNow(t, "timed out waiting for no-op staging plan comment")
 	}
 
 	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
@@ -1765,7 +1765,7 @@ func TestE2EApplyNoOpUnblocksPriorEnvironmentGate(t *testing.T) {
 			"production apply should not be blocked after the staging no-op apply recorded the passing check")
 		assert.Contains(t, body, "No schema changes detected")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for production comment")
+		require.FailNow(t, "timed out waiting for production comment")
 	}
 }
 
@@ -1808,7 +1808,7 @@ func TestE2EApplyExecutesAutomatically(t *testing.T) {
 		assert.Contains(t, body, "## Schema Change Apply")
 		assert.Contains(t, body, "Applying automatically")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for auto-confirm plan comment")
+		require.FailNow(t, "timed out waiting for auto-confirm plan comment")
 	}
 
 	// Wait for summary comment (skip progress comment posted by observer)
@@ -1871,7 +1871,7 @@ func TestE2EApplyAutoConfirmRejectsWhenHEADAdvanced(t *testing.T) {
 				rejection = body
 			}
 		case <-deadline:
-			t.Fatal("timed out waiting for rejection comment")
+			require.FailNow(t, "timed out waiting for rejection comment")
 		}
 		if rejection != "" {
 			break
@@ -1939,7 +1939,7 @@ func TestE2EApplyAutoConfirmRejectsStaleBaseSchema(t *testing.T) {
 		assert.Contains(t, body, "Merge or rebase")
 		assert.NotContains(t, body, "Applying automatically")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for base-schema rejection")
+		require.FailNow(t, "timed out waiting for base-schema rejection")
 	}
 
 	require.Eventually(t, func() bool {
@@ -2002,7 +2002,7 @@ func TestE2EApplyStaleBaseSchemaOutranksUnsafePrompt(t *testing.T) {
 		assert.NotContains(t, body, "unsafe change", "unsafe prompt must not outrank the freshness rejection")
 		assert.NotContains(t, body, "DROP COLUMN", "no stale-plan DDL may be rendered")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for base-schema rejection")
+		require.FailNow(t, "timed out waiting for base-schema rejection")
 	}
 
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
@@ -2126,7 +2126,7 @@ func TestE2EApplyConfirmStaleBaseSchemaAtFinalGateOutranksUnsafePrompt(t *testin
 		assert.NotContains(t, body, "allow-unsafe", "stale branch must not be coached toward --allow-unsafe")
 		assert.NotContains(t, body, "unsafe change", "unsafe prompt must not outrank the freshness rejection")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for final-gate base-schema rejection")
+		require.FailNow(t, "timed out waiting for final-gate base-schema rejection")
 	}
 
 	require.Eventually(t, func() bool {
@@ -2181,7 +2181,7 @@ func TestE2EApplyConfirmRejectsStaleBaseSchema(t *testing.T) {
 		assert.Contains(t, body, "Apply rejected — base schema is newer")
 		assert.Contains(t, body, "Merge or rebase")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for apply-confirm base-schema rejection")
+		require.FailNow(t, "timed out waiting for apply-confirm base-schema rejection")
 	}
 
 	require.Eventually(t, func() bool {
@@ -2234,7 +2234,7 @@ func TestE2EApplyConfirmPreservesRollbackLock(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "This lock belongs to a rollback plan")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for rollback-lock rejection")
+		require.FailNow(t, "timed out waiting for rollback-lock rejection")
 	}
 
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
@@ -2292,7 +2292,7 @@ func TestE2EApplyConfirmFreshnessRacePreservesReplacementRollbackLock(t *testing
 	case body := <-result.comments:
 		assert.Contains(t, body, "Apply rejected — base schema is newer")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for apply-confirm base-schema rejection")
+		require.FailNow(t, "timed out waiting for apply-confirm base-schema rejection")
 	}
 
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
@@ -2393,7 +2393,7 @@ func TestE2EApplyConfirmRejectsWhenHEADAdvanced(t *testing.T) {
 		assert.NotContains(t, body, "Schema Change Status", "apply must not have started")
 		assert.NotContains(t, body, "Schema Change Applied", "apply must not have completed")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for rejection comment")
+		require.FailNow(t, "timed out waiting for rejection comment")
 	}
 
 	// Lock must be released after rejection so the user can re-run `apply`.
@@ -2456,7 +2456,7 @@ func TestE2EApplyDefaultAutoConfirmRejectsWhenHEADAdvanced(t *testing.T) {
 				rejection = body
 			}
 		case <-deadline:
-			t.Fatal("timed out waiting for rejection comment")
+			require.FailNow(t, "timed out waiting for rejection comment")
 		}
 	}
 
@@ -2528,7 +2528,7 @@ func TestE2EApplyConfirmStaleSchemaPreservesOtherPRLock(t *testing.T) {
 		assert.Contains(t, body, "Rejected", "stale-schema rejection must still post the rejection comment")
 		assert.Contains(t, body, "new commits since discovery")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for rejection comment")
+		require.FailNow(t, "timed out waiting for rejection comment")
 	}
 
 	// The other PR's lock must remain intact for the full polling window —
@@ -2583,7 +2583,7 @@ func TestE2EPlanRejectsWhenHEADAdvanced(t *testing.T) {
 		assert.Contains(t, body, "schemabot plan -e staging")
 		assert.NotContains(t, body, "Schema Change Plan", "stale plan comment must not be posted")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for rejection comment")
+		require.FailNow(t, "timed out waiting for rejection comment")
 	}
 }
 
@@ -2694,7 +2694,7 @@ func TestE2EApplyConfirmRejectsWhenPlanSHAStale(t *testing.T) {
 		assert.NotContains(t, body, "Schema Change Status", "apply must not have started")
 		assert.NotContains(t, body, "Schema Change Applied", "apply must not have completed")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for rejection comment")
+		require.FailNow(t, "timed out waiting for rejection comment")
 	}
 
 	// Lock owned by this PR must be released so the user can re-issue `apply`.
@@ -2755,7 +2755,7 @@ func TestE2EApplyConfirmRejectsRollbackLock(t *testing.T) {
 		assert.Contains(t, body, "schemabot rollback-confirm")
 		assert.NotContains(t, body, "Schema Change Status")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for rollback-lock rejection comment")
+		require.FailNow(t, "timed out waiting for rollback-lock rejection comment")
 	}
 
 	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
@@ -2846,7 +2846,7 @@ func TestE2EApplyConfirmStalePlanPreservesOtherPRLock(t *testing.T) {
 	select {
 	case <-result.comments:
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for any comment")
+		require.FailNow(t, "timed out waiting for any comment")
 	}
 
 	require.Never(t, func() bool {
@@ -2960,7 +2960,7 @@ func TestE2EApplyConfirmRejectsWhenPlainPlanSupersedesApplyPlan(t *testing.T) {
 		assert.NotContains(t, body, "Schema Change Status", "apply must not start")
 		assert.NotContains(t, body, "Schema Change Applied", "apply must not complete")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for apply-confirm rejection")
+		require.FailNow(t, "timed out waiting for apply-confirm rejection")
 	}
 
 	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
@@ -3042,7 +3042,7 @@ func TestE2EApplyAutoConfirmReGatesAgainstFreshHEADBeforeApply(t *testing.T) {
 				blocked = body
 			}
 		case <-deadline:
-			t.Fatal("timed out waiting for fresh-HEAD checks-gate block comment")
+			require.FailNow(t, "timed out waiting for fresh-HEAD checks-gate block comment")
 		}
 	}
 
@@ -3152,7 +3152,7 @@ func TestE2EApplyAutoConfirmFreshHEADBlockPreservesOtherPRLock(t *testing.T) {
 				blocked = body
 			}
 		case <-deadline:
-			t.Fatal("timed out waiting for fresh-HEAD checks-gate block comment")
+			require.FailNow(t, "timed out waiting for fresh-HEAD checks-gate block comment")
 		}
 	}
 
@@ -3210,7 +3210,7 @@ func TestE2EApplyThreeEnvEnforcement(t *testing.T) {
 	case body := <-comments:
 		assert.Contains(t, body, "sandbox")
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for blocked comment (case 1)")
+		require.FailNow(t, "timed out waiting for blocked comment (case 1)")
 	}
 
 	// Case 2: production blocked when sandbox is success but staging is action_required
@@ -3226,7 +3226,7 @@ func TestE2EApplyThreeEnvEnforcement(t *testing.T) {
 	case body := <-comments:
 		assert.Contains(t, body, "staging")
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for blocked comment (case 2)")
+		require.FailNow(t, "timed out waiting for blocked comment (case 2)")
 	}
 
 	// Case 3: production allowed when both sandbox and staging are success
@@ -3296,7 +3296,7 @@ func TestE2EApplyStoresServerSideTarget(t *testing.T) {
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for apply plan comment")
+		require.FailNow(t, "timed out waiting for apply plan comment")
 	}
 
 	// Verify the stored plan has the server-side target.

@@ -182,7 +182,7 @@ func runCommandWithNoCurrentSchemaFilesAndApplyOwnedCheck(t *testing.T, comment,
 	case body := <-comments:
 		return body, treeCalls.Load()
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for reconciliation comment")
+		require.FailNow(t, "timed out waiting for reconciliation comment")
 		return "", treeCalls.Load()
 	}
 }

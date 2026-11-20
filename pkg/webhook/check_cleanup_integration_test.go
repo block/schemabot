@@ -319,7 +319,7 @@ func requireAggregateCheckRun(t *testing.T, checkRuns chan checkRunCapture) chec
 		require.Equal(t, aggregateCheckName, cr.Name)
 		return cr
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for the aggregate check run")
+		require.FailNow(t, "timed out waiting for the aggregate check run")
 		return checkRunCapture{}
 	}
 }
@@ -354,7 +354,7 @@ func TestE2EStaleCheckCleanupDatabaseTypeChanged(t *testing.T) {
 	assert.Equal(t, checkConclusionActionRequired, mysqlCheck.Conclusion)
 	select {
 	case cr := <-checkRuns:
-		t.Fatalf("stale cleanup published an aggregate before the Strata plan stored a result: status=%s conclusion=%s", cr.Status, cr.Conclusion)
+		require.FailNow(t, fmt.Sprintf("stale cleanup published an aggregate before the Strata plan stored a result: status=%s conclusion=%s", cr.Status, cr.Conclusion))
 	default:
 	}
 
@@ -553,7 +553,7 @@ func runPlanCommand(t *testing.T, h *Handler, result *planFlowResult, comment st
 	select {
 	case <-result.comments:
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatalf("timed out waiting for the plan comment of %q", comment)
+		require.FailNow(t, fmt.Sprintf("timed out waiting for the plan comment of %q", comment))
 	}
 }
 
@@ -648,7 +648,7 @@ func TestE2EStaleCheckCleanupWithNothingPlannedPublishesAggregate(t *testing.T) 
 		assert.Equal(t, checkStatusCompleted, cr.Status)
 		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for the aggregate check run stale cleanup publishes")
+		require.FailNow(t, "timed out waiting for the aggregate check run stale cleanup publishes")
 	}
 }
 
@@ -902,7 +902,7 @@ func TestE2EReconcileStaleInProgressCheck(t *testing.T) {
 		require.NotNil(t, checkRun.Output)
 		assert.Equal(t, awaitingCurrentCommitTitle, checkRun.Output.Title)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for aggregate check run")
+		require.FailNow(t, "timed out waiting for aggregate check run")
 	}
 
 	aggregate := waitForStoredAggregate(t, svc, "octocat/hello-world", 1, checkStatusInProgress, "")
@@ -1000,7 +1000,7 @@ func TestE2EReconcileStaleInProgressCheckFailure(t *testing.T) {
 		assert.Equal(t, checkStatusInProgress, checkRun.Status)
 		assert.Empty(t, checkRun.Conclusion)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for blocking aggregate check run")
+		require.FailNow(t, "timed out waiting for blocking aggregate check run")
 	}
 }
 
@@ -1214,7 +1214,7 @@ func TestE2EPRCloseReopenRetainsStartedApplyBlock(t *testing.T) {
 				checkRun.Conclusion == checkConclusionActionRequired &&
 				checkRun.HeadSHA == "abc123"
 		case <-deadline:
-			t.Fatal("timed out waiting for blocking aggregate check run after reopen")
+			require.FailNow(t, "timed out waiting for blocking aggregate check run after reopen")
 		}
 		if blocked {
 			break
@@ -1360,7 +1360,7 @@ func TestE2EUnmergedCloseRetainsSuccessfulApplyOwnedCheck(t *testing.T) {
 				checkRun.Conclusion == checkConclusionActionRequired &&
 				checkRun.HeadSHA == "abc123"
 		case <-deadline:
-			t.Fatal("timed out waiting for blocking aggregate check run after reopen")
+			require.FailNow(t, "timed out waiting for blocking aggregate check run after reopen")
 		}
 		if blocked {
 			break

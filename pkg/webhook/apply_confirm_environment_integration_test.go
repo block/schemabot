@@ -133,7 +133,7 @@ func TestE2EApplyConfirmRejectsPendingConfirmationForOtherEnvironment(t *testing
 		assert.Contains(t, body, "To apply `production` instead, dropping the pending `staging` confirmation and planning and applying `production` in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n```\nschemabot apply -e production -d "+dbName+" --defer-cutover\n```")
 		assert.NotContains(t, body, "Schema Change Status", "apply must not have started")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for environment mismatch rejection")
+		require.FailNow(t, "timed out waiting for environment mismatch rejection")
 	}
 
 	assert.Empty(t, appliesForDatabase(t, svc, dbName), "no apply may be dispatched for another environment's confirmation")
@@ -169,11 +169,11 @@ func TestE2EApplyConfirmExecutesPendingConfirmationForSameEnvironment(t *testing
 			case summary := <-result.comments:
 				assert.Contains(t, summary, "Schema Change Applied")
 			case <-time.After(webhookIntegrationPollDeadline):
-				t.Fatal("timed out waiting for summary comment")
+				require.FailNow(t, "timed out waiting for summary comment")
 			}
 		}
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for apply comment")
+		require.FailNow(t, "timed out waiting for apply comment")
 	}
 
 	applies := appliesForDatabase(t, svc, dbName)
@@ -211,7 +211,7 @@ func TestE2EApplyConfirmBlockedWhenPriorEnvironmentNoLongerClean(t *testing.T) {
 		assert.Contains(t, body, "schemabot apply -e staging")
 		assert.NotContains(t, body, "Schema Change Status", "apply must not have started")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for environment ordering block")
+		require.FailNow(t, "timed out waiting for environment ordering block")
 	}
 
 	assert.Empty(t, appliesForDatabase(t, svc, dbName), "production must not be applied before staging is clean")

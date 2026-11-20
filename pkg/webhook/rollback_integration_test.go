@@ -143,7 +143,7 @@ func TestE2ERollbackPlanViaWebhook(t *testing.T) {
 		assert.Contains(t, body, "schemabot rollback-confirm -e staging")
 		assert.Contains(t, body, "schemabot unlock")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for rollback plan comment")
+		require.FailNow(t, "timed out waiting for rollback plan comment")
 	}
 
 	// Step 6: Verify lock was acquired
@@ -162,7 +162,7 @@ func TestE2ERollbackPlanViaWebhook(t *testing.T) {
 
 	select {
 	case cr := <-result.checkRuns:
-		t.Fatalf("rollback planning should not update check runs before confirmation, got: %+v", cr)
+		require.FailNow(t, fmt.Sprintf("rollback planning should not update check runs before confirmation, got: %+v", cr))
 	case <-time.After(500 * time.Millisecond):
 	}
 }
@@ -189,7 +189,7 @@ func TestE2ERollbackApplyNotFound(t *testing.T) {
 		assert.Contains(t, body, "Apply Not Found")
 		assert.Contains(t, body, "apply_deadbeef0000")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for comment")
+		require.FailNow(t, "timed out waiting for comment")
 	}
 }
 
@@ -243,7 +243,7 @@ func TestE2ERollbackConfirmNoLock(t *testing.T) {
 		assert.Contains(t, body, "No Lock Found")
 		assert.Contains(t, body, "schemabot rollback <apply-id> -e staging")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for no-lock comment")
+		require.FailNow(t, "timed out waiting for no-lock comment")
 	}
 }
 
@@ -347,7 +347,7 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 		assert.Contains(t, body, "`idx_name`")
 		assert.Contains(t, body, "To confirm this rollback:\n1. Make the dropped index invisible, then verify application queries no longer rely on it for safe performance.\n2. Add `--allow-unsafe` to confirm 1 unsafe change on `users`")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for rollback plan comment")
+		require.FailNow(t, "timed out waiting for rollback plan comment")
 	}
 	pinnedLock, err := svc.Storage().Locks().Get(ctx, dbName, "mysql")
 	require.NoError(t, err)
@@ -406,7 +406,7 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 				assert.NotContains(t, body, "Schema Change Applied")
 			}
 		case <-deadline:
-			t.Fatal("timed out waiting for the rollback summary comment — " +
+			require.FailNow(t, "timed out waiting for the rollback summary comment — "+
 				"watchApplyProgress may have lost repo/PR/installationID context")
 		}
 	}
@@ -693,7 +693,7 @@ func setupRollbackConfirmRace(t *testing.T, dbName string) *rollbackConfirmRaceF
 	case body := <-f.result.comments:
 		require.Contains(t, body, "Rollback Plan")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for rollback plan comment")
+		require.FailNow(t, "timed out waiting for rollback plan comment")
 	}
 
 	f.confirmedLock, err = f.lockStore.Get(ctx, dbName, "mysql")
@@ -771,7 +771,7 @@ func TestE2ERollbackConfirmRejectedWhenLockIntentChangesBeforeExecute(t *testing
 				assert.Contains(t, body, msgRollbackLockIntentChanged)
 				assert.NotContains(t, body, storage.ErrLockIntentChanged.Error(), "the raw storage error must not reach the PR comment")
 			case <-time.After(webhookIntegrationPollDeadline):
-				t.Fatal("timed out waiting for the rollback-confirm rejection comment")
+				require.FailNow(t, "timed out waiting for the rollback-confirm rejection comment")
 			}
 
 			allApplies, err := f.svc.Storage().Applies().GetByDatabase(ctx, tt.dbName, "mysql", "staging")
@@ -1346,7 +1346,7 @@ func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 	select {
 	case <-result.comments:
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for rollback plan comment")
+		require.FailNow(t, "timed out waiting for rollback plan comment")
 	}
 
 	// Run rollback-confirm, recording every stored check state write for this
@@ -1421,7 +1421,7 @@ func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 				return
 			}
 		case <-deadline:
-			t.Fatal("timed out waiting for rollback aggregate to become action_required")
+			require.FailNow(t, "timed out waiting for rollback aggregate to become action_required")
 		}
 	}
 }
@@ -1512,9 +1512,9 @@ func TestE2ERollbackIgnoredByNonOwningInstance(t *testing.T) {
 	// the staging commands). Wait long enough for any async handler to fire.
 	select {
 	case body := <-comments:
-		t.Fatalf("production instance should not post a comment for staging rollback command, got: %s", body)
+		require.FailNow(t, fmt.Sprintf("production instance should not post a comment for staging rollback command, got: %s", body))
 	case reaction := <-reactions:
-		t.Fatalf("production instance should not react to staging rollback command, got: %s", reaction)
+		require.FailNow(t, fmt.Sprintf("production instance should not react to staging rollback command, got: %s", reaction))
 	case <-time.After(2 * time.Second):
 		// Expected: no comment or reaction posted.
 	}

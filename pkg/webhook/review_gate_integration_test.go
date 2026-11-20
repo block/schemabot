@@ -283,7 +283,7 @@ func TestE2EApplyBlockedByReviewGate(t *testing.T) {
 		assert.Contains(t, body, "approval from an authorized reviewer")
 		assert.NotContains(t, body, "Schema Change Plan")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timeout waiting for review gate comment")
+		require.FailNow(t, "timeout waiting for review gate comment")
 	}
 }
 
@@ -341,7 +341,7 @@ func TestE2EApplyProceedsWithApproval(t *testing.T) {
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.NotContains(t, body, "Review Required")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timeout waiting for plan comment")
+		require.FailNow(t, "timeout waiting for plan comment")
 	}
 }
 
@@ -396,7 +396,7 @@ func TestE2EApplyBlockedBySelfApproval(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "Review Required")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timeout waiting for review gate comment")
+		require.FailNow(t, "timeout waiting for review gate comment")
 	}
 }
 
@@ -446,7 +446,7 @@ func TestE2EApplyNoCodeownersFile_Blocked(t *testing.T) {
 		assert.Contains(t, body, "Review Required")
 		assert.Contains(t, body, "authorized reviewer")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timeout waiting for review gate comment")
+		require.FailNow(t, "timeout waiting for review gate comment")
 	}
 }
 
@@ -502,7 +502,7 @@ func TestE2EApplyNoCodeownersFile_Approved(t *testing.T) {
 		assert.Contains(t, body, "## Schema Change Apply")
 		assert.NotContains(t, body, "Review Required")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timeout waiting for plan comment")
+		require.FailNow(t, "timeout waiting for plan comment")
 	}
 }
 
@@ -565,7 +565,7 @@ func TestE2EApplyTeamSlugApproval(t *testing.T) {
 		assert.Contains(t, body, "## Schema Change Apply")
 		assert.NotContains(t, body, "Review Required")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timeout waiting for plan comment")
+		require.FailNow(t, "timeout waiting for plan comment")
 	}
 }
 
@@ -631,7 +631,7 @@ func TestE2EApplyTeamSlugBlocked(t *testing.T) {
 		assert.Contains(t, body, "Review Required")
 		assert.Contains(t, body, "@octocat/dba-team")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timeout waiting for review gate comment")
+		require.FailNow(t, "timeout waiting for review gate comment")
 	}
 }
 
@@ -689,7 +689,7 @@ func TestE2EApplyCodeownersOptIn(t *testing.T) {
 		assert.Contains(t, body, "## Schema Change Apply")
 		assert.NotContains(t, body, "Review Required")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timeout waiting for plan comment")
+		require.FailNow(t, "timeout waiting for plan comment")
 	}
 }
 
@@ -739,6 +739,6 @@ func TestE2EApplyReviewGateDisabled(t *testing.T) {
 		assert.Contains(t, body, "## Schema Change Apply")
 		assert.NotContains(t, body, "Review Required")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timeout waiting for plan comment")
+		require.FailNow(t, "timeout waiting for plan comment")
 	}
 }

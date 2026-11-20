@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -164,7 +165,7 @@ func findLogEntry(t *testing.T, logs *bytes.Buffer, msg string) map[string]any {
 			return entry
 		}
 	}
-	t.Fatalf("no log entry %q in:\n%s", msg, logs.String())
+	require.FailNow(t, fmt.Sprintf("no log entry %q in:\n%s", msg, logs.String()))
 	return nil
 }
 

@@ -53,7 +53,7 @@ func requestPlan(t *testing.T, h *Handler, result *planFlowResult, comment strin
 		require.Contains(t, body, "Schema Change Plan")
 		return body
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the plan comment")
+		require.FailNow(t, "timed out waiting for the plan comment")
 		return ""
 	}
 }
@@ -139,7 +139,7 @@ func TestE2EAutoPlanNoChangesWarnsBranchMissingBaseSchemaChanges(t *testing.T) {
 	case body := <-f.result.comments:
 		assert.Contains(t, body, "**This branch is missing newer changes from `main` to `schema`.**")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the plan comment carrying the base-schema notice")
+		require.FailNow(t, "timed out waiting for the plan comment carrying the base-schema notice")
 	}
 	requireOnlyVisiblePlanComment(t, f, dbName, "abc123", false)
 }
@@ -164,13 +164,13 @@ func TestE2EAutoPlanSchemaNeutralSyncReplacesPlanWithoutBaseSchemaNotice(t *test
 		assert.Contains(t, body, "**This branch is missing newer changes from `main` to `schema`.**")
 		assert.Contains(t, body, "CREATE TABLE")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the plan comment carrying the base-schema notice")
+		require.FailNow(t, "timed out waiting for the plan comment carrying the base-schema notice")
 	}
 	select {
 	case id := <-f.deleted:
 		assert.Equal(t, "9001", id)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the prior head's plan comment to be deleted")
+		require.FailNow(t, "timed out waiting for the prior head's plan comment to be deleted")
 	}
 	requireOnlyVisiblePlanComment(t, f, dbName, "newsha", false)
 }
@@ -253,13 +253,13 @@ func TestE2EAutoPlanSchemaNeutralSyncReplacesPlanWhoseBaseSchemaNoticeNoLongerHo
 		assert.NotContains(t, body, "is missing newer changes")
 		assert.Contains(t, body, "CREATE TABLE")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the plan comment without the base-schema notice")
+		require.FailNow(t, "timed out waiting for the plan comment without the base-schema notice")
 	}
 	select {
 	case id := <-f.deleted:
 		assert.Equal(t, "9001", id)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the comment carrying the stale notice to be deleted")
+		require.FailNow(t, "timed out waiting for the comment carrying the stale notice to be deleted")
 	}
 	requireOnlyVisiblePlanComment(t, f, dbName, "newsha", false)
 }

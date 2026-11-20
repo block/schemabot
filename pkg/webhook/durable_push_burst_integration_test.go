@@ -154,14 +154,14 @@ func (f *pushBurstFixture) requirePlanOf(t *testing.T, dbName, head string) {
 		assert.Contains(t, body, "## Schema Change Plan")
 		assert.Contains(t, body, dbName)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatalf("timed out waiting for the plan comment of %s", head)
+		require.FailNow(t, fmt.Sprintf("timed out waiting for the plan comment of %s", head))
 	}
 	select {
 	case cr := <-f.result.checkRuns:
 		assert.Contains(t, cr.Name, "SchemaBot")
 		assert.Equal(t, head, cr.HeadSHA, "the Check Run must be published on the pull request's current head")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatalf("timed out waiting for the Check Run of %s", head)
+		require.FailNow(t, fmt.Sprintf("timed out waiting for the Check Run of %s", head))
 	}
 }
 
@@ -253,7 +253,7 @@ func TestE2EDurableDispatchKeepsTheCurrentHeadThroughAReplayedPushCycle(t *testi
 	case body := <-f.result.comments:
 		assert.Contains(t, body, "## Schema Change Plan")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatalf("timed out waiting for the second plan comment of %s", currentHead)
+		require.FailNow(t, fmt.Sprintf("timed out waiting for the second plan comment of %s", currentHead))
 	}
 
 	before := f.requests.snapshot()
