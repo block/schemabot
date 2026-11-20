@@ -818,7 +818,7 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		cutoverReq.Metadata = metadata
 	}
 	recorded, alreadyPending, err := controlStore.RequestPending(admitCtx, cutoverReq)
-	if errors.Is(err, storage.ErrFreezeEpochChanged) {
+	if isFreezeAdmissionRefusal(err) {
 		err := s.changeGateAdmissionError(ctx, changeGateCheckpointCutover, apply.Environment, err)
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
 		return nil, 0, err

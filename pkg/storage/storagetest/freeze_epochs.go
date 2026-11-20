@@ -60,6 +60,35 @@ func testFreezeEpochs(t *testing.T, h Harness) {
 		require.NoError(t, err, "a write without a guard ran no change gate and is not checked")
 	})
 
+	t.Run("CreateWithGroupedOperationsRefusesAStaleGuard", func(t *testing.T) {
+		// The API creates every apply through CreateWithGroupedOperations.
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "epoch_grouped_db", storage.DatabaseTypeMySQL)
+		guarded := guardAtCurrentEpoch(t, store, "staging")
+		createFreeze(t, store, onDemandFreeze("staging", time.Now().UTC()))
+
+		refused := epochTestApply(lock, "apply-epoch-grouped", state.Apply.Pending)
+		_, err := store.Applies().CreateWithGroupedOperations(guarded, refused, epochTestGroups(refused))
+		require.ErrorIs(t, err, storage.ErrFreezeEpochChanged)
+		stored, err := store.Applies().GetByApplyIdentifier(ctx, "apply-epoch-grouped")
+		require.NoError(t, err)
+		assert.Nil(t, stored, "a refused apply is never stored")
+		tasks, err := store.Tasks().GetByDatabase(ctx, lock.DatabaseName)
+		require.NoError(t, err)
+		assert.Empty(t, tasks, "a refused apply stores no tasks")
+
+		admitted := epochTestApply(lock, "apply-epoch-grouped-current", state.Apply.Pending)
+		id, err := store.Applies().CreateWithGroupedOperations(guardAtCurrentEpoch(t, store, "staging"), admitted, epochTestGroups(admitted))
+		require.NoError(t, err, "a guard read after the freeze admits the apply")
+		operations, err := store.ApplyOperations().ListByApply(ctx, id)
+		require.NoError(t, err)
+		assert.Len(t, operations, 1)
+		tasks, err = store.Tasks().GetByDatabase(ctx, lock.DatabaseName)
+		require.NoError(t, err)
+		assert.Len(t, tasks, 1, "only the admitted apply's task is stored")
+	})
+
 	t.Run("RequestPendingRefusesAStaleGuardForStartAndCutover", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -115,6 +144,14 @@ func epochTestApply(lock *storage.Lock, applyID, applyState string) *storage.App
 		Engine:          storage.EngineForType(lock.DatabaseType),
 		State:           applyState,
 	}
+}
+
+// epochTestGroups returns one operation with one task for apply.
+func epochTestGroups(apply *storage.Apply) []*storage.ApplyOperationWithTasks {
+	return []*storage.ApplyOperationWithTasks{{
+		Operation: &storage.ApplyOperation{Deployment: "default", OperationKey: "default", State: state.ApplyOperation.Pending},
+		Tasks:     []*storage.Task{newTask(apply, "task_"+apply.ApplyIdentifier, "users", time.Now())},
+	}}
 }
 
 func epochTestRequest(apply *storage.Apply, operation storage.ControlOperation) *storage.ApplyControlRequest {

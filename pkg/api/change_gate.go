@@ -163,7 +163,8 @@ func (s *Service) checkChangeGatesForApply(ctx context.Context, checkpoint chang
 // When nothing blocks, it also returns the context for the write that admits
 // the change. The context carries the freeze epoch read before the freezes
 // were listed, and that write refuses with storage.ErrFreezeEpochChanged if a
-// freeze was created since; changeGateAdmissionError maps that refusal. Use
+// freeze was created since, or storage.ErrFreezeEpochUnreadable if it could
+// not read the epoch; changeGateAdmissionError maps both refusals. Use
 // the context for that write only.
 func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, caller string) (context.Context, error) {
 	attrs := []any{
@@ -208,17 +209,27 @@ func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, call
 	return ctx, &ChangeGateRefusedError{Checkpoint: in.Checkpoint, Environment: in.Environment, Blockers: blockers}
 }
 
-// changeGateAdmissionError maps the admission write's refusal of a stale
-// freeze check to *ChangeGateUnavailableError, which asks the caller to try
-// again: the retry checks the freezes afresh and sees the new freeze. Any
-// other error is returned as it is.
+// isFreezeAdmissionRefusal reports whether the admission write refused the
+// change over its freeze check: the epoch moved, or could not be read.
+func isFreezeAdmissionRefusal(err error) bool {
+	return errors.Is(err, storage.ErrFreezeEpochChanged) || errors.Is(err, storage.ErrFreezeEpochUnreadable)
+}
+
+// changeGateAdmissionError maps the admission write's refusal over its freeze
+// check to *ChangeGateUnavailableError, which asks the caller to try again.
+// After a stale check, the retry checks the freezes afresh and sees the new
+// freeze. After an unreadable epoch, the gate fails closed, as it does when
+// it cannot list the freezes. Any other error is returned as it is.
 func (s *Service) changeGateAdmissionError(ctx context.Context, checkpoint changeGateCheckpoint, environment string, err error) error {
-	if !errors.Is(err, storage.ErrFreezeEpochChanged) {
+	if !isFreezeAdmissionRefusal(err) {
 		return err
 	}
 	metrics.RecordChangeGateError(ctx, environment, string(checkpoint))
-	s.logger.Warn("a freeze was created while the change was being admitted, so the change was refused",
-		"checkpoint", string(checkpoint), "environment", environment, "error", err)
+	message := "a freeze was created while the change was being admitted, so the change was refused"
+	if !errors.Is(err, storage.ErrFreezeEpochChanged) {
+		message = "the freeze epoch could not be read while the change was being admitted, so the change was refused"
+	}
+	s.logger.Warn(message, "checkpoint", string(checkpoint), "environment", environment, "error", err)
 	return &ChangeGateUnavailableError{Checkpoint: checkpoint, Gate: "freeze", Err: err}
 }
 

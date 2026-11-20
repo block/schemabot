@@ -34,6 +34,9 @@ type memoryFreezeStore struct {
 	freezes []*storage.EnvironmentFreeze
 	epochs  map[string]int64
 	nowErr  error
+	// epochCheckErr, when set, is the error the admission write's epoch
+	// read fails with.
+	epochCheckErr error
 	// afterListInEffect runs after ListInEffect has read the freezes, as a
 	// freeze committed between the check and the admission write would.
 	afterListInEffect func()
@@ -114,6 +117,9 @@ func (m *memoryFreezeStore) checkEpochGuard(ctx context.Context) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.epochCheckErr != nil {
+		return fmt.Errorf("check freeze epoch of %s: %w: %w", guard.Environment, storage.ErrFreezeEpochUnreadable, m.epochCheckErr)
+	}
 	if m.epochs[guard.Environment] != guard.Epoch {
 		return fmt.Errorf("check freeze epoch of %s: %w", guard.Environment, storage.ErrFreezeEpochChanged)
 	}

@@ -241,7 +241,7 @@ func checkFreezeEpochGuard(ctx context.Context, tx queryExecer) error {
 		return fmt.Errorf("check freeze epoch of %s: no epoch recorded: %w", guard.Environment, storage.ErrFreezeEpochChanged)
 	}
 	if err != nil {
-		return fmt.Errorf("check freeze epoch of %s: %w", guard.Environment, err)
+		return fmt.Errorf("check freeze epoch of %s: %w: %w", guard.Environment, storage.ErrFreezeEpochUnreadable, err)
 	}
 	if epoch != guard.Epoch {
 		return fmt.Errorf("check freeze epoch of %s: checked at %d, now %d: %w", guard.Environment, guard.Epoch, epoch, storage.ErrFreezeEpochChanged)
