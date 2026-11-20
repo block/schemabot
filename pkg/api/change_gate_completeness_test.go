@@ -17,6 +17,9 @@ import (
 // recording a start request, and recording a cutover request.
 var changeGateSinks = []string{"enqueueApply", "persistStartRequestForOperator", cutoverRequestSink}
 
+// changeGateChecks are the functions that run the change gates.
+var changeGateChecks = []string{"checkChangeGates", "checkChangeGatesForApply"}
+
 // cutoverRequestSink names any function that builds a cutover control request.
 const cutoverRequestSink = "<cutover request literal>"
 
@@ -34,7 +37,7 @@ func TestChangeGatesGuardEveryWayToAdmitWork(t *testing.T) {
 	gated := map[string]bool{}
 	for name, decl := range decls {
 		for _, ref := range referencedNames(decl.Body) {
-			if ref == "checkChangeGates" {
+			if slices.Contains(changeGateChecks, ref) {
 				gated[name] = true
 			}
 			if _, ok := decls[ref]; ok && ref != name {

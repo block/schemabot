@@ -790,7 +790,7 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 	}
 	// The change gates run only for a cutover this command would start: a
 	// request already pending or a cutover in progress was answered above.
-	if err := s.checkChangeGates(ctx, s.changeGateInputForApply(changeGateCheckpointCutover, apply), caller); err != nil {
+	if err := s.checkChangeGatesForApply(ctx, changeGateCheckpointCutover, apply, caller); err != nil {
 		status := "rejected"
 		if controlOperationHTTPStatus(err) >= http.StatusInternalServerError {
 			status = "error"
@@ -2003,7 +2003,7 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 	// start already pending is an idempotent duplicate and is answered
 	// without them.
 	resumeGate := func() error {
-		return s.checkChangeGates(ctx, s.changeGateInputForApply(changeGateCheckpointResume, apply), caller)
+		return s.checkChangeGatesForApply(ctx, changeGateCheckpointResume, apply, caller)
 	}
 	switch {
 	case state.IsState(apply.State, state.Apply.WaitingForDeploy):

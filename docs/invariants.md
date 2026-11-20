@@ -2190,9 +2190,10 @@ its state so the retry uses the same execution authority.
 While a freeze covering a change is in effect, SchemaBot refuses to create its apply, to record a
 start for an apply that is stopped or waiting to start, and to record a cutover for a deferred
 apply. A change that started before the freeze keeps running. If any deployment the change runs on
-is covered, the whole change is refused. "In effect" is decided by the database clock, so every pod
-agrees at the edges of a freeze. A pull request rollback is never held, nor is a stop, a cancel or
-a revert. When SchemaBot cannot read the freezes it refuses the change with a retryable error,
+is covered, the whole change is refused; for an existing apply that includes every deployment its
+stored operations run on. "In effect" is decided by the database clock, so every pod agrees at the
+edges of a freeze. A pull request rollback is never held, at creation or at a later start or
+cutover, nor is a stop, a cancel or a revert. When SchemaBot cannot read the freezes it refuses the change with a retryable error,
 never letting it through unchecked. Nobody overrides a freeze in this version, admins included.
 *Breaks if violated:* a schema change starts, or its cutover runs, during an incident or a code freeze.
 *Enforced:* the change gates and their evaluator (`checkChangeGates`, `pkg/api/change_gate.go`),

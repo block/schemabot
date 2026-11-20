@@ -115,16 +115,38 @@ func (s *Service) changeGateDeployments(database, environment, deployment string
 	return deployments
 }
 
-// changeGateInputForApply is the gate input for a start or cutover of an
-// existing apply.
-func (s *Service) changeGateInputForApply(checkpoint changeGateCheckpoint, apply *storage.Apply) changeGateInput {
-	return changeGateInput{
+// checkChangeGatesForApply runs the change gates for a start or cutover of an
+// existing apply. A pinned PR rollback passes, as it did at creation. The
+// deployments checked are the apply's own and its stored operations', with
+// the configured rollout added for an apply not narrowed to one member: an
+// operation keeps running on a deployment later dropped from the rollout
+// configuration. If the operations cannot be read, the change is refused.
+func (s *Service) checkChangeGatesForApply(ctx context.Context, checkpoint changeGateCheckpoint, apply *storage.Apply, caller string) error {
+	if apply.GetOptions().PinnedRollback {
+		return nil
+	}
+	deployments := s.changeGateDeployments(apply.Database, apply.Environment, apply.Deployment, apply.GetOptions().NarrowedTo != "")
+	if operations := s.storage.ApplyOperations(); operations != nil {
+		stored, err := operations.ListByApply(ctx, apply.ID)
+		if err != nil {
+			metrics.RecordChangeGateError(ctx, apply.Environment, string(checkpoint))
+			s.logger.Error("change gate could not read the apply's operations, so the change was refused",
+				append(apply.LogAttrs(), "checkpoint", string(checkpoint), "caller", caller, "error", err)...)
+			return &ChangeGateUnavailableError{Checkpoint: checkpoint, Gate: "operations", Err: fmt.Errorf("list operations of apply %s: %w", apply.ApplyIdentifier, err)}
+		}
+		for _, operation := range stored {
+			if operation.Deployment != "" && !slices.Contains(deployments, operation.Deployment) {
+				deployments = append(deployments, operation.Deployment)
+			}
+		}
+	}
+	return s.checkChangeGates(ctx, changeGateInput{
 		Checkpoint:  checkpoint,
 		Environment: apply.Environment,
-		Deployments: s.changeGateDeployments(apply.Database, apply.Environment, apply.Deployment, apply.GetOptions().NarrowedTo != ""),
+		Deployments: deployments,
 		Database:    apply.Database,
 		Repository:  apply.Repository,
-	}
+	}, caller)
 }
 
 // checkChangeGates runs every change gate. It returns nil when nothing
@@ -205,8 +227,10 @@ type ChangeGateUnavailableError struct {
 	Err        error
 }
 
+// Error is the operator-facing refusal, since PR commands post it as is. The
+// gate already logged the cause, and Unwrap keeps it.
 func (e *ChangeGateUnavailableError) Error() string {
-	return fmt.Sprintf("%s gate check failed at %s: %v", e.Gate, e.Checkpoint, e.Err)
+	return e.UserMessage()
 }
 
 func (e *ChangeGateUnavailableError) Unwrap() error { return e.Err }
@@ -214,14 +238,14 @@ func (e *ChangeGateUnavailableError) Unwrap() error { return e.Err }
 // UserMessage is the operator-facing refusal. It leaves out the storage
 // cause.
 func (e *ChangeGateUnavailableError) UserMessage() string {
-	what := "this"
+	outcome := "this did not start"
 	switch e.Checkpoint {
 	case changeGateCheckpointCutover:
-		what = "the cutover"
+		outcome = "the cutover did not start"
 	case changeGateCheckpointResume:
-		what = "the start"
+		outcome = "the schema change was not started"
 	}
-	return fmt.Sprintf("SchemaBot could not check for freezes, so %s did not start. Try again.", what)
+	return fmt.Sprintf("SchemaBot could not check for freezes, so %s. Try again.", outcome)
 }
 
 // changeGateErrorStatus maps a change gate error to its HTTP status and

@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -169,7 +170,90 @@ func TestChangeGateNeverHoldsPinnedRollback(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	assert.NotNil(t, applies.apply)
+	require.NotNil(t, applies.apply)
+	assert.True(t, applies.apply.GetOptions().PinnedRollback, "the apply records that it is a pinned rollback")
+}
+
+// The rollback option alone is the caller's to set, so it does not pass the
+// gates, and it is not recorded as a pinned rollback.
+func TestChangeGateHoldsAnUnpinnedRollbackOption(t *testing.T) {
+	svc, applies := newGateApplyTestService(t, gateTestFreeze("freeze-incident"))
+
+	_, _, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID: "plan-1", Environment: "staging",
+		Options: map[string]string{"rollback": "true", "pinned_rollback": "true"},
+	})
+
+	require.ErrorAs(t, err, new(*ChangeGateRefusedError))
+	assert.Nil(t, applies.apply)
+}
+
+// A pinned rollback that was stopped, or deferred its cutover, can still be
+// started and cut over during the freeze: the gates never hold a rollback.
+func TestChangeGateLetsAPinnedRollbackStartAndCutover(t *testing.T) {
+	for _, tc := range []struct {
+		name, path string
+		state      string
+	}{
+		{"start", "/api/start", state.Apply.WaitingForDeploy},
+		{"cutover", "/api/cutover", state.Apply.WaitingForCutover},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := activeTestApply("apply-rollback")
+			apply.State = tc.state
+			apply.SetOptions(storage.ApplyOptions{Rollback: true, PinnedRollback: true})
+			_, mux := newGateControlTestService(t, apply, newGateFreezeStore(t, gateTestFreeze("freeze-incident")))
+
+			rec := postGateControl(t, mux, tc.path, `{"environment": "staging", "apply_id": "apply-rollback", "caller": "cli:bob"}`)
+
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		})
+	}
+}
+
+// An apply's stored operation keeps running on a deployment later dropped
+// from the rollout configuration, so a freeze of that deployment holds the
+// apply's cutover.
+func TestChangeGateCoversTheDeploymentsOfStoredOperations(t *testing.T) {
+	apply := activeTestApply("apply-eu")
+	apply.State = state.Apply.WaitingForCutover
+	freeze := gateTestFreeze("freeze-eu")
+	freeze.Deployments = []string{"eu"}
+	svc, mux := newGateControlTestService(t, apply, newGateFreezeStore(t, freeze))
+	svc.storage.(*mockStorageWithApplyStores).operations = &staticApplyOperationStore{
+		operations: []*storage.ApplyOperation{{ApplyID: apply.ID, Deployment: "eu"}},
+	}
+
+	rec := postGateControl(t, mux, "/api/cutover", `{"environment": "staging", "apply_id": "apply-eu", "caller": "cli:bob"}`)
+
+	require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+	assert.Equal(t, "freeze-eu", decodeGateError(t, rec).Blockers[0].ID)
+}
+
+// If the apply's operations cannot be read, its deployments are unknown, so
+// the start is refused with a retryable 503.
+func TestChangeGateFailsClosedWhenOperationsUnreadable(t *testing.T) {
+	apply := activeTestApply("apply-unknown")
+	apply.State = state.Apply.WaitingForDeploy
+	svc, mux := newGateControlTestService(t, apply, newGateFreezeStore(t))
+	svc.storage.(*mockStorageWithApplyStores).operations = &staticApplyOperationStore{err: errors.New("connection refused")}
+
+	rec := postGateControl(t, mux, "/api/start", `{"environment": "staging", "apply_id": "apply-unknown", "caller": "cli:bob"}`)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+	resp := decodeGateError(t, rec)
+	assert.Equal(t, apitypes.ErrCodeChangeGateUnavailable, resp.ErrorCode)
+	assert.Equal(t, "SchemaBot could not check for freezes, so the schema change was not started. Try again.", resp.Error)
+}
+
+// PR commands post a gate error as is, so it reads as the operator-facing
+// message and leaves out the storage cause, which Unwrap keeps.
+func TestChangeGateUnavailableErrorIsTheOperatorMessage(t *testing.T) {
+	cause := errors.New("dial tcp 10.0.0.1:3306: connection refused")
+	err := &ChangeGateUnavailableError{Checkpoint: changeGateCheckpointResume, Gate: "freeze", Err: cause}
+
+	assert.Equal(t, "SchemaBot could not check for freezes, so the schema change was not started. Try again.", err.Error())
+	assert.ErrorIs(t, err, cause)
 }
 
 // A deferred apply waits at its cutover when a freeze begins. Cutting over is

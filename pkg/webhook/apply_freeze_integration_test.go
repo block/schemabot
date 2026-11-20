@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -23,9 +24,11 @@ func TestE2EApplyIsRefusedDuringAFreeze(t *testing.T) {
 	}, api.PlanIndependent)
 
 	// The freeze covers only this test's database, and is lifted when the
-	// test ends, because the storage is shared with the other tests.
+	// test ends, because the storage is shared with the other tests. A
+	// fresh identifier lets the test run again against the same storage.
+	freezeID := engine.NewFreezeID()
 	_, err := svc.Storage().Freezes().Create(t.Context(), &storage.EnvironmentFreeze{
-		Identifier:  "freeze-e2e",
+		Identifier:  freezeID,
 		Environment: driftEnv,
 		Databases:   []string{dbName},
 		Kind:        storage.FreezeKindOnDemand,
@@ -37,11 +40,44 @@ func TestE2EApplyIsRefusedDuringAFreeze(t *testing.T) {
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = svc.Storage().Freezes().Lift(context.WithoutCancel(t.Context()), "freeze-e2e", "alice", "test done")
+		_, _ = svc.Storage().Freezes().Lift(context.WithoutCancel(t.Context()), freezeID, "alice", "test done")
 	})
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	awaitCommentContaining(t, apply, "This change did not start: it is blocked in "+driftEnv+" by freeze freeze-e2e (incident 42, until lifted)")
+	awaitCommentContaining(t, apply, "This change did not start: it is blocked in "+driftEnv+" by freeze "+freezeID+" (incident 42, until lifted)")
+
+	requireNoApplies(t, svc, dbName)
+	requireNoApplyLock(t, svc, dbName)
+}
+
+// apply-confirm reaches the gate holding the pending confirmation's lock. A
+// freeze refusal releases it too, so the database is not left locked for
+// other pull requests while the freeze lasts.
+func TestE2EApplyConfirmIsRefusedDuringAFreeze(t *testing.T) {
+	dbName := "webhook_confirm_frozen"
+	svc := setupE2EService(t, dbName)
+	seedCheck(t, svc, dbName, "staging", "action_required")
+	seedPendingConfirmation(t, svc, dbName, "plan-pending-"+dbName, "staging")
+
+	freezeID := engine.NewFreezeID()
+	_, err := svc.Storage().Freezes().Create(t.Context(), &storage.EnvironmentFreeze{
+		Identifier:  freezeID,
+		Environment: "staging",
+		Databases:   []string{dbName},
+		Kind:        storage.FreezeKindOnDemand,
+		Running:     storage.FreezeRunningContinue,
+		StartsAt:    time.Now().Add(-time.Hour),
+		Reason:      "incident 43",
+		CreatedBy:   "alice",
+		Source:      storage.FreezeSourceManual,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = svc.Storage().Freezes().Lift(context.WithoutCancel(t.Context()), freezeID, "alice", "test done")
+	})
+
+	result := sendApplyConfirm(t, svc, dbName, "schemabot apply-confirm -e staging")
+	awaitCommentContaining(t, result, "This change did not start: it is blocked in staging by freeze "+freezeID+" (incident 43, until lifted)")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)

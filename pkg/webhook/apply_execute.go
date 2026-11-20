@@ -602,12 +602,12 @@ func (h *Handler) executeApply(
 		}
 		if isChangeGateError(err) {
 			// The gate refused before the apply was created, so the pending
-			// lock this attempt pinned would otherwise stay held.
-			if storedPlan != nil {
-				releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-				h.releaseApplyLockIfIntentUnchanged(releaseCtx, repo, pr, database, dbType, environment, expectedPendingPlanID, "change gate refused")
-				cancel()
-			}
+			// lock this attempt pinned, by an apply or an apply-confirm,
+			// would otherwise stay held. The release is conditional on that
+			// pin, so a lock repinned meanwhile stays.
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			h.releaseApplyLockIfIntentUnchanged(releaseCtx, repo, pr, database, dbType, environment, expectedPendingPlanID, "change gate refused")
+			cancel()
 			h.logger.Info("apply refused by a change gate", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(actionName, environment, h.deploymentTenant(), err))
 			return
