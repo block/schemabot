@@ -539,6 +539,33 @@ func TestWriteDatabaseHistoryAlignsMultiByteCells(t *testing.T) {
 		"the ASCII row pads to the same visible width, not to the CJK value's byte length")
 }
 
+// A start that follows the schema change, the default, first reports how many
+// tables it resumed and how many had already finished, each under its own
+// label, and leaves out a count that is zero.
+func TestWriteStartSuccess(t *testing.T) {
+	header := ANSIBold + ANSIGreen + "▶️  Schema change resumed" + ANSIReset + "\n\n" +
+		"Database:    orders\n" +
+		"Environment: staging\n"
+	footer := "\n" + ANSIDim + "Resuming from checkpoint..." + ANSIReset + "\n"
+
+	t.Run("resumed and skipped tables", func(t *testing.T) {
+		output := captureStdout(t, func() {
+			WriteStartSuccess(StartData{Database: "orders", Environment: "staging", ApplyID: "apply-example", StartedCount: 2, SkippedCount: 1})
+		})
+		assert.Equal(t, header+
+			"Resumed:     2 table(s)\n"+
+			"Skipped:     1 table(s) (already complete)\n"+
+			footer, output)
+	})
+
+	t.Run("nothing skipped", func(t *testing.T) {
+		output := captureStdout(t, func() {
+			WriteStartSuccess(StartData{Database: "orders", Environment: "staging", ApplyID: "apply-example", StartedCount: 3})
+		})
+		assert.Equal(t, header+"Resumed:     3 table(s)\n"+footer, output)
+	})
+}
+
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 
