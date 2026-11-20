@@ -18,3 +18,10 @@ func TestRenderHelpCommentListsControlCommands(t *testing.T) {
 	assert.Contains(t, rendered, "`schemabot cutover <apply-id> -e <env>`")
 	assert.Contains(t, rendered, "Complete a deferred cutover")
 }
+
+// The override flag is listed with the commands that take it.
+func TestRenderHelpCommentListsOverrideFlag(t *testing.T) {
+	rendered := RenderHelpComment()
+	assert.Contains(t, rendered, "`--override \"<reason>\"`")
+	assert.Contains(t, rendered, "(apply, start and cutover)")
+}

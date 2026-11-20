@@ -100,6 +100,9 @@ func TestIssueCommentGateBlockParity(t *testing.T) {
 		{name: "rollback misplaced defer-cutover", comment: "schemabot rollback apply_123 -e production --defer-cutover -t alpha", want: issueCommentGateDeferCutover},
 		{name: "unsupported database", comment: "schemabot stop -e production -d accounts -t alpha", want: issueCommentGateDatabase},
 		{name: "unsupported target", comment: "schemabot apply-confirm -e production --target payments-002 -t alpha", want: issueCommentGateTarget},
+		{name: "unsupported override", comment: `schemabot rollback apply_123 -e production --override "fix" -t alpha`, want: issueCommentGateOverride},
+		{name: "override passes on apply", comment: `schemabot apply -e production --override "fix" -t alpha`, want: issueCommentGatePass},
+		{name: "blank override reason", comment: `schemabot apply -e production --override "" -t alpha`, want: issueCommentGateOverrideReason},
 		{name: "narrowed plan missing environment", comment: "schemabot plan --target payments-002 -t alpha", want: issueCommentGateMissingEnvironment},
 	}
 	for _, tt := range tests {

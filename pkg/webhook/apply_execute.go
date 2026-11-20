@@ -593,6 +593,17 @@ func (h *Handler) executeApply(
 		ConfirmedMemberWork:   confirmedMemberWork,
 		Target:                result.Target,
 	}
+	// The commenter is who the gate admits on an approved override, so it
+	// rides on every apply, not only one asking for an override. The author
+	// is from the fresh read above: a request needs one, and the gate records
+	// none without it. A fan-out runs this once per deployment, so each
+	// records its own request.
+	ctx = api.WithPullRequestOverrideRequester(ctx, api.PullRequestRequester{
+		Login: requestedBy, Repository: repo, PullRequest: pr, Author: freshPRInfo.User,
+	})
+	if result.OverrideGiven {
+		applyReq.Override = result.Override
+	}
 
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
@@ -916,7 +927,7 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 		return msgs.lockIntentChanged
 	}
 	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
-		return "This change did not start: it is " + refused.Error() + "."
+		return "This change did not start: it is " + changeGateRefusalDetail(refused)
 	}
 	if unavailable, ok := errors.AsType[*api.ChangeGateUnavailableError](err); ok {
 		return unavailable.UserMessage()

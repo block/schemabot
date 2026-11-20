@@ -165,7 +165,7 @@ See [Check Runs](../../docs/check-runs.md) for the current lifecycle, `apply_id`
 ## Command Syntax
 
 ```text
-schemabot <command> [args] [-e <environment>] [-d <database>] [--defer-cutover] [--allow-unsafe] [--skip-revert] [--enable-revert]
+schemabot <command> [args] [-e <environment>] [-d <database>] [--defer-cutover] [--allow-unsafe] [--skip-revert] [--enable-revert] [--override "<reason>"]
 ```
 
 | Command | `-e` required | Description |
@@ -186,6 +186,22 @@ schemabot <command> [args] [-e <environment>] [-d <database>] [--defer-cutover] 
 PR comments for `stop`, `cutover`, `revert`, and `skip-revert` are parsed so
 SchemaBot can return a clear "not yet available" response. Use the CLI for
 those operator controls today.
+
+### Freeze override
+
+`apply`, `start` and `cutover` take `--override "<reason>"` (also
+`--override=<reason>` and single quotes). Quotes group only this flag's value;
+without them the reason is the next word. When a freeze refuses the command,
+SchemaBot records an override request for the commenter and the pull request's
+author, and the comment names it. The reason is trimmed, must not be blank, and
+is at most 500 characters. `rollback`, `revert` and `apply-confirm` do not take
+the flag, and rollbacks skip the freeze gate.
+
+A request from a pull request is recorded as `github:<login>` for both the
+commenter and the author, and only a pull request approves it: the API route
+refuses it, since a GitHub login cannot be matched to an API subject. The
+command that approves from a pull request arrives next; until then a request
+from a pull request stays pending and expires after 24 hours.
 
 ## Error Handling
 

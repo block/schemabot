@@ -52,6 +52,19 @@ func RenderUnsupportedTargetFlag(action string) string {
 	return fmt.Sprintf("The `--target` flag is not supported for `%s`. Only `plan` and `apply` take it.", action)
 }
 
+// RenderUnsupportedOverrideFlag renders the message posted when `--override`
+// is supplied to a command that no freeze can refuse.
+func RenderUnsupportedOverrideFlag(action string) string {
+	return fmt.Sprintf("The `--override` flag is not supported for `%s`. Only `apply`, `start` and `cutover` take it.", action)
+}
+
+// RenderInvalidOverrideReason renders the message posted when the reason
+// after `--override` is blank or too long. problem is the validator's text,
+// which names only lengths.
+func RenderInvalidOverrideReason(action, problem string) string {
+	return fmt.Sprintf("Could not read `--override` on `%s`: %s. Give the reason in quotes, like `--override \"fix the index\"`.", action, problem)
+}
+
 // RenderTargetMissingEnv renders the message posted when `--target` is given
 // without `-e`. A target is a member of one environment's rollout, so the
 // usage line keeps the target the caller typed and asks only for the

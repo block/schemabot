@@ -2,11 +2,13 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -188,14 +190,23 @@ func runControlCommand[R any](
 	}
 
 	caller := formatGitHubCaller(requestedBy, repo, pr)
-	resp, err := execute(ctx, apitypes.ControlRequest{
+	request := apitypes.ControlRequest{
 		ApplyID:     result.ApplyID,
 		Environment: result.Environment,
 		Caller:      caller,
-	})
+	}
+	if result.OverrideGiven {
+		request.Override = result.Override
+		ctx = h.withPullRequestOverrideRequester(ctx, client, repo, pr, installationID, requestedBy)
+	} else {
+		// The commenter is who the gate admits on an approved override. Only
+		// asking for one needs the author, so a plain command skips that read.
+		ctx = api.WithPullRequestOverrideRequester(ctx, api.PullRequestRequester{Login: requestedBy, Repository: repo, PullRequest: pr})
+	}
+	resp, err := execute(ctx, request)
 	if err != nil {
 		h.logControlCommandError(actionName, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
-		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, controlErrorMessage(err))
 		return nil
 	}
 	if resp == nil {
@@ -225,6 +236,41 @@ func runControlCommand[R any](
 		return nil
 	}
 	return resp
+}
+
+// withPullRequestOverrideRequester marks ctx with the commenter asking for an
+// override, for a start or cutover. Unlike an apply, the command has no fresh
+// read of the pull request, so the author comes from the one the actor check
+// made when it ran, or a new read. If the author cannot be read, ctx stays
+// as it is: the gate records no request, and the refusal says so.
+// client is nil when actor authorization is off.
+func (h *Handler) withPullRequestOverrideRequester(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, requestedBy string) context.Context {
+	if client == nil {
+		var err error
+		if client, err = h.clientForRepo(repo, installationID); err != nil {
+			h.logger.Warn("override not requested: cannot resolve the GitHub client to read the pull request's author",
+				"repo", repo, "pr", pr, "requested_by", requestedBy, "error", err)
+			return ctx
+		}
+	}
+	info, err := client.FetchPullRequest(ctx, repo, pr)
+	if err != nil || info.User == "" {
+		h.logger.Warn("override not requested: cannot read the pull request's author",
+			"repo", repo, "pr", pr, "requested_by", requestedBy, "error", err)
+		return ctx
+	}
+	return api.WithPullRequestOverrideRequester(ctx, api.PullRequestRequester{
+		Login: requestedBy, Repository: repo, PullRequest: pr, Author: info.User,
+	})
+}
+
+// controlErrorMessage renders a failed control command for the PR. A freeze
+// refusal reads as it does for an apply; other errors post as they are.
+func controlErrorMessage(err error) string {
+	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
+		return changeGateRefusalDetail(refused)
+	}
+	return err.Error()
 }
 
 // handleStopCommand handles the "schemabot stop <apply-id> -e <env>" PR

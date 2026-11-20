@@ -3178,7 +3178,7 @@ schemabot apply -e staging
 | `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
-**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess), `--target <target>` one target of the rollout (plan and apply)
+**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess), `--target <target>` one target of the rollout (plan and apply), `--override "<reason>"` ask a freeze approver to let the change through a freeze (apply, start and cutover)
 
 **Quick start**: `plan` → `apply`
 <!-- schemabot:offer-support-channel -->
@@ -3209,7 +3209,7 @@ That command wasn't recognized. Available commands:
 | `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
-**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess), `--target <target>` one target of the rollout (plan and apply)
+**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess), `--target <target>` one target of the rollout (plan and apply), `--override "<reason>"` ask a freeze approver to let the change through a freeze (apply, start and cutover)
 
 **Quick start**: `plan` → `apply`
 <!-- schemabot:offer-support-channel -->
@@ -3657,7 +3657,7 @@ That command wasn't recognized. Available commands:
 | `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
-**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess), `--target <target>` one target of the rollout (plan and apply)
+**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess), `--target <target>` one target of the rollout (plan and apply), `--override "<reason>"` ask a freeze approver to let the change through a freeze (apply, start and cutover)
 
 **Quick start**: `plan` → `apply`
 <!-- schemabot:offer-support-channel -->
