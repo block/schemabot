@@ -105,6 +105,11 @@ func (s *Service) changeGateDeployments(database, environment, deployment string
 	}
 	targets, err := s.config.ResolveDatabaseTargets(database, environment)
 	if err != nil {
+		// Not failing closed is deliberate. When the config does not resolve
+		// the targets, apply creation runs the change on the plan's own
+		// deployment alone (applyTargets), so that deployment is the whole
+		// set. A start or cutover also checks the deployments of the apply's
+		// stored operations.
 		return deployments
 	}
 	for _, target := range targets {
