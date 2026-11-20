@@ -203,7 +203,7 @@ var githubRoutePatterns = []githubRoutePattern{
 	{method: http.MethodGet, path: "/repos/{owner}/{repo}/installation", operation: metrics.GitHubOperationFetchRepositoryInstallation},
 	{method: http.MethodGet, path: "/repos/{owner}/{repo}/issues/comments/{comment_id}", operation: metrics.GitHubOperationFetchIssueComment},
 	{method: http.MethodGet, path: "/repos/{owner}/{repo}/issues/{issue_number}/timeline", operation: metrics.GitHubOperationListIssueTimeline},
-	{method: http.MethodDelete, path: "/repos/{owner}/{repo}/issues/{issue_number}/labels/{name}", operation: metrics.GitHubOperationRemoveIssueLabel},
+	{method: http.MethodDelete, path: "/repos/{owner}/{repo}/issues/{issue_number}/labels/{name...}", operation: metrics.GitHubOperationRemoveIssueLabel},
 	{method: http.MethodGet, path: "/repos/{owner}/{repo}/pulls", operation: metrics.GitHubOperationListPullRequests},
 	{method: http.MethodGet, path: "/repos/{owner}/{repo}/commits/{commit_sha}/pulls", operation: metrics.GitHubOperationListPullRequestsForCommit},
 	{method: http.MethodGet, path: "/repos/{owner}/{repo}/compare/{basehead...}", operation: metrics.GitHubOperationCompareCommits},

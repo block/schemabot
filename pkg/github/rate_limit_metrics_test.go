@@ -347,6 +347,13 @@ func TestGitHubRateLimitContextFromRequestClassifiesRESTRoutes(t *testing.T) {
 			repository: "octocat/hello-world",
 		},
 		{
+			name:       "remove issue label containing an encoded slash",
+			method:     http.MethodDelete,
+			url:        "https://api.github.com/repos/octocat/hello-world/issues/7/labels/schema%2Fexception",
+			operation:  metrics.GitHubOperationRemoveIssueLabel,
+			repository: "octocat/hello-world",
+		},
+		{
 			name:       "list open pull requests",
 			method:     http.MethodGet,
 			url:        "https://api.github.com/repos/octocat/hello-world/pulls?state=open&sort=updated",
