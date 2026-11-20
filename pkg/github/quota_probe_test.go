@@ -257,25 +257,27 @@ func TestQuotaProbeRepeatsUntilStopped(t *testing.T) {
 }
 
 // Every pass publishes the installations it is responsible for, including the
-// owners it could not resolve, once its budget reads are done, so the targets
-// carry the App label the reads' snapshots were recorded under.
+// owners it could not resolve, as soon as it lists them, so the gauge counts
+// this pass while its reads run, and again once its reads are done, so the
+// targets carry the App label the reads' snapshots were recorded under.
 func TestQuotaProbeReportsItsTargetsEachPass(t *testing.T) {
 	probe, reads, _ := recordingQuotaProbe(t, nil)
 	probe.listInstallations = func(context.Context) (quotaTargets, error) {
 		return quotaTargets{installations: []int64{11}, unresolved: 1}, nil
 	}
 	var reported []quotaTargets
-	readsBeforeReport := -1
+	var readsAtReport []int
 	probe.reportTargets = func(targets quotaTargets) {
-		readsBeforeReport = len(reads)
+		readsAtReport = append(readsAtReport, len(reads))
 		reported = append(reported, targets)
 	}
 
 	probe.probeOnce(t.Context())
 
-	assert.Equal(t, 1, readsBeforeReport, "targets must be reported after the pass's reads finish")
+	assert.Equal(t, []int{0, 1}, readsAtReport, "targets are reported before the reads start and after they finish")
 	assert.Equal(t, int64(11), receiveRead(t, reads))
-	assert.Equal(t, []quotaTargets{{installations: []int64{11}, unresolved: 1}}, reported)
+	want := quotaTargets{installations: []int64{11}, unresolved: 1}
+	assert.Equal(t, []quotaTargets{want, want}, reported)
 }
 
 // Before its first pass, an App counts one unobserved installation, and a
@@ -289,7 +291,7 @@ func TestQuotaProbeIsUnresolvedUntilItsFirstPass(t *testing.T) {
 	probe.probeOnce(t.Context())
 
 	assert.Equal(t, int64(11), receiveRead(t, reads))
-	assert.Equal(t, []quotaTargets{{unresolved: 1}, {installations: []int64{11}}}, reported)
+	assert.Equal(t, []quotaTargets{{unresolved: 1}, {installations: []int64{11}}, {installations: []int64{11}}}, reported)
 }
 
 // A pass that cannot list installations keeps the targets from the last good
@@ -310,6 +312,7 @@ func TestQuotaProbeCountsAFailedListAsUnobserved(t *testing.T) {
 	probe.probeOnce(t.Context())
 
 	assert.Equal(t, []quotaTargets{
+		{installations: []int64{11}},
 		{installations: []int64{11}},
 		{installations: []int64{11}, unresolved: 1},
 	}, reported)

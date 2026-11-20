@@ -188,11 +188,12 @@ func (p *QuotaProbe) probeOnce(ctx context.Context) {
 		return
 	}
 	p.lastTargets = targets
-	// Report the targets once the reads are done, not before: the App slug
-	// that labels them can be learned during the first pass's reads, and the
-	// targets must carry the same label as the snapshots those reads record.
-	// The reads are bounded by readTimeout, so the report is never held for
-	// longer than that.
+	// Report the targets as soon as they are listed, so the gauge counts this
+	// pass's installations and unresolved owners while the reads run, and
+	// again once the reads are done: the App slug that labels the targets can
+	// be learned during the first pass's reads, and the targets must carry the
+	// same label as the snapshots those reads record.
+	p.reportTargets(targets)
 	defer p.reportTargets(targets)
 	ids := targets.installations
 	if len(ids) == 0 {

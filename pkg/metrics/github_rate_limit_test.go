@@ -306,9 +306,33 @@ func TestGitHubQuotaUnobservedInstallations(t *testing.T) {
 	assert.True(t, strings.HasSuffix(lines[0], " 0"), lines[0])
 
 	now = now.Add(GitHubRateLimitSnapshotMaxAge + time.Second)
+	SetGitHubQuotaProbeTargets(1, "example-app", []int64{42}, 0)
 	lines = snapshotLines(scrape(), "schemabot_github_rate_limit_unobserved_installations")
 	require.Len(t, lines, 1)
 	assert.True(t, strings.HasSuffix(lines[0], " 1"), "the aged-out snapshot leaves installation 42 unobserved: %s", lines[0])
+}
+
+// A probe that stops reporting its targets counts one more unobserved
+// installation once its targets are older than a snapshot may be, even while
+// webhook traffic keeps the known installations' snapshots fresh: an
+// installation added since the probe's last pass would otherwise never be
+// counted.
+func TestGitHubQuotaProbeTargetsGoStaleWhenTheProbeStopsReporting(t *testing.T) {
+	recorder, scrape := newQuotaRegistry(t)
+	now := time.Date(2026, 1, 1, 0, 10, 0, 0, time.UTC)
+	recorder.now = func() time.Time { return now }
+	SetGitHubQuotaProbeTargets(1, "example-app", []int64{42}, 0)
+
+	now = now.Add(GitHubRateLimitSnapshotMaxAge + time.Second)
+	RecordGitHubRateLimit(t.Context(), quotaSample(now, 9000))
+	lines := snapshotLines(scrape(), "schemabot_github_rate_limit_unobserved_installations")
+	require.Len(t, lines, 1)
+	assert.True(t, strings.HasSuffix(lines[0], " 1"), "installation 42 is fresh but the targets are stale: %s", lines[0])
+
+	SetGitHubQuotaProbeTargets(1, "example-app", []int64{42}, 0)
+	lines = snapshotLines(scrape(), "schemabot_github_rate_limit_unobserved_installations")
+	require.Len(t, lines, 1)
+	assert.True(t, strings.HasSuffix(lines[0], " 0"), "a fresh report clears the stale count: %s", lines[0])
 }
 
 // A probe keeps one set of targets per App even when the label it reports

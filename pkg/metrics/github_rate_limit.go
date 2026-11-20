@@ -40,11 +40,13 @@ type githubRateLimitDiagnostic struct {
 // githubQuotaProbeTargets is the set of installations one App's quota probe is
 // responsible for keeping observed: every installation that serves a
 // configured repository, plus the count of repository owners whose
-// installation could not be resolved on the probe's last pass.
+// installation could not be resolved on the probe's last pass. reportedAt is
+// when the probe last reported them.
 type githubQuotaProbeTargets struct {
 	githubApp     string
 	installations []int64
 	unresolved    int
+	reportedAt    time.Time
 }
 
 type githubRateLimitRecorder struct {
@@ -188,10 +190,14 @@ func snapshotExportable(sample GitHubRateLimitSample, now time.Time) bool {
 }
 
 // unobservedInstallations counts the probe targets whose core budget is
-// unknown: owners whose installation could not be resolved, and installations
-// with no exportable core snapshot. The caller holds r.mu.
+// unknown: owners whose installation could not be resolved, installations
+// with no exportable core snapshot, and one more when the targets themselves
+// are stale. The caller holds r.mu.
 func (r *githubRateLimitRecorder) unobservedInstallations(targets githubQuotaProbeTargets, now time.Time) int64 {
 	unobserved := int64(targets.unresolved)
+	if probeTargetsStale(targets, now) {
+		unobserved++
+	}
 	for _, installation := range targets.installations {
 		sample, ok := r.snapshots[githubRateLimitIdentity{targets.githubApp, installation, GitHubRateLimitResourceCore}]
 		if !ok || !snapshotExportable(sample, now) {
@@ -201,12 +207,24 @@ func (r *githubRateLimitRecorder) unobservedInstallations(targets githubQuotaPro
 	return unobserved
 }
 
+// probeTargetsStale reports whether a probe's targets are older than a
+// snapshot may be. Webhook traffic keeps refreshing the snapshots of
+// installations the targets already name, so those snapshots staying fresh
+// does not show the probe is still running: a stalled probe would leave an
+// installation added since its last pass, and its last unresolved count,
+// standing indefinitely. Stale targets therefore count one more unobserved
+// installation until the probe reports again.
+func probeTargetsStale(targets githubQuotaProbeTargets, now time.Time) bool {
+	return now.Sub(targets.reportedAt) > GitHubRateLimitSnapshotMaxAge
+}
+
 // SetGitHubQuotaProbeTargets records the installations an App's quota probe
 // keeps observed, replacing what the probe reported on its previous pass. The
 // unobserved-installations gauge is computed from these targets at every
-// collection, so an installation whose reads start failing, or a probe that
-// stops running, shows as unobserved once its last snapshot ages out rather
-// than keeping the count from the last pass.
+// collection, so an installation whose reads start failing shows as
+// unobserved once its last snapshot ages out, and a probe that stops reporting
+// shows one more once its targets age out, rather than keeping the count from
+// the last pass.
 func SetGitHubQuotaProbeTargets(appID int64, githubApp string, installations []int64, unresolved int) {
 	recorder := activeGitHubRateLimits.Load()
 	if recorder == nil {
@@ -219,6 +237,7 @@ func SetGitHubQuotaProbeTargets(appID int64, githubApp string, installations []i
 		githubApp:     githubApp,
 		installations: append([]int64(nil), installations...),
 		unresolved:    unresolved,
+		reportedAt:    recorder.now(),
 	}
 }
 
