@@ -72,7 +72,7 @@ type FreezeListResponse struct {
 }
 
 // FreezeOverrideRequest asks to let one change through the freezes that hold
-// it (GET /api/freezes/overrides/{id}). A second person approves it, and the
+// it. A second person approves it, and the
 // change goes ahead only while every blocker it meets is one the request names.
 type FreezeOverrideRequest struct {
 	ID          string `json:"id"`

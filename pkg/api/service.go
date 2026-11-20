@@ -1006,8 +1006,6 @@ func (s *Service) apiRoutes() []apiRoute {
 		{"GET /api/freezes", s.handleFreezeList},
 		{"GET /api/freezes/{id}", s.handleFreezeGet},
 		{"POST /api/freezes/{id}/lift", s.handleFreezeLift},
-		{"GET /api/freezes/overrides/{id}", s.handleFreezeOverrideGet},
-		{"POST /api/freezes/overrides/{id}/approve", s.handleFreezeOverrideApprove},
 
 		// GitHub webhook endpoint — registered externally via RegisterWebhook
 	}

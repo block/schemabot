@@ -200,8 +200,6 @@ func TestMutatingRoutesDenyOperatorOutsideGrantedEnvironment(t *testing.T) {
 		"POST /api/checks/repos":         "admin-only; TestMutatingRoutesDenyScopedOperatorByDefault covers the denial",
 		"POST /api/storage/schema/plan":  "admin-only; TestMutatingRoutesDenyScopedOperatorByDefault covers the denial",
 		"POST /api/storage/schema/apply": "admin-only; TestMutatingRoutesDenyScopedOperatorByDefault covers the denial",
-
-		"POST /api/freezes/overrides/{id}/approve": "needs a freeze group; TestFreezeOverrideApproveAuthorization covers the denial",
 	}
 
 	svc := New(productionPaymentsStorage(&[]string{}), scopedWriteConfig(), nil, slog.New(slog.DiscardHandler))

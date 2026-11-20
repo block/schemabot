@@ -62,8 +62,6 @@ func TestMutatingRoutesDenyFreezeOnlyCallerByDefault(t *testing.T) {
 	runMutatingRouteSweep(t, cfg, commander, map[string]bool{
 		"POST /api/freezes":           true,
 		"POST /api/freezes/{id}/lift": true,
-
-		"POST /api/freezes/overrides/{id}/approve": true,
 	})
 }
 
@@ -143,8 +141,6 @@ func runMutatingRouteSweep(t *testing.T, cfg *ServerConfig, caller *auth.User, a
 		// grant.
 		"POST /api/storage/schema/plan":  `{}`,
 		"POST /api/storage/schema/apply": `{}`,
-
-		"POST /api/freezes/overrides/{id}/approve": `{}`,
 	}
 
 	svc := New(st, cfg, nil, slog.New(slog.DiscardHandler))

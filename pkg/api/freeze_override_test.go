@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -441,100 +440,6 @@ func TestFreezeOverrideDoesNotCoverAFreezeLandingBeforeTheWrite(t *testing.T) {
 	_, _, err = svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
 	require.ErrorAs(t, err, new(*ChangeGateRefusedError))
 	assert.Nil(t, applies.apply)
-}
-
-// newOverrideApproveService is a freeze service with an override request
-// from rita, the way the gate records one.
-func newOverrideApproveService(t *testing.T, config *ServerConfig) (*Service, *http.ServeMux, *memoryFreezeOverrideStore, *clock.Fake) {
-	t.Helper()
-	svc, mux := newFreezeTestService(t, config)
-	mock := svc.storage.(*mockStorageWithFreezes)
-	fake := mock.freezes.(*memoryFreezeStore).clock.(*clock.Fake)
-	store := &memoryFreezeOverrideStore{clock: fake}
-	mock.overrides = store
-	_, err := store.Create(t.Context(), &storage.FreezeOverrideRequest{
-		Identifier: "ovr-1", Environment: "staging", Action: storage.FreezeOverrideActionApply, TargetID: "plan-1",
-		Database: "testdb", Blockers: []string{"freeze freeze-incident"}, Reason: "fix", RequestedBy: "rita", ExpiresAt: freezeTestNow.Add(time.Hour),
-	})
-	require.NoError(t, err)
-	return svc, mux, store, fake
-}
-
-func approveRoute(t *testing.T, mux *http.ServeMux, user *auth.User, id string) *httptest.ResponseRecorder {
-	t.Helper()
-	return doFreezeRequest(t, mux, user, http.MethodPost, "/api/freezes/overrides/"+id+"/approve", `{}`)
-}
-
-// Only a verified freeze-group member who is not the requester approves.
-// Write groups do not grant approval, and nobody approves their own request.
-func TestFreezeOverrideApproveAuthorization(t *testing.T) {
-	_, mux, store, _ := newOverrideApproveService(t, freezeConfig())
-
-	other := &auth.User{Subject: "rita", Groups: []string{"incident-commanders"}}
-	rec := approveRoute(t, mux, other, "ovr-1")
-	require.Equal(t, http.StatusForbidden, rec.Code, "the requester may not approve")
-	assert.Contains(t, rec.Body.String(), "other than the person who asked")
-
-	rec = approveRoute(t, mux, freezeAdmin, "ovr-1")
-	require.Equal(t, http.StatusForbidden, rec.Code, "a write group does not approve")
-	assert.Contains(t, rec.Body.String(), "freeze group (incident-commanders)")
-
-	req := httptest.NewRequestWithContext(auth.WithUser(t.Context(), freezeMember), http.MethodPost, "/api/freezes/overrides/ovr-1/approve", strings.NewReader(`{}`))
-	unverified := httptest.NewRecorder()
-	mux.ServeHTTP(unverified, req)
-	require.Equal(t, http.StatusForbidden, unverified.Code)
-	assert.Contains(t, unverified.Body.String(), "needs a verified caller")
-
-	rec = approveRoute(t, mux, freezeMember, "ovr-nope")
-	require.Equal(t, http.StatusNotFound, rec.Code)
-
-	stored, err := store.Get(t.Context(), "ovr-1")
-	require.NoError(t, err)
-	assert.Nil(t, stored.ApprovedAt, "no denied attempt approves")
-}
-
-// An approver approves once. The request reads back approved, and one past its
-// expiry cannot be approved.
-func TestFreezeOverrideApproveAndRead(t *testing.T) {
-	_, mux, store, fake := newOverrideApproveService(t, freezeConfig())
-	expiring, err := store.Create(t.Context(), &storage.FreezeOverrideRequest{
-		Identifier: "ovr-2", Environment: "staging", Action: storage.FreezeOverrideActionCutover, TargetID: "apply-1",
-		Database: "testdb", Blockers: []string{"freeze freeze-incident"}, Reason: "fix", RequestedBy: "rita", ExpiresAt: freezeTestNow.Add(time.Minute),
-	})
-	require.NoError(t, err)
-
-	rec := approveRoute(t, mux, freezeMember, "ovr-1")
-	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	var approved apitypes.FreezeOverrideRequest
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &approved))
-	assert.Equal(t, "ida", approved.ApprovedBy)
-	assert.Equal(t, "rita", approved.RequestedBy)
-	assert.Equal(t, []string{"freeze freeze-incident"}, approved.Blockers)
-
-	assert.Equal(t, http.StatusConflict, approveRoute(t, mux, freezeMember, "ovr-1").Code, "a second approval conflicts")
-
-	rec = doFreezeRequest(t, mux, nil, http.MethodGet, "/api/freezes/overrides/ovr-1", "")
-	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	assert.Contains(t, rec.Body.String(), `"approved_by":"ida"`)
-	assert.Equal(t, http.StatusNotFound, doFreezeRequest(t, mux, nil, http.MethodGet, "/api/freezes/overrides/ovr-nope", "").Code)
-
-	fake.Advance(time.Hour)
-	assert.Equal(t, http.StatusConflict, approveRoute(t, mux, freezeMember, expiring.Identifier).Code, "an expired request cannot be approved")
-}
-
-// Only a freeze group grants approval. With none configured nobody may
-// approve, a write-group member included, and the denial says so.
-func TestAuthorizeFreezeApprove(t *testing.T) {
-	assert.False(t, (&ServerConfig{}).AuthorizeFreezeApprove(nil).Allowed)
-	writeGroupsOnly := &ServerConfig{Auth: AuthConfig{Type: "forward_auth", ForwardAuth: ForwardAuthSettings{WriteGroups: []string{"schema-admins"}}}}
-	assert.False(t, writeGroupsOnly.AuthorizeFreezeApprove(freezeAdmin).Allowed)
-
-	config := scopedWriteConfig() // operator groups, no freeze groups
-	assert.False(t, config.AuthorizeFreezeApprove(freezeAdmin).Allowed)
-	_, mux, _, _ := newOverrideApproveService(t, config)
-	rec := approveRoute(t, mux, freezeAdmin, "ovr-1")
-	require.Equal(t, http.StatusForbidden, rec.Code)
-	assert.Contains(t, rec.Body.String(), "none are configured")
 }
 
 // An apply's override covers the schema it asks for, not one plan: a

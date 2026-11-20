@@ -73,8 +73,6 @@ request bodies that try to send database or deployment fields.
 | GET | `/api/freezes` | List freezes in effect, scheduled, and recent |
 | GET | `/api/freezes/{id}` | Get one freeze |
 | POST | `/api/freezes/{id}/lift` | Lift a freeze early |
-| GET | `/api/freezes/overrides/{id}` | Get one freeze override request |
-| POST | `/api/freezes/overrides/{id}/approve` | Approve a freeze override request (verified `freeze.groups` member other than the requester) |
 
 ### Health
 
