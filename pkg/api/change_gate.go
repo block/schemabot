@@ -259,6 +259,7 @@ func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, call
 			s.logger.Info("override requested for a change a gate refused", append(attrs,
 				"override_request", requested.Identifier, "reason", requested.Reason, "blockers", requested.Blockers)...)
 			refusal.OverrideRequest = requested
+			refusal.OverrideReasonKept = requested.Reason != in.Override
 		} else {
 			refusal.OverrideUnrecorded = true
 		}
@@ -416,6 +417,10 @@ type ChangeGateRefusedError struct {
 	// OverrideRequest is the request recorded for a caller who gave an
 	// override reason, awaiting an approver other than the requester.
 	OverrideRequest *storage.FreezeOverrideRequest
+	// OverrideReasonKept reports a repeat that found the requester's
+	// pending request with a different reason. The request keeps its
+	// first reason, which is the one the approver sees.
+	OverrideReasonKept bool
 	// OverrideUnrecorded reports an override reason given by a caller who
 	// is not verified, or to a server with no override storage: no request
 	// was recorded.
@@ -434,6 +439,9 @@ func (e *ChangeGateRefusedError) Error() string {
 	message := fmt.Sprintf("blocked in %s by %s; try again after it ends or is lifted", e.Environment, strings.Join(parts, "; "))
 	if e.OverrideRequest != nil {
 		message += fmt.Sprintf("; override request %s needs a freeze approver other than you", e.OverrideRequest.Identifier)
+		if e.OverrideReasonKept {
+			message += fmt.Sprintf(" (you asked for it earlier, and it keeps that reason: %q)", e.OverrideRequest.Reason)
+		}
 	}
 	if e.OverrideUnrecorded {
 		message += "; no override was requested, because asking for one needs a verified caller"

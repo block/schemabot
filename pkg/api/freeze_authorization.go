@@ -87,7 +87,6 @@ func (c *ServerConfig) AuthorizeFreezeWrite(user *auth.User) DirectWriteAuthoriz
 // AuthorizeFreezeApprove decides whether the caller may approve a freeze
 // override request. Only a freeze-group member may: a write group grants
 // freeze writes but not approval, so nobody overrides alone, admins included.
-// Without the scoped lane there are no groups to check, as for freeze writes.
 func (c *ServerConfig) AuthorizeFreezeApprove(user *auth.User) DirectWriteAuthorizationResult {
 	// No lane grants approval by default: with no freeze groups configured,
 	// nobody approves, write-group members included.

@@ -193,6 +193,10 @@ func TestFreezeOverrideLetsAnApplyThrough(t *testing.T) {
 	rec = postAs(t, mux, overrideRequester, "/api/apply", overrideApplyBody)
 	require.Equal(t, http.StatusConflict, rec.Code)
 	assert.Equal(t, id, decodeGateError(t, rec).OverrideRequest.ID, "asking again keeps the one request")
+	assert.NotContains(t, decodeGateError(t, rec).Error, "keeps that reason")
+	rec = postAs(t, mux, overrideRequester, "/api/apply", `{"plan_id":"plan-1","environment":"staging","override":"another reason"}`)
+	require.Equal(t, http.StatusConflict, rec.Code)
+	assert.Contains(t, decodeGateError(t, rec).Error, `(you asked for it earlier, and it keeps that reason: "fix for incident 42")`)
 	assert.Equal(t, 1, store.count())
 
 	approveOverride(t, store, id)
@@ -205,7 +209,7 @@ func TestFreezeOverrideLetsAnApplyThrough(t *testing.T) {
 	require.NotNil(t, applies.apply)
 	assert.Equal(t, id, applies.apply.GetOptions().FreezeOverride)
 	assert.Equal(t, 1, store.count(), "an admitted apply records no second request")
-	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 3}, changeGateCounters(t, reader, "schemabot.change_gate.refusals"))
+	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 4}, changeGateCounters(t, reader, "schemabot.change_gate.refusals"))
 	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 1}, changeGateCounters(t, reader, "schemabot.change_gate.overrides"))
 }
 
