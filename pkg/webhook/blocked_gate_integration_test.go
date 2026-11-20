@@ -80,7 +80,7 @@ func TestE2EApplyRejectedOnBlockedPlan(t *testing.T) {
 		assert.Contains(t, body, "`users`")
 		assert.NotContains(t, body, "--allow-unsafe", "a guaranteed failure must not coach an unsafe override")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the apply rejection comment")
+		require.FailNow(t, "timed out waiting for the apply rejection comment")
 	}
 
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")

@@ -67,7 +67,7 @@ func TestE2EAggregateCheck(t *testing.T) {
 	select {
 	case <-result.comments:
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for plan comment")
+		require.FailNow(t, "timed out waiting for plan comment")
 	}
 
 	// Collect the aggregate check run (only aggregates are created, no per-database)
@@ -75,7 +75,7 @@ func TestE2EAggregateCheck(t *testing.T) {
 	select {
 	case aggCR = <-result.checkRuns:
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for aggregate check run")
+		require.FailNow(t, "timed out waiting for aggregate check run")
 	}
 
 	assert.Equal(t, "SchemaBot", aggCR.Name)
@@ -221,7 +221,7 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
 		assert.False(t, prematurePassingAggregate.Load(), "passing aggregate was published before stale per-database records were cleaned")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for aggregate check run")
+		require.FailNow(t, "timed out waiting for aggregate check run")
 	}
 
 	// Poll for per-database storage records to be updated by cleanupStaleChecks.
@@ -237,7 +237,7 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 			}
 			select {
 			case <-deadline:
-				t.Fatalf("timed out waiting for %s check to update to new SHA", env)
+				require.FailNow(t, fmt.Sprintf("timed out waiting for %s check to update to new SHA", env))
 			case <-time.After(100 * time.Millisecond):
 			}
 		}
@@ -254,7 +254,7 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 		}
 		select {
 		case <-deadline2:
-			t.Fatal("timed out waiting for aggregate storage update")
+			require.FailNow(t, "timed out waiting for aggregate storage update")
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
@@ -354,7 +354,7 @@ func TestE2ENewHeadPlanPreservesInProgressApplyOwnership(t *testing.T) {
 		assert.Equal(t, checkStatusInProgress, cr.Status)
 		assert.Empty(t, cr.Conclusion)
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for new-head aggregate check run")
+		require.FailNow(t, "timed out waiting for new-head aggregate check run")
 	}
 
 	// The running apply keeps ownership: the new commit's plan result must not
@@ -496,7 +496,7 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 		assert.Equal(t, checkStatusInProgress, cr.Status)
 		assert.Empty(t, cr.Conclusion)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for in-progress aggregate check run")
+		require.FailNow(t, "timed out waiting for in-progress aggregate check run")
 	}
 
 	installClient := ghclient.NewInstallationClientWithSlug(client, h.logger, "schemabot")
@@ -538,7 +538,7 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 		assert.Equal(t, checkStatusCompleted, cr.Status)
 		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for terminal blocking aggregate check run")
+		require.FailNow(t, "timed out waiting for terminal blocking aggregate check run")
 	}
 }
 
@@ -699,7 +699,7 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 					assert.Equal(t, "completed", cr.Status)
 					assert.Equal(t, "success", cr.Conclusion)
 				case <-time.After(10 * time.Second):
-					t.Fatalf("timed out waiting for passing aggregate check run %d/2, seen: %v", i+1, seen)
+					require.FailNow(t, fmt.Sprintf("timed out waiting for passing aggregate check run %d/2, seen: %v", i+1, seen))
 				}
 			}
 			assert.True(t, seen["SchemaBot (staging)"], "expected SchemaBot (staging) check")
@@ -783,11 +783,11 @@ func TestE2EParticipantSilentOnNonSchemaPR(t *testing.T) {
 	select {
 	case <-filesFetched:
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for participant auto-plan discovery")
+		require.FailNow(t, "timed out waiting for participant auto-plan discovery")
 	}
 	select {
 	case cr := <-checkRuns:
-		t.Fatalf("participant posted a check run on a non-schema PR: %q", cr.Name)
+		require.FailNow(t, fmt.Sprintf("participant posted a check run on a non-schema PR: %q", cr.Name))
 	case <-time.After(2 * time.Second):
 	}
 }
@@ -853,7 +853,7 @@ func TestE2ECheckRunRerequestReplansCurrentPR(t *testing.T) {
 		assert.Equal(t, checkStatusCompleted, cr.Status)
 		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for rerun aggregate check")
+		require.FailNow(t, "timed out waiting for rerun aggregate check")
 	}
 }
 
@@ -909,7 +909,7 @@ func TestE2ECheckRunRerequestIgnoresStaleHeadSHA(t *testing.T) {
 
 	select {
 	case cr := <-checkRuns:
-		t.Fatalf("stale check rerun should not publish a check run, got: %+v", cr)
+		require.FailNow(t, fmt.Sprintf("stale check rerun should not publish a check run, got: %+v", cr))
 	case <-time.After(250 * time.Millisecond):
 	}
 }
@@ -990,7 +990,7 @@ func TestE2EPassingAggregateSynchronizeUpdatesNewSHA(t *testing.T) {
 		assert.Equal(t, "sha1aaa", cr.HeadSHA, "first aggregate should be on the opened SHA")
 		assert.Equal(t, "success", cr.Conclusion)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for check run on opened event")
+		require.FailNow(t, "timed out waiting for check run on opened event")
 	}
 
 	// Step 2: synchronize with sha2 (force push)
@@ -1008,7 +1008,7 @@ func TestE2EPassingAggregateSynchronizeUpdatesNewSHA(t *testing.T) {
 		assert.Equal(t, "sha2bbb", cr.HeadSHA, "aggregate must be recreated on the new SHA after synchronize")
 		assert.Equal(t, "success", cr.Conclusion)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out — aggregate was not recreated on new SHA after synchronize")
+		require.FailNow(t, "timed out — aggregate was not recreated on new SHA after synchronize")
 	}
 }
 
@@ -1074,7 +1074,7 @@ func TestE2EAggregateUpdateSkipsStaleHeadSHA(t *testing.T) {
 	// run and no stored aggregate row.
 	select {
 	case cr := <-checkRuns:
-		t.Fatalf("stale aggregate update should not publish a check run, got: %+v", cr)
+		require.FailNow(t, fmt.Sprintf("stale aggregate update should not publish a check run, got: %+v", cr))
 	case <-time.After(250 * time.Millisecond):
 	}
 
@@ -1180,7 +1180,7 @@ func TestE2EPassingAggregateRequiresGitHubHeadVerification(t *testing.T) {
 	// aggregate check that could incorrectly unblock branch protection.
 	select {
 	case cr := <-checkRuns:
-		t.Fatalf("passing aggregate should not publish without current head verification, got: %+v", cr)
+		require.FailNow(t, fmt.Sprintf("passing aggregate should not publish without current head verification, got: %+v", cr))
 	case <-time.After(250 * time.Millisecond):
 	}
 
@@ -1267,7 +1267,7 @@ func TestE2EPassingAggregateOnSQLWithoutSchemabotYAML(t *testing.T) {
 		assert.Equal(t, "completed", cr.Status)
 		assert.Equal(t, "success", cr.Conclusion)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for passing aggregate check run")
+		require.FailNow(t, "timed out waiting for passing aggregate check run")
 	}
 }
 
@@ -1345,7 +1345,7 @@ func TestE2EPassingAggregateWithoutAllowedEnvs(t *testing.T) {
 		assert.Equal(t, "completed", cr.Status)
 		assert.Equal(t, "success", cr.Conclusion)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for passing aggregate check run")
+		require.FailNow(t, "timed out waiting for passing aggregate check run")
 	}
 }
 
@@ -1394,7 +1394,7 @@ func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 		assert.Contains(t, body, "Database Not Configured")
 		assert.Contains(t, body, "`unconfigured-db`")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for error comment")
+		require.FailNow(t, "timed out waiting for error comment")
 	}
 
 	// Should also get a failing aggregate check run
@@ -1404,7 +1404,7 @@ func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 		assert.Equal(t, "completed", cr.Status)
 		assert.Equal(t, "failure", cr.Conclusion)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for failing aggregate check run")
+		require.FailNow(t, "timed out waiting for failing aggregate check run")
 	}
 }
 
@@ -1439,7 +1439,7 @@ func TestE2EFailingAggregateSanitizesErrorSummary(t *testing.T) {
 		assert.Equal(t, "Plan failed", cr.Output.Title)
 		assert.Equal(t, "plan failed: dial tcp &#91;endpoint redacted&#93;: connect &amp; retry &lt;5s&gt;", cr.Output.Summary)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for failing aggregate check run")
+		require.FailNow(t, "timed out waiting for failing aggregate check run")
 	}
 }
 
@@ -1532,7 +1532,7 @@ func TestE2EAggregateBlockedStateSurvivesRecompute(t *testing.T) {
 	// on the channel. Nothing may be published over the blocked state.
 	select {
 	case cr := <-checkRuns:
-		t.Fatalf("aggregate check run published over blocked stored state: %+v", cr)
+		require.FailNow(t, fmt.Sprintf("aggregate check run published over blocked stored state: %+v", cr))
 	default:
 	}
 
@@ -1593,7 +1593,7 @@ func TestE2EAggregateStaleCommitRowsHoldAggregateOpen(t *testing.T) {
 		require.NotNil(t, cr.Output)
 		assert.Equal(t, awaitingCurrentCommitTitle, cr.Output.Title)
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for blocking aggregate check run on the new commit")
+		require.FailNow(t, "timed out waiting for blocking aggregate check run on the new commit")
 	}
 
 	stored, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1,
@@ -1680,7 +1680,7 @@ func TestE2EAggregateBlockClearedByReplan(t *testing.T) {
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("timed out waiting for the aggregate block to clear and the re-plan result to land; last stored state: %+v", stored)
+			require.FailNow(t, fmt.Sprintf("timed out waiting for the aggregate block to clear and the re-plan result to land; last stored state: %+v", stored))
 		case <-time.After(100 * time.Millisecond):
 		}
 	}

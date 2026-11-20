@@ -269,7 +269,7 @@ func TestPRSchemaCapLabelTimelineBudget(t *testing.T) {
 		reads.Add(1)
 		assert.Equal(t, "100", r.URL.Query().Get("per_page"))
 		if r.URL.Query().Get("page") == "2" {
-			t.Error("requested a second timeline page")
+			assert.Fail(t, "requested a second timeline page")
 			http.Error(w, "unexpected page", http.StatusBadRequest)
 			return
 		}

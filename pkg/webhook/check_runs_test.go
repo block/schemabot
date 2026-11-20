@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -382,10 +383,10 @@ func TestTenantScopedWorkCommandRouting(t *testing.T) {
 		} {
 			client, mux := setupGitHubServer(t)
 			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(http.ResponseWriter, *http.Request) {
-				t.Errorf("participant must not post a comment for unscoped %q on an unowned apply", tc.comment)
+				assert.Fail(t, fmt.Sprintf("participant must not post a comment for unscoped %q on an unowned apply", tc.comment))
 			})
 			mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(http.ResponseWriter, *http.Request) {
-				t.Errorf("participant must not react to unscoped %q on an unowned apply", tc.comment)
+				assert.Fail(t, fmt.Sprintf("participant must not react to unscoped %q on an unowned apply", tc.comment))
 			})
 			factory := &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}
 

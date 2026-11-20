@@ -96,7 +96,7 @@ func TestE2EPlanFlagsDropOfTableAnOpenPullRequestOwns(t *testing.T) {
 		assert.Contains(t, body, "▶️ **To apply**",
 			"reconciling to the declared schema stays the operator's call, so the command is still offered")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the plan comment")
+		require.FailNow(t, "timed out waiting for the plan comment")
 	}
 }
 
@@ -143,7 +143,7 @@ func TestE2EPlanFlagsDroppedColumnOnTableAnOpenPullRequestOwns(t *testing.T) {
 		assert.Contains(t, body, "(changed by open PR [#2](https://github.com/octocat/hello-world/pull/2))")
 		assert.Contains(t, body, "▶️ **To apply**")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the plan comment")
+		require.FailNow(t, "timed out waiting for the plan comment")
 	}
 }
 
@@ -203,7 +203,7 @@ func TestE2EPlanDoesNotAttributeATableItCreates(t *testing.T) {
 		assert.NotContains(t, body, "shows up here as one to undo")
 		assert.NotContains(t, body, "Check before applying")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the plan comment")
+		require.FailNow(t, "timed out waiting for the plan comment")
 	}
 }
 
@@ -258,7 +258,7 @@ func TestE2EPlanOffersDropWhenTheOwningPullRequestIsClosed(t *testing.T) {
 		assert.NotContains(t, body, "(changed by open PR")
 		assert.Contains(t, body, "▶️ **To apply**")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the plan comment")
+		require.FailNow(t, "timed out waiting for the plan comment")
 	}
 }
 
@@ -300,7 +300,7 @@ func TestE2EPlanFlagsDropAsUnresolvedWhenOwnershipLookupFails(t *testing.T) {
 		assert.NotContains(t, body, ownershipLookupFailureMessage, "a public comment must not carry the raw lookup error")
 		assert.Contains(t, body, "▶️ **To apply**")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the plan comment")
+		require.FailNow(t, "timed out waiting for the plan comment")
 	}
 }
 
@@ -350,7 +350,7 @@ func TestE2EPlanOffersDropOfATableThisPullRequestApplied(t *testing.T) {
 			"a pull request undoing its own applied change owes no attribution notice")
 		assert.Contains(t, body, "▶️ **To apply**")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the plan comment")
+		require.FailNow(t, "timed out waiting for the plan comment")
 	}
 }
 
@@ -399,7 +399,7 @@ func TestE2EPlanFlagsDropAsUnresolvedWhenTheOwningPullRequestCannotBeRead(t *tes
 			"a pull request whose state is unknown must not be presented as an established owner")
 		assert.Contains(t, body, "▶️ **To apply**")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the plan comment")
+		require.FailNow(t, "timed out waiting for the plan comment")
 	}
 }
 
@@ -448,7 +448,7 @@ func TestE2EUnsafeBlockedApplyDisclosesAttributedChange(t *testing.T) {
 		assert.Contains(t, body, "--allow-unsafe",
 			"the override is still offered; the attribution informs the decision to take it")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the unsafe-blocked comment")
+		require.FailNow(t, "timed out waiting for the unsafe-blocked comment")
 	}
 }
 
@@ -498,7 +498,7 @@ func TestE2ELockedAutoApplyCommentOmitsAttributedChange(t *testing.T) {
 		assert.NotContains(t, body, "Check before applying")
 		assert.NotContains(t, body, "octocat/hello-world#2")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the locked apply comment")
+		require.FailNow(t, "timed out waiting for the locked apply comment")
 	}
 }
 

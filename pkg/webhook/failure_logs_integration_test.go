@@ -12,15 +12,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/webhook/templates"
-	"github.com/block/spirit/pkg/utils"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // This scenario covers the failure-triage UX on the PR timeline: when an apply
@@ -252,7 +253,7 @@ func waitForSummaryCreate(t *testing.T, capture *commentCapture) string {
 	case created := <-capture.creates:
 		return created.Body
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for terminal summary comment")
+		require.FailNow(t, "timed out waiting for terminal summary comment")
 		return ""
 	}
 }

@@ -2082,10 +2082,13 @@ source policy (`pkg/webhook/schema_source_policy.go`).
 
 An API route not classified as a read is treated as a write. Planning counts as a write, since it
 stages a change. A target that cannot be resolved never authorizes. A configured grant that could
-never match any request is a startup error rather than silent dead config. And a new mutating
+never match any request is a startup error rather than silent dead config. An operator whose grant
+is limited to some environments is denied, and nothing is written, for work outside them, including
+when the request names a granted environment for work stored in another. And a new mutating
 endpoint cannot ship without a test proving it denies unauthorized callers. *Enforced:* the tier
-classification (`pkg/auth/tiers.go`), with a structural sweep test over the route table
-(`pkg/api/service.go`).
+classification (`pkg/auth/tiers.go`), with structural sweep tests over the route table
+(`pkg/api/service.go`): `pkg/api/route_authorization_sweep_test.go` for the database scope and
+`pkg/api/route_environment_scope_sweep_test.go` for the environment scope.
 
 ### AZ-3: Identity comes from a verified lane
 

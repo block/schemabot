@@ -1230,7 +1230,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 		case content := <-reactions:
 			assert.Equal(t, "eyes", content)
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for the acknowledgment reaction")
+			require.FailNow(t, "timed out waiting for the acknowledgment reaction")
 		}
 	})
 
@@ -1259,7 +1259,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 		case content := <-reactions:
 			assert.Equal(t, "eyes", content)
 		case <-time.After(2 * time.Second):
-			t.Fatal("the acknowledgment must fire from config discovery, before schema files load")
+			require.FailNow(t, "the acknowledgment must fire from config discovery, before schema files load")
 		}
 	})
 
@@ -1276,7 +1276,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 
 		select {
 		case <-reactions:
-			t.Fatal("a deployment that cannot resolve the database in its registry must not acknowledge")
+			require.FailNow(t, "a deployment that cannot resolve the database in its registry must not acknowledge")
 		case <-time.After(100 * time.Millisecond):
 		}
 	})
@@ -1292,7 +1292,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 		assert.Empty(t, comments, "the silent skip posts nothing")
 		select {
 		case <-reactions:
-			t.Fatal("a silently skipping deployment must not acknowledge the command")
+			require.FailNow(t, "a silently skipping deployment must not acknowledge the command")
 		case <-time.After(100 * time.Millisecond):
 		}
 	})
@@ -1327,7 +1327,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 				case content := <-reactions:
 					assert.Equal(t, "eyes", content)
 				case <-time.After(2 * time.Second):
-					t.Fatal("the leader that answers must acknowledge the command")
+					require.FailNow(t, "the leader that answers must acknowledge the command")
 				}
 			})
 		}

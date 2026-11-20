@@ -41,12 +41,13 @@ func recordingQuotaProbe(t *testing.T, listErr error, ids ...int64) (*QuotaProbe
 		listTimeout:     quotaProbeTestDeadline,
 		readTimeout:     quotaProbeTestDeadline,
 		readConcurrency: 1,
-		listInstallations: func(context.Context) ([]int64, error) {
+		listInstallations: func(context.Context) (quotaTargets, error) {
 			if listErr != nil {
-				return nil, listErr
+				return quotaTargets{}, listErr
 			}
-			return ids, nil
+			return quotaTargets{installations: ids}, nil
 		},
+		reportTargets: func(quotaTargets) {},
 		readQuota: func(_ context.Context, id int64) error {
 			reads <- id
 			mu.Lock()
@@ -168,7 +169,7 @@ func TestQuotaProbeContainsAPanickingList(t *testing.T) {
 	probe, reads, _ := recordingQuotaProbe(t, nil, 11)
 	list := probe.listInstallations
 	var calls int
-	probe.listInstallations = func(ctx context.Context) ([]int64, error) {
+	probe.listInstallations = func(ctx context.Context) (quotaTargets, error) {
 		calls++
 		if calls == 1 {
 			panic("unexpected installation list")
@@ -187,9 +188,9 @@ func TestQuotaProbeKeepsRunningWhileGitHubIsDown(t *testing.T) {
 	probe, _, _ := recordingQuotaProbe(t, nil)
 	probe.interval = 10 * time.Millisecond
 	lists := make(chan struct{}, 64)
-	probe.listInstallations = func(context.Context) ([]int64, error) {
+	probe.listInstallations = func(context.Context) (quotaTargets, error) {
 		lists <- struct{}{}
-		return nil, errors.New("dial tcp: connect: connection refused")
+		return quotaTargets{}, errors.New("dial tcp: connect: connection refused")
 	}
 	probe.Start(t.Context())
 	t.Cleanup(probe.Stop)
@@ -253,6 +254,201 @@ func TestQuotaProbeRepeatsUntilStopped(t *testing.T) {
 	probe.Stop()
 	probe.Stop()
 	assert.Nil(t, probe.cancel)
+}
+
+// Every pass publishes the installations it is responsible for, including the
+// owners it could not resolve, as soon as it lists them, so the gauge counts
+// this pass while its reads run, and again once its reads are done, so the
+// targets carry the App label the reads' snapshots were recorded under.
+func TestQuotaProbeReportsItsTargetsEachPass(t *testing.T) {
+	probe, reads, _ := recordingQuotaProbe(t, nil)
+	probe.listInstallations = func(context.Context) (quotaTargets, error) {
+		return quotaTargets{installations: []int64{11}, unresolved: 1}, nil
+	}
+	var reported []quotaTargets
+	var readsAtReport []int
+	probe.reportTargets = func(targets quotaTargets) {
+		readsAtReport = append(readsAtReport, len(reads))
+		reported = append(reported, targets)
+	}
+
+	probe.probeOnce(t.Context())
+
+	assert.Equal(t, []int{0, 1}, readsAtReport, "targets are reported before the reads start and after they finish")
+	assert.Equal(t, int64(11), receiveRead(t, reads))
+	want := quotaTargets{installations: []int64{11}, unresolved: 1}
+	assert.Equal(t, []quotaTargets{want, want}, reported)
+}
+
+// Before its first pass, an App counts one unobserved installation, and a
+// first pass that resolves its targets replaces that.
+func TestQuotaProbeIsUnresolvedUntilItsFirstPass(t *testing.T) {
+	probe, reads, _ := recordingQuotaProbe(t, nil, 11)
+	var reported []quotaTargets
+	probe.reportTargets = func(targets quotaTargets) { reported = append(reported, targets) }
+
+	probe.MarkUnresolved()
+	probe.probeOnce(t.Context())
+
+	assert.Equal(t, int64(11), receiveRead(t, reads))
+	assert.Equal(t, []quotaTargets{{unresolved: 1}, {installations: []int64{11}}, {installations: []int64{11}}}, reported)
+}
+
+// A pass that cannot list installations keeps the targets from the last good
+// pass and adds one unresolved, so a quota gate fails while the App's
+// installation set is unknown, even if webhook traffic keeps the known
+// installations' snapshots fresh.
+func TestQuotaProbeCountsAFailedListAsUnobserved(t *testing.T) {
+	probe, reads, _ := recordingQuotaProbe(t, nil, 11)
+	var reported []quotaTargets
+	probe.reportTargets = func(targets quotaTargets) { reported = append(reported, targets) }
+
+	probe.probeOnce(t.Context())
+	assert.Equal(t, int64(11), receiveRead(t, reads))
+
+	probe.listInstallations = func(context.Context) (quotaTargets, error) {
+		return quotaTargets{}, errors.New("GitHub returned 502")
+	}
+	probe.probeOnce(t.Context())
+
+	assert.Equal(t, []quotaTargets{
+		{installations: []int64{11}},
+		{installations: []int64{11}},
+		{installations: []int64{11}, unresolved: 1},
+	}, reported)
+	assert.Empty(t, reads, "a pass that cannot list installations reads no budget")
+}
+
+// An App installed on an account the server serves no repository of has a
+// budget nobody spends. The serving probe resolves installations from the
+// configured repositories, so that installation is never read: its untouched
+// budget cannot stand in for the serving installation's lower one. One lookup
+// answers each owner.
+func TestServingInstallationsSkipInstallationsServingNoConfiguredRepo(t *testing.T) {
+	client, server := newInstallationLookupClient(t, installedFor(map[string]int64{"octo": 7, "idle": 9}))
+
+	targets := client.servingInstallations(t.Context(), []string{"octo/a", "octo/b", "octo/c"})
+
+	assert.Equal(t, quotaTargets{installations: []int64{7}}, targets)
+	assert.Equal(t, 1, server.total(), "one lookup answers the owner")
+	assert.Zero(t, server.count("idle/anything"))
+}
+
+// When GitHub cannot say which installation serves an owner, the owner counts
+// as unobserved instead of being dropped, so a gate on the budget fails closed.
+// The owner's remaining repositories are not each looked up in turn, so GitHub
+// being down costs one lookup per owner per pass.
+func TestServingInstallationsCountUnresolvedOwnerAsUnobserved(t *testing.T) {
+	client, server := newInstallationLookupClient(t, func(owner, _ string) (int, int64, string) {
+		if owner == "octo" {
+			return http.StatusBadGateway, 0, ""
+		}
+		return http.StatusOK, 9, owner
+	})
+
+	targets := client.servingInstallations(t.Context(), []string{"octo/a", "octo/b", "other/c"})
+
+	assert.Equal(t, quotaTargets{installations: []int64{9}, unresolved: 1}, targets)
+	assert.Equal(t, 1, server.count("octo/a"))
+	assert.Zero(t, server.count("octo/b"))
+}
+
+// Every pass resolves each owner afresh, so an App that was uninstalled and
+// reinstalled is probed under its new installation on the next pass rather
+// than under the retired one until the server restarts. The fresh answer also
+// replaces the cached installation webhook dispatch reads.
+func TestServingInstallationsFollowAReinstall(t *testing.T) {
+	ids := map[string]int64{"octo": 7}
+	var mu sync.Mutex
+	client, server := newInstallationLookupClient(t, func(owner, _ string) (int, int64, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		return http.StatusOK, ids[owner], owner
+	})
+
+	assert.Equal(t, quotaTargets{installations: []int64{7}}, client.servingInstallations(t.Context(), []string{"octo/a", "octo/b"}))
+	mu.Lock()
+	ids["octo"] = 8
+	mu.Unlock()
+	assert.Equal(t, quotaTargets{installations: []int64{8}}, client.servingInstallations(t.Context(), []string{"octo/a", "octo/b"}))
+
+	assert.Equal(t, 2, server.total(), "one lookup per owner per pass")
+	cached, ok := client.cachedOwnerInstallation("octo")
+	require.True(t, ok)
+	assert.Equal(t, int64(8), cached)
+}
+
+// An installation on an account other than the repository's owner answers only
+// the repository asked about, so the owner's other repositories are resolved
+// too and every installation serving them is read.
+func TestServingInstallationsResolveEachRepositoryWhenAnswerIsNotOwnerWide(t *testing.T) {
+	client, server := newInstallationLookupClient(t, func(owner, name string) (int, int64, string) {
+		if name == "a" {
+			return http.StatusOK, 5, "another-account"
+		}
+		return http.StatusOK, 7, owner
+	})
+
+	targets := client.servingInstallations(t.Context(), []string{"octo/a", "octo/b", "octo/c"})
+
+	assert.Equal(t, quotaTargets{installations: []int64{5, 7}}, targets)
+	assert.Equal(t, 1, server.count("octo/a"))
+	assert.Equal(t, 1, server.count("octo/b"))
+	assert.Zero(t, server.count("octo/c"), "the owner-wide answer stands for the rest")
+}
+
+// Once the pass's deadline has passed, no further lookups start, and every
+// owner not yet resolved counts as unobserved, so a slow GitHub fails the gate
+// closed instead of leaving owners out of it.
+func TestServingInstallationsCountOwnersLeftAfterTheDeadlineAsUnobserved(t *testing.T) {
+	client, server := newInstallationLookupClient(t, installedFor(map[string]int64{"octo": 7, "other": 9}))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	targets := client.servingInstallations(ctx, []string{"octo/a", "other/b"})
+
+	assert.Equal(t, quotaTargets{unresolved: 2}, targets)
+	assert.Zero(t, server.total())
+}
+
+// A configured repository the App is not installed on is served by no
+// installation, so it has no budget to observe and is not counted as
+// unobserved. The owner's other repositories are still tried, since an
+// installation limited to selected repositories may cover them.
+func TestServingInstallationsSkipRepositoryAppIsNotInstalledOn(t *testing.T) {
+	client, server := newInstallationLookupClient(t, func(owner, name string) (int, int64, string) {
+		if name == "a" {
+			return http.StatusNotFound, 0, ""
+		}
+		return http.StatusOK, 7, owner
+	})
+
+	targets := client.servingInstallations(t.Context(), []string{"octo/a", "octo/b"})
+
+	assert.Equal(t, quotaTargets{installations: []int64{7}}, targets)
+	assert.Equal(t, 1, server.count("octo/a"))
+	assert.Equal(t, 1, server.count("octo/b"))
+}
+
+// A configured repository whose owner suspended the App's installation is
+// skipped like one the App is not installed on: the installation cannot mint a
+// token to read its budget and serves no work until it is unsuspended, so it
+// is neither read nor counted unobserved. The owner's answer still stands for
+// its other repositories.
+func TestServingInstallationsSkipSuspendedInstallation(t *testing.T) {
+	client, server := newInstallationLookupClient(t, func(owner, _ string) (int, int64, string) {
+		if owner == "paused" {
+			return http.StatusOK, 9, owner
+		}
+		return http.StatusOK, 7, owner
+	})
+	server.suspended = map[int64]bool{9: true}
+
+	targets := client.servingInstallations(t.Context(), []string{"octo/a", "paused/a", "paused/b"})
+
+	assert.Equal(t, quotaTargets{installations: []int64{7}}, targets)
+	assert.Equal(t, 1, server.count("paused/a"))
+	assert.Equal(t, 0, server.count("paused/b"))
 }
 
 // Listing pages through every installation and skips suspended ones, whose
