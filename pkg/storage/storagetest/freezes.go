@@ -93,6 +93,11 @@ func TestFreezes(t *testing.T, h Harness) {
 		// both dialects, so ids differing only in case are distinct entries.
 		_, err = store.Freezes().Create(ctx, plannedFreeze("production", start, start.Add(time.Hour), "chill-calendar", "Event-1"))
 		require.NoError(t, err, "external ids are case-sensitive")
+
+		// Sources compare byte for byte too, so the pair key means the same
+		// thing on both dialects.
+		_, err = store.Freezes().Create(ctx, plannedFreeze("production", start, start.Add(time.Hour), "Chill-calendar", "event-1"))
+		require.NoError(t, err, "sources are case-sensitive")
 	})
 
 	t.Run("Create_ManyManualFreezes", func(t *testing.T) {

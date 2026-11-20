@@ -521,7 +521,7 @@ func (f *EnvironmentFreeze) Validate() error {
 		return errors.New("freeze is required")
 	case strings.TrimSpace(f.Identifier) == "":
 		return errors.New("freeze identifier is required")
-	case CanonicalKey(f.Environment) == "":
+	case strings.TrimSpace(f.Environment) == "":
 		return errors.New("freeze environment is required")
 	case f.Kind != FreezeKindOnDemand && f.Kind != FreezeKindPlanned:
 		return fmt.Errorf("freeze kind %q is not %q or %q", f.Kind, FreezeKindOnDemand, FreezeKindPlanned)

@@ -83,6 +83,7 @@ func TestEnvironmentFreezeValidate(t *testing.T) {
 	}{
 		{name: "identifier", mutate: func(f *EnvironmentFreeze) { f.Identifier = " " }, want: "identifier is required"},
 		{name: "environment", mutate: func(f *EnvironmentFreeze) { f.Environment = "" }, want: "environment is required"},
+		{name: "blank environment", mutate: func(f *EnvironmentFreeze) { f.Environment = "  " }, want: "environment is required"},
 		{name: "kind", mutate: func(f *EnvironmentFreeze) { f.Kind = "sometimes" }, want: "freeze kind"},
 		{name: "running", mutate: func(f *EnvironmentFreeze) { f.Running = "throttle" }, want: "freeze running policy"},
 		{name: "start", mutate: func(f *EnvironmentFreeze) { f.StartsAt = time.Time{} }, want: "start time is required"},

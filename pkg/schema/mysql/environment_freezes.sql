@@ -10,7 +10,7 @@ CREATE TABLE `environment_freezes` (
   `ends_at` datetime(6) DEFAULT NULL,
   `reason` text NOT NULL,
   `created_by` varchar(255) NOT NULL,
-  `source` varchar(64) NOT NULL,
+  `source` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
   `external_id` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,
   `lifted_by` varchar(255) DEFAULT NULL,
   `lift_reason` text,
