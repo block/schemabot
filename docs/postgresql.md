@@ -918,7 +918,7 @@ table's grants, which should include each service role.
 The [Supabase adapter tests](../pkg/engine/postgres/supabase_integration_test.go)
 run against the pinned Supabase PostgreSQL 17.6.1.136 image, using its
 non-superuser `postgres` role. They need Docker, not a hosted project or API keys.
-They run in CI's per-package integration shard and with `make test-integration`.
+They run in CI's `pkg/engine` integration shard and with `make test-integration`.
 
 | Case | What passing proves |
 | --- | --- |
