@@ -204,11 +204,16 @@ func (s *freezeStore) Now(ctx context.Context) (time.Time, error) {
 	return readFreezeClock(ctx, s.db, s.dialect)
 }
 
-// Epoch returns the environment's freeze epoch. It first records the
-// environment at epoch 0 if it has no row, outside any transaction, so the
-// admission write that checks the guard finds a row to lock.
+// Epoch returns the environment's freeze epoch. An environment with no row
+// is first recorded at epoch 0, outside any transaction, so the admission
+// write that checks the guard finds a row to lock. Once the row exists, a
+// read is a single SELECT.
 func (s *freezeStore) Epoch(ctx context.Context, environment string) (int64, error) {
 	environment = storage.CanonicalKey(environment)
+	epoch, err := s.readEpoch(ctx, environment)
+	if !errors.Is(err, sql.ErrNoRows) {
+		return epoch, err
+	}
 	insertIfAbsent := s.dialect.InsertIfAbsent([]string{"environment"})
 	if _, err := s.db.ExecContext(ctx, `
 		INSERT`+insertIfAbsent.Modifier+` INTO freeze_epochs (environment, epoch)
@@ -217,6 +222,12 @@ func (s *freezeStore) Epoch(ctx context.Context, environment string) (int64, err
 	`, environment); err != nil {
 		return 0, fmt.Errorf("record freeze epoch of %s: %w", environment, err)
 	}
+	return s.readEpoch(ctx, environment)
+}
+
+// readEpoch reads the environment's freeze epoch. It returns sql.ErrNoRows,
+// wrapped, when the environment has no row.
+func (s *freezeStore) readEpoch(ctx context.Context, environment string) (int64, error) {
 	var epoch int64
 	if err := s.db.QueryRowContext(ctx, `SELECT epoch FROM freeze_epochs WHERE environment = ?`, environment).Scan(&epoch); err != nil {
 		return 0, fmt.Errorf("read freeze epoch of %s: %w", environment, err)

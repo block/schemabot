@@ -2202,10 +2202,10 @@ A freeze created while a change is being admitted is not missed. Creating a free
 environment's freeze epoch in the same transaction. The gate reads the epoch before it lists the
 freezes, and the transaction that writes the apply, start or cutover locks the epoch row and
 refuses the change with a retryable error if the epoch moved or could not be read. The lock makes
-a freeze being created
-wait for that write, so the freeze is acknowledged only after any change it did not see. One edge
-stays open: a planned freeze whose start time passes between the check and the write does not move
-the epoch, so a change admitted in that moment runs. The window is one request long.
+a freeze being created wait for that write, so the freeze is acknowledged only after any change it
+did not see. One edge stays open: a planned freeze whose start time passes between the check and
+the write does not move the epoch, so a change admitted in that moment runs. The window is one
+request long.
 *Breaks if violated:* a schema change starts, or its cutover runs, during an incident or a code freeze.
 *Enforced:* the change gates and their evaluator (`checkChangeGates`, `pkg/api/change_gate.go`),
 run before apply creation in `queueValidatedApply` (`pkg/api/plan_handlers.go`), before a start is

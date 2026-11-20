@@ -342,13 +342,18 @@ func TestChangeGateLetsAQueuedStartRetry(t *testing.T) {
 // stopped apply: the local one and the one that first checks a remote
 // executor. Each is refused during the freeze before it records or asks
 // anything, and queued after the lift.
-func TestChangeGateHoldsStartOfAStoppedApply(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		client func() *mockTernClient
-		apply  func() *storage.Apply
-		tasks  func(*storage.Apply) []*storage.Task
-	}{
+// stoppedStartCase is a stopped apply on one of the two start branches:
+// local, where SchemaBot runs the tasks, and remote, where it asks the
+// remote executor.
+type stoppedStartCase struct {
+	name   string
+	client func() *mockTernClient
+	apply  func() *storage.Apply
+	tasks  func(*storage.Apply) []*storage.Task
+}
+
+func stoppedStartCases() []stoppedStartCase {
+	return []stoppedStartCase{
 		{
 			name:   "local",
 			client: func() *mockTernClient { return &mockTernClient{} },
@@ -375,7 +380,11 @@ func TestChangeGateHoldsStartOfAStoppedApply(t *testing.T) {
 			},
 			tasks: func(*storage.Apply) []*storage.Task { return nil },
 		},
-	} {
+	}
+}
+
+func TestChangeGateHoldsStartOfAStoppedApply(t *testing.T) {
+	for _, tc := range stoppedStartCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			client := tc.client()
 			apply := tc.apply()
@@ -494,6 +503,33 @@ func TestChangeGateRefusesAChangeAFreezeLandsBeforeItIsWritten(t *testing.T) {
 			assert.Nil(t, pending, "the request must not be recorded")
 
 			rec = postGateControl(t, mux, tc.path, body)
+			require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+			assert.Equal(t, "freeze-late", decodeGateError(t, rec).Blockers[0].ID)
+		})
+	}
+
+	for _, tc := range stoppedStartCases() {
+		t.Run("start stopped "+tc.name, func(t *testing.T) {
+			apply := tc.apply()
+			svc := newControlTestServiceWithTasks(tc.client(), apply, tc.tasks(apply))
+			freezes := newGateFreezeStore(t)
+			mock := svc.storage.(*mockStorageWithApplyStores)
+			mock.freezes = freezes
+			mock.controls = epochCheckingControlStore{ControlRequestStore: mock.controls, freezes: freezes}
+			mux := http.NewServeMux()
+			svc.ConfigureRoutes(mux)
+			landFreezeDuringCheck(t, freezes)
+			body := `{"environment": "staging", "apply_id": "apply-stopped", "caller": "cli:bob"}`
+
+			rec := postGateControl(t, mux, "/api/start", body)
+
+			require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+			assert.Equal(t, apitypes.ErrCodeChangeGateUnavailable, decodeGateError(t, rec).ErrorCode)
+			pending, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+			require.NoError(t, err)
+			assert.Nil(t, pending, "the start must not be queued")
+
+			rec = postGateControl(t, mux, "/api/start", body)
 			require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
 			assert.Equal(t, "freeze-late", decodeGateError(t, rec).Blockers[0].ID)
 		})
