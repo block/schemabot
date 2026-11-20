@@ -363,12 +363,14 @@ func requirePermanent(t *testing.T, operation string, err error) {
 // so the caller resolves the operator's command with the engine's reason
 // instead of sending it again, and it must stay retryable, so no generic
 // failure path records the schema change as failed when only the command was
-// undeliverable. The reason reaches the operator verbatim, so it must not be
-// empty.
+// undeliverable. The caller shows the operator the typed decline's own
+// message, without any text an engine wraps around it, so that message is
+// the one that must not be empty.
 func requireUnsupported(t *testing.T, operation string, err error) {
 	t.Helper()
 	require.Error(t, err, "a %s the engine does not support must be declined", operation)
-	assert.True(t, engine.IsUnsupportedOperation(err),
+	declined, typed := engine.AsUnsupportedOperation(err)
+	assert.True(t, typed,
 		"a %s the engine declines for its whole database type must be a typed UnsupportedOperationError so the caller resolves the command instead of resending it, got: %v", operation, err)
 	assert.True(t, engine.IsRetryable(err),
 		"a declined %s must stay retryable so no generic failure path records the schema change as failed, got: %v", operation, err)
@@ -376,7 +378,10 @@ func requireUnsupported(t *testing.T, operation string, err error) {
 		"a declined %s must not read as already-completed, got: %v", operation, err)
 	assert.False(t, engine.IsNotReady(err),
 		"a declined %s must not read as not-ready — the engine will never accept it, got: %v", operation, err)
-	assert.NotEmpty(t, err.Error(), "a declined %s must give the operator a reason", operation)
+	if typed {
+		assert.NotEmpty(t, strings.TrimSpace(declined.Error()),
+			"a declined %s must give the operator a reason in the typed decline itself, since text wrapped around it never reaches the operator, got: %v", operation, err)
+	}
 }
 
 // OptionalCapabilities names every exported optional interface package engine
