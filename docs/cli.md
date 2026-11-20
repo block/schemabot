@@ -641,8 +641,10 @@ with `freeze override <ovr-id>` and approve it with `freeze approve <ovr-id>`.
 Only a verified member of `freeze.groups` other than the requester may approve.
 Each command prints the server's reason when it refuses.
 
-A freeze refuses every `apply`, `start` and `cutover` it covers, whether or not
-you ask for an override, and the command exits 1 with nothing started:
+A freeze refuses every `apply`, `start` and `cutover` it covers unless an
+approved override for you covers that change. Asking for one with `--override`
+is not enough on its own: until it is approved, the command exits 1 with
+nothing started:
 
 ```console
 $ schemabot apply -s schema -e production
@@ -662,8 +664,9 @@ $ schemabot apply -s schema -e production --override "SEV-1234 fix the index"
 Override requested: ovr-123. A freeze approver other than you must run 'schemabot freeze approve ovr-123', then run this command again.
 ```
 
-Once an approver approves it, run the same command again. When SchemaBot could
-not check the freezes, nothing started and the command says to try again.
+Once an approver approves it, run the same command again: the approval admits
+it, and it runs instead of exiting 1. When SchemaBot could not check the
+freezes, nothing started and the command says to try again.
 
 ## Follow and control a change
 

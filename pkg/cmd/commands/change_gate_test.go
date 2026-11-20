@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -231,4 +233,25 @@ func TestStartAndCutoverFreezeRefusal(t *testing.T) {
 			assert.ErrorContains(t, err, "SchemaBot could not check the freezes, so nothing started; try again in a moment")
 		})
 	}
+}
+
+// With -o json the error prints only the template's text, which is
+// terminal-safe; the raw server message never reaches stderr, yet the API
+// error is still there for lock cleanup.
+func TestQuietChangeGateRefusalPrintsOnlyTheTemplate(t *testing.T) {
+	apiErr := &client.APIError{
+		Status: http.StatusConflict, ErrorCode: apitypes.ErrCodeChangeGateRefused,
+		Message:         "production is frozen\n\x1b[31mINJECTED",
+		Blockers:        []apitypes.ChangeGateBlocker{{Gate: "freeze", ID: "freeze-abc", Reason: "SEV-1234"}},
+		OverrideRequest: &apitypes.FreezeOverrideRequest{ID: "ovr-123"},
+	}
+
+	err := reportChangeGate(apiErr, "production", "apply", true, true)
+
+	assert.Equal(t, strings.Join(templates.ChangeGateRefusedText(templates.ChangeGateRefusedData{
+		Environment: "production", Operation: "apply", Blockers: apiErr.Blockers,
+		OverrideRequest: apiErr.OverrideRequest, OverrideAsked: true, Message: apiErr.Message,
+	}), " "), err.Error())
+	assert.NotContains(t, err.Error(), "INJECTED")
+	assert.ErrorIs(t, err, apiErr, "the API error stays reachable for lock cleanup")
 }

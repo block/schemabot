@@ -35,7 +35,7 @@ func reportChangeGate(err error, environment, operation string, overrideAsked, q
 			Message:         apiErr.Message,
 		}
 		if quiet {
-			return fmt.Errorf("%s: %w", strings.Join(templates.ChangeGateRefusedText(data), " "), err)
+			return &changeGateRefusal{text: strings.Join(templates.ChangeGateRefusedText(data), " "), cause: err}
 		}
 		templates.WriteChangeGateRefused(data)
 		return fmt.Errorf("%w: %w", ErrSilent, err)
@@ -44,3 +44,14 @@ func reportChangeGate(err error, environment, operation string, overrideAsked, q
 	}
 	return err
 }
+
+// changeGateRefusal is a refusal reported in the error, for -o json. Its text
+// is the template's, which keeps server strings terminal-safe; the API error
+// stays reachable through Unwrap for lock cleanup but is never printed.
+type changeGateRefusal struct {
+	text  string
+	cause error
+}
+
+func (e *changeGateRefusal) Error() string { return e.text }
+func (e *changeGateRefusal) Unwrap() error { return e.cause }
