@@ -2231,7 +2231,8 @@ recorded in `executeStartForApply` and before a cutover is recorded in `executeC
 (`pkg/api/change_gate_completeness_test.go`) fails on any path that creates an apply or records a
 start or cutover without passing a function that runs the gates. The override check is
 `approvedOverride` (`pkg/api/change_gate.go`), which reads `ListApproved` and admits only a request
-whose `Covers` names every blocker. The approver rules are in `Approve` (`pkg/storage/internal/sqlstore/freeze_overrides.go`).
+whose `Covers` names every blocker. The approver rules are `AuthorizeFreezeApprove`
+(`pkg/api/freeze_authorization.go`) and `Approve` (`pkg/storage/internal/sqlstore/freeze_overrides.go`).
 
 ## Structural enforcement
 
