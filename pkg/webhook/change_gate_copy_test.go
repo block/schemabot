@@ -103,27 +103,35 @@ func TestChangeGateRefusalDetail(t *testing.T) {
 	})
 
 	// However long the reasons and however many freezes, the request and its
-	// instructions fit inside the bound the refusal is posted under.
+	// instructions survive the comment's own sanitizing, which escapes text and
+	// redacts anything that looks like an endpoint ("a:12" grows to
+	// "[endpoint redacted]").
 	t.Run("long reasons and many freezes keep the instructions", func(t *testing.T) {
-		long := strings.Repeat("@x&", 400)
-		refused := &api.ChangeGateRefusedError{Environment: "production"}
-		for i := range 6 {
-			refused.Blockers = append(refused.Blockers, apitypes.ChangeGateBlocker{Gate: "freeze", ID: fmt.Sprintf("frz-%d", i), Reason: long})
-		}
-		refused.OverrideRequest = &storage.FreezeOverrideRequest{
-			Identifier: "ovr-0123456789abcdef", RequestedBy: "github:" + strings.Repeat("c", 39), PRAuthor: "github:" + strings.Repeat("a", 39),
-			Reason: strings.Repeat("@y&", 170),
-		}
-		refused.OverrideReasonKept = true
-		for command, ending := range map[string]string{
-			action.Apply:        " runs this command again.",
-			action.ApplyConfirm: " runs `apply` again, then `apply-confirm`.",
-		} {
-			detail := "This change did not start: it is " + changeGateRefusalDetail(refused, command, strings.Repeat("t", 63))
-			assert.LessOrEqual(t, utf8.RuneCountInString(detail), templates.MaxChangeGateRefusalLen, command)
-			assert.Contains(t, detail, " 3 more freezes also block it.", command)
-			assert.NotContains(t, detail, "frz-3", command)
-			assert.True(t, strings.HasSuffix(detail, ending), detail)
+		for name, unit := range map[string]string{"escaped": "@x&", "redacted": "a:12 "} {
+			refused := &api.ChangeGateRefusedError{Environment: "production"}
+			for i := range 6 {
+				refused.Blockers = append(refused.Blockers, apitypes.ChangeGateBlocker{Gate: "freeze", ID: fmt.Sprintf("frz-%d", i), Reason: strings.Repeat(unit, 400)})
+			}
+			refused.OverrideRequest = &storage.FreezeOverrideRequest{
+				Identifier: "ovr-0123456789abcdef", RequestedBy: "github:" + strings.Repeat("c", 39), PRAuthor: "github:" + strings.Repeat("a", 39),
+				Reason: strings.Repeat(unit, 170),
+			}
+			refused.OverrideReasonKept = true
+			for command, ending := range map[string]string{
+				action.Apply:        " runs this command again.",
+				action.ApplyConfirm: " runs `apply` again, then `apply-confirm`.",
+			} {
+				detail := "This change did not start: it is " + changeGateRefusalDetail(refused, command, strings.Repeat("t", 63))
+				assert.LessOrEqual(t, utf8.RuneCountInString(detail), templates.MaxChangeGateRefusalLen, name, command)
+				assert.Contains(t, detail, " 3 more freezes also block it.", name, command)
+				assert.NotContains(t, detail, "frz-3", name, command)
+				assert.True(t, strings.HasSuffix(detail, ending), detail)
+
+				rendered := templates.RenderGenericError(templates.SchemaErrorData{
+					CommandName: command, Environment: "production", ErrorDetail: detail, DetailLimit: templates.MaxChangeGateRefusalLen,
+				})
+				assert.Contains(t, rendered, "Then @"+strings.Repeat("c", 39)+ending, name, command)
+			}
 		}
 	})
 }

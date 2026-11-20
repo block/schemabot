@@ -22,9 +22,10 @@ import (
 // override admits only the person who asked for it. A refused apply-confirm
 // has released its pending confirmation, so its retry starts with apply.
 func changeGateRefusalDetail(refused *api.ChangeGateRefusedError, command, tenant string) string {
-	// Reasons are clamped and at most maxListedBlockers are named, so the
-	// detail stays inside templates.MaxChangeGateRefusalLen and the request
-	// and its instructions at the end are never cut off.
+	// Reasons are redacted, then clamped, and at most maxListedBlockers are
+	// named, so the detail stays inside templates.MaxChangeGateRefusalLen
+	// after the comment's own redaction, and the request and its instructions
+	// at the end are never cut off.
 	listed := *refused
 	unlisted := 0
 	if len(listed.Blockers) > maxListedBlockers {
@@ -32,7 +33,7 @@ func changeGateRefusalDetail(refused *api.ChangeGateRefusedError, command, tenan
 		listed.Blockers = listed.Blockers[:maxListedBlockers]
 	}
 	detail := listed.BlockedWith(func(reason string) string {
-		return templates.ErrorDetailReason(clampReason(reason, maxListedFreezeReason))
+		return templates.ErrorDetailReason(templates.RedactedReason(reason, maxListedFreezeReason))
 	}) + "."
 	switch {
 	case unlisted == 1:
@@ -45,7 +46,7 @@ func changeGateRefusalDetail(refused *api.ChangeGateRefusedError, command, tenan
 		requester := strings.TrimPrefix(request.RequestedBy, storage.GitHubIdentityPrefix)
 		author := strings.TrimPrefix(request.PRAuthor, storage.GitHubIdentityPrefix)
 		detail += fmt.Sprintf(" Override request `%s` was recorded.", request.Identifier)
-		if reason := clampReason(strings.TrimSpace(request.Reason), maxShownOverrideReason); reason != "" {
+		if reason := templates.RedactedReason(request.Reason, maxShownOverrideReason); reason != "" {
 			detail += " Reason the approver sees: " + templates.ErrorDetailReason(reason)
 			if !endsSentence(reason) {
 				detail += "."
@@ -97,12 +98,3 @@ const (
 	maxListedFreezeReason  = 150
 	maxShownOverrideReason = 300
 )
-
-// clampReason cuts reason to at most limit runes, marking a cut with "…".
-func clampReason(reason string, limit int) string {
-	runes := []rune(reason)
-	if len(runes) <= limit {
-		return reason
-	}
-	return strings.TrimSpace(string(runes[:limit-1])) + "…"
-}

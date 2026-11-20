@@ -320,6 +320,19 @@ func sanitizeCommentErrorWithin(msg string, limit int) string {
 	return msg
 }
 
+// RedactedReason redacts a person's reason, such as a freeze's, as an error
+// detail is redacted, then clamps it to limit runes, marking a cut with "…".
+// Redaction can lengthen text, so a caller that budgets a detail under a bound
+// redacts each reason before it counts it; the sanitizer the whole detail goes
+// through then has nothing left to lengthen.
+func RedactedReason(reason string, limit int) string {
+	reason = strings.TrimSpace(redactConnectionDetails(stripControlText(reason)))
+	if runes := []rune(reason); len(runes) > limit {
+		reason = strings.TrimSpace(trimPartialRedactionMarker(string(runes[:limit-1]))) + "…"
+	}
+	return reason
+}
+
 // redactionMarker is the placeholder every redaction pass substitutes for
 // sensitive text.
 const redactionMarker = "[endpoint redacted]"

@@ -4,6 +4,7 @@ import (
 	"html"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -270,4 +271,22 @@ func TestErrorDetailReasonLeavesHTMLToTheEscape(t *testing.T) {
 	assert.Equal(t, "R&D latency <= 5ms", ErrorDetailReason("R&D latency <= 5ms"))
 	assert.Equal(t, "see <b>this</b>", ErrorDetailReason("see <b>this</b>"))
 	assert.Equal(t, `SEV-1234 \*payments\*`, ErrorDetailReason("SEV-1234 *payments*"))
+}
+
+func TestRedactedReason(t *testing.T) {
+	assert.Equal(t, "page [endpoint redacted] now", RedactedReason("  page db-1:3306 now ", 100))
+
+	// Redaction comes before the clamp, so the result is within the limit.
+	clamped := RedactedReason(strings.Repeat("a:12 ", 100), 150)
+	assert.LessOrEqual(t, utf8.RuneCountInString(clamped), 150)
+	assert.True(t, strings.HasSuffix(clamped, "…"), clamped)
+	assert.NotContains(t, clamped, "a:12")
+
+	// A cut never leaves part of a redaction marker behind.
+	for limit := 2; limit < 40; limit++ {
+		got := strings.TrimSuffix(RedactedReason("x [endpoint redacted] y", limit), "…")
+		if i := strings.LastIndexByte(got, '['); i >= 0 {
+			assert.True(t, strings.HasPrefix(got[i:], redactionMarker), "limit %d: %q", limit, got)
+		}
+	}
 }
