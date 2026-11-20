@@ -211,7 +211,17 @@ approvers are their own list and not the admins and operators of PR commands.
 that the request came from this pull request, and storage's refusals of the
 requester, the author, an approved request and an expired one. Approval is
 recorded as `github:<login>`. On an aggregate repo the request lives in one
-deployment, so the others stay silent on an unknown ID.
+deployment, so the others stay silent on an unknown ID; the refusal therefore
+names the approve command with the deployment's `--tenant`, so a pasted
+command is always answered.
+
+The refusal (`changeGateRefusalDetail`) lists each freeze with its reason and
+end. Without `--override`, a command that takes the flag is told how to ask
+for one. With a recorded request, it shows the reason the approver sees, who
+may approve, the approve command, and that the commenter then runs the command
+again, since an approved override admits only the person who asked. Freeze and
+override reasons are a person's text, written so a mention in them notifies
+nobody (`templates.ErrorDetailReason`).
 
 ## Error Handling
 

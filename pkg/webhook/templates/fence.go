@@ -557,14 +557,50 @@ func markdownReason(reason string) string {
 // underscore between two letters or digits is left alone, since it cannot
 // start emphasis there and names such as seen_at read as written.
 func escapeProse(text string) string {
+	return codeMentions(text, escapeProseWords)
+}
+
+// ErrorDetailReason renders a person's reason, such as a freeze's or an
+// override request's, inside an error detail that RenderGenericError
+// HTML-escapes. A mention is written as inline code, which GitHub does not
+// notify, and other Markdown delimiters are escaped as markdownReason escapes
+// them. An ampersand and a less than sign are left to the HTML escape, which
+// already keeps a character reference or a tag from rendering; escaped twice,
+// they would show their entity text.
+func ErrorDetailReason(reason string) string {
+	return mapOutsideCodeSpans(flattenIdentifier(reason), func(text string) string {
+		return codeMentions(text, escapeHTMLEscapedProseWords)
+	})
+}
+
+// codeMentions writes each mention in text as inline code, and every other
+// stretch through words. Mentions that touch share one span so no backtick
+// lands between them.
+func codeMentions(text string, words func(string) string) string {
 	var b strings.Builder
 	last := 0
 	for _, span := range mentionSpans(text) {
-		b.WriteString(escapeProseWords(text[last:span[0]]))
+		b.WriteString(words(text[last:span[0]]))
 		b.WriteByte('`')
 		b.WriteString(text[span[0]:span[1]])
 		b.WriteByte('`')
 		last = span[1]
+	}
+	b.WriteString(words(text[last:]))
+	return b.String()
+}
+
+// escapeHTMLEscapedProseWords is escapeProseWords for text an HTML escape
+// follows: the ampersand and the less than sign are written as they are.
+func escapeHTMLEscapedProseWords(text string) string {
+	var b strings.Builder
+	last := 0
+	for i, r := range text {
+		if r == '&' || r == '<' {
+			b.WriteString(escapeProseWords(text[last:i]))
+			b.WriteRune(r)
+			last = i + 1
+		}
 	}
 	b.WriteString(escapeProseWords(text[last:]))
 	return b.String()

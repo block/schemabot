@@ -85,7 +85,7 @@ func TestE2EApplyOverrideFromAPullRequestNeedsAnotherGitHubApprover(t *testing.T
 	request := requestNamedIn(t, svc.Storage(), comment)
 	assert.Contains(t, comment, "Override request `"+request.Identifier+"` was recorded")
 	assert.Contains(t, comment, "other than @carol and other than the PR author (@testuser)")
-	assert.Contains(t, comment, "`schemabot freeze approve "+request.Identifier+"`, then run this command again")
+	assert.Contains(t, comment, "`schemabot freeze approve "+request.Identifier+"`. Then @carol runs this command again.")
 	requireNoApplies(t, svc, dbName)
 
 	assert.Equal(t, "github:carol", request.RequestedBy)

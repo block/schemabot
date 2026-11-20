@@ -4314,6 +4314,12 @@ func scopedApplyCommand(baseCommand, environment, database string, opts ApplyCom
 	return command
 }
 
+// TenantFlag is appendTenantFlag for a command with no environment, such as
+// `schemabot freeze approve`, which refuses -e.
+func TenantFlag(command, tenant string) string {
+	return appendTenantFlag(command, tenant)
+}
+
 // appendTenantFlag appends the --tenant flag to a pasteable command hint when
 // tenant is set. In tenant mode, commands without an explicit tenant target
 // are ignored, so every command hint a user may copy-paste must carry the

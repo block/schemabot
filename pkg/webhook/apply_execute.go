@@ -927,7 +927,7 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 		return msgs.lockIntentChanged
 	}
 	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
-		return "This change did not start: it is " + changeGateRefusalDetail(refused)
+		return "This change did not start: it is " + changeGateRefusalDetail(refused, msgs.command, msgs.tenant)
 	}
 	if unavailable, ok := errors.AsType[*api.ChangeGateUnavailableError](err); ok {
 		return unavailable.UserMessage()
