@@ -2086,6 +2086,32 @@ func RecordWebhookInboxStuckProcessing(ctx context.Context, count int64) {
 	)
 }
 
+// RecordEnvironmentFrozen reports whether a freeze is in effect in the
+// environment: 1 while any freeze covers it, whole or narrowed to some
+// deployments or databases, else 0. A promotion pipeline can hold on it.
+// The unit is empty so the exporter keeps the bare schemabot_environment_frozen
+// name rather than adding _ratio.
+func RecordEnvironmentFrozen(ctx context.Context, environment string, frozen bool) {
+	value := int64(0)
+	if frozen {
+		value = 1
+	}
+	recordGauge(ctx, "schemabot.environment.frozen", value,
+		"1 while a freeze is in effect in the environment, else 0", "",
+		EnvironmentAttribute(environment),
+	)
+}
+
+// RecordEnvironmentFreezeCollectionFailure counts failed freeze snapshots. The
+// frozen gauge is last-value, so a failed snapshot leaves it at its last
+// values; a nonzero rate means the gauge is stale.
+func RecordEnvironmentFreezeCollectionFailure(ctx context.Context) {
+	addCounter(ctx, "schemabot.environment.frozen_collection_failures",
+		"Total number of failed environment freeze metric snapshots", "{failure}",
+		EnvironmentAttribute(""),
+	)
+}
+
 // RecordWebhookInboxStatsCollectionFailure counts failed inbox snapshots. The
 // inbox depth/backlog gauges are last-value instruments, so a failed snapshot
 // leaves them frozen at their last-good values — indistinguishable from a
