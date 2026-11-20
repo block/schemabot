@@ -2205,9 +2205,10 @@ records one. The requester repeats the command and it is admitted; only the requ
 approval (`approvedOverride`), and anyone else asks for their own. An approval covers one
 environment, one action and one target and expires after 24 hours. Within that window the
 requester may use it more than once, for example to re-apply the same schema after a stop. For an apply the target is the
-database, the rollout members it resolves to and the schema it asks for (`applyOverrideTarget`),
-not the plan, because a repeated command plans afresh; a changed schema or a rollout that gains a
-member needs a new approval. For a
+database and, for each rollout member it runs, the schema and the `ignore_tables` and
+`drop_tables` that member's plan was reviewed under (`applyOverrideTarget`), not the plan,
+because a repeated command plans afresh. A change to what any member would run, or a rollout
+that gains a member, needs a new approval. For a
 start or a cutover it is the apply. A blocker the request does not name refuses again and needs a
 new request.
 A PR rollback is known by a `pinned_rollback` option the server records when it creates the apply.
