@@ -363,6 +363,18 @@ func (s *Service) logControlOperationForApply(ctx context.Context, apply *storag
 	}
 }
 
+// logFreezeOverrideForApply writes the apply log entry for a start or cutover
+// that an approved override request let past a freeze. It does nothing when no
+// override admitted the change.
+func (s *Service) logFreezeOverrideForApply(ctx context.Context, apply *storage.Apply, caller, eventType string, request *storage.FreezeOverrideRequest) {
+	if request == nil {
+		return
+	}
+	s.logControlOperationForApply(ctx, apply, caller, eventType, fmt.Sprintf(
+		"Freeze override %s admitted this change: requested by %s, approved by %s, covering %s",
+		request.Identifier, request.RequestedBy, request.ApprovedBy, strings.Join(request.Blockers, ", ")))
+}
+
 // writeControlError logs and writes an HTTP error for a control operation.
 func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply *storage.Apply, err error) {
 	if s.writeChangeGateError(w, opName, err) {
@@ -642,12 +654,19 @@ type CutoverRequest struct {
 	ApplyID     string `json:"apply_id"`
 	Environment string `json:"environment"`
 	Caller      string `json:"caller,omitempty"`
+	// Override is the reason to ask for a freeze override when a freeze
+	// refuses the cutover. At most 500 characters after trimming.
+	Override string `json:"override,omitempty"`
 }
 
 // handleCutover handles POST /api/cutover requests.
 func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 	var req CutoverRequest
 	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, "cutover", &req, &req.ApplyID, &req.Environment)
+	if !ok {
+		return
+	}
+	override, ok := s.overrideReasonFromRequest(w, r, req.Override)
 	if !ok {
 		return
 	}
@@ -662,7 +681,7 @@ func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, httpStatus, err := s.executeCutoverForApply(r.Context(), client, apply, ternApplyID, req.Caller)
+	resp, httpStatus, err := s.executeCutoverForApply(r.Context(), client, apply, ternApplyID, req.Caller, override)
 	if err != nil {
 		s.writeControlError(w, "cutover", apply, err)
 		return
@@ -681,7 +700,7 @@ func (s *Service) ExecuteCutover(ctx context.Context, req apitypes.ControlReques
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, err
 	}
-	resp, _, err := s.executeCutoverForApply(ctx, client, apply, ternApplyID, req.Caller)
+	resp, _, err := s.executeCutoverForApply(ctx, client, apply, ternApplyID, req.Caller, "")
 	return resp, err
 }
 
@@ -689,7 +708,7 @@ func (s *Service) ExecuteCutover(ctx context.Context, req apitypes.ControlReques
 // returned HTTP status is meaningful only when err == nil; every error path
 // returns a zero status, and callers must derive the response status from the
 // error (e.g. via writeControlError).
-func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.ControlResponse, int, error) {
+func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller, override string) (*apitypes.ControlResponse, int, error) {
 	caller = resolveCaller(ctx, caller)
 	controlStore := s.storage.ControlRequests()
 	if controlStore == nil {
@@ -790,7 +809,7 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 	}
 	// The change gates run only for a cutover this command would start: a
 	// request already pending or a cutover in progress was answered above.
-	admitCtx, err := s.checkChangeGatesForApply(ctx, changeGateCheckpointCutover, apply, caller)
+	admitCtx, overridden, err := s.checkChangeGatesForApply(ctx, changeGateCheckpointCutover, apply, caller, override)
 	if err != nil {
 		status := "rejected"
 		if controlOperationHTTPStatus(err) >= http.StatusInternalServerError {
@@ -842,6 +861,7 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		message = "Cutover requested by user while cutover request already pending"
 	}
 	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCutoverTriggered, message)
+	s.logFreezeOverrideForApply(ctx, apply, caller, storage.LogEventCutoverTriggered, overridden)
 	s.logger.Info("cutover request queued for operator",
 		append(apply.LogAttrs(),
 			"requested_by", caller)...)
@@ -1932,6 +1952,9 @@ type StartRequest struct {
 	ApplyID     string `json:"apply_id"`
 	Environment string `json:"environment"`
 	Caller      string `json:"caller,omitempty"`
+	// Override is the reason to ask for a freeze override when a freeze
+	// refuses the start. At most 500 characters after trimming.
+	Override string `json:"override,omitempty"`
 }
 
 type startControlRequestMetadata struct {
@@ -1954,7 +1977,11 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	resp, httpStatus, err := s.executeStartForApply(r.Context(), client, apply, req.Caller)
+	override, ok := s.overrideReasonFromRequest(w, r, req.Override)
+	if !ok {
+		return
+	}
+	resp, httpStatus, err := s.executeStartForApply(r.Context(), client, apply, req.Caller, override)
 	if err != nil {
 		s.writeControlError(w, "start", apply, err)
 		return
@@ -1970,7 +1997,7 @@ func (s *Service) ExecuteStart(ctx context.Context, req apitypes.ControlRequest)
 	if err != nil {
 		return nil, err
 	}
-	resp, _, err := s.executeStartForApply(ctx, client, apply, req.Caller)
+	resp, _, err := s.executeStartForApply(ctx, client, apply, req.Caller, "")
 	return resp, err
 }
 
@@ -1978,7 +2005,7 @@ func (s *Service) ExecuteStart(ctx context.Context, req apitypes.ControlRequest)
 // HTTP status is meaningful only when err == nil; every error path returns a
 // zero status, and callers must derive the response status from the error (e.g.
 // via writeControlError).
-func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) (*apitypes.StartResponse, int, error) {
+func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, apply *storage.Apply, caller, override string) (*apitypes.StartResponse, int, error) {
 	caller = resolveCaller(ctx, caller)
 	if err := validateStartRequestState(apply); err != nil {
 		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, "rejected")
@@ -2011,9 +2038,11 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 	// The gate's context goes to the write that records the start, which
 	// refuses it if a freeze was created since the check.
 	admitCtx := ctx
+	var overridden *storage.FreezeOverrideRequest
 	resumeGate := func() error {
-		gatedCtx, err := s.checkChangeGatesForApply(ctx, changeGateCheckpointResume, apply, caller)
+		gatedCtx, approved, err := s.checkChangeGatesForApply(ctx, changeGateCheckpointResume, apply, caller, override)
 		admitCtx = gatedCtx
+		overridden = approved
 		return err
 	}
 	switch {
@@ -2062,6 +2091,7 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 	metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStartRequested, "Start requested by user")
+		s.logFreezeOverrideForApply(ctx, apply, caller, storage.LogEventStartRequested, overridden)
 		if queuedForOperator {
 			s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 		}

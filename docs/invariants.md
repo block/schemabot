@@ -2193,8 +2193,16 @@ apply. A change that started before the freeze keeps running. If any deployment 
 is covered, the whole change is refused; for an existing apply that includes every deployment its
 stored operations run on. "In effect" is decided by the database clock, so every pod agrees at the
 edges of a freeze. A pull request rollback is never held, at creation or at a later start or
-cutover, nor is a stop, a cancel or a revert. When SchemaBot cannot read the freezes it refuses the change with a retryable error,
-never letting it through unchecked. Nobody overrides a freeze in this version, admins included.
+cutover, nor is a stop, a cancel or a revert. When SchemaBot cannot read the freezes, or the override
+requests below, it refuses the change with a retryable error, never letting it through unchecked.
+A freeze refuses a change unless an approved override request covers every blocker on it. The
+requester, who must be verified, runs the apply, start or cutover with an override reason, and
+SchemaBot records a request and refuses, naming it. A verified member of `freeze.groups` who is not the requester approves it;
+write groups do not grant approval, so nobody overrides alone, admins included. Storage also refuses
+the pull request's author once a request records one. The requester repeats the command and it is
+admitted. An approval covers one environment, one action and one target (a plan for an apply, an
+apply for a start or a cutover) and expires after 24 hours. A blocker the request does not name
+refuses again and needs a new request.
 A PR rollback is known by a `pinned_rollback` option the server records when it creates the apply.
 A rollback created by an earlier version has none, so a freeze holds its later start or cutover;
 lifting the freeze lets it through.
@@ -2216,7 +2224,10 @@ recorded in `executeStartForApply` and before a cutover is recorded in `executeC
 (`pkg/storage/internal/sqlstore/applies.go`) and in `requestPending` for a start or cutover
 (`pkg/storage/internal/sqlstore/control_requests.go`). A call-graph test
 (`pkg/api/change_gate_completeness_test.go`) fails on any path that creates an apply or records a
-start or cutover without passing a function that runs the gates.
+start or cutover without passing a function that runs the gates. The override check is
+`approvedOverride` (`pkg/api/change_gate.go`), which reads `ListApproved` and admits only a request
+whose `Covers` names every blocker. The approver rules are `AuthorizeFreezeApprove`
+(`pkg/api/freeze_authorization.go`) and `Approve` (`pkg/storage/internal/sqlstore/freeze_overrides.go`).
 
 ## Structural enforcement
 

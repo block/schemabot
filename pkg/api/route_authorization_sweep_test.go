@@ -51,7 +51,7 @@ func TestMutatingRoutesDenyScopedOperatorByDefault(t *testing.T) {
 	runMutatingRouteSweep(t, scopedWriteConfig(), operator, nil)
 }
 
-// A freeze group lets its members set and lift freezes, and nothing else. The
+// A freeze group lets its members set and lift freezes and approve overrides, and nothing else. The
 // same sweep, driven as a caller in freeze.groups and no other group, requires
 // a 403 from every other write route, including routes added later, and no
 // 403 from the two freeze writes.
@@ -62,6 +62,8 @@ func TestMutatingRoutesDenyFreezeOnlyCallerByDefault(t *testing.T) {
 	runMutatingRouteSweep(t, cfg, commander, map[string]bool{
 		"POST /api/freezes":           true,
 		"POST /api/freezes/{id}/lift": true,
+
+		"POST /api/freezes/overrides/{id}/approve": true,
 	})
 }
 
@@ -141,6 +143,8 @@ func runMutatingRouteSweep(t *testing.T, cfg *ServerConfig, caller *auth.User, a
 		// grant.
 		"POST /api/storage/schema/plan":  `{}`,
 		"POST /api/storage/schema/apply": `{}`,
+
+		"POST /api/freezes/overrides/{id}/approve": `{}`,
 	}
 
 	svc := New(st, cfg, nil, slog.New(slog.DiscardHandler))

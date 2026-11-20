@@ -599,6 +599,12 @@ type ApplyRequest struct {
 	// operator the plan every rollout member runs. It is not operator consent;
 	// see apitypes.ApplyRequest.RendersRollout.
 	RendersRollout bool `json:"renders_rollout,omitempty"`
+	// Override is the reason to ask for a freeze override when a freeze
+	// refuses the apply; see apitypes.ApplyRequest.Override.
+	Override string `json:"override,omitempty"`
+	// freezeOverride is the approved override request that admitted this
+	// apply, set by the server after the change gates and never by a caller.
+	freezeOverride string
 	// viaHTTP is set by POST /api/apply, the one entry point whose caller has
 	// to say it rendered the rollout. The webhook and the trusted enqueue path
 	// call the service in process and leave it unset.
@@ -1542,6 +1548,11 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "environment is required")
 		return
 	}
+	override, ok := s.overrideReasonFromRequest(w, r, req.Override)
+	if !ok {
+		return
+	}
+	req.Override = override
 
 	if !s.authorizeDirectWriteForStoredPlan(w, r, "apply", req.PlanID, req.Environment) {
 		return
@@ -2155,18 +2166,24 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		// A rollback undoes a change, so the change gates never hold it. Only
 		// the webhook's pinned rollback is known to be one: the rollback
 		// option is the caller's to set.
-		gatedCtx, err := s.checkChangeGates(ctx, changeGateInput{
+		gatedCtx, override, err := s.checkChangeGates(ctx, changeGateInput{
 			Checkpoint:  changeGateCheckpointStart,
 			Environment: req.Environment,
 			Deployments: s.changeGateDeployments(plan.Database, req.Environment, plan.Deployment, req.Target != ""),
 			Database:    plan.Database,
 			Repository:  plan.Repository,
+			Action:      storage.FreezeOverrideActionApply,
+			TargetID:    plan.PlanIdentifier,
+			Override:    strings.TrimSpace(req.Override),
 		}, resolveCaller(ctx, req.Caller))
 		if err != nil {
 			recordApplyError("change gate", err)
 			return nil, 0, err
 		}
 		admitCtx = gatedCtx
+		if override != nil {
+			req.freezeOverride = override.Identifier
+		}
 	}
 	applyIdentifier, storedApplyID, err := s.enqueueApply(admitCtx, plan, req, options, attachObserver)
 	if err != nil {
@@ -2285,6 +2302,8 @@ func (s *Service) createStoredApply(
 	// A pinned rollback is recorded so its later start or cutover passes the
 	// change gates as its creation did.
 	applyOpts.PinnedRollback = isPinnedRollback(plan, req)
+	// Only the server records the override that admitted the apply.
+	applyOpts.FreezeOverride = req.freezeOverride
 
 	// Attribute the apply to the authenticated caller when the request carried a
 	// real identity (API auth enabled); see resolveCaller.

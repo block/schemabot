@@ -605,6 +605,8 @@ var knownDirectWriteAuthOperations = map[string]bool{
 	"freeze_create":      true,
 	"freeze_lift":        true,
 
+	"freeze_override_approve": true,
+
 	"storage_schema_plan":  true,
 	"storage_schema_apply": true,
 }
@@ -627,6 +629,7 @@ var knownDirectWriteAuthReasons = map[string]bool{
 	"missing_database_config": true,
 	"freeze_allow":            true,
 	"not_freeze_admin":        true,
+	"not_freeze_approver":     true,
 	"unknown":                 true,
 }
 
@@ -2129,6 +2132,18 @@ const (
 func RecordChangeGateRefusal(ctx context.Context, environment, gate, checkpoint string) {
 	addCounter(ctx, "schemabot.change_gate.refusals",
 		"Total number of applies, starts and cutovers refused by a change gate", "{refusal}",
+		EnvironmentAttribute(environment),
+		attribute.String("gate", gate),
+		attribute.String("checkpoint", checkpoint),
+	)
+}
+
+// RecordChangeGateOverride counts applies, starts and cutovers a change gate
+// would have refused that an approved override request let through, once per
+// gate that blocked the attempt.
+func RecordChangeGateOverride(ctx context.Context, environment, gate, checkpoint string) {
+	addCounter(ctx, "schemabot.change_gate.overrides",
+		"Total number of applies, starts and cutovers let through a change gate by an approved override", "{override}",
 		EnvironmentAttribute(environment),
 		attribute.String("gate", gate),
 		attribute.String("checkpoint", checkpoint),

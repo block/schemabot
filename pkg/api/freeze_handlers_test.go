@@ -161,7 +161,8 @@ func (m *memoryFreezeStore) filter(environment string, keep func(*storage.Enviro
 
 type mockStorageWithFreezes struct {
 	mockStorage
-	freezes storage.FreezeStore
+	freezes   storage.FreezeStore
+	overrides storage.FreezeOverrideStore
 }
 
 func (m *mockStorageWithFreezes) Freezes() storage.FreezeStore { return m.freezes }

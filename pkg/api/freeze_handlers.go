@@ -311,3 +311,110 @@ func freezeResponse(freeze *storage.EnvironmentFreeze, now time.Time) apitypes.F
 		InEffect:    freeze.InEffectAt(now),
 	}
 }
+
+// overrideReasonFromRequest trims the reason a caller gave for a freeze
+// override and writes the error when the request cannot ask for one.
+// Whitespace alone is no reason, and one too long for a pull request is
+// refused before any gate runs. Only a verified caller may ask: a request
+// recorded as "unverified" names nobody, so its asker could approve it.
+func (s *Service) overrideReasonFromRequest(w http.ResponseWriter, r *http.Request, raw string) (string, bool) {
+	reason := strings.TrimSpace(raw)
+	if n := len([]rune(reason)); n > storage.FreezeOverrideReasonMax {
+		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest,
+			fmt.Sprintf("override reason is %d characters; the limit is %d", n, storage.FreezeOverrideReasonMax))
+		return "", false
+	}
+	if _, verified := auth.VerifiedSubject(r.Context()); reason != "" && !verified {
+		s.writeError(w, http.StatusForbidden, "asking for an override needs a verified caller")
+		return "", false
+	}
+	return reason, true
+}
+
+// handleFreezeOverrideGet returns one freeze override request.
+func (s *Service) handleFreezeOverrideGet(w http.ResponseWriter, r *http.Request) {
+	if !s.freezeOverrideStorageReady(w) {
+		return
+	}
+	id := r.PathValue("id")
+	request, err := s.storage.FreezeOverrides().Get(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, storage.ErrFreezeOverrideNotFound) {
+			s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeNotFound, fmt.Sprintf("override request %q not found", id))
+			return
+		}
+		s.logger.Error("get freeze override request failed", "override_request", id, "error", err)
+		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "get override request failed")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, freezeOverrideResponse(request))
+}
+
+// handleFreezeOverrideApprove approves a freeze override request. The
+// approver is a verified freeze group member, and storage refuses the
+// requester and the pull request's author.
+func (s *Service) handleFreezeOverrideApprove(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeFreezeApprove(w, r) {
+		return
+	}
+	if !s.freezeOverrideStorageReady(w) {
+		return
+	}
+	approver, ok := auth.VerifiedSubject(r.Context())
+	if !ok {
+		s.writeError(w, http.StatusForbidden, "approving an override needs a verified caller")
+		return
+	}
+	id := r.PathValue("id")
+	approved, err := s.storage.FreezeOverrides().Approve(r.Context(), id, approver)
+	switch {
+	case errors.Is(err, storage.ErrFreezeOverrideNotFound):
+		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeNotFound, fmt.Sprintf("override request %q not found", id))
+		return
+	case errors.Is(err, storage.ErrFreezeOverrideSelfApproval):
+		s.writeError(w, http.StatusForbidden, "an override needs an approver other than the person who asked for it")
+		return
+	case errors.Is(err, storage.ErrFreezeOverrideAlreadyApproved):
+		s.writeError(w, http.StatusConflict, fmt.Sprintf("override request %q is already approved", id))
+		return
+	case errors.Is(err, storage.ErrFreezeOverrideExpired):
+		s.writeError(w, http.StatusConflict, fmt.Sprintf("override request %q expired", id))
+		return
+	case err != nil:
+		s.logger.Error("approve freeze override request failed", "override_request", id, "approver", approver, "error", err)
+		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "approve override request failed")
+		return
+	}
+	s.logger.Info("freeze override request approved",
+		"override_request", approved.Identifier, "approver", approver, "requested_by", approved.RequestedBy,
+		"environment", approved.Environment, "action", approved.Action, "target_id", approved.TargetID,
+		"blockers", approved.Blockers, "reason", approved.Reason)
+	s.writeJSON(w, http.StatusOK, freezeOverrideResponse(approved))
+}
+
+// freezeOverrideStorageReady writes a 503 when the service has no override
+// store, as a server started without storage does.
+func (s *Service) freezeOverrideStorageReady(w http.ResponseWriter) bool {
+	if s.storage == nil || s.storage.FreezeOverrides() == nil {
+		s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeStorageError, "freeze override storage is not available")
+		return false
+	}
+	return true
+}
+
+func freezeOverrideResponse(request *storage.FreezeOverrideRequest) apitypes.FreezeOverrideRequest {
+	return apitypes.FreezeOverrideRequest{
+		ID:          request.Identifier,
+		Environment: request.Environment,
+		Action:      request.Action,
+		TargetID:    request.TargetID,
+		Database:    request.Database,
+		Blockers:    request.Blockers,
+		Reason:      request.Reason,
+		RequestedBy: request.RequestedBy,
+		ApprovedBy:  request.ApprovedBy,
+		ApprovedAt:  request.ApprovedAt,
+		ExpiresAt:   request.ExpiresAt,
+		CreatedAt:   request.CreatedAt,
+	}
+}

@@ -70,3 +70,24 @@ type FreezeListResponse struct {
 	// including the ones above.
 	Recent []Freeze `json:"recent"`
 }
+
+// FreezeOverrideRequest asks to let one change through the freezes that hold
+// it (GET /api/freezes/overrides/{id}). A second person approves it, and the
+// change goes ahead only while every blocker it meets is one the request names.
+type FreezeOverrideRequest struct {
+	ID          string `json:"id"`
+	Environment string `json:"environment"`
+	// Action is "apply", "start" or "cutover". TargetID is the plan an apply
+	// would run, or the apply a start or cutover would act on.
+	Action   string `json:"action"`
+	TargetID string `json:"target_id"`
+	Database string `json:"database"`
+	// Blockers are the blockers the request covers, each "gate id".
+	Blockers    []string   `json:"blockers"`
+	Reason      string     `json:"reason"`
+	RequestedBy string     `json:"requested_by"`
+	ApprovedBy  string     `json:"approved_by,omitempty"`
+	ApprovedAt  *time.Time `json:"approved_at,omitempty"`
+	ExpiresAt   time.Time  `json:"expires_at"`
+	CreatedAt   time.Time  `json:"created_at"`
+}
