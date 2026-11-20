@@ -256,7 +256,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 		assert.Equal(t, "Initial progress", created.Body)
 		progressCommentID = created.ID
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for progress comment create")
+		require.FailNow(t, "timed out waiting for progress comment create")
 	}
 
 	// Verify it was stored in apply_comments
@@ -282,7 +282,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 		assert.Equal(t, progressCommentID, edited.CommentID)
 		assert.Equal(t, "Updated progress: running 45%", edited.Body)
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for progress comment edit")
+		require.FailNow(t, "timed out waiting for progress comment edit")
 	}
 
 	// Step 3: Verify active comment resolves to progress (no cutover yet)
@@ -305,7 +305,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 		assert.Equal(t, "Cutover ready", created.Body)
 		cutoverCommentID = created.ID
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for cutover comment create")
+		require.FailNow(t, "timed out waiting for cutover comment create")
 	}
 
 	// Step 5: Verify active comment now resolves to cutover
@@ -323,7 +323,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 		assert.Equal(t, cutoverCommentID, edited.CommentID)
 		assert.Equal(t, "Cutover in progress", edited.Body)
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for cutover comment edit")
+		require.FailNow(t, "timed out waiting for cutover comment edit")
 	}
 
 	// Step 7: Post summary comment (terminal state)
@@ -335,7 +335,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 		assert.Equal(t, "Schema change completed", created.Body)
 		summaryCommentID = created.ID
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for summary comment create")
+		require.FailNow(t, "timed out waiting for summary comment create")
 	}
 
 	// Step 8: Verify all three comments are stored
@@ -399,7 +399,7 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 		assert.NotContains(t, created.Body, "Stopped")
 		assert.NotContains(t, created.Body, "50%", "the indeterminate resume window must not show a stale percent")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected a new progress comment to be posted on resume")
+		require.FailNow(t, "expected a new progress comment to be posted on resume")
 	}
 	assert.NotEqual(t, stoppedProgressID, newProgressID, "resume must post a new comment, not reuse the stopped one")
 
@@ -413,7 +413,7 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 		assert.Contains(t, edited.Body, "<details>")
 		assert.Contains(t, edited.Body, "Stopped at 21%", "the pre-stop body is preserved inside the fold")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the superseded progress comment to be frozen")
+		require.FailNow(t, "expected the superseded progress comment to be frozen")
 	}
 
 	// The progress row now tracks the new comment with no freeze left owing;
@@ -442,9 +442,9 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 		assert.Equal(t, newProgressID, edited.CommentID, "later edits land on the new comment")
 		assert.Contains(t, edited.Body, "70.00%", "once running, the new comment shows real row-copy progress")
 	case created := <-capture.creates:
-		t.Fatalf("resume must rotate exactly once; got another new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("resume must rotate exactly once; got another new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the new progress comment on the next tick")
+		require.FailNow(t, "expected an in-place edit of the new progress comment on the next tick")
 	}
 }
 
@@ -510,14 +510,14 @@ func TestE2ERolloutStartRotatesOnceAcrossTheTargetHandoff(t *testing.T) {
 		freshID = created.ID
 		assert.NotContains(t, created.Body, "Stopped")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the start to post a fresh progress comment")
+		require.FailNow(t, "expected the start to post a fresh progress comment")
 	}
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, stoppedProgressID, edited.CommentID, "the freeze edit lands on the stopped comment")
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the stopped progress comment to be frozen")
+		require.FailNow(t, "expected the stopped progress comment to be frozen")
 	}
 
 	// requireInPlaceEdit advances past the edit interval, ticks, and requires
@@ -531,9 +531,9 @@ func TestE2ERolloutStartRotatesOnceAcrossTheTargetHandoff(t *testing.T) {
 			assert.Equal(t, freshID, edited.CommentID, msg)
 			return edited.Body
 		case created := <-capture.creates:
-			t.Fatalf("%s: a start rotates once; got another new comment %d:\n%s", msg, created.ID, created.Body)
+			require.FailNow(t, fmt.Sprintf("%s: a start rotates once; got another new comment %d:\n%s", msg, created.ID, created.Body))
 		case <-time.After(5 * time.Second):
-			t.Fatalf("%s: expected an in-place edit of the fresh comment", msg)
+			require.FailNow(t, fmt.Sprintf("%s: expected an in-place edit of the fresh comment", msg))
 		}
 		return ""
 	}
@@ -556,7 +556,7 @@ func TestE2ERolloutStartRotatesOnceAcrossTheTargetHandoff(t *testing.T) {
 
 	select {
 	case created := <-capture.creates:
-		t.Fatalf("no summary posts while the rollout is under way; got comment %d:\n%s", created.ID, created.Body)
+		require.FailNow(t, fmt.Sprintf("no summary posts while the rollout is under way; got comment %d:\n%s", created.ID, created.Body))
 	default:
 	}
 	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
@@ -605,13 +605,13 @@ func TestE2EResumeSummaryMarkerSupersedeRetriedUntilItLands(t *testing.T) {
 		newProgressID = created.ID
 		assert.Contains(t, created.Body, "**Status**: Resuming")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the resume rotation to post a fresh progress comment")
+		require.FailNow(t, "expected the resume rotation to post a fresh progress comment")
 	}
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, stoppedProgressID, edited.CommentID, "the freeze edit lands on the superseded comment")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the superseded progress comment to be frozen")
+		require.FailNow(t, "expected the superseded progress comment to be frozen")
 	}
 	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 	require.NoError(t, err)
@@ -630,9 +630,9 @@ func TestE2EResumeSummaryMarkerSupersedeRetriedUntilItLands(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, newProgressID, edited.CommentID, "ticks during the outage keep editing the rotated comment")
 	case created := <-capture.creates:
-		t.Fatalf("the supersede retry must not rotate again; got another new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("the supersede retry must not rotate again; got another new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the rotated comment during the outage")
+		require.FailNow(t, "expected an in-place edit of the rotated comment during the outage")
 	}
 	summary, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 	require.NoError(t, err)
@@ -651,9 +651,9 @@ func TestE2EResumeSummaryMarkerSupersedeRetriedUntilItLands(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, newProgressID, edited.CommentID, "the healed tick still edits the rotated comment in place")
 	case created := <-capture.creates:
-		t.Fatalf("the healed retry must not rotate again; got another new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("the healed retry must not rotate again; got another new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the rotated comment after storage heals")
+		require.FailNow(t, "expected an in-place edit of the rotated comment after storage heals")
 	}
 	summary, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 	require.NoError(t, err)
@@ -695,11 +695,11 @@ func TestE2EResumeRotationWaitsForSummaryClaimSentinel(t *testing.T) {
 	obs.OnProgress(apply, []*storage.Task{task})
 	select {
 	case created := <-capture.creates:
-		t.Fatalf("rotation must wait for the in-flight summary publish; got new comment %d: %s", created.ID, created.Body)
+		require.FailNow(t, fmt.Sprintf("rotation must wait for the in-flight summary publish; got new comment %d: %s", created.ID, created.Body))
 	case edited := <-capture.edits:
 		assert.Equal(t, stoppedProgressID, edited.CommentID, "ticks keep editing the tracked comment while the publish is in flight")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the tracked comment while the sentinel is live")
+		require.FailNow(t, "expected an in-place edit of the tracked comment while the sentinel is live")
 	}
 
 	// The publisher finishes: the marker records its posted summary comment.
@@ -717,7 +717,7 @@ func TestE2EResumeRotationWaitsForSummaryClaimSentinel(t *testing.T) {
 		assert.Contains(t, created.Body, "**Status**: Resuming")
 		assert.NotEqual(t, stoppedProgressID, created.ID, "the rotation posts a new comment, not a reuse of the stopped one")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the rotation once the summary marker records its posted comment")
+		require.FailNow(t, "expected the rotation once the summary marker records its posted comment")
 	}
 	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 	require.NoError(t, err)
@@ -759,7 +759,7 @@ func TestE2EStopResumeCompleteStillPostsTerminalSummary(t *testing.T) {
 	select {
 	case <-capture.edits: // freeze of the superseded progress comment
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the superseded progress comment to be frozen")
+		require.FailNow(t, "expected the superseded progress comment to be frozen")
 	}
 	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 	require.NoError(t, err)
@@ -778,7 +778,7 @@ func TestE2EStopResumeCompleteStillPostsTerminalSummary(t *testing.T) {
 	select {
 	case <-capture.edits:
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the progress comment to be edited to its final rendering")
+		require.FailNow(t, "expected the progress comment to be edited to its final rendering")
 	}
 	var terminalSummaryID int64
 	select {
@@ -786,7 +786,7 @@ func TestE2EStopResumeCompleteStillPostsTerminalSummary(t *testing.T) {
 		terminalSummaryID = created.ID
 		assert.Contains(t, created.Body, "Schema Change Applied")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected a terminal summary comment for the completed apply")
+		require.FailNow(t, "expected a terminal summary comment for the completed apply")
 	}
 	assert.NotEqual(t, stoppedSummaryID, terminalSummaryID, "the terminal summary is a fresh comment, not the stop's")
 
@@ -834,7 +834,7 @@ func TestE2EStartedApplyCompletingBeforeRotationPostsItsSummary(t *testing.T) {
 		completionSummaryID = created.ID
 		assert.Contains(t, created.Body, "Schema Change Applied")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the completion summary while the stop's summary is still recorded")
+		require.FailNow(t, "expected the completion summary while the stop's summary is still recorded")
 	}
 	assert.NotEqual(t, stoppedSummaryID, completionSummaryID)
 
@@ -891,11 +891,11 @@ func TestE2EStopDuringResumeRotationKeepsStopSummaryAndNextRotation(t *testing.T
 		firstRotationID = created.ID
 		assert.Contains(t, created.Body, "**Status**: Resuming")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the first start's rotation to post a fresh progress comment")
+		require.FailNow(t, "expected the first start's rotation to post a fresh progress comment")
 	}
 	select {
 	case created := <-capture.creates:
-		t.Fatalf("the second stop's publish must lose its claim to the recorded summary; got comment %d: %s", created.ID, created.Body)
+		require.FailNow(t, fmt.Sprintf("the second stop's publish must lose its claim to the recorded summary; got comment %d: %s", created.ID, created.Body))
 	default:
 	}
 
@@ -924,7 +924,7 @@ func TestE2EStopDuringResumeRotationKeepsStopSummaryAndNextRotation(t *testing.T
 		secondStopSummaryID = created.ID
 		assert.Contains(t, created.Body, "Schema Change Stopped")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected reconciliation to post the second stop's summary")
+		require.FailNow(t, "expected reconciliation to post the second stop's summary")
 	}
 	summary, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 	require.NoError(t, err)
@@ -948,7 +948,7 @@ func TestE2EStopDuringResumeRotationKeepsStopSummaryAndNextRotation(t *testing.T
 		require.NotNil(t, tracked)
 		assert.Equal(t, created.ID, tracked.GitHubCommentID, "the second start's comment is the tracked progress comment")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the second start to post a fresh progress comment")
+		require.FailNow(t, "expected the second start to post a fresh progress comment")
 	}
 	summary, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 	require.NoError(t, err)
@@ -987,7 +987,7 @@ func TestE2EResumeSummarySettleFlushedAtTerminalPublish(t *testing.T) {
 	case created := <-capture.creates:
 		assert.Contains(t, created.Body, "**Status**: Resuming")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the start's rotation to post a fresh progress comment")
+		require.FailNow(t, "expected the start's rotation to post a fresh progress comment")
 	}
 	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 	require.NoError(t, err)
@@ -1009,7 +1009,7 @@ func TestE2EResumeSummarySettleFlushedAtTerminalPublish(t *testing.T) {
 		secondStopSummaryID = created.ID
 		assert.Contains(t, created.Body, "Schema Change Stopped")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the second stop's summary once the terminal publish settles the owed summary")
+		require.FailNow(t, "expected the second stop's summary once the terminal publish settles the owed summary")
 	}
 	assert.NotEqual(t, firstStopSummaryID, secondStopSummaryID)
 
@@ -1103,7 +1103,7 @@ func TestE2EResumeRotationFreezesAcrossIterations(t *testing.T) {
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", secondProgressID), "the frozen comment links to its successor")
 		assert.Contains(t, edited.Body, "Stopped at 21%", "the superseded body is preserved inside the fold")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the owed freeze from the prior drive to be reconciled")
+		require.FailNow(t, "expected the owed freeze from the prior drive to be reconciled")
 	}
 
 	// The same tick rotates for the second resume: a fresh progress comment is
@@ -1114,7 +1114,7 @@ func TestE2EResumeRotationFreezesAcrossIterations(t *testing.T) {
 		thirdProgressID = created.ID
 		assert.Contains(t, created.Body, "Schema Change Status — Staging")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected a new progress comment on the second resume")
+		require.FailNow(t, "expected a new progress comment on the second resume")
 	}
 	select {
 	case edited := <-capture.edits:
@@ -1123,7 +1123,7 @@ func TestE2EResumeRotationFreezesAcrossIterations(t *testing.T) {
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", thirdProgressID), "the frozen comment links to its successor")
 		assert.Contains(t, edited.Body, "Stopped at 63%", "the superseded body is preserved inside the fold")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the second cycle's progress comment to be frozen")
+		require.FailNow(t, "expected the second cycle's progress comment to be frozen")
 	}
 
 	// The tracked row points at the live comment with no freeze left owing, and
@@ -1147,7 +1147,7 @@ func requireCommentCreate(t *testing.T, capture *commentCapture) int64 {
 	case created := <-capture.creates:
 		return created.ID
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for comment create")
+		require.FailNow(t, "timed out waiting for comment create")
 		return 0
 	}
 }
@@ -1337,7 +1337,7 @@ func TestE2ERevertRotatesProgressComment(t *testing.T) {
 		assert.Contains(t, created.Body, "Schema Change Status — Staging")
 		assert.Contains(t, created.Body, "**Status**: Reverting")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected a new progress comment to be posted when the revert takes effect")
+		require.FailNow(t, "expected a new progress comment to be posted when the revert takes effect")
 	}
 	assert.NotEqual(t, preRevertID, newProgressID, "the revert must post a new comment, not reuse the pre-revert one")
 
@@ -1351,7 +1351,7 @@ func TestE2ERevertRotatesProgressComment(t *testing.T) {
 		assert.Contains(t, edited.Body, "<details>")
 		assert.Contains(t, edited.Body, "Revert window open", "the pre-revert body is preserved inside the fold")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the superseded progress comment to be frozen")
+		require.FailNow(t, "expected the superseded progress comment to be frozen")
 	}
 
 	// The progress row tracks the new comment with no freeze left owing, and
@@ -1374,9 +1374,9 @@ func TestE2ERevertRotatesProgressComment(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, newProgressID, edited.CommentID, "later edits land on the new comment")
 	case created := <-capture.creates:
-		t.Fatalf("a revert must rotate exactly once; got another new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("a revert must rotate exactly once; got another new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the new progress comment on the next tick")
+		require.FailNow(t, "expected an in-place edit of the new progress comment on the next tick")
 	}
 
 	// A fresh observer — a later drive claim after a restart — sees the durable
@@ -1391,9 +1391,9 @@ func TestE2ERevertRotatesProgressComment(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, newProgressID, edited.CommentID, "a fresh observer edits the tracked comment in place")
 	case created := <-capture.creates:
-		t.Fatalf("a fresh observer must not rotate for a revert already tracked; got new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("a fresh observer must not rotate for a revert already tracked; got new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the fresh observer to edit the tracked progress comment")
+		require.FailNow(t, "expected the fresh observer to edit the tracked progress comment")
 	}
 }
 
@@ -1449,7 +1449,7 @@ func TestE2ESkipRevertRotatesProgressComment(t *testing.T) {
 		assert.Contains(t, created.Body, "Schema Change Status — Staging")
 		assert.Contains(t, created.Body, "**Status**: Skipping revert")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected a new progress comment to be posted when the skip-revert takes effect")
+		require.FailNow(t, "expected a new progress comment to be posted when the skip-revert takes effect")
 	}
 	assert.NotEqual(t, preSkipID, newProgressID, "the skip-revert must post a new comment, not reuse the revert-window one")
 
@@ -1463,7 +1463,7 @@ func TestE2ESkipRevertRotatesProgressComment(t *testing.T) {
 		assert.Contains(t, edited.Body, "<details>")
 		assert.Contains(t, edited.Body, "Revert window open", "the revert-window body is preserved inside the fold")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the superseded progress comment to be frozen")
+		require.FailNow(t, "expected the superseded progress comment to be frozen")
 	}
 
 	// The progress row tracks the new comment with no freeze left owing, and
@@ -1488,9 +1488,9 @@ func TestE2ESkipRevertRotatesProgressComment(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, newProgressID, edited.CommentID, "a fresh observer edits the tracked comment in place")
 	case created := <-capture.creates:
-		t.Fatalf("a fresh observer must not rotate for a skip-revert already tracked; got new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("a fresh observer must not rotate for a skip-revert already tracked; got new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the fresh observer to edit the tracked progress comment")
+		require.FailNow(t, "expected the fresh observer to edit the tracked progress comment")
 	}
 }
 
@@ -1536,9 +1536,9 @@ func TestE2ESkipRevertWithoutOperatorCommandEditsProgressCommentInPlace(t *testi
 		assert.Equal(t, windowID, edited.CommentID, "the progress comment transitions in place")
 		assert.Contains(t, edited.Body, "Skipping revert")
 	case created := <-capture.creates:
-		t.Fatalf("a window expiry must not rotate the progress comment; got new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("a window expiry must not rotate the progress comment; got new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the tracked progress comment")
+		require.FailNow(t, "expected an in-place edit of the tracked progress comment")
 	}
 
 	// A fresh observer — a later drive claim after a restart — re-checks the
@@ -1552,9 +1552,9 @@ func TestE2ESkipRevertWithoutOperatorCommandEditsProgressCommentInPlace(t *testi
 	case edited := <-capture.edits:
 		assert.Equal(t, windowID, edited.CommentID, "a fresh observer edits the tracked comment in place")
 	case created := <-capture.creates:
-		t.Fatalf("a fresh observer must not rotate for a window expiry; got new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("a fresh observer must not rotate for a window expiry; got new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the fresh observer to edit the tracked progress comment")
+		require.FailNow(t, "expected the fresh observer to edit the tracked progress comment")
 	}
 }
 
@@ -1611,9 +1611,9 @@ func TestE2EControlPhaseRotationReconcilesPendingFreezeFromPriorDrive(t *testing
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshID), "the frozen comment links to its successor")
 		assert.Contains(t, edited.Body, "Revert window open", "the superseded body is preserved inside the fold")
 	case created := <-capture.creates:
-		t.Fatalf("reconciling a pending freeze must not post a new comment; got %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("reconciling a pending freeze must not post a new comment; got %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the pending freeze to be reconciled on the first tick")
+		require.FailNow(t, "expected the pending freeze to be reconciled on the first tick")
 	}
 
 	// The marker is cleared once the freeze lands; the row still tracks the
@@ -1631,7 +1631,7 @@ func TestE2EControlPhaseRotationReconcilesPendingFreezeFromPriorDrive(t *testing
 	case edited := <-capture.edits:
 		assert.Equal(t, freshID, edited.CommentID, "the tick's progress edit lands on the tracked comment")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the tick's progress edit on the tracked comment")
+		require.FailNow(t, "expected the tick's progress edit on the tracked comment")
 	}
 }
 
@@ -1677,7 +1677,7 @@ func TestE2EDeferredCutoverRotatesProgressComment(t *testing.T) {
 		assert.Contains(t, created.Body, "Schema Change Status — Staging")
 		assert.Contains(t, created.Body, "**Status**: Revert Window")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected a new progress comment to be posted when the deferred cutover completes")
+		require.FailNow(t, "expected a new progress comment to be posted when the deferred cutover completes")
 	}
 	assert.NotEqual(t, cutoverPromptID, newProgressID, "the rotation must post a new comment, not reuse the cutover prompt")
 	assert.NotEqual(t, preCutoverProgressID, newProgressID, "the rotation must post a new comment, not reuse the frozen progress comment")
@@ -1692,7 +1692,7 @@ func TestE2EDeferredCutoverRotatesProgressComment(t *testing.T) {
 		assert.Contains(t, edited.Body, "<details>")
 		assert.Contains(t, edited.Body, "Ready for cutover", "the prompt body is preserved inside the fold")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the cutover prompt to be frozen")
+		require.FailNow(t, "expected the cutover prompt to be frozen")
 	}
 
 	// The progress row tracks the new comment with no freeze left owing and
@@ -1718,9 +1718,9 @@ func TestE2EDeferredCutoverRotatesProgressComment(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, newProgressID, edited.CommentID, "later edits land on the fresh comment")
 	case created := <-capture.creates:
-		t.Fatalf("a deferred cutover must rotate exactly once; got another new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("a deferred cutover must rotate exactly once; got another new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the fresh progress comment on the next tick")
+		require.FailNow(t, "expected an in-place edit of the fresh progress comment on the next tick")
 	}
 
 	// A fresh observer — a later drive claim after a restart — finds the
@@ -1735,9 +1735,9 @@ func TestE2EDeferredCutoverRotatesProgressComment(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, newProgressID, edited.CommentID, "a fresh observer edits the tracked comment in place")
 	case created := <-capture.creates:
-		t.Fatalf("a fresh observer must not rotate for a cutover already tracked; got new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("a fresh observer must not rotate for a cutover already tracked; got new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the fresh observer to edit the tracked progress comment")
+		require.FailNow(t, "expected the fresh observer to edit the tracked progress comment")
 	}
 }
 
@@ -1779,14 +1779,14 @@ func TestE2EDeferredCutoverSupersedeRetriedUntilItLands(t *testing.T) {
 		freshProgressID = created.ID
 		assert.Contains(t, created.Body, "**Status**: Revert Window")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the rotation to post a fresh progress comment")
+		require.FailNow(t, "expected the rotation to post a fresh progress comment")
 	}
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, cutoverPromptID, edited.CommentID, "the freeze edit lands on the cutover prompt")
 		assert.Contains(t, edited.Body, "Cutover complete")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the cutover prompt to be frozen")
+		require.FailNow(t, "expected the cutover prompt to be frozen")
 	}
 	cutoverRow, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
 	require.NoError(t, err)
@@ -1804,9 +1804,9 @@ func TestE2EDeferredCutoverSupersedeRetriedUntilItLands(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, freshProgressID, edited.CommentID, "progress edits land on the fresh comment while the supersede is owed")
 	case created := <-capture.creates:
-		t.Fatalf("a deferred cutover must rotate exactly once; got another new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("a deferred cutover must rotate exactly once; got another new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the fresh progress comment during the outage")
+		require.FailNow(t, "expected an in-place edit of the fresh progress comment during the outage")
 	}
 
 	// Once storage heals, the next tick's retry consumes the cutover row while
@@ -1820,9 +1820,9 @@ func TestE2EDeferredCutoverSupersedeRetriedUntilItLands(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, freshProgressID, edited.CommentID)
 	case created := <-capture.creates:
-		t.Fatalf("the supersede retry must not post a comment; got %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("the supersede retry must not post a comment; got %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the fresh progress comment after healing")
+		require.FailNow(t, "expected an in-place edit of the fresh progress comment after healing")
 	}
 	cutoverRow, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
 	require.NoError(t, err)
@@ -1865,9 +1865,9 @@ func TestE2EDeferredCutoverPromptStaysMutedWithoutCutover(t *testing.T) {
 		obs.OnProgress(apply, []*storage.Task{task})
 		select {
 		case created := <-capture.creates:
-			t.Fatalf("state %q must not rotate while the prompt is unanswered; got new comment %d: %s", applyState, created.ID, created.Body)
+			require.FailNow(t, fmt.Sprintf("state %q must not rotate while the prompt is unanswered; got new comment %d: %s", applyState, created.ID, created.Body))
 		case edited := <-capture.edits:
-			t.Fatalf("state %q must not edit while the prompt is unanswered; got an edit of %d: %s", applyState, edited.CommentID, edited.Body)
+			require.FailNow(t, fmt.Sprintf("state %q must not edit while the prompt is unanswered; got an edit of %d: %s", applyState, edited.CommentID, edited.Body))
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
@@ -1924,9 +1924,9 @@ func TestE2EDeferredCutoverParkedGateEditsProgressInPlace(t *testing.T) {
 		assert.Contains(t, edited.Body, "**Status**: Waiting for Cutover")
 		assert.Contains(t, edited.Body, fmt.Sprintf("To proceed with cutover:\n```\nschemabot cutover %s -e staging\n```\n", apply.ApplyIdentifier))
 	case created := <-capture.creates:
-		t.Fatalf("reaching the gate must not post a comment; got %d: %s", created.ID, created.Body)
+		require.FailNow(t, fmt.Sprintf("reaching the gate must not post a comment; got %d: %s", created.ID, created.Body))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the progress comment to move to waiting for cutover")
+		require.FailNow(t, "expected the progress comment to move to waiting for cutover")
 	}
 
 	cutoverRow, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
@@ -1944,7 +1944,7 @@ func TestE2EDeferredCutoverParkedGateEditsProgressInPlace(t *testing.T) {
 		o.OnProgress(apply, []*storage.Task{task})
 		select {
 		case created := <-capture.creates:
-			t.Fatalf("a tick at the gate must not post a comment; got %d: %s", created.ID, created.Body)
+			require.FailNow(t, fmt.Sprintf("a tick at the gate must not post a comment; got %d: %s", created.ID, created.Body))
 		case edited := <-capture.edits:
 			assert.Equal(t, progressID, edited.CommentID, "an edit at the gate lands on the tracked progress comment")
 		case <-time.After(100 * time.Millisecond):
@@ -2003,7 +2003,7 @@ func TestE2EDeferredCutoverCommandRotatesProgressComment(t *testing.T) {
 				freshID = created.ID
 				assert.Contains(t, created.Body, "Schema Change Status — Staging")
 			case <-time.After(5 * time.Second):
-				t.Fatal("expected a fresh progress comment when the cutover takes effect")
+				require.FailNow(t, "expected a fresh progress comment when the cutover takes effect")
 			}
 
 			select {
@@ -2014,7 +2014,7 @@ func TestE2EDeferredCutoverCommandRotatesProgressComment(t *testing.T) {
 				assert.Contains(t, edited.Body, "<summary>Progress before the cutover</summary>")
 				assert.Contains(t, edited.Body, "Waiting for Cutover — run `schemabot cutover` to proceed", "the waiting rendering is kept inside the fold")
 			case <-time.After(5 * time.Second):
-				t.Fatal("expected the comment that waited for cutover to be folded")
+				require.FailNow(t, "expected the comment that waited for cutover to be folded")
 			}
 
 			prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
@@ -2034,7 +2034,7 @@ func TestE2EDeferredCutoverCommandRotatesProgressComment(t *testing.T) {
 				o.OnProgress(apply, []*storage.Task{task})
 				select {
 				case created := <-capture.creates:
-					t.Fatalf("a cutover rotates once; got another comment %d: %s", created.ID, created.Body)
+					require.FailNow(t, fmt.Sprintf("a cutover rotates once; got another comment %d: %s", created.ID, created.Body))
 				case edited := <-capture.edits:
 					assert.Equal(t, freshID, edited.CommentID, "later edits land on the fresh comment")
 				case <-time.After(100 * time.Millisecond):
@@ -2086,7 +2086,7 @@ func TestE2EDeferredCutoverFirstObservedSkippingRevertRotates(t *testing.T) {
 		assert.True(t, strings.HasPrefix(edited.Body, fmt.Sprintf(
 			"Cutover started — progress continues in [a new progress comment](https://github.com/%s/pull/158#issuecomment-%d).", repo, freshID)), edited.Body)
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the comment that waited for cutover to be folded")
+		require.FailNow(t, "expected the comment that waited for cutover to be folded")
 	}
 
 	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
@@ -2101,7 +2101,7 @@ func TestE2EDeferredCutoverFirstObservedSkippingRevertRotates(t *testing.T) {
 		o.OnProgress(apply, []*storage.Task{task})
 		select {
 		case created := <-capture.creates:
-			t.Fatalf("the cutover rotates once; got another comment %d: %s", created.ID, created.Body)
+			require.FailNow(t, fmt.Sprintf("the cutover rotates once; got another comment %d: %s", created.ID, created.Body))
 		case edited := <-capture.edits:
 			assert.Equal(t, freshID, edited.CommentID, "later edits land on the fresh comment")
 		case <-time.After(100 * time.Millisecond):
@@ -2167,7 +2167,7 @@ func TestE2EOrderedDeferredCutoverRotatesForEachMember(t *testing.T) {
 					assert.True(t, strings.HasPrefix(edited.Body, fmt.Sprintf(
 						"Cutover started — progress continues in [a new progress comment](https://github.com/%s/pull/159#issuecomment-%d).", repo, freshID)), edited.Body)
 				case <-time.After(5 * time.Second):
-					t.Fatal("expected the comment tracking the previous cutover to be folded")
+					require.FailNow(t, "expected the comment tracking the previous cutover to be folded")
 				}
 
 				prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
@@ -2193,11 +2193,11 @@ func TestE2EOrderedDeferredCutoverRotatesForEachMember(t *testing.T) {
 			obs.OnProgress(apply, []*storage.Task{task})
 			select {
 			case created := <-capture.creates:
-				t.Fatalf("parking the next member at the gate must not rotate; got %d: %s", created.ID, created.Body)
+				require.FailNow(t, fmt.Sprintf("parking the next member at the gate must not rotate; got %d: %s", created.ID, created.Body))
 			case edited := <-capture.edits:
 				assert.Equal(t, firstID, edited.CommentID, "the gate edits the first member's comment in place")
 			case <-time.After(5 * time.Second):
-				t.Fatal("expected the gate to edit the first member's comment")
+				require.FailNow(t, "expected the gate to edit the first member's comment")
 			}
 
 			second := obs
@@ -2215,7 +2215,7 @@ func TestE2EOrderedDeferredCutoverRotatesForEachMember(t *testing.T) {
 				o.OnProgress(apply, []*storage.Task{task})
 				select {
 				case created := <-capture.creates:
-					t.Fatalf("a member's cutover rotates once; got another comment %d: %s", created.ID, created.Body)
+					require.FailNow(t, fmt.Sprintf("a member's cutover rotates once; got another comment %d: %s", created.ID, created.Body))
 				case edited := <-capture.edits:
 					assert.Equal(t, secondID, edited.CommentID, "later edits land on the second member's comment")
 				case <-time.After(100 * time.Millisecond):
@@ -2275,7 +2275,7 @@ func TestE2EOrderedDeferredCutoverRotatesPastCommentWithoutMember(t *testing.T) 
 		assert.True(t, strings.HasPrefix(edited.Body, fmt.Sprintf(
 			"Cutover started — progress continues in [a new progress comment](https://github.com/%s/pull/160#issuecomment-%d).", repo, freshID)), edited.Body)
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the comment that recorded no member to be folded")
+		require.FailNow(t, "expected the comment that recorded no member to be folded")
 	}
 	prog, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
 	require.NoError(t, err)
@@ -2317,11 +2317,11 @@ func TestE2ECutoverWithoutOperatorCommandEditsInPlace(t *testing.T) {
 				obs.OnProgress(apply, []*storage.Task{task})
 				select {
 				case created := <-capture.creates:
-					t.Fatalf("state %q must not rotate without an operator's cutover; got %d: %s", applyState, created.ID, created.Body)
+					require.FailNow(t, fmt.Sprintf("state %q must not rotate without an operator's cutover; got %d: %s", applyState, created.ID, created.Body))
 				case edited := <-capture.edits:
 					assert.Equal(t, progressID, edited.CommentID, "state %q edits the tracked comment in place", applyState)
 				case <-time.After(5 * time.Second):
-					t.Fatalf("expected state %q to edit the tracked comment", applyState)
+					require.FailNow(t, fmt.Sprintf("expected state %q to edit the tracked comment", applyState))
 				}
 			}
 		})
@@ -2372,7 +2372,7 @@ func TestE2EDeferredCutoverFastTerminalFinalizesProgressComment(t *testing.T) {
 		assert.Equal(t, promptID, edited.CommentID, "the terminal summary lands on the cutover prompt")
 		assert.Contains(t, edited.Body, "✅ Schema Change Applied")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the cutover prompt to be edited into the terminal summary")
+		require.FailNow(t, "expected the cutover prompt to be edited into the terminal summary")
 	}
 
 	// The tracked progress comment receives its final status freeze: the
@@ -2384,14 +2384,14 @@ func TestE2EDeferredCutoverFastTerminalFinalizesProgressComment(t *testing.T) {
 		assert.NotContains(t, edited.Body, "To proceed with cutover:", "the frozen progress comment must not advertise the spent gate")
 		assert.NotContains(t, edited.Body, "schemabot cutover", "the frozen progress comment must not carry a live cutover command")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the tracked progress comment to be frozen at its final status")
+		require.FailNow(t, "expected the tracked progress comment to be frozen at its final status")
 	}
 
 	// No extra comment is posted — the prompt already sits at the bottom of
 	// the PR as the summary.
 	select {
 	case created := <-capture.creates:
-		t.Fatalf("a cutover apply's terminal publish edits the prompt, it must not post a new comment; got %d: %s", created.ID, created.Body)
+		require.FailNow(t, fmt.Sprintf("a cutover apply's terminal publish edits the prompt, it must not post a new comment; got %d: %s", created.ID, created.Body))
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -2445,7 +2445,7 @@ func TestE2EStopAtCutoverGateThenResumeRotatesFreshComment(t *testing.T) {
 		assert.Equal(t, cutoverPromptID, edited.CommentID, "the stop record lands on the prompt")
 		assert.Contains(t, edited.Body, "Schema Change Stopped")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the cutover prompt to be edited into the stop record")
+		require.FailNow(t, "expected the cutover prompt to be edited into the stop record")
 	}
 	// The tracked progress comment is frozen at the stopped rendering too, so
 	// it stops advertising the gate's cutover command.
@@ -2455,11 +2455,11 @@ func TestE2EStopAtCutoverGateThenResumeRotatesFreshComment(t *testing.T) {
 		assert.Contains(t, edited.Body, "**Status**: Stopped")
 		assert.NotContains(t, edited.Body, "schemabot cutover", "the frozen progress comment must not carry a live cutover command")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the tracked progress comment to be frozen at the stopped rendering")
+		require.FailNow(t, "expected the tracked progress comment to be frozen at the stopped rendering")
 	}
 	select {
 	case created := <-capture.creates:
-		t.Fatalf("a stop at the gate completes the prompt itself; got a new comment %d: %s", created.ID, created.Body)
+		require.FailNow(t, fmt.Sprintf("a stop at the gate completes the prompt itself; got a new comment %d: %s", created.ID, created.Body))
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -2490,7 +2490,7 @@ func TestE2EStopAtCutoverGateThenResumeRotatesFreshComment(t *testing.T) {
 		assert.Contains(t, created.Body, "Schema Change Status — Staging")
 		assert.Contains(t, created.Body, "**Status**: Resuming")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the resume to post a fresh progress comment")
+		require.FailNow(t, "expected the resume to post a fresh progress comment")
 	}
 	assert.NotEqual(t, cutoverPromptID, resumedProgressID, "the resumed apply gets its own comment; the stop record is not reused")
 
@@ -2502,7 +2502,7 @@ func TestE2EStopAtCutoverGateThenResumeRotatesFreshComment(t *testing.T) {
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", resumedProgressID), "the frozen comment links to its successor")
 		assert.NotContains(t, edited.Body, "Cutover complete", "nothing renders a cutover that never happened")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the pre-stop progress comment to be frozen")
+		require.FailNow(t, "expected the pre-stop progress comment to be frozen")
 	}
 
 	// The summary marker is consumed and later ticks edit the fresh comment —
@@ -2521,9 +2521,9 @@ func TestE2EStopAtCutoverGateThenResumeRotatesFreshComment(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, resumedProgressID, edited.CommentID, "later edits land on the fresh comment")
 	case created := <-capture.creates:
-		t.Fatalf("a resume rotates exactly once; got another new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("a resume rotates exactly once; got another new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the fresh progress comment")
+		require.FailNow(t, "expected an in-place edit of the fresh progress comment")
 	}
 }
 
@@ -2569,11 +2569,11 @@ func TestE2EDeferredCutoverUntrackedFreshCommentAdoptedWhenStorageHeals(t *testi
 		freshProgressID = created.ID
 		assert.Contains(t, created.Body, "**Status**: Revert Window")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the rotation to post a fresh progress comment")
+		require.FailNow(t, "expected the rotation to post a fresh progress comment")
 	}
 	select {
 	case edited := <-capture.edits:
-		t.Fatalf("no comment may be edited when the fresh comment was not tracked; got an edit of %d: %s", edited.CommentID, edited.Body)
+		require.FailNow(t, fmt.Sprintf("no comment may be edited when the fresh comment was not tracked; got an edit of %d: %s", edited.CommentID, edited.Body))
 	case <-time.After(100 * time.Millisecond):
 	}
 	cutoverRow, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
@@ -2591,9 +2591,9 @@ func TestE2EDeferredCutoverUntrackedFreshCommentAdoptedWhenStorageHeals(t *testi
 	obs.OnProgress(apply, []*storage.Task{task})
 	select {
 	case created := <-capture.creates:
-		t.Fatalf("an untracked rotation must not repost; got another new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("an untracked rotation must not repost; got another new comment %d", created.ID))
 	case edited := <-capture.edits:
-		t.Fatalf("no comment may be edited while adoption is owed; got an edit of %d: %s", edited.CommentID, edited.Body)
+		require.FailNow(t, fmt.Sprintf("no comment may be edited while adoption is owed; got an edit of %d: %s", edited.CommentID, edited.Body))
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -2609,9 +2609,9 @@ func TestE2EDeferredCutoverUntrackedFreshCommentAdoptedWhenStorageHeals(t *testi
 		assert.Contains(t, edited.Body, "Cutover complete")
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshProgressID), "the frozen prompt links to its adopted successor")
 	case created := <-capture.creates:
-		t.Fatalf("adoption must not post another comment; got %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("adoption must not post another comment; got %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the cutover prompt to be frozen after adoption")
+		require.FailNow(t, "expected the cutover prompt to be frozen after adoption")
 	}
 	prog, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
 	require.NoError(t, err)
@@ -2634,9 +2634,9 @@ func TestE2EDeferredCutoverUntrackedFreshCommentAdoptedWhenStorageHeals(t *testi
 	case edited := <-capture.edits:
 		assert.Equal(t, freshProgressID, edited.CommentID, "progress edits move to the adopted comment")
 	case created := <-capture.creates:
-		t.Fatalf("no further rotation is owed; got new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("no further rotation is owed; got new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the adopted comment")
+		require.FailNow(t, "expected an in-place edit of the adopted comment")
 	}
 }
 
@@ -2677,13 +2677,13 @@ func TestE2EDeferredCutoverStaleCutoverRowRoutesTerminalToFreshComment(t *testin
 	case created := <-capture.creates:
 		freshProgressID = created.ID
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the rotation to post a fresh progress comment")
+		require.FailNow(t, "expected the rotation to post a fresh progress comment")
 	}
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, cutoverPromptID, edited.CommentID, "the freeze edit lands on the cutover prompt")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the cutover prompt to be frozen")
+		require.FailNow(t, "expected the cutover prompt to be frozen")
 	}
 
 	// The revert window expires and the apply completes. A fresh observer —
@@ -2699,18 +2699,18 @@ func TestE2EDeferredCutoverStaleCutoverRowRoutesTerminalToFreshComment(t *testin
 	case edited := <-capture.edits:
 		assert.Equal(t, freshProgressID, edited.CommentID, "the terminal freeze lands on the fresh progress comment, not the folded prompt")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the fresh progress comment to be edited to its final rendering")
+		require.FailNow(t, "expected the fresh progress comment to be edited to its final rendering")
 	}
 	select {
 	case created := <-capture.creates:
 		assert.Contains(t, created.Body, "Schema Change Applied")
 		assert.Contains(t, created.Body, apply.ApplyIdentifier)
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected a summary comment for the completed apply")
+		require.FailNow(t, "expected a summary comment for the completed apply")
 	}
 	select {
 	case edited := <-capture.edits:
-		t.Fatalf("the folded prompt must not be overwritten on terminal; got an edit of %d: %s", edited.CommentID, edited.Body)
+		require.FailNow(t, fmt.Sprintf("the folded prompt must not be overwritten on terminal; got an edit of %d: %s", edited.CommentID, edited.Body))
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -2758,13 +2758,13 @@ func TestE2EDeferredCutoverFreshObserverConsumesStaleCutoverRow(t *testing.T) {
 	case created := <-capture.creates:
 		freshProgressID = created.ID
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the rotation to post a fresh progress comment")
+		require.FailNow(t, "expected the rotation to post a fresh progress comment")
 	}
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, cutoverPromptID, edited.CommentID, "the freeze edit lands on the cutover prompt")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the cutover prompt to be frozen")
+		require.FailNow(t, "expected the cutover prompt to be frozen")
 	}
 
 	// A fresh observer claims the drive. Its first tick reads the live row,
@@ -2775,9 +2775,9 @@ func TestE2EDeferredCutoverFreshObserverConsumesStaleCutoverRow(t *testing.T) {
 	obs2.OnProgress(apply, []*storage.Task{task})
 	select {
 	case created := <-capture.creates:
-		t.Fatalf("a fresh observer must not rotate for a cutover already tracked; got new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("a fresh observer must not rotate for a cutover already tracked; got new comment %d", created.ID))
 	case edited := <-capture.edits:
-		t.Fatalf("a fresh observer must not re-fold; got an edit of %d: %s", edited.CommentID, edited.Body)
+		require.FailNow(t, fmt.Sprintf("a fresh observer must not re-fold; got an edit of %d: %s", edited.CommentID, edited.Body))
 	case <-time.After(100 * time.Millisecond):
 	}
 	cutoverRow, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
@@ -2794,9 +2794,9 @@ func TestE2EDeferredCutoverFreshObserverConsumesStaleCutoverRow(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, freshProgressID, edited.CommentID, "progress edits continue on the fresh comment")
 	case created := <-capture.creates:
-		t.Fatalf("no further rotation is owed; got new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("no further rotation is owed; got new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the fresh progress comment")
+		require.FailNow(t, "expected an in-place edit of the fresh progress comment")
 	}
 }
 
@@ -2838,11 +2838,11 @@ func TestE2ERevertRotationUntrackedFreshCommentAdoptedWhenStorageHeals(t *testin
 		freshProgressID = created.ID
 		assert.Contains(t, created.Body, "**Status**: Reverting")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the revert to post a fresh progress comment")
+		require.FailNow(t, "expected the revert to post a fresh progress comment")
 	}
 	select {
 	case edited := <-capture.edits:
-		t.Fatalf("no comment may be edited when the fresh comment was not tracked; got an edit of %d: %s", edited.CommentID, edited.Body)
+		require.FailNow(t, fmt.Sprintf("no comment may be edited when the fresh comment was not tracked; got an edit of %d: %s", edited.CommentID, edited.Body))
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -2857,9 +2857,9 @@ func TestE2ERevertRotationUntrackedFreshCommentAdoptedWhenStorageHeals(t *testin
 	case edited := <-capture.edits:
 		assert.Equal(t, preRevertID, edited.CommentID, "progress edits continue on the prior tracked comment")
 	case created := <-capture.creates:
-		t.Fatalf("an untracked rotation must not repost for the same phase; got another new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("an untracked rotation must not repost for the same phase; got another new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the prior tracked comment")
+		require.FailNow(t, "expected an in-place edit of the prior tracked comment")
 	}
 
 	// Once storage heals, the next tick adopts the already-live fresh comment
@@ -2877,15 +2877,15 @@ func TestE2ERevertRotationUntrackedFreshCommentAdoptedWhenStorageHeals(t *testin
 		assert.Contains(t, edited.Body, "Schema change reverting")
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshProgressID), "the frozen comment links to its adopted successor")
 	case created := <-capture.creates:
-		t.Fatalf("adoption must not post another comment; got %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("adoption must not post another comment; got %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the superseded progress comment to be frozen after adoption")
+		require.FailNow(t, "expected the superseded progress comment to be frozen after adoption")
 	}
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, freshProgressID, edited.CommentID, "progress edits move to the adopted comment")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected a progress edit on the adopted comment")
+		require.FailNow(t, "expected a progress edit on the adopted comment")
 	}
 
 	// The tracked row records the adopted comment with the reverting phase and
@@ -2908,9 +2908,9 @@ func TestE2ERevertRotationUntrackedFreshCommentAdoptedWhenStorageHeals(t *testin
 	case edited := <-capture.edits:
 		assert.Equal(t, freshProgressID, edited.CommentID, "a fresh observer edits the adopted comment in place")
 	case created := <-capture.creates:
-		t.Fatalf("a fresh observer must not rotate for a revert already tracked; got new comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("a fresh observer must not rotate for a revert already tracked; got new comment %d", created.ID))
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the fresh observer to edit the adopted comment")
+		require.FailNow(t, "expected the fresh observer to edit the adopted comment")
 	}
 }
 
@@ -2949,7 +2949,7 @@ func TestE2ERevertRotationUntrackedFreshCommentAdoptedAtTerminal(t *testing.T) {
 		freshProgressID = created.ID
 		assert.Contains(t, created.Body, "**Status**: Reverting")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the revert to post a fresh progress comment")
+		require.FailNow(t, "expected the revert to post a fresh progress comment")
 	}
 
 	// Storage heals, but the revert finishes before another progress tick —
@@ -2967,7 +2967,7 @@ func TestE2ERevertRotationUntrackedFreshCommentAdoptedAtTerminal(t *testing.T) {
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshProgressID), "the frozen comment links to its adopted successor")
 		assert.Contains(t, edited.Body, "Revert window open", "the pre-revert body is preserved inside the fold")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the superseded progress comment to be frozen during the terminal publish")
+		require.FailNow(t, "expected the superseded progress comment to be frozen during the terminal publish")
 	}
 
 	// The terminal rendering lands on the adopted fresh comment.
@@ -2975,7 +2975,7 @@ func TestE2ERevertRotationUntrackedFreshCommentAdoptedAtTerminal(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, freshProgressID, edited.CommentID, "the terminal rendering lands on the adopted comment")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the terminal rendering on the adopted comment")
+		require.FailNow(t, "expected the terminal rendering on the adopted comment")
 	}
 
 	// The terminal summary still posts as its own fresh comment.
@@ -2983,7 +2983,7 @@ func TestE2ERevertRotationUntrackedFreshCommentAdoptedAtTerminal(t *testing.T) {
 	case created := <-capture.creates:
 		assert.Contains(t, created.Body, apply.ApplyIdentifier)
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the terminal summary comment")
+		require.FailNow(t, "expected the terminal summary comment")
 	}
 
 	// The tracked row records the adopted comment with no freeze left owing.
@@ -3029,7 +3029,7 @@ func TestE2ECancelSurfacesThroughTerminalSummaryComment(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, progressID, edited.CommentID, "the terminal freeze lands on the tracked progress comment")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the progress comment to be edited to its final rendering")
+		require.FailNow(t, "expected the progress comment to be edited to its final rendering")
 	}
 
 	// The cancel's operator-visible effect is a fresh summary comment at the
@@ -3041,7 +3041,7 @@ func TestE2ECancelSurfacesThroughTerminalSummaryComment(t *testing.T) {
 		assert.Contains(t, created.Body, "🚫 Schema Change Cancelled")
 		assert.Contains(t, created.Body, apply.ApplyIdentifier)
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected a new summary comment to be posted for the cancel")
+		require.FailNow(t, "expected a new summary comment to be posted for the cancel")
 	}
 	assert.NotEqual(t, progressID, summaryID, "the summary is a new comment, not an edit of the progress comment")
 
@@ -3049,7 +3049,7 @@ func TestE2ECancelSurfacesThroughTerminalSummaryComment(t *testing.T) {
 	// post a duplicate.
 	select {
 	case duplicate := <-capture.creates:
-		t.Fatalf("a cancel must surface through exactly one new comment; got another: %q", duplicate.Body)
+		require.FailNow(t, fmt.Sprintf("a cancel must surface through exactly one new comment; got another: %q", duplicate.Body))
 	default:
 	}
 
@@ -3457,7 +3457,7 @@ func TestE2EReconcileMissingSummaryCommentsRespectsFreshClaim(t *testing.T) {
 
 	select {
 	case created := <-capture.creates:
-		t.Fatalf("reconciler must not post while a fresh claim is held, posted: %q", created.Body)
+		require.FailNow(t, fmt.Sprintf("reconciler must not post while a fresh claim is held, posted: %q", created.Body))
 	default:
 	}
 
@@ -3515,7 +3515,7 @@ func TestE2EAggregateTerminalObserverClaimsSummaryExactlyOnce(t *testing.T) {
 
 	select {
 	case duplicate := <-capture.creates:
-		t.Fatalf("the second publisher must lose the claim and skip, posted duplicate: %q", duplicate.Body)
+		require.FailNow(t, fmt.Sprintf("the second publisher must lose the claim and skip, posted duplicate: %q", duplicate.Body))
 	default:
 	}
 
@@ -3597,7 +3597,7 @@ func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 		assert.Equal(t, "Resumed progress", created.Body)
 		newProgressID = created.ID
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for resumed progress comment")
+		require.FailNow(t, "timed out waiting for resumed progress comment")
 	}
 
 	// Verify the old comment ID was replaced
@@ -3616,7 +3616,7 @@ func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 		assert.Equal(t, "Resumed summary", created.Body)
 		newSummaryID = created.ID
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for resumed summary comment")
+		require.FailNow(t, "timed out waiting for resumed summary comment")
 	}
 
 	comment, err = st.ApplyComments().Get(ctx, applyID, state.Comment.Summary)
@@ -3751,9 +3751,9 @@ func TestE2ECommentObserverSkipsTerminalSideEffectsAfterLeaseLoss(t *testing.T) 
 
 	select {
 	case edited := <-capture.edits:
-		t.Fatalf("expected no edit call after lease loss, got comment %d: %s", edited.CommentID, edited.Body)
+		require.FailNow(t, fmt.Sprintf("expected no edit call after lease loss, got comment %d: %s", edited.CommentID, edited.Body))
 	case created := <-capture.creates:
-		t.Fatalf("expected no create call after lease loss, got comment %d: %s", created.ID, created.Body)
+		require.FailNow(t, fmt.Sprintf("expected no create call after lease loss, got comment %d: %s", created.ID, created.Body))
 	case <-time.After(500 * time.Millisecond):
 		// expected: no GitHub side effects
 	}
@@ -3804,7 +3804,7 @@ func TestE2EEditTrackedCommentNotFound(t *testing.T) {
 	// No GitHub API call should be made
 	select {
 	case <-capture.edits:
-		t.Fatal("expected no edit call for non-existent tracked comment")
+		require.FailNow(t, "expected no edit call for non-existent tracked comment")
 	case <-time.After(500 * time.Millisecond):
 		// expected: no edit
 	}
@@ -3870,7 +3870,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		case created = <-capture.creates:
 			assert.Contains(t, created.Body, "**Status**: Queued")
 		case <-time.After(webhookIntegrationCheckRunDeadline):
-			t.Fatal("timed out waiting for the initial progress comment")
+			require.FailNow(t, "timed out waiting for the initial progress comment")
 		}
 
 		select {
@@ -3879,7 +3879,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 			assert.Contains(t, edited.Body, "**Status**: Applied")
 			assert.NotContains(t, edited.Body, "**Status**: Queued")
 		case <-time.After(webhookIntegrationCheckRunDeadline):
-			t.Fatal("timed out waiting for the terminal finalize edit")
+			require.FailNow(t, "timed out waiting for the terminal finalize edit")
 		}
 
 		comment, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
@@ -3906,12 +3906,12 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		select {
 		case <-capture.creates:
 		case <-time.After(webhookIntegrationCheckRunDeadline):
-			t.Fatal("timed out waiting for the initial progress comment")
+			require.FailNow(t, "timed out waiting for the initial progress comment")
 		}
 
 		select {
 		case edited := <-capture.edits:
-			t.Fatalf("an observer-edited comment must not be finalized by the handler, got edit: %q", edited.Body)
+			require.FailNow(t, fmt.Sprintf("an observer-edited comment must not be finalized by the handler, got edit: %q", edited.Body))
 		case <-time.After(500 * time.Millisecond):
 			// expected: the observer's terminal edit owns the final body
 		}
@@ -3927,12 +3927,12 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		select {
 		case <-capture.creates:
 		case <-time.After(webhookIntegrationCheckRunDeadline):
-			t.Fatal("timed out waiting for the initial progress comment")
+			require.FailNow(t, "timed out waiting for the initial progress comment")
 		}
 
 		select {
 		case edited := <-capture.edits:
-			t.Fatalf("active apply must not be finalized by the handler, got edit: %q", edited.Body)
+			require.FailNow(t, fmt.Sprintf("active apply must not be finalized by the handler, got edit: %q", edited.Body))
 		case <-time.After(500 * time.Millisecond):
 			// expected: the observer owns all further edits
 		}
