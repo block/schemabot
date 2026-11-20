@@ -694,12 +694,11 @@ var requestEffects = map[string]requestEffect{
 	"/api/locks/acquire": shownBy("locks"),
 
 	// Freeze routes carry an ID, so effectOf looks them up by these prefixes.
-	// Setting or lifting a freeze shows in the freeze list; an override
-	// approval shows in no single command, since the request ID is the only
-	// way to read it.
+	// Setting or lifting a freeze shows in the freeze list, and an override
+	// approval in the override request itself.
 	"/api/freezes":            shownBy("freeze list"),
 	"/api/freezes/":           shownBy("freeze list"),
-	"/api/freezes/overrides/": changesWithoutCommand,
+	"/api/freezes/overrides/": shownBy("freeze override <ovr-id>"),
 
 	// Changes that no single command shows.
 	"/api/checks/synthesize":    changesWithoutCommand,

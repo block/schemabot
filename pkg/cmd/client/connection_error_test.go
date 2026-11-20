@@ -297,7 +297,7 @@ func TestEveryNonGetRequestPathIsClassified(t *testing.T) {
 		"/api/locks/acquire":        {changes: true, check: "locks"},
 		"/api/freezes":              {changes: true, check: "freeze list"},
 		"/api/freezes/":             {changes: true, check: "freeze list"},
-		"/api/freezes/overrides/":   {changes: true},
+		"/api/freezes/overrides/":   {changes: true, check: "freeze override <ovr-id>"},
 		"/api/checks/synthesize":    {changes: true},
 		"/api/storage/schema/apply": {changes: true},
 	}
@@ -665,10 +665,10 @@ func TestRefusedCauseWithoutAnErrnoKeepsTheShortMessage(t *testing.T) {
 
 // A freeze request carries an ID in its path, and is still classified by its
 // route: setting or lifting a freeze points at the freeze list, and an
-// override approval warns without naming a command.
+// override approval at the override request.
 func TestEffectOfClassifiesFreezeRoutesWithIDs(t *testing.T) {
 	assert.Equal(t, shownBy("freeze list"), effectOf(http.MethodPost, "/api/freezes"))
 	assert.Equal(t, shownBy("freeze list"), effectOf(http.MethodPost, "/api/freezes/freeze-abc/lift"))
-	assert.Equal(t, changesWithoutCommand, effectOf(http.MethodPost, "/schemabot/api/freezes/overrides/ovr-1/approve"))
+	assert.Equal(t, shownBy("freeze override <ovr-id>"), effectOf(http.MethodPost, "/schemabot/api/freezes/overrides/ovr-1/approve"))
 	assert.Equal(t, readsOnly, effectOf(http.MethodGet, "/api/freezes/freeze-abc"))
 }
