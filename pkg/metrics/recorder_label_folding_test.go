@@ -18,7 +18,8 @@ import (
 const notARealValue = "not-a-real-value"
 
 // Every recorder that allowlists a label must record an unrecognized value as
-// its fallback ("unknown", or "other" for webhook failure reasons), never as
+// its fallback ("unknown" for most labels, "other" for webhook failure reasons,
+// and "error" and "unavailable" for remote deployment health checks), never as
 // the raw value. Otherwise one unexpected caller value opens a new time series
 // per distinct input.
 func TestRecordersFoldUnrecognizedLabelValues(t *testing.T) {
@@ -126,6 +127,14 @@ func TestRecordersFoldUnrecognizedLabelValues(t *testing.T) {
 			},
 			metrics: []string{"schemabot.control.taskless_settle_deferrals_total"},
 			want:    map[string]string{"operation": "unknown"},
+		},
+		{
+			name: "remote deployment health check status and reason",
+			record: func(ctx context.Context) {
+				RecordRemoteDeploymentHealthCheck(ctx, "default", "staging", notARealValue, notARealValue)
+			},
+			metrics: []string{"schemabot.remote_deployment.health_checks_total"},
+			want:    map[string]string{"status": "error", "reason": "unavailable"},
 		},
 		{
 			name: "remote apply dedup outcome",
