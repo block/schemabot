@@ -309,6 +309,40 @@ func TestFreezeLiftConflicts(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, doFreezeRequest(t, mux, freezeAdmin, http.MethodGet, "/api/freezes/freeze-missing", "").Code)
 }
 
+// An incident commander lifts a freeze someone else set. Each audit line
+// names the person who acted as its caller, and the lift line keeps the
+// creator under created_by.
+func TestFreezeAuditLinesNameTheActorAsCaller(t *testing.T) {
+	service, mux := newFreezeTestService(t, freezeConfig())
+	var logs strings.Builder
+	service.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+
+	w := doFreezeRequest(t, mux, freezeAdmin, http.MethodPost, "/api/freezes", `{"environment":"staging","reason":"incident"}`)
+	require.Equal(t, http.StatusCreated, w.Code)
+	freeze := decodeFreeze(t, w)
+	w = doFreezeRequest(t, mux, freezeMember, http.MethodPost, "/api/freezes/"+freeze.ID+"/lift", `{"reason":"resolved"}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	lifted := decodeFreeze(t, w)
+
+	lines := map[string]map[string]any{}
+	for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
+		var record map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &record), line)
+		if msg, _ := record["msg"].(string); strings.HasPrefix(msg, "environment freeze ") {
+			lines[msg] = record
+		}
+	}
+	require.Contains(t, lines, "environment freeze set")
+	require.Contains(t, lines, "environment freeze lifted")
+	set, lift := lines["environment freeze set"], lines["environment freeze lifted"]
+	assert.Equal(t, freeze.CreatedBy, set["caller"])
+	assert.Equal(t, freeze.CreatedBy, set["created_by"])
+	assert.Equal(t, lifted.LiftedBy, lift["caller"], "the lift is attributed to the lifter")
+	assert.NotEqual(t, freeze.CreatedBy, lift["caller"])
+	assert.Equal(t, freeze.CreatedBy, lift["created_by"])
+	assert.NotContains(t, lift, "lifted_by", "caller already names the lifter")
+}
+
 // The list splits current freezes into in effect and scheduled, and the
 // recent list holds every freeze of the environment, newest first.
 func TestFreezeList(t *testing.T) {

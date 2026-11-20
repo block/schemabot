@@ -47,6 +47,29 @@ func (s *staticTaskStore) GetByDatabase(context.Context, string) ([]*storage.Tas
 // route without a fixture fails the sweep — a new endpoint cannot ship until
 // it proves it denies scoped operators by default.
 func TestMutatingRoutesDenyScopedOperatorByDefault(t *testing.T) {
+	operator := &auth.User{Subject: "bob", Groups: []string{"payments-team"}}
+	runMutatingRouteSweep(t, scopedWriteConfig(), operator, nil)
+}
+
+// A freeze group lets its members set and lift freezes, and nothing else. The
+// same sweep, driven as a caller in freeze.groups and no other group, requires
+// a 403 from every other write route, including routes added later, and no
+// 403 from the two freeze writes.
+func TestMutatingRoutesDenyFreezeOnlyCallerByDefault(t *testing.T) {
+	cfg := scopedWriteConfig()
+	cfg.Freeze = FreezeConfig{Groups: []string{"incident-commanders"}}
+	commander := &auth.User{Subject: "ida", Groups: []string{"incident-commanders"}}
+	runMutatingRouteSweep(t, cfg, commander, map[string]bool{
+		"POST /api/freezes":           true,
+		"POST /api/freezes/{id}/lift": true,
+	})
+}
+
+// runMutatingRouteSweep drives every write-tier route as caller and requires a
+// 403 from each route not in allowed, and anything but a 403 from each route
+// in it.
+func runMutatingRouteSweep(t *testing.T, cfg *ServerConfig, caller *auth.User, allowed map[string]bool) {
+	t.Helper()
 	// Every stored object resolves to the orders database, which the
 	// payments-team operator's grant does not cover. The rollback source
 	// chain (completed apply -> plan with captured original files -> latest
@@ -120,10 +143,9 @@ func TestMutatingRoutesDenyScopedOperatorByDefault(t *testing.T) {
 		"POST /api/storage/schema/apply": `{}`,
 	}
 
-	svc := New(st, scopedWriteConfig(), nil, slog.New(slog.DiscardHandler))
+	svc := New(st, cfg, nil, slog.New(slog.DiscardHandler))
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
-	operator := &auth.User{Subject: "bob", Groups: []string{"payments-team"}}
 
 	used := make(map[string]bool)
 	for _, route := range svc.apiRoutes() {
@@ -140,17 +162,25 @@ func TestMutatingRoutesDenyScopedOperatorByDefault(t *testing.T) {
 				route.pattern)
 			used[route.pattern] = true
 
-			ctx := auth.WithUser(t.Context(), operator)
+			ctx := auth.WithUser(t.Context(), caller)
 			req := httptest.NewRequestWithContext(ctx, method, path, strings.NewReader(body))
 			rec := httptest.NewRecorder()
 			mux.ServeHTTP(rec, req)
 
+			if allowed[route.pattern] {
+				assert.NotEqualf(t, http.StatusForbidden, rec.Code,
+					"%s must be admitted to this route; got 403 body %q", caller.Subject, rec.Body.String())
+				return
+			}
 			assert.Equalf(t, http.StatusForbidden, rec.Code,
-				"a scoped operator outside their grant must be denied with 403; got %d body %q", rec.Code, rec.Body.String())
+				"%s is outside their grant and must be denied with 403; got %d body %q", caller.Subject, rec.Code, rec.Body.String())
 		})
 	}
 
 	for pattern := range fixtures {
 		assert.Truef(t, used[pattern], "fixture %q matches no registered mutating route; remove it", pattern)
+	}
+	for pattern := range allowed {
+		assert.Truef(t, used[pattern], "allowed route %q matches no registered mutating route", pattern)
 	}
 }

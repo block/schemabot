@@ -56,7 +56,7 @@ func (s *Service) handleFreezeCreate(w http.ResponseWriter, r *http.Request) {
 		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "create freeze failed")
 		return
 	}
-	s.logger.Info("environment freeze set", freezeLogArgs(created)...)
+	s.logger.Info("environment freeze set", freezeLogArgs(created, created.CreatedBy)...)
 	s.writeJSON(w, http.StatusCreated, freezeResponse(created, now))
 }
 
@@ -211,8 +211,8 @@ func (s *Service) handleFreezeLift(w http.ResponseWriter, r *http.Request) {
 		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "lift freeze failed")
 		return
 	}
-	s.logger.Info("environment freeze lifted", append(freezeLogArgs(lifted),
-		"lifted_by", lifted.LiftedBy, "lift_reason", lifted.LiftReason)...)
+	s.logger.Info("environment freeze lifted", append(freezeLogArgs(lifted, lifted.LiftedBy),
+		"lift_reason", lifted.LiftReason)...)
 	// A lifted freeze is never in effect, so the response needs no clock read.
 	s.writeJSON(w, http.StatusOK, freezeResponse(lifted, time.Time{}))
 }
@@ -268,9 +268,10 @@ func canonicalFreezeScope(values []string) []string {
 	return scope
 }
 
-// freezeLogArgs are the audit fields of a freeze. The numeric row id stays
-// out of logs; the identifier is the handle.
-func freezeLogArgs(freeze *storage.EnvironmentFreeze) []any {
+// freezeLogArgs are the audit fields of a freeze, with caller the person who
+// acted: the creator on a create, the lifter on a lift. The numeric row id
+// stays out of logs; the identifier is the handle.
+func freezeLogArgs(freeze *storage.EnvironmentFreeze, caller string) []any {
 	args := []any{
 		"freeze_id", freeze.Identifier,
 		"environment", freeze.Environment,
@@ -280,7 +281,8 @@ func freezeLogArgs(freeze *storage.EnvironmentFreeze) []any {
 		"running", freeze.Running,
 		"starts_at", freeze.StartsAt,
 		"reason", freeze.Reason,
-		"caller", freeze.CreatedBy,
+		"created_by", freeze.CreatedBy,
+		"caller", caller,
 	}
 	if freeze.EndsAt != nil {
 		args = append(args, "ends_at", *freeze.EndsAt)
