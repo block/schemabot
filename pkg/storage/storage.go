@@ -121,6 +121,9 @@ type Storage interface {
 	// Settings returns the settings store.
 	Settings() SettingsStore
 
+	// Freezes returns the environment freeze store.
+	Freezes() FreezeStore
+
 	// WebhookEvents returns the durable webhook event inbox store.
 	WebhookEvents() WebhookEventStore
 
@@ -355,6 +358,34 @@ type CheckStore interface {
 	//     it to action_required when the schema change is gone from the PR,
 	//     or a fresh plan result replaces it when the change is still present.
 	DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int, merged bool) error
+}
+
+// FreezeStore records environment freezes. While a freeze is in effect,
+// SchemaBot refuses new changes in its scope unless they carry an override.
+// Freezes may overlap, and each is lifted by its own identifier. A row stays
+// after its freeze ends or is lifted, as the audit trail.
+//
+// Environments, deployments and databases are identity strings: the store
+// passes them through CanonicalKey.
+type FreezeStore interface {
+	// Create records a freeze and returns it as stored. It returns
+	// ErrFreezeExists when the identifier, or the source and external id, is
+	// already taken.
+	Create(ctx context.Context, freeze *EnvironmentFreeze) (*EnvironmentFreeze, error)
+
+	// Get returns the freeze with this identifier, or ErrFreezeNotFound.
+	Get(ctx context.Context, identifier string) (*EnvironmentFreeze, error)
+
+	// Lift ends a freeze early and returns it as lifted. The update is
+	// conditional, so two concurrent lifts end it once. It returns
+	// ErrFreezeNotFound when there is no such freeze, ErrFreezeAlreadyLifted
+	// when someone lifted it first, and ErrFreezeEnded when it reached its
+	// end time before at.
+	Lift(ctx context.Context, identifier, liftedBy, reason string, at time.Time) (*EnvironmentFreeze, error)
+
+	// ListInEffect returns the freezes in effect at at, oldest start first.
+	// An empty environment returns every environment's freezes.
+	ListInEffect(ctx context.Context, environment string, at time.Time) ([]*EnvironmentFreeze, error)
 }
 
 // SettingsStore manages admin-level SchemaBot settings (global config).
