@@ -260,7 +260,7 @@ func TestDurablePullRequestWebhookQueuesAndAcks(t *testing.T) {
 
 	select {
 	case <-clientFactory.forInstallationStarted:
-		t.Fatal("durable request path should not create a GitHub client")
+		require.FailNow(t, "durable request path should not create a GitHub client")
 	default:
 	}
 }
@@ -585,7 +585,7 @@ func TestDurableWebhookDriverCompletesUnsupportedEvent(t *testing.T) {
 		require.Equal(t, int64(1), outcome.id)
 		require.Equal(t, "token-1", outcome.leaseToken)
 	default:
-		t.Fatal("expected unsupported event to be marked completed")
+		require.FailNow(t, "expected unsupported event to be marked completed")
 	}
 	require.Empty(t, store.failed)
 }
@@ -605,7 +605,7 @@ func TestDurableWebhookDriverFailsMalformedPullRequestTerminally(t *testing.T) {
 	case failure := <-store.failedPermanent:
 		require.Contains(t, failure.errMsg, "decode durable pull_request delivery")
 	default:
-		t.Fatal("expected malformed event to be dead-lettered")
+		require.FailNow(t, "expected malformed event to be dead-lettered")
 	}
 	require.Empty(t, store.failed, "a malformed payload is deterministic and must not burn retry budget")
 	require.Empty(t, store.completed)
@@ -682,7 +682,7 @@ func TestDurableWebhookDriverFailsUnparseableTenantTerminally(t *testing.T) {
 	case failure := <-store.failedPermanent:
 		require.Contains(t, failure.errMsg, "unparseable tenant ID")
 	default:
-		t.Fatal("expected unparseable tenant to be dead-lettered")
+		require.FailNow(t, "expected unparseable tenant to be dead-lettered")
 	}
 	require.Empty(t, store.failed, "a corrupted persisted tenant is deterministic and must not burn retry budget")
 	require.Empty(t, store.completed)
@@ -761,7 +761,7 @@ func TestDurableWebhookDriverFailsPRFileCapTerminally(t *testing.T) {
 		require.Contains(t, failure.errMsg, "reached GitHub API limit")
 		require.Contains(t, failure.errMsg, "config discovery is incomplete")
 	default:
-		t.Fatal("expected an over-cap PR to be dead-lettered")
+		require.FailNow(t, "expected an over-cap PR to be dead-lettered")
 	}
 	require.Empty(t, store.failed, "GitHub's per-PR file cap is deterministic and must not burn retry budget")
 	require.Empty(t, store.completed, "a delivery SchemaBot could not plan must not be completed")
@@ -782,7 +782,7 @@ func TestDurableWebhookDriverRetriesBootstrapFailure(t *testing.T) {
 		require.True(t, failure.retryAfter.After(before), "retry must be scheduled in the future")
 		require.Contains(t, failure.errMsg, "installation token unavailable")
 	default:
-		t.Fatal("expected bootstrap failure to be marked failed")
+		require.FailNow(t, "expected bootstrap failure to be marked failed")
 	}
 	require.Empty(t, store.completed)
 }
@@ -799,12 +799,12 @@ func TestDurableWebhookDriverCompletesUnregisteredRepo(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected unregistered-repo event to be marked completed")
+		require.FailNow(t, "expected unregistered-repo event to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	select {
 	case <-factory.forInstallationStarted:
-		t.Fatal("unregistered repo must not create a GitHub client")
+		require.FailNow(t, "unregistered repo must not create a GitHub client")
 	default:
 	}
 	requireUnregisteredRepositoryCounted(t, reader, "pull_request", "opened")
@@ -1114,7 +1114,7 @@ func TestDurableWebhookHeartbeatLossCancelsRun(t *testing.T) {
 	select {
 	case <-runCtx.Done():
 	case <-time.After(durableWebhookTestDeadline):
-		t.Fatal("expected heartbeat lease loss to cancel the run context")
+		require.FailNow(t, "expected heartbeat lease loss to cancel the run context")
 	}
 	require.ErrorIs(t, stop(), storage.ErrWebhookEventLeaseLost)
 }
@@ -1151,7 +1151,7 @@ func TestDurableWebhookDriverStopsRetryingAtAttemptCap(t *testing.T) {
 		require.Nil(t, failure.retryAfter, "delivery at the attempt cap must fail terminally")
 		require.Contains(t, failure.errMsg, "installation token unavailable")
 	default:
-		t.Fatal("expected exhausted delivery to be marked failed")
+		require.FailNow(t, "expected exhausted delivery to be marked failed")
 	}
 	require.Empty(t, store.completed)
 }
@@ -1248,7 +1248,7 @@ func TestDurableWebhookDrainProcessesBacklogInOnePass(t *testing.T) {
 		select {
 		case <-store.completed:
 		default:
-			t.Fatalf("expected delivery %d of 3 to be drained in a single pass", i+1)
+			require.FailNow(t, fmt.Sprintf("expected delivery %d of 3 to be drained in a single pass", i+1))
 		}
 	}
 	require.Empty(t, store.failed)
@@ -1271,7 +1271,7 @@ func TestDurableWebhookDriverRecoversPanic(t *testing.T) {
 		require.Contains(t, failure.errMsg, "panic processing durable webhook delivery")
 		require.Contains(t, failure.errMsg, "poison payload")
 	default:
-		t.Fatal("expected recovered panic to be recorded as a delivery failure")
+		require.FailNow(t, "expected recovered panic to be recorded as a delivery failure")
 	}
 	require.Empty(t, store.completed)
 }
@@ -1296,7 +1296,7 @@ func TestDurableWebhookShutdownReleasesClaim(t *testing.T) {
 	case released := <-store.released:
 		require.Equal(t, "token-1", released.leaseToken)
 	default:
-		t.Fatal("expected shutdown-cancelled claim to be released")
+		require.FailNow(t, "expected shutdown-cancelled claim to be released")
 	}
 	require.Empty(t, store.failed, "shutdown cancellation must not consume the attempt budget")
 	require.Empty(t, store.completed)
@@ -1324,7 +1324,7 @@ func TestDurableWebhookShutdownReleasesClaimWhenCancelErrorIsStringified(t *test
 	case released := <-store.released:
 		require.Equal(t, "token-1", released.leaseToken)
 	default:
-		t.Fatal("expected shutdown-cancelled claim to be released even when the cancel error is stringified")
+		require.FailNow(t, "expected shutdown-cancelled claim to be released even when the cancel error is stringified")
 	}
 	require.Empty(t, store.failed, "shutdown cancellation must not consume the attempt budget")
 	require.Empty(t, store.completed)
@@ -1356,7 +1356,7 @@ func TestDurableWebhookHeartbeatTransientErrorKeepsRunAlive(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected delivery to complete despite transient heartbeat errors")
+		require.FailNow(t, "expected delivery to complete despite transient heartbeat errors")
 	}
 	require.Empty(t, store.failed)
 }
@@ -1377,7 +1377,7 @@ func TestDurableWebhookDispatchLifecycleDrainsQueuedEvent(t *testing.T) {
 	case outcome := <-store.completed:
 		require.Equal(t, "token-1", outcome.leaseToken)
 	case <-time.After(durableWebhookTestDeadline):
-		t.Fatal("expected driver pool to drain the queued event")
+		require.FailNow(t, "expected driver pool to drain the queued event")
 	}
 
 	h.StopDurableWebhookDispatch()

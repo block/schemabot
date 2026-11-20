@@ -56,7 +56,7 @@ func collectCounterPoints(t *testing.T, reader *sdkmetric.ManualReader, name str
 			return sum.DataPoints
 		}
 	}
-	t.Fatalf("metric %s was never recorded", name)
+	require.FailNow(t, fmt.Sprintf("metric %s was never recorded", name))
 	return nil
 }
 

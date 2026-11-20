@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -116,7 +117,7 @@ func TestWebhookMergeGroupPostsPassingChecks(t *testing.T) {
 		case c := <-created:
 			got[c.Name] = c
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for merge_group check run")
+			require.FailNow(t, "timed out waiting for merge_group check run")
 		}
 	}
 
@@ -143,7 +144,7 @@ func TestWebhookMergeGroupIgnoresNonChecksRequested(t *testing.T) {
 
 	select {
 	case c := <-created:
-		t.Fatalf("unexpected check run created for destroyed action: %q", c.Name)
+		require.FailNow(t, fmt.Sprintf("unexpected check run created for destroyed action: %q", c.Name))
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -162,7 +163,7 @@ func TestWebhookMergeGroupRejectsUnregisteredRepo(t *testing.T) {
 
 	select {
 	case c := <-created:
-		t.Fatalf("unexpected check run created for unregistered repo: %q", c.Name)
+		require.FailNow(t, fmt.Sprintf("unexpected check run created for unregistered repo: %q", c.Name))
 	case <-time.After(100 * time.Millisecond):
 	}
 	requireUnregisteredRepositoryCounted(t, reader, "merge_group", "checks_requested")
@@ -215,12 +216,12 @@ func TestWebhookMergeGroupUpdatesExistingCheck(t *testing.T) {
 	case id := <-updated:
 		assert.Equal(t, int64(7), id)
 	case <-time.After(2 * time.Second):
-		t.Fatal("expected the existing check run to be updated")
+		require.FailNow(t, "expected the existing check run to be updated")
 	}
 
 	select {
 	case name := <-created:
-		t.Fatalf("expected an update, not a new check run: %q", name)
+		require.FailNow(t, fmt.Sprintf("expected an update, not a new check run: %q", name))
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -241,12 +242,12 @@ func TestWebhookMergeGroupSingleAggregateWhenNoEnvScoping(t *testing.T) {
 		assert.Equal(t, "mergesha123", c.HeadSHA)
 		assert.Equal(t, "success", c.Conclusion)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for merge_group check run")
+		require.FailNow(t, "timed out waiting for merge_group check run")
 	}
 
 	select {
 	case c := <-created:
-		t.Fatalf("expected exactly one aggregate check, got extra: %q", c.Name)
+		require.FailNow(t, fmt.Sprintf("expected exactly one aggregate check, got extra: %q", c.Name))
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -271,7 +272,7 @@ func TestWebhookMergeGroupParticipantStaysSilent(t *testing.T) {
 
 	select {
 	case c := <-created:
-		t.Fatalf("participant posted a merge_group check run: %q", c.Name)
+		require.FailNow(t, fmt.Sprintf("participant posted a merge_group check run: %q", c.Name))
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -300,7 +301,7 @@ func TestWebhookMergeGroupLeaderStillPosts(t *testing.T) {
 		assert.Equal(t, "SchemaBot (production)", c.Name)
 		assert.Equal(t, "success", c.Conclusion)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the leader's merge_group check run")
+		require.FailNow(t, "timed out waiting for the leader's merge_group check run")
 	}
 }
 
@@ -324,7 +325,7 @@ func TestBackfillMergeQueueCheckPostsPassingChecks(t *testing.T) {
 		case c := <-created:
 			got[c.Name] = c
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for the backfilled merge queue check run")
+			require.FailNow(t, "timed out waiting for the backfilled merge queue check run")
 		}
 	}
 	for _, name := range []string{"SchemaBot (staging)", "SchemaBot (production)"} {
@@ -362,7 +363,7 @@ func TestBackfillMergeQueueCheckSkipsWhereTheWebhookWould(t *testing.T) {
 
 			select {
 			case c := <-created:
-				t.Fatalf("backfill posted a merge queue check run it should have skipped: %q", c.Name)
+				require.FailNow(t, fmt.Sprintf("backfill posted a merge queue check run it should have skipped: %q", c.Name))
 			case <-time.After(100 * time.Millisecond):
 			}
 		})
@@ -442,7 +443,7 @@ func assertCreatedCheckRuns(t *testing.T, created chan checkRunCapture, names ..
 		case c := <-created:
 			got[c.Name] = c
 		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for check runs %v; got %d", names, len(got))
+			require.FailNow(t, fmt.Sprintf("timed out waiting for check runs %v; got %d", names, len(got)))
 		}
 	}
 	for _, name := range names {
@@ -454,7 +455,7 @@ func assertCreatedCheckRuns(t *testing.T, created chan checkRunCapture, names ..
 	}
 	select {
 	case c := <-created:
-		t.Fatalf("backfill created an unexpected check run: %q", c.Name)
+		require.FailNow(t, fmt.Sprintf("backfill created an unexpected check run: %q", c.Name))
 	case <-time.After(100 * time.Millisecond):
 	}
 }

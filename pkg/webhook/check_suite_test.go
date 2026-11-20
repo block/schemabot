@@ -712,7 +712,7 @@ func TestDurableCheckSuiteDriverFailsMalformedTerminally(t *testing.T) {
 	case failure := <-store.failedPermanent:
 		require.Contains(t, failure.errMsg, "decode durable check_suite delivery")
 	default:
-		t.Fatal("expected malformed check_suite delivery to be dead-lettered")
+		require.FailNow(t, "expected malformed check_suite delivery to be dead-lettered")
 	}
 	require.Empty(t, store.failed, "a malformed payload is deterministic and must not burn retry budget")
 	require.Empty(t, store.completed)

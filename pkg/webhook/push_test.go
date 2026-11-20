@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -63,7 +64,7 @@ func TestWebhookPushPostsPassingChecksOnDefaultBranch(t *testing.T) {
 		case c := <-created:
 			got[c.Name] = c
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for default-branch check run")
+			require.FailNow(t, "timed out waiting for default-branch check run")
 		}
 	}
 
@@ -94,7 +95,7 @@ func TestWebhookPushIgnoresNonDefaultBranch(t *testing.T) {
 
 	select {
 	case c := <-created:
-		t.Fatalf("unexpected check run created for non-default branch push: %q", c.Name)
+		require.FailNow(t, fmt.Sprintf("unexpected check run created for non-default branch push: %q", c.Name))
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -114,7 +115,7 @@ func TestWebhookPushIgnoresBranchDeletion(t *testing.T) {
 
 	select {
 	case c := <-created:
-		t.Fatalf("unexpected check run created for branch deletion: %q", c.Name)
+		require.FailNow(t, fmt.Sprintf("unexpected check run created for branch deletion: %q", c.Name))
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -138,7 +139,7 @@ func TestWebhookPushParticipantStaysSilent(t *testing.T) {
 
 	select {
 	case c := <-created:
-		t.Fatalf("participant posted a default-branch check run: %q", c.Name)
+		require.FailNow(t, fmt.Sprintf("participant posted a default-branch check run: %q", c.Name))
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -168,7 +169,7 @@ func TestWebhookPushLeaderStillPosts(t *testing.T) {
 		assert.Equal(t, "pushsha123", c.HeadSHA)
 		assert.Equal(t, "success", c.Conclusion)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the leader's default-branch check run")
+		require.FailNow(t, "timed out waiting for the leader's default-branch check run")
 	}
 }
 
@@ -189,7 +190,7 @@ func TestWebhookPushRejectsUnregisteredRepo(t *testing.T) {
 
 	select {
 	case c := <-created:
-		t.Fatalf("unexpected check run created for unregistered repo: %q", c.Name)
+		require.FailNow(t, fmt.Sprintf("unexpected check run created for unregistered repo: %q", c.Name))
 	case <-time.After(100 * time.Millisecond):
 	}
 	requireUnregisteredRepositoryCounted(t, reader, "push", "")

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -265,7 +266,7 @@ func findLogRecord(t *testing.T, logs []byte, msg string) map[string]any {
 			return record
 		}
 	}
-	t.Fatalf("no log record with message %q in:\n%s", msg, logs)
+	require.FailNow(t, fmt.Sprintf("no log record with message %q in:\n%s", msg, logs))
 	return nil
 }
 

@@ -98,7 +98,7 @@ func TestDurableCheckRunCompletionQueuesAndAcks(t *testing.T) {
 
 	select {
 	case <-clientFactory.forInstallationStarted:
-		t.Fatal("durable request path should not create a GitHub client")
+		require.FailNow(t, "durable request path should not create a GitHub client")
 	default:
 	}
 }
@@ -178,7 +178,7 @@ func TestDurableCheckRunRerequestQueuesAndAcks(t *testing.T) {
 
 	select {
 	case <-clientFactory.forInstallationStarted:
-		t.Fatal("durable request path should not create a GitHub client")
+		require.FailNow(t, "durable request path should not create a GitHub client")
 	default:
 	}
 }
@@ -246,7 +246,7 @@ func TestDurableCheckRunDriverCompletesUnsupportedAction(t *testing.T) {
 		require.Equal(t, int64(1), outcome.id)
 		require.Equal(t, "token-1", outcome.leaseToken)
 	default:
-		t.Fatal("expected unsupported check_run action to be marked completed")
+		require.FailNow(t, "expected unsupported check_run action to be marked completed")
 	}
 	require.Empty(t, store.failed)
 }
@@ -268,7 +268,7 @@ func TestDurableCheckRunDriverFailsMalformedTerminally(t *testing.T) {
 	case failure := <-store.failedPermanent:
 		require.Contains(t, failure.errMsg, "decode durable check_run delivery")
 	default:
-		t.Fatal("expected malformed check_run event to be dead-lettered")
+		require.FailNow(t, "expected malformed check_run event to be dead-lettered")
 	}
 	require.Empty(t, store.failed, "a malformed payload is deterministic and must not burn retry budget")
 	require.Empty(t, store.completed)
@@ -288,12 +288,12 @@ func TestDurableCheckRunDriverCompletesUnregisteredRepo(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected unregistered-repo check_run event to be marked completed")
+		require.FailNow(t, "expected unregistered-repo check_run event to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	select {
 	case <-factory.forInstallationStarted:
-		t.Fatal("unregistered repo must not create a GitHub client")
+		require.FailNow(t, "unregistered repo must not create a GitHub client")
 	default:
 	}
 	requireUnregisteredRepositoryCounted(t, reader, "check_run", "rerequested")
@@ -319,12 +319,12 @@ func TestDurableCheckRunDriverCompletesNonSchemaBotCheck(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected non-SchemaBot check_run rerequest to be marked completed")
+		require.FailNow(t, "expected non-SchemaBot check_run rerequest to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	select {
 	case <-factory.forInstallationStarted:
-		t.Fatal("non-SchemaBot check must not create a GitHub client")
+		require.FailNow(t, "non-SchemaBot check must not create a GitHub client")
 	default:
 	}
 }
@@ -362,7 +362,7 @@ func TestDurableCheckRunDriverCompletesStaleHead(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected a stale-head rerequest to be marked completed")
+		require.FailNow(t, "expected a stale-head rerequest to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	require.Equal(t, int64(0), fileListCalls.Load(), "a stale rerequest must stop before config discovery")
@@ -387,7 +387,7 @@ func TestDurableCheckRunDriverRetriesHeadVerificationFailure(t *testing.T) {
 		require.NotNil(t, failure.retryAfter, "head-verification failure must stay retryable")
 		require.Contains(t, failure.errMsg, "verify current head for durable check_run rerequest")
 	default:
-		t.Fatal("expected head-verification failure to be marked failed")
+		require.FailNow(t, "expected head-verification failure to be marked failed")
 	}
 	require.Empty(t, store.completed)
 }
@@ -414,7 +414,7 @@ func TestDurableCheckRunDriverReplansCurrentHead(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected a current-head rerequest to be marked completed")
+		require.FailNow(t, "expected a current-head rerequest to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	require.Equal(t, int64(1), fileListCalls.Load(), "a current rerequest must run config discovery")
@@ -440,7 +440,7 @@ func TestDurableCheckRunDriverFailsPRFileCapTerminally(t *testing.T) {
 		require.Contains(t, failure.errMsg, "auto-plan for durable check_run rerequest")
 		require.Contains(t, failure.errMsg, "reached GitHub API limit")
 	default:
-		t.Fatal("expected an over-cap rerequest to be dead-lettered")
+		require.FailNow(t, "expected an over-cap rerequest to be dead-lettered")
 	}
 	require.Empty(t, store.failed, "GitHub's per-PR file cap is deterministic and must not burn retry budget")
 	require.Empty(t, store.completed, "a rerequest SchemaBot could not plan must not be completed")
@@ -461,7 +461,7 @@ func TestDurableCheckRunDriverRetriesBootstrapFailure(t *testing.T) {
 		require.NotNil(t, failure.retryAfter, "bootstrap failure must stay retryable")
 		require.Contains(t, failure.errMsg, "installation token unavailable")
 	default:
-		t.Fatal("expected bootstrap failure to be marked failed")
+		require.FailNow(t, "expected bootstrap failure to be marked failed")
 	}
 	require.Empty(t, store.completed)
 }
@@ -479,12 +479,12 @@ func TestDurableCheckRunDriverCompletionSkipsNonLeader(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected a non-leader check_run completion to be marked completed")
+		require.FailNow(t, "expected a non-leader check_run completion to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	select {
 	case <-factory.forInstallationStarted:
-		t.Fatal("a non-leader completion must not create a GitHub client")
+		require.FailNow(t, "a non-leader completion must not create a GitHub client")
 	default:
 	}
 }
@@ -508,7 +508,7 @@ func TestDurableCheckRunDriverCompletionRetriesFoldFailure(t *testing.T) {
 		require.NotNil(t, failure.retryAfter, "a fold failure must stay retryable")
 		require.Contains(t, failure.errMsg, "re-fold aggregate for durable check_run completion")
 	default:
-		t.Fatal("expected a fold failure to be marked failed")
+		require.FailNow(t, "expected a fold failure to be marked failed")
 	}
 	require.Empty(t, store.completed)
 }
@@ -542,13 +542,13 @@ func TestDurableCheckRunDriverCompletionFailsUnresolvableTenantTerminally(t *tes
 			case failure := <-store.failedPermanent:
 				require.Contains(t, failure.errMsg, tt.wantErr)
 			default:
-				t.Fatal("expected an unresolvable tenant to be dead-lettered")
+				require.FailNow(t, "expected an unresolvable tenant to be dead-lettered")
 			}
 			require.Empty(t, store.failed, "an unresolvable persisted tenant is deterministic and must not burn retry budget")
 			require.Empty(t, store.completed)
 			select {
 			case <-factory.forInstallationStarted:
-				t.Fatal("an unresolvable tenant must not create a GitHub client")
+				require.FailNow(t, "an unresolvable tenant must not create a GitHub client")
 			default:
 			}
 		})
@@ -579,7 +579,7 @@ func TestDurableCheckRunDriverCompletionCompletesStaleHeadAndArmsRefold(t *testi
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected a stale-head completion re-fold to be marked completed")
+		require.FailNow(t, "expected a stale-head completion re-fold to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	require.Equal(t, int64(0), fileListCalls.Load(), "a stale-head fold must stop before participant discovery")
@@ -610,7 +610,7 @@ func TestDurableCheckRunDriverCompletionRefoldsCurrentHead(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected a current-head completion re-fold to be marked completed")
+		require.FailNow(t, "expected a current-head completion re-fold to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	require.Equal(t, int64(1), fileListCalls.Load(), "the leader re-fold must run participant discovery")

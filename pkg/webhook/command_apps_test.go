@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -278,7 +279,7 @@ func TestDurableCommandAppCommentRetriedUntilOwnAppKnown(t *testing.T) {
 		assert.True(t, failure.retryAfter.After(before), "retry must be scheduled in the future")
 		assert.Contains(t, failure.errMsg, errCommandAppIdentityUnknown.Error())
 	default:
-		t.Fatal("expected the delivery to be marked failed for retry")
+		require.FailNow(t, "expected the delivery to be marked failed for retry")
 	}
 	require.Empty(t, store.completed, "the delivery must not complete as an ignored bot comment")
 
@@ -287,9 +288,9 @@ func TestDurableCommandAppCommentRetriedUntilOwnAppKnown(t *testing.T) {
 	select {
 	case <-store.completed:
 	case failure := <-store.failed:
-		t.Fatalf("the retried delivery must run once the own App slug is known, got failure %q", failure.errMsg)
+		require.FailNow(t, fmt.Sprintf("the retried delivery must run once the own App slug is known, got failure %q", failure.errMsg))
 	default:
-		t.Fatal("expected the retried delivery to complete")
+		require.FailNow(t, "expected the retried delivery to complete")
 	}
 	assert.Contains(t, requireComment(t, comments, "unlock reply to the command App"), "No Locks Found")
 }
@@ -415,7 +416,7 @@ func TestPlanForResolvedDatabaseGatesCommandAppWithAuthorizationDisabled(t *test
 			if !tt.wantBlocked {
 				select {
 				case body := <-comments:
-					t.Fatalf("no comment should be posted for a listed command App, got %q", body)
+					require.FailNow(t, fmt.Sprintf("no comment should be posted for a listed command App, got %q", body))
 				default:
 				}
 				return

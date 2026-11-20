@@ -612,7 +612,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 			assert.Contains(t, body, "Commit statuses")
 			assert.NotContains(t, body, "Resource not accessible", "should not expose raw GitHub API error")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for permission error comment")
+			require.FailNow(t, "timed out waiting for permission error comment")
 		}
 	})
 
@@ -654,7 +654,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 			assert.Contains(t, body, "Apply Blocked")
 			assert.Contains(t, body, "Unable to verify")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for API failure comment")
+			require.FailNow(t, "timed out waiting for API failure comment")
 		}
 	})
 
@@ -732,7 +732,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 			assert.Contains(t, body, "CI / tests")
 			assert.Contains(t, body, "failure")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for failing-checks comment")
+			require.FailNow(t, "timed out waiting for failing-checks comment")
 		}
 	})
 
@@ -778,7 +778,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 			assert.Contains(t, body, "CI / tests")
 			assert.Contains(t, body, "cancelled")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for cancelled-checks comment")
+			require.FailNow(t, "timed out waiting for cancelled-checks comment")
 		}
 	})
 
@@ -876,7 +876,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 			assert.Contains(t, body, "CI / tests")
 			assert.Contains(t, body, "failure")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for failing-checks comment")
+			require.FailNow(t, "timed out waiting for failing-checks comment")
 		}
 	})
 
@@ -926,7 +926,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 				"a never-reported check must not get the wait-and-retry remediation")
 			assert.NotContains(t, body, "Required Review", "the passing required check should not be listed as blocking")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for missing-required-check comment")
+			require.FailNow(t, "timed out waiting for missing-required-check comment")
 		}
 	})
 
@@ -976,7 +976,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 			assert.NotContains(t, body, "Cannot apply while PR checks are still running",
 				"never-reported required checks must not get the wait-and-retry remediation")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for missing-required-checks comment")
+			require.FailNow(t, "timed out waiting for missing-required-checks comment")
 		}
 	})
 
@@ -1066,7 +1066,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 			assert.Contains(t, body, "| `Security scan` | not reported |")
 			assert.Contains(t, body, "Verify the name in `required_checks` matches the check exactly and that it runs on this PR")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for combined in-progress and not-reported comment")
+			require.FailNow(t, "timed out waiting for combined in-progress and not-reported comment")
 		}
 	})
 
@@ -1159,7 +1159,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 		case body := <-comments:
 			assert.Contains(t, body, "still running")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for in-progress-checks comment")
+			require.FailNow(t, "timed out waiting for in-progress-checks comment")
 		}
 	})
 
@@ -1315,7 +1315,7 @@ func TestEnforceOpenPR(t *testing.T) {
 			assert.Contains(t, body, "Retry")
 			assert.NotContains(t, body, "Resource not accessible", "raw GitHub error text must never render in PR markdown")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for evaluation-failure comment")
+			require.FailNow(t, "timed out waiting for evaluation-failure comment")
 		}
 	})
 
@@ -1345,7 +1345,7 @@ func TestEnforceOpenPR(t *testing.T) {
 		case body := <-comments:
 			assert.Contains(t, body, "Apply Blocked: PR Is Closed")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for closed-PR block comment")
+			require.FailNow(t, "timed out waiting for closed-PR block comment")
 		}
 	})
 
@@ -1361,7 +1361,7 @@ func TestEnforceOpenPR(t *testing.T) {
 		case body := <-comments:
 			assert.Contains(t, body, "Apply Blocked: PR Is Closed")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for closed-PR block comment")
+			require.FailNow(t, "timed out waiting for closed-PR block comment")
 		}
 	})
 
@@ -1377,7 +1377,7 @@ func TestEnforceOpenPR(t *testing.T) {
 		case body := <-comments:
 			assert.Contains(t, body, "Apply Blocked: PR Is Merged")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for merged-PR block comment")
+			require.FailNow(t, "timed out waiting for merged-PR block comment")
 		}
 	})
 

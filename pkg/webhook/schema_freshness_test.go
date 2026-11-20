@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -39,7 +40,7 @@ func TestAssertSchemaStillCurrent_MatchProceeds(t *testing.T) {
 
 	select {
 	case body := <-comments:
-		t.Fatalf("no comment should be posted on a match; got: %s", body)
+		require.FailNow(t, fmt.Sprintf("no comment should be posted on a match; got: %s", body))
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -77,7 +78,7 @@ func TestAssertSchemaStillCurrent_MismatchRejectsAndPostsComment(t *testing.T) {
 		assert.Contains(t, body, "schemabot apply-confirm -e staging", "retry hint must use the action and env")
 		assert.Contains(t, body, "alice", "must attribute the requester")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for rejection comment")
+		require.FailNow(t, "timed out waiting for rejection comment")
 	}
 }
 
