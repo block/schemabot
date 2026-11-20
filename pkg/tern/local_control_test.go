@@ -57,6 +57,54 @@ func (s *controlTestTaskStore) GetByDatabase(_ context.Context, _ string) ([]*st
 	return s.tasks, nil
 }
 
+func (s *controlTestTaskStore) GetNonTerminalByDatabase(_ context.Context, _ string) ([]*storage.Task, error) {
+	return nonTerminalTasks(s.tasks), nil
+}
+
+// nonTerminalTasks mirrors TaskStore.GetNonTerminalByDatabase for a fake's
+// seeded tasks: it keeps their order and leaves out the terminal ones.
+func nonTerminalTasks(tasks []*storage.Task) []*storage.Task {
+	var kept []*storage.Task
+	for _, task := range tasks {
+		if !state.IsTerminalTaskState(task.State) {
+			kept = append(kept, task)
+		}
+	}
+	return kept
+}
+
+// rawNonTerminalStore answers only the non-terminal read, and returns its rows
+// unfiltered the way the SQL can: a row stored under an alias of a terminal
+// state is returned, and only the caller's own check skips it.
+type rawNonTerminalStore struct {
+	storage.TaskStore
+	rows []*storage.Task
+}
+
+func (s rawNonTerminalStore) GetNonTerminalByDatabase(context.Context, string) ([]*storage.Task, error) {
+	return s.rows, nil
+}
+
+// A stop or cancel that names no apply acts on the database's newest active
+// task. A row whose stored state only reads as terminal once normalized can
+// sit ahead of the running task in the non-terminal read, and it is skipped,
+// so the request lands on the task that is actually running.
+func TestActiveTaskSkipsARowThatReadsTerminal(t *testing.T) {
+	aliased := &storage.Task{ID: 2, TaskIdentifier: "task-aliased", State: "STATE_COMPLETED"}
+	running := &storage.Task{ID: 1, TaskIdentifier: "task-running", State: state.Task.Running}
+	client := &LocalClient{
+		config:  LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{tasks: rawNonTerminalStore{rows: []*storage.Task{aliased, running}}},
+		logger:  slog.Default(),
+	}
+
+	got, err := client.getActiveTaskForDatabase(t.Context(), "testdb")
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "task-running", got.TaskIdentifier)
+}
+
 func (s *controlTestTaskStore) Update(_ context.Context, task *storage.Task) error {
 	for i, storedTask := range s.tasks {
 		if storedTask.ID == task.ID || storedTask.TaskIdentifier == task.TaskIdentifier {
@@ -3399,6 +3447,10 @@ func (s *revertScopeTaskStore) GetByApplyID(_ context.Context, applyID int64) ([
 // GetByDatabase mirrors the SQL store: every environment's tasks, newest first.
 func (s *revertScopeTaskStore) GetByDatabase(_ context.Context, _ string) ([]*storage.Task, error) {
 	return s.tasks, nil
+}
+
+func (s *revertScopeTaskStore) GetNonTerminalByDatabase(_ context.Context, _ string) ([]*storage.Task, error) {
+	return nonTerminalTasks(s.tasks), nil
 }
 
 type revertScopeOperationStore struct {

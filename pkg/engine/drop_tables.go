@@ -60,6 +60,23 @@ func (d DroppedTables) Names(table string) bool { return d.entries[table] }
 // Entries returns the distinct entries in the order the config lists them.
 func (d DroppedTables) Entries() []string { return slices.Clone(d.order) }
 
+// Unmatched returns the entries that name no live table, in the order the
+// config lists them: a typo, a case mismatch, or a table already dropped. Such
+// an entry drops nothing, so callers report it rather than letting the config
+// imply a drop that is not happening.
+//
+// live is every table on the target, including the ones an engine leaves out
+// of plans by their names.
+func (d DroppedTables) Unmatched(live []string) []string {
+	var unmatched []string
+	for _, entry := range d.order {
+		if !slices.Contains(live, entry) {
+			unmatched = append(unmatched, entry)
+		}
+	}
+	return unmatched
+}
+
 // RefuseDropTables refuses a plan that carries drop_tables on an engine that
 // does not honor the list. Planning as if the list were empty would leave the
 // tables the repository asked to drop in place while the plan looked clean.

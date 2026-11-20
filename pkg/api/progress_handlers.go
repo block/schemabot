@@ -26,6 +26,10 @@ import (
 const (
 	defaultStatusLimit = 20
 	maxStatusLimit     = 1000
+	// defaultHistoryLimit is the cap itself, so a client that does not page
+	// the history still receives a database's whole history unless it runs
+	// past one full page; has_more then tells it there is more to read.
+	defaultHistoryLimit = maxStatusLimit
 )
 
 // progressEngineUnavailableMessage is what a progress request for an active
@@ -640,26 +644,56 @@ func overlayStoredDisplayMetadata(resp *apitypes.ProgressResponse, apply *storag
 }
 
 // handleDatabaseHistory handles GET /api/history/{database} requests.
-// Returns all applies for a database, sorted by created_at desc.
+// Returns one page of a database's applies, newest first, in the same order
+// and with the same starting_after paging as the status list.
 func (s *Service) handleDatabaseHistory(w http.ResponseWriter, r *http.Request) {
 	database := storage.CanonicalKey(r.PathValue("database"))
 	if database == "" {
 		s.writeError(w, http.StatusBadRequest, "database is required")
 		return
 	}
-
-	environment := storage.CanonicalKey(r.URL.Query().Get("environment"))
-
-	applies, err := s.storage.Applies().GetByDatabase(r.Context(), database, "", environment)
+	limit, err := parseApplyListLimit(r, defaultHistoryLimit)
 	if err != nil {
-		s.logger.Error("failed to get applies", "database", database, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "failed to get applies: "+err.Error())
+		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
+	filter := storage.RecentAppliesFilter{
+		Limit:       limit + 1,
+		Environment: storage.CanonicalKey(r.URL.Query().Get("environment")),
+		Database:    database,
+	}
+	startingAfter := r.URL.Query().Get("starting_after")
+	if startingAfter != "" {
+		anchorID, status, err := s.statusListAnchor(r.Context(), startingAfter, filter)
+		if err != nil {
+			s.writeError(w, status, err.Error())
+			return
+		}
+		filter.AfterID = anchorID
+	}
+	applies, err := s.storage.Applies().GetRecent(r.Context(), filter)
+	if err != nil {
+		s.logger.Error("get apply history failed",
+			"database", database,
+			"environment", filter.Environment,
+			"starting_after", startingAfter,
+			"error", err)
+		s.writeError(w, http.StatusInternalServerError, "failed to get apply history")
+		return
+	}
+	hasMore := len(applies) > limit
+	if hasMore {
+		applies = applies[:limit]
+	}
+
 	resp := &apitypes.DatabaseHistoryResponse{
-		Database: database,
-		Applies:  make([]*apitypes.ApplyHistoryResponse, 0, len(applies)),
+		Database:      database,
+		Limit:         limit,
+		MaxLimit:      maxStatusLimit,
+		HasMore:       hasMore,
+		StartingAfter: startingAfter,
+		Applies:       make([]*apitypes.ApplyHistoryResponse, 0, len(applies)),
 	}
 
 	for _, apply := range applies {
@@ -917,7 +951,7 @@ func sanitizedDatabaseDeployments(database, environment string, envConfig Enviro
 // handleStatus handles GET /api/status requests.
 // Returns recent schema changes.
 func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
-	limit, err := parseStatusLimit(r)
+	limit, err := parseApplyListLimit(r, defaultStatusLimit)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1043,8 +1077,8 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
-// statusListAnchor resolves the starting_after apply of a status page to its
-// row id. The apply must exist and match the request's environment, database,
+// statusListAnchor resolves the starting_after apply of a status or history
+// page to its row id. The apply must exist and match the request's environment, database,
 // and deployment, which never change for an apply, so a page continues the
 // list the anchor came from rather than one with different filters. The
 // state, failed, active, and last filters are not checked: the anchor's state
@@ -1219,10 +1253,13 @@ func activeApplyResponseFromStorage(apply *storage.Apply, op *storage.ApplyOpera
 	return active
 }
 
-func parseStatusLimit(r *http.Request) (int, error) {
+// parseApplyListLimit parses the optional limit of an apply list page: the
+// status list and the database history share the cap, and each passes its own
+// default for a request that names no limit.
+func parseApplyListLimit(r *http.Request, defaultLimit int) (int, error) {
 	raw := r.URL.Query().Get("limit")
 	if raw == "" {
-		return defaultStatusLimit, nil
+		return defaultLimit, nil
 	}
 	limit, err := strconv.Atoi(raw)
 	if err != nil || limit <= 0 {

@@ -117,6 +117,11 @@ type Engine struct {
 	// sends, given the probe's context, so tests can make the server slow to
 	// answer and prove every statement runs under the probe's budget.
 	sizeProbeSQL func(ctx context.Context, stmt string) string
+
+	// dropTablesQuietPeriod is how long a drop_tables entry must have gone
+	// without a write before a plan proposes dropping it. New sets it to
+	// defaultDropTablesQuietPeriod; it is a field so tests can shorten it.
+	dropTablesQuietPeriod time.Duration
 }
 
 // runningSchemaChange tracks the state of an in-progress schema change.
@@ -254,6 +259,8 @@ func New(cfg Config) *Engine {
 		lockWaitTimeout:     lockWaitTimeout,
 		disablePendingDrops: cfg.DisablePendingDrops,
 		checkpointMaxAge:    checkpointMaxAge,
+
+		dropTablesQuietPeriod: defaultDropTablesQuietPeriod,
 	}
 	eng.debugLogs.Store(cfg.DebugLogs)
 
@@ -787,6 +794,20 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			ExistingCopiesChecked: true,
 			ExemptTables:          exemptTables,
 		}, nil
+	}
+
+	// A drop_tables entry is dropped only once the target shows it has gone
+	// the quiet period without a write. The check comes after the config's own
+	// contradictions are refused above, so an entry that should not be listed
+	// at all is reported as that, whatever the target says about its writes.
+	if !drops.Empty() {
+		db, err := target.get(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("plan database %s: check when drop_tables entries were last written: %w", database, err)
+		}
+		if err := e.requireQuietDropTables(ctx, db, database, drops); err != nil {
+			return nil, fmt.Errorf("plan database %s: %w", database, err)
+		}
 	}
 
 	// The engine's refusal checks compare a redeclared column against its
@@ -1437,8 +1458,15 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		tables = append(tables, ts)
 	}
 	if !drops.Empty() {
-		if err := refuseRecentlyWrittenDrops(ctx, db, database, drops); err != nil {
-			return nil, err
+		// Every listed table that exists is in tables by now: the loader
+		// returned it, or it was read back in above.
+		liveNames := make([]string, 0, len(tables))
+		for _, ts := range tables {
+			liveNames = append(liveNames, ts.Name)
+		}
+		if unmatched := drops.Unmatched(liveNames); len(unmatched) > 0 {
+			e.logger.Info("drop_tables entries name no table on the target, so the plan drops nothing for them",
+				"database", database, "entries", unmatched)
 		}
 	}
 

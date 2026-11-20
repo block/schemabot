@@ -194,6 +194,11 @@ type Handler struct {
 	checkSuiteRecovery      bool
 	checkSuiteRecoveryGrace time.Duration
 
+	// synchronizeQuietPeriod defers each durable synchronize delivery by this
+	// long after receipt, so a later push in the same burst supersedes it
+	// before it plans. Zero dispatches synchronize deliveries immediately.
+	synchronizeQuietPeriod time.Duration
+
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
 	priorEnvCheckRetryInterval time.Duration
@@ -278,6 +283,28 @@ func WithWebhookReconcileScanBounds(maxPages int, lookback time.Duration) Handle
 func WithCheckSuiteRecovery() HandlerOption {
 	return func(h *Handler) {
 		h.checkSuiteRecovery = true
+	}
+}
+
+// DefaultSynchronizeQuietPeriod is the quiet period the server gives a
+// durable synchronize delivery when the operator does not set one. It is long
+// enough to cover the pushes of one stacked-branch rebase or a quick series of
+// fix-up commits, and short enough that a lone push is planned promptly.
+const DefaultSynchronizeQuietPeriod = 15 * time.Second
+
+// WithSynchronizeQuietPeriod defers every durable pull_request synchronize
+// delivery until the quiet period after its receipt has passed. A push that
+// follows within the window is in the inbox by the time the earlier delivery
+// is claimed, so the earlier delivery is superseded at claim time, once the
+// live PR confirms its head is no longer current, and only the newest head of
+// a burst is planned. Opened and reopened deliveries are never deferred. A
+// non-positive period is a no-op, leaving synchronize deliveries immediately
+// claimable. It takes effect only alongside WithDurableWebhookDispatch.
+func WithSynchronizeQuietPeriod(period time.Duration) HandlerOption {
+	return func(h *Handler) {
+		if period > 0 {
+			h.synchronizeQuietPeriod = period
+		}
 	}
 }
 

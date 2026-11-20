@@ -178,6 +178,62 @@ func TestStatusCmdAllRefusesAServerThatIgnoresPaging(t *testing.T) {
 	require.EqualError(t, runErr, "the server did not continue after apply apply-2; it predates paging, so --all cannot list every apply")
 }
 
+// historyPage is a database history response listing the given completed
+// applies of orders in staging.
+func historyPage(hasMore bool, identifiers ...string) apitypes.DatabaseHistoryResponse {
+	page := apitypes.DatabaseHistoryResponse{Database: "orders", Limit: len(identifiers), MaxLimit: 1000, HasMore: hasMore}
+	for _, identifier := range identifiers {
+		page.Applies = append(page.Applies, &apitypes.ApplyHistoryResponse{
+			ApplyID: identifier, Environment: "staging", State: state.Apply.Completed, Engine: "spirit", Caller: "cli",
+		})
+	}
+	return page
+}
+
+// status -d lists a database's whole history: it requests each page after the
+// last apply of the one before, repeating the environment, until the server
+// reports no more, and prints one response holding every page.
+func TestStatusCmdDatabaseHistoryFollowsEveryPage(t *testing.T) {
+	ps, server := newPagedServer(t, "/api/history/orders", map[string]any{
+		"":        historyPage(true, "apply-5", "apply-4"),
+		"apply-4": historyPage(true, "apply-3", "apply-2"),
+		"apply-2": historyPage(false, "apply-1"),
+	})
+
+	cmd := &StatusCmd{Database: "orders", Environment: "staging", JSON: true}
+	var runErr error
+	output := captureOutput(t, func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) })
+	require.NoError(t, runErr)
+
+	var merged apitypes.DatabaseHistoryResponse
+	require.NoError(t, json.Unmarshal([]byte(output), &merged))
+	identifiers := make([]string, 0, len(merged.Applies))
+	for _, apply := range merged.Applies {
+		identifiers = append(identifiers, apply.ApplyID)
+	}
+	assert.Equal(t, []string{"apply-5", "apply-4", "apply-3", "apply-2", "apply-1"}, identifiers)
+	assert.False(t, merged.HasMore)
+
+	require.Len(t, ps.queries, 3)
+	for i, query := range ps.queries {
+		assert.Equal(t, "staging", query["environment"], "page %d repeats the environment", i)
+	}
+	assert.Empty(t, ps.queries[0]["starting_after"])
+	assert.Equal(t, "apply-4", ps.queries[1]["starting_after"])
+	assert.Equal(t, "apply-2", ps.queries[2]["starting_after"])
+}
+
+// A server that ignores starting_after serves its first page again, so status
+// -d fails rather than repeating that page as the rest of the history.
+func TestStatusCmdDatabaseHistoryRefusesAServerThatIgnoresPaging(t *testing.T) {
+	ps, server := newPagedServer(t, "/api/history/orders", map[string]any{"": historyPage(true, "apply-2", "apply-1")})
+	ps.setLegacy()
+
+	var runErr error
+	captureOutput(t, func() { runErr = (&StatusCmd{Database: "orders", JSON: true}).Run(&Globals{Endpoint: server.URL}) })
+	require.EqualError(t, runErr, "the server did not continue after apply apply-1; it predates paging, so -d cannot list every apply")
+}
+
 // A server that predates paging ignores starting_after and serves its first
 // page, which need not list the apply the operator asked to start after once
 // newer applies push it down. It never echoes starting_after, so the command

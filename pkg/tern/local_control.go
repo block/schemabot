@@ -3097,11 +3097,13 @@ func (c *LocalClient) logDeclinedControlOperation(task *storage.Task, operation 
 		append(task.LogAttrs(), "operation", operation, "error", err)...)
 }
 
-// getActiveTaskForDatabase finds the first non-terminal task for a database.
+// getActiveTaskForDatabase finds the newest non-terminal task for a database.
+// The storage read already leaves out terminal tasks; the check here also
+// skips a row whose stored state only reads as terminal once normalized.
 func (c *LocalClient) getActiveTaskForDatabase(ctx context.Context, database string) (*storage.Task, error) {
-	tasks, err := c.storage.Tasks().GetByDatabase(ctx, database)
+	tasks, err := c.storage.Tasks().GetNonTerminalByDatabase(ctx, database)
 	if err != nil {
-		return nil, fmt.Errorf("get tasks failed: %w", err)
+		return nil, fmt.Errorf("get non-terminal tasks for database %s: %w", database, err)
 	}
 
 	for _, t := range tasks {
