@@ -965,7 +965,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "plan failed")
-		s.logger.Error("ExecutePlan: client.Plan failed",
+		planFailureAttrs := []any{
 			"database", req.Database,
 			"type", resolvedTarget.DatabaseType,
 			"deployment", deployment,
@@ -976,7 +976,12 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			"endpoint", client.Endpoint(),
 			"is_remote", client.IsRemote(),
 			"error", err,
-		)
+		}
+		if isPlanRefusal(err) {
+			s.logger.Warn("ExecutePlan: engine refused the plan; the PR's schema files must change before it can plan", planFailureAttrs...)
+		} else {
+			s.logger.Error("ExecutePlan: client.Plan failed", planFailureAttrs...)
+		}
 		if client.IsRemote() && grpcstatus.Code(err) == grpccodes.Unavailable {
 			return nil, nil, &RemoteDeploymentUnavailableError{
 				Deployment: deployment,
@@ -3740,4 +3745,15 @@ func validateSchemaFiles(schemaFiles map[string]*ternv1.SchemaFiles) (warning st
 		}
 	}
 	return warning, nil
+}
+
+// isPlanRefusal reports whether a Plan failure is the engine declining the
+// declared schema as written, from a local engine or from a remote data plane
+// that answered FailedPrecondition. The PR author fixes it by changing the
+// schema files, so it is not a SchemaBot fault and is not logged as an error.
+func isPlanRefusal(err error) bool {
+	if engine.IsPlanRefused(err) {
+		return true
+	}
+	return grpcstatus.Code(err) == grpccodes.FailedPrecondition
 }
