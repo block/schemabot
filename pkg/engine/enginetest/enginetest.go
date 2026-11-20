@@ -8,19 +8,23 @@
 // outcome instead of retrying a rejection that can never succeed), a control
 // operation addressing a change the backend has no record of must be permanent
 // (retrying can never make the change appear), progress must report terminal
-// outcomes truthfully in engine-agnostic states, and a backend that is merely
-// not ready yet must be distinguishable from a failure.
+// outcomes truthfully in engine-agnostic states, a backend that is merely
+// not ready yet must be distinguishable from a failure, and an engine that
+// declines a start, cutover, revert, or skip-revert for its whole database type
+// must say so with a typed UnsupportedOperationError.
 //
 // An engine that genuinely cannot exhibit one of the cases documents that with
 // an explicit skip reason in Harness.Skips — the suite fails on a missing
 // fixture without one, so a new engine cannot silently opt out of the
-// contract.
+// contract. An engine that supports an operation skips that operation's
+// unsupported case, saying what the operation does on that engine.
 //
 // The postgres engine runs the cancel and progress cases: a concurrent index
 // build is the one PostgreSQL change an operator can cancel, and the engine
 // answers a cancel from the outcome the tracked apply settled on. It skips the
 // stop cases with a documented reason — it declines stop for every change with
-// a typed UnsupportedOperationError, which its own unit tests pin.
+// a typed UnsupportedOperationError, which its own unit tests pin. It declines
+// start, cutover, revert, and skip-revert, and runs all four unsupported cases.
 package enginetest
 
 import (
@@ -65,6 +69,18 @@ const (
 	// an operation surfaces a typed NotReadyError, distinguishable from a
 	// permanent failure and from an already-completed rejection.
 	CaseNotReadyDistinguishable Case = "not-ready-distinguishable"
+	// CaseStartUnsupported: an engine that has no stopped phase to resume
+	// declines a start with a typed UnsupportedOperationError.
+	CaseStartUnsupported Case = "start-unsupported"
+	// CaseCutoverUnsupported: an engine that has no cutover phase declines a
+	// cutover with a typed UnsupportedOperationError.
+	CaseCutoverUnsupported Case = "cutover-unsupported"
+	// CaseRevertUnsupported: an engine that has no revert window declines a
+	// revert with a typed UnsupportedOperationError.
+	CaseRevertUnsupported Case = "revert-unsupported"
+	// CaseSkipRevertUnsupported: an engine that has no revert window declines
+	// a skip-revert with a typed UnsupportedOperationError.
+	CaseSkipRevertUnsupported Case = "skip-revert-unsupported"
 )
 
 // ControlFixture is an engine primed so that the returned control request
@@ -103,6 +119,10 @@ type Harness struct {
 	StopNonexistent        func(t *testing.T) ControlFixture
 	TerminalProgress       func(t *testing.T) []ProgressFixture
 	NotReady               func(t *testing.T) NotReadyFixture
+	StartUnsupported       func(t *testing.T) ControlFixture
+	CutoverUnsupported     func(t *testing.T) ControlFixture
+	RevertUnsupported      func(t *testing.T) ControlFixture
+	SkipRevertUnsupported  func(t *testing.T) ControlFixture
 
 	// Skips documents the cases this engine genuinely cannot exhibit, keyed by
 	// case with a human-readable reason. A skipped case must not also provide
@@ -137,6 +157,10 @@ var contractCases = []contractCase{
 	// The not-ready fixture invokes an operation of the engine's choosing,
 	// so the case pins the rejection's error typing, not one method.
 	{name: CaseNotReadyDistinguishable, harnessField: "NotReady", fixtureType: reflect.TypeFor[func(*testing.T) NotReadyFixture](), run: runNotReadyDistinguishable},
+	{name: CaseStartUnsupported, harnessField: "StartUnsupported", fixtureType: reflect.TypeFor[func(*testing.T) ControlFixture](), engineMethods: []string{"Start"}, run: runStartUnsupported},
+	{name: CaseCutoverUnsupported, harnessField: "CutoverUnsupported", fixtureType: reflect.TypeFor[func(*testing.T) ControlFixture](), engineMethods: []string{"Cutover"}, run: runCutoverUnsupported},
+	{name: CaseRevertUnsupported, harnessField: "RevertUnsupported", fixtureType: reflect.TypeFor[func(*testing.T) ControlFixture](), engineMethods: []string{"Revert"}, run: runRevertUnsupported},
+	{name: CaseSkipRevertUnsupported, harnessField: "SkipRevertUnsupported", fixtureType: reflect.TypeFor[func(*testing.T) ControlFixture](), engineMethods: []string{"SkipRevert"}, run: runSkipRevertUnsupported},
 }
 
 // engineMethodExclusions documents the engine.Engine methods this suite
@@ -146,13 +170,9 @@ var contractCases = []contractCase{
 // own tests. A new engine.Engine method must either be pinned by a contract
 // case or carry a reason here — the completeness test fails it otherwise.
 var engineMethodExclusions = map[string]string{
-	"Name":       "identifier accessor with no backend behavior to pin",
-	"Plan":       "plan output is engine-specific; each engine's own tests pin it",
-	"Apply":      "apply orchestration is engine-specific; each engine's own tests pin it",
-	"Start":      "resume semantics are engine-specific; each engine's own tests pin them",
-	"Cutover":    "the suite exercises cutover only indirectly through engine-specific fixtures, so it cannot pin the method directly",
-	"Revert":     "revert semantics are engine-specific; each engine's own tests pin them",
-	"SkipRevert": "revert-window semantics are engine-specific; each engine's own tests pin them",
+	"Name":  "identifier accessor with no backend behavior to pin",
+	"Plan":  "plan output is engine-specific; each engine's own tests pin it",
+	"Apply": "apply orchestration is engine-specific; each engine's own tests pin it",
 }
 
 // Run executes the engine contract suite against the harness. Every
@@ -245,6 +265,42 @@ func runNotReadyDistinguishable(t *testing.T, h Harness, c contractCase) {
 		"a not-ready rejection must not read as already-completed, got: %v", err)
 }
 
+func runStartUnsupported(t *testing.T, h Harness, c contractCase) {
+	fixture, ok := controlFixture(t, h, c.name, fixtureField[func(*testing.T) ControlFixture](t, h, c))
+	if !ok {
+		return
+	}
+	_, err := fixture.Engine.Start(t.Context(), fixture.Req)
+	requireUnsupported(t, "start", err)
+}
+
+func runCutoverUnsupported(t *testing.T, h Harness, c contractCase) {
+	fixture, ok := controlFixture(t, h, c.name, fixtureField[func(*testing.T) ControlFixture](t, h, c))
+	if !ok {
+		return
+	}
+	_, err := fixture.Engine.Cutover(t.Context(), fixture.Req)
+	requireUnsupported(t, "cutover", err)
+}
+
+func runRevertUnsupported(t *testing.T, h Harness, c contractCase) {
+	fixture, ok := controlFixture(t, h, c.name, fixtureField[func(*testing.T) ControlFixture](t, h, c))
+	if !ok {
+		return
+	}
+	_, err := fixture.Engine.Revert(t.Context(), fixture.Req)
+	requireUnsupported(t, "revert", err)
+}
+
+func runSkipRevertUnsupported(t *testing.T, h Harness, c contractCase) {
+	fixture, ok := controlFixture(t, h, c.name, fixtureField[func(*testing.T) ControlFixture](t, h, c))
+	if !ok {
+		return
+	}
+	_, err := fixture.Engine.SkipRevert(t.Context(), fixture.Req)
+	requireUnsupported(t, "skip-revert", err)
+}
+
 func fixtureField[T any](t *testing.T, h Harness, c contractCase) T {
 	t.Helper()
 	field := reflect.ValueOf(h).FieldByName(c.harnessField)
@@ -300,6 +356,27 @@ func requirePermanent(t *testing.T, operation string, err error) {
 		"a %s of a change the backend has no record of must be permanent — retrying can never make the change appear, got: %v", operation, err)
 	assert.False(t, engine.IsAlreadyCompleted(err),
 		"a %s of a nonexistent change must not read as already-completed — nothing landed, got: %v", operation, err)
+}
+
+// requireUnsupported checks the decline of an operation the engine does not
+// support for its database type. It must be a typed UnsupportedOperationError,
+// so the caller resolves the operator's command with the engine's reason
+// instead of sending it again, and it must stay retryable, so no generic
+// failure path records the schema change as failed when only the command was
+// undeliverable. The reason reaches the operator verbatim, so it must not be
+// empty.
+func requireUnsupported(t *testing.T, operation string, err error) {
+	t.Helper()
+	require.Error(t, err, "a %s the engine does not support must be declined", operation)
+	assert.True(t, engine.IsUnsupportedOperation(err),
+		"a %s the engine declines for its whole database type must be a typed UnsupportedOperationError so the caller resolves the command instead of resending it, got: %v", operation, err)
+	assert.True(t, engine.IsRetryable(err),
+		"a declined %s must stay retryable so no generic failure path records the schema change as failed, got: %v", operation, err)
+	assert.False(t, engine.IsAlreadyCompleted(err),
+		"a declined %s must not read as already-completed, got: %v", operation, err)
+	assert.False(t, engine.IsNotReady(err),
+		"a declined %s must not read as not-ready — the engine will never accept it, got: %v", operation, err)
+	assert.NotEmpty(t, err.Error(), "a declined %s must give the operator a reason", operation)
 }
 
 // OptionalCapabilities names every exported optional interface package engine
