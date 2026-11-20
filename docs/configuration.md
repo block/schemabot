@@ -2636,7 +2636,7 @@ Do not require the staging ConfigMap to contain production targets, or the produ
 
 ### Freeze groups (forward-auth)
 
-An environment freeze marks an environment, or some of its deployments and databases, as frozen until it ends or someone lifts it. In this release SchemaBot records and lists freezes; refusing applies and cutovers during a freeze arrives with the change gate in a later release. Each freeze records a running policy: `continue`, the default, lets applies that started before the freeze finish, and `stop` asks SchemaBot to stop them; acting on `stop` also arrives later. Whether a freeze is in effect is decided by the database clock, so every pod agrees. A freeze is stored by the instance that serves its environment. `write_groups` members may set and lift freezes. To let others, such as incident commanders, do so without any other write, list their forwarded groups in `freeze.groups`:
+An environment freeze marks an environment, or some of its deployments and databases, as frozen until it ends or someone lifts it. While a freeze is in effect, SchemaBot refuses every new apply, start and cutover it covers, unless a second person approved an override for that change. Each freeze records a running policy: `continue`, the default, lets applies that started before the freeze finish, and `stop` asks SchemaBot to stop them; acting on `stop` also arrives later. Whether a freeze is in effect is decided by the database clock, so every pod agrees. A freeze is stored by the instance that serves its environment. `write_groups` members may set and lift freezes. To let others, such as incident commanders, do so without any other write, list their forwarded groups in `freeze.groups`:
 
 ```yaml
 auth:
@@ -2646,6 +2646,8 @@ freeze:
 ```
 
 The middleware admits `freeze.groups` members to write-tier endpoints, and the freeze handlers (`POST /api/freezes`, `POST /api/freezes/{id}/lift`) allow them. Every other mutating handler still requires `write_groups` or a database's `operator_groups`, and database operator grants do not cover freezes, which reach past any one database. Members also get the read tier, deployment-wide. `freeze.groups` requires `auth.type: forward_auth`, and its entries must be unique; either mistake is a startup error. Under other auth types, freezes follow the plain admin write gate.
+
+The CLI sets, lists, shows and lifts freezes and approves override requests: see [Freeze an environment](cli.md#freeze-an-environment).
 
 ### Tenant-scoped command routing
 
