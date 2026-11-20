@@ -124,6 +124,11 @@ engine accepts the statement, but the copy refuses the table
         └─ within it ────────────────────────────► direct
 ```
 
+A `direct` verdict on such a table is therefore not a promise. The apply reads
+the table's size again, and if the table has grown past the bound since the
+plan, the statement runs on the engine's default path instead, with an Info
+log. It is not blocked, as a statement the engine refuses outright would be.
+
 When both ends of a foreign key run directly, the plan's own `DROP FOREIGN
 KEY` runs before any statement the engine copies, because every direct
 statement runs first.
