@@ -210,6 +210,86 @@ func TestCleaner_ReportsAQuarantineLogItCannotRead(t *testing.T) {
 	})
 }
 
+// makeQuarantineLogReadOnly replaces the quarantine log with a view that lists
+// the given records but refuses deletes, as a log the account can read but not
+// write does.
+func makeQuarantineLogReadOnly(t *testing.T, db *sql.DB, records ...string) {
+	t.Helper()
+	for _, stmt := range []string{
+		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", Database),
+		fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`%s`", Database, LogTable),
+		fmt.Sprintf("CREATE TABLE `%s`.`log_base` (quarantine_table varchar(64) NOT NULL)", Database),
+		fmt.Sprintf("CREATE VIEW `%s`.`%s` AS SELECT DISTINCT quarantine_table FROM `%s`.`log_base`", Database, LogTable, Database),
+	} {
+		_, err := db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+	for _, name := range records {
+		_, err := db.ExecContext(t.Context(),
+			fmt.Sprintf("INSERT INTO `%s`.`log_base` (quarantine_table) VALUES (?)", Database), name)
+		require.NoError(t, err)
+	}
+}
+
+// makeQuarantineLogWritable replaces the read-only quarantine log built by
+// makeQuarantineLogReadOnly with a view over the same records that accepts
+// deletes, as when the account is given write access to the log.
+func makeQuarantineLogWritable(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(),
+		fmt.Sprintf("CREATE OR REPLACE VIEW `%s`.`%s` AS SELECT quarantine_table FROM `%s`.`log_base`", Database, LogTable, Database))
+	require.NoError(t, err, "make the quarantine log writable")
+}
+
+// quarantineLogRecords returns the copies the quarantine log lists.
+func quarantineLogRecords(t *testing.T, db *sql.DB) []string {
+	t.Helper()
+	rows, err := db.QueryContext(t.Context(),
+		fmt.Sprintf("SELECT quarantine_table FROM `%s`.`%s` ORDER BY quarantine_table", Database, LogTable))
+	require.NoError(t, err, "read the quarantine log")
+	defer utils.CloseAndLog(rows)
+
+	var names []string
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name), "scan quarantine log record")
+		names = append(names, name)
+	}
+	require.NoError(t, rows.Err(), "iterate quarantine log records")
+	return names
+}
+
+// A pass drops an expired copy and then cannot delete that copy's quarantine
+// log record, because it can read the log but not write it. The pass fails
+// under log_error, naming the record in its error and in its log, and the
+// record stays. Once the log can be written, the next pass deletes the record
+// and drops nothing more.
+func TestCleaner_ReportsALogRecordItCannotDelete(t *testing.T) {
+	db := setupCleanerTest(t)
+	ctx := boundedContext(t)
+	expired := createQuarantinedTable(t, db, "old_orders", time.Now().Add(-8*24*time.Hour))
+	makeQuarantineLogReadOnly(t, db, expired)
+	reader := newManualMetricReader(t)
+	var logs bytes.Buffer
+	cleaner := testCleanerLoggingTo(t, &logs, DefaultRetention, false)
+
+	err := cleaner.Run(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "prune "+Database+"."+LogTable)
+	assert.Contains(t, err.Error(), "delete log record of "+expired)
+	assert.Equal(t, map[string]string{"testdb": "log_error"}, cleanupErrorReasonsByDatabase(t, reader))
+	assert.NotContains(t, quarantinedTables(t, db), expired, "the copy is still dropped")
+	assert.Equal(t, int64(1), counterTotal(t, reader, "schemabot.pending_drops.cleanup_dropped_total"))
+	assert.Equal(t, []string{expired}, quarantineLogRecords(t, db), "the record the pass could not delete is still there")
+	assert.Contains(t, logs.String(), "could not delete the quarantine log record of a copy that is gone")
+	assert.Contains(t, logs.String(), "quarantine_table="+expired)
+
+	makeQuarantineLogWritable(t, db)
+	require.NoError(t, cleaner.Run(ctx))
+	assert.Empty(t, quarantineLogRecords(t, db), "a later pass that can write the log deletes the record")
+	assert.Equal(t, int64(1), counterTotal(t, reader, "schemabot.pending_drops.cleanup_dropped_total"), "the later pass drops nothing more")
+}
+
 // The quarantine log lives in the pending drops database beside the copies it
 // describes. The cleaner never drops it or reports it unparseable, deletes the
 // record of a copy once that copy is gone and past retention, whether the
