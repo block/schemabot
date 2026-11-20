@@ -300,6 +300,45 @@ func TestBuildOnboardWritePlanRefusesACaseDifferingEntry(t *testing.T) {
 	}
 }
 
+// Re-onboarding a repository whose drop_tables names a table the target still
+// has would write that table's file beside the entry, a config every later plan
+// refuses, while the verification plan, which runs without drop_tables, passes.
+// Onboarding refuses before anything reaches disk instead.
+func TestBuildOnboardWritePlanRefusesToDeclareAListedDrop(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		entry string
+		live  string
+	}{
+		{"entry names the live table exactly", "legacy_orders", "legacy_orders"},
+		{"entry differs from the live table only in case", "Legacy_Orders", "legacy_orders"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			_, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+				Database:    "orders",
+				Type:        "mysql",
+				Environment: "production",
+				TableCount:  2,
+				Namespaces: map[string]*apitypes.PulledNamespace{
+					"orders": {Tables: map[string]string{
+						"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
+						tc.live: "CREATE TABLE `" + tc.live + "` (`id` bigint NOT NULL);\n",
+					}},
+				},
+			}, client.PlanExclusions{DropTables: []string{"_users_old", tc.entry}})
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "drop_tables entry \""+tc.entry+"\"")
+			assert.Contains(t, err.Error(), "names a table the target still has in namespace \"orders\"")
+			assert.NotContains(t, err.Error(), "_users_old", "an entry naming no pulled table is not a conflict")
+			assert.NoFileExists(t, filepath.Join(root, "schemabot.yaml"),
+				"the refusal lands before anything reaches disk")
+			assert.NoDirExists(t, filepath.Join(root, "orders"))
+		})
+	}
+}
+
 // A namespace whose every table is withheld still belongs to the plan, so it
 // keeps its comment-only declaration rather than vanishing from the repository.
 func TestBuildOnboardWritePlanKeepsAFullyWithheldNamespaceExplicit(t *testing.T) {

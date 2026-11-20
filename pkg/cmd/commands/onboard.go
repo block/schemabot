@@ -312,6 +312,9 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		if err := ignored.RefuseDeclared(namespace, tableNames); err != nil {
 			return nil, err
 		}
+		if err := refuseDeclaringADroppedTable(namespace, tableNames, exclusions.DropTables); err != nil {
+			return nil, err
+		}
 		if group := ignored.Exemption(namespace, withheld); group != nil {
 			withheldGroups = append(withheldGroups, &apitypes.ExemptTablesResponse{
 				Namespace: group.Namespace,
@@ -498,6 +501,32 @@ func onboardConfigYAML(database, databaseType string, exclusions client.PlanExcl
 		return "", fmt.Errorf("encode schemabot.yaml for database %s: %w", database, err)
 	}
 	return b.String(), nil
+}
+
+// refuseDeclaringADroppedTable refuses to write a schema file for a pulled
+// table that a preserved drop_tables entry names. The pull returns every live
+// table, so re-onboarding before a listed table's drop has landed would declare
+// it, and every later plan refuses a table that is both declared and listed.
+// The verification plan runs without drop_tables and would not notice.
+// Entries are compared ignoring case, as the planner compares them.
+func refuseDeclaringADroppedTable(namespace string, tableNames, dropTables []string) error {
+	pulledByKey := make(map[string]string, len(tableNames))
+	for _, table := range tableNames {
+		pulledByKey[schema.CaseFoldKey(table)] = table
+	}
+	for _, entry := range dropTables {
+		table, ok := pulledByKey[schema.CaseFoldKey(entry)]
+		if !ok {
+			continue
+		}
+		spelling := ""
+		if table != entry {
+			spelling = fmt.Sprintf(" (the target spells it %q)", table)
+		}
+		return fmt.Errorf("onboarding refused; no files were written. drop_tables entry %s%s names a table the target still has in namespace %q, so onboarding would write a schema file for it, and every later plan would refuse the repository. Apply the drop first, or remove the entry from drop_tables",
+			schema.QuoteIgnoreTablesEntry(entry), spelling, namespace)
+	}
+	return nil
 }
 
 func validateRelativePathPart(kind, value string) error {

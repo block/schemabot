@@ -534,7 +534,10 @@ the retention period ends.
 - A listed table written in the last 24 hours is refused, naming it. A table
   that still receives rows, such as the shadow table of an online schema change
   another tool is running, is not a leftover yet. Wait until nothing writes to
-  it.
+  it. The check reads the write time MySQL keeps in memory, which starts empty
+  when the server restarts, so a table not written since the last restart
+  passes however recently it was written before it. Passing the check does not
+  prove nothing uses the table: confirm that yourself before you list it.
 - A listed table that is a working table of a SchemaBot apply on the same
   database and environment that is still running or is stopped, such as its
   copy `_users_new` or its checkpoint `_users_chkpnt`, is refused, naming the
