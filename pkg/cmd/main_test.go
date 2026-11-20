@@ -168,3 +168,25 @@ func TestMainWritesToStderrOnlyThroughErrorLine(t *testing.T) {
 	assert.Positive(t, errorLineWrites, "main.go reports errors on stderr")
 	assert.Equal(t, errorLineWrites, stderrUses, "os.Stderr is used somewhere other than as the destination of an errorLine write")
 }
+
+// The freeze commands call the schema API, so a selected local runtime starts
+// for them, including the bare `freeze` that creates a freeze.
+func TestUsesLocalRuntime_FreezeCommands(t *testing.T) {
+	for _, args := range [][]string{
+		{"freeze", "-e", "production", "--reason", "SEV-1234"},
+		{"freeze", "list"},
+		{"freeze", "approve", "ovr-123"},
+		{"unfreeze", "freeze-abc"},
+	} {
+		var cli CLI
+		parser, err := kong.New(&cli,
+			kong.Name("schemabot"),
+			kong.Writers(io.Discard, io.Discard),
+			kong.Vars{"cli_name": "schemabot"},
+		)
+		require.NoError(t, err)
+		ctx, err := parser.Parse(args)
+		require.NoError(t, err, args)
+		assert.True(t, usesLocalRuntime(ctx.Command(), &cli), args)
+	}
+}

@@ -613,6 +613,34 @@ For changes that need PR approval and merge checks, use the
 [PR workflow](pre-merge-workflow.md). Direct CLI access is a separate path;
 it does not create a PR review trail.
 
+### Freeze an environment
+
+An environment freeze holds new schema changes in its scope until it ends or
+someone lifts it. Setting or lifting one is a write, and
+[`freeze.groups`](configuration.md#freeze-groups-forward-auth) members may do
+so without any other write access.
+
+```console
+$ schemabot freeze -e production --reason "SEV-1234 payments latency"
+$ schemabot freeze -e production --reason "holiday freeze" --planned \
+    --start 2026-12-20T00:00:00Z --end 2027-01-03T00:00:00Z
+$ schemabot freeze list -e production
+$ schemabot freeze show freeze-abc123
+$ schemabot unfreeze freeze-abc123 --reason "SEV resolved"
+```
+
+`--deployment` and `--database` narrow a freeze and repeat; without them it
+covers the whole environment. `--running` records `continue` (the default) or
+`stop` for applies already running in scope. SchemaBot does not act on `stop`
+yet, so stop a running apply with `schemabot stop`. Times are RFC3339 and
+print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
+and the recent ones.
+
+A second person approves a request to let one change through a freeze. Read it
+with `freeze override <ovr-id>` and approve it with `freeze approve <ovr-id>`.
+Only a verified member of `freeze.groups` other than the requester may approve.
+Each command prints the server's reason when it refuses.
+
 ## Follow and control a change
 
 An apply can outlive your terminal. Keep its apply ID to inspect it or
