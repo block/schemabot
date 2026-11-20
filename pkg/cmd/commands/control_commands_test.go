@@ -10,31 +10,61 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/state"
 )
 
 const controlTestApplyID = "apply-0f1e2d3c4b5a6978"
+
+// controlTestStub describes the server a control command talks to: the
+// schema change's state, and how the control request on controlPath is
+// answered. A zero status answers 200 OK.
+type controlTestStub struct {
+	applyState  string
+	controlPath string
+	controlBody any
+	// controlStatus is the HTTP status of the answer to the control request.
+	controlStatus int
+	// progressStatus, when set, fails the progress lookup with that HTTP
+	// status, the way the server answers an apply it does not know.
+	progressStatus int
+}
 
 // controlTestServer serves a schema change in the given state and answers the
 // control request on controlPath with the given body, recording every request
 // it receives on that path.
 func controlTestServer(t *testing.T, applyState, controlPath string, controlBody any) (*httptest.Server, *[]apitypes.ControlRequest) {
 	t.Helper()
+	return serveControlTestStub(t, controlTestStub{applyState: applyState, controlPath: controlPath, controlBody: controlBody})
+}
+
+// serveControlTestStub serves stub, recording every control request it
+// receives on stub.controlPath.
+func serveControlTestStub(t *testing.T, stub controlTestStub) (*httptest.Server, *[]apitypes.ControlRequest) {
+	t.Helper()
 	var requests []apitypes.ControlRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/progress/apply/"+controlTestApplyID:
+			if stub.progressStatus != 0 {
+				w.WriteHeader(stub.progressStatus)
+				assert.NoError(t, json.NewEncoder(w).Encode(apitypes.ErrorResponse{Error: "apply not found: " + controlTestApplyID}))
+				return
+			}
 			assert.NoError(t, json.NewEncoder(w).Encode(apitypes.ProgressResponse{
-				State:    applyState,
+				State:    stub.applyState,
 				Database: "orders",
 				ApplyID:  controlTestApplyID,
 			}))
-		case r.Method == http.MethodPost && r.URL.Path == controlPath:
+		case r.Method == http.MethodPost && r.URL.Path == stub.controlPath:
 			var req apitypes.ControlRequest
 			assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
 			requests = append(requests, req)
-			assert.NoError(t, json.NewEncoder(w).Encode(controlBody))
+			if stub.controlStatus != 0 {
+				w.WriteHeader(stub.controlStatus)
+			}
+			assert.NoError(t, json.NewEncoder(w).Encode(stub.controlBody))
 		default:
 			http.Error(w, "unexpected request", http.StatusBadRequest)
 		}
@@ -57,13 +87,34 @@ func runControlCmd(endpoint string, run func(*Globals) error) (string, error) {
 	return stripAnsi(output), runErr
 }
 
-// assertSentOnce checks that the command sent exactly one control request, and
-// that it named the schema change and environment the operator asked for.
+// assertSentOnce checks that the command sent exactly one control request,
+// that it named the schema change and environment the operator asked for, and
+// that it carried the CLI identity the server records as the requester.
 func assertSentOnce(t *testing.T, requests []apitypes.ControlRequest) {
 	t.Helper()
 	require.Len(t, requests, 1)
 	assert.Equal(t, controlTestApplyID, requests[0].ApplyID)
 	assert.Equal(t, "staging", requests[0].Environment)
+	assert.Equal(t, client.GenerateCLIOwner(), requests[0].Caller)
+}
+
+// controlCmdCase is one control command, a state it acts on, and the first
+// line of the success output it prints.
+type controlCmdCase struct {
+	applyState string
+	path       string
+	run        func(*Globals) error
+	success    string
+}
+
+// controlCmdCases returns each control command run against a schema change in
+// a state it acts on.
+func controlCmdCases() map[string]controlCmdCase {
+	return map[string]controlCmdCase{
+		"cancel":  {state.Apply.Running, "/api/cancel", (&CancelCmd{ControlFlags: controlTestFlags(), AutoApprove: true}).Run, "Schema change cancelled"},
+		"start":   {state.Apply.Stopped, "/api/start", (&StartCmd{ControlFlags: controlTestFlags()}).Run, "Schema change resumed"},
+		"release": {state.Apply.Paused, "/api/release", (&ReleaseCmd{ControlFlags: controlTestFlags()}).Run, "Paused rollout released"},
+	}
 }
 
 // An operator who cancels a schema change that is no longer running is told
@@ -200,6 +251,56 @@ func TestControlCmdsReturnARefusalAsAnError(t *testing.T) {
 			assert.Equal(t, tc.wantErr, err.Error())
 			assert.Equal(t, 1, ExitCodeFor(err))
 			assertSentOnce(t, *requests)
+			assert.NotContains(t, out, tc.success)
+		})
+	}
+}
+
+// The server refuses most control requests an operator gets wrong (an unknown
+// apply, a caller who may not act on it, one that is already finishing) with
+// an HTTP error rather than an unaccepted answer. The CLI returns the server's
+// reason as an error and exits non-zero, so a runbook never reads a refusal as
+// done.
+func TestControlCmdsReturnAnHTTPRejectionAsAnError(t *testing.T) {
+	const reason = "schema change is already terminal"
+	for name, tc := range controlCmdCases() {
+		for _, status := range []int{http.StatusForbidden, http.StatusNotFound, http.StatusConflict} {
+			t.Run(name+"/"+http.StatusText(status), func(t *testing.T) {
+				server, requests := serveControlTestStub(t, controlTestStub{
+					applyState:    tc.applyState,
+					controlPath:   tc.path,
+					controlBody:   apitypes.ErrorResponse{Error: reason},
+					controlStatus: status,
+				})
+
+				out, err := runControlCmd(server.URL, tc.run)
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), reason)
+				assert.Equal(t, 1, ExitCodeFor(err))
+				assertSentOnce(t, *requests)
+				assert.NotContains(t, out, tc.success)
+			})
+		}
+	}
+}
+
+// When the CLI cannot read the schema change it was asked to act on, it stops
+// with the server's reason and sends no control request.
+func TestControlCmdsStopWhenProgressCannotBeRead(t *testing.T) {
+	for name, tc := range controlCmdCases() {
+		t.Run(name, func(t *testing.T) {
+			server, requests := serveControlTestStub(t, controlTestStub{
+				controlPath:    tc.path,
+				controlBody:    map[string]any{"accepted": true},
+				progressStatus: http.StatusNotFound,
+			})
+
+			out, err := runControlCmd(server.URL, tc.run)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "get progress")
+			assert.Contains(t, err.Error(), "apply not found: "+controlTestApplyID)
+			assert.Equal(t, 1, ExitCodeFor(err))
+			assert.Empty(t, *requests, "a schema change the CLI cannot read must not be sent a control request")
 			assert.NotContains(t, out, tc.success)
 		})
 	}
