@@ -551,6 +551,100 @@ func (f *EnvironmentFreeze) Validate() error {
 	return nil
 }
 
+// Freeze override actions: the change an override request lets through.
+const (
+	// FreezeOverrideActionApply creates an apply from a plan.
+	FreezeOverrideActionApply = "apply"
+	// FreezeOverrideActionCutover records a deferred cutover for an apply.
+	FreezeOverrideActionCutover = "cutover"
+	// FreezeOverrideActionStart records a start for a stopped or waiting
+	// apply.
+	FreezeOverrideActionStart = "start"
+)
+
+// FreezeOverrideReasonMax caps an override reason so it fits on a pull
+// request.
+const FreezeOverrideReasonMax = 500
+
+// FreezeOverrideRequest asks to let one change through the freezes that hold
+// it. Nobody overrides alone: a second person approves the request, and the
+// change goes ahead only while every blocker it meets is one the request
+// names.
+type FreezeOverrideRequest struct {
+	ID          int64
+	Identifier  string
+	Environment string
+	// Action is the change the request lets through; TargetID is the plan
+	// an apply would run, or the apply a cutover or start would act on.
+	Action   string
+	TargetID string
+	Database string
+	// Repository and PullRequest name the pull request the change came
+	// from, when it came from one.
+	Repository  string
+	PullRequest int
+	// PRAuthor is that pull request's author, who may not approve.
+	PRAuthor string
+	// Blockers are the blockers the request covers, each "gate id".
+	Blockers    []string
+	Reason      string
+	RequestedBy string
+	ApprovedBy  string
+	ApprovedAt  *time.Time
+	// ExpiresAt is when the request stops counting, approved or not.
+	ExpiresAt time.Time
+	CreatedAt time.Time
+}
+
+// Validate reports the first problem that makes the request unfit to store.
+func (r *FreezeOverrideRequest) Validate() error {
+	switch {
+	case r == nil:
+		return errors.New("freeze override request is required")
+	case strings.TrimSpace(r.Identifier) == "":
+		return errors.New("freeze override request identifier is required")
+	case strings.TrimSpace(r.Environment) == "":
+		return errors.New("freeze override request environment is required")
+	case r.Action != FreezeOverrideActionApply && r.Action != FreezeOverrideActionCutover && r.Action != FreezeOverrideActionStart:
+		return fmt.Errorf("freeze override action %q is not %q, %q or %q", r.Action,
+			FreezeOverrideActionApply, FreezeOverrideActionCutover, FreezeOverrideActionStart)
+	case strings.TrimSpace(r.TargetID) == "":
+		return errors.New("freeze override request target is required")
+	case strings.TrimSpace(r.Database) == "":
+		return errors.New("freeze override request database is required")
+	case len(r.Blockers) == 0:
+		return errors.New("a freeze override request covers at least one blocker")
+	case hasBlankEntry(r.Blockers):
+		return errors.New("freeze override blockers must not contain an empty entry")
+	case strings.TrimSpace(r.Reason) == "":
+		return errors.New("freeze override reason is required")
+	case len([]rune(strings.TrimSpace(r.Reason))) > FreezeOverrideReasonMax:
+		return fmt.Errorf("freeze override reason is longer than %d characters", FreezeOverrideReasonMax)
+	case strings.TrimSpace(r.RequestedBy) == "":
+		return errors.New("freeze override requester is required")
+	case r.ExpiresAt.IsZero():
+		return errors.New("freeze override request expiry is required")
+	}
+	return nil
+}
+
+// Covers reports whether the request names every one of blockers.
+func (r *FreezeOverrideRequest) Covers(blockers []string) bool {
+	for _, blocker := range blockers {
+		if !slices.Contains(r.Blockers, blocker) {
+			return false
+		}
+	}
+	return true
+}
+
+// IsPersonOf reports whether who is the request's requester or its pull
+// request's author, compared case-insensitively.
+func (r *FreezeOverrideRequest) IsPersonOf(who string) bool {
+	who = CanonicalKey(strings.TrimSpace(who))
+	return who == CanonicalKey(r.RequestedBy) || (r.PRAuthor != "" && who == CanonicalKey(r.PRAuthor))
+}
+
 // Setting represents an admin-level SchemaBot setting.
 // Examples: feature flags, default options, maintenance mode.
 type Setting struct {

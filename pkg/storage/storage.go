@@ -124,6 +124,9 @@ type Storage interface {
 	// Freezes returns the environment freeze store.
 	Freezes() FreezeStore
 
+	// FreezeOverrides returns the store of freeze override requests.
+	FreezeOverrides() FreezeOverrideStore
+
 	// WebhookEvents returns the durable webhook event inbox store.
 	WebhookEvents() WebhookEventStore
 
@@ -397,6 +400,39 @@ type FreezeStore interface {
 	// against. A caller that labels a freeze as in effect or scheduled uses
 	// it, so the label agrees with the query.
 	Now(ctx context.Context) (time.Time, error)
+}
+
+// FreezeOverrideStore records requests to let one change through the freezes
+// that hold it, and their approvals. Requests are never deleted, so they are
+// the audit record of every override.
+type FreezeOverrideStore interface {
+	// Create records a request and returns it as stored.
+	Create(ctx context.Context, request *FreezeOverrideRequest) (*FreezeOverrideRequest, error)
+
+	// Get returns the request with this identifier, or
+	// ErrFreezeOverrideNotFound.
+	Get(ctx context.Context, identifier string) (*FreezeOverrideRequest, error)
+
+	// Approve records approver's approval and returns the approved request.
+	// It refuses the requester and the pull request's author
+	// (ErrFreezeOverrideSelfApproval), a request already approved
+	// (ErrFreezeOverrideAlreadyApproved), and one past its expiry by the
+	// database clock (ErrFreezeOverrideExpired). Of two racing approvals,
+	// exactly one succeeds.
+	Approve(ctx context.Context, identifier, approver string) (*FreezeOverrideRequest, error)
+
+	// ListApproved returns the approved requests for one change that have
+	// not expired by the database clock, most recently approved first.
+	ListApproved(ctx context.Context, target FreezeOverrideTarget) ([]*FreezeOverrideRequest, error)
+}
+
+// FreezeOverrideTarget names the change an override request is for.
+type FreezeOverrideTarget struct {
+	Environment string
+	Action      string
+	// TargetID is the plan an apply would run, or the apply a cutover or
+	// start would act on.
+	TargetID string
 }
 
 // FreezeListing is what FreezeStore.List read. Both lists come from one

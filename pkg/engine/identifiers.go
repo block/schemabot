@@ -34,6 +34,11 @@ func NewFreezeID() string {
 	return "freeze-" + randomIdentifierSuffix()
 }
 
+// NewFreezeOverrideID mints a freeze override request's identifier.
+func NewFreezeOverrideID() string {
+	return "ovr-" + randomIdentifierSuffix()
+}
+
 func randomIdentifierSuffix() string {
 	return strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
 }
