@@ -514,6 +514,13 @@ failure. The default budgets, and how to tune them, are in
 consumer is a periodic sync that pulls each database on a schedule and keeps
 its own copy, not a per-request passthrough.
 
+A pull of a database with thousands of tables can take close to a minute. The
+server allows a pull up to two minutes to answer, so set the client's request
+timeout above that. A client that gives up sooner abandons a pull the server
+is still going to answer, and its retry spends budget to start the same read
+over. A read that runs out of time is answered with `504 Gateway Timeout`;
+pulling fewer namespaces per request keeps each read shorter.
+
 <details>
 <summary>Rate-limited pull example (HTTP 429)</summary>
 
