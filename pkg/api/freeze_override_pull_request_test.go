@@ -60,6 +60,46 @@ func TestFreezeOverrideFromAPullRequestIsInTheGitHubDomain(t *testing.T) {
 	assert.Equal(t, 1, store.count())
 }
 
+// The target names only the schema, so the same change on two pull requests
+// shares it. A request belongs to the pull request it was asked for on:
+// asking again on another records a new one, and an approval there, even by
+// this pull request's author, does not admit it. Otherwise Bob could approve
+// Carol's change on Alice's PR and so admit it on his own (AZ-10).
+func TestFreezeOverrideBelongsToItsPullRequest(t *testing.T) {
+	svc, applies := newGateApplyTestService(t, gateTestFreeze("freeze-incident"))
+	store := withOverrides(svc)
+	onAlices := WithPullRequestOverrideRequester(t.Context(), pullRequestRequester)
+	bobsPR := pullRequestRequester
+	bobsPR.PullRequest, bobsPR.Author = 8, "bob"
+	onBobs := WithPullRequestOverrideRequester(t.Context(), bobsPR)
+	request := ApplyRequest{PlanID: "plan-1", Environment: "staging", Override: "fix"}
+
+	_, _, err := svc.ExecuteApply(onAlices, request)
+	first, ok := errors.AsType[*ChangeGateRefusedError](err)
+	require.True(t, ok, "got %v", err)
+	require.NotNil(t, first.OverrideRequest)
+
+	_, _, err = svc.ExecuteApply(onBobs, request)
+	second, ok := errors.AsType[*ChangeGateRefusedError](err)
+	require.True(t, ok, "got %v", err)
+	require.NotNil(t, second.OverrideRequest)
+	assert.NotEqual(t, first.OverrideRequest.Identifier, second.OverrideRequest.Identifier, "PR #8 records its own request")
+	assert.Equal(t, 2, store.count())
+
+	// Bob is not PR #7's author, so storage lets him approve its request.
+	_, err = store.Approve(t.Context(), first.OverrideRequest.Identifier, storage.GitHubIdentity("bob"))
+	require.NoError(t, err)
+
+	_, _, err = svc.ExecuteApply(onBobs, ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+	_, refused := errors.AsType[*ChangeGateRefusedError](err)
+	assert.True(t, refused, "an approval on PR #7 does not admit PR #8: got %v", err)
+	assert.Nil(t, applies.apply)
+
+	_, _, err = svc.ExecuteApply(onAlices, ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+	require.NoError(t, err, "it still admits the pull request it was asked for on")
+	require.NotNil(t, applies.apply)
+}
+
 // A pull request request is never recorded without its author or commenter,
 // and a verified API subject spelled like a GitHub login records nothing: it
 // would pass for that login.
