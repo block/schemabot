@@ -49,6 +49,7 @@ func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore { return nil
 func (m *mockStorage) Checks() storage.CheckStore                   { return nil }
 func (m *mockStorage) Settings() storage.SettingsStore              { return nil }
 func (m *mockStorage) Freezes() storage.FreezeStore                 { return nil }
+func (m *mockStorage) FreezeOverrides() storage.FreezeOverrideStore { return nil }
 func (m *mockStorage) WebhookEvents() storage.WebhookEventStore     { return m.webhookEvents }
 func (m *mockStorage) DriverPools() storage.DriverPoolStore {
 	return &m.driverPools

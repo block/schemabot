@@ -48,6 +48,30 @@ var (
 	// already lifted.
 	ErrFreezeAlreadyLifted = errors.New("freeze already lifted")
 
+	// ErrFreezeOverrideExists is returned when an override request with the
+	// same identifier already exists.
+	ErrFreezeOverrideExists = errors.New("freeze override request already exists")
+
+	// ErrFreezeOverrideNotFound is returned when an override request does
+	// not exist.
+	ErrFreezeOverrideNotFound = errors.New("freeze override request not found")
+
+	// ErrFreezeOverrideAlreadyApproved is returned when approving a request
+	// someone already approved.
+	ErrFreezeOverrideAlreadyApproved = errors.New("freeze override request already approved")
+
+	// ErrFreezeOverrideExpired is returned when approving a request past its
+	// expiry.
+	ErrFreezeOverrideExpired = errors.New("freeze override request expired")
+
+	// ErrFreezeOverrideSelfApproval is returned when the requester or the
+	// pull request's author tries to approve a request.
+	ErrFreezeOverrideSelfApproval = errors.New("freeze override request needs a second person")
+
+	// ErrFreezeOverrideLifetime is returned when creating a request that
+	// expires more than FreezeOverrideMaxLifetime after the database clock.
+	ErrFreezeOverrideLifetime = errors.New("freeze override request expires too late")
+
 	// ErrFreezeEnded is returned when lifting a freeze that already reached
 	// its end time.
 	ErrFreezeEnded = errors.New("freeze already ended")
