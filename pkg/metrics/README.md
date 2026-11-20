@@ -330,10 +330,21 @@ across replicas. Snapshots require a named App, positive installation ID, valid
 remaining/limit headers, and a future reset time. They disappear from collection
 when older than 120 seconds or when their reset time passes. Repeated scrapes,
 local quota refusals and secondary cooldown waits do not refresh observation age.
-Older reset windows and delayed larger allowances within a window cannot replace
-a depleted snapshot. Within one window, a lower allowance wins even when it is
-recorded out of receipt order; its original receipt time still controls expiry.
-A new window can increase the allowance.
+Within one window the lowest allowance seen is kept, in any receipt order, even
+when GitHub later reports more; a later response with more remaining still
+refreshes the observation time, so an installation that is read keeps its
+snapshot exported. Expiry follows the latest receipt in the window, and a
+response recorded late never moves it later than its own receipt time. When a
+response reports a different reset time, the one received most recently says
+which window is current, and a new window can increase the allowance. That
+holds when the reset time moves earlier too: GitHub can report one reset time
+and then an earlier one for the rest of the window, and the snapshot follows
+the newer readings instead of ageing out on the first. A response received
+before the current snapshot never replaces it with another window. Each reset
+time that has not yet passed keeps its own lowest allowance, so a window that
+becomes current again still exports the depletion already seen in it, whatever
+order the responses are recorded in. The number of reset times kept per
+installation is bounded; past the bound the least recently reported is dropped.
 
 Webhook traffic refreshes a snapshot from the headers of every response, and
 the server's GitHub quota probe refreshes it while there is no traffic: once a
