@@ -268,11 +268,18 @@ func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, call
 }
 
 // approvedOverride returns the first approved, unexpired override request for
-// the change that names every blocker, or nil when there is none. A server
-// without override storage has none to find.
+// the change that names every blocker and that the caller asked for, or nil
+// when there is none. Only the requester runs on an approval: anyone else asks
+// for their own. Within its window the requester may use it more than once,
+// for example to re-apply the same schema after a stop. A server without
+// override storage has none to find.
 func (s *Service) approvedOverride(ctx context.Context, in changeGateInput, blockers []apitypes.ChangeGateBlocker) (*storage.FreezeOverrideRequest, error) {
 	overrides := s.storage.FreezeOverrides()
 	if overrides == nil {
+		return nil, nil
+	}
+	caller, verified := overrideCaller(ctx)
+	if !verified {
 		return nil, nil
 	}
 	approved, err := overrides.ListApproved(ctx, storage.FreezeOverrideTarget{
@@ -283,7 +290,7 @@ func (s *Service) approvedOverride(ctx context.Context, in changeGateInput, bloc
 	}
 	ids := changeGateBlockerIDs(blockers)
 	for _, request := range approved {
-		if request.Covers(ids) {
+		if request.Covers(ids) && storage.CanonicalKey(request.RequestedBy) == storage.CanonicalKey(caller) {
 			return request, nil
 		}
 	}
@@ -303,7 +310,7 @@ func (s *Service) requestOverride(ctx context.Context, in changeGateInput, block
 	}
 	// Only a verified caller may ask. A request recorded as "unverified"
 	// names nobody, so its asker could approve it under their own name.
-	requester, verified := auth.VerifiedSubject(ctx)
+	requester, verified := overrideCaller(ctx)
 	if !verified {
 		return nil, nil
 	}
@@ -322,6 +329,12 @@ func (s *Service) requestOverride(ctx context.Context, in changeGateInput, block
 		RequestedBy: requester,
 		ExpiresAt:   now.Add(storage.FreezeOverrideMaxLifetime),
 	})
+}
+
+// overrideCaller is the verified caller who asks for an override and
+// runs on its approval.
+func overrideCaller(ctx context.Context) (string, bool) {
+	return auth.VerifiedSubject(ctx)
 }
 
 // applyOverrideTarget names what an override of an apply covers: the

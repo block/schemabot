@@ -183,13 +183,16 @@ func TestFreezeOverrideLetsAnApplyThrough(t *testing.T) {
 	assert.Nil(t, applies.apply, "a refused apply must not be created")
 
 	approveOverride(t, store, id)
+	other := &auth.User{Subject: "sam", Groups: []string{"schema-admins"}}
+	rec = postAs(t, mux, other, "/api/apply", `{"plan_id":"plan-1","environment":"staging"}`)
+	require.Equal(t, http.StatusConflict, rec.Code, "only the requester runs on an approval")
 	rec = postAs(t, mux, overrideRequester, "/api/apply", overrideApplyBody)
 
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	require.NotNil(t, applies.apply)
 	assert.Equal(t, id, applies.apply.GetOptions().FreezeOverride)
 	assert.Equal(t, 1, store.count(), "an admitted apply records no second request")
-	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 1}, changeGateCounters(t, reader, "schemabot.change_gate.refusals"))
+	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 2}, changeGateCounters(t, reader, "schemabot.change_gate.refusals"))
 	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 1}, changeGateCounters(t, reader, "schemabot.change_gate.overrides"))
 }
 
@@ -237,7 +240,7 @@ func TestFreezeOverrideCoversOneActionAndTarget(t *testing.T) {
 		{"apply of a plan", storage.FreezeOverrideActionApply, "apply-1", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, admitted, err := svc.checkChangeGates(t.Context(), changeGateInput{
+			_, admitted, err := svc.checkChangeGates(auth.WithVerifiedUser(t.Context(), overrideRequester), changeGateInput{
 				Checkpoint: changeGateCheckpointResume, Environment: "staging", Deployments: []string{DefaultDeployment},
 				Database: "testdb", Action: tc.action, TargetID: tc.target,
 			}, "cli:rita")
@@ -433,11 +436,12 @@ func TestFreezeOverrideDoesNotCoverAFreezeLandingBeforeTheWrite(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	_, _, err = svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+	rita := auth.WithVerifiedUser(t.Context(), overrideRequester)
+	_, _, err = svc.ExecuteApply(rita, ApplyRequest{PlanID: "plan-1", Environment: "staging"})
 	require.ErrorIs(t, err, storage.ErrFreezeEpochChanged)
 	assert.Nil(t, applies.apply)
 
-	_, _, err = svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+	_, _, err = svc.ExecuteApply(rita, ApplyRequest{PlanID: "plan-1", Environment: "staging"})
 	require.ErrorAs(t, err, new(*ChangeGateRefusedError))
 	assert.Nil(t, applies.apply)
 }

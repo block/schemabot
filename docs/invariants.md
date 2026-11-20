@@ -2200,8 +2200,10 @@ requester, who must be verified, runs the apply, start or cutover with an overri
 SchemaBot records a request and refuses, naming it. A verified member of `freeze.groups` who is not the requester approves it;
 write groups do not grant approval, and with no freeze group configured nobody approves, so nobody
 overrides alone, admins included. Storage also refuses the pull request's author once a request
-records one. The requester repeats the command and it is admitted. An approval covers one
-environment, one action and one target and expires after 24 hours. For an apply the target is the
+records one. The requester repeats the command and it is admitted; only the requester runs on an
+approval (`approvedOverride`), and anyone else asks for their own. An approval covers one
+environment, one action and one target and expires after 24 hours. Within that window the
+requester may use it more than once, for example to re-apply the same schema after a stop. For an apply the target is the
 database, the rollout member it is narrowed to and the schema it asks for (`applyOverrideTarget`),
 not the plan, because a repeated command plans afresh; a changed schema needs a new approval. For a
 start or a cutover it is the apply. A blocker the request does not name refuses again and needs a
