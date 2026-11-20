@@ -142,6 +142,30 @@ func TestFreezes(t *testing.T, h Harness) {
 		assert.ElementsMatch(t, []string{active.Identifier, windowed.Identifier, staging.Identifier}, freezeIdentifiers(all))
 	})
 
+	t.Run("ListCurrent", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		now := time.Now().UTC()
+
+		active := createFreeze(t, store, onDemandFreeze("production", now.Add(-time.Hour)))
+		scheduled := createFreeze(t, store, plannedFreeze("production", now.Add(time.Hour), now.Add(2*time.Hour), "chill-calendar", "later"))
+		createFreeze(t, store, plannedFreeze("production", now.Add(-2*time.Hour), now.Add(-time.Hour), "chill-calendar", "ended"))
+
+		current, err := store.Freezes().ListCurrent(ctx, "production")
+		require.NoError(t, err)
+		assert.Equal(t, []string{active.Identifier, scheduled.Identifier}, freezeIdentifiers(current))
+	})
+
+	t.Run("Now", func(t *testing.T) {
+		store := h.NewStorage(t)
+		before := time.Now().UTC()
+
+		now, err := store.Freezes().Now(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, time.UTC, now.Location())
+		assert.WithinDuration(t, before, now, time.Minute, "the database clock is the session's UTC time")
+	})
+
 	t.Run("Lift", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -256,6 +280,32 @@ func TestFreezes(t *testing.T, h Harness) {
 		assert.Equal(t, 1, succeeded)
 	})
 
+	t.Run("History", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		now := time.Now().UTC()
+
+		oldest := createFreeze(t, store, onDemandFreeze("production", now.Add(-3*time.Hour)))
+		middle := createFreeze(t, store, onDemandFreeze("production", now.Add(-2*time.Hour)))
+		newest := createFreeze(t, store, onDemandFreeze("production", now.Add(-time.Hour)))
+		staging := createFreeze(t, store, onDemandFreeze("staging", now.Add(-90*time.Minute)))
+
+		history, err := store.Freezes().History(ctx, "production", 10)
+		require.NoError(t, err)
+		assert.Equal(t, []string{newest.Identifier, middle.Identifier, oldest.Identifier}, freezeIdentifiers(history))
+
+		limited, err := store.Freezes().History(ctx, "production", 2)
+		require.NoError(t, err)
+		assert.Equal(t, []string{newest.Identifier, middle.Identifier}, freezeIdentifiers(limited))
+
+		all, err := store.Freezes().History(ctx, "", 10)
+		require.NoError(t, err)
+		assert.Equal(t, []string{newest.Identifier, staging.Identifier, middle.Identifier, oldest.Identifier}, freezeIdentifiers(all))
+
+		_, err = store.Freezes().History(ctx, "production", 0)
+		require.Error(t, err)
+	})
+
 	t.Run("UnreachableStorageSurfacesErrors", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewUnreachableStorage(t)
@@ -269,6 +319,12 @@ func TestFreezes(t *testing.T, h Harness) {
 		_, err = store.Freezes().Lift(ctx, "freeze-any", "bob", "")
 		require.Error(t, err)
 		_, err = store.Freezes().ListInEffect(ctx, "production")
+		require.Error(t, err)
+		_, err = store.Freezes().ListCurrent(ctx, "production")
+		require.Error(t, err)
+		_, err = store.Freezes().Now(ctx)
+		require.Error(t, err)
+		_, err = store.Freezes().History(ctx, "production", 10)
 		require.Error(t, err)
 	})
 }

@@ -602,6 +602,8 @@ var knownDirectWriteAuthOperations = map[string]bool{
 	"checks_synthesize":  true,
 	"checks_repos":       true,
 	"settings_set":       true,
+	"freeze_create":      true,
+	"freeze_lift":        true,
 
 	"storage_schema_plan":  true,
 	"storage_schema_apply": true,
@@ -623,6 +625,8 @@ var knownDirectWriteAuthReasons = map[string]bool{
 	"not_database_operator":   true,
 	"environment_not_allowed": true,
 	"missing_database_config": true,
+	"freeze_allow":            true,
+	"not_freeze_admin":        true,
 	"unknown":                 true,
 }
 

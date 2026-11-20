@@ -193,6 +193,8 @@ func TestMutatingRoutesDenyOperatorOutsideGrantedEnvironment(t *testing.T) {
 		"POST /api/locks/acquire":        "database locks carry no environment; the database grant alone decides them",
 		"DELETE /api/locks":              "database locks carry no environment; the database grant alone decides them",
 		"POST /api/settings":             "admin-only; TestMutatingRoutesDenyScopedOperatorByDefault covers the denial",
+		"POST /api/freezes":              "freeze writes need a write group or a freeze group; TestMutatingRoutesDenyScopedOperatorByDefault covers the denial",
+		"POST /api/freezes/{id}/lift":    "freeze writes need a write group or a freeze group; TestMutatingRoutesDenyScopedOperatorByDefault covers the denial",
 		"POST /api/checks/scan":          "admin-only; TestMutatingRoutesDenyScopedOperatorByDefault covers the denial",
 		"POST /api/checks/synthesize":    "admin-only; TestMutatingRoutesDenyScopedOperatorByDefault covers the denial",
 		"POST /api/checks/repos":         "admin-only; TestMutatingRoutesDenyScopedOperatorByDefault covers the denial",

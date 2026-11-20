@@ -132,6 +132,57 @@ func (s *freezeStore) ListInEffect(ctx context.Context, environment string) ([]*
 	return freezes, nil
 }
 
+// ListCurrent returns the freezes in effect now, by the database's clock, and
+// the ones scheduled to start later, oldest start first.
+func (s *freezeStore) ListCurrent(ctx context.Context, environment string) ([]*storage.EnvironmentFreeze, error) {
+	now := s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)
+	where, args := freezeEnvironmentFilter(environment)
+	freezes, err := s.list(ctx, `
+		SELECT `+freezeColumns+`
+		FROM environment_freezes
+		WHERE `+where+`lifted_at IS NULL AND (ends_at IS NULL OR ends_at > `+now+`)
+		ORDER BY starts_at, id
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list current freezes (environment %q): %w", environment, err)
+	}
+	return freezes, nil
+}
+
+// Now returns the database's clock.
+func (s *freezeStore) Now(ctx context.Context) (time.Time, error) {
+	var now sql.NullTime
+	if err := s.db.QueryRowContext(ctx, `SELECT `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)).Scan(&now); err != nil {
+		return time.Time{}, fmt.Errorf("read database clock: %w", err)
+	}
+	if !now.Valid {
+		return time.Time{}, errors.New("read database clock: got NULL")
+	}
+	return freezeTime(now.Time), nil
+}
+
+// History returns up to limit freezes of any state, newest start first.
+func (s *freezeStore) History(ctx context.Context, environment string, limit int) ([]*storage.EnvironmentFreeze, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("list freeze history (environment %q): limit %d must be positive", environment, limit)
+	}
+	where, args := freezeEnvironmentFilter(environment)
+	if where != "" {
+		where = "WHERE " + strings.TrimSuffix(where, "AND ")
+	}
+	freezes, err := s.list(ctx, `
+		SELECT `+freezeColumns+`
+		FROM environment_freezes
+		`+where+`
+		ORDER BY starts_at DESC, id DESC
+		LIMIT ?
+	`, append(args, limit)...)
+	if err != nil {
+		return nil, fmt.Errorf("list freeze history (environment %q): %w", environment, err)
+	}
+	return freezes, nil
+}
+
 func (s *freezeStore) getByID(ctx context.Context, id int64) (*storage.EnvironmentFreeze, error) {
 	return scanFreeze(s.db.QueryRowContext(ctx, `
 		SELECT `+freezeColumns+`

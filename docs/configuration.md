@@ -2600,6 +2600,19 @@ tern_deployments:
 
 Do not require the staging ConfigMap to contain production targets, or the production ConfigMap to contain staging targets. Each instance resolves only the environments it owns.
 
+### Freeze groups (forward-auth)
+
+An environment freeze stops new schema changes in an environment, or in some of its deployments and databases, until it ends or someone lifts it. `write_groups` members may set and lift freezes. To let others, such as incident commanders, do so without any other write, list their forwarded groups in `freeze.groups`:
+
+```yaml
+auth:
+  type: forward_auth
+freeze:
+  groups: [incident-commanders]
+```
+
+The middleware admits `freeze.groups` members to write-tier endpoints, and the freeze handlers (`POST /api/freezes`, `POST /api/freezes/{id}/lift`) allow them. Every other mutating handler still requires `write_groups` or a database's `operator_groups`, and database operator grants do not cover freezes, which reach past any one database. Members also get the read tier, deployment-wide. `freeze.groups` requires `auth.type: forward_auth`, and its entries must be unique; either mistake is a startup error. Under other auth types, freezes follow the plain admin write gate.
+
 ### Tenant-scoped command routing
 
 When multiple isolated SchemaBot deployments are installed on the same

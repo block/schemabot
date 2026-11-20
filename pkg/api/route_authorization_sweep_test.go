@@ -107,6 +107,8 @@ func TestMutatingRoutesDenyScopedOperatorByDefault(t *testing.T) {
 		"POST /api/locks/acquire":     lockBody,
 		"DELETE /api/locks":           lockBody,
 		"POST /api/settings":          `{"key":"pause_applies","value":"true"}`,
+		"POST /api/freezes":           `{"environment":"staging","reason":"incident"}`,
+		"POST /api/freezes/{id}/lift": `{}`,
 		"POST /api/checks/scan":       `{}`,
 		"POST /api/checks/synthesize": `{}`,
 		"POST /api/checks/repos":      `{}`,

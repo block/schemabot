@@ -299,8 +299,8 @@ fields they do not recognize, because there an unknown field is a caller's mista
 operator's typo rather than a peer on a different release, and ignoring it would swallow intent.
 *Enforced:* the additive-only proto and storage-schema rules, checked before a tag
 ([release.md](release.md)); strict decoding on the HTTP API handlers
-(`pkg/api/control_handlers.go`, `pkg/api/lock_handlers.go`, `pkg/api/plan_handlers.go`,
-`pkg/api/settings_handlers.go`, `pkg/api/storage_schema_handlers.go`) and on config load
+(`pkg/api/control_handlers.go`, `pkg/api/freeze_handlers.go`, `pkg/api/lock_handlers.go`,
+`pkg/api/plan_handlers.go`, `pkg/api/settings_handlers.go`, `pkg/api/storage_schema_handlers.go`) and on config load
 (`pkg/api/config.go`).
 
 ### AV-7: An acknowledged delivery is a promise
