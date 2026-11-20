@@ -142,6 +142,12 @@ type ErrorResponse struct {
 	// Blockers lists what refused a change_gate_refused apply, start or
 	// cutover.
 	Blockers []ChangeGateBlocker `json:"blockers,omitempty"`
+
+	// OverrideRequest is the override request SchemaBot recorded when it
+	// refused a change for a caller who gave an override reason. A freeze
+	// approver other than the requester approves it, and the caller then
+	// repeats the command.
+	OverrideRequest *FreezeOverrideRequest `json:"override_request,omitempty"`
 }
 
 // ChangeGateBlocker is one reason a change gate refused an apply, start or
@@ -899,6 +905,9 @@ type ApplyRequest struct {
 	// rollout-wide apply of an environment with more than one member from a
 	// caller that does not set it.
 	RendersRollout bool `json:"renders_rollout,omitempty"`
+	// Override is the reason to ask for a freeze override when a freeze
+	// refuses the apply. At most 500 characters after trimming.
+	Override string `json:"override,omitempty"`
 }
 
 // ControlRequest is the HTTP request body for control operations

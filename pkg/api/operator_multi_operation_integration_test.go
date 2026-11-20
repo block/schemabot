@@ -390,7 +390,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		assert.Equal(t, 0, svc.matrixSummary.count(), "a rollout that has not settled owes no terminal summary")
 
 		clients["region-b/staging"].(*matrixTernClient).outcome.taskState = state.Task.Completed
-		resp, _, err := svc.executeStartForApply(ctx, clients["region-b/staging"], apply, "cli:alice")
+		resp, _, err := svc.executeStartForApply(ctx, clients["region-b/staging"], apply, "cli:alice", "")
 		require.NoError(t, err, "the stopped member never started, so its work is what the start resumes")
 		require.NotNil(t, resp)
 		assert.True(t, resp.Accepted)
@@ -472,7 +472,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 			"the stop caught the finalizer before it began")
 		require.True(t, stopRequestCompleted(t, ctx, stor, seed.applyID))
 		apply := getApply(t, ctx, stor, seed.applyID)
-		resp, _, err := svc.executeStartForApply(ctx, clients["region-a/staging"], apply, "cli:alice")
+		resp, _, err := svc.executeStartForApply(ctx, clients["region-a/staging"], apply, "cli:alice", "")
 		require.NoError(t, err, "the stopped finalizer is work the start resumes")
 		require.NotNil(t, resp)
 		assert.True(t, resp.Accepted)

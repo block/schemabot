@@ -51,7 +51,7 @@ func TestMutatingRoutesDenyScopedOperatorByDefault(t *testing.T) {
 	runMutatingRouteSweep(t, scopedWriteConfig(), operator, nil)
 }
 
-// A freeze group lets its members set and lift freezes, and nothing else. The
+// A freeze group lets its members set and lift freezes and approve overrides, and nothing else. The
 // same sweep, driven as a caller in freeze.groups and no other group, requires
 // a 403 from every other write route, including routes added later, and no
 // 403 from the two freeze writes.

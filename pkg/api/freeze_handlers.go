@@ -311,3 +311,39 @@ func freezeResponse(freeze *storage.EnvironmentFreeze, now time.Time) apitypes.F
 		InEffect:    freeze.InEffectAt(now),
 	}
 }
+
+// overrideReasonFromRequest trims the reason a caller gave for a freeze
+// override and writes the error when the request cannot ask for one.
+// Whitespace alone is no reason, and one too long for a pull request is
+// refused before any gate runs. Only a verified caller may ask: a request
+// recorded as "unverified" names nobody, so its asker could approve it.
+func (s *Service) overrideReasonFromRequest(w http.ResponseWriter, r *http.Request, raw string) (string, bool) {
+	reason := strings.TrimSpace(raw)
+	if n := len([]rune(reason)); n > storage.FreezeOverrideReasonMax {
+		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest,
+			fmt.Sprintf("override reason is %d characters; the limit is %d", n, storage.FreezeOverrideReasonMax))
+		return "", false
+	}
+	if _, verified := auth.VerifiedSubject(r.Context()); reason != "" && !verified {
+		s.writeError(w, http.StatusForbidden, "asking for an override needs a verified caller")
+		return "", false
+	}
+	return reason, true
+}
+
+func freezeOverrideResponse(request *storage.FreezeOverrideRequest) apitypes.FreezeOverrideRequest {
+	return apitypes.FreezeOverrideRequest{
+		ID:          request.Identifier,
+		Environment: request.Environment,
+		Action:      request.Action,
+		TargetID:    request.TargetID,
+		Database:    request.Database,
+		Blockers:    request.Blockers,
+		Reason:      request.Reason,
+		RequestedBy: request.RequestedBy,
+		ApprovedBy:  request.ApprovedBy,
+		ApprovedAt:  request.ApprovedAt,
+		ExpiresAt:   request.ExpiresAt,
+		CreatedAt:   request.CreatedAt,
+	}
+}

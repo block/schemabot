@@ -2053,6 +2053,11 @@ type ApplyOptions struct {
 	// options: the rollback option above is the caller's to set.
 	PinnedRollback bool `json:"pinned_rollback,omitempty"`
 
+	// FreezeOverride is the identifier of the approved freeze override request
+	// that let this apply past a freeze at creation. It is recorded at
+	// creation and never read from caller options.
+	FreezeOverride string `json:"freeze_override,omitempty"`
+
 	// NarrowedTo is the MemberID (deployment/target) of the one rollout member
 	// a narrowed apply ran on. Empty for an apply of the whole rollout. It is
 	// recorded at creation and never read from caller options, so a rollback

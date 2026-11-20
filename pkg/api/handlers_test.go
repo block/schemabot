@@ -197,6 +197,7 @@ type mockStorageWithApplyStores struct {
 	controls   storage.ControlRequestStore
 	operations storage.ApplyOperationStore
 	freezes    storage.FreezeStore
+	overrides  storage.FreezeOverrideStore
 }
 
 func (m *mockStorageWithApplyStores) Plans() storage.PlanStore         { return m.plans }

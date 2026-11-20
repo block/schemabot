@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,6 +12,8 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -35,6 +39,13 @@ type changeGateInput struct {
 	Deployments []string
 	Database    string
 	Repository  string
+	// Action and TargetID name the change an override request covers: the
+	// plan an apply would run, or the apply a start or cutover acts on.
+	Action   string
+	TargetID string
+	// Override is the requester's trimmed reason for asking an approver to
+	// override the blockers. Empty when none was given.
+	Override string
 }
 
 // changeGate is one check an apply, start or cutover must pass at a
@@ -126,11 +137,12 @@ func (s *Service) changeGateDeployments(database, environment, deployment string
 // the configured rollout added for an apply not narrowed to one member: an
 // operation keeps running on a deployment later dropped from the rollout
 // configuration. If the operations cannot be read, the change is refused.
-// The returned context is for the write that records the start or cutover;
-// see checkChangeGates.
-func (s *Service) checkChangeGatesForApply(ctx context.Context, checkpoint changeGateCheckpoint, apply *storage.Apply, caller string) (context.Context, error) {
+// The returned context is for the write that records the start or cutover,
+// and the returned request is the approved override that admitted it, if any;
+// see checkChangeGates. override is the caller's reason for asking one.
+func (s *Service) checkChangeGatesForApply(ctx context.Context, checkpoint changeGateCheckpoint, apply *storage.Apply, caller, override string) (context.Context, *storage.FreezeOverrideRequest, error) {
 	if apply.GetOptions().PinnedRollback {
-		return ctx, nil
+		return ctx, nil, nil
 	}
 	deployments := s.changeGateDeployments(apply.Database, apply.Environment, apply.Deployment, apply.GetOptions().NarrowedTo != "")
 	if operations := s.storage.ApplyOperations(); operations != nil {
@@ -139,7 +151,7 @@ func (s *Service) checkChangeGatesForApply(ctx context.Context, checkpoint chang
 			metrics.RecordChangeGateError(ctx, apply.Environment, string(checkpoint))
 			s.logger.Error("change gate could not read the apply's operations, so the change was refused",
 				append(apply.LogAttrs(), "checkpoint", string(checkpoint), "caller", caller, "error", err)...)
-			return ctx, &ChangeGateUnavailableError{Checkpoint: checkpoint, Gate: "operations", Err: fmt.Errorf("list operations of apply %s: %w", apply.ApplyIdentifier, err)}
+			return ctx, nil, &ChangeGateUnavailableError{Checkpoint: checkpoint, Gate: "operations", Err: fmt.Errorf("list operations of apply %s: %w", apply.ApplyIdentifier, err)}
 		}
 		for _, operation := range stored {
 			if operation.Deployment != "" && !slices.Contains(deployments, operation.Deployment) {
@@ -147,12 +159,19 @@ func (s *Service) checkChangeGatesForApply(ctx context.Context, checkpoint chang
 			}
 		}
 	}
+	action := storage.FreezeOverrideActionStart
+	if checkpoint == changeGateCheckpointCutover {
+		action = storage.FreezeOverrideActionCutover
+	}
 	return s.checkChangeGates(ctx, changeGateInput{
 		Checkpoint:  checkpoint,
 		Environment: apply.Environment,
 		Deployments: deployments,
 		Database:    apply.Database,
 		Repository:  apply.Repository,
+		Action:      action,
+		TargetID:    apply.ApplyIdentifier,
+		Override:    override,
 	}, caller)
 }
 
@@ -160,13 +179,21 @@ func (s *Service) checkChangeGatesForApply(ctx context.Context, checkpoint chang
 // blocks, *ChangeGateRefusedError when something does, and
 // *ChangeGateUnavailableError when a gate could not decide.
 //
-// When nothing blocks, it also returns the context for the write that admits
-// the change. The context carries the freeze epoch read before the freezes
+// Blockers are overridden by an approved override request for this
+// environment, action and target that names every one of them. The request is
+// returned with the admitting context so the caller can record it. Without
+// one, a caller who gave an override reason has a request recorded and the
+// refusal carries it. Any storage error on that path is
+// *ChangeGateUnavailableError: an override never gets past a gate that could
+// not decide.
+//
+// When nothing blocks or an override admits the change, it also returns the
+// context for the write that admits the change. The context carries the freeze epoch read before the freezes
 // were listed, and that write refuses with storage.ErrFreezeEpochChanged if a
 // freeze was created since, or storage.ErrFreezeEpochUnreadable if it could
 // not read the epoch; changeGateAdmissionError maps both refusals. Use
 // the context for that write only.
-func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, caller string) (context.Context, error) {
+func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, caller string) (context.Context, *storage.FreezeOverrideRequest, error) {
 	attrs := []any{
 		"checkpoint", string(in.Checkpoint),
 		"environment", in.Environment,
@@ -184,7 +211,7 @@ func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, call
 			if err != nil {
 				metrics.RecordChangeGateError(ctx, in.Environment, string(in.Checkpoint))
 				s.logger.Error("change gate could not read the freeze epoch, so the change was refused", append(attrs, "error", err)...)
-				return ctx, &ChangeGateUnavailableError{Checkpoint: in.Checkpoint, Gate: "freeze", Err: err}
+				return ctx, nil, &ChangeGateUnavailableError{Checkpoint: in.Checkpoint, Gate: "freeze", Err: err}
 			}
 			admitCtx = storage.WithFreezeEpochGuard(ctx, storage.FreezeEpochGuard{Environment: in.Environment, Epoch: epoch})
 		}
@@ -195,18 +222,134 @@ func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, call
 		if err != nil {
 			metrics.RecordChangeGateError(ctx, in.Environment, string(in.Checkpoint))
 			s.logger.Error("change gate check failed, so the change was refused", append(attrs, "gate", gate.Name(), "error", err)...)
-			return ctx, &ChangeGateUnavailableError{Checkpoint: in.Checkpoint, Gate: gate.Name(), Err: err}
+			return ctx, nil, &ChangeGateUnavailableError{Checkpoint: in.Checkpoint, Gate: gate.Name(), Err: err}
 		}
 		blockers = append(blockers, found...)
 	}
 	if len(blockers) == 0 {
-		return admitCtx, nil
+		return admitCtx, nil, nil
+	}
+	approved, err := s.approvedOverride(ctx, in, blockers)
+	if err != nil {
+		metrics.RecordChangeGateError(ctx, in.Environment, string(in.Checkpoint))
+		s.logger.Error("change gate could not read the override requests, so the change was refused", append(attrs, "error", err)...)
+		return ctx, nil, &ChangeGateUnavailableError{Checkpoint: in.Checkpoint, Gate: "override", Err: err}
+	}
+	if approved != nil {
+		for _, gate := range distinctChangeGateNames(blockers) {
+			metrics.RecordChangeGateOverride(ctx, in.Environment, gate, string(in.Checkpoint))
+		}
+		s.logger.Info("change gate admitted the change on an approved override", append(attrs,
+			"override_request", approved.Identifier, "requested_by", approved.RequestedBy, "approved_by", approved.ApprovedBy,
+			"reason", approved.Reason, "blockers", approved.Blockers)...)
+		return admitCtx, approved, nil
 	}
 	for _, gate := range distinctChangeGateNames(blockers) {
 		metrics.RecordChangeGateRefusal(ctx, in.Environment, gate, string(in.Checkpoint))
 	}
+	refusal := &ChangeGateRefusedError{Checkpoint: in.Checkpoint, Environment: in.Environment, Blockers: blockers}
+	if in.Override != "" {
+		requested, err := s.requestOverride(ctx, in, blockers)
+		if err != nil {
+			metrics.RecordChangeGateError(ctx, in.Environment, string(in.Checkpoint))
+			s.logger.Error("change gate could not record the override request, so the change was refused", append(attrs, "error", err)...)
+			return ctx, nil, &ChangeGateUnavailableError{Checkpoint: in.Checkpoint, Gate: "override", Err: err}
+		}
+		if requested != nil {
+			s.logger.Info("override requested for a change a gate refused", append(attrs,
+				"override_request", requested.Identifier, "reason", requested.Reason, "blockers", requested.Blockers)...)
+			refusal.OverrideRequest = requested
+		} else {
+			refusal.OverrideUnrecorded = true
+		}
+	}
 	s.logger.Warn("change gate refused the change", append(attrs, "blockers", changeGateBlockerIDs(blockers))...)
-	return ctx, &ChangeGateRefusedError{Checkpoint: in.Checkpoint, Environment: in.Environment, Blockers: blockers}
+	return ctx, nil, refusal
+}
+
+// approvedOverride returns the first approved, unexpired override request for
+// the change that names every blocker and that the caller asked for, or nil
+// when there is none. Only the requester runs on an approval: anyone else asks
+// for their own. Within its window the requester may use it more than once,
+// for example to re-apply the same schema after a stop. A server without
+// override storage has none to find.
+func (s *Service) approvedOverride(ctx context.Context, in changeGateInput, blockers []apitypes.ChangeGateBlocker) (*storage.FreezeOverrideRequest, error) {
+	overrides := s.storage.FreezeOverrides()
+	if overrides == nil {
+		return nil, nil
+	}
+	caller, verified := overrideCaller(ctx)
+	if !verified {
+		return nil, nil
+	}
+	approved, err := overrides.ListApproved(ctx, storage.FreezeOverrideTarget{
+		Environment: in.Environment, Action: in.Action, TargetID: in.TargetID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list approved overrides for %s %s in %s: %w", in.Action, in.TargetID, in.Environment, err)
+	}
+	ids := changeGateBlockerIDs(blockers)
+	for _, request := range approved {
+		if request.Covers(ids) && storage.CanonicalKey(request.RequestedBy) == storage.CanonicalKey(caller) {
+			return request, nil
+		}
+	}
+	return nil, nil
+}
+
+// requestOverride records a request for an approver to override the blockers
+// of this change, for the caller who asked. Repository, pull request and
+// author stay empty: the plan does not store its pull request's author, and
+// storage needs the author of a request from a pull request. The pull request
+// command fills them from the webhook.
+func (s *Service) requestOverride(ctx context.Context, in changeGateInput, blockers []apitypes.ChangeGateBlocker) (*storage.FreezeOverrideRequest, error) {
+	overrides := s.storage.FreezeOverrides()
+	freezes := s.storage.Freezes()
+	if overrides == nil || freezes == nil {
+		return nil, nil
+	}
+	// Only a verified caller may ask. A request recorded as "unverified"
+	// names nobody, so its asker could approve it under their own name.
+	requester, verified := overrideCaller(ctx)
+	if !verified {
+		return nil, nil
+	}
+	now, err := freezes.Now(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read the database clock for an override request: %w", err)
+	}
+	return overrides.Create(ctx, &storage.FreezeOverrideRequest{
+		Identifier:  engine.NewFreezeOverrideID(),
+		Environment: in.Environment,
+		Action:      in.Action,
+		TargetID:    in.TargetID,
+		Database:    in.Database,
+		Blockers:    changeGateBlockerIDs(blockers),
+		Reason:      in.Override,
+		RequestedBy: requester,
+		ExpiresAt:   now.Add(storage.FreezeOverrideMaxLifetime),
+	})
+}
+
+// overrideCaller is the verified caller who asks for an override and
+// runs on its approval.
+func overrideCaller(ctx context.Context) (string, bool) {
+	return auth.VerifiedSubject(ctx)
+}
+
+// applyOverrideTarget names what an override of an apply covers: the
+// database, the rollout member it is narrowed to, and the schema it asks
+// for. It is not the plan's identifier, because each apply from a pull
+// request or the CLI plans afresh, and a repeated command would never find
+// its approval. A changed schema is a new target and needs a new approval.
+func applyOverrideTarget(plan *storage.Plan, target string) string {
+	files, err := json.Marshal(plan.SchemaFiles) // map keys marshal sorted
+	if err != nil {
+		// Fail safe: a target no approval names.
+		return plan.PlanIdentifier
+	}
+	sum := sha256.Sum256(files)
+	return fmt.Sprintf("%s/%s@%x", plan.Database, target, sum[:8])
 }
 
 // isFreezeAdmissionRefusal reports whether the admission write refused the
@@ -257,6 +400,13 @@ type ChangeGateRefusedError struct {
 	Checkpoint  changeGateCheckpoint
 	Environment string
 	Blockers    []apitypes.ChangeGateBlocker
+	// OverrideRequest is the request recorded for a caller who gave an
+	// override reason, awaiting an approver other than the requester.
+	OverrideRequest *storage.FreezeOverrideRequest
+	// OverrideUnrecorded reports an override reason given by a caller who
+	// is not verified, or to a server with no override storage: no request
+	// was recorded.
+	OverrideUnrecorded bool
 }
 
 func (e *ChangeGateRefusedError) Error() string {
@@ -268,7 +418,14 @@ func (e *ChangeGateRefusedError) Error() string {
 		}
 		parts = append(parts, fmt.Sprintf("%s %s (%s, %s)", blocker.Gate, blocker.ID, blocker.Reason, until))
 	}
-	return fmt.Sprintf("blocked in %s by %s; try again after it ends or is lifted", e.Environment, strings.Join(parts, "; "))
+	message := fmt.Sprintf("blocked in %s by %s; try again after it ends or is lifted", e.Environment, strings.Join(parts, "; "))
+	if e.OverrideRequest != nil {
+		message += fmt.Sprintf("; override request %s needs a freeze approver other than you", e.OverrideRequest.Identifier)
+	}
+	if e.OverrideUnrecorded {
+		message += "; no override was requested, because asking for one needs a verified caller"
+	}
+	return message
 }
 
 // ChangeGateUnavailableError reports a change gate that could not decide. The
@@ -322,6 +479,10 @@ func (s *Service) writeChangeGateError(w http.ResponseWriter, opName string, err
 	response := apitypes.ErrorResponse{Error: opName + " rejected: " + err.Error(), ErrorCode: code}
 	if refused, isRefusal := errors.AsType[*ChangeGateRefusedError](err); isRefusal {
 		response.Blockers = refused.Blockers
+		if refused.OverrideRequest != nil {
+			overrideRequest := freezeOverrideResponse(refused.OverrideRequest)
+			response.OverrideRequest = &overrideRequest
+		}
 	}
 	if unavailable, isUnavailable := errors.AsType[*ChangeGateUnavailableError](err); isUnavailable {
 		response.Error = unavailable.UserMessage()
