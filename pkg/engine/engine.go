@@ -537,6 +537,16 @@ type PlanRequest struct {
 	// ExemptTables, and refuses a table the config withholds that a schema file
 	// also declares (see IgnoredTables).
 	IgnoreTables []string
+
+	// DropTables lists live tables the repository's drop_tables config asks
+	// the planner to drop although no schema file declares them, including
+	// tables an engine otherwise leaves out of every plan by their names, such
+	// as an online schema change's leftover tables. Entries are exact table
+	// names. A listed table that exists is planned as DROP TABLE, an unsafe
+	// change that needs the usual confirmation. Only the MySQL engine honors
+	// the list; every other engine refuses a plan that carries one (see
+	// DroppedTables).
+	DropTables []string
 }
 
 // PlanResult contains the computed schema change plan.
@@ -573,6 +583,13 @@ type ExemptTables struct {
 	Tables    []string
 	Reason    string
 }
+
+// ExemptReasonLeadingUnderscore is the exemption reason a MySQL plan carries
+// for a live table whose name starts with "_". Online schema change tools name
+// their shadow, checkpoint and leftover tables that way, so the planner never
+// diffs, drops or creates one, and a no-change plan is where a reviewer learns
+// that such a table is still on the target.
+const ExemptReasonLeadingUnderscore = "leading underscore"
 
 // HasErrors returns true if any lint warning has error severity.
 // Error-severity violations block apply unless overridden with --allow-unsafe.

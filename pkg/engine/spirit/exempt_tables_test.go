@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // mustIgnoredTables indexes ignore_tables entries the test knows are valid.
@@ -131,6 +132,43 @@ func TestLiveSchemaFilterOptions_ArchiveExclusionStaysWithTheLoader(t *testing.T
 func TestLiveSchemaFilterOptions_UnrelatedEntriesKeepTheLoaderExclusion(t *testing.T) {
 	opts := liveSchemaFilterOptions(mustIgnoredTables(t, []string{"flyway_schema_history"}))
 	assert.Contains(t, opts, table.WithoutArchiveTables)
+}
+
+// A plan discloses each reason the diff skipped live tables in its own group:
+// the config's entries first, then the leading-underscore and archive naming
+// conventions, so a reviewer can tell which decision kept each table out.
+// With one namespace in the request the groups name it; nothing skipped means
+// no groups.
+func TestExemptLiveTablesGroupsEachReason(t *testing.T) {
+	live := &liveSchema{
+		withheld:   []string{"flyway"},
+		underscore: []string{"_a_old", "_b_new"},
+		archive:    []string{"x_archive_2024"},
+	}
+	req := &engine.PlanRequest{SchemaFiles: schema.SchemaFiles{"app": {}}}
+	assert.Equal(t, []*engine.ExemptTables{
+		{Namespace: "app", Tables: []string{"flyway"}, Reason: engine.ExemptReasonIgnoreTables},
+		{Namespace: "app", Tables: []string{"_a_old", "_b_new"}, Reason: engine.ExemptReasonLeadingUnderscore},
+		{Namespace: "app", Tables: []string{"x_archive_2024"}, Reason: engine.ExemptReasonArchiveNaming},
+	}, exemptLiveTables(mustIgnoredTables(t, []string{"flyway"}), req, "db", live))
+	assert.Nil(t, exemptLiveTables(mustIgnoredTables(t, nil), &engine.PlanRequest{}, "db", &liveSchema{}))
+}
+
+// A schema file declaring a live table a naming convention skips would plan a
+// CREATE TABLE for a table that already exists, so the plan is refused naming
+// the table and the convention, whatever case the file spells it in.
+func TestRefuseDeclaredSkippedTables(t *testing.T) {
+	live := &liveSchema{underscore: []string{"_legacy"}, archive: []string{"orders_archive_2024"}}
+
+	require.NoError(t, refuseDeclaredSkippedTables("app", []string{"orders", "legacy"}, live))
+
+	err := refuseDeclaredSkippedTables("app", []string{"orders", "_Legacy"}, live)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `declares table "_Legacy", which the MySQL planner never manages because its name starts with "_"`)
+
+	err = refuseDeclaredSkippedTables("app", []string{"orders_archive_2024"}, live)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "because its name follows the archive convention")
 }
 
 // An entry naming a table the archive convention also excludes is the one case

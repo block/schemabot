@@ -32,10 +32,14 @@ the PR has either been applied successfully or resolved by a new plan.
 
 ## PR target eligibility
 
-SchemaBot plans and publishes checks for PRs targeting the repository's configured
-**default branch**. It also runs on another branch when active repository or
-organization rulesets, or classic branch protection, require its aggregate or
-promotion check. Check names and GitHub App identity pins remain unchanged.
+By default, SchemaBot plans and publishes checks for PRs into every branch.
+With `skip_unrequired_branches: true` in the server config, it serves only PRs
+targeting the repository's configured **default branch**, plus another branch
+when active repository or organization rulesets, or classic branch protection,
+require its aggregate or promotion check. Check names and GitHub App identity
+pins remain unchanged. The rest of this section describes behavior with
+`skip_unrequired_branches` on; with it off, no target is excluded and no branch
+policy is read.
 
 For an ordinary PR, the target is its direct base. For a native GitHub stack,
 the target is the stack's ultimate base: every member receives real validation
@@ -103,12 +107,20 @@ uncached PR metadata reads. A two-environment
 no-work publisher reads one initial target snapshot and performs one final
 uncached check per published environment, in addition to scope discovery and
 revalidation. Existing snapshots are reused for the initial currency check. A successful null
-classic rule proves absence; an ambiguous REST 404 does not. Missing metadata,
+classic rule proves absence; an ambiguous REST 404 does not. Except for the
+missing permission described next, missing metadata,
 permission failures, and incomplete lookup responses stop processing rather
-than permitting exclusion. The GitHub App needs **Administration: read** access
-for protection discovery, in addition to its existing permissions.
+than permitting exclusion.
 
-Before rollout, audit repository and organization rulesets plus classic branch
+Reading classic branch protection needs the GitHub App's **Administration:
+read** permission. Without it, SchemaBot cannot tell whether a non-default
+branch requires its check, so it treats every such target as enforced: it
+plans, applies, and publishes Check Runs there, as it did before target
+enforcement existed, and logs a warning naming the missing permission. Rulesets
+are read with the Metadata permission every App has. Grant Administration: read
+to limit SchemaBot to the default branch and the branches that require it.
+
+Before turning on `skip_unrequired_branches`, grant Administration: read and audit repository and organization rulesets plus classic branch
 protection. Scope SchemaBot requirements to the default branch and intentionally
 included release refs. If a shared ruleset covers additional branches, split out
 only SchemaBot's requirements; preserve other builds and App pins. Existing
@@ -455,6 +467,26 @@ already-completed, already-gated apply. A repository SchemaBot does not manage,
 or one with check publishing disabled, gets no merge-group check because its
 check is not required there.
 
+A `checks_requested` delivery lost during a GitHub or SchemaBot outage leaves
+its merge group without the check, and the queue stalls behind it.
+[`checks backfill`](#backfilling-missing-check-runs) reads the merge queue of
+each repository it sweeps and posts the same passing check on every merge
+group missing one. Before it posts, the server lists the queue again and
+posts only on heads the queue still holds, and it skips the repositories this
+webhook would skip. A `gh-readonly-queue/` branch counts only when GitHub's
+merge queue for its base branch has an entry whose head is that branch's
+commit, so a branch pushed under that name by hand gets nothing. If the queue
+cannot be read, it posts nothing (MG-1).
+The backfill posts only the checks in the run's `-e` and `--check-name`, and
+only those the merge group does not already carry. It leaves an existing
+check as it is, and posts nothing on a head whose existing checks it cannot
+read. It also refuses a head that is the head of an open PR, because the
+passing check would pass that PR's own required check too, and it posts
+nothing on a head it cannot check against open PRs.
+Listing the queue reads branches, which the App's Contents read permission
+grants, and the merge queue itself, which needs the same Merge queues read
+permission as the `merge_group` webhook.
+
 ### Auto-Plan
 
 A PR is synchronized when GitHub sends a `pull_request` webhook with action
@@ -767,6 +799,22 @@ recreates each by replaying the auto-plan flow server-side. Check Runs that
 exist but never completed are reported for investigation, never acted on — an
 uncompleted run can belong to a genuinely in-flight apply.
 
+A PR that changes managed schema needs a plan to recreate its check, and a
+plan reads every changed database's schema once per environment. Without
+`--plan`, the server defers those PRs before it writes any Check Run or
+stored check state, so the missing required check keeps the merge
+blocked (MG-1). The report names the databases each deferred PR changes and
+prints the `--plan --pr` command that plans them. The server also re-reads
+the GitHub budget before each PR and stops the batch below
+`--rate-limit-floor`; the CLI resends the PRs it did not start after the
+budget resets.
+
+A sweep of a repository also reads its merge queue and posts the passing
+check on each merge group missing one, before it recreates any PR's check,
+because a blocked group holds every PR queued behind it. See
+[Merge Queue Events](#merge-queue-events). A scan of named PRs leaves the
+merge queue out.
+
 Each reported run carries the stored check state behind it, classified the
 same way [`checks show`](#explaining-a-blocked-check) classifies it: the
 sweep says whether the run is waiting on SchemaBot or on an operator, and
@@ -782,8 +830,9 @@ its own `allowed_environments`, and its own storage, so one run converges only
 the checks that instance owns:
 
 - **Repositories.** Naming a repository (`schemabot checks backfill
-  <owner/name>`) scans just that one; `--all-repos` scans every repository
-  declared in the instance's `repos:` config. A legacy single-App config
+  <owner/name>`) scans just that one, and `--pr` narrows it to the named PRs;
+  `--all-repos` scans every repository declared in the instance's `repos:`
+  config, less any named by `--skip-repo`. A legacy single-App config
   declares no repos, so there `--all-repos` is rejected and repositories must
   be named explicitly. Repositories with `enable_checks: false` (including
   `listen_only` repositories, which never publish checks) are skipped,
@@ -852,9 +901,9 @@ that leaves work behind exits nonzero with a one-line count summary, after
 printing the full report, so a scheduled sweep can alert on the exit code
 without parsing the output. A `--dry-run` acts on nothing, so any finding —
 missing, held, or stuck — fails the run. Outside `--dry-run`, successfully
-recreated checks are resolved and do not fail the run; held PRs, failed
-recreations, and stuck Check Runs do, because the backfill never acts on
-those and an operator still has to. A run stopped by Ctrl-C or SIGTERM exits
+recreated checks are resolved and do not fail the run; held PRs, deferred
+schema PRs, failed recreations, and stuck Check Runs do, because their checks
+are still missing or unfinished and an operator still has to act. A run stopped by Ctrl-C or SIGTERM exits
 130 instead. Any report it prints is marked as interrupted, with
 `"interrupted": true` in its JSON; see
 [the CLI reference](cli.md#recover-missing-github-checks) for what it holds.
@@ -1035,6 +1084,30 @@ Webhook delivery and background work can be reordered. Before SchemaBot writes
 plan, cleanup, or aggregate state, it verifies the PR's current head SHA when it
 can. If the work belongs to an older head, SchemaBot skips the write instead of
 publishing a misleading check on the current commit.
+
+#### A burst of pushes
+
+With durable webhook dispatch, SchemaBot holds each push to a PR back for a
+quiet period before it plans it, 15 seconds by default. If another push to the
+same PR arrives in that time, SchemaBot reads the PR from GitHub when the
+earlier push's turn comes. If the PR's head has moved on, the earlier push is
+skipped without a plan, so a rebase or a quick series of commits is planned
+once, on its newest head. A push whose head is still the PR's current head is
+always planned, even when later webhooks are queued behind it.
+
+The wait applies to every push, including a lone one: its plan and its
+SchemaBot Check Run start once the quiet period has passed. Opened and reopened
+PRs, commands in PR comments, and recovery work are not held back.
+
+Set `WEBHOOK_SYNCHRONIZE_QUIET_PERIOD` on the server to change the wait, as a
+duration such as `30s`. `0` turns it off, so every push is planned as soon as it
+arrives. The maximum is `2m`; a value above it, a negative value, or one that
+is not a duration is logged as an error and the 15-second default is used.
+
+A push only replaces one that SchemaBot received strictly earlier. With MySQL
+storage, the inbox records when it received each push to the second, so two
+pushes received in the same clock second are both planned. PostgreSQL storage
+records the time to the microsecond.
 
 ### PR closed
 

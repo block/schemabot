@@ -153,7 +153,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (PR command actor authorization): `allowed`, `denied`, `error`, `skipped`, `unknown`
 
-**reason** (PR command actor authorization): `disabled`, `allowed_admin_team`, `allowed_admin_user`, `allowed_repo_admin_team`, `allowed_repo_admin_user`, `allowed_operator_team`, `allowed_operator_user`, `missing_actor`, `missing_server_config`, `missing_database_config`, `no_configured_principal`, `not_authorized`, `github_error`, `unknown`
+**reason** (PR command actor authorization): `disabled`, `allowed_admin_team`, `allowed_admin_user`, `allowed_repo_admin_team`, `allowed_repo_admin_user`, `allowed_operator_team`, `allowed_operator_user`, `allowed_command_app`, `missing_actor`, `missing_server_config`, `missing_database_config`, `no_configured_principal`, `not_authorized`, `github_error`, `unknown`
 
 **operation** (check ownership): `apply_finished`, `apply_cancelled_finished`, `rollback_finished`
 
@@ -535,7 +535,7 @@ Reason values:
 
 Operation names mirror the mutating endpoints (`plan`, `apply`, control
 operations, `lock_acquire`/`lock_release`/`lock_force_release`, and the
-admin-only `checks_*`, `webhook_redrive`, `settings_set`). Unrecognized
+admin-only `checks_*`, `settings_set`). Unrecognized
 operation, status, or reason values are recorded as `unknown` to keep
 cardinality bounded. `database` and `environment` use the `unknown` sentinel
 when the operation has no such dimension (admin-only operations have no single
@@ -673,7 +673,7 @@ On a quota alert, find this warning for the installation/resource and check the
 reset time. The logged repository encountered exhaustion; it is not necessarily
 the repository that consumed the shared budget. Compare `requests_total` volume
 by repository and operation for that installation/resource before exhaustion to
-locate excess traffic, then reduce avoidable requests or repeated redrives. After
+locate excess traffic, then reduce avoidable requests or repeated backfills. After
 reset, verify fresh successful checks for affected repositories before declaring
 recovery. Keep the rejection counter as the direct alert signal, including
 locally blocked calls; use the warning for investigation context.

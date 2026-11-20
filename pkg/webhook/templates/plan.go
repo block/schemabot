@@ -1323,7 +1323,11 @@ func writeExemptTablesGroup(sb *strings.Builder, group ExemptTablesData, env str
 	if len(group.Tables) == 0 {
 		return
 	}
-	names := strings.Join(inlineCodeList(group.Tables), ", ")
+	shown, more := presentation.ExemptTableNames(group.Tables)
+	names := strings.Join(inlineCodeList(shown), ", ")
+	if more > 0 {
+		names += fmt.Sprintf(", and %d more", more)
+	}
 
 	if len(group.Tables) <= exemptTablesInlineLimit {
 		prefix, noun := "", "Ignored tables"

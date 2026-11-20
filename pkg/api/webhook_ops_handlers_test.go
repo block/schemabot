@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -22,377 +21,171 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-type fakeWebhookRedriveDeliveryClient struct {
-	pages              [][]*gh.HookDelivery
-	details            map[int64]*gh.HookDelivery
-	redelivered        []int64
-	afterRedeliverHook func(deliveryID int64)
-}
-
-func (f *fakeWebhookRedriveDeliveryClient) ListHookDeliveries(_ context.Context, opts *gh.ListCursorOptions) ([]*gh.HookDelivery, *gh.Response, error) {
-	page := 0
-	if opts != nil && opts.Cursor == "page-2" {
-		page = 1
-	}
-	if page >= len(f.pages) {
-		return nil, &gh.Response{}, nil
-	}
-	resp := &gh.Response{}
-	if page+1 < len(f.pages) {
-		resp.Cursor = "page-2"
-	}
-	return f.pages[page], resp, nil
-}
-
-func (f *fakeWebhookRedriveDeliveryClient) GetHookDelivery(_ context.Context, deliveryID int64) (*gh.HookDelivery, *gh.Response, error) {
-	detail := f.details[deliveryID]
-	if detail == nil {
-		return nil, nil, errors.New("not found")
-	}
-	return detail, &gh.Response{}, nil
-}
-
-func (f *fakeWebhookRedriveDeliveryClient) RedeliverHookDelivery(_ context.Context, deliveryID int64) (*gh.HookDelivery, *gh.Response, error) {
-	if deliveryID == 999 {
-		return nil, nil, errors.New("boom")
-	}
-	f.redelivered = append(f.redelivered, deliveryID)
-	if f.afterRedeliverHook != nil {
-		f.afterRedeliverHook(deliveryID)
-	}
-	return &gh.HookDelivery{ID: new(deliveryID)}, &gh.Response{}, nil
-}
-
-func TestWebhookRedriveEventEligibleMatchesCheckCreatingEvents(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		event  string
-		action string
-		want   bool
-	}{
-		{name: "pull request opened", event: "pull_request", action: "opened", want: true},
-		{name: "pull request synchronize", event: "pull_request", action: "synchronize", want: true},
-		{name: "check suite requested", event: "check_suite", action: "requested", want: true},
-		{name: "merge group checks requested", event: "merge_group", action: "checks_requested", want: true},
-		{name: "issue comment excluded", event: "issue_comment", action: "created", want: false},
-		{name: "closed pull request excluded", event: "pull_request", action: "closed", want: false},
-		{name: "destroyed merge group excluded", event: "merge_group", action: "destroyed", want: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			delivery := &gh.HookDelivery{ID: new(int64(123)), Event: new(tt.event), Action: new(tt.action)}
-			assert.Equal(t, tt.want, webhookRedriveEventEligible(delivery))
-		})
-	}
-}
-
-// Delivery success is judged by the 2xx status code, not the literal status
-// string: a 202 ("Accepted") is a success, not a failure to redrive.
-func TestWebhookDeliverySucceededUsesStatusCode(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		code int
-		want bool
-	}{
-		{name: "200 OK", code: 200, want: true},
-		{name: "202 Accepted", code: 202, want: true},
-		{name: "500 error", code: 500, want: false},
-		{name: "408 timeout", code: 408, want: false},
-		{name: "0 never delivered", code: 0, want: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			assert.Equal(t, tt.want, webhookDeliverySucceeded(&gh.HookDelivery{StatusCode: new(tt.code)}))
-		})
-	}
-}
-
-func TestRedriveWebhookAppDeliveriesDryRunSelectsFailedDeliveriesInWindow(t *testing.T) {
-	t.Parallel()
-
-	windowStart := time.Date(2026, 7, 7, 19, 40, 0, 0, time.UTC)
-	windowEnd := time.Date(2026, 7, 7, 19, 50, 0, 0, time.UTC)
-	client := &fakeWebhookRedriveDeliveryClient{pages: [][]*gh.HookDelivery{
-		{
-			webhookRedriveTestDelivery(101, windowEnd.Add(-time.Minute), "pull_request", "opened", "timed out", 504),
-			webhookRedriveTestDelivery(102, windowEnd.Add(-2*time.Minute), "pull_request", "opened", "OK", 200),
-		},
-		{
-			webhookRedriveTestDelivery(103, windowStart.Add(time.Minute), "issue_comment", "created", "ERROR", 500),
-			webhookRedriveTestDelivery(104, windowStart.Add(-time.Minute), "pull_request", "synchronize", "ERROR", 500),
-		},
-	}}
-
-	result, err := redriveWebhookAppDeliveries(t.Context(), client, "default", "", windowStart, windowEnd, 10, true, "", 0, discardLogger())
-
-	require.NoError(t, err)
-	require.Len(t, result.Selected, 1)
-	assert.True(t, result.DryRun)
-	assert.Equal(t, int64(101), result.Selected[0].ID)
-	assert.Equal(t, 4, result.Fetched)
-	assert.Equal(t, 2, result.Pages)
-	assert.True(t, result.ReachedWindowStart)
-	assert.Empty(t, client.redelivered)
-}
-
-func TestRedriveWebhookAppDeliveriesReturnsCursorWhenWindowStartNotReached(t *testing.T) {
-	t.Parallel()
-
-	windowStart := time.Date(2026, 7, 7, 19, 40, 0, 0, time.UTC)
-	windowEnd := time.Date(2026, 7, 7, 19, 50, 0, 0, time.UTC)
-	// Two pages exist but only one is allowed: the cursor is still available
-	// when the page budget runs out, so the caller can continue the listing
-	// with a follow-up request instead of restarting from the newest page.
-	client := &fakeWebhookRedriveDeliveryClient{pages: [][]*gh.HookDelivery{
-		{webhookRedriveTestDelivery(101, windowEnd.Add(-time.Minute), "pull_request", "opened", "ERROR", 500)},
-		{webhookRedriveTestDelivery(102, windowEnd.Add(-2*time.Minute), "pull_request", "opened", "ERROR", 500)},
-	}}
-
-	result, err := redriveWebhookAppDeliveries(t.Context(), client, "default", "", windowStart, windowEnd, 1, true, "", 0, discardLogger())
-
-	require.NoError(t, err)
-	assert.False(t, result.ReachedWindowStart)
-	assert.False(t, result.HistoryExhausted)
-	assert.Equal(t, "page-2", result.NextCursor)
-}
-
-func TestRedriveWebhookAppDeliveriesRedeliversSelectedDeliveries(t *testing.T) {
-	t.Parallel()
-
-	windowStart := time.Date(2026, 7, 7, 19, 40, 0, 0, time.UTC)
-	windowEnd := time.Date(2026, 7, 7, 19, 50, 0, 0, time.UTC)
-	client := &fakeWebhookRedriveDeliveryClient{pages: [][]*gh.HookDelivery{
-		{
-			webhookRedriveTestDelivery(101, windowEnd.Add(-time.Minute), "pull_request", "opened", "ERROR", 500),
-			webhookRedriveTestDelivery(102, windowStart.Add(-time.Minute), "pull_request", "opened", "ERROR", 500),
-		},
-	}}
-
-	result, err := redriveWebhookAppDeliveries(t.Context(), client, "default", "", windowStart, windowEnd, 10, false, "", 0, discardLogger())
-
-	require.NoError(t, err)
-	assert.False(t, result.DryRun)
-	assert.Equal(t, []int64{101}, client.redelivered)
-	assert.Equal(t, 1, result.Redelivered)
-	assert.Equal(t, 0, result.Failed)
-}
-
-func TestRedriveWebhookAppDeliveriesStopsPromptlyWhenDelayContextIsCanceled(t *testing.T) {
-	t.Parallel()
-
-	windowStart := time.Date(2026, 7, 7, 19, 40, 0, 0, time.UTC)
-	windowEnd := time.Date(2026, 7, 7, 19, 50, 0, 0, time.UTC)
-	ctx, cancel := context.WithCancel(t.Context())
-	client := &fakeWebhookRedriveDeliveryClient{
-		pages: [][]*gh.HookDelivery{{
-			webhookRedriveTestDelivery(101, windowEnd.Add(-time.Minute), "pull_request", "opened", "ERROR", 500),
-			webhookRedriveTestDelivery(102, windowEnd.Add(-2*time.Minute), "pull_request", "opened", "ERROR", 500),
-			webhookRedriveTestDelivery(103, windowStart.Add(-time.Minute), "pull_request", "opened", "ERROR", 500),
-		}},
-		afterRedeliverHook: func(deliveryID int64) {
-			if deliveryID == 101 {
-				cancel()
-			}
-		},
-	}
-
-	result, err := redriveWebhookAppDeliveries(ctx, client, "default", "", windowStart, windowEnd, 10, false, "", 0, discardLogger())
-
-	require.Error(t, err)
-	assert.ErrorIs(t, err, context.Canceled)
-	assert.Equal(t, []int64{101}, client.redelivered)
-	assert.Equal(t, 1, result.Redelivered)
-}
-
-func TestRedriveWebhookAppDeliveriesFiltersByRepoAndPullRequest(t *testing.T) {
-	t.Parallel()
-
-	windowStart := time.Date(2026, 7, 7, 19, 40, 0, 0, time.UTC)
-	windowEnd := time.Date(2026, 7, 7, 19, 50, 0, 0, time.UTC)
-	client := &fakeWebhookRedriveDeliveryClient{
-		pages: [][]*gh.HookDelivery{{
-			webhookRedriveTestDelivery(101, windowEnd.Add(-time.Minute), "pull_request", "opened", "ERROR", 500),
-			webhookRedriveTestDelivery(102, windowEnd.Add(-2*time.Minute), "pull_request", "opened", "ERROR", 500),
-			webhookRedriveTestDelivery(103, windowStart.Add(-time.Minute), "pull_request", "opened", "ERROR", 500),
-		}},
-		details: map[int64]*gh.HookDelivery{
-			101: webhookRedriveTestDeliveryDetail(101, "octo/repo", 12),
-			102: webhookRedriveTestDeliveryDetail(102, "octo/other", 12),
-		},
-	}
-
-	result, err := redriveWebhookAppDeliveries(t.Context(), client, "default", "", windowStart, windowEnd, 10, true, "octo/repo", 12, discardLogger())
-
-	require.NoError(t, err)
-	require.Len(t, result.Selected, 1)
-	assert.Equal(t, int64(101), result.Selected[0].ID)
-	assert.Equal(t, "octo/repo", result.Selected[0].Repo)
-	assert.Equal(t, 12, result.Selected[0].PR)
-}
-
-// A check_suite payload can carry several pull requests; a delivery is
-// selected when any of them matches the PR filter, so a busy-repo check_suite
-// touching the requested PR is not silently skipped.
-func TestRedriveWebhookAppDeliveriesMatchesPRAmongMultiplePayloadPRs(t *testing.T) {
-	t.Parallel()
-
-	windowStart := time.Date(2026, 7, 7, 19, 40, 0, 0, time.UTC)
-	windowEnd := time.Date(2026, 7, 7, 19, 50, 0, 0, time.UTC)
-	multiPRPayload, err := json.Marshal(map[string]any{
-		"repository": map[string]any{"full_name": "octo/repo"},
-		"check_suite": map[string]any{
-			"pull_requests": []map[string]any{{"number": 7}, {"number": 12}},
-		},
-	})
-	require.NoError(t, err)
-	raw := json.RawMessage(multiPRPayload)
-	client := &fakeWebhookRedriveDeliveryClient{
-		pages: [][]*gh.HookDelivery{{
-			webhookRedriveTestDelivery(201, windowEnd.Add(-time.Minute), "check_suite", "requested", "ERROR", 500),
-			webhookRedriveTestDelivery(202, windowStart.Add(-time.Minute), "pull_request", "opened", "ERROR", 500),
-		}},
-		details: map[int64]*gh.HookDelivery{
-			201: {ID: new(int64(201)), Request: &gh.HookRequest{RawPayload: &raw}},
-		},
-	}
-
-	result, err := redriveWebhookAppDeliveries(t.Context(), client, "default", "", windowStart, windowEnd, 10, true, "octo/repo", 12, discardLogger())
-
-	require.NoError(t, err)
-	require.Len(t, result.Selected, 1)
-	assert.Equal(t, int64(201), result.Selected[0].ID)
-	assert.Equal(t, 12, result.Selected[0].PR)
-}
-
-// When GitHub's retained delivery history ends before the requested window
-// start, the result reports the fact so the caller can distinguish "raise the
-// page budget" from "older deliveries no longer exist".
-func TestRedriveWebhookAppDeliveriesReportsExhaustedHistory(t *testing.T) {
-	t.Parallel()
-
-	windowStart := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
-	windowEnd := time.Date(2026, 7, 7, 19, 50, 0, 0, time.UTC)
-	client := &fakeWebhookRedriveDeliveryClient{
-		pages: [][]*gh.HookDelivery{{
-			webhookRedriveTestDelivery(301, windowEnd.Add(-time.Minute), "pull_request", "opened", "ERROR", 500),
-		}},
-	}
-
-	result, err := redriveWebhookAppDeliveries(t.Context(), client, "default", "", windowStart, windowEnd, 10, true, "", 0, discardLogger())
-
-	require.NoError(t, err)
-	assert.False(t, result.ReachedWindowStart)
-	assert.True(t, result.HistoryExhausted)
-	assert.Empty(t, result.NextCursor)
-}
-
-// A failed delivery is not re-selected when a newer redelivery of it (same
-// GUID) already succeeded during the crawl, so repeated redrives over a
-// stable window converge instead of re-firing downstream events.
-func TestRedriveWebhookAppDeliveriesSkipsAlreadySucceededRedeliveries(t *testing.T) {
-	t.Parallel()
-
-	windowStart := time.Date(2026, 7, 7, 19, 40, 0, 0, time.UTC)
-	windowEnd := time.Date(2026, 7, 7, 19, 50, 0, 0, time.UTC)
-	succeededRedelivery := webhookRedriveTestDelivery(11, windowEnd.Add(-time.Minute), "pull_request", "opened", "OK", 200)
-	succeededRedelivery.GUID = new("guid-a")
-	failedOriginalA := webhookRedriveTestDelivery(10, windowEnd.Add(-2*time.Minute), "pull_request", "opened", "ERROR", 500)
-	failedOriginalA.GUID = new("guid-a")
-	failedOriginalB := webhookRedriveTestDelivery(20, windowEnd.Add(-3*time.Minute), "pull_request", "opened", "ERROR", 500)
-	failedOriginalB.GUID = new("guid-b")
-
-	// Newest first: the successful redelivery of guid-a precedes its failed original.
-	client := &fakeWebhookRedriveDeliveryClient{pages: [][]*gh.HookDelivery{{succeededRedelivery, failedOriginalA, failedOriginalB}}}
-
-	result, err := redriveWebhookAppDeliveries(t.Context(), client, "default", "", windowStart, windowEnd, 10, true, "", 0, discardLogger())
-
-	require.NoError(t, err)
-	require.Len(t, result.Selected, 1, "guid-a already succeeded; only guid-b remains")
-	assert.Equal(t, int64(20), result.Selected[0].ID)
-}
-
-// A per-delivery detail-fetch failure during repo/PR filtering skips that one
-// delivery (counted) instead of aborting the whole crawl.
-func TestRedriveWebhookAppDeliveriesSkipsDeliveriesWithUnresolvableDetail(t *testing.T) {
-	t.Parallel()
-
-	windowStart := time.Date(2026, 7, 7, 19, 40, 0, 0, time.UTC)
-	windowEnd := time.Date(2026, 7, 7, 19, 50, 0, 0, time.UTC)
-	client := &fakeWebhookRedriveDeliveryClient{
-		pages: [][]*gh.HookDelivery{{
-			webhookRedriveTestDelivery(101, windowEnd.Add(-time.Minute), "pull_request", "opened", "ERROR", 500),
-			webhookRedriveTestDelivery(102, windowEnd.Add(-2*time.Minute), "pull_request", "opened", "ERROR", 500),
-		}},
-		details: map[int64]*gh.HookDelivery{
-			101: webhookRedriveTestDeliveryDetail(101, "octo/repo", 12),
-			// 102 has no detail → GetHookDelivery errors → skipped, not fatal.
-		},
-	}
-
-	result, err := redriveWebhookAppDeliveries(t.Context(), client, "default", "", windowStart, windowEnd, 10, true, "octo/repo", 12, discardLogger())
-
-	require.NoError(t, err)
-	assert.Equal(t, 1, result.Skipped)
-	require.Len(t, result.Selected, 1)
-	assert.Equal(t, int64(101), result.Selected[0].ID)
-}
-
-func webhookRedriveTestDelivery(id int64, deliveredAt time.Time, event, action, status string, statusCode int) *gh.HookDelivery {
-	return &gh.HookDelivery{
-		ID:          new(id),
-		DeliveredAt: &gh.Timestamp{Time: deliveredAt},
-		Event:       new(event),
-		Action:      new(action),
-		Status:      new(status),
-		StatusCode:  new(statusCode),
-	}
-}
-
-func webhookRedriveTestDeliveryDetail(id int64, repo string, pr int) *gh.HookDelivery {
-	payload, err := json.Marshal(map[string]any{
-		"number": pr,
-		"repository": map[string]any{
-			"full_name": repo,
-		},
-	})
-	if err != nil {
-		panic(err)
-	}
-	raw := json.RawMessage(payload)
-	return &gh.HookDelivery{
-		ID: new(id),
-		Request: &gh.HookRequest{
-			RawPayload: &raw,
-		},
-	}
-}
-
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 type fakeCheckRunBackfiller struct {
 	calls    []int
+	opts     []CheckRunBackfillOptions
 	failPR   int
 	outcomes map[int]string
+	// deferred maps a PR to the databases it changes; without Plan the fake
+	// defers it, as the webhook handler defers a PR that changes schema.
+	deferred map[int][]string
+	// mergeQueueCalls records each merge group head the fake posted on, and
+	// failHead names one whose post fails.
+	mergeQueueCalls []string
+	failHead        string
+	// mergeQueueScopes records the scope each merge group post carried.
+	mergeQueueScopes []MergeQueueCheckScope
 }
 
-func (f *fakeCheckRunBackfiller) BackfillPRCheckRuns(_ context.Context, _ string, pr int, _ int64) (string, error) {
+func (f *fakeCheckRunBackfiller) BackfillMergeQueueCheck(_ context.Context, _ string, _ int64, headSHA string, scope MergeQueueCheckScope) (string, error) {
+	f.mergeQueueCalls = append(f.mergeQueueCalls, headSHA)
+	f.mergeQueueScopes = append(f.mergeQueueScopes, scope)
+	if headSHA == f.failHead {
+		return "", errors.New("create check run: 502 Bad Gateway")
+	}
+	return "posted passing merge queue check", nil
+}
+
+func (f *fakeCheckRunBackfiller) BackfillPRCheckRuns(_ context.Context, _ string, pr int, _ int64, opts CheckRunBackfillOptions) (CheckRunBackfillResult, error) {
 	f.calls = append(f.calls, pr)
+	f.opts = append(f.opts, opts)
 	if pr == f.failPR {
-		return "", errors.New("boom")
+		return CheckRunBackfillResult{Outcome: "config discovery failed"}, errors.New("boom")
+	}
+	if databases, ok := f.deferred[pr]; ok && !opts.Plan {
+		return CheckRunBackfillResult{Outcome: "deferred: PR changes managed schema", Deferred: true, Databases: databases, ChangedFiles: 3}, nil
 	}
 	if outcome, ok := f.outcomes[pr]; ok {
-		return outcome, nil
+		return CheckRunBackfillResult{Outcome: outcome}, nil
 	}
-	return "auto-plan started", nil
+	return CheckRunBackfillResult{Outcome: "auto-plan started"}, nil
+}
+
+// fakeCoreRateLimit serves a sequence of budget readings, one per call, and
+// repeats the last once the sequence runs out.
+type fakeCoreRateLimit struct {
+	remaining []int
+	limit     int
+	err       error
+	calls     int
+}
+
+func (f *fakeCoreRateLimit) CoreRateLimit(context.Context) (int, int, time.Time, error) {
+	f.calls++
+	if f.err != nil {
+		return 0, 0, time.Time{}, f.err
+	}
+	i := min(f.calls-1, len(f.remaining)-1)
+	return f.remaining[i], f.limit, time.Now().Add(time.Hour), nil
+}
+
+// fakeMergeQueueSynthesizeClient lists a fixed merge queue on top of a budget
+// sequence, the GitHub surface a merge queue backfill reads.
+type fakeMergeQueueSynthesizeClient struct {
+	fakeCoreRateLimit
+	queue    []ghclient.MergeQueueHead
+	queueErr error
+	// prHeads maps a commit to the open PR whose head it is, and prHeadErr
+	// fails that lookup.
+	prHeads   map[string]int
+	prHeadErr error
+}
+
+func (f *fakeMergeQueueSynthesizeClient) OpenPullRequestHeadedAt(_ context.Context, _, sha string) (int, error) {
+	if f.prHeadErr != nil {
+		return 0, f.prHeadErr
+	}
+	return f.prHeads[sha], nil
+}
+
+func (f *fakeMergeQueueSynthesizeClient) ListMergeQueueHeads(context.Context, string) ([]ghclient.MergeQueueHead, error) {
+	if f.queueErr != nil {
+		return nil, f.queueErr
+	}
+	return f.queue, nil
+}
+
+// A synthesize batch defers each PR that changes managed schema unless the
+// request asks for plans, and carries the databases back so the operator can
+// see what planning it would cost.
+func TestBackfillPRsWithinBudgetDefersSchemaPRsUnlessPlanned(t *testing.T) {
+	t.Parallel()
+
+	backfiller := &fakeCheckRunBackfiller{deferred: map[int][]string{2: {"orders", "payments"}}}
+	results := backfillPRsWithinBudget(t.Context(), &fakeCoreRateLimit{remaining: []int{5000}, limit: 5000}, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1, 2}}, 7, discardLogger())
+
+	require.Len(t, results, 2)
+	assert.Equal(t, ChecksSynthesizeResult{PR: 1, Outcome: "auto-plan started"}, results[0])
+	assert.Equal(t, ChecksSynthesizeResult{PR: 2, Outcome: "deferred: PR changes managed schema", Deferred: true, Databases: []string{"orders", "payments"}, ChangedFiles: 3}, results[1])
+	assert.Equal(t, []CheckRunBackfillOptions{{Plan: false}, {Plan: false}}, backfiller.opts)
+
+	planned := &fakeCheckRunBackfiller{deferred: map[int][]string{2: {"orders"}}}
+	results = backfillPRsWithinBudget(t.Context(), &fakeCoreRateLimit{remaining: []int{5000}, limit: 5000}, planned,
+		ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{2}, Plan: true}, 7, discardLogger())
+	require.Len(t, results, 1)
+	assert.Equal(t, ChecksSynthesizeResult{PR: 2, Outcome: "auto-plan started"}, results[0])
+	assert.Equal(t, []CheckRunBackfillOptions{{Plan: true}}, planned.opts)
+}
+
+// The budget floor is checked before every PR, not only between batches:
+// once the budget drops below it, the batch stops and the PRs not started
+// come back marked RateLimited for the caller to resend after the reset.
+func TestBackfillPRsWithinBudgetStopsAtTheFloor(t *testing.T) {
+	t.Parallel()
+
+	backfiller := &fakeCheckRunBackfiller{}
+	rate := &fakeCoreRateLimit{remaining: []int{3000, 1500, 900}, limit: 5000}
+	results := backfillPRsWithinBudget(t.Context(), rate, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1, 2, 3, 4}, RateLimitFloorPercent: 20}, 7, discardLogger())
+
+	assert.Equal(t, []int{1, 2}, backfiller.calls)
+	require.Len(t, results, 4)
+	assert.Equal(t, "auto-plan started", results[1].Outcome)
+	for _, result := range results[2:] {
+		assert.True(t, result.RateLimited, "PR %d", result.PR)
+		assert.Equal(t, "not started: GitHub budget is below 20% (900 of 5000 requests left)", result.Outcome)
+		assert.Empty(t, result.Error)
+	}
+	assert.Equal(t, []int{3, 4}, []int{results[2].PR, results[3].PR})
+}
+
+// The floor is pacing, not a safety gate: with no floor the budget is never
+// read, and a budget that cannot be read does not stop the batch.
+func TestBackfillPRsWithinBudgetWithoutAReadableFloor(t *testing.T) {
+	t.Parallel()
+
+	unread := &fakeCoreRateLimit{remaining: []int{0}, limit: 5000}
+	backfiller := &fakeCheckRunBackfiller{}
+	results := backfillPRsWithinBudget(t.Context(), unread, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1, 2}}, 7, discardLogger())
+	assert.Len(t, results, 2)
+	assert.Equal(t, 0, unread.calls)
+
+	failing := &fakeCoreRateLimit{err: errors.New("rate limit endpoint unavailable")}
+	backfiller = &fakeCheckRunBackfiller{}
+	results = backfillPRsWithinBudget(t.Context(), failing, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1, 2}, RateLimitFloorPercent: 20}, 7, discardLogger())
+	assert.Equal(t, []int{1, 2}, backfiller.calls)
+	for _, result := range results {
+		assert.False(t, result.RateLimited)
+	}
+}
+
+// A PR whose backfill fails reports the error with the outcome, and the batch
+// keeps going.
+func TestBackfillPRsWithinBudgetReportsFailuresAndContinues(t *testing.T) {
+	t.Parallel()
+
+	backfiller := &fakeCheckRunBackfiller{failPR: 1}
+	results := backfillPRsWithinBudget(t.Context(), &fakeCoreRateLimit{remaining: []int{5000}, limit: 5000}, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1, 2}}, 7, discardLogger())
+
+	require.Len(t, results, 2)
+	assert.Equal(t, ChecksSynthesizeResult{PR: 1, Outcome: "config discovery failed", Error: "boom"}, results[0])
+	assert.Equal(t, ChecksSynthesizeResult{PR: 2, Outcome: "auto-plan started"}, results[1])
 }
 
 // Synthesize requests are validated before any GitHub work: request-shaped
@@ -410,7 +203,19 @@ func TestExecuteChecksSynthesizeValidation(t *testing.T) {
 
 	_, err = executeChecksSynthesize(t.Context(), cfg, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo"}, discardLogger())
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "prs is required")
+	assert.Contains(t, err.Error(), "prs or merge_queue_heads is required")
+
+	tooManyHeads := make([]string, checksSynthesizeMaxMergeQueueHeadsPerRequest+1)
+	for i := range tooManyHeads {
+		tooManyHeads[i] = fmt.Sprintf("sha%d", i)
+	}
+	_, err = executeChecksSynthesize(t.Context(), cfg, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: tooManyHeads}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "at most 20 merge_queue_heads per request")
+
+	_, err = executeChecksSynthesize(t.Context(), cfg, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"sha1", ""}}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "merge_queue_heads must not contain an empty commit")
 
 	tooMany := make([]int, checksSynthesizeMaxPRsPerRequest+1)
 	_, err = executeChecksSynthesize(t.Context(), cfg, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", PRs: tooMany}, discardLogger())
@@ -424,6 +229,25 @@ func TestExecuteChecksSynthesizeValidation(t *testing.T) {
 	_, err = executeChecksSynthesize(t.Context(), cfg, nil, ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1}}, discardLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no GitHub webhook runtime")
+
+	narrowable := &ServerConfig{AllowedEnvironments: []string{"staging"}}
+	_, err = executeChecksSynthesize(t.Context(), narrowable, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"sha1"}, Environment: "production"}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `environment "production" is not one this instance handles`)
+	assert.Empty(t, backfiller.mergeQueueScopes, "a refused environment posts nothing")
+}
+
+// An operator who types "-e Production" names the environment the scan
+// already accepted under that spelling. The synthesize request folds it the
+// same way, so the merge queue post is not refused and its scope matches the
+// configured lowercase name.
+func TestChecksSynthesizeFoldsTheEnvironmentLikeTheScan(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{AllowedEnvironments: []string{"staging", "production"}}
+	req := ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"sha1"}, Environment: " Production "}
+	require.NoError(t, validateChecksSynthesizeRequest(cfg, &req))
+	assert.Equal(t, "production", req.Environment)
 }
 
 // A repository that is not an owner/name pair is the caller's mistake, and it
@@ -449,21 +273,6 @@ func TestRepoTakingEndpointsRefuseAMalformedRepository(t *testing.T) {
 		}},
 		{"synthesize", func(ctx context.Context, repo string) error {
 			_, err := executeChecksSynthesize(ctx, cfg, &fakeCheckRunBackfiller{}, ChecksSynthesizeRequest{Repo: repo, PRs: []int{1}}, discardLogger())
-			return err
-		}},
-		// The redrive crawl takes the repository as an optional filter rather
-		// than as its subject, so a malformed one matches no delivery instead
-		// of failing anything: the crawl walks the whole window and answers
-		// 200 with nothing selected, which reads exactly like a window that
-		// really is empty.
-		{"redrive", func(ctx context.Context, repo string) error {
-			redriveCfg := &ServerConfig{GitHub: GitHubConfig{AppID: "1", PrivateKey: "key"}}
-			_, err := executeWebhookRedrive(ctx, redriveCfg, WebhookRedriveRequest{
-				Repo:        repo,
-				MaxPages:    1,
-				WindowStart: "2026-01-01T00:00:00Z",
-				WindowEnd:   "2026-01-02T00:00:00Z",
-			}, discardLogger())
 			return err
 		}},
 	}
@@ -566,131 +375,6 @@ func checksEnvironmentTakingEndpoints(t *testing.T, cfg *ServerConfig) []checksE
 	}
 }
 
-// Redelivery by explicit delivery IDs is a precise continuation of a prior
-// listing pass; it refuses request shapes that would silently change meaning.
-func TestExecuteWebhookRedriveByIDsValidation(t *testing.T) {
-	t.Parallel()
-
-	cfg := &ServerConfig{GitHub: GitHubConfig{AppID: "1", PrivateKey: "key"}}
-
-	_, err := executeWebhookRedrive(t.Context(), cfg, WebhookRedriveRequest{DeliveryIDs: []int64{1}}, discardLogger())
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "requires app")
-
-	_, err = executeWebhookRedrive(t.Context(), cfg, WebhookRedriveRequest{DeliveryIDs: []int64{1}, App: "default", Cursor: "c1"}, discardLogger())
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "mutually exclusive")
-
-	_, err = executeWebhookRedrive(t.Context(), cfg, WebhookRedriveRequest{DeliveryIDs: []int64{1}, App: "default", DryRun: true}, discardLogger())
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no dry run")
-
-	// The crawl's filters have nothing to narrow once the deliveries are named
-	// outright, and this path never reads them. Honored silently, a repository
-	// the crawl refuses outright would redeliver every named delivery anyway.
-	_, err = executeWebhookRedrive(t.Context(), cfg, WebhookRedriveRequest{DeliveryIDs: []int64{1}, App: "default", Repo: "acme"}, discardLogger())
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "nothing to narrow")
-
-	_, err = executeWebhookRedrive(t.Context(), cfg, WebhookRedriveRequest{DeliveryIDs: []int64{1}, App: "default", PR: 412}, discardLogger())
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "nothing to narrow")
-}
-
-// On a single-App deployment a redrive that names an App is served only when
-// the name is the default App. Naming any other App is refused as the
-// operator's mistake, so a redrive aimed at an App that is not configured here
-// never replays the default App's deliveries in its place. Credentials that do
-// not resolve are reported before the name is checked, with the class a caller
-// can match on.
-func TestWebhookRedriveAppsSingleApp(t *testing.T) {
-	t.Parallel()
-
-	cfg := &ServerConfig{GitHub: GitHubConfig{AppID: "123", PrivateKey: "key"}}
-
-	t.Run("unscoped redrive serves the default App", func(t *testing.T) {
-		apps, err := webhookRedriveApps(cfg, "")
-		require.NoError(t, err)
-		require.Len(t, apps, 1)
-		assert.Equal(t, "default", apps[0].name)
-		assert.Equal(t, int64(123), apps[0].id)
-		assert.Equal(t, cfg.GitHub, apps[0].config)
-	})
-
-	t.Run("redrive scoped to the default App is served", func(t *testing.T) {
-		apps, err := webhookRedriveApps(cfg, "default")
-		require.NoError(t, err)
-		require.Len(t, apps, 1)
-		assert.Equal(t, int64(123), apps[0].id)
-	})
-
-	t.Run("redrive scoped to another App is refused as a request error", func(t *testing.T) {
-		_, err := webhookRedriveApps(cfg, "other-app")
-		var reqErr *webhookOpsRequestError
-		require.ErrorAs(t, err, &reqErr)
-		assert.Contains(t, err.Error(), `no configured GitHub App named "other-app"`)
-	})
-
-	t.Run("unusable credentials are reported with their class", func(t *testing.T) {
-		_, err := webhookRedriveApps(&ServerConfig{GitHub: GitHubConfig{AppID: "abc", PrivateKey: "key"}}, "")
-		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
-		assert.Contains(t, err.Error(), "default GitHub App: app-id must be a positive integer")
-
-		_, err = webhookRedriveApps(&ServerConfig{GitHub: GitHubConfig{AppID: "123"}}, "default")
-		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
-	})
-}
-
-// The redrive repository is an optional filter: an incident redrive replays a
-// whole window across every repository, and passing no repository is how that
-// is asked for. A guard on the filter's shape must not turn into a requirement.
-func TestExecuteWebhookRedriveLeavesTheRepositoryOptional(t *testing.T) {
-	t.Parallel()
-
-	cfg := &ServerConfig{GitHub: GitHubConfig{AppID: "1", PrivateKey: "key"}}
-
-	// The crawl gets as far as needing a GitHub client it cannot build from
-	// this key, so what is pinned is the refusal that does not happen first.
-	_, err := executeWebhookRedrive(t.Context(), cfg, WebhookRedriveRequest{
-		MaxPages:    1,
-		WindowStart: "2026-01-01T00:00:00Z",
-		WindowEnd:   "2026-01-02T00:00:00Z",
-	}, discardLogger())
-
-	require.Error(t, err)
-	assert.NotContains(t, err.Error(), "repo is required")
-	assert.NotContains(t, err.Error(), "owner/name pair")
-}
-
-// A repository carrying surrounding whitespace clears the owner/name shape
-// check — the padding lands inside the name half — and is then compared
-// verbatim against the repository each delivery names, matching nothing. The
-// crawl would walk the whole window and answer 200 with nothing selected, which
-// reads exactly like a window that really is empty.
-func TestExecuteWebhookRedriveTrimsTheRepositoryFilter(t *testing.T) {
-	t.Parallel()
-
-	windowStart := time.Date(2026, 7, 7, 19, 40, 0, 0, time.UTC)
-	windowEnd := time.Date(2026, 7, 7, 19, 50, 0, 0, time.UTC)
-	newClient := func() *fakeWebhookRedriveDeliveryClient {
-		return &fakeWebhookRedriveDeliveryClient{
-			pages:   [][]*gh.HookDelivery{{webhookRedriveTestDelivery(101, windowEnd.Add(-time.Minute), "pull_request", "opened", "ERROR", 500)}},
-			details: map[int64]*gh.HookDelivery{101: webhookRedriveTestDeliveryDetail(101, "acme/store", 412)},
-		}
-	}
-	selectWith := func(t *testing.T, repo string) []WebhookRedriveSelection {
-		t.Helper()
-		result, err := redriveWebhookAppDeliveries(t.Context(), newClient(), "default", "", windowStart, windowEnd, 10, true, repo, 0, discardLogger())
-		require.NoError(t, err)
-		return result.Selected
-	}
-
-	assert.Empty(t, selectWith(t, " acme/store "),
-		"the filter is compared verbatim, so the padding is what makes it match nothing")
-	require.Len(t, selectWith(t, canonicalRepo(" acme/store ")), 1,
-		"trimmed, it names the repository the delivery names")
-}
-
 // productionCheckName is the single environment-scoped Check Run name most
 // scan tests expect, so a stuck run's stored rows are read against the one
 // environment it gates.
@@ -702,6 +386,17 @@ type fakeWebhookMissingCheckScanClient struct {
 	// untrusted maps headSHA+"/"+checkName to app slugs that published a
 	// same-named check but are not trusted.
 	untrusted map[string][]string
+	// queue is the merge queue the repository lists, and queueErr fails the
+	// listing.
+	queue    []ghclient.MergeQueueHead
+	queueErr error
+}
+
+func (f fakeWebhookMissingCheckScanClient) ListMergeQueueHeads(context.Context, string) ([]ghclient.MergeQueueHead, error) {
+	if f.queueErr != nil {
+		return nil, f.queueErr
+	}
+	return f.queue, nil
 }
 
 func (f fakeWebhookMissingCheckScanClient) ListOpenPullRequestsPage(_ context.Context, _ string, page, perPage int) ([]ghclient.OpenPullRequest, int, int, error) {
@@ -722,6 +417,17 @@ func (f fakeWebhookMissingCheckScanClient) ListOpenPullRequestsPage(_ context.Co
 		lastPage = (len(f.prs) + perPage - 1) / perPage
 	}
 	return f.prs[start:end], nextPage, lastPage, nil
+}
+
+// FetchOpenPullRequest serves a named PR from prs; a PR not among them reads
+// as closed, the way a named PR that is no longer open does.
+func (f fakeWebhookMissingCheckScanClient) FetchOpenPullRequest(_ context.Context, _ string, number int) (ghclient.OpenPullRequest, bool, error) {
+	for _, pr := range f.prs {
+		if pr.Number == number {
+			return pr, true, nil
+		}
+	}
+	return ghclient.OpenPullRequest{}, false, nil
 }
 
 func (f fakeWebhookMissingCheckScanClient) FindCheckRunByName(_ context.Context, _ string, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error) {
@@ -969,6 +675,7 @@ func TestExecuteChecksScanSkipsRepoWithChecksDisabled(t *testing.T) {
 	assert.Equal(t, "octo/repo", response.Repo)
 	assert.Zero(t, response.Scanned)
 	assert.Empty(t, response.Missing)
+	assert.Equal(t, apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true, MergeQueue: true}, response.Supports, "a skipped repository still tells the CLI what this server supports")
 }
 
 // fakeChecksScanClient adds the installation budget read a scan page ends
@@ -1024,6 +731,7 @@ func TestExecuteChecksScanSkipsRepoWithoutTheAppInstalled(t *testing.T) {
 	assert.Zero(t, response.Scanned)
 	assert.Empty(t, response.Missing)
 	assert.Empty(t, response.CheckNames)
+	assert.Equal(t, apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true, MergeQueue: true}, response.Supports, "a skipped repository still tells the CLI what this server supports")
 
 	var entry map[string]any
 	require.NoError(t, json.Unmarshal(logs.Bytes(), &entry), "exactly one log line: %s", logs.String())
@@ -1099,6 +807,7 @@ func TestExecuteChecksScanScansThroughTheResolvedInstallation(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, response.AppNotInstalled)
 	assert.Empty(t, response.GitHubApp)
+	assert.Equal(t, apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true, MergeQueue: true}, response.Supports)
 	assert.Equal(t, 1, response.Scanned)
 	require.Len(t, response.Missing, 1)
 	assert.Equal(t, 7, response.Missing[0].Number)
@@ -1699,4 +1408,282 @@ func TestWebhookExpectedCheckNamesUsesRegisteredEnvironments(t *testing.T) {
 	assert.Equal(t, []webhookExpectedCheckName{
 		{Name: "SchemaBot (staging)", Environment: "staging"},
 	}, webhookExpectedCheckNames(cfg, "octocat/repo", "", ""))
+}
+
+// A scan of named PRs reads only those PRs instead of paging the repository,
+// leaves out a named PR that is no longer open, and reports each one's
+// missing checks exactly as a paged scan would.
+func TestExecuteChecksScanOfNamedPRsReadsOnlyThosePRs(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{
+		Apps:  map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos: map[string]RepoConfig{"octo/repo": {GitHubApp: "main"}},
+	}
+	client := fakeChecksScanClient{fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 1, HeadSHA: "sha1", Title: "one"},
+			{Number: 2, HeadSHA: "sha2", Title: "two"},
+			{Number: 3, HeadSHA: "sha3", Title: "three"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha3/SchemaBot": {ID: 30, Name: "SchemaBot", Status: "completed", Conclusion: "success"},
+		},
+	}}
+	resolve := checksScanResolverByRepo(map[string]checksScanClient{"octo/repo": client}, nil)
+
+	response, err := executeChecksScanWith(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/repo", PRs: []int{2, 3, 99}}, discardLogger(), resolve)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, response.Scanned, "PR 99 is not open, so it is left out")
+	assert.Zero(t, response.NextPage)
+	require.Len(t, response.Missing, 1)
+	assert.Equal(t, 2, response.Missing[0].Number)
+	assert.Equal(t, []string{"SchemaBot"}, response.Missing[0].MissingNames)
+}
+
+// A scan of named PRs refuses the paging and time-window fields, which only
+// apply to a scan of the repository's open PRs, and bounds how many PRs one
+// request reads.
+func TestExecuteChecksScanOfNamedPRsValidation(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{}
+	for name, tc := range map[string]struct {
+		req  ChecksScanRequest
+		want string
+	}{
+		"page":          {ChecksScanRequest{Repo: "octo/repo", PRs: []int{1}, Page: 2}, "page does not apply to a scan of named prs"},
+		"updated since": {ChecksScanRequest{Repo: "octo/repo", PRs: []int{1}, UpdatedSince: "2026-11-19T00:00:00Z"}, "updated_since does not apply to a scan of named prs"},
+		"non-positive":  {ChecksScanRequest{Repo: "octo/repo", PRs: []int{1, 0}}, "pr numbers must be positive; got 0"},
+		"too many":      {ChecksScanRequest{Repo: "octo/repo", PRs: make([]int, checksScanMaxNamedPRs+1)}, "at most 30 prs per scan"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := executeChecksScan(t.Context(), cfg, nil, tc.req, discardLogger())
+			require.ErrorContains(t, err, tc.want)
+		})
+	}
+}
+
+// testMergeQueue is a merge queue testing two merge groups on main.
+var testMergeQueue = []ghclient.MergeQueueHead{
+	{Ref: "gh-readonly-queue/main/pr-412-0a1b2c3d", BaseRef: "main", PR: 412, HeadSHA: "group-412"},
+	{Ref: "gh-readonly-queue/main/pr-418-4e5f6a7b", BaseRef: "main", PR: 418, HeadSHA: "group-418"},
+}
+
+func checksScanTestConfig(repo RepoConfig) *ServerConfig {
+	return &ServerConfig{
+		Apps:  map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos: map[string]RepoConfig{"octo/repo": repo},
+	}
+}
+
+// A first-page scan that asks for the merge queue reports each merge group
+// missing a SchemaBot check, with the PR that created it, alongside the open
+// PRs. A group that already has the check is not reported.
+func TestExecuteChecksScanReportsMergeGroupsMissingChecks(t *testing.T) {
+	t.Parallel()
+
+	client := fakeChecksScanClient{fakeWebhookMissingCheckScanClient{
+		queue: testMergeQueue,
+		runs: map[string]*ghclient.CheckRunResult{
+			"group-418/SchemaBot": {ID: 40, Name: "SchemaBot", Status: "completed", Conclusion: "success"},
+		},
+	}}
+	resolve := checksScanResolverByRepo(map[string]checksScanClient{"octo/repo": client}, nil)
+
+	response, err := executeChecksScanWith(t.Context(), checksScanTestConfig(RepoConfig{GitHubApp: "main"}), nil,
+		ChecksScanRequest{Repo: "octo/repo", MergeQueue: true}, discardLogger(), resolve)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, response.MergeQueueScanned)
+	require.Len(t, response.MergeQueue, 1)
+	assert.Equal(t, MissingMergeQueueCheck{
+		Ref:          "gh-readonly-queue/main/pr-412-0a1b2c3d",
+		BaseRef:      "main",
+		PR:           412,
+		URL:          "https://github.com/octo/repo/pull/412",
+		HeadSHA:      "group-412",
+		MissingNames: []string{"SchemaBot"},
+	}, response.MergeQueue[0])
+}
+
+// A paged sweep reads the merge queue once, on its first page; later pages
+// and scans that did not ask for the queue never list it.
+func TestExecuteChecksScanReadsTheMergeQueueOnlyOnTheFirstPage(t *testing.T) {
+	t.Parallel()
+
+	client := fakeChecksScanClient{fakeWebhookMissingCheckScanClient{queueErr: errors.New("merge queue must not be listed")}}
+	resolve := checksScanResolverByRepo(map[string]checksScanClient{"octo/repo": client}, nil)
+	cfg := checksScanTestConfig(RepoConfig{GitHubApp: "main"})
+
+	for name, req := range map[string]ChecksScanRequest{
+		"second page":         {Repo: "octo/repo", MergeQueue: true, Page: 2},
+		"queue not requested": {Repo: "octo/repo"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			response, err := executeChecksScanWith(t.Context(), cfg, nil, req, discardLogger(), resolve)
+			require.NoError(t, err)
+			assert.Empty(t, response.MergeQueueError, "the queue was listed")
+			assert.Zero(t, response.MergeQueueScanned)
+			assert.Empty(t, response.MergeQueue)
+		})
+	}
+}
+
+// A merge queue that cannot be listed is reported as unread rather than as an
+// empty queue, so a sweep never reports a blocked queue as clear. The PRs on
+// the page are still scanned, so one repository's queue cannot stop the PRs'
+// recovery in it or in the repositories after it.
+func TestExecuteChecksScanReportsAMergeQueueItCannotList(t *testing.T) {
+	t.Parallel()
+
+	client := fakeChecksScanClient{fakeWebhookMissingCheckScanClient{queueErr: errors.New("502 Bad Gateway")}}
+	resolve := checksScanResolverByRepo(map[string]checksScanClient{"octo/repo": client}, nil)
+
+	response, err := executeChecksScanWith(t.Context(), checksScanTestConfig(RepoConfig{GitHubApp: "main"}), nil,
+		ChecksScanRequest{Repo: "octo/repo", MergeQueue: true}, discardLogger(), resolve)
+	require.NoError(t, err)
+	assert.Equal(t, "scan merge queue of octo/repo for missing checks: 502 Bad Gateway", response.MergeQueueError)
+	assert.Zero(t, response.MergeQueueScanned)
+	assert.Empty(t, response.MergeQueue)
+}
+
+// An aggregate participant posts no checks on merge groups (its leader posts
+// the required one), so its queue is not scanned: every group would read as
+// missing a check that is not supposed to exist.
+func TestExecuteChecksScanLeavesOutAParticipantsMergeQueue(t *testing.T) {
+	t.Parallel()
+
+	client := fakeChecksScanClient{fakeWebhookMissingCheckScanClient{queue: testMergeQueue}}
+	resolve := checksScanResolverByRepo(map[string]checksScanClient{"octo/repo": client}, nil)
+	cfg := checksScanTestConfig(RepoConfig{GitHubApp: "main", Aggregate: &AggregateConfig{Role: AggregateRoleParticipant}})
+
+	response, err := executeChecksScanWith(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/repo", MergeQueue: true}, discardLogger(), resolve)
+	require.NoError(t, err)
+	assert.Zero(t, response.MergeQueueScanned)
+	assert.Empty(t, response.MergeQueue)
+}
+
+// A scan of named PRs refuses the merge queue: the queue belongs to the
+// repository, not to the PRs the operator named.
+func TestExecuteChecksScanOfNamedPRsRefusesTheMergeQueue(t *testing.T) {
+	t.Parallel()
+
+	_, err := executeChecksScan(t.Context(), &ServerConfig{}, nil,
+		ChecksScanRequest{Repo: "octo/repo", PRs: []int{1}, MergeQueue: true}, discardLogger())
+	require.ErrorContains(t, err, "merge_queue does not apply to a scan of named prs")
+}
+
+// The passing merge queue check goes only on a head the queue is still
+// testing when the request arrives. A head the caller sends that the queue no
+// longer holds gets nothing, and one head whose post fails does not stop the
+// rest.
+func TestBackfillMergeQueuePostsOnlyOnLiveHeads(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeMergeQueueSynthesizeClient{fakeCoreRateLimit: fakeCoreRateLimit{remaining: []int{5000}, limit: 5000}, queue: testMergeQueue}
+	backfiller := &fakeCheckRunBackfiller{failHead: "group-418"}
+
+	results := backfillMergeQueueWithinBudget(t.Context(), client, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"group-412", "merged-group", "group-418"}, Environment: "production", CheckName: "SchemaBot (production)"}, 7, discardLogger())
+
+	assert.Equal(t, []string{"group-412", "group-418"}, backfiller.mergeQueueCalls)
+	scope := MergeQueueCheckScope{Environment: "production", CheckName: "SchemaBot (production)"}
+	assert.Equal(t, []MergeQueueCheckScope{scope, scope}, backfiller.mergeQueueScopes, "each post carries the run's scope, so it posts only the checks the scan looked for")
+	assert.Equal(t, []ChecksMergeQueueResult{
+		{HeadSHA: "group-412", Outcome: "posted passing merge queue check"},
+		{HeadSHA: "merged-group", Outcome: mergeQueueHeadGoneOutcome},
+		{HeadSHA: "group-418", Error: "create check run: 502 Bad Gateway"},
+	}, results)
+}
+
+// If the queue cannot be listed, no head can be verified, so nothing is
+// posted and every head reports why (MG-1).
+func TestBackfillMergeQueuePostsNothingWhenTheQueueCannotBeListed(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeMergeQueueSynthesizeClient{queueErr: errors.New("502 Bad Gateway")}
+	backfiller := &fakeCheckRunBackfiller{}
+
+	results := backfillMergeQueueWithinBudget(t.Context(), client, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"group-412", "group-418"}}, 7, discardLogger())
+
+	assert.Empty(t, backfiller.mergeQueueCalls)
+	assert.Equal(t, []ChecksMergeQueueResult{
+		{HeadSHA: "group-412", Error: "list merge queue to verify this head: 502 Bad Gateway"},
+		{HeadSHA: "group-418", Error: "list merge queue to verify this head: 502 Bad Gateway"},
+	}, results)
+}
+
+// A gh-readonly-queue/ branch proves only that a branch points at the commit,
+// not that the merge queue made it. A head that is also an open PR's head is
+// refused, since the passing check would pass that PR's own required check,
+// and a head that cannot be checked gets nothing either (MG-1).
+func TestBackfillMergeQueueRefusesAnOpenPRsHead(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeMergeQueueSynthesizeClient{
+		fakeCoreRateLimit: fakeCoreRateLimit{remaining: []int{5000}, limit: 5000},
+		queue:             testMergeQueue,
+		prHeads:           map[string]int{"group-418": 418},
+	}
+	backfiller := &fakeCheckRunBackfiller{}
+
+	results := backfillMergeQueueWithinBudget(t.Context(), client, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"group-412", "group-418"}}, 7, discardLogger())
+
+	assert.Equal(t, []string{"group-412"}, backfiller.mergeQueueCalls)
+	assert.Equal(t, []ChecksMergeQueueResult{
+		{HeadSHA: "group-412", Outcome: "posted passing merge queue check"},
+		{HeadSHA: "group-418", Error: "refused: this commit is also the head of open PR #418, and a passing merge queue check would pass that PR's required check"},
+	}, results)
+
+	failing := &fakeMergeQueueSynthesizeClient{
+		fakeCoreRateLimit: fakeCoreRateLimit{remaining: []int{5000}, limit: 5000},
+		queue:             testMergeQueue,
+		prHeadErr:         errors.New("502 Bad Gateway"),
+	}
+	backfiller = &fakeCheckRunBackfiller{}
+	results = backfillMergeQueueWithinBudget(t.Context(), failing, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"group-412"}}, 7, discardLogger())
+
+	assert.Empty(t, backfiller.mergeQueueCalls)
+	assert.Equal(t, []ChecksMergeQueueResult{
+		{HeadSHA: "group-412", Error: "check whether this head is an open PR's head: 502 Bad Gateway"},
+	}, results)
+}
+
+// Merge queue heads stop at the budget floor like PRs do, and the ones not
+// started come back marked RateLimited for the caller to resend.
+func TestBackfillMergeQueueStopsAtTheFloor(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeMergeQueueSynthesizeClient{fakeCoreRateLimit: fakeCoreRateLimit{remaining: []int{3000, 900}, limit: 5000}, queue: testMergeQueue}
+	backfiller := &fakeCheckRunBackfiller{}
+
+	results := backfillMergeQueueWithinBudget(t.Context(), client, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"group-412", "group-418"}, RateLimitFloorPercent: 20}, 7, discardLogger())
+
+	assert.Equal(t, []string{"group-412"}, backfiller.mergeQueueCalls)
+	assert.Equal(t, []ChecksMergeQueueResult{
+		{HeadSHA: "group-412", Outcome: "posted passing merge queue check"},
+		{HeadSHA: "group-418", Outcome: "not started: GitHub budget is below 20% (900 of 5000 requests left)", RateLimited: true},
+	}, results)
+}
+
+// A repository with Check Run publishing turned off skips its merge queue
+// heads the same way it skips its PRs, without touching GitHub.
+func TestExecuteChecksSynthesizeSkipsMergeQueueWithChecksDisabled(t *testing.T) {
+	t.Parallel()
+
+	checksOff := false
+	backfiller := &fakeCheckRunBackfiller{}
+
+	response, err := executeChecksSynthesize(t.Context(), checksScanTestConfig(RepoConfig{GitHubApp: "main", EnableChecks: &checksOff}), backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"group-412"}}, discardLogger())
+	require.NoError(t, err)
+	assert.Empty(t, backfiller.mergeQueueCalls)
+	assert.Equal(t, []ChecksMergeQueueResult{{HeadSHA: "group-412", Outcome: checksDisabledSkipOutcome}}, response.MergeQueue)
+	assert.Empty(t, response.Results)
 }

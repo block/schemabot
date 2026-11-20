@@ -204,6 +204,14 @@ type ServerConfig struct {
 	// Defaults to true (respond to all commands).
 	RespondToUnscoped *bool `yaml:"respond_to_unscoped"`
 
+	// SkipUnrequiredBranches skips plans, applies, and Check Runs on PRs whose
+	// final target is neither the repository's default branch nor a branch
+	// that requires a SchemaBot check. Off by default: SchemaBot serves PRs
+	// into every branch. Turn it on after granting the GitHub App the
+	// Administration: read permission and auditing which branches require
+	// SchemaBot checks.
+	SkipUnrequiredBranches bool `yaml:"skip_unrequired_branches,omitempty"`
+
 	// PendingDrops configures the pending drops quarantine for MySQL/Spirit
 	// databases. When enabled, DROP TABLE statements rename the table into the
 	// _pending_drops database instead of dropping it, and the background cleaner
@@ -1298,6 +1306,15 @@ type DatabaseConfig struct {
 	// for this database when PR command authorization is enabled.
 	OperatorUsers []string `yaml:"operator_users,omitempty"`
 
+	// CommandApps are GitHub App slugs whose comments may run PR commands for
+	// this database, such as a deploy gate's test App. SchemaBot otherwise
+	// ignores every comment from an App. A listed App runs commands only for
+	// this database and only from repositories the database accepts, whether
+	// or not PR command authorization is enabled, and its approval never
+	// counts toward the review gate. A slug may not be one of this
+	// deployment's trusted-check-app-slugs, whose comments are SchemaBot's own.
+	CommandApps []string `yaml:"command_apps,omitempty"`
+
 	// OperatorGroups are forwarded identity groups (see auth.forward_auth)
 	// whose members may run mutating direct API/CLI operations against this
 	// database only, in the instance-wide environments listed in
@@ -1881,6 +1898,9 @@ func (c *PlanetScaleConfig) validate() error {
 
 // RepoConfig holds configuration for a specific repository.
 type RepoConfig struct {
+	// PRSchemaCap limits planning fan-out for pull requests in this repository.
+	PRSchemaCap *PRSchemaCapConfig `yaml:"pr_schema_cap,omitempty"`
+
 	// EnableChecks controls whether SchemaBot publishes GitHub Check Runs for
 	// this repository. Stored check state is still maintained for SchemaBot's
 	// own safety gates. Defaults to true when not configured.
@@ -2501,6 +2521,9 @@ func (c *ServerConfig) Validate() error {
 		if err := validateDatabaseActorAuthorization(name, dbConfig); err != nil {
 			return err
 		}
+		if err := c.validateDatabaseCommandApps(name, dbConfig); err != nil {
+			return err
+		}
 		if err := c.validateDatabaseReviewPolicy(name, dbConfig); err != nil {
 			return err
 		}
@@ -2640,6 +2663,9 @@ func (c *ServerConfig) Validate() error {
 	for repo, repoConfig := range c.Repos {
 		if repo != storage.CanonicalKey(repo) {
 			return fmt.Errorf("repos repository key %q must be canonical", repo)
+		}
+		if err := c.validatePRSchemaCap(repo, repoConfig); err != nil {
+			return err
 		}
 		if err := validateAggregateConfig(repo, repoConfig.Aggregate); err != nil {
 			return err
@@ -4003,6 +4029,12 @@ func (c *ServerConfig) GitHubCheckNameBaseForRepo(repo string) string {
 		return appConfig.CheckRunNameBase()
 	}
 	return c.GitHub.CheckRunNameBase()
+}
+
+// SkipsUnrequiredBranches reports whether SchemaBot skips PRs whose final
+// target neither is the default branch nor requires a SchemaBot check.
+func (c *ServerConfig) SkipsUnrequiredBranches() bool {
+	return c != nil && c.SkipUnrequiredBranches
 }
 
 // PromotionCheckNameBaseForRepo returns the aggregate Check Run base name the

@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -243,22 +244,36 @@ func TestAggregateFoldPublishesAtTheQuotaReserve(t *testing.T) {
 }
 
 // A merge-queue head gets its passing aggregate while the installation's quota
-// is down to its reserve: the config reads that decide which environments it
+// is down to its reserve, whether the merge_group webhook posts it or an
+// operator backfills it: the config reads that decide which environments it
 // covers go out, so the queue entry is not left waiting on a required check.
 func TestMergeGroupPublishesAtTheQuotaReserve(t *testing.T) {
-	h, mux, client, reserve := newQuotaReserveFoldHandler(t, &foldCheckStore{})
-	var names []string
-	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		var opts ghclient.CheckRunOptions
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&opts))
-		names = append(names, opts.Name)
-		w.WriteHeader(http.StatusCreated)
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 555}))
-	})
+	for name, post := range map[string]func(h *Handler, ctx context.Context, client *ghclient.InstallationClient) error{
+		"merge_group webhook": func(h *Handler, ctx context.Context, client *ghclient.InstallationClient) error {
+			return h.postPassingAggregateChecks(ctx, client, "octocat/hello-world", "abc123", mergeGroupCheckContent())
+		},
+		"checks backfill": func(h *Handler, ctx context.Context, client *ghclient.InstallationClient) error {
+			_, err := h.postMissingMergeQueueChecks(ctx, client, "octocat/hello-world", "abc123", api.MergeQueueCheckScope{})
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, mux, client, reserve := newQuotaReserveFoldHandler(t, &foldCheckStore{})
+			serveTrustedCheckRuns(t, mux, "octocat/hello-world", "abc123")
+			var names []string
+			mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+				var opts ghclient.CheckRunOptions
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&opts))
+				names = append(names, opts.Name)
+				w.WriteHeader(http.StatusCreated)
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 555}))
+			})
 
-	require.NoError(t, h.postPassingAggregateChecks(t.Context(), client, "octocat/hello-world", "abc123", mergeGroupCheckContent()))
-	assert.Zero(t, reserve.refused.Load(), "the coverage reads are sent at the reserve")
-	assert.Equal(t, []string{"SchemaBot (production)"}, names)
+			require.NoError(t, post(h, t.Context(), client))
+			assert.Zero(t, reserve.refused.Load(), "the coverage reads are sent at the reserve")
+			assert.Equal(t, []string{"SchemaBot (production)"}, names)
+		})
+	}
 }
 
 // Participant path selection and environment coverage are independent: a
@@ -431,7 +446,7 @@ func TestAggregateScopeRejectsMovingPR(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.change, func(t *testing.T) {
 			store := &foldCheckStore{}
-			cfg := &api.ServerConfig{AllowedEnvironments: []string{"sandbox"}, Repos: map[string]api.RepoConfig{"octocat/hello-world": {}}}
+			cfg := &api.ServerConfig{SkipUnrequiredBranches: true, AllowedEnvironments: []string{"sandbox"}, Repos: map[string]api.RepoConfig{"octocat/hello-world": {}}}
 			h, mux, client := newFoldHandler(t, cfg, store)
 			reads := 0
 			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {

@@ -112,6 +112,9 @@ const (
 	OnFailurePause = "pause"
 )
 
+// RollbackPendingPlanPrefix tags a lock pin created for rollback confirmation.
+const RollbackPendingPlanPrefix = "rollback:"
+
 // Lock represents a database-level deployment lock.
 // Locks prevent concurrent schema changes to the same database across
 // all environments and PRs. Lock key is database:type (no environment).
@@ -2989,6 +2992,12 @@ var AutoPlanPullRequestActions = []string{"opened", "synchronize", "reopened"}
 // but a closed delivery itself is never superseded, because its cleanup must
 // always run.
 const PullRequestClosedAction = "closed"
+
+// PullRequestSynchronizeAction is the pull_request action GitHub delivers when
+// new commits are pushed to a PR's head branch, force-pushes included. Pushes
+// arrive in bursts, so it is the one auto-plan action a webhook handler may
+// hold back for a quiet period before a driver can claim it.
+const PullRequestSynchronizeAction = "synchronize"
 
 // WebhookEventStatesAll lists every canonical webhook inbox state, ordered from
 // earliest to terminal. Use it to enumerate states for metrics and stats so a

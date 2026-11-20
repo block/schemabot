@@ -601,8 +601,8 @@ func storageSchemaApplyWriteBudget(convergence time.Duration) time.Duration {
 // database operator grant authorizes an operator for their own database's
 // schema changes; SchemaBot's storage database is not any team's database, it
 // is the instance's own bookkeeping — the same class of operation as changing
-// deployment settings or redriving webhooks, which are admin-only for the same
-// reason.
+// deployment settings or backfilling Check Runs, which are admin-only for the
+// same reason.
 //
 // This is the second of two gates and it is not the one that usually bites.
 // The first is the tier the auth middleware admits the route at, and both

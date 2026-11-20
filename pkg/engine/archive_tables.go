@@ -15,9 +15,8 @@ var archiveTableRegexp = regexp.MustCompile(`^.*_archive_[0-9]{4}(_[0-9]{2}(_[0-
 // convention: <name>_archive_YYYY, <name>_archive_YYYY_MM, or
 // <name>_archive_YYYY_MM_DD. An archive is a retired copy kept outside
 // declarative schema files, so no engine plans to drop one that no schema file
-// declares. What a plan says about it is the engine's own: an engine that
-// reads the table lists it as exempt under ExemptReasonArchiveNaming, and an
-// engine whose loader leaves it out says nothing. On either, a table that an
+// declares. The MySQL and PostgreSQL engines list it as exempt under
+// ExemptReasonArchiveNaming. On either, a table that an
 // ignore_tables entry also names is disclosed under that entry instead,
 // because the config's own entry is reported ahead of the naming convention.
 //

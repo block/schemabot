@@ -40,6 +40,10 @@ func previewLockKeptOutput() {
 func previewUnsubmittedLockNotReleasedOutput() {
 	WriteUnsubmittedLockKept("testapp", "mysql", fmt.Errorf("API error (500): internal error"))
 	fmt.Println()
+	fmt.Println("--- Nothing submitted, release request got no answer ---")
+	fmt.Println()
+	WriteUnsubmittedLockReleaseUnknown("testapp", "mysql")
+	fmt.Println()
 	fmt.Println("--- Nothing submitted, lock already released ---")
 	fmt.Println()
 	WriteUnsubmittedLockAlreadyReleased("testapp", "mysql")

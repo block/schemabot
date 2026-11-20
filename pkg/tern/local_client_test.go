@@ -669,6 +669,10 @@ func (s *exactProgressTaskStore) GetByDatabase(context.Context, string) ([]*stor
 	return s.tasks, s.err
 }
 
+func (s *exactProgressTaskStore) GetNonTerminalByDatabase(context.Context, string) ([]*storage.Task, error) {
+	return nonTerminalTasks(s.tasks), s.err
+}
+
 func (s *exactProgressTaskStore) Update(ctx context.Context, task *storage.Task) error {
 	if s.updateErr != nil {
 		return s.updateErr(ctx, task)

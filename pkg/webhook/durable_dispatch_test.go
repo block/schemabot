@@ -941,6 +941,50 @@ func TestDurableWebhookDriverProcessesWhenLiveHeadFetchFails(t *testing.T) {
 	require.Zero(t, supersedes, "an unconfirmed head must never reach the supersede write")
 }
 
+// The synchronize quiet period defers only pushes. An opened or reopened PR
+// has no earlier head to coalesce with, so it is claimable at once, while a
+// synchronize delivery waits out the window.
+func TestDurablePullRequestWebhookDefersOnlySynchronize(t *testing.T) {
+	const quietPeriod = time.Minute
+	for _, tc := range []struct {
+		name        string
+		quietPeriod time.Duration
+		action      string
+		wantDefer   bool
+	}{
+		{"opened is never deferred", quietPeriod, "opened", false},
+		{"reopened is never deferred", quietPeriod, "reopened", false},
+		{"synchronize waits out the quiet period", quietPeriod, "synchronize", true},
+		{"synchronize is claimable at once without a quiet period", 0, "synchronize", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := newRecordingWebhookEventStore()
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{}, nil, logger)
+			h := NewHandler(service, &fakeClientFactory{}, nil, logger,
+				WithDurableWebhookDispatch(), WithSynchronizeQuietPeriod(tc.quietPeriod))
+
+			req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: tc.action, beforeSHA: "previous-head", headSHA: "head-sha"}, nil)
+			req.Header.Set(headerDeliveryID, "delivery-1")
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			require.Equal(t, http.StatusOK, rr.Code)
+
+			event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-1")
+			require.NoError(t, err)
+			require.NotNil(t, event)
+			assert.Equal(t, tc.action, event.Action)
+			if !tc.wantDefer {
+				assert.Nil(t, event.RetryAfter, "the delivery must be claimable as soon as it is stored")
+				return
+			}
+			require.NotNil(t, event.RetryAfter)
+			assert.Equal(t, event.ReceivedAt.Add(quietPeriod), *event.RetryAfter,
+				"the delivery must wait out the quiet period measured from its receipt")
+		})
+	}
+}
+
 // A claimed delivery without a stored head SHA cannot be verified against the
 // live PR, so it processes normally rather than being discarded on an
 // unverifiable comparison.

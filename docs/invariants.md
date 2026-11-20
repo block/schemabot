@@ -253,12 +253,14 @@ the drive loop (`pkg/api/operator.go`), the pre-start task re-read and the outco
 terminal side effects in the sequential drive (`pkg/tern/local_apply_sequential.go`), the same gate
 in the grouped drive (`pkg/tern/local_apply_grouped.go`), with `outcomeWriteLanded`
 (`pkg/tern/local_apply_failure.go`) as the only proof that lets either gate adopt an outcome write
-that returned an error, the resume's refusal to record a failure over an outcome it already stored
-(the no-remaining-work branches of `resumeApplyWithTasks` and `launchAtomicResume` return a
-`postTerminalReconcileError` that `handleGroupedResumeFailure` passes through,
-`pkg/tern/local_control_resume.go`), the progress-poll error budget in the grouped drive and the
-resume's handling of a failed reattach to accepted engine work, whose pause disposition is
-`shouldPauseAcceptedWork` (`pkg/tern/local_apply_sequential.go`), the remote progress error
+that returned an error, the re-read before an outcome write that returns a failed or missing read
+as an error instead of writing (`storedTerminalApply`, `pkg/tern/local_apply_failure.go`), the
+resume's refusal to record a failure over an outcome it already stored (the no-remaining-work
+branches of `resumeApplyWithTasks` and `launchAtomicResume` return a `postTerminalReconcileError`
+that `handleGroupedResumeFailure` passes through, `pkg/tern/local_control_resume.go`), the
+progress-poll error budget in the grouped drive and the resume's handling of a failed reattach to
+accepted engine work, whose pause disposition is `shouldPauseAcceptedWork`
+(`pkg/tern/local_apply_sequential.go`), the remote progress error
 limit (`pkg/tern/grpc_client.go`), and the PlanetScale engine's re-read of a deploy request whose
 deploy call failed, which tracks a deploy that started instead of failing it and reports an
 unknown outcome when PlanetScale did not refuse the deploy and the re-read fails or still reads
@@ -552,6 +554,21 @@ timeout fails them. *Enforced:* the width refusal at apply and at apply creation
 (`pkg/api/deferred_cutover_capacity.go`), the queue gate on the claim's start arms
 (`deferredCutoverQueueClause`, `pkg/storage/internal/sqlstore/apply_operations.go`), and the resume
 place recorded with a start request (`markResumed`, `pkg/storage/internal/sqlstore/control_requests.go`).
+
+### AV-17: An upgrade never needs a new GitHub App permission
+
+A GitHub App permission that existing installs do not already grant is used only by behavior a
+server config key turns on, and that key is off by default. With the key off, the server makes no
+request that needs the permission. With the key on and the permission still missing, the server
+serves pull requests as it would with the key off and logs which permission is missing.
+
+*Breaks if violated:* every install that upgrades without changing its App loses plans, Check Runs,
+or commands on the pull requests the new permission covers. *Enforced:* `skip_unrequired_branches`
+gating every PR target read (`pkg/api/config.go`, `pkg/webhook/pr_target.go`); the fallback that
+serves a target whose classic branch protection the App cannot read (`pkg/github/pr_target.go`);
+and `TestGitHubAppPermissionsAreRequiredOrGatedByConfig`
+(`pkg/api/github_app_permissions_test.go`), which fails when the setup guide lists a permission that
+is neither one existing installs grant nor optional behind a server config key.
 
 ## Merge gate (MG)
 
@@ -2087,8 +2104,9 @@ and `Acquire` in `pkg/storage/internal/sqlstore/locks.go`).
 ### AZ-4: Applying takes an authorized actor
 
 A PR apply requires an actor authorized for the target (configured operators, admin teams, repo
-admins, or CODEOWNERS, per config), evaluated per database. The change's author cannot satisfy
-their own review requirement. An approval that the reviewer withdrew or that the repository
+admins, CODEOWNERS, or Apps the database lists as command Apps, per config), evaluated per
+database. The change's author cannot satisfy their own review requirement, and a command App's
+approval never satisfies it. An approval that the reviewer withdrew or that the repository
 dismissed does not count. By default an authorized approval counts on whichever commit of the
 change it was given. Where the review policy requires re-approval, an approval counts only for the
 schema change it reviewed: it was given on the commit being applied, or on an earlier commit at which the change's own
@@ -2193,6 +2211,11 @@ The strongest invariants are enforced by structure, so regressions fail CI inste
   that the first does not. It drives the auto-plan on open and on push, the plan command, and the
   plan command in a repository whose tree GitHub truncates, so a lookup per changed file on those
   paths fails CI instead of exhausting the rate limit in production (AV-15).
+
+- **GitHub App permissions.** A test reads the setup guide's permission tables and fails on any
+  permission that existing installs do not already grant unless it is marked optional and names
+  the server config key that turns on the behavior needing it, so a release cannot quietly require
+  a new grant (AV-17).
 
 New invariants should aspire to this tier. When adding one, prefer a completeness test over the
 relevant registry to a hand-maintained list.

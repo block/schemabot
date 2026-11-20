@@ -2,6 +2,7 @@ package spirit
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -245,6 +246,41 @@ func TestDrainContextEndsWithTheCallersContext(t *testing.T) {
 	close(exit)
 	require.NoError(t, eng.DrainContext(t.Context()))
 	assert.Nil(t, eng.runningSchemaChange)
+}
+
+// A run publishes its tables under the engine lock after it is tracked, so a
+// drain that gives up on a run still starting reads them under the same lock
+// when it names the run in its error.
+func TestDrainContextNamesARunThatIsStillPublishingItsTables(t *testing.T) {
+	eng := New(Config{})
+	exit := make(chan struct{})
+	rm := &runningSchemaChange{
+		database: "orders",
+		state:    engine.StateRunning,
+	}
+	rm.goRun(func() {
+		for {
+			select {
+			case <-exit:
+				return
+			default:
+			}
+			eng.mu.Lock()
+			rm.tables = []string{"line_items"}
+			eng.mu.Unlock()
+			runtime.Gosched()
+		}
+	})
+	eng.runningSchemaChange = rm
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	err := eng.DrainContext(ctx)
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Contains(t, err.Error(), "database orders")
+	close(exit)
+	require.NoError(t, eng.DrainContext(t.Context()))
 }
 
 // Spirit drains the previous schema change before it starts the next. That

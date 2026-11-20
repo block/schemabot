@@ -1,6 +1,7 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -103,6 +104,8 @@ func TestEvaluatePRTarget(t *testing.T) {
 		classicRef  string
 		rulesStatus int
 		eligible    bool
+		unreadable  bool
+		forbidden   string
 		wantErr     string
 	}{
 		{name: "custom default", base: "trunk", eligible: true},
@@ -117,6 +120,9 @@ func TestEvaluatePRTarget(t *testing.T) {
 		{name: "missing permission", base: "feature", rulesStatus: http.StatusForbidden, wantErr: "read active branch rules"},
 		{name: "rules lookup missing", base: "feature", rulesStatus: http.StatusNotFound, wantErr: "read active branch rules"},
 		{name: "classic permission failure", base: "feature", rules: `[]`, classic: `null`, wantErr: "protection denied"},
+		{name: "classic protection unreadable without Administration", base: "feature", rules: `[]`, forbidden: `[{"type":"FORBIDDEN","path":["repository","ref","branchProtectionRule"],"message":"Resource not accessible by integration"}]`, eligible: true, unreadable: true},
+		{name: "ruleset match wins over unreadable classic protection", base: "release/1", rules: `[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"SchemaBot (production)"}]}}]`, forbidden: `[{"type":"FORBIDDEN","message":"Resource not accessible by integration"}]`, eligible: true},
+		{name: "forbidden mixed with another error stays an error", base: "feature", rules: `[]`, forbidden: `[{"type":"FORBIDDEN","message":"Resource not accessible by integration"},{"type":"INTERNAL","message":"something broke"}]`, wantErr: "Resource not accessible by integration"},
 		{name: "prefix is not a match", base: "feature", rules: `[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"SchemaBot impersonator"}]}}]`, classic: `null`},
 		{name: "missing closing parenthesis", base: "feature", rules: `[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"SchemaBot (production"}]}}]`, classic: `null`},
 		{name: "classic lookup returns a different branch", base: "feature", rules: `[]`, classicRef: "release", classic: `{"requiresStatusChecks":true,"requiredStatusCheckContexts":["SchemaBot (staging)"]}`, wantErr: `classic branch protection query returned branch "release", expected "feature"`},
@@ -145,6 +151,11 @@ func TestEvaluatePRTarget(t *testing.T) {
 				}
 				require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
 				assert.Equal(t, "refs/heads/"+target, request.Variables["ref"])
+				if tt.forbidden != "" {
+					_, err := fmt.Fprintf(w, `{"data":{"repository":{"ref":{"name":%q,"branchProtectionRule":null}}},"errors":%s}`, target, tt.forbidden)
+					require.NoError(t, err)
+					return
+				}
 				if tt.wantErr == "protection denied" {
 					_, err := io.WriteString(w, `{"errors":[{"message":"protection denied"}]}`)
 					require.NoError(t, err)
@@ -168,6 +179,7 @@ func TestEvaluatePRTarget(t *testing.T) {
 			}
 			require.NoError(t, err)
 			assert.Equal(t, tt.eligible, decision.Eligible)
+			assert.Equal(t, tt.unreadable, decision.ClassicProtectionUnreadable)
 			assert.Equal(t, target, decision.Target)
 			_, err = ic.EvaluatePRTarget(ctx, "octocat/hello-world", info, []string{"SchemaBot"})
 			require.NoError(t, err)
@@ -576,13 +588,63 @@ func TestFreshPRTargetPolicyDoesNotJoinBackgroundRead(t *testing.T) {
 func TestBranchPolicyCacheCopiesNames(t *testing.T) {
 	var cache branchPolicyCache
 	names := []string{"SchemaBot"}
-	cache.put("release", names)
+	cache.put("release", branchPolicy{contexts: names, classicUnreadable: true})
 	names[0] = "mutated input"
 	cached, ok := cache.get("release")
 	require.True(t, ok)
-	assert.Equal(t, []string{"SchemaBot"}, cached)
-	cached[0] = "mutated result"
+	assert.Equal(t, branchPolicy{contexts: []string{"SchemaBot"}, classicUnreadable: true}, cached)
+	cached.contexts[0] = "mutated result"
 	cached, ok = cache.get("release")
 	require.True(t, ok)
-	assert.Equal(t, []string{"SchemaBot"}, cached)
+	assert.Equal(t, branchPolicy{contexts: []string{"SchemaBot"}, classicUnreadable: true}, cached)
+}
+
+// An App without Administration: read cannot see classic branch protection.
+// Apply acceptance then treats a non-default target as enforced, as SchemaBot
+// did before target enforcement, and warns that the permission is missing.
+func TestFreshPRTargetEnforcesWhenClassicProtectionIsUnreadable(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/rules/branches/feature", func(w http.ResponseWriter, _ *http.Request) {
+		_, err := io.WriteString(w, `[]`)
+		require.NoError(t, err)
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, _ *http.Request) {
+		_, err := io.WriteString(w, `{"data":{"repository":{"ref":{"name":"feature","branchProtectionRule":null}}},"errors":[{"type":"FORBIDDEN","path":["repository","ref","branchProtectionRule"],"message":"Resource not accessible by integration"}]}`)
+		require.NoError(t, err)
+	})
+	var logs bytes.Buffer
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(&logs, nil)))
+
+	decision, err := ic.EvaluatePRTargetFresh(t.Context(), "octocat/hello-world", &PullRequestInfo{BaseRef: "feature", DefaultBranch: "main"}, []string{"SchemaBot"})
+	require.NoError(t, err)
+	assert.Equal(t, PRTargetEligibility{Target: "feature", Eligible: true, ClassicProtectionUnreadable: true}, decision)
+	assert.Contains(t, logs.String(), "level=WARN")
+	assert.Contains(t, logs.String(), "lacks Administration: read")
+	assert.Contains(t, logs.String(), "repo=octocat/hello-world")
+	assert.Contains(t, logs.String(), "branch=feature")
+}
+
+// The missing-permission warning comes from the GitHub read, not from each
+// evaluation, so the many evaluations of one push served from the branch
+// policy cache log it once.
+func TestCachedPRTargetWarnsOncePerPolicyRead(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/rules/branches/feature", func(w http.ResponseWriter, _ *http.Request) {
+		_, err := io.WriteString(w, `[]`)
+		require.NoError(t, err)
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, _ *http.Request) {
+		_, err := io.WriteString(w, `{"data":{"repository":{"ref":{"name":"feature","branchProtectionRule":null}}},"errors":[{"type":"FORBIDDEN","path":["repository","ref","branchProtectionRule"],"message":"Resource not accessible by integration"}]}`)
+		require.NoError(t, err)
+	})
+	var logs bytes.Buffer
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(&logs, nil)))
+	info := &PullRequestInfo{BaseRef: "feature", DefaultBranch: "main"}
+
+	for range 3 {
+		decision, err := ic.EvaluatePRTarget(t.Context(), "octocat/hello-world", info, []string{"SchemaBot"})
+		require.NoError(t, err)
+		assert.Equal(t, PRTargetEligibility{Target: "feature", Eligible: true, ClassicProtectionUnreadable: true}, decision)
+	}
+	assert.Equal(t, 1, strings.Count(logs.String(), "lacks Administration: read"))
 }

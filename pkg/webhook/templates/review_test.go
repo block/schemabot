@@ -94,6 +94,40 @@ func TestRenderReviewRequired_UnauthorizedApproversWithTeam(t *testing.T) {
 	assert.Contains(t, result, "\n1. Request a review from anyone listed above, or add @dave, @erin and @frank to @org/payments-operators\n2. Then run `schemabot apply -e staging` again\n")
 }
 
+// A command App approved alongside an unauthorized person. The App gets its
+// own line saying its approval never counts, and only the person is offered
+// the operator team, since no team makes an App's approval count.
+func TestRenderReviewRequired_CommandAppApprover(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:              "payments",
+		Environment:           "staging",
+		RequestedBy:           "alice",
+		OperatorReviewers:     []string{"org/payments-operators"},
+		PRAuthor:              "alice",
+		UnauthorizedApprovers: []string{"dave"},
+		CommandAppApprovers:   []string{"deploy-gate[bot]"},
+	})
+
+	assert.Contains(t, result, "\n@deploy-gate[bot] approved, but it is an App that runs SchemaBot commands, so its approval never counts. A person has to approve.\n")
+	assert.Contains(t, result, "\n1. Request a review from anyone listed above, or add @dave to @org/payments-operators\n")
+	assert.NotContains(t, result, "add @deploy-gate[bot]")
+}
+
+// Several command Apps approved, and nobody else did.
+func TestRenderReviewRequired_CommandAppApprovers(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:            "payments",
+		Environment:         "staging",
+		RequestedBy:         "alice",
+		OtherReviewers:      []string{"bob"},
+		PRAuthor:            "alice",
+		CommandAppApprovers: []string{"deploy-gate[bot]", "release-gate[bot]"},
+	})
+
+	assert.Contains(t, result, "\n@deploy-gate[bot] and @release-gate[bot] approved, but they are Apps that run SchemaBot commands, so their approvals never count. A person has to approve.\n")
+	assert.Contains(t, result, "\n1. Request a review from anyone listed above\n")
+}
+
 // The only team listed is an admin team, which grants approval for every
 // database, so the next step does not offer adding the approver to it.
 func TestRenderReviewRequired_UnauthorizedApproverWithOnlyAdminTeam(t *testing.T) {

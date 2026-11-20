@@ -678,6 +678,10 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 
 	primaryPlan, resp, err := s.ExecutePlanProto(r.Context(), req)
 	if err != nil {
+		if _, refused := errors.AsType[*PRSchemaAdmissionError](err); refused {
+			s.writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		if typeMismatchErr, ok := errors.AsType[*databaseTypeMismatchError](err); ok {
 			s.logger.Warn("plan rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
 			s.writeError(w, http.StatusBadRequest, err.Error())
@@ -953,6 +957,10 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		)
 	}
 
+	ctx, err = s.withPRSchemaPlanAdmission(ctx, client, req.Repository, int(ternReq.PullRequest), ternReq.HeadSha)
+	if err != nil {
+		return nil, nil, err
+	}
 	resp, err := client.Plan(ctx, ternReq)
 	if err != nil {
 		span.RecordError(err)
@@ -1194,7 +1202,19 @@ func (s *Service) refuseDropsOfWithheldTables(req PlanRequest, resp *ternv1.Plan
 	if req.PullRequest != nil {
 		prInt = int(*req.PullRequest)
 	}
-	if unmatched := ignored.Unmatched(withheldTablesFromProto(resp.ExemptTables)); len(unmatched) > 0 {
+	unmatched := ignored.Unmatched(withheldTablesFromProto(resp.ExemptTables))
+	unmatched, redundant := splitEntriesSkippedByNaming(unmatched, resp.ExemptTables)
+	if len(redundant) > 0 {
+		s.logger.Info("ignore_tables entries name tables the planner already skips by their names; the entries are not needed",
+			"database", req.Database,
+			"environment", req.Environment,
+			"deployment", deployment,
+			"repository", req.Repository,
+			"pull_request", prInt,
+			"redundant_entries", redundant,
+		)
+	}
+	if len(unmatched) > 0 {
 		s.logger.Warn("ignore_tables entries matched no live table and withheld nothing",
 			"database", req.Database,
 			"environment", req.Environment,
@@ -1440,6 +1460,10 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 	req.viaHTTP = true
 	resp, applyID, err := s.ExecuteApply(r.Context(), req)
 	if err != nil {
+		if _, refused := errors.AsType[*PRSchemaAdmissionError](err); refused {
+			s.writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		if errors.Is(err, errPlanLookupFailed) {
 			s.logger.Error("apply failed to load the stored plan", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, storedPlanLookupFailedMessage("apply", req.PlanID))
@@ -2014,6 +2038,16 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		s.rememberResumeObserver(storedApplyID, 0)
 	}
 
+	// Recovery remains available after the PR closes or its exception is revoked.
+	// Both guards are internal. Storage verifies the owner and exact rollback pin
+	// in the transaction that creates the apply, including after a concurrent repin.
+	pinnedRollback := req.ExpectedLockOwner != "" && plan.PlanIdentifier != "" &&
+		req.ExpectedPendingPlanID == storage.RollbackPendingPlanPrefix+plan.PlanIdentifier
+	if !pinnedRollback {
+		if err := s.admitPRSchemaWork(ctx, plan.Repository, plan.PullRequest, plan.HeadSHA); err != nil {
+			return nil, 0, err
+		}
+	}
 	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, options, attachObserver)
 	if err != nil {
 		recordApplyError("enqueue apply", err)

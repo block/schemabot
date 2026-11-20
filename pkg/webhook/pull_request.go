@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,17 +15,29 @@ import (
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // pullRequestPayload represents the relevant fields from a GitHub pull_request webhook.
 type pullRequestPayload struct {
-	Action      string `json:"action"`
-	Before      string `json:"before"`
+	Action string `json:"action"`
+	Before string `json:"before"`
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
+	Label struct {
+		Name string `json:"name"`
+	} `json:"label"`
 	PullRequest struct {
-		Number int  `json:"number"`
-		Merged bool `json:"merged"`
-		Head   struct {
+		Number    int       `json:"number"`
+		Merged    bool      `json:"merged"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Base      struct {
+			SHA string `json:"sha"`
+			Ref string `json:"ref"`
+		} `json:"base"`
+		Head struct {
 			SHA string `json:"sha"`
 			Ref string `json:"ref"`
 		} `json:"head"`
@@ -104,6 +117,9 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 
 	// Route PR actions
 	switch {
+	case h.isPRSchemaExceptionEvent(payload):
+		h.handlePRSchemaExceptionEvent(ctx, w, body, deliveryID)
+		return
 	case isAutoPlannablePullRequest(payload):
 		// proceed to auto-plan below
 	case payload.Action == storage.PullRequestClosedAction:
@@ -111,7 +127,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			// Enqueue and ACK fast; a leased driver runs cleanup with retries so
 			// a process restart mid-cleanup cannot drop the delivery and leave a
 			// lock held or stale check state behind.
-			inserted, err := h.enqueueDurablePullRequest(ctx, payload, body, deliveryID, installationID)
+			inserted, _, err := h.enqueueDurablePullRequest(ctx, payload, body, deliveryID, installationID)
 			if err != nil {
 				h.logger.Error("failed to enqueue durable PR close cleanup",
 					"repo", payload.Repository.FullName, "pr", payload.PullRequest.Number,
@@ -189,7 +205,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		// rather than silently, but GitHub never auto-retries, so the delivery
 		// stays lost until an operator hits "Redeliver" (which re-opens a
 		// terminal row — failed or completed) or a new push arrives.
-		inserted, err := h.enqueueDurablePullRequest(ctx, payload, body, deliveryID, installationID)
+		inserted, notBefore, err := h.enqueueDurablePullRequest(ctx, payload, body, deliveryID, installationID)
 		if err != nil {
 			h.logger.Error("failed to enqueue durable pull_request auto-plan",
 				"action", payload.Action,
@@ -214,13 +230,24 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan already queued"})
 			return
 		}
-		h.logger.Info("durable pull_request auto-plan queued",
-			"action", payload.Action,
-			"repo", repo,
-			"pr", pr,
-			"head_sha", headSHA,
-			"delivery_id", deliveryID,
-		)
+		if notBefore != nil {
+			h.logger.Info("durable pull_request auto-plan queued; no driver will claim it until the synchronize quiet period has passed",
+				"action", payload.Action,
+				"repo", repo,
+				"pr", pr,
+				"head_sha", headSHA,
+				"delivery_id", deliveryID,
+				"not_before", notBefore.UTC(),
+			)
+		} else {
+			h.logger.Info("durable pull_request auto-plan queued",
+				"action", payload.Action,
+				"repo", repo,
+				"pr", pr,
+				"head_sha", headSHA,
+				"delivery_id", deliveryID,
+			)
+		}
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan queued"})
 		return
 	}
@@ -397,6 +424,38 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 // check here (the post re-verifies the head SHA and can no-op during a GitHub
 // outage).
 func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string) (string, error) {
+	dispatch, err := h.dispatchAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, source, action, beforeSHA, deliveryID, autoPlanOptions{})
+	return dispatch.message, err
+}
+
+// autoPlanOptions changes what one auto-plan dispatch is allowed to start.
+type autoPlanOptions struct {
+	// deferSchemaPlans stops before any Check Run or check state is written
+	// when the PR changes schema this deployment manages, and reports the
+	// databases it would have planned.
+	// Planning is the expensive part of an auto-plan: every database reads its
+	// schema files once per environment. An operator recovering checks across
+	// many PRs sets this so the cheap PRs settle first and each schema PR is
+	// planned only when asked for by number.
+	deferSchemaPlans bool
+	// Exception events reconcile only PRs that need an exception.
+	schemaExceptionEvent bool
+}
+
+// autoPlanDispatch is what one auto-plan dispatch did.
+type autoPlanDispatch struct {
+	message string
+	// deferredDatabases lists the managed databases a deferred dispatch would
+	// have planned. It is set only when deferSchemaPlans stopped the dispatch.
+	deferredDatabases []string
+	// changedFiles counts the files the PR proposes against the default
+	// branch, as a size hint for the plan a deferred dispatch skipped.
+	changedFiles int
+}
+
+// dispatchAutoPlanForPR is runAutoPlanForPR with options; see its comment.
+func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string, opts autoPlanOptions) (autoPlanDispatch, error) {
+	repo = storage.CanonicalKey(repo)
 	// Snapshot the base ref before anything is read, so the publish-time check
 	// below covers the whole of discovery. A base that moves mid-discovery
 	// changes which databases the PR touches, which is the case that check
@@ -408,85 +467,56 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
 		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
-		return "config discovery failed", fmt.Errorf("read %s#%d for auto-plan: %w", repo, pr, err)
+		return autoPlanDispatch{message: "config discovery failed"}, fmt.Errorf("read %s#%d for auto-plan: %w", repo, pr, err)
 	}
 	decision, err := h.evaluatePRTarget(ctx, client, repo, prInfo)
 	if err != nil {
 		h.logger.Error("auto-plan could not verify PR target", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
-		return "target eligibility could not be verified", fmt.Errorf("evaluate target for %s#%d: %w", repo, pr, err)
+		return autoPlanDispatch{message: "target eligibility could not be verified"}, fmt.Errorf("evaluate target for %s#%d: %w", repo, pr, err)
 	}
 	if prInfo.HeadSHA != headSHA {
-		return "auto-plan discarded because the PR moved during discovery", nil
+		return autoPlanDispatch{message: "auto-plan discarded because the PR moved during discovery"}, nil
 	}
 	if err := h.recordPRTargetObservation(ctx, repo, pr, prInfo, decision, deliveryID); err != nil {
 		h.logger.Error("auto-plan could not record PR target observation", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
-		return "target observation failed", fmt.Errorf("record target for %s#%d: %w", repo, pr, err)
+		return autoPlanDispatch{message: "target observation failed"}, fmt.Errorf("record target for %s#%d: %w", repo, pr, err)
 	}
 	if !decision.Eligible {
 		h.logger.Info("auto-plan skipped for excluded PR target", "repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA, "effective_target", decision.Target, "source", source)
-		return "skipped: PR target is excluded", nil
+		return autoPlanDispatch{message: "skipped: PR target is excluded"}, nil
 	}
 	baseRef := prInfo.BaseRef
 
-	// Fetch the changed files once so the same list drives both config discovery
-	// and the server-managed-directory safety check below.
-	changedFiles, err := client.FetchPRFiles(ctx, repo, pr)
-	if err != nil {
-		if errors.Is(err, ghclient.ErrPRFilesIncomplete) {
-			// The schema_visible label records whether the truncated prefix
-			// already shows a schema or config path. Both shapes get the same
-			// cap-specific blocking check — the withheld tail is not
-			// inspectable either way — but the label lets operators see how
-			// many cap hits look schema-related versus pure refactors.
-			metrics.RecordPRFileCapExceeded(ctx, repo, ghclient.HasDiscoveryInputFiles(changedFiles))
+	policy := h.config().PRSchemaCapForRepo(repo)
+	var discovery *prPlanDiscovery
+	var cacheKey prPlanDiscoveryKey
+	if policy.Limit > 0 {
+		cacheKey = h.prPlanDiscoveryKey(repo, pr, prInfo)
+		if !cacheKey.revision.valid() {
+			err := fmt.Errorf("GitHub did not supply the PR head and base revision")
+			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			return autoPlanDispatch{message: "config discovery failed"}, err
 		}
-		h.logConfigDiscoveryFailure("list PR changed files", repo, pr, headSHA, source, deliveryID, err)
-		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
-		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
-		return "config discovery failed", fmt.Errorf("fetch PR files for %s#%d: %w", repo, pr, err)
+		discovery, err = h.cachedPRPlanDiscovery(ctx, client, cacheKey)
+		if err != nil {
+			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			return autoPlanDispatch{message: "config discovery failed"}, err
+		}
 	}
-
-	// Narrow the list to what the PR proposes against the default branch before
-	// anything reads it. Every guard below asks a question about the PR's own
-	// schema changes — which databases it touches, whether it drops a config out
-	// from under a managed directory, whether participants must report — and a
-	// file the PR inherited from history it has not caught up with answers none
-	// of them. Failing here is a discovery failure like any other: without the
-	// comparison there is no way to tell an inherited file from a proposed one.
-	files, defaultTipSHA, err := client.PRFilesProposedAgainstDefaultBranch(ctx, repo, headSHA, changedFiles)
-	if err != nil {
-		h.logger.Error("failed to scope PR files to what the PR proposes", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
-		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
-		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
-		return "config discovery failed", fmt.Errorf("scope PR files for %s#%d to what it proposes: %w", repo, pr, err)
+	cacheMiss := discovery == nil
+	if cacheMiss {
+		discovery, err = h.readPRPlanDiscovery(ctx, client, repo, pr, prInfo, source, deliveryID)
+		if err != nil {
+			h.logConfigDiscoveryFailure("discover PR planning inputs", repo, pr, headSHA, source, deliveryID, err)
+			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+			return autoPlanDispatch{message: "config discovery failed"}, err
+		}
 	}
-	if len(files) != len(changedFiles) {
-		h.logger.Info("auto-plan scoped to the files the PR proposes against the default branch",
-			"repo", repo, "pr", pr, "head_sha", headSHA, "default_tip_sha", defaultTipSHA,
-			"changed_files", len(changedFiles), "proposed_files", len(files),
-			"source", source, "delivery_id", deliveryID)
-	}
-
-	// Discover all configs matching changed schema files in this PR
-	configs, err := client.FindConfigsForPRFiles(ctx, repo, headSHA, files)
-	if err != nil {
-		h.logConfigDiscoveryFailure("resolve schema configs for changed files", repo, pr, headSHA, source, deliveryID, err)
-		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+	if len(discovery.unmanagedFiles) > 0 {
+		h.failClosedOnUnmanagedSchemaDir(ctx, client, repo, pr, headSHA, source, discovery.unmanagedFiles)
 		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
-		return "config discovery failed", fmt.Errorf("discover configs for %s#%d: %w", repo, pr, err)
-	}
-
-	// Fail closed when the PR changes schema files under a directory the server
-	// config manages but no schemabot.yaml resolves for them — e.g. the PR
-	// removed the config while keeping schema changes. Dropping the config must
-	// not silently unmanage a server-owned schema directory.
-	if unmanaged := h.unmanagedServerManagedSchemaChanges(repo, files, configs); len(unmanaged) > 0 {
-		h.failClosedOnUnmanagedSchemaDir(ctx, client, repo, pr, headSHA, source, unmanaged)
-		// This exit posts a blocking aggregate and no plan comment, so an earlier
-		// head's plan comment would otherwise stay expanded beside it, still
-		// offering to apply DDL for a config this head no longer carries.
-		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
-		return "schema change under managed directory has no config", nil
+		return autoPlanDispatch{message: "schema change under managed directory has no config"}, nil
 	}
 
 	// Publishing a plan asserts that the inputs it was computed from still
@@ -495,21 +525,77 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// proposes and so which databases it touches. Re-read them and discard
 	// rather than publish a plan and a merge-blocking check for a PR that has
 	// moved on — whichever event moved it re-plans on its own.
-	moved, err := h.autoPlanInputsMoved(ctx, client, repo, pr, headSHA, prInfo)
+	fresh, moved, err := h.revalidateAutoPlanInputs(ctx, client, repo, pr, headSHA, prInfo)
 	if err != nil {
 		h.logger.Error("failed to re-verify the PR before publishing its plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postPlanPublishVerificationFailure(ctx, client, repo, pr, headSHA, err)
-		return "plan publish verification failed", fmt.Errorf("re-verify %s#%d before publishing its plan: %w", repo, pr, err)
+		return autoPlanDispatch{message: "plan publish verification failed"}, fmt.Errorf("re-verify %s#%d before publishing its plan: %w", repo, pr, err)
 	}
 	if moved != autoPlanInputsUnchanged {
 		h.logger.Info("discarding auto-plan because the PR moved while it was being discovered; the event that moved it re-plans",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", baseRef,
 			"source", source, "delivery_id", deliveryID)
-		return "auto-plan discarded because the PR moved during discovery", nil
+		return autoPlanDispatch{message: "auto-plan discarded because the PR moved during discovery"}, nil
 	}
 
-	discovered := slices.Clone(configs)
-	configs = h.filterManagedDiscoveredConfigs(ctx, repo, pr, headSHA, source, configs)
+	changedFiles, files := discovery.changedFiles, discovery.files
+	discovered, configs := discovery.discovered, discovery.managed
+	if policy.Limit > 0 {
+		if cacheKey != h.prPlanDiscoveryKey(repo, pr, fresh) || !fresh.IsOpen() {
+			return autoPlanDispatch{message: "auto-plan discarded because the PR or registrations moved during discovery"}, nil
+		}
+		if cacheMiss {
+			h.prPlanDiscovery.put(cacheKey, discovery)
+		}
+	}
+	if opts.schemaExceptionEvent && (policy.Limit == 0 || len(discovery.localDatabases) <= policy.Limit) {
+		return autoPlanDispatch{message: "PR is within this control plane's database limit"}, nil
+	}
+	if opts.deferSchemaPlans && len(configs) > 0 {
+		// No Check Run or stored check state has been written for this head yet,
+		// so a missing required check keeps blocking the merge until the
+		// operator asks for these plans (MG-1).
+		databases := managedDatabaseNames(configs)
+		h.logger.Info("auto-plan deferred schema plans; the PR's Check Runs are left as they are until its plans are requested",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "databases", databases,
+			"proposed_files", len(files), "source", source, "delivery_id", deliveryID)
+		return autoPlanDispatch{
+			message:           "deferred: PR changes managed schema",
+			deferredDatabases: databases,
+			changedFiles:      len(files),
+		}, nil
+	}
+	var admission prSchemaAdmission
+	if policy.Limit > 0 {
+		if policy.Observe {
+			admission, err = h.evaluatePRSchemaCap(ctx, client, repo, pr, fresh, policy, discovery.localDatabases, schemaCapAutoPlan)
+		} else {
+			err = h.withPRSchemaPublication(ctx, repo, pr, func() error {
+				current, err := h.verifyPRSchemaRevision(ctx, client, cacheKey, fresh.State)
+				if err != nil {
+					return err
+				}
+				admission, err = h.evaluatePRSchemaCap(ctx, client, repo, pr, current, policy, discovery.localDatabases, schemaCapAutoPlan)
+				if err != nil {
+					return err
+				}
+				ctx := withExpectedPRTarget(ctx, repo, pr, current)
+				h.clearAggregateBlocksForVerifiedPR(ctx, client, repo, pr, headSHA, configs)
+				return nil
+			})
+		}
+		if errors.Is(err, errPRSchemaMoved) {
+			return autoPlanDispatch{message: err.Error()}, nil
+		}
+		if errors.Is(err, errPRSchemaCapHeld) {
+			h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+			return autoPlanDispatch{message: err.Error()}, nil
+		}
+		if err != nil {
+			return autoPlanDispatch{message: "could not evaluate the PR schema cap"}, err
+		}
+		admission.key, admission.info, admission.discovery, admission.compareTip = cacheKey, fresh, discovery, discovery.defaultTip
+	}
 	// On synchronize the comment cadence compares changed files between SHAs —
 	// a GitHub compare call. The unmanaged-config notice and the plan comments
 	// follow the same cadence, so the decision is memoized and computed at most
@@ -524,9 +610,18 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// discovered database. Together those cover every condition that records
 	// a discovery block. Prior plan successes are invalidated before a stored
 	// aggregate block is released, so only replacement results can pass.
-	h.clearAggregateBlocksForVerifiedPR(ctx, client, repo, pr, headSHA, configs)
+	if policy.Limit == 0 || policy.Observe {
+		h.clearAggregateBlocksForVerifiedPR(ctx, client, repo, pr, headSHA, configs)
+	}
 
 	affectedDatabases := checkDatabaseKeysForConfigs(configs)
+
+	// Persist registration errors before cleanup or a successful sibling plan can
+	// publish an aggregate. Keep all discovered keys in the stale-check sweep.
+	planConfigs, err := h.registeredAutoPlanConfigs(ctx, client, repo, pr, headSHA, installationID, configs)
+	if err != nil {
+		return autoPlanDispatch{}, err
+	}
 
 	// Clean up stale checks from databases no longer in the PR, on the new HEAD
 	// SHA. This runs to completion before any plan below launches, so every
@@ -556,7 +651,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 				Repository: repo,
 				Status:     "skipped",
 			})
-			return "no schema files in PR (aggregate participant, staying silent)", nil
+			return autoPlanDispatch{message: "no schema files in PR (aggregate participant, staying silent)"}, nil
 		}
 		// A PR with no leader-managed schema can still touch schema owned by
 		// expected participant deployments. The leader's aggregate is the
@@ -592,7 +687,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 				}
 				h.updateAggregateCheck(ctx, c, repo, pr, headSHA)
 			})
-			return "no schema files in PR (aggregate folds expected participants)", nil
+			return autoPlanDispatch{message: "no schema files in PR (aggregate folds expected participants)"}, nil
 		}
 		// Post passing aggregates on the current HEAD SHA so branch protection
 		// isn't blocked on PRs that don't touch schema files. Always post —
@@ -614,7 +709,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 			}
 			h.postPassingAggregates(ctx, c, repo, pr, headSHA, unmanaged)
 		})
-		return "no schema files in PR", nil
+		return autoPlanDispatch{message: "no schema files in PR"}, nil
 	}
 
 	// Discovery is complete. Publish empty environments and pending placeholders
@@ -631,14 +726,40 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		tenant = config.Tenant
 	}
 	commandScopeDatabases := h.autoPlanCommandScopeDatabases(ctx, client, repo, pr, headSHA, changedFiles, files, discovered)
-	for _, cfg := range configs {
+	for _, cfg := range planConfigs {
 		database := cfg.Config.Database
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
-			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, commandScopeDatabases, postPlanComment, 0, unmanagedPlanNote)
+			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, commandScopeDatabases, postPlanComment, 0, unmanagedPlanNote, admission)
 		})
 	}
 
-	return "auto-plan started", nil
+	return autoPlanDispatch{message: "auto-plan started"}, nil
+}
+
+// registeredAutoPlanConfigs records a durable aggregate failure before returning
+// the databases that can proceed. A later successful plan folds that same block.
+func (h *Handler) registeredAutoPlanConfigs(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, configs []ghclient.DiscoveredConfig) ([]ghclient.DiscoveredConfig, error) {
+	if h.isRepoListenOnly(repo) || !h.config().AreChecksEnabled(repo) {
+		return configs, nil
+	}
+	var messages []string
+	var registered []ghclient.DiscoveredConfig
+	for _, cfg := range configs {
+		if _, err := h.configuredDatabaseEnvironments(cfg.Config.Database); err != nil {
+			messages = append(messages, fmt.Sprintf("%s: %s", cfg.Path, userFacingError(err)))
+			h.handleSchemaRequestError(repo, pr, installationID, "", cfg.Config.Database, "", action.Plan, err, false)
+			continue
+		}
+		registered = append(registered, cfg)
+	}
+	if len(messages) > 0 {
+		slices.Sort(messages)
+		if !h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA,
+			h.aggregateMessagesForAllEnvironments(strings.Join(messages, "\n")), configDiscoveryFailedBlock) {
+			return nil, fmt.Errorf("could not record invalid schema configuration for %s#%d at %s", repo, pr, headSHA)
+		}
+	}
+	return registered, nil
 }
 
 // severalDatabases is the count that makes an auto-plan comment name its
@@ -719,28 +840,33 @@ const (
 // be answered — the caller must not publish on an unverified PR, and durable
 // callers retry the delivery.
 func (h *Handler) autoPlanInputsMoved(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, previous *ghclient.PullRequestInfo) (autoPlanInputMove, error) {
+	_, moved, err := h.revalidateAutoPlanInputs(ctx, client, repo, pr, headSHA, previous)
+	return moved, err
+}
+
+func (h *Handler) revalidateAutoPlanInputs(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, previous *ghclient.PullRequestInfo) (*ghclient.PullRequestInfo, autoPlanInputMove, error) {
 	fresh, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
-		return autoPlanInputsUnchanged, fmt.Errorf("fetch PR %s#%d: %w", repo, pr, err)
+		return fresh, autoPlanInputsUnchanged, fmt.Errorf("fetch PR %s#%d: %w", repo, pr, err)
 	}
 	if fresh.HeadSHA != headSHA {
 		h.logger.Info("PR head moved while its plan was being discovered",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "current_head_sha", fresh.HeadSHA)
-		return autoPlanHeadMoved, nil
+		return fresh, autoPlanHeadMoved, nil
 	}
 	if !samePRTargetContext(fresh, previous) {
 		h.logger.Info("PR target metadata moved while its plan was being discovered",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", previous.BaseRef, "current_base_ref", fresh.BaseRef)
-		return autoPlanBaseMoved, nil
+		return fresh, autoPlanBaseMoved, nil
 	}
 	decision, err := h.evaluatePRTarget(ctx, client, repo, fresh)
 	if err != nil {
-		return autoPlanInputsUnchanged, err
+		return fresh, autoPlanInputsUnchanged, err
 	}
 	if !decision.Eligible {
-		return autoPlanBaseMoved, nil
+		return fresh, autoPlanBaseMoved, nil
 	}
-	return autoPlanInputsUnchanged, nil
+	return fresh, autoPlanInputsUnchanged, nil
 }
 
 // notifyUnmanagedDiscoveredConfigs posts a PR-visible notice when auto-plan
@@ -1154,16 +1280,26 @@ func (h *Handler) inFlightAppliesForClosedPR(ctx context.Context, repo string, p
 }
 
 // releaseLocksForClosedPR releases the closed PR's locks, except locks on
-// databases that still have an in-flight apply. Every release is attempted even
-// if an earlier one fails, and the failures are joined and returned so a caller
-// with a retry mechanism re-attempts the still-held locks. Release itself is
-// not idempotent — a missing row returns storage.ErrLockNotFound and a
-// re-acquired lock returns storage.ErrLockNotOwned — so re-running converges
-// only because each attempt re-lists the PR's locks first and a released
-// lock's row is deleted, never reappearing in a later attempt. A concurrent
-// manual unlock between the list and the release surfaces as a spurious
-// ErrLockNotFound that fails that attempt; the next retry no longer sees the
-// row and converges.
+// databases that still have an in-flight apply. Each release deletes only the
+// lock row this pass listed, held for the pending plan it listed, so a lock
+// taken after the listing is never released by it.
+//
+// A listed lock that is already gone, released by an unlock or an apply's own
+// cleanup in between, is what cleanup wanted, so it is logged and not an
+// error. A database locked again since the listing, by a new row or by the
+// same row for a new plan, stays held and is returned as an error: the PR may
+// have reopened and planned again after cleanup read its live state, so this
+// pass must not go on to delete its check state. A new row can also belong to
+// another owner, which locked the database once the listed lock was released;
+// the release cannot tell the two apart, so it treats both the same way. A
+// caller that retries re-reads the live PR first and lists the PR's locks
+// again, so it releases a lock only if the PR is still closed and still holds
+// it.
+//
+// Every release is attempted even if an earlier one fails, and the failures
+// are joined and returned so a caller with a retry mechanism re-attempts the
+// still-held locks. Each attempt re-lists the PR's locks first, and a released
+// lock's row is deleted, so a retry converges.
 func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr int, inFlight map[closedPRDatabase]bool) error {
 	locks, err := h.service.Storage().Locks().GetByPR(ctx, repo, pr)
 	if err != nil {
@@ -1177,14 +1313,32 @@ func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr i
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType)
 			continue
 		}
-		if err := h.service.Storage().Locks().Release(ctx, lock.DatabaseName, lock.DatabaseType, lock.Owner); err != nil {
+		err := h.service.Storage().Locks().ReleaseByID(ctx, lock.ID, lock.DatabaseName, lock.DatabaseType, lock.Owner, lock.PendingPlanID)
+		switch {
+		case err == nil:
+			h.logger.Info("released lock on PR close",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName)
+		case isVettedLockGone(err):
+			h.logger.Info("lock already released before PR close cleanup reached it",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+				"owner", lock.Owner, "error", err)
+		case errors.Is(err, storage.ErrLockReplaced):
+			// The new row can belong to this PR or to another owner that
+			// locked the database after the listed lock was released.
+			h.logger.Warn("a different lock row holds the database since PR close cleanup listed its lock; that row is kept and this cleanup pass deletes no check state",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+				"owner", lock.Owner, "listed_pending_plan_id", lock.PendingPlanID, "error", err)
+			releaseErrs = append(releaseErrs, fmt.Errorf("lock on %s (%s) is held by a different lock row than the one close cleanup listed: %w", lock.DatabaseName, lock.DatabaseType, err))
+		case errors.Is(err, storage.ErrLockIntentChanged):
+			h.logger.Warn("lock acquired again for another pending plan after PR close cleanup listed it; it is kept and this cleanup pass deletes no check state",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+				"owner", lock.Owner, "listed_pending_plan_id", lock.PendingPlanID, "error", err)
+			releaseErrs = append(releaseErrs, fmt.Errorf("lock on %s (%s) was acquired again for another pending plan after close cleanup listed it: %w", lock.DatabaseName, lock.DatabaseType, err))
+		default:
 			h.logger.Error("failed to release lock on PR close",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
 			releaseErrs = append(releaseErrs, fmt.Errorf("release lock on %s (%s): %w", lock.DatabaseName, lock.DatabaseType, err))
-			continue
 		}
-		h.logger.Info("released lock on PR close",
-			"repo", repo, "pr", pr, "database", lock.DatabaseName)
 	}
 	return errors.Join(releaseErrs...)
 }
@@ -1593,4 +1747,15 @@ func (h *Handler) markStalePlanOnlyCheckStateSuccessful(ctx context.Context, rep
 		Status:       "success",
 	})
 	return true
+}
+
+// managedDatabaseNames returns the sorted, de-duplicated database names of
+// configs.
+func managedDatabaseNames(configs []ghclient.DiscoveredConfig) []string {
+	names := make([]string, 0, len(configs))
+	for _, cfg := range configs {
+		names = append(names, cfg.Config.Database)
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
 }

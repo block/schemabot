@@ -59,6 +59,10 @@ type ReviewGateResult struct {
 	// approval to count, since the schema change may have changed since, so
 	// the comment also asks them to approve the latest commit.
 	UnauthorizedEarlierApprovers []string
+	// CommandAppApprovers approved the PR but are command Apps, whose approval
+	// never counts and which no team or reviewer setting can make eligible, so
+	// the comment says that instead of the unauthorized-reviewer guidance.
+	CommandAppApprovers []string
 	// BaseRef and DefaultBranch are the PR's base branch and the repository's
 	// default branch. An approval is carried across base branch changes only
 	// when they are the same, so the review-required comment says so when they
@@ -118,6 +122,7 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 			UncomparedApprovers:          gateResult.UncomparedApprovers,
 			UnauthorizedApprovers:        gateResult.UnauthorizedApprovers,
 			UnauthorizedEarlierApprovers: gateResult.UnauthorizedEarlierApprovers,
+			CommandAppApprovers:          gateResult.CommandAppApprovers,
 			BaseRef:                      gateResult.BaseRef,
 			DefaultBranch:                gateResult.DefaultBranch,
 		}
@@ -238,10 +243,16 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		compareStatements: h.statementComparerFor(repo, pr, database, environment, schema.Type),
 		verdicts:          make(map[string]approvalVerdict),
 	}
-	var changedApprovers, changedPaths, changedBasePaths, uncomparedApprovers, unauthorizedApprovers, unauthorizedEarlierApprovers []string
+	var changedApprovers, changedPaths, changedBasePaths, uncomparedApprovers, unauthorizedApprovers, unauthorizedEarlierApprovers, commandAppApprovers []string
 	var staleApprovals []staleApproval
 	for _, approval := range validApprovals {
 		reviewer := approval.User
+		if policy.IsCommandApp != nil && policy.IsCommandApp(reviewer) {
+			h.logger.Info("review gate: approval does not count because the reviewer is a command App",
+				"repo", repo, "pr", pr, "database", database, "reviewer", reviewer, "head_sha", headSHA)
+			commandAppApprovers = append(commandAppApprovers, reviewer)
+			continue
+		}
 		matched, principal, err := policy.Matches(ctx, client, reviewer)
 		if err != nil {
 			return nil, err
@@ -313,7 +324,8 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		"valid_approvers", validApprovers,
 		"changed_approvers", changedApprovers,
 		"uncompared_approvers", uncomparedApprovers,
-		"unauthorized_approvers", unauthorizedApprovers, "head_sha", headSHA,
+		"unauthorized_approvers", unauthorizedApprovers,
+		"command_app_approvers", commandAppApprovers, "head_sha", headSHA,
 		"operator_reviewers", policy.OperatorReviewers,
 		"other_reviewers", policy.OtherReviewers)
 	return &ReviewGateResult{
@@ -328,6 +340,7 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		UncomparedApprovers:          uncomparedApprovers,
 		UnauthorizedApprovers:        unauthorizedApprovers,
 		UnauthorizedEarlierApprovers: unauthorizedEarlierApprovers,
+		CommandAppApprovers:          commandAppApprovers,
 		BaseRef:                      prInfo.BaseRef,
 		DefaultBranch:                prInfo.DefaultBranch,
 	}, nil
@@ -656,6 +669,11 @@ type reviewGatePolicy struct {
 	OperatorTeams      []string
 	OperatorUsers      []string
 	CodeownerReviewers map[string]struct{}
+	// IsCommandApp reports whether a reviewer is an App that any database
+	// lists in command_apps. Such an App may run commands, but its approval
+	// never counts, for any database, even if its login is also configured as
+	// a reviewer; it is also left out of the reviewer lists.
+	IsCommandApp func(reviewer string) bool
 	// IncludeCodeowners records that CODEOWNERS was consulted, so an empty
 	// reviewer set can name CODEOWNERS as the source that contributed none.
 	IncludeCodeowners bool
@@ -670,6 +688,9 @@ type reviewGatePolicy struct {
 }
 
 func (p reviewGatePolicy) Matches(ctx context.Context, client *ghclient.InstallationClient, reviewer string) (bool, string, error) {
+	if p.IsCommandApp != nil && p.IsCommandApp(reviewer) {
+		return false, "", nil
+	}
 	if len(p.AdminTeams) > 0 {
 		matched, principal, err := actorInAnyTeam(ctx, client, p.AdminTeams, reviewer)
 		if err != nil {
@@ -725,10 +746,16 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 		RepoAdminTeams:     repoAdminTeams,
 		RepoAdminUsers:     repoAdminUsers,
 		CodeownerReviewers: make(map[string]struct{}),
+		IsCommandApp:       config.IsConfiguredCommandApp,
 	}
+	// A command App's approval never counts, so it is never listed as a
+	// reviewer to ask.
 	appendOperatorReviewers := func(values ...[]string) {
 		for _, group := range values {
 			for _, value := range group {
+				if config.IsConfiguredCommandApp(value) {
+					continue
+				}
 				policy.OperatorReviewers = appendUniqueString(policy.OperatorReviewers, value)
 			}
 		}
@@ -739,6 +766,9 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 		for _, group := range values {
 			for _, value := range group {
 				if containsFold(policy.OperatorReviewers, value) {
+					continue
+				}
+				if config.IsConfiguredCommandApp(value) {
 					continue
 				}
 				policy.OtherReviewers = appendUniqueString(policy.OtherReviewers, value)

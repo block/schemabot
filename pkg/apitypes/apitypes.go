@@ -195,61 +195,6 @@ func NewRateLimitedResponse(reason string, retryAfter time.Duration) ErrorRespon
 	}
 }
 
-type WebhookRedriveRequest struct {
-	WindowStart string `json:"window_start"`
-	WindowEnd   string `json:"window_end"`
-	App         string `json:"app,omitempty"`
-	Repo        string `json:"repo,omitempty"`
-	PR          int    `json:"pr,omitempty"`
-	MaxPages    int    `json:"max_pages"`
-	DryRun      bool   `json:"dry_run,omitempty"`
-	// Cursor continues a previous request's listing for one App. Each request
-	// processes a bounded number of pages so it finishes well within any
-	// intermediary HTTP timeout; the caller loops until next_cursor is empty.
-	Cursor string `json:"cursor,omitempty"`
-	// DeliveryIDs redelivers exactly these deliveries for App, skipping the
-	// window listing entirely — for callers that already identified the
-	// failed deliveries (for example a checks backfill classification pass).
-	DeliveryIDs []int64 `json:"delivery_ids,omitempty"`
-}
-
-type WebhookRedriveResponse struct {
-	Results []WebhookRedriveResult `json:"results"`
-}
-
-type WebhookRedriveResult struct {
-	AppName            string `json:"app_name"`
-	DryRun             bool   `json:"dry_run"`
-	Fetched            int    `json:"fetched"`
-	Pages              int    `json:"pages"`
-	OldestFetched      string `json:"oldest_fetched,omitempty"`
-	ReachedWindowStart bool   `json:"reached_window_start"`
-	// HistoryExhausted is true when GitHub's retained delivery history ended
-	// before the window start was reached: older deliveries no longer exist.
-	HistoryExhausted bool `json:"history_exhausted,omitempty"`
-	// NextCursor continues the listing in a follow-up request (with app set);
-	// empty when the window is covered or history is exhausted.
-	NextCursor string                    `json:"next_cursor,omitempty"`
-	Selected   []WebhookRedriveSelection `json:"selected"`
-	// Skipped counts in-window eligible deliveries whose detail could not be
-	// resolved for repo/PR filtering; they are left out of Selected rather
-	// than aborting the crawl.
-	Skipped     int `json:"skipped,omitempty"`
-	Redelivered int `json:"redelivered"`
-	Failed      int `json:"failed"`
-}
-
-type WebhookRedriveSelection struct {
-	ID          int64  `json:"id"`
-	DeliveredAt string `json:"delivered_at"`
-	Event       string `json:"event"`
-	Action      string `json:"action"`
-	Status      string `json:"status"`
-	StatusCode  int    `json:"status_code"`
-	Repo        string `json:"repo,omitempty"`
-	PR          int    `json:"pr,omitempty"`
-}
-
 type ChecksScanRequest struct {
 	Repo        string `json:"repo"`
 	Environment string `json:"environment,omitempty"`
@@ -280,6 +225,17 @@ type ChecksScanRequest struct {
 	// gets an error, so a client that predates the field never reads an unread
 	// repository as one scanned clean.
 	ReportAppNotInstalled bool `json:"report_app_not_installed,omitempty"`
+	// PRs, when set, scans only these PR numbers instead of paging the
+	// repository's open PRs. Each is read on its own, so the scan costs what
+	// the named PRs cost rather than what the repository's open PRs cost. A
+	// named PR that is not open is left out. Page and UpdatedSince must be
+	// unset alongside it.
+	PRs []int `json:"prs,omitempty"`
+	// MergeQueue also scans the merge groups the repository's merge queues
+	// are testing, on the first page only. A merge group missing SchemaBot's
+	// required check blocks every PR queued behind it. It cannot be set
+	// alongside PRs.
+	MergeQueue bool `json:"merge_queue,omitempty"`
 }
 
 type ChecksScanResponse struct {
@@ -325,6 +281,52 @@ type ChecksScanResponse struct {
 	// the live webhook path that shares the same budget. Nil when the rate
 	// state could not be read (advisory only; the scan itself succeeded).
 	RateLimit *GitHubRateLimit `json:"rate_limit,omitempty"`
+	// MergeQueueScanned counts the merge groups this page read, when the
+	// request set MergeQueue.
+	MergeQueueScanned int `json:"merge_queue_scanned,omitempty"`
+	// MergeQueue lists the merge groups missing an expected SchemaBot check.
+	MergeQueue []MissingMergeQueueCheck `json:"merge_queue,omitempty"`
+	// MergeQueueError says why the merge queue could not be read. The PRs on
+	// this page are still reported, and MergeQueue and MergeQueueScanned are
+	// empty, so the caller can report the queue as unchecked rather than clear.
+	MergeQueueError string `json:"merge_queue_error,omitempty"`
+	// Supports names the backfill behaviors this server implements. A server
+	// that predates one ignores the request field that asks for it, so the
+	// CLI checks this before relying on a behavior rather than finding out
+	// from what the server did.
+	Supports ChecksBackfillSupport `json:"supports"`
+}
+
+// ChecksBackfillSupport lists the backfill behaviors a server confirms it
+// implements. A field a server leaves unset is a behavior it lacks.
+type ChecksBackfillSupport struct {
+	// NamedPRs means a scan request with prs reads only those PRs, instead of
+	// paging through the repository's open PRs.
+	NamedPRs bool `json:"named_prs,omitempty"`
+	// DeferSchemaPRs means a synthesize request without plan defers each PR
+	// that changes managed schema before writing any Check Run or check state,
+	// and checks rate_limit_floor_percent before every PR it starts.
+	DeferSchemaPRs bool `json:"defer_schema_prs,omitempty"`
+	// MergeQueue means a scan request with merge_queue reports the merge
+	// groups missing a check, and a synthesize request with
+	// merge_queue_heads posts their passing checks.
+	MergeQueue bool `json:"merge_queue,omitempty"`
+}
+
+// MissingMergeQueueCheck is a merge group the merge queue is testing whose
+// head commit lacks an expected SchemaBot check.
+type MissingMergeQueueCheck struct {
+	// Ref is the merge group's temporary branch.
+	Ref     string `json:"ref"`
+	BaseRef string `json:"base_ref"`
+	// PR is the pull request whose queue entry built this merge group, and URL
+	// its address; both are empty when the branch name does not carry it.
+	PR           int      `json:"pr,omitempty"`
+	URL          string   `json:"url,omitempty"`
+	HeadSHA      string   `json:"head_sha"`
+	MissingNames []string `json:"missing_check_names"`
+	// UntrustedConflictNames mirrors MissingCheckPR.UntrustedConflictNames.
+	UntrustedConflictNames []string `json:"untrusted_conflict_check_names,omitempty"`
 }
 
 // GitHubRateLimit is a point-in-time snapshot of a GitHub installation's
@@ -351,16 +353,36 @@ type ChecksReposResponse struct {
 
 // ChecksSynthesizeRequest asks the server to recreate missing Check Runs for
 // specific PRs by replaying the auto-plan flow, as if the check-creating
-// webhook delivery had arrived. Used for PRs with no delivery to redrive
-// (for example PRs opened before check enablement).
+// webhook delivery had arrived. Used for PRs whose check-creating delivery
+// never arrived or failed (for example PRs opened before check enablement).
 type ChecksSynthesizeRequest struct {
 	Repo string `json:"repo"`
 	PRs  []int  `json:"prs"`
+	// Plan runs the auto-plans of PRs that change managed schema. Without it
+	// such a PR is deferred: the result names its databases, and nothing is
+	// written for it, so its missing check keeps blocking the merge.
+	Plan bool `json:"plan,omitempty"`
+	// RateLimitFloorPercent stops the batch before a PR when the GitHub
+	// budget left is below this percentage of its limit. The PRs not started
+	// come back with RateLimited set. Zero turns the check off.
+	RateLimitFloorPercent int `json:"rate_limit_floor_percent,omitempty"`
+	// MergeQueueHeads are merge group head commits to post SchemaBot's
+	// passing merge-queue check on. The server lists the merge queue again
+	// and posts only on heads it is still testing, so a commit that is not a
+	// live merge group never gets a passing check. They are handled before
+	// PRs, since each one blocks the PRs queued behind it.
+	MergeQueueHeads []string `json:"merge_queue_heads,omitempty"`
+	// Environment and CheckName are the run's scope, as on the scan request.
+	// They limit the checks posted on MergeQueueHeads to the ones the scan
+	// looked for. A head gets only the checks in scope it is still missing.
+	Environment string `json:"environment,omitempty"`
+	CheckName   string `json:"check_name,omitempty"`
 }
 
 type ChecksSynthesizeResponse struct {
-	Repo    string                   `json:"repo"`
-	Results []ChecksSynthesizeResult `json:"results"`
+	Repo       string                   `json:"repo"`
+	Results    []ChecksSynthesizeResult `json:"results"`
+	MergeQueue []ChecksMergeQueueResult `json:"merge_queue,omitempty"`
 	// RateLimit mirrors ChecksScanResponse.RateLimit: the installation's
 	// remaining GitHub budget after this batch, for caller-side pacing.
 	RateLimit *GitHubRateLimit `json:"rate_limit,omitempty"`
@@ -370,6 +392,27 @@ type ChecksSynthesizeResult struct {
 	PR      int    `json:"pr"`
 	Outcome string `json:"outcome"`
 	Error   string `json:"error,omitempty"`
+	// Deferred is true when the PR changes managed schema and the request did
+	// not ask for plans. Nothing was written for the PR.
+	Deferred bool `json:"deferred,omitempty"`
+	// Databases are the managed databases a deferred PR would plan.
+	Databases []string `json:"databases,omitempty"`
+	// ChangedFiles counts the files a deferred PR proposes, as a size hint
+	// for its plan.
+	ChangedFiles int `json:"changed_files,omitempty"`
+	// RateLimited is true when the batch stopped before this PR because the
+	// GitHub budget fell below the request's floor. Nothing was done for it.
+	RateLimited bool `json:"rate_limited,omitempty"`
+}
+
+// ChecksMergeQueueResult is what a synthesize request did for one merge
+// group head.
+type ChecksMergeQueueResult struct {
+	HeadSHA string `json:"head_sha"`
+	Outcome string `json:"outcome"`
+	Error   string `json:"error,omitempty"`
+	// RateLimited mirrors ChecksSynthesizeResult.RateLimited.
+	RateLimited bool `json:"rate_limited,omitempty"`
 }
 
 type MissingCheckPR struct {
@@ -1974,10 +2017,21 @@ type ApplyHistoryResponse struct {
 	State       string `json:"state"`
 }
 
-// DatabaseHistoryResponse is the response for GET /api/history/{database}.
+// DatabaseHistoryResponse is the response for GET /api/history/{database}:
+// one page of the database's applies, newest first.
 type DatabaseHistoryResponse struct {
-	Database string                  `json:"database"`
-	Applies  []*ApplyHistoryResponse `json:"applies"`
+	Database string `json:"database"`
+	Limit    int    `json:"limit,omitempty"`
+	MaxLimit int    `json:"max_limit,omitempty"`
+	// HasMore reports that more applies match than this page holds. Request
+	// the next page with the same environment and starting_after set to the
+	// last apply's ID.
+	HasMore bool `json:"has_more"`
+	// StartingAfter echoes the starting_after apply the page continues from,
+	// so a client can tell this page apart from a first page served by a
+	// server that ignores the parameter.
+	StartingAfter string                  `json:"starting_after,omitempty"`
+	Applies       []*ApplyHistoryResponse `json:"applies"`
 }
 
 // ActiveApplyResponse represents a schema change in the status list.

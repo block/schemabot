@@ -51,6 +51,16 @@ func WriteUnsubmittedLockKept(database, dbType string, releaseErr error) {
 	fmt.Printf("   Nothing was submitted, so release it now: %s\n", cliname.Command("unlock", "-d", database, "-t", dbType))
 }
 
+// WriteUnsubmittedLockReleaseUnknown writes the message when the request to
+// release the lock a command took for a schema change it never submitted
+// failed after the server may have received it, so the lock may or may not
+// still be held. Unlock is right either way: it releases a lock that is still
+// held and reports that none is found otherwise.
+func WriteUnsubmittedLockReleaseUnknown(database, dbType string) {
+	fmt.Printf("🔒 Lock for %s (%s) may still be held: the release request failed, so its result is unknown.\n", database, dbType)
+	fmt.Printf("   Nothing was submitted. Release it if it is still held: %s\n", cliname.Command("unlock", "-d", database, "-t", dbType))
+}
+
 // WriteUnsubmittedLockAlreadyReleased writes the message when the lock a
 // command took for a schema change it never submitted was gone by the time the
 // command released it. Nothing is held, so no unlock command is offered.

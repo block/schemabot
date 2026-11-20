@@ -46,6 +46,9 @@ type ReviewGateData struct {
 	// approval was given on an earlier commit, so joining a team is not
 	// enough on its own: they also need to approve the latest commit.
 	UnauthorizedEarlierApprovers []string
+	// CommandAppApprovers approved the PR but are command Apps: their
+	// approval never counts, and no team or reviewer setting changes that.
+	CommandAppApprovers []string
 	// BaseRef is the PR's base branch and DefaultBranch the repository's
 	// default branch; either may be empty when unknown.
 	BaseRef       string
@@ -80,6 +83,7 @@ func RenderReviewRequired(data ReviewGateData) string {
 			sb.WriteString("\nSchema changes require approval from an authorized reviewer before applying.\n")
 		}
 		writeUnauthorizedApprovers(&sb, data)
+		writeCommandAppApprovers(&sb, data)
 		writeChangedApprovers(&sb, data)
 		writeChangedStatements(&sb, data.ChangedStatements, budget)
 		writeReviewersAndNextSteps(&sb, data)
@@ -103,6 +107,7 @@ func RenderReviewGateError(data ReviewGateData) string {
 
 		writeUncomparedApprovers(&sb, data.UncomparedApprovers)
 		writeUnauthorizedApprovers(&sb, data)
+		writeCommandAppApprovers(&sb, data)
 		writeChangedApprovers(&sb, data)
 		writeChangedStatements(&sb, data.ChangedStatements, budget)
 		writeReviewersAndNextSteps(&sb, data)
@@ -135,6 +140,21 @@ func writeUnauthorizedApprovers(sb *strings.Builder, data ReviewGateData) {
 	}
 	fmt.Fprintf(sb, "\n%s approved, but %s for `%s`, so %s count.\n",
 		joinWithAnd(mentions(data.UnauthorizedApprovers)), verb, data.Database, approvals)
+}
+
+// writeCommandAppApprovers says which command Apps approved the PR and that
+// their approval never counts, so the reader neither waits on it nor tries to
+// make the App an authorized reviewer.
+func writeCommandAppApprovers(sb *strings.Builder, data ReviewGateData) {
+	if len(data.CommandAppApprovers) == 0 {
+		return
+	}
+	what := "it is an App that runs SchemaBot commands, so its approval never counts"
+	if len(data.CommandAppApprovers) > 1 {
+		what = "they are Apps that run SchemaBot commands, so their approvals never count"
+	}
+	fmt.Fprintf(sb, "\n%s approved, but %s. A person has to approve.\n",
+		joinWithAnd(mentions(data.CommandAppApprovers)), what)
 }
 
 // writeChangedApprovers says who approved an earlier commit, what changed

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -47,6 +48,25 @@ func (pri *PullRequestInfo) EffectiveTarget() (string, error) {
 type PRTargetEligibility struct {
 	Target   string
 	Eligible bool
+	// ClassicProtectionUnreadable reports that the target was treated as
+	// enforced because the App cannot read its classic branch protection.
+	ClassicProtectionUnreadable bool
+}
+
+// errClassicProtectionUnreadable marks a classic protection read that GitHub
+// refused because the App lacks the Administration: read permission.
+var errClassicProtectionUnreadable = errors.New("GitHub App lacks the Administration: read permission")
+
+// branchPolicy is the required-check policy read for one repository branch.
+// classicUnreadable means classic protection could not be read, so contexts
+// holds only what the active rulesets require.
+type branchPolicy struct {
+	contexts          []string
+	classicUnreadable bool
+}
+
+func (p branchPolicy) clone() branchPolicy {
+	return branchPolicy{contexts: slices.Clone(p.contexts), classicUnreadable: p.classicUnreadable}
 }
 
 // EvaluatePRTarget enforces the default branch and branches whose active rules
@@ -65,7 +85,7 @@ func (ic *InstallationClient) EvaluatePRTargetFresh(ctx context.Context, repo st
 	return evaluatePRTarget(fetchCtx, repo, info, checkBases, ic.fetchRequiredChecks)
 }
 
-func evaluatePRTarget(ctx context.Context, repo string, info *PullRequestInfo, checkBases []string, readPolicy func(context.Context, string, string) ([]string, error)) (PRTargetEligibility, error) {
+func evaluatePRTarget(ctx context.Context, repo string, info *PullRequestInfo, checkBases []string, readPolicy func(context.Context, string, string) (branchPolicy, error)) (PRTargetEligibility, error) {
 	target, err := info.EffectiveTarget()
 	if err != nil {
 		return PRTargetEligibility{}, err
@@ -74,29 +94,45 @@ func evaluatePRTarget(ctx context.Context, repo string, info *PullRequestInfo, c
 	if result.Eligible {
 		return result, nil
 	}
-	contexts, err := readPolicy(ctx, repo, target)
+	policy, err := readPolicy(ctx, repo, target)
 	if err != nil {
 		return result, fmt.Errorf("resolve required checks for %s branch %q: %w", repo, target, err)
 	}
-	for _, name := range contexts {
-		for _, base := range checkBases {
-			if base != "" && (name == base || (strings.HasPrefix(name, base+" (") && strings.HasSuffix(name, ")"))) {
-				result.Eligible = true
-				return result, nil
-			}
-		}
+	if requiresAnyCheck(policy.contexts, checkBases) {
+		result.Eligible = true
+		return result, nil
+	}
+	// Without classic protection, SchemaBot cannot prove the branch does not
+	// require its check. Enforce rather than exclude, as before target
+	// enforcement existed.
+	if policy.classicUnreadable {
+		result.Eligible = true
+		result.ClassicProtectionUnreadable = true
 	}
 	return result, nil
 }
 
-func (ic *InstallationClient) requiredChecksForBranch(ctx context.Context, repo, branch string) ([]string, error) {
+// requiresAnyCheck reports whether a required context is one of checkBases,
+// either exactly or as "<base> (<environment>)".
+func requiresAnyCheck(contexts, checkBases []string) bool {
+	for _, name := range contexts {
+		for _, base := range checkBases {
+			if base != "" && (name == base || (strings.HasPrefix(name, base+" (") && strings.HasSuffix(name, ")"))) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (ic *InstallationClient) requiredChecksForBranch(ctx context.Context, repo, branch string) (branchPolicy, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return branchPolicy{}, err
 	}
 	// GitHub repository names are case-insensitive, and ref names are exact.
 	key := strings.ToLower(repo) + "\x00" + branch
-	if names, ok := ic.branchPolicies.get(key); ok {
-		return names, nil
+	if policy, ok := ic.branchPolicies.get(key); ok {
+		return policy, nil
 	}
 
 	// Bound the combined ruleset and classic lookup independently of the
@@ -104,55 +140,55 @@ func (ic *InstallationClient) requiredChecksForBranch(ctx context.Context, repo,
 	flight := ic.branchPolicyReads.DoChan(key, func() (any, error) {
 		// A successful read may have landed between the first cache miss
 		// and the start of this flight. Apply acceptance uses a different path.
-		if names, ok := ic.branchPolicies.get(key); ok {
-			return names, nil
+		if policy, ok := ic.branchPolicies.get(key); ok {
+			return policy, nil
 		}
 
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedFetchTimeout)
 		defer cancel()
-		names, err := ic.fetchRequiredChecks(fetchCtx, repo, branch)
+		policy, err := ic.fetchRequiredChecks(fetchCtx, repo, branch)
 		if err != nil {
 			return nil, err
 		}
-		ic.branchPolicies.put(key, names)
-		return names, nil
+		ic.branchPolicies.put(key, policy)
+		return policy, nil
 	})
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return branchPolicy{}, ctx.Err()
 	case result := <-flight:
 		if result.Err != nil {
-			return nil, result.Err
+			return branchPolicy{}, result.Err
 		}
 		// Each waiter owns its result independently of the other waiters.
-		return slices.Clone(result.Val.([]string)), nil
+		return result.Val.(branchPolicy).clone(), nil
 	}
 }
 
-func (ic *InstallationClient) fetchRequiredChecks(ctx context.Context, repo, branch string) ([]string, error) {
+func (ic *InstallationClient) fetchRequiredChecks(ctx context.Context, repo, branch string) (branchPolicy, error) {
 	owner, name := splitRepo(repo)
 	var contexts []string
 	for page := 1; page != 0; {
 		rules, resp, err := ic.client.Repositories.GetRulesForBranch(ctx, owner, name, url.PathEscape(branch), &gh.ListOptions{Page: page, PerPage: 100})
 		if err != nil {
-			return nil, fmt.Errorf("read active branch rules: %w", classifyGitHubAPIError(err))
+			return branchPolicy{}, fmt.Errorf("read active branch rules: %w", classifyGitHubAPIError(err))
 		}
 		if rules == nil {
-			return nil, fmt.Errorf("active branch rules response is missing")
+			return branchPolicy{}, fmt.Errorf("active branch rules response is missing")
 		}
 		for _, rule := range rules.RequiredStatusChecks {
 			if rule == nil {
-				return nil, fmt.Errorf("active branch rules returned an empty required-check rule")
+				return branchPolicy{}, fmt.Errorf("active branch rules returned an empty required-check rule")
 			}
 			if rule.Parameters.RequiredStatusChecks == nil {
-				return nil, fmt.Errorf("active branch rules omitted required check contexts")
+				return branchPolicy{}, fmt.Errorf("active branch rules omitted required check contexts")
 			}
 			for _, check := range rule.Parameters.RequiredStatusChecks {
 				if check == nil {
-					return nil, fmt.Errorf("active branch rules returned an empty required check")
+					return branchPolicy{}, fmt.Errorf("active branch rules returned an empty required check")
 				}
 				if check.Context == "" {
-					return nil, fmt.Errorf("active branch rules returned a required check without a context")
+					return branchPolicy{}, fmt.Errorf("active branch rules returned a required check without a context")
 				}
 				contexts = append(contexts, check.Context)
 			}
@@ -163,10 +199,18 @@ func (ic *InstallationClient) fetchRequiredChecks(ctx context.Context, repo, bra
 		}
 	}
 	classic, err := ic.classicRequiredChecks(ctx, repo, branch)
-	if err != nil {
-		return nil, err
+	if errors.Is(err, errClassicProtectionUnreadable) {
+		// Logged once per GitHub read, so cached evaluations stay quiet.
+		if ic.logger != nil {
+			ic.logger.Warn("classic branch protection is unreadable because the GitHub App lacks Administration: read; SchemaBot plans and publishes checks for PRs into this branch",
+				"repo", repo, "branch", branch)
+		}
+		return branchPolicy{contexts: contexts, classicUnreadable: true}, nil
 	}
-	return append(contexts, classic...), nil
+	if err != nil {
+		return branchPolicy{}, err
+	}
+	return branchPolicy{contexts: append(contexts, classic...)}, nil
 }
 
 // A successful GraphQL null branchProtectionRule proves there is no classic
@@ -206,12 +250,13 @@ func (ic *InstallationClient) classicRequiredChecks(ctx context.Context, repo, b
 				} `json:"ref"`
 			} `json:"repository"`
 		} `json:"data"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
+		Errors []graphQLError `json:"errors"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("decode classic branch protection: %w", err)
+	}
+	if classicProtectionForbidden(result.Errors) {
+		return nil, fmt.Errorf("read classic branch protection: %w", errClassicProtectionUnreadable)
 	}
 	if len(result.Errors) > 0 {
 		return nil, fmt.Errorf("read classic branch protection: %s", result.Errors[0].Message)
@@ -239,4 +284,25 @@ func (ic *InstallationClient) classicRequiredChecks(ctx context.Context, repo, b
 		return nil, fmt.Errorf("classic branch protection query omitted required check contexts")
 	}
 	return *ref.BranchProtectionRule.RequiredStatusCheckContexts, nil
+}
+
+// classicProtectionForbidden reports whether GitHub refused every part of the
+// classic protection query for lack of permission. Any other error, alone or
+// mixed in, stays an error.
+func classicProtectionForbidden(errs []graphQLError) bool {
+	if len(errs) == 0 {
+		return false
+	}
+	for _, e := range errs {
+		if e.Type != "FORBIDDEN" {
+			return false
+		}
+	}
+	return true
+}
+
+// graphQLError is one entry of a GraphQL response's errors list.
+type graphQLError struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
 }

@@ -634,6 +634,10 @@ func submitRefusedByServer(err error) bool {
 // A lock that is already gone, or that another owner now holds, is not a
 // failed release: this command holds nothing either way, so cause is returned
 // alone and no unlock command is offered.
+//
+// A release the server may have received without answering leaves it unknown
+// whether the lock is still held, so the operator is told that instead of
+// being told the lock was kept.
 func releaseUnsubmittedLock(ep, database, dbType, owner string, cause error) error {
 	err := client.ReleaseLock(ep, database, dbType, owner)
 	switch {
@@ -646,6 +650,9 @@ func releaseUnsubmittedLock(ep, database, dbType, owner string, cause error) err
 	case errors.Is(err, client.ErrLockNotOwned):
 		templates.WriteUnsubmittedLockHeldByAnotherOwner(database, dbType)
 		return cause
+	case client.ServerMayHaveActed(err):
+		templates.WriteUnsubmittedLockReleaseUnknown(database, dbType)
+		return errors.Join(cause, fmt.Errorf("release lock for %s: %w", database, err))
 	default:
 		templates.WriteUnsubmittedLockKept(database, dbType, err)
 		return errors.Join(cause, fmt.Errorf("release lock for %s: %w", database, err))

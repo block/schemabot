@@ -27,6 +27,7 @@ import (
 func TestExcludedPRPreservesConfirmation(t *testing.T) {
 	database := "webhook_target_confirmation"
 	svc := setupE2EService(t, database)
+	svc.Config().SkipUnrequiredBranches = true
 	client, mux := setupGitHubServer(t)
 	var base atomic.Value
 	base.Store("parent")
@@ -69,6 +70,7 @@ func TestExcludedPRPreservesConfirmation(t *testing.T) {
 func TestExcludedPRRecordsAcceptedApplyOutcomeWithoutPublishing(t *testing.T) {
 	database := "webhook_target_outcome"
 	svc := setupE2EService(t, database)
+	svc.Config().SkipUnrequiredBranches = true
 	client, mux := setupGitHubServer(t)
 	var base atomic.Value
 	base.Store("parent")
@@ -114,6 +116,7 @@ func TestRetargetedCommandPreservesConfirmationBeforePlanResponses(t *testing.T)
 		t.Run(phase, func(t *testing.T) {
 			database := "webhook_target_response_" + strings.ReplaceAll(phase, " ", "_")
 			svc := setupE2EService(t, database)
+			svc.Config().SkipUnrequiredBranches = true
 			ddl := "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
 			seedTargetTable(t, database, ddl)
 			planID := "plan-pending-" + database
@@ -185,6 +188,7 @@ func TestApplyAcceptanceRechecksCachedBranchPolicy(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			database := "webhook_target_policy_apply"
 			svc := setupE2EServiceOpts(t, database, e2eServiceOpts{skipOperator: true})
+			svc.Config().SkipUnrequiredBranches = true
 			client, mux := setupGitHubServer(t)
 			fixture := setupFakeGitHubForPlan(t, mux, map[string]string{
 				"users.sql": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL PRIMARY KEY) ENGINE=InnoDB;",

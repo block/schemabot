@@ -29,8 +29,10 @@
 - [CLI Name](#cli-name)
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
+- [Skipping Unrequired Branches](#skipping-unrequired-branches)
 - [Base Branch Schema Freshness](#base-branch-schema-freshness)
 - [Review Gate](#review-gate)
+- [Command Apps](#command-apps)
 - [Authentication](#authentication)
 - [Multi-Environment Deployment](#multi-environment-deployment)
 - [Multi-App Routing](#multi-app-routing)
@@ -2035,6 +2037,46 @@ unlisted repository:
 
 If `repos` is not configured or empty, all repositories are allowed.
 
+### Pull request database limit
+
+Set `pr_schema_cap` under a repository to pause planning and new applies when
+a pull request changes more than five logical databases managed by this control
+plane. The count covers the full pull request, including when a command names
+one database or target. Environments, keyspaces, and shards of the same
+database count once. Each control plane evaluates its own registrations.
+
+```yaml
+repos:
+  example-org/service:
+    pr_schema_cap:
+      control_plane: payments
+      limit: 5
+      observe: true
+      label: "schemabot: allow-large-plan"
+```
+
+Use `observe: true` to record decisions and projected database planning fan-out
+before enforcement. Omit it to enforce the limit. Omit `limit` for the default of
+five. On shared repositories, give each deployment a distinct `control_plane`
+for the comment and Check Run summary. It defaults to the deployment's
+`tenant`, or the GitHub Check Run name when the deployment has no tenant.
+
+Provision the configured label in the repository before enabling enforcement.
+Applying it acknowledges the current head and base. SchemaBot holds new work
+when the label is removed or the revision changes. On shared repositories,
+designate one deployment to remove stale labels with `manage_label: true` and
+set it to `false` on the others. By default, standalone deployments and aggregate
+leaders remove stale labels. If a stale label remains visible, remove it and
+add it again to acknowledge the new revision.
+
+At or below the limit, admission skips label verification. Above the limit,
+SchemaBot verifies an exception using at most one page of 100 PR timeline
+events. If GitHub reports another page, the PR stays held. Split the changes
+into smaller PRs to proceed.
+
+The exception enables planning and new work on that revision. Existing apply
+approval policies are evaluated independently.
+
 ### Listen-only repositories
 
 A listen-only repository is one SchemaBot reads from but never writes to. Use it to measure what a repository would cost in GitHub requests before you onboard it. For example, a separate SchemaBot deployment with its own GitHub App and no required checks can listen to your largest repository, and catch a release whose reads grow with pull request size before any deployment that gates merges runs it.
@@ -2049,7 +2091,9 @@ For a listen-only repository, SchemaBot:
 - processes its webhooks and reads GitHub the same way it does for any other repository;
 - sends no comments, reactions, review requests, or Check Runs;
 - ignores comment commands, so no apply ever starts from the repository. Auto-plan still runs for any database this deployment manages in the repository, but its plan comment and checks are not posted;
+- reads a plan's inputs for a database the pull request changes that this deployment does not register: the schema files at the head for each environment in `allowed_environments`, then one base-branch comparison for all of them. A deployment without `allowed_environments` reads the environments of its `environment_order` (`staging` and `production` by default). Each environment reads its own directory where the repository keeps one, and the config directory otherwise, as a deployment that registers the database does. Nothing is planned, because there is no target to plan against, but the reads are the ones a deployment that registers the database makes, so the measurement covers plans and not only config discovery;
 - runs the default-branch push and merge queue paths up to the Check Run write, so their coverage and Check Run lookups are measured too.
+- reads the pull request head once after config discovery, as the release of a stored aggregate block does, and releases nothing: a listen-only repository has no aggregate check, so it has no block to release.
 
 One path is not measured: the PR aggregate check sync, which reads the PR head and looks up the aggregate Check Run before it writes. A listen-only repository skips it, as any repository with `enable_checks: false` does. Its cost is a few reads per delivery, and it does not grow with the number of files in the pull request.
 
@@ -2090,6 +2134,23 @@ When checks are not passing, SchemaBot posts a comment listing the non-passing c
 If the GitHub API is unreachable when checking statuses, the apply is blocked (fail-closed). SchemaBot posts a comment explaining the error and suggests retrying.
 
 Set `require_passing_checks: false` to disable this gate.
+
+## Skipping Unrequired Branches
+
+By default, SchemaBot plans, applies, and publishes Check Runs for PRs into
+every branch. Turn on `skip_unrequired_branches` to serve only PRs whose final
+target is the repository's default branch or a branch whose rulesets or
+classic branch protection require a SchemaBot check:
+
+```yaml
+# Skip PRs into branches that do not require SchemaBot (default: false)
+skip_unrequired_branches: true
+```
+
+Before turning it on, grant the GitHub App the **Administration: read**
+permission and audit which branches require SchemaBot checks. See
+[PR target eligibility](check-runs.md#pr-target-eligibility) for how targets
+are evaluated and what an excluded PR receives.
 
 ## Base Branch Schema Freshness
 
@@ -2219,6 +2280,27 @@ The PR's change is measured against the default branch it was built on: SchemaBo
 
 If the PR's change differs, the Review Required comment names the reviewers whose approvals no longer count and the schema file whose change differs, and the reviewer must approve the current head. If the comparison cannot be completed (GitHub cannot find the approved commit, a directory is too large to list, a symlink points outside the repository, or there are more distinct symlinks than a comparison reads) and no other approval covers the head, that approval does not count and the apply is blocked with a Review Gate Error comment. The comment names the approval that did not count, lists who can approve, and asks for an approval of the latest commit, which needs no comparison. The reason goes to the server logs. Asking GitHub again would return the same answer, so the command is not retried. If GitHub is unavailable while the gate compares the commits, the command fails with a retryable error instead of reporting that a review is required. `apply-confirm` re-checks the gate, so a schema change pushed between `apply` and `apply-confirm` also needs a fresh approval.
 
+## Command Apps
+
+SchemaBot ignores every PR comment written by a GitHub App, so that its own comments and those of sibling SchemaBot deployments never run as commands. A database can list Apps whose comments it does run in `command_apps`, such as the App a deploy pipeline's end-to-end test uses to drive `plan`, `apply`, and the control commands:
+
+```yaml
+databases:
+  orders:
+    type: mysql
+    command_apps: [deploy-gate]      # App slug, not its "deploy-gate[bot]" login
+    environments:
+      staging:
+        dsn: "env:STAGING_ORDERS_DSN"
+```
+
+- A listed App runs commands for this database only, and only from repositories the database accepts (`allowed_repos`).
+- The grant holds whether or not `pr_command_authorization` is enabled, and so does its limit: with authorization off, an App still cannot run `plan` or any other gated command for a database that does not list it. With it enabled, an App is never matched against admin or operator teams and users, so listing its login there grants nothing; `command_apps` is the only way to authorize an App.
+- An App listed by any database never counts as a reviewer, for any database, even when its login is also configured as a reviewer. It is left out of the reviewers a Review Required comment lists, and an approval it gives is called out as one that never counts. Where the review gate is on, an App can apply only a change that a person approved.
+- SchemaBot never runs its own comments: a comment from this deployment's App is ignored even when `command_apps` lists it, and while the deployment does not yet know its own App slug it ignores every App's comment.
+
+SchemaBot refuses to start when a `command_apps` entry is not an App slug (letters, digits, hyphens and underscores, as in the App's URL), carries the `[bot]` suffix, is listed twice, or names an App in `trusted-check-app-slugs`, since those Apps are SchemaBot's own.
+
 ## Authentication
 
 This section is the YAML reference. For setup instructions, working examples, and help with denied requests, start with the [authentication guide](auth.md).
@@ -2327,7 +2409,7 @@ Which environments accept scoped writes is a deployment policy, uniform across d
 
 The two value namespaces do not overlap and are verified by different systems, so they are deliberately separate fields: a GitHub team slug has no meaning in the groups header, and a forwarded group name is not a GitHub team. Grant each lane explicitly.
 
-The decision has two halves. The middleware admits any caller in `write_groups` or in any database's `operator_groups` to write-tier endpoints — it runs before the request body is parsed, so it cannot know the target. Each mutating handler then enforces the scope once the target database resolves: `plan` and `apply` from the request/stored plan, control operations (`stop`, `start`, `cutover`, `cancel`, `release`, `revert`, `skip-revert`, `rollback plan`) from the stored apply, and lock acquire/release from the named database (locks are operator controls in the same family as stop/cancel and have no environment dimension, so the grant applies database-wide). Operations with no single target database — settings mutation, checks scan/synthesize/repos, webhook redrive — stay admin-only (`write_groups`). Operator members also get the read tier, deployment-wide.
+The decision has two halves. The middleware admits any caller in `write_groups` or in any database's `operator_groups` to write-tier endpoints — it runs before the request body is parsed, so it cannot know the target. Each mutating handler then enforces the scope once the target database resolves: `plan` and `apply` from the request/stored plan, control operations (`stop`, `start`, `cutover`, `cancel`, `release`, `revert`, `skip-revert`, `rollback plan`) from the stored apply, and lock acquire/release from the named database (locks are operator controls in the same family as stop/cancel and have no environment dimension, so the grant applies database-wide). Operations with no single target database — settings mutation, checks scan/synthesize/repos — stay admin-only (`write_groups`). Operator members also get the read tier, deployment-wide.
 
 Two consequences of the environment-less lock grant are worth stating outright. First, a scoped operator's lock holds applies off **every** environment of their database, including environments outside `operator_environments` — an operator scoped to staging can still freeze production applies of their own database. That direction is fail-safe (a lock only ever prevents changes), so the grant deliberately allows it. Second, the reverse direction is not: force release (`force: true`) bypasses the lock ownership check, so it could undo another holder's safety brake — for example an admin's incident lock. Force release therefore stays admin-only (`write_groups`).
 

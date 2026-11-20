@@ -356,10 +356,16 @@ type ResponseReadError struct {
 
 func (e *ResponseReadError) Error() string {
 	msg := "read response: " + e.Err.Error()
-	if warning := effectOf(e.Method, e.Path).warning(); warning != "" {
+	if warning := e.effect().warning(); warning != "" {
 		msg += "\n" + warning
 	}
 	return msg
+}
+
+// effect returns what the request may have left behind on the server, which
+// received it before the answer failed.
+func (e *ResponseReadError) effect() requestEffect {
+	return effectOf(e.Method, e.Path)
 }
 
 func (e *ResponseReadError) Unwrap() error {
@@ -608,13 +614,36 @@ func (e *ConnectionError) message() string {
 	} else {
 		msg = fmt.Sprintf("connection failed: %s: %s", e.Endpoint, cause)
 	}
-	if failedBeforeSending(e.Err) {
-		return msg
-	}
-	if warning := effectOf(failedRequest(e.Err)).warning(); warning != "" {
+	if warning := e.effect().warning(); warning != "" {
 		msg += "\n" + warning
 	}
 	return msg
+}
+
+// effect returns what the failed request may have left behind on the server.
+// A request that never reached the server changed nothing: its connection was
+// refused, its host did not resolve, or it failed before any of it was sent.
+func (e *ConnectionError) effect() requestEffect {
+	if isConnectionRefused(e.Err) || isHostNotFound(e.Err) || failedBeforeSending(e.Err) {
+		return requestEffect{}
+	}
+	return effectOf(failedRequest(e.Err))
+}
+
+// ServerMayHaveActed reports whether err is the failure of a request that
+// changes something and that the server may have received: the connection
+// failed after some of the request could have been sent, or the answer was cut
+// off. These are the failures whose message says the server may already have
+// acted. It is false when the server answered, when the request never reached
+// it, and when the request only reads.
+func ServerMayHaveActed(err error) bool {
+	if connErr, ok := errors.AsType[*ConnectionError](err); ok {
+		return connErr.effect().changes
+	}
+	if readErr, ok := errors.AsType[*ResponseReadError](err); ok {
+		return readErr.effect().changes
+	}
+	return false
 }
 
 // requestEffect says what a failed request may have left behind on the
@@ -665,7 +694,6 @@ var requestEffects = map[string]requestEffect{
 
 	// Changes that no single command shows.
 	"/api/checks/synthesize":    changesWithoutCommand,
-	"/api/webhooks/redrive":     changesWithoutCommand,
 	"/api/storage/schema/apply": changesWithoutCommand,
 }
 

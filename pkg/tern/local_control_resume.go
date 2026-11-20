@@ -2951,7 +2951,12 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		// recovery must complete it too rather than failing it. (A VSchema-only
 		// plan is exempted above and re-driven below so its VSchema is applied.)
 		now := time.Now()
-		if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err == nil && freshApply != nil && state.IsTerminalApplyState(freshApply.State) {
+		freshApply, err := c.storedTerminalApply(ctx, apply)
+		if err != nil {
+			logOutcomeReReadFailure(logger, apply, "completing it as a task-less no-op", err)
+			return fmt.Errorf("complete task-less apply %s during recovery: %w", apply.ApplyIdentifier, err)
+		}
+		if freshApply != nil {
 			// A concurrent drive already settled it — adopt its verdict and still
 			// notify this recovery's observer so a registered waiter (e.g. the PR
 			// check/comment) sees the terminal state instead of hanging.

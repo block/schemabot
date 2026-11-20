@@ -1092,8 +1092,96 @@ when findings remain; do not treat every nonzero exit as a transport error.
 This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
 
-A Ctrl-C or SIGTERM stops `checks backfill` and `webhooks redrive` where they
-are. Each says on stderr that it was canceled and exits 130, the status a
+`checks backfill` replaces the removed `webhooks redrive` command and its
+`POST /api/webhooks/redrive` endpoint. To recover missing Check Runs, run
+`checks backfill`, then run the `--plan --pr` command it prints for deferred
+schema PRs. To inspect or redeliver one specific failed delivery, use
+**Recent Deliveries** on the GitHub App's **Advanced** settings page. Scripts
+that sent delivery IDs to the removed endpoint should move to that page or to
+GitHub's App delivery API.
+
+A missing check on a PR that changes no managed schema costs a few GitHub
+requests to recreate. A PR that does change managed schema needs a plan, and
+a plan reads every changed database's schema once per environment, so one
+large PR can spend thousands of requests. Without `--plan`, the backfill
+recreates the cheap checks and defers the schema PRs. A deferred PR keeps its
+missing check, so its merge stays blocked, and the report prints the command
+that plans it:
+
+```console
+$ schemabot checks backfill acme/store -e production
+Scanned 3 open PRs in acme/store for SchemaBot (production).
+PR                                      MISSING CHECKS          OUTCOME
+https://github.com/acme/store/pull/412  SchemaBot (production)  no schema files in PR
+https://github.com/acme/store/pull/418  SchemaBot (production)  deferred: changes schema in 1 database (orders); 2 changed files
+https://github.com/acme/store/pull/431  SchemaBot (production)  deferred: changes schema in 4 databases (billing, catalog, orders and 1 more); 409 changed files
+
+2 PRs change managed schema and were not planned, so their Check Runs are still missing and the merge stays blocked. Each plan reads every changed database's schema once per environment. To plan them:
+  schemabot checks backfill acme/store -e production --plan --pr 418,431
+Error: checks backfill left 2 deferred schema PRs needing attention
+```
+
+`--pr` scans only the named PRs instead of paging the repository, and
+`--plan` requires it, so every plan the backfill runs is one an operator
+asked for by number. Plan the PRs whose merges matter most first. The
+printed command keeps the run's `-e` and `--check-name` filters, so it plans
+for the same missing checks.
+
+A server older than the CLI may not defer schema PRs or read named PRs. Each
+scan reports what the server supports, and the command stops before it
+recreates anything the server would handle differently: it refuses `--pr`
+unless the server reads named PRs, and refuses a run without `--dry-run`
+unless the server defers schema PRs. Upgrade the server, or use `--dry-run`
+to report the missing checks without recreating them.
+
+The server checks the GitHub budget before each PR. When the budget falls
+below `--rate-limit-floor` (20% by default), it stops the batch and returns
+the PRs it did not start. The command waits for the budget to reset and sends
+them again, so live webhook traffic keeps its headroom.
+
+A blocked merge queue holds every PR queued behind it, so a sweep of a
+repository also reads its merge queue. A merge group missing its SchemaBot
+check gets the same passing check the `merge_group` webhook posts, before
+any PR's check is recreated. The server lists the queue again first and
+posts only on groups it still holds. It posts only the checks in the run's
+`-e` and `--check-name` that the group is missing, and leaves the group's
+existing checks as they are:
+
+```console
+$ schemabot checks backfill acme/store -e production
+Scanned 1 open PRs and 3 queued merge groups in acme/store for SchemaBot (production).
+2 merge groups are missing SchemaBot Check Runs, blocking the PRs queued behind them:
+MERGE GROUP                             BASE  MISSING CHECKS          OUTCOME
+https://github.com/acme/store/pull/431  main  SchemaBot (production)  posted passing merge queue check
+https://github.com/acme/store/pull/436  main  SchemaBot (production)  skipped: no longer in the merge queue
+
+PR                                      MISSING CHECKS          OUTCOME
+https://github.com/acme/store/pull/418  SchemaBot (production)  created 1 Check Run
+```
+
+A scan of named PRs (`--pr`) leaves the merge queue out. If the server
+cannot read a repository's merge queue, because it is older or because the
+read failed, the backfill still recreates the PRs' checks. The report names
+the repositories whose queue went unchecked, and the run exits nonzero,
+since an unchecked queue may still be blocked. A request to post merge queue
+checks that fails does not stop the sweep either: the PRs' checks are still
+recreated, the groups in that request are reported as failed, and the run
+exits nonzero.
+
+`--skip-repo` leaves repositories out of an `--all-repos` sweep, for example
+one you have already backfilled by hand. Separate names with commas or repeat
+the flag. A name the server does not declare stops the sweep, so a typo
+cannot sweep the repository you meant to skip.
+
+```console
+$ schemabot checks backfill --all-repos -e staging --last 2h --dry-run --skip-repo acme/monorepo
+Scanned 6 open PRs updated in the last 2h in acme/ledger, acme/store for SchemaBot (staging).
+Skipped repositories named by --skip-repo: acme/monorepo.
+No missing SchemaBot Check Runs found.
+```
+
+A Ctrl-C or SIGTERM stops `checks backfill` where it is. It says on stderr
+that it was canceled and exits 130, the status a
 shell reports for an interrupted process, so a script can tell an interrupted
 run from one that failed or left findings.
 
@@ -1112,8 +1200,6 @@ What an interrupted run reports depends on where it stopped:
   may have acted on the request in flight. A PR in a later batch reads
   `not attempted: interrupted before this PR was sent`, because it never
   reached the server.
-- `webhooks redrive` prints the redelivery counts from the chunks that
-  completed, and prints none under `--dry-run`.
 
 ```console
 $ schemabot checks backfill acme/store -e production
@@ -1150,10 +1236,8 @@ sent for it. The same interrupted run, cut down to two of its PRs:
 }
 ```
 
-Treat the redrive counts as a lower bound: the server may have finished part
-of the chunk that was in flight. Checks already recreated and deliveries
-already redelivered are not undone. Run `checks backfill` again to finish the
-sweep; it only acts on PRs whose Check Runs are still missing.
+Checks already recreated are not undone. Run `checks backfill` again to finish
+the sweep; it only acts on PRs whose Check Runs are still missing.
 
 If `checks backfill` cannot write its interrupted report to stdout, for
 example because the disk behind a redirect is full, it says so on stderr,

@@ -1419,14 +1419,29 @@ func (h *Handler) postFailingAggregateTargetsWithBlock(ctx context.Context, clie
 					"blocking_reason", blockingReason)
 			}
 		}
-		summary = sanitizeCheckRunErrorSummary(summary)
+		title, conclusion := planFailedCheckText, checkConclusionFailure
+		if block == prSchemaCapBlock {
+			title, conclusion = prSchemaCapTitle, checkConclusionActionRequired
+			existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, ec.environment, aggregateSentinel, aggregateSentinel)
+			if err != nil {
+				h.logger.Warn("could not read stored database limit check", "repo", repo, "pr", pr, "error", err)
+				stored = false
+				continue
+			}
+			if existing != nil && existing.HeadSHA == headSHA && existing.BlockingReason == blockingReason &&
+				existing.ErrorMessage == errorMessage && existing.CheckRunID != 0 {
+				continue
+			}
+		} else {
+			summary = sanitizeCheckRunErrorSummary(summary)
+		}
 
 		opts := ghclient.CheckRunOptions{
 			Name:       ec.name,
 			Status:     checkStatusCompleted,
-			Conclusion: checkConclusionFailure,
+			Conclusion: conclusion,
 			Output: &ghclient.CheckRunOutput{
-				Title:   planFailedCheckText,
+				Title:   title,
 				Summary: summary,
 			},
 		}
@@ -1457,7 +1472,7 @@ func (h *Handler) postFailingAggregateTargetsWithBlock(ctx context.Context, clie
 			CheckRunID:     id,
 			HasChanges:     false,
 			Status:         checkStatusCompleted,
-			Conclusion:     checkConclusionFailure,
+			Conclusion:     conclusion,
 			BlockingReason: blockingReason,
 			ErrorMessage:   errorMessage,
 		}
@@ -1529,6 +1544,21 @@ func sanitizeCheckRunErrorSummary(summary string) string {
 // was read, so a block recorded concurrently (for example by a newer commit's
 // guards on another pod) stays authoritative.
 func (h *Handler) clearAggregateBlocksForVerifiedPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, configs []ghclient.DiscoveredConfig) {
+	if h.isRepoListenOnly(repo) {
+		// A listen-only repository publishes no aggregate check, so it has no
+		// block to release. Its databases are usually registered by another
+		// deployment, and the registry check below would warn on every pull
+		// request that merge stays blocked, though nothing blocks it. Make
+		// the uncached head read a deployment that serves the repository
+		// makes, so the listener measures it, and stop. The read goes around
+		// the verification helper because that helper records status-check
+		// metrics and logs for a check this repository never has.
+		if _, err := client.FetchPullRequestNoCache(ctx, repo, pr); err != nil {
+			h.logger.Warn("listen-only PR head read failed; this delivery's GitHub request measurement misses the head read a serving deployment makes",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "listen_only", true, "error", err)
+		}
+		return
+	}
 	for _, cfg := range configs {
 		environments, err := h.configuredDatabaseEnvironments(cfg.Config.Database)
 		if err != nil {

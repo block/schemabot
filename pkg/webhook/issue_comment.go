@@ -144,13 +144,15 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		requestedBy = payload.Comment.User.Login
 	}
 
-	// Ignore comments from bots to prevent infinite loops. The one exception is
-	// a trusted sibling SchemaBot deployment's comment on a repo this
-	// deployment leads: it is consumed as an aggregate re-fold nudge — never
-	// parsed as a command — because participants comment at exactly the moments
-	// their Check Runs change, and GitHub delivers check_run events only to the
-	// App that created the check.
-	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" {
+	// Ignore comments from bots to prevent infinite loops. There are two
+	// exceptions. An App listed in command_apps has its comments parsed as
+	// commands, authorized per database like a person's. A trusted sibling
+	// SchemaBot deployment's comment on a repo this deployment leads is
+	// consumed as an aggregate re-fold nudge — never parsed as a command —
+	// because participants comment at exactly the moments their Check Runs
+	// change, and GitHub delivers check_run events only to the App that
+	// created the check.
+	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" && !h.isCommandAppComment(repo, installationID, requestedBy) {
 		if h.participantCommentNudge(ctx, repo, pr, installationID, deliveryID, requestedBy) {
 			h.writeJSON(w, http.StatusOK, map[string]string{
 				"message": "participant comment triggered aggregate re-fold",
@@ -308,12 +310,17 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			// aggregate role and -t-scoped plans acknowledge at dispatch, while
 			// an unscoped plan on an aggregate-role repo acknowledges at the
 			// handler's act-point once discovery resolves owned schema.
+			admission, err := h.admitPRSchemaBeforeQueue(ctx, repo, pr, installationID, prPlanDiscoveryKey{})
+			if err != nil {
+				h.answerPRSchemaPlanRefusal(w, repo, pr, installationID, "", requestedBy, err)
+				return
+			}
 			h.logger.Info("plan without -e flag", "repo", repo, "pr", pr)
 			if h.service == nil || h.service.Config().AggregateRoleForRepo(repo) == "" || result.Tenant != "" {
 				h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 			}
 			h.goSafe(repo, pr, installationID, deliveryID, func() {
-				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, 0, true, result.CommentID, nil)
+				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, 0, true, result.CommentID, nil, admission)
 			})
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "multi-env plan started"})
 			return
@@ -1032,9 +1039,18 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 	}
 	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" {
-		h.logger.Info("durable issue_comment delivery ignored because the comment author is a bot",
-			"delivery_id", event.DeliveryID, "repo", event.Repository, "pr", event.PullRequest)
-		return false, nil
+		admitted, err := h.durableCommandAppAdmission(event, &payload)
+		if err != nil {
+			h.logger.Warn("durable issue_comment delivery from a command App will be retried because this deployment cannot yet rule out a self-comment",
+				"delivery_id", event.DeliveryID, "repo", event.Repository, "pr", event.PullRequest,
+				"author", payload.Comment.User.Login, "error", err)
+			return true, fmt.Errorf("durable issue_comment delivery %s: %w", event.DeliveryID, err)
+		}
+		if !admitted {
+			h.logger.Info("durable issue_comment delivery ignored because the comment author is a bot",
+				"delivery_id", event.DeliveryID, "repo", event.Repository, "pr", event.PullRequest)
+			return false, nil
+		}
 	}
 
 	installationID, err := durableInstallationID(event)

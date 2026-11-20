@@ -278,6 +278,9 @@ type Service struct {
 	// what storage records. It must not block: the drive waits on it.
 	OnStoppedApplyClaimed func(apply *storage.Apply)
 
+	// OnPRSchemaAdmission rechecks a PR before planning or accepting a new apply.
+	OnPRSchemaAdmission func(context.Context, string, int, string) error
+
 	// OnQueuedStartWithdrawn is called after a stop withdrew a start no driver
 	// had acted on, whatever surface sent the stop. The apply never left
 	// stopped, so no drive runs to update its PR, which would otherwise end on
@@ -966,7 +969,6 @@ func (s *Service) apiRoutes() []apiRoute {
 		{"GET /api/plans/{plan_identifier}", s.handlePlanGet},
 		{"GET /api/logs/{database}", s.handleLogs},
 		{"GET /api/logs", s.handleLogsWithoutDatabase},
-		{"POST /api/webhooks/redrive", s.handleWebhookRedrive},
 		{"POST /api/checks/scan", s.handleChecksScan},
 		{"GET /api/checks/inspect", s.handleChecksInspect},
 		{"POST /api/checks/synthesize", s.handleChecksSynthesize},

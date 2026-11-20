@@ -609,6 +609,8 @@ schemabot apply -e staging
 
 ℹ️ Ignored tables in namespace `testapp` (ignore_tables): `flyway_schema_history`
 
+ℹ️ Ignored tables in namespace `testapp` (leading underscore): `_orders_old`, `_users_old`
+
 
 </details>
 
@@ -4188,6 +4190,17 @@ Options:
 
 🔒 Lock kept for testapp (mysql): the server did not release it (API error (500): internal error).
    Nothing was submitted, so release it now: schemabot unlock -d testapp -t mysql
+
+```
+</details>
+
+<details>
+<summary><a name="nothing-submitted-release-request-got-no-answer"></a><strong>Nothing Submitted, Release Request Got No Answer</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) may still be held: the release request failed, so its result is unknown.
+   Nothing was submitted. Release it if it is still held: schemabot unlock -d testapp -t mysql
 
 ```
 </details>

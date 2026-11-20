@@ -36,6 +36,7 @@ import (
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/pendingdrops"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/targetauth"
 )
 
@@ -116,6 +117,11 @@ type Engine struct {
 	// sends, given the probe's context, so tests can make the server slow to
 	// answer and prove every statement runs under the probe's budget.
 	sizeProbeSQL func(ctx context.Context, stmt string) string
+
+	// dropTablesQuietPeriod is how long a drop_tables entry must have gone
+	// without a write before a plan proposes dropping it. New sets it to
+	// defaultDropTablesQuietPeriod; it is a field so tests can shorten it.
+	dropTablesQuietPeriod time.Duration
 }
 
 // runningSchemaChange tracks the state of an in-progress schema change.
@@ -253,6 +259,8 @@ func New(cfg Config) *Engine {
 		lockWaitTimeout:     lockWaitTimeout,
 		disablePendingDrops: cfg.DisablePendingDrops,
 		checkpointMaxAge:    checkpointMaxAge,
+
+		dropTablesQuietPeriod: defaultDropTablesQuietPeriod,
 	}
 	eng.debugLogs.Store(cfg.DebugLogs)
 
@@ -388,10 +396,19 @@ func (e *Engine) DrainContext(ctx context.Context) error {
 		return nil
 	}
 	if err := waitForRunExit(ctx, rm); err != nil {
-		return fmt.Errorf("drain schema change on database %s tables %v: still running after %w", rm.database, rm.tables, err)
+		database, tables := e.runTarget(rm)
+		return fmt.Errorf("drain schema change on database %s tables %v: still running after %w", database, tables, err)
 	}
 	e.releaseDrained(rm, raceWindow)
 	return nil
+}
+
+// runTarget reads the database and tables of a run that may still be running.
+// The run is still publishing its tables under e.mu, so they are read under it.
+func (e *Engine) runTarget(rm *runningSchemaChange) (string, []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return rm.database, rm.tables
 }
 
 // trackedForDrain returns the schema change a drain waits for, if any.
@@ -659,16 +676,23 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	if err != nil {
 		return nil, fmt.Errorf("plan database %s: %w", database, err)
 	}
-	current, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored)
+	drops, err := engine.NewDroppedTables(req.DropTables)
+	if err != nil {
+		return nil, fmt.Errorf("plan database %s: %w", database, err)
+	}
+	if err := drops.RefuseIgnored(ignored); err != nil {
+		return nil, fmt.Errorf("plan database %s: %w", database, err)
+	}
+	current, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored, drops)
 	if err != nil {
 		return nil, fmt.Errorf("fetch current schema: %w", err)
 	}
-	currentSchema, withheld, lowerCaseTableNames := current.tables, current.withheld, current.lowerCaseTableNames
+	currentSchema, lowerCaseTableNames := current.tables, current.lowerCaseTableNames
 	e.logger.Debug("fetched current schema", "database", database, "tables", len(currentSchema))
 	for i, ts := range currentSchema {
 		e.logger.Debug("current schema table", "index", i, "stmt", ts.Schema[:min(200, len(ts.Schema))])
 	}
-	exemptTables := exemptWithheldTables(ignored, req, database, withheld)
+	exemptTables := exemptLiveTables(ignored, req, database, current)
 
 	// Build list of desired table schemas from all namespaces. Every namespace
 	// is diffed as one set against the database, so a table two schema files
@@ -722,6 +746,12 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		if err := ignored.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
 			return nil, err
 		}
+		if err := drops.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
+			return nil, err
+		}
+		if err := refuseDeclaredSkippedTables(namespace, declaredByNamespace[namespace], current); err != nil {
+			return nil, err
+		}
 	}
 
 	// Use Spirit's PlanChanges to diff + lint in one call.
@@ -764,6 +794,20 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			ExistingCopiesChecked: true,
 			ExemptTables:          exemptTables,
 		}, nil
+	}
+
+	// A drop_tables entry is dropped only once the target shows it has gone
+	// the quiet period without a write. The check comes after the config's own
+	// contradictions are refused above, so an entry that should not be listed
+	// at all is reported as that, whatever the target says about its writes.
+	if !drops.Empty() {
+		db, err := target.get(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("plan database %s: check when drop_tables entries were last written: %w", database, err)
+		}
+		if err := e.requireQuietDropTables(ctx, db, database, drops); err != nil {
+			return nil, fmt.Errorf("plan database %s: %w", database, err)
+		}
 	}
 
 	// The engine's refusal checks compare a redeclared column against its
@@ -882,23 +926,56 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	}, nil
 }
 
-// exemptWithheldTables builds the plan's ignore_tables disclosure. A withheld
-// table has no declaring file, so the file-based attribution the table changes
-// use cannot place it in a namespace: with one namespace in the request it
-// belongs to that namespace, and with several the unit being diffed is the
+// exemptLiveTables builds the plan's disclosure of the live tables the diff
+// never saw: the ones ignore_tables withheld, then the ones the underscore and
+// archive naming conventions excluded, one group per reason. None of these
+// tables has a declaring file, so the file-based attribution the table changes
+// use cannot place them in a namespace: with one namespace in the request they
+// belong to that namespace, and with several the unit being diffed is the
 // database itself, which is what the disclosure then names.
-func exemptWithheldTables(ignored engine.IgnoredTables, req *engine.PlanRequest, database string, withheld []string) []*engine.ExemptTables {
+func exemptLiveTables(ignored engine.IgnoredTables, req *engine.PlanRequest, database string, live *liveSchema) []*engine.ExemptTables {
 	namespace := database
 	if len(req.SchemaFiles) == 1 {
 		for ns := range req.SchemaFiles {
 			namespace = ns
 		}
 	}
-	exemption := ignored.Exemption(namespace, withheld)
-	if exemption == nil {
-		return nil
+	var groups []*engine.ExemptTables
+	if exemption := ignored.Exemption(namespace, live.withheld); exemption != nil {
+		groups = append(groups, exemption)
 	}
-	return []*engine.ExemptTables{exemption}
+	if len(live.underscore) > 0 {
+		groups = append(groups, &engine.ExemptTables{Namespace: namespace, Tables: live.underscore, Reason: engine.ExemptReasonLeadingUnderscore})
+	}
+	if len(live.archive) > 0 {
+		groups = append(groups, &engine.ExemptTables{Namespace: namespace, Tables: live.archive, Reason: engine.ExemptReasonArchiveNaming})
+	}
+	return groups
+}
+
+// refuseDeclaredSkippedTables refuses a schema file that declares a live table
+// a naming convention keeps out of the diff. The diff never sees the live
+// table, so it would propose CREATE TABLE for a table that already exists, and
+// the apply would fail part way. Names compare ignoring case, the way
+// IgnoredTables.RefuseDeclared compares them, because whether two spellings
+// are one table is the target's answer.
+func refuseDeclaredSkippedTables(namespace string, declared []string, live *liveSchema) error {
+	skipped := make(map[string]string, len(live.underscore)+len(live.archive))
+	for _, name := range live.underscore {
+		skipped[schema.CaseFoldKey(name)] = "its name starts with \"_\""
+	}
+	for _, name := range live.archive {
+		skipped[schema.CaseFoldKey(name)] = "its name follows the archive convention <name>_archive_YYYY"
+	}
+	for _, table := range declared {
+		why, ok := skipped[schema.CaseFoldKey(table)]
+		if !ok {
+			continue
+		}
+		return fmt.Errorf("a schema file in namespace %q declares table %q, which the MySQL planner never manages because %s. Rename the table, or remove its schema file",
+			namespace, table, why)
+	}
+	return nil
 }
 
 // Apply starts executing a schema change plan using Spirit.
@@ -1271,9 +1348,10 @@ func progressState(rm *runningSchemaChange, spiritState status.State) engine.Sta
 // config does not name would have to come from the loader, which already holds
 // the full list from SHOW TABLES before it reads a definition.
 //
-// The leading-underscore exclusion stays with the loader unconditionally: it
-// discards the names it drops, so an entry naming one cannot be disclosed as
-// withheld from here whatever the ordering.
+// The leading-underscore exclusion stays with the loader unconditionally, so a
+// table it excludes is disclosed under the naming convention, never as
+// withheld by an ignore_tables entry that also names it. The loader reports
+// every table either exclusion dropped, which is what the plan discloses.
 func liveSchemaFilterOptions(ignored engine.IgnoredTables) []table.FilterOption {
 	opts := []table.FilterOption{table.WithoutUnderscoreTables, table.WithStrippedAutoIncrement}
 	if !ignored.MayWithhold(table.IsArchiveTable) {
@@ -1314,6 +1392,14 @@ type liveSchema struct {
 	// disclosure a withheld table would be indistinguishable from an
 	// unchanged one.
 	withheld []string
+	// underscore and archive are the live tables the naming conventions kept
+	// out of the diff, sorted, for the plan to disclose the same way: a table
+	// starting with "_" and a table named <name>_archive_YYYY[_MM[_DD]]. An
+	// archive table ignore_tables also names is reported in withheld instead;
+	// a "_" table is always reported here, because the loader drops it before
+	// the config is matched.
+	underscore []string
+	archive    []string
 	// lowerCaseTableNames is the target's @@lower_case_table_names, which
 	// decides whether the diff compares table names case-insensitively.
 	lowerCaseTableNames int
@@ -1324,7 +1410,10 @@ type liveSchema struct {
 // and archive tables that are maintained outside declarative schema files.
 //
 // ignored withholds the tables the repository's ignore_tables config names.
-func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, ignored engine.IgnoredTables) (*liveSchema, error) {
+// drops names tables the repository's drop_tables config asks to drop: one the
+// naming conventions would exclude is read back into the live schema, so the
+// diff proposes DROP TABLE for it like any other undeclared table.
+func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, ignored engine.IgnoredTables, drops engine.DroppedTables) (*liveSchema, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open target database: %w", err)
@@ -1342,9 +1431,43 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		return nil, fmt.Errorf("read lower_case_table_names: %w", err)
 	}
 
-	tables, err := table.LoadSchemaFromDB(ctx, db, liveSchemaFilterOptions(ignored)...)
+	tables, excluded, err := table.LoadSchemaAndExcludedTablesFromDB(ctx, db, liveSchemaFilterOptions(ignored)...)
 	if err != nil {
 		return nil, fmt.Errorf("load schema: %w", err)
+	}
+	var underscore, archive, reclaimed []string
+	for _, ex := range excluded {
+		if drops.Names(ex.Name) {
+			reclaimed = append(reclaimed, ex.Name)
+			continue
+		}
+		switch ex.Filter {
+		case table.WithoutUnderscoreTables:
+			underscore = append(underscore, ex.Name)
+		case table.WithoutArchiveTables:
+			archive = append(archive, ex.Name)
+		default:
+			return nil, fmt.Errorf("load schema: the loader excluded table %q under filter option %d, which the plan cannot disclose", ex.Name, ex.Filter)
+		}
+	}
+	for _, name := range reclaimed {
+		ts, err := loadTableSchema(ctx, db, name)
+		if err != nil {
+			return nil, fmt.Errorf("load schema of drop_tables entry %q: %w", name, err)
+		}
+		tables = append(tables, ts)
+	}
+	if !drops.Empty() {
+		// Every listed table that exists is in tables by now: the loader
+		// returned it, or it was read back in above.
+		liveNames := make([]string, 0, len(tables))
+		for _, ts := range tables {
+			liveNames = append(liveNames, ts.Name)
+		}
+		if unmatched := drops.Unmatched(liveNames); len(unmatched) > 0 {
+			e.logger.Info("drop_tables entries name no table on the target, so the plan drops nothing for them",
+				"database", database, "entries", unmatched)
+		}
 	}
 
 	// The archive-naming exclusion is applied here when the loader was not
@@ -1361,12 +1484,19 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 			withheld = append(withheld, ts.Name)
 			continue
 		}
-		if table.IsArchiveTable(ts.Name) {
+		if table.IsArchiveTable(ts.Name) && !drops.Names(ts.Name) {
+			archive = append(archive, ts.Name)
 			continue
 		}
 		kept = append(kept, ts)
 	}
+	if len(reclaimed) > 0 {
+		e.logger.Info("drop_tables entries read into the live schema so the plan drops them",
+			"database", database, "tables", reclaimed)
+	}
 	slices.Sort(withheld)
+	slices.Sort(underscore)
+	slices.Sort(archive)
 	if len(withheld) > 0 {
 		// The plan discloses this too; the log is where an operator tracing
 		// "why does the plan not mention table X" finds the answer without a
@@ -1374,7 +1504,13 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		e.logger.Info("live tables withheld from the plan by ignore_tables",
 			"database", database, "tables", withheld)
 	}
-	return &liveSchema{tables: kept, withheld: withheld, lowerCaseTableNames: lowerCaseTableNames}, nil
+	return &liveSchema{
+		tables:              kept,
+		withheld:            withheld,
+		underscore:          underscore,
+		archive:             archive,
+		lowerCaseTableNames: lowerCaseTableNames,
+	}, nil
 }
 
 // tableSizeEstimate is one table's approximate plan-time size read from

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -20,9 +21,10 @@ import (
 // "testdb" mysql database up to its submit. The lock is free; the acquire
 // answers acquireBody, after calling onAcquire when it is set; the submit
 // answers applyStatus with applyBody; and a lock release answers
-// releaseStatus, with releaseBody when it is set. The plan carries no plan ID
-// when planWithoutID is set. It counts the releases the CLI sends and fails
-// the test when one names anything but the lock the command took.
+// releaseStatus, with releaseBody when it is set, or is read and then dropped
+// without an answer when dropRelease is set. The plan carries no plan ID when
+// planWithoutID is set. It counts the releases the CLI sends and fails the
+// test when one names anything but the lock the command took.
 type unsubmittedLockServer struct {
 	planWithoutID bool
 	acquireBody   string
@@ -31,6 +33,7 @@ type unsubmittedLockServer struct {
 	applyBody     string
 	releaseStatus int
 	releaseBody   string
+	dropRelease   bool
 }
 
 func (s unsubmittedLockServer) start(t *testing.T) (*httptest.Server, *atomic.Int32) {
@@ -72,6 +75,14 @@ func (s unsubmittedLockServer) start(t *testing.T) (*httptest.Server, *atomic.In
 			assert.NoError(t, json.NewDecoder(r.Body).Decode(&sent), "decode the lock release request")
 			assert.Equal(t, map[string]any{"database": "testdb", "database_type": "mysql", "owner": client.GenerateCLIOwner()}, sent,
 				"the release names the lock this command took, under this command's owner, and is not forced")
+			if s.dropRelease {
+				conn, _, hijackErr := http.NewResponseController(w).Hijack()
+				if !assert.NoError(t, hijackErr, "hijack the lock release connection") {
+					return
+				}
+				utils.CloseAndLog(conn)
+				return
+			}
 			status = s.releaseStatus
 			switch {
 			case s.releaseBody != "":
@@ -185,6 +196,25 @@ func TestApplyNamesTheUnlockCommandWhenTheReleaseFails(t *testing.T) {
 	assert.Equal(t, int32(1), releases.Load(), out)
 	assert.Contains(t, out, "🔒 Lock kept for testdb (mysql): the server did not release it")
 	assert.Contains(t, out, "Nothing was submitted, so release it now: schemabot unlock -d testdb -t mysql")
+}
+
+// The server reads the release and the connection drops before it answers, so
+// the lock may or may not have been released. The operator is told that, on
+// lines of its own, and given the one command that is right either way.
+func TestApplySaysTheLockMayStillBeHeldWhenTheReleaseGetsNoAnswer(t *testing.T) {
+	t.Setenv("SCHEMABOT_TOKEN", "fictional-unsubmitted-lock-test")
+	server, releases := unsubmittedLockServer{acquireBody: acquireCreatedLock, applyStatus: http.StatusConflict, applyBody: activeApplyRefusal, dropRelease: true}.start(t)
+
+	out, err := runUnsubmittedApply(t.Context(), writeTestSchemaDir(t), server)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "apply apply-other is still running")
+	assert.Contains(t, err.Error(), "release lock for testdb")
+	assert.Positive(t, releases.Load(), out)
+	assert.Contains(t, out, "🔒 Lock for testdb (mysql) may still be held: the release request failed, so its result is unknown.\n"+
+		"   Nothing was submitted. Release it if it is still held: schemabot unlock -d testdb -t mysql\n")
+	assert.NotContains(t, out, "the server did not release it")
+	assert.NotContains(t, out, "may already have acted", "the lock message is not interrupted by the request warning")
 }
 
 // The lock this apply took was released by someone else before the apply was

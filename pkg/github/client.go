@@ -17,6 +17,7 @@ import (
 	"path"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -103,13 +104,27 @@ type Client struct {
 	installationsMu sync.Mutex
 	installations   map[int64]*InstallationClient
 
-	// repoInstallations caches the App's installation id for a repository,
-	// resolved via the App JWT. Repo-level webhook deliveries (unlike
-	// App-installed webhook deliveries) carry no installation id in the
-	// payload, so repo-webhook dispatch must look it up. A GitHub App installs
-	// once per account/org, so the id is stable per repo and safe to memoise.
-	repoInstallationsMu sync.Mutex
-	repoInstallations   map[string]int64
+	// appClientOnce builds appClient, the go-github client that signs its
+	// requests with the App JWT (the slug fetch, installation lookups, the
+	// installation list), once per Client so those calls share one transport.
+	// appClientErr holds the construction error, which only an unusable
+	// private key produces and which retrying cannot fix.
+	appClientOnce sync.Once
+	appClient     *gh.Client
+	appClientErr  error
+
+	// ownerInstallations caches the App's installation id per repository
+	// owner, keyed by the owner's lowercased login, resolved via the App JWT.
+	// Repo-level webhook deliveries (unlike App-installed webhook deliveries)
+	// carry no installation id in the payload, so repo-webhook dispatch and
+	// the webhook reconciler must look it up. A GitHub App has at most one
+	// installation per account, so every repository of one owner shares the
+	// id, and one lookup serves them all however many repositories are
+	// configured. ownerInstallationLookups collapses concurrent misses for one
+	// owner into a single lookup.
+	ownerInstallationsMu     sync.Mutex
+	ownerInstallations       map[string]int64
+	ownerInstallationLookups singleflight.Group
 
 	// checkStatusSingleflight coalesces concurrent GetPRCheckStatuses
 	// calls for the same (repo, sha) into a single upstream request via
@@ -214,7 +229,7 @@ func NewClient(appID int64, privateKey []byte, logger *slog.Logger, opts ...Clie
 		privateKey:              privateKey,
 		logger:                  logger,
 		installations:           make(map[int64]*InstallationClient),
-		repoInstallations:       make(map[string]int64),
+		ownerInstallations:      make(map[string]int64),
 		checkStatusSingleflight: NewCheckStatusSingleflight(),
 	}
 	for _, opt := range opts {
@@ -242,6 +257,25 @@ func (c *Client) appBaseTransport() http.RoundTripper {
 	return newGitHubRateLimitTransport(newGitHubMetricsTransport(base, 0, c.loadAppSlug))
 }
 
+// jwtClient returns the Client's App-JWT go-github client, building it on
+// first use.
+// appJWTRequestTimeout bounds one request made with the App JWT.
+const appJWTRequestTimeout = 10 * time.Second
+
+func (c *Client) jwtClient() (*gh.Client, error) {
+	c.appClientOnce.Do(func() {
+		appTransport, err := ghinstallation.NewAppsTransport(c.appBaseTransport(), c.appID, c.privateKey)
+		if err != nil {
+			c.appClientErr = fmt.Errorf("create GitHub App JWT transport for app %d: %w", c.appID, err)
+			return
+		}
+		client := gh.NewClient(&http.Client{Transport: appTransport, Timeout: appJWTRequestTimeout})
+		client.DisableRateLimitCheck = true
+		c.appClient = client
+	})
+	return c.appClient, c.appClientErr
+}
+
 // fetchAppSlug fetches the app slug from GitHub via GET /app, bounded by ctx
 // and the App client's own timeout. On failure, logs an error and leaves
 // appSlug empty.
@@ -250,13 +284,11 @@ func (c *Client) fetchAppSlug(ctx context.Context) {
 	c.lastSlugAttempt = time.Now()
 	c.slugFetchMu.Unlock()
 
-	appTransport, err := ghinstallation.NewAppsTransport(c.appBaseTransport(), c.appID, c.privateKey)
+	appClient, err := c.jwtClient()
 	if err != nil {
 		c.logger.Error("failed to create app transport for slug fetch", "error", err)
 		return
 	}
-	appClient := gh.NewClient(&http.Client{Transport: appTransport, Timeout: 10 * time.Second})
-	appClient.DisableRateLimitCheck = true
 	app, _, err := appClient.Apps.Get(ctx, "")
 	if err != nil {
 		c.logger.Error("failed to fetch app slug from GitHub — check gate will not exclude own checks",
@@ -362,6 +394,7 @@ func (c *Client) forInstallation(ctx context.Context, installationID int64) (*In
 		checkStatusSingleflight: c.checkStatusSingleflight,
 		treeLevels:              newTreeLevelCache(),
 		prETags:                 newPRETagCache(),
+		blobs:                   newBlobContentCache(),
 	}
 	ic.storeAppSlug(slug)
 	c.installations[installationID] = ic
@@ -371,44 +404,127 @@ func (c *Client) forInstallation(ctx context.Context, installationID int64) (*In
 }
 
 // InstallationIDForRepo resolves this App's installation id for repo (in
-// "owner/name" form) via the App JWT, caching the result. Repo-level webhook
-// deliveries carry no installation id in the payload — only App-installed
-// webhook deliveries do — so repo-webhook dispatch uses this to obtain the id
-// needed to mint an installation client for API calls.
+// "owner/name" form) via the App JWT. Repo-level webhook deliveries carry no
+// installation id in the payload — only App-installed webhook deliveries do —
+// so repo-webhook dispatch and the webhook reconciler use this to obtain the
+// id needed to mint an installation client for API calls.
+//
+// The id is cached per owner, so the first repository of an owner pays the
+// lookup and every later one is answered from memory. A cached answer does not
+// confirm the App's installation covers repo: on an installation limited to
+// selected repositories, a repository outside the selection gets the owner's
+// id and fails on its first installation-scoped call instead, with a 404. A
+// caller that must tell "the App is not installed on this repository" apart
+// from other failures through ErrAppNotInstalled needs a Client whose cache
+// has not seen the owner.
 func (c *Client) InstallationIDForRepo(ctx context.Context, repo string) (int64, error) {
-	c.repoInstallationsMu.Lock()
-	if id, ok := c.repoInstallations[repo]; ok {
-		c.repoInstallationsMu.Unlock()
-		return id, nil
-	}
-	c.repoInstallationsMu.Unlock()
-
 	owner, name := splitRepo(repo)
 	if owner == "" || name == "" {
 		return 0, fmt.Errorf("resolve installation for %q: repository must be in owner/name form", repo)
 	}
-
-	appTransport, err := ghinstallation.NewAppsTransport(c.appBaseTransport(), c.appID, c.privateKey)
-	if err != nil {
-		return 0, fmt.Errorf("create app transport to resolve installation for %s: %w", repo, err)
+	ownerKey := strings.ToLower(owner)
+	if id, ok := c.cachedOwnerInstallation(ownerKey); ok {
+		return id, nil
 	}
-	appClient := gh.NewClient(&http.Client{Transport: appTransport, Timeout: 10 * time.Second})
-	appClient.DisableRateLimitCheck = true
 
+	// The shared lookup runs on a context detached from this caller's
+	// cancellation and bounded by the App client's own timeout, so a caller
+	// that gives up cannot fail the other callers waiting on the same owner.
+	results := c.ownerInstallationLookups.DoChan(ownerKey, func() (any, error) {
+		// A lookup that finished while this caller waited to enter the
+		// flight has already cached the owner.
+		if id, ok := c.cachedOwnerInstallation(ownerKey); ok {
+			return ownerInstallationLookup{repo: repo, id: id, ownerWide: true}, nil
+		}
+		lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), appJWTRequestTimeout)
+		defer cancel()
+		return c.lookUpRepoInstallation(lookupCtx, repo, owner, name)
+	})
+	var result singleflight.Result
+	select {
+	case result = <-results:
+	case <-ctx.Done():
+		return 0, fmt.Errorf("resolve installation for %s: %w", repo, ctx.Err())
+	}
+	lookup, _ := result.Val.(ownerInstallationLookup)
+	if lookup.repo != repo && !sharedLookupAnswersOwner(lookup, result.Err) {
+		// The shared lookup went through another repository of this owner and
+		// either failed or found an installation that does not stand for the
+		// whole owner. Its outcome says nothing certain about this repository,
+		// so ask GitHub about this one; the answer then depends only on the
+		// repository asked about.
+		c.logger.Debug("shared installation lookup does not answer for the owner; looking up this repository on its own",
+			"repo", repo, "owner", owner, "shared_lookup_repo", lookup.repo, "shared_lookup_error", result.Err)
+		own, err := c.lookUpRepoInstallation(ctx, repo, owner, name)
+		if err != nil {
+			return 0, err
+		}
+		return own.id, nil
+	}
+	if result.Err != nil {
+		return 0, result.Err
+	}
+	return lookup.id, nil
+}
+
+// sharedLookupAnswersOwner reports whether a lookup made through one
+// repository also answers for the owner's other repositories: it succeeded and
+// found the installation of the owner's own account.
+func sharedLookupAnswersOwner(lookup ownerInstallationLookup, err error) bool {
+	return err == nil && lookup.ownerWide
+}
+
+// ownerInstallationLookup is the result of one owner's installation lookup,
+// naming the repository the lookup went through. ownerWide reports that the
+// installation belongs to the owner's account and was cached for it, so it
+// answers every repository of the owner; otherwise it answers only repo.
+type ownerInstallationLookup struct {
+	repo      string
+	id        int64
+	ownerWide bool
+}
+
+func (c *Client) cachedOwnerInstallation(ownerKey string) (int64, bool) {
+	c.ownerInstallationsMu.Lock()
+	defer c.ownerInstallationsMu.Unlock()
+	id, ok := c.ownerInstallations[ownerKey]
+	return id, ok
+}
+
+// lookUpRepoInstallation asks GitHub for the installation covering repo and
+// caches its id under the repository's owner. A failed lookup caches nothing,
+// so the next repository of the owner, or the next pass, asks again.
+func (c *Client) lookUpRepoInstallation(ctx context.Context, repo, owner, name string) (ownerInstallationLookup, error) {
+	failed := ownerInstallationLookup{repo: repo}
+	appClient, err := c.jwtClient()
+	if err != nil {
+		return failed, fmt.Errorf("resolve installation for %s: %w", repo, err)
+	}
 	installation, _, err := appClient.Apps.FindRepositoryInstallation(ctx, owner, name)
 	if err != nil {
-		return 0, findInstallationError(repo, err)
+		return failed, findInstallationError(repo, err)
 	}
 	id := installation.GetID()
 	if id == 0 {
-		return 0, fmt.Errorf("find installation for %s: GitHub returned installation id 0", repo)
+		return failed, fmt.Errorf("find installation for %s: GitHub returned installation id 0", repo)
 	}
-
-	c.repoInstallationsMu.Lock()
-	c.repoInstallations[repo] = id
-	c.repoInstallationsMu.Unlock()
-	c.logger.Info("resolved GitHub App installation for repo", "repo", repo, "installation_id", id)
-	return id, nil
+	account := installation.GetAccount().GetLogin()
+	if !strings.EqualFold(account, owner) {
+		// The installation belongs to an account other than the repository's
+		// owner, so it cannot stand for the owner's other repositories. The id
+		// still answers this repository; it is just not cached.
+		c.logger.Warn("GitHub App installation for repository belongs to another account; using it for this repository without caching it for the owner",
+			"repo", repo, "owner", owner, "installation_account", account, "installation_id", id)
+		return ownerInstallationLookup{repo: repo, id: id}, nil
+	}
+	c.ownerInstallationsMu.Lock()
+	if c.ownerInstallations == nil {
+		c.ownerInstallations = make(map[string]int64)
+	}
+	c.ownerInstallations[strings.ToLower(owner)] = id
+	c.ownerInstallationsMu.Unlock()
+	c.logger.Info("resolved GitHub App installation for repository owner", "repo", repo, "owner", owner, "installation_id", id)
+	return ownerInstallationLookup{repo: repo, id: id, ownerWide: true}, nil
 }
 
 // ErrAppNotInstalled reports that GitHub has no installation of this App
@@ -445,6 +561,7 @@ func NewInstallationClientWithSlug(client *gh.Client, logger *slog.Logger, appSl
 		trustedCheckAppSlugs: trustedCheckAppSlugs,
 		treeLevels:           newTreeLevelCache(),
 		prETags:              newPRETagCache(),
+		blobs:                newBlobContentCache(),
 	}
 	ic.storeAppSlug(appSlug)
 	return ic
@@ -499,6 +616,11 @@ type InstallationClient struct {
 	// so a repeat read of an unchanged pull request is a conditional request
 	// that GitHub answers with 304 without spending primary rate limit.
 	prETags *prETagCache
+
+	// blobs holds schema file content by blob SHA, so a file whose content did
+	// not change is read from GitHub once per installation, however many
+	// environments, plans, and pushes read it.
+	blobs *blobContentCache
 }
 
 // InstallationID returns the GitHub App installation this client is scoped
@@ -882,6 +1004,7 @@ type PullRequestInfo struct {
 	// read from the same response as BaseRef.
 	DefaultBranch string
 	User          string
+	labels        []string
 	// State is the PR's lifecycle state as GitHub reports it: "open" or
 	// "closed" (a merged PR reads as closed).
 	State string
@@ -957,27 +1080,264 @@ func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo
 		return nil, 0, 0, fmt.Errorf("list open pull requests for %s page %d: %w", repo, page, err)
 	}
 	for _, pr := range ghPRs {
-		info := OpenPullRequest{
-			DefaultBranch: pr.GetBase().GetRepo().GetDefaultBranch(),
-			Number:        pr.GetNumber(),
-			Title:         pr.GetTitle(),
-			HeadRef:       pr.GetHead().GetRef(),
-			HeadSHA:       pr.GetHead().GetSHA(),
-			BaseRef:       pr.GetBase().GetRef(),
-			User:          pr.GetUser().GetLogin(),
-			UpdatedAt:     pr.GetUpdatedAt().Time,
-		}
-		if pr.Stack != nil {
-			info.NativeStack = true
-			info.StackBaseRef = pr.Stack.Base.Ref
-		}
-		prs = append(prs, info)
+		prs = append(prs, openPullRequestFrom(pr))
 	}
 	if resp != nil {
 		nextPage = resp.NextPage
 		lastPage = resp.LastPage
 	}
 	return prs, nextPage, lastPage, nil
+}
+
+// FetchOpenPullRequest reads one pull request in the shape
+// ListOpenPullRequestsPage returns, so a caller that already knows which PRs
+// it wants reads only those instead of paging the repository. open is false
+// when the PR is closed or merged.
+func (ic *InstallationClient) FetchOpenPullRequest(ctx context.Context, repo string, number int) (pr OpenPullRequest, open bool, err error) {
+	owner, repoName := splitRepo(repo)
+	ghPR, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchPullRequest, "get pull request", []any{"repo", repo, "pr", number}, func(ctx context.Context) (*pullRequestWithStack, error) {
+		req, reqErr := ic.client.NewRequest(ctx, http.MethodGet, fmt.Sprintf("repos/%s/%s/pulls/%d", owner, repoName, number), nil)
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		var got pullRequestWithStack
+		if _, getErr := ic.client.Do(req, &got); getErr != nil {
+			return nil, classifyGitHubAPIError(getErr)
+		}
+		return &got, nil
+	})
+	if err != nil {
+		return OpenPullRequest{}, false, fmt.Errorf("get pull request %s#%d: %w", repo, number, err)
+	}
+	return openPullRequestFrom(ghPR), ghPR.GetState() == "open", nil
+}
+
+// mergeQueueRefPrefix is the branch namespace GitHub's merge queue creates a
+// temporary branch in for each merge group: gh-readonly-queue/<base>/pr-<n>-<sha>.
+const mergeQueueRefPrefix = "heads/gh-readonly-queue/"
+
+// MergeQueueHead is one merge group GitHub's merge queue is testing: the
+// temporary branch it created and the commit required checks must pass on.
+type MergeQueueHead struct {
+	// Ref is the branch name without the refs/heads/ prefix.
+	Ref string
+	// BaseRef is the branch the merge group lands on.
+	BaseRef string
+	// PR is the pull request whose entry created this merge group; 0 when the
+	// branch name does not carry one.
+	PR      int
+	HeadSHA string
+}
+
+// ListMergeQueueHeads lists the merge groups a repository's merge queues are
+// testing right now, across every base branch.
+//
+// A gh-readonly-queue/ branch alone does not prove the merge queue made it, so
+// a branch is returned only when GitHub's merge queue for its base branch has
+// an entry whose head commit is the branch's commit. A branch whose name does
+// not say which base branch it targets cannot be checked that way and is left
+// out. GitHub deletes a merge group's branch once the group merges or leaves
+// the queue, so every head returned is a commit the queue is still waiting on.
+//
+// The cost is one request for the branches, plus one merge queue read per base
+// branch that has a queued group.
+func (ic *InstallationClient) ListMergeQueueHeads(ctx context.Context, repo string) ([]MergeQueueHead, error) {
+	owner, repoName := splitRepo(repo)
+	refs, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "list merge queue refs", []any{"repo", repo}, func(ctx context.Context) ([]*gh.Reference, error) {
+		listed, _, listErr := ic.client.Git.ListMatchingRefs(ctx, owner, repoName, mergeQueueRefPrefix)
+		if listErr != nil {
+			return nil, classifyGitHubAPIError(listErr)
+		}
+		return listed, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list merge queue refs for %s: %w", repo, err)
+	}
+	entryHeadsByBase := make(map[string]map[string]bool)
+	heads := make([]MergeQueueHead, 0, len(refs))
+	for _, ref := range refs {
+		head := mergeQueueHeadFrom(strings.TrimPrefix(ref.GetRef(), "refs/"), ref.GetObject().GetSHA())
+		if head.BaseRef == "" {
+			ic.warnMergeQueueHeadLeftOut(repo, head, "the branch name does not say which base branch it targets, so the merge queue cannot confirm it")
+			continue
+		}
+		entryHeads, read := entryHeadsByBase[head.BaseRef]
+		if !read {
+			entryHeads, err = ic.mergeQueueEntryHeads(ctx, repo, head.BaseRef)
+			if err != nil {
+				return nil, fmt.Errorf("confirm merge queue groups for %s: %w", repo, err)
+			}
+			entryHeadsByBase[head.BaseRef] = entryHeads
+		}
+		if !entryHeads[head.HeadSHA] {
+			ic.warnMergeQueueHeadLeftOut(repo, head, "no entry in the base branch's merge queue has this commit as its head")
+			continue
+		}
+		heads = append(heads, head)
+	}
+	return heads, nil
+}
+
+func (ic *InstallationClient) warnMergeQueueHeadLeftOut(repo string, head MergeQueueHead, reason string) {
+	if ic.logger == nil {
+		return
+	}
+	ic.logger.Warn("merge queue head left out: SchemaBot will not report or backfill a check on it",
+		"repo", repo, "ref", head.Ref, "head_sha", head.HeadSHA, "reason", reason)
+}
+
+// mergeQueueEntryHeads returns the head commit of every entry in the merge
+// queue for base. It is an error, never an empty set, when GitHub returns no
+// merge queue for a base branch that has queue branches, so a caller cannot
+// mistake a queue it could not read for an empty one.
+func (ic *InstallationClient) mergeQueueEntryHeads(ctx context.Context, repo, base string) (map[string]bool, error) {
+	owner, name := splitRepo(repo)
+	heads := make(map[string]bool)
+	cursor := ""
+	for {
+		variables := map[string]any{"owner": owner, "name": name, "branch": base}
+		if cursor != "" {
+			variables["after"] = cursor
+		}
+		payload, err := json.Marshal(map[string]any{
+			"query":     `query($owner: String!, $name: String!, $branch: String!, $after: String) { repository(owner: $owner, name: $name) { mergeQueue(branch: $branch) { entries(first: 100, after: $after) { nodes { headCommit { oid } } pageInfo { hasNextPage endCursor } } } } }`,
+			"variables": variables,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("encode merge queue query for branch %s: %w", base, err)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, ic.graphQLURL(), bytes.NewReader(payload))
+		if err != nil {
+			return nil, fmt.Errorf("build merge queue query for branch %s: %w", base, err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := ic.client.Client().Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("read merge queue for branch %s: %w", base, err)
+		}
+		var result struct {
+			Data struct {
+				Repository *struct {
+					MergeQueue *struct {
+						Entries struct {
+							Nodes []struct {
+								HeadCommit *struct {
+									OID string `json:"oid"`
+								} `json:"headCommit"`
+							} `json:"nodes"`
+							PageInfo struct {
+								HasNextPage bool   `json:"hasNextPage"`
+								EndCursor   string `json:"endCursor"`
+							} `json:"pageInfo"`
+						} `json:"entries"`
+					} `json:"mergeQueue"`
+				} `json:"repository"`
+			} `json:"data"`
+			Errors []graphQLError `json:"errors"`
+		}
+		status := resp.StatusCode
+		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
+		closeErr := resp.Body.Close()
+		if status != http.StatusOK {
+			return nil, fmt.Errorf("read merge queue for branch %s: GraphQL endpoint returned %d", base, status)
+		}
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode merge queue for branch %s: %w", base, decodeErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close merge queue response for branch %s: %w", base, closeErr)
+		}
+		if len(result.Errors) > 0 {
+			return nil, fmt.Errorf("read merge queue for branch %s: %s", base, result.Errors[0].Message)
+		}
+		if result.Data.Repository == nil {
+			return nil, fmt.Errorf("merge queue query for branch %s returned no repository", base)
+		}
+		queue := result.Data.Repository.MergeQueue
+		if queue == nil {
+			return nil, fmt.Errorf("GitHub returned no merge queue for branch %s, which has merge queue branches", base)
+		}
+		for _, entry := range queue.Entries.Nodes {
+			if entry.HeadCommit != nil && entry.HeadCommit.OID != "" {
+				heads[entry.HeadCommit.OID] = true
+			}
+		}
+		if !queue.Entries.PageInfo.HasNextPage {
+			return heads, nil
+		}
+		if queue.Entries.PageInfo.EndCursor == "" {
+			return nil, fmt.Errorf("merge queue query for branch %s reported another page but no cursor to read it", base)
+		}
+		cursor = queue.Entries.PageInfo.EndCursor
+	}
+}
+
+// OpenPullRequestHeadedAt returns the number of an open pull request whose
+// head commit is sha, or 0 when no open pull request has that head. A passing
+// merge queue check posted on such a commit would also pass that pull
+// request's own required check, so a caller about to post one asks first.
+func (ic *InstallationClient) OpenPullRequestHeadedAt(ctx context.Context, repo, sha string) (int, error) {
+	owner, repoName := splitRepo(repo)
+	opts := &gh.ListOptions{PerPage: 100}
+	for {
+		var resp *gh.Response
+		prs, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "list pull requests for commit", []any{"repo", repo, "sha", sha}, func(ctx context.Context) ([]*gh.PullRequest, error) {
+			listed, listResp, listErr := ic.client.PullRequests.ListPullRequestsWithCommit(ctx, owner, repoName, sha, opts)
+			if listErr != nil {
+				return nil, classifyGitHubAPIError(listErr)
+			}
+			resp = listResp
+			return listed, nil
+		})
+		if err != nil {
+			return 0, fmt.Errorf("list pull requests for commit %s in %s: %w", sha, repo, err)
+		}
+		for _, pr := range prs {
+			if pr.GetState() == "open" && pr.GetHead().GetSHA() == sha {
+				return pr.GetNumber(), nil
+			}
+		}
+		if resp == nil || resp.NextPage == 0 {
+			return 0, nil
+		}
+		opts.Page = resp.NextPage
+	}
+}
+
+// mergeQueueHeadFrom reads the base branch and PR number out of a merge group
+// branch name, heads/gh-readonly-queue/<base>/pr-<n>-<sha>. The base can itself
+// contain slashes, so the PR segment is found from the end.
+func mergeQueueHeadFrom(ref, sha string) MergeQueueHead {
+	head := MergeQueueHead{Ref: strings.TrimPrefix(ref, "heads/"), HeadSHA: sha}
+	rest := strings.TrimPrefix(ref, mergeQueueRefPrefix)
+	cut := strings.LastIndex(rest, "/pr-")
+	if cut < 0 {
+		return head
+	}
+	head.BaseRef = rest[:cut]
+	number, _, _ := strings.Cut(rest[cut+len("/pr-"):], "-")
+	if pr, err := strconv.Atoi(number); err == nil {
+		head.PR = pr
+	}
+	return head
+}
+
+func openPullRequestFrom(pr *pullRequestWithStack) OpenPullRequest {
+	info := OpenPullRequest{
+		DefaultBranch: pr.GetBase().GetRepo().GetDefaultBranch(),
+		Number:        pr.GetNumber(),
+		Title:         pr.GetTitle(),
+		HeadRef:       pr.GetHead().GetRef(),
+		HeadSHA:       pr.GetHead().GetSHA(),
+		BaseRef:       pr.GetBase().GetRef(),
+		User:          pr.GetUser().GetLogin(),
+		UpdatedAt:     pr.GetUpdatedAt().Time,
+	}
+	if pr.Stack != nil {
+		info.NativeStack = true
+		info.StackBaseRef = pr.Stack.Base.Ref
+	}
+	return info
 }
 
 // CoreRateLimit reports the installation's remaining core REST budget. The
@@ -1107,6 +1467,9 @@ func pullRequestInfoFromGitHub(ghPR *pullRequestWithStack) PullRequestInfo {
 		State:         ghPR.GetState(),
 		Merged:        ghPR.GetMerged(),
 		BaseSHA:       ghPR.GetBase().GetSHA(),
+	}
+	for _, label := range ghPR.Labels {
+		info.labels = append(info.labels, label.GetName())
 	}
 	if ghPR.Stack != nil {
 		info.NativeStack = true
@@ -2451,6 +2814,35 @@ func pathInsideAny(p string, dirs []string) bool {
 	return false
 }
 
+// ResolveDefaultBranchTip reads the exact commit used to scope proposed files.
+func (ic *InstallationClient) ResolveDefaultBranchTip(ctx context.Context, repo string) (string, error) {
+	owner, repoName := splitRepo(repo)
+	defaultBranch, err := ic.repositoryDefaultBranch(ctx, repo)
+	if err != nil {
+		return "", err
+	}
+
+	// Pin the tip up front so a commit landing on the default branch mid-pass
+	// cannot leave some files compared against one commit and some against the
+	// next.
+	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve default branch tip", []any{"repo", repo, "default_branch", defaultBranch}, func(ctx context.Context) (*gh.Reference, error) {
+		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+defaultBranch)
+		if err != nil {
+			return nil, fmt.Errorf("get ref heads/%s: %w", defaultBranch, classifyGitHubAPIError(err))
+		}
+		return ref, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	defaultTipSHA := tip.GetObject().GetSHA()
+	if defaultTipSHA == "" {
+		return "", fmt.Errorf("ref heads/%s for %s resolved to no commit", defaultBranch, repo)
+	}
+
+	return defaultTipSHA, nil
+}
+
 // PRFilesProposedAgainstDefaultBranch narrows a pull request's changed files to
 // the ones it actually proposes, and returns the pinned default branch tip the
 // narrowing was measured against for operator logs.
@@ -2484,28 +2876,9 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 		return files, "", nil
 	}
 
-	owner, repoName := splitRepo(repo)
-	defaultBranch, err := ic.repositoryDefaultBranch(ctx, repo)
+	defaultTipSHA, err = ic.ResolveDefaultBranchTip(ctx, repo)
 	if err != nil {
 		return nil, "", err
-	}
-
-	// Pin the tip up front so a commit landing on the default branch mid-pass
-	// cannot leave some files compared against one commit and some against the
-	// next.
-	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve default branch tip", []any{"repo", repo, "default_branch", defaultBranch}, func(ctx context.Context) (*gh.Reference, error) {
-		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+defaultBranch)
-		if err != nil {
-			return nil, fmt.Errorf("get ref heads/%s: %w", defaultBranch, classifyGitHubAPIError(err))
-		}
-		return ref, nil
-	})
-	if err != nil {
-		return nil, "", err
-	}
-	defaultTipSHA = tip.GetObject().GetSHA()
-	if defaultTipSHA == "" {
-		return nil, "", fmt.Errorf("ref heads/%s for %s resolved to no commit", defaultBranch, repo)
 	}
 
 	// One cache serves both refs: it is keyed by tree SHA, and the two refs
@@ -3472,7 +3845,16 @@ func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, rep
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			content, err := ic.FetchFileContent(ctx, repo, loc.fetchPath, headSHA)
+			// The listing and the read name the same commit only when the ref
+			// is a full commit SHA; a branch could move between them and
+			// return other content than the listed blob, so it is not cached.
+			blobSHA := ""
+			if fullObjectSHA.MatchString(headSHA) {
+				blobSHA = loc.blobSHA
+			}
+			content, err := ic.cachedBlobContent(repo, blobSHA, func() (string, error) {
+				return ic.FetchFileContent(ctx, repo, loc.fetchPath, headSHA)
+			})
 			if err != nil {
 				results <- fileResult{err: fmt.Errorf("fetch %s: %w", loc.fetchPath, err)}
 				return
@@ -3580,7 +3962,9 @@ func (ic *InstallationClient) fetchSchemaFilesFromTree(ctx context.Context, repo
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			content, err := ic.FetchBlobContent(ctx, repo, entry.SHA)
+			content, err := ic.cachedBlobContent(repo, entry.SHA, func() (string, error) {
+				return ic.FetchBlobContent(ctx, repo, entry.SHA)
+			})
 			if err != nil {
 				results <- fileResult{err: fmt.Errorf("fetch %s: %w", entry.Path, err)}
 				return
@@ -3627,6 +4011,10 @@ func (ic *InstallationClient) fetchSchemaFilesFromTree(ctx context.Context, repo
 type schemaFileLocator struct {
 	fetchPath   string
 	displayPath string
+	// blobSHA is the file's blob SHA from the directory listing, which keys
+	// its content in the installation's blob cache. Empty when the listing
+	// did not report one; the file is then read without the cache.
+	blobSHA string
 }
 
 // schemaFileLocators lists every schema file directly under the schema root and
@@ -3649,7 +4037,7 @@ func (ic *InstallationClient) schemaFileLocators(ctx context.Context, repo, ref,
 	for _, entry := range rootEntries {
 		switch entry.GetType() {
 		case "file":
-			locators = append(locators, schemaFileLocator{fetchPath: entry.GetPath(), displayPath: entry.GetPath()})
+			locators = append(locators, schemaFileLocator{fetchPath: entry.GetPath(), displayPath: entry.GetPath(), blobSHA: entry.GetSHA()})
 		case "dir", "symlink":
 			namespaceEntries = append(namespaceEntries, entry)
 		default:
@@ -3705,7 +4093,7 @@ func (ic *InstallationClient) directoryFileLocators(ctx context.Context, repo, r
 				"repo", repo, "ref", ref, "path", sub.GetPath(), "type", sub.GetType())
 			continue
 		}
-		locators = append(locators, schemaFileLocator{fetchPath: sub.GetPath(), displayPath: sub.GetPath()})
+		locators = append(locators, schemaFileLocator{fetchPath: sub.GetPath(), displayPath: sub.GetPath(), blobSHA: sub.GetSHA()})
 	}
 	return locators, nil
 }
@@ -3759,6 +4147,7 @@ func (ic *InstallationClient) symlinkedNamespaceLocators(ctx context.Context, re
 		locators = append(locators, schemaFileLocator{
 			fetchPath:   sub.GetPath(),
 			displayPath: path.Join(schemaPath, symlinkName, path.Base(sub.GetPath())),
+			blobSHA:     sub.GetSHA(),
 		})
 	}
 	return locators, nil

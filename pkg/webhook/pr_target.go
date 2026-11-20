@@ -17,7 +17,23 @@ import (
 var errPRTargetExcluded = errors.New("pull request target is excluded from SchemaBot")
 
 func (h *Handler) evaluatePRTarget(ctx context.Context, client *ghclient.InstallationClient, repo string, info *ghclient.PullRequestInfo) (ghclient.PRTargetEligibility, error) {
+	if !h.skipsUnrequiredBranches() {
+		return servedPRTarget(), nil
+	}
 	return client.EvaluatePRTarget(ctx, repo, info, h.prTargetCheckBases(repo))
+}
+
+// skipsUnrequiredBranches reports whether skip_unrequired_branches is on. With
+// it off, every PR target is served, so no branch policy is read.
+func (h *Handler) skipsUnrequiredBranches() bool {
+	config, ok := h.serverConfig()
+	return ok && config.SkipsUnrequiredBranches()
+}
+
+// servedPRTarget is the decision for every PR while skip_unrequired_branches
+// is off: the target is served. No target is resolved, so Target stays empty.
+func servedPRTarget() ghclient.PRTargetEligibility {
+	return ghclient.PRTargetEligibility{Eligible: true}
 }
 
 func (h *Handler) prTargetCheckBases(repo string) []string {
@@ -38,6 +54,10 @@ func (h *Handler) enforcePRTarget(ctx context.Context, client *ghclient.Installa
 type prTargetEvaluator func(context.Context, string, *ghclient.PullRequestInfo, []string) (ghclient.PRTargetEligibility, error)
 
 func (h *Handler) enforcePRTargetWithPolicy(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, command, environment, requestedBy string, silent, suppressRetryComments bool, evaluate prTargetEvaluator) (bool, error) {
+	if !h.skipsUnrequiredBranches() {
+		h.logger.Debug("PR target not checked because skip_unrequired_branches is off", "repo", repo, "pr", pr, "command", command)
+		return false, nil
+	}
 	info, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		return h.prTargetVerificationFailure(repo, pr, installationID, command, environment, requestedBy, silent, suppressRetryComments, err)

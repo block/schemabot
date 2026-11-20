@@ -183,15 +183,15 @@ func TestEngine_Plan_IgnoreTablesRefusesDeclaredTableWhateverTheCase(t *testing.
 }
 
 // The planner excludes a table whose name follows the archive convention on
-// its own, and says nothing about it. An entry naming such a table is matched
-// against the target's catalog before that exclusion reaches it, so the plan
-// reports it as withheld by the config — the same answer every other engine
-// gives — rather than as an entry that matched no live table.
+// its own and discloses it under that convention. An entry naming such a table
+// is matched against the target's catalog before that exclusion reaches it, so
+// the plan reports it as withheld by the config — the same answer every other
+// engine gives — rather than as an entry that matched no live table.
 //
 // A second archive table the config does not name shares the target, because
 // the entry takes the archive exclusion off the loader for the whole read: the
 // unnamed one comes back from the loader and must still be excluded by its
-// name, undisclosed, exactly as it was before the entry existed.
+// name and disclosed under the convention, exactly as before the entry existed.
 func TestEngine_Plan_IgnoreTablesOutranksArchiveNaming(t *testing.T) {
 	const (
 		archiveTable        = "executions_archive_2024"
@@ -213,7 +213,7 @@ func TestEngine_Plan_IgnoreTablesOutranksArchiveNaming(t *testing.T) {
 	})
 
 	// Without the entry both archive tables are excluded by name alone: not
-	// dropped, and not disclosed.
+	// dropped, and disclosed under the archive convention.
 	result, err := New(Config{}).Plan(t.Context(), &engine.PlanRequest{
 		Database:    "testdb",
 		SchemaFiles: files,
@@ -221,7 +221,11 @@ func TestEngine_Plan_IgnoreTablesOutranksArchiveNaming(t *testing.T) {
 	})
 	require.NoError(t, err, "Plan()")
 	assert.Empty(t, droppedTables(result), "the archive tables are not proposed for DROP TABLE")
-	assert.Empty(t, result.ExemptTables, "the archive exclusion is the engine's own and is not disclosed here")
+	assert.Equal(t, []*engine.ExemptTables{{
+		Namespace: "testdb",
+		Tables:    []string{unnamedArchiveTable, archiveTable},
+		Reason:    engine.ExemptReasonArchiveNaming,
+	}}, result.ExemptTables, "both archive tables are disclosed under the naming convention")
 
 	result, err = New(Config{}).Plan(t.Context(), &engine.PlanRequest{
 		Database:     "testdb",
@@ -233,6 +237,10 @@ func TestEngine_Plan_IgnoreTablesOutranksArchiveNaming(t *testing.T) {
 	assert.Empty(t, droppedTables(result),
 		"neither the withheld table nor the unnamed archive table is proposed for DROP TABLE")
 	assertWithheld(t, result, "testdb", archiveTable)
+	archived := exemptGroup(t, result, engine.ExemptReasonArchiveNaming)
+	require.NotNil(t, archived, "the unnamed archive table is still disclosed under the convention")
+	assert.Equal(t, []string{unnamedArchiveTable}, archived.Tables,
+		"the table the entry withheld is reported once, under the entry")
 }
 
 // An application that creates one table per configured trigger leaves an
@@ -335,7 +343,7 @@ func TestEngine_Plan_IgnoreTablesInvalidPatternFailsThePlan(t *testing.T) {
 // withhold an archive table, and a pattern could, so a pattern takes the
 // exclusion off the loader. An archive table the pattern matches is then
 // disclosed as the config's exclusion, and one it does not match is still
-// excluded by its name alone, undisclosed and not dropped.
+// excluded by its name alone, disclosed under the convention and not dropped.
 func TestEngine_Plan_IgnoreTablesPatternOutranksArchiveNaming(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
@@ -360,6 +368,68 @@ func TestEngine_Plan_IgnoreTablesPatternOutranksArchiveNaming(t *testing.T) {
 	require.NoError(t, err, "Plan()")
 	assert.Empty(t, droppedTables(result), "neither archive table is proposed for DROP TABLE")
 	assertWithheld(t, result, "testdb", "executions_archive_2024")
+	archived := exemptGroup(t, result, engine.ExemptReasonArchiveNaming)
+	require.NotNil(t, archived, "the archive table the pattern misses is disclosed under the convention")
+	assert.Equal(t, []string{"audit_log_archive_2019"}, archived.Tables)
+}
+
+// An online schema change leaves its shadow and leftover tables behind under a
+// leading "_", and a retired table is kept as <name>_archive_YYYY. The planner
+// never diffs either kind, so a no-change plan is the only place a reviewer
+// learns they are still on the target. Each convention is disclosed in its own
+// group, an ignore_tables entry naming a "_" table does not move it out of the
+// convention's group, and neither kind is proposed for DROP TABLE.
+func TestEngine_Plan_DisclosesTablesExcludedByNamingConvention(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	for _, stmt := range []string{
+		`CREATE TABLE executions (id INT PRIMARY KEY)`,
+		"CREATE TABLE `_executions_old` (id INT PRIMARY KEY)",
+		"CREATE TABLE `_jobs_new` (id INT PRIMARY KEY)",
+		"CREATE TABLE `executions_archive_2024_06` (id INT PRIMARY KEY)",
+	} {
+		_, err := db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+
+	result, err := New(Config{}).Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"executions.sql": `CREATE TABLE executions (id INT PRIMARY KEY)`,
+		}),
+		Credentials:  &engine.Credentials{DSN: dsn},
+		IgnoreTables: []string{"_jobs_new"},
+	})
+	require.NoError(t, err, "Plan()")
+	assert.True(t, result.NoChanges, "neither convention's tables change the plan: %v", result.FlatDDL())
+	assert.Empty(t, droppedTables(result))
+	assert.Equal(t, []*engine.ExemptTables{
+		{Namespace: "testdb", Tables: []string{"_executions_old", "_jobs_new"}, Reason: engine.ExemptReasonLeadingUnderscore},
+		{Namespace: "testdb", Tables: []string{"executions_archive_2024_06"}, Reason: engine.ExemptReasonArchiveNaming},
+	}, result.ExemptTables)
+}
+
+// A schema file declaring a live "_" table asks the planner to manage a table
+// it never reads, so the diff would propose creating a table that already
+// exists. The plan fails naming the table, and the target is left as it was.
+func TestEngine_Plan_RefusesADeclaredTableTheNamingConventionSkips(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `_legacy` (id INT PRIMARY KEY)")
+	require.NoError(t, err)
+
+	result, err := New(Config{}).Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"legacy.sql": "CREATE TABLE `_legacy` (id INT PRIMARY KEY)",
+		}),
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.Error(t, err, "Plan() must refuse to plan a CREATE for a live table it skips")
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), `declares table "_legacy", which the MySQL planner never manages because its name starts with "_"`)
 }
 
 func droppedTables(result *engine.PlanResult) []string {
@@ -375,11 +445,25 @@ func droppedTables(result *engine.PlanResult) []string {
 func assertWithheld(t *testing.T, result *engine.PlanResult, namespace string, tables ...string) {
 	t.Helper()
 
-	require.Len(t, result.ExemptTables, 1, "one disclosure group for the withheld tables")
-	group := result.ExemptTables[0]
-	require.NotNil(t, group)
+	group := exemptGroup(t, result, engine.ExemptReasonIgnoreTables)
+	require.NotNil(t, group, "the disclosure names the config key a reviewer reads the decision in: %+v", result.ExemptTables)
 	assert.Equal(t, namespace, group.Namespace)
 	assert.Equal(t, tables, group.Tables)
-	assert.Equal(t, engine.ExemptReasonIgnoreTables, group.Reason,
-		"the disclosure names the config key a reviewer reads the decision in")
+}
+
+// exemptGroup returns the plan's disclosure group for one reason, failing the
+// test when the plan carries two groups for it.
+func exemptGroup(t *testing.T, result *engine.PlanResult, reason string) *engine.ExemptTables {
+	t.Helper()
+
+	var found *engine.ExemptTables
+	for _, group := range result.ExemptTables {
+		require.NotNil(t, group)
+		if group.Reason != reason {
+			continue
+		}
+		require.Nil(t, found, "one disclosure group per reason, got two for %q", reason)
+		found = group
+	}
+	return found
 }
