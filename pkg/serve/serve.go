@@ -1476,7 +1476,8 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	ghClient := ghclient.NewClient(creds.AppID, []byte(creds.PrivateKey), logger,
 		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs),
 		ghclient.WithConfigDirHints(serverConfig),
-		ghclient.WithListenOnlyRepos(serverConfig))
+		ghclient.WithListenOnlyRepos(serverConfig),
+		ghclient.WithQuotaReserve(serverConfig.GitHub.QuotaReserve))
 	handlerOpts := append([]webhook.HandlerOption{
 		webhook.WithRepoWebhookSecret([]byte(repoWebhookSecret)),
 		webhook.WithDurableWebhookDispatch(),
@@ -1489,6 +1490,7 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub webhook endpoint registered",
 		"app_id", creds.AppID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs,
+		"quota_reserve", serverConfig.GitHub.QuotaReserve,
 		"repo_webhook_dispatch", repoWebhookSecret != "")
 	return webhookRuntime{
 		startDurableWebhookDispatch:    handler.StartDurableWebhookDispatch,
@@ -1564,14 +1566,16 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 		appClient := ghclient.NewClient(e.id, []byte(privateKey), logger,
 			ghclient.WithTrustedCheckAppSlugs(e.cfg.TrustedCheckAppSlugs),
 			ghclient.WithConfigDirHints(serverConfig),
-			ghclient.WithListenOnlyRepos(serverConfig))
+			ghclient.WithListenOnlyRepos(serverConfig),
+			ghclient.WithQuotaReserve(e.cfg.QuotaReserve))
 		clients[e.name] = appClient
 		quotaProbes = append(quotaProbes, appClient.NewQuotaProbe())
 		secretsByApp[e.name] = []byte(secret)
 		appByID[e.id] = e.name
 
 		logger.Info("registered GitHub App",
-			"app_name", e.name, "app_id", e.id, "trusted_check_app_slugs", e.cfg.TrustedCheckAppSlugs)
+			"app_name", e.name, "app_id", e.id, "trusted_check_app_slugs", e.cfg.TrustedCheckAppSlugs,
+			"quota_reserve", e.cfg.QuotaReserve)
 	}
 
 	handlerOpts := append([]webhook.HandlerOption{

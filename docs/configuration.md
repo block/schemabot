@@ -1124,6 +1124,42 @@ refusal is the same `429` with `error_code: rate_limited` and `Retry-After`, and
 it is returned before any GitHub call is made. Set `enabled: false` to turn
 enforcement off.
 
+### GitHub quota reserve
+
+One GitHub App installation's hourly REST quota is shared by every pull request
+in every repository it serves. Planning a pull request reads its schema files
+and repository trees, and a burst of plans can spend the whole quota. Once it
+is gone, GitHub refuses SchemaBot's Check Run writes too, so required checks
+stop posting on every pull request the installation serves.
+
+`quota-reserve` holds back that many requests per installation for the work
+that gates merges. Once GitHub reports that many or fewer requests remaining,
+SchemaBot stops sending the schema file, blob, and tree reads a plan makes until
+the quota resets. Check Run writes and reads, pull request reads, changed-file
+lists, and comments still go out, and so do the same file and tree reads when
+SchemaBot makes them to decide what a Check Run says, such as which
+environments a pull request's configs cover. A plan that needs a refused read
+fails closed: the pull request's SchemaBot check does not pass until a plan
+succeeds after the reset. A refused plan is retried on the usual schedule, not
+at the reset, so push or re-run the check after the reset if it is still
+failing.
+
+```yaml
+github:
+  quota-reserve: 1500  # default: 0 (disabled)
+```
+
+Under `apps:`, each App takes its own `quota-reserve`, since each App has its
+own installations and quotas. The value must not be negative. SchemaBot tracks
+the remaining quota from GitHub's response headers per installation and per
+server process, less the requests that process has sent and not yet had
+answered, so each replica reaches the reserve on its own reading of the shared
+quota; size the reserve to cover the Check Run traffic of every replica until
+the reset. Each refused read increments
+`schemabot.github.primary_rate_limit_rejections_total` with `origin=reserve`,
+and the first refusal in each reset window logs a warning naming the
+installation, App, remaining quota, reserve, and reset time.
+
 ## Pending Drops
 
 For MySQL databases executed by the Spirit engine, `DROP TABLE` statements can

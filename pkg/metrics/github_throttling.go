@@ -14,6 +14,10 @@ import (
 const (
 	GitHubRejectionOriginHTTP  = "http"
 	GitHubRejectionOriginLocal = "local"
+	// GitHubRejectionOriginReserve marks a deferrable request SchemaBot did
+	// not send because the installation's core quota was at its configured
+	// reserve. Like a local refusal, it consumed no GitHub quota.
+	GitHubRejectionOriginReserve = "reserve"
 
 	GitHubWaitLayerReadRetry       = "read_retry"
 	GitHubWaitReasonSecondaryLimit = "secondary_rate_limit"
@@ -56,10 +60,11 @@ func (s GitHubClientMetricContext) attributes() []attribute.KeyValue {
 
 // RecordGitHubPrimaryRateLimitRejection counts at the producing layer only.
 // HTTP rejections also appear in requests_total; local refusals do not consume
-// GitHub quota. Alert on either origin without adding these to HTTP totals.
+// GitHub quota, and neither do reserve refusals. Alert on any origin without
+// adding these to HTTP totals.
 func RecordGitHubPrimaryRateLimitRejection(ctx context.Context, sample GitHubClientMetricContext, origin string) {
 	origin = normalizeGitHubLabel("origin", origin, func(v string) bool {
-		return v == GitHubRejectionOriginHTTP || v == GitHubRejectionOriginLocal
+		return v == GitHubRejectionOriginHTTP || v == GitHubRejectionOriginLocal || v == GitHubRejectionOriginReserve
 	})
 	attrs := append(sample.attributes(), attribute.String("origin", origin))
 	addCounter(ctx, "schemabot.github.primary_rate_limit_rejections_total",
