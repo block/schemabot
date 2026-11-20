@@ -48,6 +48,16 @@ func (c *namespaceSelectingTernClient) PlanDiff(_ context.Context, req *ternv1.P
 	return &ternv1.PlanDiffResponse{Engine: ternv1.Engine_ENGINE_SPIRIT}, nil
 }
 
+// ResolveNamespaces answers like a data plane whose targets name no database:
+// each namespace is its own schema.
+func (c *namespaceSelectingTernClient) ResolveNamespaces(_ context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error) {
+	schemas := make(map[string]string, len(req.GetNamespaces()))
+	for _, namespace := range req.GetNamespaces() {
+		schemas[namespace] = namespace
+	}
+	return &ternv1.ResolveNamespacesResponse{Schemas: schemas}, nil
+}
+
 func (c *namespaceSelectingTernClient) IsRemote() bool   { return true }
 func (c *namespaceSelectingTernClient) Endpoint() string { return "tern-eu:9090" }
 func (c *namespaceSelectingTernClient) Close() error     { return nil }
