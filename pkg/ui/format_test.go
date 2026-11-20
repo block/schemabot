@@ -2,6 +2,7 @@ package ui
 
 import (
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -71,29 +72,42 @@ func TestFormatTableSizeClause(t *testing.T) {
 	assert.Empty(t, FormatTableSizeClause(nil))
 }
 
+// Every task state has a pinned place in the table listing, so a state added
+// to pkg/state fails here until the listing says where it goes. States the
+// priority does not name, and statuses it does not recognize, list with
+// pending.
 func TestTableStatePriority(t *testing.T) {
-	tests := []struct {
-		state    string
-		expected int
-	}{
-		{state.Task.Running, 0},
-		{state.Task.CuttingOver, 0},
-		{state.Task.WaitingForCutover, 1},
-		{state.Task.Recovering, 1},
-		{state.Task.Pending, 2},
-		{state.Task.Failed, 3},
-		{state.Task.Stopped, 3},
-		{state.Task.Completed, 4},
-		{state.Task.Cancelled, 4},
-		{state.Task.Reverted, 4},
-		{"unknown_state", 2}, // default
+	task := state.Task
+	want := map[string]int{
+		task.Running:           0,
+		task.CatchingUp:        0,
+		task.Checksumming:      0,
+		task.PostChecksum:      0,
+		task.CuttingOver:       0,
+		task.WaitingForCutover: 1,
+		task.Recovering:        1,
+		task.FailedRetryable:   1,
+		task.Pending:           2,
+		task.WaitingForDeploy:  2,
+		task.RevertWindow:      2,
+		task.Reverting:         2,
+		task.Failed:            3,
+		task.Stopped:           3,
+		task.Completed:         4,
+		task.Cancelled:         4,
+		task.Reverted:          4,
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.state, func(t *testing.T) {
-			assert.Equal(t, tt.expected, TableStatePriority(tt.state))
-		})
+	fields := reflect.ValueOf(state.Task)
+	assert.Len(t, want, fields.NumField(), "the expected priorities must name every task state, and only those")
+	for _, field := range fields.Fields() {
+		s := field.String()
+		wantPriority, ok := want[s]
+		if !assert.Truef(t, ok, "no expected priority for task state %q", s) {
+			continue
+		}
+		assert.Equalf(t, wantPriority, TableStatePriority(s), "priority of task state %q", s)
 	}
+	assert.Equal(t, 2, TableStatePriority("unknown_state"))
 }
 
 func TestVSchemaStatusLabel(t *testing.T) {
