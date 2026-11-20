@@ -418,7 +418,7 @@ func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
 	paused := state.IsState(data.Model.State, state.Apply.Paused)
 	if paused {
 		writeRolloutFooterAction(sb, footerStart, "Paused after a failure — to let the held deployments proceed:",
-			appendTenantFlag(fmt.Sprintf("schemabot release %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+			AppendTenantFlag(fmt.Sprintf("schemabot release %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	}
 	if !actionPending && !paused {
 		// The single-deployment footer already writes stop under every
@@ -457,7 +457,7 @@ func rolloutStopAction(footer ApplyStatusCommentData) (string, string) {
 	if command == "cancel" {
 		label = "To cancel this schema change:"
 	}
-	return label, appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, footer.ApplyID, footer.Environment), footer.Tenant)
+	return label, AppendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, footer.ApplyID, footer.Environment), footer.Tenant)
 }
 
 // rolloutFooterData is the apply-wide comment data the rollout footer renders
@@ -501,9 +501,9 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 		}
 		writeFooterAction(sb,
 			fmt.Sprintf("To run the cutover for %s:", inlineCode(na.Name)),
-			appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+			AppendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case presentation.NextActionResume:
-		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeFooterAction(sb, "Paused — to resume from where it stopped:", AppendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case presentation.NextActionReviewFailure:
 		// revert applies only to a deployment still in its post-cutover revert
 		// window, not to a failure; the recovery path for a failed apply is a
@@ -511,7 +511,7 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 		// is terminal a new apply is refused, so writeRolloutFooter offers
 		// stop instead.
 		if data.Model.OffersRetry() {
-			writeFooterAction(sb, presentation.RetryLabel+":", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+			writeFooterAction(sb, presentation.RetryLabel+":", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 		}
 	case presentation.NextActionNone:
 		// No operator action is pending; nothing to render.

@@ -743,7 +743,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			sb.WriteString("**Confirmation required** — review the plan above, then confirm manually:\n")
 			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)
 			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
-			unlockCmd := appendTenantFlag(appendDatabaseFlag("schemabot unlock", data.ScopedDatabase), data.Tenant)
+			unlockCmd := AppendTenantFlag(appendDatabaseFlag("schemabot unlock", data.ScopedDatabase), data.Tenant)
 			fmt.Fprintf(&sb, "```\n%s\n```\n", unlockCmd)
 		} else {
 			// Automatic apply is proceeding. No unlock hint — it's noise on the
@@ -753,7 +753,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	case data.MemberApplyRefusal != "":
 		writeMemberApplyRefusal(&sb, data.MemberApplyRefusalTarget, data.MemberApplyRefusal)
 	case data.applyFailsOnRefusedChange():
-		writeRefusedChangeReplan(&sb, "this plan", appendTenantFlag(appendTargetFlag(appendDatabaseFlag(fmt.Sprintf("schemabot plan -e %s", data.Environment), data.ScopedDatabase), data.Target), data.Tenant))
+		writeRefusedChangeReplan(&sb, "this plan", AppendTenantFlag(appendTargetFlag(appendDatabaseFlag(fmt.Sprintf("schemabot plan -e %s", data.Environment), data.ScopedDatabase), data.Target), data.Tenant))
 	default:
 		applyCmd := appendTargetFlag(appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase), data.Target)
 		if data.Tenant != "" {
@@ -4239,7 +4239,7 @@ func TenantCommand(baseCommand, environment, tenant string) string {
 // one lifted from another.
 func scopedCommand(baseCommand, environment, database, tenant string) string {
 	command := appendDatabaseFlag(fmt.Sprintf("%s -e %s", baseCommand, environment), database)
-	return appendTenantFlag(command, tenant)
+	return AppendTenantFlag(command, tenant)
 }
 
 // ApplyCommandOptions are the flags an apply or apply-confirm command carries
@@ -4301,7 +4301,7 @@ func writeRerunCommand(sb *strings.Builder, lead, consent, command, gap string) 
 // them.
 func scopedApplyCommand(baseCommand, environment, database string, opts ApplyCommandOptions) string {
 	command := appendDatabaseFlag(fmt.Sprintf("%s -e %s", baseCommand, environment), database)
-	command = appendTenantFlag(appendTargetFlag(command, opts.Target), opts.Tenant)
+	command = AppendTenantFlag(appendTargetFlag(command, opts.Target), opts.Tenant)
 	if opts.AllowUnsafe {
 		command += " --allow-unsafe"
 	}
@@ -4314,17 +4314,11 @@ func scopedApplyCommand(baseCommand, environment, database string, opts ApplyCom
 	return command
 }
 
-// TenantFlag is appendTenantFlag for a command with no environment, such as
-// `schemabot freeze approve`, which refuses -e.
-func TenantFlag(command, tenant string) string {
-	return appendTenantFlag(command, tenant)
-}
-
-// appendTenantFlag appends the --tenant flag to a pasteable command hint when
+// AppendTenantFlag appends the --tenant flag to a pasteable command hint when
 // tenant is set. In tenant mode, commands without an explicit tenant target
 // are ignored, so every command hint a user may copy-paste must carry the
 // deployment's tenant.
-func appendTenantFlag(command, tenant string) string {
+func AppendTenantFlag(command, tenant string) string {
 	if tenant == "" {
 		return command
 	}

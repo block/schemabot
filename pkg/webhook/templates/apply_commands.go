@@ -414,9 +414,9 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 
 	if isCLI {
 		fmt.Fprintf(&sb, "Ask the lock holder to run `%s` from their CLI, or force-unlock with:\n", cliCommand(data.CLIName, cliUnlockArgs(data.Database, data.DatabaseType)))
-		fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag("schemabot unlock -d "+data.Database+" --force", data.Tenant))
+		fmt.Fprintf(&sb, "```\n%s\n```\n", AppendTenantFlag("schemabot unlock -d "+data.Database+" --force", data.Tenant))
 	} else {
-		sb.WriteString(otherPRLockReleaseHint(appendTenantFlag("schemabot unlock", data.Tenant), data.LockedApply) + "\n")
+		sb.WriteString(otherPRLockReleaseHint(AppendTenantFlag("schemabot unlock", data.Tenant), data.LockedApply) + "\n")
 	}
 
 	return offerSupportChannel(sb.String())
@@ -468,14 +468,14 @@ func RenderApplyInProgress(data ApplyLockConflictData) string {
 
 	applyAgain := data.ApplyAgainCommand
 	if applyAgain == "" {
-		applyAgain = appendTenantFlag("schemabot apply -e "+data.Environment, data.Tenant)
+		applyAgain = AppendTenantFlag("schemabot apply -e "+data.Environment, data.Tenant)
 	}
 	applyEnvironment := data.ApplyEnvironment
 	if applyEnvironment == "" {
 		applyEnvironment = data.Environment
 	}
 	control := func(verb string) string {
-		return appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", verb, data.ApplyID, applyEnvironment), data.Tenant)
+		return AppendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", verb, data.ApplyID, applyEnvironment), data.Tenant)
 	}
 	// An apply in another environment is named by it, since the heading
 	// names the requested one.

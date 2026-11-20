@@ -25,9 +25,40 @@ func TestChangeGateRefusalDetail(t *testing.T) {
 	const freezeLine = "blocked in production by freeze frz-1 (SEV-1234, page `@payments-oncall`, until lifted); try again after it ends or is lifted."
 
 	t.Run("a command that takes --override is told how to ask", func(t *testing.T) {
-		for _, command := range []string{action.Apply, action.ApplyConfirm, action.Start, action.Cutover} {
+		for _, command := range []string{action.Apply, action.Start, action.Cutover} {
 			assert.Equal(t, freezeLine+" To ask a freeze approver to let it through, run the same command again with `--override` followed by your reason in quotes.",
 				changeGateRefusalDetail(blocked(), command, ""), command)
+		}
+	})
+
+	// A refused apply-confirm has released its pending confirmation, so
+	// running apply-confirm again would find nothing to confirm.
+	t.Run("apply-confirm is told to run apply first", func(t *testing.T) {
+		assert.Equal(t, freezeLine+" The pending confirmation was released. To ask a freeze approver to let it through, run `apply` again, then run `apply-confirm` with `--override` followed by your reason in quotes.",
+			changeGateRefusalDetail(blocked(), action.ApplyConfirm, ""))
+
+		refused := blocked()
+		refused.OverrideRequest = &storage.FreezeOverrideRequest{
+			Identifier: "ovr-0123456789abcdef", RequestedBy: "github:carol", PRAuthor: "github:alice", Reason: "hotfix",
+		}
+		assert.True(t, strings.HasSuffix(changeGateRefusalDetail(refused, action.ApplyConfirm, ""), " Then @carol runs `apply` again, then `apply-confirm`."))
+
+		refused = blocked()
+		refused.OverrideUnrecorded = true
+		assert.Contains(t, changeGateRefusalDetail(refused, action.ApplyConfirm, ""), "Run `apply` again, then `apply-confirm` with `--override`; if this persists")
+	})
+
+	t.Run("a reason that ends a sentence gets no extra period", func(t *testing.T) {
+		for reason, shown := range map[string]string{
+			"hotfix!":                "hotfix!",
+			"why?":                   "why?",
+			strings.Repeat("a", 400): strings.Repeat("a", maxShownOverrideReason-1) + "…",
+		} {
+			refused := blocked()
+			refused.OverrideRequest = &storage.FreezeOverrideRequest{
+				Identifier: "ovr-0123456789abcdef", RequestedBy: "github:carol", PRAuthor: "github:alice", Reason: reason,
+			}
+			assert.Contains(t, changeGateRefusalDetail(refused, action.Apply, ""), " Reason the approver sees: "+shown+" A freeze approver", reason)
 		}
 	})
 
@@ -84,10 +115,15 @@ func TestChangeGateRefusalDetail(t *testing.T) {
 			Reason: strings.Repeat("@y&", 170),
 		}
 		refused.OverrideReasonKept = true
-		detail := "This change did not start: it is " + changeGateRefusalDetail(refused, action.Apply, strings.Repeat("t", 63))
-		assert.LessOrEqual(t, utf8.RuneCountInString(detail), templates.MaxChangeGateRefusalLen)
-		assert.Contains(t, detail, " 3 more freezes also block it.")
-		assert.NotContains(t, detail, "frz-3")
-		assert.True(t, strings.HasSuffix(detail, " runs this command again."), detail)
+		for command, ending := range map[string]string{
+			action.Apply:        " runs this command again.",
+			action.ApplyConfirm: " runs `apply` again, then `apply-confirm`.",
+		} {
+			detail := "This change did not start: it is " + changeGateRefusalDetail(refused, command, strings.Repeat("t", 63))
+			assert.LessOrEqual(t, utf8.RuneCountInString(detail), templates.MaxChangeGateRefusalLen, command)
+			assert.Contains(t, detail, " 3 more freezes also block it.", command)
+			assert.NotContains(t, detail, "frz-3", command)
+			assert.True(t, strings.HasSuffix(detail, ending), detail)
+		}
 	})
 }

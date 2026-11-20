@@ -945,11 +945,11 @@ func shardStatusCell(s ShardStatus) string {
 func writeShardedFooter(sb *strings.Builder, data ShardedApplyData) {
 	switch {
 	case state.IsState(data.State, state.Apply.Failed):
-		writeFooterAction(sb, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+		writeFooterAction(sb, "To retry:", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case state.IsState(data.State, state.Apply.FailedRetryable):
-		writeFooterAction(sb, "An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:", appendTenantFlag(fmt.Sprintf("schemabot stop %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeFooterAction(sb, "An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:", AppendTenantFlag(fmt.Sprintf("schemabot stop %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.IsState(data.State, state.Apply.Stopped):
-		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeFooterAction(sb, "Paused — to resume from where it stopped:", AppendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.IsState(data.State, state.Apply.Cancelled):
 		sb.WriteString("\n---\n\nThis schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.\n")
 	}
