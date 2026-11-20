@@ -136,5 +136,11 @@ func TestEngineConformance(t *testing.T) {
 				},
 			}
 		},
+		Skips: map[enginetest.Case]string{
+			enginetest.CaseStartUnsupported:      "PlanetScale supports start: it deploys a deploy request whose deploy was deferred.",
+			enginetest.CaseCutoverUnsupported:    "PlanetScale supports cutover: it applies a deploy request's staged changes.",
+			enginetest.CaseRevertUnsupported:     "PlanetScale supports revert: it reverts a deployed request during its revert window.",
+			enginetest.CaseSkipRevertUnsupported: "PlanetScale supports skip-revert: it closes a deploy request's revert window early.",
+		},
 	})
 }
