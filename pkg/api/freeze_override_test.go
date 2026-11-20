@@ -18,6 +18,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/clock"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -178,7 +179,7 @@ func TestFreezeOverrideLetsAnApplyThrough(t *testing.T) {
 	assert.Equal(t, []string{"freeze freeze-incident"}, stored.Blockers)
 	assert.Equal(t, "rita", stored.RequestedBy)
 	assert.Equal(t, "fix for incident 42", stored.Reason)
-	assert.Equal(t, []string{"staging", "apply", "plan-1"}, []string{stored.Environment, stored.Action, stored.TargetID})
+	assert.Equal(t, []string{"staging", "apply", applyOverrideTarget(executeApplyTestPlan(), "")}, []string{stored.Environment, stored.Action, stored.TargetID})
 	assert.Equal(t, freezeTestNow.Add(storage.FreezeOverrideMaxLifetime), stored.ExpiresAt)
 	assert.Nil(t, applies.apply, "a refused apply must not be created")
 
@@ -423,7 +424,7 @@ func TestFreezeOverrideDoesNotCoverAFreezeLandingBeforeTheWrite(t *testing.T) {
 	mock.applies = epochCheckingApplyStore{ApplyStore: applies, freezes: freezes}
 	store := withOverrides(svc)
 	request, err := store.Create(t.Context(), &storage.FreezeOverrideRequest{
-		Identifier: "ovr-1", Environment: "staging", Action: storage.FreezeOverrideActionApply, TargetID: "plan-1",
+		Identifier: "ovr-1", Environment: "staging", Action: storage.FreezeOverrideActionApply, TargetID: applyOverrideTarget(executeApplyTestPlan(), ""),
 		Database: "testdb", Blockers: []string{"freeze freeze-incident"}, Reason: "fix", RequestedBy: "rita", ExpiresAt: freezeTestNow.Add(time.Hour),
 	})
 	require.NoError(t, err)
@@ -521,10 +522,12 @@ func TestFreezeOverrideApproveAndRead(t *testing.T) {
 	assert.Equal(t, http.StatusConflict, approveRoute(t, mux, freezeMember, expiring.Identifier).Code, "an expired request cannot be approved")
 }
 
-// Without the scoped lane there are no groups to check, as for freeze writes;
-// with it but no freeze group, nobody may approve and the denial says so.
+// Only a freeze group grants approval. With none configured nobody may
+// approve, a write-group member included, and the denial says so.
 func TestAuthorizeFreezeApprove(t *testing.T) {
-	assert.True(t, (&ServerConfig{}).AuthorizeFreezeApprove(nil).Allowed)
+	assert.False(t, (&ServerConfig{}).AuthorizeFreezeApprove(nil).Allowed)
+	writeGroupsOnly := &ServerConfig{Auth: AuthConfig{Type: "forward_auth", ForwardAuth: ForwardAuthSettings{WriteGroups: []string{"schema-admins"}}}}
+	assert.False(t, writeGroupsOnly.AuthorizeFreezeApprove(freezeAdmin).Allowed)
 
 	config := scopedWriteConfig() // operator groups, no freeze groups
 	assert.False(t, config.AuthorizeFreezeApprove(freezeAdmin).Allowed)
@@ -532,4 +535,34 @@ func TestAuthorizeFreezeApprove(t *testing.T) {
 	rec := approveRoute(t, mux, freezeAdmin, "ovr-1")
 	require.Equal(t, http.StatusForbidden, rec.Code)
 	assert.Contains(t, rec.Body.String(), "none are configured")
+}
+
+// An apply's override covers the schema it asks for, not one plan: a
+// repeated command plans afresh and must still find its approval.
+func TestApplyOverrideTargetIsTheSchemaNotThePlan(t *testing.T) {
+	plan := executeApplyTestPlan()
+	replanned := executeApplyTestPlan()
+	replanned.PlanIdentifier = "plan-2"
+	assert.Equal(t, applyOverrideTarget(plan, ""), applyOverrideTarget(replanned, ""))
+
+	changed := executeApplyTestPlan()
+	changed.SchemaFiles = schema.SchemaFiles{"testdb": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)"}}}
+	assert.NotEqual(t, applyOverrideTarget(plan, ""), applyOverrideTarget(changed, ""))
+	assert.NotEqual(t, applyOverrideTarget(plan, ""), applyOverrideTarget(plan, "member-a"))
+}
+
+// The gate records only a verified requester. An in-process caller with no
+// verified identity is refused with no request recorded.
+func TestFreezeOverrideNeedsAVerifiedRequester(t *testing.T) {
+	svc, applies := newGateApplyTestService(t, gateTestFreeze("freeze-incident"))
+	store := withOverrides(svc)
+
+	_, _, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging", Override: "fix"})
+
+	refused, ok := errors.AsType[*ChangeGateRefusedError](err)
+	require.True(t, ok, "got %v", err)
+	assert.Nil(t, refused.OverrideRequest)
+	assert.Contains(t, refused.Error(), "asking for one needs a verified caller")
+	assert.Zero(t, store.count())
+	assert.Nil(t, applies.apply)
 }

@@ -2198,11 +2198,14 @@ requests below, it refuses the change with a retryable error, never letting it t
 A freeze refuses a change unless an approved override request covers every blocker on it. The
 requester, who must be verified, runs the apply, start or cutover with an override reason, and
 SchemaBot records a request and refuses, naming it. A verified member of `freeze.groups` who is not the requester approves it;
-write groups do not grant approval, so nobody overrides alone, admins included. Storage also refuses
-the pull request's author once a request records one. The requester repeats the command and it is
-admitted. An approval covers one environment, one action and one target (a plan for an apply, an
-apply for a start or a cutover) and expires after 24 hours. A blocker the request does not name
-refuses again and needs a new request.
+write groups do not grant approval, and with no freeze group configured nobody approves, so nobody
+overrides alone, admins included. Storage also refuses the pull request's author once a request
+records one. The requester repeats the command and it is admitted. An approval covers one
+environment, one action and one target and expires after 24 hours. For an apply the target is the
+database, the rollout member it is narrowed to and the schema it asks for (`applyOverrideTarget`),
+not the plan, because a repeated command plans afresh; a changed schema needs a new approval. For a
+start or a cutover it is the apply. A blocker the request does not name refuses again and needs a
+new request.
 A PR rollback is known by a `pinned_rollback` option the server records when it creates the apply.
 A rollback created by an earlier version has none, so a freeze holds its later start or cutover;
 lifting the freeze lets it through.

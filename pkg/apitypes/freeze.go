@@ -77,8 +77,9 @@ type FreezeListResponse struct {
 type FreezeOverrideRequest struct {
 	ID          string `json:"id"`
 	Environment string `json:"environment"`
-	// Action is "apply", "start" or "cutover". TargetID is the plan an apply
-	// would run, or the apply a start or cutover would act on.
+	// Action is "apply", "start" or "cutover". TargetID is the database,
+	// member and schema an apply asks for, or the apply a start or cutover
+	// would act on.
 	Action   string `json:"action"`
 	TargetID string `json:"target_id"`
 	Database string `json:"database"`

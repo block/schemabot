@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -256,6 +259,8 @@ func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, call
 			s.logger.Info("override requested for a change a gate refused", append(attrs,
 				"override_request", requested.Identifier, "reason", requested.Reason, "blockers", requested.Blockers)...)
 			refusal.OverrideRequest = requested
+		} else {
+			refusal.OverrideUnrecorded = true
 		}
 	}
 	s.logger.Warn("change gate refused the change", append(attrs, "blockers", changeGateBlockerIDs(blockers))...)
@@ -296,6 +301,12 @@ func (s *Service) requestOverride(ctx context.Context, in changeGateInput, block
 	if overrides == nil || freezes == nil {
 		return nil, nil
 	}
+	// Only a verified caller may ask. A request recorded as "unverified"
+	// names nobody, so its asker could approve it under their own name.
+	requester, verified := auth.VerifiedSubject(ctx)
+	if !verified {
+		return nil, nil
+	}
 	now, err := freezes.Now(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("read the database clock for an override request: %w", err)
@@ -308,9 +319,24 @@ func (s *Service) requestOverride(ctx context.Context, in changeGateInput, block
 		Database:    in.Database,
 		Blockers:    changeGateBlockerIDs(blockers),
 		Reason:      in.Override,
-		RequestedBy: freezeCaller(ctx),
+		RequestedBy: requester,
 		ExpiresAt:   now.Add(storage.FreezeOverrideMaxLifetime),
 	})
+}
+
+// applyOverrideTarget names what an override of an apply covers: the
+// database, the rollout member it is narrowed to, and the schema it asks
+// for. It is not the plan's identifier, because each apply from a pull
+// request or the CLI plans afresh, and a repeated command would never find
+// its approval. A changed schema is a new target and needs a new approval.
+func applyOverrideTarget(plan *storage.Plan, target string) string {
+	files, err := json.Marshal(plan.SchemaFiles) // map keys marshal sorted
+	if err != nil {
+		// Fail safe: a target no approval names.
+		return plan.PlanIdentifier
+	}
+	sum := sha256.Sum256(files)
+	return fmt.Sprintf("%s/%s@%x", plan.Database, target, sum[:8])
 }
 
 // isFreezeAdmissionRefusal reports whether the admission write refused the
@@ -364,6 +390,10 @@ type ChangeGateRefusedError struct {
 	// OverrideRequest is the request recorded for a caller who gave an
 	// override reason, awaiting an approver other than the requester.
 	OverrideRequest *storage.FreezeOverrideRequest
+	// OverrideUnrecorded reports an override reason given by a caller who
+	// is not verified, or to a server with no override storage: no request
+	// was recorded.
+	OverrideUnrecorded bool
 }
 
 func (e *ChangeGateRefusedError) Error() string {
@@ -378,6 +408,9 @@ func (e *ChangeGateRefusedError) Error() string {
 	message := fmt.Sprintf("blocked in %s by %s; try again after it ends or is lifted", e.Environment, strings.Join(parts, "; "))
 	if e.OverrideRequest != nil {
 		message += fmt.Sprintf("; override request %s needs a freeze approver other than you", e.OverrideRequest.Identifier)
+	}
+	if e.OverrideUnrecorded {
+		message += "; no override was requested, because asking for one needs a verified caller"
 	}
 	return message
 }
