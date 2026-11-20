@@ -233,10 +233,10 @@ func TestCheckSharedSchemaIgnoreLists_TableDeclaredByBoth(t *testing.T) {
 	require.True(t, errors.As(err, &mismatch), "want a SharedSchemaIgnoreListsError, got %v", err)
 	assert.Empty(t, mismatch.Missing)
 	assert.Equal(t, []DoublyDeclaredTables{{
-		Databases:  [2]string{"shop", "shop_sharded"},
-		Namespaces: [2]string{"shop_0", "shop_0"},
-		Target:     "shop-001",
-		Tables:     []string{"Orders"},
+		Databases: [2]string{"shop", "shop_sharded"},
+		Namespace: "shop_0",
+		Target:    "shop-001",
+		Tables:    []string{"Orders"},
 	}}, mismatch.Doubled)
 	assert.Contains(t, err.Error(), `"shop" and "shop_sharded" both declare "Orders" in namespace "shop_0" on target "shop-001"`)
 }
@@ -441,9 +441,12 @@ func namespacedSide(database, namespace string, ignore []string, tables ...strin
 // is sent as that one database, so two databases on the same target collide
 // even when their namespace keys differ, and only the data plane knows which
 // kind of connection the target uses. The check therefore compares a MySQL
-// pair across namespaces: each needs the other's tables in its ignore_tables,
-// and a table both declare is refused. A PostgreSQL target plans each schema
-// on its own, so the same pair under different keys shares nothing.
+// pair across namespaces: each needs the other's tables in its ignore_tables.
+// A table both declare under different namespaces is not refused, because on
+// a target whose connection names no database those are two separate tables
+// and neither database could act on the refusal. A PostgreSQL target plans
+// each schema on its own, so the same pair under different keys shares
+// nothing.
 func TestCheckSharedSchemaIgnoreLists_MySQLComparesAcrossNamespaces(t *testing.T) {
 	cfg, err := ParseServerConfig([]byte(sharedTargetConfig))
 	require.NoError(t, err)
@@ -485,20 +488,31 @@ func TestCheckSharedSchemaIgnoreLists_MySQLComparesAcrossNamespaces(t *testing.T
 		require.NoError(t, cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded}))
 	})
 
-	t.Run("a table both declare is refused", func(t *testing.T) {
-		shop := namespacedSide("shop", "shop", nil, "orders")
-		sharded := namespacedSide("shop_sharded", "shop_sharded", nil, "orders")
+	t.Run("a table both declare under different namespaces passes", func(t *testing.T) {
+		shop := namespacedSide("shop", "shop", nil, "users")
+		sharded := namespacedSide("shop_sharded", "shop_sharded", nil, "users")
+
+		require.NoError(t, cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded}))
+	})
+
+	t.Run("a doubly declared table does not hide a missing entry beside it", func(t *testing.T) {
+		shop := namespacedSide("shop", "shop", nil, "users")
+		sharded := namespacedSide("shop_sharded", "shop_sharded", nil, "users", "orders")
 
 		err := cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded})
 		var mismatch *SharedSchemaIgnoreListsError
 		require.True(t, errors.As(err, &mismatch), "want a SharedSchemaIgnoreListsError, got %v", err)
-		assert.Empty(t, mismatch.Missing)
-		assert.Equal(t, []DoublyDeclaredTables{{
-			Databases:  [2]string{"shop", "shop_sharded"},
-			Namespaces: [2]string{"shop", "shop_sharded"},
-			Target:     "shop-001",
-			Tables:     []string{"orders"},
-		}}, mismatch.Doubled)
+		assert.Empty(t, mismatch.Doubled)
+		assert.Equal(t, []MissingIgnoreEntry{{
+			Database:       "shop",
+			ConfigPath:     "db/shop/schemabot.yaml",
+			DeclaredBy:     "shop_sharded",
+			Namespace:      "shop_sharded",
+			OwnerNamespace: "shop",
+			Target:         "shop-001",
+			Tables:         []string{"orders"},
+			Entries:        []string{"orders"},
+		}}, mismatch.Missing)
 	})
 
 	t.Run("postgres schemas under different keys share nothing", func(t *testing.T) {
