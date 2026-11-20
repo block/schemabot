@@ -815,16 +815,18 @@ fresh-snapshot and uncached apply-acceptance gates (`pkg/webhook/apply_handlers.
 
 ### MG-14: Databases that share a schema pass only while each withholds the other's tables
 
-When two databases managed from one repository can plan the same tables on the same rollout member,
-because they share a namespace there or because the member may plan their namespaces as one unit,
-a plan or apply of either passes only while each withholds from its plans every table the other
-declares there, and no table is declared by both in a namespace they share. Both databases' schema
-files are read at the pull request's head, so the rule holds before an apply has created a new
-table, and a pull request that adds a table to one database and withholds it from the other in the
-same change passes. A database whose files cannot be read fails the environment rather than passing
-it. *Breaks if violated:* a pull request that adds a table to one database merges green, and once
+When two databases managed from one repository have namespaces that the same rollout member stores
+in one schema, as that member's data plane reports it, a plan or apply of either passes only while
+each withholds from its plans every table the other declares in that schema, and no table is
+declared by both there. Both databases' schema files are read at the pull request's head, so the
+rule holds before an apply has created a new table, and a pull request that adds a table to one
+database and withholds it from the other in the same change passes. A database whose files cannot
+be read, or whose namespaces the member's data plane cannot place, fails the environment rather
+than passing it. *Breaks if violated:* a pull request that adds a table to one database merges green, and once
 it is applied the other database's next plan proposes dropping it. *Enforced:*
-`CheckSharedSchemaIgnoreLists` in `pkg/api/shared_schema.go`, run before the plan by
+`CheckSharedSchemaIgnoreLists` in `pkg/api/shared_schema.go`, which places each namespace through
+`Service.ResolveNamespaces` (`pkg/api/shared_schema_resolve.go`) and the data plane's
+`ResolveNamespaces` (`pkg/tern/local_client.go`), run before the plan by
 `verifySharedSchemaIgnoreLists` (`pkg/webhook/shared_schema.go`) from the single- and
 multi-environment plans in `pkg/webhook/plan.go`, and before an apply or apply-confirm by
 `enforceSharedSchemaIgnoreLists` in `pkg/webhook/apply_handlers.go`, whose comparison holds only
