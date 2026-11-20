@@ -89,6 +89,11 @@ func userFacingError(err error) string {
 	if _, ok := errors.AsType[*api.DropTablesCheckError](err); ok {
 		return dropTablesCheckFailedMessage
 	}
+	// The cause is the data plane's error, which the caller logs with its
+	// identifiers.
+	if resolveErr, ok := errors.AsType[*api.NamespaceResolutionError](err); ok {
+		return namespaceResolutionFailedMessage(resolveErr)
+	}
 	var remoteErr *api.RemoteDeploymentUnavailableError
 	if errors.As(err, &remoteErr) {
 		return userFacingRemoteUnavailableError(remoteErr.Deployment, remoteErr.Target, err.Error())
@@ -97,6 +102,20 @@ func userFacingError(err error) string {
 		return userFacingRemoteUnavailableError("", "", err.Error())
 	}
 	return err.Error()
+}
+
+// namespaceResolutionFailedMessage is the PR comment line for a shared schema
+// check that could not learn which schemas a database's namespaces address on
+// a target. A data plane too old to answer needs an upgrade, and saying so is
+// the whole remedy; any other failure is named only by its identifiers.
+func namespaceResolutionFailedMessage(err *api.NamespaceResolutionError) string {
+	where := "target `" + err.Target + "` of deployment `" + err.Deployment + "`"
+	if err.DataPlaneTooOld() {
+		return "SchemaBot could not check which schemas `" + err.Database + "` shares with other databases on " + where +
+			", because that deployment's data plane cannot report which schema each namespace addresses. Upgrade that data plane, then run the command again."
+	}
+	return "SchemaBot could not check which schemas `" + err.Database + "` shares with other databases on " + where +
+		", so the command was refused. Run the command again; if it fails again, the SchemaBot server logs have the cause."
 }
 
 func userFacingConfigNotAuthorizedError(err error) (string, bool) {
