@@ -36,7 +36,7 @@ func (ic *InstallationClient) FetchPRSchemaEvents(ctx context.Context, repo stri
 	opts := &gh.ListOptions{PerPage: 100}
 	var state PRSchemaEvents
 	var response *gh.Response
-	events, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "list PR schema exception events", []any{"repo", repo, "pr", pr}, func(ctx context.Context) ([]*gh.Timeline, error) {
+	events, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationListIssueTimeline, "list PR schema exception events", []any{"repo", repo, "pr", pr}, func(ctx context.Context) ([]*gh.Timeline, error) {
 		events, resp, err := ic.client.Issues.ListIssueTimeline(ctx, owner, name, pr, opts)
 		response = resp
 		return events, classifyGitHubAPIError(err)
