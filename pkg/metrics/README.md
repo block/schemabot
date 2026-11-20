@@ -350,8 +350,10 @@ installation of the App instead (`operation="list_app_installations"`).
 `schemabot.github.rate_limit.unobserved_installations` makes a missing budget
 visible. It counts the probe's installations with no exportable snapshot, plus
 each configured owner whose installation the probe could not resolve on its
-last pass (a 404, meaning the App is not installed on that repository, is not
-counted: no installation serves it). Because a missing series cannot lower a
+last pass. A 404, meaning the App is not installed on that repository, is not
+counted: no installation serves it. Neither is an installation its owner has
+suspended, which cannot mint the token a budget read needs and serves no work
+until it is unsuspended. Because a missing series cannot lower a
 `min`, a headroom gate checks both: `min` of the snapshot `remaining` at or
 above its threshold, and `max` of `unobserved_installations` at 0. Treat no
 data on either query as a failure. The budget read is

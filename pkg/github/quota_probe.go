@@ -183,7 +183,12 @@ func (p *QuotaProbe) probeOnce(ctx context.Context) {
 			"error", err)
 		return
 	}
-	p.reportTargets(targets)
+	// Report the targets once the reads are done, not before: the App slug
+	// that labels them can be learned during the first pass's reads, and the
+	// targets must carry the same label as the snapshots those reads record.
+	// The reads are bounded by readTimeout, so the report is never held for
+	// longer than that.
+	defer p.reportTargets(targets)
 	ids := targets.installations
 	if len(ids) == 0 {
 		p.logger.Debug("GitHub quota probe has no installations to read", "unresolved_owners", targets.unresolved)
@@ -274,6 +279,11 @@ func (c *Client) listActiveInstallations(ctx context.Context) (quotaTargets, err
 // repository: the first repository's answer stands for the whole owner when
 // the installation belongs to the owner's account.
 //
+// A suspended installation is skipped like a repository the App is not
+// installed on, matching the all-installations listing: it cannot mint the
+// token a budget read needs, and it serves no SchemaBot work until the owner
+// unsuspends it, so its budget is not one a gate should wait on.
+//
 // A lookup that fails for any reason other than the App not being installed
 // counts the owner as unresolved and moves on, so GitHub being down fails
 // closed at one lookup per owner. Once the pass's deadline has passed, the
@@ -314,7 +324,10 @@ func (c *Client) servingInstallations(ctx context.Context, repos []string) quota
 				targets.unresolved++
 				break
 			}
-			if !seen[lookup.id] {
+			if lookup.suspended {
+				c.logger.Warn("GitHub quota probe found a configured repository served by a suspended installation; it cannot mint the token a budget read needs and serves no requests until it is unsuspended, so it has no budget to observe",
+					"repo", repo, "installation_id", lookup.id)
+			} else if !seen[lookup.id] {
 				seen[lookup.id] = true
 				targets.installations = append(targets.installations, lookup.id)
 			}

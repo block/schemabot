@@ -257,18 +257,23 @@ func TestQuotaProbeRepeatsUntilStopped(t *testing.T) {
 }
 
 // Every pass publishes the installations it is responsible for, including the
-// owners it could not resolve, before it reads any budget, so the count of
-// unobserved installations reflects this pass even if a read then hangs.
+// owners it could not resolve, once its budget reads are done, so the targets
+// carry the App label the reads' snapshots were recorded under.
 func TestQuotaProbeReportsItsTargetsEachPass(t *testing.T) {
 	probe, reads, _ := recordingQuotaProbe(t, nil)
 	probe.listInstallations = func(context.Context) (quotaTargets, error) {
 		return quotaTargets{installations: []int64{11}, unresolved: 1}, nil
 	}
 	var reported []quotaTargets
-	probe.reportTargets = func(targets quotaTargets) { reported = append(reported, targets) }
+	readsBeforeReport := -1
+	probe.reportTargets = func(targets quotaTargets) {
+		readsBeforeReport = len(reads)
+		reported = append(reported, targets)
+	}
 
 	probe.probeOnce(t.Context())
 
+	assert.Equal(t, 1, readsBeforeReport, "targets must be reported after the pass's reads finish")
 	assert.Equal(t, int64(11), receiveRead(t, reads))
 	assert.Equal(t, []quotaTargets{{installations: []int64{11}, unresolved: 1}}, reported)
 }
@@ -407,6 +412,27 @@ func TestServingInstallationsSkipRepositoryAppIsNotInstalledOn(t *testing.T) {
 	assert.Equal(t, quotaTargets{installations: []int64{7}}, targets)
 	assert.Equal(t, 1, server.count("octo/a"))
 	assert.Equal(t, 1, server.count("octo/b"))
+}
+
+// A configured repository whose owner suspended the App's installation is
+// skipped like one the App is not installed on: the installation cannot mint a
+// token to read its budget and serves no work until it is unsuspended, so it
+// is neither read nor counted unobserved. The owner's answer still stands for
+// its other repositories.
+func TestServingInstallationsSkipSuspendedInstallation(t *testing.T) {
+	client, server := newInstallationLookupClient(t, func(owner, _ string) (int, int64, string) {
+		if owner == "paused" {
+			return http.StatusOK, 9, owner
+		}
+		return http.StatusOK, 7, owner
+	})
+	server.suspended = map[int64]bool{9: true}
+
+	targets := client.servingInstallations(t.Context(), []string{"octo/a", "paused/a", "paused/b"})
+
+	assert.Equal(t, quotaTargets{installations: []int64{7}}, targets)
+	assert.Equal(t, 1, server.count("paused/a"))
+	assert.Equal(t, 0, server.count("paused/b"))
 }
 
 // Listing pages through every installation and skips suspended ones, whose

@@ -449,10 +449,13 @@ func sharedLookupAnswersOwner(lookup ownerInstallationLookup, err error) bool {
 // naming the repository the lookup went through. ownerWide reports that the
 // installation belongs to the owner's account and was cached for it, so it
 // answers every repository of the owner; otherwise it answers only repo.
+// suspended reports that the owner has suspended the installation, so it
+// cannot mint installation tokens until it is unsuspended.
 type ownerInstallationLookup struct {
 	repo      string
 	id        int64
 	ownerWide bool
+	suspended bool
 }
 
 func (c *Client) cachedOwnerInstallation(ownerKey string) (int64, bool) {
@@ -480,13 +483,14 @@ func (c *Client) lookUpRepoInstallation(ctx context.Context, repo, owner, name s
 		return failed, fmt.Errorf("find installation for %s: GitHub returned installation id 0", repo)
 	}
 	account := installation.GetAccount().GetLogin()
+	suspended := installation.SuspendedAt != nil
 	if !strings.EqualFold(account, owner) {
 		// The installation belongs to an account other than the repository's
 		// owner, so it cannot stand for the owner's other repositories. The id
 		// still answers this repository; it is just not cached.
 		c.logger.Warn("GitHub App installation for repository belongs to another account; using it for this repository without caching it for the owner",
 			"repo", repo, "owner", owner, "installation_account", account, "installation_id", id)
-		return ownerInstallationLookup{repo: repo, id: id}, nil
+		return ownerInstallationLookup{repo: repo, id: id, suspended: suspended}, nil
 	}
 	c.ownerInstallationsMu.Lock()
 	if c.ownerInstallations == nil {
@@ -500,7 +504,7 @@ func (c *Client) lookUpRepoInstallation(ctx context.Context, repo, owner, name s
 	} else {
 		c.logger.Info("resolved GitHub App installation for repository owner", "repo", repo, "owner", owner, "installation_id", id, "previous_installation_id", previous)
 	}
-	return ownerInstallationLookup{repo: repo, id: id, ownerWide: true}, nil
+	return ownerInstallationLookup{repo: repo, id: id, ownerWide: true, suspended: suspended}, nil
 }
 
 // ErrAppNotInstalled reports that GitHub has no installation of this App
