@@ -58,6 +58,8 @@ const (
 	issueCommentGateDeferCutover        issueCommentGateBlockReason = "defer-cutover flag unsupported for command"
 	issueCommentGateDatabase            issueCommentGateBlockReason = "database flag unsupported for command"
 	issueCommentGateTarget              issueCommentGateBlockReason = "target flag unsupported for command"
+	issueCommentGateOverride            issueCommentGateBlockReason = "override flag unsupported for command"
+	issueCommentGateOverrideReason      issueCommentGateBlockReason = "override reason invalid"
 )
 
 // issueCommentGateBlock evaluates the routing and usage gates shared by the
@@ -104,6 +106,14 @@ func (h *Handler) issueCommentGateBlock(repo string, result CommandResult, parse
 	}
 	if !commandSupportsTargetFlag(result.Action) && parser.HasTargetFlag(commentBody) {
 		return issueCommentGateTarget
+	}
+	if !commandSupportsOverrideFlag(result.Action) && parser.HasOverrideFlag(commentBody) {
+		return issueCommentGateOverride
+	}
+	if result.OverrideGiven {
+		if _, err := api.ValidateOverrideReason(result.Override); err != nil {
+			return issueCommentGateOverrideReason
+		}
 	}
 	return issueCommentGatePass
 }
@@ -483,6 +493,24 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		}
 		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 		h.postComment(repo, pr, installationID, templates.RenderUnsupportedTargetFlag(result.Action))
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
+		return
+	}
+
+	if gateReason == issueCommentGateOverride || gateReason == issueCommentGateOverrideReason {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping override flag reply for unscoped fan-out; the leader posts it once",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
+			return
+		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
+		if gateReason == issueCommentGateOverride {
+			h.postComment(repo, pr, installationID, templates.RenderUnsupportedOverrideFlag(result.Action))
+		} else {
+			_, err := api.ValidateOverrideReason(result.Override)
+			h.postComment(repo, pr, installationID, templates.RenderInvalidOverrideReason(result.Action, err.Error()))
+		}
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
 		return
 	}

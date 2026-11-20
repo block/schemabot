@@ -3,6 +3,7 @@ package webhook
 import (
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/block/schemabot/pkg/storage"
@@ -47,6 +48,12 @@ type CommandSpec struct {
 	// SupportsTarget means `--target <target>` is recognized: the command can
 	// be narrowed to one rollout member of the environment `-e` names.
 	SupportsTarget bool
+
+	// SupportsOverride means `--override "<reason>"` is recognized: the
+	// command asks for a freeze override when a freeze refuses it. Rollback,
+	// revert and the pinned rollback skip the freeze gate, so they never take
+	// it.
+	SupportsOverride bool
 }
 
 // commandSpecs is the registry of all SchemaBot commands. Order does not
@@ -57,18 +64,18 @@ var commandSpecs = []CommandSpec{
 	{Name: action.Plan, RequiresEnv: true, SupportsDB: true, SupportsTarget: true},
 	{Name: action.Apply, RequiresEnv: true, SupportsDB: true,
 		SupportsSkipRevert: true, SupportsDeferCutover: true,
-		SupportsAllowUnsafe: true, SupportsTarget: true},
+		SupportsAllowUnsafe: true, SupportsTarget: true, SupportsOverride: true},
 	{Name: action.ApplyConfirm, RequiresEnv: true, SupportsDB: true,
 		SupportsSkipRevert: true, SupportsDeferCutover: true, SupportsAllowUnsafe: true},
 	{Name: action.Unlock, SupportsDB: true, SupportsForce: true},
 	{Name: action.FixLint, SupportsDB: true},
 	{Name: action.Stop, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Cancel, RequiresEnv: true, HasApplyID: true},
-	{Name: action.Start, RequiresEnv: true, HasApplyID: true},
+	{Name: action.Start, RequiresEnv: true, HasApplyID: true, SupportsOverride: true},
 	{Name: action.Release, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Revert, RequiresEnv: true, HasApplyID: true},
 	{Name: action.SkipRevert, RequiresEnv: true, HasApplyID: true},
-	{Name: action.Cutover, RequiresEnv: true, HasApplyID: true},
+	{Name: action.Cutover, RequiresEnv: true, HasApplyID: true, SupportsOverride: true},
 	{Name: action.Rollback, RequiresEnv: true, HasApplyID: true},
 	{Name: action.RollbackConfirm, RequiresEnv: true, SupportsDeferCutover: true, SupportsAllowUnsafe: true},
 }
@@ -106,6 +113,11 @@ func commandSupportsDatabaseFlag(actionName string) bool {
 func commandSupportsTargetFlag(actionName string) bool {
 	spec, ok := specByName[actionName]
 	return ok && spec.SupportsTarget
+}
+
+func commandSupportsOverrideFlag(actionName string) bool {
+	spec, ok := specByName[actionName]
+	return ok && spec.SupportsOverride
 }
 
 // CommandParser parses SchemaBot commands from PR comments.
@@ -151,16 +163,21 @@ type CommandResult struct {
 	// Target is the optional --target value: the one rollout member of the
 	// environment a plan or apply is narrowed to, by its target name or as
 	// deployment/target.
-	Target       string
-	Tenant       string // Optional --tenant/-t routing target for this command.
-	TenantError  bool   // True when --tenant/-t is present without a valid routing target.
-	SkipRevert   bool
-	DeferCutover bool
-	AllowUnsafe  bool
-	Force        bool
-	Found        bool
-	IsHelp       bool
-	IsMention    bool
+	Target string
+	// Override is the raw --override value, a reason for a freeze override;
+	// OverrideGiven reports the flag was present, so a blank one can be
+	// refused. The dispatcher validates it (api.ValidateOverrideReason).
+	Override      string
+	OverrideGiven bool
+	Tenant        string // Optional --tenant/-t routing target for this command.
+	TenantError   bool   // True when --tenant/-t is present without a valid routing target.
+	SkipRevert    bool
+	DeferCutover  bool
+	AllowUnsafe   bool
+	Force         bool
+	Found         bool
+	IsHelp        bool
+	IsMention     bool
 	// ProseMention is true when the comment has a line opening with
 	// `schemabot` that reads as a sentence about SchemaBot, and no line
 	// addressed to it. Such a comment is not answered.
@@ -268,6 +285,8 @@ var valueFlags = map[string]string{
 	"-t":       "-t",
 	"--tenant": "-t",
 	"--target": "--target",
+	// The value may be quoted; see splitCommandWords.
+	overrideFlag: overrideFlag,
 }
 
 // firstDirective returns the first line that opens with `schemabot` and is
@@ -280,7 +299,12 @@ func (p *CommandParser) firstDirective(body string) (d directive, ok, prose bool
 		if loc == nil {
 			continue
 		}
-		d := p.parseDirective(strings.Fields(line[loc[1]:]))
+		words, bound, badQuote := splitCommandWords(line[loc[1]:])
+		d := p.parseDirective(words, bound)
+		// A quote left open is a command attempt gone wrong, not a sentence.
+		if badQuote && d.kind == lineCommand {
+			d.kind = lineMalformed
+		}
 		if d.kind == lineProse {
 			prose = true
 			continue
@@ -288,6 +312,72 @@ func (p *CommandParser) firstDirective(body string) (d directive, ok, prose bool
 		return d, true, prose
 	}
 	return directive{}, false, prose
+}
+
+// overrideFlag is the one flag whose value may be quoted: a reason is a
+// sentence, and Fields would break it into words. A quote anywhere else is an
+// ordinary character, so `SchemaBot "apply" failed` or an apostrophe in prose
+// parses as it always did.
+const overrideFlag = "--override"
+
+// splitCommandWords splits the text after `schemabot` into words exactly as
+// strings.Fields does, except that the value of --override may be wrapped in
+// double or straight single quotes, as `--override "fix the index"` or
+// `--override="fix the index"`, and then comes out as one word, unquoted.
+// bound marks the index of each such value, quoted or after `=`, so a reason
+// that opens with a dash stays the reason instead of reading as a flag.
+// badQuote reports a quote that never closes, or text glued to its close.
+func splitCommandWords(s string) (words []string, bound map[int]bool, badQuote bool) {
+	bound = map[int]bool{}
+	for rest := strings.TrimLeftFunc(s, unicode.IsSpace); rest != ""; rest = strings.TrimLeftFunc(rest, unicode.IsSpace) {
+		end := strings.IndexFunc(rest, unicode.IsSpace)
+		if end < 0 {
+			end = len(rest)
+		}
+		word, lower := rest[:end], strings.ToLower(rest[:end])
+		rest = rest[end:]
+		switch {
+		case lower == overrideFlag:
+			words = append(words, word)
+			if value, after, ok, bad := cutQuoted(strings.TrimLeftFunc(rest, unicode.IsSpace)); ok {
+				bound[len(words)] = true
+				words, rest, badQuote = append(words, value), after, badQuote || bad
+			}
+		case strings.HasPrefix(lower, overrideFlag+"="):
+			words = append(words, word[:len(overrideFlag)])
+			value := word[len(overrideFlag)+1:]
+			if quoted, after, ok, bad := cutQuoted(value + rest); ok {
+				value, rest, badQuote = quoted, after, badQuote || bad
+			}
+			bound[len(words)] = true
+			words = append(words, value)
+		default:
+			words = append(words, word)
+		}
+	}
+	return words, bound, badQuote
+}
+
+// cutQuoted reads the quoted value that opens s, and returns what follows it.
+// Text glued to the closing quote is dropped and reported bad, as is a quote
+// left open.
+func cutQuoted(s string) (value, after string, ok, bad bool) {
+	if s == "" || (s[0] != '"' && s[0] != '\'') {
+		return "", s, false, false
+	}
+	value, after, closed := strings.Cut(s[1:], s[:1])
+	if !closed {
+		return s[1:], "", true, true
+	}
+	if r, _ := utf8.DecodeRuneInString(after); after != "" && !unicode.IsSpace(r) {
+		bad = true
+		if i := strings.IndexFunc(after, unicode.IsSpace); i >= 0 {
+			after = after[i:]
+		} else {
+			after = ""
+		}
+	}
+	return value, after, true, bad
 }
 
 // parseDirective splits words, everything after `schemabot` on a line, into a
@@ -305,7 +395,10 @@ func (p *CommandParser) firstDirective(body string) (d directive, ok, prose bool
 // database, or target), or when it is ambiguous (a value flag given twice, two
 // apply IDs). A present -e or -t value is checked later, where an invalid one gets its own
 // usage answer.
-func (p *CommandParser) parseDirective(words []string) directive {
+//
+// bound marks words that are a flag's value by their quoting or `=`, from
+// splitCommandWords; such a word is the value even when it opens with a dash.
+func (p *CommandParser) parseDirective(words []string, bound map[int]bool) directive {
 	d := directive{kind: lineCommand, flags: map[string]bool{}, values: map[string]string{}, repeated: map[string]bool{}}
 	if len(words) == 0 {
 		return d
@@ -332,7 +425,7 @@ func (p *CommandParser) parseDirective(words []string) directive {
 				malformed = true
 			}
 			value := ""
-			if i+1 < len(words) && !looksLikeFlag(words[i+1]) {
+			if i+1 < len(words) && (bound[i+1] || !looksLikeFlag(words[i+1])) {
 				i++
 				value = words[i]
 			}
@@ -644,6 +737,9 @@ func (p *CommandParser) applySpec(spec CommandSpec, d directive, tenant string, 
 	if spec.SupportsTarget {
 		result.Target = d.values["--target"]
 	}
+	if spec.SupportsOverride {
+		result.Override, result.OverrideGiven = d.values[overrideFlag]
+	}
 	if spec.SupportsSkipRevert {
 		result.SkipRevert = d.flags["--skip-revert"]
 	}
@@ -729,6 +825,18 @@ func (p *CommandParser) HasDatabaseFlag(body string) bool {
 func (p *CommandParser) HasTargetFlag(body string) bool {
 	d, ok := p.commandDirective(body)
 	return ok && d.values["--target"] != ""
+}
+
+// HasOverrideFlag reports whether the command carries `--override`, regardless
+// of which command it accompanies. Read off the directive line for the same
+// reason as HasDatabaseFlag.
+func (p *CommandParser) HasOverrideFlag(body string) bool {
+	d, ok := p.commandDirective(body)
+	if !ok {
+		return false
+	}
+	_, given := d.values[overrideFlag]
+	return given
 }
 
 // HasDeferCutoverFlag reports whether the command carries `--defer-cutover`,
