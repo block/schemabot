@@ -93,6 +93,14 @@ func (m *memoryFreezeOverrideStore) Approve(_ context.Context, identifier, appro
 }
 
 func (m *memoryFreezeOverrideStore) ListApproved(_ context.Context, target storage.FreezeOverrideTarget) ([]*storage.FreezeOverrideRequest, error) {
+	return m.list(target, true)
+}
+
+func (m *memoryFreezeOverrideStore) ListPending(_ context.Context, target storage.FreezeOverrideTarget) ([]*storage.FreezeOverrideRequest, error) {
+	return m.list(target, false)
+}
+
+func (m *memoryFreezeOverrideStore) list(target storage.FreezeOverrideTarget, approvedOnly bool) ([]*storage.FreezeOverrideRequest, error) {
 	if m.listErr != nil {
 		return nil, m.listErr
 	}
@@ -100,7 +108,7 @@ func (m *memoryFreezeOverrideStore) ListApproved(_ context.Context, target stora
 	defer m.mu.Unlock()
 	var approved []*storage.FreezeOverrideRequest
 	for _, request := range m.requests {
-		if request.ApprovedAt != nil && request.ExpiresAt.After(m.clock.Now().UTC()) &&
+		if (request.ApprovedAt != nil) == approvedOnly && request.ExpiresAt.After(m.clock.Now().UTC()) &&
 			request.Environment == storage.CanonicalKey(target.Environment) && request.Action == target.Action && request.TargetID == target.TargetID {
 			copied := *request
 			approved = append(approved, &copied)
@@ -182,6 +190,10 @@ func TestFreezeOverrideLetsAnApplyThrough(t *testing.T) {
 	assert.Equal(t, []string{"staging", "apply", applyOverrideTarget(executeApplyTestPlan(), "")}, []string{stored.Environment, stored.Action, stored.TargetID})
 	assert.Equal(t, freezeTestNow.Add(storage.FreezeOverrideMaxLifetime), stored.ExpiresAt)
 	assert.Nil(t, applies.apply, "a refused apply must not be created")
+	rec = postAs(t, mux, overrideRequester, "/api/apply", overrideApplyBody)
+	require.Equal(t, http.StatusConflict, rec.Code)
+	assert.Equal(t, id, decodeGateError(t, rec).OverrideRequest.ID, "asking again keeps the one request")
+	assert.Equal(t, 1, store.count())
 
 	approveOverride(t, store, id)
 	other := &auth.User{Subject: "sam", Groups: []string{"schema-admins"}}
@@ -193,7 +205,7 @@ func TestFreezeOverrideLetsAnApplyThrough(t *testing.T) {
 	require.NotNil(t, applies.apply)
 	assert.Equal(t, id, applies.apply.GetOptions().FreezeOverride)
 	assert.Equal(t, 1, store.count(), "an admitted apply records no second request")
-	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 2}, changeGateCounters(t, reader, "schemabot.change_gate.refusals"))
+	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 3}, changeGateCounters(t, reader, "schemabot.change_gate.refusals"))
 	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 1}, changeGateCounters(t, reader, "schemabot.change_gate.overrides"))
 }
 

@@ -314,6 +314,19 @@ func (s *Service) requestOverride(ctx context.Context, in changeGateInput, block
 	if !verified {
 		return nil, nil
 	}
+	// A requester who repeats the command before approval keeps the one
+	// request, so the approver sees one thread per change.
+	pending, err := overrides.ListPending(ctx, storage.FreezeOverrideTarget{Environment: in.Environment, Action: in.Action, TargetID: in.TargetID})
+	if err != nil {
+		return nil, fmt.Errorf("list pending override requests for %s %s in %s: %w", in.Action, in.TargetID, in.Environment, err)
+	}
+	ids := changeGateBlockerIDs(blockers)
+	for _, request := range pending {
+		if storage.CanonicalKey(request.RequestedBy) == storage.CanonicalKey(requester) &&
+			len(request.Blockers) == len(ids) && request.Covers(ids) {
+			return request, nil
+		}
+	}
 	now, err := freezes.Now(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("read the database clock for an override request: %w", err)
@@ -324,7 +337,7 @@ func (s *Service) requestOverride(ctx context.Context, in changeGateInput, block
 		Action:      in.Action,
 		TargetID:    in.TargetID,
 		Database:    in.Database,
-		Blockers:    changeGateBlockerIDs(blockers),
+		Blockers:    ids,
 		Reason:      in.Override,
 		RequestedBy: requester,
 		ExpiresAt:   now.Add(storage.FreezeOverrideMaxLifetime),

@@ -2197,7 +2197,8 @@ cutover, nor is a stop, a cancel or a revert. When SchemaBot cannot read the fre
 requests below, it refuses the change with a retryable error, never letting it through unchecked.
 A freeze refuses a change unless an approved override request covers every blocker on it. The
 requester, who must be verified, runs the apply, start or cutover with an override reason, and
-SchemaBot records a request and refuses, naming it. A verified member of `freeze.groups` who is not the requester approves it;
+SchemaBot records a request and refuses, naming it. Asking again before approval names the same request
+(`requestOverride`). A verified member of `freeze.groups` who is not the requester approves it;
 write groups do not grant approval, and with no freeze group configured nobody approves, so nobody
 overrides alone, admins included. Storage also refuses the pull request's author once a request
 records one. The requester repeats the command and it is admitted; only the requester runs on an
