@@ -35,6 +35,7 @@ type ApplyCmd struct {
 	SkipRevert   bool          `help:"Skip revert window after completion (Vitess only)" name:"skip-revert"`
 	Branch       string        `help:"Reuse existing PlanetScale branch (syncs with main, skips branch creation)" name:"branch"`
 	AllowUnsafe  bool          `help:"Allow destructive changes (DROP TABLE, DROP COLUMN, etc.)" name:"allow-unsafe"`
+	Override     string        `help:"Reason to ask a freeze approver to let this change through a freeze" name:"override"`
 	Force        bool          `help:"Force acquire lock (breaks existing lock from another owner)"`
 	Yield        bool          `help:"Release the lock once the apply has finished (kept while it is still running or stopped)"`
 	NoLock       bool          `help:"Don't hold a database lock during the operation" name:"no-lock"`
@@ -337,7 +338,7 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 	// what each runs. Members the server listed as refused were turned away
 	// before the prompt; a member whose own plan apply creation refuses
 	// without having listed it is refused by POST /api/apply instead.
-	applyID, err := applyAndWatch(ctx, ep, planResult, true, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
+	applyID, err := applyAndWatch(ctx, ep, planResult, true, cfg.Database, cmd.Environment, owner, cmd.Override, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
 	if err != nil {
 		if lockCreated && neverSubmitted(err) {
 			return releaseUnsubmittedLock(ep, cfg.Database, cfg.Type, owner, err)
