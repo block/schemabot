@@ -382,7 +382,7 @@ func TestBackfillMergeQueueCheckPostsOnlyTheMissingChecksInScope(t *testing.T) {
 		ID: 701, Name: "SchemaBot (staging)", Status: "in_progress",
 	})
 	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(http.ResponseWriter, *http.Request) {
-		t.Error("backfill updated an existing merge queue check run")
+		assert.Fail(t, "backfill updated an existing merge queue check run")
 	})
 
 	outcome, err := h.BackfillMergeQueueCheck(t.Context(), "octocat/hello-world", 12345, "group-412",

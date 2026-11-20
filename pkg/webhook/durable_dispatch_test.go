@@ -821,7 +821,7 @@ func TestDurableWebhookDriverSupersedesCoveredAutoPlan(t *testing.T) {
 	factory, fetches := newLiveHeadGitHubFactory(t, "newer-head", "open")
 	h := newDurableDriverHandler(t, store, nil, factory)
 	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
-		t.Error("a superseded delivery must not be processed")
+		assert.Fail(t, "a superseded delivery must not be processed")
 		return false, nil
 	}
 
@@ -842,7 +842,7 @@ func TestDurableWebhookDriverSupersedesAutoPlanForClosedPR(t *testing.T) {
 	factory, _ := newLiveHeadGitHubFactory(t, "head-sha", "closed")
 	h := newDurableDriverHandler(t, store, nil, factory)
 	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
-		t.Error("a superseded delivery must not be processed")
+		assert.Fail(t, "a superseded delivery must not be processed")
 		return false, nil
 	}
 
@@ -1056,7 +1056,7 @@ func TestDurableWebhookDriverStopsWhenSupersedeLosesLease(t *testing.T) {
 	factory, _ := newLiveHeadGitHubFactory(t, "newer-head", "open")
 	h := newDurableDriverHandler(t, store, nil, factory)
 	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
-		t.Error("a lease-lost delivery must not be processed")
+		assert.Fail(t, "a lease-lost delivery must not be processed")
 		return false, nil
 	}
 

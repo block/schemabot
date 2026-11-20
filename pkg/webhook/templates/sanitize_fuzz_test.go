@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"unicode"
@@ -52,8 +53,9 @@ func FuzzSanitizeCommentError(f *testing.F) {
 			if r == '\n' || r == '\t' {
 				continue
 			}
-			require.False(t, unicode.IsControl(r) || unicode.Is(unicode.Cf, r),
-				"control or format character %q in %q", r, got)
+			if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+				require.FailNow(t, fmt.Sprintf("control or format character %q in %q", r, got))
+			}
 		}
 		requireNoPartialMarker(t, got)
 	})
@@ -79,8 +81,9 @@ func FuzzSanitizeLogText(f *testing.F) {
 			if r == '\t' {
 				continue
 			}
-			require.False(t, unicode.IsControl(r) || unicode.Is(unicode.Cf, r),
-				"control or format character %q in %q", r, got)
+			if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+				require.FailNow(t, fmt.Sprintf("control or format character %q in %q", r, got))
+			}
 		}
 		requireNoPartialMarker(t, got)
 	})
