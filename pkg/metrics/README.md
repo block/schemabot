@@ -188,7 +188,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `superseded`, `released`, `lease_lost`, `finish_error`, `unknown`
 
-**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_combined_status`, `get_team`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
+**operation** (GitHub API): `add_comment_reaction`, `compare_commits`, `create_check_run`, `create_installation_access_token`, `create_issue_comment`, `delete_issue_comment`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_branch_rules`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_issue_comment`, `fetch_pull_request`, `fetch_rate_limit`, `fetch_ref`, `fetch_repository`, `fetch_repository_installation`, `get_combined_status`, `get_team`, `get_team_membership`, `graphql_branch_protection`, `graphql_merge_queue_entries`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_app_installations`, `list_check_runs_for_ref`, `list_issue_timeline`, `list_matching_refs`, `list_pr_files`, `list_pull_requests`, `list_pull_requests_for_commit`, `list_reviews`, `list_team_members`, `remove_issue_label`, `request_reviewers`, `unknown`, `update_check_run`
 
 **category** (GitHub API): `auth`, `read`, `write`, `unknown`
 
@@ -330,10 +330,21 @@ across replicas. Snapshots require a named App, positive installation ID, valid
 remaining/limit headers, and a future reset time. They disappear from collection
 when older than 120 seconds or when their reset time passes. Repeated scrapes,
 local quota refusals and secondary cooldown waits do not refresh observation age.
-Older reset windows and delayed larger allowances within a window cannot replace
-a depleted snapshot. Within one window, a lower allowance wins even when it is
-recorded out of receipt order; its original receipt time still controls expiry.
-A new window can increase the allowance.
+Within one window the lowest allowance seen is kept, in any receipt order, even
+when GitHub later reports more; a later response with more remaining still
+refreshes the observation time, so an installation that is read keeps its
+snapshot exported. Expiry follows the latest receipt in the window, and a
+response recorded late never moves it later than its own receipt time. When a
+response reports a different reset time, the one received most recently says
+which window is current, and a new window can increase the allowance. That
+holds when the reset time moves earlier too: GitHub can report one reset time
+and then an earlier one for the rest of the window, and the snapshot follows
+the newer readings instead of ageing out on the first. A response received
+before the current snapshot never replaces it with another window. Each reset
+time that has not yet passed keeps its own lowest allowance, so a window that
+becomes current again still exports the depletion already seen in it, whatever
+order the responses are recorded in. The number of reset times kept per
+installation is bounded; past the bound the least recently reported is dropped.
 
 Webhook traffic refreshes a snapshot from the headers of every response, and
 the server's GitHub quota probe refreshes it while there is no traffic: once a
