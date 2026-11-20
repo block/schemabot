@@ -368,3 +368,67 @@ func TestEngine_TriggerTableRunsDirect(t *testing.T) {
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT note FROM trg_audited WHERE id = 3").Scan(&note))
 	assert.Equal(t, "fired", note, "the trigger still fires")
 }
+
+// addOwnerColumn adds a column to the foreign key's child, where the copy
+// process refuses the table and statements run direct. It runs in a session
+// without the zero-date checks, so a zero-date default can be declared, the
+// way a table created long ago under a laxer server sql_mode holds one.
+func addOwnerColumn(t *testing.T, db *sql.DB, column, update string) {
+	t.Helper()
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err, "acquire a session")
+	defer utils.CloseAndLog(conn)
+	for _, stmt := range []string{
+		"SET SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION'",
+		"ALTER TABLE `fk_owners` ADD COLUMN " + column,
+		update,
+	} {
+		_, err := conn.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+}
+
+// A direct statement that would rewrite rows fails rather than losing data:
+// narrowing a column on the foreign key's child, below a value it holds, is
+// refused by MySQL and the apply fails naming the error code. The column and
+// the value are as they were. The plan does not flag narrowing as unsafe,
+// since the engine's copy refuses a row that would change, so the direct path
+// has to refuse it too.
+func TestEngine_ExecuteAlterPhase_DirectNarrowingThatTruncatesFails(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	createForeignKeyPair(t, db)
+	addOwnerColumn(t, db, "`label` varchar(20) DEFAULT NULL", "UPDATE `fk_owners` SET `label` = 'hello world' WHERE `group_id` = 1")
+
+	_, state, errorMessage := runAlters(t, dsn, []string{"fk_owners"},
+		[]string{"ALTER TABLE `fk_owners` MODIFY COLUMN `label` varchar(5) DEFAULT NULL"},
+		directPolicy{Enabled: true, MaxTableBytes: 100 << 20})
+
+	require.Equal(t, engine.StateFailed, state)
+	assert.Contains(t, errorMessage, "(error 1265)")
+	assert.NotContains(t, errorMessage, "hello world")
+	assert.Equal(t, "varchar(20)", columnType(t, db, "fk_owners", "label"))
+	var label string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT `label` FROM `fk_owners` WHERE `group_id` = 1").Scan(&label))
+	assert.Equal(t, "hello world", label, "the value is not truncated")
+}
+
+// A direct statement on a table that holds and defaults to a zero date runs:
+// direct statements refuse to rewrite rows, but they keep the zero-date checks
+// off, as the engine's own sessions do, so a table from a laxer server
+// sql_mode can still be altered, and its zero dates stay as they were.
+func TestEngine_ExecuteAlterPhase_DirectAlterOnZeroDateTableRuns(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	createForeignKeyPair(t, db)
+	addOwnerColumn(t, db, "`legacy_at` datetime NOT NULL DEFAULT '0000-00-00 00:00:00'", "UPDATE `fk_owners` SET `legacy_at` = '0000-00-00 00:00:00'")
+
+	_, state, errorMessage := runAlters(t, dsn, []string{"fk_owners"},
+		[]string{"ALTER TABLE `fk_owners` ADD COLUMN `note` varchar(20) DEFAULT NULL"},
+		directPolicy{Enabled: true, MaxTableBytes: 100 << 20})
+
+	require.Equal(t, engine.StateCompleted, state, "schema change error: %s", errorMessage)
+	assert.Equal(t, "varchar(20)", columnType(t, db, "fk_owners", "note"))
+	var zeroDates int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM `fk_owners` WHERE CAST(`legacy_at` AS CHAR) = '0000-00-00 00:00:00'").Scan(&zeroDates))
+	assert.Equal(t, 2, zeroDates, "the zero dates are kept")
+}

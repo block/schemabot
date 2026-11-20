@@ -803,45 +803,56 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 }
 
 // openDirectExecutionDB opens the pool direct statements run on, with the
-// policy's lock bound set as session variables on every connection it opens.
-// dbconn.ForceExec takes the statement's connection from the pool itself, so
-// the bound has to be a property of the pool rather than a SET on one
-// connection. The same pool serves the kill's performance_schema reads and
-// KILLs on other connections while the statement waits, so it is capped at
+// session settings Spirit gives its own connections to the target and the
+// policy's lock bound, set on every connection it opens. dbconn.ForceExec
+// takes the statement's connection from the pool itself, so the settings have
+// to be properties of the pool rather than a SET on one connection. The same
+// pool serves the kill's performance_schema reads and KILLs on other
+// connections while the statement waits, so it is capped at
 // directExecutionPoolSize rather than one.
-func openDirectExecutionDB(ctx context.Context, dsn string, lockWaitSeconds int64) (*sql.DB, error) {
-	cfg, err := mysql.ParseDSN(dsn)
+//
+// The pool is opened with the configuration ForceExec runs under (see
+// directForceExecConfig), which makes its sessions strict. mysqlconn settles
+// TLS and the transport timeouts first, as for every connection SchemaBot
+// makes to a target; dbconn keeps that TLS configuration and adds its session
+// settings.
+func openDirectExecutionDB(ctx context.Context, dsn string, cfg *dbconn.DBConfig) (*sql.DB, error) {
+	connDSN, err := mysqlconn.ConnectionDSN(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("parse target DSN: %w", err)
+		return nil, fmt.Errorf("prepare target DSN: %w", err)
 	}
-	if cfg.Params == nil {
-		cfg.Params = make(map[string]string)
-	}
-	bound := strconv.FormatInt(lockWaitSeconds, 10)
-	cfg.Params["lock_wait_timeout"] = bound
-	cfg.Params["innodb_lock_wait_timeout"] = bound
-	db, err := mysqlconn.Open(cfg.FormatDSN())
+	// NewContext pings, which opens the first connection: that is where MySQL
+	// accepts or rejects the session lock bound and sql_mode.
+	db, err := dbconn.NewContext(ctx, connDSN, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("open target database: %w", err)
-	}
-	db.SetMaxOpenConns(directExecutionPoolSize)
-	// The ping opens the first connection, which is where MySQL accepts or
-	// rejects the session lock bound.
-	if err := db.PingContext(ctx); err != nil {
-		utils.CloseAndLog(db)
-		return nil, fmt.Errorf("ping target database with session lock wait timeouts of %ds: %w", lockWaitSeconds, err)
+		return nil, fmt.Errorf("open target database with session lock wait timeouts of %ds: %w", cfg.LockWaitTimeout, err)
 	}
 	return db, nil
 }
 
 // directForceExecConfig is the dbconn configuration direct statements run
-// under: Spirit's kill (once the statement has waited 90% of the lock wait),
-// both lock waits taken from the policy, and directMaxAttempts attempts.
+// under, used both to open their pool and for ForceExec: Spirit's kill (once
+// the statement has waited 90% of the lock wait), both lock waits taken from
+// the policy, directMaxAttempts attempts, and a strict sql_mode.
+//
+// Strict mode is what keeps a direct statement from rewriting data. The plan
+// does not flag a narrowing change as unsafe, because Spirit's copy refuses a
+// row that would change. A direct statement runs as native DDL with whatever
+// algorithm MySQL picks, and in a non-strict session a rebuild that narrows a
+// column truncates the values that no longer fit, and NULLs become ” under a
+// new NOT NULL, each with only a warning. Strict mode makes MySQL refuse the
+// statement and leave the table as it was. It leaves zero dates alone, so a
+// table holding them can still be altered.
 func directForceExecConfig(lockWaitSeconds int64) *dbconn.DBConfig {
 	cfg := dbconn.NewDBConfig()
 	cfg.LockWaitTimeout = int(lockWaitSeconds)
 	cfg.InnodbLockWaitTimeout = int(lockWaitSeconds)
 	cfg.MaxRetries = directMaxAttempts
+	cfg.MaxOpenConnections = directExecutionPoolSize
+	// mysqlconn interpolates parameters client-side for every connection
+	// SchemaBot makes; dbconn would otherwise turn it back off.
+	cfg.InterpolateParams = true
+	cfg.StrictSQLMode = true
 	return cfg
 }
 
@@ -858,7 +869,8 @@ func directForceExecConfig(lockWaitSeconds int64) *dbconn.DBConfig {
 func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTargetDB, database string, stmts []directRouted, policy directPolicy) bool {
 	logger := e.changeLogger()
 	lockWaitSeconds := policy.lockAcquisitionTimeoutSeconds()
-	db, err := openDirectExecutionDB(ctx, target.dsn, lockWaitSeconds)
+	forceExecConfig := directForceExecConfig(lockWaitSeconds)
+	db, err := openDirectExecutionDB(ctx, target.dsn, forceExecConfig)
 	if err != nil {
 		if ctx.Err() != nil {
 			logger.Info("schema change stopped while connecting for direct execution",
@@ -873,7 +885,6 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 		return false
 	}
 	defer utils.CloseAndLog(db)
-	forceExecConfig := directForceExecConfig(lockWaitSeconds)
 	for _, ds := range stmts {
 		progress := e.trackDirectStatement(ds.table, ds.stmt)
 		logger.Info("executing statement directly as native MySQL DDL",

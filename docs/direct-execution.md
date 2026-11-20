@@ -141,6 +141,21 @@ When both ends of a foreign key run directly, the plan's own `DROP FOREIGN
 KEY` runs before any statement the engine copies, because every direct
 statement runs first.
 
+### Statements that would change existing rows
+
+Direct statements run under the engine's own session settings plus a strict
+`sql_mode`, whatever the server's mode is. A statement that would rewrite a
+row fails instead of changing it: narrowing a column below a value it holds,
+or adding `NOT NULL` to a column that holds a NULL. MySQL refuses it, the
+table is left as it was, and the apply fails with the error code. The engine's
+online copy refuses the same rows, so neither path can change existing data,
+and the plan does not flag such a change as unsafe. To make the change, fix
+the rows first.
+
+The zero-date checks stay off, as on the engine's own sessions, so a table that
+holds or defaults to a zero date such as `0000-00-00` can still be altered, and
+its zero dates are kept.
+
 ### The policy travels with the request
 
 The server that runs the statement is not always the one whose configuration
