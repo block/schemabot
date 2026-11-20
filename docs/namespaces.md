@@ -535,11 +535,20 @@ the retention period ends.
   that still receives rows, such as the shadow table of an online schema change
   another tool is running, is not a leftover yet. Wait until nothing writes to
   it.
+- A listed table that is a working table of a SchemaBot apply on the same
+  database and environment that is still running or is stopped, such as its
+  copy `_users_new` or its checkpoint `_users_chkpnt`, is refused, naming the
+  apply. A stopped apply resumes from that copy, so start or cancel the apply
+  first. The names are worked out from the tables the apply changes, the way
+  the engine shortens them to fit 64 characters included. A collision refuses
+  the entry for both tables, which errs on the safe side. The check runs when
+  the plan is made and again when the apply is created.
 - An entry that names no live table plans nothing and the plan proceeds. The
   server logs the entry, so an operator can tell a stale or misspelled entry
   from a drop that ran.
 - A rollback never drops a listed table. It restores the schema the apply
-  started from, so a listed table still on the target is left in place.
+  started from, so a listed table still on the target is left in place, and a
+  listed table the apply dropped stays dropped.
 - A plan records the entries, and an apply, resume or drift check of that plan
   proposes the same drops.
 
