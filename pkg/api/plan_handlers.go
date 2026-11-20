@@ -1554,6 +1554,9 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusConflict, err.Error())
 			return
 		}
+		if s.writeChangeGateError(w, "apply", err) {
+			return
+		}
 		if errors.Is(err, errPlanLookupFailed) {
 			s.logger.Error("apply failed to load the stored plan", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, storedPlanLookupFailedMessage("apply", req.PlanID))
@@ -1682,6 +1685,11 @@ func applyMetricStatusForError(err error) string {
 	}
 	// So is a drop of another apply's working table, until that apply settles.
 	if _, ok := errors.AsType[*DropTablesInUseError](err); ok {
+		return applyMetricStatusRejected
+	}
+	// So is a change gate refusal. A gate that could not decide is a server
+	// failure.
+	if status, _, ok := changeGateErrorStatus(err); ok && status < http.StatusInternalServerError {
 		return applyMetricStatusRejected
 	}
 	return "error"
@@ -2143,6 +2151,19 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		req.ExpectedPendingPlanID == storage.RollbackPendingPlanPrefix+plan.PlanIdentifier
 	if !pinnedRollback {
 		if err := s.admitPRSchemaWork(ctx, plan.Repository, plan.PullRequest, plan.HeadSHA); err != nil {
+			return nil, 0, err
+		}
+		// A rollback undoes a change, so the change gates never hold it. Only
+		// the webhook's pinned rollback is known to be one: the rollback
+		// option is the caller's to set.
+		if err := s.checkChangeGates(ctx, changeGateInput{
+			Checkpoint:  changeGateCheckpointStart,
+			Environment: req.Environment,
+			Deployments: s.changeGateDeployments(plan.Database, req.Environment, plan.Deployment, req.Target != ""),
+			Database:    plan.Database,
+			Repository:  plan.Repository,
+		}, resolveCaller(ctx, req.Caller)); err != nil {
+			recordApplyError("change gate", err)
 			return nil, 0, err
 		}
 	}

@@ -2185,6 +2185,24 @@ its state so the retry uses the same execution authority.
 `pkg/cmd/commands/init_publish_linux.go`, `pkg/cmd/commands/init_publish_other.go`,
 `pkg/cmd/commands/init_sample.go`, and `pkg/localdemo/database.go`.
 
+### AZ-10: A freeze holds every new change it covers
+
+While a freeze covering a change is in effect, SchemaBot refuses to create its apply, to record a
+start for an apply that is stopped or waiting to start, and to record a cutover for a deferred
+apply. A change that started before the freeze keeps running. If any deployment the change runs on
+is covered, the whole change is refused. "In effect" is decided by the database clock, so every pod
+agrees at the edges of a freeze. A pull request rollback is never held, nor is a stop, a cancel or
+a revert. When SchemaBot cannot read the freezes it refuses the change with a retryable error,
+never letting it through unchecked. Nobody overrides a freeze in this version, admins included.
+*Breaks if violated:* a schema change starts, or its cutover runs, during an incident or a code freeze.
+*Enforced:* the change gates and their evaluator (`checkChangeGates`, `pkg/api/change_gate.go`),
+run before apply creation in `queueValidatedApply` (`pkg/api/plan_handlers.go`), before a start is
+recorded in `executeStartForApply` and before a cutover is recorded in `executeCutoverForApply`
+(`pkg/api/control_handlers.go`), with the freeze query `ListInEffect`
+(`pkg/storage/internal/sqlstore/freezes.go`). A call-graph test
+(`pkg/api/change_gate_completeness_test.go`) fails on any path that creates an apply or records a
+start or cutover without passing a function that runs the gates.
+
 ## Structural enforcement
 
 The strongest invariants are enforced by structure, so regressions fail CI instead of review:
@@ -2194,6 +2212,8 @@ The strongest invariants are enforced by structure, so regressions fail CI inste
   recovery arm (ST-8).
 - **Route-table sweep.** Every mutating endpoint requires a denial fixture proving its
   handler-level authorization check (AZ-2).
+- **Change gate coverage.** A call-graph test fails on any path that creates an apply or records a
+  start or cutover without running the change gates (AZ-10).
 - **Engine conformance.** Engines run a shared conformance kit, and an engine that cannot
   exhibit a case documents an explicit skip rather than a silent opt-out (CO-3, CO-8).
 - **Claim parity.** The states the claim query accepts are pinned by tests, so a state added to

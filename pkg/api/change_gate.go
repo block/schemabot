@@ -1,0 +1,255 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/storage"
+)
+
+// changeGateCheckpoint names where in a change's life the change gates run.
+type changeGateCheckpoint string
+
+const (
+	// changeGateCheckpointStart runs before an apply is created.
+	changeGateCheckpointStart changeGateCheckpoint = "start"
+	// changeGateCheckpointResume runs before a start request is recorded for
+	// an apply that is stopped or waiting to be started.
+	changeGateCheckpointResume changeGateCheckpoint = "resume"
+	// changeGateCheckpointCutover runs before a deferred cutover is recorded.
+	changeGateCheckpointCutover changeGateCheckpoint = "cutover"
+)
+
+// changeGateInput is what a change gate decides on.
+type changeGateInput struct {
+	Checkpoint  changeGateCheckpoint
+	Environment string
+	// Deployments are every deployment the change runs on.
+	Deployments []string
+	Database    string
+	Repository  string
+}
+
+// changeGate is one check an apply, start or cutover must pass at a
+// checkpoint. Each gate reports blockers. Time windows and scheduled
+// cutovers plug in as further gates.
+type changeGate interface {
+	// Name labels the gate's blockers and metrics.
+	Name() string
+	// Blockers returns what refuses the change. An error means the gate
+	// could not decide, and the change is refused.
+	Blockers(ctx context.Context, in changeGateInput) ([]apitypes.ChangeGateBlocker, error)
+}
+
+// freezeGate blocks a change while a freeze covering it is in effect. "In
+// effect" is decided by the database clock, so every pod agrees at the edges
+// of a freeze.
+type freezeGate struct {
+	freezes storage.FreezeStore
+}
+
+func (freezeGate) Name() string { return "freeze" }
+
+func (g freezeGate) Blockers(ctx context.Context, in changeGateInput) ([]apitypes.ChangeGateBlocker, error) {
+	freezes, err := g.freezes.ListInEffect(ctx, in.Environment)
+	if err != nil {
+		return nil, fmt.Errorf("list freezes in effect in %s: %w", in.Environment, err)
+	}
+	var blockers []apitypes.ChangeGateBlocker
+	for _, freeze := range freezes {
+		// One frozen deployment refuses the whole change: a change that ran
+		// on the others would leave the database half changed.
+		covers := slices.ContainsFunc(in.Deployments, func(deployment string) bool {
+			return freeze.Covers(deployment, in.Database)
+		})
+		if !covers {
+			continue
+		}
+		blockers = append(blockers, apitypes.ChangeGateBlocker{
+			Gate:   g.Name(),
+			ID:     freeze.Identifier,
+			Reason: freeze.Reason,
+			EndsAt: freeze.EndsAt,
+		})
+	}
+	return blockers, nil
+}
+
+// changeGates lists the gates every apply, start and cutover must pass. A
+// server without freeze storage has no freezes to enforce.
+func (s *Service) changeGates() []changeGate {
+	if s.storage == nil {
+		return nil
+	}
+	var gates []changeGate
+	if freezes := s.storage.Freezes(); freezes != nil {
+		gates = append(gates, freezeGate{freezes: freezes})
+	}
+	return gates
+}
+
+// changeGateDeployments lists the deployments a change to database runs on:
+// the given one, and for a change not narrowed to one rollout member, every
+// deployment of the rollout.
+func (s *Service) changeGateDeployments(database, environment, deployment string, narrowed bool) []string {
+	deployments := []string{deployment}
+	if narrowed {
+		return deployments
+	}
+	targets, err := s.config.ResolveDatabaseTargets(database, environment)
+	if err != nil {
+		return deployments
+	}
+	for _, target := range targets {
+		if !slices.Contains(deployments, target.Deployment) {
+			deployments = append(deployments, target.Deployment)
+		}
+	}
+	return deployments
+}
+
+// changeGateInputForApply is the gate input for a start or cutover of an
+// existing apply.
+func (s *Service) changeGateInputForApply(checkpoint changeGateCheckpoint, apply *storage.Apply) changeGateInput {
+	return changeGateInput{
+		Checkpoint:  checkpoint,
+		Environment: apply.Environment,
+		Deployments: s.changeGateDeployments(apply.Database, apply.Environment, apply.Deployment, apply.GetOptions().NarrowedTo != ""),
+		Database:    apply.Database,
+		Repository:  apply.Repository,
+	}
+}
+
+// checkChangeGates runs every change gate. It returns nil when nothing
+// blocks, *ChangeGateRefusedError when something does, and
+// *ChangeGateUnavailableError when a gate could not decide.
+func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, caller string) error {
+	attrs := []any{
+		"checkpoint", string(in.Checkpoint),
+		"environment", in.Environment,
+		"deployments", in.Deployments,
+		"database", in.Database,
+		"repository", in.Repository,
+		"caller", caller,
+	}
+	var blockers []apitypes.ChangeGateBlocker
+	for _, gate := range s.changeGates() {
+		found, err := gate.Blockers(ctx, in)
+		if err != nil {
+			metrics.RecordChangeGateError(ctx, in.Environment, string(in.Checkpoint))
+			s.logger.Error("change gate check failed, so the change was refused", append(attrs, "gate", gate.Name(), "error", err)...)
+			return &ChangeGateUnavailableError{Checkpoint: in.Checkpoint, Gate: gate.Name(), Err: err}
+		}
+		blockers = append(blockers, found...)
+	}
+	if len(blockers) == 0 {
+		return nil
+	}
+	for _, gate := range distinctChangeGateNames(blockers) {
+		metrics.RecordChangeGateRefusal(ctx, in.Environment, gate, string(in.Checkpoint))
+	}
+	s.logger.Warn("change gate refused the change", append(attrs, "blockers", changeGateBlockerIDs(blockers))...)
+	return &ChangeGateRefusedError{Checkpoint: in.Checkpoint, Environment: in.Environment, Blockers: blockers}
+}
+
+func changeGateBlockerIDs(blockers []apitypes.ChangeGateBlocker) []string {
+	ids := make([]string, 0, len(blockers))
+	for _, blocker := range blockers {
+		ids = append(ids, blocker.Gate+" "+blocker.ID)
+	}
+	return ids
+}
+
+func distinctChangeGateNames(blockers []apitypes.ChangeGateBlocker) []string {
+	var names []string
+	for _, blocker := range blockers {
+		if !slices.Contains(names, blocker.Gate) {
+			names = append(names, blocker.Gate)
+		}
+	}
+	return names
+}
+
+// ChangeGateRefusedError reports an apply, start or cutover a change gate
+// refused.
+type ChangeGateRefusedError struct {
+	Checkpoint  changeGateCheckpoint
+	Environment string
+	Blockers    []apitypes.ChangeGateBlocker
+}
+
+func (e *ChangeGateRefusedError) Error() string {
+	parts := make([]string, 0, len(e.Blockers))
+	for _, blocker := range e.Blockers {
+		until := "until lifted"
+		if blocker.EndsAt != nil {
+			until = "until " + blocker.EndsAt.UTC().Format(time.RFC3339)
+		}
+		parts = append(parts, fmt.Sprintf("%s %s (%s, %s)", blocker.Gate, blocker.ID, blocker.Reason, until))
+	}
+	return fmt.Sprintf("blocked in %s by %s; try again after it ends or is lifted", e.Environment, strings.Join(parts, "; "))
+}
+
+// ChangeGateUnavailableError reports a change gate that could not decide. The
+// change is refused; retrying may succeed.
+type ChangeGateUnavailableError struct {
+	Checkpoint changeGateCheckpoint
+	Gate       string
+	Err        error
+}
+
+func (e *ChangeGateUnavailableError) Error() string {
+	return fmt.Sprintf("%s gate check failed at %s: %v", e.Gate, e.Checkpoint, e.Err)
+}
+
+func (e *ChangeGateUnavailableError) Unwrap() error { return e.Err }
+
+// UserMessage is the operator-facing refusal. It leaves out the storage
+// cause.
+func (e *ChangeGateUnavailableError) UserMessage() string {
+	what := "this"
+	switch e.Checkpoint {
+	case changeGateCheckpointCutover:
+		what = "the cutover"
+	case changeGateCheckpointResume:
+		what = "the start"
+	}
+	return fmt.Sprintf("SchemaBot could not check for freezes, so %s did not start. Try again.", what)
+}
+
+// changeGateErrorStatus maps a change gate error to its HTTP status and
+// error code.
+func changeGateErrorStatus(err error) (status int, code string, ok bool) {
+	if _, refused := errors.AsType[*ChangeGateRefusedError](err); refused {
+		return http.StatusConflict, apitypes.ErrCodeChangeGateRefused, true
+	}
+	if _, unavailable := errors.AsType[*ChangeGateUnavailableError](err); unavailable {
+		return http.StatusServiceUnavailable, apitypes.ErrCodeChangeGateUnavailable, true
+	}
+	return 0, "", false
+}
+
+// writeChangeGateError writes a change gate error and reports whether err was
+// one. The gate already logged it.
+func (s *Service) writeChangeGateError(w http.ResponseWriter, opName string, err error) bool {
+	status, code, ok := changeGateErrorStatus(err)
+	if !ok {
+		return false
+	}
+	response := apitypes.ErrorResponse{Error: opName + " rejected: " + err.Error(), ErrorCode: code}
+	if refused, isRefusal := errors.AsType[*ChangeGateRefusedError](err); isRefusal {
+		response.Blockers = refused.Blockers
+	}
+	if unavailable, isUnavailable := errors.AsType[*ChangeGateUnavailableError](err); isUnavailable {
+		response.Error = unavailable.UserMessage()
+	}
+	s.writeJSON(w, status, response)
+	return true
+}

@@ -2124,6 +2124,27 @@ const (
 	environmentFreezeCollectionFailuresDescription = "Total number of failed environment freeze metric snapshots"
 )
 
+// RecordChangeGateRefusal counts applies, starts and cutovers a change gate
+// refused, once per gate that blocked the attempt.
+func RecordChangeGateRefusal(ctx context.Context, environment, gate, checkpoint string) {
+	addCounter(ctx, "schemabot.change_gate.refusals",
+		"Total number of applies, starts and cutovers refused by a change gate", "{refusal}",
+		EnvironmentAttribute(environment),
+		attribute.String("gate", gate),
+		attribute.String("checkpoint", checkpoint),
+	)
+}
+
+// RecordChangeGateError counts change gate checks that failed, so the apply,
+// start or cutover was refused without knowing whether a gate blocks it.
+func RecordChangeGateError(ctx context.Context, environment, checkpoint string) {
+	addCounter(ctx, "schemabot.change_gate.errors",
+		"Total number of change gate checks that failed and refused the change", "{error}",
+		EnvironmentAttribute(environment),
+		attribute.String("checkpoint", checkpoint),
+	)
+}
+
 // RecordWebhookInboxStatsCollectionFailure counts failed inbox snapshots. The
 // inbox depth/backlog gauges are last-value instruments, so a failed snapshot
 // leaves them frozen at their last-good values — indistinguishable from a

@@ -84,6 +84,9 @@ func terminalControlf(format string, args ...any) error {
 // controlOperationErrorCode is the error code a rejection carries, empty for
 // one that carries none.
 func controlOperationErrorCode(err error) string {
+	if _, code, ok := changeGateErrorStatus(err); ok {
+		return code
+	}
 	var httpErr *controlOperationHTTPError
 	if errors.As(err, &httpErr) {
 		return httpErr.code
@@ -92,6 +95,9 @@ func controlOperationErrorCode(err error) string {
 }
 
 func controlOperationHTTPStatus(err error) int {
+	if status, _, ok := changeGateErrorStatus(err); ok {
+		return status
+	}
 	var httpErr *controlOperationHTTPError
 	if errors.As(err, &httpErr) {
 		return httpErr.status
@@ -359,6 +365,9 @@ func (s *Service) logControlOperationForApply(ctx context.Context, apply *storag
 
 // writeControlError logs and writes an HTTP error for a control operation.
 func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply *storage.Apply, err error) {
+	if s.writeChangeGateError(w, opName, err) {
+		return
+	}
 	status := controlOperationHTTPStatus(err)
 	attrs := []any{"error", err}
 	if apply != nil {
@@ -777,6 +786,16 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 	if readiness == cutoverRequestNotReady {
 		err := controlConflictf("schema change is not waiting for cutover (current state: %s)", apply.State)
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, err
+	}
+	// The change gates run only for a cutover this command would start: a
+	// request already pending or a cutover in progress was answered above.
+	if err := s.checkChangeGates(ctx, s.changeGateInputForApply(changeGateCheckpointCutover, apply), caller); err != nil {
+		status := "rejected"
+		if controlOperationHTTPStatus(err) >= http.StatusInternalServerError {
+			status = "error"
+		}
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, status)
 		return nil, 0, err
 	}
 	cutoverReq := &storage.ApplyControlRequest{
@@ -1980,9 +1999,21 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 	var err error
 	responseStatus := ""
 	queuedForOperator := false
+	// The change gates run only for a start this command would record: a
+	// start already pending is an idempotent duplicate and is answered
+	// without them.
+	resumeGate := func() error {
+		return s.checkChangeGates(ctx, s.changeGateInputForApply(changeGateCheckpointResume, apply), caller)
+	}
 	switch {
 	case state.IsState(apply.State, state.Apply.WaitingForDeploy):
-		resp, responseStatus, err = s.persistStartRequestForOperator(ctx, apply, caller, 1, 0)
+		var foundPendingStart bool
+		resp, responseStatus, foundPendingStart, err = s.pendingStartResponseIfPresent(ctx, apply)
+		if err == nil && !foundPendingStart {
+			if err = resumeGate(); err == nil {
+				resp, responseStatus, err = s.persistStartRequestForOperator(ctx, apply, caller, 1, 0)
+			}
+		}
 		queuedForOperator = err == nil && resp.Accepted
 	case state.IsState(apply.State, state.Apply.Pending):
 		resp, responseStatus, err = s.startResponseForPendingStartRequest(ctx, apply)
@@ -1995,6 +2026,9 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 		var foundPendingStart bool
 		resp, responseStatus, foundPendingStart, err = s.pendingStartResponseIfPresent(ctx, apply)
 		queuedForOperator = err == nil && foundPendingStart && resp.Accepted
+		if err == nil && !foundPendingStart {
+			err = resumeGate()
+		}
 		if err == nil && !foundPendingStart && client.IsRemote() && apply.ExternalID != "" {
 			resp, responseStatus, err = s.queueRemoteStoppedApplyForOperator(ctx, client, apply, caller)
 		} else if err == nil && !foundPendingStart {
