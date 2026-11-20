@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -395,6 +396,160 @@ const (
 	CheckStatusSuccess = "success"
 	CheckStatusFailure = "failure"
 )
+
+// Freeze kinds say how a freeze was set.
+const (
+	// FreezeKindOnDemand is a freeze that starts when it is set, for any
+	// reason, such as an incident. It may have no end time, in which case it
+	// lasts until someone lifts it.
+	FreezeKindOnDemand = "on_demand"
+
+	// FreezeKindPlanned is a freeze with a known window, such as a code
+	// freeze on a calendar. It ends on its own at its end time.
+	FreezeKindPlanned = "planned"
+)
+
+// Freeze running policies say what happens to applies admitted before a
+// freeze started. A freeze always refuses new applies; the policy decides
+// whether admitted ones finish or stop.
+const (
+	// FreezeRunningContinue lets admitted applies run to the end, every
+	// operation and the cutover included. It suits a calendar freeze.
+	FreezeRunningContinue = "continue"
+
+	// FreezeRunningStop stops admitted applies, and keeps an admitted apply
+	// from starting an operation it has not started. It suits an incident.
+	FreezeRunningStop = "stop"
+)
+
+// FreezeSourceManual is the source of a freeze set by a person or a direct
+// API caller. Other sources are synced from an external system, and each
+// source owns its own freezes.
+const FreezeSourceManual = "manual"
+
+// EnvironmentFreeze is one freeze of an environment, or of part of it.
+// While a freeze is in effect, SchemaBot refuses new changes in its scope
+// unless a second person approved an override. The row stays after the freeze ends or is
+// lifted, as the audit trail.
+type EnvironmentFreeze struct {
+	ID         int64  // internal; Identifier is the handle users and logs see
+	Identifier string // "freeze-..."
+
+	// Environment is the frozen environment. Deployments and Databases
+	// narrow the freeze; an empty list covers everything at that level.
+	Environment string
+	Deployments []string
+	Databases   []string
+
+	Kind    string // FreezeKindOnDemand or FreezeKindPlanned
+	Running string // FreezeRunningContinue or FreezeRunningStop
+
+	// StartsAt is when the freeze takes effect. EndsAt is when it ends on
+	// its own; nil means it lasts until someone lifts it.
+	StartsAt time.Time
+	EndsAt   *time.Time
+
+	Reason    string
+	CreatedBy string // the verified caller who set the freeze
+
+	// Source is FreezeSourceManual or the external system the freeze was
+	// synced from; ExternalID identifies it there and is empty for manual.
+	Source     string
+	ExternalID string
+
+	// LiftedBy, LiftReason and LiftedAt are set when the freeze is lifted
+	// early; LiftReason is optional.
+	LiftedBy   string
+	LiftReason string
+	LiftedAt   *time.Time
+
+	CreatedAt time.Time
+}
+
+// InEffectAt reports whether the freeze blocks changes at t: it has started,
+// it has not reached its end time, and nobody has lifted it.
+func (f *EnvironmentFreeze) InEffectAt(t time.Time) bool {
+	if f == nil || f.LiftedAt != nil {
+		return false
+	}
+	if t.Before(f.StartsAt) {
+		return false
+	}
+	return f.EndsAt == nil || t.Before(*f.EndsAt)
+}
+
+// Covers reports whether a change to database in deployment falls inside the
+// freeze's scope. Deployment and database are compared in canonical form.
+func (f *EnvironmentFreeze) Covers(deployment, database string) bool {
+	if f == nil {
+		return false
+	}
+	return scopeIncludes(f.Deployments, deployment) && scopeIncludes(f.Databases, database)
+}
+
+// scopeIncludes reports whether value is in scope, where an empty scope
+// includes everything.
+func scopeIncludes(scope []string, value string) bool {
+	if len(scope) == 0 {
+		return true
+	}
+	value = CanonicalKey(value)
+	for _, entry := range scope {
+		if CanonicalKey(entry) == value {
+			return true
+		}
+	}
+	return false
+}
+
+// hasBlankEntry reports whether scope names an empty entry. An empty scope
+// list covers everything, so a blank entry must be refused rather than
+// dropped: dropping it would widen the freeze to the whole level.
+func hasBlankEntry(scope []string) bool {
+	for _, entry := range scope {
+		if strings.TrimSpace(entry) == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// Validate reports the first problem that makes the freeze unfit to store.
+func (f *EnvironmentFreeze) Validate() error {
+	switch {
+	case f == nil:
+		return errors.New("freeze is required")
+	case strings.TrimSpace(f.Identifier) == "":
+		return errors.New("freeze identifier is required")
+	case strings.TrimSpace(f.Environment) == "":
+		return errors.New("freeze environment is required")
+	case f.Kind != FreezeKindOnDemand && f.Kind != FreezeKindPlanned:
+		return fmt.Errorf("freeze kind %q is not %q or %q", f.Kind, FreezeKindOnDemand, FreezeKindPlanned)
+	case f.Running != FreezeRunningContinue && f.Running != FreezeRunningStop:
+		return fmt.Errorf("freeze running policy %q is not %q or %q", f.Running, FreezeRunningContinue, FreezeRunningStop)
+	case f.StartsAt.IsZero():
+		return errors.New("freeze start time is required")
+	case f.EndsAt != nil && !f.EndsAt.After(f.StartsAt):
+		return errors.New("freeze end time must be after its start time")
+	case f.Kind == FreezeKindPlanned && f.EndsAt == nil:
+		return errors.New("a planned freeze needs an end time")
+	case hasBlankEntry(f.Deployments):
+		return errors.New("freeze deployments must not contain an empty name")
+	case hasBlankEntry(f.Databases):
+		return errors.New("freeze databases must not contain an empty name")
+	case strings.TrimSpace(f.Reason) == "":
+		return errors.New("freeze reason is required")
+	case strings.TrimSpace(f.CreatedBy) == "":
+		return errors.New("freeze creator is required")
+	case strings.TrimSpace(f.Source) == "":
+		return errors.New("freeze source is required")
+	case f.Source == FreezeSourceManual && f.ExternalID != "":
+		return errors.New("a manual freeze has no external id")
+	case f.Source != FreezeSourceManual && f.ExternalID == "":
+		return fmt.Errorf("a freeze from source %q needs an external id", f.Source)
+	}
+	return nil
+}
 
 // Setting represents an admin-level SchemaBot setting.
 // Examples: feature flags, default options, maintenance mode.
