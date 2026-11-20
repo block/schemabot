@@ -240,9 +240,10 @@ func runControlCommand[R any](
 
 // withPullRequestOverrideRequester marks ctx with the commenter asking for an
 // override, for a start or cutover. Unlike an apply, the command has no fresh
-// read of the pull request, so the author comes from the one the actor check
-// made when it ran, or a new read. If the author cannot be read, ctx stays
-// as it is: the gate records no request, and the refusal says so.
+// read of the pull request, so the author comes from FetchPullRequest: the
+// delivery's cached read when the actor check already made one, otherwise a
+// new read. If the author cannot be read, ctx stays as it is: the gate
+// records no request, and the refusal says so.
 // client is nil when actor authorization is off.
 func (h *Handler) withPullRequestOverrideRequester(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, requestedBy string) context.Context {
 	if client == nil {

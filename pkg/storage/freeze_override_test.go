@@ -94,6 +94,7 @@ func TestFreezeOverrideRequestFromPullRequest(t *testing.T) {
 	assert.Equal(t, "github:carol", GitHubIdentity("carol"))
 	assert.True(t, IsGitHubIdentity("github:carol"))
 	assert.True(t, IsGitHubIdentity(" github:carol"))
+	assert.True(t, IsGitHubIdentity("GitHub:carol"))
 	assert.False(t, IsGitHubIdentity("carol@example.com"))
 	assert.False(t, IsGitHubIdentity("githubcarol"))
 
