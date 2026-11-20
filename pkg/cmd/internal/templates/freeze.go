@@ -165,7 +165,7 @@ func WriteFreezeOverride(r apitypes.FreezeOverrideRequest) {
 // tells the operator.
 type ChangeGateRefusedData struct {
 	Environment string
-	// Operation is "apply", "start" or "cutover".
+	// Operation is "apply", "start", "cutover" or "rollback".
 	Operation string
 	Blockers  []apitypes.ChangeGateBlocker
 	// OverrideRequest is the request SchemaBot recorded for this caller, nil
@@ -198,6 +198,14 @@ func ChangeGateRefusedText(d ChangeGateRefusedData) []string {
 		id := ui.TerminalSafeLine(d.OverrideRequest.ID)
 		lines = append(lines, fmt.Sprintf("Override requested: %s. A freeze approver other than you must run '%s', then run this command again.",
 			id, cliname.Command("freeze", "approve", id)))
+		// Asking again while a request is pending keeps its first reason, so
+		// say which one the approver sees.
+		if d.OverrideRequest.Reason != "" {
+			lines = append(lines, "Reason the approver sees: "+ui.TerminalSafeLine(d.OverrideRequest.Reason))
+		}
+	case d.Operation == "rollback":
+		// rollback has no --override; only the freezes ending lets it run.
+		lines = append(lines, "Run the rollback again once these freezes end or are lifted.")
 	case !d.OverrideAsked:
 		lines = append(lines, `To ask for an override, run the same command with --override "<reason>".`)
 	default:

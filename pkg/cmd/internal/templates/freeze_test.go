@@ -34,6 +34,35 @@ func TestChangeGateRefusedText(t *testing.T) {
 	assertNoTerminalControls(t, strings.Join(lines, "\n"))
 }
 
+// A pending request keeps its first reason, so the refusal shows the one the
+// approver sees, even when the operator asked again with another.
+func TestChangeGateRefusedTextShowsTheRecordedReason(t *testing.T) {
+	lines := ChangeGateRefusedText(ChangeGateRefusedData{
+		Environment:     "production",
+		Operation:       "apply",
+		Blockers:        []apitypes.ChangeGateBlocker{{ID: "freeze-abc", Reason: "SEV-1234"}},
+		OverrideRequest: &apitypes.FreezeOverrideRequest{ID: "ovr-123", Reason: "first reason " + lineAttack},
+		OverrideAsked:   true,
+	})
+
+	require.Len(t, lines, 4)
+	assert.Equal(t, "Reason the approver sees: first reason "+lineAttackCleaned, lines[3])
+	assertNoTerminalControls(t, strings.Join(lines, "\n"))
+}
+
+// rollback has no --override, so its refusal does not suggest one.
+func TestChangeGateRefusedTextForARollbackSaysToWait(t *testing.T) {
+	lines := ChangeGateRefusedText(ChangeGateRefusedData{
+		Environment: "production",
+		Operation:   "rollback",
+		Blockers:    []apitypes.ChangeGateBlocker{{ID: "freeze-abc", Reason: "SEV-1234"}},
+	})
+
+	require.Len(t, lines, 3)
+	assert.Equal(t, "Run the rollback again once these freezes end or are lifted.", lines[2])
+	assert.NotContains(t, strings.Join(lines, "\n"), "--override")
+}
+
 // An override asked for and not recorded says why, in the server's words.
 func TestChangeGateRefusedTextSaysWhyNoRequestWasRecorded(t *testing.T) {
 	lines := ChangeGateRefusedText(ChangeGateRefusedData{
