@@ -105,6 +105,60 @@ func TestEngine_Plan_DropTablesDropsTablesTheNamingConventionsSkip(t *testing.T)
 	assert.True(t, ok, "quarantined table name %q must carry a parseable timestamp", quarantined[0])
 }
 
+// A plan records the definitions a rollback restores, and a drop_tables entry
+// is not among them. Rolling back an apply that dropped a listed leftover
+// restores the schema files the plan manages and leaves the leftover dropped,
+// rather than recreating an empty copy that a resume of the rollback, planning
+// without the list, would refuse as a declared table the planner never
+// manages.
+func TestEngine_Plan_DropTablesEntryIsNotRestoredByARollback(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	for _, stmt := range []string{
+		`CREATE TABLE executions (id INT PRIMARY KEY)`,
+		"CREATE TABLE `_jobs_old` (id INT PRIMARY KEY)",
+	} {
+		_, err := db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+
+	eng := newEngineWithShortQuietPeriod(t, db)
+	forward, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: testDatabase,
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"executions.sql": `CREATE TABLE executions (id INT PRIMARY KEY, status INT)`,
+		}),
+		Credentials: &engine.Credentials{DSN: dsn},
+		DropTables:  []string{"_jobs_old"},
+	})
+	require.NoError(t, err, "Plan()")
+	require.Contains(t, droppedTables(forward), "_jobs_old")
+	require.Len(t, forward.Changes, 1, "both changes belong to the one namespace")
+	originals := forward.Changes[0].OriginalFiles
+	assert.Contains(t, originals, "executions.sql", "the managed table's definition is recorded for a rollback")
+	assert.NotContains(t, originals, "_jobs_old.sql", "the dropped leftover's definition is not recorded")
+
+	for _, change := range forward.FlatTableChanges() {
+		applyTableChange(t, eng, dsn, change.Table, change.DDL)
+		waitForTerminalOutcome(t, eng, engine.StateCompleted)
+	}
+	require.False(t, tableExists(t, db, "_jobs_old"), "the forward apply dropped the listed leftover")
+
+	rollback, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database:    testDatabase,
+		SchemaFiles: schema.SchemaFiles{testDatabase: &schema.Namespace{Files: originals}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "a rollback plans from the recorded definitions without the drop list")
+	var reverted []string
+	for _, change := range rollback.FlatTableChanges() {
+		reverted = append(reverted, change.Table)
+	}
+	assert.Equal(t, []string{"executions"}, reverted, "the rollback reverts the managed table and does not recreate the dropped leftover")
+}
+
 // A name alone does not prove a table is abandoned. The shadow table of an
 // online schema change another tool is running is written continuously, so a
 // drop_tables entry written within the quiet period fails the plan instead of

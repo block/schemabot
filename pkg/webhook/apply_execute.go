@@ -890,6 +890,11 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 		}
 		return strings.Join(parts, " ")
 	}
+	if inUse, ok := errors.AsType[*api.DropTablesInUseError](err); ok {
+		// Built from the config entry, the apply's identifier and state, and
+		// the table its plan changes, never from storage error text.
+		return inUse.Error()
+	}
 	if missing, ok := errors.AsType[*api.PlanNotFoundError](err); ok {
 		return templates.PlanNotFoundDetail(missing.PlanID, msgs.replan)
 	}

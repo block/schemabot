@@ -907,7 +907,12 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		lintViolations = append(lintViolations, lint.PlannedChangeViolations(pc)...)
 	}
 
-	schemaChanges, err := groupChangesByNamespace(changes, currentSchema, namespaceByTable, req.SchemaFiles, database)
+	// A drop_tables entry is in currentSchema only so it can be dropped; the
+	// planner skips it by its name otherwise. A rollback restores the recorded
+	// definitions, so recording one would have the rollback recreate an empty
+	// leftover that its own resume, planning without the list, then refuses as
+	// a declared table it never manages.
+	schemaChanges, err := groupChangesByNamespace(changes, withoutDropTablesEntries(currentSchema, drops), namespaceByTable, req.SchemaFiles, database)
 	if err != nil {
 		return nil, err
 	}

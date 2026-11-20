@@ -728,6 +728,10 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeSourcePolicyDenied, "plan failed: "+err.Error())
 			return
 		}
+		if _, ok := errors.AsType[*DropTablesInUseError](err); ok {
+			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "plan rejected: "+err.Error())
+			return
+		}
 		s.logger.Error("plan failed", "database", req.Database, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
 		return
@@ -975,6 +979,11 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			"repository", req.Repository,
 			"drop_tables", req.DropTables,
 		)
+	}
+	if err := s.refuseDropsOfUnsettledApplyWorkTables(ctx, req.Database, resolvedTarget.DatabaseType, req.Environment, req.DropTables); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "drop_tables working table in use")
+		return nil, nil, err
 	}
 
 	resp, err := client.Plan(ctx, ternReq)
@@ -1530,6 +1539,10 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, activeApplyConflictMessage(err))
 			return
 		}
+		if _, ok := errors.AsType[*DropTablesInUseError](err); ok {
+			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "apply rejected: "+err.Error())
+			return
+		}
 		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
 			s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeSourcePolicyDenied, "apply failed: "+err.Error())
 			return
@@ -1624,6 +1637,10 @@ func applyMetricStatusForError(err error) string {
 	}
 	// So is a deferred cutover wider than the drivers that can run it.
 	if _, ok := errors.AsType[*DeferredCutoverCapacityError](err); ok {
+		return applyMetricStatusRejected
+	}
+	// So is a drop of another apply's working table, until that apply settles.
+	if _, ok := errors.AsType[*DropTablesInUseError](err); ok {
 		return applyMetricStatusRejected
 	}
 	return "error"
@@ -2162,6 +2179,11 @@ func (s *Service) createStoredApply(
 		return nil, 0, err
 	}
 	if err := rejectUnsafeStoredPlanWithoutOptIn(plan, applyOpts); err != nil {
+		return nil, 0, err
+	}
+	// An apply stopped after this plan was made is checked here: storage
+	// admits a new apply past a stopped one.
+	if err := s.refuseDropsOfUnsettledApplyWorkTables(ctx, plan.Database, plan.DatabaseType, req.Environment, plan.DropTables()); err != nil {
 		return nil, 0, err
 	}
 

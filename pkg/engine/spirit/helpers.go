@@ -40,6 +40,21 @@ func parseDSN(dsn string) (host, username, password, database string, err error)
 	return cfg.Addr, cfg.User, cfg.Passwd, cfg.DBName, nil
 }
 
+// withoutDropTablesEntries returns the live tables other than the ones the
+// plan's drop_tables lists.
+func withoutDropTablesEntries(current []table.TableSchema, drops engine.DroppedTables) []table.TableSchema {
+	if drops.Empty() {
+		return current
+	}
+	kept := make([]table.TableSchema, 0, len(current))
+	for _, ts := range current {
+		if !drops.Names(ts.Name) {
+			kept = append(kept, ts)
+		}
+	}
+	return kept
+}
+
 // groupChangesByNamespace builds the plan's per-namespace SchemaChanges.
 // Spirit operates on a single database, but table changes are grouped by the
 // namespace they belong to (from SchemaFiles keys) for consistency with
