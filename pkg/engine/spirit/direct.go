@@ -666,7 +666,10 @@ const (
 // then judged by the table checks, which read the target's foreign keys and
 // triggers. The table checks run only under an enabled policy, since a table
 // refusal changes nothing without one. An error says the statement could not
-// be judged and is never a refusal.
+// be judged and is never a refusal. A failed read of the table checks carries
+// a fixed operator message naming the table and the check, since the raw
+// cause names target infrastructure and an apply that fails here has not
+// started any statement.
 func classifyRefusal(ctx context.Context, logger *slog.Logger, target *lazyTargetDB, policy directPolicy, database, table, stmt, currentCreateTable string) (string, refusalKind, error) {
 	reason, refused, err := check.StatementRefusal(ctx, stmt, currentCreateTable, logger)
 	if err != nil {
@@ -680,16 +683,23 @@ func classifyRefusal(ctx context.Context, logger *slog.Logger, target *lazyTarge
 	}
 	db, err := target.get(ctx)
 	if err != nil {
-		return "", notRefused, fmt.Errorf("connect to read the foreign keys and triggers of table %q: %w", table, err)
+		return "", notRefused, tableCheckReadError(table, fmt.Errorf("connect to the target: %w", err))
 	}
 	reason, refused, err = check.TableRefusal(ctx, db, database, table, logger)
 	if err != nil {
-		return "", notRefused, fmt.Errorf("read the foreign keys and triggers of table %q: %w", table, err)
+		return "", notRefused, tableCheckReadError(table, err)
 	}
 	if refused {
 		return reason, tableRefused, nil
 	}
 	return "", notRefused, nil
+}
+
+// tableCheckReadError is the failure of reading table's foreign keys and
+// triggers to decide its route. The message is fixed so a pull request never
+// shows the target's own error text; cause keeps it for the server logs.
+func tableCheckReadError(table string, cause error) error {
+	return engine.OperatorErrorf(cause, "SchemaBot could not read the foreign keys and triggers of table %q on the target to choose how to run its statement, so no statement ran; see the server logs for the reason.", table)
 }
 
 // routeAlterStatements re-evaluates the plan-time refusal predicate per
