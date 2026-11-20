@@ -315,6 +315,129 @@ func TestResolve_SecretsManagerRecoveredBuildPanicDoesNotBlockLaterResolves(t *t
 	assert.Equal(t, 2, builds)
 }
 
+// registerResolver registers resolver for prefix for the rest of the test.
+func registerResolver(t *testing.T, prefix string, resolver ResolverFunc) {
+	t.Helper()
+	Register(prefix, resolver)
+	t.Cleanup(func() { Unregister(prefix) })
+}
+
+// A registered resolver receives the reference with its prefix stripped, and
+// its value and its error reach the caller unchanged.
+func TestResolve_CustomResolverReceivesTheReferenceWithoutItsPrefix(t *testing.T) {
+	var refs []string
+	registerResolver(t, "vault", func(ref string) (string, error) {
+		refs = append(refs, ref)
+		if ref == "secret/data/missing" {
+			return "", errors.New("vault: secret not found")
+		}
+		return "vault-password", nil
+	})
+
+	value, err := Resolve("vault:secret/data/myapp#password", "")
+	require.NoError(t, err)
+	assert.Equal(t, "vault-password", value)
+
+	_, err = Resolve("vault:secret/data/missing", "")
+	require.EqualError(t, err, "vault: secret not found")
+
+	assert.Equal(t, []string{"secret/data/myapp#password", "secret/data/missing"}, refs)
+}
+
+// A registered resolver takes precedence over the built-in resolver for the
+// same prefix, and unregistering it gives the prefix back to the built-in.
+func TestResolve_CustomResolverOverridesABuiltInPrefixUntilUnregistered(t *testing.T) {
+	t.Setenv("ORDERS_PASSWORD", "from-environment")
+	registerResolver(t, "env", func(ref string) (string, error) {
+		return "from-custom-resolver:" + ref, nil
+	})
+
+	value, err := Resolve("env:ORDERS_PASSWORD", "")
+	require.NoError(t, err)
+	assert.Equal(t, "from-custom-resolver:ORDERS_PASSWORD", value)
+
+	Unregister("env")
+	value, err = Resolve("env:ORDERS_PASSWORD", "")
+	require.NoError(t, err)
+	assert.Equal(t, "from-environment", value)
+}
+
+// deadlineRecordingSecretsManager records the deadline of the context each
+// fetch runs under.
+type deadlineRecordingSecretsManager struct {
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (f *deadlineRecordingSecretsManager) GetSecretValue(ctx context.Context, _ *secretsmanager.GetSecretValueInput, _ ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
+	f.deadline, f.hasDeadline = ctx.Deadline()
+	return &secretsmanager.GetSecretValueOutput{SecretString: aws.String("s3cret")}, nil
+}
+
+// A Secrets Manager lookup, the client build included, is bounded by the
+// caller's deadline or a ten-second cap, whichever comes first. A caller with
+// no deadline, such as Resolve, still cannot hang on an unreachable endpoint.
+func TestResolve_SecretsManagerLookupIsBoundedByTheCallerOrTenSeconds(t *testing.T) {
+	const lookupCap = 10 * time.Second
+
+	tests := []struct {
+		name           string
+		callerDeadline time.Duration // zero means the caller sets no deadline
+		wantCapped     bool
+	}{
+		{name: "caller without a deadline gets the cap", wantCapped: true},
+		{name: "caller deadline later than the cap is shortened to it", callerDeadline: time.Minute, wantCapped: true},
+		{name: "caller deadline sooner than the cap is kept", callerDeadline: 2 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := &deadlineRecordingSecretsManager{}
+			var buildDeadline time.Time
+			var buildHasDeadline bool
+			useSecretsManagerBuilder(t, func(ctx context.Context) (secretGetter, error) {
+				buildDeadline, buildHasDeadline = ctx.Deadline()
+				return fake, nil
+			})
+
+			ctx := t.Context()
+			if tt.callerDeadline > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, tt.callerDeadline)
+				defer cancel()
+			}
+			callerDeadline, callerHasDeadline := ctx.Deadline()
+
+			start := time.Now()
+			value, err := ResolveContext(ctx, "secretsmanager:/example/orders", "")
+			require.NoError(t, err)
+			assert.Equal(t, "s3cret", value)
+
+			require.True(t, fake.hasDeadline, "the fetch must run under a deadline")
+			require.True(t, buildHasDeadline, "the client build must run under a deadline")
+			assert.Equal(t, fake.deadline, buildDeadline, "the build and the fetch share one deadline")
+			if tt.wantCapped {
+				assert.WithinDuration(t, start.Add(lookupCap), fake.deadline, time.Second)
+			} else {
+				require.True(t, callerHasDeadline)
+				assert.Equal(t, callerDeadline, fake.deadline)
+			}
+		})
+	}
+}
+
+// A failed fetch names the secret, so an operator can tell which reference
+// is wrong from the error alone.
+func TestResolve_SecretsManagerFetchErrorNamesTheSecret(t *testing.T) {
+	fake := &fakeSecretsManager{values: map[string]string{}}
+	useSecretsManagerBuilder(t, func(context.Context) (secretGetter, error) {
+		return fake, nil
+	})
+
+	_, err := ResolveContext(t.Context(), "secretsmanager:/example/missing#password", "")
+	require.EqualError(t, err, `get secret "/example/missing": secret /example/missing not found`)
+}
+
 func TestValueFromGetSecretOutput(t *testing.T) {
 	// The string form is used when present.
 	got, err := ValueFromGetSecretOutput(&secretsmanager.GetSecretValueOutput{SecretString: aws.String("pw")}, "secret")
