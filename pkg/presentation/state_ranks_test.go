@@ -1,52 +1,26 @@
 package presentation
 
 import (
-	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/state/statetest"
 )
 
-// The tests in this file pin, for every state, where each ranking in this
-// package places it. A state added to pkg/state fails them until each ranking
-// says where it goes, and changing a rank means editing the expected table
-// here, so no ranking moves as a side effect of another change.
-
-// everyState lists the value of every field of a state constant struct such as
-// state.Task.
-func everyState(t *testing.T, constants any) []string {
-	t.Helper()
-	var states []string
-	for _, field := range reflect.ValueOf(constants).Fields() {
-		require.NotEmpty(t, field.String())
-		states = append(states, field.String())
-	}
-	require.NotEmpty(t, states)
-	return states
-}
-
-// assertRanks checks that want names every state exactly and that rank gives
-// each state the value want pins for it.
-func assertRanks(t *testing.T, states []string, want map[string]int, rank func(string) int) {
-	t.Helper()
-	assert.Len(t, want, len(states), "the expected ranks must name every state, and only those")
-	for _, s := range states {
-		wantRank, ok := want[s]
-		if !assert.Truef(t, ok, "no expected rank for state %q", s) {
-			continue
-		}
-		assert.Equalf(t, wantRank, rank(s), "rank of state %q", s)
-	}
-}
+// The tests in this file pin, for every state, where each ranking over the
+// states of pkg/state in this package places it. A state added to pkg/state
+// fails them until each ranking says where it goes, and changing a rank means
+// editing the expected table here, so no ranking moves as a side effect of
+// another change.
 
 // A sharded table reads as its most urgent shard: a failure first, then work
 // in progress, then paused and queued work, then the settled states.
 func TestTaskAttentionRankRanksEveryTaskState(t *testing.T) {
 	task := state.Task
-	assertRanks(t, everyState(t, state.Task), map[string]int{
+	statetest.AssertRanks(t, statetest.Every(t, state.Task), map[string]int{
 		task.Failed:            17,
 		task.FailedRetryable:   16,
 		task.CuttingOver:       15,
@@ -71,7 +45,7 @@ func TestTaskAttentionRankRanksEveryTaskState(t *testing.T) {
 // rank with pending.
 func TestShardStateRankRanksEveryOperationState(t *testing.T) {
 	op := state.ApplyOperation
-	assertRanks(t, everyState(t, state.ApplyOperation), map[string]int{
+	statetest.AssertRanks(t, statetest.Every(t, state.ApplyOperation), map[string]int{
 		op.Failed:                  12,
 		op.FailedRetryable:         11,
 		op.Running:                 10,
@@ -101,10 +75,50 @@ func TestShardStateRankRanksEveryOperationState(t *testing.T) {
 	}, ShardStateRank)
 }
 
+// The row that leads a target's rows is the one most in need of an operator:
+// a failure, then a retry, a stop, a cutover, work under way, work still
+// queued, and settled work last. Active states the ranking does not name rank
+// with work under way.
+func TestRowLeadRankRanksEveryOperationState(t *testing.T) {
+	op := state.ApplyOperation
+	statetest.AssertRanks(t, statetest.Every(t, state.ApplyOperation), map[string]int{
+		op.Failed:                  0,
+		op.FailedRetryable:         1,
+		op.Stopped:                 2,
+		op.WaitingForCutover:       3,
+		op.CuttingOver:             3,
+		op.Running:                 4,
+		op.RunningDegraded:         4,
+		op.CatchingUp:              4,
+		op.Checksumming:            4,
+		op.PostChecksum:            4,
+		op.Recovering:              4,
+		op.Resuming:                4,
+		op.Paused:                  4,
+		op.WaitingForDeploy:        4,
+		op.RevertWindow:            4,
+		op.SkippingRevert:          4,
+		op.Reverting:               4,
+		op.PreparingBranch:         4,
+		op.ApplyingBranchChanges:   4,
+		op.ValidatingBranch:        4,
+		op.CreatingDeployRequest:   4,
+		op.ValidatingDeployRequest: 4,
+		op.Pending:                 5,
+		op.Cancelled:               6,
+		op.Reverted:                6,
+		op.Completed:               7,
+	}, rowLeadRank)
+}
+
+// rolloutRankOnOneTarget is the TableRolloutRank of a table that one target
+// runs, given that target's state.
+func rolloutRankOnOneTarget(s string) int { return TableRolloutRank([]string{s}) }
+
 // A table that one target runs sorts in the rollout by that target's state.
 func TestTableRolloutRankRanksEveryTaskStateOnOneTarget(t *testing.T) {
 	task := state.Task
-	assertRanks(t, everyState(t, state.Task), map[string]int{
+	statetest.AssertRanks(t, statetest.Every(t, state.Task), map[string]int{
 		task.Running:           tableRankWorking,
 		task.CatchingUp:        tableRankWorking,
 		task.Checksumming:      tableRankWorking,
@@ -122,5 +136,42 @@ func TestTableRolloutRankRanksEveryTaskStateOnOneTarget(t *testing.T) {
 		task.Pending:           tableRankNotStarted,
 		task.Completed:         tableRankFinished,
 		task.RevertWindow:      tableRankFinished,
-	}, func(s string) int { return TableRolloutRank([]string{s}) })
+	}, rolloutRankOnOneTarget)
+}
+
+// A table that two targets run sorts by whichever target's state lists
+// earlier, so a waiting target leads a halted one and both lead a target that
+// has not started. The one exception is a table finished on one target and
+// not started on the other, which is partly done. The order the targets
+// report in makes no difference.
+func TestTableRolloutRankRanksEveryPairOfTaskStates(t *testing.T) {
+	states := statetest.Every(t, state.Task)
+	for _, a := range states {
+		for _, b := range states {
+			rankA, rankB := rolloutRankOnOneTarget(a), rolloutRankOnOneTarget(b)
+			want := min(rankA, rankB)
+			if min(rankA, rankB) == tableRankNotStarted && max(rankA, rankB) == tableRankFinished {
+				want = tableRankPartlyDone
+			}
+			assert.Equalf(t, want, TableRolloutRank([]string{a, b}), "targets report %q and %q", a, b)
+		}
+	}
+}
+
+// A task ranking gives a state the same rank however it is spelled: the
+// proto-prefixed form ranks as the canonical state, and an operation state
+// that is not a task state ranks as running, the state it stands in for.
+func TestTaskRankingsRankAStateTheSameHoweverItIsSpelled(t *testing.T) {
+	rankings := map[string]func(string) int{
+		"TaskAttentionRank": TaskAttentionRank,
+		"TableRolloutRank":  rolloutRankOnOneTarget,
+	}
+	for name, rank := range rankings {
+		for _, s := range statetest.Every(t, state.Task) {
+			proto := "STATE_" + strings.ToUpper(s)
+			assert.Equalf(t, rank(s), rank(proto), "%s of %q", name, proto)
+		}
+		assert.Equalf(t, rank(state.Task.Running), rank(state.ApplyOperation.RunningDegraded),
+			"%s of an operation state that stands in for running", name)
+	}
 }

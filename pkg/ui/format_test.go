@@ -2,11 +2,11 @@ package ui
 
 import (
 	"math"
-	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/state/statetest"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -78,7 +78,7 @@ func TestFormatTableSizeClause(t *testing.T) {
 // pending.
 func TestTableStatePriority(t *testing.T) {
 	task := state.Task
-	want := map[string]int{
+	statetest.AssertRanks(t, statetest.Every(t, state.Task), map[string]int{
 		task.Running:           0,
 		task.CatchingUp:        0,
 		task.Checksumming:      0,
@@ -96,17 +96,7 @@ func TestTableStatePriority(t *testing.T) {
 		task.Completed:         4,
 		task.Cancelled:         4,
 		task.Reverted:          4,
-	}
-	fields := reflect.ValueOf(state.Task)
-	assert.Len(t, want, fields.NumField(), "the expected priorities must name every task state, and only those")
-	for _, field := range fields.Fields() {
-		s := field.String()
-		wantPriority, ok := want[s]
-		if !assert.Truef(t, ok, "no expected priority for task state %q", s) {
-			continue
-		}
-		assert.Equalf(t, wantPriority, TableStatePriority(s), "priority of task state %q", s)
-	}
+	}, TableStatePriority)
 	assert.Equal(t, 2, TableStatePriority("unknown_state"))
 }
 
