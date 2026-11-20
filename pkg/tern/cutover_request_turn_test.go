@@ -166,6 +166,14 @@ func TestOperationCutoverRequestTurn(t *testing.T) {
 			wantBlocker: true,
 		},
 		{
+			name:        "a request bound to eu while eu can still cut over is left for eu while us still copies",
+			boundTo:     turnEUOperationID,
+			euState:     state.ApplyOperation.WaitingForCutover,
+			usTasks:     []*storage.Task{turnTask(turnUSOperationID, state.Task.Running)},
+			want:        cutoverRequestTurn{reason: "the request is bound to another member"},
+			wantBlocker: true,
+		},
+		{
 			name:        "a request bound to eu after eu completed is settled as landed",
 			boundTo:     turnEUOperationID,
 			euState:     state.ApplyOperation.Completed,
