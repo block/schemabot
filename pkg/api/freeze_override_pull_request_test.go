@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -163,13 +164,16 @@ func newPullRequestOverrideService(t *testing.T, requestedBy string, pullRequest
 // refuses a request asked for on a pull request, whoever the approver is, and
 // storage is never asked to approve it.
 func TestFreezeOverrideApproveRefusesAPullRequestRequest(t *testing.T) {
+	onThePullRequest := `override request ovr-pr was asked for on pull request octocat/hello-world#7; approve it there with \"schemabot freeze approve ovr-pr\"`
 	for name, tc := range map[string]struct {
 		requestedBy string
 		pullRequest int
+		message     string
 	}{
-		"from a pull request":    {storage.GitHubIdentity("carol"), 7},
-		"github requester alone": {storage.GitHubIdentity("carol"), 0},
-		"pull request only":      {"carol", 7},
+		"from a pull request": {storage.GitHubIdentity("carol"), 7, onThePullRequest},
+		// No pull request to send the approver to, so the requester asks again.
+		"github requester alone": {storage.GitHubIdentity("carol"), 0, "override request ovr-pr has a GitHub requester but no pull request, so nothing can approve it; ask for a new override"},
+		"pull request only":      {"carol", 7, onThePullRequest},
 	} {
 		t.Run(name, func(t *testing.T) {
 			mux, store := newPullRequestOverrideService(t, tc.requestedBy, tc.pullRequest)
@@ -177,7 +181,7 @@ func TestFreezeOverrideApproveRefusesAPullRequestRequest(t *testing.T) {
 			rec := approveRoute(t, mux, freezeMember, "ovr-pr")
 
 			require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
-			assert.Contains(t, rec.Body.String(), `override request ovr-pr was asked for on a pull request; approve it there with \"schemabot freeze approve ovr-pr\"`)
+			assert.Contains(t, rec.Body.String(), tc.message)
 			stored, err := store.Get(t.Context(), "ovr-pr")
 			require.NoError(t, err)
 			assert.Nil(t, stored.ApprovedAt, "storage must not approve it")
@@ -188,6 +192,36 @@ func TestFreezeOverrideApproveRefusesAPullRequestRequest(t *testing.T) {
 	// A request that does not exist is still not found, not conflicting.
 	mux, _ := newPullRequestOverrideService(t, storage.GitHubIdentity("carol"), 7)
 	assert.Equal(t, http.StatusNotFound, approveRoute(t, mux, freezeMember, "ovr-nope").Code)
+}
+
+// lookupFailingOverrides fails Get and counts Approve calls.
+type lookupFailingOverrides struct {
+	*memoryFreezeOverrideStore
+	approves int
+}
+
+func (l *lookupFailingOverrides) Get(context.Context, string) (*storage.FreezeOverrideRequest, error) {
+	return nil, errors.New("connection refused")
+}
+
+func (l *lookupFailingOverrides) Approve(ctx context.Context, id, approver string) (*storage.FreezeOverrideRequest, error) {
+	l.approves++
+	return l.memoryFreezeOverrideStore.Approve(ctx, id, approver)
+}
+
+// A lookup that fails leaves the request's domain unknown, so the route
+// answers 500 and never asks storage to approve it.
+func TestFreezeOverrideApproveLookupFailureApprovesNothing(t *testing.T) {
+	svc, mux, store, _ := newOverrideApproveService(t, freezeConfig())
+	failing := &lookupFailingOverrides{memoryFreezeOverrideStore: store}
+	svc.storage.(*mockStorageWithFreezes).overrides = failing
+
+	rec := approveRoute(t, mux, freezeMember, "ovr-1")
+
+	require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "approve override request failed")
+	assert.NotContains(t, rec.Body.String(), "connection refused", "the storage error stays in the logs")
+	assert.Zero(t, failing.approves, "storage must not be asked to approve")
 }
 
 // A forward-auth subject that starts with "github:" cannot approve anything

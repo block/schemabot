@@ -395,8 +395,13 @@ func (s *Service) handleFreezeOverrideApprove(w http.ResponseWriter, r *http.Req
 		s.logger.Error("get freeze override request failed", "override_request", id, "error", err)
 		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "approve override request failed")
 		return
+	case request.FromPullRequest() && request.PullRequest > 0:
+		s.writeError(w, http.StatusConflict, fmt.Sprintf("override request %s was asked for on pull request %s#%d; approve it there with \"schemabot freeze approve %s\"", id, request.Repository, request.PullRequest, id))
+		return
 	case request.FromPullRequest():
-		s.writeError(w, http.StatusConflict, fmt.Sprintf("override request %s was asked for on a pull request; approve it there with \"schemabot freeze approve %s\"", id, id))
+		// A GitHub requester with no pull request to approve it on, such as a
+		// row recorded before the prefix was reserved: nowhere can approve it.
+		s.writeError(w, http.StatusConflict, fmt.Sprintf("override request %s has a GitHub requester but no pull request, so nothing can approve it; ask for a new override", id))
 		return
 	}
 	approved, err := s.storage.FreezeOverrides().Approve(r.Context(), id, approver)
