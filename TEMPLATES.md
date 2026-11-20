@@ -642,7 +642,7 @@ DROP TABLE `_events_old`;
 1. Deploy application code that no longer reads from or writes to the dropped table.
 2. Add `--allow-unsafe` to confirm 1 unsafe change on `_events_old`:
    ```
-   schemabot apply -e staging
+   schemabot apply -e staging --allow-unsafe
    ```
 
 </details>
@@ -765,7 +765,7 @@ CREATE TABLE `customers` (
 
 ▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
 ```
-schemabot apply -e staging
+schemabot apply -e staging --allow-unsafe
 ```
 
 </details>
@@ -852,7 +852,7 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 
 ▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `users`:
 ```
-schemabot apply -e staging
+schemabot apply -e staging --allow-unsafe
 ```
 
 </details>
@@ -1001,7 +1001,7 @@ ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;
 1. Deploy application code that no longer reads from or writes to the dropped column.
 2. Add `--allow-unsafe` to confirm 1 unsafe change on `orders`:
    ```
-   schemabot apply -e staging
+   schemabot apply -e staging --allow-unsafe
    ```
 
 </details>
@@ -1088,7 +1088,7 @@ DROP TABLE `refund_backfill`;
 2. Make the dropped index invisible, then verify application queries no longer rely on it for safe performance.
 3. Add `--allow-unsafe` to confirm 9 unsafe changes on `transfer_events`, `payouts` and 4 more:
    ```
-   schemabot apply -e staging
+   schemabot apply -e staging --allow-unsafe
    ```
 
 </details>
@@ -1126,7 +1126,7 @@ A plan diffs this PR's schema files against the live database, so a change anoth
 1. Deploy application code that no longer reads from or writes to the dropped table and column.
 2. Add `--allow-unsafe` to confirm 2 unsafe changes on `orders` and `reconcile_state`:
    ```
-   schemabot apply -e staging
+   schemabot apply -e staging --allow-unsafe
    ```
 
 </details>
@@ -1705,7 +1705,7 @@ schemabot apply -e staging
 
 ▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes on `commerce_sharded` VSchema:
 ```
-schemabot apply -e staging
+schemabot apply -e staging --allow-unsafe
 ```
 
 </details>
@@ -3078,7 +3078,7 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 1. Deploy application code that no longer reads from or writes to the dropped column.
 2. Add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
    ```
-   schemabot apply -e staging
+   schemabot apply -e staging --allow-unsafe
    ```
 <!-- schemabot:offer-support-channel -->
 
@@ -3109,7 +3109,7 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 1. Make the dropped index invisible, then verify application queries no longer rely on it for safe performance.
 2. Add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
    ```
-   schemabot apply -e staging
+   schemabot apply -e staging --allow-unsafe
    ```
 <!-- schemabot:offer-support-channel -->
 
@@ -3152,7 +3152,7 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 
 **🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 3 unsafe changes on `orders` and `users`:
 ```
-schemabot apply -e staging
+schemabot apply -e staging --allow-unsafe
 ```
 <!-- schemabot:offer-support-channel -->
 
@@ -10867,7 +10867,7 @@ ALTER TABLE `mutes`
 1. Deploy application code that no longer reads from or writes to the dropped column.
 2. Add `--allow-unsafe` to confirm 1 unsafe change on `mutes`:
    ```
-   schemabot apply -e production
+   schemabot apply -e production --allow-unsafe
    ```
 
 </details>

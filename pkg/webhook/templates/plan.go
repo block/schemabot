@@ -812,7 +812,7 @@ func writeRefusedChangeReplan(sb *strings.Builder, plan, planCommand string) {
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
 func writeApplyInstruction(sb *strings.Builder, command string, data PlanCommentData) {
 	if consent, ok := planUnsafeConsent(data); ok {
-		writeUnsafeConsentCommand(sb, "▶️ **To apply**", consent, command)
+		writeUnsafeConsentCommand(sb, "▶️ **To apply**", consent, command+" --allow-unsafe")
 		return
 	}
 	sb.WriteString("▶️ **To apply**, comment:\n")
@@ -906,9 +906,7 @@ func principalList(principals []string) string {
 // --allow-unsafe. The apply instruction states it in the sentence that leads
 // into the command, so the reader meets the requirement before copying the
 // command rather than after the gate rejects it, and without scrolling back up
-// to the sections that explain it. The flag is deliberately left out of the
-// pasteable command: consenting to destroy data takes typing it, which a
-// copy-paste of the plan's own command never does.
+// to the sections that explain it.
 type unsafeConsent struct {
 	findings int
 	tables   string
@@ -968,8 +966,8 @@ func (d PlanCommentData) applyInstructionCarriesDropSteps() bool {
 	return ok
 }
 
-// writeUnsafeConsentCommand writes the lead-in to a command --allow-unsafe
-// must be added to, then the command. lead is the phrase the instruction
+// writeUnsafeConsentCommand writes the unsafe consent instruction and command.
+// lead is the phrase the instruction
 // continues, such as "▶️ **To apply**". With drops to make safe, the lead
 // heads a numbered list: the drop steps, then the consent, with the command
 // under it.
@@ -4169,7 +4167,7 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		}
 	case len(envsWithChanges) == 1:
 		if consent, ok := planUnsafeConsent(*data.Plans[envsWithChanges[0]]); ok {
-			writeUnsafeConsentCommand(sb, "▶️ **To apply** these changes", consent, command("schemabot apply", envsWithChanges[0]))
+			writeUnsafeConsentCommand(sb, "▶️ **To apply** these changes", consent, command("schemabot apply", envsWithChanges[0])+" --allow-unsafe")
 		} else {
 			sb.WriteString("▶️ **To apply** these changes, comment:\n")
 			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
@@ -4211,13 +4209,14 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 // the steps that make its drops safe, when its plan needs them.
 func writeEnvApplyCommand(sb *strings.Builder, sentence string, plan *PlanCommentData, command string) {
 	consent, ok := planUnsafeConsent(*plan)
-	switch {
-	case ok && len(consent.dropSteps) > 0:
-		writeUnsafeConsentSteps(sb, sentence, consent, command)
-		return
-	case ok:
+	if ok {
+		command += " --allow-unsafe"
+		if len(consent.dropSteps) > 0 {
+			writeUnsafeConsentSteps(sb, sentence, consent, command)
+			return
+		}
 		fmt.Fprintf(sb, "%s. %s:\n", sentence, capitalizeFirst(consent.instruction()))
-	default:
+	} else {
 		sb.WriteString(sentence + ":\n")
 	}
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
@@ -4274,7 +4273,7 @@ func ApplyCommand(environment, database string, opts ApplyCommandOptions) string
 
 // UnsafeReconsent is the consent clause that leads into an ApplyCommand built
 // from a command that carried --allow-unsafe, and empty for one that did not.
-// Like the plan comment's apply instruction, it states the consent in the
+// It states the consent in the
 // sentence that leads into the command rather than putting the flag in it, so
 // consenting again takes typing it.
 func UnsafeReconsent(opts ApplyCommandOptions) string {
