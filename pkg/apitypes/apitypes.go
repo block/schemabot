@@ -916,6 +916,11 @@ type ControlRequest struct {
 	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id"`
 	Caller      string `json:"caller,omitempty"`
+	// Override is the reason to ask for a freeze override when a freeze
+	// refuses a start or cutover. A caller outside the HTTP routes sets it
+	// and validates it: the routes read the same field from their own
+	// request types and validate it themselves.
+	Override string `json:"override,omitempty"`
 }
 
 // =============================================================================

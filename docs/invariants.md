@@ -2201,10 +2201,14 @@ SchemaBot records a request and refuses, naming it. Asking again before approval
 (`requestOverride`), which keeps its first reason; the refusal says so when the new reason differs. A verified member of `freeze.groups` who is not the requester approves it;
 write groups do not grant approval, and with no freeze group configured nobody approves, so nobody
 overrides alone, admins included. Storage also refuses the pull request's author once a request
-records one. The requester repeats the command and it is admitted; only the requester runs on an
-approval (`approvedOverride`), and anyone else asks for their own. An approval covers one
-environment, one action and one target and expires after 24 hours. Within that window the
-requester may use it more than once, for example to re-apply the same schema after a stop. For an apply the target is the
+records one. A request from a pull request records its commenter and author as `github:<login>`,
+which storage cannot match to a forward-auth subject, so an approval must come from the same
+identity domain: `handleFreezeOverrideApprove` refuses a request where `FromPullRequest` holds, and
+`AuthorizeFreezeApprove` refuses a subject that starts with `github:`. The requester repeats the
+command and it is admitted; only the requester runs on an approval (`approvedOverride`), and anyone
+else asks for their own. An approval covers one environment, one action and one target and expires
+after 24 hours. Within that window the requester may use it more than once, for example to re-apply
+the same schema after a stop. For an apply the target is the
 database and, for each rollout member it runs, the schema and the `ignore_tables` and
 `drop_tables` that member's plan was reviewed under (`applyOverrideTarget`), not the plan,
 because a repeated command plans afresh. A change to what any member would run, or a rollout

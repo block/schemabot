@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // FreezeConfig configures environment freezes.
@@ -31,6 +32,10 @@ const DirectWriteReasonFreezeAllow = "freeze_allow"
 // DirectWriteReasonNotFreezeApprover denies approving a freeze override to a
 // caller who is not in a freeze group, write-group members included.
 const DirectWriteReasonNotFreezeApprover = "not_freeze_approver"
+
+// DirectWriteReasonPullRequestIdentity denies approving through the API to a
+// caller whose subject is in the pull request identity domain.
+const DirectWriteReasonPullRequestIdentity = "pull_request_identity"
 
 // validateFreeze rejects freeze groups that could never take effect.
 func (c *ServerConfig) validateFreeze() error {
@@ -93,6 +98,12 @@ func (c *ServerConfig) AuthorizeFreezeApprove(user *auth.User) DirectWriteAuthor
 	if user == nil {
 		return DirectWriteAuthorizationResult{Allowed: false, Reason: DirectWriteReasonMissingIdentity}
 	}
+	// A request from a pull request is approved from a pull request, where the
+	// identity is a GitHub login. An API subject spelled like one would pass
+	// for that login, so none approves here (AZ-10).
+	if storage.IsGitHubIdentity(user.Subject) {
+		return DirectWriteAuthorizationResult{Allowed: false, Reason: DirectWriteReasonPullRequestIdentity}
+	}
 	if matched, ok := auth.MatchedGroup(user.Groups, trimmedNonEmpty(c.Freeze.Groups)); ok {
 		return DirectWriteAuthorizationResult{Allowed: true, Reason: DirectWriteReasonFreezeAllow, MatchedPrincipal: matched}
 	}
@@ -115,6 +126,10 @@ func (s *Service) authorizeFreezeApprove(w http.ResponseWriter, r *http.Request)
 		subject = user.Subject
 	}
 	s.logger.Warn("freeze override approval denied", "subject", subject, "reason", result.Reason)
+	if result.Reason == DirectWriteReasonPullRequestIdentity {
+		s.writeError(w, http.StatusForbidden, "an identity that starts with \""+storage.GitHubIdentityPrefix+"\" cannot approve an override through the API")
+		return false
+	}
 	groups := trimmedNonEmpty(s.config.Freeze.Groups)
 	message := "approving an override requires membership in a freeze group (" + strings.Join(groups, ", ") + ")"
 	if len(groups) == 0 {

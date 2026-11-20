@@ -580,8 +580,8 @@ type FreezeOverrideRequest struct {
 	ID          int64
 	Identifier  string
 	Environment string
-	// Action is the change the request lets through; TargetID is the plan
-	// an apply would run, or the apply a cutover or start would act on.
+	// Action is the change the request lets through; TargetID is the schema
+	// an apply asks for, or the apply a cutover or start would act on.
 	Action   string
 	TargetID string
 	Database string
@@ -651,6 +651,26 @@ func (r *FreezeOverrideRequest) Covers(blockers []string) bool {
 		}
 	}
 	return true
+}
+
+// GitHubIdentityPrefix marks an identity from a pull request command. SchemaBot
+// cannot map a GitHub login to a forward-auth subject, so the two never compare
+// equal by name; the prefix keeps each in its own domain.
+const GitHubIdentityPrefix = "github:"
+
+// GitHubIdentity returns the identity of a GitHub login in the pull request
+// domain.
+func GitHubIdentity(login string) string { return GitHubIdentityPrefix + login }
+
+// IsGitHubIdentity reports whether who is in the pull request domain.
+func IsGitHubIdentity(who string) bool {
+	return strings.HasPrefix(strings.TrimSpace(who), GitHubIdentityPrefix)
+}
+
+// FromPullRequest reports whether the request was asked for on a pull request,
+// so only a pull request approves it. Either marker puts it there.
+func (r *FreezeOverrideRequest) FromPullRequest() bool {
+	return r.PullRequest > 0 || IsGitHubIdentity(r.RequestedBy)
 }
 
 // IsPersonOf reports whether who is the request's requester or its pull
