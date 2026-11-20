@@ -179,7 +179,8 @@ func TestFreezeGroupAdmittedThroughServerHandler(t *testing.T) {
 		},
 		Freeze: api.FreezeConfig{Groups: []string{"incident-commanders"}},
 	}
-	svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
+	overrides := &approverRecordingOverrides{}
+	svc := api.New(overrideStorage{Storage: mysqlstore.New(nil), overrides: overrides}, cfg, nil, logger)
 	webhook, err := buildWebhookRuntime(cfg, svc, logger)
 	require.NoError(t, err)
 	authz, err := buildServerAuthorizer(t.Context(), cfg, logger)
@@ -197,6 +198,30 @@ func TestFreezeGroupAdmittedThroughServerHandler(t *testing.T) {
 	}
 	assert.Equal(t, http.StatusBadRequest, post("/api/freezes"))
 	assert.Equal(t, http.StatusForbidden, post("/api/settings"))
+	// Approving an override is the third freeze write: the middleware admits
+	// ida, the handler verifies her and reaches storage, which knows no ovr-1.
+	assert.Equal(t, http.StatusNotFound, post("/api/freezes/overrides/ovr-1/approve"))
+	assert.Equal(t, "ida", overrides.approver)
+}
+
+// overrideStorage swaps in a fake override store so the approve route can
+// reach storage without a database.
+type overrideStorage struct {
+	storage.Storage
+	overrides storage.FreezeOverrideStore
+}
+
+func (s overrideStorage) FreezeOverrides() storage.FreezeOverrideStore { return s.overrides }
+
+// approverRecordingOverrides records who approved and knows no request.
+type approverRecordingOverrides struct {
+	storage.FreezeOverrideStore
+	approver string
+}
+
+func (o *approverRecordingOverrides) Approve(_ context.Context, _, approver string) (*storage.FreezeOverrideRequest, error) {
+	o.approver = approver
+	return nil, storage.ErrFreezeOverrideNotFound
 }
 
 // Configuring the service-caller lane (trusted_gateway_spiffe +
