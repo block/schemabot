@@ -110,8 +110,10 @@ type installationLookupServer struct {
 	mu      sync.Mutex
 	lookups map[string]int
 	respond func(owner, name string) (status int, id int64, account string)
-	started chan string
-	release chan struct{}
+	// suspended lists installation ids answered as suspended by their owner.
+	suspended map[int64]bool
+	started   chan string
+	release   chan struct{}
 }
 
 // holdLookups makes every later lookup wait until the returned function
@@ -168,6 +170,9 @@ func newInstallationLookupClient(t *testing.T, respond func(owner, name string) 
 			body := `{"message":"status"}`
 			if status < 300 {
 				body = fmt.Sprintf(`{"id":%d,"account":{"login":%q}}`, id, account)
+				if server.suspended[id] {
+					body = fmt.Sprintf(`{"id":%d,"account":{"login":%q},"suspended_at":"2026-01-02T03:04:05Z"}`, id, account)
+				}
 			}
 			return &http.Response{
 				StatusCode: status,

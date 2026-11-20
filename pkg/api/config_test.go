@@ -6839,3 +6839,34 @@ func TestValidateListenOnlyRepo(t *testing.T) {
 		})
 	}
 }
+
+// The quota probe reads only the installations serving the repositories an App
+// is configured for. With Apps configured, an App serves the repos whose
+// github_app names it, and an App no repository points at serves none. A
+// single-App config that lists repositories serves exactly those; one that
+// lists none may serve any repository, so the probe reads every installation.
+func TestReposServedByGitHubApp(t *testing.T) {
+	multi := &ServerConfig{
+		Apps: map[string]GitHubAppConfig{"primary": {}, "secondary": {}, "unused": {}},
+		Repos: map[string]RepoConfig{
+			"octo/b": {GitHubApp: "primary"},
+			"octo/a": {GitHubApp: "primary"},
+			"else/c": {GitHubApp: "secondary"},
+		},
+	}
+	repos, restricted := multi.ReposServedByGitHubApp("primary")
+	assert.True(t, restricted)
+	assert.Equal(t, []string{"octo/a", "octo/b"}, repos)
+	repos, restricted = multi.ReposServedByGitHubApp("unused")
+	assert.True(t, restricted)
+	assert.Empty(t, repos)
+
+	single := &ServerConfig{Repos: map[string]RepoConfig{"octo/b": {}, "octo/a": {}}}
+	repos, restricted = single.ReposServedByGitHubApp("default")
+	assert.True(t, restricted)
+	assert.Equal(t, []string{"octo/a", "octo/b"}, repos)
+
+	repos, restricted = (&ServerConfig{}).ReposServedByGitHubApp("default")
+	assert.False(t, restricted)
+	assert.Nil(t, repos)
+}
