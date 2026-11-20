@@ -20,6 +20,12 @@ type FreezeConfig struct {
 	// Requires auth type forward_auth, the authenticator that forwards caller
 	// groups.
 	Groups []string `yaml:"groups,omitempty"`
+
+	// GitHubTeams are the GitHub teams, as org/team-slug, whose members may
+	// approve a freeze override from the pull request it was asked for on.
+	// They govern only that approval and need no forward_auth. Empty means
+	// nobody approves from a pull request.
+	GitHubTeams []string `yaml:"github_teams,omitempty"`
 }
 
 // DirectWriteReasonNotFreezeAdmin denies a freeze write to a caller in
@@ -37,8 +43,12 @@ const DirectWriteReasonNotFreezeApprover = "not_freeze_approver"
 // caller whose subject is in the pull request identity domain.
 const DirectWriteReasonPullRequestIdentity = "pull_request_identity"
 
-// validateFreeze rejects freeze groups that could never take effect.
+// validateFreeze rejects freeze groups that could never take effect, and
+// malformed or repeated approver teams.
 func (c *ServerConfig) validateFreeze() error {
+	if err := validateGitHubTeamPrincipals("freeze.github_teams", c.Freeze.GitHubTeams); err != nil {
+		return err
+	}
 	groups := trimmedNonEmpty(c.Freeze.Groups)
 	if len(groups) == 0 {
 		return nil

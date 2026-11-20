@@ -17,5 +17,6 @@ const (
 	Rollback        = "rollback"
 	RollbackConfirm = "rollback-confirm"
 	FixLint         = "fix-lint"
+	Freeze          = "freeze"
 	Help            = "help"
 )

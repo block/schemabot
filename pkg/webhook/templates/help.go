@@ -16,6 +16,7 @@ func commandReference() string {
 | ` + "`schemabot cutover <apply-id> -e <env>`" + ` | Complete a deferred cutover |
 | ` + "`schemabot rollback <apply-id> -e <env> [-t <tenant>]`" + ` | Generate a rollback plan |
 | ` + "`schemabot rollback-confirm -e <env> [-t <tenant>]`" + ` | Execute a rollback |
+| ` + "`schemabot freeze approve <ovr-id>`" + ` | Approve a freeze override request asked for on this PR |
 
 **Options**: ` + "`-e <env>`" + ` environment, ` + "`-d <db>`" + ` database, ` + "`-t, --tenant <name>`" + ` deployment routing, ` + "`--defer-cutover`" + `, ` + "`--allow-unsafe`" + `, ` + "`--skip-revert`" + ` (Vitess), ` + "`--target <target>`" + ` one target of the rollout (plan and apply), ` + "`--override \"<reason>\"`" + ` ask a freeze approver to let the change through a freeze (apply, start and cutover)
 

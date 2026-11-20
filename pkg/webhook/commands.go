@@ -54,6 +54,16 @@ type CommandSpec struct {
 	// revert and the pinned rollback skip the freeze gate, so they never take
 	// it.
 	SupportsOverride bool
+
+	// Subcommand is the word after the command word that selects what it
+	// does, as in `freeze approve`. The command word alone, or with another
+	// word, is not a command.
+	Subcommand string
+
+	// HasOverrideID means the command takes one positional `ovr-<id>`
+	// argument, the freeze override request it acts on. The request carries
+	// its own environment, so the command takes no `-e`.
+	HasOverrideID bool
 }
 
 // commandSpecs is the registry of all SchemaBot commands. Order does not
@@ -78,6 +88,7 @@ var commandSpecs = []CommandSpec{
 	{Name: action.Cutover, RequiresEnv: true, HasApplyID: true, SupportsOverride: true},
 	{Name: action.Rollback, RequiresEnv: true, HasApplyID: true},
 	{Name: action.RollbackConfirm, RequiresEnv: true, SupportsDeferCutover: true, SupportsAllowUnsafe: true},
+	{Name: action.Freeze, Subcommand: "approve", HasOverrideID: true},
 }
 
 // CommandNames returns the command word of every registered PR comment
@@ -156,8 +167,11 @@ type CommandResult struct {
 	// CommentID is the PR comment that carried this command. Handlers
 	// acknowledge it with a reaction once they commit to acting, so on a
 	// fan-out only the deployments actually doing work acknowledge.
-	CommentID   int64
-	ApplyID     string // Positional apply identifier for apply-scoped commands.
+	CommentID int64
+	ApplyID   string // Positional apply identifier for apply-scoped commands.
+	// OverrideID is the override request a `freeze approve` names, as typed;
+	// the approval checks its shape.
+	OverrideID  string
 	Environment string
 	Database    string // Optional -d flag value
 	// Target is the optional --target value: the one rollout member of the
@@ -264,6 +278,9 @@ type directive struct {
 	// spelling; which value was meant is ambiguous.
 	repeated map[string]bool
 	applyID  string
+	// overrideID is the positional word of a command that takes an override
+	// request, as typed.
+	overrideID string
 }
 
 // booleanFlags maps every accepted spelling of a flag that takes no value to
@@ -412,7 +429,19 @@ func (p *CommandParser) parseDirective(words []string, bound map[int]bool) direc
 		}
 		malformed = true
 	}
-	for i := 1; i < len(words); i++ {
+	spec := specByName[strings.TrimRight(d.name, sentencePunctuation)]
+	first := 1
+	if spec.Subcommand != "" {
+		// "schemabot freeze the deploys tonight" is a sentence; the command
+		// word alone is an attempt at the command.
+		if len(words) > 1 && strings.ToLower(words[1]) != spec.Subcommand {
+			d.kind = lineProse
+			return d
+		}
+		malformed = malformed || len(words) == 1
+		first = 2
+	}
+	for i := first; i < len(words); i++ {
 		word := words[i]
 		lower := strings.ToLower(word)
 		if flag, ok := autocorrectedValueFlag(lower); ok {
@@ -449,6 +478,8 @@ func (p *CommandParser) parseDirective(words []string, bound map[int]bool) direc
 		case isUsagePlaceholder(word):
 		case isUsageNotation(word):
 			malformed = true
+		case spec.HasOverrideID && d.overrideID == "":
+			d.overrideID = word
 		default:
 			d.kind = lineProse
 			return d
@@ -456,6 +487,11 @@ func (p *CommandParser) parseDirective(words []string, bound map[int]bool) direc
 	}
 	if env, given := d.values["-e"]; given && env == "" {
 		malformed = true
+	}
+	if spec.HasOverrideID {
+		// The request names its environment, so `-e` can only contradict it.
+		_, envGiven := d.values["-e"]
+		malformed = malformed || d.overrideID == "" || envGiven
 	}
 	if database, given := d.values["-d"]; given && !p.databaseNameRegex.MatchString(database) {
 		malformed = true
@@ -728,6 +764,9 @@ func (p *CommandParser) applySpec(spec CommandSpec, d directive, tenant string, 
 
 	if spec.HasApplyID {
 		result.ApplyID = d.applyID
+	}
+	if spec.HasOverrideID {
+		result.OverrideID = d.overrideID
 	}
 	if spec.SupportsDB && d.values["-d"] != "" {
 		result.Database = storage.CanonicalKey(d.values["-d"])

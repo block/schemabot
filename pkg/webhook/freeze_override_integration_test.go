@@ -118,6 +118,131 @@ func TestE2EApplyOverrideFromAPullRequestNeedsAnotherGitHubApprover(t *testing.T
 	assert.Equal(t, request.Identifier, created.GetOptions().FreezeOverride)
 }
 
+// approveTeam is the one freeze approver team the approval tests configure.
+const approveTeam = "acme/freeze-approvers"
+
+// approveFromPullRequest comments `schemabot freeze approve id` as login on the
+// pull request. The team holds dave, carol and testuser, and reads as
+// teamStatus says.
+func approveFromPullRequest(t *testing.T, svc *api.Service, dbName, login, id string, teamStatus int) *planFlowResult {
+	t.Helper()
+	return runRolloutWebhookWithFiles(t, svc, dbName, commentRequest(t, login, "schemabot freeze approve "+id),
+		map[string]string{"users.sql": usersWithEmailSchema},
+		func(mux *http.ServeMux, _ *planFlowResult) {
+			handleTeamMembers(t, mux, "acme", "freeze-approvers", teamStatus, "dave", "carol", "testuser")
+		})
+}
+
+// storePullRequestOverride records a pending request from carol on the
+// pull request, for a test that needs one the command did not make.
+func storePullRequestOverride(t *testing.T, st storage.Storage, dbName string, pullRequest int) *storage.FreezeOverrideRequest {
+	t.Helper()
+	request, err := st.FreezeOverrides().Create(t.Context(), &storage.FreezeOverrideRequest{
+		Identifier: engine.NewFreezeOverrideID(), Environment: driftEnv, Action: storage.FreezeOverrideActionApply,
+		TargetID: dbName + "/x@0123456789abcdef", Database: dbName, Blockers: []string{"freeze freeze-x"}, Reason: "fix",
+		RequestedBy: "github:carol", PRAuthor: "github:testuser", Repository: "octocat/hello-world", PullRequest: pullRequest,
+		ExpiresAt: time.Now().UTC().Add(time.Hour),
+	})
+	require.NoError(t, err)
+	return request
+}
+
+// A freeze approver comments `schemabot freeze approve` on the pull request
+// the request was made on. SchemaBot approves it as that GitHub login and says
+// who approved what; the requester runs the command again and it is admitted.
+func TestE2EFreezeApproveFromTheSamePullRequest(t *testing.T) {
+	dbName := "webhook_override_approve"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	svc.Config().Freeze.GitHubTeams = []string{approveTeam}
+	schemabotDB := openDriftDB(t, e2eSchemabotDSN)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+		_, err := schemabotDB.ExecContext(context.WithoutCancel(t.Context()), "DELETE FROM `freeze_override_requests` WHERE `database_name` = ?", dbName)
+		assert.NoError(t, err)
+	})
+	freezeID := freezeForOverride(t, svc.Storage(), driftEnv, dbName)
+	refused := runRolloutWebhook(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv+` --override "fix"`))
+	request := requestNamedIn(t, svc.Storage(), awaitCommentContaining(t, refused, "blocked in "+driftEnv+" by freeze "+freezeID))
+
+	t.Run("the requester and the author, though in the team, and a stranger approve nothing", func(t *testing.T) {
+		for login, want := range map[string]string{
+			"carol":    "other than the person who asked for it and the pull request's author",
+			"testuser": "other than the person who asked for it and the pull request's author",
+			"mallory":  "is not a member of a team that may approve",
+		} {
+			comment := awaitCommentContaining(t, approveFromPullRequest(t, svc, dbName, login, request.Identifier, http.StatusOK), "Nothing was approved")
+			assert.Contains(t, comment, want, login)
+		}
+		stored, err := svc.Storage().FreezeOverrides().Get(t.Context(), request.Identifier)
+		require.NoError(t, err)
+		assert.Nil(t, stored.ApprovedAt, "the request stays pending")
+	})
+
+	t.Run("a team that cannot be read refuses", func(t *testing.T) {
+		comment := awaitCommentContaining(t, approveFromPullRequest(t, svc, dbName, "dave", request.Identifier, http.StatusInternalServerError), "could not check whether @dave is a freeze approver")
+		assert.Contains(t, comment, "Nothing was approved")
+		stored, err := svc.Storage().FreezeOverrides().Get(t.Context(), request.Identifier)
+		require.NoError(t, err)
+		assert.Nil(t, stored.ApprovedAt)
+	})
+
+	t.Run("a request from another pull request is not approved here", func(t *testing.T) {
+		other := storePullRequestOverride(t, svc.Storage(), dbName, 2)
+		comment := awaitCommentContaining(t, approveFromPullRequest(t, svc, dbName, "dave", other.Identifier, http.StatusOK), "belongs to octocat/hello-world#2")
+		assert.Contains(t, comment, "Nothing was approved")
+		stored, err := svc.Storage().FreezeOverrides().Get(t.Context(), other.Identifier)
+		require.NoError(t, err)
+		assert.Nil(t, stored.ApprovedAt)
+	})
+
+	t.Run("an approver approves, and the requester is admitted", func(t *testing.T) {
+		comment := awaitCommentContaining(t, approveFromPullRequest(t, svc, dbName, "dave", request.Identifier, http.StatusOK), "approved `"+request.Identifier+"`")
+		assert.Contains(t, comment, "@dave approved `"+request.Identifier+"` for apply on `"+dbName+"` in "+driftEnv)
+		assert.Contains(t, comment, "Requested by @carol: fix.")
+		assert.Contains(t, comment, "@carol can now re-run the command.")
+		stored, err := svc.Storage().FreezeOverrides().Get(t.Context(), request.Identifier)
+		require.NoError(t, err)
+		assert.Equal(t, "github:dave", stored.ApprovedBy)
+
+		admitted := runRolloutWebhook(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv))
+		created := awaitRolloutApply(t, svc, dbName, admitted)
+		assert.Equal(t, request.Identifier, created.GetOptions().FreezeOverride)
+	})
+}
+
+// With no freeze.github_teams nobody approves from a pull request, and a
+// request made through the API or CLI is not approved there.
+func TestE2EFreezeApproveNeedsConfiguredTeamsAndAPullRequestRequest(t *testing.T) {
+	dbName := "webhook_override_approve_cfg"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	schemabotDB := openDriftDB(t, e2eSchemabotDSN)
+	t.Cleanup(func() {
+		_, err := schemabotDB.ExecContext(context.WithoutCancel(t.Context()), "DELETE FROM `freeze_override_requests` WHERE `database_name` = ?", dbName)
+		assert.NoError(t, err)
+	})
+	request := storePullRequestOverride(t, svc.Storage(), dbName, 1)
+
+	comment := awaitCommentContaining(t, approveFromPullRequest(t, svc, dbName, "dave", request.Identifier, http.StatusOK), "Nothing was approved")
+	assert.Contains(t, comment, "not configured")
+
+	svc.Config().Freeze.GitHubTeams = []string{approveTeam}
+	viaAPI, err := svc.Storage().FreezeOverrides().Create(t.Context(), &storage.FreezeOverrideRequest{
+		Identifier: engine.NewFreezeOverrideID(), Environment: driftEnv, Action: storage.FreezeOverrideActionApply,
+		TargetID: dbName + "/x@0123456789abcdef", Database: dbName, Blockers: []string{"freeze freeze-x"}, Reason: "fix",
+		RequestedBy: "rita", ExpiresAt: time.Now().UTC().Add(time.Hour),
+	})
+	require.NoError(t, err)
+	comment = awaitCommentContaining(t, approveFromPullRequest(t, svc, dbName, "dave", viaAPI.Identifier, http.StatusOK), "Nothing was approved")
+	assert.Contains(t, comment, "schemabot freeze approve "+viaAPI.Identifier+"` in the CLI")
+	stored, err := svc.Storage().FreezeOverrides().Get(t.Context(), viaAPI.Identifier)
+	require.NoError(t, err)
+	assert.Nil(t, stored.ApprovedAt)
+}
+
 // A blank reason, or --override on a command no freeze refuses, is answered
 // before any work starts.
 func TestE2EApplyOverrideFlagMisuseIsAnswered(t *testing.T) {

@@ -2204,7 +2204,9 @@ overrides alone, admins included. Storage also refuses the pull request's author
 records one. A request from a pull request records its commenter and author as `github:<login>`,
 which storage cannot match to a forward-auth subject, so an approval must come from the same
 identity domain: `handleFreezeOverrideApprove` refuses a request where `FromPullRequest` holds, and
-`AuthorizeFreezeApprove` refuses a subject that starts with `github:`. The requester repeats the
+`AuthorizeFreezeApprove` refuses a subject that starts with `github:`. The reverse holds too:
+`ApprovePullRequestOverride` approves only a request where `FromPullRequest` holds, and only from
+the pull request it names, as `github:<login>` of a `freeze.github_teams` member. The requester repeats the
 command and it is admitted; only the requester runs on an approval (`approvedOverride`), and anyone
 else asks for their own. A request also belongs to where it was asked for (`sameOverrideOrigin`):
 the same change on another pull request records and needs its own, so one pull request's author
