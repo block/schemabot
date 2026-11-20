@@ -447,3 +447,52 @@ func TestGitHubQuotaSnapshotFollowsNewerResponseWithEarlierReset(t *testing.T) {
 	require.Len(t, ages, 1)
 	assert.True(t, strings.HasSuffix(ages[0], " 30"), ages[0])
 }
+
+// A window that becomes current again still carries the depletion already
+// observed in it. Three responses arrive in order: A reports 100 remaining for
+// the earlier reset, B reports 4,990 for a later reset, and C reports 3,100 for
+// the earlier reset again. Whichever order they are recorded in, the exported
+// snapshot is C's window with A's lower remaining, observed at C's receipt.
+func TestGitHubQuotaSnapshotKeepsDepletionWhenAWindowBecomesCurrentAgain(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 30, 0, 0, time.UTC)
+	a := quotaSample(start, 100)
+	b := quotaSample(start.Add(10*time.Second), 4990)
+	b.ResetAt = a.ResetAt.Add(18 * time.Minute)
+	c := quotaSample(start.Add(20*time.Second), 3100)
+	require.Equal(t, a.ResetAt, c.ResetAt)
+
+	want := a
+	want.ObservedAt = c.ObservedAt
+	key := githubRateLimitIdentity{"example-app", 42, "core"}
+	for name, order := range map[string][]GitHubRateLimitSample{
+		"A B C": {a, b, c}, "A C B": {a, c, b}, "B A C": {b, a, c},
+		"B C A": {b, c, a}, "C A B": {c, a, b}, "C B A": {c, b, a},
+	} {
+		t.Run(name, func(t *testing.T) {
+			recorder, scrape := newQuotaRegistry(t)
+			recorder.now = func() time.Time { return c.ObservedAt }
+			for _, sample := range order {
+				RecordGitHubRateLimit(t.Context(), sample)
+			}
+			assert.Equal(t, want, recorder.snapshots[key])
+			lines := snapshotLines(scrape(), "schemabot_github_rate_limit_remaining")
+			require.Len(t, lines, 1)
+			assert.True(t, strings.HasSuffix(lines[0], " 100"), lines[0])
+		})
+	}
+}
+
+// A window whose reset has passed by the newest response is dropped, so the
+// per-reset record does not grow with every window an installation lives
+// through.
+func TestGitHubQuotaSnapshotDropsWindowsThatHaveReset(t *testing.T) {
+	recorder, _ := newQuotaRegistry(t)
+	first := quotaSample(time.Date(2026, 1, 1, 0, 30, 0, 0, time.UTC), 200)
+	RecordGitHubRateLimit(t.Context(), first)
+	next := quotaSample(first.ResetAt.Add(time.Minute), 14990)
+	RecordGitHubRateLimit(t.Context(), next)
+
+	key := githubRateLimitIdentity{"example-app", 42, "core"}
+	assert.Equal(t, next, recorder.snapshots[key])
+	assert.Equal(t, map[int64]GitHubRateLimitSample{next.ResetAt.UnixNano(): next}, recorder.windows[key])
+}

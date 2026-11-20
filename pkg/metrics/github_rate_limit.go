@@ -52,7 +52,15 @@ type githubQuotaProbeTargets struct {
 type githubRateLimitRecorder struct {
 	mu          sync.Mutex
 	diagnostics map[attribute.Distinct]githubRateLimitDiagnostic
-	snapshots   map[githubRateLimitIdentity]GitHubRateLimitSample
+	// snapshots holds each identity's current window: the one GitHub reported
+	// on the most recently received response. It is derived from windows.
+	snapshots map[githubRateLimitIdentity]GitHubRateLimitSample
+	// windows holds, per identity, the lowest remaining seen for every reset
+	// time that has not yet passed, keyed by reset time in Unix nanoseconds.
+	// Keeping each one separately means a window that becomes current again
+	// still carries the depletion already observed in it, whatever order the
+	// responses are recorded in.
+	windows map[githubRateLimitIdentity]map[int64]GitHubRateLimitSample
 	// probeTargets is keyed by App ID rather than by the App label, so a probe
 	// whose label changes (the slug is learned after startup) replaces its
 	// earlier entry instead of leaving it behind.
@@ -68,6 +76,7 @@ func RegisterGitHubRateLimitMetrics(provider otelmetric.MeterProvider) error {
 	recorder := &githubRateLimitRecorder{
 		diagnostics:  make(map[attribute.Distinct]githubRateLimitDiagnostic),
 		snapshots:    make(map[githubRateLimitIdentity]GitHubRateLimitSample),
+		windows:      make(map[githubRateLimitIdentity]map[int64]GitHubRateLimitSample),
 		probeTargets: make(map[int64]githubQuotaProbeTargets),
 		now:          time.Now,
 	}
@@ -159,18 +168,13 @@ func (r *githubRateLimitRecorder) record(sample GitHubRateLimitSample) {
 		return
 	}
 	key := githubRateLimitIdentity{sample.GitHubApp, sample.InstallationID, sample.Resource}
-	if previous, ok := r.snapshots[key]; ok {
-		if !sample.ResetAt.Equal(previous.ResetAt) {
-			if !supersedesGitHubQuotaWindow(previous, sample) {
-				slog.Debug("Ignoring GitHub quota window from an earlier response", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource, "reset_at", sample.ResetAt, "current_reset_at", previous.ResetAt)
-				return
-			}
-			if sample.ResetAt.Before(previous.ResetAt) {
-				slog.Info("GitHub reported an earlier quota reset than the last response; following the newer response", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource, "reset_at", sample.ResetAt, "previous_reset_at", previous.ResetAt, "remaining", sample.Remaining, "previous_remaining", previous.Remaining)
-			}
-			r.snapshots[key] = sample
-			return
-		}
+	windows := r.windows[key]
+	if windows == nil {
+		windows = make(map[int64]GitHubRateLimitSample)
+		r.windows[key] = windows
+	}
+	reset := sample.ResetAt.UnixNano()
+	if previous, ok := windows[reset]; ok {
 		merged, changed := sameWindowGitHubRateLimitSnapshot(previous, sample)
 		if !changed {
 			slog.Debug("Ignoring GitHub quota observation that is neither lower nor newer", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource)
@@ -179,10 +183,46 @@ func (r *githubRateLimitRecorder) record(sample GitHubRateLimitSample) {
 		if merged.Remaining < sample.Remaining {
 			slog.Debug("Keeping lower GitHub quota allowance from earlier in the window", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource, "remaining", merged.Remaining, "reported_remaining", sample.Remaining)
 		}
-		r.snapshots[key] = merged
-		return
+		windows[reset] = merged
+	} else {
+		windows[reset] = sample
 	}
-	r.snapshots[key] = sample
+	current := currentGitHubQuotaWindow(windows)
+	pruneElapsedGitHubQuotaWindows(windows, current.ObservedAt)
+	previous, hadPrevious := r.snapshots[key]
+	switch {
+	case !current.ResetAt.Equal(sample.ResetAt):
+		slog.Debug("Recorded GitHub quota window from an earlier response; a newer response's window stays current", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource, "reset_at", sample.ResetAt, "current_reset_at", current.ResetAt)
+	case hadPrevious && current.ResetAt.Before(previous.ResetAt):
+		slog.Info("GitHub reported an earlier quota reset than the last response; following the newer response", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource, "reset_at", current.ResetAt, "previous_reset_at", previous.ResetAt, "remaining", current.Remaining, "previous_remaining", previous.Remaining)
+	}
+	r.snapshots[key] = current
+}
+
+// currentGitHubQuotaWindow returns the window reported on the most recently
+// received response, using supersedesGitHubQuotaWindow to order them. windows
+// is never empty: record inserts the incoming sample before calling it.
+func currentGitHubQuotaWindow(windows map[int64]GitHubRateLimitSample) GitHubRateLimitSample {
+	var current GitHubRateLimitSample
+	first := true
+	for _, window := range windows {
+		if first || supersedesGitHubQuotaWindow(current, window) {
+			current = window
+			first = false
+		}
+	}
+	return current
+}
+
+// pruneElapsedGitHubQuotaWindows drops windows that had reset by the newest
+// receipt. The current window is never dropped, since a trustworthy snapshot
+// always resets after it was received.
+func pruneElapsedGitHubQuotaWindows(windows map[int64]GitHubRateLimitSample, newestReceipt time.Time) {
+	for reset, window := range windows {
+		if !window.ResetAt.After(newestReceipt) {
+			delete(windows, reset)
+		}
+	}
 }
 
 // snapshotExportable reports whether a snapshot still stands for the
@@ -250,8 +290,9 @@ func SetGitHubQuotaProbeTargets(appID int64, githubApp string, installations []i
 // says which window is current, whichever way its reset time moved: GitHub can
 // report one reset time and then an earlier one for the rest of the window, and
 // holding on to the first would stop the installation's budget from being
-// refreshed until it ages out. A response received earlier is stale. Between
-// responses received at the same instant, the later window wins.
+// refreshed until it ages out. A window last reported on an earlier response
+// is kept with its lowest remaining but is not current. Between responses
+// received at the same instant, the later window wins.
 func supersedesGitHubQuotaWindow(previous, sample GitHubRateLimitSample) bool {
 	switch {
 	case sample.ObservedAt.After(previous.ObservedAt):

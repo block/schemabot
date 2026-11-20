@@ -339,7 +339,10 @@ which window is current, and a new window can increase the allowance. That
 holds when the reset time moves earlier too: GitHub can report one reset time
 and then an earlier one for the rest of the window, and the snapshot follows
 the newer readings instead of ageing out on the first. A response received
-before the current snapshot never replaces it with another window.
+before the current snapshot never replaces it with another window. Each reset
+time that has not yet passed keeps its own lowest allowance, so a window that
+becomes current again still exports the depletion already seen in it, whatever
+order the responses are recorded in.
 
 Webhook traffic refreshes a snapshot from the headers of every response, and
 the server's GitHub quota probe refreshes it while there is no traffic: once a
