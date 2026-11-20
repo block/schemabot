@@ -2195,6 +2195,9 @@ stored operations run on. "In effect" is decided by the database clock, so every
 edges of a freeze. A pull request rollback is never held, at creation or at a later start or
 cutover, nor is a stop, a cancel or a revert. When SchemaBot cannot read the freezes it refuses the change with a retryable error,
 never letting it through unchecked. Nobody overrides a freeze in this version, admins included.
+A PR rollback is known by a `pinned_rollback` option the server records when it creates the apply.
+A rollback created by an earlier version has none, so a freeze holds its later start or cutover;
+lifting the freeze lets it through.
 *Known gap:* the gate reads the freezes in one step and writes the apply, start or cutover in
 another. A freeze created between the two does not hold that change. #2119 closes this window.
 *Breaks if violated:* a schema change starts, or its cutover runs, during an incident or a code freeze.

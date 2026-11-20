@@ -30,6 +30,13 @@ const cutoverRequestSink = "<cutover request literal>"
 // The call graph is built by name from this package's source. Function values
 // and method calls count as calls, so the graph over-approximates; a path it
 // finds that does not exist still has to be gated or explained here.
+//
+// A function counts as gated when it calls a gate anywhere, so this test
+// cannot tell whether the gate runs before the write on every branch. The
+// behavioral tests do: each admitting branch has one that a gate moved after
+// its write fails (TestChangeGateRefusesApplyDuringFreeze,
+// TestChangeGateHoldsStart, TestChangeGateHoldsStartOfAStoppedApply,
+// TestChangeGateHoldsDeferredCutover).
 func TestChangeGatesGuardEveryWayToAdmitWork(t *testing.T) {
 	decls := parseAPIFuncDecls(t)
 

@@ -17,6 +17,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/clock"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -334,4 +335,71 @@ func TestChangeGateLetsAQueuedStartRetry(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	assert.True(t, resp.Accepted)
 	assert.Equal(t, startResponseStatusAlreadyRequested, resp.Status)
+}
+
+// Restarting a stopped apply is a new step, on both start branches for a
+// stopped apply: the local one and the one that first checks a remote
+// executor. Each is refused during the freeze before it records or asks
+// anything, and queued after the lift.
+func TestChangeGateHoldsStartOfAStoppedApply(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		client func() *mockTernClient
+		apply  func() *storage.Apply
+		tasks  func(*storage.Apply) []*storage.Task
+	}{
+		{
+			name:   "local",
+			client: func() *mockTernClient { return &mockTernClient{} },
+			apply:  func() *storage.Apply { return stoppedTestApply("apply-stopped") },
+			tasks: func(apply *storage.Apply) []*storage.Task {
+				return []*storage.Task{{ID: 10, TaskIdentifier: "task-stopped", ApplyID: apply.ID, State: state.Task.Stopped}}
+			},
+		},
+		{
+			name: "remote",
+			client: func() *mockTernClient {
+				return &mockTernClient{
+					isRemote: true,
+					progressResp: &ternv1.ProgressResponse{
+						State:  ternv1.State_STATE_STOPPED,
+						Tables: []*ternv1.TableProgress{{TableName: "users", Status: state.Task.Stopped}},
+					},
+				}
+			},
+			apply: func() *storage.Apply {
+				apply := activeTestApply("apply-stopped")
+				apply.ExternalID = "remote-apply-stopped"
+				return apply
+			},
+			tasks: func(*storage.Apply) []*storage.Task { return nil },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := tc.client()
+			apply := tc.apply()
+			svc := newControlTestServiceWithTasks(client, apply, tc.tasks(apply))
+			freezes := newGateFreezeStore(t, gateTestFreeze("freeze-incident"))
+			svc.storage.(*mockStorageWithApplyStores).freezes = freezes
+			mux := http.NewServeMux()
+			svc.ConfigureRoutes(mux)
+			body := `{"environment": "staging", "apply_id": "apply-stopped", "caller": "cli:bob"}`
+
+			rec := postGateControl(t, mux, "/api/start", body)
+			require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+			assert.Equal(t, apitypes.ErrCodeChangeGateRefused, decodeGateError(t, rec).ErrorCode)
+			pending, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+			require.NoError(t, err)
+			assert.Nil(t, pending, "a refused start must not be queued")
+			assert.Nil(t, client.progressReq, "a refused start never asks the remote executor")
+
+			_, err = freezes.Lift(t.Context(), "freeze-incident", "alice", "resolved")
+			require.NoError(t, err)
+			rec = postGateControl(t, mux, "/api/start", body)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			pending, err = svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+			require.NoError(t, err)
+			assert.NotNil(t, pending)
+		})
+	}
 }
