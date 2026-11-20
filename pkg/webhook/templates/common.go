@@ -294,8 +294,8 @@ var grpcStatusPrefixRe = regexp.MustCompile(`rpc error: code = [A-Za-z]+ desc = 
 // format characters (including bidi overrides usable for visual spoofing),
 // drops gRPC status prefixes, redacts connection details that leak
 // credentials, identifiers, or internal infrastructure, trims surrounding
-// whitespace, and clamps the length by rune count. The raw error remains available server-side in the apply logs, so
-// nothing is lost for triage.
+// whitespace, and clamps the length by rune count. The raw error remains
+// available server-side in the apply logs, so nothing is lost for triage.
 func sanitizeCommentError(msg string) string {
 	msg = strings.ReplaceAll(msg, "\r\n", "\n")
 	msg = strings.ReplaceAll(msg, "\r", "\n")
