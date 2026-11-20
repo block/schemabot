@@ -2106,11 +2106,30 @@ func RecordEnvironmentFrozen(ctx context.Context, environment string, frozen boo
 // frozen gauge is last-value, so a failed snapshot leaves it at its last
 // values; a nonzero rate means the gauge is stale.
 func RecordEnvironmentFreezeCollectionFailure(ctx context.Context) {
-	addCounter(ctx, "schemabot.environment.frozen_collection_failures",
-		"Total number of failed environment freeze metric snapshots", "{failure}",
+	addCounterN(ctx, 1, environmentFreezeCollectionFailures, environmentFreezeCollectionFailuresDescription, "{failure}",
 		EnvironmentAttribute(""),
 	)
 }
+
+// InitEnvironmentFreezeCollectionFailures exports the freeze collection
+// failure counter at 0, so a rate or increase alert sees the first failure.
+func InitEnvironmentFreezeCollectionFailures(ctx context.Context) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter(environmentFreezeCollectionFailures,
+		otelmetric.WithDescription(environmentFreezeCollectionFailuresDescription),
+		otelmetric.WithUnit("{failure}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create counter", "metric", environmentFreezeCollectionFailures, "error", err)
+		return
+	}
+	counter.Add(ctx, 0, otelmetric.WithAttributes(EnvironmentAttribute("")))
+}
+
+const (
+	environmentFreezeCollectionFailures            = "schemabot.environment.frozen_collection_failures"
+	environmentFreezeCollectionFailuresDescription = "Total number of failed environment freeze metric snapshots"
+)
 
 // RecordWebhookInboxStatsCollectionFailure counts failed inbox snapshots. The
 // inbox depth/backlog gauges are last-value instruments, so a failed snapshot

@@ -26,7 +26,7 @@ import (
 func TestCollectFreezeMetricsReportsEachEnvironment(t *testing.T) {
 	reader := newFreezeMetricsReader(t)
 	freezes := &memoryFreezeStore{}
-	config := &ServerConfig{AllowedEnvironments: []string{"staging", "production"}}
+	config := freezeMetricsConfig([]string{"staging", "production"}, "staging", "production")
 	svc := New(&mockStorageWithFreezes{freezes: freezes}, config, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	require.NoError(t, svc.SetClock(clock.NewFake(freezeTestNow)))
 
@@ -50,29 +50,113 @@ func TestCollectFreezeMetricsReportsEachEnvironment(t *testing.T) {
 // operator can tell the frozen values are stale.
 func TestCollectFreezeMetricsCountsFailure(t *testing.T) {
 	reader := newFreezeMetricsReader(t)
-	svc := New(&mockStorageWithFreezes{freezes: &failingFreezeStore{}}, &ServerConfig{AllowedEnvironments: []string{"production"}}, nil,
+	svc := New(&mockStorageWithFreezes{freezes: &failingFreezeStore{}}, freezeMetricsConfig([]string{"production"}, "production"), nil,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	svc.CollectFreezeMetrics(t.Context())
 
 	assert.Empty(t, frozenGaugeValues(t, reader))
+	failures, ok := freezeCollectionFailures(t, reader)
+	require.True(t, ok)
+	assert.Equal(t, int64(1), failures)
+}
+
+// A staging-only instance names production in its environment order, but
+// production's freezes live in another store. Reporting production as 0 would
+// read as "not frozen" while it may be, so the instance reports nothing for it.
+func TestCollectFreezeMetricsSkipsPeerEnvironments(t *testing.T) {
+	reader := newFreezeMetricsReader(t)
+	config := freezeMetricsConfig([]string{"staging"}, "staging", "production")
+	config.EnvironmentOrder = []string{"staging", "production"}
+	svc := New(&mockStorageWithFreezes{freezes: &memoryFreezeStore{}}, config, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, svc.SetClock(clock.NewFake(freezeTestNow)))
+
+	svc.CollectFreezeMetrics(t.Context())
+
+	assert.Equal(t, map[string]int64{"staging": 0}, frozenGaugeValues(t, reader))
+}
+
+// Stopping the monitor while a query is in flight is an orderly shutdown and
+// must not tick the failure counter that alerts on a stale gauge.
+func TestCollectFreezeMetricsIgnoresCancellation(t *testing.T) {
+	reader := newFreezeMetricsReader(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	store := &cancellingFreezeStore{cancel: cancel}
+	svc := New(&mockStorageWithFreezes{freezes: store}, freezeMetricsConfig([]string{"production"}, "production"), nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	svc.CollectFreezeMetrics(ctx)
+
+	require.True(t, store.called)
+	assert.Empty(t, frozenGaugeValues(t, reader))
+	_, ok := freezeCollectionFailures(t, reader)
+	assert.False(t, ok, "cancellation must not record a collection failure")
+}
+
+// The monitor exports the failure counter at 0 when it starts, so the first
+// failure is an increase an alert can see.
+func TestStartFreezeMonitorExportsFailureBaseline(t *testing.T) {
+	reader := newFreezeMetricsReader(t)
+	svc := New(&mockStorageWithFreezes{freezes: &memoryFreezeStore{}}, freezeMetricsConfig([]string{"production"}, "production"), nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc.StartFreezeMonitor(t.Context())
+	t.Cleanup(svc.StopFreezeMonitor)
+
+	failures, ok := freezeCollectionFailures(t, reader)
+	require.True(t, ok, "failure counter must be exported before any failure")
+	assert.Equal(t, int64(0), failures)
+}
+
+// freezeMetricsConfig allows the given environments and routes one database to
+// each routed environment, the two conditions for serving an environment.
+func freezeMetricsConfig(allowed []string, routed ...string) *ServerConfig {
+	environments := make(map[string]EnvironmentConfig, len(routed))
+	for _, environment := range routed {
+		environments[environment] = EnvironmentConfig{DSN: "root@tcp(localhost)/orders_" + environment}
+	}
+	return &ServerConfig{
+		AllowedEnvironments: allowed,
+		Databases:           map[string]DatabaseConfig{"orders": {Type: "mysql", Environments: environments}},
+	}
+}
+
+func freezeCollectionFailures(t *testing.T, reader *sdkmetric.ManualReader) (int64, bool) {
+	t.Helper()
 	var failures int64
+	found := false
 	for _, m := range collectFreezeMetrics(t, reader) {
-		if m.Name == "schemabot.environment.frozen_collection_failures" {
-			sum, ok := m.Data.(metricdata.Sum[int64])
-			require.True(t, ok)
-			for _, dp := range sum.DataPoints {
-				failures += dp.Value
-			}
+		if m.Name != "schemabot.environment.frozen_collection_failures" {
+			continue
+		}
+		sum, ok := m.Data.(metricdata.Sum[int64])
+		require.True(t, ok)
+		for _, dp := range sum.DataPoints {
+			found = true
+			failures += dp.Value
 		}
 	}
-	assert.Equal(t, int64(1), failures)
+	return failures, found
 }
 
 type failingFreezeStore struct{ memoryFreezeStore }
 
 func (*failingFreezeStore) ListInEffect(_ context.Context, _ string, _ time.Time) ([]*storage.EnvironmentFreeze, error) {
 	return nil, errors.New("database unavailable")
+}
+
+// cancellingFreezeStore cancels the caller's context mid-query, as a monitor
+// stop would, and fails the query with the resulting cancellation error.
+type cancellingFreezeStore struct {
+	memoryFreezeStore
+	cancel context.CancelFunc
+	called bool
+}
+
+func (s *cancellingFreezeStore) ListInEffect(ctx context.Context, _ string, _ time.Time) ([]*storage.EnvironmentFreeze, error) {
+	s.called = true
+	s.cancel()
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
 
 func newFreezeMetricsReader(t *testing.T) *sdkmetric.ManualReader {

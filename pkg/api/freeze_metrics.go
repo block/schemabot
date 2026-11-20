@@ -38,6 +38,10 @@ func (s *Service) StartFreezeMonitor(ctx context.Context) {
 	s.freezeMonitorCancel = cancel
 	s.freezeMonitorMu.Unlock()
 
+	// Export the failure counter at 0 before any pass runs, so the first
+	// failure shows up as an increase rather than as a new series at 1.
+	metrics.InitEnvironmentFreezeCollectionFailures(monitorCtx)
+
 	s.freezeMonitorWg.Go(func() {
 		ticker := time.NewTicker(FreezeMetricsInterval)
 		defer ticker.Stop()
@@ -73,7 +77,9 @@ func (s *Service) StopFreezeMonitor() {
 
 // CollectFreezeMetrics records schemabot.environment.frozen once: 1 for each
 // environment with a freeze in effect, whole or narrowed to some deployments
-// or databases, and 0 for every other known environment. It is exported so
+// or databases, and 0 for every other environment this instance serves. A
+// peer environment has its own store, so this instance cannot know whether it
+// is frozen and reports nothing for it. It is exported so
 // tests can run one synchronous collection.
 func (s *Service) CollectFreezeMetrics(ctx context.Context) {
 	if err := ctx.Err(); err != nil {
@@ -85,11 +91,22 @@ func (s *Service) CollectFreezeMetrics(ctx context.Context) {
 		return
 	}
 
+	// SetClock swaps s.clock under operatorMu, so read it under the same lock.
+	s.operatorMu.Lock()
+	now := s.clock.Now().UTC()
+	s.operatorMu.Unlock()
+
 	collectCtx, cancel := context.WithTimeout(ctx, FreezeMetricsTimeout)
 	defer cancel()
 
-	inEffect, err := s.storage.Freezes().ListInEffect(collectCtx, "", s.clock.Now().UTC())
+	inEffect, err := s.storage.Freezes().ListInEffect(collectCtx, "", now)
 	if err != nil {
+		// A stop that lands mid-query cancels the monitor context. That is an
+		// orderly shutdown, not a stale gauge, so it must not count as a failure.
+		if ctx.Err() != nil {
+			s.logger.Debug("freeze metrics collection aborted because context is done", "error", err)
+			return
+		}
 		// The gauge is last-value: leaving it untouched re-exports the last
 		// snapshot. The failure counter tells operators it is stale.
 		metrics.RecordEnvironmentFreezeCollectionFailure(ctx)
@@ -99,7 +116,9 @@ func (s *Service) CollectFreezeMetrics(ctx context.Context) {
 
 	frozen := make(map[string]bool)
 	for _, environment := range s.config.KnownEnvironments() {
-		frozen[storage.CanonicalKey(environment)] = false
+		if s.config.ServesEnvironment(environment) {
+			frozen[storage.CanonicalKey(environment)] = false
+		}
 	}
 	for _, freeze := range inEffect {
 		frozen[storage.CanonicalKey(freeze.Environment)] = true
