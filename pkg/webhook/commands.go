@@ -299,8 +299,8 @@ func (p *CommandParser) firstDirective(body string) (d directive, ok, prose bool
 		if loc == nil {
 			continue
 		}
-		words, badQuote := splitCommandWords(line[loc[1]:])
-		d := p.parseDirective(words)
+		words, bound, badQuote := splitCommandWords(line[loc[1]:])
+		d := p.parseDirective(words, bound)
 		// A quote left open is a command attempt gone wrong, not a sentence.
 		if badQuote && d.kind == lineCommand {
 			d.kind = lineMalformed
@@ -324,8 +324,11 @@ const overrideFlag = "--override"
 // strings.Fields does, except that the value of --override may be wrapped in
 // double or straight single quotes, as `--override "fix the index"` or
 // `--override="fix the index"`, and then comes out as one word, unquoted.
+// bound marks the index of each such value, quoted or after `=`, so a reason
+// that opens with a dash stays the reason instead of reading as a flag.
 // badQuote reports a quote that never closes, or text glued to its close.
-func splitCommandWords(s string) (words []string, badQuote bool) {
+func splitCommandWords(s string) (words []string, bound map[int]bool, badQuote bool) {
+	bound = map[int]bool{}
 	for rest := strings.TrimLeftFunc(s, unicode.IsSpace); rest != ""; rest = strings.TrimLeftFunc(rest, unicode.IsSpace) {
 		end := strings.IndexFunc(rest, unicode.IsSpace)
 		if end < 0 {
@@ -337,6 +340,7 @@ func splitCommandWords(s string) (words []string, badQuote bool) {
 		case lower == overrideFlag:
 			words = append(words, word)
 			if value, after, ok, bad := cutQuoted(strings.TrimLeftFunc(rest, unicode.IsSpace)); ok {
+				bound[len(words)] = true
 				words, rest, badQuote = append(words, value), after, badQuote || bad
 			}
 		case strings.HasPrefix(lower, overrideFlag+"="):
@@ -345,12 +349,13 @@ func splitCommandWords(s string) (words []string, badQuote bool) {
 			if quoted, after, ok, bad := cutQuoted(value + rest); ok {
 				value, rest, badQuote = quoted, after, badQuote || bad
 			}
+			bound[len(words)] = true
 			words = append(words, value)
 		default:
 			words = append(words, word)
 		}
 	}
-	return words, badQuote
+	return words, bound, badQuote
 }
 
 // cutQuoted reads the quoted value that opens s, and returns what follows it.
@@ -390,7 +395,10 @@ func cutQuoted(s string) (value, after string, ok, bad bool) {
 // database, or target), or when it is ambiguous (a value flag given twice, two
 // apply IDs). A present -e or -t value is checked later, where an invalid one gets its own
 // usage answer.
-func (p *CommandParser) parseDirective(words []string) directive {
+//
+// bound marks words that are a flag's value by their quoting or `=`, from
+// splitCommandWords; such a word is the value even when it opens with a dash.
+func (p *CommandParser) parseDirective(words []string, bound map[int]bool) directive {
 	d := directive{kind: lineCommand, flags: map[string]bool{}, values: map[string]string{}, repeated: map[string]bool{}}
 	if len(words) == 0 {
 		return d
@@ -417,7 +425,7 @@ func (p *CommandParser) parseDirective(words []string) directive {
 				malformed = true
 			}
 			value := ""
-			if i+1 < len(words) && !looksLikeFlag(words[i+1]) {
+			if i+1 < len(words) && (bound[i+1] || !looksLikeFlag(words[i+1])) {
 				i++
 				value = words[i]
 			}
