@@ -2095,35 +2095,6 @@ const (
 	FreezeScopePartial = "partial"
 )
 
-// RecordEnvironmentFrozen reports whether a freeze of the given scope is in
-// effect in the environment: 1 while one is, else 0. Scope is
-// FreezeScopeEnvironment or FreezeScopePartial; both series are recorded on
-// every pass, so max by environment answers "is anything frozen". A promotion
-// pipeline can hold on it. The unit is empty so the exporter keeps the bare
-// schemabot_environment_frozen name rather than adding _ratio.
-func RecordEnvironmentFrozen(ctx context.Context, environment, scope string, frozen bool) {
-	value := int64(0)
-	if frozen {
-		value = 1
-	}
-	recordGauge(ctx, "schemabot.environment.frozen", value,
-		"1 while a freeze of this scope is in effect in the environment, else 0", "",
-		EnvironmentAttribute(environment),
-		attribute.String("scope", scope),
-	)
-}
-
-// RecordEnvironmentFreezeOpenSeconds reports the age of the oldest open-ended
-// freeze in effect in the environment, or 0 when none is. A planned freeze has
-// an end time and cannot be forgotten, so it is not counted. An alert on it
-// catches an incident freeze nobody lifted.
-func RecordEnvironmentFreezeOpenSeconds(ctx context.Context, environment string, age time.Duration) {
-	recordGauge(ctx, "schemabot.environment.freeze_open_seconds", int64(max(age, 0).Seconds()),
-		"Age in seconds of the oldest open-ended freeze in effect in the environment, 0 when none is", "s",
-		EnvironmentAttribute(environment),
-	)
-}
-
 // RecordEnvironmentFreezeCollectionFailure counts failed freeze snapshots. The
 // frozen gauge is last-value, so a failed snapshot leaves it at its last
 // values; a nonzero rate means the gauge is stale.

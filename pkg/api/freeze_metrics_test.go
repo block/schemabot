@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/block/schemabot/pkg/clock"
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -207,7 +210,12 @@ func newFreezeMetricsReader(t *testing.T) *sdkmetric.ManualReader {
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	prevMP := otel.GetMeterProvider()
 	otel.SetMeterProvider(mp)
+	// The freeze gauges read a process-wide snapshot; start each test from
+	// none, as a fresh process does.
+	metrics.PublishEnvironmentFreezes(nil)
+	require.NoError(t, metrics.RegisterEnvironmentFreezeMetrics(mp))
 	t.Cleanup(func() {
+		metrics.PublishEnvironmentFreezes(nil)
 		otel.SetMeterProvider(prevMP)
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
@@ -275,4 +283,87 @@ func createMetricsFreeze(t *testing.T, freezes storage.FreezeStore, identifier s
 	})
 	require.NoError(t, err)
 	return freeze
+}
+
+// The monitor loop itself keeps the gauge current: a planned freeze reads 0
+// before its start, 1 once the database clock passes it, and 0 again after its
+// end, with no API call in between.
+func TestFreezeMonitorFollowsAPlannedFreeze(t *testing.T) {
+	reader := newFreezeMetricsReader(t)
+	databaseClock := clock.NewFake(freezeTestNow)
+	freezes := &memoryFreezeStore{clock: databaseClock}
+	start := freezeTestNow.Add(time.Hour)
+	end := start.Add(time.Hour)
+	_, err := freezes.Create(t.Context(), &storage.EnvironmentFreeze{
+		Identifier: "freeze-0123456789abcdef", Environment: "production",
+		Kind: storage.FreezeKindPlanned, Running: storage.FreezeRunningContinue,
+		StartsAt: start, EndsAt: &end, Reason: "holiday", CreatedBy: "alice", Source: storage.FreezeSourceManual,
+	})
+	require.NoError(t, err)
+	svc := New(&mockStorageWithFreezes{freezes: freezes}, freezeMetricsConfig([]string{"production"}, "production"), nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc.freezeMetricsInterval = 10 * time.Millisecond
+	svc.StartFreezeMonitor(t.Context())
+	t.Cleanup(svc.StopFreezeMonitor)
+
+	frozen := func(want int64) func() bool {
+		return func() bool {
+			value, ok := frozenGaugeValues(t, reader)["production/environment"]
+			return ok && value == want
+		}
+	}
+	require.Eventually(t, frozen(0), 5*time.Second, 10*time.Millisecond, "not frozen before the start")
+	databaseClock.Advance(90 * time.Minute)
+	require.Eventually(t, frozen(1), 5*time.Second, 10*time.Millisecond, "frozen once the start passes")
+	databaseClock.Advance(time.Hour)
+	require.Eventually(t, frozen(0), 5*time.Second, 10*time.Millisecond, "not frozen after the end")
+}
+
+// A scrape reads one snapshot. While a whole-environment freeze and a partial
+// one keep replacing each other, production is frozen throughout, so no
+// scrape may read both scopes at 0.
+func TestFreezeGaugesNeverReadBothScopesClearDuringATransition(t *testing.T) {
+	reader := newFreezeMetricsReader(t)
+	store := &alternatingFreezeStore{memoryFreezeStore: memoryFreezeStore{clock: clock.NewFake(freezeTestNow)}}
+	svc := New(&mockStorageWithFreezes{freezes: store}, freezeMetricsConfig([]string{"production"}, "production"), nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc.CollectFreezeMetrics(t.Context())
+
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for !stop.Load() {
+			svc.CollectFreezeMetrics(t.Context())
+		}
+	})
+	for range 500 {
+		values := frozenGaugeValues(t, reader)
+		if values["production/environment"]+values["production/partial"] == 0 {
+			stop.Store(true)
+			wg.Wait()
+			require.FailNow(t, "a scrape read production as not frozen while a freeze held throughout", "%v", values)
+		}
+	}
+	stop.Store(true)
+	wg.Wait()
+	assert.Positive(t, store.calls.Load(), "the collections ran")
+}
+
+// alternatingFreezeStore answers each ListInEffect with a whole-environment
+// production freeze or a partial one, in turn.
+type alternatingFreezeStore struct {
+	memoryFreezeStore
+	calls atomic.Int64
+}
+
+func (s *alternatingFreezeStore) ListInEffect(context.Context, string) ([]*storage.EnvironmentFreeze, error) {
+	freeze := &storage.EnvironmentFreeze{
+		Identifier: "freeze-0123456789abcdef", Environment: "production",
+		Kind: storage.FreezeKindOnDemand, Running: storage.FreezeRunningContinue,
+		StartsAt: freezeTestNow.Add(-time.Minute), Reason: "incident", CreatedBy: "alice", Source: storage.FreezeSourceManual,
+	}
+	if s.calls.Add(1)%2 == 0 {
+		freeze.Databases = []string{"orders"}
+	}
+	return []*storage.EnvironmentFreeze{freeze}, nil
 }

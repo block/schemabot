@@ -260,6 +260,9 @@ type Service struct {
 	// freezeMonitorSeen holds every environment the monitor has reported
 	// frozen, so each keeps a series that returns to 0.
 	freezeMonitorSeen map[string]bool
+	// freezeMetricsInterval overrides FreezeMetricsInterval when positive,
+	// so a test can watch the monitor loop itself.
+	freezeMetricsInterval time.Duration
 
 	// Operator stuck-pending apply monitor loop management.
 	stuckPendingMu     sync.Mutex

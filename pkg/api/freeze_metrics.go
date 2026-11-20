@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"slices"
 	"sort"
 	"time"
 
@@ -43,8 +42,12 @@ func (s *Service) StartFreezeMonitor(ctx context.Context) {
 	// failure shows up as an increase rather than as a new series at 1.
 	metrics.InitEnvironmentFreezeCollectionFailures(monitorCtx)
 
+	interval := s.freezeMetricsInterval
+	if interval <= 0 {
+		interval = FreezeMetricsInterval
+	}
 	s.freezeMonitorWg.Go(func() {
-		ticker := time.NewTicker(FreezeMetricsInterval)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		s.CollectFreezeMetrics(monitorCtx)
 		for {
@@ -57,7 +60,7 @@ func (s *Service) StartFreezeMonitor(ctx context.Context) {
 			}
 		}
 	})
-	s.logger.Info("freeze monitor started", "interval", FreezeMetricsInterval, "timeout", FreezeMetricsTimeout)
+	s.logger.Info("freeze monitor started", "interval", interval, "timeout", FreezeMetricsTimeout)
 }
 
 // StopFreezeMonitor stops the background freeze monitor. Safe to call
@@ -106,8 +109,8 @@ func (s *Service) CollectFreezeMetrics(ctx context.Context) {
 			s.logger.Debug("freeze metrics collection aborted because context is done", "error", err)
 			return
 		}
-		// The gauges are last-value: leaving them untouched re-exports the last
-		// snapshot. The failure counter tells operators they are stale.
+		// Leaving the published snapshot in place re-exports the last one. The
+		// failure counter tells operators it is stale.
 		metrics.RecordEnvironmentFreezeCollectionFailure(ctx)
 		s.logger.Warn("freeze metrics collection failed", "error", err)
 		return
@@ -158,24 +161,19 @@ func (s *Service) CollectFreezeMetrics(ctx context.Context) {
 		environments = append(environments, environment)
 	}
 	sort.Strings(environments)
+	samples := make([]metrics.EnvironmentFreezeSample, 0, len(environments))
 	for _, environment := range environments {
 		st := states[environment]
-		// Record the scope in effect before clearing the other, so a scrape
-		// between the two never sees both at 0 while a freeze holds
-		// throughout, such as a whole-environment freeze replaced by a
-		// partial one.
-		scopes := []struct {
-			name   string
-			frozen bool
-		}{{metrics.FreezeScopeEnvironment, st.whole}, {metrics.FreezeScopePartial, st.partial}}
-		if st.partial && !st.whole {
-			slices.Reverse(scopes)
-		}
-		for _, scope := range scopes {
-			metrics.RecordEnvironmentFrozen(ctx, environment, scope.name, scope.frozen)
-		}
-		metrics.RecordEnvironmentFreezeOpenSeconds(ctx, environment, st.openFor)
+		samples = append(samples, metrics.EnvironmentFreezeSample{
+			Environment: environment,
+			Whole:       st.whole,
+			Partial:     st.partial,
+			OpenFor:     st.openFor,
+		})
 	}
+	// One snapshot for every environment and scope, swapped whole: a scrape
+	// reads all of this pass or all of the last, never a mix of the two.
+	metrics.PublishEnvironmentFreezes(samples)
 }
 
 // freezeSnapshot reads the database clock and the freezes in effect.
