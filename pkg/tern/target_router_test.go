@@ -103,6 +103,7 @@ type targetRouterRecordingClient struct {
 	applyReq           *ternv1.ApplyRequest
 	progressReq        *ternv1.ProgressRequest
 	logsReq            *ternv1.LogsRequest
+	resolveReq         *ternv1.ResolveNamespacesRequest
 	resumeApply        *storage.Apply
 	targetDSN          string
 	targetMetadata     map[string]string
@@ -198,6 +199,15 @@ func (c *targetRouterRecordingClient) SkipRevert(context.Context, *ternv1.SkipRe
 }
 
 func (c *targetRouterRecordingClient) Health(context.Context) error { return nil }
+
+func (c *targetRouterRecordingClient) ResolveNamespaces(_ context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error) {
+	c.resolveReq = req
+	schemas := make(map[string]string, len(req.Namespaces))
+	for _, ns := range req.Namespaces {
+		schemas[ns] = ns
+	}
+	return &ternv1.ResolveNamespacesResponse{Schemas: schemas}, nil
+}
 
 func (c *targetRouterRecordingClient) ResumeApply(_ context.Context, apply *storage.Apply) error {
 	return c.recordResume(apply)

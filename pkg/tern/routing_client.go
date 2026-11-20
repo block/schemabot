@@ -168,6 +168,42 @@ func (c *RoutingClient) CompareSchemaFileChange(ctx context.Context, req *ternv1
 	return client.CompareSchemaFileChange(ctx, routedReq)
 }
 
+// ResolveNamespaces routes a namespace resolution to the deployment that
+// serves the requested target among the database's execution targets. A
+// target the database does not have, or one two of its deployments both
+// address, is refused rather than guessed.
+func (c *RoutingClient) ResolveNamespaces(ctx context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("resolve namespaces request is required")
+	}
+	targets, err := c.resolver.ResolveTargets(ctx, routing.Request{Database: req.Database, Environment: req.Environment})
+	if err != nil {
+		return nil, fmt.Errorf("resolve execution targets for database %q environment %q: %w", req.Database, req.Environment, err)
+	}
+	var matches []routing.ExecutionTarget
+	for _, t := range targets {
+		if t.Target == targetOrDatabase(req.Target, req.Database) {
+			matches = append(matches, t)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return nil, fmt.Errorf("database %q has no target %q in environment %q", req.Database, req.Target, req.Environment)
+	case 1:
+	default:
+		return nil, fmt.Errorf("database %q addresses target %q through %d deployments in environment %q; resolve it through the deployment's client", req.Database, req.Target, len(matches), req.Environment)
+	}
+	target := matches[0]
+	client, err := c.clientForDeployment(ctx, target.Deployment, req.Environment)
+	if err != nil {
+		return nil, fmt.Errorf("get client for deployment %q environment %q: %w", target.Deployment, req.Environment, err)
+	}
+	routedReq := proto.Clone(req).(*ternv1.ResolveNamespacesRequest)
+	routedReq.Type = target.DatabaseType
+	routedReq.Target = target.Target
+	return client.ResolveNamespaces(ctx, routedReq)
+}
+
 // Apply executes a stored plan on its plan-time execution target.
 func (c *RoutingClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
 	if req == nil {

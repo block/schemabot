@@ -1675,6 +1675,60 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	}, nil
 }
 
+// ResolveNamespaces reports the schema each requested namespace addresses on
+// this target, the same schema a plan or apply of that namespace connects to.
+// A MySQL target whose DSN names a database addresses that database whatever
+// namespace it is sent. Otherwise a target with schema overrides addresses
+// each namespace's override and refuses a namespace it does not map, and a
+// target without them addresses the namespace itself. An engine type this
+// client does not know is refused with ErrResolveNamespacesUnsupported, since
+// nothing says what its namespaces address.
+func (c *LocalClient) ResolveNamespaces(_ context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("resolve namespaces request is required")
+	}
+	pinned, err := c.pinnedDatabase()
+	if err != nil {
+		return nil, fmt.Errorf("resolve namespaces for database %s: %w", c.config.Database, err)
+	}
+	schemas := make(map[string]string, len(req.GetNamespaces()))
+	for _, namespace := range req.GetNamespaces() {
+		if pinned != "" {
+			schemas[namespace] = pinned
+			continue
+		}
+		if namespace == "" && usesPerNamespaceCredentials(c.config.Type) {
+			return nil, fmt.Errorf("resolve namespaces for database %s: MySQL namespace is required for a namespace-free target DSN", c.config.Database)
+		}
+		physical, err := c.physicalNamespace(namespace)
+		if err != nil {
+			return nil, fmt.Errorf("resolve namespace %q for database %s: %w", namespace, c.config.Database, err)
+		}
+		schemas[namespace] = physical
+	}
+	c.logger.Debug("LocalClient.ResolveNamespaces: resolved namespaces",
+		"database", c.config.Database, "database_type", c.config.Type, "target", req.GetTarget(), "schemas", schemas)
+	return &ternv1.ResolveNamespacesResponse{Schemas: schemas}, nil
+}
+
+// pinnedDatabase returns the database a MySQL target's DSN names, which every
+// namespace sent to the target addresses, or "" when the DSN names none or
+// the engine does not connect per namespace.
+func (c *LocalClient) pinnedDatabase() (string, error) {
+	switch c.config.Type {
+	case storage.DatabaseTypeMySQL:
+		database, err := mysqlDSNDatabase(c.config.TargetDSN)
+		if err != nil {
+			return "", fmt.Errorf("inspect MySQL target DSN: %w", err)
+		}
+		return database, nil
+	case storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
+		return "", nil
+	default:
+		return "", fmt.Errorf("database type %q: %w", c.config.Type, ErrResolveNamespacesUnsupported)
+	}
+}
+
 // CompareSchemaFileChange delegates a schema file comparison to the engine's
 // SchemaFileChangeComparer capability, and fails closed with
 // ErrCompareSchemaFileChangeUnsupported when the engine has none.

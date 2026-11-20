@@ -89,6 +89,22 @@ service Tern {
     };
   }
 
+  // ResolveNamespaces reports the schema each namespace of a database
+  // addresses on one of its targets. Two namespaces with different names can
+  // address one schema, for example on a target whose connection names a
+  // database, so the control plane asks the data plane before it treats two
+  // databases' namespaces as separate tables.
+  //
+  // It is read-only and runs nothing on the target. A namespace the
+  // target does not authorize fails the request, and a data plane that
+  // predates this RPC returns UNIMPLEMENTED; the caller fails closed on both.
+  rpc ResolveNamespaces(ResolveNamespacesRequest) returns (ResolveNamespacesResponse) {
+    option (google.api.http) = {
+      post: "/v1/resolve-namespaces"
+      body: "*"
+    };
+  }
+
   // Apply executes a previously generated plan. Returns immediately with an
   // apply_id; execution happens asynchronously. Use Progress to track status.
   //
@@ -402,6 +418,26 @@ message CompareSchemaFileChangeResponse {
   bool same = 1;
   // Why the change is not the same, for operator logs. Empty when same.
   string reason = 2;
+}
+
+// ResolveNamespacesRequest names the namespaces of a database to resolve on
+// one of its targets.
+message ResolveNamespacesRequest {
+  // Database name from server-side config.
+  string database = 1;
+  // Database type, e.g. "mysql", "vitess", or "postgres".
+  string type = 2;
+  string environment = 3;
+  // Opaque identifier for endpoint discovery. Defaults to database if empty.
+  string target = 4;
+  // The namespaces to resolve, as the database's schema files name them.
+  repeated string namespaces = 5;
+}
+
+// ResolveNamespacesResponse maps each requested namespace to the schema it
+// addresses on the target.
+message ResolveNamespacesResponse {
+  map<string, string> schemas = 1;
 }
 
 // PullSchemaRequest requests a live schema export for a database route.

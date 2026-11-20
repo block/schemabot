@@ -239,8 +239,8 @@ const DefaultMaxRecvMsgBytes = 16 << 20 // 16 MiB
 //
 // Only RPCs that are safe to re-send are retried, in two budgets:
 //
-// Caller-facing reads (PullSchema, Plan, PlanDiff, CompareSchemaFileChange)
-// get a long budget: a
+// Caller-facing reads (PullSchema, Plan, PlanDiff, CompareSchemaFileChange,
+// ResolveNamespaces) get a long budget: a
 // human or review workflow is waiting on the response, and a data-plane pod
 // restart or mesh drain lasts seconds — well past a sub-second budget — so
 // these ride out up to roughly fifteen seconds before surfacing UNAVAILABLE.
@@ -269,7 +269,8 @@ const retryServiceConfig = `{
 			{"service": "tern.v1.Tern", "method": "PullSchema"},
 			{"service": "tern.v1.Tern", "method": "Plan"},
 			{"service": "tern.v1.Tern", "method": "PlanDiff"},
-			{"service": "tern.v1.Tern", "method": "CompareSchemaFileChange"}
+			{"service": "tern.v1.Tern", "method": "CompareSchemaFileChange"},
+			{"service": "tern.v1.Tern", "method": "ResolveNamespaces"}
 		],
 		"retryPolicy": {
 			"maxAttempts": 5,
@@ -491,6 +492,21 @@ func (c *GRPCClient) CompareSchemaFileChange(ctx context.Context, req *ternv1.Co
 		return nil, fmt.Errorf("remote data plane cannot compare schema files for database %s: %w: %w", req.GetDatabase(), ErrCompareSchemaFileChangeUnsupported, err)
 	}
 	return resp, err
+}
+
+// ResolveNamespaces asks the remote data plane which schema each namespace
+// addresses on a target. A data plane that predates the RPC, or whose engine
+// cannot resolve namespaces, answers UNIMPLEMENTED, which is returned as
+// ErrResolveNamespacesUnsupported.
+func (c *GRPCClient) ResolveNamespaces(ctx context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error) {
+	resp, err := c.client.ResolveNamespaces(ctx, req)
+	if status.Code(err) == codes.Unimplemented {
+		return nil, fmt.Errorf("remote data plane cannot resolve namespaces for database %s target %s: %w: %w", req.GetDatabase(), req.GetTarget(), ErrResolveNamespacesUnsupported, err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("resolve namespaces for database %s target %s: %w", req.GetDatabase(), req.GetTarget(), err)
+	}
+	return resp, nil
 }
 
 func (c *GRPCClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {

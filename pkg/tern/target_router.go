@@ -299,6 +299,25 @@ func (r *TargetRouter) CompareSchemaFileChange(ctx context.Context, req *ternv1.
 	return response, err
 }
 
+// ResolveNamespaces routes a namespace resolution to the resolved target,
+// mirroring CompareSchemaFileChange's routing.
+func (r *TargetRouter) ResolveNamespaces(ctx context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("resolve namespaces request is required")
+	}
+	var response *ternv1.ResolveNamespacesResponse
+	err := r.routeReadWithAuthRetry(ctx, "resolve_namespaces", targetOrDatabase(req.Target, req.Database), req.Type, req.Environment, req.Database,
+		func(gen *targetClientGeneration, resolved *inventory.Target) error {
+			routedReq := proto.Clone(req).(*ternv1.ResolveNamespacesRequest)
+			routedReq.Type = resolved.DatabaseType
+			routedReq.Target = resolved.Target
+			var dispatchErr error
+			response, dispatchErr = gen.client.ResolveNamespaces(ctx, routedReq)
+			return dispatchErr
+		})
+	return response, err
+}
+
 // routeReadWithAuthRetry dispatches a routed read on the route's current
 // generation and, when the dispatch fails with a classified target
 // authentication error, evicts that exact generation, re-resolves the target,

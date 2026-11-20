@@ -23,6 +23,7 @@ const (
 	Tern_Plan_FullMethodName                    = "/tern.v1.Tern/Plan"
 	Tern_PlanDiff_FullMethodName                = "/tern.v1.Tern/PlanDiff"
 	Tern_CompareSchemaFileChange_FullMethodName = "/tern.v1.Tern/CompareSchemaFileChange"
+	Tern_ResolveNamespaces_FullMethodName       = "/tern.v1.Tern/ResolveNamespaces"
 	Tern_Apply_FullMethodName                   = "/tern.v1.Tern/Apply"
 	Tern_Progress_FullMethodName                = "/tern.v1.Tern/Progress"
 	Tern_BatchProgress_FullMethodName           = "/tern.v1.Tern/BatchProgress"
@@ -103,6 +104,16 @@ type TernClient interface {
 	// that cannot compare files returns UNIMPLEMENTED, and the caller treats the
 	// file as changed.
 	CompareSchemaFileChange(ctx context.Context, in *CompareSchemaFileChangeRequest, opts ...grpc.CallOption) (*CompareSchemaFileChangeResponse, error)
+	// ResolveNamespaces reports the schema each namespace of a database
+	// addresses on one of its targets. Two namespaces with different names can
+	// address one schema, for example on a target whose connection names a
+	// database, so the control plane asks the data plane before it treats two
+	// databases' namespaces as separate tables.
+	//
+	// It is read-only and opens no connection to the target. A namespace the
+	// target does not authorize fails the request, and a data plane that
+	// predates this RPC returns UNIMPLEMENTED; the caller fails closed on both.
+	ResolveNamespaces(ctx context.Context, in *ResolveNamespacesRequest, opts ...grpc.CallOption) (*ResolveNamespacesResponse, error)
 	// Apply executes a previously generated plan. Returns immediately with an
 	// apply_id; execution happens asynchronously. Use Progress to track status.
 	//
@@ -283,6 +294,16 @@ func (c *ternClient) CompareSchemaFileChange(ctx context.Context, in *CompareSch
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CompareSchemaFileChangeResponse)
 	err := c.cc.Invoke(ctx, Tern_CompareSchemaFileChange_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *ternClient) ResolveNamespaces(ctx context.Context, in *ResolveNamespacesRequest, opts ...grpc.CallOption) (*ResolveNamespacesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResolveNamespacesResponse)
+	err := c.cc.Invoke(ctx, Tern_ResolveNamespaces_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -493,6 +514,16 @@ type TernServer interface {
 	// that cannot compare files returns UNIMPLEMENTED, and the caller treats the
 	// file as changed.
 	CompareSchemaFileChange(context.Context, *CompareSchemaFileChangeRequest) (*CompareSchemaFileChangeResponse, error)
+	// ResolveNamespaces reports the schema each namespace of a database
+	// addresses on one of its targets. Two namespaces with different names can
+	// address one schema, for example on a target whose connection names a
+	// database, so the control plane asks the data plane before it treats two
+	// databases' namespaces as separate tables.
+	//
+	// It is read-only and opens no connection to the target. A namespace the
+	// target does not authorize fails the request, and a data plane that
+	// predates this RPC returns UNIMPLEMENTED; the caller fails closed on both.
+	ResolveNamespaces(context.Context, *ResolveNamespacesRequest) (*ResolveNamespacesResponse, error)
 	// Apply executes a previously generated plan. Returns immediately with an
 	// apply_id; execution happens asynchronously. Use Progress to track status.
 	//
@@ -650,6 +681,9 @@ func (UnimplementedTernServer) PlanDiff(context.Context, *PlanRequest) (*PlanDif
 func (UnimplementedTernServer) CompareSchemaFileChange(context.Context, *CompareSchemaFileChangeRequest) (*CompareSchemaFileChangeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CompareSchemaFileChange not implemented")
 }
+func (UnimplementedTernServer) ResolveNamespaces(context.Context, *ResolveNamespacesRequest) (*ResolveNamespacesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResolveNamespaces not implemented")
+}
 func (UnimplementedTernServer) Apply(context.Context, *ApplyRequest) (*ApplyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Apply not implemented")
 }
@@ -780,6 +814,24 @@ func _Tern_CompareSchemaFileChange_Handler(srv interface{}, ctx context.Context,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(TernServer).CompareSchemaFileChange(ctx, req.(*CompareSchemaFileChangeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Tern_ResolveNamespaces_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResolveNamespacesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TernServer).ResolveNamespaces(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tern_ResolveNamespaces_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TernServer).ResolveNamespaces(ctx, req.(*ResolveNamespacesRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1058,6 +1110,10 @@ var Tern_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CompareSchemaFileChange",
 			Handler:    _Tern_CompareSchemaFileChange_Handler,
+		},
+		{
+			MethodName: "ResolveNamespaces",
+			Handler:    _Tern_ResolveNamespaces_Handler,
 		},
 		{
 			MethodName: "Apply",

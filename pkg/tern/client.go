@@ -176,6 +176,10 @@ var (
 	// ErrCompareSchemaFileChangeUnsupported marks a schema file comparison
 	// for a database type whose engine cannot compare files.
 	ErrCompareSchemaFileChangeUnsupported = errors.New("schema file comparison unsupported for database type")
+	// ErrResolveNamespacesUnsupported marks a namespace resolution the data
+	// plane cannot answer: an engine whose namespaces it does not know how to
+	// map to schemas, or a data plane that predates the RPC.
+	ErrResolveNamespacesUnsupported = errors.New("namespace resolution unsupported")
 )
 
 // SchemaFileChangeComparer is the optional engine capability behind
@@ -217,6 +221,12 @@ type Client interface {
 	// each version on the target in a rolled-back transaction. It is
 	// read-only; the review gate asks it for files it cannot compare offline.
 	CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error)
+
+	// ResolveNamespaces reports the schema each namespace of a database
+	// addresses on one of its targets, so the control plane can tell when two
+	// namespaces with different names are one schema. It is read-only and
+	// runs nothing on the target.
+	ResolveNamespaces(ctx context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error)
 
 	// Apply executes a previously generated plan.
 	// Validates that the schema hasn't changed since Plan was called.
