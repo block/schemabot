@@ -83,17 +83,17 @@ func (m *memoryFreezeStore) ListInEffect(_ context.Context, environment string) 
 	return m.filter(environment, func(f *storage.EnvironmentFreeze) bool { return f.InEffectAt(at) }), nil
 }
 
-func (m *memoryFreezeStore) ListCurrent(_ context.Context, environment string) ([]*storage.EnvironmentFreeze, error) {
+func (m *memoryFreezeStore) List(_ context.Context, environment string, recent int) (*storage.FreezeListing, error) {
+	if m.nowErr != nil {
+		return nil, m.nowErr
+	}
 	at := m.clock.Now().UTC()
-	return m.filter(environment, func(f *storage.EnvironmentFreeze) bool {
+	current := m.filter(environment, func(f *storage.EnvironmentFreeze) bool {
 		return f.LiftedAt == nil && (f.EndsAt == nil || at.Before(*f.EndsAt))
-	}), nil
-}
-
-func (m *memoryFreezeStore) History(_ context.Context, environment string, limit int) ([]*storage.EnvironmentFreeze, error) {
+	})
 	all := m.filter(environment, func(*storage.EnvironmentFreeze) bool { return true })
 	slices.Reverse(all)
-	return all[:min(limit, len(all))], nil
+	return &storage.FreezeListing{Now: at, Current: current, Recent: all[:min(recent, len(all))]}, nil
 }
 
 func (m *memoryFreezeStore) Now(context.Context) (time.Time, error) {
@@ -210,7 +210,7 @@ func TestFreezeDatabaseClockUnavailable(t *testing.T) {
 	w := doFreezeRequest(t, mux, freezeAdmin, http.MethodPost, "/api/freezes", `{"environment":"staging","reason":"incident"}`)
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
 	w = doFreezeRequest(t, mux, freezeAdmin, http.MethodGet, "/api/freezes", "")
-	assert.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
+	assert.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
 }
 
 // A freeze request that names something SchemaBot does not know, or that
@@ -340,6 +340,30 @@ func TestFreezeList(t *testing.T) {
 	w = doFreezeRequest(t, mux, freezeAdmin, http.MethodGet, "/api/freezes/"+active.ID, "")
 	require.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, active.ID, decodeFreeze(t, w).ID)
+}
+
+// The list labels every freeze by the clock its snapshot was read at, not by
+// a separate read. Here the store's clock has moved past a planned start that
+// the service's own clock has not reached: the freeze is listed in effect,
+// in both lists, because that is what the snapshot's query selected.
+func TestFreezeListLabelsByTheSnapshotClock(t *testing.T) {
+	service, mux := newFreezeTestService(t, freezeConfig())
+	w := doFreezeRequest(t, mux, freezeAdmin, http.MethodPost, "/api/freezes",
+		`{"environment":"staging","kind":"planned","starts_at":"2026-11-20T12:30:00Z","ends_at":"2026-11-20T14:00:00Z","reason":"deploy window"}`)
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	planned := decodeFreeze(t, w)
+
+	service.storage.Freezes().(*memoryFreezeStore).clock = clock.NewFake(freezeTestNow.Add(time.Hour))
+
+	w = doFreezeRequest(t, mux, freezeOperator, http.MethodGet, "/api/freezes", "")
+	require.Equal(t, http.StatusOK, w.Code)
+	var list apitypes.FreezeListResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &list))
+	assert.Empty(t, list.Scheduled)
+	require.Len(t, list.InEffect, 1)
+	assert.Equal(t, planned.ID, list.InEffect[0].ID)
+	require.Len(t, list.Recent, 1)
+	assert.True(t, list.Recent[0].InEffect, "one freeze has one status in one response")
 }
 
 func TestServerConfig_ValidateFreeze(t *testing.T) {

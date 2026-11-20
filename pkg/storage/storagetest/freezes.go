@@ -142,20 +142,6 @@ func TestFreezes(t *testing.T, h Harness) {
 		assert.ElementsMatch(t, []string{active.Identifier, windowed.Identifier, staging.Identifier}, freezeIdentifiers(all))
 	})
 
-	t.Run("ListCurrent", func(t *testing.T) {
-		ctx := t.Context()
-		store := h.NewStorage(t)
-		now := time.Now().UTC()
-
-		active := createFreeze(t, store, onDemandFreeze("production", now.Add(-time.Hour)))
-		scheduled := createFreeze(t, store, plannedFreeze("production", now.Add(time.Hour), now.Add(2*time.Hour), "chill-calendar", "later"))
-		createFreeze(t, store, plannedFreeze("production", now.Add(-2*time.Hour), now.Add(-time.Hour), "chill-calendar", "ended"))
-
-		current, err := store.Freezes().ListCurrent(ctx, "production")
-		require.NoError(t, err)
-		assert.Equal(t, []string{active.Identifier, scheduled.Identifier}, freezeIdentifiers(current))
-	})
-
 	t.Run("Now", func(t *testing.T) {
 		store := h.NewStorage(t)
 		before := time.Now().UTC()
@@ -280,29 +266,37 @@ func TestFreezes(t *testing.T, h Harness) {
 		assert.Equal(t, 1, succeeded)
 	})
 
-	t.Run("History", func(t *testing.T) {
+	t.Run("List", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		now := time.Now().UTC()
 
-		oldest := createFreeze(t, store, onDemandFreeze("production", now.Add(-3*time.Hour)))
-		middle := createFreeze(t, store, onDemandFreeze("production", now.Add(-2*time.Hour)))
-		newest := createFreeze(t, store, onDemandFreeze("production", now.Add(-time.Hour)))
-		staging := createFreeze(t, store, onDemandFreeze("staging", now.Add(-90*time.Minute)))
-
-		history, err := store.Freezes().History(ctx, "production", 10)
+		ended := createFreeze(t, store, plannedFreeze("production", now.Add(-3*time.Hour), now.Add(-2*time.Hour), "chill-calendar", "ended"))
+		active := createFreeze(t, store, onDemandFreeze("production", now.Add(-time.Hour)))
+		scheduled := createFreeze(t, store, plannedFreeze("production", now.Add(time.Hour), now.Add(2*time.Hour), "chill-calendar", "later"))
+		lifted := createFreeze(t, store, onDemandFreeze("production", now.Add(-90*time.Minute)))
+		_, err := store.Freezes().Lift(ctx, lifted.Identifier, "bob", "done")
 		require.NoError(t, err)
-		assert.Equal(t, []string{newest.Identifier, middle.Identifier, oldest.Identifier}, freezeIdentifiers(history))
+		staging := createFreeze(t, store, onDemandFreeze("staging", now.Add(-30*time.Minute)))
 
-		limited, err := store.Freezes().History(ctx, "production", 2)
+		listing, err := store.Freezes().List(ctx, "production", 10)
 		require.NoError(t, err)
-		assert.Equal(t, []string{newest.Identifier, middle.Identifier}, freezeIdentifiers(limited))
+		assert.WithinDuration(t, now, listing.Now, time.Minute, "the listing carries the database clock")
+		assert.Equal(t, []string{active.Identifier, scheduled.Identifier}, freezeIdentifiers(listing.Current),
+			"current holds what is in effect or scheduled at the listing's clock, oldest start first")
+		assert.Equal(t, []string{scheduled.Identifier, active.Identifier, lifted.Identifier, ended.Identifier}, freezeIdentifiers(listing.Recent),
+			"recent holds every state, newest start first")
 
-		all, err := store.Freezes().History(ctx, "", 10)
+		limited, err := store.Freezes().List(ctx, "production", 2)
 		require.NoError(t, err)
-		assert.Equal(t, []string{newest.Identifier, staging.Identifier, middle.Identifier, oldest.Identifier}, freezeIdentifiers(all))
+		assert.Equal(t, []string{scheduled.Identifier, active.Identifier}, freezeIdentifiers(limited.Recent))
+		assert.Len(t, limited.Current, 2, "recent does not limit current")
 
-		_, err = store.Freezes().History(ctx, "production", 0)
+		all, err := store.Freezes().List(ctx, "", 10)
+		require.NoError(t, err)
+		assert.Equal(t, []string{active.Identifier, staging.Identifier, scheduled.Identifier}, freezeIdentifiers(all.Current))
+
+		_, err = store.Freezes().List(ctx, "production", 0)
 		require.Error(t, err)
 	})
 
@@ -320,11 +314,9 @@ func TestFreezes(t *testing.T, h Harness) {
 		require.Error(t, err)
 		_, err = store.Freezes().ListInEffect(ctx, "production")
 		require.Error(t, err)
-		_, err = store.Freezes().ListCurrent(ctx, "production")
-		require.Error(t, err)
 		_, err = store.Freezes().Now(ctx)
 		require.Error(t, err)
-		_, err = store.Freezes().History(ctx, "production", 10)
+		_, err = store.Freezes().List(ctx, "production", 10)
 		require.Error(t, err)
 	})
 }

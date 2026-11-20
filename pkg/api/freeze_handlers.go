@@ -130,35 +130,29 @@ func (s *Service) handleFreezeList(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
-	now, ok := s.freezeNow(r.Context(), w)
-	if !ok {
-		return
-	}
-	current, err := s.storage.Freezes().ListCurrent(r.Context(), environment)
+	// One snapshot and one clock label every freeze in the response, so a
+	// freeze that ends or is lifted mid-request cannot appear twice with
+	// different statuses.
+	listing, err := s.storage.Freezes().List(r.Context(), environment, limit)
 	if err != nil {
-		s.logger.Error("list current freezes failed", "environment", environment, "error", err)
+		s.logger.Error("list freezes failed", "environment", environment, "error", err)
 		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "list freezes failed")
 		return
 	}
-	recent, err := s.storage.Freezes().History(r.Context(), environment, limit)
-	if err != nil {
-		s.logger.Error("list freeze history failed", "environment", environment, "error", err)
-		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "list freezes failed")
-		return
-	}
+	now := listing.Now
 	response := apitypes.FreezeListResponse{
 		InEffect:  []apitypes.Freeze{},
 		Scheduled: []apitypes.Freeze{},
-		Recent:    make([]apitypes.Freeze, 0, len(recent)),
+		Recent:    make([]apitypes.Freeze, 0, len(listing.Recent)),
 	}
-	for _, freeze := range current {
+	for _, freeze := range listing.Current {
 		if freeze.InEffectAt(now) {
 			response.InEffect = append(response.InEffect, freezeResponse(freeze, now))
 		} else {
 			response.Scheduled = append(response.Scheduled, freezeResponse(freeze, now))
 		}
 	}
-	for _, freeze := range recent {
+	for _, freeze := range listing.Recent {
 		response.Recent = append(response.Recent, freezeResponse(freeze, now))
 	}
 	s.writeJSON(w, http.StatusOK, response)

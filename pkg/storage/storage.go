@@ -388,19 +388,27 @@ type FreezeStore interface {
 	// database's clock, so every pod agrees at the edges of a freeze.
 	ListInEffect(ctx context.Context, environment string) ([]*EnvironmentFreeze, error)
 
-	// ListCurrent returns the freezes in effect now and the ones scheduled
-	// to start later, oldest start first. An empty environment returns every
-	// environment's freezes. "Now" is the database's clock.
-	ListCurrent(ctx context.Context, environment string) ([]*EnvironmentFreeze, error)
+	// List reads one consistent view of the freezes: the ones in effect or
+	// scheduled at the database's clock, and up to recent freezes of any
+	// state. An empty environment returns every environment's freezes.
+	List(ctx context.Context, environment string, recent int) (*FreezeListing, error)
 
-	// History returns up to limit freezes of any state, newest start first.
-	// An empty environment returns every environment's freezes.
-	History(ctx context.Context, environment string, limit int) ([]*EnvironmentFreeze, error)
-
-	// Now returns the database's clock, the one ListInEffect and ListCurrent
-	// compare against. A caller that labels a listed freeze as in effect or
-	// scheduled uses it, so the label agrees with the query.
+	// Now returns the database's clock, the one ListInEffect compares
+	// against. A caller that labels a freeze as in effect or scheduled uses
+	// it, so the label agrees with the query.
 	Now(ctx context.Context) (time.Time, error)
+}
+
+// FreezeListing is what FreezeStore.List read. Both lists come from one
+// snapshot of the store, and Now is the database clock they were filtered
+// by, so a caller that labels them by Now never contradicts itself.
+type FreezeListing struct {
+	Now time.Time
+	// Current holds the freezes in effect or scheduled at Now, oldest start
+	// first.
+	Current []*EnvironmentFreeze
+	// Recent holds the most recent freezes of any state, newest start first.
+	Recent []*EnvironmentFreeze
 }
 
 // SettingsStore manages admin-level SchemaBot settings (global config).
