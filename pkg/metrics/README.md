@@ -342,7 +342,8 @@ the newer readings instead of ageing out on the first. A response received
 before the current snapshot never replaces it with another window. Each reset
 time that has not yet passed keeps its own lowest allowance, so a window that
 becomes current again still exports the depletion already seen in it, whatever
-order the responses are recorded in.
+order the responses are recorded in. The number of reset times kept per
+installation is bounded; past the bound the least recently reported is dropped.
 
 Webhook traffic refreshes a snapshot from the headers of every response, and
 the server's GitHub quota probe refreshes it while there is no traffic: once a

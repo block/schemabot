@@ -22,6 +22,12 @@ const GitHubOperationRateLimitSnapshot = "rate_limit_snapshot"
 // again more often than this.
 const GitHubRateLimitSnapshotMaxAge = 120 * time.Second
 
+// maxGitHubQuotaWindowsPerIdentity bounds how many unexpired reset times the
+// recorder keeps for one installation and resource. GitHub normally reports one
+// or two; the bound keeps the per-response scan small, under the shared lock,
+// if reset times ever jitter between responses.
+const maxGitHubQuotaWindowsPerIdentity = 8
+
 // Like the global OTel provider, the active recorder is installed once during
 // telemetry setup. Each provider's callback owns its own state and lifetime.
 var activeGitHubRateLimits atomic.Pointer[githubRateLimitRecorder]
@@ -189,7 +195,7 @@ func (r *githubRateLimitRecorder) record(sample GitHubRateLimitSample) {
 		windows[reset] = sample
 	}
 	current := currentGitHubQuotaWindow(windows)
-	pruneElapsedGitHubQuotaWindows(windows, current.ObservedAt)
+	pruneGitHubQuotaWindows(windows, current)
 	previous, hadPrevious := r.snapshots[key]
 	switch {
 	case !current.ResetAt.Equal(sample.ResetAt):
@@ -219,14 +225,29 @@ func currentGitHubQuotaWindow(windows map[int64]GitHubRateLimitSample) GitHubRat
 	return current
 }
 
-// pruneElapsedGitHubQuotaWindows drops windows that had reset by the newest
-// receipt. The current window is never dropped, since a trustworthy snapshot
-// always resets after it was received.
-func pruneElapsedGitHubQuotaWindows(windows map[int64]GitHubRateLimitSample, newestReceipt time.Time) {
+// pruneGitHubQuotaWindows drops windows that had reset by the newest receipt,
+// then, past maxGitHubQuotaWindowsPerIdentity, the windows least recently
+// reported, which are the least likely to become current again. The current
+// window is never dropped: a trustworthy snapshot always resets after it was
+// received, and it is the most recently reported.
+func pruneGitHubQuotaWindows(windows map[int64]GitHubRateLimitSample, current GitHubRateLimitSample) {
 	for reset, window := range windows {
-		if !window.ResetAt.After(newestReceipt) {
+		if !window.ResetAt.After(current.ObservedAt) {
 			delete(windows, reset)
 		}
+	}
+	for len(windows) > maxGitHubQuotaWindowsPerIdentity {
+		var oldestReset int64
+		var oldest GitHubRateLimitSample
+		first := true
+		for reset, window := range windows {
+			if first || supersedesGitHubQuotaWindow(window, oldest) {
+				oldestReset, oldest = reset, window
+				first = false
+			}
+		}
+		slog.Debug("Dropping least recently reported GitHub quota window past the per-installation bound", "github_app", oldest.GitHubApp, "installation_id", oldest.InstallationID, "resource", oldest.Resource, "reset_at", oldest.ResetAt, "observed_at", oldest.ObservedAt)
+		delete(windows, oldestReset)
 	}
 }
 

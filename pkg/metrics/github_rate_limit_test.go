@@ -531,3 +531,27 @@ func TestGitHubQuotaEarlierResetLogsOncePerResetTime(t *testing.T) {
 	assert.Equal(t, float64(3100), entry["remaining"])
 	assert.Equal(t, float64(4990), entry["previous_remaining"])
 }
+
+// Reset times that jitter between responses each become a window. The
+// recorder keeps a bounded number per installation, dropping the least
+// recently reported, so the work done under the lock on every response stays
+// small. The current window and the most recent ones keep their readings.
+func TestGitHubQuotaSnapshotBoundsWindowsPerInstallation(t *testing.T) {
+	recorder, _ := newQuotaRegistry(t)
+	start := time.Date(2026, 1, 1, 0, 30, 0, 0, time.UTC)
+	var samples []GitHubRateLimitSample
+	for i := range maxGitHubQuotaWindowsPerIdentity + 3 {
+		sample := quotaSample(start.Add(time.Duration(i)*time.Second), int64(5000-i))
+		sample.ResetAt = sample.ResetAt.Add(time.Duration(i) * time.Second)
+		samples = append(samples, sample)
+		RecordGitHubRateLimit(t.Context(), sample)
+	}
+
+	key := githubRateLimitIdentity{"example-app", 42, "core"}
+	windows := recorder.windows[key]
+	require.Len(t, windows, maxGitHubQuotaWindowsPerIdentity)
+	for _, sample := range samples[len(samples)-maxGitHubQuotaWindowsPerIdentity:] {
+		assert.Equal(t, sample, windows[sample.ResetAt.UnixNano()])
+	}
+	assert.Equal(t, samples[len(samples)-1], recorder.snapshots[key])
+}
