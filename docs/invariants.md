@@ -2206,7 +2206,9 @@ which storage cannot match to a forward-auth subject, so an approval must come f
 identity domain: `handleFreezeOverrideApprove` refuses a request where `FromPullRequest` holds, and
 `AuthorizeFreezeApprove` refuses a subject that starts with `github:`. The requester repeats the
 command and it is admitted; only the requester runs on an approval (`approvedOverride`), and anyone
-else asks for their own. An approval covers one environment, one action and one target and expires
+else asks for their own. A request also belongs to where it was asked for (`sameOverrideOrigin`):
+the same change on another pull request records and needs its own, so one pull request's author
+cannot approve a request on another and so admit their own. An approval covers one environment, one action and one target and expires
 after 24 hours. Within that window the requester may use it more than once, for example to re-apply
 the same schema after a stop. For an apply the target is the
 database and, for each rollout member it runs, the schema and the `ignore_tables` and

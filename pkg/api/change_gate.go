@@ -304,7 +304,7 @@ func (s *Service) approvedOverride(ctx context.Context, in changeGateInput, bloc
 	}
 	ids := changeGateBlockerIDs(blockers)
 	for _, request := range approved {
-		if request.Covers(ids) && storage.CanonicalKey(request.RequestedBy) == storage.CanonicalKey(caller) {
+		if request.Covers(ids) && storage.CanonicalKey(request.RequestedBy) == storage.CanonicalKey(caller) && sameOverrideOrigin(ctx, request) {
 			return request, nil
 		}
 	}
@@ -343,7 +343,7 @@ func (s *Service) requestOverride(ctx context.Context, in changeGateInput, block
 	ids := changeGateBlockerIDs(blockers)
 	for _, request := range pending {
 		if storage.CanonicalKey(request.RequestedBy) == storage.CanonicalKey(requester) &&
-			len(request.Blockers) == len(ids) && request.Covers(ids) {
+			len(request.Blockers) == len(ids) && request.Covers(ids) && sameOverrideOrigin(ctx, request) {
 			return request, nil
 		}
 	}
@@ -368,6 +368,19 @@ func (s *Service) requestOverride(ctx context.Context, in changeGateInput, block
 	}
 	request.ExpiresAt = now.Add(storage.FreezeOverrideMaxLifetime)
 	return overrides.Create(ctx, request)
+}
+
+// sameOverrideOrigin reports whether request was asked for where this change
+// comes from: on the same pull request for a pull request command, or outside
+// any pull request otherwise. The target names only the schema, so the same
+// change on two pull requests shares it, and without this a request asked for
+// on one, approved by the other's author, would admit the other (AZ-10). A
+// pull request's number fixes its author, so matching it matches the author.
+func sameOverrideOrigin(ctx context.Context, request *storage.FreezeOverrideRequest) bool {
+	if pr, ok := pullRequestOverrideRequester(ctx); ok {
+		return request.PullRequest == pr.PullRequest && strings.EqualFold(request.Repository, pr.Repository)
+	}
+	return !request.FromPullRequest()
 }
 
 // overrideCaller is the verified caller who asks for an override and
