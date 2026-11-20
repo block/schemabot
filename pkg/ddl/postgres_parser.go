@@ -428,11 +428,14 @@ func alterCmdScalesWithTableSize(cmd *pgproto.AlterTableCmd) bool {
 // addColumnScalesWithTableSize reports whether adding this column forces a
 // table rewrite or scan: an inline PRIMARY KEY or UNIQUE builds an index, a
 // generated, identity, or serial column is computed for every existing row, a
-// non-constant DEFAULT is evaluated per row, an inline CHECK is validated
-// against every existing row even though the new column is NULL in all of
-// them, and a REFERENCES column with a DEFAULT validates every existing row
-// against the referenced table. A plain column with no DEFAULT (or a constant
-// one), including a nullable REFERENCES column without one, is metadata-only.
+// DEFAULT not provably non-volatile may be evaluated per row, an inline CHECK
+// is validated against every existing row even though the new column is NULL
+// in all of them, and a REFERENCES column with a DEFAULT validates every
+// existing row against the referenced table. A plain column with no DEFAULT,
+// or with one PostgreSQL evaluates once and stores in the catalog (a
+// constant, a cast of one, or CURRENT_TIMESTAMP and the other SQL value
+// functions), including a nullable REFERENCES column without one, is
+// metadata-only.
 func addColumnScalesWithTableSize(col *pgproto.ColumnDef) bool {
 	if postgresSerialType(col.GetTypeName()) {
 		return true
@@ -447,7 +450,7 @@ func addColumnScalesWithTableSize(col *pgproto.ColumnDef) bool {
 			return true
 		case pgproto.ConstrType_CONSTR_DEFAULT:
 			hasDefault = true
-			if !isConstantExpr(constraint.GetRawExpr()) {
+			if !postgresNonVolatileExpression(constraint.GetRawExpr()) {
 				return true
 			}
 		case pgproto.ConstrType_CONSTR_FOREIGN:
@@ -458,21 +461,6 @@ func addColumnScalesWithTableSize(col *pgproto.ColumnDef) bool {
 		}
 	}
 	return foreignKey && hasDefault
-}
-
-// isConstantExpr reports whether a default-value expression is a bare
-// constant, possibly wrapped in type casts (DEFAULT 'x'::jsonb). Anything
-// else — a function call, an operator expression — may be volatile, and a
-// volatile default forces a full-table rewrite on ADD COLUMN.
-func isConstantExpr(node *pgproto.Node) bool {
-	switch expr := node.GetNode().(type) {
-	case *pgproto.Node_AConst:
-		return true
-	case *pgproto.Node_TypeCast:
-		return isConstantExpr(expr.TypeCast.GetArg())
-	default:
-		return false
-	}
 }
 
 // classifyPostgresNode maps one parsed statement node onto the pkg/ddl-owned
