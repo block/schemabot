@@ -22,6 +22,9 @@ func TestOutboxEvents(t *testing.T, h Harness) {
 		t.Run(name, func(t *testing.T) {
 			ctx := t.Context()
 			store := h.NewStorage(t)
+			highWater, err := store.OutboxEvents().MaxID(ctx)
+			require.NoError(t, err)
+			require.Zero(t, highWater)
 			apply := createOutboxApply(t, store, state.Apply.Running)
 			completedAt := time.Now().UTC().Truncate(time.Second)
 			if derived {
@@ -42,6 +45,9 @@ func TestOutboxEvents(t *testing.T, h Harness) {
 			events, err := store.OutboxEvents().ListUnpublished(ctx, 0, 10)
 			require.NoError(t, err)
 			require.Len(t, events, 1)
+			highWater, err = store.OutboxEvents().MaxID(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, events[0].ID, highWater)
 			assert.Equal(t, apply.ID, events[0].ApplyID)
 			assert.Equal(t, "apply_completed", events[0].EventType)
 			var message storage.ApplyCompletedEvent

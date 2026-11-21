@@ -29,6 +29,7 @@ type OutboxEvent struct {
 // OutboxStore holds pending completion notifications. Concurrent senders may
 // deliver the same event; publication is recorded only after transport acceptance.
 type OutboxStore interface {
+	MaxID(ctx context.Context) (int64, error)
 	ListUnpublished(ctx context.Context, afterID int64, limit int) ([]*OutboxEvent, error)
 	MarkPublished(ctx context.Context, id int64) error
 	OldestUnpublishedAt(ctx context.Context) (*time.Time, error)

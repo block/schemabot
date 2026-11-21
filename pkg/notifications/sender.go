@@ -20,12 +20,14 @@ const (
 // Sender scans durable intent in bounded batches. It needs no claim: duplicate
 // publication is valid, including acceptance followed by a failed storage mark.
 // Each scan advances by ID even when publication fails, so a full batch of bad
-// rows cannot hide later rows. At the end it returns to the oldest pending ID.
+// rows cannot hide later rows. Each scan captures a high-water ID, then returns
+// to the oldest pending ID even while new full batches keep arriving.
 type Sender struct {
-	store     storage.OutboxStore
-	publisher Publisher
-	logger    *slog.Logger
-	afterID   int64
+	store         storage.OutboxStore
+	publisher     Publisher
+	logger        *slog.Logger
+	afterID       int64
+	scanThroughID int64
 }
 
 // NewSender constructs a single-loop sender; Run must not be called concurrently.
@@ -55,6 +57,15 @@ func (s *Sender) Run(ctx context.Context) {
 }
 
 func (s *Sender) sendBatch(ctx context.Context) error {
+	if s.afterID == 0 {
+		boundCtx, cancel := context.WithTimeout(ctx, operationTimeout)
+		bound, err := s.store.MaxID(boundCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("bound completion notification scan: %w", err)
+		}
+		s.scanThroughID = bound
+	}
 	readCtx, cancel := context.WithTimeout(ctx, operationTimeout)
 	events, err := s.store.ListUnpublished(readCtx, s.afterID, batchSize)
 	cancel()
@@ -72,7 +83,7 @@ func (s *Sender) sendBatch(ctx context.Context) error {
 			failed = true
 		}
 	}
-	if len(events) < batchSize {
+	if len(events) < batchSize || s.afterID >= s.scanThroughID {
 		s.afterID = 0
 	}
 	ageCtx, cancel := context.WithTimeout(ctx, operationTimeout)
