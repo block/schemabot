@@ -251,3 +251,25 @@ func WriteChangeGateRefused(d ChangeGateRefusedData) {
 		fmt.Println(line)
 	}
 }
+
+// StoppedByFreezeText is what status says about an apply a freeze with
+// running "stop" stopped (AZ-11): which freeze, and how the apply resumes. It
+// is empty when no freeze stopped the apply.
+func StoppedByFreezeText(freeze *apitypes.FreezeStopRef, applyID, environment string) string {
+	if freeze == nil || freeze.ID == "" {
+		return ""
+	}
+	text := "Stopped by freeze " + ui.TerminalSafeLine(freeze.ID)
+	if freeze.Reason != "" {
+		text += " (" + ui.TerminalSafeLine(freeze.Reason) + ")"
+	}
+	start := cliname.Command("start", ui.TerminalSafeLine(applyID), "-e", ui.TerminalSafeLine(environment))
+	return text + fmt.Sprintf(". Run '%s' after the freeze ends or is lifted, or add --override \"<reason>\" to ask a freeze approver to let it through.", start)
+}
+
+// writeStoppedByFreeze writes StoppedByFreezeText below the status box.
+func writeStoppedByFreeze(data ProgressData) {
+	if text := StoppedByFreezeText(data.StoppedByFreeze, data.ApplyID, data.Environment); text != "" {
+		fmt.Printf("\n  ⏹️ %s\n", text)
+	}
+}

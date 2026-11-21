@@ -1381,6 +1381,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	httpResp.Operations = stored.responses
 	httpResp.Released = stored.released
 	overlayStoredDisplayMetadata(httpResp, apply, stored.rows)
+	httpResp.StoppedByFreeze = s.StoppedByFreeze(ctx, apply)
 
 	rows := make([]*apitypes.TableProgressResponse, 0, len(tasks))
 	for _, task := range tasks {

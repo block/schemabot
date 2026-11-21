@@ -2269,6 +2269,8 @@ This holds work a planned `stop` freeze meets once it starts. An approved overri
 apply, at creation or at its start, and that names the freeze lets it start. When the freezes or the
 override requests cannot be read, or the stop cannot be recorded, the operation goes back unstarted and
 the next pass checks again, so it never starts unchecked.
+Status names the freeze that stopped an apply, read from the stop's requester, so a stopped apply
+never reads as an operator's stop or as one a start will resume while the freeze holds it.
 *Breaks if violated:* a schema change judged unsafe keeps writing through the incident that froze
 it, or an operator reads a freeze as having stopped changes that still run.
 *Enforced:* `stopAppliesForFreeze` (`pkg/api/freeze_stop_sweep.go`), called by `handleFreezeCreate`
@@ -2277,7 +2279,9 @@ it, or an operator reads a freeze as having stopped changes that still run.
 caller where `storage.IsFreezeStopCaller` holds. The claim checkpoint is `holdClaimForStopFreeze`
 (`pkg/api/freeze_claim_checkpoint.go`), called by `recoverApplyOperation` (`pkg/api/operator.go`)
 before the drive, which hands the claim back with `ReturnUnstartedClaim`
-(`pkg/storage/internal/sqlstore/apply_operations.go`).
+(`pkg/storage/internal/sqlstore/apply_operations.go`). `StoppedByFreeze`
+(`pkg/api/freeze_stopped_by.go`) names the freeze for the progress response and the pull request
+comments.
 
 ## Structural enforcement
 

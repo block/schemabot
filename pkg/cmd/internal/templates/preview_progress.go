@@ -938,6 +938,25 @@ func previewStoppedOutput() {
 	fmt.Print(FormatNextCommand(ResumeLabel, ControlCommand("start", "<apply_id>", "staging")))
 }
 
+// previewStoppedByFreezeOutput is status of an apply that a freeze with
+// running "stop" stopped before it started.
+func previewStoppedByFreezeOutput() {
+	WriteProgress(ProgressData{
+		State:       state.Apply.Stopped,
+		Engine:      "Spirit",
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Database:    "testapp",
+		Environment: "staging",
+		Tables: []TableProgress{{
+			TableName: "users", Namespace: "testapp",
+			Dialect: schema.DialectMySQL,
+			DDL:     "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
+			Status:  state.Apply.Stopped,
+		}},
+		StoppedByFreeze: &apitypes.FreezeStopRef{ID: "freeze-a1b2c3", Reason: "SEV-1234: checkout errors"},
+	})
+}
+
 func previewApplyWatchOutput() {
 	fmt.Println("Apply watch mode: Running with footer controls")
 	fmt.Printf("(%s apply -s ./schema -e staging)\n", cliname.Name())
