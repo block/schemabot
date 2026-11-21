@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +32,13 @@ func TestSQSPublisherPayloadAndErrors(t *testing.T) {
 			event := Event{ApplyIdentifier: "apply-stable", Database: "orders", DatabaseType: "postgres", Environment: "staging", CompletedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 			require.NoError(t, publisher.Publish(t.Context(), event))
 			assert.Equal(t, queue, aws.ToString(client.input.QueueUrl))
+			if strings.HasSuffix(queue, ".fifo") {
+				assert.Equal(t, "apply-completions", aws.ToString(client.input.MessageGroupId))
+				assert.Equal(t, event.ApplyIdentifier, aws.ToString(client.input.MessageDeduplicationId))
+			} else {
+				assert.Nil(t, client.input.MessageGroupId)
+				assert.Nil(t, client.input.MessageDeduplicationId)
+			}
 			var payload map[string]any
 			require.NoError(t, json.Unmarshal([]byte(aws.ToString(client.input.MessageBody)), &payload))
 			assert.Len(t, payload, 5)
