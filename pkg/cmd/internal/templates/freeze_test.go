@@ -77,3 +77,19 @@ func TestChangeGateRefusedTextSaysWhyNoRequestWasRecorded(t *testing.T) {
 	assert.Equal(t, "No override request was recorded. SchemaBot said: production is frozen; asking for one needs a verified caller "+lineAttackCleaned, lines[2])
 	assertNoTerminalControls(t, strings.Join(lines, "\n"))
 }
+
+// The watch TUI's keys carry no override reason, so its refusal names the
+// exact command that asks for one instead of saying to rerun with --override.
+func TestChangeGateRefusedTextNamesTheOverrideCommand(t *testing.T) {
+	lines := ChangeGateRefusedText(ChangeGateRefusedData{
+		Environment:     "production",
+		Operation:       "cutover",
+		Blockers:        []apitypes.ChangeGateBlocker{{ID: "freeze-abc", Reason: "SEV-1234"}},
+		OverrideCommand: "schemabot cutover apply-" + lineAttack + " -e production",
+	})
+
+	require.Len(t, lines, 3)
+	assert.Equal(t, "✗ production is frozen. This cutover did not start.", lines[0])
+	assert.Equal(t, `To ask for an override, run: schemabot cutover apply-`+lineAttackCleaned+` -e production --override "<reason>"`, lines[2])
+	assertNoTerminalControls(t, strings.Join(lines, "\n"))
+}

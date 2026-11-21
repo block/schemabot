@@ -27,6 +27,11 @@ type WatchModel struct {
 	skipRevertTriggered bool
 	skipRevertAt        time.Time // When skip-revert was triggered (for timeout)
 	stopTriggered       bool
+	// changeGateAnswer is what the freeze gate said to the last start or
+	// cutover this watcher sent, as lines the footer shows. It outlives
+	// errorMsg, which the next poll clears, and stays until the operator
+	// presses Enter again or the apply leaves the state it was refused in.
+	changeGateAnswer []string
 
 	// State from API
 	state      string
@@ -195,6 +200,9 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.errorMsg = ""
 		m.requestedRetryDelay = 0
 		m.state = msg.state
+		if !state.IsState(m.state, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) {
+			m.changeGateAnswer = nil
+		}
 		if !state.IsState(m.state, state.Apply.Pending) {
 			m.pastPending = true
 		}
@@ -249,14 +257,23 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case cutoverResultMsg:
-		if msg.err != nil {
+		if lines, ok := m.changeGateLines("cutover", msg.err); ok {
+			// The gate answered before the cutover began, so Enter can ask
+			// for it again; any other error may mean it is underway.
+			m.changeGateAnswer = lines
+			m.cutoverTriggered = false
+		} else if msg.err != nil {
 			m.errorMsg = msg.err.Error()
 		}
 		// Continue polling - next tick will fetch updated state
 
 	case deployResultMsg:
-		if msg.err != nil {
+		if lines, ok := m.changeGateLines("start", msg.err); ok {
+			m.changeGateAnswer = lines
+		} else if msg.err != nil {
 			m.errorMsg = msg.err.Error()
+		}
+		if msg.err != nil {
 			m.deployTriggered = false // Allow retry
 		}
 		// Continue polling - next tick will fetch updated state
@@ -307,11 +324,13 @@ func (m WatchModel) handleEnterKey() (tea.Model, tea.Cmd) {
 	// Trigger deploy if waiting for deploy and not already triggered
 	if state.IsState(m.state, state.Apply.WaitingForDeploy) && m.allowControlActions && !m.deployTriggered {
 		m.deployTriggered = true
+		m.changeGateAnswer = nil
 		return m, m.triggerDeploy()
 	}
 	// Trigger cutover if waiting and not already triggered
 	if state.IsState(m.state, state.Apply.WaitingForCutover) && m.allowControlActions && !m.cutoverTriggered {
 		m.cutoverTriggered = true
+		m.changeGateAnswer = nil
 		return m, m.triggerCutover()
 	}
 	// Trigger skip-revert if in revert window

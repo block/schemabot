@@ -176,6 +176,10 @@ type ChangeGateRefusedData struct {
 	// Message is the server's refusal, which says why no override request
 	// was recorded when one was asked for.
 	Message string
+	// OverrideCommand is the CLI command that asks for an override, for a
+	// caller whose own request cannot carry --override: the watch TUI's keys
+	// send none. Empty when the operator ran a command they can rerun with it.
+	OverrideCommand string
 }
 
 // ChangeGateRefusedText is the refusal as lines, so a caller that cannot print
@@ -206,6 +210,8 @@ func ChangeGateRefusedText(d ChangeGateRefusedData) []string {
 	case d.Operation == "rollback":
 		// rollback has no --override; only the freezes ending lets it run.
 		lines = append(lines, "Run the rollback again once these freezes end or are lifted.")
+	case !d.OverrideAsked && d.OverrideCommand != "":
+		lines = append(lines, fmt.Sprintf(`To ask for an override, run: %s --override "<reason>"`, ui.TerminalSafeLine(d.OverrideCommand)))
 	case !d.OverrideAsked:
 		lines = append(lines, `To ask for an override, run the same command with --override "<reason>".`)
 	default:
