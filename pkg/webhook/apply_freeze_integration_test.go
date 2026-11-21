@@ -45,7 +45,7 @@ func TestE2EApplyIsRefusedDuringAFreeze(t *testing.T) {
 	})
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	refusal := awaitCommentContaining(t, apply, "This change did not start: it is blocked in "+driftEnv+" by freeze "+freezeID+" (incident 42, until lifted)")
+	refusal := awaitCommentContaining(t, apply, "This change did not start: "+driftEnv+" is frozen by freeze "+freezeID+" until someone lifts it. Reason: incident 42.")
 	assert.Contains(t, refusal, "run the same command again with `--override` followed by your reason in quotes")
 
 	requireNoApplies(t, svc, dbName)
@@ -79,7 +79,7 @@ func TestE2EApplyConfirmIsRefusedDuringAFreeze(t *testing.T) {
 	})
 
 	result := sendApplyConfirm(t, svc, dbName, "schemabot apply-confirm -e staging")
-	refusal := awaitCommentContaining(t, result, "This change did not start: it is blocked in staging by freeze "+freezeID+" (incident 43, until lifted)")
+	refusal := awaitCommentContaining(t, result, "This change did not start: staging is frozen by freeze "+freezeID+" until someone lifts it. Reason: incident 43.")
 	assert.Contains(t, refusal, "The pending confirmation was released. To ask a freeze approver to let it through, run `apply` again, then run `apply-confirm` with `--override`")
 
 	requireNoApplies(t, svc, dbName)

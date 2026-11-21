@@ -22,11 +22,12 @@ func TestChangeGateRefusalDetail(t *testing.T) {
 			Blockers:    []apitypes.ChangeGateBlocker{{Gate: "freeze", ID: "frz-1", Reason: "SEV-1234, page @payments-oncall"}},
 		}
 	}
-	const freezeLine = "blocked in production by freeze frz-1 (SEV-1234, page `@payments-oncall`, until lifted); try again after it ends or is lifted."
+	const frozen = "production is frozen by freeze frz-1 until someone lifts it. Reason: SEV-1234, page `@payments-oncall`."
+	const freezeLine = "This change did not start: " + frozen
 
 	t.Run("a command that takes --override is told how to ask", func(t *testing.T) {
-		for _, command := range []string{action.Apply, action.Start, action.Cutover} {
-			assert.Equal(t, freezeLine+" To ask a freeze approver to let it through, run the same command again with `--override` followed by your reason in quotes.",
+		for command, outcome := range map[string]string{action.Apply: "This change", action.Start: "This change", action.Cutover: "This cutover"} {
+			assert.Equal(t, outcome+" did not start: "+frozen+" To ask a freeze approver to let it through, run the same command again with `--override` followed by your reason in quotes.",
 				changeGateRefusalDetail(blocked(), command, ""), command)
 		}
 	})
@@ -121,7 +122,7 @@ func TestChangeGateRefusalDetail(t *testing.T) {
 				action.Apply:        " runs this command again.",
 				action.ApplyConfirm: " runs `apply` again, then `apply-confirm`.",
 			} {
-				detail := "This change did not start: it is " + changeGateRefusalDetail(refused, command, strings.Repeat("t", 63))
+				detail := changeGateRefusalDetail(refused, command, strings.Repeat("t", 63))
 				assert.LessOrEqual(t, utf8.RuneCountInString(detail), templates.MaxChangeGateRefusalLen, name, command)
 				assert.Contains(t, detail, " 3 more freezes also block it.", name, command)
 				assert.NotContains(t, detail, "frz-3", name, command)

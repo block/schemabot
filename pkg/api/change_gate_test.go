@@ -110,7 +110,7 @@ func TestChangeGateRefusesApplyDuringFreeze(t *testing.T) {
 	require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
 	resp := decodeGateError(t, rec)
 	assert.Equal(t, apitypes.ErrCodeChangeGateRefused, resp.ErrorCode)
-	assert.Contains(t, resp.Error, "freeze freeze-incident (incident 42, until lifted)")
+	assert.Contains(t, resp.Error, "staging is frozen by freeze freeze-incident until someone lifts it. Reason: incident 42.")
 	assert.Equal(t, []apitypes.ChangeGateBlocker{{Gate: "freeze", ID: "freeze-incident", Reason: "incident 42"}}, resp.Blockers)
 	assert.Nil(t, applies.apply, "a refused apply must not be created")
 	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 1}, changeGateCounters(t, reader, "schemabot.change_gate.refusals"))
@@ -586,5 +586,40 @@ func TestChangeGateFailsClosedWhenTheAdmissionWriteCannotReadTheEpoch(t *testing
 			require.NoError(t, err)
 			assert.Nil(t, pending, "the request must not be recorded")
 		})
+	}
+}
+
+// A refusal reads as whole sentences: what freezes the environment, until
+// when, and each reason after "Reason:", so a reason never runs into the
+// text around it.
+func TestChangeGateRefusalReadsAsSentences(t *testing.T) {
+	ends := time.Date(2026, 11, 22, 18, 0, 0, 0, time.FixedZone("PST", -8*60*60))
+	freeze := func(id, reason string, endsAt *time.Time) apitypes.ChangeGateBlocker {
+		return apitypes.ChangeGateBlocker{Gate: "freeze", ID: id, Reason: reason, EndsAt: endsAt}
+	}
+	for name, tc := range map[string]struct {
+		blockers []apitypes.ChangeGateBlocker
+		listed   int
+		want     string
+	}{
+		"no blocker named": {
+			want: "production is frozen.",
+		},
+		"one freeze until lifted": {
+			blockers: []apitypes.ChangeGateBlocker{freeze("frz-1", "rpc error: code = Unavailable during the outage", nil)},
+			want:     "production is frozen by freeze frz-1 until someone lifts it. Reason: rpc error: code = Unavailable during the outage.",
+		},
+		"a reason that ends a sentence and a blank one": {
+			blockers: []apitypes.ChangeGateBlocker{freeze("frz-1", "SEV-1234!", nil), freeze("frz-2", " ", &ends)},
+			want:     "production is frozen by 2 freezes. Freeze frz-1 lasts until someone lifts it. Reason: SEV-1234! Freeze frz-2 lasts until 2026-11-23T02:00:00Z.",
+		},
+		"more freezes than listed are counted": {
+			blockers: []apitypes.ChangeGateBlocker{freeze("frz-1", "a", nil), freeze("frz-2", "b", nil), freeze("frz-3", "c", nil)},
+			listed:   1,
+			want:     "production is frozen by 3 freezes. Freeze frz-1 lasts until someone lifts it. Reason: a. 2 more freezes also block it.",
+		},
+	} {
+		refused := &ChangeGateRefusedError{Environment: "production", Blockers: tc.blockers}
+		assert.Equal(t, tc.want, refused.BlockedWith(func(reason string) string { return reason }, tc.listed), name)
 	}
 }

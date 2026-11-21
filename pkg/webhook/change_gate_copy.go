@@ -26,21 +26,13 @@ func changeGateRefusalDetail(refused *api.ChangeGateRefusedError, command, tenan
 	// named, so the detail stays inside templates.MaxChangeGateRefusalLen
 	// after the comment's own redaction, and the request and its instructions
 	// at the end are never cut off.
-	listed := *refused
-	unlisted := 0
-	if len(listed.Blockers) > maxListedBlockers {
-		unlisted = len(listed.Blockers) - maxListedBlockers
-		listed.Blockers = listed.Blockers[:maxListedBlockers]
+	outcome := "This change did not start: "
+	if command == action.Cutover {
+		outcome = "This cutover did not start: "
 	}
-	detail := listed.BlockedWith(func(reason string) string {
+	detail := outcome + refused.BlockedWith(func(reason string) string {
 		return templates.ErrorDetailReason(templates.RedactedReason(reason, maxListedFreezeReason))
-	}) + "."
-	switch {
-	case unlisted == 1:
-		detail += " 1 more freeze also blocks it."
-	case unlisted > 1:
-		detail += fmt.Sprintf(" %d more freezes also block it.", unlisted)
-	}
+	}, maxListedBlockers)
 	switch request := refused.OverrideRequest; {
 	case request != nil:
 		requester := strings.TrimPrefix(request.RequestedBy, storage.GitHubIdentityPrefix)
@@ -48,7 +40,7 @@ func changeGateRefusalDetail(refused *api.ChangeGateRefusedError, command, tenan
 		detail += fmt.Sprintf(" Override request `%s` was recorded.", request.Identifier)
 		if reason := templates.RedactedReason(request.Reason, maxShownOverrideReason); reason != "" {
 			detail += " Reason the approver sees: " + templates.ErrorDetailReason(reason)
-			if !endsSentence(reason) {
+			if !api.EndsSentence(reason) {
 				detail += "."
 			}
 		}
@@ -79,13 +71,6 @@ func changeGateRefusalDetail(refused *api.ChangeGateRefusedError, command, tenan
 		detail += " To ask a freeze approver to let it through, run the same command again with `--override` followed by your reason in quotes."
 	}
 	return detail
-}
-
-// endsSentence reports whether text already ends a sentence, so no period is
-// added after it. A clamped reason ends in "…".
-func endsSentence(text string) bool {
-	return strings.HasSuffix(text, ".") || strings.HasSuffix(text, "!") ||
-		strings.HasSuffix(text, "?") || strings.HasSuffix(text, "…")
 }
 
 const (
