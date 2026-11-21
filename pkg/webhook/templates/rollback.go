@@ -62,7 +62,7 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 	// Summary (after DDL, matching CLI layout)
 	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 
-	// Footer. Like the apply instruction, the consent requirement leads into
+	// The rollback consent requirement leads into
 	// the command and the flag stays out of the pasteable command, so
 	// consenting to destroy data takes typing it.
 	sb.WriteString("---\n\n")

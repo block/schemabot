@@ -256,7 +256,7 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	if data.Tenant != "" {
 		applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 	}
-	writeUnsafeChangesRejection(&sb, data, "Apply rejected", applyCmd)
+	writeUnsafeChangesRejection(&sb, data, "Apply rejected", applyCmd+" --allow-unsafe")
 
 	return appendAgentHint(offerSupportChannel(sb.String()), data.AgentHint)
 }
@@ -264,9 +264,7 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 // writeUnsafeChangesRejection writes the refusal for a command that would run
 // unsafe changes without `--allow-unsafe`: the heading names what was
 // rejected, each unsafe change is listed, and the comment ends in the steps
-// that make any destructive drop safe and the command to re-run. Like the plan's apply instruction, the consent requirement leads
-// into the command and the flag stays out of the pasteable command, so
-// consenting to destroy data takes typing it.
+// that make any destructive drop safe and the command to re-run.
 func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, rejected, command string) {
 	sb.WriteString("---\n\n")
 	drops, rest := splitDestructiveDrops(data.UnsafeChanges, data.DatabaseType)
