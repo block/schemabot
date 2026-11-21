@@ -1483,6 +1483,7 @@ func RecordOperatorTerminalSummaryFailure(ctx context.Context, reason string) {
 // containment boundaries that exist in the codebase.
 var knownRecoveredPanicOperations = map[string]bool{
 	"apply_drive":            true,
+	"completion_sender":      true,
 	"operator_tick":          true,
 	"summary_reconciliation": true,
 	"observer_poll":          true,
