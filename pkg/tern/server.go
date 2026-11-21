@@ -238,6 +238,21 @@ func pullSchemaErrorCode(err error) codes.Code {
 	return codes.Internal
 }
 
+func (s *Server) ResolveNamespaces(ctx context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error) {
+	resp, err := ResolveNamespacesWith(ctx, s.client, req)
+	if err != nil {
+		// UNIMPLEMENTED is left to mean a data plane that predates the RPC, so
+		// the control plane can tell an upgrade from an engine that has no
+		// answer: this data plane serves the RPC, and its engine declines.
+		code := codes.Internal
+		if errors.Is(err, ErrResolveNamespacesUnsupported) {
+			code = codes.FailedPrecondition
+		}
+		return nil, status.Error(code, err.Error())
+	}
+	return resp, nil
+}
+
 func (s *Server) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
 	resp, err := s.client.CompareSchemaFileChange(ctx, req)
 	if err != nil {
