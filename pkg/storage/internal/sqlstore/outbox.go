@@ -44,6 +44,15 @@ type outboxStore struct {
 	db *rebindDB
 }
 
+// MaxID bounds a scan independently of later inserts and their commit order.
+func (s *outboxStore) MaxID(ctx context.Context) (int64, error) {
+	var id int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM outbox_events`).Scan(&id); err != nil {
+		return 0, fmt.Errorf("read completion notification high-water ID: %w", err)
+	}
+	return id, nil
+}
+
 func (s *outboxStore) ListUnpublished(ctx context.Context, afterID int64, limit int) ([]*storage.OutboxEvent, error) {
 	if limit < 1 || limit > 100 {
 		return nil, fmt.Errorf("list unpublished notifications: limit must be between 1 and 100")

@@ -1063,8 +1063,9 @@ Acceptance by SQS does not mean that a receiver processed the message.
 
 The sender processes at most 100 rows per batch, continues past failed rows, and
 backs off between failed batches from two seconds up to 30 seconds. It scans
-later IDs even if an earlier batch cannot be published, then returns to retry
-pending rows. A persistently failing row can delay healthy notifications by up
+later IDs even if an earlier batch cannot be published. Each scan captures the
+highest stored ID and returns to retry earlier pending rows after reaching it,
+even while new full batches keep arriving. A persistently failing row can delay healthy notifications by up
 to 30 seconds through the shared batch backoff. Storage and transport operations have ten-second deadlines;
 shutdown cancels the sender and waits at most five seconds. No sender election,
 consumer, retention cleanup, or backfill runs. Published rows remain in storage.

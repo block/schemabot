@@ -16,12 +16,22 @@ import (
 )
 
 type memoryOutbox struct {
-	events    []*storage.OutboxEvent
-	published map[int64]bool
-	markErr   error
-	listErr   error
-	oldestErr error
-	limits    []int
+	events     []*storage.OutboxEvent
+	published  map[int64]bool
+	markErr    error
+	listErr    error
+	oldestErr  error
+	maxIDErr   error
+	limits     []int
+	batchSizes []int
+}
+
+func (m *memoryOutbox) MaxID(context.Context) (int64, error) {
+	var id int64
+	for _, event := range m.events {
+		id = max(id, event.ID)
+	}
+	return id, m.maxIDErr
 }
 
 func (m *memoryOutbox) ListUnpublished(_ context.Context, afterID int64, limit int) ([]*storage.OutboxEvent, error) {
@@ -35,6 +45,7 @@ func (m *memoryOutbox) ListUnpublished(_ context.Context, afterID int64, limit i
 			}
 		}
 	}
+	m.batchSizes = append(m.batchSizes, len(events))
 	return events, m.listErr
 }
 
@@ -119,6 +130,41 @@ func TestSenderFailureDoesNotHideLaterBatches(t *testing.T) {
 	assert.Len(t, attempts, 2*batchSize+1)
 }
 
+// Continuously full batches do not hide earlier failures or rows that commit
+// behind the cursor. Both are revisited after the captured high-water ID.
+func TestSenderSustainedArrivalsRevisitEarlierRows(t *testing.T) {
+	store := newMemoryOutbox(t, 4*batchSize+1)
+	lateCommit := store.events[0]
+	arrivals := store.events[2*batchSize+1:]
+	store.events = store.events[1 : 2*batchSize+1]
+	var accepted []string
+	recovered := false
+	publisher := publisherFunc(func(_ context.Context, payload json.RawMessage) error {
+		var message storage.ApplyCompletedEvent
+		require.NoError(t, json.Unmarshal(payload, &message))
+		if message.ID == "apply_2" && !recovered {
+			return errors.New("SQS rejected notification")
+		}
+		accepted = append(accepted, message.ID)
+		return nil
+	})
+	sender := NewSender(store, publisher, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.Error(t, sender.sendBatch(t.Context()))
+	assert.Equal(t, int64(2*batchSize+1), sender.scanThroughID)
+	store.events = append(store.events, arrivals[:batchSize]...)
+	require.NoError(t, sender.sendBatch(t.Context()))
+	require.Zero(t, sender.afterID, "reaching the captured bound ends even a full batch")
+	store.events = append([]*storage.OutboxEvent{lateCommit}, store.events...)
+	store.events = append(store.events, arrivals[batchSize:]...)
+	recovered = true
+	require.NoError(t, sender.sendBatch(t.Context()))
+	assert.True(t, store.published[lateCommit.ID], "the row committed behind the cursor must be delivered")
+	assert.True(t, store.published[2], "the earlier failure must be retried after recovery")
+	assert.Contains(t, accepted, "apply_1")
+	assert.Contains(t, accepted, "apply_2")
+	assert.Equal(t, []int{batchSize, batchSize, batchSize}, store.batchSizes)
+}
+
 func TestSenderCancellationInterruptsPublish(t *testing.T) {
 	store := newMemoryOutbox(t, 1)
 	started := make(chan struct{})
@@ -154,6 +200,9 @@ func TestSenderStorageErrorsRemainVisible(t *testing.T) {
 	store := newMemoryOutbox(t, 0)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	sender := NewSender(store, publisherFunc(func(context.Context, json.RawMessage) error { return nil }), logger)
+	store.maxIDErr = errors.New("bound unavailable")
+	require.ErrorContains(t, sender.sendBatch(t.Context()), "bound unavailable")
+	store.maxIDErr = nil
 	store.listErr = errors.New("list unavailable")
 	require.ErrorContains(t, sender.sendBatch(t.Context()), "list unavailable")
 	store.listErr = nil
