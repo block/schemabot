@@ -2955,8 +2955,11 @@ cancelled, and reverted applies do not. Existing GitHub terminal summaries keep
 their behavior, including their errors, independently of notification sends.
 
 Coverage is deliberately limited to the existing aggregate terminal-summary
-callback, installed by the webhook handler. Deployments without that handler
-send nothing. Direct completions in `local_control.go`,
+callback, installed by the webhook handler. A normal task-bearing single-operation
+apply on the parent-lease drive does not reach this hook and sends no notification.
+Taskless operations and manifest-held generations can take the aggregate path
+even with one attached operation. Deployments without the webhook handler send
+nothing. Direct completions in `local_control.go`,
 `local_control_resume.go`, `local_apply_grouped.go`, and
 `local_apply_sequential.go` that report through the per-driver observer do not
 reach this callback. Apply/task reload failures before the callback, process
