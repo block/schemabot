@@ -1460,14 +1460,14 @@ var knownOperatorTerminalSummaryFailureReasons = map[string]bool{
 	"apply_not_terminal_after_cas": true,
 	"reload_tasks_error":           true,
 	"callback_error":               true,
+	"notification_send_error":      true,
 }
 
-// RecordOperatorTerminalSummaryFailure increments the counter for an apply
-// whose aggregate terminal summary failed to publish after the projection CAS
-// already terminalized the parent. A spike means terminal PR summaries / check
-// refreshes are being dropped; the parent state itself is already durable, so
-// the expected operator action is to check the GitHub side-effect path (App
-// client, check state) and rely on summary reconciliation.
+// RecordOperatorTerminalSummaryFailure counts failed terminal side effects
+// after the parent's outcome is durable. Summary failures call for checking
+// GitHub publication and relying on summary reconciliation. The distinct
+// notification_send_error reason counts dropped completion notifications;
+// those are not reconciled or retried and do not imply a missing PR summary.
 func RecordOperatorTerminalSummaryFailure(ctx context.Context, reason string) {
 	if !knownOperatorTerminalSummaryFailureReasons[reason] {
 		reason = "unknown"

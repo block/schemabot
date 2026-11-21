@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	gomysql "github.com/block/mysql"
+	"github.com/block/schemabot/pkg/applynotifications"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
@@ -54,6 +55,9 @@ type ServerConfig struct {
 	// If not specified, falls back to the STORAGE_DSN environment variable,
 	// then to MYSQL_DSN (legacy name, honored for every dialect).
 	Storage StorageConfig `yaml:"storage"`
+
+	// ApplyNotifications optionally sends best-effort successful apply completions.
+	ApplyNotifications applynotifications.Config `yaml:"apply_notifications,omitempty"`
 
 	// Auth configures API authentication. When Type is empty or "none" (the
 	// default), authentication is disabled and all requests are allowed,
@@ -819,8 +823,7 @@ func (g *GitHubConfig) ResolveAppID() (int64, error) {
 		// strconv's error quotes the input; keep only its cause so the
 		// resolved value never reaches a log line or startup error.
 		cause := err
-		var numErr *strconv.NumError
-		if errors.As(err, &numErr) {
+		if numErr, ok := errors.AsType[*strconv.NumError](err); ok {
 			cause = numErr.Err
 		}
 		return 0, fmt.Errorf("%s must be a positive integer, or 0 for no App: %w (%w)", setting, ErrInvalidGitHubAppID, cause)
@@ -2428,6 +2431,9 @@ func (c *ServerConfig) validateTargetTableOwners() error {
 
 // Validate checks the configuration for required fields and consistency.
 func (c *ServerConfig) Validate() error {
+	if err := c.ApplyNotifications.Validate(); err != nil {
+		return err
+	}
 	if err := c.ValidateExperimentalStrata(); err != nil {
 		return err
 	}
