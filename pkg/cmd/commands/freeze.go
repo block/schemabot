@@ -28,7 +28,7 @@ type FreezeCmd struct {
 type FreezeCreateCmd struct {
 	Environment string   `short:"e" required:"" help:"Environment to freeze"`
 	Reason      string   `required:"" help:"Why the freeze is set; shown wherever it holds a change"`
-	Running     string   `help:"Policy recorded for applies already running in scope: continue (default) or stop; SchemaBot does not stop them yet"`
+	Running     string   `help:"What happens to applies already pending or running in scope: continue (default) lets them finish; stop stops them when the freeze is set"`
 	Deployment  []string `help:"Limit the freeze to this deployment (repeatable)"`
 	Database    []string `help:"Limit the freeze to this database (repeatable)"`
 	Planned     bool     `help:"Schedule a planned freeze; needs --end"`

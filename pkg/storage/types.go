@@ -2501,12 +2501,41 @@ const ForwardingControlRequestCaller = "tern-grpc"
 // SchemaBot.
 const EndedOperationStopCaller = "schemabot"
 
+// freezeStopCallerPrefix starts the requester recorded for the stop a freeze
+// with running policy FreezeRunningStop issues on an admitted apply. The rest
+// is the freeze's identifier.
+const freezeStopCallerPrefix = "freeze:"
+
+// FreezeStopCaller is the requester recorded for the stop that the freeze
+// with this identifier issues. No operator issued it, so it names the freeze,
+// and status can say which freeze stopped the apply.
+func FreezeStopCaller(freezeID string) string {
+	return freezeStopCallerPrefix + freezeID
+}
+
+// IsFreezeStopCaller reports whether requestedBy is in the form SchemaBot
+// reserves for the stop a freeze issues.
+func IsFreezeStopCaller(requestedBy string) bool {
+	return strings.HasPrefix(requestedBy, freezeStopCallerPrefix)
+}
+
+// FreezeFromStopCaller returns the identifier of the freeze that issued a
+// stop, when requestedBy is a FreezeStopCaller.
+func FreezeFromStopCaller(requestedBy string) (string, bool) {
+	freezeID, ok := strings.CutPrefix(requestedBy, freezeStopCallerPrefix)
+	if !ok || freezeID == "" {
+		return "", false
+	}
+	return freezeID, true
+}
+
 // ControlRequestNamesAnOperator reports whether a requester identifies the
 // operator who issued the command. Only such a value is worth showing in the
 // PR notice, whose whole purpose is telling an operator which of their commands
 // did not take effect.
 func ControlRequestNamesAnOperator(requestedBy string) bool {
-	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller && requestedBy != EndedOperationStopCaller
+	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller && requestedBy != EndedOperationStopCaller &&
+		!IsFreezeStopCaller(requestedBy)
 }
 
 // IsMirroredRemoteRejection reports whether this row exists only to carry

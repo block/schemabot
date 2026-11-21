@@ -163,9 +163,18 @@ type mockStorageWithFreezes struct {
 	mockStorage
 	freezes   storage.FreezeStore
 	overrides storage.FreezeOverrideStore
+	// applies is what a stop freeze's sweep reads; nil holds no applies.
+	applies storage.ApplyStore
 }
 
 func (m *mockStorageWithFreezes) Freezes() storage.FreezeStore { return m.freezes }
+
+func (m *mockStorageWithFreezes) Applies() storage.ApplyStore {
+	if m.applies == nil {
+		return &staticApplyStore{}
+	}
+	return m.applies
+}
 
 var freezeTestNow = time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
 
