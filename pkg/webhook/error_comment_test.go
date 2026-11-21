@@ -95,3 +95,35 @@ func TestPostCommandErrorExplainsRemoteUnavailable(t *testing.T) {
 		require.FailNow(t, "timed out waiting for posted comment")
 	}
 }
+
+// A refusal quotes the freeze's reason. One that reads like a gRPC
+// unavailable error is still posted as a refusal, not explained as an outage.
+func TestPostChangeGateRefusalIsPostedAsWritten(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	bodies := make(chan string, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		bodies <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+
+	h := &Handler{
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
+	}
+
+	const refusal = "This change did not start: it is blocked in production by freeze frz-1 (rpc error: code = Unavailable during the outage, until lifted); try again after it ends or is lifted."
+	h.postChangeGateRefusal("octocat/hello-world", 1, 12345, "apply", "production", "alice", refusal)
+
+	select {
+	case body := <-bodies:
+		assert.Contains(t, body, refusal)
+		assert.NotContains(t, body, "could not reach")
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "timed out waiting for posted comment")
+	}
+}

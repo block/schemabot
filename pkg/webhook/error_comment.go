@@ -31,12 +31,14 @@ func (h *Handler) postCommandError(
 	repo string, pr int, installationID int64,
 	commandName, environment, requestedBy, errorDetail string,
 ) {
-	h.postCommandErrorWithin(repo, pr, installationID, commandName, environment, requestedBy, errorDetail, 0)
+	h.postCommandErrorWithin(repo, pr, installationID, commandName, environment, requestedBy, userFacingErrorDetail(errorDetail), 0)
 }
 
 // postChangeGateRefusal is postCommandError for a change gate's refusal,
 // which SchemaBot writes itself and whose last sentences say how to get the
 // change through, so it is posted under the longer MaxChangeGateRefusalLen.
+// It is posted as written: the refusal quotes people's reasons, and a reason
+// that reads like a gRPC error must not make it look like an outage.
 func (h *Handler) postChangeGateRefusal(
 	repo string, pr int, installationID int64,
 	commandName, environment, requestedBy, errorDetail string,
@@ -54,7 +56,7 @@ func (h *Handler) postCommandErrorWithin(
 		Environment:  environment,
 		Environments: h.deploymentEnvironmentScope(environment),
 		CommandName:  commandName,
-		ErrorDetail:  userFacingErrorDetail(errorDetail),
+		ErrorDetail:  errorDetail,
 		DetailLimit:  detailLimit,
 	}))
 }
