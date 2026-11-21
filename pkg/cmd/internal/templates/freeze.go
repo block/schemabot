@@ -75,27 +75,31 @@ func freezeRunning(f apitypes.Freeze) string {
 	return policy
 }
 
-// writeFreezeStopSweep lists the applies a stop freeze stopped when it was
-// set, and the ones it could not stop, each with the reason.
+// writeFreezeStopSweep lists the applies a stop freeze asked to stop when it
+// was set, and the ones it did not, each with the reason. A stop is a durable
+// request its driver delivers, so the applies listed may still be writing as
+// this prints; status confirms each one has stopped. An apply not stopped
+// keeps running, and its reason says what to do, since the remedy differs:
+// one engine has no stop at all.
 func writeFreezeStopSweep(sweep *apitypes.FreezeStopSweep) {
 	if sweep == nil {
 		return
 	}
 	if sweep.Error != "" {
-		fmt.Printf("   Stopped:         none. %s\n", ui.TerminalSafeLine(sweep.Error))
+		fmt.Printf("   Stop requested:  none. %s\n", ui.TerminalSafeLine(sweep.Error))
 		return
 	}
-	switch len(sweep.Stopped) {
-	case 0:
-		fmt.Println("   Stopped:         none; no schema change in scope was pending or running")
+	switch {
+	case len(sweep.Stopped) > 0:
+		fmt.Printf("   Stop requested:  %s\n", ui.TerminalSafeLine(strings.Join(sweep.Stopped, ", ")))
+		fmt.Printf("                    Confirm each one has stopped with '%s'.\n", cliname.Command("status", "<apply-id>"))
+	case len(sweep.NotStopped) == 0:
+		fmt.Println("   Stop requested:  none; no schema change in scope was pending or running")
 	default:
-		fmt.Printf("   Stopped:         %s\n", ui.TerminalSafeLine(strings.Join(sweep.Stopped, ", ")))
+		fmt.Println("   Stop requested:  none")
 	}
 	for _, unstopped := range sweep.NotStopped {
-		fmt.Printf("   Not stopped:     %s: %s\n", ui.TerminalSafeLine(unstopped.ApplyID), ui.TerminalSafeLine(unstopped.Reason))
-	}
-	if len(sweep.NotStopped) > 0 {
-		fmt.Println("   Stop each one still running with 'schemabot stop'.")
+		fmt.Printf("   Not stopped:     %s keeps running: %s\n", ui.TerminalSafeLine(unstopped.ApplyID), ui.TerminalSafeLine(unstopped.Reason))
 	}
 }
 

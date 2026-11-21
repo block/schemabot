@@ -72,6 +72,7 @@ func TestFreezeStopSweepCandidate(t *testing.T) {
 		{"Pending", &storage.Apply{Environment: "staging", State: state.Apply.Pending}, true},
 		{"Running", &storage.Apply{Environment: "Staging", State: state.Apply.Running}, true},
 		{"FailedRetryable", &storage.Apply{Environment: "staging", State: state.Apply.FailedRetryable}, true},
+		{"PausedRollout", &storage.Apply{Environment: "staging", State: state.Apply.Paused}, true},
 		{"OtherEnvironment", &storage.Apply{Environment: "production", State: state.Apply.Running}, false},
 		{"PinnedRollback", rollback, false},
 		{"WaitingForCutover", &storage.Apply{Environment: "staging", State: state.Apply.WaitingForCutover}, false},
