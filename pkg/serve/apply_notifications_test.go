@@ -20,6 +20,7 @@ func TestConfigureApplyNotificationsDisabled(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	cfg := &api.ServerConfig{}
 	svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
+	logs.Reset() // Only notification setup and publication are under test.
 	summaryCalls := 0
 	svc.OnApplyTerminalSummary = func(context.Context, *storage.Apply, []*storage.Task) error { summaryCalls++; return nil }
 	// An unusable AWS region would fail a real send; disabled wiring never
