@@ -1644,6 +1644,24 @@ func (s *applyOperationStore) deferredCutoverWorkExclusion(filter storage.Operat
 				AND NOT ` + s.deferredCutoverApplySQL()
 }
 
+// skippedOperationExclusion returns the predicate that leaves
+// filter.SkipOperationIDs out of the arms that start or resume work, or ""
+// when it lists none. The ids are integers written into the statement, so it
+// binds no arguments and every placeholder keeps its position.
+//
+// The fragment begins with AND.
+func skippedOperationExclusion(filter storage.OperationClaimFilter) string {
+	if len(filter.SkipOperationIDs) == 0 {
+		return ""
+	}
+	ids := make([]string, len(filter.SkipOperationIDs))
+	for i, id := range filter.SkipOperationIDs {
+		ids[i] = strconv.FormatInt(id, 10)
+	}
+	return `
+				AND apply_operations.id NOT IN (` + strings.Join(ids, ", ") + `)`
+}
+
 // deferredCutoverQueueClause keeps deferred applies from deadlocking the
 // drivers between them. A deferred operation keeps its driver until an
 // operator cuts its apply over, and the cutover waits for every operation of
@@ -1887,6 +1905,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// failed_retryable arm's crash-recovery branch take it.
 	claimFilter := storage.BuildOperationClaimFilter(opts...)
 	notDeferred := s.deferredCutoverWorkExclusion(claimFilter)
+	// startExclusions gates every arm that starts or resumes work: the
+	// deferred-cutover exclusion and the operations the driver holds back
+	// unstarted. Neither binds arguments.
+	startExclusions := notDeferred + skippedOperationExclusion(claimFilter)
 	notDeferredRecovery, notDeferredRecoveryArgs := s.deferredCutoverRecoveryExclusion(claimFilter)
 	// deferredQueue holds a deferred apply's operations back while a deferred
 	// apply ahead of it still has operations waiting to start, so deferred
@@ -2172,7 +2194,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.status = ?
 				)
 				AND `+parentClaimable+`
-				AND `+driverCap+notDeferred+deferredQueue+`
+				AND `+driverCap+startExclusions+deferredQueue+`
 			)
 			OR (
 				state IN (%s)
@@ -2207,7 +2229,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND `+parentClaimable+`
 					)
 				)
-				AND `+driverCap+notDeferred+deferredQueue+`
+				AND `+driverCap+startExclusions+deferredQueue+`
 			)
 			OR (
 				state = ?
@@ -2254,7 +2276,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.status = ?
 						AND `+deferredDeployGuard+`
 				)
-				AND `+driverCap+notDeferred+`
+				AND `+driverCap+startExclusions+`
 			)
 			OR (
 				state = ?
@@ -2272,7 +2294,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								-- Names no column of a, but belongs to this arm
 								-- alone: a deliberate redispatch starts work, so
 								-- it is capped; crash recovery below is not.
-								AND `+driverCap+notDeferred+deferredQueue+`
+								AND `+driverCap+startExclusions+deferredQueue+`
 							)
 							OR (
 								a.state IN (%s)
@@ -2899,6 +2921,47 @@ func (s *applyOperationStore) ReleaseClaim(ctx context.Context, lease storage.Op
 	rows, err := result.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("read release claim rows affected for apply_operation %d: %w", lease.OperationID, err)
+	}
+	return rows > 0, nil
+}
+
+// ReturnUnstartedClaim undoes the claim of an operation the claiming driver
+// will not start: the pending claim's move to running and started_at stamp,
+// or the stopped claim's move to resuming, with the lease it rotated on. The
+// write is a compare-and-set on the claim's state and lease token.
+func (s *applyOperationStore) ReturnUnstartedClaim(ctx context.Context, lease storage.OperationLease, claimedFrom string) (bool, error) {
+	if !lease.Valid() {
+		return false, fmt.Errorf("return unstarted claim of apply_operation %d: %w", lease.OperationID, storage.ErrApplyLeaseLost)
+	}
+	var query string
+	var args []any
+	switch {
+	case state.IsState(claimedFrom, state.ApplyOperation.Pending):
+		query = `
+			UPDATE apply_operations
+			SET state = ?, started_at = NULL, updated_at = NOW(),
+			    lease_owner = '', lease_token = '', lease_acquired_at = NULL
+			WHERE id = ? AND lease_token = ? AND state = ?
+		`
+		args = []any{state.ApplyOperation.Pending, lease.OperationID, lease.Token, state.ApplyOperation.Running}
+	case state.IsState(claimedFrom, state.ApplyOperation.Stopped):
+		query = `
+			UPDATE apply_operations
+			SET state = ?, updated_at = NOW(),
+			    lease_owner = '', lease_token = '', lease_acquired_at = NULL
+			WHERE id = ? AND lease_token = ? AND state = ?
+		`
+		args = []any{state.ApplyOperation.Stopped, lease.OperationID, lease.Token, state.ApplyOperation.Resuming}
+	default:
+		return false, fmt.Errorf("return unstarted claim of apply_operation %d: a claim from %q starts nothing to undo", lease.OperationID, claimedFrom)
+	}
+	result, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return false, fmt.Errorf("return unstarted claim of apply_operation %d: %w", lease.OperationID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read rows affected returning unstarted claim of apply_operation %d: %w", lease.OperationID, err)
 	}
 	return rows > 0, nil
 }

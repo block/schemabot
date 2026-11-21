@@ -2035,6 +2035,16 @@ type ApplyOperationStore interface {
 	// row has moved on and needs nothing from the caller.
 	ReleaseClaim(ctx context.Context, lease OperationLease) (bool, error)
 
+	// ReturnUnstartedClaim hands back an operation a driver claimed to start
+	// but will not start, as it was before the claim: an operation claimed out
+	// of pending goes back to pending with no started_at, and one claimed out
+	// of stopped goes back to stopped. claimedFrom is that earlier state,
+	// pending or stopped. Unlike ReleaseClaim, the row does not re-enter as
+	// active work a later claim would drive without starting it again. The
+	// write is guarded on the lease token and on the state the claim moved
+	// the row to; it reports false when either no longer matches.
+	ReturnUnstartedClaim(ctx context.Context, lease OperationLease, claimedFrom string) (bool, error)
+
 	// ReleaseFinishedClaim hands back the lease on an operation whose drive has
 	// ended. A drive that finishes leaves its lease in place, so the row it
 	// walks away from is indistinguishable from one a driver just claimed —
