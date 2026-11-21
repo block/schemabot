@@ -3,6 +3,7 @@ package commands
 import (
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -173,4 +174,36 @@ func TestWatchModel_MultiDeploymentViewShowsTheFreezeRefusal(t *testing.T) {
 	assert.NotContains(t, view, cutoverInProgressFooter)
 	assert.Contains(t, view, "staging is frozen. This cutover did not start.")
 	assert.Contains(t, view, `cutover apply-abc123 -e staging --override "<reason>"`)
+}
+
+// A refused start's guidance does not outlive the state it was given in: once
+// the apply waits for cutover, Enter asks for a cutover, not a start.
+func TestWatchModel_StartRefusalClearsWhenTheApplyWaitsForCutover(t *testing.T) {
+	m := waitingWatchModel(state.Apply.WaitingForDeploy)
+	updated, _ := m.Update(deployResultMsg{err: freezeRefusedAPIError()})
+	m = updated.(WatchModel)
+	require.NotEmpty(t, m.changeGateAnswer)
+
+	updated, _ = m.Update(progressMsg{state: state.Apply.WaitingForCutover})
+	m = updated.(WatchModel)
+	assert.Empty(t, m.changeGateAnswer)
+	assert.NotContains(t, m.View(), "start apply-abc123")
+}
+
+// In an 80-column watch, which cuts wide lines, the override command still
+// shows whole on a line of its own.
+func TestWatchModel_FreezeRefusalCommandFitsANarrowWatch(t *testing.T) {
+	m := waitingWatchModel(state.Apply.WaitingForCutover)
+	updated, _ := m.Update(cutoverResultMsg{err: freezeRefusedAPIError()})
+	m = updated.(WatchModel)
+
+	var command string
+	for _, line := range m.changeGateAnswer {
+		if strings.Contains(line, "--override") {
+			command = line
+		}
+	}
+	require.NotEmpty(t, command)
+	assert.True(t, strings.HasPrefix(strings.TrimSpace(command), "schemabot cutover "), "the command starts its own line: %q", command)
+	assert.LessOrEqual(t, len(command), 80)
 }

@@ -211,7 +211,10 @@ func ChangeGateRefusedText(d ChangeGateRefusedData) []string {
 		// rollback has no --override; only the freezes ending lets it run.
 		lines = append(lines, "Run the rollback again once these freezes end or are lifted.")
 	case !d.OverrideAsked && d.OverrideCommand != "":
-		lines = append(lines, fmt.Sprintf(`To ask for an override, run: %s --override "<reason>"`, ui.TerminalSafeLine(d.OverrideCommand)))
+		// The command gets a line of its own so a narrow watch, which cuts
+		// wide lines rather than wrapping them, still shows it whole.
+		lines = append(lines, "To ask for an override, run:",
+			fmt.Sprintf(`  %s --override "<reason>"`, ui.TerminalSafeLine(d.OverrideCommand)))
 	case !d.OverrideAsked:
 		lines = append(lines, `To ask for an override, run the same command with --override "<reason>".`)
 	default:

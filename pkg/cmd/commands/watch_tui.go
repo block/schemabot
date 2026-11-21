@@ -199,10 +199,12 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.consecutiveErrors = 0
 		m.errorMsg = ""
 		m.requestedRetryDelay = 0
-		m.state = msg.state
-		if !state.IsState(m.state, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) {
+		if msg.state != m.state {
+			// The refusal answered a key pressed in the old state; in a new
+			// one Enter asks for something else, so its guidance is stale.
 			m.changeGateAnswer = nil
 		}
+		m.state = msg.state
 		if !state.IsState(m.state, state.Apply.Pending) {
 			m.pastPending = true
 		}
