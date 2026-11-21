@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -122,7 +123,7 @@ func TestClaimCheckpointHoldsAQueuedStartUnderAStopFreeze(t *testing.T) {
 	db := openMatrixStorage(t)
 	stor := mysqlstore.New(db)
 
-	setup := func(t *testing.T, identifier string) (seededMultiOpApply, *matrixService, *driveRecorder) {
+	setup := func(t *testing.T, identifier, admittedOn string) (seededMultiOpApply, *matrixService, *driveRecorder) {
 		t.Helper()
 		resetMatrixTables(t, ctx, db)
 		resetFreezeTables(t, ctx, db)
@@ -137,8 +138,11 @@ func TestClaimCheckpointHoldsAQueuedStartUnderAStopFreeze(t *testing.T) {
 			opState:         state.ApplyOperation.Stopped,
 			taskState:       state.Task.Stopped,
 		})
+		metadata, err := json.Marshal(startControlRequestMetadata{FreezeOverride: admittedOn})
+		require.NoError(t, err)
 		_, _, err = stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
 			ApplyID: seed.applyID, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending, RequestedBy: "cli:alice",
+			Metadata: metadata,
 		})
 		require.NoError(t, err)
 		_, err = stor.Freezes().Create(ctx, claimTestFreeze(t, ctx, stor, storage.FreezeRunningStop, nil))
@@ -152,7 +156,7 @@ func TestClaimCheckpointHoldsAQueuedStartUnderAStopFreeze(t *testing.T) {
 	}
 
 	t.Run("WithdrawsTheStart", func(t *testing.T) {
-		seed, svc, rec := setup(t, "claim-queued-start")
+		seed, svc, rec := setup(t, "claim-queued-start", "")
 
 		driveNextOperation(t, ctx, svc, 1)
 
@@ -171,18 +175,23 @@ func TestClaimCheckpointHoldsAQueuedStartUnderAStopFreeze(t *testing.T) {
 		assert.Equal(t, state.Apply.Stopped, getApply(t, ctx, stor, seed.applyID).State)
 	})
 
-	t.Run("AnApprovedOverrideLetsItResume", func(t *testing.T) {
-		seed, svc, rec := setup(t, "claim-queued-start-override")
+	approveStartOverride := func(t *testing.T, target string) {
+		t.Helper()
 		now, err := stor.Freezes().Now(ctx)
 		require.NoError(t, err)
 		request, err := stor.FreezeOverrides().Create(ctx, &storage.FreezeOverrideRequest{
 			Identifier: "ovr-claim", Environment: "staging", Action: storage.FreezeOverrideActionStart,
-			TargetID: "claim-queued-start-override", Database: "payments", Blockers: []string{"freeze freeze-claim"},
+			TargetID: target, Database: "payments", Blockers: []string{"freeze freeze-claim"},
 			Reason: "SEV-1234 fix forward", RequestedBy: "alice", ExpiresAt: now.Add(time.Hour),
 		})
 		require.NoError(t, err)
 		_, err = stor.FreezeOverrides().Approve(ctx, request.Identifier, "bob")
 		require.NoError(t, err)
+	}
+
+	t.Run("TheOverrideThatAdmittedTheStartLetsItResume", func(t *testing.T) {
+		seed, svc, rec := setup(t, "claim-queued-start-override", "ovr-claim")
+		approveStartOverride(t, "claim-queued-start-override")
 
 		driveNextOperation(t, ctx, svc, 1)
 
@@ -191,6 +200,104 @@ func TestClaimCheckpointHoldsAQueuedStartUnderAStopFreeze(t *testing.T) {
 		require.NoError(t, err)
 		assert.Nil(t, stop, "nothing stopped the apply")
 	})
+
+	// An approval the queued start was not admitted on, such as another
+	// requester's later one for the same apply, does not let it through.
+	t.Run("AnotherApprovalDoesNotLetItResume", func(t *testing.T) {
+		seed, svc, rec := setup(t, "claim-queued-start-other-approval", "")
+		approveStartOverride(t, "claim-queued-start-other-approval")
+
+		driveNextOperation(t, ctx, svc, 1)
+
+		assert.Empty(t, rec.resumeOrder(), "nothing resumes under a stop freeze")
+		stop, err := stor.ControlRequests().GetByOperation(ctx, seed.applyID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		require.NotNil(t, stop)
+		assert.Equal(t, storage.FreezeStopCaller("freeze-claim"), stop.RequestedBy)
+	})
+}
+
+// A cancel pending on a stopped rollout is delivered under a stop freeze: a
+// freeze never holds a cancel (AZ-10, CO-2), so the claim that carries it is
+// not returned and the freeze records no stop.
+func TestClaimCheckpointDeliversAPendingCancelUnderAStopFreeze(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := t.Context()
+	db := openMatrixStorage(t)
+	stor := mysqlstore.New(db)
+	resetMatrixTables(t, ctx, db)
+	resetFreezeTables(t, ctx, db)
+	seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+		applyIdentifier: "claim-pending-cancel",
+		parentState:     state.Apply.Stopped,
+		cutoverPolicy:   storage.CutoverPolicyBarrier,
+		onFailure:       storage.OnFailureHalt,
+		deployments:     []string{"eu", "us"},
+		opState:         state.ApplyOperation.Stopped,
+		taskState:       state.Task.Stopped,
+	})
+	_, _, err := stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID: seed.applyID, Operation: storage.ControlOperationCancel, Status: storage.ControlRequestPending, RequestedBy: "cli:alice",
+	})
+	require.NoError(t, err)
+	_, err = stor.Freezes().Create(ctx, claimTestFreeze(t, ctx, stor, storage.FreezeRunningStop, nil))
+	require.NoError(t, err)
+	rec := &driveRecorder{}
+	svc := newMatrixService(t, stor, matrixClients(stor, rec, map[string]matrixOutcome{
+		"eu": {taskState: state.Task.Completed},
+		"us": {taskState: state.Task.Completed},
+	}))
+
+	driveNextOperation(t, ctx, svc, 1)
+
+	stop, err := stor.ControlRequests().GetByOperation(ctx, seed.applyID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, stop, "the freeze recorded no stop over the cancel")
+	op, err := stor.ApplyOperations().Get(ctx, seed.opID("eu"))
+	require.NoError(t, err)
+	assert.NotEqual(t, state.ApplyOperation.Stopped, op.State, "the claim delivered the cancel instead of handing the operation back")
+}
+
+// Unstarted work whose claim could not be handed back reads as running, and
+// once its lease goes stale its recovery passes the claim checkpoint again: a
+// stop freeze in effect has its stop recorded on the apply, which the drive
+// delivers, so the work does not run on under the freeze unseen.
+func TestClaimCheckpointStopsRecoveredWorkUnderAStopFreeze(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := t.Context()
+	db := openMatrixStorage(t)
+	stor := mysqlstore.New(db)
+	resetMatrixTables(t, ctx, db)
+	resetFreezeTables(t, ctx, db)
+	seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+		applyIdentifier: "claim-recovered",
+		parentState:     state.Apply.Running,
+		cutoverPolicy:   storage.CutoverPolicyBarrier,
+		onFailure:       storage.OnFailureHalt,
+		deployments:     []string{"eu"},
+		opState:         state.ApplyOperation.Running,
+		taskState:       state.Task.Pending,
+	})
+	stalenessBackdate(t, ctx, db, seed.applyID)
+	_, err := stor.Freezes().Create(ctx, claimTestFreeze(t, ctx, stor, storage.FreezeRunningStop, nil))
+	require.NoError(t, err)
+	rec := &driveRecorder{}
+	svc := newMatrixService(t, stor, matrixClients(stor, rec, map[string]matrixOutcome{
+		"eu": {taskState: state.Task.Completed},
+	}))
+
+	driveNextOperation(t, ctx, svc, 1)
+
+	stop, err := stor.ControlRequests().GetByOperation(ctx, seed.applyID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, stop, "the recovery recorded the freeze's stop")
+	assert.Equal(t, storage.FreezeStopCaller("freeze-claim"), stop.RequestedBy)
 }
 
 // claimTestFreeze is a freeze of staging in effect by the database clock.

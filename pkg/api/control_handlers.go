@@ -1982,6 +1982,25 @@ type startControlRequestMetadata struct {
 	// start was accepted. Duplicate start calls use this metadata so clients see
 	// the same "already complete" count as the original request.
 	SkippedCount int64 `json:"skipped_count,omitempty"`
+	// FreezeOverride is the approved freeze override request that admitted
+	// this start, so the claim checkpoint honors that request and no other.
+	FreezeOverride string `json:"freeze_override,omitempty"`
+}
+
+// admittingFreezeOverrideKey carries, to the write that records a start, the
+// approved freeze override request that admitted it.
+type admittingFreezeOverrideKey struct{}
+
+func withAdmittingFreezeOverride(ctx context.Context, request *storage.FreezeOverrideRequest) context.Context {
+	if request == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, admittingFreezeOverrideKey{}, request.Identifier)
+}
+
+func admittingFreezeOverride(ctx context.Context) string {
+	id, _ := ctx.Value(admittingFreezeOverrideKey{}).(string)
+	return id
 }
 
 const (
@@ -2060,7 +2079,7 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 	var overridden *storage.FreezeOverrideRequest
 	resumeGate := func() error {
 		gatedCtx, approved, err := s.checkChangeGatesForApply(ctx, changeGateCheckpointResume, apply, caller, override)
-		admitCtx = gatedCtx
+		admitCtx = withAdmittingFreezeOverride(gatedCtx, approved)
 		overridden = approved
 		return err
 	}
@@ -2414,8 +2433,9 @@ func (s *Service) persistStartRequestForOperator(ctx context.Context, apply *sto
 
 func (s *Service) createStartControlRequest(ctx context.Context, apply *storage.Apply, caller string, startedCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
 	return s.createControlRequest(ctx, apply, storage.ControlOperationStart, caller, startControlRequestMetadata{
-		StartedCount: startedCount,
-		SkippedCount: skippedCount,
+		StartedCount:   startedCount,
+		SkippedCount:   skippedCount,
+		FreezeOverride: admittingFreezeOverride(ctx),
 	})
 }
 

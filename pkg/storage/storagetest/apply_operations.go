@@ -2560,6 +2560,30 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.Error(t, err, "a claim of running work started nothing to undo")
 	})
 
+	// SkipOperations verifies a claim passes over the operations it is told to
+	// skip, oldest first, and reaches the next one, and that the skipped one
+	// is claimable again once the claim no longer lists it.
+	t.Run("SkipOperations", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		heldLock := CreateLock(t, store, "operation_skip_held_db", storage.DatabaseTypeMySQL)
+		heldApply := CreateApply(t, store, heldLock, "apply_operation_skip_held", 911)
+		held := createOperation(t, store, heldApply.ID, "region-a", "schema")
+		nextLock := CreateLock(t, store, "operation_skip_next_db", storage.DatabaseTypeMySQL)
+		nextApply := CreateApply(t, store, nextLock, "apply_operation_skip_next", 912)
+		next := createOperation(t, store, nextApply.ID, "region-a", "schema")
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a", storage.SkipOperations(held))
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		assert.Equal(t, next, claimed.ID, "the claim passes over the skipped operation")
+
+		claimed, err = store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a", storage.SkipOperations(next))
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		assert.Equal(t, held, claimed.ID, "an operation no longer skipped is claimable")
+	})
+
 	// MarkResumedRunning verifies the resumed operation's move to running is a
 	// compare-and-set on resuming under its own operation lease: it moves a
 	// resuming row once, leaves a row in any other state alone, and fails
