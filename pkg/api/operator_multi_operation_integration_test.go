@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -71,7 +72,19 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 
 		driveNextOperation(t, ctx, svc, 1)
 		driveNextOperation(t, ctx, svc, 2)
+		pendingEvents, err := stor.OutboxEvents().ListUnpublished(ctx, 0, 100)
+		require.NoError(t, err)
+		require.Empty(t, pendingEvents, "an unfinished projection must not enqueue completion")
+
+		// The final operation projects the parent under its operation lease.
 		driveNextOperation(t, ctx, svc, 3)
+		pendingEvents, err = stor.OutboxEvents().ListUnpublished(ctx, 0, 100)
+		require.NoError(t, err)
+		require.Len(t, pendingEvents, 1, "the winning operation-lease projection must enqueue completion")
+		assert.Equal(t, seed.applyID, pendingEvents[0].ApplyID)
+		var completion storage.ApplyCompletedEvent
+		require.NoError(t, json.Unmarshal(pendingEvents[0].Payload, &completion))
+		assert.Equal(t, "matrix-rolling-halt-ok", completion.ID)
 
 		assert.Equal(t, []string{"region-a", "region-b", "region-c"}, rec.resumeOrder(),
 			"rolling policy must drive deployments serially in deployment_order")
@@ -823,7 +836,7 @@ func openMatrixStorage(t *testing.T) *sql.DB {
 // container without leaking claimable operations across cases.
 func resetMatrixTables(t *testing.T, ctx context.Context, db *sql.DB) {
 	t.Helper()
-	for _, table := range []string{"tasks", "apply_operations", "apply_control_requests", "apply_logs", "applies"} {
+	for _, table := range []string{"outbox_events", "tasks", "apply_operations", "apply_control_requests", "apply_logs", "applies"} {
 		_, err := db.ExecContext(ctx, "DELETE FROM "+table)
 		require.NoErrorf(t, err, "reset table %s", table)
 	}

@@ -12,6 +12,7 @@
 - [Hybrid Mode](#hybrid-mode)
 - [Drivers](#drivers)
 - [Metrics](#metrics)
+- [Apply Completion Notifications](#apply-completion-notifications)
 - [Rate Limits](#rate-limits)
 - [Pending Drops](#pending-drops)
 - [Direct Execution](#direct-execution)
@@ -1019,6 +1020,61 @@ The cap applies only to *starting* new operations — a first start, a resume af
 
 A multi-shard apply started with a manual `--defer-cutover` keeps its drivers while it waits: unlike the automatic barrier park, a manually deferred operation holds its claim and keeps heartbeating, so it stays counted. Its cutover is accepted only once every operation waits, which takes a cap no smaller than the apply's width, so a deferred apply that would hold more operations at once than `max_drivers_per_apply` is [refused at the start](#deferred-cutover-capacity). Run it without `--defer-cutover`, or raise `max_drivers_per_apply` to at least its width.
 
+## Apply Completion Notifications
+
+Every winning transition to `completed` records an outbox row in the same storage
+transaction, on MySQL and PostgreSQL. Failed and stopped applies do not emit
+notifications, and historical completed applies are not backfilled.
+
+Delivery is disabled by default. To send pending notifications to a standard SQS
+queue, configure the server that owns the apply storage:
+
+```yaml
+apply_notifications:
+  publisher: sqs
+  queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/apply-completed
+  region: us-east-1
+```
+
+The publisher uses the AWS SDK's normal credential chain and needs
+`sqs:SendMessage` on that queue. `region` may be omitted when the normal AWS
+configuration supplies it. FIFO queues are not supported. An empty `publisher`
+disables delivery without discarding stored intent; enabling it later sends the
+pending rows accumulated while it was disabled.
+
+Each SQS message body is JSON:
+
+```json
+{
+  "id": "apply_example",
+  "database": "orders",
+  "database_type": "mysql",
+  "environment": "production",
+  "repository": "example/schemas",
+  "pull_request": 42,
+  "completed_at": "2026-11-20T00:00:00Z"
+}
+```
+
+`id` is the stable apply identifier. `repository` and `pull_request` are omitted
+when absent. Receivers must deduplicate by `id`: multiple senders and a restart
+after SQS acceptance but before the published mark can produce duplicates.
+Acceptance by SQS does not mean that a receiver processed the message.
+
+The sender processes at most 100 rows per batch, continues past failed rows, and
+backs off between failed batches from two seconds up to 30 seconds. It scans
+later IDs even if an earlier batch cannot be published. Each scan captures the
+highest stored ID and returns to retry earlier pending rows after reaching it,
+even while new full batches keep arriving. A persistently failing row can delay healthy notifications by up
+to 30 seconds through the shared batch backoff. Storage and transport operations have ten-second deadlines;
+shutdown cancels the sender and waits at most five seconds. No sender election,
+consumer, retention cleanup, or backfill runs. Published rows remain in storage.
+
+While delivery is enabled, `schemabot.outbox.oldest_unpublished_age` records the
+oldest pending row's age in seconds, or zero when drained. A growing value calls
+for checking sender logs, queue permissions, and SQS reachability. A failed
+storage read does not record a misleading zero.
+
 ## Rate Limits
 
 `POST /api/pull` reads a database's live schema. Per namespace, that opens a
@@ -1472,7 +1528,7 @@ an unknown dialect never falls back to the MySQL flow.
 
 The DSN format follows the dialect: a Go MySQL driver DSN
 (`user:pass@tcp(host:3306)/schemabot`) for `mysql`, and a PostgreSQL URL or
-keyword/value string (`postgres://user:pass@host:5432/schemabot`) for
+keyword/value string (`postgres://user@host:5432/schemabot`) for
 `postgres`. Both dialects support the same secret reference formats (`env:`,
 `file:`, `secretsmanager:`). When `storage.dsn` is unset, the DSN is read
 from the `STORAGE_DSN` environment variable, falling back to `MYSQL_DSN` — a
