@@ -57,16 +57,46 @@ func WriteFreezeCreated(f apitypes.Freeze) {
 		freezeKind(f.Kind), freezeUntil(f), ui.TerminalSafeLine(f.CreatedBy), ui.TerminalSafeLine(f.Reason))
 	fmt.Printf("   Scope:           %s\n", freezeScope(f))
 	fmt.Printf("   Starts:          %s\n", freezeTime(f.StartsAt))
-	fmt.Printf("   Running applies: %s\n", freezeRunning(f.Running))
+	fmt.Printf("   Running applies: %s\n", freezeRunning(f))
+	writeFreezeStopSweep(f.StopSweep)
 }
 
-// freezeRunning shows the recorded running policy. SchemaBot does not act on
-// stop yet, so a responder must not read it as applies having stopped.
-func freezeRunning(policy string) string {
-	if policy == "stop" {
-		return ui.TerminalSafeLine(policy) + " (recorded; running applies are not stopped yet, use 'schemabot stop')"
+// freezeRunning shows the running policy, and for stop, what setting the
+// freeze did to the applies already running, so a responder never reads it
+// as more than happened.
+func freezeRunning(f apitypes.Freeze) string {
+	policy := ui.TerminalSafeLine(f.Running)
+	if f.Running != "stop" {
+		return policy
 	}
-	return ui.TerminalSafeLine(policy)
+	if !f.InEffect {
+		return policy + " (applies running when it starts are not stopped; use 'schemabot stop')"
+	}
+	return policy
+}
+
+// writeFreezeStopSweep lists the applies a stop freeze stopped when it was
+// set, and the ones it could not stop, each with the reason.
+func writeFreezeStopSweep(sweep *apitypes.FreezeStopSweep) {
+	if sweep == nil {
+		return
+	}
+	if sweep.Error != "" {
+		fmt.Printf("   Stopped:         none. %s\n", ui.TerminalSafeLine(sweep.Error))
+		return
+	}
+	switch len(sweep.Stopped) {
+	case 0:
+		fmt.Println("   Stopped:         none; no schema change in scope was pending or running")
+	default:
+		fmt.Printf("   Stopped:         %s\n", ui.TerminalSafeLine(strings.Join(sweep.Stopped, ", ")))
+	}
+	for _, unstopped := range sweep.NotStopped {
+		fmt.Printf("   Not stopped:     %s: %s\n", ui.TerminalSafeLine(unstopped.ApplyID), ui.TerminalSafeLine(unstopped.Reason))
+	}
+	if len(sweep.NotStopped) > 0 {
+		fmt.Println("   Stop each one still running with 'schemabot stop'.")
+	}
 }
 
 // WriteFreezeLifted writes the confirmation of a lifted freeze.

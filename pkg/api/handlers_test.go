@@ -349,6 +349,18 @@ type staticApplyStore struct {
 	err     error
 }
 
+// GetInProgress returns the store's applies, as the SQL store returns the
+// applies not yet terminal.
+func (s *staticApplyStore) GetInProgress(context.Context) ([]*storage.Apply, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.apply != nil {
+		return append([]*storage.Apply{s.apply}, s.applies...), nil
+	}
+	return s.applies, nil
+}
+
 func (s *staticApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
 	if s.err != nil {
 		return nil, s.err

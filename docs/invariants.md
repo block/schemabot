@@ -2191,10 +2191,10 @@ its state so the retry uses the same execution authority.
 
 While a freeze covering a change is in effect, SchemaBot refuses to create its apply, to record a
 start for an apply that is stopped or waiting to start, and to record a cutover for a deferred
-apply. A change that started before the freeze keeps running. If any deployment the change runs on
-is covered, the whole change is refused; for an existing apply that includes every deployment its
-stored operations run on. "In effect" is decided by the database clock, so every pod agrees at the
-edges of a freeze. A pull request rollback is never held, at creation or at a later start or
+apply. A change that started before the freeze keeps running, unless the freeze stops it (AZ-11).
+If any deployment the change runs on is covered, the whole change is refused; for an existing
+apply that includes every deployment its stored operations run on. "In effect" is decided by the
+database clock, so every pod agrees at the edges of a freeze. A pull request rollback is never held, at creation or at a later start or
 cutover, nor is a stop, a cancel or a revert. When SchemaBot cannot read the freezes, or the override
 requests below, it refuses the change with a retryable error, never letting it through unchecked.
 A freeze refuses a change unless an approved override request covers every blocker on it. The
@@ -2246,6 +2246,27 @@ start or cutover without passing a function that runs the gates. The override ch
 `approvedOverride` (`pkg/api/change_gate.go`), which reads `ListApproved` and admits only a request
 whose `Covers` names every blocker. The approver rules are `AuthorizeFreezeApprove`
 (`pkg/api/freeze_authorization.go`) and `Approve` (`pkg/storage/internal/sqlstore/freeze_overrides.go`).
+
+### AZ-11: A stop freeze stops the admitted changes it covers
+
+Setting a freeze with running `stop` that is in effect at once records a stop on every apply it
+covers that is pending or doing work a stop can end, by the same rule as AZ-10: one covered
+deployment holds the whole change. The stop is the ordinary durable stop, recorded with the freeze
+as its requester (`freeze:<id>`), so its driver delivers it as it would an operator's, and the apply
+resumes with a start, which the freeze's gate holds (AZ-10). No client may send a stop under that
+requester, so a stop that reads as a freeze's is one a freeze issued. The freeze is stored before the
+sweep, so it refuses new changes whatever the sweep reports. An apply the sweep cannot stop, such as
+a PlanetScale apply, which has no stop, or one whose operations it cannot read, is listed in the
+response with why, never skipped silently; when it cannot list the applies at all, it says it
+stopped none. An apply waiting for its cutover is left alone, because the freeze refuses the cutover,
+and so is a pull request rollback, which no freeze holds. A planned `stop` freeze stops nothing when
+it is set, and does not stop the applies already running when it starts.
+*Breaks if violated:* a schema change judged unsafe keeps writing through the incident that froze
+it, or an operator reads a freeze as having stopped changes that still run.
+*Enforced:* `stopAppliesForFreeze` (`pkg/api/freeze_stop_sweep.go`), called by `handleFreezeCreate`
+(`pkg/api/freeze_handlers.go`) after the freeze is stored, records each stop through `stopApply`
+(`pkg/api/control_handlers.go`) with `storage.FreezeStopCaller`. `executeStopForApply` refuses a
+caller where `storage.IsFreezeStopCaller` holds.
 
 ## Structural enforcement
 
