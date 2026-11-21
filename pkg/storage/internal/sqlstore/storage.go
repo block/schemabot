@@ -31,6 +31,7 @@ type Storage struct {
 	freezeOverrides *freezeOverrideStore
 	webhookEvents   *webhookEventStore
 	driverPools     *driverPoolStore
+	outboxEvents    *outboxStore
 }
 
 var _ storage.Storage = (*Storage)(nil)
@@ -103,6 +104,7 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		freezeOverrides: &freezeOverrideStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 		webhookEvents:   &webhookEventStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 		driverPools:     &driverPoolStore{db: rdb, dialect: deps.Dialect},
+		outboxEvents:    &outboxStore{db: rdb},
 	}
 }
 
@@ -119,6 +121,11 @@ func (s *Storage) Plans() storage.PlanStore {
 // Applies returns the apply store.
 func (s *Storage) Applies() storage.ApplyStore {
 	return s.applies
+}
+
+// OutboxEvents returns the completion notification store.
+func (s *Storage) OutboxEvents() storage.OutboxStore {
+	return s.outboxEvents
 }
 
 // Tasks returns the task store.

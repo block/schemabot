@@ -86,6 +86,7 @@ var parityFamilies = []parityFamily{
 	{storageMethod: "WebhookEvents", test: TestWebhookEvents},
 	{storageMethod: "Checks", test: TestChecks},
 	{storageMethod: "DriverPools", test: TestDriverPools},
+	{storageMethod: "OutboxEvents", test: TestOutboxEvents},
 }
 
 // Run executes every parity family against the harness. Implementations call

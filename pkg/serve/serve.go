@@ -37,6 +37,7 @@ import (
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/notifications"
 	"github.com/block/schemabot/pkg/panicsafe"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
@@ -611,7 +612,10 @@ type Server struct {
 	version string
 	// reconcile is the terminal outcome pass Start kicked off, nil when Start
 	// has not run or the pass is not configured. Close bounds it.
-	reconcile *reconcilePass
+	reconcile          *reconcilePass
+	notificationSender *notifications.Sender
+	notificationCancel context.CancelFunc
+	notificationWG     sync.WaitGroup
 }
 
 // registerPlanetScaleMTLS registers the configured planetscale.mtls
@@ -762,6 +766,15 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		}
 	}()
 
+	publisher, err := notifications.NewPublisher(ctx, cfg.ApplyNotifications)
+	if err != nil {
+		return nil, fmt.Errorf("configure apply completion publisher: %w", err)
+	}
+	var notificationSender *notifications.Sender
+	if publisher != nil {
+		notificationSender = notifications.NewSender(store.OutboxEvents(), publisher, logger)
+	}
+
 	// Register embedder-supplied engines before any client is built or the
 	// operator starts, so both the operator's in-process clients (via the
 	// service) and the data-plane gRPC/router clients can resolve custom
@@ -821,20 +834,21 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		targetResolver = router.Resolver()
 	}
 	srv := &Server{
-		cfg:             cfg,
-		svc:             svc,
-		storage:         store,
-		logger:          logger,
-		dataPlaneClient: dataPlaneClient,
-		targetResolver:  targetResolver,
-		webhook:         webhookRuntime,
-		telemetry:       telemetry,
-		authz:           authz,
-		engines:         o.engines,
-		dialect:         dialect,
-		storageDSN:      storageDSN,
-		version:         version,
-		localHosted:     o.localHosted,
+		cfg:                cfg,
+		svc:                svc,
+		storage:            store,
+		logger:             logger,
+		dataPlaneClient:    dataPlaneClient,
+		targetResolver:     targetResolver,
+		webhook:            webhookRuntime,
+		telemetry:          telemetry,
+		authz:              authz,
+		engines:            o.engines,
+		dialect:            dialect,
+		storageDSN:         storageDSN,
+		version:            version,
+		localHosted:        o.localHosted,
+		notificationSender: notificationSender,
 	}
 
 	if err := srv.registerStorageSchema(svc); err != nil {
@@ -1201,6 +1215,20 @@ func (s *Server) MetricsHandler() http.Handler {
 // binds its own listeners before calling it: a process that then fails to bind
 // would exit holding claims a peer has to wait out.
 func (s *Server) Start(ctx context.Context) {
+	if s.notificationSender != nil {
+		senderCtx, cancel := context.WithCancel(ctx)
+		s.notificationCancel = cancel
+		s.notificationWG.Go(func() {
+			recovered, _ := panicsafe.Catch(func() error {
+				s.notificationSender.Run(senderCtx)
+				return nil
+			})
+			if recovered != nil {
+				s.logger.Error("completion sender stopped after panic; pending notifications remain in storage", "panic", fmt.Sprint(recovered.Value), "stack", string(recovered.Stack))
+				metrics.RecordRecoveredPanic(senderCtx, "completion_sender")
+			}
+		})
+	}
 	s.reconcile = s.webhook.StartTerminalOutcomeReconciliation(ctx, s.logger)
 	if s.targetResolver != nil {
 		s.startTargetProbe(ctx)
@@ -1280,6 +1308,12 @@ func (s *Server) stopTargetProbe() {
 // anything another process cannot redo or reclaim, which is what makes stopping
 // the right move when the wait is the thing holding the process open.
 func (s *Server) Close() error {
+	if s.notificationCancel != nil {
+		s.notificationCancel()
+		if !drain.Wait(&s.notificationWG, 5*time.Second) {
+			s.logger.Warn("completion sender shutdown deadline reached; pending notifications will retry after restart")
+		}
+	}
 	s.stopTargetProbe()
 	s.webhook.stopQuotaProbes()
 	s.svc.StopPendingDropsCleaner()

@@ -1607,6 +1607,18 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 		}
 	}
 
+	// Only a stored transition creates notification intent. A completed apply
+	// refreshed after an upgrade must not become a historical notification.
+	completionTransition := false
+	if state.IsState(apply.State, state.Apply.Completed) {
+		var previousState string
+		err := writeTx.tx.QueryRowContext(ctx, `SELECT state FROM applies WHERE id = ? FOR UPDATE`, apply.ID).Scan(&previousState)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("read previous state of completing apply %d: %w", apply.ID, err)
+		}
+		completionTransition = err == nil && !state.IsState(previousState, state.Apply.Completed)
+	}
+
 	optionsUpdate := ""
 	args := []any{
 		apply.State, storedMessage(ctx, "applies.error_message", apply.ErrorMessage, apply.LogAttrs),
@@ -1667,6 +1679,11 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 					return err
 				}
 			}
+		}
+	}
+	if completionTransition {
+		if err := enqueueApplyCompleted(ctx, writeTx.tx, apply.ID); err != nil {
+			return err
 		}
 	}
 	if err := writeTx.commit(); err != nil {
@@ -1799,6 +1816,9 @@ func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expe
 	args := []any{newState, storedMessage(ctx, "applies.error_message", errorMessage, nil), startedAt, completedAt, applyID, expectedState}
 	args = append(args, guard.predicateArgs...)
 
+	if state.IsState(newState, state.Apply.Completed) && !state.IsState(expectedState, state.Apply.Completed) {
+		return s.completeDerivedState(ctx, applyID, expectedState, guard, args)
+	}
 	result, err := s.db.ExecContext(ctx, guard.query, args...)
 	if err != nil {
 		return false, fmt.Errorf("compare-and-swap derived apply state for apply %d (%q -> %q): %w", applyID, expectedState, newState, err)
@@ -1840,6 +1860,41 @@ func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expe
 		return false, fmt.Errorf("re-read derived apply state for apply %d: %w", applyID, err)
 	}
 	return state.IsState(currentState, expectedState), nil
+}
+
+// completeDerivedState preserves the projection's joined lease fence as the
+// first write. A parent-first locking read would invert its ownership ordering.
+func (s *applyStore) completeDerivedState(ctx context.Context, applyID int64, expectedState string, guard derivedStateGuard, args []any) (bool, error) {
+	// Each statement needs a fresh snapshot, including the ownership recheck
+	// after a losing CAS. Repeatable Read changes concurrent-loss classification.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return false, fmt.Errorf("begin completing derived apply transaction: %w", err)
+	}
+	defer rollbackTx(ctx, tx, "complete derived apply state")
+	result, err := tx.ExecContext(ctx, guard.query, args...)
+	if err != nil {
+		return false, fmt.Errorf("complete derived apply %d from %q: %w", applyID, expectedState, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read completing derived apply %d rows affected: %w", applyID, err)
+	}
+	if rows == 0 {
+		if guard.ensureStillOwned != nil {
+			if err := guard.ensureStillOwned(ctx, tx); err != nil {
+				return false, err
+			}
+		}
+		return false, nil
+	}
+	if err := enqueueApplyCompleted(ctx, tx, applyID); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit completing derived apply %d: %w", applyID, err)
+	}
+	return true, nil
 }
 
 // GetInProgress returns all applies in non-terminal states.
