@@ -28,7 +28,7 @@ func TestChangeGateRefusedText(t *testing.T) {
 	})
 
 	assert.Len(t, lines, 3)
-	assert.Equal(t, "✗ production is frozen. This change did not start.", lines[0])
+	assert.Equal(t, "❄️ production is frozen. This change did not start.", lines[0])
 	assert.Equal(t, "   freeze-abc  SEV-1234 "+lineAttackCleaned+"  (until 2026-11-22T10:00:00Z)", lines[1])
 	assert.True(t, strings.HasPrefix(lines[2], "Override requested: ovr-"+lineAttackCleaned+". "))
 	assertNoTerminalControls(t, strings.Join(lines, "\n"))

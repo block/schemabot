@@ -797,6 +797,14 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
 		h.service.ClearPendingObserver(pendingObserver)
+		if isChangeGateError(err) {
+			// A refusal stores nothing and leaves the pin in place, so the
+			// same rollback-confirm can run once the freeze ends.
+			h.logger.Info("rollback refused by a change gate", "repo", repo, "pr", pr, "database", database,
+				"database_type", dbType, "environment", environment, "plan_id", rollbackPlan.PlanIdentifier, "error", err)
+			h.postChangeGateRefusal(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, err)
+			return false, nil
+		}
 		if errors.Is(err, storage.ErrLockIntentChanged) {
 			h.logger.Warn("rollback-confirm rejected: the database lock no longer pins the confirmed rollback plan; no rollback apply was created",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,

@@ -185,7 +185,7 @@ func ChangeGateRefusedText(d ChangeGateRefusedData) []string {
 	if d.Operation == "cutover" {
 		outcome = "This cutover did not start."
 	}
-	lines := []string{fmt.Sprintf("✗ %s is frozen. %s", ui.TerminalSafeLine(d.Environment), outcome)}
+	lines := []string{fmt.Sprintf("%s %s is frozen. %s", glyph.Frozen, ui.TerminalSafeLine(d.Environment), outcome)}
 	for _, b := range d.Blockers {
 		until := "until lifted"
 		if b.EndsAt != nil {
