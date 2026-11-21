@@ -1148,6 +1148,11 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_missing")
 		return claimSpent
 	}
+	// The claim checkpoint: a stop freeze in effect holds an operation that
+	// has not started, so the driver stops the apply instead (AZ-11).
+	if s.holdClaimForStopFreeze(ctx, driverID, apply, op, opLease) {
+		return claimSpent
+	}
 	mode, err := tern.DecideApplyDriveMode(ctx, s.storage, apply, ops)
 	if err != nil {
 		s.logClaimFailure(ctx, "operator: failed to inspect claimed operation tasks; operation will not be driven", "operation_task_inspect_error",

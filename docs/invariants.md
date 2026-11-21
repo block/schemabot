@@ -2261,12 +2261,23 @@ response with why, never skipped silently; when it cannot list the applies at al
 stopped none. An apply waiting for its cutover is left alone, because the freeze refuses the cutover,
 and so is a pull request rollback, which no freeze holds. A planned `stop` freeze stops nothing when
 it is set, and does not stop the applies already running when it starts.
+A driver checks again at claim, before it starts an operation that has not started or resumes a
+stopped one for a queued start. While a `stop` freeze covering the apply is in effect, it returns the
+claim with the operation as it was, unstarted, and records the freeze's stop, which stop
+reconciliation delivers without starting anything; for a queued start, the stop withdraws it (CO-4).
+This holds work a planned `stop` freeze meets once it starts. An approved override that admitted the
+apply, at creation or at its start, and that names the freeze lets it start. When the freezes or the
+override requests cannot be read, or the stop cannot be recorded, the operation goes back unstarted and
+the next pass checks again, so it never starts unchecked.
 *Breaks if violated:* a schema change judged unsafe keeps writing through the incident that froze
 it, or an operator reads a freeze as having stopped changes that still run.
 *Enforced:* `stopAppliesForFreeze` (`pkg/api/freeze_stop_sweep.go`), called by `handleFreezeCreate`
 (`pkg/api/freeze_handlers.go`) after the freeze is stored, records each stop through `stopApply`
 (`pkg/api/control_handlers.go`) with `storage.FreezeStopCaller`. `executeStopForApply` refuses a
-caller where `storage.IsFreezeStopCaller` holds.
+caller where `storage.IsFreezeStopCaller` holds. The claim checkpoint is `holdClaimForStopFreeze`
+(`pkg/api/freeze_claim_checkpoint.go`), called by `recoverApplyOperation` (`pkg/api/operator.go`)
+before the drive, which hands the claim back with `ReturnUnstartedClaim`
+(`pkg/storage/internal/sqlstore/apply_operations.go`).
 
 ## Structural enforcement
 

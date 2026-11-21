@@ -2512,6 +2512,54 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Nil(t, stopped.StartedAt, "an operation that never dispatched reads as never started")
 	})
 
+	// ReturnUnstartedClaim verifies a claim the driver will not start is
+	// undone: a pending claim goes back to pending with no started_at, so the
+	// next claim starts it afresh rather than recovering it as running work;
+	// a stopped claim goes back to stopped. A stale token changes nothing.
+	t.Run("ReturnUnstartedClaim", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_return_unstarted_claim_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_return_unstarted_claim", 910)
+		id := createOperation(t, store, apply.ID, "region-a", "schema")
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, id, claimed.ID)
+		stale := claimed.Lease()
+		stale.Token = "not-the-lease"
+		returned, err := store.ApplyOperations().ReturnUnstartedClaim(ctx, stale, state.ApplyOperation.Pending)
+		require.NoError(t, err)
+		assert.False(t, returned, "a stale token returns nothing")
+
+		returned, err = store.ApplyOperations().ReturnUnstartedClaim(ctx, claimed.Lease(), state.ApplyOperation.Pending)
+		require.NoError(t, err)
+		assert.True(t, returned)
+		op, err := store.ApplyOperations().Get(ctx, id)
+		require.NoError(t, err)
+		assert.Equal(t, state.ApplyOperation.Pending, op.State)
+		assert.Nil(t, op.StartedAt, "the claim's started_at is cleared")
+		assert.Empty(t, op.LeaseToken)
+
+		reclaimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, reclaimed, "the returned operation is claimable again")
+		assert.Equal(t, state.ApplyOperation.Pending, reclaimed.State, "it is claimed as one to start")
+
+		require.NoError(t, store.ApplyOperations().UpdateState(storage.WithOperationLease(ctx, reclaimed.Lease()), id, state.ApplyOperation.Resuming))
+		returned, err = store.ApplyOperations().ReturnUnstartedClaim(ctx, reclaimed.Lease(), state.ApplyOperation.Stopped)
+		require.NoError(t, err)
+		assert.True(t, returned)
+		op, err = store.ApplyOperations().Get(ctx, id)
+		require.NoError(t, err)
+		assert.Equal(t, state.ApplyOperation.Stopped, op.State)
+		assert.Empty(t, op.LeaseToken)
+
+		_, err = store.ApplyOperations().ReturnUnstartedClaim(ctx, reclaimed.Lease(), state.ApplyOperation.Running)
+		require.Error(t, err, "a claim of running work started nothing to undo")
+	})
+
 	// MarkResumedRunning verifies the resumed operation's move to running is a
 	// compare-and-set on resuming under its own operation lease: it moves a
 	// resuming row once, leaves a row in any other state alone, and fails

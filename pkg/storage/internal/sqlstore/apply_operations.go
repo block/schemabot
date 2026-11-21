@@ -2903,6 +2903,47 @@ func (s *applyOperationStore) ReleaseClaim(ctx context.Context, lease storage.Op
 	return rows > 0, nil
 }
 
+// ReturnUnstartedClaim undoes the claim of an operation the claiming driver
+// will not start: the pending claim's move to running and started_at stamp,
+// or the stopped claim's move to resuming, with the lease it rotated on. The
+// write is a compare-and-set on the claim's state and lease token.
+func (s *applyOperationStore) ReturnUnstartedClaim(ctx context.Context, lease storage.OperationLease, claimedFrom string) (bool, error) {
+	if !lease.Valid() {
+		return false, fmt.Errorf("return unstarted claim of apply_operation %d: %w", lease.OperationID, storage.ErrApplyLeaseLost)
+	}
+	var query string
+	var args []any
+	switch {
+	case state.IsState(claimedFrom, state.ApplyOperation.Pending):
+		query = `
+			UPDATE apply_operations
+			SET state = ?, started_at = NULL, updated_at = NOW(),
+			    lease_owner = '', lease_token = '', lease_acquired_at = NULL
+			WHERE id = ? AND lease_token = ? AND state = ?
+		`
+		args = []any{state.ApplyOperation.Pending, lease.OperationID, lease.Token, state.ApplyOperation.Running}
+	case state.IsState(claimedFrom, state.ApplyOperation.Stopped):
+		query = `
+			UPDATE apply_operations
+			SET state = ?, updated_at = NOW(),
+			    lease_owner = '', lease_token = '', lease_acquired_at = NULL
+			WHERE id = ? AND lease_token = ? AND state = ?
+		`
+		args = []any{state.ApplyOperation.Stopped, lease.OperationID, lease.Token, state.ApplyOperation.Resuming}
+	default:
+		return false, fmt.Errorf("return unstarted claim of apply_operation %d: a claim from %q starts nothing to undo", lease.OperationID, claimedFrom)
+	}
+	result, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return false, fmt.Errorf("return unstarted claim of apply_operation %d: %w", lease.OperationID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read rows affected returning unstarted claim of apply_operation %d: %w", lease.OperationID, err)
+	}
+	return rows > 0, nil
+}
+
 // ReleaseFinishedClaim clears the lease on an operation whose drive has ended,
 // so a fresh lease on a row means a drive is in progress rather than that one
 // ended here.
