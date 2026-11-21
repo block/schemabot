@@ -59,7 +59,10 @@ type WatchModel struct {
 	// UI state
 	// windowHeight is the terminal's height in rows, zero until the first
 	// window size message arrives.
-	windowHeight       int
+	windowHeight int
+	// windowWidth is the terminal's width in columns, zero until the first
+	// window size message arrives.
+	windowWidth        int
 	pastPending        bool
 	detached           bool
 	quitting           bool
@@ -143,6 +146,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.windowHeight = msg.Height
+		m.windowWidth = msg.Width
 		return m, nil
 
 	case tea.KeyMsg:

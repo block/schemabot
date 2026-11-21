@@ -523,6 +523,9 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// but never the headline state: sourcing state from the engine here would
 	// let this endpoint disagree with the comment, which renders stored state.
 	httpResp.State = apply.State
+	// A freeze can stop the apply while this poll runs, so the reread apply
+	// says which freeze stopped it, as the stored path does.
+	httpResp.StoppedByFreeze = s.StoppedByFreeze(r.Context(), apply)
 	if apply.StartedAt != nil {
 		httpResp.StartedAt = apply.StartedAt.Format(time.RFC3339)
 	}

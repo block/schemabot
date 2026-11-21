@@ -2,17 +2,23 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/clock"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // stopRequestStore answers the stop request of every apply with stop.
@@ -79,4 +85,60 @@ func TestStoppedByFreeze(t *testing.T) {
 			assert.Equal(t, tc.want, svc.StoppedByFreeze(t.Context(), tc.apply))
 		})
 	}
+}
+
+// stoppingApplyStore serves the apply as stored for the first read and as
+// stopped for every later one, as when a freeze stops it during a poll.
+type stoppingApplyStore struct {
+	staticApplyStore
+	reads int
+}
+
+func (s *stoppingApplyStore) GetByApplyIdentifier(ctx context.Context, applyIdentifier string) (*storage.Apply, error) {
+	s.reads++
+	apply, err := s.staticApplyStore.GetByApplyIdentifier(ctx, applyIdentifier)
+	if err != nil || apply == nil || s.reads == 1 {
+		return apply, err
+	}
+	stopped := *apply
+	stopped.State = state.Apply.Stopped
+	return &stopped, nil
+}
+
+// A poll that reaches the engine while the apply runs, and rereads it as
+// stopped after a freeze stopped it, says which freeze stopped it, as a poll
+// served from storage does, so the watch that exits on it shows the freeze's
+// guidance rather than the ordinary resume.
+func TestProgressByApplyIDNamesTheFreezeThatStoppedItDuringThePoll(t *testing.T) {
+	mock := &mockTernClient{
+		isRemote:     true,
+		progressResp: &ternv1.ProgressResponse{ApplyId: "remote-apply-freeze", State: ternv1.State_STATE_STOPPED},
+	}
+	apply := activeTestApply("apply-freeze-live")
+	apply.ExternalID = "remote-apply-freeze"
+	controls := &memoryControlRequestStore{}
+	_, _, err := controls.RequestPending(t.Context(), &storage.ApplyControlRequest{
+		ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending,
+		RequestedBy: storage.FreezeStopCaller("freeze-live"),
+	})
+	require.NoError(t, err)
+	require.NoError(t, controls.CompletePending(t.Context(), apply.ID, storage.ControlOperationStop))
+	svc := New(&mockStorageWithApplyStores{
+		applies:  &stoppingApplyStore{staticApplyStore: staticApplyStore{apply: apply}},
+		tasks:    &capturingTaskStore{},
+		controls: controls,
+	}, testServerConfig(), map[string]tern.Client{"default/staging": mock}, slog.New(slog.DiscardHandler))
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-freeze-live", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, state.Apply.Stopped, resp.State)
+	require.NotNil(t, resp.StoppedByFreeze, "the poll names the freeze that stopped the apply")
+	assert.Equal(t, "freeze-live", resp.StoppedByFreeze.ID)
 }

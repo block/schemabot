@@ -201,7 +201,7 @@ func (m WatchModel) progressSections() (string, string) {
 		f.WriteString(templates.FormatApplyStopped())
 		f.WriteString("\n")
 		if text := templates.StoppedByFreezeText(m.stoppedByFreeze, m.applyID, m.environment); text != "" {
-			f.WriteString("⏹️ " + text + "\n")
+			f.WriteString(m.wrapToWindow("⏹️ "+text) + "\n")
 		}
 		if m.applyID != "" {
 			f.WriteString(templates.FormatNextCommand(templates.ResumeLabel, templates.ControlCommand("start", m.applyID, m.environment)))

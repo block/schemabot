@@ -195,7 +195,7 @@ func (m WatchModel) writeMultiDeploymentOutcome(b *strings.Builder, model presen
 	case state.IsState(model.State, state.Apply.Stopped):
 		b.WriteString(templates.FormatApplyStopped() + outcomeCounts(model, groups) + "\n")
 		if text := templates.StoppedByFreezeText(m.stoppedByFreeze, m.applyID, m.environment); text != "" {
-			b.WriteString("⏹️ " + text + "\n")
+			b.WriteString(m.wrapToWindow("⏹️ "+text) + "\n")
 		}
 	case state.IsState(model.State, state.Apply.Failed):
 		b.WriteString(templates.FormatApplyFailedHeadline() + outcomeCounts(model, groups) + "\n")
