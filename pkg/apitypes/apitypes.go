@@ -1924,6 +1924,18 @@ type ProgressResponse struct {
 	// VSchema change. Operations still lists every shard and finalizer row,
 	// but a client renders the apply as one change, the way its PR comments do.
 	Sharded bool `json:"sharded,omitempty"`
+	// StoppedByFreeze names the freeze that stopped this apply, set only while
+	// the apply is stopped and the stop that stopped it was a freeze's (one
+	// with running "stop"), not an operator's.
+	StoppedByFreeze *FreezeStopRef `json:"stopped_by_freeze,omitempty"`
+}
+
+// FreezeStopRef names the freeze that stopped an apply.
+type FreezeStopRef struct {
+	ID string `json:"id"`
+	// Reason is the freeze's reason, empty when SchemaBot could not read the
+	// freeze.
+	Reason string `json:"reason,omitempty"`
 }
 
 // ProgressOperationResponse represents progress for one deployment operation.

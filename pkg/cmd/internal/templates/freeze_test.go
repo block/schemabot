@@ -77,3 +77,19 @@ func TestChangeGateRefusedTextSaysWhyNoRequestWasRecorded(t *testing.T) {
 	assert.Equal(t, "No override request was recorded. SchemaBot said: production is frozen; asking for one needs a verified caller "+lineAttackCleaned, lines[2])
 	assertNoTerminalControls(t, strings.Join(lines, "\n"))
 }
+
+// Status says which freeze stopped an apply and how it resumes, and says
+// nothing of a freeze for an apply an operator stopped. The freeze's text is
+// printed safe for a terminal.
+func TestStoppedByFreezeText(t *testing.T) {
+	freeze := &apitypes.FreezeStopRef{ID: "freeze-1", Reason: "SEV-1234\x1b[31m"}
+	text := StoppedByFreezeText(freeze, "apply-1", "staging")
+	assert.Contains(t, text, "Stopped by freeze freeze-1 (SEV-1234")
+	assert.NotContains(t, text, "\x1b", "the reason cannot write escape sequences")
+	assert.Contains(t, text, "'schemabot start apply-1 -e staging' after the freeze ends or is lifted")
+	assert.Contains(t, text, `add --override "<reason>" to ask a freeze approver to let it through`)
+
+	assert.Empty(t, StoppedByFreezeText(nil, "apply-1", "staging"))
+	assert.Equal(t, "Stopped by freeze freeze-1. Run 'schemabot start apply-1 -e staging' after the freeze ends or is lifted, or add --override \"<reason>\" to ask a freeze approver to let it through.",
+		StoppedByFreezeText(&apitypes.FreezeStopRef{ID: "freeze-1"}, "apply-1", "staging"))
+}

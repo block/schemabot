@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
@@ -27,6 +28,10 @@ type MultiDeploymentApplyData struct {
 	// header and used to format the next-action commands. Always set: every
 	// apply is created with a server-generated identifier.
 	ApplyID string
+
+	// StoppedByFreeze names the freeze that stopped the apply, nil when an
+	// operator stopped it or it is not stopped.
+	StoppedByFreeze *apitypes.FreezeStopRef
 
 	// Environment is the rollout environment, shown in the header and used to
 	// format the next-action commands. Always set: a non-empty environment is
@@ -407,6 +412,7 @@ func rolloutMemberNoun(groups []presentation.Group) presentation.Noun {
 // a failure on an apply that is still active is offered stop first, since a
 // new apply is refused until this one settles.
 func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
+	writeStoppedByFreeze(sb, data.StoppedByFreeze)
 	footer := rolloutFooterData(data)
 	footerStart := sb.Len()
 	actionPending := data.Model.NextAction.Kind != presentation.NextActionNone

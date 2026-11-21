@@ -640,9 +640,10 @@ keeps running, with the reason and what to do: a PlanetScale apply has no stop,
 and cancel ends it permanently. While a `stop` freeze is in effect, SchemaBot
 also stops an apply instead of starting work on it that has not started, so a
 planned `stop` freeze holds what has not started once it begins. It does not
-stop the applies already running when it starts. A stopped apply resumes with
-`schemabot start` once the freeze ends, or with an approved
-override. Times are RFC3339 and print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
+stop the applies already running when it starts. `schemabot status <apply-id>`,
+the watch view and the pull request comment say which freeze stopped an apply.
+A stopped apply resumes with `schemabot start` once the freeze ends, or with an
+approved override. Times are RFC3339 and print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
 and the recent ones.
 
 A second person approves a request to let one change through a freeze. Read it

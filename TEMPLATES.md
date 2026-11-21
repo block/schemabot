@@ -6519,6 +6519,61 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 </details>
 
 <details>
+<summary><a name="stopped-by-a-freeze"></a><strong>Stopped By A Freeze</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Stopped
+
+📊 1/2 complete · 1 stopped
+
+**Schema `testapp`**
+
+**`users`**: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 72.00%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+- Rows: 1,055,687 / 1,466,232 · ~391 MB
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+> ⏹️ Stopped by freeze `freeze-a1b2c3` (SEV-1234: checkout errors). Start it again after the freeze ends or is lifted. To start it while the freeze is in effect, add `--override` and your reason to the start command, then have a freeze approver approve the request.
+
+---
+
+Paused — to resume from where it stopped:
+```
+schemabot start apply-a1b2c3d4e5f6 -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="start-withdrawn-by-a-freeze"></a><strong>Start Withdrawn By A Freeze</strong></summary>
+
+
+## Start Withdrawn
+
+**Apply**: `apply-a1b2c3d4e5f6`
+**Environment**: `staging`
+**Stopped by**: freeze `freeze-a1b2c3`
+
+A freeze that stops schema changes in this environment took effect before the start requested earlier did, so the start was withdrawn. The schema change stays stopped. Start it again after the freeze ends or is lifted, or add `--override` and your reason to the start command to ask a freeze approver to let it through.
+
+</details>
+
+<details>
 <summary><a name="resuming"></a><strong>Resuming</strong></summary>
 
 
@@ -8059,6 +8114,30 @@ The new apply will only process tables that haven't completed.
 ⏹️ Apply stopped
 To resume from where it stopped:
   schemabot start <apply_id> -e staging
+
+```
+</details>
+
+<details>
+<summary><a name="mysql-stopped-by-a-freeze"></a><strong>MySQL: Stopped By A Freeze</strong></summary>
+
+```
+
+┌────────────────────────────────────┐
+│  Apply ID:     apply-a1b2c3d4e5f6  │
+│  Database:     testapp             │
+│  Environment:  staging             │
+│  State:        Stopped             │
+└────────────────────────────────────┘
+
+  ⏹️ Stopped by freeze freeze-a1b2c3 (SEV-1234: checkout errors). Run 'schemabot start apply-a1b2c3d4e5f6 -e staging' after the freeze ends or is lifted, or add --override "<reason>" to ask a freeze approver to let it through.
+
+
+  ── testapp ──
+
+     ~ users: ⏹️ Stopped (not started)
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+
 
 ```
 </details>
