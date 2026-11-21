@@ -2250,8 +2250,9 @@ whose `Covers` names every blocker. The approver rules are `AuthorizeFreezeAppro
 ### AZ-11: A stop freeze stops the admitted changes it covers
 
 Setting a freeze with running `stop` that is in effect at once records a stop on every apply it
-covers that is pending or doing work a stop can end, by the same rule as AZ-10: one covered
-deployment holds the whole change. The stop is the ordinary durable stop, recorded with the freeze
+covers that is pending, paused, or doing work a stop can end, by the same rule as AZ-10: one covered
+deployment holds the whole change. A rollout paused after a failure is stopped because its other
+members can still be writing. The stop is the ordinary durable stop, recorded with the freeze
 as its requester (`freeze:<id>`), so its driver delivers it as it would an operator's, and the apply
 resumes with a start, which the freeze's gate holds (AZ-10). No client may send a stop under that
 requester, so a stop that reads as a freeze's is one a freeze issued. The freeze is stored before the

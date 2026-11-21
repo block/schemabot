@@ -69,6 +69,8 @@ func TestFreezeStopSweepStopsTheAdmittedAppliesInScope(t *testing.T) {
 	}{
 		{"Running", state.Apply.Running, state.ApplyOperation.Running},
 		{"Pending", state.Apply.Pending, state.ApplyOperation.Pending},
+		// A rollout paused after a failure can still have members running.
+		{"PausedRollout", state.Apply.Paused, state.ApplyOperation.Running},
 	} {
 		t.Run("Stops"+tc.name, func(t *testing.T) {
 			applyID := seed(t, "sweep-"+tc.name, tc.parentState, tc.opState)
