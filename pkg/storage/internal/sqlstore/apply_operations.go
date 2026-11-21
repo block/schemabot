@@ -1644,6 +1644,24 @@ func (s *applyOperationStore) deferredCutoverWorkExclusion(filter storage.Operat
 				AND NOT ` + s.deferredCutoverApplySQL()
 }
 
+// skippedOperationExclusion returns the predicate that leaves
+// filter.SkipOperationIDs out of the arms that start or resume work, or ""
+// when it lists none. The ids are integers written into the statement, so it
+// binds no arguments and every placeholder keeps its position.
+//
+// The fragment begins with AND.
+func skippedOperationExclusion(filter storage.OperationClaimFilter) string {
+	if len(filter.SkipOperationIDs) == 0 {
+		return ""
+	}
+	ids := make([]string, len(filter.SkipOperationIDs))
+	for i, id := range filter.SkipOperationIDs {
+		ids[i] = strconv.FormatInt(id, 10)
+	}
+	return `
+				AND apply_operations.id NOT IN (` + strings.Join(ids, ", ") + `)`
+}
+
 // deferredCutoverQueueClause keeps deferred applies from deadlocking the
 // drivers between them. A deferred operation keeps its driver until an
 // operator cuts its apply over, and the cutover waits for every operation of
@@ -1887,6 +1905,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// failed_retryable arm's crash-recovery branch take it.
 	claimFilter := storage.BuildOperationClaimFilter(opts...)
 	notDeferred := s.deferredCutoverWorkExclusion(claimFilter)
+	// startExclusions gates every arm that starts or resumes work: the
+	// deferred-cutover exclusion and the operations the driver holds back
+	// unstarted. Neither binds arguments.
+	startExclusions := notDeferred + skippedOperationExclusion(claimFilter)
 	notDeferredRecovery, notDeferredRecoveryArgs := s.deferredCutoverRecoveryExclusion(claimFilter)
 	// deferredQueue holds a deferred apply's operations back while a deferred
 	// apply ahead of it still has operations waiting to start, so deferred
@@ -2172,7 +2194,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.status = ?
 				)
 				AND `+parentClaimable+`
-				AND `+driverCap+notDeferred+deferredQueue+`
+				AND `+driverCap+startExclusions+deferredQueue+`
 			)
 			OR (
 				state IN (%s)
@@ -2207,7 +2229,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND `+parentClaimable+`
 					)
 				)
-				AND `+driverCap+notDeferred+deferredQueue+`
+				AND `+driverCap+startExclusions+deferredQueue+`
 			)
 			OR (
 				state = ?
@@ -2254,7 +2276,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.status = ?
 						AND `+deferredDeployGuard+`
 				)
-				AND `+driverCap+notDeferred+`
+				AND `+driverCap+startExclusions+`
 			)
 			OR (
 				state = ?
@@ -2272,7 +2294,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								-- Names no column of a, but belongs to this arm
 								-- alone: a deliberate redispatch starts work, so
 								-- it is capped; crash recovery below is not.
-								AND `+driverCap+notDeferred+deferredQueue+`
+								AND `+driverCap+startExclusions+deferredQueue+`
 							)
 							OR (
 								a.state IN (%s)
