@@ -15,6 +15,7 @@ import (
 
 // Storage implements the storage.Storage interface over database/sql.
 type Storage struct {
+	notifications   *notificationStore
 	db              *rebindDB
 	locks           *lockStore
 	plans           *planStore
@@ -87,6 +88,7 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		maxDriversPerApply = storage.DefaultMaxDriversPerApply
 	}
 	return &Storage{
+		notifications:   &notificationStore{db: rdb, dialect: deps.Dialect},
 		db:              rdb,
 		locks:           &lockStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 		plans:           &planStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier},
@@ -190,3 +192,6 @@ func (s *Storage) Ping(ctx context.Context) error {
 func (s *Storage) Close() error {
 	return s.db.Close()
 }
+
+// Notifications returns the apply publication store.
+func (s *Storage) Notifications() storage.NotificationStore { return s.notifications }

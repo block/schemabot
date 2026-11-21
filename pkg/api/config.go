@@ -24,6 +24,7 @@ import (
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
+	"github.com/block/schemabot/pkg/notifications"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/ratelimit"
@@ -44,6 +45,9 @@ var configIdentifierPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 // ServerConfig holds the server-side SchemaBot configuration.
 // This is loaded from a YAML file specified by SCHEMABOT_CONFIG_FILE.
 type ServerConfig struct {
+	// Notifications opts into asynchronous completion publication, independent of GitHub.
+	Notifications notifications.Config `yaml:"notifications,omitempty"`
+
 	liveDatabases *liveDatabaseRegistry
 
 	// ExperimentalStrataEnabled permits experimental Strata registrations and
@@ -819,8 +823,7 @@ func (g *GitHubConfig) ResolveAppID() (int64, error) {
 		// strconv's error quotes the input; keep only its cause so the
 		// resolved value never reaches a log line or startup error.
 		cause := err
-		var numErr *strconv.NumError
-		if errors.As(err, &numErr) {
+		if numErr, ok := errors.AsType[*strconv.NumError](err); ok {
 			cause = numErr.Err
 		}
 		return 0, fmt.Errorf("%s must be a positive integer, or 0 for no App: %w (%w)", setting, ErrInvalidGitHubAppID, cause)
