@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/auth"
@@ -518,44 +519,32 @@ func (e *ChangeGateRefusedError) Error() string {
 	return message
 }
 
-// Blocked is the refusal without what it says about an override request: what
-// blocks the change and until when, as whole sentences.
-func (e *ChangeGateRefusedError) Blocked() string {
-	return e.BlockedWith(func(reason string) string { return reason }, 0)
-}
-
-// BlockedWith is Blocked with each blocker's reason written by reason, for a
-// caller that renders the refusal where a person's text needs escaping. A
-// positive listed names at most that many blockers and counts the rest. Each
-// blocker's end and reason are their own sentences, so a reason never runs
-// into the text around it. For example:
+// Blocked is the refusal without what it says about an override request:
+// what blocks the change and until when, and when to retry, as whole
+// sentences. Each blocker's end and reason are their own sentences, so a
+// reason never runs into the text around it. For example:
 //
-//	production is frozen by freeze frz-1 until someone lifts it. Reason: SEV-1234.
-func (e *ChangeGateRefusedError) BlockedWith(reason func(string) string, listed int) string {
+//	production is frozen by freeze frz-1 until someone lifts it. Reason: SEV-1234. Retry after it ends or is lifted.
+func (e *ChangeGateRefusedError) Blocked() string {
 	var b strings.Builder
 	switch len(e.Blockers) {
 	case 0:
-		return e.Environment + " is frozen."
+		b.WriteString(e.Environment + " is frozen.")
 	case 1:
 		blocker := e.Blockers[0]
 		fmt.Fprintf(&b, "%s is frozen by %s %s %s.", e.Environment, blocker.Gate, blocker.ID, blockerUntil(blocker))
-		writeBlockerReason(&b, blocker.Reason, reason)
-		return b.String()
+		writeBlockerReason(&b, blocker.Reason)
+	default:
+		fmt.Fprintf(&b, "%s is frozen by %d freezes.", e.Environment, len(e.Blockers))
+		for _, blocker := range e.Blockers {
+			fmt.Fprintf(&b, " %s %s lasts %s.", capitalizeFirst(blocker.Gate), blocker.ID, blockerUntil(blocker))
+			writeBlockerReason(&b, blocker.Reason)
+		}
 	}
-	fmt.Fprintf(&b, "%s is frozen by %d freezes.", e.Environment, len(e.Blockers))
-	shown := e.Blockers
-	if listed > 0 && len(shown) > listed {
-		shown = shown[:listed]
-	}
-	for _, blocker := range shown {
-		fmt.Fprintf(&b, " %s %s lasts %s.", capitalizeFirst(blocker.Gate), blocker.ID, blockerUntil(blocker))
-		writeBlockerReason(&b, blocker.Reason, reason)
-	}
-	switch unlisted := len(e.Blockers) - len(shown); {
-	case unlisted == 1:
-		b.WriteString(" 1 more freeze also blocks it.")
-	case unlisted > 1:
-		fmt.Fprintf(&b, " %d more freezes also block it.", unlisted)
+	if len(e.Blockers) > 1 {
+		b.WriteString(" Retry after they end or are lifted.")
+	} else {
+		b.WriteString(" Retry after it ends or is lifted.")
 	}
 	return b.String()
 }
@@ -568,22 +557,28 @@ func blockerUntil(blocker apitypes.ChangeGateBlocker) string {
 	return "until " + blocker.EndsAt.UTC().Format(time.RFC3339)
 }
 
-// writeBlockerReason writes a blocker's reason as its own sentence, as reason
-// renders it. A reason that already ends a sentence gets no extra period.
-func writeBlockerReason(b *strings.Builder, raw string, reason func(string) string) {
-	if strings.TrimSpace(raw) == "" {
+// writeBlockerReason writes a blocker's reason as its own sentence, and
+// nothing for a reason with no visible text. A reason that already ends a
+// sentence gets no extra period.
+func writeBlockerReason(b *strings.Builder, reason string) {
+	reason = strings.TrimSpace(strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, reason))
+	if reason == "" {
 		return
 	}
-	shown := reason(raw)
-	b.WriteString(" Reason: " + shown)
-	if !EndsSentence(shown) {
+	b.WriteString(" Reason: " + reason)
+	if !endsSentence(reason) {
 		b.WriteString(".")
 	}
 }
 
-// EndsSentence reports whether text already ends a sentence, so no period is
+// endsSentence reports whether text already ends a sentence, so no period is
 // added after it. A clamped reason ends in "…".
-func EndsSentence(text string) bool {
+func endsSentence(text string) bool {
 	return strings.HasSuffix(text, ".") || strings.HasSuffix(text, "!") ||
 		strings.HasSuffix(text, "?") || strings.HasSuffix(text, "…")
 }

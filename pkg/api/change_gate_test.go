@@ -590,8 +590,8 @@ func TestChangeGateFailsClosedWhenTheAdmissionWriteCannotReadTheEpoch(t *testing
 }
 
 // A refusal reads as whole sentences: what freezes the environment, until
-// when, and each reason after "Reason:", so a reason never runs into the
-// text around it.
+// when, each reason after "Reason:", and when to retry, so a reason never runs
+// into the text around it.
 func TestChangeGateRefusalReadsAsSentences(t *testing.T) {
 	ends := time.Date(2026, 11, 22, 18, 0, 0, 0, time.FixedZone("PST", -8*60*60))
 	freeze := func(id, reason string, endsAt *time.Time) apitypes.ChangeGateBlocker {
@@ -599,27 +599,21 @@ func TestChangeGateRefusalReadsAsSentences(t *testing.T) {
 	}
 	for name, tc := range map[string]struct {
 		blockers []apitypes.ChangeGateBlocker
-		listed   int
 		want     string
 	}{
 		"no blocker named": {
-			want: "production is frozen.",
+			want: "production is frozen. Retry after it ends or is lifted.",
 		},
 		"one freeze until lifted": {
 			blockers: []apitypes.ChangeGateBlocker{freeze("frz-1", "rpc error: code = Unavailable during the outage", nil)},
-			want:     "production is frozen by freeze frz-1 until someone lifts it. Reason: rpc error: code = Unavailable during the outage.",
+			want:     "production is frozen by freeze frz-1 until someone lifts it. Reason: rpc error: code = Unavailable during the outage. Retry after it ends or is lifted.",
 		},
-		"a reason that ends a sentence and a blank one": {
-			blockers: []apitypes.ChangeGateBlocker{freeze("frz-1", "SEV-1234!", nil), freeze("frz-2", " ", &ends)},
-			want:     "production is frozen by 2 freezes. Freeze frz-1 lasts until someone lifts it. Reason: SEV-1234! Freeze frz-2 lasts until 2026-11-23T02:00:00Z.",
-		},
-		"more freezes than listed are counted": {
-			blockers: []apitypes.ChangeGateBlocker{freeze("frz-1", "a", nil), freeze("frz-2", "b", nil), freeze("frz-3", "c", nil)},
-			listed:   1,
-			want:     "production is frozen by 3 freezes. Freeze frz-1 lasts until someone lifts it. Reason: a. 2 more freezes also block it.",
+		"a reason that ends a sentence and one with no visible text": {
+			blockers: []apitypes.ChangeGateBlocker{freeze("frz-1", "SEV-1234!", nil), freeze("frz-2", " \u200b ", &ends)},
+			want:     "production is frozen by 2 freezes. Freeze frz-1 lasts until someone lifts it. Reason: SEV-1234! Freeze frz-2 lasts until 2026-11-23T02:00:00Z. Retry after they end or are lifted.",
 		},
 	} {
 		refused := &ChangeGateRefusedError{Environment: "production", Blockers: tc.blockers}
-		assert.Equal(t, tc.want, refused.BlockedWith(func(reason string) string { return reason }, tc.listed), name)
+		assert.Equal(t, tc.want, refused.Blocked(), name)
 	}
 }

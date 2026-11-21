@@ -5,10 +5,10 @@
 // emphasis) is markup around the glyph and stays with the surface.
 //
 // Most of the vocabulary is severity: how urgently an operator should react
-// to the line beside the glyph. Docs and Tip are the members that are not —
-// one marks a pointer to documentation, the other advice nothing blocks on,
-// and neither carries urgency — and they live here so both surfaces render
-// the same glyph and the rules below cover them.
+// to the line beside the glyph. Docs, Tip and Frozen are the members that are
+// not — a pointer to documentation, advice nothing blocks on, and a freeze —
+// and they live here so both surfaces render the same glyph and the rules
+// below cover them.
 //
 // Two rules keep the vocabulary unambiguous at the sites that could blur it:
 //
@@ -16,6 +16,9 @@
 //     rejected over unsafe changes headlines with Refused because the apply is
 //     not proceeding; the same changes disclosed at plan time, before anything
 //     is refused, carry Attention.
+//   - A freeze refusal headlines with Frozen, not Refused. The change is not
+//     proceeding, but what must change before a retry is the freeze, which
+//     ends on its own, is lifted, or is overridden. Frozen says which.
 //   - Errors in the operator's own input (a database name that resolves to
 //     nothing, a config that fails validation) carry Attention — fixing the
 //     input and retrying can succeed. Refused is reserved for requests
@@ -68,4 +71,9 @@ const (
 	// destructive drop. It is not a severity: following the advice is the
 	// operator's call, and a finding it accompanies carries its own.
 	Tip = "💡"
+
+	// Frozen marks an environment freeze: a change the freeze held, or the
+	// freeze itself. The change waits until the freeze ends or is lifted, or
+	// until a freeze approver approves an override.
+	Frozen = "❄️"
 )

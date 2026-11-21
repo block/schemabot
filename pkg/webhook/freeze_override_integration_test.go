@@ -84,11 +84,11 @@ func TestE2EApplyOverrideFromAPullRequestNeedsAnotherGitHubApprover(t *testing.T
 	freezeID := freezeForOverride(t, svc.Storage(), driftEnv, dbName)
 
 	refused := runRolloutWebhook(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv+` --override "fix the index"`))
-	comment := awaitCommentContaining(t, refused, "This change did not start: "+driftEnv+" is frozen by freeze "+freezeID)
+	comment := awaitCommentContaining(t, refused, "| `"+freezeID+"` | When lifted |")
 	request := requestNamedIn(t, svc.Storage(), comment)
-	assert.Contains(t, comment, "Override request `"+request.Identifier+"` was recorded")
+	assert.Contains(t, comment, "Override request `"+request.Identifier+"` is waiting for a freeze approver.")
 	assert.Contains(t, comment, "other than @carol and other than the PR author (@testuser)")
-	assert.Contains(t, comment, "`schemabot freeze approve "+request.Identifier+"`. Then @carol runs this command again.")
+	assert.Contains(t, comment, "   schemabot freeze approve "+request.Identifier+"\n   ```\n2. Then @carol runs this command again.")
 	requireNoApplies(t, svc, dbName)
 
 	assert.Equal(t, "github:carol", request.RequestedBy)
@@ -106,7 +106,7 @@ func TestE2EApplyOverrideFromAPullRequestNeedsAnotherGitHubApprover(t *testing.T
 	// Without an approval the same command, with or without the reason, is
 	// still refused.
 	again := runRolloutWebhook(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv))
-	awaitCommentContaining(t, again, "This change did not start")
+	awaitCommentContaining(t, again, "is frozen, so this command did not run.")
 	requireNoApplies(t, svc, dbName)
 
 	for _, who := range []string{"github:carol", "github:testuser", "github:TestUser"} {
@@ -167,7 +167,7 @@ func TestE2EFreezeApproveFromTheSamePullRequest(t *testing.T) {
 	})
 	freezeID := freezeForOverride(t, svc.Storage(), driftEnv, dbName)
 	refused := runRolloutWebhook(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv+` --override "fix"`))
-	request := requestNamedIn(t, svc.Storage(), awaitCommentContaining(t, refused, driftEnv+" is frozen by freeze "+freezeID))
+	request := requestNamedIn(t, svc.Storage(), awaitCommentContaining(t, refused, "| `"+freezeID+"` | When lifted |"))
 
 	t.Run("the requester and the author, though in the team, and a stranger approve nothing", func(t *testing.T) {
 		for login, want := range map[string]string{
@@ -367,7 +367,7 @@ func TestE2EStartAndCutoverOverrideFromAPullRequest(t *testing.T) {
 
 			body := readComment(t, f.comments)
 			request := requestNamedIn(t, f.store, body)
-			assert.Contains(t, body, "staging is frozen by freeze "+f.freezeID)
+			assert.Contains(t, body, "| `"+f.freezeID+"` |")
 			assert.Contains(t, body, "other than @carol and other than the PR author (@alice)")
 			assert.Equal(t, tc.command, request.Action)
 			assert.Equal(t, tc.identifier, request.TargetID)
@@ -398,8 +398,8 @@ func TestE2EStartAndCutoverOverrideFromAPullRequest(t *testing.T) {
 			f.comment(t, "carol", "schemabot "+tc.command+" "+tc.identifier+` -e staging --override "fix the index"`)
 
 			body := readComment(t, f.comments)
-			assert.Contains(t, body, "staging is frozen by freeze "+f.freezeID)
-			assert.Contains(t, body, "No override request was recorded")
+			assert.Contains(t, body, "| `"+f.freezeID+"` |")
+			assert.Contains(t, body, "so it recorded no override request")
 			assert.NotRegexp(t, overrideIDPattern, body)
 			var count int
 			require.NoError(t, e2eCount(t, "SELECT COUNT(*) FROM freeze_override_requests WHERE database_name = ?", "override_"+tc.name+"_nopr_db").Scan(&count))

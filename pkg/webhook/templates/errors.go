@@ -29,14 +29,11 @@ type SchemaErrorData struct {
 	// names the concrete environments the failed command covered. Empty means
 	// the deployment is unscoped and the header omits the environment segment
 	// rather than rendering filler.
-	Environments []string
-	DatabaseName string
-	SchemaPath   string
-	CommandName  string // "plan" or "apply"
-	ErrorDetail  string
-	// DetailLimit bounds ErrorDetail in runes. Zero is the default bound for
-	// untrusted error text; a freeze refusal sets MaxChangeGateRefusalLen.
-	DetailLimit        int
+	Environments       []string
+	DatabaseName       string
+	SchemaPath         string
+	CommandName        string // "plan" or "apply"
+	ErrorDetail        string
 	AvailableDatabases string
 	// SearchedDirs lists the schema directories a database-scoped search was
 	// limited to when GitHub truncated the repository tree. Empty when the
@@ -592,11 +589,7 @@ func RenderGenericError(data SchemaErrorData) string {
 	// sanitize it, escape HTML, and keep a multi-line message inside the
 	// blockquote so it cannot leak endpoints, inject markup, or escape into
 	// the surrounding comment structure.
-	limit := maxCommentErrorLen
-	if data.DetailLimit > 0 {
-		limit = data.DetailLimit
-	}
-	data.ErrorDetail = quoteBlockLines(html.EscapeString(sanitizeCommentErrorWithin(data.ErrorDetail, limit)))
+	data.ErrorDetail = quoteBlockLines(html.EscapeString(sanitizeCommentError(data.ErrorDetail)))
 	return offerSupportChannel(renderTemplate(tmplGenericError, data))
 }
 
