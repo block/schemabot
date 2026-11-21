@@ -51,7 +51,11 @@ func (h *Handler) postChangeGateRefusal(
 	commandName, environment, requestedBy string, err error,
 ) {
 	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
-		h.postComment(repo, pr, installationID, templates.RenderChangeGateRefusal(changeGateRefusalData(refused, commandName, h.deploymentTenant(), requestedBy)))
+		var approvers []string
+		if config, ok := h.serverConfig(); ok {
+			approvers = config.Freeze.GitHubTeams
+		}
+		h.postComment(repo, pr, installationID, templates.RenderChangeGateRefusal(changeGateRefusalData(refused, commandName, h.deploymentTenant(), requestedBy, approvers)))
 		return
 	}
 	message := "SchemaBot could not check for freezes, so this did not start. Try again."

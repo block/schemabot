@@ -82,11 +82,13 @@ func TestE2EApplyOverrideFromAPullRequestNeedsAnotherGitHubApprover(t *testing.T
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
 	freezeID := freezeForOverride(t, svc.Storage(), driftEnv, dbName)
+	svc.Config().Freeze.GitHubTeams = []string{approveTeam}
 
 	refused := runRolloutWebhook(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv+` --override "fix the index"`))
 	comment := awaitCommentContaining(t, refused, "| `"+freezeID+"` | When lifted |")
 	request := requestNamedIn(t, svc.Storage(), comment)
 	assert.Contains(t, comment, "Override request `"+request.Identifier+"` is waiting for a freeze approver.")
+	assert.Contains(t, comment, "**Freeze approvers**:\n- @"+approveTeam+"\n")
 	assert.Contains(t, comment, "other than @carol and other than the PR author (@testuser)")
 	assert.Contains(t, comment, "   schemabot freeze approve "+request.Identifier+"\n   ```\n2. Then @carol runs this command again.")
 	requireNoApplies(t, svc, dbName)
@@ -330,6 +332,7 @@ func newControlOverrideFixture(t *testing.T, applyIdentifier, database string, c
 
 	service := apiServiceForStopCommandTest(t, store, database)
 	service.RegisterTernClient(database, "staging", &stopCommandTernClient{remote: cutover})
+	service.Config().Freeze.GitHubTeams = []string{approveTeam}
 	h := &Handler{
 		service:   service,
 		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),

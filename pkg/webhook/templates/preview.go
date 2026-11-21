@@ -4040,12 +4040,16 @@ func PreviewCommentSummaryMultiNamespaceCompleted() string {
 // previewFreezeEnds is when the preview's scheduled freeze ends.
 var previewFreezeEnds = time.Date(2026, 1, 15, 18, 0, 0, 0, time.UTC)
 
+// previewFreezeApprovers are the preview deployment's freeze.github_teams.
+var previewFreezeApprovers = []string{"acme/freeze-approvers", "acme/sre"}
+
 // PreviewCommentFreezeRefused renders an apply refused by one freeze, with
 // the next steps for a commenter who did not ask for an override.
 func PreviewCommentFreezeRefused() string {
 	return RenderChangeGateRefusal(ChangeGateRefusalData{
 		CommandName: action.Apply, Environment: "production", RequestedBy: previewRequestedBy, Timestamp: "2026-01-15 14:30:00",
-		Freezes: []RefusingFreeze{{ID: "frz-7f3a", Reason: "SEV-1234: payments latency, page @payments-oncall"}},
+		Freezes:   []RefusingFreeze{{ID: "frz-7f3a", Reason: "SEV-1234: payments latency, page @payments-oncall"}},
+		Approvers: previewFreezeApprovers,
 	})
 }
 
@@ -4058,6 +4062,7 @@ func PreviewCommentFreezeRefusedSeveral() string {
 			{ID: "frz-7f3a", Reason: "SEV-1234: payments latency"},
 			{ID: "frz-91c2", Reason: "Holiday change freeze", EndsAt: &previewFreezeEnds},
 		},
+		Approvers: previewFreezeApprovers,
 	})
 }
 
@@ -4066,8 +4071,9 @@ func PreviewCommentFreezeRefusedSeveral() string {
 func PreviewCommentFreezeOverrideRequested() string {
 	return RenderChangeGateRefusal(ChangeGateRefusalData{
 		CommandName: action.Apply, Environment: "production", Tenant: "acme", RequestedBy: "carol", Timestamp: "2026-01-15 14:30:00",
-		Freezes:  []RefusingFreeze{{ID: "frz-7f3a", Reason: "SEV-1234: payments latency"}},
-		Override: &RefusalOverrideRequest{ID: "ovr-0123456789abcdef", Requester: "carol", Author: "alice", Reason: "Index that fixes SEV-1234"},
+		Freezes:   []RefusingFreeze{{ID: "frz-7f3a", Reason: "SEV-1234: payments latency"}},
+		Override:  &RefusalOverrideRequest{ID: "ovr-0123456789abcdef", Requester: "carol", Author: "alice", Reason: "Index that fixes SEV-1234"},
+		Approvers: previewFreezeApprovers,
 	})
 }
 
@@ -4077,6 +4083,7 @@ func PreviewCommentFreezeOverrideRequested() string {
 func PreviewCommentFreezeApplyConfirmRefused() string {
 	return RenderChangeGateRefusal(ChangeGateRefusalData{
 		CommandName: action.ApplyConfirm, Environment: "production", RequestedBy: previewRequestedBy, Timestamp: "2026-01-15 14:30:00",
-		Freezes: []RefusingFreeze{{ID: "frz-91c2", Reason: "Holiday change freeze", EndsAt: &previewFreezeEnds}},
+		Freezes:   []RefusingFreeze{{ID: "frz-91c2", Reason: "Holiday change freeze", EndsAt: &previewFreezeEnds}},
+		Approvers: previewFreezeApprovers,
 	})
 }

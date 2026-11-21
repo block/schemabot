@@ -17,6 +17,7 @@ func refusalData(command string, freezes ...RefusingFreeze) ChangeGateRefusalDat
 	}
 	return ChangeGateRefusalData{
 		CommandName: command, Environment: "production", RequestedBy: "carol", Timestamp: "2026-01-15 14:30:00", Freezes: freezes,
+		Approvers: []string{"acme/freeze-approvers"},
 	}
 }
 
@@ -32,7 +33,7 @@ func TestRenderChangeGateRefusal(t *testing.T) {
 		"### What you can do\n\n"+
 		"- **Wait for the freeze to end**, then run the same command again.\n"+
 		"- **Ask for an override** if this change can't wait. Run the same command with `--override \"<why it can't wait>\"`. "+
-		"A freeze approver other than you and the PR author must approve it.\n"+
+		"A freeze approver other than you and the PR author must approve it: a member of `acme/freeze-approvers`.\n"+
 		supportChannelOfferMarker+"\n",
 		RenderChangeGateRefusal(refusalData(action.Apply)))
 }
@@ -60,6 +61,24 @@ func TestRenderChangeGateRefusalNextSteps(t *testing.T) {
 		assert.Contains(t, rendered, "Nothing was applied, and the pending confirmation was released.")
 		assert.Contains(t, rendered, "- **Wait for the freeze to end**, then run `apply` again, then `apply-confirm`.\n")
 		assert.Contains(t, rendered, "Run `apply` again, then run `apply-confirm` with `--override")
+	})
+
+	// Approver teams are named, not mentioned: nobody has asked them for
+	// anything yet.
+	t.Run("the approver teams are named without a mention", func(t *testing.T) {
+		data := refusalData(action.Apply)
+		data.Approvers = []string{"acme/freeze-approvers", "acme/sre"}
+		rendered := RenderChangeGateRefusal(data)
+		assert.Contains(t, rendered, "must approve it: a member of `acme/freeze-approvers` or `acme/sre`.\n")
+		assert.NotContains(t, rendered, "@acme/")
+	})
+
+	t.Run("with no approver team there is no override to ask for", func(t *testing.T) {
+		data := refusalData(action.Apply)
+		data.Approvers = nil
+		rendered := RenderChangeGateRefusal(data)
+		assert.Contains(t, rendered, "- **Wait for the freeze to end**, then run the same command again.\n")
+		assert.NotContains(t, rendered, "override")
 	})
 
 	t.Run("an unrecorded request says to retry instead", func(t *testing.T) {
@@ -128,6 +147,7 @@ func TestRenderChangeGateRefusalOverrideRequested(t *testing.T) {
 	assert.Contains(t, rendered, "### Override requested\n\n"+
 		"Override request `ovr-0123456789abcdef` is waiting for a freeze approver.\n\n"+
 		"**Reason the approver sees:** hotfix for `@payments-oncall`.\n\n"+
+		"**Freeze approvers**:\n- @acme/freeze-approvers\n\n"+
 		"1. A freeze approver other than @carol and other than the PR author (@alice) comments:\n"+
 		"   ```\n   schemabot freeze approve ovr-0123456789abcdef --tenant acme\n   ```\n"+
 		"2. Then @carol runs this command again.\n")
@@ -140,6 +160,18 @@ func TestRenderChangeGateRefusalOverrideRequested(t *testing.T) {
 		assert.Contains(t, rendered, "**Reason the approver sees:** hotfix! You asked for it earlier, so it keeps the reason you gave then.\n")
 		assert.Contains(t, rendered, "1. A freeze approver other than @alice, who wrote this pull request, comments:\n")
 		assert.Contains(t, rendered, "2. Then @alice runs `apply` again, then `apply-confirm`.\n")
+	})
+
+	t.Run("with no approver team nobody is waited on", func(t *testing.T) {
+		data := refusalData(action.ApplyConfirm)
+		data.Approvers = nil
+		data.Override = &RefusalOverrideRequest{ID: "ovr-1", Requester: "carol", Author: "alice", Reason: "hotfix"}
+		rendered := RenderChangeGateRefusal(data)
+		assert.Contains(t, rendered, "### Override requested\n\nSchemaBot recorded override request `ovr-1`, but no team can approve an override from a pull request, so nobody can approve it here. "+
+			"Wait for the freeze to end, then run `apply` again, then `apply-confirm`.\n")
+		assert.NotContains(t, rendered, "freeze approve")
+		assert.NotContains(t, rendered, "waiting")
+		assert.NotContains(t, rendered, "Freeze approvers")
 	})
 
 	t.Run("a long reason is clamped", func(t *testing.T) {

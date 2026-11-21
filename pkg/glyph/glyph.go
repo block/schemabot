@@ -10,7 +10,7 @@
 // and they live here so both surfaces render the same glyph and the rules
 // below cover them.
 //
-// Two rules keep the vocabulary unambiguous at the sites that could blur it:
+// Three rules keep the vocabulary unambiguous at the sites that could blur it:
 //
 //   - Refused attaches to the refusal, never to what was refused. An apply
 //     rejected over unsafe changes headlines with Refused because the apply is

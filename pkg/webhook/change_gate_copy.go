@@ -9,9 +9,9 @@ import (
 )
 
 // changeGateRefusalData is what the comment on a freeze refusal names:
-// command is the refused PR command, tenant the deployment's own, and
-// requestedBy the commenter.
-func changeGateRefusalData(refused *api.ChangeGateRefusedError, command, tenant, requestedBy string) templates.ChangeGateRefusalData {
+// command is the refused PR command, tenant the deployment's own, requestedBy
+// the commenter, and approvers the teams of freeze.github_teams.
+func changeGateRefusalData(refused *api.ChangeGateRefusedError, command, tenant, requestedBy string, approvers []string) templates.ChangeGateRefusalData {
 	data := templates.ChangeGateRefusalData{
 		CommandName:        command,
 		Environment:        refused.Environment,
@@ -19,6 +19,7 @@ func changeGateRefusalData(refused *api.ChangeGateRefusedError, command, tenant,
 		RequestedBy:        requestedBy,
 		Timestamp:          templates.NowFunc().UTC().Format("2006-01-02 15:04:05"),
 		OverrideUnrecorded: refused.OverrideUnrecorded,
+		Approvers:          approvers,
 	}
 	for _, blocker := range refused.Blockers {
 		data.Freezes = append(data.Freezes, templates.RefusingFreeze{ID: blocker.ID, Reason: blocker.Reason, EndsAt: blocker.EndsAt})

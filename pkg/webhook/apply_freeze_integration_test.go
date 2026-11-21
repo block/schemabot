@@ -44,10 +44,12 @@ func TestE2EApplyIsRefusedDuringAFreeze(t *testing.T) {
 		_, _ = svc.Storage().Freezes().Lift(context.WithoutCancel(t.Context()), freezeID, "alice", "test done")
 	})
 
+	svc.Config().Freeze.GitHubTeams = []string{"acme/freeze-approvers"}
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
 	refusal := awaitCommentContaining(t, apply, "| `"+freezeID+"` | When lifted | incident 42 |")
 	assert.Contains(t, refusal, "## ❄️ Apply Blocked by a Freeze\n")
 	assert.Contains(t, refusal, "Run the same command with `--override")
+	assert.Contains(t, refusal, "must approve it: a member of `acme/freeze-approvers`.")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)
@@ -79,6 +81,7 @@ func TestE2EApplyConfirmIsRefusedDuringAFreeze(t *testing.T) {
 		_, _ = svc.Storage().Freezes().Lift(context.WithoutCancel(t.Context()), freezeID, "alice", "test done")
 	})
 
+	svc.Config().Freeze.GitHubTeams = []string{"acme/freeze-approvers"}
 	result := sendApplyConfirm(t, svc, dbName, "schemabot apply-confirm -e staging")
 	refusal := awaitCommentContaining(t, result, "| `"+freezeID+"` | When lifted | incident 43 |")
 	assert.Contains(t, refusal, "Nothing was applied, and the pending confirmation was released.")

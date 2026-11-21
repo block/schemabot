@@ -28,6 +28,9 @@ type ChangeGateRefusalData struct {
 	// OverrideUnrecorded says the commenter asked for an override and
 	// SchemaBot could not record one.
 	OverrideUnrecorded bool
+	// Approvers are the GitHub teams, as org/team, whose members may approve
+	// an override from this pull request. Empty means nobody can.
+	Approvers []string
 }
 
 // RefusingFreeze is one freeze that holds the environment.
@@ -103,7 +106,7 @@ func RenderChangeGateRefusal(data ChangeGateRefusalData) string {
 		b.WriteString("SchemaBot could not confirm who is asking and who wrote this pull request, so it recorded no override request. " +
 			retry + ". If this keeps happening, the SchemaBot server logs have the cause.\n")
 	default:
-		writeRefusalNextSteps(&b, data.CommandName, len(data.Freezes))
+		writeRefusalNextSteps(&b, data)
 	}
 	return offerSupportChannel(b.String())
 }
@@ -140,24 +143,43 @@ func writeRefusingFreezes(b *strings.Builder, freezes []RefusingFreeze) {
 }
 
 // writeRefusalNextSteps writes what the commenter can do when no override was
-// asked for: wait, and, for a command that takes --override, ask for one.
-func writeRefusalNextSteps(b *strings.Builder, command string, freezes int) {
-	wait := "- **Wait for the freeze to end**"
-	if freezes > 1 {
-		wait = "- **Wait for the freezes to end**"
-	}
+// asked for: wait, and, for a command that takes --override when a team can
+// approve one, ask for one. The approver teams are named, not mentioned:
+// nobody has asked them for anything yet, and a freeze can refuse many pull
+// requests at once.
+func writeRefusalNextSteps(b *strings.Builder, data ChangeGateRefusalData) {
 	b.WriteString("### What you can do\n\n")
-	if command == action.ApplyConfirm {
-		b.WriteString(wait + ", then run `apply` again, then `apply-confirm`.\n")
-		b.WriteString("- **Ask for an override** if this change can't wait. Run `apply` again, then run `apply-confirm` with `" + overridePlaceholder + "`. " +
-			"A freeze approver other than you and the PR author must approve it.\n")
+	fmt.Fprintf(b, "- **Wait for %s to end**, then %s.\n", theFreezes(len(data.Freezes)), rerun(data.CommandName))
+	if !commandTakesOverride(data.CommandName) || len(data.Approvers) == 0 {
 		return
 	}
-	b.WriteString(wait + ", then run the same command again.\n")
-	if commandTakesOverride(command) {
-		b.WriteString("- **Ask for an override** if this change can't wait. Run the same command with `" + overridePlaceholder + "`. " +
-			"A freeze approver other than you and the PR author must approve it.\n")
+	ask := "Run the same command with `" + overridePlaceholder + "`."
+	if data.CommandName == action.ApplyConfirm {
+		ask = "Run `apply` again, then run `apply-confirm` with `" + overridePlaceholder + "`."
 	}
+	teams := make([]string, 0, len(data.Approvers))
+	for _, team := range data.Approvers {
+		teams = append(teams, inlineCode(team))
+	}
+	fmt.Fprintf(b, "- **Ask for an override** if this change can't wait. %s "+
+		"A freeze approver other than you and the PR author must approve it: a member of %s.\n", ask, joinWithOr(teams))
+}
+
+// theFreezes names the refusing freezes as the subject of a sentence.
+func theFreezes(count int) string {
+	if count > 1 {
+		return "the freezes"
+	}
+	return "the freeze"
+}
+
+// rerun says how to run a refused command again. A refused apply-confirm has
+// released its pending confirmation, so its retry starts with apply.
+func rerun(command string) string {
+	if command == action.ApplyConfirm {
+		return "run `apply` again, then `apply-confirm`"
+	}
+	return "run the same command again"
 }
 
 // writeOverrideRequested writes the recorded request and the two steps that
@@ -165,6 +187,13 @@ func writeRefusalNextSteps(b *strings.Builder, command string, freezes int) {
 // runs the command again.
 func writeOverrideRequested(b *strings.Builder, data ChangeGateRefusalData, request *RefusalOverrideRequest) {
 	b.WriteString("### Override requested\n\n")
+	// With no approver team, the request can never be approved here, so the
+	// steps would send the reader to wait on nobody.
+	if len(data.Approvers) == 0 {
+		fmt.Fprintf(b, "SchemaBot recorded override request %s, but no team can approve an override from a pull request, so nobody can approve it here. "+
+			"Wait for %s to end, then %s.\n", inlineCode(request.ID), theFreezes(len(data.Freezes)), rerun(data.CommandName))
+		return
+	}
 	fmt.Fprintf(b, "Override request %s is waiting for a freeze approver.\n\n", inlineCode(request.ID))
 	if reason := RedactedReason(request.Reason, maxShownOverrideReason); reason != "" {
 		b.WriteString("**Reason the approver sees:** " + markdownReason(reason))
@@ -177,16 +206,22 @@ func writeOverrideRequested(b *strings.Builder, data ChangeGateRefusalData, requ
 		b.WriteString("\n\n")
 	}
 
+	// The request waits on these teams, so they are mentioned, the same as the
+	// reviewers a review-required comment waits on.
+	b.WriteString("**Freeze approvers**:\n")
+	writeMentionList(b, data.Approvers)
+	b.WriteString("\n")
+
 	approver := fmt.Sprintf("A freeze approver other than @%s and other than the PR author (@%s)", request.Requester, request.Author)
 	if strings.EqualFold(request.Requester, request.Author) {
 		approver = fmt.Sprintf("A freeze approver other than @%s, who wrote this pull request,", request.Requester)
 	}
-	rerun := "runs this command again"
+	again := "runs this command again"
 	if data.CommandName == action.ApplyConfirm {
-		rerun = "runs `apply` again, then `apply-confirm`"
+		again = "runs `apply` again, then `apply-confirm`"
 	}
 	fmt.Fprintf(b, "1. %s comments:\n   ```\n   %s\n   ```\n", approver, AppendTenantFlag("schemabot freeze approve "+request.ID, data.Tenant))
-	fmt.Fprintf(b, "2. Then @%s %s.\n", request.Requester, rerun)
+	fmt.Fprintf(b, "2. Then @%s %s.\n", request.Requester, again)
 }
 
 // commandTakesOverride reports whether a PR command accepts --override.

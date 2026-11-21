@@ -34,7 +34,7 @@ func TestChangeGateRefusalData(t *testing.T) {
 		OverrideReasonKept: true,
 	}
 
-	data := changeGateRefusalData(refused, action.Start, "acme", "carol")
+	data := changeGateRefusalData(refused, action.Start, "acme", "carol", []string{"acme/freeze-approvers"})
 
 	assert.Equal(t, action.Start, data.CommandName)
 	assert.Equal(t, "production", data.Environment)
@@ -43,6 +43,7 @@ func TestChangeGateRefusalData(t *testing.T) {
 	assert.Equal(t, []templates.RefusingFreeze{{ID: "frz-1", Reason: "SEV-1234"}, {ID: "frz-2", Reason: "deploy window", EndsAt: &ends}}, data.Freezes)
 	assert.Equal(t, &templates.RefusalOverrideRequest{ID: "ovr-1", Requester: "carol", Author: "alice", Reason: "hotfix", ReasonKept: true}, data.Override)
 	assert.False(t, data.OverrideUnrecorded)
+	assert.Equal(t, []string{"acme/freeze-approvers"}, data.Approvers)
 }
 
 // A freeze refusal posts as its own comment, and a gate that could not

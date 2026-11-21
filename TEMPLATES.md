@@ -3624,7 +3624,7 @@ If SchemaBot should manage them, ask a SchemaBot operator to add the directory t
 ### What you can do
 
 - **Wait for the freeze to end**, then run the same command again.
-- **Ask for an override** if this change can't wait. Run the same command with `--override "<why it can't wait>"`. A freeze approver other than you and the PR author must approve it.
+- **Ask for an override** if this change can't wait. Run the same command with `--override "<why it can't wait>"`. A freeze approver other than you and the PR author must approve it: a member of `acme/freeze-approvers` or `acme/sre`.
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -3649,7 +3649,7 @@ If SchemaBot should manage them, ask a SchemaBot operator to add the directory t
 ### What you can do
 
 - **Wait for the freezes to end**, then run the same command again.
-- **Ask for an override** if this change can't wait. Run the same command with `--override "<why it can't wait>"`. A freeze approver other than you and the PR author must approve it.
+- **Ask for an override** if this change can't wait. Run the same command with `--override "<why it can't wait>"`. A freeze approver other than you and the PR author must approve it: a member of `acme/freeze-approvers` or `acme/sre`.
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -3675,6 +3675,10 @@ If SchemaBot should manage them, ask a SchemaBot operator to add the directory t
 Override request `ovr-0123456789abcdef` is waiting for a freeze approver.
 
 **Reason the approver sees:** Index that fixes SEV-1234.
+
+**Freeze approvers**:
+- @acme/freeze-approvers
+- @acme/sre
 
 1. A freeze approver other than @carol and other than the PR author (@alice) comments:
    ```
@@ -3704,7 +3708,7 @@ Override request `ovr-0123456789abcdef` is waiting for a freeze approver.
 ### What you can do
 
 - **Wait for the freeze to end**, then run `apply` again, then `apply-confirm`.
-- **Ask for an override** if this change can't wait. Run `apply` again, then run `apply-confirm` with `--override "<why it can't wait>"`. A freeze approver other than you and the PR author must approve it.
+- **Ask for an override** if this change can't wait. Run `apply` again, then run `apply-confirm` with `--override "<why it can't wait>"`. A freeze approver other than you and the PR author must approve it: a member of `acme/freeze-approvers` or `acme/sre`.
 <!-- schemabot:offer-support-channel -->
 
 </details>
