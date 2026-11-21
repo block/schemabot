@@ -18,6 +18,7 @@ const (
 	SendTimeout                = 15 * time.Second
 	QueryTimeout               = 5 * time.Second
 	ObservationPageSize        = 500
+	ObservationPagePause       = 250 * time.Millisecond
 )
 
 // Config opts a server into completion publication. Empty Type disables it.

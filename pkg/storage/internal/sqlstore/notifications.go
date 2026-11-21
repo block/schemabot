@@ -25,7 +25,7 @@ func (s *notificationStore) FindUnpublished(ctx context.Context, lookback time.D
 	rows, err := s.db.QueryContext(ctx, `SELECT `+applyColumnsForApplyAlias+`
  FROM applies a
  LEFT JOIN apply_notifications n ON n.apply_id = a.id
- WHERE a.completed_at >= `+cutoff+` 
+ WHERE a.completed_at >= `+cutoff+`
  AND a.state = ? AND n.published_at IS NULL
  AND (n.claimed_until IS NULL OR n.claimed_until <= `+now+`)
  ORDER BY a.completed_at, a.id LIMIT ?`, lookback.Microseconds(), state.Apply.Completed, limit)

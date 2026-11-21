@@ -64,8 +64,6 @@ func (r *Runner) Run(ctx context.Context) {
 }
 
 func (r *Runner) loop(ctx context.Context, interval time.Duration, pass func(context.Context) error) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 	for {
 		if ctx.Err() != nil {
 			r.logger.Debug("apply notification loop stopped", "error", ctx.Err())
@@ -73,16 +71,20 @@ func (r *Runner) loop(ctx context.Context, interval time.Duration, pass func(con
 		}
 		panicErr, err := panicsafe.Catch(func() error { return pass(ctx) })
 		if panicErr != nil {
-			r.logger.Error("apply notification pass panicked; next tick retries", "error", panicErr)
+			r.logger.Error("apply notification loop panicked; stopping this loop permanently", "panic", fmt.Sprint(panicErr.Value), "stack", string(panicErr.Stack))
+			metrics.RecordRecoveredPanic(ctx, "apply_notifications")
+			return
 		}
 		if err != nil {
 			r.logger.Warn("apply notification pass failed; next tick retries", "error", err)
 		}
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			r.logger.Debug("apply notification loop stopping", "error", ctx.Err())
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
 }
@@ -149,10 +151,28 @@ func (r *Runner) publish(ctx context.Context, apply *storage.Apply) error {
 	return err
 }
 
-// observe consumes one primary-key page per tick, never a filtered all-history
-// COUNT. Cutoff/ceiling stay fixed through a sweep; concurrent state changes are
+// observe completes a sweep using paced primary-key pages, never a filtered
+// all-history COUNT. Cutoff/ceiling stay fixed through a sweep; concurrent state changes are
 // observed by the next sweep. An unfinished sweep never replaces a good gauge.
 func (r *Runner) observe(ctx context.Context) error {
+	for {
+		if err := r.observePage(ctx); err != nil {
+			return err
+		}
+		if r.sweep == nil {
+			return nil
+		}
+		timer := time.NewTimer(ObservationPagePause)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (r *Runner) observePage(ctx context.Context) error {
 	queryCtx, cancel := context.WithTimeout(ctx, QueryTimeout)
 	defer cancel()
 	if r.sweep == nil {

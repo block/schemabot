@@ -1,12 +1,16 @@
 package notifications
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"sync"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -26,6 +30,8 @@ type memoryStore struct {
 	observations []storage.NotificationObservation
 	at           time.Time
 	scans        chan struct{}
+	afterPage    func()
+	pageCalls    int
 }
 
 func (s *memoryStore) FindUnpublished(_ context.Context, _ time.Duration, limit int) ([]*storage.Apply, error) {
@@ -75,10 +81,15 @@ func (s *memoryStore) ObservationCeiling(context.Context) (int64, time.Time, err
 	return int64(len(s.observations)), s.at, nil
 }
 func (s *memoryStore) ObservePage(_ context.Context, after, through int64, limit int) ([]storage.NotificationObservation, error) {
+	s.pageCalls++
 	if s.pageErr != nil {
 		return nil, s.pageErr
 	}
-	return s.observations[after:min(through, after+int64(limit))], nil
+	page := s.observations[after:min(through, after+int64(limit))]
+	if s.afterPage != nil {
+		s.afterPage()
+	}
+	return page, nil
 }
 
 type publisherFunc func(context.Context, Event) error
@@ -113,7 +124,8 @@ func TestRestartRetriesFailedPublicationWithStableIdentifier(t *testing.T) {
 }
 
 func TestObservationPagesAllHistoryAndPublishesOnlyFinishedSweeps(t *testing.T) {
-	defer metrics.PublishApplyNotificationBacklog(nil)
+	reader := backlogReader(t)
+	metrics.PublishApplyNotificationBacklog(&metrics.ApplyNotificationBacklog{OutOfWindow: 9})
 	now := time.Now().UTC()
 	old := now.Add(-48 * time.Hour)
 	recent := now.Add(-time.Hour)
@@ -125,20 +137,25 @@ func TestObservationPagesAllHistoryAndPublishesOnlyFinishedSweeps(t *testing.T) 
 	store.observations[1] = storage.NotificationObservation{ID: 2, Completed: true, CompletedAt: &recent}
 	runner, err := New(store, publisherFunc(func(context.Context, Event) error { return nil }), Config{}, slog.Default())
 	require.NoError(t, err)
-	require.NoError(t, runner.observe(t.Context()))
+	require.NoError(t, runner.observePage(t.Context()))
 	require.NotNil(t, runner.sweep)
 	assert.Equal(t, int64(ObservationPageSize), runner.sweep.after)
 	assert.Equal(t, int64(1), runner.sweep.outside)
+	assert.Equal(t, int64(9), observedOutside(t, reader))
 	// The page cursor stays on the last successful page if storage is unavailable.
 	store.pageErr = errors.New("database unavailable")
-	require.Error(t, runner.observe(t.Context()))
+	require.Error(t, runner.observePage(t.Context()))
 	assert.Equal(t, int64(ObservationPageSize), runner.sweep.after)
+	assert.Equal(t, int64(9), observedOutside(t, reader))
+	// Appended rows do not extend the current sweep ceiling.
+	store.observations = append(store.observations, storage.NotificationObservation{ID: ObservationPageSize + 2, Completed: true, CompletedAt: &old})
 	store.pageErr = nil
-	require.NoError(t, runner.observe(t.Context()))
+	require.NoError(t, runner.observePage(t.Context()))
 	assert.Nil(t, runner.sweep)
+	assert.Equal(t, int64(1), observedOutside(t, reader))
 	// A publication since the previous sweep is observed on the next one.
 	store.observations[0].Published = true
-	require.NoError(t, runner.observe(t.Context()))
+	require.NoError(t, runner.observePage(t.Context()))
 	require.NotNil(t, runner.sweep)
 	assert.Zero(t, runner.sweep.outside)
 	assert.Equal(t, recent, *runner.sweep.oldest)
@@ -177,4 +194,116 @@ func TestConfigSelectionAndValidation(t *testing.T) {
 	assert.Equal(t, DefaultInterval, interval)
 	assert.Equal(t, DefaultBatchSize, batch)
 	require.NoError(t, (Config{Type: "sqs", QueueURL: "queue", Lookback: "48h", Interval: "1m", BatchSize: 10}).Validate())
+}
+
+func backlogReader(t *testing.T) *metric.ManualReader {
+	t.Helper()
+	reader := metric.NewManualReader()
+	provider := metric.NewMeterProvider(metric.WithReader(reader))
+	require.NoError(t, metrics.RegisterApplyNotificationMetrics(provider))
+	t.Cleanup(func() {
+		metrics.PublishApplyNotificationBacklog(nil)
+		require.NoError(t, provider.Shutdown(context.WithoutCancel(t.Context())))
+	})
+	return reader
+}
+
+func observedOutside(t *testing.T, reader *metric.ManualReader) int64 {
+	t.Helper()
+	var data metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &data))
+	for _, scope := range data.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name == "schemabot.apply_notifications.out_of_window" {
+				gauge, ok := m.Data.(metricdata.Gauge[int64])
+				require.True(t, ok)
+				require.Len(t, gauge.DataPoints, 1)
+				return gauge.DataPoints[0].Value
+			}
+		}
+	}
+	require.FailNow(t, "out-of-window gauge was not emitted")
+	return 0
+}
+
+func TestObservationEmitsMultiplePagesBeforeInterSweepPause(t *testing.T) {
+	reader := backlogReader(t)
+	now := time.Now().UTC()
+	old := now.Add(-48 * time.Hour)
+	store := &memoryStore{at: now}
+	for i := range ObservationPageSize + 1 {
+		store.observations = append(store.observations, storage.NotificationObservation{ID: int64(i + 1), Completed: true, CompletedAt: &old})
+	}
+	runner, err := New(store, publisherFunc(func(context.Context, Event) error { return nil }), Config{ObservationInterval: "5m"}, slog.Default())
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, runner.observe(ctx))
+	require.NoError(t, ctx.Err(), "a complete snapshot must not wait for the inter-sweep pause")
+	assert.Equal(t, 2, store.pageCalls)
+	assert.Nil(t, runner.sweep)
+	assert.Equal(t, int64(ObservationPageSize+1), observedOutside(t, reader))
+}
+
+func TestRunCancelsDuringObservationPagePacing(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	pageRead := make(chan struct{}, 1)
+	store := &memoryStore{at: time.Now(), afterPage: func() { pageRead <- struct{}{} }}
+	for i := range ObservationPageSize + 1 {
+		store.observations = append(store.observations, storage.NotificationObservation{ID: int64(i + 1)})
+	}
+	runner, err := New(store, publisherFunc(func(context.Context, Event) error { return nil }), Config{}, slog.Default())
+	require.NoError(t, err)
+	done := make(chan struct{})
+	go func() { defer close(done); runner.Run(ctx) }()
+	select {
+	case <-pageRead:
+	case <-time.After(time.Second):
+		require.FailNow(t, "observer did not read its first page")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		require.FailNow(t, "page pacing did not stop on cancellation")
+	}
+	assert.Equal(t, 1, store.pageCalls)
+	require.NotNil(t, runner.sweep, "cancellation must not finish a partial snapshot")
+}
+
+func TestLoopStopsPermanentlyOnContainedPanic(t *testing.T) {
+	var logs bytes.Buffer
+	runner := &Runner{logger: slog.New(slog.NewTextHandler(&logs, nil))}
+	calls := 0
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	runner.loop(ctx, time.Millisecond, func(context.Context) error {
+		calls++
+		panic("poisoned publisher")
+	})
+	require.NoError(t, ctx.Err(), "contained panic must stop the loop without waiting for shutdown")
+	assert.Equal(t, 1, calls)
+	assert.Contains(t, logs.String(), "poisoned publisher")
+	assert.Contains(t, logs.String(), "stack=")
+	assert.Contains(t, logs.String(), "TestLoopStopsPermanentlyOnContainedPanic")
+}
+
+func TestLoopRetriesReturnedErrorsAfterPause(t *testing.T) {
+	runner := &Runner{logger: slog.Default()}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	var calls int
+	var first time.Time
+	runner.loop(ctx, 20*time.Millisecond, func(context.Context) error {
+		calls++
+		if calls == 1 {
+			first = time.Now()
+			return errors.New("temporary storage failure")
+		}
+		assert.GreaterOrEqual(t, time.Since(first), 20*time.Millisecond)
+		cancel()
+		return nil
+	})
+	assert.Equal(t, 2, calls)
 }

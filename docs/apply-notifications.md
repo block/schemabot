@@ -105,10 +105,13 @@ These are **observed backlog gauges, not a durable lost-event counter**. Do not
 sum replicas sharing storage; use max. Existing historical completions with no
 tracking rows are included, even when they predate this feature. That history
 can remain out of window indefinitely; the feature does not infer an activation
-baseline or call an empty tracking table a healthy zero.
+baseline or call an empty tracking table a healthy zero. Pre-feature history can
+dominate the all-history lag gauge indefinitely.
 
-The observer reads one primary-key page of 500 applies per observation interval (default 5m),
-including non-completed and published rows before filtering in memory. Each sweep
+The observer reads primary-key pages of 500 applies with a cancellation-aware
+250ms pause between pages, including non-completed and published rows before
+filtering in memory. The configurable `observation_interval` (default 5m) is the
+pause between completed sweeps, or before retrying a failed page. Each sweep
 pins its ID ceiling and database-clock cutoff once. This bounds SQL work per
 page without adding a storage index or running an all-history filtered COUNT.
 Concurrent completions/publications are eventually reflected on a subsequent
@@ -116,8 +119,13 @@ sweep; a sweep is not a transactionally consistent snapshot. Delivery runs on a
 separate loop and never waits for this historical scan.
 
 Both gauges update together only after a complete sweep. Refresh latency grows
-with history (approximately `ceil(apply rows / 500) * observation_interval`); a restart loses
-the in-memory cursor and starts again. On query failure the cursor and last-good
+with history: approximately `ceil(apply rows / 500) * 250ms` plus SQL time per
+sweep, then the inter-sweep pause. A million-row sweep takes about 8m20s plus
+SQL time. The provisional page pacing permits roughly 4 page queries/s and
+2,000 rows/s per observer, less SQL time; multiply by replica count. This is
+**not production capacity validation**; query-plan checks do not prove a safe
+aggregate read rate. A restart loses the in-memory cursor and starts again, so
+frequent restarts can still prevent a first snapshot. On query failure the cursor and last-good
 gauges remain, and a warning records the failed pass. Gauges are absent until the
 first finished sweep and cleared when the runner stops; consult logs for stalled
 sweeps rather than interpreting repeated samples as fresh storage reads.
@@ -134,3 +142,10 @@ suggests checking publisher errors, queue permissions, and catch-up throughput.
 Out-of-window backlog cannot be recovered by this job. No dashboard or alerting
 service is provisioned here; verify collection mapping and panels in the target
 deployment before treating dashboard visibility as validated.
+
+Ordinary errors retry after the configured loop pause. A contained panic logs
+its value/stack, records the existing recovered-panic signal, and permanently
+stops the affected delivery or observation loop (AV-5); the other loop remains
+independent. Poison-message fairness/backoff and per-event warning aggregation
+are not implemented: a full batch of permanently failing events can starve newer
+events and a dead queue can generate one warning per event each delivery pass.
