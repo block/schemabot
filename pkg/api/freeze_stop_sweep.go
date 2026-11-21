@@ -85,10 +85,12 @@ func (s *Service) stopAppliesForFreeze(ctx context.Context, freeze *storage.Envi
 }
 
 // freezeStopSweepCandidate reports whether a freeze's stop sweep considers
-// apply at all: it is in the freeze's environment, it is pending or doing
-// work a stop can end, and it is not a pull request rollback, which no gate
-// holds. An apply waiting for its cutover is left alone, because the freeze
-// already refuses its cutover.
+// apply at all: it is in the freeze's environment, it is pending, paused or
+// doing work a stop can end, and it is not a pull request rollback, which no
+// gate holds. A rollout paused after a failure can still have members
+// writing, so it is stopped too, as its own footer offers. An apply waiting
+// for its cutover is left alone: every member is waiting or done, and the
+// freeze already refuses the cutover.
 func freezeStopSweepCandidate(freeze *storage.EnvironmentFreeze, apply *storage.Apply) bool {
 	if storage.CanonicalKey(apply.Environment) != storage.CanonicalKey(freeze.Environment) {
 		return false
@@ -96,7 +98,7 @@ func freezeStopSweepCandidate(freeze *storage.EnvironmentFreeze, apply *storage.
 	if apply.GetOptions().PinnedRollback {
 		return false
 	}
-	return state.IsState(apply.State, state.Apply.Pending) || presentation.OffersStop(apply.State)
+	return state.IsState(apply.State, state.Apply.Pending, state.Apply.Paused) || presentation.OffersStop(apply.State)
 }
 
 // freezeCoversAnyDeployment reports whether the freeze covers database on any

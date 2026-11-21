@@ -87,12 +87,15 @@ func TestFreezeCreateCmdPrintsTheFreezeAndSendsItsFlags(t *testing.T) {
 	assert.Contains(t, out, "freeze-abc created: production frozen (on demand, until lifted) by dana. Reason: SEV-1234 payments latency\n")
 	assert.Contains(t, out, "Scope:           deployments payments; databases orders, games\n")
 	assert.Contains(t, out, "Starts:          2026-11-21T10:00:00Z\n")
-	// The confirmation names every apply the freeze stopped, and each one it
-	// could not stop with why, so the responder knows what is still running.
+	// The confirmation names every apply the freeze asked to stop, says the
+	// stops are requests that status confirms, and names each one it could
+	// not stop with its own remedy, so the responder knows what is still
+	// running and is never told to run a stop that cannot work.
 	assert.Contains(t, out, "Running applies: stop\n")
-	assert.Contains(t, out, "Stopped:         apply-111, apply-222\n")
-	assert.Contains(t, out, "Not stopped:     apply-333: stop is not supported for this schema change; use cancel to permanently cancel it\n")
-	assert.Contains(t, out, "Stop each one still running with 'schemabot stop'.\n")
+	assert.Contains(t, out, "Stop requested:  apply-111, apply-222\n")
+	assert.Contains(t, out, "Confirm each one has stopped with 'schemabot status <apply-id>'.\n")
+	assert.Contains(t, out, "Not stopped:     apply-333 keeps running: stop is not supported for this schema change; use cancel to permanently cancel it\n")
+	assert.NotContains(t, out, "schemabot stop")
 	assert.Equal(t, http.MethodPost, api.method)
 	assert.Equal(t, "/api/freezes", api.path)
 	assert.Equal(t, "SEV-1234 payments latency", api.body["reason"])
@@ -114,12 +117,12 @@ func TestFreezeCreateCmdReportsTheStopSweep(t *testing.T) {
 	}{
 		{
 			name: "NothingInScope", inEffect: true, sweep: &apitypes.FreezeStopSweep{Stopped: []string{}},
-			want: []string{"Running applies: stop\n", "Stopped:         none; no schema change in scope was pending or running\n"},
+			want: []string{"Running applies: stop\n", "Stop requested:  none; no schema change in scope was pending or running\n"},
 		},
 		{
 			name: "ListFailed", inEffect: true,
 			sweep: &apitypes.FreezeStopSweep{Stopped: []string{}, Error: "SchemaBot could not list the schema changes in scope, so it stopped none of them."},
-			want:  []string{"Stopped:         none. SchemaBot could not list the schema changes in scope, so it stopped none of them.\n"},
+			want:  []string{"Stop requested:  none. SchemaBot could not list the schema changes in scope, so it stopped none of them.\n"},
 		},
 		{
 			name: "StartsLater",
@@ -142,6 +145,25 @@ func TestFreezeCreateCmdReportsTheStopSweep(t *testing.T) {
 			assert.NotContains(t, out, "Not stopped:")
 		})
 	}
+}
+
+// When every apply in scope is one the freeze could not stop, the
+// confirmation says it requested no stop, never that nothing was in scope.
+func TestFreezeCreateCmdReportsOnlyUnstoppedApplies(t *testing.T) {
+	f := freezeFixture()
+	f.Running, f.InEffect = "stop", true
+	f.StopSweep = &apitypes.FreezeStopSweep{Stopped: []string{}, NotStopped: []apitypes.FreezeUnstoppedApply{
+		{ApplyID: "apply-333", Reason: "stop is not supported for this schema change; use cancel to permanently cancel it"},
+	}}
+	api := &freezeAPI{status: http.StatusCreated, reply: f}
+	endpoint := api.start(t)
+
+	out, err := runFreezeCmd(endpoint, (&FreezeCreateCmd{Environment: "production", Reason: "SEV-1234", Running: "stop"}).Run)
+
+	require.NoError(t, err)
+	assert.Contains(t, out, "Stop requested:  none\n")
+	assert.NotContains(t, out, "no schema change in scope")
+	assert.Contains(t, out, "Not stopped:     apply-333 keeps running: stop is not supported")
 }
 
 func TestFreezeCreateCmdPlannedWindow(t *testing.T) {
