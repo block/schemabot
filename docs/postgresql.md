@@ -80,7 +80,10 @@ PostgreSQL support has to reach to leave alpha.
 ## Where it runs
 
 SchemaBot works with PostgreSQL 14 and later, self-hosted or managed,
-including:
+including the providers below. CI tests self-hosted PostgreSQL and the
+[Supabase PostgreSQL image](#supabase-compatibility-tests). It does not test
+hosted Supabase projects, Supavisor, or PlanetScale Postgres, so treat those
+rows as connection guidance rather than tested support.
 
 | Provider | Connect to |
 |---|---|
@@ -91,9 +94,13 @@ including:
 
 Whatever the provider, SchemaBot needs the read-write primary and a connection
 that keeps one PostgreSQL session per client connection. A transaction-mode
-pooler breaks both the schema change session settings and SchemaBot's own
-coordination, so startup refuses one it can detect. Your application keeps
-whatever pooling it already uses.
+pooler can move the schema change's session settings, such as its
+`statement_timeout`, onto another client's backend. SchemaBot does not check a
+target's connection for a pooler, so make sure each target DSN points at a
+direct or session-mode endpoint. Only the storage DSN is checked: startup
+refuses a transaction-mode pooler there it can detect, because SchemaBot
+coordinates its instances with session-scoped advisory locks. Your application
+keeps whatever pooling it already uses.
 
 ## What pg-sprite does
 
@@ -256,7 +263,7 @@ dedicated owner role, read [Table ownership](#table-ownership) before the first
 | A new table, with its indexes | Runs together: the table, then its indexes, built without `CONCURRENTLY` because nothing reads the table yet. See [Greenfield tables](#greenfield-tables) |
 | Row-level security policies on an existing table | Run in one transaction, after you explicitly approve them, because they change who can read rows. See [Row-level security](#row-level-security) |
 | Adding or dropping a foreign key | Shown in the plan, but blocked. See [Blocked plans](#blocked-plans) |
-| A table with no schema file, or a deleted file | Blocked as a `DROP TABLE`. SchemaBot never drops a PostgreSQL table |
+| A table with no schema file, or a deleted file | Blocked as a `DROP TABLE`, except archive tables and `ignore_tables` entries. SchemaBot never drops a PostgreSQL table |
 
 Once a statement starts, it runs until it commits or its timeout ends it; it
 cannot be paused. A concurrent index build is the one change you can cancel
