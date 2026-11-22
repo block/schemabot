@@ -552,6 +552,48 @@ func TestFindAllConfigsFailsClosedOnTruncatedGitTree(t *testing.T) {
 	assert.ErrorIs(t, err, ErrGitTreeTruncated)
 }
 
+// refuseContentReadTransport refuses reads of one repository file the way the
+// quota reserve does, before the request is sent, and sends everything else.
+type refuseContentReadTransport struct {
+	path    string
+	resetAt time.Time
+}
+
+func (rt refuseContentReadTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(req.URL.Path, "/contents/"+rt.path) {
+		return nil, &QuotaReservedError{Operation: "fetch_file_content", Remaining: 40, Reserve: 100, ResetAt: rt.resetAt}
+	}
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+// A walk of the repository's configs that reaches the quota reserve partway
+// says nothing about the config it could not read. The walk fails with the
+// refusal, which carries the reset time, instead of reporting the config as
+// invalid next to the ones it read before the reserve was reached.
+func TestFindAllConfigsReturnsQuotaReserveRefusalInsteadOfInvalidConfig(t *testing.T) {
+	plain, mux := setupConfigTestGitHubServer(t)
+	resetAt := time.Date(2026, 11, 22, 15, 4, 30, 0, time.UTC)
+	client := gh.NewClient(&http.Client{Transport: refuseContentReadTransport{path: "billing/schemabot.yaml", resetAt: resetAt}})
+	client.BaseURL = plain.BaseURL
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"tree": []any{
+			map[string]any{"path": "orders/schemabot.yaml", "type": "blob", "sha": "blob-orders"},
+			map[string]any{"path": "billing/schemabot.yaml", "type": "blob", "sha": "blob-billing"},
+		}}))
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/orders/schemabot.yaml", "database: orders\ntype: mysql\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	result, err := ic.FindAllConfigs(t.Context(), "octocat/hello-world", "abc123")
+
+	require.ErrorIs(t, err, ErrGitHubQuotaReserved)
+	var refusal *QuotaReservedError
+	require.ErrorAs(t, err, &refusal)
+	assert.True(t, resetAt.Equal(refusal.ResetAt))
+	assert.Contains(t, err.Error(), "billing/schemabot.yaml")
+	assert.Nil(t, result, "no partial discovery is returned, so no config is recorded as invalid")
+}
+
 func TestFindAllConfigsForPRFailsClosedOnIncompletePRFileList(t *testing.T) {
 	client, mux := setupConfigTestGitHubServer(t)
 	registerPullRequest(t, mux, "abc123")

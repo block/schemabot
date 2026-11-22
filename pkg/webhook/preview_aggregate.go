@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/storage"
@@ -127,6 +128,20 @@ func PreviewAggregateCheckRollout() string {
 // the author to split the PR so SchemaBot can see the full changed-file list.
 func PreviewAggregateCheckFileCapBlocked() string {
 	return "Plan failed\n\n" + prFileCapExceededBlock.message
+}
+
+// PreviewAggregateCheckQuotaReserved renders the failing aggregate-check
+// output published when the GitHub quota reserve refused the reads that
+// discover a PR's schema changes: once for a delivery SchemaBot retries at the
+// reset, and once for a path that is not retried, where the author re-runs
+// the check.
+func PreviewAggregateCheckQuotaReserved() string {
+	resetAt := time.Date(2026, 1, 15, 15, 4, 30, 0, time.UTC)
+	render := func(retriedAtReset bool) string {
+		return planFailedCheckText + "\n\n" + sanitizeCheckRunErrorSummary(githubQuotaReservedBlockFor(resetAt, retriedAtReset).message)
+	}
+	return "**When SchemaBot retries at the reset**\n\n" + render(true) +
+		"\n\n**When the check has to be re-run**\n\n" + render(false)
 }
 
 // PreviewRollbackConfirmPlanWithoutRouting renders the refusal of a

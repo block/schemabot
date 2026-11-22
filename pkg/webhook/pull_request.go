@@ -465,7 +465,7 @@ func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.In
 	if err != nil {
 		h.logger.Error("failed to read the PR for auto-plan; its base branch cannot be re-verified before publishing",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
-		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err, durableRetryAtQuotaReset(ctx))
 		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return autoPlanDispatch{message: "config discovery failed"}, fmt.Errorf("read %s#%d for auto-plan: %w", repo, pr, err)
 	}
@@ -494,12 +494,12 @@ func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.In
 		cacheKey = h.prPlanDiscoveryKey(repo, pr, prInfo)
 		if !cacheKey.revision.valid() {
 			err := fmt.Errorf("GitHub did not supply the PR head and base revision")
-			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err, durableRetryAtQuotaReset(ctx))
 			return autoPlanDispatch{message: "config discovery failed"}, err
 		}
 		discovery, err = h.cachedPRPlanDiscovery(ctx, client, cacheKey)
 		if err != nil {
-			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err, durableRetryAtQuotaReset(ctx))
 			return autoPlanDispatch{message: "config discovery failed"}, err
 		}
 	}
@@ -508,7 +508,7 @@ func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.In
 		discovery, err = h.readPRPlanDiscovery(ctx, client, repo, pr, prInfo, source, deliveryID)
 		if err != nil {
 			h.logConfigDiscoveryFailure("discover PR planning inputs", repo, pr, headSHA, source, deliveryID, err)
-			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err, durableRetryAtQuotaReset(ctx))
 			h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 			return autoPlanDispatch{message: "config discovery failed"}, err
 		}
@@ -1016,13 +1016,19 @@ func (h *Handler) logConfigDiscoveryFailure(step, repo string, pr int, headSHA, 
 	h.logger.Error("auto-plan config discovery failed", attrs...)
 }
 
-func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, discoveryErr error) {
+// postConfigDiscoveryFailure fails the aggregate closed for a discovery that
+// could not finish. retriedAtReset reports whether the caller's durable
+// delivery re-runs this discovery when a quota reserve refusal lifts, which
+// decides whether the check says SchemaBot retries or asks for a re-run.
+func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, discoveryErr error, retriedAtReset bool) {
 	// The causes stay apart because operators triage them differently: GitHub
-	// being unavailable is an outage to wait out, a PR past GitHub's per-PR
-	// changed-file cap is a property of the PR that no retry can change, and
-	// anything else is a configuration problem to investigate.
+	// being unavailable is an outage to wait out, the quota reserve lifts at a
+	// known reset time, a PR past GitHub's per-PR changed-file cap is a
+	// property of the PR that no retry can change, and anything else is a
+	// configuration problem to investigate.
 	block := configDiscoveryFailedBlock
 	discoveryStatus := "error"
+	var refusal *ghclient.QuotaReservedError
 	switch {
 	case errors.Is(discoveryErr, ghclient.ErrPRFilesIncomplete):
 		// A deterministic cap is a block, not an error: reporting it as one
@@ -1031,6 +1037,11 @@ func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclie
 		discoveryStatus = "blocked"
 	case ghclient.IsUnavailableError(discoveryErr):
 		block = githubConfigDiscoveryUnavailableBlock
+	case errors.As(discoveryErr, &refusal):
+		// The refusal is a deliberate hold on SchemaBot's own reads, not a
+		// discovery error; the quota reserve already counts and logs it.
+		block = githubQuotaReservedBlockFor(refusal.ResetAt, retriedAtReset)
+		discoveryStatus = "blocked"
 	}
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 		Operation:  "schema_config_discovery",

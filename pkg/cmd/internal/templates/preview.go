@@ -189,6 +189,7 @@ const (
 	PreviewCommentShardedAll            PreviewType = "comment_sharded_all"              // Show all sharded apply + plan previews
 	PreviewAggregateCheckSummary        PreviewType = "aggregate_check_summary"          // Aggregate check Details summary (own databases + tenant deployments)
 	PreviewAggregateCheckFileCapBlocked PreviewType = "aggregate_check_file_cap_blocked" // Failing aggregate when the PR exceeds GitHub's changed-file cap
+	PreviewAggregateCheckQuotaReserved  PreviewType = "aggregate_check_quota_reserved"   // Failing aggregate when the GitHub quota reserve refused discovery reads
 	PreviewAggregateCheckStopped        PreviewType = "aggregate_check_stopped"          // Aggregate check while a stopped apply holds the PR
 	PreviewAggregateCheckRollout        PreviewType = "aggregate_check_rollout"          // Aggregate check naming the targets a multi-target rollout still needs
 

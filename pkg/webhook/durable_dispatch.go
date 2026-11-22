@@ -325,6 +325,9 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 	}
 
 	runCtx, cancelRun := context.WithCancel(ctx)
+	if quotaReserveRefusalIsRetried(event, claimedAt) {
+		runCtx = withDurableRetryAtQuotaReset(runCtx)
+	}
 	stopHeartbeat := h.startDurableWebhookHeartbeat(runCtx, driverID, event, cancelRun)
 	process := h.processDurableWebhookEvent
 	if h.durableWebhookProcessOverride != nil {
@@ -640,6 +643,16 @@ func (h *Handler) postDurableCommandTerminalComment(event *storage.WebhookEvent,
 			"pr", event.PullRequest, "error", err)
 		return
 	}
+	// A quota reserve refusal's text carries the installation's remaining
+	// quota and reserve, which belong in the server log (the retry budget
+	// exhaustion is logged with it) and not on the PR. What the author needs
+	// is when the reads go out again.
+	if refusal, ok := errors.AsType[*ghclient.QuotaReservedError](processErr); ok {
+		h.postCommandError(repo, pr, installationID, result.Action, result.Environment, requestedBy,
+			"SchemaBot could not complete this command because it is holding back its remaining GitHub API quota for check runs. "+
+				"Comment the command again after the quota resets at "+quotaResetTime(refusal.ResetAt)+".")
+		return
+	}
 	// The answer carries the wrapped error chain rather than the gates'
 	// curated per-attempt messages. Those messages advise retrying — the
 	// wrong advice once the retry budget is exhausted — while the chain names
@@ -920,6 +933,31 @@ func quotaReserveRefusalIsUncharged(event *storage.WebhookEvent, now time.Time) 
 		return false
 	}
 	return now.Sub(event.ReceivedAt) < quotaReserveUnchargedWindow
+}
+
+// quotaReserveRefusalIsRetried reports whether a quota reserve refusal of this
+// claim would be rescheduled for the reset rather than end the delivery: it is
+// while the refusal is uncharged, and while the claim has attempts left. It is
+// decided from the claim time, before the processing whose refusal it covers.
+func quotaReserveRefusalIsRetried(event *storage.WebhookEvent, claimedAt time.Time) bool {
+	return quotaReserveRefusalIsUncharged(event, claimedAt) || event.Attempts < maxDurableWebhookAttempts
+}
+
+// durableRetryAtQuotaResetKey marks the context of a durable delivery that is
+// retried at the quota reset when the quota reserve refuses one of its reads.
+type durableRetryAtQuotaResetKey struct{}
+
+func withDurableRetryAtQuotaReset(ctx context.Context) context.Context {
+	return context.WithValue(ctx, durableRetryAtQuotaResetKey{}, true)
+}
+
+// durableRetryAtQuotaReset reports whether ctx belongs to a durable delivery
+// that is retried at the quota reset if the quota reserve refuses a read, so
+// a refusal can tell the author SchemaBot retries then. It is false on the
+// request path and for work a delivery starts but does not wait for.
+func durableRetryAtQuotaReset(ctx context.Context) bool {
+	marked, _ := ctx.Value(durableRetryAtQuotaResetKey{}).(bool)
+	return marked
 }
 
 // quotaReserveRetryAt returns when to retry a delivery the quota reserve

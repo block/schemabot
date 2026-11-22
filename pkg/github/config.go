@@ -249,7 +249,10 @@ func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref stri
 		return result, nil
 	}
 
-	result := ic.collectConfigsFromTree(ctx, repo, ref, entries)
+	result, err := ic.collectConfigsFromTree(ctx, repo, ref, entries)
+	if err != nil {
+		return nil, err
+	}
 
 	ic.logger.Debug("config discovery complete",
 		"valid", len(result.ValidConfigs),
@@ -261,14 +264,18 @@ func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref stri
 
 // collectConfigsFromTree fetches and parses every schemabot.yaml among the
 // given tree entries. Unparseable configs are reported as invalid rather than
-// failing the whole discovery.
-func (ic *InstallationClient) collectConfigsFromTree(ctx context.Context, repo, ref string, entries []TreeEntry) *FindAllConfigsResult {
+// failing the whole discovery. A read the quota reserve refused says nothing
+// about the config, so it fails the walk instead of being reported as invalid.
+func (ic *InstallationClient) collectConfigsFromTree(ctx context.Context, repo, ref string, entries []TreeEntry) (*FindAllConfigsResult, error) {
 	result := &FindAllConfigsResult{}
 	for _, entry := range entries {
 		if entry.Type != "blob" || !isConfigFile(entry.Path) {
 			continue
 		}
 		config, err := ic.FetchConfig(ctx, repo, entry.Path, ref)
+		if errors.Is(err, ErrGitHubQuotaReserved) {
+			return nil, fmt.Errorf("read schemabot config %s in repo %s ref %s: %w", entry.Path, repo, ref, err)
+		}
 		if err != nil {
 			ic.logger.Warn("failed to parse config", "path", entry.Path, "error", err)
 			result.InvalidConfigs = append(result.InvalidConfigs, InvalidConfigInfo{
@@ -284,7 +291,7 @@ func (ic *InstallationClient) collectConfigsFromTree(ctx context.Context, repo, 
 			SchemaDir: path.Dir(entry.Path),
 		})
 	}
-	return result
+	return result, nil
 }
 
 // findAllConfigsForDatabase discovers configs for a database-scoped lookup.
@@ -300,7 +307,11 @@ func (ic *InstallationClient) findAllConfigsForDatabase(ctx context.Context, rep
 		return nil, nil, false, fmt.Errorf("fetch git tree: %w", err)
 	}
 	if !truncated {
-		return ic.collectConfigsFromTree(ctx, repo, ref, entries), nil, false, nil
+		result, err := ic.collectConfigsFromTree(ctx, repo, ref, entries)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		return result, nil, false, nil
 	}
 	result, searchedDirs, ok, hintErr := ic.findConfigsInDatabaseHintDirs(ctx, repo, ref, databaseName)
 	if hintErr != nil {
@@ -420,6 +431,9 @@ func (ic *InstallationClient) scanHintDirsForConfigs(ctx context.Context, repo, 
 			seen[configPath] = struct{}{}
 
 			config, err := ic.FetchConfig(ctx, repo, configPath, ref)
+			if errors.Is(err, ErrGitHubQuotaReserved) {
+				return nil, fmt.Errorf("read schemabot config %s in repo %s ref %s: %w", configPath, repo, ref, err)
+			}
 			if err != nil {
 				ic.logger.Warn("failed to parse config", "path", configPath, "error", err)
 				result.InvalidConfigs = append(result.InvalidConfigs, InvalidConfigInfo{
