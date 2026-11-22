@@ -85,6 +85,12 @@ func metricActionKey(action string) string {
 // base commits), so unrelated commits elsewhere in a monorepo never block an
 // apply.
 //
+// sharedSchemaPeers are the inputs of the databases this one's ignore_tables
+// were compared with (verifySharedSchemaIgnoreLists). That comparison read
+// them at the PR head, so a base change to them that the branch lacks makes
+// the comparison stale as surely as a change to this database's own schema
+// makes its plan stale, and the apply is refused the same way.
+//
 // Returns rejected=true only for a verified stale branch. GitHub read
 // uncertainty stops the apply rather than silently bypassing the guard, and is
 // returned as an error, not a rejection: freshness could not be verified, so
@@ -97,12 +103,14 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 	pr int,
 	installationID int64,
 	schema *ghclient.SchemaRequestResult,
+	sharedSchemaPeers []sharedSchemaPeerInputs,
 	prInfo *ghclient.PullRequestInfo,
 	environment string,
 	requestedBy string,
 	action string,
 ) (rejected bool, err error) {
-	changed, baseTipSHA, err := client.SchemaPathsChangedSinceMergeBase(ctx, repo, prInfo.BaseRef, prInfo.HeadSHA, environmentSchemaPaths(schema))
+	paths, peerOfPath := baseFreshnessPaths(schema, sharedSchemaPeers)
+	changed, baseTipSHA, err := client.SchemaPathsChangedSinceMergeBase(ctx, repo, prInfo.BaseRef, prInfo.HeadSHA, paths)
 	if err != nil && len(changed) == 0 {
 		h.logger.Error("apply stopped: could not verify base schema freshness",
 			"repo", repo,
@@ -111,6 +119,7 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 			"database", schema.Database,
 			"database_type", schema.Type,
 			"schema_path", schema.SchemaPath,
+			"compared_paths", paths,
 			"base_ref", prInfo.BaseRef,
 			"head_sha", prInfo.HeadSHA,
 			"action", action,
@@ -139,6 +148,7 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 			"changed_paths", changed, "action", action, "error", err)
 	}
 
+	shownPath, shownPeer := stalePathToShow(schema, changed, peerOfPath)
 	h.logger.Warn("apply rejected: schema path changed on base branch after PR divergence",
 		"repo", repo,
 		"pr", pr,
@@ -146,6 +156,8 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 		"database", schema.Database,
 		"database_type", schema.Type,
 		"schema_path", schema.SchemaPath,
+		"changed_paths", changed,
+		"shared_schema_peer", shownPeer,
 		"base_ref", prInfo.BaseRef,
 		"base_tip_sha", baseTipSHA,
 		"head_sha", prInfo.HeadSHA,
@@ -154,12 +166,51 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 	)
 	metrics.RecordBaseSchemaFreshnessRejected(ctx, metricActionKey(action), environment, "stale")
 	h.postComment(repo, pr, installationID, templates.RenderBaseSchemaFreshnessRejection(templates.BaseSchemaFreshnessRejectionData{
-		RequestedBy: requestedBy,
-		Database:    schema.Database,
-		Environment: environment,
-		SchemaPath:  schema.SchemaPath,
+		RequestedBy:      requestedBy,
+		Database:         schema.Database,
+		Environment:      environment,
+		SchemaPath:       shownPath,
+		SharedSchemaPeer: shownPeer,
 	}))
 	return true, nil
+}
+
+// baseFreshnessPaths lists the paths an apply's base freshness check compares:
+// the database's own environment schema paths, then each shared schema peer's
+// inputs. peerOfPath names the peer for each path that is only a peer's, so a
+// rejection can say whose files changed.
+func baseFreshnessPaths(schema *ghclient.SchemaRequestResult, sharedSchemaPeers []sharedSchemaPeerInputs) (paths []string, peerOfPath map[string]string) {
+	paths = environmentSchemaPaths(schema)
+	own := map[string]bool{}
+	for _, p := range paths {
+		own[p] = true
+	}
+	peerOfPath = map[string]string{}
+	for _, peer := range sharedSchemaPeers {
+		for _, p := range peer.Paths {
+			if own[p] {
+				continue
+			}
+			if _, seen := peerOfPath[p]; seen {
+				continue
+			}
+			peerOfPath[p] = peer.Database
+			paths = append(paths, p)
+		}
+	}
+	return paths, peerOfPath
+}
+
+// stalePathToShow picks the changed path a stale rejection names. A change to
+// the database's own schema leads, since that is what its plan would revert;
+// otherwise the rejection names the first changed peer path and its database.
+func stalePathToShow(schema *ghclient.SchemaRequestResult, changed []string, peerOfPath map[string]string) (path, peer string) {
+	for _, p := range changed {
+		if _, isPeer := peerOfPath[p]; !isPeer {
+			return schema.SchemaPath, ""
+		}
+	}
+	return changed[0], peerOfPath[changed[0]]
 }
 
 // environmentSchemaPaths are the paths whose content decides an environment's

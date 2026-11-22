@@ -75,6 +75,20 @@ func TestRenderBaseSchemaFreshnessRejection(t *testing.T) {
 		require.Contains(t, out, "@alice")
 	})
 
+	t.Run("a database sharing the schema changed", func(t *testing.T) {
+		out := RenderBaseSchemaFreshnessRejection(BaseSchemaFreshnessRejectionData{
+			Database:         "shop_sharded",
+			Environment:      "production",
+			SchemaPath:       "schema/shop",
+			SharedSchemaPeer: "shop",
+		})
+
+		require.Contains(t, out, "newer changes to `schema/shop`, the schema of `shop`, which shares a schema with this database")
+		require.Contains(t, out, "compared with the older version")
+		require.Contains(t, out, "Merge or rebase")
+		require.NotContains(t, out, "schema directory")
+	})
+
 	t.Run("verification failure is sanitized", func(t *testing.T) {
 		out := RenderBaseSchemaFreshnessRejection(BaseSchemaFreshnessRejectionData{
 			Database:          "orders",
