@@ -29,6 +29,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/applynotifications"
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/drain"
 	"github.com/block/schemabot/pkg/engine"
@@ -733,6 +734,12 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	// serves a disabled webhook endpoint and skips comment reconciliation.
 	webhookRuntime, err := buildWebhookRuntime(cfg, svc, logger)
 	if err != nil {
+		return nil, err
+	}
+
+	// Register after the webhook runtime: its handler owns the GitHub callback.
+	// With no handler there is no terminal hook, so these deployments send nothing.
+	if err := configureApplyNotifications(ctx, cfg, svc, logger); err != nil {
 		return nil, err
 	}
 
@@ -1864,4 +1871,21 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups, opera
 	default:
 		return nil, fmt.Errorf("auth type %q is not yet supported", cfg.Type)
 	}
+}
+
+// configureApplyNotifications only decorates an existing summary publisher;
+// it deliberately leaves deployments without a webhook callback uncovered.
+func configureApplyNotifications(ctx context.Context, cfg *api.ServerConfig, svc *api.Service, logger *slog.Logger) error {
+	if err := cfg.ApplyNotifications.Validate(); err != nil {
+		return err
+	}
+	if !cfg.ApplyNotifications.Enabled || svc.OnApplyTerminalSummary == nil {
+		return nil
+	}
+	publisher, err := applynotifications.NewSQS(ctx, cfg.ApplyNotifications.QueueURL)
+	if err != nil {
+		return fmt.Errorf("configure apply notifications: %w", err)
+	}
+	svc.OnApplyTerminalSummary = applynotifications.Wrap(svc.OnApplyTerminalSummary, publisher, logger)
+	return nil
 }
