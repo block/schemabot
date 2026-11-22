@@ -1265,6 +1265,21 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "the caller %q is reserved for SchemaBot's own stop; send the stop under your own name", caller)
 	}
+	// Status reads a stop sent under a freeze's caller as that freeze's stop,
+	// so only the freeze may send one.
+	if storage.IsFreezeStopCaller(caller) {
+		s.logger.Warn("refused a stop sent under the caller SchemaBot reserves for a freeze's stop",
+			append(apply.LogAttrs(), "caller", caller)...)
+		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "the caller %q is reserved for the stop a freeze issues; send the stop under your own name", caller)
+	}
+	return s.stopApply(ctx, client, apply, ternApplyID, environment, caller)
+}
+
+// stopApply records durable stop intent for an apply under a caller already
+// resolved and checked, and attempts an immediate local stop. Its returns are
+// those of executeStopForApply.
+func (s *Service) stopApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) (*apitypes.StopResponse, int, error) {
 	if apply.Engine == storage.EnginePlanetScale {
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "stop is not supported for this schema change; use cancel to permanently cancel it")
@@ -1280,12 +1295,16 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 	}
 	metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
-		logMessage := "Stop requested by user"
+		requester := "user"
+		if freezeID, byFreeze := storage.FreezeFromStopCaller(caller); byFreeze {
+			requester = "freeze " + freezeID
+		}
+		logMessage := "Stop requested by " + requester
 		switch responseStatus {
 		case stopResponseStatusAlreadyRequested:
-			logMessage = "Stop requested by user while stop request already pending"
+			logMessage = "Stop requested by " + requester + " while stop request already pending"
 		case apitypes.ControlStatusStartWithdrawn:
-			logMessage = "Stop requested by user withdrew the queued start; schema change stays stopped"
+			logMessage = "Stop requested by " + requester + " withdrew the queued start; schema change stays stopped"
 		}
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested, logMessage)
 		switch responseStatus {
@@ -1963,6 +1982,25 @@ type startControlRequestMetadata struct {
 	// start was accepted. Duplicate start calls use this metadata so clients see
 	// the same "already complete" count as the original request.
 	SkippedCount int64 `json:"skipped_count,omitempty"`
+	// FreezeOverride is the approved freeze override request that admitted
+	// this start, so the claim checkpoint honors that request and no other.
+	FreezeOverride string `json:"freeze_override,omitempty"`
+}
+
+// admittingFreezeOverrideKey carries, to the write that records a start, the
+// approved freeze override request that admitted it.
+type admittingFreezeOverrideKey struct{}
+
+func withAdmittingFreezeOverride(ctx context.Context, request *storage.FreezeOverrideRequest) context.Context {
+	if request == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, admittingFreezeOverrideKey{}, request.Identifier)
+}
+
+func admittingFreezeOverride(ctx context.Context) string {
+	id, _ := ctx.Value(admittingFreezeOverrideKey{}).(string)
+	return id
 }
 
 const (
@@ -2041,7 +2079,7 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 	var overridden *storage.FreezeOverrideRequest
 	resumeGate := func() error {
 		gatedCtx, approved, err := s.checkChangeGatesForApply(ctx, changeGateCheckpointResume, apply, caller, override)
-		admitCtx = gatedCtx
+		admitCtx = withAdmittingFreezeOverride(gatedCtx, approved)
 		overridden = approved
 		return err
 	}
@@ -2395,8 +2433,9 @@ func (s *Service) persistStartRequestForOperator(ctx context.Context, apply *sto
 
 func (s *Service) createStartControlRequest(ctx context.Context, apply *storage.Apply, caller string, startedCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
 	return s.createControlRequest(ctx, apply, storage.ControlOperationStart, caller, startControlRequestMetadata{
-		StartedCount: startedCount,
-		SkippedCount: skippedCount,
+		StartedCount:   startedCount,
+		SkippedCount:   skippedCount,
+		FreezeOverride: admittingFreezeOverride(ctx),
 	})
 }
 

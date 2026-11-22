@@ -303,11 +303,25 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		if err := refuseTableDeclaredTwice(namespace, parsed); err != nil {
 			return nil, err
 		}
+		if err := refuseEnumTypeDeclaredTwice(namespace, parsed); err != nil {
+			return nil, err
+		}
 		schemaChange := engine.SchemaChange{Namespace: namespace}
 		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
 		for _, filename := range files {
 			file := parsed[filename]
+			// An enum type is not a table: it stays out of desiredTables,
+			// so it never counts against the undeclared-table drops, the
+			// ignore list, or the rollback baseline.
+			if enumType, ok := file.EnumType(); ok {
+				enumChanges, err := planEnumType(ctx, pool, namespace, enumType, parser)
+				if err != nil {
+					return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+				}
+				schemaChange.TableChanges = append(schemaChange.TableChanges, enumChanges...)
+				continue
+			}
 			if rowSecurity, ok := file.RowSecurity(); ok {
 				rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity)
 				if err != nil {
@@ -402,10 +416,14 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 // operator knows which one to remove. It runs before any file is planned, on
 // the same admitted files the plan uses, and applies the same rule every
 // planner does (ddl.TableDeclarations), so a duplicate declaration reads the
-// same whichever engine refuses it.
+// same whichever engine refuses it. An enum types file declares no table and
+// is checked by refuseEnumTypeDeclaredTwice instead.
 func refuseTableDeclaredTwice(namespace string, files map[string]pgstatement.DesiredFile) error {
 	var declared ddl.TableDeclarations
 	for _, filename := range sortedKeys(files) {
+		if _, ok := files[filename].EnumType(); ok {
+			continue
+		}
 		if err := declared.Declare(filename, files[filename].Table()); err != nil {
 			return fmt.Errorf("plan PostgreSQL namespace %q: %w", namespace, err)
 		}

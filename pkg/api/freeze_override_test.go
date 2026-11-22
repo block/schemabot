@@ -37,8 +37,8 @@ type memoryFreezeOverrideStore struct {
 	mu       sync.Mutex
 	clock    clock.Clock
 	requests []*storage.FreezeOverrideRequest
-	// listErr and createErr fail ListApproved and Create.
-	listErr, createErr error
+	// listErr, createErr and getErr fail ListApproved, Create and Get.
+	listErr, createErr, getErr error
 }
 
 func (m *memoryFreezeOverrideStore) Create(_ context.Context, request *storage.FreezeOverrideRequest) (*storage.FreezeOverrideRequest, error) {
@@ -59,6 +59,9 @@ func (m *memoryFreezeOverrideStore) Create(_ context.Context, request *storage.F
 }
 
 func (m *memoryFreezeOverrideStore) Get(_ context.Context, identifier string) (*storage.FreezeOverrideRequest, error) {
+	if m.getErr != nil {
+		return nil, m.getErr
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, request := range m.requests {
@@ -182,7 +185,7 @@ func TestFreezeOverrideLetsAnApplyThrough(t *testing.T) {
 	require.NotNil(t, resp.OverrideRequest)
 	id := resp.OverrideRequest.ID
 	assert.True(t, strings.HasPrefix(id, "ovr-"), id)
-	assert.Contains(t, resp.Error, "override request "+id+" needs a freeze approver other than you")
+	assert.Contains(t, resp.Error, "Override request "+id+" needs a freeze approver other than you")
 	stored, err := store.Get(t.Context(), id)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"freeze freeze-incident"}, stored.Blockers)
@@ -197,7 +200,7 @@ func TestFreezeOverrideLetsAnApplyThrough(t *testing.T) {
 	assert.NotContains(t, decodeGateError(t, rec).Error, "keeps that reason")
 	rec = postAs(t, mux, overrideRequester, "/api/apply", `{"plan_id":"plan-1","environment":"staging","override":"another reason"}`)
 	require.Equal(t, http.StatusConflict, rec.Code)
-	assert.Contains(t, decodeGateError(t, rec).Error, `(you asked for it earlier, and it keeps that reason: "fix for incident 42")`)
+	assert.Contains(t, decodeGateError(t, rec).Error, `You asked for it earlier, and it keeps that reason: "fix for incident 42".`)
 	assert.Equal(t, 1, store.count())
 
 	approveOverride(t, store, id)

@@ -681,7 +681,7 @@ func TestChecks(t *testing.T, h Harness) {
 		stale := transition
 		stale.HasChanges = false
 		stale.Conclusion = "success"
-		marked, err := store.Checks().MarkStalePlanSuccessful(ctx, &stale)
+		marked, err := store.Checks().MarkStalePlanSuccessful(ctx, &stale, stale.HeadSHA)
 		require.NoError(t, err)
 		require.True(t, marked)
 		stored = get("rollout_db")
@@ -843,7 +843,7 @@ func TestChecks(t *testing.T, h Harness) {
 		success.HeadSHA = "new"
 		success.HasChanges = false
 		success.Conclusion = "success"
-		marked, err := store.Checks().MarkStalePlanSuccessful(ctx, &success)
+		marked, err := store.Checks().MarkStalePlanSuccessful(ctx, &success, planOnly.HeadSHA)
 		require.NoError(t, err)
 		assert.True(t, marked)
 
@@ -856,7 +856,7 @@ func TestChecks(t *testing.T, h Harness) {
 		guarded.HasChanges = false
 		guarded.Status = "completed"
 		guarded.Conclusion = "success"
-		marked, err = store.Checks().MarkStalePlanSuccessful(ctx, guarded)
+		marked, err = store.Checks().MarkStalePlanSuccessful(ctx, guarded, "old")
 		require.NoError(t, err)
 		assert.False(t, marked)
 
@@ -868,7 +868,7 @@ func TestChecks(t *testing.T, h Harness) {
 		owned.HeadSHA = "new"
 		owned.ApplyID = 0
 		owned.Conclusion = "success"
-		marked, err = store.Checks().MarkStalePlanSuccessful(ctx, owned)
+		marked, err = store.Checks().MarkStalePlanSuccessful(ctx, owned, "old")
 		require.NoError(t, err)
 		assert.False(t, marked)
 		stored, err := store.Checks().Get(ctx, "org/repo", 123, "staging", storage.DatabaseTypeMySQL, "owned_completed_stale_db")
@@ -876,6 +876,76 @@ func TestChecks(t *testing.T, h Harness) {
 		require.NotNil(t, stored)
 		assert.Equal(t, "action_required", stored.Conclusion)
 		assert.Equal(t, apply.ID, stored.ApplyID)
+	})
+
+	// Two plans settle the same plan-only row. The plan for commit B reads it on
+	// commit A, but the plan for the newer commit C settles it first. The slower
+	// write for B must leave the row on C, or C's aggregate would read the row
+	// as left on an earlier commit and wait for a plan that may never come.
+	t.Run("MarkStalePlanSuccessfulLeavesRowANewerWriteMoved", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		read := &storage.Check{Repository: "org/repo", PullRequest: 123, HeadSHA: "sha-a", Environment: "sandbox", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "moved_db", Status: "completed", Conclusion: "failure"}
+		require.NoError(t, store.Checks().Upsert(ctx, read))
+
+		newer := *read
+		newer.HeadSHA = "sha-c"
+		newer.Conclusion = "success"
+		marked, err := store.Checks().MarkStalePlanSuccessful(ctx, &newer, "sha-a")
+		require.NoError(t, err)
+		require.True(t, marked)
+
+		older := *read
+		older.HeadSHA = "sha-b"
+		older.Conclusion = "success"
+		marked, err = store.Checks().MarkStalePlanSuccessful(ctx, &older, "sha-a")
+		require.NoError(t, err)
+		assert.False(t, marked)
+		stored, err := store.Checks().Get(ctx, "org/repo", 123, "sandbox", storage.DatabaseTypeMySQL, "moved_db")
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "sha-c", stored.HeadSHA, "the newer write keeps the row")
+		assert.Equal(t, "success", stored.Conclusion)
+	})
+
+	// A plan-only row no plan can store again is removed, and removing it again
+	// is a no-op that still reports it gone. A row an apply owns, or one a
+	// newer write moved off the head the caller read it at, is kept.
+	t.Run("DeleteStalePlanOnly", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		get := func(name string) *storage.Check {
+			stored, err := store.Checks().Get(ctx, "org/repo", 123, "sandbox", storage.DatabaseTypeMySQL, name)
+			require.NoError(t, err)
+			return stored
+		}
+		planOnly := &storage.Check{Repository: "org/repo", PullRequest: 123, HeadSHA: "sha-a", Environment: "sandbox", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "removed_db", Status: "completed", Conclusion: "action_required", HasChanges: true}
+		require.NoError(t, store.Checks().Upsert(ctx, planOnly))
+		removed, err := store.Checks().DeleteStalePlanOnly(ctx, planOnly, "sha-a")
+		require.NoError(t, err)
+		assert.True(t, removed)
+		assert.Nil(t, get("removed_db"))
+		removed, err = store.Checks().DeleteStalePlanOnly(ctx, planOnly, "sha-a")
+		require.NoError(t, err)
+		assert.True(t, removed, "a row already gone counts as removed")
+
+		moved := &storage.Check{Repository: "org/repo", PullRequest: 123, HeadSHA: "sha-c", Environment: "sandbox", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "moved_db", Status: "completed", Conclusion: "success"}
+		require.NoError(t, store.Checks().Upsert(ctx, moved))
+		removed, err = store.Checks().DeleteStalePlanOnly(ctx, moved, "sha-a")
+		require.NoError(t, err)
+		assert.False(t, removed)
+		require.NotNil(t, get("moved_db"))
+		assert.Equal(t, "sha-c", get("moved_db").HeadSHA, "a newer write keeps the row")
+
+		lock := CreateLock(t, store, "owned_removed_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "removed-env-guard", 711, state.Apply.Running, "sandbox")
+		owned := &storage.Check{Repository: "org/repo", PullRequest: 123, HeadSHA: "sha-a", Environment: "sandbox", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "owned_removed_db", ApplyID: apply.ID, HasChanges: true, Status: "in_progress"}
+		require.NoError(t, store.Checks().Upsert(ctx, owned))
+		removed, err = store.Checks().DeleteStalePlanOnly(ctx, owned, "sha-a")
+		require.NoError(t, err)
+		assert.False(t, removed)
+		require.NotNil(t, get("owned_removed_db"))
+		assert.Equal(t, apply.ID, get("owned_removed_db").ApplyID, "an apply-owned row is never removed")
 	})
 
 	// Stale cleanup reads an in-progress apply-owned row, the apply completes,
@@ -1359,8 +1429,12 @@ func TestChecks(t *testing.T, h Harness) {
 		_, err := h.NewUnreachableStorage(t).Checks().RecoverApplyOwnedCheckWithNoOpPlan(t.Context(), check)
 		require.Error(t, err)
 	})
+	t.Run("DeleteStalePlanOnly_DBError", func(t *testing.T) {
+		_, err := h.NewUnreachableStorage(t).Checks().DeleteStalePlanOnly(t.Context(), check, check.HeadSHA)
+		require.Error(t, err)
+	})
 	t.Run("MarkStalePlanSuccessful_DBError", func(t *testing.T) {
-		_, err := h.NewUnreachableStorage(t).Checks().MarkStalePlanSuccessful(t.Context(), check)
+		_, err := h.NewUnreachableStorage(t).Checks().MarkStalePlanSuccessful(t.Context(), check, check.HeadSHA)
 		require.Error(t, err)
 	})
 	t.Run("BlockStaleStartedApply_DBError", func(t *testing.T) {

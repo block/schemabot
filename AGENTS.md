@@ -34,7 +34,7 @@ make lint                 # golangci-lint via Docker
 
 Four test layers, each with its own make target:
 
-- **Unit** (`make test-unit`, `./...`) — No containers, no network. Fast. Tests individual functions and packages with `-race`.
+- **Unit** (`make test-unit`, `./...` plus the Python tests under `scripts/`) — No containers, no network. Fast. Tests individual functions and packages with `-race`, and the shell scripts the test targets run.
 - **Consumer module** (`make test-consumer-module`, `e2e/consumermodule/`) — No containers, no network, no build tags. A nested Go module that embeds schemabot the way a host binary does, pinning newer dependency versions than this repo to prove the public startup surface tolerates version skew. Runs in the Unit Tests CI job. Module-boundary tests belong here.
 - **Integration** (`make test-integration`, `-tags=integration ./...`) — A mix of Docker containers (MySQL via testcontainers) and in-process server/gRPC components. Tests cross-package interactions without requiring a full deployment. Lives in `pkg/` and `integration/`.
 - **E2E** (`make test-e2e`, `-tags=e2e ./e2e/...`) — Full docker-compose stack. All components (SchemaBot server, MySQL instances) are real containers — nothing is in-process or mocked. Tests the CLI against a running system. Lives in `e2e/local/` and `e2e/grpc/`.

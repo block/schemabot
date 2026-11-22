@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -196,7 +197,7 @@ func inspectChecks(ctx context.Context, cfg *ServerConfig, store storage.Storage
 	}
 
 	for _, check := range cfg.CheckRowsForEnvironment(stored, req.Environment, req.Repo, req.PullRequest, prInfo.HeadSHA) {
-		response.Rows = append(response.Rows, inspectedCheck(ctx, store, check, prInfo.HeadSHA, logger))
+		response.Rows = append(response.Rows, inspectedCheck(ctx, cfg, store, check, prInfo.HeadSHA, logger))
 	}
 	// Ordered on every field that distinguishes two rows, so the answer does
 	// not depend on the order storage returned them in: a database name is
@@ -236,9 +237,13 @@ func inspectChecks(ctx context.Context, cfg *ServerConfig, store storage.Storage
 // The apply is resolved before the row is diagnosed, not after: whether the
 // gate is waiting or owed turns on the owner's state, so a disposition derived
 // without it would report a stopped apply as one in flight.
-func inspectedCheck(ctx context.Context, store storage.Storage, check *storage.Check, headSHA string, logger *slog.Logger) InspectedCheck {
+//
+// cfg is the server config the row is read against, or nil when the caller has
+// none; without it, a row in an environment the database no longer has reads
+// as it would in a configured one.
+func inspectedCheck(ctx context.Context, cfg *ServerConfig, store storage.Storage, check *storage.Check, headSHA string, logger *slog.Logger) InspectedCheck {
 	apply := applyHoldingCheck(ctx, store, check, logger)
-	disposition := checkstate.Diagnose(check, headSHA, apply)
+	disposition := checkstate.Diagnose(check, headSHA, apply, planEnvironmentForUnconfiguredCheck(cfg, check, logger))
 	row := InspectedCheck{
 		Environment:    check.Environment,
 		DatabaseType:   check.DatabaseType,
@@ -394,4 +399,44 @@ type headCheckRuns struct {
 	missing            []string
 	unreadable         []string
 	untrustedConflicts []string
+}
+
+// planEnvironmentForUnconfiguredCheck names an environment whose plan removes
+// the row, when this server no longer plans the row's database in the row's
+// environment: the environment is not configured for the database, or this
+// instance's allowed_environments leaves it out. The webhook plan reads the
+// same two settings when it removes such a row. It returns the first
+// environment, in promotion order, that this server still plans the database
+// in. It returns "" when the row's environment is still planned, when the
+// answer is not known, or when no environment is left to plan: the row then
+// keeps the diagnosis it has today rather than naming a plan that cannot run.
+func planEnvironmentForUnconfiguredCheck(cfg *ServerConfig, check *storage.Check, logger *slog.Logger) string {
+	if checkstate.IsAggregate(check) {
+		return ""
+	}
+	if cfg == nil {
+		logger.Debug("check diagnosis reads the row as configured because no server config is available",
+			"repo", check.Repository, "pr", check.PullRequest, "database", check.DatabaseName,
+			"database_type", check.DatabaseType, "environment", check.Environment, "check_id", check.ID)
+		return ""
+	}
+	environments, err := cfg.DatabaseEnvironments(check.DatabaseName)
+	if err != nil {
+		logger.Warn("check diagnosis reads the row as configured because the database's environments could not be resolved",
+			"repo", check.Repository, "pr", check.PullRequest, "database", check.DatabaseName,
+			"database_type", check.DatabaseType, "environment", check.Environment, "check_id", check.ID, "error", err)
+		return ""
+	}
+	if slices.Contains(environments, check.Environment) && cfg.IsEnvironmentAllowed(check.Environment) {
+		return ""
+	}
+	for _, environment := range environments {
+		if cfg.IsEnvironmentAllowed(environment) {
+			return environment
+		}
+	}
+	logger.Warn("check diagnosis reads the row as configured because the database has no environment left on this server to plan",
+		"repo", check.Repository, "pr", check.PullRequest, "database", check.DatabaseName,
+		"database_type", check.DatabaseType, "environment", check.Environment, "check_id", check.ID)
+	return ""
 }

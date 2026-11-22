@@ -255,12 +255,15 @@ type CheckStore interface {
 	// from in_progress to a successful no-op plan result. Returns true when recovery occurred.
 	RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, check *Check) (bool, error)
 
-	// MarkStalePlanSuccessful marks plan-only stored check state successful when
-	// the database it covers is no longer in the PR. It fails closed: the update
-	// is skipped when the row is in_progress or owns an apply ID, so a started
-	// apply that began after stale cleanup read the row keeps blocking the PR.
-	// Returns true when the row was marked successful.
-	MarkStalePlanSuccessful(ctx context.Context, check *Check) (bool, error)
+	// MarkStalePlanSuccessful marks plan-only stored check state successful on
+	// check.HeadSHA when nothing will replace the row. It fails closed: the
+	// update is skipped when the row is in_progress or owns an apply ID, so a
+	// started apply that began after stale cleanup read the row keeps blocking
+	// the PR. readHeadSHA is the head the caller read the row at; a row a newer
+	// write moved to any head other than readHeadSHA or check.HeadSHA belongs to
+	// that write and is left alone. Returns true when the row is plan-only
+	// successful on check.HeadSHA after the call.
+	MarkStalePlanSuccessful(ctx context.Context, check *Check, readHeadSHA string) (bool, error)
 
 	// BlockStaleStartedApply records that the schema change a started apply
 	// owns is gone from the PR: it moves the row onto headSHA with check's
@@ -340,6 +343,13 @@ type CheckStore interface {
 
 	// Delete removes stored check state by ID.
 	Delete(ctx context.Context, id int64) error
+
+	// DeleteStalePlanOnly removes check's plan-only row when no plan can store
+	// it again. It fails closed: a row that is in_progress or owns an apply ID
+	// is kept, and so is a row a newer write moved off readHeadSHA, the head the
+	// caller read it at. Returns true when no row is stored for check's key
+	// after the call.
+	DeleteStalePlanOnly(ctx context.Context, check *Check, readHeadSHA string) (bool, error)
 
 	// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a
 	// closed PR, retaining apply-owned rows the close must not unblock. Once
@@ -2034,6 +2044,16 @@ type ApplyOperationStore interface {
 	// longer matches (another writer rotated or cleared it), in which case the
 	// row has moved on and needs nothing from the caller.
 	ReleaseClaim(ctx context.Context, lease OperationLease) (bool, error)
+
+	// ReturnUnstartedClaim hands back an operation a driver claimed to start
+	// but will not start, as it was before the claim: an operation claimed out
+	// of pending goes back to pending with no started_at, and one claimed out
+	// of stopped goes back to stopped. claimedFrom is that earlier state,
+	// pending or stopped. Unlike ReleaseClaim, the row does not re-enter as
+	// active work a later claim would drive without starting it again. The
+	// write is guarded on the lease token and on the state the claim moved
+	// the row to; it reports false when either no longer matches.
+	ReturnUnstartedClaim(ctx context.Context, lease OperationLease, claimedFrom string) (bool, error)
 
 	// ReleaseFinishedClaim hands back the lease on an operation whose drive has
 	// ended. A drive that finishes leaves its lease in place, so the row it

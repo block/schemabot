@@ -614,7 +614,10 @@ still gets one: an explicit passing "no schema files changed". GitHub treats a m
 check as not passing, so having nothing to say has to be said rather than left empty. The same
 logic applies in reverse. When SchemaBot expects a check, environment, or config and cannot find
 it, that reads as blocking, never as not-applicable. A gate must not be removable by the very
-change it guards. *Enforced:* aggregate creation on head-commit events
+change it guards. An environment the server config no longer lists for a database is no longer
+expected, so a plan of that database removes the plan-only rows left in it; a row a started apply
+owns keeps blocking (MG-6), and an environment listed again reads as missing, never as passing.
+*Enforced:* aggregate creation on head-commit events
 (`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); verified per-environment
 scope and pending contributions for missing local results (`pkg/webhook/aggregate_scope.go`,
 `pkg/webhook/check_publisher.go`); config discovery, the command
@@ -697,11 +700,12 @@ A later commit that removes the schema change must not make the aggregate pass b
 the check stays blocked (`schema_removed_after_apply_started`) until the apply settles and an
 operator reconciles the target. Closing and reopening the PR does not wash this state away.
 *Enforced:* stale-check cleanup and the plan that settles the rows a database left under an old
-type, both of which block a row a started apply owns instead of clearing it (`cleanupStaleChecks`
-and `settleChecksReplacedByNewType` in `pkg/webhook/pull_request.go`, the latter called from
-`handlePlanCommand` and `handleMultiEnvPlan` in `pkg/webhook/plan.go`, and `checkHasStartedApply` in
-`pkg/webhook/check_aggregate.go`), and the storage write that marks a stale plan successful only
-while no apply owns the row (`MarkStalePlanSuccessful` in `pkg/storage/internal/sqlstore/checks.go`);
+type or in an environment it no longer has, both of which block a row a started apply owns instead
+of clearing it (`cleanupStaleChecks` and `settleLeftBehindChecks` in `pkg/webhook/pull_request.go`,
+the latter called from `handlePlanCommand` and `handleMultiEnvPlan` in `pkg/webhook/plan.go`, and
+`checkHasStartedApply` in `pkg/webhook/check_aggregate.go`), and the storage writes that mark a stale plan successful,
+or remove one in an environment the database no longer has, only while no apply owns the row
+(`MarkStalePlanSuccessful` and `DeleteStalePlanOnly` in `pkg/storage/internal/sqlstore/checks.go`);
 the block decided against the row as stored under its row lock (`BlockStaleStartedApply`), and the
 apply completion that keeps that block rather than writing it away (`CompleteForApply`, both in
 `pkg/storage/internal/sqlstore/checks.go`);
@@ -745,8 +749,11 @@ too, by the operator reconciling the target — what it must not do is converge 
 that would clear the block without the divergence behind it being addressed.
 
 *Enforced:* stale-check reconciliation (`pkg/webhook/check_records.go`), aggregate re-evaluation
-(`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), and the re-plan a settled
-apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`).
+(`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), the re-plan a settled
+apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`), and
+the plan that settles the rows a database left on earlier commits under an old type, and removes
+those it left in an environment it no longer has, which no later plan would store again (`settleLeftBehindChecks` in
+`pkg/webhook/pull_request.go`).
 A concurrent stale publication can leave an obsolete blocker without arming these retries;
 that case requires another fold ([publication concurrency](check-runs.md#publication-concurrency)).
 
@@ -1948,7 +1955,8 @@ belongs to the target that will run the statement: a deployment that applies a p
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
 planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the
 privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS admission refusals
-in `pkg/engine/postgres/row_security.go` that abort plan creation and the apply-time gate in
+in `pkg/engine/postgres/row_security.go` and enum type refusals and blocked label additions
+in `pkg/engine/postgres/enum_type.go` that abort plan creation or mark the plan blocked, and the apply-time gate in
 `pkg/engine/postgres/row_security_apply.go`); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
 path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), and for a shard dispatch attaching
@@ -2211,10 +2219,10 @@ its state so the retry uses the same execution authority.
 
 While a freeze covering a change is in effect, SchemaBot refuses to create its apply, to record a
 start for an apply that is stopped or waiting to start, and to record a cutover for a deferred
-apply. A change that started before the freeze keeps running. If any deployment the change runs on
-is covered, the whole change is refused; for an existing apply that includes every deployment its
-stored operations run on. "In effect" is decided by the database clock, so every pod agrees at the
-edges of a freeze. A pull request rollback is never held, at creation or at a later start or
+apply. A change that started before the freeze keeps running, unless the freeze stops it (AZ-11).
+If any deployment the change runs on is covered, the whole change is refused; for an existing
+apply that includes every deployment its stored operations run on. "In effect" is decided by the
+database clock, so every pod agrees at the edges of a freeze. A pull request rollback is never held, at creation or at a later start or
 cutover, nor is a stop, a cancel or a revert. When SchemaBot cannot read the freezes, or the override
 requests below, it refuses the change with a retryable error, never letting it through unchecked.
 A freeze refuses a change unless an approved override request covers every blocker on it. The
@@ -2266,6 +2274,57 @@ start or cutover without passing a function that runs the gates. The override ch
 `approvedOverride` (`pkg/api/change_gate.go`), which reads `ListApproved` and admits only a request
 whose `Covers` names every blocker. The approver rules are `AuthorizeFreezeApprove`
 (`pkg/api/freeze_authorization.go`) and `Approve` (`pkg/storage/internal/sqlstore/freeze_overrides.go`).
+
+### AZ-11: A stop freeze stops the admitted changes it covers
+
+Setting a freeze with running `stop` that is in effect at once records a stop on every apply it
+covers that is pending, paused, or doing work a stop can end, by the same rule as AZ-10: one covered
+deployment holds the whole change. A rollout paused after a failure is stopped because its other
+members can still be writing. The stop is the ordinary durable stop, recorded with the freeze
+as its requester (`freeze:<id>`), so its driver delivers it as it would an operator's, and the apply
+resumes with a start, which the freeze's gate holds (AZ-10). A stopped apply with a start queued
+before the freeze is swept too: the stop withdraws the start, or stays pending for the drive that
+already claimed it (CO-4). A stopped apply with no start queued has nothing to stop and is in
+neither list. No client may send a stop under that
+requester, so a stop that reads as a freeze's is one a freeze issued. The freeze is stored before the
+sweep, so it refuses new changes whatever the sweep reports. An apply the sweep cannot stop, such as
+a PlanetScale apply, which has no stop, or one whose operations it cannot read, is listed in the
+response with why, never skipped silently; when it cannot list the applies at all, it says it
+stopped none. An apply waiting for its cutover is left alone, because the freeze refuses the cutover,
+and so is a pull request rollback, which no freeze holds. A planned `stop` freeze stops nothing when
+it is set; an apply already running when it starts is stopped only at the checkpoint below.
+A driver checks again at claim, before it starts an operation that has not started or resumes a
+stopped one for a queued start. While a `stop` freeze covering the apply is in effect, it returns the
+claim with the operation as it was, unstarted, and records the freeze's stop, which stop
+reconciliation delivers without starting anything; for a queued start, the stop withdraws it (CO-4).
+This holds work a planned `stop` freeze meets once it starts, and stops a running rollout when it
+claims its next deployment. A claim that recovers or redispatches work instead records the freeze's
+stop and drives on, so the drive delivers it; that covers unstarted work whose claim could not be
+returned, which reads as running until its lease goes stale. When the engine refuses that stop, the
+work keeps running, except a PlanetScale deploy queued before the freeze, which is not driven, so it
+waits until the freeze ends. An apply that runs to the end without such a claim keeps running. A pending
+cancel is never held: the claim that carries it is driven whatever the freezes (AZ-10, CO-2). An
+approved override that admitted the apply at its creation, or the one that admitted its queued start,
+which the start request names, lets it start when it names the freeze; another approval for the same
+apply does not. When the freezes or the override requests cannot be read, or the stop cannot be
+recorded, the operation is not driven, so it never starts unchecked: a start claim goes back unstarted
+and the pod skips it in its claims for a short while, so other work is claimed meanwhile, and a
+recovery keeps its lease until it goes stale and is checked again.
+Status names the freeze that stopped an apply, read from the stop's requester, so a stopped apply
+never reads as an operator's stop or as one a start will resume while the freeze holds it.
+*Breaks if violated:* a schema change judged unsafe keeps writing through the incident that froze
+it, or an operator reads a freeze as having stopped changes that still run.
+*Enforced:* `stopAppliesForFreeze` (`pkg/api/freeze_stop_sweep.go`), which lists applies with
+`GetUnsettled` so stopped ones are included, called by `handleFreezeCreate`
+(`pkg/api/freeze_handlers.go`) after the freeze is stored, records each stop through `stopApply`
+(`pkg/api/control_handlers.go`) with `storage.FreezeStopCaller`. `executeStopForApply` refuses a
+caller where `storage.IsFreezeStopCaller` holds. The claim checkpoint is `holdClaimForStopFreeze`
+(`pkg/api/freeze_claim_checkpoint.go`), called by `recoverApplyOperation` (`pkg/api/operator.go`)
+before the drive, which hands the claim back with `ReturnUnstartedClaim`
+(`pkg/storage/internal/sqlstore/apply_operations.go`) and skips it with `storage.SkipOperations`.
+The start request records the override that admitted it in `startControlRequestMetadata`
+(`pkg/api/control_handlers.go`). `StoppedByFreeze` (`pkg/api/freeze_stopped_by.go`) names the freeze
+for the progress response and the pull request comments.
 
 ## Structural enforcement
 
