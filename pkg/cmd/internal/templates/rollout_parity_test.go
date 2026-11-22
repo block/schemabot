@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -129,6 +130,42 @@ func prTableReading(t *testing.T, targets []parityTarget) (percent, rows string)
 		Model: presentation.Derive(ops), ApplyID: "apply-7f3c", Environment: "production", Details: details,
 	})
 	return tableReading(t, out, prTableLine)
+}
+
+// The CLI and the PR comment draw the same checksum bar for one table: the bar
+// fills only once every row is verified, and shows a first segment as soon as
+// verification has begun, on both surfaces (UX-5).
+func TestChecksumBarReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
+	cases := []struct {
+		name           string
+		checked, total int64
+		filled         int
+		percent        string
+	}{
+		{name: "in its final stretch", checked: 997_500, total: 1_000_000, filled: 19, percent: "99.75%"},
+		{name: "just begun", checked: 4, total: 1_000, filled: 1, percent: "0.40%"},
+		{name: "every row verified", checked: 1_000_000, total: 1_000_000, filled: 20, percent: "100.00%"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cli := FormatTableProgress(TableProgress{
+				TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
+				ChecksumRowsChecked: tc.checked, ChecksumRowsTotal: tc.total,
+			})
+			pr := webhooktemplates.RenderApplyStatusComment(webhooktemplates.ApplyStatusCommentData{
+				Database: "payments", State: state.Apply.Running, ApplyID: "apply-7f3c", Environment: "production",
+				Engine: storage.EngineSpirit,
+				Tables: []webhooktemplates.TableProgressData{{
+					TableName: "orders", DDL: addRegion, Status: state.Task.Checksumming,
+					ChecksumRowsChecked: tc.checked, ChecksumRowsTotal: tc.total,
+				}},
+			})
+			want := strings.Repeat(ui.ColorBlue, tc.filled) + strings.Repeat(ui.ColorEmpty, 20-tc.filled) +
+				" 🔍 Checksumming to verify data (" + tc.percent + ")"
+			assert.Contains(t, cli, want, "CLI checksum bar")
+			assert.Contains(t, pr, want, "PR comment checksum bar")
+		})
+	}
 }
 
 func tableReading(t *testing.T, out string, tableLine *regexp.Regexp) (percent, rows string) {

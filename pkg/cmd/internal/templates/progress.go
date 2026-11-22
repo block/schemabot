@@ -3,7 +3,6 @@ package templates
 import (
 	"fmt"
 	"log/slog"
-	"math"
 	"sort"
 	"strings"
 	"time"
@@ -606,10 +605,9 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// source. On a large table this can run for hours, so show how far the
 		// verification has progressed once Spirit has reported a total.
 		if t.ChecksumRowsTotal > 0 {
-			checksumPct := int(math.Round(float64(t.ChecksumRowsChecked) * 100 / float64(t.ChecksumRowsTotal)))
-			pct := ui.RowCopyDisplayPercent(checksumPct, t.ChecksumRowsChecked)
+			pct := ui.ChecksumDisplayPercent(t.ChecksumRowsChecked, t.ChecksumRowsTotal)
 			writeTableLine(&b, t, "%s 🔍 Checksumming to verify data (%s%s)%s", ui.ProgressBarRowCopy(pct),
-				ui.FormatRowCopyPercent(checksumPct, t.ChecksumRowsChecked, t.ChecksumRowsTotal), shardCoverageSuffix(t), throttledSuffix(t))
+				ui.FormatRowCopyPercent(pct, t.ChecksumRowsChecked, t.ChecksumRowsTotal), shardCoverageSuffix(t), throttledSuffix(t))
 			if t.DDL != "" {
 				b.WriteString(formatTableDDL(t))
 			}
