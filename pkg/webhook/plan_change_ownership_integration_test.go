@@ -197,7 +197,7 @@ func TestE2EPlanDoesNotAttributeATableItCreates(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "CREATE TABLE `stations`")
 		assert.Contains(t, body, "TIMESTAMP", "the lint finding on the new column still renders")
-		assert.Contains(t, body, "post this command to confirm", "the finding still needs consent")
+		assert.Contains(t, body, "add `--allow-unsafe` to confirm", "the finding still needs consent")
 		assert.NotContains(t, body, "changed by open PR", "a created table is attributed to no pull request")
 		assert.NotContains(t, body, "#2")
 		assert.NotContains(t, body, "shows up here as one to undo")

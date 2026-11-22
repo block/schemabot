@@ -812,7 +812,7 @@ func writeRefusedChangeReplan(sb *strings.Builder, plan, planCommand string) {
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
 func writeApplyInstruction(sb *strings.Builder, command string, data PlanCommentData) {
 	if consent, ok := planUnsafeConsent(data); ok {
-		writeUnsafeConsentCommand(sb, "▶️ **To apply**", consent, command, true)
+		writeUnsafeConsentCommand(sb, "▶️ **To apply**", consent, command, false)
 		return
 	}
 	sb.WriteString("▶️ **To apply**, comment:\n")
@@ -4173,7 +4173,7 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		}
 	case len(envsWithChanges) == 1:
 		if consent, ok := planUnsafeConsent(*data.Plans[envsWithChanges[0]]); ok {
-			writeUnsafeConsentCommand(sb, "▶️ **To apply** these changes", consent, command("schemabot apply", envsWithChanges[0]), true)
+			writeUnsafeConsentCommand(sb, "▶️ **To apply** these changes", consent, command("schemabot apply", envsWithChanges[0]), false)
 		} else {
 			sb.WriteString("▶️ **To apply** these changes, comment:\n")
 			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
@@ -4216,12 +4216,12 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 func writeEnvApplyCommand(sb *strings.Builder, sentence string, plan *PlanCommentData, command string) {
 	consent, ok := planUnsafeConsent(*plan)
 	if ok {
-		command += " --allow-unsafe"
+		instruction := consent.instruction(false)
 		if len(consent.dropSteps) > 0 {
-			writeUnsafeConsentSteps(sb, sentence, consent.dropSteps, consent.instruction(true), command)
+			writeUnsafeConsentSteps(sb, sentence, consent.dropSteps, instruction, command)
 			return
 		}
-		fmt.Fprintf(sb, "%s. %s:\n", sentence, capitalizeFirst(consent.instruction(true)))
+		fmt.Fprintf(sb, "%s. %s:\n", sentence, capitalizeFirst(instruction))
 	} else {
 		sb.WriteString(sentence + ":\n")
 	}

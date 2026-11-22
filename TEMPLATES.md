@@ -640,9 +640,9 @@ DROP TABLE `_events_old`;
 
 ▶️ **To apply**:
 1. Deploy application code that no longer reads from or writes to the dropped table.
-2. Post this command to confirm 1 unsafe change on `_events_old`:
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `_events_old`:
    ```
-   schemabot apply -e staging --allow-unsafe
+   schemabot apply -e staging
    ```
 
 </details>
@@ -763,9 +763,9 @@ CREATE TABLE `customers` (
 
 ---
 
-▶️ **To apply**, post this command to confirm 1 unsafe change on `customers`:
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
 ```
-schemabot apply -e staging --allow-unsafe
+schemabot apply -e staging
 ```
 
 </details>
@@ -850,9 +850,9 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 
 ---
 
-▶️ **To apply**, post this command to confirm 1 unsafe change on `users`:
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `users`:
 ```
-schemabot apply -e staging --allow-unsafe
+schemabot apply -e staging
 ```
 
 </details>
@@ -999,9 +999,9 @@ ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;
 
 ▶️ **To apply**:
 1. Deploy application code that no longer reads from or writes to the dropped column.
-2. Post this command to confirm 1 unsafe change on `orders`:
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `orders`:
    ```
-   schemabot apply -e staging --allow-unsafe
+   schemabot apply -e staging
    ```
 
 </details>
@@ -1086,9 +1086,9 @@ DROP TABLE `refund_backfill`;
 ▶️ **To apply**:
 1. Deploy application code that no longer reads from or writes to the dropped table and column.
 2. Make the dropped index invisible, then verify application queries no longer rely on it for safe performance.
-3. Post this command to confirm 9 unsafe changes on `transfer_events`, `payouts` and 4 more:
+3. Add `--allow-unsafe` to confirm 9 unsafe changes on `transfer_events`, `payouts` and 4 more:
    ```
-   schemabot apply -e staging --allow-unsafe
+   schemabot apply -e staging
    ```
 
 </details>
@@ -1124,9 +1124,9 @@ A plan diffs this PR's schema files against the live database, so a change anoth
 
 ▶️ **To apply**:
 1. Deploy application code that no longer reads from or writes to the dropped table and column.
-2. Post this command to confirm 2 unsafe changes on `orders` and `reconcile_state`:
+2. Add `--allow-unsafe` to confirm 2 unsafe changes on `orders` and `reconcile_state`:
    ```
-   schemabot apply -e staging --allow-unsafe
+   schemabot apply -e staging
    ```
 
 </details>
@@ -1703,9 +1703,9 @@ schemabot apply -e staging
 
 ---
 
-▶️ **To apply**, post this command to confirm 2 unsafe changes on `commerce_sharded` VSchema:
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes on `commerce_sharded` VSchema:
 ```
-schemabot apply -e staging --allow-unsafe
+schemabot apply -e staging
 ```
 
 </details>
@@ -10865,9 +10865,9 @@ ALTER TABLE `mutes`
 
 ▶️ **To apply**:
 1. Deploy application code that no longer reads from or writes to the dropped column.
-2. Post this command to confirm 1 unsafe change on `mutes`:
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `mutes`:
    ```
-   schemabot apply -e production --allow-unsafe
+   schemabot apply -e production
    ```
 
 </details>
