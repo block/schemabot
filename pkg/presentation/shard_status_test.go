@@ -66,3 +66,23 @@ func TestDeriveShardsReadsAStartUnderWay(t *testing.T) {
 	assert.Equal(t, "2 resuming", ShardCounts(labels(state.Apply.Resuming)))
 	assert.Equal(t, "2 stopped", ShardCounts(labels(state.Apply.Stopped)))
 }
+
+// A running shard whose table changes all copy no rows, such as a CREATE
+// TABLE, reads as applying; a shard with any change that copies rows reads as
+// copying, so the count never calls a create a table copy.
+func TestDeriveShardsReadsAChangeThatCopiesNoRowsAsApplying(t *testing.T) {
+	shards := DeriveShards(state.Apply.Running, []ShardWork{
+		{Keyspace: "shop_001", Shard: "-80", Operations: []Operation{{State: state.ApplyOperation.Running, Parallel: true, CopiesNoRows: true}}},
+		{Keyspace: "shop_001", Shard: "80-", Operations: []Operation{
+			{State: state.ApplyOperation.Running, Parallel: true, CopiesNoRows: true},
+			{State: state.ApplyOperation.Running, Parallel: true},
+		}},
+		{Keyspace: "shop_001", Shard: "c0-", Operations: []Operation{{State: state.ApplyOperation.Completed, Parallel: true, CopiesNoRows: true}}},
+	})
+
+	require.Len(t, shards, 3)
+	assert.Equal(t, RunningApplying, shards[0].Label)
+	assert.Equal(t, "running table copy", shards[1].Label)
+	assert.Equal(t, "1 applying, 1 running table copy, 1 completed",
+		ShardCounts([]string{shards[0].Label, shards[1].Label, shards[2].Label}))
+}

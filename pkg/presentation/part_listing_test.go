@@ -396,3 +396,14 @@ func TestAcrossTargetsPercent(t *testing.T) {
 	assert.Equal(t, "99.99%", AcrossTargetsPercent(99, true, 4000, 4000))
 	assert.Equal(t, "0%", AcrossTargetsPercent(0, true, 0, 0))
 }
+
+// A CREATE TABLE, a DROP TABLE and an instant ALTER copy no rows; any other
+// ALTER does, and an action the rule does not recognize reads as copying.
+func TestChangeCopiesRows(t *testing.T) {
+	assert.False(t, ChangeCopiesRows("create", false))
+	assert.False(t, ChangeCopiesRows("drop", false))
+	assert.False(t, ChangeCopiesRows("alter", true))
+	assert.True(t, ChangeCopiesRows("alter", false))
+	assert.True(t, ChangeCopiesRows("", false))
+	assert.True(t, ChangeCopiesRows("", true))
+}

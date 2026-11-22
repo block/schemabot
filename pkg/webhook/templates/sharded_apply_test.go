@@ -1109,6 +1109,8 @@ func TestRenderShardedApplyComment_PartialLandingStatesCoverage(t *testing.T) {
 
 	betweenWaves := RenderShardedApplyComment(mixed(state.Task.Pending, state.Task.Pending))
 	assert.Contains(t, betweenWaves, "**`mutes`**: ⏳ Queued — applied on 2 of 4 shards")
+	assert.Contains(t, betweenWaves, "**Status**: In Progress — 0 of 1 change applied (done on 2 of 4 shards)",
+		"a change counts only once it lands everywhere, so the status line says how far it has got")
 	assert.NotContains(t, betweenWaves, "| Shard | Status |",
 		"a routine wave rollout does not promote the per-shard table")
 
@@ -1274,4 +1276,38 @@ func TestRenderShardedApplySummary_FirstFailureSkipsShardsStoppedAtCutover(t *te
 	assert.Contains(t, got, "**First failure:** shard <code>-80</code> — duplicate key name")
 	assert.NotContains(t, got, "**First failure:** shard <code>-</code>")
 	assert.Contains(t, got, "> ⏹️ 1 shard stopped at the cutover because <code>shop_b/-80</code> failed. Its copy is saved, so applying again resumes it.")
+}
+
+// A running table whose change copies no rows, such as a CREATE TABLE, reads
+// as applying rather than as a row copy, and its shard list says the same.
+func TestRenderShardedApplyComment_ChangeThatCopiesNoRowsReadsAsApplying(t *testing.T) {
+	data := func(copiesNoRows bool) ShardedApplyData {
+		return ShardedApplyData{
+			State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+			ApplyID: "apply-x",
+			Keyspaces: []ShardedKeyspace{{
+				Keyspace: "cdb_resolute_sharded",
+				Tables: []ShardedTableStatus{{
+					Table: "mutes", Status: state.Task.Running, CopiesNoRows: copiesNoRows,
+					Shards: []ShardProgressData{
+						{Shard: "-80", Status: state.Task.Completed},
+						{Shard: "80-", Status: state.Task.Running},
+					},
+				}},
+				Shards: []ShardStatus{
+					{Shard: "-80", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+					{Shard: "80-", Emoji: "🔄", Label: "applying", State: state.ApplyOperation.Running},
+				},
+				Cells: []ShardCell{mutesCell("-80"), mutesCell("80-")},
+			}},
+		}
+	}
+
+	create := RenderShardedApplyComment(data(true))
+	assert.Contains(t, create, "**`mutes`**: 🔄 Applying\n")
+	assert.NotContains(t, create, "Row copy in progress")
+	assert.Contains(t, create, "**Shards**: 1 completed, 1 applying")
+
+	alter := RenderShardedApplyComment(data(false))
+	assert.Contains(t, alter, "**`mutes`**: 🔄 Row copy in progress\n")
 }

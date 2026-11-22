@@ -37,6 +37,28 @@ func TestShardOperationCopy(t *testing.T) {
 		ShardOperationCopy(state.ApplyOperation.Running, []ShardCopy{{Status: state.Task.Completed}, {Status: state.Task.Failed, RowsCopied: 5}}))
 }
 
+// A shard whose operation is running reads as running even while its task row
+// still says pending: a driver has dispatched it, and the task row only
+// catches up on the next progress poll. A pending task under a pending
+// operation stays queued.
+func TestShardOperationCopyReadsADispatchedShardAsRunning(t *testing.T) {
+	assert.Equal(t, state.ApplyOperation.Running,
+		ShardOperationCopy(state.ApplyOperation.Running, []ShardCopy{{Status: state.Task.Pending}}).Status)
+	assert.Equal(t, state.Task.Pending,
+		ShardOperationCopy(state.ApplyOperation.Pending, []ShardCopy{{Status: state.Task.Pending}}).Status)
+
+	// 97 shards landed and 31 dispatched with pending task rows: the table
+	// reads as in progress, not queued.
+	var shards []ShardCopy
+	for range 97 {
+		shards = append(shards, ShardOperationCopy(state.ApplyOperation.Completed, []ShardCopy{{Status: state.Task.Completed}}))
+	}
+	for range 31 {
+		shards = append(shards, ShardOperationCopy(state.ApplyOperation.Running, []ShardCopy{{Status: state.Task.Pending}}))
+	}
+	assert.Equal(t, state.Task.Running, RollUpShardedTable(shards).Status)
+}
+
 // A finalizer whose rollout ended without running it must not read as
 // pending, whichever record says so: a cancelled/reverted operation row
 // (written by the cancel path or mirrored by the stranded-operation reaper)

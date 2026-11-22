@@ -20,11 +20,14 @@ type ShardCopy struct {
 // most attention-worthy task, which is where the engine reports live shard
 // state. The operation state stands in for a task that has not reported a
 // state, and for an operation with no tasks yet, since dispatch creates them
-// when the operation's wave starts.
+// when the operation's wave starts. It also stands in for a task still
+// recorded as pending under a running operation: a driver has dispatched the
+// shard, and the task row only catches up on the next progress poll, so the
+// shard is under way rather than queued.
 func ShardOperationCopy(operationState string, tasks []ShardCopy) ShardCopy {
 	best := ShardCopy{}
 	for _, t := range tasks {
-		if t.Status == "" {
+		if t.Status == "" || dispatchedButPending(operationState, t.Status) {
 			t.Status = operationState
 		}
 		if best.Status == "" || TaskAttentionRank(t.Status) > TaskAttentionRank(best.Status) {
@@ -35,6 +38,13 @@ func ShardOperationCopy(operationState string, tasks []ShardCopy) ShardCopy {
 		return ShardCopy{Status: operationState}
 	}
 	return best
+}
+
+// dispatchedButPending reports whether a task still reads pending although
+// its operation is running, so a driver has already dispatched it.
+func dispatchedButPending(operationState, taskStatus string) bool {
+	return state.IsState(operationState, state.ApplyOperation.Running) &&
+		state.NormalizeTaskStatus(taskStatus) == state.Task.Pending
 }
 
 // ShardedTableCopy is one keyspace table's change rolled up across the shards

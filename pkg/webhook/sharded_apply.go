@@ -398,6 +398,7 @@ func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, release
 				ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
 				PauseOnFailure:    op.OnFailure == storage.OnFailurePause,
 				Released:          released,
+				CopiesNoRows:      tasksCopyNoRows(tasksByOp[op.ID]),
 				Error:             shardOperationError(op, tasksByOp[op.ID]),
 			})
 		}
@@ -430,6 +431,10 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 	var order []keyspaceTable
 	shardsByTable := make(map[keyspaceTable][]templates.ShardProgressData)
 	copiesByTable := make(map[keyspaceTable][]presentation.ShardCopy)
+	// A table copies no rows only once some shard's tasks say so and none
+	// says otherwise; a table with no tasks yet reads as copying.
+	reportsNoRowCopy := make(map[keyspaceTable]bool)
+	reportsRowCopy := make(map[keyspaceTable]bool)
 	for _, op := range ops {
 		ns, shard, table, ok := state.ShardWorkKey(op.OperationKey)
 		if !ok {
@@ -439,6 +444,13 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 		key := keyspaceTable{namespace: ns, table: table}
 		if _, seen := copiesByTable[key]; !seen {
 			order = append(order, key)
+		}
+		if tasks := tasksByOp[op.ID]; len(tasks) > 0 {
+			if tasksCopyNoRows(tasks) {
+				reportsNoRowCopy[key] = true
+			} else {
+				reportsRowCopy[key] = true
+			}
 		}
 		sp := shardOperationCopy(op, tasksByOp[op.ID])
 		copiesByTable[key] = append(copiesByTable[key], sp)
@@ -465,6 +477,7 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 			ShardsReporting: rollup.ShardsReporting,
 			EstimatedBytes:  estimatedBytes,
 			PlannedShards:   plannedShards,
+			CopiesNoRows:    reportsNoRowCopy[key] && !reportsRowCopy[key],
 			Shards:          shardsByTable[key],
 		})
 	}
@@ -488,6 +501,21 @@ func shardOperationCopy(op *storage.ApplyOperation, tasks []*storage.Task) prese
 		})
 	}
 	return presentation.ShardOperationCopy(op.State, copies)
+}
+
+// tasksCopyNoRows reports whether an operation's tasks are all table changes
+// that copy no rows (presentation.ChangeCopiesRows). An operation with no
+// tasks yet reads as copying, since nothing says otherwise.
+func tasksCopyNoRows(tasks []*storage.Task) bool {
+	if len(tasks) == 0 {
+		return false
+	}
+	for _, t := range tasks {
+		if presentation.ChangeCopiesRows(t.DDLAction, t.IsInstant) {
+			return false
+		}
+	}
+	return true
 }
 
 // shardOperationError is a shard operation's error. When the row carries no

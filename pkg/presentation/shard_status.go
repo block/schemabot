@@ -62,6 +62,7 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 			ContinueOnFailure: first.ContinueOnFailure,
 			PauseOnFailure:    first.PauseOnFailure,
 			Released:          first.Released,
+			CopiesNoRows:      shardCopiesNoRows(sw.Operations),
 			Error:             sw.Operations[best].Error,
 			EndedBy:           shardEndedBy(sw.Operations, best, shardOf),
 		})
@@ -85,6 +86,18 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 		out = append(out, ShardStatus{Keyspace: sw.Keyspace, Shard: sw.Shard, Deployment: d})
 	}
 	return out
+}
+
+// shardCopiesNoRows reports whether none of a shard's table changes copies
+// rows, so a running shard reads as applying only when every change it runs
+// does.
+func shardCopiesNoRows(ops []Operation) bool {
+	for _, op := range ops {
+		if !op.CopiesNoRows {
+			return false
+		}
+	}
+	return true
 }
 
 // shardIdentity is the name a shard's status goes by: the shard, qualified by

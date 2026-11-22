@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -69,6 +70,21 @@ func RunningWord(copiesRows bool) string {
 		return RunningCopying
 	}
 	return RunningApplying
+}
+
+// ChangeCopiesRows reports whether a table change copies the table's rows,
+// given its DDL action ("create", "alter" or "drop") and whether its engine
+// runs it as instant DDL. A CREATE TABLE, a DROP TABLE and an instant ALTER
+// copy none. An action it does not recognize reads as copying, the label a
+// change that may copy has always carried.
+func ChangeCopiesRows(ddlAction string, instant bool) bool {
+	switch ddl.OpToStatementType(ddlAction) {
+	case ddl.StatementCreateTable, ddl.StatementDropTable:
+		return false
+	case ddl.StatementAlterTable:
+		return !instant
+	}
+	return true
 }
 
 // PendingWord names the parts still to run of a rollout that has or has not

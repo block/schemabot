@@ -67,13 +67,14 @@ func shardStatuses(applyState string, ops []ProgressOperation, tables []TablePro
 	var work []presentation.ShardWork
 	sharded := false
 	for _, op := range ProgressOperationsForPresentation(ops, tables, released) {
-		keyspace, shard, _, ok := state.ShardWorkKey(op.OperationKey)
+		keyspace, shard, table, ok := state.ShardWorkKey(op.OperationKey)
 		if !ok {
 			continue
 		}
 		if shard != state.FullKeyRangeShard {
 			sharded = true
 		}
+		op.CopiesNoRows = shardTableCopiesNoRows(keyspace, table, tables)
 		key := keyspaceShard{keyspace, shard}
 		j, seen := index[key]
 		if !seen {
@@ -87,4 +88,17 @@ func shardStatuses(applyState string, ops []ProgressOperation, tables []TablePro
 		return nil, false
 	}
 	return presentation.DeriveShards(applyState, work), true
+}
+
+// shardTableCopiesNoRows reports whether a keyspace table's change copies no
+// rows (presentation.ChangeCopiesRows), so its running shards read as applying
+// on the CLI as they do on the PR comment. A table the progress does not list
+// reads as copying, since nothing says otherwise.
+func shardTableCopiesNoRows(keyspace, table string, tables []TableProgress) bool {
+	for _, t := range tables {
+		if t.Namespace == keyspace && t.TableName == table {
+			return !presentation.ChangeCopiesRows(t.ChangeType, t.IsInstant)
+		}
+	}
+	return false
 }
