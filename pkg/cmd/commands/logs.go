@@ -74,19 +74,22 @@ func (cmd *LogsCmd) Run(ctx context.Context, g *Globals) error {
 	case cmd.Follow:
 		return followLogs(ctx, ep, cmd.Database, cmd.Environment, cmd.ApplyID, scope, cmd.Limit)
 	case cmd.Deployment != "":
-		return showDeploymentLogs(ep, cmd.ApplyID, cmd.Deployment, scope, cmd.Limit, cmd.JSON)
+		return showDeploymentLogs(ctx, ep, cmd.ApplyID, cmd.Deployment, scope, cmd.Limit, cmd.JSON)
 	default:
-		return showLogs(ep, cmd.Database, cmd.Environment, cmd.ApplyID, scope, cmd.Limit, cmd.JSON)
+		return showLogs(ctx, ep, cmd.Database, cmd.Environment, cmd.ApplyID, scope, cmd.Limit, cmd.JSON)
 	}
 }
 
-func showDeploymentLogs(endpoint, applyID, deployment string, scope client.LogScope, limit int, outputJSON bool) error {
+func showDeploymentLogs(ctx context.Context, endpoint, applyID, deployment string, scope client.LogScope, limit int, outputJSON bool) error {
 	var result *apitypes.DeploymentLogsResponse
 	err := withLoading("Loading data-plane logs...", !outputJSON, func() error {
 		var loadErr error
-		result, loadErr = client.GetDeploymentLogs(endpoint, applyID, deployment, scope, limit)
+		result, loadErr = client.GetDeploymentLogsCtx(ctx, endpoint, applyID, deployment, scope, limit)
 		return loadErr
 	})
+	if endedByInterrupt(ctx, err) {
+		return interrupted(ctx)
+	}
 	if err != nil {
 		return err
 	}
@@ -135,14 +138,18 @@ func deploymentLogSourceLabel(target string, operations []*apitypes.LogOperation
 	return ui.TerminalSafeLine(label)
 }
 
-// showLogs displays logs once and exits.
-func showLogs(endpoint, database, environment, applyID string, scope client.LogScope, limit int, outputJSON bool) error {
+// showLogs displays logs once and exits. Ctrl-C abandons the read and exits
+// with ExitInterrupted, since the command never reached its output.
+func showLogs(ctx context.Context, endpoint, database, environment, applyID string, scope client.LogScope, limit int, outputJSON bool) error {
 	var result *apitypes.LogsResponse
 	err := withLoading("Loading logs...", !outputJSON, func() error {
 		var loadErr error
-		result, loadErr = client.GetLogs(endpoint, database, environment, applyID, scope, limit)
+		result, loadErr = client.GetLogsCtx(ctx, endpoint, database, environment, applyID, scope, limit)
 		return loadErr
 	})
+	if endedByInterrupt(ctx, err) {
+		return interrupted(ctx)
+	}
 	if err != nil {
 		return err
 	}
