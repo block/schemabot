@@ -1,16 +1,20 @@
 //go:build ignore
 
-// Generate fictional multi-target PR comments through the production webhook
+// Generate fictional PR comments through the production webhook
 // templates, for the PR workflow recordings. scripts/prepare-pr-multi-target-demo.py
-// runs it from the repository root: go run ./pkg/cmd/prdemo/main.go
+// and scripts/prepare-pr-postgres-demo.py run it from the repository root:
+// go run ./pkg/cmd/prdemo/main.go [postgres]
 package main
 
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine/postgres/indexphase"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -258,6 +262,10 @@ func main() {
 	}
 
 	out := map[string]any{"multiTarget": fanOut, "target": narrowed, "stop": stopDemo()}
+	// scripts/prepare-pr-postgres-demo.py asks for the PostgreSQL recording alone.
+	if len(os.Args) > 1 && os.Args[1] == "postgres" {
+		out = map[string]any{"postgres": postgresDemo()}
+	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", " ")
 	if err := enc.Encode(out); err != nil {
@@ -312,5 +320,141 @@ func stopDemo() stopScenario {
 	for _, percents := range resumed {
 		demo.Resumed = append(demo.Resumed, rolloutComment(percents, 0, false))
 	}
+	return demo
+}
+
+// The PostgreSQL recording: one PR adds a column and an index to users. The
+// schema file declares a plain CREATE INDEX; pg-sprite plans the concurrent
+// form, and the apply runs each statement as its own task.
+const (
+	pgEnvironment = "staging"
+	pgNamespace   = "public"
+	pgApplyID     = "apply-example-42"
+	pgAddColumn   = "ALTER TABLE users ADD COLUMN last_seen_at timestamptz"
+	pgAddIndex    = "CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at)"
+	// The executor reports the statement it is running schema-qualified.
+	pgAddColumnRunning = "ALTER TABLE public.users ADD COLUMN last_seen_at timestamptz"
+	pgAddIndexRunning  = "CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON public.users USING btree (last_seen_at)"
+	pgTableBlocks      = 48_000
+	pgTableTuples      = 2_400_000
+)
+
+func pgPlanComment(locked bool) string {
+	data := templates.PlanCommentData{
+		Database:     database,
+		SchemaName:   pgNamespace,
+		Environment:  pgEnvironment,
+		HeadSHA:      headSHA,
+		Repository:   repository,
+		RequestedBy:  requestedBy,
+		DatabaseType: "postgres",
+		Changes:      []templates.KeyspaceChangeData{{Keyspace: pgNamespace, Statements: []string{pgAddColumn + ";", pgAddIndex + ";"}}},
+	}
+	if locked {
+		data.IsLocked = true
+		data.LockOwner = lockOwner
+		data.LockAcquired = startedAt.Format("2006-01-02 15:04:05 UTC")
+	}
+	return templates.RenderPlanComment(data)
+}
+
+// buildPoll is one progress poll of the concurrent index build: the server
+// phase PostgreSQL reports and the counters it publishes for that phase.
+type buildPoll struct {
+	phase string
+	work  apitypes.BuildWork
+}
+
+// percent places the poll in the whole build with the same phase bands the
+// engine uses, so the bar moves the way a real build's bar does.
+func (p buildPoll) percent() int {
+	phase, ok := indexphase.Lookup(p.phase)
+	if !ok {
+		panic("unknown index build phase " + p.phase)
+	}
+	fraction := 0.0
+	switch {
+	case p.work.BlocksTotal > 0 && (phase.Counter == indexphase.Blocks || phase.Counter == indexphase.BlocksOrTuples):
+		fraction = float64(p.work.BlocksDone) / float64(p.work.BlocksTotal)
+	case p.work.TuplesTotal > 0 && phase.Counter == indexphase.Tuples:
+		fraction = float64(p.work.TuplesDone) / float64(p.work.TuplesTotal)
+	}
+	return phase.Start + int(math.Round(fraction*float64(phase.End-phase.Start)))
+}
+
+func blocks(phase string, done int64) buildPoll {
+	return buildPoll{phase: phase, work: apitypes.BuildWork{BlocksDone: done, BlocksTotal: pgTableBlocks}}
+}
+
+func pgTables(column, index string, indexPercent int) []templates.TableProgressData {
+	return []templates.TableProgressData{
+		{Namespace: pgNamespace, TableName: "users", DDL: pgAddColumn, Status: column, PercentComplete: percentFor(column, 0)},
+		{Namespace: pgNamespace, TableName: "users", DDL: pgAddIndex, Status: index, PercentComplete: percentFor(index, indexPercent)},
+	}
+}
+
+func percentFor(status string, running int) int {
+	switch status {
+	case state.Task.Completed:
+		return 100
+	case state.Task.Running:
+		return running
+	default:
+		return 0
+	}
+}
+
+func pgApplyData(applyState string, tables []templates.TableProgressData) templates.ApplyStatusCommentData {
+	return templates.ApplyStatusCommentData{
+		Database:    database,
+		Environment: pgEnvironment,
+		RequestedBy: requestedBy,
+		State:       applyState,
+		Engine:      "postgres",
+		ApplyID:     pgApplyID,
+		StartedAt:   startedAt.Format(time.RFC3339),
+		Tables:      tables,
+	}
+}
+
+func postgresDemo() scenario {
+	polls := []buildPoll{
+		{phase: "building index: initializing"},
+		blocks("building index: scanning table", 6_200),
+		blocks("building index: scanning table", 15_800),
+		blocks("building index: scanning table", 26_400),
+		blocks("building index: scanning table", 37_100),
+		blocks("building index: scanning table", 46_900),
+		{phase: "building index: sorting live tuples"},
+		{phase: "building index: loading tuples in tree", work: apitypes.BuildWork{TuplesDone: 1_350_000, TuplesTotal: pgTableTuples}},
+		blocks("index validation: scanning index", 31_000),
+		blocks("index validation: scanning table", 29_500),
+		{phase: "waiting for old snapshots", work: apitypes.BuildWork{LockersDone: 0, LockersTotal: 1}},
+	}
+
+	demo := scenario{
+		Command: "schemabot apply -e " + pgEnvironment,
+		Plan:    pgPlanComment(false),
+		Apply:   pgPlanComment(true),
+	}
+
+	// The column add is metadata-only and finishes on the first poll.
+	adding := pgApplyData(state.Apply.Running, pgTables(state.Task.Running, state.Task.Pending, 0))
+	adding.Step, adding.StepsTotal, adding.Statement = 1, 1, pgAddColumnRunning
+	demo.Progress = append(demo.Progress, templates.RenderApplyStatusComment(adding))
+
+	for _, poll := range polls {
+		data := pgApplyData(state.Apply.Running, pgTables(state.Task.Completed, state.Task.Running, poll.percent()))
+		data.Step, data.StepsTotal, data.Statement = 1, 1, pgAddIndexRunning
+		data.BuildWork = poll.work
+		data.BuildWork.Operation = "concurrent-index-build"
+		data.BuildWork.ServerPhase = poll.phase
+		demo.Progress = append(demo.Progress, templates.RenderApplyStatusComment(data))
+	}
+
+	done := pgApplyData(state.Apply.Completed, pgTables(state.Task.Completed, state.Task.Completed, 100))
+	done.CompletedAt = startedAt.Add(4 * time.Minute).Format(time.RFC3339)
+	demo.Complete = templates.RenderApplyStatusComment(done)
+	demo.Summary = templates.RenderApplySummaryComment(done)
 	return demo
 }
