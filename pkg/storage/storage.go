@@ -351,16 +351,16 @@ type CheckStore interface {
 	// Delete removes stored check state by ID.
 	Delete(ctx context.Context, id int64) error
 
-	// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a
-	// closed PR, retaining apply-owned rows the close must not unblock. Once
+	// ListRemovableOnPRClose returns the stored check state a close of the PR
+	// removes, retaining apply-owned rows the close must not unblock. Once
 	// an apply has started, its stored check state stays authoritative across
 	// a close and reopen until an operator reconciles the target environment.
-	// Plan-only rows (no apply_id) are always deleted. Apply-owned rows are
+	// Plan-only rows (no apply_id) are always listed. Apply-owned rows are
 	// handled by close kind:
 	//
 	//   - merged close: rows that are in_progress or whose conclusion is
 	//     anything but success are retained; rows that concluded successfully
-	//     are deleted, because the merged PR carries the applied schema and
+	//     are listed, because the merged PR carries the applied schema and
 	//     nothing remains for the row to block.
 	//   - unmerged close: every apply-owned row is retained, including rows
 	//     whose conclusion is success. A stored success only proves the
@@ -370,7 +370,16 @@ type CheckStore interface {
 	//     Reopen-time stale cleanup converges the retained row: it converts
 	//     it to action_required when the schema change is gone from the PR,
 	//     or a fresh plan result replaces it when the change is still present.
-	DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int, merged bool) error
+	ListRemovableOnPRClose(ctx context.Context, repo string, pr int, merged bool) ([]*Check, error)
+
+	// DeleteListedIfUnchanged deletes each row ListRemovableOnPRClose listed
+	// only while every column it was listed with, updated_at included, is
+	// unchanged, and returns the rows it kept because they were written since
+	// the listing. A row is compared and deleted under its row lock, so a
+	// write after the comparison cannot be deleted. A listed row already gone
+	// is neither deleted nor kept, and a row inserted since the listing is
+	// never touched.
+	DeleteListedIfUnchanged(ctx context.Context, listed []*Check) (kept []*Check, err error)
 }
 
 // FreezeStore records environment freezes. While a freeze is in effect,

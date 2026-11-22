@@ -2,10 +2,12 @@
 package sqlstore
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/state"
@@ -1020,13 +1022,13 @@ func (s *checkStore) Delete(ctx context.Context, id int64) error {
 	return checkRowsAffected(result, storage.ErrCheckNotFound)
 }
 
-// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a
-// closed PR, retaining apply-owned rows the close must not unblock. Once an
-// apply has started, its stored check state is authoritative until an
-// operator reconciles the target environment — closing and reopening the PR
-// must not convert it into a passing aggregate.
+// ListRemovableOnPRClose returns the stored check state a close of the PR
+// removes, for DeleteListedIfUnchanged to delete, retaining apply-owned rows
+// the close must not unblock. Once an apply has started, its stored check
+// state is authoritative until an operator reconciles the target environment —
+// closing and reopening the PR must not convert it into a passing aggregate.
 //
-// Plan-only rows (apply_id unset) are always deleted: no apply ever reached
+// Plan-only rows (apply_id unset) are always listed: no apply ever reached
 // the live database for them, so a reopened PR starts clean.
 //
 // On a merged close, an apply-owned row is retained when it is either:
@@ -1039,7 +1041,7 @@ func (s *checkStore) Delete(ctx context.Context, id int64) error {
 //     operator attention is still required, e.g. the schema change was
 //     removed from the PR after the apply started or a rollback completed.
 //
-// Apply-owned rows whose conclusion is success are deleted on a merged
+// Apply-owned rows whose conclusion is success are listed on a merged
 // close: the apply finished cleanly and the merged PR carries the applied
 // schema, so nothing remains for the row to block.
 //
@@ -1051,29 +1053,129 @@ func (s *checkStore) Delete(ctx context.Context, id int64) error {
 // Reopen-time stale cleanup converges the retained row: it converts it to
 // action_required when the schema change is gone from the PR, or a fresh
 // plan result replaces it when the change is still present.
-func (s *checkStore) DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int, merged bool) error {
+func (s *checkStore) ListRemovableOnPRClose(ctx context.Context, repo string, pr int, merged bool) ([]*storage.Check, error) {
 	repo = storage.CanonicalKey(repo)
 	if merged {
-		_, err := s.db.ExecContext(ctx, `
-			DELETE FROM checks
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT `+checkColumns+`
+			FROM checks
 			WHERE repository = ? AND pull_request = ?
 			  AND (apply_id IS NULL OR (status != ? AND conclusion = ?))
+			ORDER BY id
 		`, repo, pr, checkStatusInProgress, checkConclusionSuccess)
 		if err != nil {
-			return fmt.Errorf("delete checks for merged closed PR %s#%d: %w", repo, pr, err)
+			return nil, fmt.Errorf("list removable checks for merged closed PR %s#%d: %w", repo, pr, err)
 		}
-		return nil
+		defer utils.CloseAndLog(rows)
+		return scanChecks(rows)
 	}
 
-	_, err := s.db.ExecContext(ctx, `
-		DELETE FROM checks
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+checkColumns+`
+		FROM checks
 		WHERE repository = ? AND pull_request = ?
 		  AND apply_id IS NULL
+		ORDER BY id
 	`, repo, pr)
 	if err != nil {
-		return fmt.Errorf("delete plan-only checks for unmerged closed PR %s#%d: %w", repo, pr, err)
+		return nil, fmt.Errorf("list plan-only checks for unmerged closed PR %s#%d: %w", repo, pr, err)
 	}
-	return nil
+	defer utils.CloseAndLog(rows)
+	return scanChecks(rows)
+}
+
+// DeleteListedIfUnchanged deletes each listed row only while it is still the
+// row ListRemovableOnPRClose returned, and returns the rows it kept because
+// they were written since. Each row is read by ID under FOR UPDATE and compared
+// with the listing in the same transaction as its delete, so a write that
+// reaches the row after the comparison waits on the row lock and then finds it
+// deleted, rather than being deleted itself.
+//
+// The comparison covers every column the listing read, updated_at included,
+// rather than updated_at alone: updated_at is whole-second on MySQL, so a
+// rewrite in the same second as the listed write keeps its timestamp and would
+// look unchanged. A rewrite is kept when it changed any column, or when it
+// landed in a later second; only a rewrite in the same second that stores
+// exactly the listed values is deleted, and that row says nothing the listed
+// row did not.
+//
+// A listed row already gone is what the caller wanted and is neither deleted
+// nor kept. A row inserted since the listing has an ID the listing does not
+// name, so it is never touched.
+func (s *checkStore) DeleteListedIfUnchanged(ctx context.Context, listed []*storage.Check) ([]*storage.Check, error) {
+	if len(listed) == 0 {
+		return nil, nil
+	}
+	ordered := slices.Clone(listed)
+	// A fixed lock order keeps two deletes over overlapping rows from
+	// deadlocking each other.
+	slices.SortFunc(ordered, func(a, b *storage.Check) int { return cmp.Compare(a.ID, b.ID) })
+
+	var kept []*storage.Check
+	err := withLockRetry(ctx, s.classifier, "delete listed check state for closed PR", func() error {
+		kept = nil
+		tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+		if err != nil {
+			return fmt.Errorf("begin listed check state delete: %w", err)
+		}
+		defer rollbackTx(ctx, tx, "delete listed check state")
+
+		for _, row := range ordered {
+			target := fmt.Sprintf("%s#%d %s/%s/%s (check %d)",
+				row.Repository, row.PullRequest, row.Environment, row.DatabaseType, row.DatabaseName, row.ID)
+			current, err := scanCheckInto(tx.QueryRowContext(ctx, `
+				SELECT `+checkColumns+`
+				FROM checks
+				WHERE id = ?
+				FOR UPDATE
+			`, row.ID))
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("read listed check state %s: %w", target, err)
+			}
+			if !checkRowUnchanged(row, current) {
+				kept = append(kept, current)
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM checks WHERE id = ?`, row.ID); err != nil {
+				return fmt.Errorf("delete listed check state %s: %w", target, err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit listed check state delete: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return kept, nil
+}
+
+// checkRowUnchanged reports whether current still holds every value listed
+// was read with.
+func checkRowUnchanged(listed, current *storage.Check) bool {
+	return listed.ID == current.ID &&
+		listed.Repository == current.Repository &&
+		listed.PullRequest == current.PullRequest &&
+		listed.HeadSHA == current.HeadSHA &&
+		listed.Environment == current.Environment &&
+		listed.DatabaseType == current.DatabaseType &&
+		listed.DatabaseName == current.DatabaseName &&
+		listed.CheckRunID == current.CheckRunID &&
+		listed.ApplyID == current.ApplyID &&
+		listed.HasChanges == current.HasChanges &&
+		listed.Status == current.Status &&
+		listed.Conclusion == current.Conclusion &&
+		listed.BlockingReason == current.BlockingReason &&
+		listed.ErrorMessage == current.ErrorMessage &&
+		listed.ChangeSummary == current.ChangeSummary &&
+		listed.RolloutTargets == current.RolloutTargets &&
+		listed.RolloutTargetsWithWork == current.RolloutTargetsWithWork &&
+		listed.CreatedAt.Equal(current.CreatedAt) &&
+		listed.UpdatedAt.Equal(current.UpdatedAt)
 }
 
 // scanCheck scans a single check row, returning nil if not found.
