@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -81,13 +82,13 @@ func (s *Service) holdClaimForStopFreeze(ctx context.Context, driverID int, appl
 	metrics.RecordChangeGateRefusal(ctx, apply.Environment, freezeGate{}.Name(), string(changeGateCheckpointClaim))
 	attrs = append(attrs, "freeze_id", freeze.Identifier)
 	if !starts {
-		return s.stopRecoveredWorkForFreeze(ctx, freeze, apply, attrs)
+		return s.stopRecoveredWorkForFreeze(ctx, freeze, apply, op, attrs)
 	}
 	// The claim goes back first: a stop recorded while this driver holds a
 	// claim on a stopped apply is left to this driver's drive, which would
 	// never come.
 	s.returnUnstartedClaim(ctx, op, opLease, attrs)
-	if reason, stopped := s.stopApplyForFreeze(ctx, freeze, apply); !stopped {
+	if reason, outcome := s.stopApplyForFreeze(ctx, freeze, apply); outcome == freezeStopNotRecorded {
 		s.skipHeldOperation(op.ID)
 		s.logger.Warn("operator: a stop freeze covers the operation this driver claimed, and its stop was not recorded; the operation stays unstarted while the freeze is in effect",
 			append(attrs, "reason", reason, "retry_after", heldClaimRetryAfter)...)
@@ -101,18 +102,28 @@ func (s *Service) holdClaimForStopFreeze(ctx context.Context, driverID int, appl
 // apply whose claimed operation is recovered or redispatched rather than
 // started, and reports whether the driver must not drive it. A recorded stop
 // is delivered by the drive. A stop the engine refuses, such as PlanetScale's,
-// leaves the work running, as the freeze's own sweep reports for it. A stop
-// that could not be recorded leaves the operation undriven until its lease
-// goes stale, so its recovery checks again.
-func (s *Service) stopRecoveredWorkForFreeze(ctx context.Context, freeze *storage.EnvironmentFreeze, apply *storage.Apply, attrs []any) bool {
-	reason, stopped := s.stopApplyForFreeze(ctx, freeze, apply)
+// leaves the work running, as the freeze's own sweep reports for it, except a
+// deploy queued while the apply waited for it: that would start a change
+// under the freeze, so it is not driven, and this pod skips it for
+// heldClaimRetryAfter. A stop that could not be recorded leaves the operation
+// undriven until its lease goes stale, so its recovery checks again.
+func (s *Service) stopRecoveredWorkForFreeze(ctx context.Context, freeze *storage.EnvironmentFreeze, apply *storage.Apply, op *storage.ApplyOperation, attrs []any) bool {
+	reason, outcome := s.stopApplyForFreeze(ctx, freeze, apply)
 	switch {
-	case stopped:
+	case outcome == freezeStopRecorded:
 		s.logger.Info("operator: a stop freeze covers the work this driver recovered; it recorded the freeze's stop, which this drive delivers", attrs...)
+		return false
+	case outcome == freezeStopNothingToStop:
+		s.logger.Info("operator: a stop freeze covers the work this driver recovered, and the apply is already stopped; the drive goes on", attrs...)
 		return false
 	case reason == freezeStopSweepStopFailed:
 		s.logger.Error("operator: a stop freeze covers the work this driver recovered, and its stop was not recorded; the operation is not driven until its lease goes stale",
 			attrs...)
+		return true
+	case state.IsState(apply.State, state.Apply.WaitingForDeploy):
+		s.skipHeldOperation(op.ID)
+		s.logger.Warn("operator: a stop freeze covers the deploy this driver claimed, and its stop was refused; the deploy waits until the freeze ends",
+			append(attrs, "reason", reason, "retry_after", heldClaimRetryAfter)...)
 		return true
 	default:
 		s.logger.Warn("operator: a stop freeze covers the work this driver recovered, and its stop was refused; the work keeps running",

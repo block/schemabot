@@ -633,17 +633,23 @@ $ schemabot unfreeze freeze-abc123 --reason "SEV resolved"
 covers the whole environment. `--running` says what happens to applies
 already pending or running in scope: `continue` (the default) lets them finish,
 and `stop` stops each one when the freeze is set, including a rollout paused
-after a failure. The confirmation lists the applies it asked to stop; a stop
+after a failure, and withdraws a start queued on a stopped apply. The confirmation lists the applies it asked to stop; a stop
 takes effect as its driver delivers it, so confirm each one with
-`schemabot status <apply-id>`. It also lists any apply it could not stop, which
+`schemabot status <apply-id>`. The CLI waits up to 15 minutes for the
+confirmation, since each stop can wait on its engine. It also lists any apply it could not stop, which
 keeps running, with the reason and what to do: a PlanetScale apply has no stop,
 and cancel ends it permanently. While a `stop` freeze is in effect, SchemaBot
 also stops an apply instead of starting work on it that has not started, so a
-planned `stop` freeze holds what has not started once it begins. It does not
-stop the applies already running when it starts. `schemabot status <apply-id>`,
-the watch view and the pull request comment say which freeze stopped an apply.
-A stopped apply resumes with `schemabot start` once the freeze ends, or with an
-approved override. Times are RFC3339 and print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
+planned `stop` freeze holds what has not started once it begins. A PlanetScale
+deploy queued before the freeze waits until it ends. A planned `stop` freeze
+stops an apply already running when it starts only at the apply's next
+checkpoint: when a rollout starts its next deployment, or when SchemaBot
+recovers a drive that crashed or failed. An apply that reaches neither keeps
+running. `schemabot status <apply-id>`, the watch view and the pull request
+comment say which freeze stopped an apply, and once that freeze has ended, that
+a plain start resumes it. A stopped apply resumes with
+`schemabot start` once the freeze ends, or with an approved
+override. Times are RFC3339 and print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
 and the recent ones.
 
 A second person approves a request to let one change through a freeze. Read it
