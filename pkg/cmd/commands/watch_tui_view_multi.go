@@ -59,8 +59,8 @@ func (m WatchModel) multiDeploymentProgressSections() (string, string) {
 	if footer := templates.FormatRolloutFooter(view); footer != "" {
 		f.WriteString(footer + "\n")
 	}
-	f.WriteString(m.changeGateFooter())
 	m.writeMultiDeploymentFooter(&f, model, view.StopByKey)
+	f.WriteString(m.changeGateFooter())
 	return header.String() + body, f.String()
 }
 

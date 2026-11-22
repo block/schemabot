@@ -174,6 +174,10 @@ func TestWatchModel_MultiDeploymentViewShowsTheFreezeRefusal(t *testing.T) {
 	assert.NotContains(t, view, cutoverInProgressFooter)
 	assert.Contains(t, view, "staging is frozen. This cutover did not start.")
 	assert.Contains(t, view, `cutover apply-abc123 -e staging --override "<reason>"`)
+	// As in the single-deployment view, the refusal follows the keys.
+	keys := strings.LastIndex(view, "ESC detach")
+	require.NotEqual(t, -1, keys)
+	assert.Greater(t, strings.Index(view, "staging is frozen"), keys)
 }
 
 // A refused start's guidance does not outlive the state it was given in: once
@@ -206,4 +210,17 @@ func TestWatchModel_FreezeRefusalCommandFitsANarrowWatch(t *testing.T) {
 	require.NotEmpty(t, command)
 	assert.True(t, strings.HasPrefix(strings.TrimSpace(command), "schemabot cutover "), "the command starts its own line: %q", command)
 	assert.LessOrEqual(t, len(command), 80)
+}
+
+// A poll that spells the refused state another way is the same state, so the
+// refusal stays.
+func TestWatchModel_FreezeRefusalSurvivesAnotherSpellingOfTheState(t *testing.T) {
+	m := waitingWatchModel(state.Apply.WaitingForCutover)
+	updated, _ := m.Update(cutoverResultMsg{err: freezeRefusedAPIError()})
+	m = updated.(WatchModel)
+	require.NotEmpty(t, m.changeGateAnswer)
+
+	updated, _ = m.Update(progressMsg{state: "STATE_" + strings.ToUpper(state.Apply.WaitingForCutover)})
+	m = updated.(WatchModel)
+	assert.NotEmpty(t, m.changeGateAnswer)
 }
