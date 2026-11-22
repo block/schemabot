@@ -61,7 +61,7 @@ func formatShardedPhaseProgress(t TableProgress) string {
 	}
 	pct := presentation.PercentAcrossTargets(parts, shardTotal(t)-len(t.Shards))
 	var b strings.Builder
-	writeTableLine(&b, t, "%s %d%%%s", ui.ProgressBarRowCopy(pct), pct, throttledSuffix(t))
+	writeTableLine(&b, t, "%s %d%%%s", ui.ProgressBarRowCopy(pct), pct, ui.ThrottledSuffix(t.Throttled))
 	if t.DDL != "" {
 		b.WriteString(formatTableDDL(t))
 	}
