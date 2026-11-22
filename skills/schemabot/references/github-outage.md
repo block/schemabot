@@ -46,7 +46,13 @@ If only a few PRs are blocked and none is urgent, unblock them one at a time wit
 
 **How:** prefer keeping the check running but stopping it from blocking, for example by moving the ruleset that requires it to evaluate mode, over deleting it. The check keeps reporting, and turning it back on restores exactly what was there. A repository that also requires the check in its own ruleset or classic branch protection needs that removed separately, so write down which repositories lost which checks; recovery restores exactly those.
 
-**At-risk PRs** are open ones with a schema change in flight: an apply still running, or applied in an earlier environment but not yet in the next. `schemabot status -e production` lists active applies with the PR that started each one; run it for every environment. Ask each author not to merge until the SchemaBot checks report again, then tell them again when it is over. Posting that request is something you can do, under the usual rules for PR comments.
+**At-risk PRs** are open ones with a schema change in flight: an apply still running, or applied in an earlier environment but not yet in the next. `status` lists every active apply but only the most recent finished ones, so page through all of them for each environment, with `--last` reaching back far enough to cover the open schema PRs:
+
+```bash
+schemabot status -e <env> --all --last 14d
+```
+
+The `SOURCE` column is the PR that started each apply. Keep the PRs that are still open and have not yet applied in every environment. Ask each author not to merge until the SchemaBot checks report again, then tell them again when it is over. Posting that request is something you can do, under the usual rules for PR comments.
 
 **Keep the window as short as you can.** Every minute the checks are off is time an unapplied schema PR can merge, and every PR that merges in that window is one more database to check afterward. Turn them off only where they are blocking, and back on as soon as SchemaBot can report again, not at the end of the day.
 

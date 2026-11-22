@@ -62,7 +62,9 @@ When you do post, announce it in the turn before: "applying to staging now, I'll
 
 ## Terminal commands that change SchemaBot itself
 
-The rules above apply in the terminal too: an `apply` run from the CLI is the same decision as an `apply` comment. The CLI also has commands with no PR comment form, which change SchemaBot for every team on the server rather than one change: `freeze`, `unfreeze`, `settings` given a value, `checks backfill`, and the `storage` commands other than `storage plan`. They are for SchemaBot's operators. Hand them over, in every environment. Their read-only forms, such as `freeze list`, `settings` with no value, `checks show`, and `storage plan`, you can run.
+The rules above apply to lifecycle commands in the terminal too: a `stop` or `cutover` run from the CLI is the same decision as the comment. A terminal `apply` is different. It runs outside the PR, so it skips the PR's environment order and checks, and its flags can drop safeguards a comment always keeps: `--no-lock` takes no database lock, `--force` breaks another owner's lock, and `--auto-approve` skips the confirmation prompt. Apply a PR's change from the PR, and hand over any terminal `apply`, in every environment.
+
+The CLI also has commands with no PR comment form, which change SchemaBot for every team on the server rather than one change: `freeze`, `unfreeze`, `settings` given a value, `checks backfill`, and the `storage` commands other than `storage plan`. They are for SchemaBot's operators. Hand them over, in every environment. Their read-only forms, such as `freeze list`, `settings` with no value, `checks show`, and `storage plan`, you can run.
 
 ## The user can opt out
 

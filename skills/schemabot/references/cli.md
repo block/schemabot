@@ -2,7 +2,7 @@
 
 The `schemabot` CLI shows what SchemaBot is running on a database: each apply's state, per-table progress, ETA, and logs, in any environment. It reads from the SchemaBot server, not from GitHub, so it still works when PR comments stop updating.
 
-These are terminal commands, not PR comments. Reading status, progress, history, plans, and logs needs only read access, and you can run them without asking each time. Commands that change something, such as `apply`, `stop`, or `cutover`, follow the same [command policy](command-policy.md) in the terminal as on the PR.
+These are terminal commands, not PR comments. Reading status, progress, history, plans, and logs needs only read access, and you can run them without asking each time. Commands that change something, such as `stop` or `cutover`, follow the same [command policy](command-policy.md) in the terminal as on the PR. Apply a PR's change from the PR: hand over any terminal `apply`, because it skips the PR's environment order and can skip the database lock.
 
 ## Set up
 

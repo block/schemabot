@@ -135,6 +135,14 @@ func TestAgentSkillCommandPolicy(t *testing.T) {
 		handOverPart, _, found := strings.Cut(section, "Their read-only forms")
 		require.True(t, found, "the section must keep the read-only forms apart from the commands to hand over")
 		cli := newCLIParser(t)
+		assert.Contains(t, handOverPart, "hand over any terminal `apply`, in every environment")
+		apply := childCommand(cli.Model.Node, action.Apply)
+		require.NotNil(t, apply, "the CLI has no apply command")
+		for _, flag := range cliApplySafeguardFlags {
+			assert.True(t, slices.ContainsFunc(apply.Flags, func(f *kong.Flag) bool { return "--"+f.Name == flag }),
+				"the CLI's apply no longer has %s; update cliApplySafeguardFlags and the command policy", flag)
+			assert.Contains(t, handOverPart, "`"+flag+"`", "the command policy must name %s among the safeguards a terminal apply can drop", flag)
+		}
 		var names []string
 		for _, child := range cli.Model.Children {
 			if child.Type != kong.CommandNode {
@@ -247,6 +255,11 @@ var policyNeutralFlags = map[string]string{
 	"--defer-cutover": "waits for a separate cutover, which has its own row",
 	"-y":              "is refused on a PR comment",
 }
+
+// cliApplySafeguardFlags are the CLI apply flags that drop a safeguard a PR
+// comment apply always keeps. The command policy names each one when it tells
+// an agent to hand over a terminal apply.
+var cliApplySafeguardFlags = []string{"--no-lock", "--force", "--auto-approve"}
 
 // cliKind is what a CLI command with no PR comment form does.
 type cliKind string
