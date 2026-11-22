@@ -263,7 +263,7 @@ func TestE2EApplyBlockedByReviewGate(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging",
@@ -322,7 +322,7 @@ func TestE2EApplyProceedsWithApproval(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging",
@@ -380,7 +380,7 @@ func TestE2EApplyBlockedBySelfApproval(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging",
@@ -429,7 +429,7 @@ func TestE2EApplyNoCodeownersFile_Blocked(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging",
@@ -485,7 +485,7 @@ func TestE2EApplyNoCodeownersFile_Approved(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging",
@@ -547,7 +547,7 @@ func TestE2EApplyTeamSlugApproval(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging",
@@ -614,7 +614,7 @@ func TestE2EApplyTeamSlugBlocked(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging",
@@ -672,7 +672,7 @@ func TestE2EApplyCodeownersOptIn(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging",
@@ -721,7 +721,7 @@ func TestE2EApplyReviewGateDisabled(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging",

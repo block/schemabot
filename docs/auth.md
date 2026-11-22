@@ -191,9 +191,15 @@ a separate route that accepts GitHub deliveries and lets SchemaBot verify
 their signatures. This does not require making the API public.
 
 Always configure the webhook secret for a shared installation. Without it,
-the single-App configuration skips signature verification. A signed delivery
-proves where the event came from; it does not grant the comment author
-permission to apply a change.
+the single-App configuration currently skips signature verification and
+accepts unsigned deliveries, and the webhook handler logs a warning that names
+the missing secret. A future release will refuse unsigned deliveries when no
+secret is set. A program that embeds the `pkg/webhook` handler and wants to
+accept unsigned deliveries on purpose, such as a test or a local harness, passes
+`webhook.WithInsecureSkipSignatureVerification()` when it builds the handler,
+which silences the warning. The `schemabot serve` command already refuses to
+start without a webhook secret. A signed delivery proves where the event came
+from; it does not grant the comment author permission to apply a change.
 
 Set command permissions and check the connection below. You can configure
 CLI and API access separately if you need those interfaces too.
