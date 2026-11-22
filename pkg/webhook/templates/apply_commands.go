@@ -612,16 +612,26 @@ func RenderLocksAlreadyReleased() string {
 	return sb.String()
 }
 
-// RenderCannotUnlock renders a comment when unlock is blocked by an active apply.
+// RenderCannotUnlock renders a comment when unlock is blocked by an apply that
+// has not settled. A stopped apply still holds its lock, so stopping is never
+// offered as the way out: an active apply is waited for or cancelled, and a
+// stopped one is resumed or cancelled.
 func RenderCannotUnlock(database, environment, applyID, applyState string) string {
 	var sb strings.Builder
 
 	writeEnvironmentTitle(&sb, glyph.Attention+" Cannot Unlock", environment)
 	writeDBLine(&sb, database)
 	sb.WriteString("\n")
+	if state.IsState(applyState, state.Apply.Stopped) {
+		fmt.Fprintf(&sb, "Apply `%s` is stopped and still holds this lock.\n\n", applyID)
+		fmt.Fprintf(&sb, "Resume it with `schemabot start %s -e %s` or cancel it with `schemabot cancel %s -e %s`, then unlock again.\n",
+			applyID, environment, applyID, environment)
+		return sb.String()
+	}
 	fmt.Fprintf(&sb, "An apply is currently active (apply ID: `%s`, state: `%s`).\n\n",
 		applyID, applyState)
-	sb.WriteString("Wait for it to complete or stop it first.\n")
+	fmt.Fprintf(&sb, "Wait for it to complete, or cancel it with `schemabot cancel %s -e %s`, then unlock again.\n",
+		applyID, environment)
 
 	return sb.String()
 }

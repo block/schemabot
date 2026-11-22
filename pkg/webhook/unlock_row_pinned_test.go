@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
@@ -52,7 +53,7 @@ func (s *replacedLockStore) replaceOnce() {
 	s.held = s.replacement
 }
 
-func (s *replacedLockStore) ReleaseByID(_ context.Context, id int64, database, dbType, owner, pendingPlanID string) error {
+func (s *replacedLockStore) ReleaseByIDIfUnused(_ context.Context, id int64, database, dbType, owner, pendingPlanID string) error {
 	s.replaceOnce()
 	switch {
 	case s.held == nil || s.held.DatabaseName != database || s.held.DatabaseType != dbType:
@@ -235,6 +236,76 @@ func TestUnlockLeavesLockAcquiredAgainForNewPlanHeld(t *testing.T) {
 			body := requireComment(t, comments, "stale-command answer")
 			assert.Contains(t, body, "acquired after the command was received")
 			assert.NotContains(t, body, "Released by @testuser")
+		})
+	}
+}
+
+// An unlock's active-apply check finds nothing running on orders, and the
+// release then finds an apply recording the vetted lock row: one that became
+// durable after the check, or a stopped apply the check treats as finished.
+// The lock still protects that apply, so it stays held, and the command
+// answers with the apply holding it and what to do: wait for or cancel an
+// active apply, resume or cancel a stopped one. It is the command's answer,
+// so the delivery is not retried and no other answer follows it.
+func TestUnlockKeepsLockAnUnsettledApplyRecords(t *testing.T) {
+	tests := []struct {
+		name       string
+		applyState string
+		wantBody   []string
+	}{
+		{
+			name:       "apply started after the active-apply check",
+			applyState: state.Apply.Running,
+			wantBody: []string{
+				"An apply is currently active (apply ID: `apply-orders-1`, state: `running`).",
+				"Wait for it to complete, or cancel it with `schemabot cancel apply-orders-1 -e staging`, then unlock again.",
+			},
+		},
+		{
+			name:       "stopped apply",
+			applyState: state.Apply.Stopped,
+			wantBody: []string{
+				"Apply `apply-orders-1` is stopped and still holds this lock.",
+				"Resume it with `schemabot start apply-orders-1 -e staging` or cancel it with `schemabot cancel apply-orders-1 -e staging`, then unlock again.",
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := recordComments(t, mux)
+			lockStore := &unlockTestLockStore{
+				locks: []*storage.Lock{withLockID(prOwnedOrdersLock(), 41)},
+				releaseErrs: map[string]error{"orders": &storage.LockInUseError{
+					LockID: 41,
+					Apply: &storage.Apply{
+						ApplyIdentifier: "apply-orders-1",
+						Database:        "orders",
+						DatabaseType:    storage.DatabaseTypeMySQL,
+						Environment:     "staging",
+						Repository:      "octocat/hello-world",
+						PullRequest:     1,
+						State:           tc.applyState,
+					},
+				}},
+			}
+			st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+			h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+			retry, err := h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+
+			require.NoError(t, err)
+			assert.False(t, retry, "a lock kept for an apply is the command's answer")
+			assert.Equal(t, 1, lockStore.releaseCalls)
+			assert.Empty(t, lockStore.released, "the lock the apply records must stay held")
+			body := requireComment(t, comments, "cannot-unlock answer")
+			assert.Contains(t, body, "Cannot Unlock")
+			assert.Contains(t, body, "`orders`")
+			for _, want := range tc.wantBody {
+				assert.Contains(t, body, want)
+			}
+			assert.NotContains(t, body, "stop it")
+			assert.Empty(t, comments, "the cannot-unlock answer must be the command's only comment")
 		})
 	}
 }
