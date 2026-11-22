@@ -390,7 +390,7 @@ endif
 		sleep 1; \
 	done
 	@echo "Applying schemas (MySQL + Vitess in parallel)..."
-	@E2E_SEED_APPLY_TIMEOUT=$(E2E_SEED_APPLY_TIMEOUT) scripts/e2e-seed.sh
+	@E2E_SEED_APPLY_TIMEOUT=$(E2E_SEED_APPLY_TIMEOUT) E2E_DC="$(E2E_DC)" scripts/e2e-seed.sh
 	@echo "Running e2e tests..."
 	@E2E_SCHEMABOT_URL=http://localhost:14370 \
 	LOCALSCALE_URL=http://localhost:14374 \

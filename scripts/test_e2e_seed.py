@@ -50,7 +50,30 @@ FAKE_SCHEMABOT = textwrap.dedent(
 )
 
 FAKE_DOCKER = '#!/usr/bin/env bash\necho "fake docker $*"\n'
-FAKE_CURL = "#!/usr/bin/env bash\nexit 0\n"
+# Counts each VSchema it is asked to seed, and rejects them all when
+# FAKE_CURL_FAIL is set, the way curl -f reports an HTTP error. Like a failing
+# seed apply, it waits for every hanging seed to start before it fails.
+FAKE_CURL = textwrap.dedent(
+    """\
+    #!/usr/bin/env bash
+    echo seed-vschema >> "$FAKE_STATE/curl"
+    if [ -n "${FAKE_CURL_FAIL:-}" ]; then
+      for hanging in ${FAKE_HANG:-}; do
+        for _ in $(seq 1 100); do
+          [ -f "$FAKE_STATE/$hanging.pid" ] && break
+          sleep 0.1
+        done
+      done
+      echo "curl: (22) The requested URL returned error: 400" >&2
+      exit 22
+    fi
+    exit 0
+    """
+)
+
+# A compose command with a project flag, so a test can tell the script used
+# E2E_DC rather than a compose command of its own.
+E2E_DC = "docker compose -f deploy/e2e/docker-compose.yml -p seed-test"
 
 
 def write_executable(path, content):
@@ -99,15 +122,17 @@ class E2ESeedTest(unittest.TestCase):
         write_executable(self.root / "fakebin" / "curl", FAKE_CURL)
         (self.root / "examples").symlink_to(REPO / "examples")
 
-    def run_seed(self, timeout="30", hang="", fail=""):
+    def run_seed(self, timeout="30", hang="", fail="", curl_fail="", compose=E2E_DC):
         state = pathlib.Path(tempfile.mkdtemp(dir=self.root))
         env = dict(os.environ)
         env.update(
             PATH=f"{self.root / 'fakebin'}{os.pathsep}{env['PATH']}",
             E2E_SEED_APPLY_TIMEOUT=timeout,
+            E2E_DC=compose,
             FAKE_STATE=str(state),
             FAKE_HANG=hang,
             FAKE_FAIL=fail,
+            FAKE_CURL_FAIL=curl_fail,
         )
         # Output goes to a file rather than a pipe: a seed apply the script
         # failed to stop would hold a pipe open and turn the assertion below
@@ -146,7 +171,7 @@ class E2ESeedTest(unittest.TestCase):
         run = self.run_seed(hang="mysql-staging", fail="vitess-staging")
         self.assertEqual(run.returncode, 1, run.output)
         self.assertIn("=== LocalScale logs ===", run.output)
-        self.assertIn("fake docker compose -f deploy/e2e/docker-compose.yml logs localscale --tail=200", run.output)
+        self.assertIn(f"fake {E2E_DC} logs localscale --tail=200", run.output)
         self.assert_not_running(run, "mysql-staging")
         self.assertNotIn("mysql-production", run.started())
         self.assertNotIn("vitess-production", run.started())
@@ -158,6 +183,22 @@ class E2ESeedTest(unittest.TestCase):
         self.assertIn("=== LocalScale logs ===", run.output)
         self.assert_not_running(run, "mysql-production")
         self.assertIn("vitess-staging", run.started())
+        self.assertLess(run.elapsed, 20, "the seed script waited on the hanging MySQL seed instead of stopping it")
+
+    # LocalScale rejects the first VSchema while the MySQL seed is still
+    # running. The setup fails on that rejection, before any Vitess apply runs
+    # against a keyspace without its VSchema, and stops the MySQL seed.
+    def test_a_rejected_vschema_fails_the_setup_before_the_vitess_seeds(self):
+        run = self.run_seed(hang="mysql-staging", curl_fail="1")
+        self.assertEqual(run.returncode, 1, run.output)
+        self.assertIn(
+            "seeding the testapp VSchema for localscale-staging failed (curl exit 22); failing the e2e setup",
+            run.output,
+        )
+        self.assertIn(f"fake {E2E_DC} logs localscale --tail=200", run.output)
+        self.assertEqual(len((run.state / "curl").read_text().splitlines()), 1)
+        self.assertNotIn("vitess-staging", run.started())
+        self.assert_not_running(run, "mysql-staging")
         self.assertLess(run.elapsed, 20, "the seed script waited on the hanging MySQL seed instead of stopping it")
 
     def test_mysql_failure_fails_the_setup(self):
@@ -173,16 +214,29 @@ class E2ESeedTest(unittest.TestCase):
         self.assert_not_running(run, "vitess-staging")
         self.assertNotIn("vitess-production", run.started())
 
-    def test_a_timeout_that_is_not_a_positive_number_is_rejected(self):
-        for timeout in ["0", "00", "000", "", "abc", "-5", "1.5"]:
+    # perl reads zero, an empty value, and anything too large for a C int as
+    # alarm(0) or a negative alarm, both of which leave the seed unbounded.
+    def test_a_timeout_that_would_not_bound_the_seed_is_rejected(self):
+        for timeout in ["0", "00", "000", "", "abc", "-5", "1.5", "1000000", "2147483648", "4294967296"]:
             with self.subTest(timeout=timeout):
                 run = self.run_seed(timeout=timeout)
                 self.assertEqual(run.returncode, 2, run.output)
                 self.assertIn(
-                    f"E2E_SEED_APPLY_TIMEOUT must be a positive whole number of seconds, got '{timeout}'",
+                    f"E2E_SEED_APPLY_TIMEOUT must be a whole number of seconds from 1 to 999999, got '{timeout}'",
                     run.output,
                 )
                 self.assertEqual(run.started(), [])
+
+    def test_the_largest_accepted_timeout_runs_the_seed(self):
+        run = self.run_seed(timeout="999999")
+        self.assertEqual(run.returncode, 0, run.output)
+        self.assertEqual(len(run.started()), 4)
+
+    def test_a_missing_compose_command_is_rejected(self):
+        run = self.run_seed(compose="")
+        self.assertEqual(run.returncode, 2, run.output)
+        self.assertIn("E2E_DC must name the docker compose command for the e2e stack", run.output)
+        self.assertEqual(run.started(), [])
 
 
 if __name__ == "__main__":
