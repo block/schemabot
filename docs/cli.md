@@ -640,8 +640,12 @@ confirmation, since each stop can wait on its engine. It also lists any apply it
 keeps running, with the reason and what to do: a PlanetScale apply has no stop,
 and cancel ends it permanently. While a `stop` freeze is in effect, SchemaBot
 also stops an apply instead of starting work on it that has not started, so a
-planned `stop` freeze holds what has not started once it begins. It does not
-stop the applies already running when it starts. A stopped apply resumes with
+planned `stop` freeze holds what has not started once it begins. A PlanetScale
+deploy queued before the freeze waits until it ends. A planned `stop` freeze
+stops an apply already running when it starts only at the apply's next
+checkpoint: when a rollout starts its next deployment, or when SchemaBot
+recovers a drive that crashed or failed. An apply that reaches neither keeps
+running. A stopped apply resumes with
 `schemabot start` once the freeze ends, or with an approved
 override. Times are RFC3339 and print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
 and the recent ones.

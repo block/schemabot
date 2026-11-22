@@ -189,3 +189,38 @@ func TestHeldOperationsAreSkippedForARetryWindow(t *testing.T) {
 	assert.Empty(t, svc.heldOperationIDs(), "the held operations are claimable again")
 	assert.Empty(t, svc.operationClaimOptions(1))
 }
+
+// PlanetScale has no stop, so a claim that recovers its work cannot record the
+// freeze's stop. Running work keeps running, as the freeze's sweep reports. A
+// deploy queued while the apply waited for it would start the change under the
+// freeze, so that claim is not driven, and this pod skips it for
+// heldClaimRetryAfter: the deploy waits until the freeze ends.
+func TestClaimCheckpointHoldsAQueuedDeployItCannotStop(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		applyState string
+		wantHeld   bool
+	}{
+		{"WaitingForDeploy", state.Apply.WaitingForDeploy, true},
+		{"Running", state.Apply.Running, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := claimCheckpointApply()
+			apply.Engine = storage.EnginePlanetScale
+			apply.State = tc.applyState
+			svc := newClaimCheckpointTestService(t, newGateFreezeStore(t, stopFreeze("freeze-stop")), nil)
+			svc.storage.(*mockStorageWithApplyStores).applies = &staticApplyStore{apply: apply}
+			svc.ternClients[DefaultDeployment+"/staging"] = &mockTernClient{}
+			op := &storage.ApplyOperation{ID: 70, ApplyID: apply.ID, State: state.ApplyOperation.Running}
+
+			held := svc.holdClaimForStopFreeze(t.Context(), 1, apply, op, op.Lease())
+
+			assert.Equal(t, tc.wantHeld, held)
+			if tc.wantHeld {
+				assert.Equal(t, []int64{70}, svc.heldOperationIDs(), "the queued deploy is skipped for a while")
+			} else {
+				assert.Empty(t, svc.heldOperationIDs())
+			}
+		})
+	}
+}

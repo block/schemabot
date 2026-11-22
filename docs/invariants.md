@@ -2264,14 +2264,17 @@ a PlanetScale apply, which has no stop, or one whose operations it cannot read, 
 response with why, never skipped silently; when it cannot list the applies at all, it says it
 stopped none. An apply waiting for its cutover is left alone, because the freeze refuses the cutover,
 and so is a pull request rollback, which no freeze holds. A planned `stop` freeze stops nothing when
-it is set, and does not stop the applies already running when it starts.
+it is set; an apply already running when it starts is stopped only at the checkpoint below.
 A driver checks again at claim, before it starts an operation that has not started or resumes a
 stopped one for a queued start. While a `stop` freeze covering the apply is in effect, it returns the
 claim with the operation as it was, unstarted, and records the freeze's stop, which stop
 reconciliation delivers without starting anything; for a queued start, the stop withdraws it (CO-4).
-This holds work a planned `stop` freeze meets once it starts. A claim that recovers or redispatches
-work instead records the freeze's stop and drives on, so the drive delivers it; that covers unstarted
-work whose claim could not be returned, which reads as running until its lease goes stale. A pending
+This holds work a planned `stop` freeze meets once it starts, and stops a running rollout when it
+claims its next deployment. A claim that recovers or redispatches work instead records the freeze's
+stop and drives on, so the drive delivers it; that covers unstarted work whose claim could not be
+returned, which reads as running until its lease goes stale. When the engine refuses that stop, the
+work keeps running, except a PlanetScale deploy queued before the freeze, which is not driven, so it
+waits until the freeze ends. An apply that runs to the end without such a claim keeps running. A pending
 cancel is never held: the claim that carries it is driven whatever the freezes (AZ-10, CO-2). An
 approved override that admitted the apply at its creation, or the one that admitted its queued start,
 which the start request names, lets it start when it names the freeze; another approval for the same
