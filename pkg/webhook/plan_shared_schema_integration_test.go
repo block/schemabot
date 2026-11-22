@@ -167,7 +167,7 @@ func (p *sharedSchemaHarness) openAndAwaitAggregate(t *testing.T) *checkRunCaptu
 				return &cr
 			}
 		case <-deadline:
-			t.Fatal("timed out waiting for the aggregate check run")
+			require.FailNow(t, "timed out waiting for the aggregate check run")
 			return nil
 		}
 	}
@@ -187,7 +187,7 @@ func (p *sharedSchemaHarness) nextComment(t *testing.T, what string) string {
 	case body := <-p.github.comments:
 		return html.UnescapeString(body)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatalf("timed out waiting for %s", what)
+		require.FailNow(t, "timed out waiting for "+what)
 		return ""
 	}
 }
@@ -439,7 +439,7 @@ func (p *sharedSchemaHarness) commentContaining(t *testing.T, want string) strin
 				return body
 			}
 		case <-deadline:
-			t.Fatalf("timed out waiting for a comment containing %q", want)
+			require.FailNowf(t, "timed out waiting for a comment", "want a comment containing %q", want)
 			return ""
 		}
 	}

@@ -103,7 +103,8 @@ func TestPostCommandErrorExplainsRemoteUnavailable(t *testing.T) {
 // A shared schema check that cannot learn which schemas a database's
 // namespaces address fails the command with a fixed line naming the database,
 // target, and deployment. The data plane's own error stays in the server logs,
-// and a data plane too old to answer is told to upgrade.
+// a data plane too old to answer is told to upgrade, and a data plane whose
+// engine cannot resolve namespaces is told a retry will not help.
 func TestUserFacingErrorHidesNamespaceResolutionCause(t *testing.T) {
 	resolution := func(cause error) error {
 		return fmt.Errorf("compare ignore_tables of %q with the databases sharing its targets in staging: %w", "shop",
@@ -111,8 +112,12 @@ func TestUserFacingErrorHidesNamespaceResolutionCause(t *testing.T) {
 	}
 
 	t.Run("a data plane that predates the RPC", func(t *testing.T) {
-		message := userFacingError(resolution(fmt.Errorf("resolve namespaces: %w", tern.ErrResolveNamespacesUnsupported)))
+		message := userFacingError(resolution(fmt.Errorf("resolve namespaces: %w", tern.ErrResolveNamespacesUnimplemented)))
 		assert.Equal(t, "SchemaBot could not check which schemas `shop` shares with other databases on target `shop-001` of deployment `east`, because that deployment's data plane cannot report which schema each namespace addresses. Upgrade that data plane, then run the command again.", message)
+	})
+	t.Run("an engine that cannot resolve namespaces", func(t *testing.T) {
+		message := userFacingError(resolution(fmt.Errorf("resolve namespaces: %w", tern.ErrResolveNamespacesUnsupported)))
+		assert.Equal(t, "SchemaBot could not check which schemas `shop` shares with other databases on target `shop-001` of deployment `east`, because that deployment's data plane cannot resolve namespaces for this database's engine. Running the command again will not help; the SchemaBot server logs have the cause.", message)
 	})
 	t.Run("any other failure", func(t *testing.T) {
 		message := userFacingError(resolution(errors.New("dial tcp db-internal.example:3306: connection refused")))

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/templates"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -107,12 +108,18 @@ func userFacingError(err error) string {
 // namespaceResolutionFailedMessage is the PR comment line for a shared schema
 // check that could not learn which schemas a database's namespaces address on
 // a target. A data plane too old to answer needs an upgrade, and saying so is
-// the whole remedy; any other failure is named only by its identifiers.
+// the whole remedy. A data plane whose engine cannot resolve namespaces will
+// refuse every retry, so the line says so instead of suggesting one. Any other
+// failure is named only by its identifiers.
 func namespaceResolutionFailedMessage(err *api.NamespaceResolutionError) string {
 	where := "target `" + err.Target + "` of deployment `" + err.Deployment + "`"
 	if err.DataPlaneTooOld() {
 		return "SchemaBot could not check which schemas `" + err.Database + "` shares with other databases on " + where +
 			", because that deployment's data plane cannot report which schema each namespace addresses. Upgrade that data plane, then run the command again."
+	}
+	if errors.Is(err, tern.ErrResolveNamespacesUnsupported) {
+		return "SchemaBot could not check which schemas `" + err.Database + "` shares with other databases on " + where +
+			", because that deployment's data plane cannot resolve namespaces for this database's engine. Running the command again will not help; the SchemaBot server logs have the cause."
 	}
 	return "SchemaBot could not check which schemas `" + err.Database + "` shares with other databases on " + where +
 		", so the command was refused. Run the command again; if it fails again, the SchemaBot server logs have the cause."
