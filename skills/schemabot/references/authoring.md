@@ -38,6 +38,16 @@ schema/
     └── orders.sql       CREATE TABLE `orders` (...)
 ```
 
+**PostgreSQL**, one subdirectory per PostgreSQL schema. PostgreSQL defines indexes outside the table, so a table's file holds its `CREATE TABLE` followed by that table's `CREATE INDEX` statements:
+
+```text
+schema/
+├── schemabot.yaml       database: shop, type: postgres
+└── public/              PostgreSQL schema
+    ├── users.sql        CREATE TABLE "users" (...); CREATE INDEX ...
+    └── orders.sql       CREATE TABLE "orders" (...)
+```
+
 **Vitess**, one subdirectory per keyspace, each with its own `vschema.json`:
 
 ```text
@@ -49,16 +59,6 @@ schema/
 └── shop/                unsharded keyspace, such as sequence tables
     ├── orders_seq.sql
     └── vschema.json
-```
-
-**PostgreSQL**, one subdirectory per PostgreSQL schema. PostgreSQL defines indexes outside the table, so a table's file holds its `CREATE TABLE` followed by that table's `CREATE INDEX` statements:
-
-```text
-schema/
-├── schemabot.yaml       database: shop, type: postgres
-└── public/              PostgreSQL schema
-    ├── users.sql        CREATE TABLE "users" (...); CREATE INDEX ...
-    └── orders.sql       CREATE TABLE "orders" (...)
 ```
 
 The repository's [examples](https://github.com/block/schemabot/tree/main/examples) directory has complete MySQL and Vitess layouts. For PostgreSQL, `schemabot pull` prints a live database's schema in the format the files use; see [Schema pull](https://github.com/block/schemabot/blob/main/docs/postgresql.md#schema-pull).
