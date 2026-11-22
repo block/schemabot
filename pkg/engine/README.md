@@ -10,7 +10,7 @@ SchemaBot supports multiple engines for executing schema changes on different da
 |--------|---------|--------|----------|
 | Spirit | [`engine/spirit`](./spirit/) | Implemented | MySQL |
 | PlanetScale | [`engine/planetscale`](./planetscale/) | Implemented | Vitess |
-| PostgreSQL | [`engine/postgres`](./postgres/) | Implemented (early alpha) | PostgreSQL |
+| PostgreSQL | [`engine/postgres`](./postgres/) | Implemented (alpha) | PostgreSQL |
 
 ## Engine Interface
 

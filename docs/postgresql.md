@@ -4,6 +4,8 @@
 
 ## Table of Contents
 
+- [Alpha status](#alpha-status)
+- [Where it runs](#where-it-runs)
 - [What pg-sprite does](#what-pg-sprite-does)
 - [How a change runs](#how-a-change-runs)
 - [Quick start](#quick-start)
@@ -31,14 +33,67 @@ review the exact SQL before anything runs. Planning and
 execution are done by [pg-sprite](https://github.com/block/pg-sprite), an
 open-source schema change engine for PostgreSQL.
 
-PostgreSQL support is in **early alpha**. That means SchemaBot runs a narrow
-set of changes today, not that it runs them less carefully.
-Changes PostgreSQL can make without long locks, such as adding a nullable
-column, building an index concurrently, or creating a table, are applied. A
-change that would rewrite or lock a large table is blocked in the plan, with the
-reason, before anything touches the database. Nothing falls back to a riskier
-way of running it. [What GA and early alpha
-mean](engines.md#what-ga-and-early-alpha-mean) lists what is missing.
+PostgreSQL support is in **alpha**. It handles a narrow set of changes today,
+and the list of what it cannot do yet is long; [Alpha status](#alpha-status)
+spells it out. Inside that set it is as careful as on any other database: a
+change it cannot run without a long lock is blocked in the plan, with the
+reason, before anything touches the database, and nothing falls back to a
+riskier way of running it.
+
+## Alpha status
+
+**What works today:**
+
+- Planning on every pull request and in the CLI, with the plan's exact SQL, and
+  a Check Run that can block the merge until the change is applied.
+- `ALTER TABLE` changes that only touch the catalog, such as adding a nullable
+  column, on tables up to 1 GiB.
+- Adding an index to an existing table, built with `CREATE INDEX CONCURRENTLY`.
+  A running build can be cancelled.
+- Creating a table together with its indexes.
+- Row-level security policies on an existing table.
+- `schemabot init` and `schemabot pull` for an existing database, and
+  PostgreSQL as the database that stores SchemaBot's own state.
+
+**Not implemented yet:**
+
+- **Changes that rewrite a table**, such as changing a column's type. These
+  need an online copy of the table, which SchemaBot does not run on PostgreSQL
+  yet, so the plan is blocked.
+- **`ALTER TABLE` on a table larger than 1 GiB.** Blocked, for the same reason.
+- **Foreign keys.** Adding or dropping one is blocked, and `pull` refuses a
+  table that has one.
+- **Dropping a table.** SchemaBot never runs `DROP TABLE` on PostgreSQL, and
+  there is no pending-drops quarantine.
+- **Controls on a running change.** `stop`, `start`, `cutover`, deferred
+  cutover, `revert`, and `skip-revert` are not available. `cancel` works only
+  on an index build.
+- **Pulling every table shape.** `pull` refuses partitioned tables, inherited
+  and unlogged tables, triggers, comments, explicit collations, and non-default
+  table options.
+- **Detailed catalog output** from the schema intelligence API.
+
+The [reference](#supported-changes) below has the rules behind each item.
+[What GA and alpha mean](engines.md#what-ga-and-alpha-mean) defines the bar
+PostgreSQL support has to reach to leave alpha.
+
+## Where it runs
+
+SchemaBot works with PostgreSQL 14 and later, self-hosted or managed,
+including:
+
+| Provider | Connect to |
+|---|---|
+| Amazon RDS for PostgreSQL | The instance endpoint |
+| Amazon Aurora PostgreSQL | The cluster's writer endpoint, not a reader endpoint |
+| Supabase | The direct connection, or the Supavisor session pooler. Not the transaction pooler |
+| PlanetScale Postgres | The direct connection. Not the PgBouncer endpoint |
+
+Whatever the provider, SchemaBot needs the read-write primary and a connection
+that keeps one PostgreSQL session per client connection. A transaction-mode
+pooler breaks both the schema change session settings and SchemaBot's own
+coordination, so startup refuses one it can detect. Your application keeps
+whatever pooling it already uses.
 
 ## What pg-sprite does
 
@@ -426,9 +481,8 @@ owner is checked at plan time as the role the create will run as: missing
 membership blocks the create step with the `GRANT` that provides it, and an
 owner the target has no role for blocks it with no grant to print.
 
-`table_owner` is one role per target, deliberately scalar. A per-namespace
-map mirroring `schema_overrides` is a later extension for a target whose
-schemas have different owners; no such target exists today.
+`table_owner` names one role for the whole target. A target whose schemas
+belong to different owner roles cannot set an owner per schema yet.
 
 A name needed by the create set that is already occupied is a permanent
 refusal. The occupant is a relation of any kind — table, view, index, or
@@ -444,8 +498,10 @@ or sequence another name. A target schema that does not exist is also a
 permanent refusal.
 
 The create path refuses shapes whose outcome it cannot prove, each
-permanently: `IF NOT EXISTS` (its no-op outcome cannot be proven),
-`CREATE TABLE ... PARTITION OF` attaching a partition to a live parent, and a
+permanently: `IF NOT EXISTS` (its no-op outcome cannot be proven);
+`PARTITION OF` or `INHERITS` naming a live parent; `LIKE` copying a live
+table; `OF` a composite type; `CREATE INDEX CONCURRENTLY` written for an index
+on the new table; a foreign key; more than one create in one statement; and a
 statement that claims the same relation name twice.
 
 A schema file may declare a new table together with `CREATE INDEX` statements
@@ -622,9 +678,9 @@ change or that depend on the target:
 - For a change to an existing table: a missing target, or an object that is
   not an ordinary or partitioned table, is refused permanently.
 - For a `CREATE TABLE`: a relation of any kind already occupying the name, a
-  missing target schema, a duplicate name inside the statement, `IF NOT
-  EXISTS`, and `PARTITION OF` against a live parent are each refused
-  permanently, with a reason directing a fix or a re-plan.
+  missing target schema, and each create-path shape listed under
+  [Greenfield tables](#greenfield-tables) are refused permanently, with a
+  reason directing a fix or a re-plan.
 - After a `CREATE TABLE` commits, pg-sprite reads back the constraint-index
   and sequence names the table owns. A table that owns a suffixed name in
   place of one the schema file claims — an occupant took the first choice
@@ -1129,8 +1185,8 @@ go test -tags=integration -run '^TestSupabaseEngine$' -count=1 ./pkg/engine/post
 Successful output ends with `ok` for `github.com/block/schemabot/pkg/engine/postgres`.
 A passing refusal case proves rejection, not support for applying that change.
 
-This is a small adapter suite, not a claim of hosted Supabase support. It does
-not exercise Supavisor, the Data API, Auth service, Realtime, or hosted TLS.
+The suite runs against the image rather than a hosted project, so it does not
+exercise Supavisor, the Data API, Auth service, Realtime, or hosted TLS.
 The Supabase fixture test covers pull and comparison; the separate atomic RLS
 integration tests cover policy replacement. The fixture RLS test also calls the native apply path directly and checks visibility with the image's `authenticated` role and
 bootstrap `auth.uid()` function. It does not test the full plan-to-apply workflow

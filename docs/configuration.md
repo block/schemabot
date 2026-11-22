@@ -260,9 +260,8 @@ blocks the create step at plan time with the grant or correction it needs.
 [Table ownership](postgresql.md#table-ownership) explains what the owner
 controls and shows the full set of grants.
 
-`table_owner` is one role per target, deliberately scalar. A per-namespace
-map mirroring `schema_overrides` is a later extension for a target whose
-schemas have different owners; no such target exists today.
+`table_owner` names one role for the whole target. A target whose schemas
+belong to different owner roles cannot set an owner per schema yet.
 
 The referenced config document is JSON with top-level `host`, `port`, and
 `dbname` fields by default; set `config_paths` to read other keys:

@@ -7,7 +7,7 @@
 - [Capability matrix](#capability-matrix)
 - [What the terms mean](#what-the-terms-mean)
 - [Why the differences exist](#why-the-differences-exist)
-- [What GA and early alpha mean](#what-ga-and-early-alpha-mean)
+- [What GA and alpha mean](#what-ga-and-alpha-mean)
 - [Load management](#load-management)
 - [Dropped tables](#dropped-tables)
 - [Reading further](#reading-further)
@@ -271,10 +271,10 @@ is bounded by its own duration budget instead. [postgresql.md](postgresql.md) ha
 the full boundary and is worth reading before you point SchemaBot at a PostgreSQL database; it
 tracks the engine more closely than this page does.
 
-## What GA and early alpha mean
+## What GA and alpha mean
 
 The engine badges on the [README](../README.md) are claims about capability, and this is where
-they are defined. An engine is **GA** when it can do the two things below. **Early alpha** means
+they are defined. An engine is **GA** when it can do the two things below. **Alpha** means
 it cannot yet, and that what is missing is written on this page rather than left for you to
 discover against a database.
 
