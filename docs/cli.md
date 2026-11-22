@@ -630,10 +630,18 @@ $ schemabot unfreeze freeze-abc123 --reason "SEV resolved"
 ```
 
 `--deployment` and `--database` narrow a freeze and repeat; without them it
-covers the whole environment. `--running` records `continue` (the default) or
-`stop` for applies already running in scope. SchemaBot does not act on `stop`
-yet, so stop a running apply with `schemabot stop`. Times are RFC3339 and
-print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
+covers the whole environment. `--running` says what happens to applies
+already pending or running in scope: `continue` (the default) lets them finish,
+and `stop` stops each one when the freeze is set, including a rollout paused
+after a failure, and withdraws a start queued on a stopped apply. The confirmation lists the applies it asked to stop; a stop
+takes effect as its driver delivers it, so confirm each one with
+`schemabot status <apply-id>`. The CLI waits up to 15 minutes for the
+confirmation, since each stop can wait on its engine. It also lists any apply it could not stop, which
+keeps running, with the reason and what to do: a PlanetScale apply has no stop,
+and cancel ends it permanently. A planned `stop` freeze stops nothing
+when it is set, and does not stop the applies running when it starts. A stopped
+apply resumes with `schemabot start` once the freeze ends, or with an approved
+override. Times are RFC3339 and print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
 and the recent ones.
 
 A second person approves a request to let one change through a freeze. Read it

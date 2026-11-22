@@ -137,6 +137,29 @@ func (s *Service) changeGateDeployments(database, environment, deployment string
 	return deployments
 }
 
+// applyChangeGateDeployments lists the deployments an existing apply runs on:
+// its own and its stored operations', with the configured rollout added for
+// an apply not narrowed to one member. An operation keeps running on a
+// deployment later dropped from the rollout configuration, so the stored
+// operations count too.
+func (s *Service) applyChangeGateDeployments(ctx context.Context, apply *storage.Apply) ([]string, error) {
+	deployments := s.changeGateDeployments(apply.Database, apply.Environment, apply.Deployment, apply.GetOptions().NarrowedTo != "")
+	operations := s.storage.ApplyOperations()
+	if operations == nil {
+		return deployments, nil
+	}
+	stored, err := operations.ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list operations of apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	for _, operation := range stored {
+		if operation.Deployment != "" && !slices.Contains(deployments, operation.Deployment) {
+			deployments = append(deployments, operation.Deployment)
+		}
+	}
+	return deployments, nil
+}
+
 // checkChangeGatesForApply runs the change gates for a start or cutover of an
 // existing apply. A pinned PR rollback passes, as it did at creation. The
 // deployments checked are the apply's own and its stored operations', with
@@ -150,20 +173,12 @@ func (s *Service) checkChangeGatesForApply(ctx context.Context, checkpoint chang
 	if apply.GetOptions().PinnedRollback {
 		return ctx, nil, nil
 	}
-	deployments := s.changeGateDeployments(apply.Database, apply.Environment, apply.Deployment, apply.GetOptions().NarrowedTo != "")
-	if operations := s.storage.ApplyOperations(); operations != nil {
-		stored, err := operations.ListByApply(ctx, apply.ID)
-		if err != nil {
-			metrics.RecordChangeGateError(ctx, apply.Environment, string(checkpoint))
-			s.logger.Error("change gate could not read the apply's operations, so the change was refused",
-				append(apply.LogAttrs(), "checkpoint", string(checkpoint), "caller", caller, "error", err)...)
-			return ctx, nil, &ChangeGateUnavailableError{Checkpoint: checkpoint, Gate: "operations", Err: fmt.Errorf("list operations of apply %s: %w", apply.ApplyIdentifier, err)}
-		}
-		for _, operation := range stored {
-			if operation.Deployment != "" && !slices.Contains(deployments, operation.Deployment) {
-				deployments = append(deployments, operation.Deployment)
-			}
-		}
+	deployments, err := s.applyChangeGateDeployments(ctx, apply)
+	if err != nil {
+		metrics.RecordChangeGateError(ctx, apply.Environment, string(checkpoint))
+		s.logger.Error("change gate could not read the apply's operations, so the change was refused",
+			append(apply.LogAttrs(), "checkpoint", string(checkpoint), "caller", caller, "error", err)...)
+		return ctx, nil, &ChangeGateUnavailableError{Checkpoint: checkpoint, Gate: "operations", Err: err}
 	}
 	action := storage.FreezeOverrideActionStart
 	if checkpoint == changeGateCheckpointCutover {

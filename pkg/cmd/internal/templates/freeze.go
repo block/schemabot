@@ -54,16 +54,50 @@ func WriteFreezeCreated(f apitypes.Freeze) {
 		freezeKind(f.Kind), freezeUntil(f), ui.TerminalSafeLine(f.CreatedBy), ui.TerminalSafeLine(f.Reason))
 	fmt.Printf("   Scope:           %s\n", freezeScope(f))
 	fmt.Printf("   Starts:          %s\n", freezeTime(f.StartsAt))
-	fmt.Printf("   Running applies: %s\n", freezeRunning(f.Running))
+	fmt.Printf("   Running applies: %s\n", freezeRunning(f))
+	writeFreezeStopSweep(f.StopSweep)
 }
 
-// freezeRunning shows the recorded running policy. SchemaBot does not act on
-// stop yet, so a responder must not read it as applies having stopped.
-func freezeRunning(policy string) string {
-	if policy == "stop" {
-		return ui.TerminalSafeLine(policy) + " (recorded; running applies are not stopped yet, use 'schemabot stop')"
+// freezeRunning shows the running policy, and for stop, what setting the
+// freeze did to the applies already running, so a responder never reads it
+// as more than happened.
+func freezeRunning(f apitypes.Freeze) string {
+	policy := ui.TerminalSafeLine(f.Running)
+	if f.Running != "stop" {
+		return policy
 	}
-	return ui.TerminalSafeLine(policy)
+	if !f.InEffect {
+		return policy + " (applies running when it starts are not stopped; use 'schemabot stop')"
+	}
+	return policy
+}
+
+// writeFreezeStopSweep lists the applies a stop freeze asked to stop when it
+// was set, and the ones it did not, each with the reason. A stop is a durable
+// request its driver delivers, so the applies listed may still be writing as
+// this prints; status confirms each one has stopped. An apply not stopped
+// keeps running, and its reason says what to do, since the remedy differs:
+// one engine has no stop at all.
+func writeFreezeStopSweep(sweep *apitypes.FreezeStopSweep) {
+	if sweep == nil {
+		return
+	}
+	if sweep.Error != "" {
+		fmt.Printf("   Stop requested:  none. %s\n", ui.TerminalSafeLine(sweep.Error))
+		return
+	}
+	switch {
+	case len(sweep.Stopped) > 0:
+		fmt.Printf("   Stop requested:  %s\n", ui.TerminalSafeLine(strings.Join(sweep.Stopped, ", ")))
+		fmt.Printf("                    Confirm each one has stopped with '%s'.\n", cliname.Command("status", "<apply-id>"))
+	case len(sweep.NotStopped) == 0:
+		fmt.Println("   Stop requested:  none; no schema change in scope was pending or running")
+	default:
+		fmt.Println("   Stop requested:  none")
+	}
+	for _, unstopped := range sweep.NotStopped {
+		fmt.Printf("   Not stopped:     %s keeps running: %s\n", ui.TerminalSafeLine(unstopped.ApplyID), ui.TerminalSafeLine(unstopped.Reason))
+	}
 }
 
 // WriteFreezeLifted writes the confirmation of a lifted freeze.
