@@ -255,6 +255,13 @@ func TestEnumTypeRefusals(t *testing.T) {
 			detail: `enum type "order_status" already has label "paid", which another change added after planning; re-plan against the current schema`,
 		},
 		{
+			name: "placement label renamed after planning",
+			err: &enumTypeError{label: "packed", err: fmt.Errorf("add label: %w", errEnumNeighborMissing),
+				cause: &pgconn.PgError{Code: sqlstateInvalidParameterValue, Message: `"shipped" is not an existing enum label`}},
+			reason: "planned-object-drift",
+			detail: `enum type "order_status" no longer has the label that "packed" is placed next to, which another change renamed or removed after planning; re-plan against the current schema`,
+		},
+		{
 			name:   "type name moved to another type",
 			err:    &enumTypeError{err: fmt.Errorf("add label: %w", executor.ErrEnumTypeDrift)},
 			reason: "planned-object-drift",

@@ -342,6 +342,38 @@ func TestEngineApplyEnumLabelAddedAfterPlanning(t *testing.T) {
 	assert.Equal(t, []string{"new", "paid", "shipped", "delivered"}, liveLabels(t, db))
 }
 
+// Another session renames the label a planned step places its new label
+// BEFORE, after the plan was made. Running the same statement again can
+// never succeed, so the step is refused, permanently, with a detail that
+// names the label it adds and says to re-plan; nothing is changed.
+func TestEngineApplyEnumPlacementLabelRenamedAfterPlanning(t *testing.T) {
+	const database = "apply_enum_neighbor_test"
+	dsn, db := testutil.StartPostgres(t, database)
+	_, err := db.ExecContext(t.Context(), `CREATE TYPE public.order_status AS ENUM ('new', 'shipped')`)
+	require.NoError(t, err)
+	files := schema.SchemaFiles{"public": {Files: map[string]string{
+		"order_status.sql": `CREATE TYPE order_status AS ENUM ('new', 'packed', 'shipped');`,
+	}}}
+	eng := New()
+	plan, err := eng.Plan(t.Context(), &engine.PlanRequest{Database: database, SchemaFiles: files, Credentials: &engine.Credentials{DSN: dsn}})
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 1)
+	require.Equal(t, "ALTER TYPE public.order_status ADD VALUE 'packed' BEFORE 'shipped'", plan.Changes[0].TableChanges[0].DDL)
+
+	_, err = db.ExecContext(t.Context(), `ALTER TYPE public.order_status RENAME VALUE 'shipped' TO 'sent'`)
+	require.NoError(t, err)
+
+	outcomes := applyPlannedSteps(t, eng, dsn, plan)
+	require.Len(t, outcomes, 1)
+	refused := outcomes[0]
+	assert.Equal(t, engine.StateFailed, refused.State)
+	assert.Equal(t, "refused", refused.Metadata["phase"])
+	assert.False(t, refused.Retryable, "running the same statement again meets the same missing label")
+	assert.Equal(t, `enum type "order_status" no longer has the label that "packed" is placed next to, which another change renamed or removed after planning; re-plan against the current schema`, refused.ErrorMessage)
+	assert.Equal(t, []string{"new", "sent"}, liveLabels(t, db), "the refused step changed nothing")
+}
+
 // The apply proves access again in the session that executes, because a
 // grant held at plan time can be revoked before the apply. A role that no
 // longer belongs to the type's owner is refused before anything runs, with

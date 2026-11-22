@@ -20,6 +20,11 @@ import (
 // carries the label.
 const sqlstateDuplicateObject = "42710"
 
+// sqlstateInvalidParameterValue is the server's invalid_parameter_value
+// error. An ALTER TYPE ... ADD VALUE raises it when the label its BEFORE or
+// AFTER names is not on the type.
+const sqlstateInvalidParameterValue = "22023"
+
 // isEnumValueAdd reports whether a planned step's statements are a single
 // ALTER TYPE ... ADD VALUE, the one statement an enum types file plans.
 func isEnumValueAdd(statements []string) (pgstatement.Statement, bool, error) {
@@ -79,16 +84,25 @@ func executeEnumValueAdd(ctx context.Context, pool *pgxpool.Pool, change nativeA
 	if err == nil {
 		return nil
 	}
-	// pg-sprite returns the server's duplicate_object error as it came, so
-	// the label that another session added since the plan is recognized
-	// here by its SQLSTATE. A typed outcome from pg-sprite's executor would
-	// retire this check.
+	// pg-sprite returns the server's errors as they came, so the two ways
+	// the type can drift from the plan between planning and this step are
+	// recognized here by their SQLSTATE. Typed outcomes from pg-sprite's
+	// executor would retire these checks.
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == sqlstateDuplicateObject {
-		return &enumTypeError{
-			label: st.AddedEnumValue(),
-			err:   fmt.Errorf("add label %q to enum type %q.%q: %w", st.AddedEnumValue(), change.namespace, change.table, errEnumLabelExists),
-			cause: err,
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case sqlstateDuplicateObject:
+			return &enumTypeError{
+				label: st.AddedEnumValue(),
+				err:   fmt.Errorf("add label %q to enum type %q.%q: %w", st.AddedEnumValue(), change.namespace, change.table, errEnumLabelExists),
+				cause: err,
+			}
+		case sqlstateInvalidParameterValue:
+			return &enumTypeError{
+				label: st.AddedEnumValue(),
+				err:   fmt.Errorf("add label %q to enum type %q.%q: %w", st.AddedEnumValue(), change.namespace, change.table, errEnumNeighborMissing),
+				cause: err,
+			}
 		}
 	}
 	return &enumTypeError{err: fmt.Errorf("add label %q to enum type %q.%q: %w", st.AddedEnumValue(), change.namespace, change.table, err)}
@@ -98,10 +112,17 @@ func executeEnumValueAdd(ctx context.Context, pool *pgxpool.Pool, change nativeA
 // adds: another change added it after the plan was made. Nothing was added.
 var errEnumLabelExists = errors.New("the enum type already carries the label")
 
+// errEnumNeighborMissing means the label the step places its new label
+// BEFORE or AFTER is no longer on the type: another change renamed or
+// removed it after the plan was made. Nothing was added, and the same
+// statement fails the same way on every attempt.
+var errEnumNeighborMissing = errors.New("the enum type no longer carries the label the step places its new label next to")
+
 // enumTypeError marks a failure of an enum label addition, so the refusal
 // names the type instead of a table and the outcomes only an enum step
-// produces are classified. label is set when the type already carries it;
-// cause keeps the server error behind that outcome for the server log.
+// produces are classified. label is the label the step adds, set for the
+// outcomes that name it; cause keeps the server error behind that outcome
+// for the server log.
 type enumTypeError struct {
 	label string
 	err   error
@@ -145,6 +166,11 @@ func enumTypeRefusal(err error, typeName string) *refusal {
 	if errors.Is(err, errEnumLabelExists) {
 		return &refusal{reason: "planned-object-drift",
 			cause:  fmt.Sprintf("enum type %s already has label %s, which another change added after planning", quotedTable(typeName), quotedTable(enumErr.label)),
+			remedy: replanRemedy}
+	}
+	if errors.Is(err, errEnumNeighborMissing) {
+		return &refusal{reason: "planned-object-drift",
+			cause:  fmt.Sprintf("enum type %s no longer has the label that %s is placed next to, which another change renamed or removed after planning", quotedTable(typeName), quotedTable(enumErr.label)),
 			remedy: replanRemedy}
 	}
 	return nil
