@@ -501,6 +501,14 @@ func assertParsesAsPRComment(t *testing.T, where string, args []string) {
 			assert.True(t, result.SkipRevert, "%s: --skip-revert is not supported by %s", where, args[0])
 		case arg == "--force":
 			assert.True(t, result.Force, "%s: --force is not supported by %s", where, args[0])
+		case arg == "-e":
+			assert.NotEmpty(t, result.Environment, "%s: -e was not read by %s", where, args[0])
+		case arg == "-t" || arg == "--tenant":
+			assert.NotEmpty(t, result.Tenant, "%s: %s was not read by %s", where, arg, args[0])
+		case arg == "--override":
+			assert.True(t, result.OverrideGiven, "%s: --override is not supported by %s", where, args[0])
+		case strings.HasPrefix(arg, "-"):
+			assert.Fail(t, "a flag this test does not check", "%s: add a case for %s so the test proves %s accepts it", where, arg, args[0])
 		case strings.HasPrefix(arg, "apply-"):
 			assert.Equal(t, arg, result.ApplyID, "%s: the apply ID was not read", where)
 		}
