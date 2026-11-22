@@ -1,5 +1,6 @@
 # Build output
 bin/
+/build/
 /localscale
 /localscale-linux
 /vtcombo-linux
