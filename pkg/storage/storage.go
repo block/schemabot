@@ -677,6 +677,17 @@ type WebhookEventStore interface {
 	// head, and GitHub Redeliver reopens it.
 	MarkFailed(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error
 
+	// MarkFailedUncharged marks a claimed event retryable after retryAfter,
+	// like MarkFailed with a retry time, and refunds the attempt its claim
+	// consumed. Drivers use it when the delivery could not run yet for a
+	// reason that has a known end, such as a GitHub quota that resets at a
+	// known time, so waiting for that end does not spend the retry budget.
+	// The caller bounds how often a delivery is rescheduled this way. Unlike
+	// Release it keeps started_at, since processing did begin. Repeating the
+	// call with the same lease token refunds nothing more and returns nil.
+	// Returns ErrWebhookEventLeaseLost when the lease token is stale.
+	MarkFailedUncharged(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter time.Time) error
+
 	// MarkFailedPermanent dead-letters a claimed event: the driver proved the
 	// delivery can never succeed for its head, so no retry, reconciler
 	// synthesis, or attempt-budget reset may revive it. The row counts as head

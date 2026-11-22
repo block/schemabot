@@ -1174,9 +1174,11 @@ lists, and comments still go out, and so do the same file and tree reads when
 SchemaBot makes them to decide what a Check Run says, such as which
 environments a pull request's configs cover. A plan that needs a refused read
 fails closed: the pull request's SchemaBot check does not pass until a plan
-succeeds after the reset. A refused plan is retried on the usual schedule, not
-at the reset, so push or re-run the check after the reset if it is still
-failing.
+succeeds after the reset. When a refused read stops SchemaBot from finding a
+pull request's configs, or from running an `apply` command, SchemaBot retries
+it when the quota resets, and for three hours after the event arrived that wait
+does not use up its retry attempts. A read refused while one database is being
+planned still fails that plan until the next push or check re-run.
 
 ```yaml
 github:
