@@ -2284,14 +2284,36 @@ a PlanetScale apply, which has no stop, or one whose operations it cannot read, 
 response with why, never skipped silently; when it cannot list the applies at all, it says it
 stopped none. An apply waiting for its cutover is left alone, because the freeze refuses the cutover,
 and so is a pull request rollback, which no freeze holds. A planned `stop` freeze stops nothing when
-it is set, and does not stop the applies already running when it starts.
+it is set; an apply already running when it starts is stopped only at the checkpoint below.
+A driver checks again at claim, before it starts an operation that has not started or resumes a
+stopped one for a queued start. While a `stop` freeze covering the apply is in effect, it returns the
+claim with the operation as it was, unstarted, and records the freeze's stop, which stop
+reconciliation delivers without starting anything; for a queued start, the stop withdraws it (CO-4).
+This holds work a planned `stop` freeze meets once it starts, and stops a running rollout when it
+claims its next deployment. A claim that recovers or redispatches work instead records the freeze's
+stop and drives on, so the drive delivers it; that covers unstarted work whose claim could not be
+returned, which reads as running until its lease goes stale. When the engine refuses that stop, the
+work keeps running, except a PlanetScale deploy queued before the freeze, which is not driven, so it
+waits until the freeze ends. An apply that runs to the end without such a claim keeps running. A pending
+cancel is never held: the claim that carries it is driven whatever the freezes (AZ-10, CO-2). An
+approved override that admitted the apply at its creation, or the one that admitted its queued start,
+which the start request names, lets it start when it names the freeze; another approval for the same
+apply does not. When the freezes or the override requests cannot be read, or the stop cannot be
+recorded, the operation is not driven, so it never starts unchecked: a start claim goes back unstarted
+and the pod skips it in its claims for a short while, so other work is claimed meanwhile, and a
+recovery keeps its lease until it goes stale and is checked again.
 *Breaks if violated:* a schema change judged unsafe keeps writing through the incident that froze
 it, or an operator reads a freeze as having stopped changes that still run.
 *Enforced:* `stopAppliesForFreeze` (`pkg/api/freeze_stop_sweep.go`), which lists applies with
 `GetUnsettled` so stopped ones are included, called by `handleFreezeCreate`
 (`pkg/api/freeze_handlers.go`) after the freeze is stored, records each stop through `stopApply`
 (`pkg/api/control_handlers.go`) with `storage.FreezeStopCaller`. `executeStopForApply` refuses a
-caller where `storage.IsFreezeStopCaller` holds.
+caller where `storage.IsFreezeStopCaller` holds. The claim checkpoint is `holdClaimForStopFreeze`
+(`pkg/api/freeze_claim_checkpoint.go`), called by `recoverApplyOperation` (`pkg/api/operator.go`)
+before the drive, which hands the claim back with `ReturnUnstartedClaim`
+(`pkg/storage/internal/sqlstore/apply_operations.go`) and skips it with `storage.SkipOperations`.
+The start request records the override that admitted it in `startControlRequestMetadata`
+(`pkg/api/control_handlers.go`).
 
 ## Structural enforcement
 

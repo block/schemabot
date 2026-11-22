@@ -177,10 +177,15 @@ type Service struct {
 	engineFactories map[string]tern.EngineFactory
 
 	// Operator loop management.
-	operatorMu     sync.Mutex
-	stopRecovery   chan struct{}
-	cancelRecovery context.CancelFunc
-	operatorWake   chan struct{}
+	operatorMu sync.Mutex
+	// freezeHeldOps are the operations this pod held back unstarted under a
+	// stop freeze, each with when its start claims may take it again
+	// (skipHeldOperation).
+	freezeHeldOpsMu sync.Mutex
+	freezeHeldOps   map[int64]time.Time
+	stopRecovery    chan struct{}
+	cancelRecovery  context.CancelFunc
+	operatorWake    chan struct{}
 	// reservedDriverWake is the reserved driver's own wake channel, set when
 	// the pool reserves one (see reservedDriverID). The reserved driver skips
 	// deferred-cutover work, so a wake for that work must never be spent on it:
