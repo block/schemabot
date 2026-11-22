@@ -235,6 +235,7 @@ func TestGRPCClient_ShardDriveReportsWholeApplyProgressOnce(t *testing.T) {
 	defer cleanup()
 	var records []capturedLog
 	client.logger = slog.New(captureHandler{records: &records})
+	logStore := &mockApplyLogStore{}
 
 	apply := &storage.Apply{
 		ID:              7,
@@ -249,6 +250,7 @@ func TestGRPCClient_ShardDriveReportsWholeApplyProgressOnce(t *testing.T) {
 	opA, opB := int64(41), int64(42)
 	client.storage = &mockStorage{
 		applies: &mockApplyStore{apply: apply},
+		logs:    logStore,
 		tasks: &mockTaskStore{tasks: []*storage.Task{{
 			ID: 11, TaskIdentifier: "task-users-a", ApplyID: apply.ID, ApplyOperationID: &opA,
 			TableName: "users", Shard: "-80", Namespace: "commerce",
@@ -275,4 +277,14 @@ func TestGRPCClient_ShardDriveReportsWholeApplyProgressOnce(t *testing.T) {
 	assert.Equal(t, slog.LevelWarn, wholeApplyWarnings[0].level)
 	assert.Equal(t, "901", wholeApplyWarnings[0].attrs["remote_operation_id"])
 	assert.Equal(t, "commerce/-80/users", wholeApplyWarnings[0].attrs["operation_key"])
+
+	var applyLogWarnings []string
+	for _, entry := range logStore.logs {
+		if entry.Level == storage.LogLevelWarn && strings.Contains(entry.Message, "read from the whole remote apply") {
+			applyLogWarnings = append(applyLogWarnings, entry.Message)
+		}
+	}
+	require.Len(t, applyLogWarnings, 1, "the apply log carries the whole-apply read once, beside the shard-named task lines")
+	assert.Equal(t, "Progress for commerce/-80/users is read from the whole remote apply, so its task state changes can show a sibling's progress: "+
+		"the data plane does not scope progress to an operation; upgrade the data plane to read this operation's progress alone", applyLogWarnings[0])
 }

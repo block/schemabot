@@ -2371,6 +2371,18 @@ func (c *GRPCClient) logProgressReadFromWholeApply(ctx context.Context, apply *s
 			"remote_operation_id", scope.operation.ExternalOperationID,
 			"operation_key", scope.operation.OperationKey,
 			"operation_deployment", scope.operation.Deployment)...)
+	// The apply log names each task's shard on its state changes. When the
+	// answer covers the whole remote apply, a task's state can come from a
+	// sibling operation's matching task, so the apply log says so beside them.
+	c.logApplyWarning(ctx, apply, wholeApplyProgressMessage(scope.operation.OperationKey, reason))
+}
+
+// wholeApplyProgressMessage tells the apply log's reader that an operation's
+// task state changes are read from the whole remote apply, not from the
+// operation alone, and why.
+func wholeApplyProgressMessage(operationKey, reason string) string {
+	return fmt.Sprintf("Progress for %s is read from the whole remote apply, so its task state changes can show a sibling's progress: %s",
+		operationKey, reason)
 }
 
 // remoteProgress polls the remote apply for this drive, scoped to its remote
