@@ -750,6 +750,26 @@ $ schemabot cutover apply-example-73 -e staging
 Keep watching until the state is `Completed`; acceptance alone does not mean
 the swap has finished.
 
+When a [freeze](#freeze-an-environment) covers the change, **Enter** in the watch is
+refused like the command, and the change does not start. The watch's keys
+send no override reason, so the refusal names the exact command that asks for
+one and stays on screen while the watch keeps following the apply:
+
+```console
+Press Enter to proceed with cutover (or ESC to detach)
+
+✗ production is frozen. This cutover did not start.
+   freeze-abc  SEV-1234 payments latency  (until lifted)
+To ask for an override, run:
+  schemabot cutover apply-example-73 -e production --override "<reason>"
+Once a freeze approver other than you approves it, press Enter to try again.
+```
+
+Run that command from another terminal. Once an approver approves the
+request, press **Enter** in the watch again; the approval admits it with no
+reason attached. **Enter** on a waiting deploy works the same way and names
+`schemabot start`.
+
 ![CLI progress shows copying, deferred cutover, and completion](../assets/cli-cutover.gif)
 
 ### Manage PlanetScale deploy requests

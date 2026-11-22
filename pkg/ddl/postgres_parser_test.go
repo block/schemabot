@@ -795,6 +795,12 @@ func TestPostgresAddColumnManualReason(t *testing.T) {
 			columnName: "external_id",
 			wantReason: "volatility cannot be proven",
 		},
+		{
+			name:       "typecast volatile function default",
+			createDDL:  "CREATE TABLE applies (id bigint, external_id text DEFAULT gen_random_uuid()::text)",
+			columnName: "external_id",
+			wantReason: "volatility cannot be proven",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -971,6 +977,12 @@ func TestPostgresCostScalesWithTableSize(t *testing.T) {
 		{"add column only", `ALTER TABLE mutes ADD COLUMN reason varchar(255)`, false},
 		{"add column with constant default", `ALTER TABLE mutes ADD COLUMN state text DEFAULT 'active'`, false},
 		{"add column with cast constant default", `ALTER TABLE mutes ADD COLUMN payload jsonb DEFAULT '{}'::jsonb`, false},
+		{"add column with current_timestamp default", `ALTER TABLE mutes ADD COLUMN created_at timestamptz DEFAULT CURRENT_TIMESTAMP`, false},
+		{"add not null column with current_date default", `ALTER TABLE mutes ADD COLUMN day date NOT NULL DEFAULT CURRENT_DATE`, false},
+		{"add column with cast current_timestamp default", `ALTER TABLE mutes ADD COLUMN day date DEFAULT CURRENT_TIMESTAMP::date`, false},
+		{"add column with precision localtimestamp default", `ALTER TABLE mutes ADD COLUMN seen_at timestamp DEFAULT LOCALTIMESTAMP(3)`, false},
+		{"add column with function call default", `ALTER TABLE mutes ADD COLUMN created_at timestamptz DEFAULT now()`, true},
+		{"add column with cast volatile function default", `ALTER TABLE mutes ADD COLUMN token text DEFAULT gen_random_uuid()::text`, true},
 		{"drop column", `ALTER TABLE mutes DROP COLUMN reason`, false},
 		{"set default", `ALTER TABLE mutes ALTER COLUMN count SET DEFAULT 0`, false},
 		{"drop not null", `ALTER TABLE mutes ALTER COLUMN reason DROP NOT NULL`, false},
