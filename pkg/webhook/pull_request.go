@@ -1380,7 +1380,7 @@ func checkDatabaseKeysForConfigs(configs []ghclient.DiscoveredConfig) map[checkD
 // cleanupStaleChecks updates checks for databases no longer in the PR. A row is
 // still affected only when the PR plans a database with the same name and type.
 // A row under a database's old type, for a database the PR now plans under a
-// new type, is left for that plan to settle (see settleChecksReplacedByNewType).
+// new type, is left for that plan to settle (see settleLeftBehindChecks).
 // When the PR plans databases, cleanup leaves the aggregate to their plans, so a
 // caller passing affected databases must launch those plans only after this
 // returns.
@@ -1519,34 +1519,45 @@ func checkDatabaseKeyStrings(keys map[checkDatabaseKey]bool) []string {
 	return out
 }
 
-// settleChecksReplacedByNewType settles the rows a database left under its old
-// type once the plan of its new type has stored results. A plan calls it after
-// storing its rows and before folding the aggregate, so the old row blocks the
-// aggregate, from its earlier commit, for as long as the result that replaces
-// it does not exist. That holds for every fold, not only the plan's own: a
-// second database still planning keeps the aggregate open through its own old
-// row.
+// settleLeftBehindChecks settles the rows a planned database left behind on
+// an earlier commit that no plan on this commit will store again: rows under
+// a type the database no longer has, and rows in an environment the database
+// no longer has. A plan calls it after storing its rows and before folding the
+// aggregate, so a left-behind row blocks the aggregate, from its earlier
+// commit, for as long as it might still be replaced. That holds for every
+// fold, not only the plan's own: a second database still planning keeps the
+// aggregate open through its own old row.
 //
-// Whether a result replaces a row is read from stored check state, not from
-// what the calling plan stored, so a plan of one environment and a plan of
-// every environment settle the same rows. A row is settled in an environment
+// A row under an old type is settled once the plan of the new type has stored
+// results. Whether a result replaces it is read from stored check state, not
+// from what the calling plan stored, so a plan of one environment and a plan
+// of every environment settle the same rows. It is settled in an environment
 // where a row under the new type is stored on headSHA, and in an environment
 // this deployment does not plan the database in, since nothing will replace it
-// there. Anywhere else the row keeps blocking until a later plan stores that
-// environment. Settling follows stale cleanup: a started apply keeps its row
-// blocking, and a plan-only row passes.
+// there. Anywhere else it keeps blocking until a later plan stores that
+// environment.
 //
-// A plan that finishes after the PR moved to a newer commit settles nothing,
-// because the newer commit's cleanup and plans own those rows. The PR head is
-// read only when there is an old-type row to settle, so a plan of a database
-// whose type never changed adds no GitHub call.
-func (h *Handler) settleChecksReplacedByNewType(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, databaseName, databaseType string) error {
+// A row under the database's current type is settled only when its
+// environment is no longer one this deployment plans the database in, for
+// example after an operator removes the environment from the database's
+// server config. No plan can store that environment again, so without this
+// the row would hold the aggregate open for good. The environments come from
+// the server config, never from the PR, so a PR cannot drop an environment to
+// clear its own gate. A row in an environment the database still has is left
+// for that environment's next plan.
+//
+// Settling follows stale cleanup: a started apply keeps its row blocking, and
+// a plan-only row passes. A plan that finishes after the PR moved to a newer
+// commit settles nothing, because the newer commit's cleanup and plans own
+// those rows. The PR head is read only when there is a row to settle, so a
+// plan with nothing left behind adds no GitHub call.
+func (h *Handler) settleLeftBehindChecks(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, databaseName, databaseType string) error {
 	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
 	if err != nil {
-		return fmt.Errorf("load checks for %s#%d to settle %s rows under types other than %s: %w", repo, pr, databaseName, databaseType, err)
+		return fmt.Errorf("load checks for %s#%d to settle rows %s left on earlier commits: %w", repo, pr, databaseName, err)
 	}
 	planned := newCheckDatabaseKey(databaseName, databaseType)
-	var oldTypeChecks []*storage.Check
+	var oldTypeChecks, earlierCommitChecks []*storage.Check
 	replacedEnvironments := map[string]bool{}
 	for _, check := range checks {
 		if isAggregateCheck(check) {
@@ -1559,7 +1570,9 @@ func (h *Handler) settleChecksReplacedByNewType(ctx context.Context, client *ghc
 		if key.databaseType == planned.databaseType {
 			if check.HeadSHA == headSHA {
 				replacedEnvironments[storage.CanonicalKey(check.Environment)] = true
+				continue
 			}
+			earlierCommitChecks = append(earlierCommitChecks, check)
 			continue
 		}
 		if check.HeadSHA == headSHA {
@@ -1571,29 +1584,37 @@ func (h *Handler) settleChecksReplacedByNewType(ctx context.Context, client *ghc
 		}
 		oldTypeChecks = append(oldTypeChecks, check)
 	}
-	if len(oldTypeChecks) == 0 {
-		h.logger.Debug("plan of a database leaves no rows under an old type to settle",
+	if len(oldTypeChecks) == 0 && len(earlierCommitChecks) == 0 {
+		h.logger.Debug("plan of a database leaves no rows on earlier commits to settle",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "database", databaseName, "database_type", databaseType)
+		return nil
+	}
+
+	environments, err := h.allowedDatabaseEnvironments(databaseName)
+	if err != nil {
+		return fmt.Errorf("resolve environments of %s to settle the rows it left on earlier commits of %s#%d: %w", databaseName, repo, pr, err)
+	}
+	plannedEnvironments := make(map[string]bool, len(environments))
+	for _, environment := range environments {
+		plannedEnvironments[storage.CanonicalKey(environment)] = true
+	}
+	removedEnvironmentChecks := checksOutsideEnvironments(earlierCommitChecks, plannedEnvironments)
+	if len(oldTypeChecks) == 0 && len(removedEnvironmentChecks) == 0 {
+		h.logger.Debug("plan of a database leaves its rows on earlier commits to the plans of their environments",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "database", databaseName, "database_type", databaseType,
+			"rows_on_earlier_commits", len(earlierCommitChecks))
 		return nil
 	}
 
 	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
-		return fmt.Errorf("verify head of %s#%d before settling %s rows under types other than %s on %s: %w", repo, pr, databaseName, databaseType, headSHA, err)
+		return fmt.Errorf("verify head of %s#%d before settling rows %s left on earlier commits, on %s: %w", repo, pr, databaseName, headSHA, err)
 	}
 	if prInfo.HeadSHA != headSHA {
-		h.logger.Info("plan of a database's new type settles no rows because the PR moved to a newer commit",
+		h.logger.Info("plan of a database settles no rows it left on earlier commits because the PR moved to a newer commit",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "current_head_sha", prInfo.HeadSHA,
 			"database", databaseName, "database_type", databaseType)
 		return nil
-	}
-	environments, err := h.allowedDatabaseEnvironments(databaseName)
-	if err != nil {
-		return fmt.Errorf("resolve environments of %s to settle its rows under types other than %s on %s#%d: %w", databaseName, databaseType, repo, pr, err)
-	}
-	plannedEnvironments := make(map[string]bool, len(environments))
-	for _, environment := range environments {
-		plannedEnvironments[storage.CanonicalKey(environment)] = true
 	}
 	for _, check := range oldTypeChecks {
 		environment := storage.CanonicalKey(check.Environment)
@@ -1611,7 +1632,29 @@ func (h *Handler) settleChecksReplacedByNewType(ctx context.Context, client *ghc
 			"previous_status", check.Status, "previous_conclusion", check.Conclusion, "apply_id", check.ApplyID)
 		h.settleStaleCheckState(ctx, repo, pr, headSHA, check)
 	}
+	for _, check := range removedEnvironmentChecks {
+		h.logger.Info("settling check in an environment the database is no longer planned in",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"planned_environments", environments,
+			"previous_head_sha", check.HeadSHA,
+			"previous_status", check.Status, "previous_conclusion", check.Conclusion, "apply_id", check.ApplyID)
+		h.settleStaleCheckState(ctx, repo, pr, headSHA, check)
+	}
 	return nil
+}
+
+// checksOutsideEnvironments returns the rows whose environment is not one of
+// environments, keyed by storage.CanonicalKey.
+func checksOutsideEnvironments(checks []*storage.Check, environments map[string]bool) []*storage.Check {
+	var outside []*storage.Check
+	for _, check := range checks {
+		if !environments[storage.CanonicalKey(check.Environment)] {
+			outside = append(outside, check)
+		}
+	}
+	return outside
 }
 
 // settleStaleCheckState moves a row nothing will replace onto headSHA. A row a
