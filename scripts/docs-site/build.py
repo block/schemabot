@@ -13,7 +13,9 @@ Links are rewritten on the way: a link to another doc or to an asset points
 at its staged copy, and a link to anything else in the repository (source
 files, examples, CONTRIBUTING.md) points at that file on GitHub. A relative
 link to a file that does not exist fails the build, so a broken link cannot
-reach the site.
+reach the site. MkDocs rewrites Markdown links to the rendered pages but
+leaves raw HTML alone, so links in HTML src and href attributes point at the
+rendered URL directly.
 
 After MkDocs renders the HTML, the script adds the files AI tools read
 (https://llmstxt.org): llms.txt, an index of every page with a one-line
@@ -103,10 +105,24 @@ def pages_from_nav(nav: list) -> list[Page]:
             raise BuildError(f"nav entries must be single-key mappings, got {entry!r}")
         (section, value), = entry.items()
         items = [value] if isinstance(value, str) else value
+        if not isinstance(items, list):
+            raise BuildError(f"nav section {section!r} must be a file or a list of files, got {value!r}")
         for item in items:
-            name = item if isinstance(item, str) else next(iter(item.values()))
+            name = nav_file(section, item)
             pages.append(Page(section=section, staged=name, source=source_path(name)))
     return pages
+
+
+def nav_file(section: str, item) -> str:
+    """Return the file a nav item names: "cli.md" or {"Title": "cli.md"}."""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict) and len(item) == 1 and isinstance(next(iter(item.values())), str):
+        return next(iter(item.values()))
+    raise BuildError(
+        f"nav section {section!r} has an entry that is not a file: {item!r}; "
+        "nested sections are not supported"
+    )
 
 
 def check_descriptions(pages: list[Page], descriptions: dict) -> None:
@@ -149,12 +165,13 @@ def is_site_page(path: str) -> bool:
     return path.startswith("docs/") and path.endswith(".md") and "/" not in path[len("docs/"):]
 
 
-def resolve_target(target: str, source: str, repo_root: Path, links) -> str:
+def resolve_target(target: str, source: str, repo_root: Path, links, html: bool = False) -> str:
     """Rewrite one link target found in `source` (a repo-relative path).
 
     `links` builds the link to another page or to an asset, so the same
     resolution serves both the staged site (relative links) and the Markdown
-    copies for AI tools (absolute links).
+    copies for AI tools (absolute links). `html` marks a target taken from an
+    HTML attribute, which MkDocs does not rewrite.
     """
     if not target or target.startswith("#") or is_external(target):
         return target
@@ -167,15 +184,20 @@ def resolve_target(target: str, source: str, repo_root: Path, links) -> str:
         raise BuildError(f"{source}: link {target!r} points at {resolved}, which does not exist")
     suffix = f"#{anchor}" if anchor else ""
     if is_site_page(resolved):
-        return links.page(staged_name(resolved), anchor)
+        return links.page(staged_name(resolved), anchor, source, html)
     if resolved.startswith("assets/"):
-        return links.asset(resolved) + suffix
+        return links.asset(resolved, source, html) + suffix
     base = GITHUB_TREE if on_disk.is_dir() else GITHUB_BLOB
     return f"{base}{resolved}{suffix}"
 
 
 class SiteLinks:
-    """Links between staged files, relative to the staged docs dir.
+    """Links between staged files, as the staged pages need them.
+
+    A Markdown link names the staged file, and MkDocs turns it into the
+    rendered page's URL. An HTML attribute gets the rendered URL itself,
+    relative to where the linking page renders: the home page at the site
+    root, every other page one directory down (use_directory_urls).
 
     Records each asset a page links to, so only those are published.
     """
@@ -183,12 +205,21 @@ class SiteLinks:
     def __init__(self) -> None:
         self.assets: set[str] = set()
 
-    def page(self, name: str, anchor: str | None) -> str:
-        return name + (f"#{anchor}" if anchor else "")
+    def page(self, name: str, anchor: str | None, source: str, html: bool) -> str:
+        fragment = f"#{anchor}" if anchor else ""
+        if not html:
+            return name + fragment
+        rendered = "" if name == HOME_PAGE else name[: -len(".md")] + "/"
+        return (rendered_prefix(source) + rendered or "./") + fragment
 
-    def asset(self, path: str) -> str:
+    def asset(self, path: str, source: str, html: bool) -> str:
         self.assets.add(path)
-        return path
+        return rendered_prefix(source) + path if html else path
+
+
+def rendered_prefix(source: str) -> str:
+    """Return the path from where `source` renders back to the site root."""
+    return "" if staged_name(source) == HOME_PAGE else "../"
 
 
 class PublishedLinks:
@@ -197,12 +228,12 @@ class PublishedLinks:
     def __init__(self, site_url: str):
         self.site_url = site_url.rstrip("/") + "/"
 
-    def page(self, name: str, anchor: str | None) -> str:
+    def page(self, name: str, anchor: str | None, source: str = "", html: bool = False) -> str:
         stem = name[: -len(".md")]
         page = "" if name == HOME_PAGE else f"{stem}/"
         return self.site_url + page + (f"#{anchor}" if anchor else "")
 
-    def asset(self, path: str) -> str:
+    def asset(self, path: str, source: str = "", html: bool = False) -> str:
         return self.site_url + path
 
 
@@ -215,7 +246,7 @@ def rewrite_links(text: str, source: str, repo_root: Path, links) -> str:
             line,
         )
         return HTML_ATTR.sub(
-            lambda m: m.group(1) + resolve_target(m.group(2), source, repo_root, links) + m.group(3),
+            lambda m: m.group(1) + resolve_target(m.group(2), source, repo_root, links, html=True) + m.group(3),
             line,
         )
 
@@ -306,19 +337,19 @@ def build_llms_full(config: dict, pages: list[Page], published: dict[str, str]) 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--out", default=str(REPO_ROOT / "build" / "docs-site"),
-                        help="output directory; the site is written to <out>/html")
+    parser.add_argument("--out", help="directory the site is written to (default: site_dir in mkdocs.yml)")
     parser.add_argument("--mkdocs", default="mkdocs", help="the mkdocs executable to run")
     args = parser.parse_args(argv)
 
-    out = Path(args.out)
-    staged_dir = out / "src"
-    html_dir = out / "html"
-
-    config = load_config(CONFIG_PATH)
-    pages = pages_from_nav(config["nav"])
-    doc_names = sorted(p.name for p in (REPO_ROOT / "docs").glob("*.md"))
     try:
+        config = load_config(CONFIG_PATH)
+        # MkDocs reads the pages from docs_dir, so they are always staged there.
+        staged_dir = REPO_ROOT / config["docs_dir"]
+        html_dir = Path(args.out) if args.out else REPO_ROOT / config["site_dir"]
+        if config.get("use_directory_urls", True) is not True:
+            raise BuildError("mkdocs.yml must keep use_directory_urls on; HTML links assume page/ URLs")
+        pages = pages_from_nav(config["nav"])
+        doc_names = sorted(p.name for p in (REPO_ROOT / "docs").glob("*.md"))
         check_nav_complete(pages, doc_names)
         descriptions = {k: " ".join(str(v).split()) for k, v in (config.get("extra", {}).get("descriptions") or {}).items()}
         check_descriptions(pages, descriptions)

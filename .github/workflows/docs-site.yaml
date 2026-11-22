@@ -1,5 +1,6 @@
 name: docs-site
 on:
+  # Deploys only when something the site is built from changes.
   push:
     branches:
       - main
@@ -8,22 +9,18 @@ on:
       - docs/**
       - assets/**
       - mkdocs.yml
+      - Makefile
       - scripts/docs-site/**
       - .github/workflows/docs-site.yaml
+  # Builds on every PR, because the docs link to source files: a PR that
+  # renames or deletes a linked file fails here, not on a later docs PR.
   pull_request:
-    paths:
-      - README.md
-      - docs/**
-      - assets/**
-      - mkdocs.yml
-      - scripts/docs-site/**
-      - .github/workflows/docs-site.yaml
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  # Builds the site on every PR that touches the docs, so a broken link or a
-  # doc missing from mkdocs.yml fails review instead of the deploy.
+  # Builds the site on every PR, so a broken link or a doc missing from
+  # mkdocs.yml fails review instead of the deploy.
   build:
     name: "Docs site"
     runs-on: ubuntu-latest

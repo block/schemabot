@@ -41,8 +41,24 @@ class LinkTests(unittest.TestCase):
         self.assertEqual(out, "[CLI](cli.md#plan)")
 
     def test_assets_are_recorded_for_publishing(self):
-        out, links = self.site('![demo](../assets/demo.gif)\n<img src="../assets/demo.gif">')
-        self.assertEqual(out, '![demo](assets/demo.gif)\n<img src="assets/demo.gif">')
+        out, links = self.site('![demo](../assets/demo.gif)')
+        self.assertEqual(out, '![demo](assets/demo.gif)')
+        self.assertEqual(links.assets, {"assets/demo.gif"})
+
+    def test_html_attributes_point_at_the_rendered_urls(self):
+        # MkDocs leaves raw HTML alone, and every page but the home page
+        # renders one directory down.
+        out, links = self.site('<img src="../assets/demo.gif"> <a href="auth.md#tokens">a</a> '
+                               '<a href="../README.md">home</a> <a href="cli.md">self</a>')
+        self.assertEqual(out, '<img src="../assets/demo.gif"> <a href="../auth/#tokens">a</a> '
+                              '<a href="../">home</a> <a href="../cli/">self</a>')
+        self.assertEqual(links.assets, {"assets/demo.gif"})
+
+    def test_html_attributes_on_the_home_page(self):
+        out, links = self.site('<img src="./assets/demo.gif"> <a href="./docs/cli.md">CLI</a> '
+                               '<a href="README.md#quick-start">top</a>', source="README.md")
+        self.assertEqual(out, '<img src="assets/demo.gif"> <a href="cli/">CLI</a> '
+                              '<a href="./#quick-start">top</a>')
         self.assertEqual(links.assets, {"assets/demo.gif"})
 
     def test_other_repository_files_point_at_github(self):
@@ -118,6 +134,12 @@ class NavTests(unittest.TestCase):
             [("Home", "index.md", "README.md"), ("Guides", "cli.md", "docs/cli.md"),
              ("Guides", "auth.md", "docs/auth.md")],
         )
+
+    def test_a_nested_nav_section_fails_with_a_message(self):
+        with self.assertRaisesRegex(BuildError, "'Guides'.*nested sections are not supported"):
+            BUILD["pages_from_nav"]([{"Guides": [{"More": ["cli.md"]}]}])
+        with self.assertRaisesRegex(BuildError, "'Guides' must be a file or a list of files"):
+            BUILD["pages_from_nav"]([{"Guides": {"cli": "cli.md"}}])
 
     def test_a_doc_missing_from_nav_fails(self):
         with self.assertRaisesRegex(BuildError, "missing from mkdocs.yml nav.*docs/new.md"):

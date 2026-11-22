@@ -1,0 +1,6 @@
+# Direct dependencies for `make docs-site`. requirements.txt is the lock
+# generated from this file; regenerate it after changing a version here:
+#   uv pip compile --universal --generate-hashes --python-version 3.13 \
+#     scripts/docs-site/requirements.in -o scripts/docs-site/requirements.txt
+mkdocs==1.6.1
+mkdocs-material==9.8.0
