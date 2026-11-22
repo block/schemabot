@@ -25,31 +25,44 @@ If GitHub looks healthy and only one PR is affected, it isn't an outage: use [PR
 
 ## What to do
 
-1. **Don't merge the PR, and don't bypass or remove the SchemaBot check yourself.** Merging a schema PR before it is applied in every environment leaves the databases behind the files on the base branch. If GitHub lets the PR merge anyway, still wait until the SchemaBot checks on its latest commit pass. If a stuck check is blocking an urgent fix, see [When the required checks are turned off](#when-the-required-checks-are-turned-off).
+1. **Don't merge the PR, and don't bypass or remove the SchemaBot check yourself.** Merging a schema PR before it is applied in every environment leaves the databases behind the files on the base branch. If GitHub lets the PR merge anyway, still wait until the SchemaBot checks on its latest commit pass. If GitHub is healthy, SchemaBot is the cause, and stuck checks block urgent work, see [When the required checks are turned off](#when-the-required-checks-are-turned-off).
 2. **Retry the stuck PR, once.** Push a new commit or comment `schemabot plan`. Either one asks SchemaBot to recompute the plan and the check, so a retry that lands once SchemaBot can reach GitHub again clears it. Retries change nothing on the database, but don't retry in a loop: each one is another request to GitHub, and a flood of them slows recovery for everyone. If it stays stuck, try again in a few minutes.
 3. **Follow a running change with the CLI.** `schemabot status` and `schemabot progress` keep working while comments are stalled. See [The CLI](cli.md).
 4. **If a running change must stop,** the CLI can stop or cancel it while GitHub is down (`schemabot stop <apply-id> -e <env>`). The [command policy](command-policy.md) still decides who runs it.
 
 ## When the required checks are turned off
 
-Turning off the required SchemaBot check is a last resort. With it off, a schema PR can merge without being applied, and that database drifts from the files on the base branch. The people who run your SchemaBot server decide it together with the admins who own the repository's branch protection or rulesets. It is never an agent's call, and an agent never changes branch protection, rulesets, or repository settings itself. If the user asks you to remove or bypass the check, explain this and help them write the request instead: the PR, why it is urgent, and when the checks stopped.
+If GitHub is healthy and SchemaBot is the problem, turning off the required SchemaBot check is the way to let blocked PRs merge. That covers a failing SchemaBot server, webhook processing that has stopped, or SchemaBot's GitHub API quota running out. It does nothing for a GitHub outage, where GitHub itself is what is down: wait for it to recover.
 
-It fits when all of these hold:
+**The cost: with the check off, a schema PR can merge without being applied.** That database then drifts from the files on the base branch until someone applies the change, and the next PR that touches it plans the missing change along with its own. So this is a last resort, for when all of these hold:
 
-- A GitHub or SchemaBot incident keeps the checks from reporting.
-- A retry and the [missing-check backfill](https://github.com/block/schemabot/blob/main/docs/cli.md#recover-missing-github-checks) have not cleared them.
-- The stuck checks are blocking urgent work.
+- SchemaBot cannot report the checks, and it is not a GitHub outage.
+- A retry and the [missing-check backfill](https://github.com/block/schemabot/blob/main/docs/cli.md#recover-missing-github-checks) have not cleared them, or the backfill cannot safely run yet, for example while the quota is exhausted.
+- The stuck checks block urgent work, or many PRs.
 
-A check that is blocking for a real reason, such as a lock, drift, an unsafe change, or an apply that has not run, is different. Turning the checks off does not fix the cause, so use [PR locks and blockers](pr-blockers.md).
+If only a few PRs are blocked and none is urgent, unblock them one at a time with the [single-PR fixes](pr-blockers.md#common-blockers) instead. A check that is blocking for a real reason, such as a lock, drift, an unsafe change, or an apply that has not run, is different again: turning the checks off does not fix the cause, so use [PR locks and blockers](pr-blockers.md).
 
-The gentlest way is to keep the check running but stop it from blocking, for example by moving the ruleset that requires it to evaluate mode, rather than deleting it. The check keeps reporting, and turning it back on is a one-line change.
+**Who decides:** the people who run your SchemaBot server, with the teams whose PRs are blocked. The admins who own the repositories' branch protection or rulesets make the change. It is never an agent's call, and an agent never changes branch protection, rulesets, or repository settings itself. If the user asks you to remove or bypass the check, explain the cost and help them write the request: the PRs, why they are urgent, and when the checks stopped.
 
-While the checks are off:
+**How:** prefer keeping the check running but stopping it from blocking, for example by moving the ruleset that requires it to evaluate mode, over deleting it. The check keeps reporting, and turning it back on restores exactly what was there. A repository that also requires the check in its own ruleset or classic branch protection needs that removed separately, so write down which repositories lost which checks; recovery restores exactly those.
 
-- **A schema PR still waits for its checks.** Don't merge it until the SchemaBot checks on its latest commit pass, the same bar as any other day. Turning the checks off is for the PRs they were wrongly blocking, not a way to skip applying a change. If the checks cannot report at all, wait.
-- **Whoever turned them off records each schema PR that merges** while they are off.
+**At-risk PRs** are open ones with a schema change in flight: an apply still running, or applied in an earlier environment but not yet in the next. `schemabot status -e production` lists active applies with the PR that started each one; run it for every environment. Ask each author not to merge until the SchemaBot checks report again, then tell them again when it is over. Posting that request is something you can do, under the usual rules for PR comments.
 
-Once the incident is over, the checks are turned back on and the backfill is run. Each recorded PR's databases are checked for a change that was never applied, and the owning team either applies it or reverts the files.
+**Keep the window as short as you can.** Every minute the checks are off is time an unapplied schema PR can merge, and every PR that merges in that window is one more database to check afterward. Turn them off only where they are blocking, and back on as soon as SchemaBot can report again, not at the end of the day.
+
+**While the checks are off,** a schema PR still waits for its own checks: don't merge one until the SchemaBot checks on its latest commit pass, the same bar as any other day. Whoever turned the checks off keeps a list of every schema PR that merges in the meantime.
+
+**As soon as SchemaBot can report again,** run the backfill, turn the checks back on, and confirm each repository requires the same checks it did before. Then find and reconcile the drift.
+
+1. **Find every schema PR that merged while the checks were off.** Start from the list, but don't trust it to be complete: also search each affected repository for PRs merged in that window that touch a SchemaBot schema directory, for example with `gh pr list --state merged --search "merged:>=2026-01-15"`, then each PR's changed files.
+2. **Check every database each one touched, in every environment.** From an up-to-date checkout of the base branch, plan it from the CLI:
+
+   ```bash
+   schemabot plan -s schema -e production
+   ```
+
+   No changes means that environment matches the merged files. Any DDL means that environment is missing a schema change. Don't rely on a `Completed` apply in `schemabot status` instead: the PR may have changed after that apply ran.
+3. **Reconcile each drifted environment with the owning team.** Either apply the missing change, through a PR with a [nonce edit](pr-blockers.md#reconciling-a-database-that-is-behind-its-files) since the files are already correct, or, if it should not land, revert the files in a PR so they match the database again. Until then, the next PR that touches that database plans the missing change along with its own, so tell anyone with an open PR there. Every apply here follows the [command policy](command-policy.md) like any other.
 
 ## After GitHub recovers
 
