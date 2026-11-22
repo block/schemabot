@@ -124,9 +124,9 @@ use deferred cutover.
 The PR plan lists the direct statements and explains why Spirit cannot run them.
 The server's direct-execution policy is the approval, so `schemabot apply` runs
 them with the rest of the plan and asks for no separate confirmation. If the
-re-plan at apply time routes a statement to direct execution that the plan
-comment showed running through Spirit, the apply pauses for `apply-confirm`
-against a comment that discloses it. A direct statement that is also an unsafe
+re-plan at `apply` or `apply-confirm` routes a statement to direct execution
+that the plan comment showed running through Spirit, the apply pauses for
+`apply-confirm` against a comment that discloses it. A direct statement that is also an unsafe
 change, such as dropping a primary key, still needs `--allow-unsafe`. See
 [direct execution in the PR workflow](direct-execution.md#in-the-pr-workflow).
 
