@@ -256,7 +256,7 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	if data.Tenant != "" {
 		applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 	}
-	writeUnsafeChangesRejection(&sb, data, "Apply rejected", applyCmd+" --allow-unsafe")
+	writeUnsafeChangesRejection(&sb, data, "Apply rejected", applyCmd, true)
 
 	return appendAgentHint(offerSupportChannel(sb.String()), data.AgentHint)
 }
@@ -265,7 +265,7 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 // unsafe changes without `--allow-unsafe`: the heading names what was
 // rejected, each unsafe change is listed, and the comment ends in the steps
 // that make any destructive drop safe and the command to re-run.
-func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, rejected, command string) {
+func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, rejected, command string, includeFlag bool) {
 	sb.WriteString("---\n\n")
 	drops, rest := splitDestructiveDrops(data.UnsafeChanges, data.DatabaseType)
 	fmt.Fprintf(sb, "**%s %s**: %s\n", glyph.Refused, rejected, unsafeCountPhrase(drops, rest))
@@ -280,7 +280,7 @@ func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, reje
 	}
 
 	consent := newUnsafeConsent(data.UnsafeChanges, data.DatabaseType, data.IsMySQL, !unsafeCountCoversEveryTarget(data.DeploymentDrift))
-	writeUnsafeConsentCommand(sb, fmt.Sprintf("**%s To proceed with these destructive changes**", glyph.Escalation), consent, command)
+	writeUnsafeConsentCommand(sb, fmt.Sprintf("**%s To proceed with these destructive changes**", glyph.Escalation), consent, command, includeFlag)
 }
 
 // RenderBlockedChangesApplyRejected renders the rejection comment for an

@@ -812,7 +812,7 @@ func writeRefusedChangeReplan(sb *strings.Builder, plan, planCommand string) {
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
 func writeApplyInstruction(sb *strings.Builder, command string, data PlanCommentData) {
 	if consent, ok := planUnsafeConsent(data); ok {
-		writeUnsafeConsentCommand(sb, "▶️ **To apply**", consent, command+" --allow-unsafe")
+		writeUnsafeConsentCommand(sb, "▶️ **To apply**", consent, command, true)
 		return
 	}
 	sb.WriteString("▶️ **To apply**, comment:\n")
@@ -966,29 +966,31 @@ func (d PlanCommentData) applyInstructionCarriesDropSteps() bool {
 	return ok
 }
 
-// writeUnsafeConsentCommand writes the unsafe consent instruction and command.
-// lead is the phrase the instruction
-// continues, such as "▶️ **To apply**". With drops to make safe, the lead
-// heads a numbered list: the drop steps, then the consent, with the command
-// under it.
-func writeUnsafeConsentCommand(sb *strings.Builder, lead string, consent unsafeConsent, command string) {
+// writeUnsafeConsentCommand renders the consent instruction and command after
+// lead, such as "▶️ **To apply**". When there are drop steps, it renders them
+// in order with the consent instruction and command as the final step.
+func writeUnsafeConsentCommand(sb *strings.Builder, lead string, consent unsafeConsent, command string, includeFlag bool) {
+	instruction := consent.instruction(includeFlag)
+	if includeFlag {
+		command += " --allow-unsafe"
+	}
 	if len(consent.dropSteps) == 0 {
-		fmt.Fprintf(sb, "%s, %s:\n", lead, consent.instruction())
+		fmt.Fprintf(sb, "%s, %s:\n", lead, instruction)
 		fmt.Fprintf(sb, "```\n%s\n```\n", command)
 		return
 	}
-	writeUnsafeConsentSteps(sb, lead, consent, command)
+	writeUnsafeConsentSteps(sb, lead, consent.dropSteps, instruction, command)
 }
 
 // writeUnsafeConsentSteps writes the lead as the heading of a numbered list:
 // each drop step, then the consent, with the command indented under it so it
 // renders inside the step it belongs to.
-func writeUnsafeConsentSteps(sb *strings.Builder, lead string, consent unsafeConsent, command string) {
+func writeUnsafeConsentSteps(sb *strings.Builder, lead string, dropSteps []string, instruction, command string) {
 	fmt.Fprintf(sb, "%s:\n", lead)
-	for i, step := range consent.dropSteps {
+	for i, step := range dropSteps {
 		fmt.Fprintf(sb, "%d. %s.\n", i+1, capitalizeFirst(step))
 	}
-	fmt.Fprintf(sb, "%d. %s:\n", len(consent.dropSteps)+1, capitalizeFirst(consent.instruction()))
+	fmt.Fprintf(sb, "%d. %s:\n", len(dropSteps)+1, capitalizeFirst(instruction))
 	fmt.Fprintf(sb, "   ```\n   %s\n   ```\n", command)
 }
 
@@ -1006,15 +1008,19 @@ func unsafeCountCoversEveryTarget(drift *DeploymentDriftData) bool {
 // instruction is the clause that tells the reader how to apply, lower-cased
 // to continue a sentence. Where a change came from is the unsafe warning's to
 // say, on the finding itself, so the instruction stays one short clause.
-func (c unsafeConsent) instruction() string {
+func (c unsafeConsent) instruction(includeFlag bool) string {
+	lead := "add `--allow-unsafe`"
+	if includeFlag {
+		lead = "post this command"
+	}
 	noun := "unsafe change"
 	if c.findings > 1 {
 		noun = "unsafe changes"
 	}
 	if c.primaryOnly {
-		return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s on %s, and any the other targets carry", c.findings, noun, c.tables)
+		return fmt.Sprintf("%s to confirm %d %s on %s, and any the other targets carry", lead, c.findings, noun, c.tables)
 	}
-	return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s on %s", c.findings, noun, c.tables)
+	return fmt.Sprintf("%s to confirm %d %s on %s", lead, c.findings, noun, c.tables)
 }
 
 // unsafeConsentTablesShown caps how many names the consent sentence lists.
@@ -4167,7 +4173,7 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		}
 	case len(envsWithChanges) == 1:
 		if consent, ok := planUnsafeConsent(*data.Plans[envsWithChanges[0]]); ok {
-			writeUnsafeConsentCommand(sb, "▶️ **To apply** these changes", consent, command("schemabot apply", envsWithChanges[0])+" --allow-unsafe")
+			writeUnsafeConsentCommand(sb, "▶️ **To apply** these changes", consent, command("schemabot apply", envsWithChanges[0]), true)
 		} else {
 			sb.WriteString("▶️ **To apply** these changes, comment:\n")
 			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
@@ -4212,10 +4218,10 @@ func writeEnvApplyCommand(sb *strings.Builder, sentence string, plan *PlanCommen
 	if ok {
 		command += " --allow-unsafe"
 		if len(consent.dropSteps) > 0 {
-			writeUnsafeConsentSteps(sb, sentence, consent, command)
+			writeUnsafeConsentSteps(sb, sentence, consent.dropSteps, consent.instruction(true), command)
 			return
 		}
-		fmt.Fprintf(sb, "%s. %s:\n", sentence, capitalizeFirst(consent.instruction()))
+		fmt.Fprintf(sb, "%s. %s:\n", sentence, capitalizeFirst(consent.instruction(true)))
 	} else {
 		sb.WriteString(sentence + ":\n")
 	}
@@ -4273,9 +4279,7 @@ func ApplyCommand(environment, database string, opts ApplyCommandOptions) string
 
 // UnsafeReconsent is the consent clause that leads into an ApplyCommand built
 // from a command that carried --allow-unsafe, and empty for one that did not.
-// It states the consent in the
-// sentence that leads into the command rather than putting the flag in it, so
-// consenting again takes typing it.
+// The operator types the flag again when retrying the apply.
 func UnsafeReconsent(opts ApplyCommandOptions) string {
 	if !opts.AllowUnsafe {
 		return ""

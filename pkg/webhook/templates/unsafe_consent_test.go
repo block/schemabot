@@ -48,7 +48,7 @@ func fencedCommands(t *testing.T, comment string) []string {
 func TestRenderPlanComment_UnsafeConsentLeadsIntoApplyCommand(t *testing.T) {
 	out := RenderPlanComment(*unsafeConsentPlan("staging"))
 
-	assert.Contains(t, out, "▶️ **To apply**:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging --allow-unsafe\n   ```")
+	assert.Contains(t, out, "▶️ **To apply**:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Post this command to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging --allow-unsafe\n   ```")
 	assert.NotContains(t, out, glyph.Tip+" Before allowing", "the drop steps lead into the command rather than repeating as a tip")
 	assert.NotContains(t, out, glyph.Attention+" This plan", "the footer adds no second warning glyph")
 }
@@ -101,7 +101,7 @@ func TestRenderPlanComment_AttributionRidesOnTheUnsafeFinding(t *testing.T) {
 	assert.NotContains(t, out, "Check before applying", "the attribution is not repeated in a section of its own")
 	_, footer, found := strings.Cut(out, "▶️ **To apply**")
 	require.True(t, found, "the comment offers an apply")
-	assert.Equal(t, ":\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging --allow-unsafe\n   ```\n", footer)
+	assert.Equal(t, ":\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Post this command to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging --allow-unsafe\n   ```\n", footer)
 }
 
 // An owner in another repository is named with its repository, and a table
@@ -195,16 +195,16 @@ func TestRenderMultiEnvPlanComment_UnsafeConsentPerEnvironment(t *testing.T) {
 
 	out := render(clean, unsafeConsentPlan("production"))
 	assert.Contains(t, out, "▶️ **To apply** these changes, start with the first environment:\n```\nschemabot apply -e staging\n```")
-	assert.Contains(t, out, "After verifying staging, apply to production:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e production --allow-unsafe\n   ```")
+	assert.Contains(t, out, "After verifying staging, apply to production:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Post this command to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e production --allow-unsafe\n   ```")
 	out = render(unsafeConsentPlan("staging"), unsafeConsentPlan("production"))
-	assert.Contains(t, out, "▶️ **To apply** these changes, start with the first environment:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging --allow-unsafe\n   ```")
+	assert.Contains(t, out, "▶️ **To apply** these changes, start with the first environment:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Post this command to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging --allow-unsafe\n   ```")
 
 	out = RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database: "payments", IsMySQL: true, DatabaseType: "mysql",
 		Environments: []string{"staging", "production"},
 		Plans:        map[string]*PlanCommentData{"staging": unsafeConsentPlan("staging"), "production": nil},
 	})
-	assert.Contains(t, out, "▶️ **To apply** these changes:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging --allow-unsafe\n   ```")
+	assert.Contains(t, out, "▶️ **To apply** these changes:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Post this command to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging --allow-unsafe\n   ```")
 }
 
 func refusedChangePlan(env string) *PlanCommentData {
@@ -244,7 +244,7 @@ func TestRenderMultiEnvPlanComment_RefusedChangeOffersReplanNotApply(t *testing.
 	}
 
 	out := render(unsafeConsentPlan("staging"), refusedChangePlan("production"))
-	assert.Contains(t, out, "▶️ **To apply** these changes:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging --allow-unsafe\n   ```")
+	assert.Contains(t, out, "▶️ **To apply** these changes:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Post this command to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging --allow-unsafe\n   ```")
 	assert.Contains(t, out, "The engine refuses a change in the **production** plan (see **Cannot apply** above), so its apply fails whatever its flags. After fixing it, re-plan:\n```\nschemabot plan -e production\n```")
 	assert.NotContains(t, fencedCommands(t, out), "schemabot apply -e production")
 
@@ -269,7 +269,7 @@ func TestRenderPlanComment_UnsafeConsentBoundsTheTableList(t *testing.T) {
 		data.UnsafeChanges = append(data.UnsafeChanges, UnsafeChangeData{Table: table, Reason: "DROP TABLE removes all data"})
 	}
 	out := RenderPlanComment(*data)
-	assert.Contains(t, out, "2. Add `--allow-unsafe` to confirm 7 unsafe changes on `t1`, `t2` and 5 more:\n")
+	assert.Contains(t, out, "2. Post this command to confirm 7 unsafe changes on `t1`, `t2` and 5 more:\n")
 
 	data.UnsafeChanges = data.UnsafeChanges[:4]
 	out = RenderPlanComment(*data)
@@ -294,7 +294,7 @@ func TestRenderPlanComment_UnsafeConsentCoversOtherTargetsWithoutTargetPlans(t *
 			data := unsafeConsentPlan("staging")
 			data.DeploymentDrift = drift
 			out := RenderPlanComment(*data)
-			assert.Contains(t, out, "▶️ **To apply**:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`, and any the other targets carry:\n   ```\n   schemabot apply -e staging --allow-unsafe\n   ```")
+			assert.Contains(t, out, "▶️ **To apply**:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Post this command to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`, and any the other targets carry:\n   ```\n   schemabot apply -e staging --allow-unsafe\n   ```")
 		})
 	}
 
@@ -318,7 +318,7 @@ func TestRenderPlanComment_UnsafeConsentCoversOtherTargets(t *testing.T) {
 	out := RenderPlanComment(data)
 	_, footer, found := strings.Cut(out, "▶️ **To apply**")
 	require.True(t, found, "the comment offers an apply")
-	assert.Contains(t, footer, "2. Add `--allow-unsafe` to confirm 2 unsafe changes on `legacy` and `users`:\n   ```\n   schemabot apply -e production --allow-unsafe\n   ```\n", "the dropped table is named first")
+	assert.Contains(t, footer, "2. Post this command to confirm 2 unsafe changes on `legacy` and `users`:\n   ```\n   schemabot apply -e production --allow-unsafe\n   ```\n", "the dropped table is named first")
 }
 
 // timestampFindings is six advisory unsafe findings, two on each of three
@@ -379,7 +379,7 @@ func TestRenderPlanComment_LongUnsafeListKeepsDropsOpen(t *testing.T) {
 	assert.Contains(t, out, "5. `refunds`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n"+
 		"\n<details>\n<summary>3 more unsafe changes</summary>\n\n6. `refunds`:", "%s", out)
 	assert.Contains(t, out, "8. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n\n</details>\n\n", "%s", out)
-	assert.Contains(t, out, "▶️ **To apply**:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add", "%s", out)
+	assert.Contains(t, out, "▶️ **To apply**:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Post this command", "%s", out)
 	assert.Contains(t, out, "to confirm 8 unsafe changes on `transfer_events`, `refund_backfill` and 3 more:",
 		"the consent sentence names the dropped tables before it starts counting")
 }
@@ -414,7 +414,7 @@ func TestRenderUnsafeChangesBlocked_LeadsWithDrops(t *testing.T) {
 		"1. `refund_backfill`: DROP TABLE removes all data\n"+
 		"2. `loans`:", "%s", out)
 	assert.Contains(t, out, "\n<details>\n<summary>2 more unsafe changes</summary>\n\n6. `ledger`:", "%s", out)
-	assert.Contains(t, out, "**"+glyph.Escalation+" To proceed with these destructive changes**:\n1. Deploy application code that no longer reads from or writes to the dropped table.\n2. Add", "%s", out)
+	assert.Contains(t, out, "**"+glyph.Escalation+" To proceed with these destructive changes**:\n1. Deploy application code that no longer reads from or writes to the dropped table.\n2. Post this command", "%s", out)
 	assert.Contains(t, out, "to confirm 7 unsafe changes on `refund_backfill`, `loans` and 2 more:", "%s", out)
 }
 

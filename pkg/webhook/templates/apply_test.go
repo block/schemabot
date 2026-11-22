@@ -592,7 +592,7 @@ func TestRenderUnsafeChangesBlockedIncludesDropIndexGuidance(t *testing.T) {
 	assert.Contains(t, rendered, "**"+glyph.Escalation+" To proceed with these destructive changes**:\n"+
 		"1. Deploy application code that no longer reads from or writes to the dropped column.\n"+
 		"2. Make the dropped index invisible, then verify application queries no longer rely on it for safe performance.\n"+
-		"3. Add `--allow-unsafe` to confirm 2 unsafe changes on `customers`:\n"+
+		"3. Post this command to confirm 2 unsafe changes on `customers`:\n"+
 		"   ```\n   schemabot apply -e staging --allow-unsafe\n   ```\n")
 	assert.NotContains(t, rendered, glyph.Tip+" Before allowing", "the steps lead into the command, not a tip of their own")
 	assert.NotContains(t, rendered, "reads from or writes to the dropped index")

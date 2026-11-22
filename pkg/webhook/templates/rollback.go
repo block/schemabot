@@ -62,13 +62,11 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 	// Summary (after DDL, matching CLI layout)
 	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 
-	// The rollback consent requirement leads into
-	// the command and the flag stays out of the pasteable command, so
-	// consenting to destroy data takes typing it.
+	// Rollback confirmation requires the operator to type the consent flag.
 	sb.WriteString("---\n\n")
 	confirmCmd := TenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant)
 	if consent, ok := planUnsafeConsent(data); ok {
-		writeUnsafeConsentCommand(&sb, "To confirm this rollback", consent, confirmCmd)
+		writeUnsafeConsentCommand(&sb, "To confirm this rollback", consent, confirmCmd, false)
 	} else {
 		sb.WriteString("To confirm this rollback, comment:\n")
 		fmt.Fprintf(&sb, "```\n%s\n```\n", confirmCmd)
@@ -116,7 +114,7 @@ func renderRollbackUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBu
 	if data.DeferCutover {
 		retryCommand += " --defer-cutover"
 	}
-	writeUnsafeChangesRejection(&sb, data, "Rollback rejected", retryCommand)
+	writeUnsafeChangesRejection(&sb, data, "Rollback rejected", retryCommand, false)
 	sb.WriteString("\nThe lock still pins this rollback plan, so the command above, with `--allow-unsafe`, confirms it.\n\n")
 	writeRollbackCancel(&sb, data.Tenant)
 
