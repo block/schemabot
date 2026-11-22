@@ -44,6 +44,13 @@ func TestChangeGateRefusalData(t *testing.T) {
 	assert.Equal(t, &templates.RefusalOverrideRequest{ID: "ovr-1", Requester: "carol", Author: "alice", Reason: "hotfix", ReasonKept: true}, data.Override)
 	assert.False(t, data.OverrideUnrecorded)
 	assert.Equal(t, []string{"acme/freeze-approvers"}, data.Approvers)
+	assert.True(t, data.TakesOverride, "start takes --override")
+
+	// Whether a command takes --override comes from its spec, so the
+	// refusal offers one exactly where the parser accepts the flag.
+	for _, spec := range commandSpecs {
+		assert.Equal(t, spec.SupportsOverride, changeGateRefusalData(refused, spec.Name, "", "carol", nil).TakesOverride, spec.Name)
+	}
 }
 
 // A freeze refusal posts as its own comment, and a gate that could not
@@ -83,7 +90,7 @@ func TestPostChangeGateRefusal(t *testing.T) {
 	body := posted()
 	assert.Contains(t, body, "## ❄️ Apply Blocked by a Freeze\n")
 	assert.Contains(t, body, "*Requested by @alice")
-	assert.Contains(t, body, "| `frz-1` | When lifted | rpc error: code = Unavailable during the outage |")
+	assert.Contains(t, body, "| `frz-1` | until lifted | rpc error: code = Unavailable during the outage |")
 	assert.NotContains(t, body, "could not reach")
 
 	unavailable := &api.ChangeGateUnavailableError{Gate: "freeze", Err: errors.New("storage down")}

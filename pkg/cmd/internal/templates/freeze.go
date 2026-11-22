@@ -40,10 +40,7 @@ func freezeScope(f apitypes.Freeze) string {
 // freezeUntil is the end of a freeze's window; one with no end lasts until
 // someone lifts it.
 func freezeUntil(f apitypes.Freeze) string {
-	if f.EndsAt == nil {
-		return "until lifted"
-	}
-	return "until " + freezeTime(*f.EndsAt)
+	return ui.FreezeUntil(f.EndsAt)
 }
 
 // WriteFreezeCreated writes the confirmation of a new freeze.
@@ -187,11 +184,7 @@ func ChangeGateRefusedText(d ChangeGateRefusedData) []string {
 	}
 	lines := []string{fmt.Sprintf("%s %s is frozen. %s", glyph.Frozen, ui.TerminalSafeLine(d.Environment), outcome)}
 	for _, b := range d.Blockers {
-		until := "until lifted"
-		if b.EndsAt != nil {
-			until = "until " + freezeTime(*b.EndsAt)
-		}
-		lines = append(lines, fmt.Sprintf("   %s  %s  (%s)", ui.TerminalSafeLine(b.ID), ui.TerminalSafeLine(b.Reason), until))
+		lines = append(lines, fmt.Sprintf("   %s  %s  (%s)", ui.TerminalSafeLine(b.ID), ui.TerminalSafeLine(b.Reason), ui.FreezeUntil(b.EndsAt)))
 	}
 	switch {
 	case d.OverrideRequest != nil:

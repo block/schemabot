@@ -798,8 +798,10 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 	if err != nil {
 		h.service.ClearPendingObserver(pendingObserver)
 		if isChangeGateError(err) {
-			// A refusal stores nothing and leaves the pin in place, so the
-			// same rollback-confirm can run once the freeze ends.
+			// The change gates never hold a pinned PR rollback (AZ-10), so
+			// this is defense in depth: should one refuse it, the refusal
+			// stores nothing, leaves the pin in place, and is posted as a
+			// gate's refusal rather than as a failed rollback.
 			h.logger.Info("rollback refused by a change gate", "repo", repo, "pr", pr, "database", database,
 				"database_type", dbType, "environment", environment, "plan_id", rollbackPlan.PlanIdentifier, "error", err)
 			h.postChangeGateRefusal(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, err)

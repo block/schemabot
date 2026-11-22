@@ -921,18 +921,12 @@ type dispatchMessages struct {
 // that creates a new one. A rollout member's refused
 // plan is named by target and table from fields SchemaBot controls. Everything
 // else is an internal error whose text stays in server logs behind the fixed
-// line.
+// line. A change gate's error never reaches here: both callers post it with
+// postChangeGateRefusal first, and a refusal's raw text would carry the
+// freezes' reasons, mentions and all.
 func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 	if errors.Is(err, storage.ErrLockIntentChanged) {
 		return msgs.lockIntentChanged
-	}
-	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
-		// A refusal is posted as its own comment by postChangeGateRefusal;
-		// this is its plain text for any other caller.
-		return refused.Error()
-	}
-	if unavailable, ok := errors.AsType[*api.ChangeGateUnavailableError](err); ok {
-		return unavailable.UserMessage()
 	}
 	var featureErr *api.UnsupportedFeatureError
 	if errors.As(err, &featureErr) {

@@ -219,13 +219,17 @@ deployment, so the others stay silent on an unknown ID; the refusal therefore
 names the approve command with the deployment's `--tenant`, so a pasted
 command is always answered.
 
-The refusal (`changeGateRefusalDetail`) lists each freeze with its reason and
-end. Without `--override`, a command that takes the flag is told how to ask
-for one. With a recorded request, it shows the reason the approver sees, who
-may approve, the approve command, and that the commenter then runs the command
-again, since an approved override admits only the person who asked. Freeze and
-override reasons are a person's text, written so a mention in them notifies
-nobody (`templates.ErrorDetailReason`).
+A refusal is its own comment (`templates.RenderChangeGateRefusal`). It lists
+each freeze with how long it holds (`ui.FreezeUntil`, the phrase the API and
+the CLI use too) and its reason. Without `--override`, a command that takes the
+flag is told how to ask for one and which teams (`freeze.github_teams`) may
+approve it; with no team configured, nobody can approve a pull request's
+request, so the comment offers none. With a recorded request, it shows the
+reason the approver sees, @-mentions the approver teams, gives the approve
+command, and says the commenter then runs the command again, since an approved
+override admits only the person who asked. Freeze and override reasons are a
+person's text, written so a mention in them notifies nobody
+(`templates.markdownReason`).
 
 ## Error Handling
 

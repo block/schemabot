@@ -4,6 +4,8 @@ package webhook
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,7 +48,7 @@ func TestE2EApplyIsRefusedDuringAFreeze(t *testing.T) {
 
 	svc.Config().Freeze.GitHubTeams = []string{"acme/freeze-approvers"}
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	refusal := awaitCommentContaining(t, apply, "| `"+freezeID+"` | When lifted | incident 42 |")
+	refusal := awaitCommentContaining(t, apply, "| `"+freezeID+"` | until lifted | incident 42 |")
 	assert.Contains(t, refusal, "## ❄️ Apply Blocked by a Freeze\n")
 	assert.Contains(t, refusal, "Run the same command with `--override")
 	assert.Contains(t, refusal, "must approve it: a member of `acme/freeze-approvers`.")
@@ -83,7 +85,7 @@ func TestE2EApplyConfirmIsRefusedDuringAFreeze(t *testing.T) {
 
 	svc.Config().Freeze.GitHubTeams = []string{"acme/freeze-approvers"}
 	result := sendApplyConfirm(t, svc, dbName, "schemabot apply-confirm -e staging")
-	refusal := awaitCommentContaining(t, result, "| `"+freezeID+"` | When lifted | incident 43 |")
+	refusal := awaitCommentContaining(t, result, "| `"+freezeID+"` | until lifted | incident 43 |")
 	assert.Contains(t, refusal, "Nothing was applied, and the pending confirmation was released.")
 	assert.Contains(t, refusal, "Run `apply` again, then run `apply-confirm` with `--override")
 
@@ -94,4 +96,41 @@ func TestE2EApplyConfirmIsRefusedDuringAFreeze(t *testing.T) {
 	// --override or not, finds nothing to confirm.
 	again := sendApplyConfirm(t, svc, dbName, `schemabot apply-confirm -e staging --override "hotfix"`)
 	awaitCommentContaining(t, again, "No apply lock is held for this database. Run `apply` first")
+}
+
+// A freeze never holds a pull request's rollback (AZ-10): a rollback undoes
+// a change, so rollback-confirm runs the pinned rollback while the freeze is
+// in effect, and no refusal is posted.
+func TestE2ERollbackConfirmRunsDuringAFreeze(t *testing.T) {
+	dbName := "webhook_rbconfirm_frozen"
+	svc := setupE2EService(t, dbName)
+	dropApply, result, sendComment := setupSafeRollback(t, svc, dbName)
+
+	sendComment(fmt.Sprintf("schemabot rollback %s -e staging", dropApply.ApplyIdentifier))
+	awaitCommentContaining(t, result, "Rollback Plan")
+
+	freezeID := engine.NewFreezeID()
+	_, err := svc.Storage().Freezes().Create(t.Context(), &storage.EnvironmentFreeze{
+		Identifier:  freezeID,
+		Environment: "staging",
+		Databases:   []string{dbName},
+		Kind:        storage.FreezeKindOnDemand,
+		Running:     storage.FreezeRunningContinue,
+		StartsAt:    time.Now().Add(-time.Hour),
+		Reason:      "incident 44",
+		CreatedBy:   "alice",
+		Source:      storage.FreezeSourceManual,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = svc.Storage().Freezes().Lift(context.WithoutCancel(t.Context()), freezeID, "alice", "test done")
+	})
+
+	svc.Config().Freeze.GitHubTeams = []string{"acme/freeze-approvers"}
+	sendComment("schemabot rollback-confirm -e staging")
+	awaitCapture(t, result.comments, "the rollback to complete", func(body string) bool {
+		assert.NotContains(t, body, "Blocked by", "a freeze does not hold a pull request's rollback")
+		return strings.Contains(body, "Rollback Complete")
+	})
+	requireSingleRollbackApply(t, svc, dbName)
 }

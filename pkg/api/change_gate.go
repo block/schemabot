@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"slices"
 	"strings"
-	"time"
 	"unicode"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -17,6 +16,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // changeGateCheckpoint names where in a change's life the change gates run.
@@ -524,7 +524,7 @@ func (e *ChangeGateRefusedError) Error() string {
 // sentences. Each blocker's end and reason are their own sentences, so a
 // reason never runs into the text around it. For example:
 //
-//	production is frozen by freeze frz-1 until someone lifts it. Reason: SEV-1234. Retry after it ends or is lifted.
+//	production is frozen by freeze frz-1 until lifted. Reason: SEV-1234. Retry after it ends or is lifted.
 func (e *ChangeGateRefusedError) Blocked() string {
 	var b strings.Builder
 	switch len(e.Blockers) {
@@ -549,12 +549,9 @@ func (e *ChangeGateRefusedError) Blocked() string {
 	return b.String()
 }
 
-// blockerUntil says when a blocker ends.
+// blockerUntil says when a blocker ends, in the words every surface uses.
 func blockerUntil(blocker apitypes.ChangeGateBlocker) string {
-	if blocker.EndsAt == nil {
-		return "until someone lifts it"
-	}
-	return "until " + blocker.EndsAt.UTC().Format(time.RFC3339)
+	return ui.FreezeUntil(blocker.EndsAt)
 }
 
 // writeBlockerReason writes a blocker's reason as its own sentence, and

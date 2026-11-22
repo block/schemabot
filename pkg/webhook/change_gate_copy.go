@@ -14,6 +14,7 @@ import (
 func changeGateRefusalData(refused *api.ChangeGateRefusedError, command, tenant, requestedBy string, approvers []string) templates.ChangeGateRefusalData {
 	data := templates.ChangeGateRefusalData{
 		CommandName:        command,
+		TakesOverride:      commandSupportsOverrideFlag(command),
 		Environment:        refused.Environment,
 		Tenant:             tenant,
 		RequestedBy:        requestedBy,

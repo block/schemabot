@@ -17,7 +17,8 @@ func refusalData(command string, freezes ...RefusingFreeze) ChangeGateRefusalDat
 	}
 	return ChangeGateRefusalData{
 		CommandName: command, Environment: "production", RequestedBy: "carol", Timestamp: "2026-01-15 14:30:00", Freezes: freezes,
-		Approvers: []string{"acme/freeze-approvers"},
+		Approvers:     []string{"acme/freeze-approvers"},
+		TakesOverride: command == action.Apply || command == action.ApplyConfirm || command == action.Start || command == action.Cutover,
 	}
 }
 
@@ -28,8 +29,8 @@ func TestRenderChangeGateRefusal(t *testing.T) {
 		"**Environment**: `production`\n\n"+
 		"*Requested by @carol at 2026-01-15 14:30:00 UTC*\n\n"+
 		"`production` is frozen, so this command did not run. Nothing changed.\n\n"+
-		"| Freeze | Ends | Reason |\n| :-- | :-- | :-- |\n"+
-		"| `frz-1` | When lifted | SEV-1234, page `@payments-oncall` |\n\n"+
+		"| Freeze | Holds | Reason |\n| :-- | :-- | :-- |\n"+
+		"| `frz-1` | until lifted | SEV-1234, page `@payments-oncall` |\n\n"+
 		"### What you can do\n\n"+
 		"- **Wait for the freeze to end**, then run the same command again.\n"+
 		"- **Ask for an override** if this change can't wait. Run the same command with `--override \"<why it can't wait>\"`. "+
@@ -101,7 +102,7 @@ func TestRenderChangeGateRefusalFreezes(t *testing.T) {
 			RefusingFreeze{ID: "frz-2", Reason: " ", EndsAt: &ends},
 		))
 		assert.Contains(t, rendered, "## ❄️ Cutover Blocked by Freezes\n")
-		assert.Contains(t, rendered, "| `frz-1` | When lifted | SEV-1234 |\n| `frz-2` | 2026-01-15 18:00:00 UTC | — |\n")
+		assert.Contains(t, rendered, "| `frz-1` | until lifted | SEV-1234 |\n| `frz-2` | until 2026-01-15T18:00:00Z | — |\n")
 		assert.Contains(t, rendered, "- **Wait for the freezes to end**")
 	})
 

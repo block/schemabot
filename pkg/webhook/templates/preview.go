@@ -4047,7 +4047,8 @@ var previewFreezeApprovers = []string{"acme/freeze-approvers", "acme/sre"}
 // the next steps for a commenter who did not ask for an override.
 func PreviewCommentFreezeRefused() string {
 	return RenderChangeGateRefusal(ChangeGateRefusalData{
-		CommandName: action.Apply, Environment: "production", RequestedBy: previewRequestedBy, Timestamp: "2026-01-15 14:30:00",
+		TakesOverride: true,
+		CommandName:   action.Apply, Environment: "production", RequestedBy: previewRequestedBy, Timestamp: "2026-01-15 14:30:00",
 		Freezes:   []RefusingFreeze{{ID: "frz-7f3a", Reason: "SEV-1234: payments latency, page @payments-oncall"}},
 		Approvers: previewFreezeApprovers,
 	})
@@ -4057,7 +4058,8 @@ func PreviewCommentFreezeRefused() string {
 // freezes, one of which ends on its own.
 func PreviewCommentFreezeRefusedSeveral() string {
 	return RenderChangeGateRefusal(ChangeGateRefusalData{
-		CommandName: action.Cutover, Environment: "production", RequestedBy: previewRequestedBy, Timestamp: "2026-01-15 14:30:00",
+		TakesOverride: true,
+		CommandName:   action.Cutover, Environment: "production", RequestedBy: previewRequestedBy, Timestamp: "2026-01-15 14:30:00",
 		Freezes: []RefusingFreeze{
 			{ID: "frz-7f3a", Reason: "SEV-1234: payments latency"},
 			{ID: "frz-91c2", Reason: "Holiday change freeze", EndsAt: &previewFreezeEnds},
@@ -4070,7 +4072,8 @@ func PreviewCommentFreezeRefusedSeveral() string {
 // override request recorded, and the two steps that let it through.
 func PreviewCommentFreezeOverrideRequested() string {
 	return RenderChangeGateRefusal(ChangeGateRefusalData{
-		CommandName: action.Apply, Environment: "production", Tenant: "acme", RequestedBy: "carol", Timestamp: "2026-01-15 14:30:00",
+		TakesOverride: true,
+		CommandName:   action.Apply, Environment: "production", Tenant: "acme", RequestedBy: "carol", Timestamp: "2026-01-15 14:30:00",
 		Freezes:   []RefusingFreeze{{ID: "frz-7f3a", Reason: "SEV-1234: payments latency"}},
 		Override:  &RefusalOverrideRequest{ID: "ovr-0123456789abcdef", Requester: "carol", Author: "alice", Reason: "Index that fixes SEV-1234"},
 		Approvers: previewFreezeApprovers,
@@ -4082,7 +4085,8 @@ func PreviewCommentFreezeOverrideRequested() string {
 // confirmation.
 func PreviewCommentFreezeApplyConfirmRefused() string {
 	return RenderChangeGateRefusal(ChangeGateRefusalData{
-		CommandName: action.ApplyConfirm, Environment: "production", RequestedBy: previewRequestedBy, Timestamp: "2026-01-15 14:30:00",
+		TakesOverride: true,
+		CommandName:   action.ApplyConfirm, Environment: "production", RequestedBy: previewRequestedBy, Timestamp: "2026-01-15 14:30:00",
 		Freezes:   []RefusingFreeze{{ID: "frz-91c2", Reason: "Holiday change freeze", EndsAt: &previewFreezeEnds}},
 		Approvers: previewFreezeApprovers,
 	})

@@ -3617,9 +3617,9 @@ If SchemaBot should manage them, ask a SchemaBot operator to add the directory t
 
 `production` is frozen, so this command did not run. Nothing changed.
 
-| Freeze | Ends | Reason |
+| Freeze | Holds | Reason |
 | :-- | :-- | :-- |
-| `frz-7f3a` | When lifted | SEV-1234: payments latency, page `@payments-oncall` |
+| `frz-7f3a` | until lifted | SEV-1234: payments latency, page `@payments-oncall` |
 
 ### What you can do
 
@@ -3641,10 +3641,10 @@ If SchemaBot should manage them, ask a SchemaBot operator to add the directory t
 
 `production` is frozen, so this command did not run. Nothing changed.
 
-| Freeze | Ends | Reason |
+| Freeze | Holds | Reason |
 | :-- | :-- | :-- |
-| `frz-7f3a` | When lifted | SEV-1234: payments latency |
-| `frz-91c2` | 2026-01-15 18:00:00 UTC | Holiday change freeze |
+| `frz-7f3a` | until lifted | SEV-1234: payments latency |
+| `frz-91c2` | until 2026-01-15T18:00:00Z | Holiday change freeze |
 
 ### What you can do
 
@@ -3666,9 +3666,9 @@ If SchemaBot should manage them, ask a SchemaBot operator to add the directory t
 
 `production` is frozen, so this command did not run. Nothing changed.
 
-| Freeze | Ends | Reason |
+| Freeze | Holds | Reason |
 | :-- | :-- | :-- |
-| `frz-7f3a` | When lifted | SEV-1234: payments latency |
+| `frz-7f3a` | until lifted | SEV-1234: payments latency |
 
 ### Override requested
 
@@ -3701,9 +3701,9 @@ Override request `ovr-0123456789abcdef` is waiting for a freeze approver.
 
 `production` is frozen, so this command did not run. Nothing was applied, and the pending confirmation was released.
 
-| Freeze | Ends | Reason |
+| Freeze | Holds | Reason |
 | :-- | :-- | :-- |
-| `frz-91c2` | 2026-01-15 18:00:00 UTC | Holiday change freeze |
+| `frz-91c2` | until 2026-01-15T18:00:00Z | Holiday change freeze |
 
 ### What you can do
 

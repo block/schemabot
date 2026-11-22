@@ -110,7 +110,7 @@ func TestChangeGateRefusesApplyDuringFreeze(t *testing.T) {
 	require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
 	resp := decodeGateError(t, rec)
 	assert.Equal(t, apitypes.ErrCodeChangeGateRefused, resp.ErrorCode)
-	assert.Contains(t, resp.Error, "staging is frozen by freeze freeze-incident until someone lifts it. Reason: incident 42.")
+	assert.Contains(t, resp.Error, "staging is frozen by freeze freeze-incident until lifted. Reason: incident 42.")
 	assert.Equal(t, []apitypes.ChangeGateBlocker{{Gate: "freeze", ID: "freeze-incident", Reason: "incident 42"}}, resp.Blockers)
 	assert.Nil(t, applies.apply, "a refused apply must not be created")
 	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 1}, changeGateCounters(t, reader, "schemabot.change_gate.refusals"))
@@ -606,11 +606,11 @@ func TestChangeGateRefusalReadsAsSentences(t *testing.T) {
 		},
 		"one freeze until lifted": {
 			blockers: []apitypes.ChangeGateBlocker{freeze("frz-1", "rpc error: code = Unavailable during the outage", nil)},
-			want:     "production is frozen by freeze frz-1 until someone lifts it. Reason: rpc error: code = Unavailable during the outage. Retry after it ends or is lifted.",
+			want:     "production is frozen by freeze frz-1 until lifted. Reason: rpc error: code = Unavailable during the outage. Retry after it ends or is lifted.",
 		},
 		"a reason that ends a sentence and one with no visible text": {
 			blockers: []apitypes.ChangeGateBlocker{freeze("frz-1", "SEV-1234!", nil), freeze("frz-2", " \u200b ", &ends)},
-			want:     "production is frozen by 2 freezes. Freeze frz-1 lasts until someone lifts it. Reason: SEV-1234! Freeze frz-2 lasts until 2026-11-23T02:00:00Z. Retry after they end or are lifted.",
+			want:     "production is frozen by 2 freezes. Freeze frz-1 lasts until lifted. Reason: SEV-1234! Freeze frz-2 lasts until 2026-11-23T02:00:00Z. Retry after they end or are lifted.",
 		},
 	} {
 		refused := &ChangeGateRefusedError{Environment: "production", Blockers: tc.blockers}

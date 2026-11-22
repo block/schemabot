@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
 
@@ -13,7 +14,10 @@ import (
 type ChangeGateRefusalData struct {
 	// CommandName is the refused PR command, such as action.Apply.
 	CommandName string
-	Environment string
+	// TakesOverride says the command accepts `--override "<reason>"`, from
+	// the command's spec, so a new command that takes one is offered it.
+	TakesOverride bool
+	Environment   string
 	// Tenant is the deployment's own, carried by the approve command the
 	// comment names, so a pasted command reaches the deployment that stores
 	// the request.
@@ -117,21 +121,17 @@ func writeRefusingFreezes(b *strings.Builder, freezes []RefusingFreeze) {
 	if len(freezes) == 0 {
 		return
 	}
-	b.WriteString("| Freeze | Ends | Reason |\n| :-- | :-- | :-- |\n")
+	b.WriteString("| Freeze | Holds | Reason |\n| :-- | :-- | :-- |\n")
 	shown := freezes
 	if len(shown) > maxListedFreezes {
 		shown = shown[:maxListedFreezes]
 	}
 	for _, freeze := range shown {
-		ends := "When lifted"
-		if freeze.EndsAt != nil {
-			ends = freeze.EndsAt.UTC().Format("2006-01-02 15:04:05") + " UTC"
-		}
 		reason := "—"
 		if shownReason := RedactedReason(freeze.Reason, maxListedFreezeReason); shownReason != "" {
 			reason = tableCellText(markdownReason(shownReason))
 		}
-		fmt.Fprintf(b, "| %s | %s | %s |\n", inlineCodeCell(freeze.ID), ends, reason)
+		fmt.Fprintf(b, "| %s | %s | %s |\n", inlineCodeCell(freeze.ID), ui.FreezeUntil(freeze.EndsAt), reason)
 	}
 	switch unlisted := len(freezes) - len(shown); {
 	case unlisted == 1:
@@ -150,7 +150,11 @@ func writeRefusingFreezes(b *strings.Builder, freezes []RefusingFreeze) {
 func writeRefusalNextSteps(b *strings.Builder, data ChangeGateRefusalData) {
 	b.WriteString("### What you can do\n\n")
 	fmt.Fprintf(b, "- **Wait for %s to end**, then %s.\n", theFreezes(len(data.Freezes)), rerun(data.CommandName))
-	if !commandTakesOverride(data.CommandName) || len(data.Approvers) == 0 {
+	// The CLI always names --override, because an API request can be
+	// approved through the API. A pull request's request can be approved only
+	// from the pull request, by a member of an approver team, so with no team
+	// the comment offers no override nobody could approve.
+	if !data.TakesOverride || len(data.Approvers) == 0 {
 		return
 	}
 	ask := "Run the same command with `" + overridePlaceholder + "`."
@@ -222,15 +226,6 @@ func writeOverrideRequested(b *strings.Builder, data ChangeGateRefusalData, requ
 	}
 	fmt.Fprintf(b, "1. %s comments:\n   ```\n   %s\n   ```\n", approver, AppendTenantFlag("schemabot freeze approve "+request.ID, data.Tenant))
 	fmt.Fprintf(b, "2. Then @%s %s.\n", request.Requester, again)
-}
-
-// commandTakesOverride reports whether a PR command accepts --override.
-func commandTakesOverride(command string) bool {
-	switch command {
-	case action.Apply, action.ApplyConfirm, action.Start, action.Cutover:
-		return true
-	}
-	return false
 }
 
 // tableCellText keeps Markdown text on one table row: a cell separator would
