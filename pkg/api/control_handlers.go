@@ -37,6 +37,10 @@ type controlOperationHTTPError struct {
 
 type terminalControlError struct {
 	err error
+	// shown is the text a 5xx answer carries: text SchemaBot wrote for the
+	// requester. Empty when the error carries a cause SchemaBot did not
+	// write, which goes to the server log instead.
+	shown string
 }
 
 func (e *terminalControlError) Error() string {
@@ -76,9 +80,23 @@ func controlConflictCodef(code, format string, args ...any) error {
 
 // terminalControlf marks a control failure that retrying the same request
 // cannot repair: an internal data invariant violation or a deterministic
-// downstream rejection.
+// downstream rejection. Its text is shown to the requester only when no
+// argument is an error: an error can carry storage, driver, or engine text
+// whichever verb formats it.
 func terminalControlf(format string, args ...any) error {
-	return &terminalControlError{err: fmt.Errorf(format, args...)}
+	err := fmt.Errorf(format, args...)
+	shown := err.Error()
+	if slices.ContainsFunc(args, func(arg any) bool { _, isErr := arg.(error); return isErr }) {
+		shown = ""
+	}
+	return &terminalControlError{err: err, shown: shown}
+}
+
+// authoredTerminalControlf is terminalControlf for a message SchemaBot wrote
+// in full, including the errors it wraps, so the whole text is shown.
+func authoredTerminalControlf(format string, args ...any) error {
+	err := fmt.Errorf(format, args...)
+	return &terminalControlError{err: err, shown: err.Error()}
 }
 
 // controlOperationErrorCode is the error code a rejection carries, empty for
@@ -405,16 +423,25 @@ func controlNotAttemptedMessage(operation, applyIdentifier string) string {
 		strings.ReplaceAll(operation, "_", "-"), applyIdentifier)
 }
 
-// authoredTerminalControlMessage returns the text of a terminal control error
-// that wraps no cause. Such a message is text SchemaBot wrote, and it carries
-// the next step. It reads the text from the terminal error itself, so
-// anything an outer wrap added stays out of it.
+// controlMissingDeploymentMessage is what a control request answers when the
+// stored apply has no deployment to route it to. Nothing was changed, and
+// sending it again meets the same record, so it does not suggest a retry.
+func controlMissingDeploymentMessage(operation, applyIdentifier string) string {
+	return fmt.Sprintf("The %s was not attempted for apply %q because SchemaBot has no deployment recorded for it, so nothing was changed. "+
+		"Sending it again will fail the same way. A SchemaBot operator can find the apply in the server log.",
+		strings.ReplaceAll(operation, "_", "-"), applyIdentifier)
+}
+
+// authoredTerminalControlMessage returns the text a terminal control error
+// shows the requester, which SchemaBot wrote and which carries the next step.
+// It reads the text from the terminal error itself, so anything an outer wrap
+// added stays out of it.
 func authoredTerminalControlMessage(err error) (string, bool) {
 	terminalErr, ok := errors.AsType[*terminalControlError](err)
-	if !ok || errors.Unwrap(terminalErr.err) != nil {
+	if !ok || terminalErr.shown == "" {
 		return "", false
 	}
-	return terminalErr.err.Error(), true
+	return terminalErr.shown, true
 }
 
 // writeControlError logs and writes an HTTP error for a control operation.
@@ -496,19 +523,19 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, o
 
 	applyIdentifier := *applyID
 	if s.storage == nil {
-		s.logger.Error("storage not available for control request", "path", r.URL.Path, "apply_id", applyIdentifier, "environment", *environment)
+		s.logger.Error("storage not available for control request", "path", r.URL.Path, "operation", operation, "apply_id", applyIdentifier, "environment", *environment)
 		s.writeError(w, http.StatusInternalServerError, controlNotAttemptedMessage(operation, applyIdentifier))
 		return nil, nil, "", false
 	}
 	applyStore := s.storage.Applies()
 	if applyStore == nil {
-		s.logger.Error("apply store not available for control request", "path", r.URL.Path, "apply_id", applyIdentifier, "environment", *environment)
+		s.logger.Error("apply store not available for control request", "path", r.URL.Path, "operation", operation, "apply_id", applyIdentifier, "environment", *environment)
 		s.writeError(w, http.StatusInternalServerError, controlNotAttemptedMessage(operation, applyIdentifier))
 		return nil, nil, "", false
 	}
 	apply, err := applyStore.GetByApplyIdentifier(r.Context(), applyIdentifier)
 	if err != nil {
-		s.logger.Error("failed to load apply for control request", "path", r.URL.Path, "apply_id", applyIdentifier, "environment", *environment, "error", err)
+		s.logger.Error("failed to load apply for control request", "path", r.URL.Path, "operation", operation, "apply_id", applyIdentifier, "environment", *environment, "error", err)
 		s.writeError(w, http.StatusInternalServerError, controlNotAttemptedMessage(operation, applyIdentifier))
 		return nil, nil, "", false
 	}
@@ -529,8 +556,8 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, o
 	if err != nil {
 		s.logger.Error("control request apply is missing stored deployment metadata",
 			append(apply.LogAttrs(),
-				"error", err)...)
-		s.writeError(w, http.StatusInternalServerError, controlNotAttemptedMessage(operation, applyIdentifier))
+				"operation", operation, "path", r.URL.Path, "error", err)...)
+		s.writeError(w, http.StatusInternalServerError, controlMissingDeploymentMessage(operation, applyIdentifier))
 		return nil, nil, "", false
 	}
 

@@ -304,6 +304,7 @@ func TestEngine_Plan_DropTablesRefusesContradictoryConfig(t *testing.T) {
 	})
 	require.Error(t, err, "Plan() must refuse an entry a schema file declares")
 	assert.Contains(t, err.Error(), `drop_tables entry "executions" (the file spells it "Executions") is also declared by a schema file`)
+	assert.True(t, engine.IsPlanRefused(err), "the schema files are refused as written, not the engine failing")
 
 	_, err = New(Config{}).Plan(t.Context(), &engine.PlanRequest{
 		Database:     testDatabase,

@@ -151,6 +151,7 @@ func TestEngine_Plan_IgnoreTablesRefusesDeclaredTable(t *testing.T) {
 	assert.Contains(t, err.Error(), flywayTable)
 	assert.Contains(t, err.Error(), "ignore_tables")
 	assert.Contains(t, err.Error(), "Remove the entry or the schema file")
+	assert.True(t, engine.IsPlanRefused(err), "the schema files are refused as written, not the engine failing")
 }
 
 // Whether a declaration and a differently-cased entry name one table is the

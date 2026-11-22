@@ -359,7 +359,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		// contradiction: the declaring file would keep managing the table while
 		// the config says to leave it alone.
 		if err := ignored.RefuseDeclared(namespace, sortedKeys(desiredTables)); err != nil {
-			return nil, err
+			return nil, &engine.PlanRefusedError{Err: err}
 		}
 		drops, exempt, withheld, err := undeclaredTableDrops(ctx, pool, req.Database, namespace, desiredTables, ignored, parser)
 		if err != nil {

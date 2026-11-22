@@ -14,8 +14,13 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -108,11 +113,15 @@ func TestControlRoutesAnswerFixedMessageWhenApplyLookupFails(t *testing.T) {
 // says the request may already be recorded. The storage error stays in the
 // server log with the apply's full triage attributes.
 func TestControlRoutesAnswerFixedMessageWhenOperationFails(t *testing.T) {
-	for _, operation := range []string{"cutover", "stop"} {
+	for _, operation := range []string{"cutover", "stop", "cancel", "start", "revert", "skip-revert"} {
 		t.Run(operation, func(t *testing.T) {
 			var logBuf bytes.Buffer
 			logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
 			apply := activeTestApply("apply-internal-error")
+			if operation == "revert" || operation == "skip-revert" {
+				apply.Engine = storage.EnginePlanetScale
+				apply.State = state.Apply.RevertWindow
+			}
 			svc := newControlInternalErrorService(&staticApplyStore{apply: apply}, failingControlRequestStore{}, logger)
 
 			w, resp := postControlRoute(t, svc, "/api/"+operation)
@@ -130,7 +139,68 @@ func TestControlRoutesAnswerFixedMessageWhenOperationFails(t *testing.T) {
 			assert.Equal(t, "apply-internal-error", line["apply_id"])
 			assert.Equal(t, "testdb", line["database"])
 			assert.Equal(t, "staging", line["environment"])
+			assert.Equal(t, DefaultDeployment, line["deployment"])
 			assert.Contains(t, line["error"], "user:pass")
+		})
+	}
+}
+
+// A control request that SchemaBot cannot route to its apply is never
+// attempted, so each answer says nothing was changed. A storage layer that is
+// not available can recover, so that answer suggests a retry; an apply with
+// no recorded deployment fails the same way every time, so that answer does
+// not. Each failure is logged with the path and apply it was for.
+func TestControlRoutesAnswerNotAttemptedBeforeTheOperation(t *testing.T) {
+	missingDeployment := activeTestApply("apply-internal-error")
+	missingDeployment.Deployment = ""
+	tests := []struct {
+		name      string
+		setup     func(svc *Service)
+		applies   storage.ApplyStore
+		wantMsg   string
+		wantLog   string
+		wantRetry bool
+	}{
+		{
+			name:      "storage not available",
+			applies:   &staticApplyStore{apply: activeTestApply("apply-internal-error")},
+			setup:     func(svc *Service) { svc.storage = nil },
+			wantMsg:   controlNotAttemptedMessage("cutover", "apply-internal-error"),
+			wantLog:   "storage not available for control request",
+			wantRetry: true,
+		},
+		{
+			name:      "apply store not available",
+			applies:   nil,
+			setup:     func(*Service) {},
+			wantMsg:   controlNotAttemptedMessage("cutover", "apply-internal-error"),
+			wantLog:   "apply store not available for control request",
+			wantRetry: true,
+		},
+		{
+			name:    "apply has no recorded deployment",
+			applies: &staticApplyStore{apply: missingDeployment},
+			setup:   func(*Service) {},
+			wantMsg: controlMissingDeploymentMessage("cutover", "apply-internal-error"),
+			wantLog: "control request apply is missing stored deployment metadata",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var logBuf bytes.Buffer
+			svc := newControlInternalErrorService(tc.applies, &memoryControlRequestStore{}, slog.New(slog.NewJSONHandler(&logBuf, nil)))
+			tc.setup(svc)
+
+			w, resp := postControlRoute(t, svc, "/api/cutover")
+
+			require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+			assert.Equal(t, tc.wantMsg, resp.Error)
+			assert.Contains(t, resp.Error, "nothing was changed")
+			assert.Equal(t, tc.wantRetry, strings.Contains(resp.Error, "Retry"), "only a failure that can recover suggests a retry")
+			line := requireLogLine(t, decodeLogLines(t, logBuf.Bytes()), tc.wantLog)
+			assert.Equal(t, "apply-internal-error", line["apply_id"])
+			assert.Equal(t, "/api/cutover", line["path"])
+			assert.Equal(t, "cutover", line["operation"])
 		})
 	}
 }
@@ -149,6 +219,94 @@ func TestControlRoutesKeepRefusalTextOn4xx(t *testing.T) {
 
 	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 	assert.Equal(t, "stop rejected: stop is not supported for this schema change; use cancel to permanently cancel it", resp.Error)
+
+	// A coded refusal keeps its code, which the CLI acts on.
+	coded := httptest.NewRecorder()
+	svc.writeControlError(coded, "stop", apply, controlConflictCodef(apitypes.ErrCodeAlreadyStopped, "schema change is already stopped"))
+	require.Equal(t, http.StatusConflict, coded.Code)
+	var codedResp apitypes.ErrorResponse
+	require.NoError(t, json.Unmarshal(coded.Body.Bytes(), &codedResp))
+	assert.Equal(t, "already_stopped", codedResp.ErrorCode)
+	assert.Equal(t, "stop rejected: schema change is already stopped", codedResp.Error)
+}
+
+// A rollback plan the engine refuses is the schema files' to fix, so the
+// answer carries the refusal and where the rollback's ignore_tables came from,
+// whether the engine ran locally or on a remote data plane, and without the
+// gRPC status. A refused drop of a withheld table is SchemaBot's own refusal
+// and keeps its text too. Any other engine failure can carry driver text, so
+// it answers the fixed message and stays in the server log.
+func TestRollbackPlanAnswerCarriesOnlyRefusals(t *testing.T) {
+	ignored, err := engine.NewIgnoredTables([]string{"flyway_schema_history"})
+	require.NoError(t, err)
+	refusal := ignored.RefuseDeclared("payments", []string{"flyway_schema_history"})
+	require.Error(t, refusal)
+	withheldDrop := &ternv1.PlanResponse{
+		PlanId: "plan_rollback_unhonored",
+		Changes: []*ternv1.SchemaChange{{
+			Namespace: "payments",
+			TableChanges: []*ternv1.TableChange{{
+				TableName: "flyway_schema_history", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP,
+				Ddl: "DROP TABLE `flyway_schema_history`",
+			}},
+		}},
+	}
+	tests := []struct {
+		name        string
+		client      *mockTernClient
+		wantContain []string
+		wantFixed   bool
+	}{
+		{
+			name:        "local engine refusal",
+			client:      &mockTernClient{planErr: fmt.Errorf("plan namespace payments: %w", &engine.PlanRefusedError{Err: refusal})},
+			wantContain: []string{"Remove the entry or the schema file", "This rollback uses the plan's recorded ignore_tables, not schemabot.yaml"},
+		},
+		{
+			name:        "remote engine refusal",
+			client:      &mockTernClient{planErr: fmt.Errorf("remote plan: %w", status.Error(codes.FailedPrecondition, refusal.Error()))},
+			wantContain: []string{"Remove the entry or the schema file", "This rollback uses the plan's recorded ignore_tables, not schemabot.yaml"},
+		},
+		{
+			name:        "refused drop of a withheld table",
+			client:      &mockTernClient{planResp: withheldDrop},
+			wantContain: []string{"ignore_tables withholds", "Upgrade that deployment to a build that supports ignore_tables"},
+		},
+		{
+			name:      "engine failure",
+			client:    &mockTernClient{planErr: status.Error(codes.Internal, sensitiveControlFailure)},
+			wantFixed: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, apply := newRollbackExemptServiceWithClient(&rollbackSourcePlanStore{source: rollbackSourcePlan()}, tc.client)
+			var logBuf bytes.Buffer
+			svc.logger = slog.New(slog.NewJSONHandler(&logBuf, nil))
+			_, planErr := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
+			require.Error(t, planErr)
+
+			w := httptest.NewRecorder()
+			svc.writeControlError(w, "rollback plan", apply, planErr)
+
+			require.Equal(t, http.StatusInternalServerError, w.Code)
+			var resp apitypes.ErrorResponse
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			assert.NotContains(t, resp.Error, "rpc error")
+			assert.NotContains(t, resp.Error, "user:pass")
+			if tc.wantFixed {
+				assert.Equal(t, controlInternalFailureMessage("rollback plan", apply), resp.Error)
+				assert.NotContains(t, resp.Error, "recorded ignore_tables")
+				line := requireLogLine(t, decodeLogLines(t, logBuf.Bytes()), "rollback plan failed")
+				assert.Contains(t, line["error"], "user:pass")
+				return
+			}
+			assert.True(t, strings.HasPrefix(resp.Error, `rollback plan failed: rollback plan for database "payments" (staging): `), resp.Error)
+			for _, want := range tc.wantContain {
+				assert.Contains(t, resp.Error, want)
+			}
+		})
+	}
 }
 
 // A rollback plan failure that wraps a cause records no control request, so its
@@ -191,6 +349,30 @@ func TestWriteControlError_FixedMessageVariants(t *testing.T) {
 			err:             authored,
 			wantMsg:         `rollback plan failed: plan plan-1 is missing server-side routing metadata field "target"; create a new plan and retry rollback`,
 			wantLogContains: "create a new plan and retry rollback",
+		},
+		{
+			name:            "an error formatted without %w is still a cause",
+			opName:          "rollback plan",
+			apply:           apply,
+			err:             terminalControlf("rollback plan for database %q: %v", "testdb", errors.New(sensitiveControlFailure)),
+			wantMsg:         "rollback plan failed for apply apply-internal-error: SchemaBot hit an internal error. No rollback was started. A SchemaBot operator can find the cause in the server log.",
+			wantLogContains: "user:pass",
+		},
+		{
+			name:            "two wrapped errors are causes",
+			opName:          "rollback plan",
+			apply:           apply,
+			err:             terminalControlf("rollback plan for database %q: %w and %w", "testdb", errors.New("first"), errors.New(sensitiveControlFailure)),
+			wantMsg:         "rollback plan failed for apply apply-internal-error: SchemaBot hit an internal error. No rollback was started. A SchemaBot operator can find the cause in the server log.",
+			wantLogContains: "user:pass",
+		},
+		{
+			name:            "a message SchemaBot wrote in full keeps its wrapped text",
+			opName:          "rollback plan",
+			apply:           apply,
+			err:             authoredTerminalControlf("rollback source apply is invalid: %w", errors.New(`apply "apply-internal-error" is missing stored deployment metadata`)),
+			wantMsg:         `rollback plan failed: rollback source apply is invalid: apply "apply-internal-error" is missing stored deployment metadata`,
+			wantLogContains: "missing stored deployment metadata",
 		},
 		{
 			name:            "outer wrap around an authored terminal error adds nothing",
