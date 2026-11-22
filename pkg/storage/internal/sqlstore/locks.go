@@ -446,14 +446,25 @@ func (s *lockStore) ReleaseByIDIfUnused(ctx context.Context, id int64, database,
 		return fmt.Errorf("lock row for %s: %w", op, err)
 	}
 
-	statePredicate, stateArgs := nonTerminalApplyStatePredicate("state")
+	// Unsettled, not merely non-terminal: a stopped apply is terminal but can
+	// be resumed under the lock it recorded, so it still uses the lock. A
+	// terminal parent with an operation still in progress uses it too: that
+	// operation is still being driven and its drive can reopen the parent
+	// (OW-5, ST-1), as checkNoInProgressRolloutForTargets holds for targets.
+	statePredicate, stateArgs := unsettledApplyStatePredicate("a.state")
+	inProgress, inProgressArgs := operationInProgressPredicate(s.dialect, "busy")
+	args := append([]any{id}, stateArgs...)
+	args = append(args, inProgressArgs...)
 	holder, err := scanApply(tx.QueryRowContext(ctx, `
-		SELECT `+applyColumns+`
-		FROM applies
-		WHERE lock_id = ? AND `+statePredicate+`
-		ORDER BY created_at DESC, id DESC
+		SELECT `+applyColumnsForApplyAlias+`
+		FROM applies a
+		WHERE a.lock_id = ? AND (`+statePredicate+` OR EXISTS (
+			SELECT 1 FROM apply_operations busy
+			WHERE busy.apply_id = a.id AND `+inProgress+`
+		))
+		ORDER BY a.created_at DESC, a.id DESC
 		LIMIT 1
-	`, append([]any{id}, stateArgs...)...))
+	`, args...))
 	if err != nil {
 		return fmt.Errorf("read applies recording the lock for %s: %w", op, err)
 	}

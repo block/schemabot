@@ -179,10 +179,18 @@ type LockStore interface {
 	ReleaseByID(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error
 
 	// ReleaseByIDIfUnused releases the lock like ReleaseByID, and also only
-	// while no apply that has not reached a terminal state records the row as
-	// its lock. The row is held for the decision, so an apply created under
-	// the row in a transaction that locks it either commits before the check
-	// and keeps the lock, or waits and finds the lock gone. It returns nil
+	// while no apply whose outcome can still change records the row as its
+	// lock. A stopped apply keeps the lock, since it can be resumed under it,
+	// and so does a terminal apply with an operation still in progress. Only
+	// applies that record this row count: an apply still running under an
+	// older row of the same database, left behind by a force release, does
+	// not keep the current owner's lock, so a caller that also refuses while
+	// any apply runs on the database checks that itself.
+	// The row is held for the decision, so an apply created under the row in
+	// a transaction that locks it either commits before the check and keeps
+	// the lock, or fails without creating the apply. A create that waited for
+	// the release can fail with a deadlock or serialization error rather than
+	// ErrLockIntentChanged. It returns nil
 	// when it released the lock; a *LockInUseError, matching ErrLockInUse and
 	// naming the apply, when it kept the lock for that apply; and the errors
 	// ReleaseByID returns when the row no longer holds the lock as given.
