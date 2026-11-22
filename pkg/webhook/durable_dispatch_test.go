@@ -1137,6 +1137,68 @@ func TestDurableWebhookHeartbeatLossSkipsCompletion(t *testing.T) {
 	require.Empty(t, store.failed, "delivery must be left processing so lease expiry hands it to another driver")
 }
 
+func TestDurableWebhookRetryDelay(t *testing.T) {
+	tests := []struct {
+		name    string
+		attempt int
+		want    time.Duration
+	}{
+		{"non-positive attempt is treated as the first", 0, time.Minute},
+		{"negative attempt is treated as the first", -3, time.Minute},
+		{"first failure waits the base delay", 1, time.Minute},
+		{"second failure doubles it", 2, 2 * time.Minute},
+		{"third failure doubles again", 3, 4 * time.Minute},
+		{"fourth failure is the last retry the budget allows", 4, 8 * time.Minute},
+		{"doubling stops at the cap", 5, durableWebhookRetryMaxDelay},
+		{"a very large attempt stays at the cap", 1 << 30, durableWebhookRetryMaxDelay},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, durableWebhookRetryDelay(tt.attempt))
+		})
+	}
+}
+
+// Every retry the attempt budget allows must wait longer than the one before,
+// and the whole schedule must still fit the budget: the last claim (the
+// terminal one) schedules no retry.
+func TestDurableWebhookRetryDelayGrowsAcrossTheAttemptBudget(t *testing.T) {
+	var previous, total time.Duration
+	for attempt := 1; attempt < maxDurableWebhookAttempts; attempt++ {
+		delay := durableWebhookRetryDelay(attempt)
+		assert.Greater(t, delay, previous, "attempt %d must wait longer than the one before", attempt)
+		previous = delay
+		total += delay
+	}
+	assert.Greater(t, total, 10*time.Minute, "the retries must outlast a ten minute GitHub outage")
+}
+
+// The driver stores a later retry time after each consecutive failure of the
+// same delivery, following durableWebhookRetryDelay.
+func TestDurableWebhookDriverBacksOffBetweenRetries(t *testing.T) {
+	for attempt := 1; attempt < maxDurableWebhookAttempts; attempt++ {
+		t.Run(fmt.Sprintf("failure_%d", attempt), func(t *testing.T) {
+			event := durablePullRequestEvent(t)
+			event.Attempts = attempt - 1 // FindNext claim increments to attempt
+			store := newScriptedWebhookEventStore(event)
+			h := newDurableDriverHandler(t, store, nil, nil)
+			h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+				return true, errors.New("github unavailable")
+			}
+
+			before := time.Now()
+			h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+			after := time.Now()
+
+			failure := <-store.failed
+			require.NotNil(t, failure.retryAfter, "a failure under the attempt cap must stay retryable")
+			want := durableWebhookRetryDelay(attempt)
+			assert.False(t, failure.retryAfter.Before(before.Add(want)), "retry must wait at least %s", want)
+			assert.False(t, failure.retryAfter.After(after.Add(want)), "retry must not wait longer than %s", want)
+		})
+	}
+}
+
 func TestDurableWebhookDriverStopsRetryingAtAttemptCap(t *testing.T) {
 	event := durablePullRequestEvent(t)
 	event.Attempts = maxDurableWebhookAttempts - 1 // FindNext claim increments to the cap

@@ -1131,7 +1131,8 @@ GitHub:
 
 A merged PR cannot reopen, so a merge skips the read.
 
-The retry is limited to five attempts, one minute apart. A GitHub outage that
+The retry is limited to five attempts. The wait between them doubles: one,
+two, four, then eight minutes, fifteen minutes in all. A GitHub outage that
 lasts longer, a suspended or removed App installation, or a deleted repository
 uses up those attempts. The lock then stays held and blocks other PRs on that
 database until an operator runs `schemabot unlock`.

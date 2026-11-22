@@ -18,7 +18,14 @@ import (
 )
 
 const (
-	durableWebhookRetryDelay = time.Minute
+	// durableWebhookRetryBaseDelay is the wait before the first retry of a
+	// failed delivery. Each later retry doubles the wait, up to
+	// durableWebhookRetryMaxDelay (see durableWebhookRetryDelay).
+	durableWebhookRetryBaseDelay = time.Minute
+
+	// durableWebhookRetryMaxDelay caps the doubling, so a larger attempt
+	// budget cannot push a retry out indefinitely.
+	durableWebhookRetryMaxDelay = 10 * time.Minute
 
 	// durableSupersedeHeadCheckTimeout bounds the live-head fetch that gates
 	// claim-time coalescing. The fetch runs before the delivery's heartbeat
@@ -34,6 +41,24 @@ const (
 	// which FindNext would stop handing the delivery out.
 	maxDurableWebhookAttempts = storage.MaxWebhookEventAttempts
 )
+
+// durableWebhookRetryDelay returns how long to wait before retrying a delivery
+// that has just failed its attempt-th claim (attempts are 1-based: the first
+// failure follows the first claim). The wait doubles with each attempt from
+// durableWebhookRetryBaseDelay and is capped at durableWebhookRetryMaxDelay, so
+// the retries that remain after a few quick failures reach past a GitHub outage
+// instead of all landing inside it. A non-positive attempt is treated as the
+// first.
+func durableWebhookRetryDelay(attempt int) time.Duration {
+	delay := durableWebhookRetryBaseDelay
+	for range attempt - 1 {
+		delay *= 2
+		if delay >= durableWebhookRetryMaxDelay {
+			return durableWebhookRetryMaxDelay
+		}
+	}
+	return delay
+}
 
 // StartDurableWebhookDispatch starts the durable webhook driver pool. The pool
 // is opt-in so direct handler tests and embedders keep the legacy request-path
@@ -376,7 +401,9 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			markErr = store.MarkFailedPermanent(finishCtx, event.ID, event.LeaseToken, processErr.Error())
 			outcome = "failed_permanent"
 		case event.Attempts < maxDurableWebhookAttempts:
-			due := time.Now().Add(durableWebhookRetryDelay)
+			// event.Attempts already counts this claim, so the first failure
+			// waits the base delay and each later one waits twice as long.
+			due := time.Now().Add(durableWebhookRetryDelay(event.Attempts))
 			markErr = store.MarkFailed(finishCtx, event.ID, event.LeaseToken, processErr.Error(), &due)
 			outcome = "retrying"
 		default:
