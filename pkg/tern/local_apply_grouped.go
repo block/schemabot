@@ -1041,7 +1041,20 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventDeployTriggered, storage.LogSourceSchemaBot,
 			"Auto-triggering deploy (defer_deploy not set)", "", "")
 		if _, err := eng.Start(withDriveWorkOwner(ctx), controlReq); err != nil {
-			logger.Error("auto-deploy failed", append(apply.MutableLogAttrs(), "error", err)...)
+			// A permanent refusal can never succeed on retry, and the apply stays
+			// at waiting-for-deploy until something changes, so retrying every
+			// poll would only repeat the log line. Fail the apply and say what
+			// to do next. Any other error is retried at the next progress tick.
+			var permanent *engine.PermanentError
+			if errors.As(err, &permanent) {
+				logger.Error("auto-deploy failed with permanent error",
+					append(apply.MutableLogAttrs(), "error", err)...)
+				ps.terminalErr = c.failApplyAndNotify(ctx, apply, tasks,
+					fmt.Sprintf("deploy could not start: %v. Fix the cause, then run a new plan and apply.", err))
+				return true
+			}
+			logger.Error("auto-deploy failed; retrying at the next progress tick",
+				append(apply.MutableLogAttrs(), "error", err)...)
 		}
 	}
 

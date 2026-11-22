@@ -616,3 +616,52 @@ func TestPollForCompletionAtomic_VitessProgressOutageInRevertWindowDoesNotPause(
 		assert.NotEqual(t, state.Task.Completed, task.State, "task %s", task.TaskIdentifier)
 	}
 }
+
+// An apply is waiting for its deploy and the engine refuses the automatic
+// start with a permanent error. The refusal can never succeed on a retry, so
+// the drive fails the apply with a message that says what to do next and does
+// not ask the engine to start again.
+func TestPollForCompletionAtomic_AutoDeployPermanentRefusalFailsApply(t *testing.T) {
+	eng := &fakeControlEngine{
+		progressResult: &engine.ProgressResult{State: engine.StateWaitingForDeploy},
+		startErr:       engine.NewPermanentError("deploy request cannot be deployed"),
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+	// The bound only matters if the drive wrongly keeps polling, which would
+	// otherwise never return.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, client.pollForCompletionAtomic(ctx, apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, 1, eng.startCount, "a permanent refusal is never retried")
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Equal(t, "deploy could not start: deploy request cannot be deployed. Fix the cause, then run a new plan and apply.", apply.ErrorMessage)
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.Failed, task.State, "task %s", task.TaskIdentifier)
+	}
+}
+
+// Any other Start error may clear on its own, so the drive logs it and asks the
+// engine to start again on the next poll while the apply keeps waiting for its
+// deploy.
+func TestHandleAtomicProgressTick_AutoDeployTransientErrorRetriesNextPoll(t *testing.T) {
+	eng := &fakeControlEngine{
+		progressResult: &engine.ProgressResult{State: engine.StateWaitingForDeploy},
+		startErr:       errors.New("start deploy request: connection reset"),
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+	ps := &atomicPollState{lastProgressLog: time.Now()}
+
+	for tick := 1; tick <= 2; tick++ {
+		done := client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, map[string]string{}, false)
+		assert.False(t, done, "tick %d: the drive keeps polling", tick)
+		assert.Equal(t, tick, eng.startCount, "tick %d: the engine is asked to start again", tick)
+	}
+
+	assert.False(t, state.IsTerminalApplyState(apply.State), "the apply is not settled, got %q", apply.State)
+	assert.NoError(t, ps.terminalErr)
+	for _, task := range tasks {
+		assert.False(t, state.IsTerminalTaskState(task.State), "task %s is not settled, got %q", task.TaskIdentifier, task.State)
+	}
+}

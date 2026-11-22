@@ -703,6 +703,7 @@ type fakeControlEngine struct {
 	cancelCount             int
 	cancelErr               error
 	startCount              int
+	startErr                error
 	cutoverCount            int
 	cutoverResult           *engine.ControlResult
 	cutoverErr              error
@@ -779,6 +780,9 @@ func (e *fakeControlEngine) Cancel(context.Context, *engine.ControlRequest) (*en
 
 func (e *fakeControlEngine) Start(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.startCount++
+	if e.startErr != nil {
+		return nil, e.startErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
