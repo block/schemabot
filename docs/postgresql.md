@@ -394,6 +394,31 @@ partitioned parent therefore fail with pg-sprite's typed refusal rather than a
 raw server error; they remain outside the supported SchemaBot envelope even if
 a plan is otherwise shown as native.
 
+### Enum types
+
+A schema file may declare one enum type and nothing else, with unqualified
+`CREATE TYPE ... AS ENUM` and its labels in order:
+
+```sql
+CREATE TYPE order_status AS ENUM ('new', 'paid', 'shipped', 'delivered');
+```
+
+The plan compares the file with the live type of that name in the namespace:
+
+- A type that carries every label the file lists plans no change.
+- Each label the type lacks plans one `ALTER TYPE ... ADD VALUE`, placed
+  `BEFORE` the next live label when the file lists it ahead of one. These
+  steps are blocked: SchemaBot does not apply enum label additions yet, so
+  run the statements outside SchemaBot and re-plan.
+- PostgreSQL cannot drop or move an enum label, so a file that no longer
+  lists a live label, or lists the labels in another order, fails the plan.
+  So does a type that does not exist yet, or a name that holds another kind
+  of type. Rename a label with `ALTER TYPE ... RENAME VALUE` or keep it in
+  the file, and create a new type with `CREATE TYPE` outside SchemaBot.
+
+Two files in one namespace that declare the same type fail the plan. An enum
+type is not a table, so it never counts as an undeclared table to drop.
+
 ## Blocked plans
 
 SchemaBot blocks every planner verdict that is not a native execution verdict.

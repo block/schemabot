@@ -64,6 +64,8 @@ func ChangeTypeToStatementType(ct ternv1.ChangeType) (ddl.StatementType, bool) {
 		return ddl.StatementTruncateTable, true
 	case ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW:
 		return ddl.StatementCreateView, true
+	case ternv1.ChangeType_CHANGE_TYPE_ALTER_TYPE:
+		return ddl.StatementAlterType, true
 	default:
 		return ddl.StatementUnknown, false
 	}
@@ -89,6 +91,8 @@ func StatementTypeToChangeType(st ddl.StatementType) ternv1.ChangeType {
 		return ternv1.ChangeType_CHANGE_TYPE_TRUNCATE
 	case ddl.StatementCreateView:
 		return ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW
+	case ddl.StatementAlterType:
+		return ternv1.ChangeType_CHANGE_TYPE_ALTER_TYPE
 	default:
 		return ternv1.ChangeType_CHANGE_TYPE_OTHER
 	}

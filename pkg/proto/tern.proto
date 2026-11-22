@@ -384,6 +384,7 @@ enum ChangeType {
   CHANGE_TYPE_RENAME = 7;
   CHANGE_TYPE_TRUNCATE = 8;
   CHANGE_TYPE_CREATE_VIEW = 9;
+  CHANGE_TYPE_ALTER_TYPE = 10;
 }
 
 // SchemaFiles contains the schema files for a namespace (e.g. schema name for MySQL, keyspace for Vitess).
