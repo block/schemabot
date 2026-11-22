@@ -397,7 +397,7 @@ func PartDetail(p Part, pendingWord string) string {
 		// A checksum reads like a copy, the percent and then its rows, the
 		// way the single-deployment comment reads it.
 		checked := ui.ClampRows(p.ChecksumRowsChecked, p.ChecksumRowsTotal)
-		pct := ui.ChecksumDisplayPercent(checked, p.ChecksumRowsTotal)
+		pct := ui.ClampPercent(int(checked * 100 / p.ChecksumRowsTotal))
 		return fmt.Sprintf("checksumming %s · %s / %s rows verified", ui.FormatRowCopyPercent(pct, checked, p.ChecksumRowsTotal), ui.FormatNumber(checked), ui.FormatNumber(p.ChecksumRowsTotal))
 	case state.Task.Stopped, state.Task.Cancelled:
 		// A part that had copied rows says how far it got before it halted.

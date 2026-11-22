@@ -271,7 +271,7 @@ func ChecksumDisplayPercent(rowsChecked, rowsTotal int64) int {
 	if rowsTotal <= 0 {
 		return 0
 	}
-	return RowCopyDisplayPercent(int(min(rowsChecked, rowsTotal)*100/rowsTotal), rowsChecked)
+	return RowCopyDisplayPercent(int(rowsChecked*100/rowsTotal), rowsChecked)
 }
 
 // RowCopyFraction returns row-copy progress as a float percent in [0, 100],

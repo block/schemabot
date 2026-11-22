@@ -134,17 +134,25 @@ func prTableReading(t *testing.T, targets []parityTarget) (percent, rows string)
 
 // The CLI and the PR comment draw the same checksum bar for one table: the bar
 // fills only once every row is verified, and shows a first segment as soon as
-// verification has begun, on both surfaces (UX-5).
+// verification has begun, on both surfaces (UX-5). Before Spirit reports a
+// total there is nothing to measure against, so both draw a full activity bar
+// with an open-ended label.
 func TestChecksumBarReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
 	cases := []struct {
 		name           string
 		checked, total int64
 		filled         int
-		percent        string
+		// label follows "Checksumming to verify data" on both surfaces.
+		label string
 	}{
-		{name: "in its final stretch", checked: 997_500, total: 1_000_000, filled: 19, percent: "99.75%"},
-		{name: "just begun", checked: 4, total: 1_000, filled: 1, percent: "0.40%"},
-		{name: "every row verified", checked: 1_000_000, total: 1_000_000, filled: 20, percent: "100.00%"},
+		{name: "in its final stretch", checked: 997_500, total: 1_000_000, filled: 19, label: " (99.75%)"},
+		{name: "just begun", checked: 4, total: 1_000, filled: 1, label: " (0.40%)"},
+		{name: "every row verified", checked: 1_000_000, total: 1_000_000, filled: 20, label: " (100.00%)"},
+		// Rounding draws two segments here and truncation one.
+		{name: "9.6 percent", checked: 96, total: 1_000, filled: 1, label: " (9.60%)"},
+		{name: "past the estimated total", checked: 1_200_000, total: 1_000_000, filled: 20, label: " (100.00%)"},
+		{name: "total not yet reported", checked: 0, total: 0, filled: 20, label: "..."},
+		{name: "rows reported without a total", checked: 500, total: 0, filled: 20, label: "..."},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -161,7 +169,7 @@ func TestChecksumBarReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
 				}},
 			})
 			want := strings.Repeat(ui.ColorBlue, tc.filled) + strings.Repeat(ui.ColorEmpty, 20-tc.filled) +
-				" 🔍 Checksumming to verify data (" + tc.percent + ")"
+				" 🔍 Checksumming to verify data" + tc.label
 			assert.Contains(t, cli, want, "CLI checksum bar")
 			assert.Contains(t, pr, want, "PR comment checksum bar")
 		})
