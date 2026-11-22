@@ -3606,6 +3606,114 @@ If SchemaBot should manage them, ask a SchemaBot operator to add the directory t
 </details>
 
 <details>
+<summary><a name="freeze-apply-refused"></a><strong>Freeze: Apply Refused</strong></summary>
+
+
+## ❄️ Apply Blocked by a Freeze
+
+**Environment**: `production`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+`production` is frozen, so this command did not run. Nothing changed.
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `frz-7f3a` | until lifted | SEV-1234: payments latency, page `@payments-oncall` |
+
+### What you can do
+
+- **Wait for the freeze to end**, then run the same command again.
+- **Ask for an override** if this change can't wait. Run the same command with `--override "<why it can't wait>"`. A freeze approver other than you and the PR author must approve it: a member of `acme/freeze-approvers` or `acme/sre`.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="freeze-cutover-refused-by-two-freezes"></a><strong>Freeze: Cutover Refused By Two Freezes</strong></summary>
+
+
+## ❄️ Cutover Blocked by Freezes
+
+**Environment**: `production`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+`production` is frozen, so this command did not run. Nothing changed.
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `frz-7f3a` | until lifted | SEV-1234: payments latency |
+| `frz-91c2` | until 2026-01-15T18:00:00Z | Holiday change freeze |
+
+### What you can do
+
+- **Wait for the freezes to end**, then run the same command again.
+- **Ask for an override** if this change can't wait. Run the same command with `--override "<why it can't wait>"`. A freeze approver other than you and the PR author must approve it: a member of `acme/freeze-approvers` or `acme/sre`.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="freeze-override-requested"></a><strong>Freeze: Override Requested</strong></summary>
+
+
+## ❄️ Apply Blocked by a Freeze
+
+**Environment**: `production`
+
+*Requested by @carol at 2026-01-15 14:30:00 UTC*
+
+`production` is frozen, so this command did not run. Nothing changed.
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `frz-7f3a` | until lifted | SEV-1234: payments latency |
+
+### Override requested
+
+Override request `ovr-0123456789abcdef` is waiting for a freeze approver.
+
+**Reason the approver sees:** Index that fixes SEV-1234.
+
+**Freeze approvers**:
+- @acme/freeze-approvers
+- @acme/sre
+
+1. A freeze approver other than @carol and other than the PR author (@alice) comments:
+   ```
+   schemabot freeze approve ovr-0123456789abcdef --tenant acme
+   ```
+2. Then @carol runs this command again.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="freeze-applyconfirm-refused"></a><strong>Freeze: Apply-confirm Refused</strong></summary>
+
+
+## ❄️ Apply-confirm Blocked by a Freeze
+
+**Environment**: `production`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+`production` is frozen, so this command did not run. Nothing was applied, and the pending confirmation was released.
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `frz-91c2` | until 2026-01-15T18:00:00Z | Holiday change freeze |
+
+### What you can do
+
+- **Wait for the freeze to end**, then run `apply` again, then `apply-confirm`.
+- **Ask for an override** if this change can't wait. Run `apply` again, then run `apply-confirm` with `--override "<why it can't wait>"`. A freeze approver other than you and the PR author must approve it: a member of `acme/freeze-approvers` or `acme/sre`.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="missing-e-flag"></a><strong>Missing -e Flag</strong></summary>
 
 
@@ -4732,6 +4840,22 @@ If the schema change still needs to be applied, open a new PR with it and apply 
 **Database**: `testapp`
 
 The base branch contains newer changes to the schema directory `schema/testapp` that are not included in this PR. Applying this branch could revert those changes.
+
+Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.
+
+_Requested by @jackjackbits_
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-shared-schema-changed-since-pr-diverged"></a><strong>Apply Blocked: Shared Schema Changed Since PR Diverged</strong></summary>
+
+
+## ⚠️ Apply rejected — base schema is newer — Production
+
+**Database**: `shop_sharded`
+
+The base branch contains newer changes to `schema/shop`, the schema of `shop`, which shares a schema with this database. This PR was compared with the older version of it.
 
 Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.
 

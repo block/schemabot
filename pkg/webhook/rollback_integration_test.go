@@ -444,52 +444,7 @@ func requireSingleRollbackApply(t *testing.T, svc *api.Service, dbName string) *
 func TestE2ERollbackConfirmSafeRollbackRunsWithoutAllowUnsafe(t *testing.T) {
 	dbName := "webhook_rbconfirm_safe"
 	svc := setupE2EService(t, dbName)
-	ctx := t.Context()
-
-	// The PR first adds the index, then drops it again; the drop is the apply
-	// rolled back.
-	seedCompletedIndexApply(t, svc, dbName)
-	prNumber := int32(1)
-	planResp, err := svc.ExecutePlan(ctx, api.PlanRequest{
-		Database:    dbName,
-		Environment: "staging",
-		Type:        "mysql",
-		Repository:  "octocat/hello-world",
-		PullRequest: &prNumber,
-		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			dbName: {Files: map[string]string{"users.sql": rollbackTestSchemaWithoutIndex}},
-		},
-	})
-	require.NoError(t, err)
-	_, dropApplyID, err := svc.ExecuteApply(ctx, api.ApplyRequest{
-		PlanID:      planResp.PlanID,
-		Environment: "staging",
-		Options:     map[string]string{"allow_unsafe": "true"},
-	})
-	require.NoError(t, err)
-	require.Eventually(t, func() bool {
-		a, err := svc.Storage().Applies().Get(ctx, dropApplyID)
-		return err == nil && a != nil && state.IsState(a.State, state.Apply.Completed)
-	}, webhookIntegrationPollDeadline, 500*time.Millisecond, "the index drop apply should complete")
-	dropApply, err := svc.Storage().Applies().Get(ctx, dropApplyID)
-	require.NoError(t, err)
-
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-	client := gh.NewClient(nil)
-	client.BaseURL, _ = url.Parse(server.URL + "/")
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
-	result := setupFakeGitHubForPlan(t, mux, map[string]string{
-		"users.sql": rollbackTestSchemaWithoutIndex,
-	}, schemabotConfig, dbName)
-	h := newE2EHandler(t, svc, client)
-	sendComment := func(comment string) {
-		t.Helper()
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil))
-		require.Equal(t, http.StatusOK, rr.Code)
-	}
+	dropApply, result, sendComment := setupSafeRollback(t, svc, dbName)
 
 	sendComment(fmt.Sprintf("schemabot rollback %s -e staging", dropApply.ApplyIdentifier))
 	plan := awaitCommentContaining(t, result, "Rollback Plan")
@@ -1518,4 +1473,60 @@ func TestE2ERollbackIgnoredByNonOwningInstance(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		// Expected: no comment or reaction posted.
 	}
+}
+
+// setupSafeRollback completes an apply that adds an index on users and then
+// one that drops it, the apply a rollback adds the index back for: a rollback
+// with no unsafe changes. It returns the drop apply, the fake GitHub's
+// recorded comments, and a function that sends a PR comment to the handler.
+func setupSafeRollback(t *testing.T, svc *api.Service, dbName string) (*storage.Apply, *planFlowResult, func(string)) {
+	t.Helper()
+	ctx := t.Context()
+
+	// The PR first adds the index, then drops it again; the drop is the apply
+	// rolled back.
+	seedCompletedIndexApply(t, svc, dbName)
+	prNumber := int32(1)
+	planResp, err := svc.ExecutePlan(ctx, api.PlanRequest{
+		Database:    dbName,
+		Environment: "staging",
+		Type:        "mysql",
+		Repository:  "octocat/hello-world",
+		PullRequest: &prNumber,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			dbName: {Files: map[string]string{"users.sql": rollbackTestSchemaWithoutIndex}},
+		},
+	})
+	require.NoError(t, err)
+	_, dropApplyID, err := svc.ExecuteApply(ctx, api.ApplyRequest{
+		PlanID:      planResp.PlanID,
+		Environment: "staging",
+		Options:     map[string]string{"allow_unsafe": "true"},
+	})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		a, err := svc.Storage().Applies().Get(ctx, dropApplyID)
+		return err == nil && a != nil && state.IsState(a.State, state.Apply.Completed)
+	}, webhookIntegrationPollDeadline, 500*time.Millisecond, "the index drop apply should complete")
+	dropApply, err := svc.Storage().Applies().Get(ctx, dropApplyID)
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": rollbackTestSchemaWithoutIndex,
+	}, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+	sendComment := func(comment string) {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil))
+		require.Equal(t, http.StatusOK, rr.Code)
+	}
+
+	return dropApply, result, sendComment
 }

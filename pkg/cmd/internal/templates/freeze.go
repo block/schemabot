@@ -40,10 +40,7 @@ func freezeScope(f apitypes.Freeze) string {
 // freezeUntil is the end of a freeze's window; one with no end lasts until
 // someone lifts it.
 func freezeUntil(f apitypes.Freeze) string {
-	if f.EndsAt == nil {
-		return "until lifted"
-	}
-	return "until " + freezeTime(*f.EndsAt)
+	return ui.FreezeUntil(f.EndsAt)
 }
 
 // WriteFreezeCreated writes the confirmation of a new freeze.
@@ -210,6 +207,10 @@ type ChangeGateRefusedData struct {
 	// Message is the server's refusal, which says why no override request
 	// was recorded when one was asked for.
 	Message string
+	// OverrideCommand is the CLI command that asks for an override, for a
+	// caller whose own request cannot carry --override: the watch TUI's keys
+	// send none. Empty when the operator ran a command they can rerun with it.
+	OverrideCommand string
 }
 
 // ChangeGateRefusedText is the refusal as lines, so a caller that cannot print
@@ -219,13 +220,9 @@ func ChangeGateRefusedText(d ChangeGateRefusedData) []string {
 	if d.Operation == "cutover" {
 		outcome = "This cutover did not start."
 	}
-	lines := []string{fmt.Sprintf("✗ %s is frozen. %s", ui.TerminalSafeLine(d.Environment), outcome)}
+	lines := []string{fmt.Sprintf("%s %s is frozen. %s", glyph.Frozen, ui.TerminalSafeLine(d.Environment), outcome)}
 	for _, b := range d.Blockers {
-		until := "until lifted"
-		if b.EndsAt != nil {
-			until = "until " + freezeTime(*b.EndsAt)
-		}
-		lines = append(lines, fmt.Sprintf("   %s  %s  (%s)", ui.TerminalSafeLine(b.ID), ui.TerminalSafeLine(b.Reason), until))
+		lines = append(lines, fmt.Sprintf("   %s  %s  (%s)", ui.TerminalSafeLine(b.ID), ui.TerminalSafeLine(b.Reason), ui.FreezeUntil(b.EndsAt)))
 	}
 	switch {
 	case d.OverrideRequest != nil:
@@ -240,6 +237,11 @@ func ChangeGateRefusedText(d ChangeGateRefusedData) []string {
 	case d.Operation == "rollback":
 		// rollback has no --override; only the freezes ending lets it run.
 		lines = append(lines, "Run the rollback again once these freezes end or are lifted.")
+	case !d.OverrideAsked && d.OverrideCommand != "":
+		// The command gets a line of its own so a narrow watch, which cuts
+		// wide lines rather than wrapping them, still shows it whole.
+		lines = append(lines, "To ask for an override, run:",
+			fmt.Sprintf(`  %s --override "<reason>"`, ui.TerminalSafeLine(d.OverrideCommand)))
 	case !d.OverrideAsked:
 		lines = append(lines, `To ask for an override, run the same command with --override "<reason>".`)
 	default:
