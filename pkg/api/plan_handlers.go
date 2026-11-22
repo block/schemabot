@@ -286,7 +286,7 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.logger.Error("pull schema failed", "database", req.Database, "environment", req.Environment, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "pull schema failed: "+err.Error())
+		s.writeError(w, http.StatusInternalServerError, pullFailureMessage(req.Database, req.Environment, err))
 		return
 	}
 
@@ -524,19 +524,19 @@ func pullNamespaces(dialect schema.Dialect, namespaces []string) ([]string, erro
 	seenOutput := make(map[string]struct{}, len(namespaces))
 	for _, namespace := range namespaces {
 		if strings.TrimSpace(namespace) != namespace || namespace == "" {
-			return nil, fmt.Errorf("pull namespace %q must be non-empty and contain no leading or trailing whitespace", namespace)
+			return nil, operatorMessagef("pull namespace %q must be non-empty and contain no leading or trailing whitespace", namespace)
 		}
 		if strings.Contains(namespace, "..") || strings.ContainsAny(namespace, `/\`) {
-			return nil, fmt.Errorf("pull namespace %q must be a single path component", namespace)
+			return nil, operatorMessagef("pull namespace %q must be a single path component", namespace)
 		}
 		if schema.HasNamespaceEnvironmentPlaceholder(namespace) {
-			return nil, fmt.Errorf("pull namespace %q must be a concrete live namespace; resolve {env} or $ENV before calling pull", namespace)
+			return nil, operatorMessagef("pull namespace %q must be a concrete live namespace; resolve {env} or $ENV before calling pull", namespace)
 		}
 		if schema.IsReservedPullNamespaceForDialect(dialect, namespace) {
-			return nil, fmt.Errorf("pull namespace %q is reserved and cannot be pulled", namespace)
+			return nil, operatorMessagef("pull namespace %q is reserved and cannot be pulled", namespace)
 		}
 		if _, ok := seenOutput[namespace]; ok {
-			return nil, fmt.Errorf("duplicate pull namespace %q", namespace)
+			return nil, operatorMessagef("duplicate pull namespace %q", namespace)
 		}
 		seenOutput[namespace] = struct{}{}
 		result = append(result, namespace)
@@ -696,7 +696,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		}
 		s.logger.Error("plan failed: the environment's rollout members did not resolve, so the rollout rendering check refuses the plan",
 			"database", req.Database, "environment", req.Environment, "repository", req.Repository, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
+		s.writeError(w, http.StatusInternalServerError, planFailureMessage(req.Database, req.Environment, err))
 		return
 	}
 
@@ -746,8 +746,8 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "plan rejected: "+err.Error())
 			return
 		}
-		s.logger.Error("plan failed", "database", req.Database, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
+		s.logger.Error("plan failed", "database", req.Database, "environment", req.Environment, "repository", req.Repository, "error", err)
+		s.writeError(w, http.StatusInternalServerError, planFailureMessage(req.Database, req.Environment, err))
 		return
 	}
 
@@ -759,7 +759,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 	rollout, err := s.planRollout(r.Context(), req, primaryPlan, resp)
 	if err != nil {
 		s.logger.Error("plan failed: the rollout's member plans could not be completed", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
+		s.writeError(w, http.StatusInternalServerError, planRolloutFailureMessage(req.Database, req.Environment, err))
 		return
 	}
 	resp.Rollout = rollout
@@ -1308,11 +1308,11 @@ func (s *Service) refuseWithheldDrops(req PlanRequest, ignored engine.IgnoredTab
 		upgrade = "Upgrade that deployment to a build that supports ignore_tables patterns"
 	}
 	if len(dropped) == 1 {
-		return fmt.Errorf(
+		return operatorMessagef(
 			"the plan from deployment %q proposes dropping %q, which ignore_tables withholds. That deployment's planner did not apply the exclusion, so the plan is refused rather than reviewed as a drop. %s",
 			deployment, dropped[0], upgrade)
 	}
-	return fmt.Errorf(
+	return operatorMessagef(
 		"the plan from deployment %q proposes dropping %s, which ignore_tables withholds. That deployment's planner did not apply the exclusion, so the plan is refused rather than reviewed as drops. %s",
 		deployment, quotedTableList(dropped), upgrade)
 }
@@ -1664,8 +1664,8 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, applyStorageFailedMessage(req.PlanID))
 			return
 		}
-		s.logger.Error("apply failed", "plan_id", req.PlanID, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "apply failed: "+err.Error())
+		s.logger.Error("apply failed", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
+		s.writeError(w, http.StatusInternalServerError, applyFailureMessage(req.PlanID, err))
 		return
 	}
 
@@ -1808,6 +1808,113 @@ func (e *applyStorageError) LogAttrs() []any {
 // nothing refuses the retry, so the caller checks the apply's state first.
 func applyStorageFailedMessage(planID string) string {
 	return fmt.Sprintf("apply failed: storage error while queueing plan %s; see server logs and check for a stored apply before retrying", planID)
+}
+
+// operatorMessageError is text SchemaBot wrote for the person reading the
+// response. It wraps no storage, driver, engine, or RPC error, and it says what
+// to change or do next, so a 500 answer carries it as written. It has no
+// Unwrap on purpose: whatever an outer wrap added stays out of the response.
+type operatorMessageError struct {
+	message string
+}
+
+func (e *operatorMessageError) Error() string { return e.message }
+
+// operatorMessagef builds an operatorMessageError. Use it only for a message
+// that wraps no cause and names the next step; any error that wraps a cause
+// belongs in the server log instead.
+func operatorMessagef(format string, args ...any) error {
+	return &operatorMessageError{message: fmt.Sprintf(format, args...)}
+}
+
+// authoredMessage returns the text of the operatorMessageError in err's chain.
+func authoredMessage(err error) (string, bool) {
+	authored, ok := errors.AsType[*operatorMessageError](err)
+	if !ok {
+		return "", false
+	}
+	return authored.message, true
+}
+
+// authoredPlanFailureText returns the text of a plan failure that is meant for
+// the reader, and only that text, without any wrap an outer caller added:
+//   - a SchemaBot-written message;
+//   - the engine declining the declared schema as written, which describes the
+//     change to make to the schema files, from a local engine (its own text) or a
+//     remote data plane that answered FailedPrecondition (the status message,
+//     without the "rpc error" framing);
+//   - a schema file the drop check could not parse.
+func authoredPlanFailureText(err error) (string, bool) {
+	if text, ok := authoredMessage(err); ok {
+		return text, true
+	}
+	if refusal, ok := errors.AsType[*engine.PlanRefusedError](err); ok {
+		return refusal.Error(), true
+	}
+	if grpcstatus.Code(err) == grpccodes.FailedPrecondition {
+		// Convert(err).Message() would carry the whole wrap chain for a wrapped
+		// status error, so read the message from the status itself.
+		var carrier interface{ GRPCStatus() *grpcstatus.Status }
+		if errors.As(err, &carrier) {
+			return carrier.GRPCStatus().Message(), true
+		}
+	}
+	if check, ok := errors.AsType[*UnselectedTableDropCheckError](err); ok {
+		if _, parse := errors.AsType[*schemaFileParseError](check.Err); parse {
+			return check.Error(), true
+		}
+	}
+	return "", false
+}
+
+// The closing sentences of the fixed 500 messages. The cause is in the server
+// log, which only a SchemaBot operator can read.
+const (
+	internalFailureTail = "A SchemaBot operator can find the cause in the server log."
+	retryFailureTail    = "If it keeps failing, a SchemaBot operator can find the cause in the server log."
+)
+
+// pullFailureMessage is the 500 body of a failed pull. The cause can be a
+// storage, driver, or engine error carrying addresses or credentials, so it
+// stays in the server log. A pull changes nothing, so it can be repeated.
+func pullFailureMessage(database, environment string, err error) string {
+	if text, ok := authoredMessage(err); ok {
+		return "pull schema failed: " + text
+	}
+	return fmt.Sprintf("pull schema failed for database %q in environment %q: SchemaBot hit an internal error while reading the live schema. "+
+		"Retry in a moment. %s", database, environment, retryFailureTail)
+}
+
+// planFailureMessage is the 500 body of a failed plan. The cause stays in the
+// server log unless it is text written for the reader.
+func planFailureMessage(database, environment string, err error) string {
+	if text, ok := authoredPlanFailureText(err); ok {
+		return "plan failed: " + text
+	}
+	return fmt.Sprintf("plan failed for database %q in environment %q: SchemaBot hit an internal error. "+
+		"Plan again in a moment. %s", database, environment, retryFailureTail)
+}
+
+// planRolloutFailureMessage is the 500 body of a plan whose rollout members
+// could not all be planned. It does not say whether any member plan was
+// recorded, because that depends on how far planning got.
+func planRolloutFailureMessage(database, environment string, err error) string {
+	if text, ok := authoredPlanFailureText(err); ok {
+		return "plan failed: " + text
+	}
+	return fmt.Sprintf("plan failed for database %q in environment %q: SchemaBot could not finish planning every rollout member. "+
+		"Plan again in a moment. %s", database, environment, retryFailureTail)
+}
+
+// applyFailureMessage is the 500 body of an apply that failed inside SchemaBot.
+// The apply may already be recorded when the failure happens, so the message
+// tells the caller to check the schema change before applying again.
+func applyFailureMessage(planID string, err error) string {
+	if text, ok := authoredMessage(err); ok {
+		return "apply failed: " + text
+	}
+	return fmt.Sprintf("apply failed for plan %s: SchemaBot hit an internal error. "+
+		"The apply may already be recorded, so check the schema change's status before applying again. %s", planID, internalFailureTail)
 }
 
 // activeApplyConflictMessage tells the operator which apply holds the target
@@ -3078,7 +3185,7 @@ func buildApplyOperationGroups(
 	// plan rather than complete an apply that skipped it.
 	for _, member := range members {
 		if namespaces := member.Plan.EngineFinalizedNamespaces(); len(namespaces) > 0 {
-			return nil, false, fmt.Errorf("plan %s asks to finalize namespaces %v after their DDL, but its changes carry no per-shard plan to schedule a group finalizer behind; re-plan, and report this if it repeats",
+			return nil, false, operatorMessagef("plan %s asks to finalize namespaces %v after their DDL, but its changes carry no per-shard plan to schedule a group finalizer behind; re-plan, and report this if it repeats",
 				member.Plan.PlanIdentifier, namespaces)
 		}
 	}
