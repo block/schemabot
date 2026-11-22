@@ -391,6 +391,138 @@ func TestRunFollowLoopInterruptDuringFailedPollIsNotAFailure(t *testing.T) {
 	assert.Equal(t, 2, polls)
 }
 
+// heldLogServer answers its first answered requests with body and holds every
+// later one open without answering, as a server stuck on a slow read would.
+// Each held request is announced on the returned channel. A held request ends
+// only when the client abandons it or the test finishes.
+func heldLogServer(t *testing.T, answered int, body any) (endpoint string, held <-chan struct{}) {
+	t.Helper()
+	heldCh := make(chan struct{}, 4)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		n := requests
+		mu.Unlock()
+		if n <= answered {
+			w.Header().Set("Content-Type", "application/json")
+			assert.NoError(t, json.NewEncoder(w).Encode(body))
+			return
+		}
+		select {
+		case heldCh <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(server.Close)
+	// Cleanups run last-registered first, so held requests are released before
+	// the server waits for them to return.
+	t.Cleanup(func() { close(release) })
+	return server.URL, heldCh
+}
+
+// waitForHeldRequest waits for the server to hold a request, failing the test
+// if none arrives.
+func waitForHeldRequest(t *testing.T, held <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-held:
+	case <-time.After(followTestDeadline):
+		require.FailNow(t, "no log read reached the server")
+	}
+}
+
+// An operator who presses Ctrl-C while the tail's first read is still waiting
+// on the server ends the tail at once and normally: the read is abandoned
+// rather than awaited, no failure is reported, and the command exits with
+// status 0, as for any other interrupt of a tail.
+func TestFollowLogsInterruptDuringFirstReadEndsAtOnce(t *testing.T) {
+	follows := map[string]func(ctx context.Context, endpoint string) error{
+		"followLogs": func(ctx context.Context, endpoint string) error {
+			return followLogs(ctx, endpoint, "", "", "apply-a", client.LogScope{}, 10)
+		},
+		"followDeploymentLogs": func(ctx context.Context, endpoint string) error {
+			return followDeploymentLogs(ctx, endpoint, "apply-a", "region-a", client.LogScope{}, 10)
+		},
+	}
+	for name, follow := range follows {
+		t.Run(name, func(t *testing.T) {
+			endpoint, held := heldLogServer(t, 0, nil)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			var err error
+			returned := false
+			stderr := captureStderr(t, func() {
+				captureOutput(t, func() {
+					done := make(chan error, 1)
+					go func() { done <- follow(ctx, endpoint) }()
+					waitForHeldRequest(t, held)
+					cancel()
+					select {
+					case err = <-done:
+						returned = true
+					case <-time.After(followTestDeadline):
+					}
+				})
+			})
+
+			require.True(t, returned, "the tail kept waiting on its first read after the interrupt")
+			require.NoError(t, err)
+			assert.Equal(t, 0, ExitCodeFor(err))
+			assert.Empty(t, stderr, "an interrupted read is not reported as a failure")
+		})
+	}
+}
+
+// An operator who presses Ctrl-C while a poll is still waiting on the server
+// ends the tail at once and normally: the poll is abandoned rather than
+// awaited, and its cancelled read is not reported as a failed poll.
+func TestRunFollowLoopInterruptDuringInFlightPollEndsAtOnce(t *testing.T) {
+	endpoint, held := heldLogServer(t, 1, apitypes.LogsResponse{ApplyID: "apply-a", Logs: []*apitypes.LogEntry{{ID: 1, Message: "copy started"}}})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	fetch := func(limit int) (*apitypes.LogsResponse, error) {
+		return client.GetLogsCtx(ctx, endpoint, "", "", "apply-a", client.LogScope{}, limit)
+	}
+	var mu sync.Mutex
+	var emitted []int64
+	emit := func(result *apitypes.LogsResponse, _ bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, log := range result.Logs {
+			emitted = append(emitted, log.ID)
+		}
+	}
+
+	var err error
+	returned := false
+	stderr := captureStderr(t, func() {
+		done := make(chan error, 1)
+		go func() { done <- runFollowLoop(ctx, fetch, emit, 10, fastFollowPacing()) }()
+		waitForHeldRequest(t, held)
+		cancel()
+		select {
+		case err = <-done:
+			returned = true
+		case <-time.After(followTestDeadline):
+		}
+	})
+
+	require.True(t, returned, "the tail kept waiting on its poll after the interrupt")
+	require.NoError(t, err)
+	assert.Empty(t, stderr, "an interrupted poll is not reported as a failure")
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []int64{1}, emitted, "the first read was shown before the poll was held")
+}
+
 func deploymentFollowSource(target, externalID string, ids ...int64) *apitypes.DeploymentLogSource {
 	source := &apitypes.DeploymentLogSource{
 		ExternalID: externalID,
