@@ -1,6 +1,6 @@
 # Adding a sharded Vitess table
 
-A sharded Vitess table takes its ids from a sequence table in an unsharded keyspace. Using the [keyspace layout](authoring.md#repo-layout), adding a `payments` table sharded by `user_id`, with ids from a sequence, takes four edits in one PR.
+A sharded Vitess table takes its ids from a sequence table in an unsharded keyspace. Using the [keyspace layout](authoring.md#repo-layout), adding a `payments` table sharded by `user_id`, with ids from a sequence, takes four edits in one PR, then one row of data once it is applied.
 
 **1. The table**, a new file `shop_sharded/payments.sql`. No `AUTO_INCREMENT` on a sharded table: ids come from the sequence, which step 2 wires up.
 
@@ -43,6 +43,14 @@ CREATE TABLE `payments_seq` (
 ```
 
 Open the PR and the plan shows all four pieces; the deploy request applies them as one unit.
+
+**5. Initialize the sequence**, in each environment after the apply and before the application writes. A new sequence table is empty, and Vitess needs its one row with `id` 0 before it can hand out ids, so inserts that rely on a generated id fail until that row exists. This is data, not schema, so it stays out of the schema files. Hand it to whoever owns the database's data:
+
+```sql
+INSERT INTO payments_seq (id, next_id, cache) VALUES (0, 1, 1000);
+```
+
+`next_id` is the first id handed out, so start it above any id already in use; `cache` is how many ids each tablet reserves at a time.
 
 To **drop** a sharded table, reverse it: delete both `.sql` files and both VSchema entries in one PR. Drops are unsafe and follow the application-first deploy order in [Unsafe changes and drops](change-behavior.md#unsafe-changes-and-drops).
 

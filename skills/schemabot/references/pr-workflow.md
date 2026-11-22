@@ -42,7 +42,13 @@ Undoing is covered in [Recovery](recovery.md).
 
 The SchemaBot check is the merge gate. It stays blocking until the change is applied to every required environment, and anything uncertain keeps it blocking rather than letting it pass. [Check Runs](https://github.com/block/schemabot/blob/main/docs/check-runs.md) explains every state.
 
-GitHub and `gh pr checks` show an `action_required` check as a red ✗ or "fail". It is not a failure: the check is waiting on an apply or a confirmation. Don't report "the SchemaBot check failed" from the mark alone. Read the conclusion and the plan or progress comment, and report what it is waiting for.
+GitHub and `gh pr checks` show an `action_required` check as a red ✗ or "fail". It is not a failure: the check is waiting for something, and its summary says what. Read it before choosing a command:
+
+- **An apply or a confirmation.** The next environment needs its apply, or a plan that changed needs `apply-confirm`.
+- **A fresh plan after a rollback.** A completed rollback never turns the check green, because the database no longer matches the PR. The check passes only once a plan finds nothing to change, so bring the PR's files back to what the database now holds, or change them to what you want next. Never reapply a change that was rolled back on purpose.
+- **An operator reconciling an environment.** A commit removed a change after its apply started. The check stays blocked until the apply settles and an operator reconciles that environment; no command from the PR clears it.
+
+Don't report "the SchemaBot check failed" from the mark alone. Report what it is waiting for.
 
 ## Review and approval
 

@@ -58,7 +58,7 @@ func TestAgentSkillCommandsParse(t *testing.T) {
 	commands := agentSkillCommands(t)
 	require.NotEmpty(t, commands, "no schemabot commands found in %s", agentSkillDir)
 
-	prCommands := webhook.CommandNames()
+	prCommands := policyCommandWords()
 	cli := newCLIParser(t)
 	var sawPR, sawCLI bool
 
@@ -68,7 +68,7 @@ func TestAgentSkillCommandsParse(t *testing.T) {
 		if !ok {
 			continue
 		}
-		if c.prComment && slices.Contains(prCommands, args[0]) {
+		if isPRCommentExample(c, args[0], prCommands) {
 			sawPR = true
 			assertParsesAsPRComment(t, where, args)
 			continue
@@ -101,6 +101,11 @@ func TestAgentSkillCommandPolicy(t *testing.T) {
 			"the command policy's at-a-glance table changed. If the change is intended, "+
 				"update expectedPolicy in the same PR so the new rule is reviewed as a safety change")
 
+		for _, word := range policyCommandWords() {
+			assert.Contains(t, webhook.CommandNames(), word,
+				"the command policy covers %q, which the PR comment parser no longer accepts; "+
+					"remove it from the skill and from expectedPolicy", word)
+		}
 		for _, name := range webhook.CommandNames() {
 			covered := slices.ContainsFunc(slices.Collect(maps.Keys(rows)), func(entry string) bool {
 				return entry == name || strings.HasPrefix(entry, name+" ")
@@ -233,7 +238,8 @@ func readDisposition(t *testing.T, cell string, production disposition) disposit
 // agentSkillCommands returns every `schemabot …` command in the skill's
 // markdown. Lines of a bash, sh, or console fence are terminal commands; lines
 // of a text fence are PR comments; inline code spans are PR comments when
-// their command word is a PR comment command, and terminal commands otherwise.
+// their command word is one the command policy pins (see isPRCommentExample),
+// and terminal commands otherwise.
 func agentSkillCommands(t *testing.T) []skillCommand {
 	t.Helper()
 	inline := regexp.MustCompile("`(schemabot [^`]+)`")
@@ -349,6 +355,35 @@ func assertParsesAsPRComment(t *testing.T, where string, args []string) {
 			assert.Equal(t, arg, result.ApplyID, "%s: the apply ID was not read", where)
 		}
 	}
+}
+
+// isPRCommentExample reports whether a command is shown as a PR comment. A
+// command in a text fence always is. An inline mention is when its command
+// word is one the command policy pins, which is independent of the parser's
+// registry, so a PR comment command dropped from the parser still gets parsed
+// as one here, and fails.
+func isPRCommentExample(c skillCommand, word string, prCommands []string) bool {
+	if !c.prComment {
+		return false
+	}
+	return c.fenced || slices.Contains(prCommands, word)
+}
+
+// policyCommandWords returns the PR comment command words the command policy
+// pins, such as "freeze" for "freeze approve". Flags are left out.
+func policyCommandWords() []string {
+	var words []string
+	for entry := range expectedPolicy {
+		if strings.HasPrefix(entry, "-") {
+			continue
+		}
+		word, _, _ := strings.Cut(entry, " ")
+		if !slices.Contains(words, word) {
+			words = append(words, word)
+		}
+	}
+	slices.Sort(words)
+	return words
 }
 
 // isMultiEnvPlan reports whether the command is `plan` with no -e and no

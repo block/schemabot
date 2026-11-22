@@ -10,15 +10,19 @@ Read `type` from `schemabot.yaml` first.
 |---|---|---|
 | `type` | `mysql` | `vitess` |
 | Schema directory | `.sql` table files, one subdirectory per schema when targets hold different schemas | keyspace subdirectories, each with `.sql` files and a `vschema.json` |
-| Server configuration | a `targets:` list (or a `deployments:` map) for the environment | one PlanetScale database |
+| Server configuration | a `targets:` list for the environment | one PlanetScale database |
 | Who runs the change on each shard | SchemaBot, once per target | PlanetScale, through one deploy request |
 | `--target` | names one member of the rollout | not used |
 
 `type: mysql` alone doesn't tell you. Most MySQL databases have one target. It's a rollout of several targets when the plan comment says it rolls out to several, or lists target names. The server configuration that defines this lives outside the repo; see [Multi-target environment](https://github.com/block/schemabot/blob/main/docs/configuration.md#multi-target-environment).
 
+### Several deployments are a different shape
+
+An environment can instead list several **deployments**, each one server. Those servers are mirrors: they are expected to hold the same schema, the first deployment's plan runs on every one of them, and a deployment whose plan differs blocks the merge. Their cutovers run one deployment at a time by default. The rest of this guide is about a `targets` list, not about deployments. When a deployment holds a `targets` list of its own, an apply of the whole environment is refused; apply one target at a time with `--target`, in rollout order. See [Planning and the primary deployment](https://github.com/block/schemabot/blob/main/docs/configuration.md#planning-and-the-primary-deployment).
+
 ## MySQL rollout of several targets
 
-A MySQL database spread across several servers is still one SchemaBot database: one schema directory, one PR, and one check per environment.
+A MySQL database spread across several servers in a `targets` list is still one SchemaBot database: one schema directory, one PR, and one check per environment.
 
 A **target** is one server in the rollout. SchemaBot plans, applies, stops, and logs each target on its own, and the plan comment and `--target` use target names. A target can hold more than one shard of the data, so talk to the user in targets when the subject is something SchemaBot does.
 

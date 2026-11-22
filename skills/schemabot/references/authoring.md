@@ -51,7 +51,17 @@ schema/
     └── vschema.json
 ```
 
-The repository's [examples](https://github.com/block/schemabot/tree/main/examples) directory has complete MySQL and Vitess layouts.
+**PostgreSQL**, one subdirectory per PostgreSQL schema. PostgreSQL defines indexes outside the table, so a table's file holds its `CREATE TABLE` followed by that table's `CREATE INDEX` statements:
+
+```text
+schema/
+├── schemabot.yaml       database: shop, type: postgres
+└── public/              PostgreSQL schema
+    ├── users.sql        CREATE TABLE "users" (...); CREATE INDEX ...
+    └── orders.sql       CREATE TABLE "orders" (...)
+```
+
+The repository's [examples](https://github.com/block/schemabot/tree/main/examples) directory has complete MySQL and Vitess layouts. For PostgreSQL, `schemabot pull` prints a live database's schema in the format the files use; see [Schema pull](https://github.com/block/schemabot/blob/main/docs/postgresql.md#schema-pull).
 
 ## Making the change
 
@@ -101,5 +111,5 @@ That is the whole authoring step.
 
 - **Put every change to one table in one PR.** Each apply is its own online change, and on a big table one copy can take days. Two PRs that each alter the same table pay for the copy twice. One PR with the table's full end state plans a single `ALTER`. If you know another change to the table is coming soon, include it.
 - **Keep unrelated tables in separate PRs** for a database serving production traffic, so each plan, apply, and undo covers one change. Early-stage projects can batch freely.
-- **Tables that must change together go in one PR, applied with `--defer-cutover`,** so every table's swap runs together. See [Change behavior](change-behavior.md#how-a-change-runs).
+- **Only when several tables need their cutovers at the same moment,** such as matching collations on columns they join on, put them in one PR and, on MySQL, apply it with `--defer-cutover` so their swaps run together. Most changes don't need this. [Change behavior](change-behavior.md#how-a-change-runs) says which statements it covers. PostgreSQL has no deferred cutover.
 - **Ship the schema early.** A feature's schema usually settles before its code. Once you know the columns you need, put the schema change in its own PR, apply it, and merge it. That also releases the database lock, which a long-lived feature PR would otherwise hold.

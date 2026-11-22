@@ -34,7 +34,7 @@ Read [Agent command policy](references/command-policy.md) before you post or han
 - [ ] Open the PR. SchemaBot plans on its own. Read the DDL and the environments the plan lists.
 - [ ] Drive the PR through the environments under the command policy, then merge once the required checks pass.
 
-No plan comment can mean the files already match the live database; read the SchemaBot check before treating silence as a failure. A check in `action_required` shows as a red mark on GitHub but is waiting for an apply or a confirmation, not reporting a failure.
+No plan comment can mean the files already match the live database; read the SchemaBot check before treating silence as a failure. A check in `action_required` shows as a red mark on GitHub but is not reporting a failure: it is waiting for something, such as an apply, a confirmation, or a fresh plan after a rollback. Read what the check says it is waiting for before choosing a command; see [Reading the check](references/pr-workflow.md#reading-the-check).
 
 ## Load only what the task needs
 
