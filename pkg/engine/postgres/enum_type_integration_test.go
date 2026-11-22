@@ -26,11 +26,20 @@ const ordersTableFile = `CREATE TABLE orders (
 // fresh database seeded with the live enum type and a table that uses it.
 func planEnumFiles(t *testing.T, database, liveLabels string, files map[string]string) (*engine.PlanResult, error) {
 	t.Helper()
-	dsn, db := testutil.StartPostgres(t, database)
-	_, err := db.ExecContext(t.Context(), `
+	return planEnumFilesAgainst(t, database, `
 		CREATE TYPE public.order_status AS ENUM `+liveLabels+`;
-		CREATE TABLE public.orders (id bigint PRIMARY KEY, status public.order_status NOT NULL)`)
-	require.NoError(t, err)
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, status public.order_status NOT NULL)`, files)
+}
+
+// planEnumFilesAgainst plans the given schema files for namespace public
+// against a fresh database seeded by setup, which may be empty.
+func planEnumFilesAgainst(t *testing.T, database, setup string, files map[string]string) (*engine.PlanResult, error) {
+	t.Helper()
+	dsn, db := testutil.StartPostgres(t, database)
+	if setup != "" {
+		_, err := db.ExecContext(t.Context(), setup)
+		require.NoError(t, err)
+	}
 	return New().Plan(t.Context(), &engine.PlanRequest{
 		Database:    database,
 		SchemaFiles: schema.SchemaFiles{"public": {Files: files}},
@@ -84,18 +93,71 @@ func TestEnginePlanEnumTypeFileAddsLabelsBlocked(t *testing.T) {
 	}
 }
 
-// PostgreSQL cannot drop an enum label, so a types file that no longer lists
-// a live label has no plan that reaches it. The plan fails, naming the file
-// and the label, rather than planning the labels it could add.
-func TestEnginePlanEnumTypeFileRefusesADroppedLabel(t *testing.T) {
-	_, err := planEnumFiles(t, "plan_enum_drop_test", `('new', 'paid', 'shipped')`, map[string]string{
-		"order_status.sql": `CREATE TYPE order_status AS ENUM ('new', 'shipped', 'delivered');`,
-		"orders.sql":       ordersTableFile,
-	})
-	require.Error(t, err)
-	assert.ErrorContains(t, err, `plan PostgreSQL schema in "public"/"order_status.sql"`)
-	assert.ErrorContains(t, err, `plan PostgreSQL enum type "order_status"`)
-	assert.ErrorContains(t, err, "carries ('paid'), which the file no longer lists")
+// A types file the live type cannot converge onto has no plan that reaches
+// it: PostgreSQL cannot drop or move an enum label, and a plan never creates
+// or replaces a type. Each case fails the plan with an error naming the
+// schema file, the type, and what blocks it, and returns no partial plan,
+// not even the labels it could add.
+func TestEnginePlanEnumTypeFileRefusals(t *testing.T) {
+	ordersTable := func(labels string) string {
+		return `CREATE TYPE public.order_status AS ENUM ` + labels + `;
+			CREATE TABLE public.orders (id bigint PRIMARY KEY, status public.order_status NOT NULL)`
+	}
+	tests := []struct {
+		name     string
+		database string
+		setup    string
+		files    map[string]string
+		reason   string
+	}{
+		{
+			name:     "dropped label",
+			database: "plan_enum_drop_test",
+			setup:    ordersTable(`('new', 'paid', 'shipped')`),
+			files: map[string]string{
+				"order_status.sql": `CREATE TYPE order_status AS ENUM ('new', 'shipped', 'delivered');`,
+				"orders.sql":       ordersTableFile,
+			},
+			reason: "enum type public.order_status carries ('paid'), which the file no longer lists",
+		},
+		{
+			name:     "reordered labels",
+			database: "plan_enum_reorder_test",
+			setup:    ordersTable(`('new', 'shipped')`),
+			files: map[string]string{
+				"order_status.sql": `CREATE TYPE order_status AS ENUM ('shipped', 'new', 'delivered');`,
+				"orders.sql":       ordersTableFile,
+			},
+			reason: "enum type public.order_status sorts its labels as ('new', 'shipped'), and the file lists them as ('shipped', 'new')",
+		},
+		{
+			name:     "missing type",
+			database: "plan_enum_missing_test",
+			files: map[string]string{
+				"order_status.sql": `CREATE TYPE order_status AS ENUM ('new', 'shipped');`,
+			},
+			reason: "enum type public.order_status does not exist, and a plan never creates a type",
+		},
+		{
+			name:     "name held by a composite type",
+			database: "plan_enum_kind_test",
+			setup:    `CREATE TYPE public.order_status AS (code text)`,
+			files: map[string]string{
+				"order_status.sql": `CREATE TYPE order_status AS ENUM ('new', 'shipped');`,
+			},
+			reason: "public.order_status is a type that is not an enum, and a plan never replaces a type",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := planEnumFilesAgainst(t, tt.database, tt.setup, tt.files)
+			require.Error(t, err)
+			assert.Nil(t, result, "a refused types file returns no partial plan")
+			assert.ErrorContains(t, err, `plan PostgreSQL schema in "public"/"order_status.sql"`)
+			assert.ErrorContains(t, err, `plan PostgreSQL enum type "order_status"`)
+			assert.ErrorContains(t, err, tt.reason)
+		})
+	}
 }
 
 // Several types files in one namespace each declare their own type, and none
