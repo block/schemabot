@@ -211,21 +211,23 @@ const (
 	ChangeType_CHANGE_TYPE_RENAME       ChangeType = 7
 	ChangeType_CHANGE_TYPE_TRUNCATE     ChangeType = 8
 	ChangeType_CHANGE_TYPE_CREATE_VIEW  ChangeType = 9
+	ChangeType_CHANGE_TYPE_ALTER_TYPE   ChangeType = 10
 )
 
 // Enum value maps for ChangeType.
 var (
 	ChangeType_name = map[int32]string{
-		0: "CHANGE_TYPE_OTHER",
-		1: "CHANGE_TYPE_CREATE",
-		2: "CHANGE_TYPE_ALTER",
-		3: "CHANGE_TYPE_DROP",
-		4: "CHANGE_TYPE_VSCHEMA",
-		5: "CHANGE_TYPE_CREATE_INDEX",
-		6: "CHANGE_TYPE_DROP_INDEX",
-		7: "CHANGE_TYPE_RENAME",
-		8: "CHANGE_TYPE_TRUNCATE",
-		9: "CHANGE_TYPE_CREATE_VIEW",
+		0:  "CHANGE_TYPE_OTHER",
+		1:  "CHANGE_TYPE_CREATE",
+		2:  "CHANGE_TYPE_ALTER",
+		3:  "CHANGE_TYPE_DROP",
+		4:  "CHANGE_TYPE_VSCHEMA",
+		5:  "CHANGE_TYPE_CREATE_INDEX",
+		6:  "CHANGE_TYPE_DROP_INDEX",
+		7:  "CHANGE_TYPE_RENAME",
+		8:  "CHANGE_TYPE_TRUNCATE",
+		9:  "CHANGE_TYPE_CREATE_VIEW",
+		10: "CHANGE_TYPE_ALTER_TYPE",
 	}
 	ChangeType_value = map[string]int32{
 		"CHANGE_TYPE_OTHER":        0,
@@ -238,6 +240,7 @@ var (
 		"CHANGE_TYPE_RENAME":       7,
 		"CHANGE_TYPE_TRUNCATE":     8,
 		"CHANGE_TYPE_CREATE_VIEW":  9,
+		"CHANGE_TYPE_ALTER_TYPE":   10,
 	}
 )
 
@@ -6208,7 +6211,7 @@ const file_tern_proto_rawDesc = "" +
 	"\x11STATE_CATCHING_UP\x10\x13\x12\x16\n" +
 	"\x12STATE_CHECKSUMMING\x10\x14\x12\x17\n" +
 	"\x13STATE_POST_CHECKSUM\x10\x15\x12\x1a\n" +
-	"\x16STATE_FAILED_RETRYABLE\x10\x16*\x8a\x02\n" +
+	"\x16STATE_FAILED_RETRYABLE\x10\x16*\xa6\x02\n" +
 	"\n" +
 	"ChangeType\x12\x15\n" +
 	"\x11CHANGE_TYPE_OTHER\x10\x00\x12\x16\n" +
@@ -6220,7 +6223,9 @@ const file_tern_proto_rawDesc = "" +
 	"\x16CHANGE_TYPE_DROP_INDEX\x10\x06\x12\x16\n" +
 	"\x12CHANGE_TYPE_RENAME\x10\a\x12\x18\n" +
 	"\x14CHANGE_TYPE_TRUNCATE\x10\b\x12\x1b\n" +
-	"\x17CHANGE_TYPE_CREATE_VIEW\x10\t*T\n" +
+	"\x17CHANGE_TYPE_CREATE_VIEW\x10\t\x12\x1a\n" +
+	"\x16CHANGE_TYPE_ALTER_TYPE\x10\n" +
+	"*T\n" +
 	"\x11PullCatalogDetail\x12\x1d\n" +
 	"\x19PULL_CATALOG_DETAIL_BASIC\x10\x00\x12 \n" +
 	"\x1cPULL_CATALOG_DETAIL_DETAILED\x10\x01*|\n" +
