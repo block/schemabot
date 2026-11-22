@@ -2254,7 +2254,10 @@ covers that is pending, paused, or doing work a stop can end, by the same rule a
 deployment holds the whole change. A rollout paused after a failure is stopped because its other
 members can still be writing. The stop is the ordinary durable stop, recorded with the freeze
 as its requester (`freeze:<id>`), so its driver delivers it as it would an operator's, and the apply
-resumes with a start, which the freeze's gate holds (AZ-10). No client may send a stop under that
+resumes with a start, which the freeze's gate holds (AZ-10). A stopped apply with a start queued
+before the freeze is swept too: the stop withdraws the start, or stays pending for the drive that
+already claimed it (CO-4). A stopped apply with no start queued has nothing to stop and is in
+neither list. No client may send a stop under that
 requester, so a stop that reads as a freeze's is one a freeze issued. The freeze is stored before the
 sweep, so it refuses new changes whatever the sweep reports. An apply the sweep cannot stop, such as
 a PlanetScale apply, which has no stop, or one whose operations it cannot read, is listed in the
@@ -2278,7 +2281,8 @@ and the pod skips it in its claims for a short while, so other work is claimed m
 recovery keeps its lease until it goes stale and is checked again.
 *Breaks if violated:* a schema change judged unsafe keeps writing through the incident that froze
 it, or an operator reads a freeze as having stopped changes that still run.
-*Enforced:* `stopAppliesForFreeze` (`pkg/api/freeze_stop_sweep.go`), called by `handleFreezeCreate`
+*Enforced:* `stopAppliesForFreeze` (`pkg/api/freeze_stop_sweep.go`), which lists applies with
+`GetUnsettled` so stopped ones are included, called by `handleFreezeCreate`
 (`pkg/api/freeze_handlers.go`) after the freeze is stored, records each stop through `stopApply`
 (`pkg/api/control_handlers.go`) with `storage.FreezeStopCaller`. `executeStopForApply` refuses a
 caller where `storage.IsFreezeStopCaller` holds. The claim checkpoint is `holdClaimForStopFreeze`

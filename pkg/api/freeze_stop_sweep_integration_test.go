@@ -132,6 +132,76 @@ func TestFreezeStopSweepStopsTheAdmittedAppliesInScope(t *testing.T) {
 		assert.Nil(t, pendingStop(t, applyID))
 	})
 
+	// A start queued on a stopped apply before the freeze would resume it
+	// once a driver claims it. The freeze's stop withdraws that start (CO-4)
+	// and reports the apply as stopped. Once a claim has moved an operation
+	// to resuming, the stop stays pending for that drive to deliver. A
+	// stopped apply with no start queued has nothing to stop and is in
+	// neither list.
+	seedStopped := func(t *testing.T, identifier string, perOpState map[string]string, queueStart bool) int64 {
+		t.Helper()
+		resetMatrixTables(t, ctx, db)
+		applyID := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: identifier,
+			parentState:     state.Apply.Stopped,
+			cutoverPolicy:   storage.CutoverPolicyBarrier,
+			onFailure:       storage.OnFailureHalt,
+			deployments:     []string{"eu", "us"},
+			opState:         state.ApplyOperation.Stopped,
+			taskState:       state.Task.Stopped,
+			perOpState:      perOpState,
+		}).applyID
+		if queueStart {
+			_, _, err := stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+				ApplyID: applyID, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending, RequestedBy: "cli:alice",
+			})
+			require.NoError(t, err)
+		}
+		return applyID
+	}
+	startStatus := func(t *testing.T, applyID int64) storage.ControlRequestStatus {
+		t.Helper()
+		start, err := stor.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, start)
+		return start.Status
+	}
+
+	t.Run("WithdrawsAStartQueuedOnAStoppedApply", func(t *testing.T) {
+		applyID := seedStopped(t, "sweep-queued-start", nil, true)
+
+		sweep := svc.stopAppliesForFreeze(ctx, freeze(storage.FreezeRunningStop, nil, nil), now)
+
+		require.NotNil(t, sweep)
+		assert.Equal(t, []string{"sweep-queued-start"}, sweep.Stopped)
+		assert.Empty(t, sweep.NotStopped)
+		assert.Equal(t, storage.ControlRequestCompleted, startStatus(t, applyID), "the queued start is withdrawn")
+		assert.Equal(t, state.Apply.Stopped, getApply(t, ctx, stor, applyID).State)
+	})
+
+	t.Run("LeavesTheStopForTheDriveThatClaimedTheStart", func(t *testing.T) {
+		applyID := seedStopped(t, "sweep-claimed-start", map[string]string{"eu": state.ApplyOperation.Resuming}, true)
+
+		sweep := svc.stopAppliesForFreeze(ctx, freeze(storage.FreezeRunningStop, nil, nil), now)
+
+		require.NotNil(t, sweep)
+		assert.Equal(t, []string{"sweep-claimed-start"}, sweep.Stopped)
+		stop := pendingStop(t, applyID)
+		require.NotNil(t, stop, "the stop is pending for the drive that resumed an operation")
+		assert.Equal(t, storage.FreezeStopCaller("freeze-sweep"), stop.RequestedBy)
+	})
+
+	t.Run("SkipsAStoppedApplyWithNoStartQueued", func(t *testing.T) {
+		applyID := seedStopped(t, "sweep-stopped", nil, false)
+
+		sweep := svc.stopAppliesForFreeze(ctx, freeze(storage.FreezeRunningStop, nil, nil), now)
+
+		require.NotNil(t, sweep)
+		assert.Empty(t, sweep.Stopped)
+		assert.Empty(t, sweep.NotStopped)
+		assert.Nil(t, pendingStop(t, applyID))
+	})
+
 	// PlanetScale has no stop, so the sweep cannot stop such an apply. It
 	// says so for that apply rather than skipping it.
 	t.Run("ReportsAnApplyItCannotStop", func(t *testing.T) {

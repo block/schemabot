@@ -55,10 +55,11 @@ func TestFreezeCreateStopSweepReportsAListFailure(t *testing.T) {
 	assert.Equal(t, storage.FreezeRunningStop, stored.Running)
 }
 
-// The sweep considers an apply in the freeze's environment that is pending
-// or doing work a stop can end. It leaves alone other environments, a pull
-// request rollback, an apply waiting for its cutover (the freeze already
-// refuses the cutover) and one that has ended.
+// The sweep considers an apply in the freeze's environment that is pending,
+// stopped (a start may be queued on it) or doing work a stop can end. It
+// leaves alone other environments, a pull request rollback, an apply waiting
+// for its cutover (the freeze already refuses the cutover) and one that has
+// ended.
 func TestFreezeStopSweepCandidate(t *testing.T) {
 	freeze := &storage.EnvironmentFreeze{Environment: "staging", Running: storage.FreezeRunningStop}
 	rollback := &storage.Apply{Environment: "staging", State: state.Apply.Running}
@@ -76,7 +77,7 @@ func TestFreezeStopSweepCandidate(t *testing.T) {
 		{"OtherEnvironment", &storage.Apply{Environment: "production", State: state.Apply.Running}, false},
 		{"PinnedRollback", rollback, false},
 		{"WaitingForCutover", &storage.Apply{Environment: "staging", State: state.Apply.WaitingForCutover}, false},
-		{"Stopped", &storage.Apply{Environment: "staging", State: state.Apply.Stopped}, false},
+		{"Stopped", &storage.Apply{Environment: "staging", State: state.Apply.Stopped}, true},
 		{"Completed", &storage.Apply{Environment: "staging", State: state.Apply.Completed}, false},
 	}
 	for _, tc := range tests {

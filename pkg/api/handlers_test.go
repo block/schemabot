@@ -361,6 +361,11 @@ func (s *staticApplyStore) GetInProgress(context.Context) ([]*storage.Apply, err
 	return s.applies, nil
 }
 
+// GetUnsettled returns the store's applies, as GetInProgress does.
+func (s *staticApplyStore) GetUnsettled(ctx context.Context) ([]*storage.Apply, error) {
+	return s.GetInProgress(ctx)
+}
+
 func (s *staticApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
 	if s.err != nil {
 		return nil, s.err
