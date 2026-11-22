@@ -387,7 +387,9 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply 
 	}
 	if status >= http.StatusInternalServerError {
 		s.logger.Error(opName+" failed", attrs...)
-		s.writeError(w, status, opName+" failed: "+err.Error())
+		// The code is what tells a client that an engine-unavailable 503 is
+		// worth retrying.
+		s.writeErrorCode(w, status, controlOperationErrorCode(err), opName+" failed: "+err.Error())
 	} else {
 		s.logger.Warn(opName+" rejected", attrs...)
 		s.writeErrorCode(w, status, controlOperationErrorCode(err), opName+" rejected: "+err.Error())
