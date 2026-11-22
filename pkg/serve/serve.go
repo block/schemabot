@@ -413,8 +413,24 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	return serveUntilShutdown(runCtx, srv, signalled, port, grpcPort)
 }
 
+// listenForServe binds the TCP port a named server will serve on, so the caller
+// learns that the port is taken before it starts any background work. The name
+// says which listener failed, since the HTTP and metrics ports are configured
+// separately.
+func listenForServe(ctx context.Context, name, port string) (net.Listener, error) {
+	var lc net.ListenConfig
+	listener, err := lc.Listen(ctx, "tcp", ":"+port)
+	if err != nil {
+		return nil, fmt.Errorf("listen for %s server on port %s: %w", name, port, err)
+	}
+	return listener, nil
+}
+
 // serveUntilShutdown serves a built server on Run's listeners until runCtx ends
 // or a listener fails, then shuts it down.
+//
+// Every listener is bound before Start launches the background work, so a port
+// that is already in use fails the run while the process holds no claim.
 //
 // The background work runs under a context of its own rather than runCtx. The
 // operator's drives end on that context, and a drive that ends before Close
@@ -451,25 +467,38 @@ func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os
 		defer stopGRPCServer(grpcServer, srv.logger, grpcDrainTimeout)
 	}
 
+	// Bind the HTTP and metrics ports before any background work starts. A port
+	// that is already taken must end the process before the operator has claimed
+	// an apply, a webhook delivery or a lease, not after it has started driving
+	// them.
+	httpListener, err := listenForServe(runCtx, "http", port)
+	if err != nil {
+		return err
+	}
+
+	// Metrics get their own listener so scrapers never traverse the API port
+	// (see ServerConfig.MetricsPort).
+	metricsPort := strconv.Itoa(srv.cfg.MetricsListenPort())
+	metricsListener, err := listenForServe(runCtx, "metrics", metricsPort)
+	if err != nil {
+		// Nothing serves the HTTP listener yet, so no server will close it.
+		return errors.Join(err, httpListener.Close())
+	}
+
 	// Start background loops (operator, health monitor, pending-drops cleaner,
 	// terminal outcome reconciliation). Server.Close stops them.
 	srv.Start(backgroundCtx)
 
 	server := &http.Server{
-		Addr:         ":" + port,
 		Handler:      srv.Handler(),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// Metrics get their own listener so scrapers never traverse the API port
-	// (see ServerConfig.MetricsPort).
-	metricsPort := strconv.Itoa(srv.cfg.MetricsListenPort())
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("GET /metrics", srv.MetricsHandler())
 	metricsServer := &http.Server{
-		Addr:         ":" + metricsPort,
 		Handler:      metricsMux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
@@ -479,13 +508,13 @@ func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os
 	errCh := make(chan error, 2)
 	go func() {
 		srv.logger.Info("starting http server", "port", port)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(httpListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("http server: %w", err)
 		}
 	}()
 	go func() {
 		srv.logger.Info("starting metrics server", "port", metricsPort)
-		if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := metricsServer.Serve(metricsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("metrics server: %w", err)
 		}
 	}()
