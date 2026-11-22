@@ -135,13 +135,18 @@ func TestAgentSkillCommandPolicy(t *testing.T) {
 		handOverPart, _, found := strings.Cut(section, "Their read-only forms")
 		require.True(t, found, "the section must keep the read-only forms apart from the commands to hand over")
 		cli := newCLIParser(t)
-		assert.Contains(t, handOverPart, "hand over any terminal `apply`, in every environment")
-		apply := childCommand(cli.Model.Node, action.Apply)
-		require.NotNil(t, apply, "the CLI has no apply command")
-		for _, flag := range cliApplySafeguardFlags {
-			assert.True(t, slices.ContainsFunc(apply.Flags, func(f *kong.Flag) bool { return "--"+f.Name == flag }),
-				"the CLI's apply no longer has %s; update cliApplySafeguardFlags and the command policy", flag)
-			assert.Contains(t, handOverPart, "`"+flag+"`", "the command policy must name %s among the safeguards a terminal apply can drop", flag)
+		assert.Contains(t, handOverPart, "hand over any terminal `apply` or `rollback`, in every environment")
+		for name, flags := range cliSafeguardFlags {
+			cmd := childCommand(cli.Model.Node, name)
+			if !assert.NotNil(t, cmd, "the CLI has no %s command; update cliSafeguardFlags", name) {
+				continue
+			}
+			for _, flag := range flags {
+				assert.True(t, hasFlag(cmd, flag),
+					"the CLI's %s no longer has %s; update cliSafeguardFlags and the command policy", name, flag)
+				assert.Contains(t, handOverPart, "`"+flag+"`",
+					"the command policy must name %s among the safeguards a terminal %s can drop", flag, name)
+			}
 		}
 		var names []string
 		for _, child := range cli.Model.Children {
@@ -155,6 +160,12 @@ func TestAgentSkillCommandPolicy(t *testing.T) {
 			}
 			if !assert.True(t, classified, "CLI command %q is neither a PR comment command nor in cliCommandKinds; "+
 				"say whether it only reads, works locally, or changes SchemaBot itself", child.Name) {
+				continue
+			}
+			if kind == cliWatchHasControls {
+				assert.True(t, hasFlag(child, "--no-watch"), "the CLI's %s has no --no-watch; update cliCommandKinds", child.Name)
+				assert.Contains(t, handOverPart, "`"+child.Name+" --no-watch`",
+					"the command policy must tell an agent to run %s with --no-watch", child.Name)
 				continue
 			}
 			if kind == cliChangesSchemaBot {
@@ -256,16 +267,30 @@ var policyNeutralFlags = map[string]string{
 	"-y":              "is refused on a PR comment",
 }
 
-// cliApplySafeguardFlags are the CLI apply flags that drop a safeguard a PR
-// comment apply always keeps. The command policy names each one when it tells
-// an agent to hand over a terminal apply.
-var cliApplySafeguardFlags = []string{"--no-lock", "--force", "--auto-approve"}
+// cliSafeguardFlags are, per CLI command, the flags that drop a safeguard the
+// PR comment form always keeps. The command policy names each one when it
+// tells an agent to hand over the terminal command.
+var cliSafeguardFlags = map[string][]string{
+	action.Apply:    {"--no-lock", "--force", "--auto-approve"},
+	action.Rollback: {"--auto-approve"},
+}
+
+// hasFlag reports whether a CLI command accepts the flag, in its long form or
+// its negated form.
+func hasFlag(cmd *kong.Node, flag string) bool {
+	return slices.ContainsFunc(cmd.Flags, func(f *kong.Flag) bool {
+		return "--"+f.Name == flag || ((f.Negated || f.Tag.Negatable != "") && "--no-"+f.Name == flag)
+	})
+}
 
 // cliKind is what a CLI command with no PR comment form does.
 type cliKind string
 
 const (
-	cliReadsOnly        cliKind = "reads only"
+	cliReadsOnly cliKind = "reads only"
+	// cliWatchHasControls reads only with --no-watch; watching, its keys
+	// stop or cancel the apply, or run its cutover.
+	cliWatchHasControls cliKind = "reads only with --no-watch"
 	cliWorksLocally     cliKind = "works on the local machine or the worktree"
 	cliRunsAServer      cliKind = "runs a SchemaBot server"
 	cliChangesSchemaBot cliKind = "changes SchemaBot itself"
@@ -279,7 +304,7 @@ var cliCommandKinds = map[string]cliKind{
 	"init":       cliWorksLocally,
 	"onboard":    cliWorksLocally,
 	"pull":       cliReadsOnly,
-	"progress":   cliReadsOnly,
+	"progress":   cliWatchHasControls,
 	"databases":  cliReadsOnly,
 	"locks":      cliReadsOnly,
 	"logs":       cliReadsOnly,

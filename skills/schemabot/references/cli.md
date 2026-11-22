@@ -2,7 +2,7 @@
 
 The `schemabot` CLI shows what SchemaBot is running on a database: each apply's state, per-table progress, ETA, and logs, in any environment. It reads from the SchemaBot server, not from GitHub, so it still works when PR comments stop updating.
 
-These are terminal commands, not PR comments. Reading status, progress, history, plans, and logs needs only read access, and you can run them without asking each time. Commands that change something, such as `stop` or `cutover`, follow the same [command policy](command-policy.md) in the terminal as on the PR. Apply a PR's change from the PR: hand over any terminal `apply`, because it skips the PR's environment order and can skip the database lock.
+These are terminal commands, not PR comments. Reading status, progress, history, plans, and logs needs only read access, and you can run them without asking each time. Run `progress` with `--no-watch`: watching, it has keys that stop or cancel the apply, or run its cutover. Commands that change something, such as `stop` or `cutover`, follow the same [command policy](command-policy.md) in the terminal as on the PR. Apply or roll back a PR's change from the PR: hand over any terminal `apply` or `rollback`, because it skips the PR's environment order and confirmation, and can skip the database lock.
 
 ## Set up
 
@@ -48,10 +48,10 @@ Then look at that apply:
 schemabot status apply-3f9a2c71
 ```
 
-`State` is the apply as a whole, and each table shows its DDL, progress, and ETA. To follow it live, `progress` keeps the same view updating until the apply finishes:
+`State` is the apply as a whole, and each table shows its DDL, progress, and ETA. `progress --no-watch` prints the progress view once. Without `--no-watch` it keeps updating until the apply finishes, and its keys stop or cancel the apply, or run its cutover; leave watching to a human.
 
 ```bash
-schemabot progress apply-3f9a2c71
+schemabot progress apply-3f9a2c71 --no-watch
 ```
 
 `Running` with progress moving is healthy: leave it to finish. `Completed` means that environment is done. For `Failed`, or `Running` with progress that has stopped moving, read the logs:
@@ -62,6 +62,6 @@ schemabot logs apply-3f9a2c71
 
 ## Use it from an agent
 
-- Prefer `--json` where a command offers it (`databases`, `status`, `list-plans`, `logs`, `plan`), and `status --json` for a snapshot instead of `progress`.
-- `progress` and a watching `apply` run until the change finishes. Don't block on them; take a `status` snapshot and check again later.
+- Prefer `--json` where a command offers it (`databases`, `status`, `list-plans`, `logs`, `plan`), and `status --json` for a snapshot.
+- Never run a watching `progress`: it runs until the change finishes, and its keys change the apply. Take a `status` or `progress --no-watch` snapshot and check again later.
 - [Use the CLI from scripts and agents](https://github.com/block/schemabot/blob/main/docs/cli.md#use-the-cli-from-scripts-and-agents) covers exit codes and output formats.

@@ -27,7 +27,7 @@ If GitHub looks healthy and only one PR is affected, it isn't an outage: use [PR
 
 1. **Don't merge the PR, and don't bypass or remove the SchemaBot check yourself.** Merging a schema PR before it is applied in every environment leaves the databases behind the files on the base branch. If GitHub lets the PR merge anyway, still wait until the SchemaBot checks on its latest commit pass. If GitHub is healthy, SchemaBot is the cause, and stuck checks block urgent work, see [When the required checks are turned off](#when-the-required-checks-are-turned-off).
 2. **Retry the stuck PR, once.** Push a new commit or comment `schemabot plan`. Either one asks SchemaBot to recompute the plan and the check, so a retry that lands once SchemaBot can reach GitHub again clears it. Retries change nothing on the database, but don't retry in a loop: each one is another request to GitHub, and a flood of them slows recovery for everyone. If it stays stuck, try again in a few minutes.
-3. **Follow a running change with the CLI.** `schemabot status` and `schemabot progress` keep working while comments are stalled. See [The CLI](cli.md).
+3. **Follow a running change with the CLI.** `schemabot status` and `schemabot progress --no-watch` keep working while comments are stalled. See [The CLI](cli.md).
 4. **If a running change must stop,** the CLI can stop or cancel it while GitHub is down (`schemabot stop <apply-id> -e <env>`). The [command policy](command-policy.md) still decides who runs it.
 
 ## When the required checks are turned off
