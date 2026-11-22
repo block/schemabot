@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -545,6 +546,93 @@ func TestLocks(t *testing.T, h Harness) {
 		assert.Equal(t, "plan-2", current.PendingPlanID)
 	})
 
+	// An apply that has not finished records the lock row it runs under, so a
+	// release that checks for it keeps the lock and names the apply. Once the
+	// apply reaches a terminal state the same release deletes the row.
+	t.Run("ReleaseByIDIfUnused_KeptWhileApplyRecordsRow", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		held := CreateLock(t, store, "in_use_db", storage.DatabaseTypeMySQL)
+		CreateApplyWithStateAndEnv(t, store, held, "apply_in_use_finished", 1, state.Apply.Completed, "staging")
+		running := CreateApplyWithStateAndEnv(t, store, held, "apply_in_use_running", 2, state.Apply.Running, "production")
+
+		err := store.Locks().ReleaseByIDIfUnused(ctx, held.ID, "in_use_db", storage.DatabaseTypeMySQL, "testuser", "")
+		require.ErrorIs(t, err, storage.ErrLockInUse)
+		var inUse *storage.LockInUseError
+		require.ErrorAs(t, err, &inUse)
+		assert.Equal(t, held.ID, inUse.LockID)
+		assert.Equal(t, "apply_in_use_running", inUse.Apply.ApplyIdentifier)
+		assert.Equal(t, state.Apply.Running, inUse.Apply.State)
+		assert.Equal(t, "production", inUse.Apply.Environment)
+
+		stored, err := store.Locks().Get(ctx, "in_use_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, stored, "a lock an unfinished apply records must stay held")
+		assert.Equal(t, held.ID, stored.ID)
+
+		running.State = state.Apply.Completed
+		require.NoError(t, store.Applies().Update(ctx, running))
+		require.NoError(t, store.Locks().ReleaseByIDIfUnused(ctx, held.ID, "IN_USE_DB", "MYSQL", "testuser", ""))
+		stored, err = store.Locks().Get(ctx, "in_use_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Nil(t, stored, "the lock is released once every apply recording it is terminal")
+	})
+
+	// A lock no apply records is released, and an unfinished apply under
+	// another database's lock row does not keep it.
+	t.Run("ReleaseByIDIfUnused_ReleasesWhenNoApplyRecordsRow", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		held := CreateLock(t, store, "unused_db", storage.DatabaseTypeMySQL)
+		other := CreateLock(t, store, "unused_other_db", storage.DatabaseTypeMySQL)
+		CreateApplyWithStateAndEnv(t, store, other, "apply_on_other_lock", 1, state.Apply.Running, "staging")
+
+		require.NoError(t, store.Locks().ReleaseByIDIfUnused(ctx, held.ID, "unused_db", storage.DatabaseTypeMySQL, "testuser", ""))
+		stored, err := store.Locks().Get(ctx, "unused_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Nil(t, stored)
+		otherStored, err := store.Locks().Get(ctx, "unused_other_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, otherStored, "a release must not touch another database's lock")
+		assert.Equal(t, other.ID, otherStored.ID)
+
+		err = store.Locks().ReleaseByIDIfUnused(ctx, held.ID, "unused_db", storage.DatabaseTypeMySQL, "testuser", "")
+		require.ErrorIs(t, err, storage.ErrLockNotFound)
+	})
+
+	// The lock a caller checked is released and acquired again under the same
+	// owner, so a new row holds it. A release pinned to the checked row
+	// reports the replacement and leaves the new row held. A wrong owner or
+	// pending plan on the current row is refused the way ReleaseByID refuses it.
+	t.Run("ReleaseByIDIfUnused_RowNoLongerHoldsLock", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := &storage.Lock{DatabaseName: "unused_replaced_db", DatabaseType: storage.DatabaseTypeMySQL, Owner: "org/repo#42", PendingPlanID: "plan-1"}
+		require.NoError(t, store.Locks().Acquire(ctx, lock))
+		checked, err := store.Locks().Get(ctx, "unused_replaced_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, checked)
+
+		require.NoError(t, store.Locks().ForceRelease(ctx, "unused_replaced_db", storage.DatabaseTypeMySQL))
+		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{DatabaseName: "unused_replaced_db", DatabaseType: storage.DatabaseTypeMySQL, Owner: "org/repo#42", PendingPlanID: "plan-1"}))
+
+		err = store.Locks().ReleaseByIDIfUnused(ctx, checked.ID, "unused_replaced_db", storage.DatabaseTypeMySQL, "org/repo#42", "plan-1")
+		require.ErrorIs(t, err, storage.ErrLockReplaced)
+		current, err := store.Locks().Get(ctx, "unused_replaced_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, current, "the new lock must survive a release pinned to the one it replaced")
+		assert.NotEqual(t, checked.ID, current.ID)
+
+		err = store.Locks().ReleaseByIDIfUnused(ctx, current.ID, "unused_replaced_db", storage.DatabaseTypeMySQL, "org/repo#43", "plan-1")
+		require.ErrorIs(t, err, storage.ErrLockNotOwned)
+		err = store.Locks().ReleaseByIDIfUnused(ctx, current.ID, "unused_replaced_db", storage.DatabaseTypeMySQL, "org/repo#42", "plan-2")
+		require.ErrorIs(t, err, storage.ErrLockIntentChanged)
+		stillHeld, err := store.Locks().Get(ctx, "unused_replaced_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, stillHeld)
+		assert.Equal(t, current.ID, stillHeld.ID)
+	})
+
 	t.Run("ReleaseIfPendingPlanID", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -880,6 +968,15 @@ func TestLocks(t *testing.T, h Harness) {
 		err := store.Locks().ReleaseByID(t.Context(), 1, "err_db", storage.DatabaseTypeMySQL, "owner-a", "")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "release lock row 1 for err_db/mysql")
+	})
+
+	t.Run("ReleaseByIDIfUnused_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		err := store.Locks().ReleaseByIDIfUnused(t.Context(), 1, "err_db", storage.DatabaseTypeMySQL, "owner-a", "")
+		require.Error(t, err)
+		require.NotErrorIs(t, err, storage.ErrLockNotFound)
+		require.NotErrorIs(t, err, storage.ErrLockInUse)
+		assert.Contains(t, err.Error(), "release unused lock row 1 for err_db/mysql")
 	})
 
 	t.Run("ReleaseIfPendingPlanID_DBError", func(t *testing.T) {

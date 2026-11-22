@@ -386,7 +386,15 @@ func (s *lockStore) ReleaseByID(ctx context.Context, id int64, database, dbType,
 	if rowsAffected > 0 {
 		return nil
 	}
+	return s.unmatchedPinnedReleaseCause(ctx, id, database, dbType, owner)
+}
 
+// unmatchedPinnedReleaseCause re-reads the lock after a release pinned to row
+// id matched nothing, and returns why: ErrLockNotFound when no lock is held,
+// ErrLockReplaced when a different row holds it, ErrLockNotOwned when the row
+// is held under another owner, and ErrLockIntentChanged when it now carries
+// another pending plan.
+func (s *lockStore) unmatchedPinnedReleaseCause(ctx context.Context, id int64, database, dbType, owner string) error {
 	current, err := s.Get(ctx, database, dbType)
 	if err != nil {
 		return fmt.Errorf("read lock after release of row %d affected no rows for %s/%s owner=%s: %w",
@@ -402,6 +410,64 @@ func (s *lockStore) ReleaseByID(ctx context.Context, id int64, database, dbType,
 		return storage.ErrLockNotOwned
 	}
 	return storage.ErrLockIntentChanged
+}
+
+// ReleaseByIDIfUnused deletes the lock row ReleaseByID would, but decides
+// under that row's lock whether an apply still records it. The row is locked
+// with the same predicate ReleaseByID deletes by; an apply create that locks
+// the row to verify its lock intent therefore either committed before this
+// transaction read the applies, and is seen, or waits for this transaction and
+// then finds the row gone. The applies are read without locking them, so the
+// release never holds a lock row while waiting on an apply row.
+func (s *lockStore) ReleaseByIDIfUnused(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error {
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
+	op := fmt.Sprintf("release unused lock row %d for %s/%s owner=%s", id, database, dbType, owner)
+
+	// Read committed, so the applies read after the row lock is granted sees
+	// every apply committed while this transaction waited for it.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin %s: %w", op, err)
+	}
+	defer rollbackTx(ctx, tx, op)
+
+	var lockedID int64
+	err = tx.QueryRowContext(ctx, `
+		SELECT id FROM locks
+		WHERE id = ? AND database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+` AND `+s.dialect.BinaryEquals("pending_plan_id")+`
+		FOR UPDATE
+	`, id, database, dbType, owner, pendingPlanID).Scan(&lockedID)
+	if errors.Is(err, sql.ErrNoRows) {
+		rollbackTx(ctx, tx, op)
+		return s.unmatchedPinnedReleaseCause(ctx, id, database, dbType, owner)
+	}
+	if err != nil {
+		return fmt.Errorf("lock row for %s: %w", op, err)
+	}
+
+	statePredicate, stateArgs := nonTerminalApplyStatePredicate("state")
+	holder, err := scanApply(tx.QueryRowContext(ctx, `
+		SELECT `+applyColumns+`
+		FROM applies
+		WHERE lock_id = ? AND `+statePredicate+`
+		ORDER BY created_at DESC, id DESC
+		LIMIT 1
+	`, append([]any{id}, stateArgs...)...))
+	if err != nil {
+		return fmt.Errorf("read applies recording the lock for %s: %w", op, err)
+	}
+	if holder != nil {
+		return &storage.LockInUseError{LockID: id, Apply: holder}
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM locks WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete row for %s: %w", op, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit %s: %w", op, err)
+	}
+	return nil
 }
 
 // ReleaseIfPendingPlanID atomically releases only the lock intent the caller

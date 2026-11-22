@@ -178,6 +178,16 @@ type LockStore interface {
 	// pending plan.
 	ReleaseByID(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error
 
+	// ReleaseByIDIfUnused releases the lock like ReleaseByID, and also only
+	// while no apply that has not reached a terminal state records the row as
+	// its lock. The row is held for the decision, so an apply created under
+	// the row in a transaction that locks it either commits before the check
+	// and keeps the lock, or waits and finds the lock gone. It returns nil
+	// when it released the lock; a *LockInUseError, matching ErrLockInUse and
+	// naming the apply, when it kept the lock for that apply; and the errors
+	// ReleaseByID returns when the row no longer holds the lock as given.
+	ReleaseByIDIfUnused(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error
+
 	// ReleaseIfPendingPlanID releases a lock only while both its owner and
 	// pending plan still match. A mismatch is a no-op so a superseding apply or
 	// rollback intent owned by the same PR remains intact.
