@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -46,11 +47,19 @@ func (m *stoppedByFreezeStorage) Freezes() storage.FreezeStore                 {
 
 // Status names the freeze that stopped an apply only when the stop recorded
 // on the stopped apply is a freeze's, and still names it when the freeze's
-// reason cannot be read.
+// reason cannot be read. It says when that freeze has ended or been lifted,
+// and reads it as in effect when the database clock cannot be read.
 func TestStoppedByFreeze(t *testing.T) {
-	freezes := &memoryFreezeStore{clock: clock.NewFake(freezeTestNow), freezes: []*storage.EnvironmentFreeze{
-		{Identifier: "freeze-1", Environment: "staging", Running: storage.FreezeRunningStop, Reason: "SEV-1234"},
-	}}
+	lifted, ended := freezeTestNow.Add(-time.Minute), freezeTestNow.Add(-time.Minute)
+	freezeRows := func() []*storage.EnvironmentFreeze {
+		return []*storage.EnvironmentFreeze{
+			{Identifier: "freeze-1", Environment: "staging", Running: storage.FreezeRunningStop, Reason: "SEV-1234"},
+			{Identifier: "freeze-lifted", Environment: "staging", Running: storage.FreezeRunningStop, Reason: "SEV-1", LiftedAt: &lifted},
+			{Identifier: "freeze-ended", Environment: "staging", Running: storage.FreezeRunningStop, Reason: "SEV-2", EndsAt: &ended},
+		}
+	}
+	freezes := &memoryFreezeStore{clock: clock.NewFake(freezeTestNow), freezes: freezeRows()}
+	noClock := &memoryFreezeStore{clock: clock.NewFake(freezeTestNow), freezes: freezeRows(), nowErr: errors.New("connection refused")}
 	stopBy := func(caller string, status storage.ControlRequestStatus) *storage.ApplyControlRequest {
 		return &storage.ApplyControlRequest{Operation: storage.ControlOperationStop, RequestedBy: caller, Status: status}
 	}
@@ -66,6 +75,12 @@ func TestStoppedByFreeze(t *testing.T) {
 	}{
 		{"FreezeStop", stopped, &stopRequestStore{stop: stopBy("freeze:freeze-1", storage.ControlRequestCompleted)}, freezes,
 			&apitypes.FreezeStopRef{ID: "freeze-1", Reason: "SEV-1234"}},
+		{"LiftedFreeze", stopped, &stopRequestStore{stop: stopBy("freeze:freeze-lifted", storage.ControlRequestCompleted)}, freezes,
+			&apitypes.FreezeStopRef{ID: "freeze-lifted", Reason: "SEV-1", Ended: true}},
+		{"EndedFreeze", stopped, &stopRequestStore{stop: stopBy("freeze:freeze-ended", storage.ControlRequestCompleted)}, freezes,
+			&apitypes.FreezeStopRef{ID: "freeze-ended", Reason: "SEV-2", Ended: true}},
+		{"ClockUnreadableReadsAsInEffect", stopped, &stopRequestStore{stop: stopBy("freeze:freeze-ended", storage.ControlRequestCompleted)}, noClock,
+			&apitypes.FreezeStopRef{ID: "freeze-ended", Reason: "SEV-2"}},
 		{"FreezeGoneKeepsTheID", stopped, &stopRequestStore{stop: stopBy("freeze:freeze-gone", storage.ControlRequestCompleted)}, freezes,
 			&apitypes.FreezeStopRef{ID: "freeze-gone"}},
 		{"NoFreezeStoreKeepsTheID", stopped, &stopRequestStore{stop: stopBy("freeze:freeze-1", storage.ControlRequestCompleted)}, nil,

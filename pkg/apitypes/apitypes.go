@@ -1936,6 +1936,10 @@ type FreezeStopRef struct {
 	// Reason is the freeze's reason, empty when SchemaBot could not read the
 	// freeze.
 	Reason string `json:"reason,omitempty"`
+	// Ended is true once the freeze has ended or been lifted, by the database
+	// clock, so a plain start resumes the apply. It is false while the
+	// freeze is in effect, and when SchemaBot could not read the freeze.
+	Ended bool `json:"ended,omitempty"`
 }
 
 // ProgressOperationResponse represents progress for one deployment operation.

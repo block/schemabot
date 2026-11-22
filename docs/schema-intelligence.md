@@ -754,6 +754,16 @@ apply whose manifest declares more than one operation, and a remote apply the
 data plane has not yet been handed. `Unknown` means the data
 plane reported an engine this server does not recognize.
 
+`stopped_by_freeze` is set while the apply is `stopped` and the stop that
+stopped it was issued by a freeze with running `stop`, rather than by an
+operator. It carries the freeze's `id`; its `reason`, which is left out when the
+freeze cannot be read; and `ended: true` once the freeze has ended or been
+lifted, so a plain start resumes the apply. While `ended` is absent, the freeze
+may still be in effect, and it refuses a start unless a freeze approver approves
+an override.
+The field is absent for an apply an operator stopped, and for one whose stop
+cannot be read, which reads as an ordinary stop.
+
 An unknown `apply_id` answers `404` with `error_code` `not_found`. When the apply
 exists but the server cannot read its progress from the data plane that runs it,
 the route answers `503` with `error_code` `engine_unavailable`. That covers a

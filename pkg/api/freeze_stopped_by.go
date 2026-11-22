@@ -17,7 +17,8 @@ import (
 //
 // The stop names the freeze by its identifier. The reason is read from the
 // freeze itself, and left empty when the freeze cannot be read, so status
-// still says which freeze stopped the apply.
+// still says which freeze stopped the apply. Ended says the freeze has since
+// ended or been lifted, so status tells the reader a plain start resumes it.
 func (s *Service) StoppedByFreeze(ctx context.Context, apply *storage.Apply) *apitypes.FreezeStopRef {
 	return StoppedByFreeze(ctx, s.storage, s.logger, apply)
 }
@@ -40,7 +41,13 @@ func StoppedByFreeze(ctx context.Context, stor storage.Storage, logger interface
 			append(apply.LogAttrs(), "error", err)...)
 		return nil
 	}
-	if stop == nil || stop.Status == storage.ControlRequestFailed {
+	if stop == nil {
+		// A stopped apply always has the stop that stopped it.
+		logger.Warn("a stopped apply has no stop recorded; status reads it as an ordinary stop", apply.LogAttrs()...)
+		return nil
+	}
+	if stop.Status == storage.ControlRequestFailed {
+		// The last stop failed, so it is not what stopped the apply.
 		return nil
 	}
 	freezeID, ok := storage.FreezeFromStopCaller(stop.RequestedBy)
@@ -62,6 +69,13 @@ func StoppedByFreeze(ctx context.Context, stor storage.Storage, logger interface
 			append(apply.LogAttrs(), "freeze_id", freezeID, "error", err)...)
 	default:
 		ref.Reason = freeze.Reason
+		now, err := freezes.Now(ctx)
+		if err != nil {
+			logger.Warn("could not read the database clock; status reads the freeze that stopped this apply as still in effect",
+				append(apply.LogAttrs(), "freeze_id", freezeID, "error", err)...)
+			break
+		}
+		ref.Ended = !freeze.InEffectAt(now)
 	}
 	return ref
 }

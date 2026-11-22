@@ -397,6 +397,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"FAILED BEFORE ROW COPY (PREFLIGHT)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFailedBeforeRowCopy()) }},
 		{"STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStopped()) }},
 		{"STOPPED BY A FREEZE", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStoppedByFreeze()) }},
+		{"STOPPED BY A FREEZE THAT HAS ENDED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStoppedByEndedFreeze()) }},
 		{"START WITHDRAWN BY A FREEZE", func() { fmt.Print(webhooktemplates.PreviewCommentStartWithdrawnByFreeze()) }},
 		{"RESUMING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyResuming()) }},
 		{"CANCELLED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCancelled()) }},

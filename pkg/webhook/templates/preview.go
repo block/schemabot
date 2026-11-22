@@ -3053,6 +3053,16 @@ func PreviewCommentApplyStoppedByFreeze() string {
 	return RenderApplyStatusComment(data)
 }
 
+// PreviewCommentApplyStoppedByEndedFreeze renders the stopped comment of an
+// apply whose freeze has since ended, which says a plain start resumes it.
+func PreviewCommentApplyStoppedByEndedFreeze() string {
+	tables := sampleApplyTables()[:1]
+	tables[0].Status = state.Task.Stopped
+	data := sampleApplyData(state.Apply.Stopped, tables)
+	data.StoppedByFreeze = &apitypes.FreezeStopRef{ID: "freeze-a1b2c3", Reason: "SEV-1234: checkout errors", Ended: true}
+	return RenderApplyStatusComment(data)
+}
+
 // PreviewCommentStartWithdrawnByFreeze renders the comment posted when a
 // freeze with running "stop" withdraws a start no driver had acted on.
 func PreviewCommentStartWithdrawnByFreeze() string {

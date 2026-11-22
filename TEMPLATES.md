@@ -6560,6 +6560,38 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 </details>
 
 <details>
+<summary><a name="stopped-by-a-freeze-that-has-ended"></a><strong>Stopped By A Freeze That Has Ended</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Stopped
+
+**Schema `testapp`**
+
+**`orders`**: ⏹️ Stopped (not started)
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+> ⏹️ Stopped by freeze `freeze-a1b2c3` (SEV-1234: checkout errors), which has ended. Start it again to resume it.
+
+---
+
+Paused — to resume from where it stopped:
+```
+schemabot start apply-a1b2c3d4e5f6 -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="start-withdrawn-by-a-freeze"></a><strong>Start Withdrawn By A Freeze</strong></summary>
 
 
