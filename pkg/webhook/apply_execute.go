@@ -42,7 +42,7 @@ import (
 // targets as they are now.
 func (h *Handler) executeApply(
 	ctx context.Context, client *ghclient.InstallationClient,
-	repo string, pr int, schemaResult *ghclient.SchemaRequestResult,
+	repo string, pr int, schemaResult *ghclient.SchemaRequestResult, sharedSchemaPeers []sharedSchemaPeerInputs,
 	environment string, installationID int64, requestedBy string,
 	result CommandResult, storedPlan, disclosedPlan *storage.Plan, expectedPendingPlanID string,
 	disclosedCopies []storage.DisclosedCopy,
@@ -148,7 +148,7 @@ func (h *Handler) executeApply(
 	// release the observed lock intent; the gate has already logged and
 	// posted the distinction, and the user's recovery is re-issuing the
 	// command.
-	rejected, freshnessErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName)
+	rejected, freshnessErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, sharedSchemaPeers, freshPRInfo, environment, requestedBy, actionName)
 	if freshnessErr != nil {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final base-schema freshness verification failure")
 		return
@@ -620,7 +620,7 @@ func (h *Handler) executeApply(
 			h.releaseApplyLockIfIntentUnchanged(releaseCtx, repo, pr, database, dbType, environment, expectedPendingPlanID, "change gate refused")
 			cancel()
 			h.logger.Info("apply refused by a change gate", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-			h.postChangeGateRefusal(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(actionName, environment, h.deploymentTenant(), err))
+			h.postChangeGateRefusal(repo, pr, installationID, actionName, environment, requestedBy, err)
 			return
 		}
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
@@ -921,16 +921,12 @@ type dispatchMessages struct {
 // that creates a new one. A rollout member's refused
 // plan is named by target and table from fields SchemaBot controls. Everything
 // else is an internal error whose text stays in server logs behind the fixed
-// line.
+// line. A change gate's error never reaches here: both callers post it with
+// postChangeGateRefusal first, and a refusal's raw text would carry the
+// freezes' reasons, mentions and all.
 func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 	if errors.Is(err, storage.ErrLockIntentChanged) {
 		return msgs.lockIntentChanged
-	}
-	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
-		return "This change did not start: it is " + changeGateRefusalDetail(refused, msgs.command, msgs.tenant)
-	}
-	if unavailable, ok := errors.AsType[*api.ChangeGateUnavailableError](err); ok {
-		return unavailable.UserMessage()
 	}
 	var featureErr *api.UnsupportedFeatureError
 	if errors.As(err, &featureErr) {

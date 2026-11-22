@@ -1691,6 +1691,19 @@ func PreviewCommentBaseSchemaFreshnessRejected() string {
 	})
 }
 
+// PreviewCommentBaseSchemaFreshnessRejectedSharedSchemaPeer renders a sample
+// base freshness rejection where the base branch changed the schema of a
+// database that shares a schema with the one being applied.
+func PreviewCommentBaseSchemaFreshnessRejectedSharedSchemaPeer() string {
+	return RenderBaseSchemaFreshnessRejection(BaseSchemaFreshnessRejectionData{
+		RequestedBy:      previewRequestedBy,
+		Database:         "shop_sharded",
+		Environment:      "production",
+		SchemaPath:       "schema/shop",
+		SharedSchemaPeer: "shop",
+	})
+}
+
 // PreviewCommentReviewRequired renders a sample "review required" comment:
 // the database's operators lead in their own section, with the broader
 // authorized principals as an explicit fallback.
@@ -4066,4 +4079,59 @@ func PreviewCommentSummaryMultiNamespaceCompleted() string {
 		{Namespace: "analytics", TableName: "events", DDL: "ALTER TABLE `events` ADD INDEX `idx_created_at` (`created_at`)", Status: state.Task.Completed},
 	}
 	return RenderApplySummaryComment(sampleSummaryDataWithDuration(state.Apply.Completed, tables, 3*24*time.Hour+4*time.Hour))
+}
+
+// previewFreezeEnds is when the preview's scheduled freeze ends.
+var previewFreezeEnds = time.Date(2026, 1, 15, 18, 0, 0, 0, time.UTC)
+
+// previewFreezeApprovers are the preview deployment's freeze.github_teams.
+var previewFreezeApprovers = []string{"acme/freeze-approvers", "acme/sre"}
+
+// PreviewCommentFreezeRefused renders an apply refused by one freeze, with
+// the next steps for a commenter who did not ask for an override.
+func PreviewCommentFreezeRefused() string {
+	return RenderChangeGateRefusal(ChangeGateRefusalData{
+		TakesOverride: true,
+		CommandName:   action.Apply, Environment: "production", RequestedBy: previewRequestedBy, Timestamp: "2026-01-15 14:30:00",
+		Freezes:   []RefusingFreeze{{ID: "frz-7f3a", Reason: "SEV-1234: payments latency, page @payments-oncall"}},
+		Approvers: previewFreezeApprovers,
+	})
+}
+
+// PreviewCommentFreezeRefusedSeveral renders a cutover refused by two
+// freezes, one of which ends on its own.
+func PreviewCommentFreezeRefusedSeveral() string {
+	return RenderChangeGateRefusal(ChangeGateRefusalData{
+		TakesOverride: true,
+		CommandName:   action.Cutover, Environment: "production", RequestedBy: previewRequestedBy, Timestamp: "2026-01-15 14:30:00",
+		Freezes: []RefusingFreeze{
+			{ID: "frz-7f3a", Reason: "SEV-1234: payments latency"},
+			{ID: "frz-91c2", Reason: "Holiday change freeze", EndsAt: &previewFreezeEnds},
+		},
+		Approvers: previewFreezeApprovers,
+	})
+}
+
+// PreviewCommentFreezeOverrideRequested renders an apply refused with an
+// override request recorded, and the two steps that let it through.
+func PreviewCommentFreezeOverrideRequested() string {
+	return RenderChangeGateRefusal(ChangeGateRefusalData{
+		TakesOverride: true,
+		CommandName:   action.Apply, Environment: "production", Tenant: "acme", RequestedBy: "carol", Timestamp: "2026-01-15 14:30:00",
+		Freezes:   []RefusingFreeze{{ID: "frz-7f3a", Reason: "SEV-1234: payments latency"}},
+		Override:  &RefusalOverrideRequest{ID: "ovr-0123456789abcdef", Requester: "carol", Author: "alice", Reason: "Index that fixes SEV-1234"},
+		Approvers: previewFreezeApprovers,
+	})
+}
+
+// PreviewCommentFreezeApplyConfirmRefused renders a refused apply-confirm,
+// whose retry starts with apply because the refusal released its pending
+// confirmation.
+func PreviewCommentFreezeApplyConfirmRefused() string {
+	return RenderChangeGateRefusal(ChangeGateRefusalData{
+		TakesOverride: true,
+		CommandName:   action.ApplyConfirm, Environment: "production", RequestedBy: previewRequestedBy, Timestamp: "2026-01-15 14:30:00",
+		Freezes:   []RefusingFreeze{{ID: "frz-91c2", Reason: "Holiday change freeze", EndsAt: &previewFreezeEnds}},
+		Approvers: previewFreezeApprovers,
+	})
 }

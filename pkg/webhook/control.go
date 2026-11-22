@@ -2,7 +2,6 @@ package webhook
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -206,11 +205,11 @@ func runControlCommand[R any](
 	resp, err := execute(ctx, request)
 	if err != nil {
 		h.logControlCommandError(actionName, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
-		post := h.postCommandError
 		if isChangeGateError(err) {
-			post = h.postChangeGateRefusal
+			h.postChangeGateRefusal(repo, pr, installationID, actionName, result.Environment, requestedBy, err)
+			return nil
 		}
-		post(repo, pr, installationID, actionName, result.Environment, requestedBy, controlErrorMessage(err, actionName, h.deploymentTenant()))
+		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, err.Error())
 		return nil
 	}
 	if resp == nil {
@@ -267,16 +266,6 @@ func (h *Handler) withPullRequestOverrideRequester(ctx context.Context, client *
 	return api.WithPullRequestOverrideRequester(ctx, api.PullRequestRequester{
 		Login: requestedBy, Repository: repo, PullRequest: pr, Author: info.User,
 	})
-}
-
-// controlErrorMessage renders a failed control command for the PR. A freeze
-// refusal reads as it does for an apply; other errors post as they are.
-// command and tenant are as changeGateRefusalDetail takes them.
-func controlErrorMessage(err error, command, tenant string) string {
-	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
-		return changeGateRefusalDetail(refused, command, tenant)
-	}
-	return err.Error()
 }
 
 // handleStopCommand handles the "schemabot stop <apply-id> -e <env>" PR

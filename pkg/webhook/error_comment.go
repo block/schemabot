@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/templates"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -31,23 +32,6 @@ func (h *Handler) postCommandError(
 	repo string, pr int, installationID int64,
 	commandName, environment, requestedBy, errorDetail string,
 ) {
-	h.postCommandErrorWithin(repo, pr, installationID, commandName, environment, requestedBy, errorDetail, 0)
-}
-
-// postChangeGateRefusal is postCommandError for a change gate's refusal,
-// which SchemaBot writes itself and whose last sentences say how to get the
-// change through, so it is posted under the longer MaxChangeGateRefusalLen.
-func (h *Handler) postChangeGateRefusal(
-	repo string, pr int, installationID int64,
-	commandName, environment, requestedBy, errorDetail string,
-) {
-	h.postCommandErrorWithin(repo, pr, installationID, commandName, environment, requestedBy, errorDetail, templates.MaxChangeGateRefusalLen)
-}
-
-func (h *Handler) postCommandErrorWithin(
-	repo string, pr int, installationID int64,
-	commandName, environment, requestedBy, errorDetail string, detailLimit int,
-) {
 	h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 		RequestedBy:  requestedBy,
 		Timestamp:    templates.NowFunc().UTC().Format("2006-01-02 15:04:05"),
@@ -55,8 +39,31 @@ func (h *Handler) postCommandErrorWithin(
 		Environments: h.deploymentEnvironmentScope(environment),
 		CommandName:  commandName,
 		ErrorDetail:  userFacingErrorDetail(errorDetail),
-		DetailLimit:  detailLimit,
 	}))
+}
+
+// postChangeGateRefusal posts a change gate's answer to a PR command, for an
+// err that isChangeGateError accepts. A freeze refusal gets its own comment,
+// which SchemaBot writes itself: what is frozen, until when and why, and what
+// the commenter can do next. A gate that could not decide posts its fixed
+// message as a command error.
+func (h *Handler) postChangeGateRefusal(
+	repo string, pr int, installationID int64,
+	commandName, environment, requestedBy string, err error,
+) {
+	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
+		var approvers []string
+		if config, ok := h.serverConfig(); ok {
+			approvers = config.Freeze.GitHubTeams
+		}
+		h.postComment(repo, pr, installationID, templates.RenderChangeGateRefusal(changeGateRefusalData(refused, commandName, h.deploymentTenant(), requestedBy, approvers)))
+		return
+	}
+	message := "SchemaBot could not check for freezes, so this did not start. Try again."
+	if unavailable, ok := errors.AsType[*api.ChangeGateUnavailableError](err); ok {
+		message = unavailable.UserMessage()
+	}
+	h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, message)
 }
 
 // deploymentEnvironmentScope returns the environments this deployment
@@ -89,6 +96,11 @@ func userFacingError(err error) string {
 	if _, ok := errors.AsType[*api.DropTablesCheckError](err); ok {
 		return dropTablesCheckFailedMessage
 	}
+	// The cause is the data plane's error, which the caller logs with its
+	// identifiers.
+	if resolveErr, ok := errors.AsType[*api.NamespaceResolutionError](err); ok {
+		return namespaceResolutionFailedMessage(resolveErr)
+	}
 	var remoteErr *api.RemoteDeploymentUnavailableError
 	if errors.As(err, &remoteErr) {
 		return userFacingRemoteUnavailableError(remoteErr.Deployment, remoteErr.Target, err.Error())
@@ -97,6 +109,26 @@ func userFacingError(err error) string {
 		return userFacingRemoteUnavailableError("", "", err.Error())
 	}
 	return err.Error()
+}
+
+// namespaceResolutionFailedMessage is the PR comment line for a shared schema
+// check that could not learn which schemas a database's namespaces address on
+// a target. A data plane too old to answer needs an upgrade, and saying so is
+// the whole remedy. A data plane whose engine cannot resolve namespaces will
+// refuse every retry, so the line says so instead of suggesting one. Any other
+// failure is named only by its identifiers.
+func namespaceResolutionFailedMessage(err *api.NamespaceResolutionError) string {
+	where := "target `" + err.Target + "` of deployment `" + err.Deployment + "`"
+	if err.DataPlaneTooOld() {
+		return "SchemaBot could not check which schemas `" + err.Database + "` shares with other databases on " + where +
+			", because that deployment's data plane cannot report which schema each namespace addresses. Upgrade that data plane, then run the command again."
+	}
+	if errors.Is(err, tern.ErrResolveNamespacesUnsupported) {
+		return "SchemaBot could not check which schemas `" + err.Database + "` shares with other databases on " + where +
+			", because that deployment's data plane cannot resolve namespaces for this database's engine. Running the command again will not help; the SchemaBot server logs have the cause."
+	}
+	return "SchemaBot could not check which schemas `" + err.Database + "` shares with other databases on " + where +
+		", so the command was refused. Run the command again; if it fails again, the SchemaBot server logs have the cause."
 }
 
 func userFacingConfigNotAuthorizedError(err error) (string, bool) {

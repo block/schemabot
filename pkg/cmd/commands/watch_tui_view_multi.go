@@ -60,6 +60,7 @@ func (m WatchModel) multiDeploymentProgressSections() (string, string) {
 		f.WriteString(footer + "\n")
 	}
 	m.writeMultiDeploymentFooter(&f, model, view.StopByKey)
+	f.WriteString(m.changeGateFooter())
 	return header.String() + body, f.String()
 }
 

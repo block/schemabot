@@ -1167,9 +1167,30 @@ type mockTernClient struct {
 	observerApplyID          int64
 	observer                 tern.ProgressObserver
 	isRemote                 bool
+	// resolveNamespacesMu guards resolveNamespacesReqs: a shared schema check
+	// resolves each peer's namespaces, possibly through one client.
+	resolveNamespacesMu   sync.Mutex
+	resolveNamespacesReqs []*ternv1.ResolveNamespacesRequest
+	// resolveNamespacesHook answers ResolveNamespaces. When nil, each
+	// namespace resolves to itself, the way an unpinned target resolves it.
+	resolveNamespacesHook func(context.Context, *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error)
 }
 
 func (m *mockTernClient) Health(ctx context.Context) error { return m.healthErr }
+func (m *mockTernClient) ResolveNamespaces(ctx context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error) {
+	m.resolveNamespacesMu.Lock()
+	m.resolveNamespacesReqs = append(m.resolveNamespacesReqs, req)
+	hook := m.resolveNamespacesHook
+	m.resolveNamespacesMu.Unlock()
+	if hook != nil {
+		return hook(ctx, req)
+	}
+	schemas := make(map[string]string, len(req.Namespaces))
+	for _, ns := range req.Namespaces {
+		schemas[ns] = ns
+	}
+	return &ternv1.ResolveNamespacesResponse{Schemas: schemas}, nil
+}
 func (m *mockTernClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
 	// A multi-target pull fans its members out concurrently, so several
 	// goroutines record through this one client.

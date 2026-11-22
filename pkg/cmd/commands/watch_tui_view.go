@@ -271,6 +271,8 @@ func (m WatchModel) progressSections() (string, string) {
 		f.WriteString("\n")
 	}
 
+	f.WriteString(m.changeGateFooter())
+
 	// Fetch error during active progress (mid-flight). State and tables are
 	// preserved from the last successful poll; the error tells the user
 	// the server is currently unreachable.
