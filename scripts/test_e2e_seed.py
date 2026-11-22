@@ -22,17 +22,25 @@ SEED = SCRIPTS / "e2e-seed.sh"
 # the script should have stopped kept it waiting.
 RUN_DEADLINE = 30
 
-# Records each seed apply it is asked to run, then hangs, fails, or succeeds as
+# Records each seed apply it is asked to run, prints its apply ID the way the
+# real CLI does once the server accepts it, then hangs, fails, or succeeds as
 # FAKE_HANG and FAKE_FAIL say. A failing seed waits until every hanging seed has
-# started, so the failure always lands while a seed apply is in flight.
+# started, so the failure always lands while a seed apply is in flight. A
+# cancel is recorded, so the fake progress API reports that apply cancelled.
 FAKE_SCHEMABOT = textwrap.dedent(
     """\
     #!/usr/bin/env bash
+    if [ "$1" = cancel ]; then
+      # Invoked as: cancel <apply id> -e <env> ...
+      echo "$2" >> "$FAKE_STATE/cancelled"
+      exit 0
+    fi
     # Invoked as: apply -s <schema dir> -e <env> ...
     case "$3" in *mysql*) engine=mysql ;; *) engine=vitess ;; esac
     label="$engine-$5"
     echo "$label" >> "$FAKE_STATE/started"
     echo $$ > "$FAKE_STATE/$label.pid"
+    echo "Apply started: apply-$label"
     case " ${FAKE_HANG:-} " in *" $label "*) exec sleep 300 ;; esac
     case " ${FAKE_FAIL:-} " in
       *" $label "*)
@@ -50,12 +58,26 @@ FAKE_SCHEMABOT = textwrap.dedent(
 )
 
 FAKE_DOCKER = '#!/usr/bin/env bash\necho "fake docker $*"\n'
-# Counts each VSchema it is asked to seed, and rejects them all when
-# FAKE_CURL_FAIL is set, the way curl -f reports an HTTP error. Like a failing
-# seed apply, it waits for every hanging seed to start before it fails.
+# Answers the progress API with "cancelled" for an apply the fake CLI
+# cancelled and "running" otherwise. Counts each VSchema it is asked to seed,
+# and rejects them all when FAKE_CURL_FAIL is set, the way curl -f reports an
+# HTTP error. Like a failing seed apply, it waits for every hanging seed to
+# start before it fails.
 FAKE_CURL = textwrap.dedent(
     """\
     #!/usr/bin/env bash
+    url="${*: -1}"
+    case "$url" in
+      */api/progress/apply/*)
+        id="${url##*/}"
+        if grep -qx "$id" "$FAKE_STATE/cancelled" 2>/dev/null; then
+          echo '{"state": "cancelled"}'
+        else
+          echo '{"state": "running"}'
+        fi
+        exit 0
+        ;;
+    esac
     echo seed-vschema >> "$FAKE_STATE/curl"
     if [ -n "${FAKE_CURL_FAIL:-}" ]; then
       for hanging in ${FAKE_HANG:-}; do
@@ -110,6 +132,10 @@ class SeedRun:
 
     def pid(self, label):
         return int((self.state / f"{label}.pid").read_text())
+
+    def cancelled(self):
+        path = self.state / "cancelled"
+        return path.read_text().split() if path.exists() else []
 
 
 class E2ESeedTest(unittest.TestCase):
@@ -166,6 +192,7 @@ class E2ESeedTest(unittest.TestCase):
             ["mysql-production", "mysql-staging", "vitess-production", "vitess-staging"],
         )
         self.assertNotIn("LocalScale logs", run.output)
+        self.assertEqual(run.cancelled(), [])
 
     def test_vitess_staging_failure_stops_the_mysql_seed_in_flight(self):
         run = self.run_seed(hang="mysql-staging", fail="vitess-staging")
@@ -173,6 +200,8 @@ class E2ESeedTest(unittest.TestCase):
         self.assertIn("=== LocalScale logs ===", run.output)
         self.assertIn(f"fake {E2E_DC} logs localscale --tail=200", run.output)
         self.assert_not_running(run, "mysql-staging")
+        self.assertEqual(run.cancelled(), ["apply-mysql-staging"])
+        self.assertIn("Seed apply (mysql-staging) apply-mysql-staging settled as cancelled", run.output)
         self.assertNotIn("mysql-production", run.started())
         self.assertNotIn("vitess-production", run.started())
         self.assertLess(run.elapsed, 20, "the seed script waited on the hanging MySQL seed instead of stopping it")
@@ -182,6 +211,7 @@ class E2ESeedTest(unittest.TestCase):
         self.assertEqual(run.returncode, 1, run.output)
         self.assertIn("=== LocalScale logs ===", run.output)
         self.assert_not_running(run, "mysql-production")
+        self.assertEqual(run.cancelled(), ["apply-mysql-production"])
         self.assertIn("vitess-staging", run.started())
         self.assertLess(run.elapsed, 20, "the seed script waited on the hanging MySQL seed instead of stopping it")
 
@@ -199,12 +229,14 @@ class E2ESeedTest(unittest.TestCase):
         self.assertEqual(len((run.state / "curl").read_text().splitlines()), 1)
         self.assertNotIn("vitess-staging", run.started())
         self.assert_not_running(run, "mysql-staging")
+        self.assertEqual(run.cancelled(), ["apply-mysql-staging"])
         self.assertLess(run.elapsed, 20, "the seed script waited on the hanging MySQL seed instead of stopping it")
 
     def test_mysql_failure_fails_the_setup(self):
         run = self.run_seed(fail="mysql-production")
         self.assertEqual(run.returncode, 1, run.output)
         self.assertIn("vitess-production", run.started())
+        self.assertEqual(run.cancelled(), [], "a seed apply that failed on its own is already settled")
 
     def test_a_stalled_seed_apply_fails_at_the_bound(self):
         run = self.run_seed(timeout="1", hang="vitess-staging")
@@ -212,6 +244,8 @@ class E2ESeedTest(unittest.TestCase):
         self.assertIn("seed apply (vitess-staging) did not finish within 1s; failing the e2e setup", run.output)
         self.assertIn("=== LocalScale logs ===", run.output)
         self.assert_not_running(run, "vitess-staging")
+        self.assertEqual(run.cancelled(), ["apply-vitess-staging"])
+        self.assertIn("Seed apply (vitess-staging) apply-vitess-staging settled as cancelled", run.output)
         self.assertNotIn("vitess-production", run.started())
 
     # perl reads zero, an empty value, and anything too large for a C int as

@@ -10,9 +10,10 @@
 # own timeout and goroutine dump never fire either; failing here keeps the stall
 # inside the path that collects evidence.
 #
-# When a VSchema seed or the Vitess pair fails, the MySQL pair is stopped and
-# reaped before the script exits, so no seed apply outlives the setup it
-# belonged to.
+# When a VSchema seed or the Vitess pair fails, the MySQL pair is stopped before
+# the script exits. A seed apply that is stopped, whether by the bound or by a
+# sibling's failure, is also cancelled on the server and given time to settle,
+# so no seed apply keeps changing a database after the setup it belonged to.
 #
 # E2E_DC is the docker compose command for the e2e stack. The Makefile passes it
 # in, so the failure log dump reads the same compose project the tests run in.
@@ -47,28 +48,37 @@ read -ra compose <<<"$E2E_DC"
 endpoint=http://localhost:14370
 localscale=http://localhost:14374
 
-# seed_apply <label> <schemabot apply args...> runs one seed apply under the
-# bound. It exits 124 when the bound ends the apply, otherwise with the apply's
-# status. perl does the timing because it ships on macOS and the CI runners,
-# where coreutils `timeout` is not guaranteed. It stops the apply with SIGTERM,
-# then SIGKILL after a grace period, rather than through an exec'd alarm: a Go
-# program ignores SIGALRM unless it asks for it. A SIGTERM or SIGINT sent to
-# perl stops the apply the same way, and perl exits only once the apply has.
-# perl installs its handlers before it forks, so a signal that lands while it is
-# starting the apply still stops it. The child restores the default handlers
-# before it execs the apply.
+# Bounds on cancelling a seed apply the script stopped: how long the cancel
+# command may take, and how long the apply may then take to settle.
+cancel_limit=30
+settle_limit=60
+
+# Each seed apply's output goes to a file here, printed once the apply ends, so
+# the script can read the apply ID back and the MySQL and Vitess output does not
+# interleave.
+seed_logs=$(mktemp -d "${TMPDIR:-/tmp}/e2e-seed.XXXXXX")
+trap 'rm -rf "$seed_logs"' EXIT
+
+# bounded <seconds> <description> <command...> runs a command under a time
+# bound. It exits 124 when the bound ends the command, otherwise with the
+# command's status. perl does the timing because it ships on macOS and the CI
+# runners, where coreutils `timeout` is not guaranteed. It stops the command
+# with SIGTERM, then SIGKILL after a grace period, rather than through an exec'd
+# alarm: a Go program ignores SIGALRM unless it asks for it. A SIGTERM or SIGINT
+# sent to perl stops the command the same way, and perl exits only once the
+# command has. perl installs its handlers before it forks, so a signal that
+# lands while it is starting the command still stops it. The child restores the
+# default handlers before it execs the command.
 #
-# Callers run it in the background, and it execs perl so the background PID is
-# perl's: signalling the subshell instead would leave perl and the apply
-# running.
-seed_apply() {
-  local label=$1
-  shift
+# It execs perl, so run it in a subshell or in the background. In the
+# background, the PID is perl's: signalling the subshell instead would leave
+# perl and the command running.
+bounded() {
   exec perl -e '
-    my ($limit, $label, @cmd) = @ARGV;
+    my ($limit, $what, @cmd) = @ARGV;
     my ($pid, $stopping, $timed_out) = (0, 0, 0);
     # $pid is 0 before the fork and in the child. Then stop only records the
-    # request, and the parent acts on it once it has the apply PID.
+    # request, and the parent acts on it once it has the command PID.
     sub stop {
       return if $stopping;
       $stopping = 1;
@@ -98,12 +108,65 @@ seed_apply() {
     my $status = $?;
     alarm(0);
     if ($timed_out) {
-      print STDERR "seed apply ($label) did not finish within ${limit}s; failing the e2e setup\n";
+      print STDERR "$what did not finish within ${limit}s; failing the e2e setup\n";
       exit(124);
     }
     exit(128 + ($status & 127)) if $status & 127;
     exit($status >> 8);
-  ' "$limit" "$label" ./bin/schemabot apply "$@" --endpoint "$endpoint" -y --allow-unsafe -o log
+  ' "$@"
+}
+
+# seed_apply <label> <env> <schema dir> runs one seed apply under the bound,
+# with its output in the label's log file. Callers run it in the background.
+seed_apply() {
+  local label=$1 env=$2 schema=$3
+  bounded "$limit" "seed apply ($label)" \
+    ./bin/schemabot apply -s "$schema" -e "$env" --endpoint "$endpoint" -y --allow-unsafe -o log \
+    >"$seed_logs/$label.log"
+}
+
+show_seed_output() {
+  local log=$seed_logs/$1.log
+  [ -f "$log" ] || return 0
+  echo "--- seed apply ($1) ---"
+  cat "$log"
+}
+
+# cancel_seed_apply <label> <env> cancels a seed apply the script stopped
+# before it finished, and waits for it to settle. Stopping the CLI only stops
+# its watch: the apply belongs to the server, which keeps running it until it
+# is cancelled through the server's durable control path.
+cancel_seed_apply() {
+  local label=$1 env=$2 id state deadline
+  [ -n "$label" ] || return 0
+  show_seed_output "$label"
+  id=$(sed -n 's/^Apply started: //p' "$seed_logs/$label.log" 2>/dev/null | tail -n 1)
+  if [ -z "$id" ]; then
+    echo "seed apply ($label) printed no apply ID, so there is no server-side apply to cancel" >&2
+    return 0
+  fi
+  echo "Cancelling seed apply ($label) $id on the server"
+  if ! (bounded "$cancel_limit" "cancel of seed apply ($label) $id" \
+    ./bin/schemabot cancel "$id" -e "$env" --endpoint "$endpoint" -y); then
+    echo "cancel of seed apply ($label) $id failed; it is still running on the server" >&2
+    return 1
+  fi
+  deadline=$((SECONDS + settle_limit))
+  while :; do
+    state=$(curl -sS --max-time 5 "$endpoint/api/progress/apply/$id" |
+      perl -MJSON::PP -0777 -ne 'my $s = lc(eval { decode_json($_)->{state} } // ""); $s =~ s/^state_//; print $s')
+    case "$state" in
+      completed | failed | cancelled | reverted)
+        echo "Seed apply ($label) $id settled as $state"
+        return 0
+        ;;
+    esac
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      echo "seed apply ($label) $id did not settle within ${settle_limit}s of its cancel; it is still '$state' on the server" >&2
+      return 1
+    fi
+    sleep 1
+  done
 }
 
 # stop_seed_applies stops and reaps every seed apply this shell has started
@@ -120,14 +183,30 @@ stop_seed_applies() {
 }
 
 # seed_pair <engine> <schema dir> applies one schema to staging, then
-# production. A SIGTERM stops the apply in flight and waits for it to exit, so
-# whoever stops the pair knows nothing it started is still running.
+# production. When the bound ends an apply, or a SIGTERM stops the pair, the
+# apply in flight is stopped and then cancelled on the server, so whoever stops
+# the pair knows nothing it started is still changing a database.
 seed_pair() {
-  local engine=$1 schema=$2 env
-  trap 'stop_seed_applies; exit 143' TERM
+  local engine=$1 schema=$2 env status
+  label='' seed_env=''
+  trap 'stop_seed_applies; cancel_seed_apply "$label" "$seed_env"; exit 143' TERM
   for env in staging production; do
-    seed_apply "$engine-$env" -s "$schema" -e "$env" &
-    wait "$!" || return
+    label=$engine-$env seed_env=$env
+    seed_apply "$label" "$env" "$schema" &
+    wait "$!"
+    status=$?
+    if [ "$status" -eq 124 ]; then
+      # The cancel runs to completion even if a SIGTERM arrives meanwhile;
+      # the trap would otherwise end it before the apply settles.
+      trap : TERM
+      cancel_seed_apply "$label" "$env"
+      return 124
+    fi
+    show_seed_output "$label"
+    label=''
+    if [ "$status" -ne 0 ]; then
+      return "$status"
+    fi
   done
 }
 
