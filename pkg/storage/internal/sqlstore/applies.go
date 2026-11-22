@@ -4153,7 +4153,7 @@ func (s *applyStore) Delete(ctx context.Context, id int64) error {
 	if err != nil {
 		return fmt.Errorf("delete apply %d: %w", id, err)
 	}
-	if err := checkRowsAffected(result, storage.ErrApplyNotFound); err != nil {
+	if err := checkRowsAffected(result, storage.ErrApplyNotFound, fmt.Sprintf("deleting apply %d", id)); err != nil {
 		return err
 	}
 

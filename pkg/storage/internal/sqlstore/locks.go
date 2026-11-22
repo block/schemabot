@@ -491,7 +491,11 @@ func (s *lockStore) Get(ctx context.Context, database, dbType string) (*storage.
 		WHERE database_name = ? AND database_type = ?
 	`, database, dbType)
 
-	return scanLock(row)
+	lock, err := scanLock(row)
+	if err != nil {
+		return nil, fmt.Errorf("get lock for %s/%s: %w", database, dbType, err)
+	}
+	return lock, nil
 }
 
 // List returns all active locks.
