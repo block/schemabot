@@ -694,6 +694,17 @@ func (c *GRPCClient) logTaskStateTransition(ctx context.Context, applyID int64, 
 		message, oldState, task.State)
 }
 
+// remoteTaskStateChangeMessage names the table and, on a sharded target, the
+// shard whose task changed state, so a slow or failed shard can be found from
+// the apply's log. The old and new states are carried on the log entry itself
+// and rendered beside the message, so the message does not repeat them.
+func remoteTaskStateChangeMessage(task *storage.Task) string {
+	if task.Shard == "" {
+		return fmt.Sprintf("Remote task %s changed state", task.TableName)
+	}
+	return fmt.Sprintf("Remote task %s on shard %s changed state", task.TableName, task.Shard)
+}
+
 func (c *GRPCClient) logApplyWarning(ctx context.Context, apply *storage.Apply, message string) {
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError,
 		message, apply.State, apply.State)
@@ -3759,7 +3770,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 			if remoteStartRequested {
 				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply start requested by operator", oldState)
 			} else if oldState != apply.State {
-				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply state refreshed before operator start: %s -> %s", oldState, apply.State), oldState)
+				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply state refreshed before operator start", oldState)
 			}
 		}
 	}
@@ -5131,7 +5142,7 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 			return fmt.Errorf("sync task %s from gRPC progress for %s: %w", storedTask.TaskIdentifier, storedApply.ApplyIdentifier, err)
 		}
 		if oldTaskState != storedTask.State {
-			c.logTaskStateTransition(ctx, storedApply.ID, storedTask, fmt.Sprintf("Remote task %s changed state: %s -> %s", storedTask.TableName, oldTaskState, storedTask.State), oldTaskState)
+			c.logTaskStateTransition(ctx, storedApply.ID, storedTask, remoteTaskStateChangeMessage(storedTask), oldTaskState)
 		}
 
 		// Mirror the per-shard progress the data plane reported into control-plane
@@ -5769,7 +5780,7 @@ func (c *GRPCClient) pollRemoteUntilDone(ctx context.Context, apply *storage.App
 				return fmt.Errorf("sync apply %s from gRPC progress: %w", apply.ApplyIdentifier, err)
 			}
 			if persisted && oldApplyState != apply.State {
-				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply changed state: %s -> %s", oldApplyState, apply.State), oldApplyState)
+				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply changed state", oldApplyState)
 			}
 
 			// Park-and-release at the cutover barrier, mirroring the LocalClient

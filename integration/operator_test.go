@@ -232,10 +232,12 @@ func TestOperator_BasicClaimAndResume(t *testing.T) {
 	require.NoError(t, err)
 	claimLogged := false
 	for _, entry := range logs {
-		if strings.Contains(entry.Message, "Operator claimed apply to resume it") {
+		if strings.HasPrefix(entry.Message, "Driver ") && strings.Contains(entry.Message, " claimed deployment ") {
 			claimLogged = true
 			assert.Equal(t, storage.LogLevelInfo, entry.Level)
 			assert.Equal(t, storage.LogSourceSchemaBot, entry.Source)
+			assert.Empty(t, entry.OldState, "a claim changes no state, so the entry carries none")
+			assert.Empty(t, entry.NewState, "a claim changes no state, so the entry carries none")
 			break
 		}
 	}

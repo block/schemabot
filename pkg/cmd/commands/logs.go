@@ -486,8 +486,7 @@ func followFailureOutcome(err error, failures int, pacing followPacing) (time.Du
 // CLI's own and are added afterwards.
 func printLogs(logs []*client.LogEntry) {
 	for _, log := range logs {
-		// Format timestamp
-		ts := log.CreatedAt.Local().Format("15:04:05")
+		ts := webhooktemplates.LogEntryTimestamp(log.CreatedAt)
 
 		// Format level with color
 		level := formatLogLevel(ui.TerminalSafeLine(log.Level))

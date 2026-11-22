@@ -674,7 +674,7 @@ func TestShowDeploymentLogsDropsTerminalEscapes(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	timestamp := templates.ANSIDim + createdAt.Local().Format("15:04:05") + templates.ANSIReset
+	timestamp := templates.ANSIDim + createdAt.UTC().Format("2006-01-02 15:04:05 UTC") + templates.ANSIReset
 	cleaned := terminalAttackCleaned
 	assert.Equal(t,
 		templates.ANSIDim+"target-a"+cleaned+" / spirit"+cleaned+" (remote-1"+cleaned+")"+templates.ANSIReset+"\n"+
@@ -723,4 +723,23 @@ func TestFollowFailureWarningDropsTerminalEscapes(t *testing.T) {
 
 	require.NoError(t, err, "one failed poll is retried, not the end of the tail")
 	assert.Equal(t, "Warning: failed to fetch logs (attempt 1/10), retrying in 1ms: storage unavailable"+terminalAttackCleaned+" Warning: the apply was cancelled\n", warning)
+}
+
+// The logs command prints each entry's time in UTC with the zone named, the
+// same way the PR comment's log section does, whatever the local zone of the
+// machine running the CLI.
+func TestPrintLogsShowsUTCTimes(t *testing.T) {
+	pacific := time.FixedZone("PST", -8*60*60)
+	logs := []*client.LogEntry{{
+		CreatedAt: time.Date(2026, 3, 15, 10, 37, 40, 0, pacific),
+		Level:     "info",
+		Message:   "Remote task orders on shard 80-c0 changed state",
+		OldState:  "pending",
+		NewState:  "running",
+	}}
+
+	out := captureOutput(t, func() { printLogs(logs) })
+
+	assert.Contains(t, out, "2026-03-15 18:37:40 UTC")
+	assert.Contains(t, out, "Remote task orders on shard 80-c0 changed state [pending -> running]")
 }
