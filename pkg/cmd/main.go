@@ -206,7 +206,7 @@ func usesLocalRuntime(command string, cli *CLI) bool {
 		return false
 	}
 	switch parts[0] {
-	case "plan", "onboard", "pull", "apply", "progress", "cutover", "stop", "cancel", "start", "release", "revert", "skip-revert", "rollback", "databases", "unlock", "locks", "freeze", "unfreeze", "logs", "status", "list-plans":
+	case "plan", "onboard", "pull", "apply", "progress", "cutover", "stop", "cancel", "start", "release", "revert", "skip-revert", "rollback", "databases", "unlock", "locks", "freeze", "unfreeze", "logs", "status", "history", "list-plans":
 		return true
 	case "storage":
 		// A storage subcommand reaches its database either through the API or

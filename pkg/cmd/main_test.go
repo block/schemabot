@@ -90,6 +90,26 @@ func TestUsesLocalRuntime_StorageSubcommands(t *testing.T) {
 	assert.True(t, usesLocalRuntime(ctx.Command(), &cli))
 }
 
+// history reads the same API as `status -d`, so a selected local runtime
+// starts for both.
+func TestUsesLocalRuntime_DatabaseHistory(t *testing.T) {
+	for _, args := range [][]string{
+		{"history", "orders", "-e", "staging"},
+		{"status", "-d", "orders", "-e", "staging"},
+	} {
+		var cli CLI
+		parser, err := kong.New(&cli,
+			kong.Name("schemabot"),
+			kong.Writers(io.Discard, io.Discard),
+			kong.Vars{"cli_name": "schemabot"},
+		)
+		require.NoError(t, err)
+		ctx, err := parser.Parse(args)
+		require.NoError(t, err, args)
+		assert.True(t, usesLocalRuntime(ctx.Command(), &cli), args)
+	}
+}
+
 func TestInitWithoutFlagsReachesWizard(t *testing.T) {
 	var cli CLI
 	parser, err := kong.New(&cli, kong.Writers(io.Discard, io.Discard), kong.Vars{"cli_name": "schemabot"})
