@@ -7136,6 +7136,157 @@ func TestControlHandlersRejectClientDatabase(t *testing.T) {
 	}
 }
 
+// A request body holds exactly one JSON value. A body that carries a second
+// object or stray text after it is refused with nothing done: acting on the
+// first value alone would carry out a request other than the one the caller
+// sent. The same body without the trailing data reaches its work, so each probe
+// is shown to see the work it reports as absent.
+func TestRequestHandlersRefuseDataAfterTheJSONValue(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	routes := []struct {
+		name string
+		path string
+		body string
+		// serve builds the service the request is sent to and returns a probe
+		// that reports whether the request reached the work it asks for.
+		serve func(t *testing.T) (*Service, func() bool)
+	}{
+		{
+			name: "pull",
+			path: "/api/pull",
+			body: `{"database":"orders","environment":"production","type":"mysql"}`,
+			serve: func(t *testing.T) (*Service, func() bool) {
+				t.Helper()
+				client := &mockTernClient{pullSchemaResp: &ternv1.PullSchemaResponse{
+					Database: "orders", Type: storage.DatabaseTypeMySQL, Environment: "production",
+				}}
+				cfg := &ServerConfig{
+					Databases: map[string]DatabaseConfig{
+						"orders": {
+							Type:         storage.DatabaseTypeMySQL,
+							Environments: map[string]EnvironmentConfig{"production": {Target: "orders-production", Deployment: DefaultDeployment}},
+						},
+					},
+					TernDeployments: TernConfig{DefaultDeployment: {"production": "localhost:9090"}},
+				}
+				svc := New(&mockStorageWithApplyStores{plans: &staticPlanStore{}, applies: &staticApplyStore{}}, cfg,
+					map[string]tern.Client{DefaultDeployment + "/production": client}, logger)
+				return svc, func() bool { return client.pullSchemaReq != nil }
+			},
+		},
+		{
+			name: "plan",
+			path: "/api/plan",
+			body: `{"database":"payments","environment":"staging","type":"mysql","schema_files":{"payments":{"files":{"users.sql":"CREATE TABLE users (id bigint primary key)"}}}}`,
+			serve: func(t *testing.T) (*Service, func() bool) {
+				t.Helper()
+				client := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-trailing-data"}}
+				plans := &capturingPlanStore{}
+				cfg := &ServerConfig{
+					Databases: map[string]DatabaseConfig{
+						"payments": {
+							Type:         storage.DatabaseTypeMySQL,
+							Environments: map[string]EnvironmentConfig{"staging": {Target: "payments-staging-target", Deployment: DefaultDeployment}},
+						},
+					},
+					TernDeployments: TernConfig{DefaultDeployment: {"staging": "localhost:9090"}},
+				}
+				svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg,
+					map[string]tern.Client{DefaultDeployment + "/staging": client}, logger)
+				return svc, func() bool { return client.planReq != nil || plans.created != nil }
+			},
+		},
+		{
+			name: "apply",
+			path: "/api/apply",
+			body: `{"plan_id":"plan-1","environment":"staging"}`,
+			serve: func(t *testing.T) (*Service, func() bool) {
+				t.Helper()
+				applies := &capturingApplyStore{}
+				svc, _ := newExecuteApplyTestService(&mockTernClient{isRemote: true}, applies)
+				return svc, func() bool {
+					applies.mu.Lock()
+					defer applies.mu.Unlock()
+					return applies.apply != nil
+				}
+			},
+		},
+		{
+			name: "stop",
+			path: "/api/stop",
+			body: `{"apply_id":"apply-123","environment":"staging"}`,
+			serve: func(t *testing.T) (*Service, func() bool) {
+				t.Helper()
+				client := &mockTernClient{stopResp: &ternv1.StopResponse{Accepted: true, StoppedCount: 1}}
+				svc, stores := newControlTestServiceWithStores(client, activeTestApply("apply-123"), nil)
+				return svc, func() bool {
+					stores.controls.mu.Lock()
+					defer stores.controls.mu.Unlock()
+					return len(stores.controls.requests) > 0 || client.stopReq != nil
+				}
+			},
+		},
+		{
+			name: "rollback plan",
+			path: "/api/rollback/plan",
+			body: `{"apply_id":"apply_latest","environment":"staging"}`,
+			serve: func(t *testing.T) (*Service, func() bool) {
+				t.Helper()
+				now := time.Now().UTC()
+				plan := rollbackGuardrailPlan(10, true)
+				plan.Target = "orders"
+				apply := rollbackGuardrailApply("apply_latest", 1, 10, now)
+				apply.Deployment = DefaultDeployment
+				// Tern refuses the rollback plan, so the probe sees the request
+				// reach Tern without the handler going on to store a plan.
+				client := &mockTernClient{planErr: errors.New("tern is unavailable")}
+				svc := New(&mockStorageWithApplyStores{
+					plans:   &staticPlanStore{plansByID: map[int64]*storage.Plan{plan.ID: plan}},
+					applies: &staticApplyStore{applies: []*storage.Apply{apply}},
+					tasks:   &capturingTaskStore{tasks: []*storage.Task{rollbackGuardrailTask(1, 10, now)}},
+				}, testServerConfig(), map[string]tern.Client{DefaultDeployment + "/staging": client}, logger)
+				return svc, func() bool { return client.planReq != nil }
+			},
+		},
+	}
+
+	send := func(t *testing.T, svc *Service, path, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w
+	}
+
+	for _, route := range routes {
+		t.Run(route.name+" without trailing data reaches its work", func(t *testing.T) {
+			svc, reached := route.serve(t)
+			w := send(t, svc, route.path, route.body)
+
+			assert.NotEqual(t, http.StatusBadRequest, w.Code, w.Body.String())
+			assert.True(t, reached(), "the request reaches its work: %s", w.Body.String())
+		})
+
+		trailing := map[string]string{
+			"a second object": route.body + `{"environment":"production"}`,
+			"stray text":      route.body + ` xx`,
+		}
+		for name, body := range trailing {
+			t.Run(route.name+" followed by "+name+" is refused", func(t *testing.T) {
+				svc, reached := route.serve(t)
+				w := send(t, svc, route.path, body)
+
+				assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+				assert.Contains(t, w.Body.String(), "invalid request body: the body must hold one JSON value, but more data follows it")
+				assert.False(t, reached(), "nothing is done for a body that was refused")
+			})
+		}
+	}
+}
+
 func TestControlHandlerRejectsApplyEnvironmentMismatch(t *testing.T) {
 	svc := newControlTestService(&mockTernClient{}, activeTestApply("apply-abc123"))
 	mux := http.NewServeMux()

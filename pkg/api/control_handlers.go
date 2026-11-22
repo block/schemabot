@@ -429,9 +429,7 @@ func (s *Service) rejectControlIfStopPending(ctx context.Context, opName string,
 func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, operation string, dest any,
 	applyID, environment *string) (tern.Client, *storage.Apply, string, bool) {
 
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(dest); err != nil {
+	if err := decodeStrictJSONBody(r, dest); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return nil, nil, "", false
 	}
@@ -3049,9 +3047,7 @@ type RollbackPlanRequest struct {
 // a plan to revert to the schema state before that apply.
 func (s *Service) handleRollbackPlan(w http.ResponseWriter, r *http.Request) {
 	var req RollbackPlanRequest
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
