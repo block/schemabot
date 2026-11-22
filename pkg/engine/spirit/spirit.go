@@ -681,7 +681,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("plan database %s: %w", database, err)
 	}
 	if err := drops.RefuseIgnored(ignored); err != nil {
-		return nil, fmt.Errorf("plan database %s: %w", database, err)
+		return nil, &engine.PlanRefusedError{Err: fmt.Errorf("plan database %s: %w", database, err)}
 	}
 	current, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored, drops)
 	if err != nil {
@@ -726,7 +726,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 					return nil, fmt.Errorf("SQL usage error in %s/%s: %w", namespace, filename, err)
 				}
 				if err := declared.Declare(namespace+"/"+filename, ct.TableName); err != nil {
-					return nil, err
+					return nil, &engine.PlanRefusedError{Err: err}
 				}
 				// The diff names a live table the way it exists, so every
 				// lookup below keys the declaration by that spelling.
@@ -743,13 +743,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	// that already exists. Refuse in namespace order so the error names the
 	// same namespace on every run.
 	for _, namespace := range slices.Sorted(maps.Keys(declaredByNamespace)) {
-		if err := ignored.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
-			return nil, err
-		}
-		if err := drops.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
-			return nil, err
-		}
-		if err := refuseDeclaredSkippedTables(namespace, declaredByNamespace[namespace], current); err != nil {
+		if err := refuseDeclaredTables(namespace, declaredByNamespace[namespace], ignored, drops, current); err != nil {
 			return nil, err
 		}
 	}
@@ -959,6 +953,20 @@ func exemptLiveTables(ignored engine.IgnoredTables, req *engine.PlanRequest, dat
 	return groups
 }
 
+// refuseDeclaredTables refuses the tables a namespace's schema files declare
+// that the config or the naming conventions withhold from the diff. Each is a
+// plan refusal: the schema files or the config must change before the same
+// request can plan.
+func refuseDeclaredTables(namespace string, declared []string, ignored engine.IgnoredTables, drops engine.DroppedTables, live *liveSchema) error {
+	if err := ignored.RefuseDeclared(namespace, declared); err != nil {
+		return &engine.PlanRefusedError{Err: err}
+	}
+	if err := drops.RefuseDeclared(namespace, declared); err != nil {
+		return &engine.PlanRefusedError{Err: err}
+	}
+	return refuseDeclaredSkippedTables(namespace, declared, live)
+}
+
 // refuseDeclaredSkippedTables refuses a schema file that declares a live table
 // a naming convention keeps out of the diff. The diff never sees the live
 // table, so it would propose CREATE TABLE for a table that already exists, and
@@ -978,8 +986,8 @@ func refuseDeclaredSkippedTables(namespace string, declared []string, live *live
 		if !ok {
 			continue
 		}
-		return fmt.Errorf("a schema file in namespace %q declares table %q, which the MySQL planner never manages because %s. Rename the table, or remove its schema file",
-			namespace, table, why)
+		return &engine.PlanRefusedError{Err: fmt.Errorf("a schema file in namespace %q declares table %q, which the MySQL planner never manages because %s. Rename the table, or remove its schema file",
+			namespace, table, why)}
 	}
 	return nil
 }

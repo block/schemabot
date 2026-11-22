@@ -10,6 +10,8 @@ import (
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/block/schemabot/pkg/engine"
 )
 
 // Table-only definitions use the ordinary planner. Managed RLS definitions
@@ -42,6 +44,24 @@ func parseDesiredFiles(namespace string, files map[string]string) (map[string]st
 		parsed[filename] = desired
 	}
 	return parsed, nil
+}
+
+// plannerRefusal reports a planner decline of the declared schema as a plan
+// refusal. pg-sprite names each decline with a sentinel: a change no ALTER can
+// converge, a foreign key to a table the target lacks, a partition or
+// inheritance declaration, and a constraint repeated within one file. Each is
+// fixed by editing the schema files. Any other failure, such as a lost
+// connection or a missing privilege, is returned as it came.
+func plannerRefusal(err error) error {
+	switch {
+	case errors.Is(err, schemadiff.ErrUnsupportedChange),
+		errors.Is(err, schemadiff.ErrReferencedTableNotFound),
+		errors.Is(err, schemadiff.ErrDesiredPartitionOf),
+		errors.Is(err, schemadiff.ErrDesiredInherits),
+		errors.Is(err, schemadiff.ErrDesiredConstraintMerged):
+		return &engine.PlanRefusedError{Err: err}
+	}
+	return err
 }
 
 // referencedTableRemedy names the fix for a foreign key the planner cannot

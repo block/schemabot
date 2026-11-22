@@ -226,7 +226,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("plan PostgreSQL database %q: DSN credentials are required", req.Database)
 	}
 	if err := engine.RefuseDropTables("PostgreSQL", req.DropTables); err != nil {
-		return nil, fmt.Errorf("plan PostgreSQL database %q: %w", req.Database, err)
+		return nil, &engine.PlanRefusedError{Err: fmt.Errorf("plan PostgreSQL database %q: %w", req.Database, err)}
 	}
 
 	pool, closePool, err := openTargetPool(ctx, req.Credentials)
@@ -316,7 +316,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			if enumType, ok := file.EnumType(); ok {
 				enumChanges, err := planEnumType(ctx, pool, namespace, enumType, parser)
 				if err != nil {
-					return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 				}
 				schemaChange.TableChanges = append(schemaChange.TableChanges, enumChanges...)
 				continue
@@ -324,7 +324,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			if rowSecurity, ok := file.RowSecurity(); ok {
 				rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity)
 				if err != nil {
-					return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 				}
 				desiredTables[file.Table()] = true
 				schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
@@ -336,7 +336,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			}
 			report, table, err := planPostgresDefinition(ctx, pool, namespace, desired)
 			if err != nil {
-				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+				return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 			}
 			desiredTables[table] = true
 			crossNamespace, err := crossNamespaceForeignKeysForDrops(ctx, pool, namespace, report)
@@ -373,7 +373,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		// contradiction: the declaring file would keep managing the table while
 		// the config says to leave it alone.
 		if err := ignored.RefuseDeclared(namespace, sortedKeys(desiredTables)); err != nil {
-			return nil, err
+			return nil, &engine.PlanRefusedError{Err: err}
 		}
 		drops, exempt, withheld, err := undeclaredTableDrops(ctx, pool, req.Database, namespace, desiredTables, ignored, parser)
 		if err != nil {
@@ -424,7 +424,7 @@ func refuseTableDeclaredTwice(namespace string, files map[string]pgstatement.Des
 			continue
 		}
 		if err := declared.Declare(filename, files[filename].Table()); err != nil {
-			return fmt.Errorf("plan PostgreSQL namespace %q: %w", namespace, err)
+			return &engine.PlanRefusedError{Err: fmt.Errorf("plan PostgreSQL namespace %q: %w", namespace, err)}
 		}
 	}
 	return nil

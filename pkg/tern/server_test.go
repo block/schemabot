@@ -15,6 +15,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -251,6 +252,44 @@ func TestServerPlanMapsRefusalToFailedPrecondition(t *testing.T) {
 			assert.Equal(t, tc.err.Error(), status.Convert(err).Message())
 		})
 	}
+}
+
+// planWithEngineClient plans through the local client's engine path and
+// returns whatever error that path produces, unchanged, so the server maps the
+// error the engine path really returns.
+type planWithEngineClient struct {
+	Client
+	local *LocalClient
+	files schema.SchemaFiles
+}
+
+func (c planWithEngineClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
+	_, err := c.local.planWithEngine(ctx, req, req.GetDatabase(), c.files)
+	return nil, err
+}
+
+// A refusal the engine path returns for a declared schema reaches the remote
+// caller as FailedPrecondition with its message intact, so the operator who
+// sees it is told what to change and the data plane is not reported as failing.
+func TestServerPlanMapsEnginePathRefusalToFailedPrecondition(t *testing.T) {
+	local, err := NewLocalClient(LocalConfig{
+		Database:  "orders",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: "user:pass@tcp(localhost:3306)/orders",
+	}, nil, slog.Default())
+	require.NoError(t, err)
+	server := NewServer(planWithEngineClient{
+		local: local,
+		files: schema.SchemaFiles{"orders": {Files: map[string]string{"orders.sql": "CREATE TABLE orders (id INT)"}}},
+	}, slog.Default())
+
+	_, err = server.Plan(t.Context(), &ternv1.PlanRequest{
+		Database:             "orders",
+		UnselectedNamespaces: []string{"ns_1"},
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, status.Convert(err).Message(), "a targets entry that selects namespaces is not supported for MySQL targets whose DSN names a database")
 }
 
 func TestServerApplyScopedRPCsRequireApplyID(t *testing.T) {
