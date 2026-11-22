@@ -3224,7 +3224,7 @@ That command wasn't recognized. Available commands:
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Failed
 <!-- schemabot:offer-support-channel -->
@@ -5454,7 +5454,7 @@ Verify the database name, or run the command against the SchemaBot instance that
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: In Progress
 
@@ -5485,7 +5485,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Applied
 
@@ -5506,7 +5506,7 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Failed
 <!-- schemabot:offer-support-channel -->
@@ -5537,7 +5537,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Stopped
 
@@ -5566,7 +5566,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: In Progress
 
@@ -5615,7 +5615,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: In Progress
 
@@ -5664,7 +5664,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: In Progress
 
@@ -5712,7 +5712,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: In Progress
 
@@ -5761,7 +5761,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: In Progress
 
@@ -5810,7 +5810,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: In Progress
 
@@ -5858,7 +5858,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Catching Up
 
@@ -5906,7 +5906,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Checksumming
 
@@ -5954,7 +5954,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Options**: ⏸️ Defer Cutover
 
@@ -6004,7 +6004,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Applying Final Changes
 
@@ -6052,7 +6052,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: In Progress
 
@@ -6099,7 +6099,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: In Progress
 
@@ -6225,7 +6225,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Applied
 
@@ -6262,7 +6262,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: In Progress
 
@@ -6294,7 +6294,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: In Progress
 
@@ -6335,7 +6335,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: In Progress
 
@@ -6373,7 +6373,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Retrying
 
@@ -6421,7 +6421,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Retrying
 
@@ -6469,7 +6469,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Failed
 <!-- schemabot:offer-support-channel -->
@@ -6516,7 +6516,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Failed
 <!-- schemabot:offer-support-channel -->
@@ -6563,7 +6563,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Failed
 <!-- schemabot:offer-support-channel -->
@@ -6611,7 +6611,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Stopped
 
@@ -6650,7 +6650,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Stopped
 
@@ -6691,7 +6691,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Stopped
 
@@ -6737,7 +6737,7 @@ A freeze that stops schema changes in this environment took effect before the st
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Resuming
 
@@ -6768,7 +6768,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Cancelled
 
@@ -6803,7 +6803,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Waiting for Cutover
 
@@ -6851,7 +6851,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Waiting for Cutover
 
@@ -6896,7 +6896,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Waiting for Cutover
 
@@ -6944,7 +6944,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Cutting Over
 
@@ -6983,7 +6983,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Revert Window | Closes in 28m 30s
 
@@ -7036,7 +7036,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Skipping revert
 
@@ -7081,7 +7081,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Reverting
 
@@ -7187,7 +7187,7 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Stopped
 
@@ -7224,7 +7224,7 @@ Schema change reverting — the revert is tracked in [a new progress comment](ht
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Revert Window
 
@@ -7267,7 +7267,7 @@ Revert skipped — the schema change is finalizing in [a new progress comment](h
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Revert Window
 
@@ -7310,7 +7310,7 @@ Cutover started — progress continues in [a new progress comment](https://githu
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Waiting for Cutover
 
@@ -7350,7 +7350,7 @@ Cutover complete — progress continues in [a new progress comment](https://gith
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Waiting for Cutover
 
@@ -7390,7 +7390,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: Stopped
 
@@ -8083,7 +8083,7 @@ schemabot unlock
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 **Status**: In Progress
 
@@ -9841,7 +9841,7 @@ No schema changes found for database 'new-db'
 
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @aparajon at 2026-03-15 14:18:00 UTC*
 
 **Deployments**: 1 ready for cutover, 1 running, 2 waiting
 
@@ -9961,7 +9961,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @aparajon at 2026-03-15 14:24:00 UTC*
 
 **Deployments**: 1 running, 1 waiting
 
@@ -10045,7 +10045,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @aparajon at 2026-03-15 14:10:00 UTC*
 
 **Targets**: 40 completed, 8 running, 79 queued, 1 failed
 
@@ -10133,7 +10133,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @aparajon at 2026-03-15 14:10:00 UTC*
 
 🔄 Rolling out: 1 of 3 targets done, 1 running, 1 queued
 
@@ -10168,7 +10168,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @aparajon at 2026-03-15 14:10:00 UTC*
 
 <details><summary>Apply details (1 table done on 3 targets)</summary>
 
@@ -10190,7 +10190,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @aparajon at 2026-03-15 14:18:00 UTC*
 
 **Deployments**: 1 ready for cutover, 1 running, 2 waiting
 
@@ -10313,7 +10313,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @aparajon at 2026-03-15 14:10:00 UTC*
 
 **Deployments**: 1 completed, 2 halted, 1 failed
 
@@ -10430,7 +10430,7 @@ schemabot apply -e production
 
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @aparajon at 2026-03-15 14:00:00 UTC*
 
 **Deployments**: 3 completed
 
@@ -10550,7 +10550,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @aparajon at 2026-03-15 14:00:00 UTC*
 
 **Deployments**: 3 completed
 
@@ -10671,7 +10671,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <!-- schemabot:offer-support-channel -->
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @aparajon at 2026-03-15 14:10:00 UTC*
 
 **Deployments**: 1 completed, 2 halted, 1 failed
 

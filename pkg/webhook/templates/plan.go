@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/mattn/go-runewidth"
 
@@ -236,6 +237,11 @@ type PlanCommentData struct {
 	// Options
 	DeferCutover bool
 	SkipRevert   bool
+
+	// RequestedAt is when the command that asked for this comment was posted.
+	// The attribution line shows it as the request time. Zero shows the
+	// render time instead.
+	RequestedAt time.Time
 
 	// Lock state (set when rendering apply-plan comments)
 	IsLocked     bool
@@ -1131,7 +1137,11 @@ func writePlanMetadata(sb *strings.Builder, data PlanCommentData) {
 }
 
 func writePlanAttribution(sb *strings.Builder, data PlanCommentData) {
-	writeAttributionLineWithSuffix(sb, "Requested", data.RequestedBy, planCommitSuffix(data.Repository, data.HeadSHA))
+	requestedAt := currentTimestamp()
+	if !data.RequestedAt.IsZero() {
+		requestedAt = data.RequestedAt.UTC().Format("2006-01-02 15:04:05 UTC")
+	}
+	writeAttributionLineAt(sb, "Requested", data.RequestedBy, requestedAt, planCommitSuffix(data.Repository, data.HeadSHA))
 }
 
 func planCommitSuffix(repository, sha string) string {
