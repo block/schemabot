@@ -758,7 +758,7 @@ one and stays on screen while the watch keeps following the apply:
 ```console
 Press Enter to proceed with cutover (or ESC to detach)
 
-✗ production is frozen. This cutover did not start.
+❄️ production is frozen. This cutover did not start.
    freeze-abc  SEV-1234 payments latency  (until lifted)
 To ask for an override, run:
   schemabot cutover apply-example-73 -e production --override "<reason>"

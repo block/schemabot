@@ -89,7 +89,7 @@ func TestChangeGateRefusedTextNamesTheOverrideCommand(t *testing.T) {
 	})
 
 	require.Len(t, lines, 4)
-	assert.Equal(t, "✗ production is frozen. This cutover did not start.", lines[0])
+	assert.Equal(t, "❄️ production is frozen. This cutover did not start.", lines[0])
 	assert.Equal(t, "To ask for an override, run:", lines[2])
 	assert.Equal(t, `  schemabot cutover apply-`+lineAttackCleaned+` -e production --override "<reason>"`, lines[3])
 	assertNoTerminalControls(t, strings.Join(lines, "\n"))
