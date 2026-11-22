@@ -52,7 +52,10 @@ picks the safest form PostgreSQL offers. A `CREATE INDEX` becomes `CREATE INDEX
 CONCURRENTLY`, and a new constraint is added `NOT VALID` and then validated.
 Each attempt runs under a short lock timeout and statement timeout, so a change
 that turns out to be expensive is cancelled and rolled back instead of holding
-the table. When pg-sprite cannot find a safe form, it refuses with a typed
+the table. A concurrent index build is the exception: it cannot run inside a
+transaction, so it runs under a separate duration bound, and a failed build can
+leave an invalid index behind for the retry to clean up (see [Index
+builds](#index-builds)). When pg-sprite cannot find a safe form, it refuses with a typed
 reason. pg-sprite supports PostgreSQL 14 and later, including Amazon RDS and
 Aurora.
 
@@ -118,9 +121,15 @@ reviewed process.
 With Docker running, run `schemabot init` in an empty directory, choose **Try a
 sample database**, and pick PostgreSQL. SchemaBot starts a local PostgreSQL
 container, seeds two tables, pulls them into schema files, and confirms the
-files match the database. Edit a file, then run `schemabot plan` to see the
-change and `schemabot apply` to run it. [Initialize a database](init.md) walks
-through each step.
+files match the database. Edit a file, then review and run the change:
+
+```bash
+schemabot plan -s schema -e development
+schemabot apply -s schema -e development
+```
+
+When init prints its next command with a `--profile` flag, add the same flag to
+both. [Initialize a database](init.md) walks through each step.
 
 ### Bring an existing database
 
@@ -170,8 +179,9 @@ supply a DSN.
 | To | The connected role needs |
 |---|---|
 | Plan | `CONNECT` on the database, `USAGE` on each schema, and `CREATE` on the database. Planning builds the desired tables in a scratch schema inside a transaction it always rolls back, so it also needs the read-write primary, not a hot standby |
-| Alter a table or add an index | To own the table, or to be a member that inherits the owner role |
-| Create a table | `CREATE` on the schema. With `table_owner` set, membership in that owner role |
+| Alter a table | To own the table, or to be a member that inherits the owner role |
+| Add an index to an existing table | The same, plus `CREATE` on the schema. Grant it to the owner role, and the connected role inherits it |
+| Create a table | `CREATE` on the schema. With `table_owner` set, the connected role needs membership in that owner role instead, and the owner role needs `USAGE` and `CREATE` on the schema |
 | Cancel an index build | Nothing more. Membership in `pg_signal_backend` lets the cancel reach the build's backend directly |
 
 SchemaBot checks the privileges each statement needs before running it, and a
