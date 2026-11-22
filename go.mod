@@ -11,7 +11,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.50.11
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.9
 	github.com/block/mysql v0.0.0-20261117230711-208b4ce0ea9a
-	github.com/block/pg-sprite v0.5.5-0.20261122193009-cb62dea0c1f4
+	github.com/block/pg-sprite v0.5.5-0.20261122200143-2a73d75867e2
 	github.com/block/spirit v0.20.1-0.20261120155727-bd7200b551bd
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
