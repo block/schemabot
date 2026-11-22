@@ -22,16 +22,27 @@ SEED = SCRIPTS / "e2e-seed.sh"
 # the script should have stopped kept it waiting.
 RUN_DEADLINE = 30
 
-# Records each seed apply it is asked to run, prints its apply ID the way the
-# real CLI does once the server accepts it, then hangs, fails, or succeeds as
-# FAKE_HANG and FAKE_FAIL say. A failing seed waits until every hanging seed has
-# started, so the failure always lands while a seed apply is in flight. A
-# cancel is recorded, so the fake progress API reports that apply cancelled.
+# Records each seed apply it is asked to run and prints its apply ID the way
+# the real CLI does once the server accepts it, unless FAKE_NO_ID names it.
+# Then it hangs, fails, or succeeds as the FAKE_* lists say:
+#   FAKE_HANG        the watch never returns.
+#   FAKE_FAIL        the apply fails on the server, which settles it, and the
+#                    CLI exits 1.
+#   FAKE_WATCH_FAIL  the CLI exits 1 while the apply keeps running on the
+#                    server.
+# A failing seed waits until every hanging seed has started, so the failure
+# always lands while a seed apply is in flight. A cancel of a running apply is
+# recorded, so the fake progress API reports it cancelled. A cancel of a
+# settled apply does nothing, as the real command does.
 FAKE_SCHEMABOT = textwrap.dedent(
     """\
     #!/usr/bin/env bash
     if [ "$1" = cancel ]; then
       # Invoked as: cancel <apply id> -e <env> ...
+      if grep -qx "$2" "$FAKE_STATE/settled-failed" 2>/dev/null; then
+        echo "Schema change already terminal (state: failed) - nothing to cancel"
+        exit 0
+      fi
       echo "$2" >> "$FAKE_STATE/cancelled"
       exit 0
     fi
@@ -40,16 +51,26 @@ FAKE_SCHEMABOT = textwrap.dedent(
     label="$engine-$5"
     echo "$label" >> "$FAKE_STATE/started"
     echo $$ > "$FAKE_STATE/$label.pid"
-    echo "Apply started: apply-$label"
+    case " ${FAKE_NO_ID:-} " in *" $label "*) ;; *) echo "Apply started: apply-$label" ;; esac
     case " ${FAKE_HANG:-} " in *" $label "*) exec sleep 300 ;; esac
+    wait_for_hanging_seeds() {
+      for hanging in ${FAKE_HANG:-}; do
+        for _ in $(seq 1 100); do
+          [ -f "$FAKE_STATE/$hanging.pid" ] && break
+          sleep 0.1
+        done
+      done
+    }
     case " ${FAKE_FAIL:-} " in
       *" $label "*)
-        for hanging in ${FAKE_HANG:-}; do
-          for _ in $(seq 1 100); do
-            [ -f "$FAKE_STATE/$hanging.pid" ] && break
-            sleep 0.1
-          done
-        done
+        wait_for_hanging_seeds
+        echo "apply-$label" >> "$FAKE_STATE/settled-failed"
+        exit 1
+        ;;
+    esac
+    case " ${FAKE_WATCH_FAIL:-} " in
+      *" $label "*)
+        wait_for_hanging_seeds
         exit 1
         ;;
     esac
@@ -58,8 +79,10 @@ FAKE_SCHEMABOT = textwrap.dedent(
 )
 
 FAKE_DOCKER = '#!/usr/bin/env bash\necho "fake docker $*"\n'
-# Answers the progress API with "cancelled" for an apply the fake CLI
-# cancelled and "running" otherwise. Counts each VSchema it is asked to seed,
+# Answers the progress API: "failed" for an apply that failed on the server,
+# "cancelled" for one the fake CLI cancelled, and "running" otherwise. For an
+# apply FAKE_TABLE_LAG names, the first answer after its cancel still shows a
+# table running under the cancelled parent. Each answer is counted. Counts each VSchema it is asked to seed,
 # and rejects them all when FAKE_CURL_FAIL is set, the way curl -f reports an
 # HTTP error. Like a failing seed apply, it waits for every hanging seed to
 # start before it fails.
@@ -70,10 +93,18 @@ FAKE_CURL = textwrap.dedent(
     case "$url" in
       */api/progress/apply/*)
         id="${url##*/}"
-        if grep -qx "$id" "$FAKE_STATE/cancelled" 2>/dev/null; then
-          echo '{"state": "cancelled"}'
+        echo "$id" >> "$FAKE_STATE/progress-polls"
+        if grep -qx "$id" "$FAKE_STATE/settled-failed" 2>/dev/null; then
+          echo '{"state": "failed", "tables": [{"status": "failed"}]}'
+        elif grep -qx "$id" "$FAKE_STATE/cancelled" 2>/dev/null; then
+          if [ "$id" = "${FAKE_TABLE_LAG:-}" ] && [ ! -f "$FAKE_STATE/table-lag-seen" ]; then
+            touch "$FAKE_STATE/table-lag-seen"
+            echo '{"state": "cancelled", "tables": [{"status": "cancelled"}, {"status": "running"}]}'
+          else
+            echo '{"state": "cancelled", "tables": [{"status": "cancelled"}]}'
+          fi
         else
-          echo '{"state": "running"}'
+          echo '{"state": "running", "tables": [{"status": "running"}]}'
         fi
         exit 0
         ;;
@@ -137,6 +168,10 @@ class SeedRun:
         path = self.state / "cancelled"
         return path.read_text().split() if path.exists() else []
 
+    def progress_polls(self, apply_id):
+        path = self.state / "progress-polls"
+        return path.read_text().split().count(apply_id) if path.exists() else 0
+
 
 class E2ESeedTest(unittest.TestCase):
     def setUp(self):
@@ -148,7 +183,7 @@ class E2ESeedTest(unittest.TestCase):
         write_executable(self.root / "fakebin" / "curl", FAKE_CURL)
         (self.root / "examples").symlink_to(REPO / "examples")
 
-    def run_seed(self, timeout="30", hang="", fail="", curl_fail="", compose=E2E_DC):
+    def run_seed(self, timeout="30", hang="", fail="", watch_fail="", no_id="", table_lag="", curl_fail="", compose=E2E_DC):
         state = pathlib.Path(tempfile.mkdtemp(dir=self.root))
         env = dict(os.environ)
         env.update(
@@ -158,6 +193,9 @@ class E2ESeedTest(unittest.TestCase):
             FAKE_STATE=str(state),
             FAKE_HANG=hang,
             FAKE_FAIL=fail,
+            FAKE_WATCH_FAIL=watch_fail,
+            FAKE_NO_ID=no_id,
+            FAKE_TABLE_LAG=table_lag,
             FAKE_CURL_FAIL=curl_fail,
         )
         # Output goes to a file rather than a pipe: a seed apply the script
@@ -236,7 +274,39 @@ class E2ESeedTest(unittest.TestCase):
         run = self.run_seed(fail="mysql-production")
         self.assertEqual(run.returncode, 1, run.output)
         self.assertIn("vitess-production", run.started())
-        self.assertEqual(run.cancelled(), [], "a seed apply that failed on its own is already settled")
+        self.assertEqual(run.cancelled(), [], "a seed apply that failed on the server is already settled")
+        self.assertIn("Seed apply (mysql-production) apply-mysql-production settled as failed", run.output)
+
+    # The CLI's watch fails while its apply is still running on the server.
+    # The script cancels the apply there and waits for it to settle, rather
+    # than leaving it running after the setup fails.
+    def test_a_failed_watch_cancels_the_apply_still_running_on_the_server(self):
+        run = self.run_seed(watch_fail="vitess-staging")
+        self.assertEqual(run.returncode, 1, run.output)
+        self.assertEqual(run.cancelled(), ["apply-vitess-staging"])
+        self.assertIn("Seed apply (vitess-staging) apply-vitess-staging settled as cancelled", run.output)
+        self.assertNotIn("vitess-production", run.started())
+
+    # The parent reads cancelled while one of its tables is still running. The
+    # script keeps waiting until the table settles too.
+    def test_a_cancelled_parent_with_a_running_table_is_not_yet_settled(self):
+        run = self.run_seed(timeout="1", hang="vitess-staging", table_lag="apply-vitess-staging")
+        self.assertEqual(run.returncode, 1, run.output)
+        self.assertEqual(run.cancelled(), ["apply-vitess-staging"])
+        self.assertEqual(run.progress_polls("apply-vitess-staging"), 2)
+        self.assertIn("Seed apply (vitess-staging) apply-vitess-staging settled as cancelled", run.output)
+
+    # The CLI is stopped before it printed an apply ID. The script says it
+    # cannot tell whether the server accepted the apply, rather than claiming
+    # nothing is running there.
+    def test_a_stopped_apply_with_no_id_is_reported_as_unresolved(self):
+        run = self.run_seed(timeout="1", hang="vitess-staging", no_id="vitess-staging")
+        self.assertEqual(run.returncode, 1, run.output)
+        self.assertEqual(run.cancelled(), [])
+        self.assertIn(
+            "seed apply (vitess-staging) printed no apply ID, so the script cannot tell whether the server accepted it and cannot cancel it there",
+            run.output,
+        )
 
     def test_a_stalled_seed_apply_fails_at_the_bound(self):
         run = self.run_seed(timeout="1", hang="vitess-staging")

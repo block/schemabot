@@ -11,9 +11,10 @@
 # inside the path that collects evidence.
 #
 # When a VSchema seed or the Vitess pair fails, the MySQL pair is stopped before
-# the script exits. A seed apply that is stopped, whether by the bound or by a
-# sibling's failure, is also cancelled on the server and given time to settle,
-# so no seed apply keeps changing a database after the setup it belonged to.
+# the script exits. A seed apply that does not succeed, whether the bound or a
+# sibling's failure stopped it or its CLI failed, is also cancelled on the
+# server and given time to settle, so no seed apply keeps changing a database
+# after the setup it belonged to.
 #
 # E2E_DC is the docker compose command for the e2e stack. The Makefile passes it
 # in, so the failure log dump reads the same compose project the tests run in.
@@ -132,18 +133,40 @@ show_seed_output() {
   cat "$log"
 }
 
-# cancel_seed_apply <label> <env> cancels a seed apply the script stopped
-# before it finished, and waits for it to settle. Stopping the CLI only stops
-# its watch: the apply belongs to the server, which keeps running it until it
-# is cancelled through the server's durable control path.
+# seed_apply_settled <apply ID> prints "settled <state>" when the apply and
+# every table under it have reached a state no driver will write again, and
+# "unsettled <state>" otherwise. A settled parent alone is not proof its work
+# stopped: one failed table fails the apply while a sibling table keeps copying.
+# Operation rows, which a multi-deployment apply carries, are checked the same
+# way. A response it cannot read counts as unsettled.
+seed_apply_settled() {
+  curl -sS --max-time 5 "$endpoint/api/progress/apply/$1" | perl -MJSON::PP -0777 -ne '
+    sub norm { my $s = lc(shift // ""); $s =~ s/^state_//; $s }
+    my %settled = map { $_ => 1 } qw(completed failed cancelled reverted);
+    my $p = eval { decode_json($_) };
+    if (ref $p ne "HASH") { print "unsettled unreadable"; exit }
+    my $state = norm($p->{state});
+    my $open = !$settled{$state}
+      || grep({ !$settled{norm($_->{state})} } @{ $p->{operations} // [] })
+      || grep({ !$settled{norm($_->{status})} } @{ $p->{tables} // [] });
+    print $open ? "unsettled $state" : "settled $state";
+  '
+}
+
+# cancel_seed_apply <label> <env> cancels a seed apply that did not succeed,
+# whether the script stopped it or its CLI failed, and waits for it to settle.
+# The CLI exiting only ends its watch: the apply belongs to the server, which
+# keeps running it until it is cancelled through the server's durable control
+# path. For an apply that has already settled, the cancel does nothing and the
+# settle check passes at once.
 cancel_seed_apply() {
-  local label=$1 env=$2 id state deadline
+  local label=$1 env=$2 id result deadline
   [ -n "$label" ] || return 0
   show_seed_output "$label"
   id=$(sed -n 's/^Apply started: //p' "$seed_logs/$label.log" 2>/dev/null | tail -n 1)
   if [ -z "$id" ]; then
-    echo "seed apply ($label) printed no apply ID, so there is no server-side apply to cancel" >&2
-    return 0
+    echo "seed apply ($label) printed no apply ID, so the script cannot tell whether the server accepted it and cannot cancel it there" >&2
+    return 1
   fi
   echo "Cancelling seed apply ($label) $id on the server"
   if ! (bounded "$cancel_limit" "cancel of seed apply ($label) $id" \
@@ -153,16 +176,15 @@ cancel_seed_apply() {
   fi
   deadline=$((SECONDS + settle_limit))
   while :; do
-    state=$(curl -sS --max-time 5 "$endpoint/api/progress/apply/$id" |
-      perl -MJSON::PP -0777 -ne 'my $s = lc(eval { decode_json($_)->{state} } // ""); $s =~ s/^state_//; print $s')
-    case "$state" in
-      completed | failed | cancelled | reverted)
-        echo "Seed apply ($label) $id settled as $state"
+    result=$(seed_apply_settled "$id")
+    case "$result" in
+      settled\ *)
+        echo "Seed apply ($label) $id settled as ${result#settled }"
         return 0
         ;;
     esac
     if [ "$SECONDS" -ge "$deadline" ]; then
-      echo "seed apply ($label) $id did not settle within ${settle_limit}s of its cancel; it is still '$state' on the server" >&2
+      echo "seed apply ($label) $id did not settle within ${settle_limit}s of its cancel; the server still reports '${result#unsettled }' or unfinished table work" >&2
       return 1
     fi
     sleep 1
@@ -183,9 +205,9 @@ stop_seed_applies() {
 }
 
 # seed_pair <engine> <schema dir> applies one schema to staging, then
-# production. When the bound ends an apply, or a SIGTERM stops the pair, the
-# apply in flight is stopped and then cancelled on the server, so whoever stops
-# the pair knows nothing it started is still changing a database.
+# production. When a seed apply does not succeed, or a SIGTERM stops the pair,
+# the apply is stopped and then cancelled on the server, so whoever stops the
+# pair knows nothing it started is still changing a database.
 seed_pair() {
   local engine=$1 schema=$2 env status
   label='' seed_env=''
@@ -195,18 +217,15 @@ seed_pair() {
     seed_apply "$label" "$env" "$schema" &
     wait "$!"
     status=$?
-    if [ "$status" -eq 124 ]; then
+    if [ "$status" -ne 0 ]; then
       # The cancel runs to completion even if a SIGTERM arrives meanwhile;
       # the trap would otherwise end it before the apply settles.
       trap : TERM
       cancel_seed_apply "$label" "$env"
-      return 124
+      return "$status"
     fi
     show_seed_output "$label"
     label=''
-    if [ "$status" -ne 0 ]; then
-      return "$status"
-    fi
   done
 }
 
