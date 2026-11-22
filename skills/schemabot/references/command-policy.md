@@ -95,7 +95,7 @@ The disclosure line states:
 - **what the change does**: factually, such as *additive*, *adds a nullable column*, *adds an index*;
 - **the limit**, stated as policy: production applies are never posted automatically.
 
-Never call a change "safe". Whether a change is destructive is SchemaBot's finding, not yours, and an additive change can still be a long, heavy copy.
+Never call a change "safe". SchemaBot flags drops, but not every change that can lose data, such as a narrowing type change (see [Unsafe changes and drops](change-behavior.md#unsafe-changes-and-drops)), and an additive change can still be a long, heavy copy.
 
 Don't start the disclosure line with the word "SchemaBot". Matching ignores case, so a line like `SchemaBot apply requested by …` can be read as a command.
 

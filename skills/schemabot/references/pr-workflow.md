@@ -12,10 +12,10 @@
 
 1. **Edit the declarative schema** to the desired end state. See [Authoring](authoring.md).
 2. **Open a PR.** SchemaBot plans on its own when the PR opens, when commits are pushed, and when it is reopened. It posts a plan comment with the DDL it will run and sets the check. A push that changes no schema file refreshes the checks without a new comment. When the files already match the live database, no plan comment is posted and the passing check is the signal. `schemabot plan` runs the same plan on demand.
-3. **Review the plan.** Confirm the DDL matches the intent. Destructive changes are flagged and blocked: see [Unsafe changes and drops](change-behavior.md#unsafe-changes-and-drops).
+3. **Review the plan.** Confirm the DDL matches the intent. Drops are flagged and blocked; a narrowing type change or a removed `ENUM` value is not, so check those against the data yourself. See [Unsafe changes and drops](change-behavior.md#unsafe-changes-and-drops).
 4. **Apply to each environment in order**, by commenting the command from the plan comment, such as `schemabot apply -e staging`. Who posts it is set by the [command policy](command-policy.md). SchemaBot plans again, takes the database lock, and applies when the new plan matches the reviewed one. When it cannot verify that, it posts the new plan, moves the check to `action_required`, and waits for `schemabot apply-confirm -e staging`. Ask the user about that confirmation, because it means the plan changed.
 5. **Watch progress.** SchemaBot updates a progress comment as the apply moves: running, copying rows with a percentage and ETA for large tables, cutover, then applied. The comment always shows the current state and the next command. When the comments stop updating, use [the CLI](cli.md).
-6. **Merge** once the required checks pass.
+6. **Merge** once the required checks pass. If the PR's base branch changed, comment `schemabot plan` first and wait for its results and any applies it calls for: a check that passed before the base changed can still satisfy GitHub.
 
 **Don't assume the environment list.** The environments a database has, and their order, live in the server's configuration, not in the repo. Some databases have only production. Until the plan posts, say "the environments the plan lists"; after it posts, read them from the plan comment and the checks. A later environment's apply is refused until the earlier ones have the change.
 

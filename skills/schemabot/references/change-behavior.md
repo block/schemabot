@@ -34,6 +34,8 @@ Drops are still declarative. Delete a table's `.sql` file to drop the table; rem
 
 A change is **unsafe** when it destroys data or structure: `DROP TABLE`, `DROP COLUMN`, or dropping an index that was not made invisible first. The plan lists it under ⚠️ Issues and the apply is refused until someone acknowledges it with `--allow-unsafe`. That command is the human's, in every environment (see the [command policy](command-policy.md)). Follow the deploy order below first.
 
+The gate does not catch every change that can lose data. Narrowing a column's type, such as `varchar(255)` to `varchar(10)` or `bigint` to `tinyint`, and removing an `ENUM` or `SET` value plan and apply without `--allow-unsafe`, on every engine. Before applying one, check it against the data the column already holds, and tell the user SchemaBot did not flag it.
+
 Some statements the engine cannot run at all are listed under ⛔ Cannot apply. No flag overrides those: rewrite the change. [Lint and safety levels](https://github.com/block/schemabot/blob/main/docs/lint-and-safety-levels.md) explains each level.
 
 **Dropping an index:**

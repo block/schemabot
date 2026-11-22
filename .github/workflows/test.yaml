@@ -51,6 +51,10 @@ jobs:
               - '!**/*.md'
               - '!docs/.toc-manifest'
               - '!{docs,assets}/**/*.{svg,png,jpg,jpeg,gif,webp,ico}'
+            # The agent skill is Markdown, but the Unit Tests job parses its
+            # commands and pins its command policy, so a skill edit runs CI.
+            skill:
+              - 'skills/**'
       - name: "Resolve code-change and coverage flags"
         id: out
         shell: bash
@@ -58,6 +62,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           FILTER_OUTCOME: ${{ steps.filter.outcome }}
           FILTER_CODE: ${{ steps.filter.outputs.code }}
+          FILTER_SKILL: ${{ steps.filter.outputs.skill }}
           PR_SMOKE_ENABLED: ${{ vars.PR_SMOKE_E2E_ENABLED }}
         run: |
           set -euo pipefail
@@ -66,6 +71,8 @@ jobs:
             code=true
           elif [ "$FILTER_OUTCOME" != "success" ]; then
             echo "::warning::paths-filter failed; running CI instead of skipping"
+            code=true
+          elif [ "$FILTER_SKILL" = "true" ]; then
             code=true
           else
             code="$FILTER_CODE"

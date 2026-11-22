@@ -480,10 +480,9 @@ func assertParsesAsPRComment(t *testing.T, where string, args []string) {
 	assert.Equal(t, args[0], result.Action, "%s: parsed as a different command", where)
 	assert.False(t, result.EnvironmentError, "%s: invalid -e value", where)
 	assert.False(t, result.TenantError, "%s: invalid --tenant value", where)
-	if isMultiEnvPlan(result) {
-		return
-	}
-	if !assert.True(t, result.Found, "%s: the PR comment parser does not accept this command", where) {
+	// A plan with no -e plans every environment, which the parser reports as
+	// not found; its flags are still checked below.
+	if !isMultiEnvPlan(result) && !assert.True(t, result.Found, "%s: the PR comment parser does not accept this command", where) {
 		return
 	}
 
