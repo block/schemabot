@@ -685,8 +685,9 @@ func (r *refusal) compose(err error) {
 }
 
 const (
-	replanRemedy    = "re-plan against the current schema"
-	clauseSeparator = "; "
+	replanRemedy             = "re-plan against the current schema"
+	invariantViolationRemedy = "inspect the target and server logs before re-running"
+	clauseSeparator          = "; "
 )
 
 // sequenceStepClause names the failed step of a multi-statement create set
@@ -1004,7 +1005,7 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		// apply fails closed until an operator has inspected the target.
 		return &refusal{reason: "engine-invariant-violation",
 			cause:  fmt.Sprintf("the engine's safety invariants did not hold while changing table %s", quotedTable(table)),
-			remedy: "inspect the target and server logs before re-running"}, true
+			remedy: invariantViolationRemedy}, true
 	case executor.CodeInvalidIndexOtherTable, executor.CodeInvalidIndexNotDroppable:
 		// The permanent members of the invalid-index family: the requested
 		// name is held by an entry this change can never clear — an invalid

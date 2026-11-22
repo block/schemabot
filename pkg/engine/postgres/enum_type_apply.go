@@ -56,8 +56,9 @@ func validateEnumValueAdd(req *engine.ApplyRequest, tc engine.TableChange, st pg
 // run in planned order, and each placement names a label the type already
 // carried when the plan was made.
 //
-// INV: ST-7 — the label is added only to the type the check resolved.
-// pg-sprite confirms by OID before its commit and rolls back otherwise.
+// The label is added only to the type the check resolved: pg-sprite's
+// executor confirms the type by OID before its commit and rolls back
+// otherwise (pg-sprite's ST-7, not an entry in SchemaBot's registry).
 func executeEnumValueAdd(ctx context.Context, pool *pgxpool.Pool, change nativeApply) error {
 	st, err := pgstatement.ParseOne(change.sql)
 	if err != nil {
@@ -129,6 +130,12 @@ func enumTypeRefusal(err error, typeName string) *refusal {
 		return &refusal{reason: "planned-object-drift",
 			cause:  fmt.Sprintf("%s is placed next to label %s, which another change renamed or removed from enum type %s after planning", quotedTable(enumErr.label), quotedTable(enumErr.neighbor), quotedTable(typeName)),
 			remedy: replanRemedy}
+	}
+	if executor.OutcomeCode(err) == executor.CodeInvariantViolation {
+		// The shared arm words this for a table; an enum step names its type.
+		return &refusal{reason: "engine-invariant-violation",
+			cause:  fmt.Sprintf("the engine's safety invariants did not hold while changing enum type %s", quotedTable(typeName)),
+			remedy: invariantViolationRemedy}
 	}
 	return nil
 }

@@ -765,7 +765,9 @@ an unrenderable ignored table or undeclared archive does not prevent capture.
 Managed RLS tables still prevent capture until recovery can restore their
 complete access rules alongside sibling tables. Capture never strips policies to
 mark a plan rollback-capable, and a catalog read failure or cancellation still
-ends planning. [RV-7](invariants.md#rv-7-rollback-needs-the-originals)
+ends planning. Rollback never removes an enum label: capture covers tables
+only, and PostgreSQL cannot drop a label. A label the plan added stays on its
+type after rollback, while the plan's table changes are reversed. [RV-7](invariants.md#rv-7-rollback-needs-the-originals)
 requires complete originals before rollback can proceed; missing originals in
 older plans are never reconstructed from the current target.
 

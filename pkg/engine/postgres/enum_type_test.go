@@ -223,8 +223,9 @@ func TestValidateOptimisticApplyEnumValueAdd(t *testing.T) {
 }
 
 // An enum step's failures reach the operator as refusals that name the
-// type: a missing grant, a type that is gone, and a label another change
-// added after planning, each with what to do next. A type name that moved
+// type: a missing grant, a type that is gone, a label another change added
+// after planning, a placement label another change removed, and a
+// broken engine invariant, each with what to do next. A type name that moved
 // to another type is pg-sprite's typed drift, refused by the shared
 // mapping. None of them is retried.
 func TestEnumTypeRefusals(t *testing.T) {
@@ -260,6 +261,12 @@ func TestEnumTypeRefusals(t *testing.T) {
 				&pgconn.PgError{Code: "22023", Message: `"shipped" is not an existing enum label`})},
 			reason: "planned-object-drift",
 			detail: `"packed" is placed next to label "shipped", which another change renamed or removed from enum type "order_status" after planning; re-plan against the current schema`,
+		},
+		{
+			name:   "engine invariant violated",
+			err:    &enumTypeError{err: fmt.Errorf("add label: %w", executor.ErrInvariantViolation)},
+			reason: "engine-invariant-violation",
+			detail: `the engine's safety invariants did not hold while changing enum type "order_status"; inspect the target and server logs before re-running`,
 		},
 		{
 			name:   "type name moved to another type",
