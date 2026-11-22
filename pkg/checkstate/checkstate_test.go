@@ -125,7 +125,7 @@ func TestDiagnose(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := Diagnose(tt.check, headSHA, tt.apply, false)
+			got := Diagnose(tt.check, headSHA, tt.apply, "")
 			assert.Equal(t, tt.reason, got.Reason)
 			assert.Equal(t, tt.blocking, got.Blocking)
 			assert.Equal(t, tt.selfConverging, got.SelfConverging)
@@ -140,7 +140,7 @@ func TestDiagnose(t *testing.T) {
 func TestDiagnoseTreatsAMissingConclusionAsABlock(t *testing.T) {
 	t.Parallel()
 
-	got := Diagnose(&storage.Check{HeadSHA: headSHA, Status: StatusCompleted}, headSHA, nil, false)
+	got := Diagnose(&storage.Check{HeadSHA: headSHA, Status: StatusCompleted}, headSHA, nil, "")
 	assert.Equal(t, ReasonBlocked, got.Reason)
 	assert.True(t, got.Blocking)
 }
@@ -159,7 +159,7 @@ func TestDiagnoseClearsOnlyOnSuccess(t *testing.T) {
 			t.Parallel()
 
 			require.True(t, ConclusionClearsGate(conclusion), "precondition: GitHub accepts %q", conclusion)
-			got := Diagnose(&storage.Check{HeadSHA: headSHA, Status: StatusCompleted, Conclusion: conclusion}, headSHA, nil, false)
+			got := Diagnose(&storage.Check{HeadSHA: headSHA, Status: StatusCompleted, Conclusion: conclusion}, headSHA, nil, "")
 			assert.Equal(t, ReasonBlocked, got.Reason)
 			assert.True(t, got.Blocking)
 		})
@@ -171,7 +171,7 @@ func TestDiagnoseClearsOnlyOnSuccess(t *testing.T) {
 func TestDiagnoseWithoutAHeadReadsRowsAsCurrent(t *testing.T) {
 	t.Parallel()
 
-	got := Diagnose(&storage.Check{HeadSHA: olderSHA, Status: StatusCompleted, Conclusion: ConclusionSuccess}, "", nil, false)
+	got := Diagnose(&storage.Check{HeadSHA: olderSHA, Status: StatusCompleted, Conclusion: ConclusionSuccess}, "", nil, "")
 	require.Equal(t, ReasonResolved, got.Reason)
 	assert.False(t, got.Blocking)
 }
@@ -210,7 +210,7 @@ func TestDiagnoseReadsDurableBlockingReasonsFirst(t *testing.T) {
 			got := Diagnose(&storage.Check{
 				HeadSHA: olderSHA, Status: StatusCompleted,
 				Conclusion: ConclusionActionRequired, BlockingReason: tt.reason,
-			}, headSHA, nil, false)
+			}, headSHA, nil, "")
 			assert.Equal(t, tt.want, got.Reason)
 			assert.True(t, got.Blocking)
 			assert.Equal(t, tt.selfConverging, got.SelfConverging)
@@ -232,7 +232,7 @@ func TestDiagnoseTellsARollupGuardBlockToReverifyThePullRequest(t *testing.T) {
 				HeadSHA: headSHA, Environment: "production",
 				DatabaseType: AggregateSentinel, DatabaseName: AggregateSentinel,
 				Status: StatusCompleted, Conclusion: ConclusionFailure, BlockingReason: reason,
-			}, headSHA, nil, false)
+			}, headSHA, nil, "")
 			assert.Equal(t, ReasonGuardBlocked, got.Reason)
 			assert.True(t, got.Blocking)
 			assert.False(t, got.SelfConverging)
@@ -245,7 +245,7 @@ func TestDiagnoseTellsARollupGuardBlockToReverifyThePullRequest(t *testing.T) {
 	row := Diagnose(&storage.Check{
 		HeadSHA: headSHA, Environment: "production", DatabaseType: "mysql", DatabaseName: "orders",
 		Status: StatusCompleted, Conclusion: ConclusionFailure, BlockingReason: BlockNamespacePlacementRefused,
-	}, headSHA, nil, false)
+	}, headSHA, nil, "")
 	assert.Equal(t, ReasonGuardBlocked, row.Reason)
 	assert.Contains(t, row.Remedy, "`schemabot plan -e <environment>`")
 }
@@ -256,7 +256,7 @@ func TestDiagnoseReadsAStoppedApplyAsOperatorOwned(t *testing.T) {
 	t.Parallel()
 
 	check := &storage.Check{HeadSHA: headSHA, ApplyID: 42, Status: StatusInProgress}
-	got := Diagnose(check, headSHA, &storage.Apply{State: "stopped"}, false)
+	got := Diagnose(check, headSHA, &storage.Apply{State: "stopped"}, "")
 	assert.Equal(t, ReasonApplyStopped, got.Reason)
 	assert.True(t, got.Blocking)
 	assert.False(t, got.SelfConverging)
@@ -270,7 +270,7 @@ func TestDiagnoseReadsAnUnreadableOwnerAsUnknown(t *testing.T) {
 	t.Parallel()
 
 	check := &storage.Check{HeadSHA: headSHA, ApplyID: 42, Status: StatusInProgress}
-	got := Diagnose(check, headSHA, nil, false)
+	got := Diagnose(check, headSHA, nil, "")
 	assert.Equal(t, ReasonApplyOwnerUnknown, got.Reason)
 	assert.True(t, got.Blocking)
 	assert.False(t, got.SelfConverging)
@@ -285,13 +285,13 @@ func TestDiagnoseReadsASettledRowWithoutItsApply(t *testing.T) {
 
 	resolved := Diagnose(&storage.Check{
 		HeadSHA: headSHA, ApplyID: 42, Status: StatusCompleted, Conclusion: ConclusionSuccess,
-	}, headSHA, nil, false)
+	}, headSHA, nil, "")
 	assert.Equal(t, ReasonResolved, resolved.Reason)
 	assert.False(t, resolved.Blocking)
 
 	owed := Diagnose(&storage.Check{
 		HeadSHA: headSHA, ApplyID: 42, Status: StatusCompleted, Conclusion: ConclusionActionRequired,
-	}, headSHA, nil, false)
+	}, headSHA, nil, "")
 	assert.Equal(t, ReasonReconciliationOwed, owed.Reason,
 		"a terminal block stays a reconciliation, not an unknown owner")
 	assert.True(t, owed.Blocking)
@@ -311,7 +311,7 @@ func TestIsAggregateRequiresBothSentinels(t *testing.T) {
 		DatabaseType: "mysql", DatabaseName: AggregateSentinel, HeadSHA: headSHA,
 		Status: StatusCompleted, Conclusion: ConclusionActionRequired,
 	}
-	assert.Equal(t, ReasonBlocked, Diagnose(blocked, headSHA, nil, false).Reason,
+	assert.Equal(t, ReasonBlocked, Diagnose(blocked, headSHA, nil, "").Reason,
 		"a database named like the sentinel keeps its own finding")
 }
 
@@ -324,10 +324,10 @@ func TestCoversHeadAgreesWithDiagnoseOnAnUnknownHead(t *testing.T) {
 
 	row := &storage.Check{HeadSHA: olderSHA, Status: StatusCompleted, Conclusion: ConclusionSuccess}
 	require.True(t, CoversHead(row, ""), "an unknown head is not evidence a row is stale")
-	assert.Equal(t, ReasonResolved, Diagnose(row, "", nil, false).Reason)
+	assert.Equal(t, ReasonResolved, Diagnose(row, "", nil, "").Reason)
 
 	require.False(t, CoversHead(row, headSHA))
-	assert.Equal(t, ReasonAwaitingPlan, Diagnose(row, headSHA, nil, false).Reason)
+	assert.Equal(t, ReasonAwaitingPlan, Diagnose(row, headSHA, nil, "").Reason)
 }
 
 // The blocks only a rollup may clear and the blocks that say work may have
@@ -388,19 +388,19 @@ func TestDiagnoseRowInEnvironmentNotConfigured(t *testing.T) {
 		{
 			name:   "row with a durable block",
 			check:  &storage.Check{HeadSHA: olderSHA, Status: StatusCompleted, Conclusion: ConclusionActionRequired, BlockingReason: "schema_removed_after_apply_started"},
-			reason: Diagnose(&storage.Check{HeadSHA: olderSHA, Status: StatusCompleted, Conclusion: ConclusionActionRequired, BlockingReason: "schema_removed_after_apply_started"}, headSHA, nil, false).Reason,
+			reason: Diagnose(&storage.Check{HeadSHA: olderSHA, Status: StatusCompleted, Conclusion: ConclusionActionRequired, BlockingReason: "schema_removed_after_apply_started"}, headSHA, nil, "").Reason,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := Diagnose(tc.check, headSHA, tc.apply, true)
+			got := Diagnose(tc.check, headSHA, tc.apply, "staging")
 			assert.Equal(t, tc.reason, got.Reason)
 			if tc.reason != ReasonEnvironmentNotConfigured {
 				return
 			}
 			assert.True(t, got.Blocking)
 			assert.False(t, got.SelfConverging, "the row clears only after someone plans another environment or pushes")
-			assert.Contains(t, got.Remedy, "still configured for")
+			assert.Contains(t, got.Remedy, "`schemabot plan -e staging`", "the remedy names an environment the database is still planned in")
 			assert.Contains(t, got.Remedy, "push a commit")
 		})
 	}

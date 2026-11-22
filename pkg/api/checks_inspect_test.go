@@ -301,7 +301,7 @@ func TestInspectChecksReportsRowInEnvironmentNoLongerConfigured(t *testing.T) {
 	assert.Equal(t, checkstate.ReasonEnvironmentNotConfigured, row.Reason)
 	assert.True(t, row.Blocking)
 	assert.False(t, row.SelfConverging)
-	assert.Contains(t, row.Remedy, "still configured for")
+	assert.Contains(t, row.Remedy, "`schemabot plan -e staging`", "the remedy names the first environment the database is still planned in")
 }
 
 // Rows come back in a stable order, an environment filter narrows them, and

@@ -534,10 +534,12 @@ func newFakeGitHubWithHead(t *testing.T, headSHA string) (*gh.Client, chan check
 // while a PR is open. The PR's earlier commit planned the database in staging,
 // sandbox, and production, and the sandbox plan failed. The new commit's plan
 // stores only staging and production, so no plan will ever store sandbox
-// again. The plan settles the plan-only sandbox row onto the new commit, and
-// the aggregate folds to the plan's real result instead of staying in
-// progress for good.
-func TestE2EPlanSettlesPlanOnlyCheckInEnvironmentRemovedFromConfig(t *testing.T) {
+// again. The plan removes the plan-only sandbox row, and the aggregate folds
+// to the plan's real result instead of staying in progress for good. Removing
+// the row rather than passing it means that if sandbox is configured again,
+// its missing result reads like any newly configured environment, never as a
+// pass.
+func TestE2EPlanRemovesPlanOnlyCheckInEnvironmentRemovedFromConfig(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		hasChanges bool
@@ -558,13 +560,7 @@ func TestE2EPlanSettlesPlanOnlyCheckInEnvironmentRemovedFromConfig(t *testing.T)
 
 			finishPlan(t, h, svc, "newsha222", storage.DatabaseTypeMySQL, dbName, []string{"staging", "production"}, 103, tc.hasChanges, tc.conclusion)
 
-			sandbox := requireStoredCheck(t, svc, "sandbox", storage.DatabaseTypeMySQL, dbName)
-			assert.Equal(t, "newsha222", sandbox.HeadSHA, "the plan settles the sandbox row onto the new commit")
-			assert.Equal(t, checkStatusCompleted, sandbox.Status)
-			assert.Equal(t, checkConclusionSuccess, sandbox.Conclusion)
-			assert.False(t, sandbox.HasChanges)
-			assert.Zero(t, sandbox.ApplyID)
-			assert.Empty(t, sandbox.BlockingReason)
+			requireNoStoredCheck(t, svc, "sandbox", storage.DatabaseTypeMySQL, dbName)
 
 			cr := requireAggregateCheckRun(t, checkRuns)
 			assert.Equal(t, "newsha222", cr.HeadSHA)
@@ -576,9 +572,9 @@ func TestE2EPlanSettlesPlanOnlyCheckInEnvironmentRemovedFromConfig(t *testing.T)
 }
 
 // The same removal of the sandbox environment, run through `schemabot plan`.
-// The plan stores staging and production, settles the plan-only sandbox row
+// The plan stores staging and production, removes the plan-only sandbox row
 // before its fold, and the aggregate reports the plan's pending changes.
-func TestE2EMultiEnvPlanSettlesCheckInEnvironmentRemovedFromConfig(t *testing.T) {
+func TestE2EMultiEnvPlanRemovesCheckInEnvironmentRemovedFromConfig(t *testing.T) {
 	dbName := "webhook_plan_settles_removed_env"
 	svc := setupE2EServiceMultiEnv(t, dbName)
 	seedPlanCheck(t, svc, "oldsha111", "sandbox", storage.DatabaseTypeMySQL, dbName, 101, false, checkConclusionFailure)
@@ -590,10 +586,7 @@ func TestE2EMultiEnvPlanSettlesCheckInEnvironmentRemovedFromConfig(t *testing.T)
 	assert.Equal(t, "abc123", cr.HeadSHA)
 	assert.Equal(t, checkStatusCompleted, cr.Status)
 	assert.Equal(t, checkConclusionActionRequired, cr.Conclusion, "the aggregate folds the plan's pending changes")
-	sandbox := requireStoredCheck(t, svc, "sandbox", storage.DatabaseTypeMySQL, dbName)
-	assert.Equal(t, "abc123", sandbox.HeadSHA, "the plan settles the sandbox row onto the new commit")
-	assert.Equal(t, checkStatusCompleted, sandbox.Status)
-	assert.Equal(t, checkConclusionSuccess, sandbox.Conclusion)
+	requireNoStoredCheck(t, svc, "sandbox", storage.DatabaseTypeMySQL, dbName)
 }
 
 // An apply had started in sandbox before the operator removed sandbox from the
@@ -759,6 +752,13 @@ func requireStoredCheck(t *testing.T, svc *api.Service, env, dbType, dbName stri
 	require.NoError(t, err)
 	require.NotNil(t, check, "expected stored check state for %s/%s/%s", env, dbType, dbName)
 	return check
+}
+
+func requireNoStoredCheck(t *testing.T, svc *api.Service, env, dbType, dbName string) {
+	t.Helper()
+	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, env, dbType, dbName)
+	require.NoError(t, err)
+	require.Nil(t, check, "expected no stored check state for %s/%s/%s", env, dbType, dbName)
 }
 
 // newPlanHandler serves a PR whose schemabot.yaml plans dbName as MySQL, and

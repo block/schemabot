@@ -344,6 +344,13 @@ type CheckStore interface {
 	// Delete removes stored check state by ID.
 	Delete(ctx context.Context, id int64) error
 
+	// DeleteStalePlanOnly removes check's plan-only row when no plan can store
+	// it again. It fails closed: a row that is in_progress or owns an apply ID
+	// is kept, and so is a row a newer write moved off readHeadSHA, the head the
+	// caller read it at. Returns true when no row is stored for check's key
+	// after the call.
+	DeleteStalePlanOnly(ctx context.Context, check *Check, readHeadSHA string) (bool, error)
+
 	// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a
 	// closed PR, retaining apply-owned rows the close must not unblock. Once
 	// an apply has started, its stored check state stays authoritative across

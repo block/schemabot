@@ -1549,10 +1549,14 @@ func checkDatabaseKeyStrings(keys map[checkDatabaseKey]bool) []string {
 // plan whose own write failed cannot leave the aggregate with no result of
 // the database at all.
 //
-// Settling follows stale cleanup: a started apply keeps its row blocking, and
-// a plan-only row passes. A plan that finishes after the PR moved to a newer
-// commit settles nothing, because the newer commit's cleanup and plans own
-// those rows. The PR head is read only when there is a row to settle, so a
+// Settling follows stale cleanup: a started apply keeps its row blocking. A
+// plan-only row under an old type passes. A plan-only row in an environment
+// the database no longer has is removed rather than passed, so the PR is left
+// as if the environment had never been configured: if an operator lists the
+// environment again, its missing result reads as it would for any newly
+// configured environment, and never as a pass. A plan that finishes after the
+// PR moved to a newer commit settles nothing, because the newer commit's
+// cleanup and plans own those rows. The PR head is read only when there is a row to settle, so a
 // plan with nothing left behind adds no GitHub call.
 func (h *Handler) settleLeftBehindChecks(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, databaseName, databaseType string) error {
 	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
@@ -1652,9 +1656,46 @@ func (h *Handler) settleLeftBehindChecks(ctx context.Context, client *ghclient.I
 			"planned_environments", environments,
 			"previous_head_sha", check.HeadSHA,
 			"previous_status", check.Status, "previous_conclusion", check.Conclusion, "apply_id", check.ApplyID)
-		h.settleStaleCheckState(ctx, repo, pr, headSHA, check)
+		if checkHasStartedApply(check) {
+			h.blockStaleStartedApplyCheckState(ctx, repo, pr, headSHA, check)
+			continue
+		}
+		h.removeStalePlanOnlyCheckState(ctx, repo, pr, headSHA, check)
 	}
 	return nil
+}
+
+// removeStalePlanOnlyCheckState removes a plan-only row in an environment the
+// database no longer has. The delete is guarded in storage: a row an apply
+// claimed, or one a newer write moved, after this plan read it is kept.
+func (h *Handler) removeStalePlanOnlyCheckState(ctx context.Context, repo string, pr int, headSHA string, check *storage.Check) {
+	readHeadSHA := check.HeadSHA
+	removed, err := h.service.Storage().Checks().DeleteStalePlanOnly(ctx, check, readHeadSHA)
+	status := "success"
+	switch {
+	case err != nil:
+		status = "error"
+		h.logger.Error("failed to remove check in an environment the database is no longer planned in; the row keeps blocking the aggregate",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"read_head_sha", readHeadSHA, "error", err)
+	case !removed:
+		status = "noop"
+		h.logger.Info("check in an environment the database is no longer planned in left to the apply or newer write that changed it after this plan read it",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"read_head_sha", readHeadSHA)
+	}
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:    "stale_check_cleanup",
+		Repository:   repo,
+		Database:     check.DatabaseName,
+		DatabaseType: check.DatabaseType,
+		Environment:  check.Environment,
+		Status:       status,
+	})
 }
 
 // checksOutsideEnvironments returns the rows whose environment is not one of

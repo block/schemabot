@@ -1026,6 +1026,30 @@ func (s *checkStore) Delete(ctx context.Context, id int64) error {
 	return checkRowsAffected(result, storage.ErrCheckNotFound)
 }
 
+// DeleteStalePlanOnly removes a plan-only row no plan can store again. The
+// delete is one guarded statement, so an apply that claimed the row, or a
+// newer write that moved it off the head the caller read it at, after the
+// caller read it keeps the row. A row already gone counts as removed.
+func (s *checkStore) DeleteStalePlanOnly(ctx context.Context, check *storage.Check, readHeadSHA string) (bool, error) {
+	canonicalizeCheck(check)
+	target := fmt.Sprintf("%s#%d %s/%s/%s",
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	if _, err := s.db.ExecContext(ctx, `
+		DELETE FROM checks
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		  AND status != ? AND apply_id IS NULL AND head_sha = ?
+	`, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		checkStatusInProgress, readHeadSHA); err != nil {
+		return false, fmt.Errorf("delete stale plan-only check %s read at %s: %w", target, readHeadSHA, err)
+	}
+	current, err := s.Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	if err != nil {
+		return false, fmt.Errorf("re-read stale plan-only check %s after delete: %w", target, err)
+	}
+	return current == nil, nil
+}
+
 // DeleteByPRRetainingBlockingApplyOwned removes stored check state for a
 // closed PR, retaining apply-owned rows the close must not unblock. Once an
 // apply has started, its stored check state is authoritative until an

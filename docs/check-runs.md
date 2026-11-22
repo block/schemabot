@@ -780,8 +780,10 @@ check or a new commit, which re-verify the whole pull request, never a plan.
 
 A row left on an earlier commit for an environment the database is no longer
 configured for reads `environment_not_configured`. The server refuses a plan of
-that environment, so the remedy names a plan of an environment the database
-still has, or a new commit. The next plan of the database settles the row.
+that environment, so the remedy names the first environment the database is
+still planned in, or a new commit. The next plan of the database removes the
+row, so an environment configured again later reads as missing rather than
+passing.
 
 The review-time rollup also shows each deployment's blocked change count. This
 is informational beside drift: blocked verdicts do not make matching change

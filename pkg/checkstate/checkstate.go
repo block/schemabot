@@ -14,6 +14,7 @@
 package checkstate
 
 import (
+	"fmt"
 	"slices"
 
 	"github.com/block/schemabot/pkg/state"
@@ -206,7 +207,7 @@ const (
 	// in an environment the database is no longer configured for on this
 	// server. No plan of that environment can run, so no plan of it replaces
 	// the row; the next plan of the database in a configured environment
-	// settles it.
+	// removes it.
 	ReasonEnvironmentNotConfigured = "environment_not_configured"
 	// ReasonAwaitingReplanAfterApply: an apply settled successfully but its row
 	// still names an earlier commit, so the gate holds a result it already has.
@@ -265,10 +266,13 @@ func CoversHead(check *storage.Check, headSHA string) bool {
 // apply, since the owner's state is the whole difference between waiting and
 // reconciling.
 //
-// environmentNotConfigured reports that the server no longer plans the row's
-// database in the row's environment. Pass false when that is not known: the
-// row then keeps the reading it would have in a configured environment.
-func Diagnose(check *storage.Check, headSHA string, apply *storage.Apply, environmentNotConfigured bool) Disposition {
+// planEnvironment is set when the server no longer plans the row's database in
+// the row's environment, and names an environment it does still plan the
+// database in, whose plan removes the row. Pass "" when the row's environment
+// is configured, when that is not known, or when the database has no
+// environment left to plan: the row then keeps the reading it would have in a
+// configured environment rather than naming a plan that cannot run.
+func Diagnose(check *storage.Check, headSHA string, apply *storage.Apply, planEnvironment string) Disposition {
 	coversHead := CoversHead(check, headSHA)
 
 	// A durable blocking reason outranks everything below it. The writer set it
@@ -284,12 +288,12 @@ func Diagnose(check *storage.Check, headSHA string, apply *storage.Apply, enviro
 	}
 	// A plan-only row in an environment the database no longer has would
 	// otherwise read as awaiting a plan of that environment, which the server
-	// refuses. The plan that settles it is one of any configured environment.
-	if environmentNotConfigured && isSettledPlanOnlyRowOnEarlierCommit(check, coversHead) {
+	// refuses. The plan that removes it is one of any configured environment.
+	if planEnvironment != "" && isSettledPlanOnlyRowOnEarlierCommit(check, coversHead) {
 		return Disposition{
 			Reason:   ReasonEnvironmentNotConfigured,
 			Summary:  "This row is for an environment the database is no longer configured for, so no plan of that environment can replace it.",
-			Remedy:   "Comment `schemabot plan -e <environment>` on the pull request for an environment the database is still configured for, or push a commit. The next plan of this database settles the row.",
+			Remedy:   fmt.Sprintf("Comment `schemabot plan -e %s` on the pull request, or push a commit. The next plan of this database removes the row.", planEnvironment),
 			Blocking: true,
 		}
 	}
