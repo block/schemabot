@@ -249,17 +249,17 @@ func TestEnumTypeRefusals(t *testing.T) {
 		},
 		{
 			name: "label added after planning",
-			err: &enumTypeError{label: "paid", err: fmt.Errorf("add label: %w", errEnumLabelExists),
-				cause: &pgconn.PgError{Code: sqlstateDuplicateObject, Message: `enum label "paid" already exists`}},
+			err: &enumTypeError{label: "paid", err: fmt.Errorf("add label: %w: %w", executor.ErrEnumLabelExists,
+				&pgconn.PgError{Code: "42710", Message: `enum label "paid" already exists`})},
 			reason: "planned-object-drift",
 			detail: `enum type "order_status" already has label "paid", which another change added after planning; re-plan against the current schema`,
 		},
 		{
 			name: "placement label renamed after planning",
-			err: &enumTypeError{label: "packed", err: fmt.Errorf("add label: %w", errEnumNeighborMissing),
-				cause: &pgconn.PgError{Code: sqlstateInvalidParameterValue, Message: `"shipped" is not an existing enum label`}},
+			err: &enumTypeError{label: "packed", neighbor: "shipped", err: fmt.Errorf("add label: %w: %w", executor.ErrEnumNeighborMissing,
+				&pgconn.PgError{Code: "22023", Message: `"shipped" is not an existing enum label`})},
 			reason: "planned-object-drift",
-			detail: `enum type "order_status" no longer has the label that "packed" is placed next to, which another change renamed or removed after planning; re-plan against the current schema`,
+			detail: `"packed" is placed next to label "shipped", which another change renamed or removed from enum type "order_status" after planning; re-plan against the current schema`,
 		},
 		{
 			name:   "type name moved to another type",
@@ -278,8 +278,8 @@ func TestEnumTypeRefusals(t *testing.T) {
 	}
 
 	t.Run("the server error stays in the log text", func(t *testing.T) {
-		err := &enumTypeError{label: "paid", err: fmt.Errorf("add label: %w", errEnumLabelExists),
-			cause: &pgconn.PgError{Code: sqlstateDuplicateObject, Message: `enum label "paid" already exists`}}
+		err := &enumTypeError{label: "paid", err: fmt.Errorf("add label: %w: %w", executor.ErrEnumLabelExists,
+			&pgconn.PgError{Code: "42710", Message: `enum label "paid" already exists`})}
 		assert.Contains(t, err.Error(), `enum label "paid" already exists`)
 	})
 }

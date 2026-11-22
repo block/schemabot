@@ -430,7 +430,8 @@ If another change adds a label after the plan was made, the apply stops at
 that step with a refusal that names the label and says to re-plan. A fresh
 plan then shows what is still missing. The same holds when another change
 renames or removes the label a step places its new label `BEFORE` or
-`AFTER`: the step is refused, not retried, and says to re-plan. pg-sprite
+`AFTER`: the step is refused, not retried, names both labels, and says to
+re-plan. pg-sprite
 also refuses a step whose type name now resolves to a different type, and
 nothing is added.
 

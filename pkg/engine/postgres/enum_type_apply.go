@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/block/pg-sprite/pkg/executor"
@@ -14,16 +13,6 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 )
-
-// sqlstateDuplicateObject is the server's duplicate_object error. An ALTER
-// TYPE ... ADD VALUE without IF NOT EXISTS raises it when the type already
-// carries the label.
-const sqlstateDuplicateObject = "42710"
-
-// sqlstateInvalidParameterValue is the server's invalid_parameter_value
-// error. An ALTER TYPE ... ADD VALUE raises it when the label its BEFORE or
-// AFTER names is not on the type.
-const sqlstateInvalidParameterValue = "22023"
 
 // isEnumValueAdd reports whether a planned step's statements are a single
 // ALTER TYPE ... ADD VALUE, the one statement an enum types file plans.
@@ -81,67 +70,35 @@ func executeEnumValueAdd(ctx context.Context, pool *pgxpool.Pool, change nativeA
 	err = executor.ExecuteEnumValueAdd(ctx, pool, target, st, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	}, executor.DefaultRetryPolicy())
-	if err == nil {
-		return nil
-	}
-	// pg-sprite returns the server's errors as they came, so the two ways
-	// the type can drift from the plan between planning and this step are
-	// recognized here by their SQLSTATE. Typed outcomes from pg-sprite's
-	// executor would retire these checks.
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		switch pgErr.Code {
-		case sqlstateDuplicateObject:
-			return &enumTypeError{
-				label: st.AddedEnumValue(),
-				err:   fmt.Errorf("add label %q to enum type %q.%q: %w", st.AddedEnumValue(), change.namespace, change.table, errEnumLabelExists),
-				cause: err,
-			}
-		case sqlstateInvalidParameterValue:
-			return &enumTypeError{
-				label: st.AddedEnumValue(),
-				err:   fmt.Errorf("add label %q to enum type %q.%q: %w", st.AddedEnumValue(), change.namespace, change.table, errEnumNeighborMissing),
-				cause: err,
-			}
+	if err != nil {
+		return &enumTypeError{
+			label:    st.AddedEnumValue(),
+			neighbor: st.EnumValueNeighbor(),
+			err:      fmt.Errorf("add label %q to enum type %q.%q: %w", st.AddedEnumValue(), change.namespace, change.table, err),
 		}
 	}
-	return &enumTypeError{err: fmt.Errorf("add label %q to enum type %q.%q: %w", st.AddedEnumValue(), change.namespace, change.table, err)}
+	return nil
 }
-
-// errEnumLabelExists means the type already carries the label the step
-// adds: another change added it after the plan was made. Nothing was added.
-var errEnumLabelExists = errors.New("the enum type already carries the label")
-
-// errEnumNeighborMissing means the label the step places its new label
-// BEFORE or AFTER is no longer on the type: another change renamed or
-// removed it after the plan was made. Nothing was added, and the same
-// statement fails the same way on every attempt.
-var errEnumNeighborMissing = errors.New("the enum type no longer carries the label the step places its new label next to")
 
 // enumTypeError marks a failure of an enum label addition, so the refusal
-// names the type instead of a table and the outcomes only an enum step
-// produces are classified. label is the label the step adds, set for the
-// outcomes that name it; cause keeps the server error behind that outcome
-// for the server log.
+// names the type instead of a table and the labels the step names. label is
+// the label the step adds and neighbor the label it is placed BEFORE or
+// AFTER; both are empty for a failure of the check that runs before the
+// statement, and neighbor is empty when the step names no position.
 type enumTypeError struct {
-	label string
-	err   error
-	cause error
+	label    string
+	neighbor string
+	err      error
 }
 
-func (e *enumTypeError) Error() string {
-	if e.cause != nil {
-		return e.err.Error() + ": " + e.cause.Error()
-	}
-	return e.err.Error()
-}
+func (e *enumTypeError) Error() string { return e.err.Error() }
 
 func (e *enumTypeError) Unwrap() error { return e.err }
 
 // enumTypeRefusal maps the outcomes only an enum step produces to permanent
-// refusals. A nil result leaves the failure to the shared mapping, which
-// covers the budgets, the type drift pg-sprite reports, and the rest of the
-// executor's vocabulary.
+// refusals that name the labels the step carries. A nil result leaves the
+// failure to the shared mapping, which covers the budgets, the type drift
+// pg-sprite reports, and the rest of the executor's vocabulary.
 func enumTypeRefusal(err error, typeName string) *refusal {
 	var enumErr *enumTypeError
 	if !errors.As(err, &enumErr) {
@@ -163,14 +120,14 @@ func enumTypeRefusal(err error, typeName string) *refusal {
 			cause:  fmt.Sprintf("%s is no longer an enum type on the target", quotedTable(typeName)),
 			remedy: replanRemedy}
 	}
-	if errors.Is(err, errEnumLabelExists) {
+	if errors.Is(err, executor.ErrEnumLabelExists) {
 		return &refusal{reason: "planned-object-drift",
 			cause:  fmt.Sprintf("enum type %s already has label %s, which another change added after planning", quotedTable(typeName), quotedTable(enumErr.label)),
 			remedy: replanRemedy}
 	}
-	if errors.Is(err, errEnumNeighborMissing) {
+	if errors.Is(err, executor.ErrEnumNeighborMissing) {
 		return &refusal{reason: "planned-object-drift",
-			cause:  fmt.Sprintf("enum type %s no longer has the label that %s is placed next to, which another change renamed or removed after planning", quotedTable(typeName), quotedTable(enumErr.label)),
+			cause:  fmt.Sprintf("%s is placed next to label %s, which another change renamed or removed from enum type %s after planning", quotedTable(enumErr.label), quotedTable(enumErr.neighbor), quotedTable(typeName)),
 			remedy: replanRemedy}
 	}
 	return nil

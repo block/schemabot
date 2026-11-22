@@ -345,7 +345,8 @@ func TestEngineApplyEnumLabelAddedAfterPlanning(t *testing.T) {
 // Another session renames the label a planned step places its new label
 // BEFORE, after the plan was made. Running the same statement again can
 // never succeed, so the step is refused, permanently, with a detail that
-// names the label it adds and says to re-plan; nothing is changed.
+// names the label it adds and the label that is gone, and says to re-plan;
+// nothing is changed.
 func TestEngineApplyEnumPlacementLabelRenamedAfterPlanning(t *testing.T) {
 	const database = "apply_enum_neighbor_test"
 	dsn, db := testutil.StartPostgres(t, database)
@@ -370,7 +371,7 @@ func TestEngineApplyEnumPlacementLabelRenamedAfterPlanning(t *testing.T) {
 	assert.Equal(t, engine.StateFailed, refused.State)
 	assert.Equal(t, "refused", refused.Metadata["phase"])
 	assert.False(t, refused.Retryable, "running the same statement again meets the same missing label")
-	assert.Equal(t, `enum type "order_status" no longer has the label that "packed" is placed next to, which another change renamed or removed after planning; re-plan against the current schema`, refused.ErrorMessage)
+	assert.Equal(t, `"packed" is placed next to label "shipped", which another change renamed or removed from enum type "order_status" after planning; re-plan against the current schema`, refused.ErrorMessage)
 	assert.Equal(t, []string{"new", "sent"}, liveLabels(t, db), "the refused step changed nothing")
 }
 
