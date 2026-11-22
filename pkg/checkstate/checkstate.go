@@ -202,6 +202,12 @@ const (
 	// ReasonAwaitingPlan: nothing owns the row and no plan result covers the
 	// commit yet.
 	ReasonAwaitingPlan = "awaiting_plan"
+	// ReasonEnvironmentNotConfigured: a plan-only row on an earlier commit is
+	// in an environment the database is no longer configured for on this
+	// server. No plan of that environment can run, so no plan of it replaces
+	// the row; the next plan of the database in a configured environment
+	// settles it.
+	ReasonEnvironmentNotConfigured = "environment_not_configured"
 	// ReasonAwaitingReplanAfterApply: an apply settled successfully but its row
 	// still names an earlier commit, so the gate holds a result it already has.
 	ReasonAwaitingReplanAfterApply = "awaiting_replan_after_apply"
@@ -258,7 +264,11 @@ func CoversHead(check *storage.Check, headSHA string) bool {
 // owner is unreadable is reported as unknown rather than as one more running
 // apply, since the owner's state is the whole difference between waiting and
 // reconciling.
-func Diagnose(check *storage.Check, headSHA string, apply *storage.Apply) Disposition {
+//
+// environmentNotConfigured reports that the server no longer plans the row's
+// database in the row's environment. Pass false when that is not known: the
+// row then keeps the reading it would have in a configured environment.
+func Diagnose(check *storage.Check, headSHA string, apply *storage.Apply, environmentNotConfigured bool) Disposition {
 	coversHead := CoversHead(check, headSHA)
 
 	// A durable blocking reason outranks everything below it. The writer set it
@@ -271,6 +281,17 @@ func Diagnose(check *storage.Check, headSHA string, apply *storage.Apply) Dispos
 	// result would attribute a per-database answer to a rollup.
 	if IsAggregate(check) {
 		return aggregateDisposition(check, coversHead)
+	}
+	// A plan-only row in an environment the database no longer has would
+	// otherwise read as awaiting a plan of that environment, which the server
+	// refuses. The plan that settles it is one of any configured environment.
+	if environmentNotConfigured && isSettledPlanOnlyRowOnEarlierCommit(check, coversHead) {
+		return Disposition{
+			Reason:   ReasonEnvironmentNotConfigured,
+			Summary:  "This row is for an environment the database is no longer configured for, so no plan of that environment can replace it.",
+			Remedy:   "Comment `schemabot plan -e <environment>` on the pull request for an environment the database is still configured for, or push a commit. The next plan of this database settles the row.",
+			Blocking: true,
+		}
 	}
 	if check.Status != StatusCompleted {
 		// An unreadable owner only changes the reading of a row still in
@@ -394,6 +415,14 @@ func aggregateDisposition(check *storage.Check, coversHead bool) Disposition {
 		Remedy:   "Read the rows below: the rollup clears when every one of them does, and they say whether that needs anyone.",
 		Blocking: true,
 	}
+}
+
+// isSettledPlanOnlyRowOnEarlierCommit reports whether a row holds a finished
+// plan result that no apply owns, recorded for a commit other than the one the
+// PR is gated on. These are the rows a plan of the database settles when their
+// environment is no longer configured.
+func isSettledPlanOnlyRowOnEarlierCommit(check *storage.Check, coversHead bool) bool {
+	return check.Status == StatusCompleted && check.ApplyID == 0 && !coversHead
 }
 
 // runningDisposition reads a row no terminal write has settled yet. An apply
