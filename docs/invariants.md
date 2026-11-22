@@ -2302,6 +2302,8 @@ apply does not. When the freezes or the override requests cannot be read, or the
 recorded, the operation is not driven, so it never starts unchecked: a start claim goes back unstarted
 and the pod skips it in its claims for a short while, so other work is claimed meanwhile, and a
 recovery keeps its lease until it goes stale and is checked again.
+Status names the freeze that stopped an apply, read from the stop's requester, so a stopped apply
+never reads as an operator's stop or as one a start will resume while the freeze holds it.
 *Breaks if violated:* a schema change judged unsafe keeps writing through the incident that froze
 it, or an operator reads a freeze as having stopped changes that still run.
 *Enforced:* `stopAppliesForFreeze` (`pkg/api/freeze_stop_sweep.go`), which lists applies with
@@ -2313,7 +2315,8 @@ caller where `storage.IsFreezeStopCaller` holds. The claim checkpoint is `holdCl
 before the drive, which hands the claim back with `ReturnUnstartedClaim`
 (`pkg/storage/internal/sqlstore/apply_operations.go`) and skips it with `storage.SkipOperations`.
 The start request records the override that admitted it in `startControlRequestMetadata`
-(`pkg/api/control_handlers.go`).
+(`pkg/api/control_handlers.go`). `StoppedByFreeze` (`pkg/api/freeze_stopped_by.go`) names the freeze
+for the progress response and the pull request comments.
 
 ## Structural enforcement
 

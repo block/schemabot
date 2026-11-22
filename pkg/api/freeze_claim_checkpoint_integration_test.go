@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
@@ -84,6 +85,7 @@ func TestClaimCheckpointStopsAnUnstartedRolloutUnderAStopFreeze(t *testing.T) {
 		assert.True(t, stopRequestCompleted(t, ctx, stor, seed.applyID))
 		assert.Equal(t, state.Apply.Stopped, getApply(t, ctx, stor, seed.applyID).State)
 		assert.True(t, applyLogContains(t, stor, seed.applyID, "Stop requested by freeze freeze-claim"))
+		assertProgressStoppedByFreeze(t, ctx, svc.Service, getApply(t, ctx, stor, seed.applyID))
 	})
 
 	for _, tc := range []struct {
@@ -173,6 +175,7 @@ func TestClaimCheckpointHoldsAQueuedStartUnderAStopFreeze(t *testing.T) {
 			assert.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.opID(deployment)), deployment)
 		}
 		assert.Equal(t, state.Apply.Stopped, getApply(t, ctx, stor, seed.applyID).State)
+		assertProgressStoppedByFreeze(t, ctx, svc.Service, getApply(t, ctx, stor, seed.applyID))
 	})
 
 	approveStartOverride := func(t *testing.T, target string) {
@@ -310,6 +313,16 @@ func claimTestFreeze(t *testing.T, ctx context.Context, stor storage.Storage, ru
 		Kind: storage.FreezeKindOnDemand, Running: running, StartsAt: now.Add(-time.Minute),
 		Reason: "SEV-1234", CreatedBy: "alice", Source: storage.FreezeSourceManual,
 	}
+}
+
+// assertProgressStoppedByFreeze checks that status names the freeze that
+// stopped apply, with its reason.
+func assertProgressStoppedByFreeze(t *testing.T, ctx context.Context, svc *Service, apply *storage.Apply) {
+	t.Helper()
+	progress, err := svc.progressFromLocalStorage(ctx, apply)
+	require.NoError(t, err)
+	assert.Equal(t, &apitypes.FreezeStopRef{ID: "freeze-claim", Reason: "SEV-1234"}, progress.StoppedByFreeze,
+		"status says the freeze stopped the apply")
 }
 
 // resetFreezeTables clears the freezes a test set, so each subtest starts

@@ -645,7 +645,9 @@ deploy queued before the freeze waits until it ends. A planned `stop` freeze
 stops an apply already running when it starts only at the apply's next
 checkpoint: when a rollout starts its next deployment, or when SchemaBot
 recovers a drive that crashed or failed. An apply that reaches neither keeps
-running. A stopped apply resumes with
+running. `schemabot status <apply-id>`, the watch view and the pull request
+comment say which freeze stopped an apply, and once that freeze has ended, that
+a plain start resumes it. A stopped apply resumes with
 `schemabot start` once the freeze ends, or with an approved
 override. Times are RFC3339 and print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
 and the recent ones.

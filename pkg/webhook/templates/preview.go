@@ -3051,6 +3051,37 @@ func PreviewCommentApplyStopped() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Stopped, tables))
 }
 
+// PreviewCommentApplyStoppedByFreeze renders the stopped comment of an apply
+// that a freeze with running "stop" stopped: it names the freeze and says how
+// the apply resumes.
+func PreviewCommentApplyStoppedByFreeze() string {
+	tables := sampleApplyTables()[:2]
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Stopped
+	tables[1].RowsCopied = 1055687
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 72
+	data := sampleApplyData(state.Apply.Stopped, tables)
+	data.StoppedByFreeze = &apitypes.FreezeStopRef{ID: "freeze-a1b2c3", Reason: "SEV-1234: checkout errors"}
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyStoppedByEndedFreeze renders the stopped comment of an
+// apply whose freeze has since ended, which says a plain start resumes it.
+func PreviewCommentApplyStoppedByEndedFreeze() string {
+	tables := sampleApplyTables()[:1]
+	tables[0].Status = state.Task.Stopped
+	data := sampleApplyData(state.Apply.Stopped, tables)
+	data.StoppedByFreeze = &apitypes.FreezeStopRef{ID: "freeze-a1b2c3", Reason: "SEV-1234: checkout errors", Ended: true}
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentStartWithdrawnByFreeze renders the comment posted when a
+// freeze with running "stop" withdraws a start no driver had acted on.
+func PreviewCommentStartWithdrawnByFreeze() string {
+	return RenderStartWithdrawn(StartWithdrawnData{ApplyID: "apply-a1b2c3d4e5f6", Environment: "staging", StoppedByFreeze: "freeze-a1b2c3"})
+}
+
 // PreviewCommentApplyResuming renders a sample comment for an apply that has just
 // been started again after a stop. During the resuming window the data plane has
 // not yet reported whether the change continues from its checkpoint or restarts

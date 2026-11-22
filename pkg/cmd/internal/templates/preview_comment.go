@@ -411,6 +411,9 @@ func previewCommentApplyFlowAllOutput() {
 		{"MIDDLE TABLE FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFailed()) }},
 		{"FAILED BEFORE ROW COPY (PREFLIGHT)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFailedBeforeRowCopy()) }},
 		{"STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStopped()) }},
+		{"STOPPED BY A FREEZE", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStoppedByFreeze()) }},
+		{"STOPPED BY A FREEZE THAT HAS ENDED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStoppedByEndedFreeze()) }},
+		{"START WITHDRAWN BY A FREEZE", func() { fmt.Print(webhooktemplates.PreviewCommentStartWithdrawnByFreeze()) }},
 		{"RESUMING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyResuming()) }},
 		{"CANCELLED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCancelled()) }},
 		// Cutover states
@@ -547,6 +550,7 @@ func previewCLIApplyAllOutput() {
 		{"MYSQL: SINGLE TABLE COMPLETED", previewCompletedOutput},
 		{"MYSQL: SINGLE TABLE FAILED", previewFailedOutput},
 		{"MYSQL: SINGLE TABLE STOPPED", previewStoppedOutput},
+		{"MYSQL: STOPPED BY A FREEZE", previewStoppedByFreezeOutput},
 		{"MYSQL: SINGLE TABLE WAITING FOR CUTOVER", previewWaitingForCutoverOutput},
 		{"MYSQL: SINGLE TABLE CUTTING OVER", previewCuttingOverOutput},
 		// MySQL: multi-table sequential
