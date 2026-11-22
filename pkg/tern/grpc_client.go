@@ -104,6 +104,7 @@ import (
 	"log/slog"
 	"net"
 	"reflect"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -3233,7 +3234,9 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			if isAmbiguousRemoteCallError(err) {
 				return fmt.Errorf("%s apply_operation %d (apply %s) has ambiguous remote dispatch outcome: %w", kind, op.ID, apply.ApplyIdentifier, err)
 			}
-			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, err.Error(), isRetryableRemoteApplyError(err), scope); markErr != nil {
+			retryable := isRetryableRemoteApplyError(err)
+			err = explainApplySizeRefusal(err)
+			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, err.Error(), retryable, scope); markErr != nil {
 				return fmt.Errorf("mark %s apply_operation %d failed after remote apply error: %w", kind, op.ID, markErr)
 			}
 			return fmt.Errorf("dispatch %s apply_operation %d (apply %s): %w", kind, op.ID, apply.ApplyIdentifier, err)
@@ -4196,6 +4199,7 @@ func (c *GRPCClient) dispatchRemoteApply(ctx context.Context, apply *storage.App
 			return dispatchError(kind, dispatchUnanswered, fmt.Errorf("apply queued gRPC apply %s has ambiguous remote dispatch outcome: %w", apply.ApplyIdentifier, err))
 		}
 		failure := classifyRemoteApplyError(err)
+		err = explainApplySizeRefusal(err)
 		if markErr := c.settleFailedDispatch(ctx, apply, tasks, scope, kind, failure, err.Error()); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after remote apply error: %w", apply.ApplyIdentifier, markErr)
 		}
@@ -4309,7 +4313,11 @@ func isRetryableRemoteApplyError(err error) bool {
 	}
 
 	switch st.Code() {
-	case codes.Internal, codes.Unknown, codes.Unavailable, codes.ResourceExhausted, codes.Aborted:
+	case codes.ResourceExhausted:
+		// Throttling clears with time, but a message over the size limit is
+		// refused the same way on every resend.
+		return !isMessageSizeRefusal(err)
+	case codes.Internal, codes.Unknown, codes.Unavailable, codes.Aborted:
 		return true
 	case codes.Canceled, codes.DeadlineExceeded:
 		return false
@@ -4319,6 +4327,49 @@ func isRetryableRemoteApplyError(err error) bool {
 	default:
 		return false
 	}
+}
+
+// messageSizeRefusalPhrases are the texts gRPC uses when it refuses a message
+// over its size limit: the receiving side reports the message it would not
+// read, and the sending side the message it would not send.
+var messageSizeRefusalPhrases = []string{
+	"received message larger than max",
+	"trying to send message larger than max",
+}
+
+// messageSizeRefusalSizes captures the "(size vs. limit)" pair gRPC appends
+// to a size refusal.
+var messageSizeRefusalSizes = regexp.MustCompile(`larger than max \((\d+) vs\. (\d+)\)`)
+
+// isMessageSizeRefusal reports whether err is gRPC refusing a message over its
+// size limit, which ResourceExhausted shares with throttling.
+func isMessageSizeRefusal(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.ResourceExhausted {
+		return false
+	}
+	for _, phrase := range messageSizeRefusalPhrases {
+		if strings.Contains(st.Message(), phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// explainApplySizeRefusal returns err with the request size and the limit it
+// crossed spelled out when err is a size refusal, and err unchanged otherwise.
+// The apply request carries the plan's schema files and changes, so a resend
+// is the same size and is refused again.
+func explainApplySizeRefusal(err error) error {
+	if !isMessageSizeRefusal(err) {
+		return err
+	}
+	st, _ := status.FromError(err)
+	match := messageSizeRefusalSizes.FindStringSubmatch(st.Message())
+	if match == nil {
+		return fmt.Errorf("apply request is over the gRPC message size limit, and resending it fails the same way: %w", err)
+	}
+	return fmt.Errorf("apply request is %s bytes, over the %s-byte gRPC message size limit, and resending it fails the same way: %w", match[1], match[2], err)
 }
 
 func isTerminalRemoteProgressError(err error) bool {
