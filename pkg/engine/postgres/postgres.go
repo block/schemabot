@@ -308,17 +308,24 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		schemaChange := engine.SchemaChange{Namespace: namespace}
 		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
+		// Enum label additions lead the namespace's changes, whichever file
+		// sorts first. The apply runs the changes one at a time in this
+		// order, each committed before the next starts, so every label the
+		// plan adds exists before any table change in the apply runs. A
+		// table change that names a new label still fails its own plan,
+		// since the table is planned against the live type.
+		var enumChanges []engine.TableChange
 		for _, filename := range files {
 			file := parsed[filename]
 			// An enum type is not a table: it stays out of desiredTables,
 			// so it never counts against the undeclared-table drops, the
 			// ignore list, or the rollback baseline.
 			if enumType, ok := file.EnumType(); ok {
-				enumChanges, err := planEnumType(ctx, pool, namespace, enumType, parser)
+				changes, err := planEnumType(ctx, pool, req.Database, namespace, enumType, parser)
 				if err != nil {
 					return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
 				}
-				schemaChange.TableChanges = append(schemaChange.TableChanges, enumChanges...)
+				enumChanges = append(enumChanges, changes...)
 				continue
 			}
 			if rowSecurity, ok := file.RowSecurity(); ok {
@@ -369,6 +376,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			}
 			schemaChange.TableChanges = append(schemaChange.TableChanges, changes...)
 		}
+		schemaChange.TableChanges = append(enumChanges, schemaChange.TableChanges...)
 		// A table the config withholds that a schema file also declares is a
 		// contradiction: the declaring file would keep managing the table while
 		// the config says to leave it alone.

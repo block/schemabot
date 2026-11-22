@@ -113,6 +113,7 @@ type nativeApply struct {
 	sql                        string
 	steps                      int
 	concurrentIndex            bool
+	enumValueAdd               bool
 	concurrentIndexMaxDuration time.Duration
 	cancelRequested            func() bool
 }
@@ -222,6 +223,17 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if err != nil {
 		slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned DDL is not one statement or a valid greenfield create set", tc.Table)
+	}
+	// A label addition to an enum type is the one shape that names a type
+	// rather than a table, so it is admitted on its own terms before the
+	// table privilege tiers, which have no rung for it.
+	enumStatement, enumValueAdd, err := isEnumValueAdd(statements)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
+	}
+	if enumValueAdd {
+		return validateEnumValueAdd(req, tc, enumStatement)
 	}
 	if _, err := preflight.RequiredTier(statements); err != nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: SchemaBot's PostgreSQL support does not execute this statement shape yet", tc.Table)
@@ -715,6 +727,11 @@ func committedCreatePrefixDetail(err error, table string) (string, bool) {
 // and remedies leave unsanitized and classifyRefusal sanitizes the composed
 // detail at its return.
 func refusalForCause(err error, table string) *refusal {
+	// An enum step's own outcomes are decided first, so a missing grant on
+	// the type is named as the type's, not a table's.
+	if r := enumTypeRefusal(err, table); r != nil {
+		return r
+	}
 	var privilegeErr *preflight.PrivilegeError
 	if errors.As(err, &privilegeErr) {
 		object := "on table " + quotedTable(table)
@@ -1332,6 +1349,9 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 			return fmt.Errorf("apply row security for %q.%q: %w", change.namespace, change.table, err)
 		}
 		return nil
+	}
+	if change.enumValueAdd {
+		return executeEnumValueAdd(ctx, pool, change)
 	}
 	statements, err := postgresCreateSetStatements(change.sql)
 	if err != nil {

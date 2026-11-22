@@ -1,0 +1,151 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/block/pg-sprite/pkg/executor"
+	"github.com/block/pg-sprite/pkg/preflight"
+	pgstatement "github.com/block/pg-sprite/pkg/statement"
+
+	"github.com/block/schemabot/pkg/engine"
+)
+
+// sqlstateDuplicateObject is the server's duplicate_object error. An ALTER
+// TYPE ... ADD VALUE without IF NOT EXISTS raises it when the type already
+// carries the label.
+const sqlstateDuplicateObject = "42710"
+
+// isEnumValueAdd reports whether a planned step's statements are a single
+// ALTER TYPE ... ADD VALUE, the one statement an enum types file plans.
+func isEnumValueAdd(statements []string) (pgstatement.Statement, bool, error) {
+	if len(statements) != 1 {
+		return pgstatement.Statement{}, false, nil
+	}
+	st, err := pgstatement.ParseOne(statements[0])
+	if err != nil {
+		return pgstatement.Statement{}, false, fmt.Errorf("parse planned statement: %w", err)
+	}
+	return st, st.Kind() == pgstatement.KindAddEnumValue, nil
+}
+
+// validateEnumValueAdd admits one label addition planned from an enum types
+// file. The plan qualified the statement with the schema it was made
+// against and named the step by the type, so a statement that names another
+// schema or another type is not the step that was reviewed and is refused
+// before any work is queued.
+func validateEnumValueAdd(req *engine.ApplyRequest, tc engine.TableChange, st pgstatement.Statement) (nativeApply, error) {
+	namespace := req.Changes[0].Namespace
+	ref := st.EnumType()
+	if ref.Schema == "" {
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL enum type %q: the planned statement does not name the type's schema, so plan again", tc.Table)
+	}
+	if ref.Schema != namespace {
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL enum type %q: the planned statement names schema %q but the apply targets schema %q; the target's schema route changed after planning, so plan again", tc.Table, ref.Schema, namespace)
+	}
+	if ref.Name != tc.Table {
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL enum type %q: the planned statement adds a label to type %q", tc.Table, ref.Name)
+	}
+	return nativeApply{namespace: namespace, table: tc.Table, sql: tc.DDL, steps: 1, enumValueAdd: true}, nil
+}
+
+// executeEnumValueAdd adds one enum label. The type is resolved and the
+// role's right to alter it is proven in the session that executes, because
+// what held at plan time proves nothing now. pg-sprite then runs the
+// statement under the apply's lock and statement budgets, in a transaction
+// of its own that commits before the step ends, so the next step of the
+// apply can use the label. Several labels for one type are separate steps,
+// run in planned order, and each placement names a label the type already
+// carried when the plan was made.
+//
+// INV: ST-7 — the label is added only to the type the check resolved.
+// pg-sprite confirms by OID before its commit and rolls back otherwise.
+func executeEnumValueAdd(ctx context.Context, pool *pgxpool.Pool, change nativeApply) error {
+	st, err := pgstatement.ParseOne(change.sql)
+	if err != nil {
+		return fmt.Errorf("parse planned label addition for enum type %q: %w", change.table, err)
+	}
+	target, err := preflight.CheckEnumTarget(ctx, pool, st.EnumType())
+	if err != nil {
+		return &enumTypeError{err: fmt.Errorf("check enum type %q.%q: %w", change.namespace, change.table, err)}
+	}
+	err = executor.ExecuteEnumValueAdd(ctx, pool, target, st, executor.Budget{
+		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+	}, executor.DefaultRetryPolicy())
+	if err == nil {
+		return nil
+	}
+	// pg-sprite returns the server's duplicate_object error as it came, so
+	// the label that another session added since the plan is recognized
+	// here by its SQLSTATE. A typed outcome from pg-sprite's executor would
+	// retire this check.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == sqlstateDuplicateObject {
+		return &enumTypeError{
+			label: st.AddedEnumValue(),
+			err:   fmt.Errorf("add label %q to enum type %q.%q: %w", st.AddedEnumValue(), change.namespace, change.table, errEnumLabelExists),
+			cause: err,
+		}
+	}
+	return &enumTypeError{err: fmt.Errorf("add label %q to enum type %q.%q: %w", st.AddedEnumValue(), change.namespace, change.table, err)}
+}
+
+// errEnumLabelExists means the type already carries the label the step
+// adds: another change added it after the plan was made. Nothing was added.
+var errEnumLabelExists = errors.New("the enum type already carries the label")
+
+// enumTypeError marks a failure of an enum label addition, so the refusal
+// names the type instead of a table and the outcomes only an enum step
+// produces are classified. label is set when the type already carries it;
+// cause keeps the server error behind that outcome for the server log.
+type enumTypeError struct {
+	label string
+	err   error
+	cause error
+}
+
+func (e *enumTypeError) Error() string {
+	if e.cause != nil {
+		return e.err.Error() + ": " + e.cause.Error()
+	}
+	return e.err.Error()
+}
+
+func (e *enumTypeError) Unwrap() error { return e.err }
+
+// enumTypeRefusal maps the outcomes only an enum step produces to permanent
+// refusals. A nil result leaves the failure to the shared mapping, which
+// covers the budgets, the type drift pg-sprite reports, and the rest of the
+// executor's vocabulary.
+func enumTypeRefusal(err error, typeName string) *refusal {
+	var enumErr *enumTypeError
+	if !errors.As(err, &enumErr) {
+		return nil
+	}
+	var privilegeErr *preflight.PrivilegeError
+	if errors.As(err, &privilegeErr) {
+		remedy := fmt.Sprintf("provision with: %s (verified by: %s)", privilegeErr.Grant, privilegeErr.Check)
+		if privilegeErr.Hint != "" {
+			remedy += "; " + privilegeErr.Hint
+		}
+		return &refusal{reason: "insufficient-privileges",
+			cause:         fmt.Sprintf("the engine role lacks access to alter enum type %s", quotedTable(typeName)),
+			remedy:        remedy,
+			provisionable: true}
+	}
+	if errors.Is(err, preflight.ErrEnumTypeNotFound) {
+		return &refusal{reason: "planned-object-drift",
+			cause:  fmt.Sprintf("%s is no longer an enum type on the target", quotedTable(typeName)),
+			remedy: replanRemedy}
+	}
+	if errors.Is(err, errEnumLabelExists) {
+		return &refusal{reason: "planned-object-drift",
+			cause:  fmt.Sprintf("enum type %s already has label %s, which another change added after planning", quotedTable(typeName), quotedTable(enumErr.label)),
+			remedy: replanRemedy}
+	}
+	return nil
+}

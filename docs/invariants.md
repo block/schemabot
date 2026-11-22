@@ -1948,9 +1948,10 @@ belongs to the target that will run the statement: a deployment that applies a p
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
 planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the
 privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS admission refusals
-in `pkg/engine/postgres/row_security.go` and enum type refusals and blocked label additions
-in `pkg/engine/postgres/enum_type.go` that abort plan creation or mark the plan blocked, and the apply-time gate in
-`pkg/engine/postgres/row_security_apply.go`); the whole-plan
+in `pkg/engine/postgres/row_security.go` and enum type refusals, the type privilege gate, and
+blocked label additions in `pkg/engine/postgres/enum_type.go` that abort plan creation or mark the
+plan blocked, and the apply-time gates in `pkg/engine/postgres/row_security_apply.go` and
+`pkg/engine/postgres/enum_type_apply.go`); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
 path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), and for a shard dispatch attaching
 to an existing apply or creating one from a stored plan row its re-planned scope
@@ -2098,7 +2099,8 @@ allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), 
 resolver identity assertions (`pkg/inventory/overrides.go`), discovery scoped to the
 configured inventory environment (`pkg/etre/resolver.go`), rollout member selection
 (`pkg/api/rollout_member_selector.go`, `applyTargets` in `pkg/api/plan_handlers.go`), the PostgreSQL
-apply's check that planned DDL names the schema it targets (`pkg/engine/postgres/apply.go`), and
+apply's check that planned DDL names the schema it targets (`pkg/engine/postgres/apply.go`, and
+`validateEnumValueAdd` in `pkg/engine/postgres/enum_type_apply.go` for an enum label addition), and
 source policy (`pkg/webhook/schema_source_policy.go`).
 
 ### AZ-2: Authorization fails closed at every tier
