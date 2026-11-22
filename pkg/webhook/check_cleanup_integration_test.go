@@ -670,6 +670,29 @@ func TestE2EPlanOnSupersededCommitSettlesNoCheckInEnvironmentRemovedFromConfig(t
 	assert.Equal(t, checkConclusionFailure, sandbox.Conclusion)
 }
 
+// The operator removed sandbox from the database's server config, and the
+// plan of staging on the new commit could not store its result. Settling the
+// sandbox row then would leave the aggregate with no result of the database
+// on this commit at all, so the row stays on its earlier commit and keeps the
+// aggregate open until a plan whose result is stored.
+func TestE2EPlanWithUnstoredResultSettlesNoCheckInEnvironmentRemovedFromConfig(t *testing.T) {
+	dbName := "webhook_removed_env_unstored"
+	svc := setupE2EService(t, dbName)
+	configureE2EServiceEnvironments(t, svc, dbName, "staging")
+	seedPlanCheck(t, svc, "oldsha111", "sandbox", storage.DatabaseTypeMySQL, dbName, 100, false, checkConclusionFailure)
+	client, checkRuns := newFakeGitHubWithHead(t, "newsha222")
+	h := newE2EHandler(t, svc, client)
+
+	finishPlan(t, h, svc, "newsha222", storage.DatabaseTypeMySQL, dbName, nil, 101, false, checkConclusionSuccess)
+
+	sandbox := requireStoredCheck(t, svc, "sandbox", storage.DatabaseTypeMySQL, dbName)
+	assert.Equal(t, "oldsha111", sandbox.HeadSHA, "without a stored result on this commit the row is not settled")
+	assert.Equal(t, checkConclusionFailure, sandbox.Conclusion)
+	cr := requireAggregateCheckRun(t, checkRuns)
+	assert.Equal(t, "newsha222", cr.HeadSHA)
+	assert.NotEqual(t, checkConclusionSuccess, cr.Conclusion, "the aggregate must not pass without a stored result of the database")
+}
+
 // A database's plan stores staging on the new commit while its production row
 // is still on the earlier commit. Production is still in the database's
 // server config, so the row is left for production's next plan and is not a

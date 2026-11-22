@@ -255,12 +255,15 @@ type CheckStore interface {
 	// from in_progress to a successful no-op plan result. Returns true when recovery occurred.
 	RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, check *Check) (bool, error)
 
-	// MarkStalePlanSuccessful marks plan-only stored check state successful when
-	// the database it covers is no longer in the PR. It fails closed: the update
-	// is skipped when the row is in_progress or owns an apply ID, so a started
-	// apply that began after stale cleanup read the row keeps blocking the PR.
-	// Returns true when the row was marked successful.
-	MarkStalePlanSuccessful(ctx context.Context, check *Check) (bool, error)
+	// MarkStalePlanSuccessful marks plan-only stored check state successful on
+	// check.HeadSHA when nothing will replace the row. It fails closed: the
+	// update is skipped when the row is in_progress or owns an apply ID, so a
+	// started apply that began after stale cleanup read the row keeps blocking
+	// the PR. readHeadSHA is the head the caller read the row at; a row a newer
+	// write moved to any head other than readHeadSHA or check.HeadSHA belongs to
+	// that write and is left alone. Returns true when the row is plan-only
+	// successful on check.HeadSHA after the call.
+	MarkStalePlanSuccessful(ctx context.Context, check *Check, readHeadSHA string) (bool, error)
 
 	// BlockStaleStartedApply records that the schema change a started apply
 	// owns is gone from the PR: it moves the row onto headSHA with check's
