@@ -825,6 +825,21 @@ func isDeployStillValidatingError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "validating that these changes are safe to deploy")
 }
 
+// isApprovalRequiredError reports whether a failed deploy call is PlanetScale
+// answering that the deploy request must be approved before it can be
+// deployed. Only an answer from the PlanetScale API counts, never a transport
+// failure whose text happens to mention approval, because the caller treats
+// the match as proof that no deploy started.
+//
+// The planetscale-go client gives this rejection no error code of its own: it
+// arrives as a *ps.Error whose Code does not name it, so the message text is
+// the only signal. This should become a typed check once the client exposes
+// the error code.
+func isApprovalRequiredError(err error) bool {
+	var psErr *ps.Error
+	return errors.As(err, &psErr) && strings.Contains(psErr.Error(), "approved")
+}
+
 // isRetryablePSError returns true if the error is a transient PlanetScale
 // condition that may succeed on retry. Uses the SDK's typed error codes
 // (e.g., ps.ErrRetry for 422, ps.ErrInternal for 500) and falls back to

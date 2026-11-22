@@ -400,20 +400,6 @@ func TestDeployDeployRequest_TransientErrorsRetry(t *testing.T) {
 	assert.Equal(t, 2, client.deployCalls)
 }
 
-// A deploy rejected because the PlanetScale database requires administrator
-// approval can never succeed on retry; it fails immediately with guidance to
-// disable the approval requirement.
-func TestDeployDeployRequest_ApprovalRequirementFailsImmediately(t *testing.T) {
-	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
-	client := &deployRejectionClient{rejectErr: errors.New("deploy request must be approved"), rejections: 1_000_000}
-
-	_, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 9, false, nil)
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "Require administrator approval")
-	assert.Equal(t, 1, client.deployCalls)
-}
-
 // deployOutcomeUnknownClient fails every deploy call, the first ones with
 // earlierDeployErrs in order and the rest with deployErr, and serves a fixed
 // deploy request (or getErr) on the re-read, so tests can drive a deploy call

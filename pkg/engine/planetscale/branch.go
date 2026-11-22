@@ -1090,8 +1090,12 @@ func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClie
 		if err == nil {
 			return dr, nil
 		}
-		if strings.Contains(err.Error(), "approved") {
-			return nil, fmt.Errorf("deploy request #%d could not be deployed: PlanetScale deploy request approvals are not supported — disable 'Require administrator approval for deploy requests' in the PlanetScale database settings", number)
+		if isApprovalRequiredError(err) {
+			// PlanetScale answered that it will not deploy this request until
+			// it is approved, and repeating the call cannot change that. The
+			// deploy never started, so nothing needs adopting: the failure is
+			// permanent, and the operator is told how to proceed.
+			return nil, engine.NewPermanentError("deploy request #%d could not be deployed: PlanetScale deploy request approvals are not supported. Turn off 'Require administrator approval for deploy requests' in the PlanetScale database settings, then re-plan and apply: %w", number, err)
 		}
 		switch {
 		case isDeployStillValidatingError(err):
