@@ -13,9 +13,21 @@ schemabot configure
 schemabot status
 ```
 
-If the server requires authentication, `schemabot login` caches a token. Your team may wrap the CLI under another name or set it up for you; use their instructions if so. [Connect to a server](https://github.com/block/schemabot/blob/main/docs/cli.md#connect-to-a-server) has the details.
+If the server requires authentication, `schemabot login` caches a token. [Connect to a server](https://github.com/block/schemabot/blob/main/docs/cli.md#connect-to-a-server) has the details. If your team runs the CLI through its own wrapper, use that instead; see [Your team's wrapper](#your-teams-wrapper).
 
 An authentication or permission error (`401` or `403`) means the account lacks access. Say which permission is missing and ask the user or an operator. Never try other credentials or work around the check.
+
+## Your team's wrapper
+
+Many teams run the CLI through a wrapper, such as `acme schemabot`. The wrapper knows the team's servers and handles sign-in, so the same command reaches the right server from any laptop. When your team has one, use it for every terminal command:
+
+- **Swap only the leading name.** Keep the subcommand and flags from this guide, so `schemabot status -e production` becomes `acme schemabot status -e production`.
+- **Find the name in your team's skill or docs, or in SchemaBot's own hints.** The server can be configured to print the wrapper's name in the CLI hints it puts in PR comments, and a wrapper does the same for the commands the CLI prints. A hint that reads `acme schemabot …` is the sign a wrapper exists.
+- **Copy printed commands as written.** A wrapper usually picks the server from `-e` and may add its own flags, such as one that selects which of the team's SchemaBot deployments to reach. A command the CLI prints for you to run next carries the flags the current run used.
+- **Let the wrapper sign in.** Don't aim the bare `schemabot` binary at a team server with `--endpoint` or a token you found to get around the wrapper. Its sign-in is how the team decides who has access.
+- **PR comment commands don't change.** They always start with `schemabot`, whatever the wrapper is called.
+
+A wrapper can trail the latest SchemaBot release. If a command or flag in this guide is missing, check the wrapper's `--version` before deciding SchemaBot can't do it. To build a wrapper, see [Wrap the CLI for your team](https://github.com/block/schemabot/blob/main/docs/cli.md#wrap-the-cli-for-your-team).
 
 ## Track a schema change
 

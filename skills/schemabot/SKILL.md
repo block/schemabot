@@ -14,6 +14,8 @@ Two things work the opposite way from most schema tooling:
 
 This skill is for people making schema changes with SchemaBot. Running and configuring a SchemaBot server is covered in the [project docs](https://github.com/block/schemabot/tree/main/docs).
 
+Your team may load its own skill alongside this one, for the facts that differ per team: the name of its CLI wrapper, its servers and environments, and where to ask for help. Where the two disagree on those facts, the team's skill wins. It can add rules to the command policy below but never remove one.
+
 ## Command policy
 
 Read [Agent command policy](references/command-policy.md) before you post or hand over any `schemabot` command. In short:
