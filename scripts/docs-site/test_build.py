@@ -122,6 +122,26 @@ class StagingTests(unittest.TestCase):
         self.assertIn('title: "SchemaBot"', out)
 
 
+    def test_list_content_indented_four_spaces_passes(self):
+        text = (
+            "1. **Plan.**\n    The plan comment.\n\n    ![plan](plan.png)\n\n"
+            "2. **Apply.**\n    - nested\n\n    ```bash\n  schemabot apply\n    ```\n"
+        )
+        BUILD["check_list_indentation"](text, "docs/guide.md")
+
+    def test_list_content_indented_three_spaces_fails(self):
+        text = "1. **Plan.**\n   The plan comment.\n\n   ![plan](plan.png)\n\n2. **Apply.**\n"
+        with self.assertRaisesRegex(BuildError, r"docs/guide.md:4: indent list content by four spaces"):
+            BUILD["check_list_indentation"](text, "docs/guide.md")
+
+    def test_a_nested_list_indented_two_spaces_fails(self):
+        with self.assertRaisesRegex(BuildError, r"docs/guide.md:2: "):
+            BUILD["check_list_indentation"]("- Tern:\n  - LocalClient\n", "docs/guide.md")
+
+    def test_fenced_code_contents_are_not_checked(self):
+        BUILD["check_list_indentation"]("```yaml\nenvironments:\n\n  - staging\n```\n", "docs/guide.md")
+
+
 class NavTests(unittest.TestCase):
     NAV = [{"Home": "index.md"}, {"Guides": ["cli.md", {"Auth": "auth.md"}]}]
 

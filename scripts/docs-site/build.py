@@ -54,6 +54,7 @@ FENCE = re.compile(r"^(\s*)(`{3,}|~{3,})")
 # Markdown link and image targets, and HTML src/href attributes.
 MD_LINK = re.compile(r"(\]\()([^)\s]+)((?:\s+\"[^\"]*\")?\))")
 HTML_ATTR = re.compile(r"""((?:src|href)=")([^"]+)(")""")
+LIST_ITEM = re.compile(r"^ *(?:[-*+]|\d+[.)]) ")
 DETAILS_OPEN = re.compile(r"<details(?![^>]*\bmarkdown=)([^>]*)>")
 
 
@@ -250,20 +251,47 @@ def rewrite_links(text: str, source: str, repo_root: Path, links) -> str:
             line,
         )
 
-    out: list[str] = []
+    return "".join(line if fenced else rewrite_line(line) for line, fenced in lines_with_fences(text))
+
+
+def lines_with_fences(text: str):
+    """Yield each line with whether it belongs to a fenced code block."""
     fence: str | None = None
     for line in text.splitlines(keepends=True):
         match = FENCE.match(line)
         if fence is None and match:
             fence = match.group(2)
-            out.append(line)
+            yield line, True
         elif fence is not None:
             if match and match.group(2).startswith(fence[0] * len(fence)) and line.strip() == match.group(2):
                 fence = None
-            out.append(line)
+            yield line, True
         else:
-            out.append(rewrite_line(line))
-    return "".join(out)
+            yield line, False
+
+
+def check_list_indentation(text: str, source: str) -> None:
+    """Fail on list content indented less than four spaces.
+
+    GitHub accepts content under a list item at the item's text column, so a
+    paragraph, image, code block, or nested list indented two or three spaces
+    stays in the list there. Python-Markdown needs four, so on the site that
+    content drops out of the list: a nested list renders flat, and the
+    numbering restarts at 1 after it. Four spaces renders the same on both.
+    """
+    previous_blank = False
+    for number, (line, fenced) in enumerate(lines_with_fences(text), start=1):
+        indent = len(line) - len(line.lstrip(" "))
+        # A fence opening line counts; its contents do not.
+        opens_fence = fenced and FENCE.match(line) is not None
+        checked = not fenced or opens_fence
+        nested_item = LIST_ITEM.match(line) is not None
+        if checked and 0 < indent < 4 and line.strip() and (nested_item or previous_blank):
+            raise BuildError(
+                f"{source}:{number}: indent list content by four spaces; "
+                f"with {indent} the site drops it out of the list"
+            )
+        previous_blank = not line.strip()
 
 
 def strip_toc(text: str) -> str:
@@ -292,7 +320,9 @@ def page_title(text: str, fallback: str) -> str:
 
 def stage_site_page(text: str, page: Page, description: str, repo_root: Path, links: SiteLinks) -> str:
     """Return the Markdown MkDocs renders for one page."""
-    body = rewrite_links(strip_toc(text), page.source, repo_root, links)
+    text = strip_toc(text)
+    check_list_indentation(text, page.source)
+    body = rewrite_links(text, page.source, repo_root, links)
     # Python-Markdown leaves HTML blocks alone unless asked; GitHub renders
     # Markdown inside <details>, so ask for the same here.
     body = DETAILS_OPEN.sub(r'<details markdown="1"\1>', body)
