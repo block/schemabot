@@ -174,7 +174,7 @@ class E2ESeedTest(unittest.TestCase):
         self.assertNotIn("vitess-production", run.started())
 
     def test_a_timeout_that_is_not_a_positive_number_is_rejected(self):
-        for timeout in ["0", "", "abc", "-5", "1.5"]:
+        for timeout in ["0", "00", "000", "", "abc", "-5", "1.5"]:
             with self.subTest(timeout=timeout):
                 run = self.run_seed(timeout=timeout)
                 self.assertEqual(run.returncode, 2, run.output)

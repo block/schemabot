@@ -17,12 +17,17 @@
 set -uo pipefail
 
 limit=${E2E_SEED_APPLY_TIMEOUT-180}
+# Digits only, with at least one that is not zero: perl reads `0`, `00` and
+# an empty value alike as alarm(0), which turns the bound off.
 case "$limit" in
-  '' | *[!0-9]* | 0)
-    echo "E2E_SEED_APPLY_TIMEOUT must be a positive whole number of seconds, got '$limit'" >&2
-    exit 2
-    ;;
+  '' | *[!0-9]*) limit_ok=false ;;
+  *[1-9]*) limit_ok=true ;;
+  *) limit_ok=false ;;
 esac
+if [ "$limit_ok" != true ]; then
+  echo "E2E_SEED_APPLY_TIMEOUT must be a positive whole number of seconds, got '$limit'" >&2
+  exit 2
+fi
 
 endpoint=http://localhost:14370
 localscale=http://localhost:14374
