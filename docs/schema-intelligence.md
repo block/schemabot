@@ -719,7 +719,10 @@ keyspace's finalizer, and the response sets `sharded: true`. Its `tables` are
 then rolled up across the shards: one entry per keyspace table, with `status`
 the shard state that needs attention first, `rows_copied` and `rows_total`
 summed over the shards that have reported a total, and `shards` listing each
-shard's own state and rows. `estimated_bytes` is the table's planned size
+shard's own state and rows. A shard sets `copies_no_rows: true` when every
+change it runs on the table copies no rows (a `CREATE TABLE`, a `DROP TABLE`,
+or an instant `ALTER`), so a running shard reads as applying rather than as a
+table copy. `estimated_bytes` is the table's planned size
 across all its shards, and `planned_shards` the number of shards the plan
 recorded it spanning. A shard whose wave has not started reports its
 operation's state and no rows. A table on its keyspace's only shard keeps its

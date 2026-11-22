@@ -211,9 +211,9 @@ func TestWriteProgressShardedCreateHeaderAndDetailAgree(t *testing.T) {
 			DDL:    "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))",
 			Status: state.Task.Running,
 			Shards: []*apitypes.ShardProgressResponse{
-				{Shard: "-40", Status: state.Task.Completed},
-				{Shard: "40-80", Status: state.Task.Running},
-				{Shard: "80-", Status: state.Task.Running},
+				{Shard: "-40", Status: state.Task.Completed, CopiesNoRows: true},
+				{Shard: "40-80", Status: state.Task.Running, CopiesNoRows: true},
+				{Shard: "80-", Status: state.Task.Running, CopiesNoRows: true},
 			},
 		}},
 	})
@@ -223,4 +223,30 @@ func TestWriteProgressShardedCreateHeaderAndDetailAgree(t *testing.T) {
 	assert.Contains(t, output, "Shards: 3 (2 applying, 1 complete)")
 	assert.NotContains(t, output, "running table copy")
 	assert.NotContains(t, output, "copying")
+}
+
+// Each shard reads by its own change: a shard the server reports as copying
+// no rows reads as applying, and a sibling running a table copy of the same
+// table reads as one, as the PR comment shows them.
+func TestWriteProgressShardedReadsEachShardByItsOwnChange(t *testing.T) {
+	ops := []*apitypes.ProgressOperationResponse{
+		{Deployment: "data-plane", OperationKey: "shop_001/-80/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel},
+		{Deployment: "data-plane", OperationKey: "shop_001/80-/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel},
+	}
+	data := ParseProgressResponse(&apitypes.ProgressResponse{
+		ApplyID: "apply-sharded-mixed", Database: "shop", DatabaseType: storage.DatabaseTypeMySQL,
+		Environment: "staging", State: state.Apply.Running, Sharded: true, Operations: ops,
+		Tables: []*apitypes.TableProgressResponse{{
+			TableName: "orders", Keyspace: "shop_001", Deployment: "data-plane", ChangeType: "alter",
+			DDL:    "ALTER TABLE `orders` ADD COLUMN `note` text",
+			Status: state.Task.Running,
+			Shards: []*apitypes.ShardProgressResponse{
+				{Shard: "-80", Status: state.Task.Running, CopiesNoRows: true},
+				{Shard: "80-", Status: state.Task.Running, RowsCopied: 400, RowsTotal: 1000},
+			},
+		}},
+	})
+	output := captureStdout(t, func() { WriteProgress(data) })
+
+	assert.Contains(t, output, "Shards:       1 applying, 1 running table copy")
 }

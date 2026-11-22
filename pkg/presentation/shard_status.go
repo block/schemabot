@@ -22,6 +22,11 @@ type ShardWork struct {
 type ShardStatus struct {
 	Keyspace string
 	Shard    string
+	// Landed is true once every table change the shard runs has landed. The
+	// shard's State names its most attention-worthy operation, which can be a
+	// landed one while a sibling operation on the same shard is still queued,
+	// so State alone cannot say the shard is done.
+	Landed bool
 	Deployment
 }
 
@@ -83,7 +88,7 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 				"identity", identity, "keyspace", sw.Keyspace, "shard", sw.Shard)
 			continue
 		}
-		out = append(out, ShardStatus{Keyspace: sw.Keyspace, Shard: sw.Shard, Deployment: d})
+		out = append(out, ShardStatus{Keyspace: sw.Keyspace, Shard: sw.Shard, Landed: shardLanded(sw.Operations), Deployment: d})
 	}
 	return out
 }
@@ -98,6 +103,27 @@ func shardCopiesNoRows(ops []Operation) bool {
 		}
 	}
 	return true
+}
+
+// shardLanded reports whether every table change a shard runs has landed:
+// completed, or applied and waiting out its revert window.
+func shardLanded(ops []Operation) bool {
+	if len(ops) == 0 {
+		return false
+	}
+	for _, op := range ops {
+		if !OperationLanded(op.State) {
+			return false
+		}
+	}
+	return true
+}
+
+// OperationLanded reports whether an operation in this state has landed its
+// change: completed, or applied and waiting out its revert window.
+func OperationLanded(operationState string) bool {
+	return state.IsState(operationState, state.ApplyOperation.Completed) ||
+		state.IsState(operationState, state.ApplyOperation.RevertWindow)
 }
 
 // shardIdentity is the name a shard's status goes by: the shard, qualified by

@@ -170,16 +170,18 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 
 			ChecksumRowsChecked: sc.ChecksumRowsChecked,
 			ChecksumRowsTotal:   sc.ChecksumRowsTotal,
+			CopiesNoRows:        tasksCopyNoRows(tasksByOp[op.ID]),
 		})
 		shardRows := rowsByOp[op.ID]
-		if len(shardRows) == 0 {
+		reported := len(shardRows) > 0
+		if !reported {
 			if planned := plannedShardChange(plan, namespace, shard, table); planned != nil {
 				shardRows = []*apitypes.TableProgressResponse{{ChangeType: planned.Operation, DDL: planned.DDL}}
 			}
 		}
 		for _, r := range shardRows {
-			if row.ChangeType == "" {
-				row.ChangeType = r.ChangeType
+			if row.ChangeType == "" || (reported && copiesRowsWhereTableDoesNot(row, r)) {
+				row.ChangeType, row.IsInstant = r.ChangeType, r.IsInstant
 			}
 			if r.DDL != "" && !slices.Contains(ddls, r.DDL) {
 				ddls = append(ddls, r.DDL)
@@ -321,4 +323,24 @@ func (s *Service) storedPlanForShardedProgress(ctx context.Context, apply *stora
 		return nil
 	}
 	return plan
+}
+
+// tasksCopyNoRows reports whether a shard operation's tasks are all table
+// changes that copy no rows (presentation.ChangesCopyNoRows), the same fact
+// the PR comment reads from the same tasks.
+func tasksCopyNoRows(tasks []*storage.Task) bool {
+	changes := make([]presentation.TableChange, 0, len(tasks))
+	for _, t := range tasks {
+		changes = append(changes, presentation.TableChange{DDLAction: t.DDLAction, Instant: t.IsInstant})
+	}
+	return presentation.ChangesCopyNoRows(changes)
+}
+
+// copiesRowsWhereTableDoesNot reports whether a shard's reported change copies
+// rows while the table row's change so far does not. The table row then takes
+// that shard's change, so the table reads as a table copy whenever any of its
+// shards runs one, not only when the first shard listed does.
+func copiesRowsWhereTableDoesNot(table, shard *apitypes.TableProgressResponse) bool {
+	return presentation.ChangeCopiesRows(shard.ChangeType, shard.IsInstant) &&
+		!presentation.ChangeCopiesRows(table.ChangeType, table.IsInstant)
 }

@@ -74,7 +74,7 @@ func shardStatuses(applyState string, ops []ProgressOperation, tables []TablePro
 		if shard != state.FullKeyRangeShard {
 			sharded = true
 		}
-		op.CopiesNoRows = shardTableCopiesNoRows(keyspace, table, tables)
+		op.CopiesNoRows = shardTableCopiesNoRows(keyspace, shard, table, tables)
 		key := keyspaceShard{keyspace, shard}
 		j, seen := index[key]
 		if !seen {
@@ -90,15 +90,28 @@ func shardStatuses(applyState string, ops []ProgressOperation, tables []TablePro
 	return presentation.DeriveShards(applyState, work), true
 }
 
-// shardTableCopiesNoRows reports whether a keyspace table's change copies no
-// rows (presentation.ChangeCopiesRows), so its running shards read as applying
-// on the CLI as they do on the PR comment. A table the progress does not list
-// reads as copying, since nothing says otherwise.
-func shardTableCopiesNoRows(keyspace, table string, tables []TableProgress) bool {
+// shardTableCopiesNoRows reports whether one shard's changes to a keyspace
+// table copy no rows, so the shard reads as applying on the CLI as it does on
+// the PR comment. A table rolled up across shards carries the answer on each
+// shard's entry, which the server derives from that shard's own tasks. A table
+// that runs on its keyspace's only shard is listed as its task rows, so the
+// answer is read from them. A shard the progress does not list reads as
+// copying, since nothing says otherwise.
+func shardTableCopiesNoRows(keyspace, shard, table string, tables []TableProgress) bool {
+	var taskRows []presentation.TableChange
 	for _, t := range tables {
-		if t.Namespace == keyspace && t.TableName == table {
-			return !presentation.ChangeCopiesRows(t.ChangeType, t.IsInstant)
+		if t.Namespace != keyspace || t.TableName != table {
+			continue
+		}
+		if len(t.Shards) == 0 {
+			taskRows = append(taskRows, presentation.TableChange{DDLAction: t.ChangeType, Instant: t.IsInstant})
+			continue
+		}
+		for _, sh := range t.Shards {
+			if sh.Shard == shard {
+				return sh.CopiesNoRows
+			}
 		}
 	}
-	return false
+	return presentation.ChangesCopyNoRows(taskRows)
 }

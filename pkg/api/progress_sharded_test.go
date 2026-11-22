@@ -117,6 +117,31 @@ func TestProgressByApplyIDRollsAShardedApplyUpByTable(t *testing.T) {
 	assert.Equal(t, []apitypes.VSchemaChange{{Namespace: "shop_001", Status: "", Diff: "+ orders"}}, changes)
 }
 
+// Each shard says whether its own change copies rows, from its own tasks, so
+// a shard running an instant ALTER reads as applying while a sibling running a
+// table copy does not. The table reads as a table copy whenever any of its
+// shards runs one, whichever shard is listed first.
+func TestProgressByApplyIDSaysWhichShardsCopyNoRows(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		shardOp(1, "shop_001/-80/orders", state.ApplyOperation.Running),
+		shardOp(2, "shop_001/80-/orders", state.ApplyOperation.Running),
+	}
+	instant := shardTask(1, state.Task.Running, 0, 0)
+	instant.IsInstant = true
+	copying := shardTask(2, state.Task.Running, 400, 1000)
+	copying.TaskIdentifier = "task-2"
+
+	resp := shardedProgress(t, ops, []*storage.Task{instant, copying}, &staticPlanStore{})
+
+	require.Len(t, resp.Tables, 1)
+	table := resp.Tables[0]
+	require.Len(t, table.Shards, 2)
+	assert.True(t, table.Shards[0].CopiesNoRows, "-80 runs an instant ALTER")
+	assert.False(t, table.Shards[1].CopiesNoRows, "80- runs a table copy")
+	assert.Equal(t, "alter", table.ChangeType)
+	assert.False(t, table.IsInstant, "a table with a shard copying rows is not instant")
+}
+
 // While a sharded apply's operations attach one dispatch at a time, it reads
 // as every operation its manifest declares: with only its first shard
 // attached, the apply is still served as the rollout, the declared shard still

@@ -86,3 +86,25 @@ func TestDeriveShardsReadsAChangeThatCopiesNoRowsAsApplying(t *testing.T) {
 	assert.Equal(t, "1 applying, 1 running table copy, 1 completed",
 		ShardCounts([]string{shards[0].Label, shards[1].Label, shards[2].Label}))
 }
+
+// A shard has landed only once every table change it runs has landed. A
+// shard whose first table waits out its revert window while a second table's
+// change is still queued reads by its revert window state, but it is not done.
+func TestDeriveShardsLandsAShardOnlyWhenEveryChangeHasLanded(t *testing.T) {
+	shards := DeriveShards(state.Apply.Running, []ShardWork{
+		{Keyspace: "shop_001", Shard: "-80", Operations: []Operation{
+			{State: state.ApplyOperation.RevertWindow},
+			{State: state.ApplyOperation.Completed},
+		}},
+		{Keyspace: "shop_001", Shard: "80-", Operations: []Operation{
+			{State: state.ApplyOperation.RevertWindow},
+			{State: state.ApplyOperation.Pending},
+		}},
+	})
+
+	require.Len(t, shards, 2)
+	assert.True(t, shards[0].Landed, "every change on -80 has landed")
+	assert.Equal(t, state.ApplyOperation.RevertWindow, shards[1].State,
+		"the shard reads as its revert window operation")
+	assert.False(t, shards[1].Landed, "80- still has a queued change")
+}

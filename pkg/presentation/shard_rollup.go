@@ -23,11 +23,14 @@ type ShardCopy struct {
 // when the operation's wave starts. It also stands in for a task still
 // recorded as pending under a running operation: a driver has dispatched the
 // shard, and the task row only catches up on the next progress poll, so the
-// shard is under way rather than queued.
+// shard is under way rather than queued. Tasks are ranked by the state they
+// recorded, and only the chosen task is read as running, so a pending
+// sibling never outranks a task that has reported a later step such as
+// checksumming.
 func ShardOperationCopy(operationState string, tasks []ShardCopy) ShardCopy {
 	best := ShardCopy{}
 	for _, t := range tasks {
-		if t.Status == "" || dispatchedButPending(operationState, t.Status) {
+		if t.Status == "" {
 			t.Status = operationState
 		}
 		if best.Status == "" || TaskAttentionRank(t.Status) > TaskAttentionRank(best.Status) {
@@ -36,6 +39,9 @@ func ShardOperationCopy(operationState string, tasks []ShardCopy) ShardCopy {
 	}
 	if best.Status == "" {
 		return ShardCopy{Status: operationState}
+	}
+	if dispatchedButPending(operationState, best.Status) {
+		best.Status = operationState
 	}
 	return best
 }

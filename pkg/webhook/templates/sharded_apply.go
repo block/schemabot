@@ -164,6 +164,11 @@ type ShardStatus struct {
 	// failure it names is EndedBy's.
 	StoppedAtCutover bool
 	EndedBy          string
+	// Landed is true once every table change the shard runs has landed.
+	// State names only the shard's most attention-worthy operation, which
+	// can be a landed one while another table's change on the shard is
+	// still queued.
+	Landed bool
 }
 
 // ShardCell is one (shard, table) operation: the statements that table runs
@@ -367,7 +372,7 @@ func shardsLandedSuffix(data ShardedApplyData) string {
 	for _, ks := range data.Keyspaces {
 		for _, sh := range ks.Shards {
 			total++
-			if shardChangeLanded(sh.State) {
+			if sh.Landed {
 				landed++
 			}
 		}

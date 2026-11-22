@@ -87,6 +87,30 @@ func ChangeCopiesRows(ddlAction string, instant bool) bool {
 	return true
 }
 
+// TableChange is what decides whether one table change copies rows: its DDL
+// action ("create", "alter" or "drop") and whether its engine runs it as
+// instant DDL.
+type TableChange struct {
+	DDLAction string
+	Instant   bool
+}
+
+// ChangesCopyNoRows reports whether none of a shard operation's table
+// changes copies rows (ChangeCopiesRows), so the shard reads as applying
+// rather than running a table copy. An operation with no changes recorded yet
+// reads as copying, since nothing says otherwise.
+func ChangesCopyNoRows(changes []TableChange) bool {
+	if len(changes) == 0 {
+		return false
+	}
+	for _, c := range changes {
+		if ChangeCopiesRows(c.DDLAction, c.Instant) {
+			return false
+		}
+	}
+	return true
+}
+
 // PendingWord names the parts still to run of a rollout that has or has not
 // settled.
 func PendingWord(settled bool) string {

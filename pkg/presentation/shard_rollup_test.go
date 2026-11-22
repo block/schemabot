@@ -46,6 +46,9 @@ func TestShardOperationCopyReadsADispatchedShardAsRunning(t *testing.T) {
 		ShardOperationCopy(state.ApplyOperation.Running, []ShardCopy{{Status: state.Task.Pending}}).Status)
 	assert.Equal(t, state.Task.Pending,
 		ShardOperationCopy(state.ApplyOperation.Pending, []ShardCopy{{Status: state.Task.Pending}}).Status)
+	assert.Equal(t, state.Task.Checksumming,
+		ShardOperationCopy(state.ApplyOperation.Running, []ShardCopy{{Status: state.Task.Pending}, {Status: state.Task.Checksumming}}).Status,
+		"a pending sibling does not hide a task that has reported a later step")
 
 	// 97 shards landed and 31 dispatched with pending task rows: the table
 	// reads as in progress, not queued.

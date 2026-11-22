@@ -1097,8 +1097,8 @@ func TestRenderShardedApplyComment_PartialLandingStatesCoverage(t *testing.T) {
 					},
 				}},
 				Shards: []ShardStatus{
-					{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
-					{Shard: "40-80", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+					{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed, Landed: true},
+					{Shard: "40-80", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed, Landed: true},
 					{Shard: "80-c0", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
 					{Shard: "c0-", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
 				},
@@ -1122,6 +1122,13 @@ func TestRenderShardedApplyComment_PartialLandingStatesCoverage(t *testing.T) {
 			"a %s aggregate's shard summary already carries the breakdown", status)
 		assert.Containsf(t, inFlight, "- Shards: 4 (", "a %s aggregate lists its shards", status)
 	}
+
+	// A shard that reads as its revert window operation while another of its
+	// changes is still queued has not landed, so it does not count.
+	halfLanded := mixed(state.Task.Pending, state.Task.Pending)
+	halfLanded.Keyspaces[0].Shards[1] = ShardStatus{Shard: "40-80", Emoji: "⏪", Label: "revert window", State: state.ApplyOperation.RevertWindow}
+	assert.Contains(t, RenderShardedApplyComment(halfLanded), "(done on 1 of 4 shards)",
+		"a shard counts as done only once every change it runs has landed")
 }
 
 // A table that changes on only some of the keyspace's shards names them above

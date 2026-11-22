@@ -414,6 +414,7 @@ func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, release
 			Error:            s.Error,
 			StoppedAtCutover: s.Presentation == presentation.StateStoppedAtCutover,
 			EndedBy:          s.EndedBy,
+			Landed:           s.Landed,
 		})
 	}
 	return out
@@ -504,18 +505,13 @@ func shardOperationCopy(op *storage.ApplyOperation, tasks []*storage.Task) prese
 }
 
 // tasksCopyNoRows reports whether an operation's tasks are all table changes
-// that copy no rows (presentation.ChangeCopiesRows). An operation with no
-// tasks yet reads as copying, since nothing says otherwise.
+// that copy no rows (presentation.ChangesCopyNoRows).
 func tasksCopyNoRows(tasks []*storage.Task) bool {
-	if len(tasks) == 0 {
-		return false
-	}
+	changes := make([]presentation.TableChange, 0, len(tasks))
 	for _, t := range tasks {
-		if presentation.ChangeCopiesRows(t.DDLAction, t.IsInstant) {
-			return false
-		}
+		changes = append(changes, presentation.TableChange{DDLAction: t.DDLAction, Instant: t.IsInstant})
 	}
-	return true
+	return presentation.ChangesCopyNoRows(changes)
 }
 
 // shardOperationError is a shard operation's error. When the row carries no
