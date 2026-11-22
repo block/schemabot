@@ -51,7 +51,7 @@ No plan comment can mean the files already match the live database; read the Sch
 | [Sharded databases](references/sharded-databases.md) | A plan that rolls out to several targets, `--target`, a rollout where one target failed |
 | [Sharded Vitess tables](references/vitess-sharded-tables.md) | Adding or dropping a sharded Vitess table with its VSchema and sequence |
 | [The CLI](references/cli.md) | Where a change stands, whether it finished, how long it has left, its logs |
-| [GitHub outages](references/github-outage.md) | Checks, comment replies, or merge queues stall across many PRs at once |
+| [GitHub outages](references/github-outage.md) | Checks, comment replies, or merge queues stall across many PRs at once, whether GitHub or SchemaBot is the cause, or someone asks to turn off the required check |
 
 ## Vocabulary
 
