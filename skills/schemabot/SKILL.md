@@ -21,8 +21,8 @@ Your team may load its own skill alongside this one, for the facts that differ p
 Read [Agent command policy](references/command-policy.md) before you post or hand over any `schemabot` command. In short:
 
 1. **Production: never post.** Hand the exact command to the human. The comment is the authorization, and SchemaBot records its author as the operator.
-2. **Never post `--allow-unsafe` or `--skip-revert`**, in any environment.
-3. **Ask first** before `apply-confirm`, `release`, `unlock`, `rollback`, `rollback-confirm`, `revert`, or `skip-revert`.
+2. **Never post `--allow-unsafe`, `--skip-revert`, `--override`, or `unlock --force`**, in any environment.
+3. **Ask first** before `apply-confirm`, `release`, `unlock`, `rollback`, `rollback-confirm`, `revert`, or `skip-revert`, and before closing a PR.
 4. **Other environments: find out who else uses the database first.** Hand the command over if the database is shared, critical, or you can't tell. Otherwise say what you are about to do, then post it.
 5. **The user can opt out.** If they say they post every command themselves, hand every command over.
 

@@ -9,7 +9,7 @@ A SchemaBot command posted from the user's GitHub account is recorded as the use
 | `plan`, `help` | Post freely: they change nothing on the database | Post freely |
 | `apply`, `stop`, `start`, `cutover`, `cancel` | Hand over | Post or hand over, by [who the database affects](#other-environments-decide-who-it-affects) |
 | `apply-confirm`, `release`, `unlock`, `rollback`, `rollback-confirm`, `revert`, `skip-revert` | Hand over | [Ask first](#ask-before-posting-these-in-any-environment) |
-| Any command carrying `--allow-unsafe` or `--skip-revert` | Hand over | [Hand over](#never-post-these-in-any-environment) |
+| Any command carrying `--allow-unsafe`, `--skip-revert`, `--override`, or `--force` | Hand over | [Hand over](#never-post-these-in-any-environment) |
 | `freeze approve` | Hand over | Hand over: approving an override of a freeze is a freeze approver's decision |
 | `fix-lint` | Run it in the terminal, not as a comment: it rewrites the schema files in the worktree | Same |
 
@@ -27,6 +27,8 @@ Production usually requires an approved PR. The command comment is the act that 
 
 - A command carrying `--allow-unsafe`. Accepting a destructive change is a human decision. Show the change and the command and let the human post it.
 - A command carrying `--skip-revert`. It gives up the Vitess revert window before anyone has seen the change land, which is the same decision as `skip-revert` made up front.
+- A command carrying `--override`. When a freeze refuses a command, SchemaBot says to run it again with `--override` and a reason. That asks a freeze approver to let the change through, and the reason is recorded as the user's. Tell the user about the freeze and let them decide whether to ask.
+- `unlock --force`. It releases a database's lock even when no PR holds it, such as the lock of an apply started from the CLI, in any environment.
 
 ## Ask before posting these, in any environment
 
@@ -35,9 +37,10 @@ Say what the command will do and let the user answer. If they would rather post 
 - **`apply-confirm`.** SchemaBot waits for it when it could not verify that the plan is the one that was reviewed, or when the change needs explicit sign-off. Confirming it yourself approves a plan nobody has read. Say what changed.
 - **`release`.** A rollout pauses here after a failure. Releasing it declares the failure acceptable and lets the remaining members go. Say what failed.
 - **`unlock`.** It takes no `-e`: it releases every lock the PR holds, which can include a production one. Name the locks it would release.
-- **`rollback` and `rollback-confirm`.** A rollback applies the previous schema, so undoing an additive change drops the column or table it added, with any data written to it. For a rollback, the confirm step is the acknowledgment. Say what will be dropped.
+- **`rollback` and `rollback-confirm`.** A rollback applies the previous schema, so undoing an additive change drops the column or table it added, with any data written to it. Say what will be dropped. A rollback that drops something needs `--allow-unsafe` on `rollback-confirm`, and that makes the confirm a hand-over: see [Never post these](#never-post-these-in-any-environment).
 - **`revert`.** Same effect as a rollback, inside the Vitess revert window.
 - **`skip-revert`.** Closes the revert window early and gives up the undo. Say what option is being closed.
+- **Closing the PR, even to reopen it.** With no apply running, closing a PR releases its locks and clears its stored check state, as `unlock` does, and throws away a plan waiting for `apply-confirm`. Say what it would release.
 
 ## Other environments: decide who it affects
 
@@ -56,6 +59,10 @@ This decides `apply` and the in-flight commands `stop`, `start`, `cutover`, and 
 When you hand over a command because the database is shared or you could not tell, say which one it was. There is no question to ask: "post it anyway" doesn't change who the database affects. If the user tells you something you didn't know, such as that the database is a scratch copy only they use, decide again with that.
 
 When you do post, announce it in the turn before: "applying to staging now, I'll report what the plan says". Then read the plan and progress comments back to the user. Never post as a side effect of unrelated work.
+
+## Terminal commands that change SchemaBot itself
+
+The rules above apply in the terminal too: an `apply` run from the CLI is the same decision as an `apply` comment. The CLI also has commands with no PR comment form, which change SchemaBot for every team on the server rather than one change: `freeze`, `unfreeze`, `settings` given a value, `checks backfill`, and the `storage` commands other than `storage plan`. They are for SchemaBot's operators. Hand them over, in every environment. Their read-only forms, such as `freeze list`, `settings` with no value, `checks show`, and `storage plan`, you can run.
 
 ## The user can opt out
 
@@ -92,4 +99,4 @@ Keep it to one line. Your reasoning and what came back belong in your reply to t
 
 ## Copy commands, don't build them
 
-SchemaBot's comments end with the exact next command: apply ID, `-e`, and any required flags filled in. Copy that command rather than writing one. `schemabot help` posts the full command table.
+SchemaBot's comments end with the exact next command: apply ID, `-e`, and any required flags filled in. Copy that command rather than writing one. A copied command still follows this policy: one that carries `--allow-unsafe` or `--override` is still the human's to post. `schemabot help` posts the full command table.

@@ -115,15 +115,59 @@ func TestAgentSkillCommandPolicy(t *testing.T) {
 		}
 	})
 
+	t.Run("states a rule for every PR comment flag", func(t *testing.T) {
+		flags := webhook.CommandFlags()
+		for _, flag := range flags {
+			_, pinned := expectedPolicy[flag]
+			_, neutral := policyNeutralFlags[flag]
+			assert.True(t, pinned || neutral, "PR comment flag %s has no rule in the command policy; add it to the "+
+				"at-a-glance table and expectedPolicy, or to policyNeutralFlags with the reason it changes nothing "+
+				"about who may post the command", flag)
+			assert.False(t, pinned && neutral, "flag %s is both pinned by the policy and listed as neutral", flag)
+		}
+		for flag := range policyNeutralFlags {
+			assert.Contains(t, flags, flag, "policyNeutralFlags lists %s, which the PR comment parser no longer accepts", flag)
+		}
+	})
+
+	t.Run("hands over terminal commands that change SchemaBot itself", func(t *testing.T) {
+		section := markdownSection(t, policy, "## Terminal commands that change SchemaBot itself")
+		handOverPart, _, found := strings.Cut(section, "Their read-only forms")
+		require.True(t, found, "the section must keep the read-only forms apart from the commands to hand over")
+		cli := newCLIParser(t)
+		var names []string
+		for _, child := range cli.Model.Children {
+			if child.Type != kong.CommandNode {
+				continue
+			}
+			names = append(names, child.Name)
+			kind, classified := cliCommandKinds[child.Name]
+			if !classified && slices.Contains(webhook.CommandNames(), child.Name) {
+				continue
+			}
+			if !assert.True(t, classified, "CLI command %q is neither a PR comment command nor in cliCommandKinds; "+
+				"say whether it only reads, works locally, or changes SchemaBot itself", child.Name) {
+				continue
+			}
+			if kind == cliChangesSchemaBot {
+				named := strings.Contains(handOverPart, "`"+child.Name+"`") || strings.Contains(handOverPart, "`"+child.Name+" ")
+				assert.True(t, named, "the command policy must tell an agent to hand over %q", child.Name)
+			}
+		}
+		for name := range cliCommandKinds {
+			assert.Contains(t, names, name, "cliCommandKinds lists %q, which is no longer a CLI command", name)
+		}
+	})
+
 	t.Run("never posts a production command", func(t *testing.T) {
 		production := markdownSection(t, policy, "## Production: never post")
 		assert.Contains(t, production, "Never post a production command")
 		assert.Contains(t, skill, "**Production: never post.**")
 	})
 
-	t.Run("never posts an unsafe or skip-revert command", func(t *testing.T) {
+	t.Run("never posts an unsafe, skip-revert, override, or forced command", func(t *testing.T) {
 		never := markdownSection(t, policy, "## Never post these, in any environment")
-		for _, flag := range []string{"--allow-unsafe", "--skip-revert"} {
+		for _, flag := range []string{"--allow-unsafe", "--skip-revert", "--override", "unlock --force"} {
 			assert.Contains(t, never, "`"+flag+"`", "the never-post list must name %s", flag)
 			assert.Contains(t, skill, "`"+flag+"`", "SKILL.md's summary must name %s", flag)
 		}
@@ -186,8 +230,58 @@ var expectedPolicy = map[string]policyRule{
 	"skip-revert":      {production: handOver, other: askFirst},
 	"--allow-unsafe":   {production: handOver, other: handOver},
 	"--skip-revert":    {production: handOver, other: handOver},
+	"--override":       {production: handOver, other: handOver},
+	"--force":          {production: handOver, other: handOver},
 	"freeze approve":   {production: handOver, other: handOver},
 	"fix-lint":         {production: inTerminal, other: inTerminal},
+}
+
+// policyNeutralFlags are the PR comment flags that only say where or how a
+// command runs, so the command's own row decides who may post it. Every other
+// flag the parser accepts needs a row of its own in expectedPolicy.
+var policyNeutralFlags = map[string]string{
+	"-e":              "names the environment, which the command's row already splits on",
+	"-d":              "picks one database of the PR",
+	"-t":              "picks one tenant of the environment",
+	"--target":        "narrows the command to one rollout member",
+	"--defer-cutover": "waits for a separate cutover, which has its own row",
+	"-y":              "is refused on a PR comment",
+}
+
+// cliKind is what a CLI command with no PR comment form does.
+type cliKind string
+
+const (
+	cliReadsOnly        cliKind = "reads only"
+	cliWorksLocally     cliKind = "works on the local machine or the worktree"
+	cliRunsAServer      cliKind = "runs a SchemaBot server"
+	cliChangesSchemaBot cliKind = "changes SchemaBot itself"
+)
+
+// cliCommandKinds classifies each CLI command that has no PR comment form, or
+// whose CLI form does more than the comment. A command that changes SchemaBot
+// itself must be named in the command policy, which tells an agent to hand it
+// over; a new CLI command fails the test until it is classified here.
+var cliCommandKinds = map[string]cliKind{
+	"init":       cliWorksLocally,
+	"onboard":    cliWorksLocally,
+	"pull":       cliReadsOnly,
+	"progress":   cliReadsOnly,
+	"databases":  cliReadsOnly,
+	"locks":      cliReadsOnly,
+	"logs":       cliReadsOnly,
+	"status":     cliReadsOnly,
+	"list-plans": cliReadsOnly,
+	"preview":    cliWorksLocally,
+	"configure":  cliWorksLocally,
+	"login":      cliWorksLocally,
+	"freeze":     cliChangesSchemaBot,
+	"unfreeze":   cliChangesSchemaBot,
+	"settings":   cliChangesSchemaBot,
+	"checks":     cliChangesSchemaBot,
+	"storage":    cliChangesSchemaBot,
+	"serve":      cliRunsAServer,
+	"local":      cliRunsAServer,
 }
 
 // policyRows reads the at-a-glance table into one rule per command or flag
@@ -265,9 +359,12 @@ func agentSkillCommands(t *testing.T) []skillCommand {
 		inFence := false
 		for i, line := range strings.Split(string(data), "\n") {
 			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "```") {
+			if marker := fenceMarker(trimmed); marker != "" {
 				inFence = !inFence
-				fence = strings.TrimPrefix(trimmed, "```")
+				fence = strings.TrimPrefix(trimmed, marker)
+				if marker != "```" {
+					fence = marker
+				}
 				continue
 			}
 			if inFence {
@@ -280,6 +377,10 @@ func agentSkillCommands(t *testing.T) []skillCommand {
 					out = append(out, skillCommand{file: rel, line: i + 1, text: cmd, fenced: true})
 				case "text":
 					out = append(out, skillCommand{file: rel, line: i + 1, text: cmd, fenced: true, prComment: true})
+				default:
+					assert.Fail(t, "a schemabot command in a fence the test cannot check",
+						"%s:%d: open the fence as ```bash for a terminal command or ```text for a PR comment, "+
+							"so the command is parsed by the surface it is shown on", rel, i+1)
 				}
 				continue
 			}
@@ -291,6 +392,17 @@ func agentSkillCommands(t *testing.T) []skillCommand {
 	})
 	require.NoError(t, err, "read the agent skill at %s", agentSkillDir)
 	return out
+}
+
+// fenceMarker returns the marker that opens or closes a fenced block on the
+// line, or "" when the line is not a fence.
+func fenceMarker(trimmed string) string {
+	for _, marker := range []string{"```", "~~~"} {
+		if strings.HasPrefix(trimmed, marker) {
+			return marker
+		}
+	}
+	return ""
 }
 
 // substitutePlaceholders replaces each known placeholder with a value the
