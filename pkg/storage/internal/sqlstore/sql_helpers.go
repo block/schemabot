@@ -147,9 +147,14 @@ const (
 )
 
 // checkRowsAffected checks that at least one row was affected by the result.
-// Returns notFoundErr if no rows were affected.
+// Returns notFoundErr if no rows were affected, and a wrapped error when the
+// driver cannot report the count: the caller cannot tell whether the row exists,
+// so it must not read that as "not found".
 func checkRowsAffected(result sql.Result, notFoundErr error) error {
-	rowsAffected, _ := result.RowsAffected()
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read rows affected: %w", err)
+	}
 	if rowsAffected == 0 {
 		return notFoundErr
 	}
