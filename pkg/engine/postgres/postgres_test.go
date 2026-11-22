@@ -19,6 +19,7 @@ import (
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/router"
 	"github.com/block/pg-sprite/pkg/schemadiff"
+	"github.com/block/pg-sprite/pkg/suggest"
 	"github.com/block/pg-sprite/pkg/verdict"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
@@ -215,6 +216,63 @@ func TestExecutionVerdictEmptyCreateShapeCause(t *testing.T) {
 		reason: `statement for table "users" is refused: it cannot be executed safely as written`,
 	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
 		Disposition: router.DispositionRefuse,
+	}, "users", nil))
+}
+
+// rewriteRequiredSentences is the operator-facing sentence for every guidance
+// code the planner can attach to a statement it will not run as written,
+// keyed by the code so each one is pinned to its own remedy. The test below
+// derives completeness from the planner's closed set rather than from this
+// table, so a code added upstream fails with the code's name.
+var rewriteRequiredSentences = map[suggest.Guidance]string{
+	suggest.GuidanceSplitStatement:              `statement for table "users" combines several changes that each need their own safer form; make one of the changes in the schema file, apply it, then make the next`,
+	suggest.GuidanceAddColumnThenConstraint:     `statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint as its own change`,
+	suggest.GuidancePrevalidatedCheck:           `statement for table "users" attaches a partition, which scans it while the parent table is locked; outside SchemaBot, add a CHECK constraint to the partition that matches its bound and validate it, then re-plan, and drop that CHECK once the partition is attached`,
+	suggest.GuidanceNotNullScaffold:             `statement for table "users" sets NOT NULL, which scans the table while it is locked; outside SchemaBot, add a CHECK (column IS NOT NULL) constraint as NOT VALID and validate it, then re-plan`,
+	suggest.GuidanceNameConstraintThenValidate:  `statement for table "users" adds a constraint, which checks every row while the table is locked; outside SchemaBot, add the constraint with a name as NOT VALID and then validate it, then re-plan`,
+	suggest.GuidanceUniqueIndexThenConstraint:   `statement for table "users" adds a primary key or unique constraint, which builds its index while the table is locked; outside SchemaBot, build a unique index on the same columns with CREATE UNIQUE INDEX CONCURRENTLY and attach it with ADD CONSTRAINT ... USING INDEX, then re-plan`,
+	suggest.GuidanceExpandContractColumn:        `statement for table "users" renames a column, which breaks running application code that still uses the old name; add the new column, have the application write to both and backfill it, switch reads to the new column, then drop the old column as its own change`,
+	suggest.GuidanceCoordinatedTableRename:      `statement for table "users" renames a table, which breaks running application code that still uses the old name; run the rename outside SchemaBot together with the application deploy that uses the new name, or keep the old name readable through a view until every instance has moved, then re-plan`,
+	suggest.GuidanceCoordinatedConstraintRename: `statement for table "users" renames an index that backs a constraint, which also renames the constraint and breaks application code that still names the old one; run the rename outside SchemaBot together with the application deploy that stops using the old constraint name, then re-plan`,
+	suggest.GuidanceAlterColumnTypeInPlace:      `statement for table "users" drops a column and adds it back, which discards every value the column holds; change the column's type in place with ALTER COLUMN ... TYPE ... USING ..., which converts its values`,
+}
+
+// Every guidance code the planner can attach to a statement it will not run
+// as written renders as the remedy written for that code, through the same
+// verdict path the plan uses, and without the placeholder record an unmapped
+// code would carry.
+func TestRewriteRequiredReasonCoversEveryGuidance(t *testing.T) {
+	guidances := suggest.Guidances()
+	assert.Len(t, rewriteRequiredSentences, len(guidances), "golden table carries a guidance code the planner no longer reports")
+	for _, guidance := range guidances {
+		t.Run(string(guidance), func(t *testing.T) {
+			want, ok := rewriteRequiredSentences[guidance]
+			require.True(t, ok, "no expected sentence for guidance %q", guidance)
+
+			got, ok := rewriteRequiredReason(guidance, "users")
+			assert.True(t, ok)
+			assert.Equal(t, want, got)
+
+			assert.Equal(t, stepVerdict{mode: engine.ExecutionModeBlocked, reason: want},
+				executionVerdict(pgplan.FormatVersion, pgplan.Statement{
+					Disposition: router.DispositionRewriteRequired,
+					Guidance:    guidance,
+				}, "users", nil))
+		})
+	}
+}
+
+// A guidance code this build has no remedy for renders the generic
+// rewrite-required sentence and reports the code for the server log, since
+// the planner's vocabulary grew.
+func TestExecutionVerdictUnknownGuidance(t *testing.T) {
+	assert.Equal(t, stepVerdict{
+		mode:         engine.ExecutionModeBlocked,
+		reason:       `statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned`,
+		unrecognized: &unrecognizedPlannerVocabulary{kind: "guidance", value: "unknown"},
+	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
+		Disposition: router.DispositionRewriteRequired,
+		Guidance:    suggest.Guidance("unknown"),
 	}, "users", nil))
 }
 

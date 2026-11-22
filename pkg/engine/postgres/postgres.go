@@ -25,6 +25,7 @@ import (
 	"github.com/block/pg-sprite/pkg/router"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
+	"github.com/block/pg-sprite/pkg/suggest"
 	"github.com/block/pg-sprite/pkg/verdict"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/jackc/pgx/v5"
@@ -579,10 +580,10 @@ type stepVerdict struct {
 
 // unrecognizedPlannerVocabulary names a planner value outside the set this
 // build renders in its own words: kind says which vocabulary grew (the plan
-// contract, a disposition, or a create shape cause) and value is the entry
-// the planner returned. The operator sees a blocked placeholder either way;
-// this record exists so the server log names the value and the schema file
-// behind it.
+// contract, a disposition, a create shape cause, or a guidance code) and value
+// is the entry the planner returned. The operator sees a blocked placeholder
+// either way; this record exists so the server log names the value and the
+// schema file behind it.
 type unrecognizedPlannerVocabulary struct {
 	kind  string
 	value string
@@ -1339,10 +1340,10 @@ func singleLine(s string) string {
 
 // executionVerdict maps one planned statement to the verdict the operator
 // reviews. A planner value outside the vocabulary this mapping knows — a plan
-// contract, a disposition, or a create shape cause the planner added after the
-// mapping was written — still renders a blocked placeholder, and is reported
-// on the verdict so the caller can log it with the identifiers this function
-// does not have.
+// contract, a disposition, a create shape cause, or a guidance code the planner
+// added after the mapping was written — still renders a blocked placeholder,
+// and is reported on the verdict so the caller can log it with the
+// identifiers this function does not have.
 func executionVerdict(formatVersion int, statement pgplan.Statement, table string, crossNamespaceForeignKeys []string) stepVerdict {
 	if formatVersion != pgplan.FormatVersion {
 		return stepVerdict{
@@ -1370,7 +1371,17 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		}
 		return blocked(fmt.Sprintf("statement for table %q requires an execution path SchemaBot's PostgreSQL support does not provide yet", table))
 	case router.DispositionRewriteRequired:
-		return blocked(fmt.Sprintf("statement for table %q must be rewritten into a form the engine can execute natively, then re-planned", table))
+		if reason, ok := rewriteRequiredReason(statement.Guidance, table); ok {
+			return blocked(reason)
+		}
+		rewrite := blocked(fmt.Sprintf("statement for table %q must be rewritten into a form the engine can execute natively, then re-planned", table))
+		// An absent guidance code leaves the generic sentence as the right
+		// one; only a code the mapping has no sentence for is vocabulary
+		// that moved.
+		if statement.Guidance != "" {
+			rewrite.unrecognized = &unrecognizedPlannerVocabulary{kind: "guidance", value: string(statement.Guidance)}
+		}
+		return rewrite
 	case router.DispositionRefuse:
 		if reason, ok := createShapeRefusalReason(statement.Cause, table); ok {
 			return blocked(reason)
@@ -1445,6 +1456,40 @@ func createShapeRefusalReason(cause executor.CreateShapeCause, table string) (st
 		reason = "declares a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; leave the foreign key out of the schema file to create the table, then add the foreign key outside SchemaBot and back to the file"
 	case executor.CreateShapeUnsupportedKind:
 		reason = "uses a statement kind SchemaBot's PostgreSQL create path does not support; use CREATE TABLE or CREATE INDEX, or create the object outside SchemaBot"
+	default:
+		return "", false
+	}
+	return fmt.Sprintf("statement for table %q %s", table, reason), true
+}
+
+// rewriteRequiredReason renders the planner's typed guidance for a statement
+// that must not run as written, in SchemaBot's words, naming what the
+// operator does instead. The mapping covers the planner's whole closed set of
+// guidance codes, so the completeness test over that set fails the day the
+// planner grows a new one.
+func rewriteRequiredReason(guidance suggest.Guidance, table string) (string, bool) {
+	var reason string
+	switch guidance {
+	case suggest.GuidanceSplitStatement:
+		reason = "combines several changes that each need their own safer form; make one of the changes in the schema file, apply it, then make the next"
+	case suggest.GuidanceAddColumnThenConstraint:
+		reason = "adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint as its own change"
+	case suggest.GuidancePrevalidatedCheck:
+		reason = "attaches a partition, which scans it while the parent table is locked; outside SchemaBot, add a CHECK constraint to the partition that matches its bound and validate it, then re-plan, and drop that CHECK once the partition is attached"
+	case suggest.GuidanceNotNullScaffold:
+		reason = "sets NOT NULL, which scans the table while it is locked; outside SchemaBot, add a CHECK (column IS NOT NULL) constraint as NOT VALID and validate it, then re-plan"
+	case suggest.GuidanceNameConstraintThenValidate:
+		reason = "adds a constraint, which checks every row while the table is locked; outside SchemaBot, add the constraint with a name as NOT VALID and then validate it, then re-plan"
+	case suggest.GuidanceUniqueIndexThenConstraint:
+		reason = "adds a primary key or unique constraint, which builds its index while the table is locked; outside SchemaBot, build a unique index on the same columns with CREATE UNIQUE INDEX CONCURRENTLY and attach it with ADD CONSTRAINT ... USING INDEX, then re-plan"
+	case suggest.GuidanceExpandContractColumn:
+		reason = "renames a column, which breaks running application code that still uses the old name; add the new column, have the application write to both and backfill it, switch reads to the new column, then drop the old column as its own change"
+	case suggest.GuidanceCoordinatedTableRename:
+		reason = "renames a table, which breaks running application code that still uses the old name; run the rename outside SchemaBot together with the application deploy that uses the new name, or keep the old name readable through a view until every instance has moved, then re-plan"
+	case suggest.GuidanceCoordinatedConstraintRename:
+		reason = "renames an index that backs a constraint, which also renames the constraint and breaks application code that still names the old one; run the rename outside SchemaBot together with the application deploy that stops using the old constraint name, then re-plan"
+	case suggest.GuidanceAlterColumnTypeInPlace:
+		reason = "drops a column and adds it back, which discards every value the column holds; change the column's type in place with ALTER COLUMN ... TYPE ... USING ..., which converts its values"
 	default:
 		return "", false
 	}
