@@ -116,6 +116,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/engine"
@@ -3231,7 +3232,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 		scope.stampMemberTarget(req, plan)
 		resp, err := c.client.Apply(ctx, req)
 		if err != nil {
-			if isAmbiguousRemoteCallError(err) {
+			if isAmbiguousRemoteCallError(err) || isUnprovenRequestSizeRefusal(err, req) {
 				return fmt.Errorf("%s apply_operation %d (apply %s) has ambiguous remote dispatch outcome: %w", kind, op.ID, apply.ApplyIdentifier, err)
 			}
 			retryable := isRetryableRemoteApplyError(err)
@@ -4195,7 +4196,7 @@ func (c *GRPCClient) dispatchRemoteApply(ctx context.Context, apply *storage.App
 	scope.stampMemberTarget(req, plan)
 	resp, err := c.client.Apply(ctx, req)
 	if err != nil {
-		if isAmbiguousRemoteCallError(err) {
+		if isAmbiguousRemoteCallError(err) || isUnprovenRequestSizeRefusal(err, req) {
 			return dispatchError(kind, dispatchUnanswered, fmt.Errorf("apply queued gRPC apply %s has ambiguous remote dispatch outcome: %w", apply.ApplyIdentifier, err))
 		}
 		failure := classifyRemoteApplyError(err)
@@ -4356,20 +4357,41 @@ func isMessageSizeRefusal(err error) bool {
 	return false
 }
 
-// explainApplySizeRefusal returns err with the request size and the limit it
-// crossed spelled out when err is a size refusal, and err unchanged otherwise.
-// The apply request carries the plan's schema files and changes, so a resend
-// is the same size and is refused again.
+// isUnprovenRequestSizeRefusal reports a size refusal that is not provably of
+// req itself. gRPC uses the same text when the response is over a limit, and
+// a response is only sent after the data plane handled the request, so such a
+// refusal says nothing about whether a remote apply was created. Only a
+// refusal reporting req's own encoded size proves the request never reached a
+// handler. The client sends uncompressed, so that size is proto.Size(req).
+// The server's own send refusal carries a "grpc: " prefix the client's lacks,
+// and is always about the response, so it never proves anything about req.
+func isUnprovenRequestSizeRefusal(err error, req *ternv1.ApplyRequest) bool {
+	if !isMessageSizeRefusal(err) {
+		return false
+	}
+	message := status.Convert(err).Message()
+	if strings.Contains(message, "grpc: trying to send message larger than max") {
+		return true
+	}
+	match := messageSizeRefusalSizes.FindStringSubmatch(message)
+	return match == nil || match[1] != strconv.Itoa(proto.Size(req))
+}
+
+// explainApplySizeRefusal returns err with the request size, the limit it
+// crossed, and what to do about it spelled out when err is a size refusal, and
+// err unchanged otherwise. Callers pass only refusals of the request itself
+// (see isUnprovenRequestSizeRefusal). The apply request carries the plan's
+// schema files and changes, so a resend is the same size and is refused again.
 func explainApplySizeRefusal(err error) error {
 	if !isMessageSizeRefusal(err) {
 		return err
 	}
-	st, _ := status.FromError(err)
-	match := messageSizeRefusalSizes.FindStringSubmatch(st.Message())
+	match := messageSizeRefusalSizes.FindStringSubmatch(status.Convert(err).Message())
 	if match == nil {
-		return fmt.Errorf("apply request is over the gRPC message size limit, and resending it fails the same way: %w", err)
+		return err
 	}
-	return fmt.Errorf("apply request is %s bytes, over the %s-byte gRPC message size limit, and resending it fails the same way: %w", match[1], match[2], err)
+	return fmt.Errorf("apply request is %s bytes, over the %s-byte gRPC message size limit, and resending it fails the same way; "+
+		"plan fewer namespaces at a time so each apply's schema files fit: %w", match[1], match[2], err)
 }
 
 func isTerminalRemoteProgressError(err error) bool {
