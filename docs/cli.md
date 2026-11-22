@@ -270,6 +270,11 @@ the server's cap (1,000 applies, 200 plans), `status` and `list-plans` name the
 ID to pass to `--after` for the next page; `--all` follows every page for you. The [schema intelligence guide](schema-intelligence.md#whats-running-across-the-fleet)
 shows a paged walk.
 
+List every apply recorded for one database with `history <database>`, adding
+`-e` to keep to one environment. `status -d <database>` prints the same list.
+The [schema intelligence guide](schema-intelligence.md#what-changed-in-this-database)
+shows the output.
+
 Inspect one apply with `status <apply_id>` for a single snapshot, or use
 `progress <apply_id>` to keep watching. The [progress example](#follow-and-control-a-change) shows the live view.
 Stored plans have their own inventory:

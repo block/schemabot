@@ -54,6 +54,7 @@ type CLI struct {
 	Unfreeze   commands.UnfreezeCmd   `cmd:"" help:"Lift an environment freeze"`
 	Logs       commands.LogsCmd       `cmd:"" help:"View apply logs"`
 	Status     commands.StatusCmd     `cmd:"" help:"Show schema change status"`
+	History    commands.HistoryCmd    `cmd:"" help:"List every apply recorded for a database"`
 	Plans      commands.PlansCmd      `cmd:"" name:"list-plans" help:"List recently generated schema change plans"`
 	Preview    commands.PreviewCmd    `cmd:"" help:"Preview CLI output templates (for development)"`
 	FixLint    commands.FixLintCmd    `cmd:"" name:"fix-lint" help:"Auto-fix lint issues in schema files"`

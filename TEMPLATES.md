@@ -9824,7 +9824,7 @@ Use 'schemabot status <apply_id>' to view details
 
 Empty database:
 
-No schema changes found for database 'new-db'
+No applies recorded for database 'new-db'
 ```
 </details>
 

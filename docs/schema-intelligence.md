@@ -561,13 +561,14 @@ fits in one page is listed whole. When more applies match, the response sets
 false. Every apply created before the walk began is listed exactly once.
 `starting_after` must name an apply of the same database and environment;
 anything else returns `400` naming the mismatch. The response echoes `limit`,
-`max_limit`, and `starting_after`. `schemabot status -d` follows every page,
-so it always lists the whole history.
+`max_limit`, and `starting_after`. `schemabot history` (and `schemabot status
+-d`, which prints the same list) follows every page, so it always lists the
+whole history.
 
 Start with the database and environment you inspected:
 
 ```sh
-schemabot status -d shop -e production
+schemabot history shop -e production
 ```
 
 ```text
