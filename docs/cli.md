@@ -650,7 +650,7 @@ nothing started:
 
 ```console
 $ schemabot apply -s schema -e production
-✗ production is frozen. This change did not start.
+❄️ production is frozen. This change did not start.
    freeze-abc  SEV-1234 payments latency  (until lifted)
 To ask for an override, run the same command with --override "<reason>".
 ```
@@ -661,7 +661,7 @@ reason is at most 500 characters. The refusal then names the request:
 
 ```console
 $ schemabot apply -s schema -e production --override "SEV-1234 fix the index"
-✗ production is frozen. This change did not start.
+❄️ production is frozen. This change did not start.
    freeze-abc  SEV-1234 payments latency  (until lifted)
 Override requested: ovr-123. A freeze approver other than you must run 'schemabot freeze approve ovr-123', then run this command again.
 ```
@@ -758,7 +758,7 @@ one and stays on screen while the watch keeps following the apply:
 ```console
 Press Enter to proceed with cutover (or ESC to detach)
 
-✗ production is frozen. This cutover did not start.
+❄️ production is frozen. This cutover did not start.
    freeze-abc  SEV-1234 payments latency  (until lifted)
 To ask for an override, run:
   schemabot cutover apply-example-73 -e production --override "<reason>"

@@ -182,7 +182,7 @@ func TestFreezeOverrideLetsAnApplyThrough(t *testing.T) {
 	require.NotNil(t, resp.OverrideRequest)
 	id := resp.OverrideRequest.ID
 	assert.True(t, strings.HasPrefix(id, "ovr-"), id)
-	assert.Contains(t, resp.Error, "override request "+id+" needs a freeze approver other than you")
+	assert.Contains(t, resp.Error, "Override request "+id+" needs a freeze approver other than you")
 	stored, err := store.Get(t.Context(), id)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"freeze freeze-incident"}, stored.Blockers)
@@ -197,7 +197,7 @@ func TestFreezeOverrideLetsAnApplyThrough(t *testing.T) {
 	assert.NotContains(t, decodeGateError(t, rec).Error, "keeps that reason")
 	rec = postAs(t, mux, overrideRequester, "/api/apply", `{"plan_id":"plan-1","environment":"staging","override":"another reason"}`)
 	require.Equal(t, http.StatusConflict, rec.Code)
-	assert.Contains(t, decodeGateError(t, rec).Error, `(you asked for it earlier, and it keeps that reason: "fix for incident 42")`)
+	assert.Contains(t, decodeGateError(t, rec).Error, `You asked for it earlier, and it keeps that reason: "fix for incident 42".`)
 	assert.Equal(t, 1, store.count())
 
 	approveOverride(t, store, id)

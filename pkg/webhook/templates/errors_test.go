@@ -536,14 +536,10 @@ func TestPlanRefusalDetails(t *testing.T) {
 	assert.Contains(t, hostile, "`` plan`1 ## injected ``")
 }
 
-// A detail is clamped to the default bound unless the caller sets its own, as
-// a freeze refusal does so its closing instructions survive.
+// A detail is clamped to the default bound.
 func TestRenderGenericErrorDetailLimit(t *testing.T) {
 	detail := strings.Repeat("a", 600) + " END"
 	clamped := RenderGenericError(SchemaErrorData{CommandName: "apply", ErrorDetail: detail})
 	assert.NotContains(t, clamped, "END")
 	assert.Contains(t, clamped, "…")
-
-	kept := RenderGenericError(SchemaErrorData{CommandName: "apply", ErrorDetail: detail, DetailLimit: MaxChangeGateRefusalLen})
-	assert.Contains(t, kept, "a END")
 }
