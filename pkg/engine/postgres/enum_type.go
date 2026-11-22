@@ -28,18 +28,20 @@ func planEnumType(ctx context.Context, pool *pgxpool.Pool, namespace string, des
 	if err != nil {
 		return nil, fmt.Errorf("plan PostgreSQL enum type %q: %w", desired.Name(), err)
 	}
-	return enumTypeChanges(report, parser)
+	return enumTypeChanges(namespace, report, parser)
 }
 
 // enumTypeChanges maps an enum type's planned statements to the changes the
-// operator reviews, one per added label, named by the type. Each step is
+// operator reviews, one per added label, named by the type in namespace.
+// Each step is
 // blocked: SchemaBot does not apply enum label additions yet, so the plan
 // shows what would converge the type and how to run it, and the merge gate
 // holds until the type carries the labels. A planned statement that is not a
-// label addition to this type is an error rather than a rendered change, so
+// label addition to this type, in this namespace, is an error rather than a
+// rendered change, so
 // a planner that grows a new enum statement kind fails the plan instead of
 // reaching apply under a name SchemaBot never reviewed.
-func enumTypeChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, error) {
+func enumTypeChanges(namespace string, report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, error) {
 	changes := make([]engine.TableChange, 0, len(report.Statements))
 	for _, statement := range report.Statements {
 		if statement.Kind != schemadiff.ChangeAddEnumValue {
@@ -55,6 +57,9 @@ func enumTypeChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine
 		parsed, err := pgstatement.ParseOne(statement.SQL)
 		if err != nil {
 			return nil, fmt.Errorf("parse planned label addition for enum type %q: %w", report.Type, err)
+		}
+		if target := parsed.EnumType(); target != (pgstatement.TypeName{Schema: namespace, Name: report.Type}) {
+			return nil, fmt.Errorf("planned statement for enum type %q in schema %q adds a label to %q in schema %q", report.Type, namespace, target.Name, target.Schema)
 		}
 		label := parsed.AddedEnumValue()
 		if label == "" {
