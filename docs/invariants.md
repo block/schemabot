@@ -614,7 +614,10 @@ still gets one: an explicit passing "no schema files changed". GitHub treats a m
 check as not passing, so having nothing to say has to be said rather than left empty. The same
 logic applies in reverse. When SchemaBot expects a check, environment, or config and cannot find
 it, that reads as blocking, never as not-applicable. A gate must not be removable by the very
-change it guards. *Enforced:* aggregate creation on head-commit events
+change it guards. An environment the server config no longer lists for a database is no longer
+expected, so a plan of that database removes the plan-only rows left in it; a row a started apply
+owns keeps blocking (MG-6), and an environment listed again reads as missing, never as passing.
+*Enforced:* aggregate creation on head-commit events
 (`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); verified per-environment
 scope and pending contributions for missing local results (`pkg/webhook/aggregate_scope.go`,
 `pkg/webhook/check_publisher.go`); config discovery, the command
@@ -697,11 +700,12 @@ A later commit that removes the schema change must not make the aggregate pass b
 the check stays blocked (`schema_removed_after_apply_started`) until the apply settles and an
 operator reconciles the target. Closing and reopening the PR does not wash this state away.
 *Enforced:* stale-check cleanup and the plan that settles the rows a database left under an old
-type, both of which block a row a started apply owns instead of clearing it (`cleanupStaleChecks`
-and `settleChecksReplacedByNewType` in `pkg/webhook/pull_request.go`, the latter called from
-`handlePlanCommand` and `handleMultiEnvPlan` in `pkg/webhook/plan.go`, and `checkHasStartedApply` in
-`pkg/webhook/check_aggregate.go`), and the storage write that marks a stale plan successful only
-while no apply owns the row (`MarkStalePlanSuccessful` in `pkg/storage/internal/sqlstore/checks.go`);
+type or in an environment it no longer has, both of which block a row a started apply owns instead
+of clearing it (`cleanupStaleChecks` and `settleLeftBehindChecks` in `pkg/webhook/pull_request.go`,
+the latter called from `handlePlanCommand` and `handleMultiEnvPlan` in `pkg/webhook/plan.go`, and
+`checkHasStartedApply` in `pkg/webhook/check_aggregate.go`), and the storage writes that mark a stale plan successful,
+or remove one in an environment the database no longer has, only while no apply owns the row
+(`MarkStalePlanSuccessful` and `DeleteStalePlanOnly` in `pkg/storage/internal/sqlstore/checks.go`);
 the block decided against the row as stored under its row lock (`BlockStaleStartedApply`), and the
 apply completion that keeps that block rather than writing it away (`CompleteForApply`, both in
 `pkg/storage/internal/sqlstore/checks.go`);
@@ -745,8 +749,11 @@ too, by the operator reconciling the target — what it must not do is converge 
 that would clear the block without the divergence behind it being addressed.
 
 *Enforced:* stale-check reconciliation (`pkg/webhook/check_records.go`), aggregate re-evaluation
-(`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), and the re-plan a settled
-apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`).
+(`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), the re-plan a settled
+apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`), and
+the plan that settles the rows a database left on earlier commits under an old type, and removes
+those it left in an environment it no longer has, which no later plan would store again (`settleLeftBehindChecks` in
+`pkg/webhook/pull_request.go`).
 A concurrent stale publication can leave an obsolete blocker without arming these retries;
 that case requires another fold ([publication concurrency](check-runs.md#publication-concurrency)).
 
