@@ -332,6 +332,9 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY BLOCKED: PR CLOSED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedClosedPR()) }},
 		{"APPLY BLOCKED: PR MERGED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedMergedPR()) }},
 		{"APPLY BLOCKED: BASE SCHEMA CHANGED SINCE PR DIVERGED", func() { fmt.Print(webhooktemplates.PreviewCommentBaseSchemaFreshnessRejected()) }},
+		{"APPLY BLOCKED: SHARED SCHEMA CHANGED SINCE PR DIVERGED", func() {
+			fmt.Print(webhooktemplates.PreviewCommentBaseSchemaFreshnessRejectedSharedSchemaPeer())
+		}},
 		{"APPLY BLOCKED: SCHEMA STALE (NEW COMMITS)", func() { fmt.Print(webhooktemplates.PreviewCommentStaleSchemaRejected()) }},
 		{"APPLY BLOCKED: CONFIRMED PLAN STALE", func() { fmt.Print(webhooktemplates.PreviewCommentStalePlanRejected()) }},
 		{"APPLY-CONFIRM REFUSED: PLAN IS FOR ANOTHER ENVIRONMENT", func() {

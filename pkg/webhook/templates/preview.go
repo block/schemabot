@@ -1691,6 +1691,19 @@ func PreviewCommentBaseSchemaFreshnessRejected() string {
 	})
 }
 
+// PreviewCommentBaseSchemaFreshnessRejectedSharedSchemaPeer renders a sample
+// base freshness rejection where the base branch changed the schema of a
+// database that shares a schema with the one being applied.
+func PreviewCommentBaseSchemaFreshnessRejectedSharedSchemaPeer() string {
+	return RenderBaseSchemaFreshnessRejection(BaseSchemaFreshnessRejectionData{
+		RequestedBy:      previewRequestedBy,
+		Database:         "shop_sharded",
+		Environment:      "production",
+		SchemaPath:       "schema/shop",
+		SharedSchemaPeer: "shop",
+	})
+}
+
 // PreviewCommentReviewRequired renders a sample "review required" comment:
 // the database's operators lead in their own section, with the broader
 // authorized principals as an explicit fallback.

@@ -42,7 +42,7 @@ import (
 // targets as they are now.
 func (h *Handler) executeApply(
 	ctx context.Context, client *ghclient.InstallationClient,
-	repo string, pr int, schemaResult *ghclient.SchemaRequestResult,
+	repo string, pr int, schemaResult *ghclient.SchemaRequestResult, sharedSchemaPeers []sharedSchemaPeerInputs,
 	environment string, installationID int64, requestedBy string,
 	result CommandResult, storedPlan, disclosedPlan *storage.Plan, expectedPendingPlanID string,
 	disclosedCopies []storage.DisclosedCopy,
@@ -148,7 +148,7 @@ func (h *Handler) executeApply(
 	// release the observed lock intent; the gate has already logged and
 	// posted the distinction, and the user's recovery is re-issuing the
 	// command.
-	rejected, freshnessErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName)
+	rejected, freshnessErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, sharedSchemaPeers, freshPRInfo, environment, requestedBy, actionName)
 	if freshnessErr != nil {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final base-schema freshness verification failure")
 		return

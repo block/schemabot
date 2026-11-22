@@ -4848,6 +4848,22 @@ _Requested by @jackjackbits_
 </details>
 
 <details>
+<summary><a name="apply-blocked-shared-schema-changed-since-pr-diverged"></a><strong>Apply Blocked: Shared Schema Changed Since PR Diverged</strong></summary>
+
+
+## ⚠️ Apply rejected — base schema is newer — Production
+
+**Database**: `shop_sharded`
+
+The base branch contains newer changes to `schema/shop`, the schema of `shop`, which shares a schema with this database. This PR was compared with the older version of it.
+
+Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.
+
+_Requested by @jackjackbits_
+
+</details>
+
+<details>
 <summary><a name="apply-blocked-schema-stale-new-commits"></a><strong>Apply Blocked: Schema Stale (New Commits)</strong></summary>
 
 

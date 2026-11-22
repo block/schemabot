@@ -10769,15 +10769,16 @@ func TestGRPCMethodDeadlineCoversEveryTernRPC(t *testing.T) {
 		ternv1.Tern_StorageSchemaPlan_FullMethodName:       true,
 	}
 	control := map[string]bool{
-		ternv1.Tern_Progress_FullMethodName:       true,
-		ternv1.Tern_BatchProgress_FullMethodName:  true,
-		ternv1.Tern_Logs_FullMethodName:           true,
-		ternv1.Tern_Cutover_FullMethodName:        true,
-		ternv1.Tern_Health_FullMethodName:         true,
-		ternv1.Tern_Stop_FullMethodName:           true,
-		ternv1.Tern_Cancel_FullMethodName:         true,
-		ternv1.Tern_Start_FullMethodName:          true,
-		ternv1.Tern_DriverCapacity_FullMethodName: true,
+		ternv1.Tern_Progress_FullMethodName:          true,
+		ternv1.Tern_BatchProgress_FullMethodName:     true,
+		ternv1.Tern_Logs_FullMethodName:              true,
+		ternv1.Tern_Cutover_FullMethodName:           true,
+		ternv1.Tern_Health_FullMethodName:            true,
+		ternv1.Tern_Stop_FullMethodName:              true,
+		ternv1.Tern_Cancel_FullMethodName:            true,
+		ternv1.Tern_Start_FullMethodName:             true,
+		ternv1.Tern_DriverCapacity_FullMethodName:    true,
+		ternv1.Tern_ResolveNamespaces_FullMethodName: true,
 	}
 
 	require.Empty(t, ternv1.Tern_ServiceDesc.Streams, "streaming RPCs bypass the unary deadline interceptor")

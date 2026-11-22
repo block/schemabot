@@ -157,7 +157,7 @@ func TestRetargetedCommandPreservesConfirmationBeforePlanResponses(t *testing.T)
 				disclosed, err := svc.Storage().Plans().Get(t.Context(), planID)
 				require.NoError(t, err)
 				fixture.BaseRef.Store(new("parent"))
-				h.executeApply(t.Context(), ic, "octocat/hello-world", 1, schema, "staging", 12345, "alice", CommandResult{}, nil, disclosed, planID, nil)
+				h.executeApply(t.Context(), ic, "octocat/hello-world", 1, schema, nil, "staging", 12345, "alice", CommandResult{}, nil, disclosed, planID, nil)
 			}
 
 			body := requireComment(t, fixture.comments, "excluded target rejection")
