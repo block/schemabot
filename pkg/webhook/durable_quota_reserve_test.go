@@ -1,10 +1,14 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,6 +120,97 @@ func TestDurableWebhookDriverChargesQuotaReserveRefusalsAfterUnchargedWindow(t *
 		require.Empty(t, store.failedUncharged)
 		require.Len(t, store.failed, 1)
 	})
+}
+
+// A quota reserve refusal is visible to an operator in three places: the
+// dispatch duration outcome, the webhook event status, and one log line that
+// says when the delivery runs again and which installation's quota refused it.
+// A refusal inside the uncharged window reads as quota_reserve_deferred; one
+// past it reads as retrying, because it spent an attempt.
+func TestDurableWebhookDriverRecordsQuotaReserveRetry(t *testing.T) {
+	tests := []struct {
+		name        string
+		receivedAgo time.Duration
+		wantOutcome string
+		wantLevel   string
+		wantMessage string
+	}{
+		{
+			name:        "inside the uncharged window",
+			wantOutcome: "quota_reserve_deferred",
+			wantLevel:   "INFO",
+			wantMessage: "durable webhook delivery was refused by the GitHub quota reserve; it will be retried when the quota resets without spending an attempt",
+		},
+		{
+			name:        "past the uncharged window",
+			receivedAgo: quotaReserveUnchargedWindow + time.Minute,
+			wantOutcome: "retrying",
+			wantLevel:   "WARN",
+			wantMessage: "durable webhook delivery was refused by the GitHub quota reserve more than the uncharged window after it was received; it will be retried when the quota resets and this refusal spent an attempt",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := newDispatchMetricsReader(t)
+			event := durablePullRequestEvent(t)
+			event.ReceivedAt = time.Now().Add(-tc.receivedAgo)
+			resetAt := time.Now().Add(40 * time.Minute).Truncate(time.Second)
+			store := newScriptedWebhookEventStore(event)
+			h := newDurableDriverHandler(t, store, nil, nil)
+			var logs bytes.Buffer
+			h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+			h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+				return true, quotaReserveRefusalError(resetAt)
+			}
+
+			require.True(t, h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0"))
+
+			durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
+			require.Len(t, durationPoints, 1)
+			assertStringAttr(t, durationPoints[0].Attributes, "outcome", tc.wantOutcome)
+			var statuses []string
+			for _, dp := range collectCounterPoints(t, reader, "schemabot.webhook.events_total") {
+				status, _ := dp.Attributes.Value("status")
+				statuses = append(statuses, status.AsString())
+			}
+			assert.Contains(t, statuses, "durable_dispatch_"+tc.wantOutcome)
+
+			var matched int
+			for line := range strings.Lines(logs.String()) {
+				var entry map[string]any
+				require.NoError(t, json.Unmarshal([]byte(line), &entry))
+				if entry["msg"] != tc.wantMessage {
+					continue
+				}
+				matched++
+				assert.Equal(t, tc.wantLevel, entry["level"])
+				assert.Equal(t, event.DeliveryID, entry["delivery_id"])
+				assert.Equal(t, event.Repository, entry["repo"])
+				assert.Equal(t, float64(event.PullRequest), entry["pr"])
+				assert.Equal(t, event.HeadSHA, entry["head_sha"])
+				assert.Equal(t, event.TenantID, entry["installation_id"])
+				assert.Equal(t, "fetch_file_content", entry["github_operation"])
+				assert.Equal(t, resetAt.UTC().Format(time.RFC3339), entry["reset_time"])
+				assert.Equal(t, resetAt.UTC().Format(time.RFC3339), entry["retry_at"])
+			}
+			assert.Equal(t, 1, matched, "exactly one quota reserve retry log line: %s", logs.String())
+		})
+	}
+}
+
+// Config discovery wraps the refusal from the installation's quota reserve
+// without dropping it, so the durable driver can find the reset time on the
+// error it gets back and wait for it.
+func TestDiscoveryKeepsQuotaRefusalOnTheErrorChain(t *testing.T) {
+	h, _, client, reserve := newQuotaReserveFoldHandler(t, &foldCheckStore{})
+
+	_, err := h.readPRPlanDiscovery(t.Context(), client, "octocat/hello-world", 1, &ghclient.PullRequestInfo{HeadSHA: "abc123"}, "pull_request", "d1")
+
+	require.Error(t, err)
+	assert.EqualValues(t, 1, reserve.refused.Load())
+	var refusal *ghclient.QuotaReservedError
+	require.ErrorAs(t, err, &refusal, "the refusal must survive the discovery wrapping")
+	assert.EqualValues(t, 100, refusal.Reserve)
 }
 
 // The retry time follows the reported reset, with a short floor for a reset

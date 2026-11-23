@@ -1177,7 +1177,10 @@ fails closed: the pull request's SchemaBot check does not pass until a plan
 succeeds after the reset. When a refused read stops SchemaBot from finding a
 pull request's configs, or from running an `apply` command, SchemaBot retries
 it when the quota resets, and for three hours after the event arrived that wait
-does not use up its retry attempts. A read refused while one database is being
+does not use up its retry attempts. After those three hours each refusal uses
+one of the event's five attempts, so an event the quota keeps refusing at every
+hourly reset stops being retried about eight hours after it arrived, and its
+check stays failing until the next push or check re-run. A read refused while one database is being
 planned still fails that plan until the next push or check re-run.
 
 ```yaml

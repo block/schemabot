@@ -945,7 +945,8 @@ func (h *Handler) logQuotaReserveRetry(driverID int, event *storage.WebhookEvent
 	attrs := []any{
 		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
-		"installation_id", event.TenantID, "operation", refusal.Operation,
+		"head_sha", event.HeadSHA, "installation_id", event.TenantID,
+		"github_operation", refusal.Operation,
 		"reset_time", refusal.ResetAt.UTC().Format(time.RFC3339),
 		"retry_at", retryAt.UTC().Format(time.RFC3339),
 	}
