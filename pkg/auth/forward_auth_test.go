@@ -954,3 +954,111 @@ func TestForwardAuth_LoopbackTrustedReadDoesNotLog(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.NotContains(t, logs.String(), "loopback")
 }
+
+// meshSourceConfig trusts the ingress over the mesh and names Istio's inbound
+// sources, the addresses a sidecar that delivers to the pod IP sends from.
+func meshSourceConfig() auth.ForwardAuthConfig {
+	return auth.ForwardAuthConfig{
+		TrustedProxySPIFFE:         []string{ingressSVID},
+		WriteGroups:                []string{"ops"},
+		TrustedMeshLoopbackSources: []string{"127.0.0.6"},
+	}
+}
+
+func meshWrite(t *testing.T, remoteAddr string, withXFCC bool) *http.Request {
+	t.Helper()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/apply", nil)
+	req.RemoteAddr = remoteAddr
+	req.Header.Set("X-Forwarded-User", "alice")
+	req.Header.Set("X-Forwarded-Groups", "ops")
+	if withXFCC {
+		req.Header.Set("X-Forwarded-Client-Cert", "URI="+ingressSVID)
+	}
+	return req
+}
+
+// The sidecar delivers proxied requests from a mesh source, while a kubectl
+// port-forward arrives from 127.0.0.1. Only the mesh source's identity is
+// verified; the port-forward keeps the break-glass treatment, unverified and
+// logged, even with the same headers.
+func TestForwardAuth_MeshLoopbackSourceIsVerifiedAndPortForwardIsNot(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		verified   bool
+	}{
+		{name: "istio inbound source", remoteAddr: "127.0.0.6:48375", verified: true},
+		{name: "port-forward", remoteAddr: "127.0.0.1:52000", verified: false},
+		{name: "port-forward over IPv6", remoteAddr: "[::1]:52000", verified: false},
+		{name: "another loopback source", remoteAddr: "127.0.0.7:52000", verified: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			captured := &capturedUser{}
+			var logs bytes.Buffer
+			authz, err := auth.NewForwardAuthAuthorizer(meshSourceConfig(), slog.New(slog.NewTextHandler(&logs, nil)))
+			require.NoError(t, err)
+			handler := authz.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				captured.user = auth.UserFromContext(r.Context())
+				_, captured.verified = auth.VerifiedSubject(r.Context())
+				w.WriteHeader(http.StatusOK)
+			}))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, meshWrite(t, tc.remoteAddr, true))
+
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.NotNil(t, captured.user)
+			assert.Equal(t, "alice", captured.user.Subject)
+			assert.Equal(t, tc.verified, captured.verified)
+			if tc.verified {
+				assert.NotContains(t, logs.String(), "loopback source", "proxied traffic is not break-glass")
+			} else {
+				assert.Contains(t, logs.String(), "loopback source", "the break-glass write is logged")
+			}
+		})
+	}
+}
+
+// A mesh source proves only that the sidecar delivered the request. The XFCC
+// SPIFFE check still decides whether the proxy sent it, so a mesh-source
+// request without the proxy's SPIFFE ID is refused.
+func TestForwardAuth_MeshLoopbackSourceStillNeedsTheProxySPIFFE(t *testing.T) {
+	handler, captured := newForwardAuth(t, meshSourceConfig())
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, meshWrite(t, "127.0.0.6:48375", false))
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Nil(t, captured.user)
+}
+
+// Without the setting, every loopback source stays break-glass, as before.
+func TestForwardAuth_MeshLoopbackSourceUnverifiedByDefault(t *testing.T) {
+	cfg := meshSourceConfig()
+	cfg.TrustedMeshLoopbackSources = nil
+	handler, captured := newForwardAuth(t, cfg)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, meshWrite(t, "127.0.0.6:48375", true))
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.False(t, captured.verified)
+}
+
+func TestNewForwardAuthAuthorizer_RejectsBadMeshLoopbackSources(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     auth.ForwardAuthConfig
+		wantErr string
+	}{
+		{name: "port-forward source", cfg: auth.ForwardAuthConfig{TrustedProxySPIFFE: []string{ingressSVID}, TrustedMeshLoopbackSources: []string{"127.0.0.1"}}, wantErr: "port-forward"},
+		{name: "IPv6 port-forward source", cfg: auth.ForwardAuthConfig{TrustedProxySPIFFE: []string{ingressSVID}, TrustedMeshLoopbackSources: []string{"::1"}}, wantErr: "port-forward"},
+		{name: "network", cfg: auth.ForwardAuthConfig{TrustedProxySPIFFE: []string{ingressSVID}, TrustedMeshLoopbackSources: []string{"127.0.0.0/8"}}, wantErr: "not an IP address"},
+		{name: "not loopback", cfg: auth.ForwardAuthConfig{TrustedProxySPIFFE: []string{ingressSVID}, TrustedMeshLoopbackSources: []string{"10.0.0.6"}}, wantErr: "not a loopback address"},
+		{name: "IPv6 mesh source is not loopback", cfg: auth.ForwardAuthConfig{TrustedProxySPIFFE: []string{ingressSVID}, TrustedMeshLoopbackSources: []string{"::6"}}, wantErr: "not a loopback address"},
+		{name: "no SPIFFE trust", cfg: auth.ForwardAuthConfig{TrustedProxyCIDRs: []string{"127.0.0.0/8"}, TrustedMeshLoopbackSources: []string{"127.0.0.6"}}, wantErr: "requires trusted_proxy_spiffe"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := auth.NewForwardAuthAuthorizer(tc.cfg, nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
