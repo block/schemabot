@@ -155,6 +155,26 @@ func TestRowCopyDisplayPercent(t *testing.T) {
 	assert.Equal(t, 100, RowCopyDisplayPercent(145, 42))
 }
 
+func TestChecksumDisplayPercent(t *testing.T) {
+	// No total yet, or nothing verified: an empty bar.
+	assert.Equal(t, 0, ChecksumDisplayPercent(0, 0))
+	assert.Equal(t, 0, ChecksumDisplayPercent(500, 0))
+	assert.Equal(t, 0, ChecksumDisplayPercent(0, 1_000_000))
+
+	// At least 1% once verification has begun, so the bar shows it started.
+	assert.Equal(t, 1, ChecksumDisplayPercent(4, 1_000))
+	assert.Equal(t, 1, ChecksumDisplayPercent(1, 1_000_000))
+
+	// Rounded down, so a checksum in its final stretch never fills the bar.
+	assert.Equal(t, 21, ChecksumDisplayPercent(321_450, 1_466_232))
+	assert.Equal(t, 99, ChecksumDisplayPercent(997_500, 1_000_000))
+	assert.Equal(t, 99, ChecksumDisplayPercent(999_999, 1_000_000))
+	assert.Equal(t, 100, ChecksumDisplayPercent(1_000_000, 1_000_000))
+
+	// A verified count past the estimated total stays at 100%.
+	assert.Equal(t, 100, ChecksumDisplayPercent(1_200_000, 1_000_000))
+}
+
 func TestRowCopyFraction(t *testing.T) {
 	assert.InDelta(t, 45.37, RowCopyFraction(45, 453_700, 1_000_000), 0.0001)
 	assert.InDelta(t, 100, RowCopyFraction(99, 1_100_000, 1_000_000), 0.0001)

@@ -108,3 +108,22 @@ func TestEnvironmentFreezeValidate(t *testing.T) {
 	var missing *EnvironmentFreeze
 	require.ErrorContains(t, missing.Validate(), "freeze is required")
 }
+
+// A freeze's stop is recorded under a caller that names the freeze, so the
+// apply can say which freeze stopped it. That caller names no operator.
+func TestFreezeStopCaller(t *testing.T) {
+	caller := FreezeStopCaller("freeze-abc")
+	assert.Equal(t, "freeze:freeze-abc", caller)
+	assert.True(t, IsFreezeStopCaller(caller))
+	freezeID, ok := FreezeFromStopCaller(caller)
+	assert.True(t, ok)
+	assert.Equal(t, "freeze-abc", freezeID)
+	assert.False(t, ControlRequestNamesAnOperator(caller))
+
+	for _, requestedBy := range []string{"", "alice", EndedOperationStopCaller, "freeze:"} {
+		freezeID, ok := FreezeFromStopCaller(requestedBy)
+		assert.False(t, ok, requestedBy)
+		assert.Empty(t, freezeID, requestedBy)
+	}
+	assert.True(t, ControlRequestNamesAnOperator("alice"))
+}

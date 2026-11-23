@@ -32,6 +32,17 @@ func TestPlanResponseFromProtoCarriesExemptTables(t *testing.T) {
 	assert.Equal(t, "archive naming", response.ExemptTables[0].Reason)
 }
 
+// The drop_tables entries a plan reports naming no live table reach the plan
+// response in the order the engine reported them, so both surfaces can say
+// the entry drops nothing.
+func TestPlanResponseFromProtoCarriesUnmatchedDropTables(t *testing.T) {
+	response := planResponseFromProto(&ternv1.PlanResponse{UnmatchedDropTables: []string{"_orders_olds", "`_jobs_old`"}})
+	assert.Equal(t, []string{"_orders_olds", "`_jobs_old`"}, response.UnmatchedDropTables)
+
+	assert.Empty(t, planResponseFromProto(&ternv1.PlanResponse{}).UnmatchedDropTables,
+		"a plan whose entries all matched reports none")
+}
+
 // apitypes carries its own copy of the exemption-reason vocabulary because it
 // is dependency-free by design. This package imports both, so it is where the
 // two are held together: a rename on the engine side that missed the wire side

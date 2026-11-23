@@ -778,6 +778,13 @@ row reads differently from one on a database's own row: every fold, a plan
 command's included, leaves it in place, so its remedy names a re-run of the
 check or a new commit, which re-verify the whole pull request, never a plan.
 
+A row left on an earlier commit for an environment the database is no longer
+configured for reads `environment_not_configured`. The server refuses a plan of
+that environment, so the remedy names the first environment the database is
+still planned in, or a new commit. The next plan of the database removes the
+row, so an environment configured again later reads as missing rather than
+passing.
+
 The review-time rollup also shows each deployment's blocked change count. This
 is informational beside drift: blocked verdicts do not make matching change
 sets diverge, while apply admission still refuses them on that deployment. The
@@ -1131,10 +1138,13 @@ GitHub:
 
 A merged PR cannot reopen, so a merge skips the read.
 
-The retry is limited to five attempts, one minute apart. A GitHub outage that
-lasts longer, a suspended or removed App installation, or a deleted repository
-uses up those attempts. The lock then stays held and blocks other PRs on that
-database until an operator runs `schemabot unlock`.
+The retry is limited to five attempts. The wait between them doubles: one,
+two, four, then eight minutes, at least fifteen minutes in all. Each wait
+also gets a random extra of up to a quarter of its length, so deliveries
+that failed together do not all retry at the same moment. A GitHub outage
+that lasts longer, a suspended or removed App installation, or a deleted
+repository uses up those attempts. The lock then stays held and blocks other
+PRs on that database until an operator runs `schemabot unlock`.
 
 The read is made once, before cleanup starts. A PR that reopens while cleanup
 is already running is not seen by that cleanup, which finishes as if the PR

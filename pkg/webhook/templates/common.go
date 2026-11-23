@@ -186,12 +186,6 @@ func inlineCodeStatement(text string) string {
 // render intact; anything longer is clamped with a truncation marker.
 const maxCommentErrorLen = 500
 
-// MaxChangeGateRefusalLen bounds a freeze refusal's error detail. SchemaBot
-// writes the refusal around reasons it clamps, and the override request ID and
-// the approval instructions come last, so the default bound would cut them off
-// behind a long freeze reason.
-const MaxChangeGateRefusalLen = 3000
-
 // maxCommentVSchemaDiffLen bounds the VSchema diffs rendered into one comment
 // — a budget shared across every keyspace's diff, not granted per diff — so
 // enormous diffs (such as the first sharding pass over a keyspace with many

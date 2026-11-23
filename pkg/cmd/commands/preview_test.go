@@ -24,6 +24,7 @@ func TestPreviewPlanDisclosuresSelectIndividually(t *testing.T) {
 		// underscore inside a word cannot start emphasis, so it is left as written.
 		{templates.PreviewCommentPlanIgnoreTables, "(ignore_tables): `flyway_schema_history`"},
 		{templates.PreviewCommentPlanDropTables, "DROP TABLE `_events_old`;"},
+		{templates.PreviewCommentPlanDropTablesUnmatched, "`drop_tables` entry `_events_olds` names no table on the target"},
 		{templates.PreviewCommentPlanWhoCanApply, "- Operators: `acme/testapp-operators`"},
 	}
 	for _, tt := range tests {

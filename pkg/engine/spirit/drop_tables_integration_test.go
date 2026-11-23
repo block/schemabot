@@ -87,6 +87,8 @@ func TestEngine_Plan_DropTablesDropsTablesTheNamingConventionsSkip(t *testing.T)
 	assert.Equal(t, []*engine.ExemptTables{
 		{Namespace: testDatabase, Tables: []string{"_other_old"}, Reason: engine.ExemptReasonLeadingUnderscore},
 	}, result.ExemptTables, "only the unlisted leftover is still disclosed as skipped")
+	assert.Equal(t, []string{"never_existed"}, result.UnmatchedDropTables,
+		"the entry that names no table is reported, and the entries that planned a drop are not")
 
 	for _, change := range result.FlatTableChanges() {
 		if change.Table != "_jobs_old" {
@@ -274,6 +276,43 @@ func TestEngine_Plan_DropTablesRefusesATableWithNoWriteTimeOnARecentlyStartedSer
 	assert.Nil(t, result)
 	assert.Contains(t, err.Error(), `SchemaBot cannot tell whether drop_tables entries "_jobs_old" were written in the last 1d: the server has no write time for them and started `)
 	assert.Contains(t, err.Error(), "Plan again in ")
+	assert.True(t, tableExists(t, db, "_jobs_old"))
+}
+
+// An entry with a typo, wrapped in backticks, or in the wrong case names no
+// table on a case-sensitive target, so it plans nothing and the plan is
+// otherwise clean, with the leftover it meant still listed under its naming
+// convention. The plan reports each such entry, in the order the config lists
+// them, so the clean plan does not read as if the leftover was seen and kept.
+func TestEngine_Plan_DropTablesReportsEntriesThatNameNoTableOnACleanPlan(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	for _, stmt := range []string{
+		`CREATE TABLE executions (id INT PRIMARY KEY)`,
+		"CREATE TABLE `_jobs_old` (id INT PRIMARY KEY)",
+	} {
+		_, err := db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+	var lowerCaseTableNames int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@lower_case_table_names").Scan(&lowerCaseTableNames))
+	require.Equal(t, 0, lowerCaseTableNames, "the test target compares table names case-sensitively")
+
+	result, err := New(Config{}).Plan(t.Context(), &engine.PlanRequest{
+		Database: testDatabase,
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"executions.sql": `CREATE TABLE executions (id INT PRIMARY KEY)`,
+		}),
+		Credentials: &engine.Credentials{DSN: dsn},
+		DropTables:  []string{"_jobs_olds", "`_jobs_old`", "_Jobs_Old"},
+	})
+	require.NoError(t, err, "Plan()")
+	assert.True(t, result.NoChanges, "no entry names a live table, so the plan drops nothing")
+	assert.Equal(t, []string{"_jobs_olds", "`_jobs_old`", "_Jobs_Old"}, result.UnmatchedDropTables)
+	assert.Equal(t, []*engine.ExemptTables{
+		{Namespace: testDatabase, Tables: []string{"_jobs_old"}, Reason: engine.ExemptReasonLeadingUnderscore},
+	}, result.ExemptTables, "the leftover the entries meant is still skipped by its name")
 	assert.True(t, tableExists(t, db, "_jobs_old"))
 }
 

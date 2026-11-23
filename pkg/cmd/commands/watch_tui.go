@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -43,6 +44,9 @@ type WatchModel struct {
 	sharded bool
 	// deferCutover is whether the apply waits for an operator at each cutover.
 	deferCutover bool
+	// stoppedByFreeze names the freeze that stopped the apply, nil when an
+	// operator stopped it or it is not stopped.
+	stoppedByFreeze *apitypes.FreezeStopRef
 	// errorMsg is the error the view shows. It is display text only: a failed
 	// poll the watch is still retrying or a refused control request leaves it
 	// set while the watch carries on, so it does not decide the exit status.
@@ -60,7 +64,10 @@ type WatchModel struct {
 	// UI state
 	// windowHeight is the terminal's height in rows, zero until the first
 	// window size message arrives.
-	windowHeight       int
+	windowHeight int
+	// windowWidth is the terminal's width in columns, zero until the first
+	// window size message arrives.
+	windowWidth        int
 	pastPending        bool
 	detached           bool
 	quitting           bool
@@ -83,18 +90,19 @@ type progressMsg struct {
 	state        string
 	tables       []templates.TableProgress
 	operations   []templates.ProgressOperation
-	released     bool              // apply-level release latch: a released pause runs degraded, not paused
-	sharded      bool              // one change fanned out across its keyspaces' shards
-	deferCutover bool              // the apply waits for an operator at each cutover
-	errorMsg     string            // Human-readable error message
-	failed       bool              // true when the API call didn't return usable progress data
-	retryable    bool              // when failed, whether the TUI should keep polling
-	retryAfter   time.Duration     // when failed, the delay the response asked for before the next poll
-	applyID      string            // Populated from progress responses
-	database     string            // Populated from apply-id progress responses
-	environment  string            // Populated from apply-id progress responses
-	engine       string            // Engine name (e.g., "Spirit", "PlanetScale")
-	metadata     map[string]string // Engine metadata (e.g., deploy_request_url)
+	released     bool                    // apply-level release latch: a released pause runs degraded, not paused
+	sharded      bool                    // one change fanned out across its keyspaces' shards
+	deferCutover bool                    // the apply waits for an operator at each cutover
+	stoppedBy    *apitypes.FreezeStopRef // the freeze that stopped the apply, nil when none did
+	errorMsg     string                  // Human-readable error message
+	failed       bool                    // true when the API call didn't return usable progress data
+	retryable    bool                    // when failed, whether the TUI should keep polling
+	retryAfter   time.Duration           // when failed, the delay the response asked for before the next poll
+	applyID      string                  // Populated from progress responses
+	database     string                  // Populated from apply-id progress responses
+	environment  string                  // Populated from apply-id progress responses
+	engine       string                  // Engine name (e.g., "Spirit", "PlanetScale")
+	metadata     map[string]string       // Engine metadata (e.g., deploy_request_url)
 }
 
 type cutoverResultMsg struct {
@@ -143,6 +151,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.windowHeight = msg.Height
+		m.windowWidth = msg.Width
 		return m, nil
 
 	case tea.KeyMsg:
@@ -214,6 +223,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.released = msg.released
 		m.sharded = msg.sharded
 		m.deferCutover = msg.deferCutover
+		m.stoppedByFreeze = msg.stoppedBy
 		m.errorMsg = msg.errorMsg
 
 		// Timeout skip-revert if state hasn't transitioned after 10s.

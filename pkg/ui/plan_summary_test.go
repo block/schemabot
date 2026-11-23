@@ -85,3 +85,20 @@ func TestPlanSummaryPartsNamesOtherStatementsOnlyBesideTypedCounts(t *testing.T)
 	assert.Equal(t, []string{"3 DDL statements"}, PlanSummaryParts(PlanCounts{}, 3, false))
 	assert.Empty(t, PlanSummaryParts(PlanCounts{}, 0, false))
 }
+
+// Labels added to an enum type are counted once per type, beside the table
+// work, however many labels the plan adds to it, and equal type names in two
+// namespaces are two types.
+func TestPlanCountsCountsATypeOncePerType(t *testing.T) {
+	var counts PlanCounts
+	counts.AddTable("app", "alter_type", "order_status")
+	counts.AddTable("app", "alter_type", "order_status")
+	counts.AddTable("billing", "alter_type", "order_status")
+	counts.AddTable("app", "alter", "orders")
+
+	assert.Equal(t, 2, counts.TypesAltered)
+	assert.Equal(t, 1, counts.Altered)
+	assert.Zero(t, counts.Other)
+	assert.Equal(t, []string{"1 table to alter", "2 types to alter"}, PlanSummaryParts(counts, 4, false))
+	assert.Equal(t, []string{"**1** type to alter"}, PlanSummaryParts(PlanCounts{TypesAltered: 1}, 1, true))
+}

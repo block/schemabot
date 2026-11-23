@@ -19,6 +19,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -210,6 +211,7 @@ func outputMultiEnvPlanResult(results map[string]*apitypes.PlanResponse, databas
 		envOrder = append(envOrder, env)
 	}
 	sortEnvironments(envOrder)
+	results = withUnmatchedDropTablesInEveryPlan(results, envOrder)
 
 	// The first configured environment, in that order, names the engine.
 	var engine string
@@ -263,6 +265,32 @@ func outputMultiEnvPlanResult(results map[string]*apitypes.PlanResponse, databas
 			writeEnvPlan(results[env])
 		}
 	}
+}
+
+// withUnmatchedDropTablesInEveryPlan copies results with each one's unmatched
+// drop_tables entries narrowed to those every configured environment's plan
+// reports, so no section tells the reader to remove an entry another
+// environment still drops a table for, the same narrowing the PR comment
+// applies (see presentation.UnmatchedDropTablesInEveryPlan).
+func withUnmatchedDropTablesInEveryPlan(results map[string]*apitypes.PlanResponse, envOrder []string) map[string]*apitypes.PlanResponse {
+	var lists [][]string
+	for _, env := range envOrder {
+		if result := results[env]; result != nil {
+			lists = append(lists, shownUnmatchedDropTables(result))
+		}
+	}
+	common := presentation.UnmatchedDropTablesInEveryPlan(lists)
+	narrowed := make(map[string]*apitypes.PlanResponse, len(results))
+	for env, result := range results {
+		if result == nil {
+			narrowed[env] = nil
+			continue
+		}
+		copied := *result
+		copied.UnmatchedDropTables = common
+		narrowed[env] = &copied
+	}
+	return narrowed
 }
 
 // writeEnvPlan writes the plan for a single environment result.
@@ -366,6 +394,21 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WriteNoChanges()
 	}
 	templates.WriteExemptTables(result.ExemptTables)
+	// A rollout reports no unmatched drop_tables entries; see
+	// shownUnmatchedDropTables.
+}
+
+// shownUnmatchedDropTables is the unmatched drop_tables entries the plan
+// reports. A rollout plan reports none, as the PR comment does: the entries
+// describe the primary target alone, while every other member is planned with
+// the same list and drops a table it still has, so a line saying the entry
+// drops nothing could sit beside that member's DROP and tell the reader to
+// remove the entry the drop depends on.
+func shownUnmatchedDropTables(result *apitypes.PlanResponse) []string {
+	if result.WholeRollout() != nil {
+		return nil
+	}
+	return result.UnmatchedDropTables
 }
 
 // rendersNamespaceChanges reports whether the plan has DDL, a VSchema change,
@@ -544,6 +587,7 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 	if w.empty() {
 		templates.WriteNoChanges()
 		templates.WriteExemptTables(result.ExemptTables)
+		templates.WriteUnmatchedDropTables(shownUnmatchedDropTables(result))
 		return
 	}
 	writeChangeDetail(result, w, isApply)
@@ -564,6 +608,7 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WritePlanSummary(w.allChanges)
 	}
 	templates.WriteExemptTables(result.ExemptTables)
+	templates.WriteUnmatchedDropTables(shownUnmatchedDropTables(result))
 }
 
 // writePlanGuidance links the guides for the lint findings the output shows.
@@ -720,8 +765,9 @@ func sortEnvironments(envs []string) {
 // Two plans fingerprint the same when their sections would read the same: the
 // same statements under the same namespaces, the same VSchema updates and
 // finalizes, the same unsafe findings, the same advisory lint, and the same
-// exempt-table disclosure. The unsafe and lint verdicts are part of it because
-// they come from each environment's live pre-state, not from the statement: an
+// exempt-table and unmatched drop_tables disclosures. The unsafe and lint
+// verdicts are part of it because they come from each environment's live
+// pre-state, not from the statement: an
 // index made invisible in staging but not yet in production gives both the
 // same DROP INDEX and only production a finding, and folding production under
 // staging's clean section would hide it. Whatever writePlanBody renders has to
@@ -781,6 +827,7 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	sort.Strings(unsafeFindings)
 	sort.Strings(lint)
 	sort.Strings(exempt)
+	unmatchedDrops := slices.Sorted(slices.Values(result.UnmatchedDropTables))
 
 	data, _ := json.Marshal(struct {
 		DDLs      []string `json:"ddls"`
@@ -789,7 +836,8 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 		Unsafe    []string `json:"unsafe"`
 		Lint      []string `json:"lint"`
 		Exempt    []string `json:"exempt"`
-	}{ddls, vschemas, finalizes, unsafeFindings, lint, exempt})
+		Unmatched []string `json:"unmatched_drop_tables"`
+	}{ddls, vschemas, finalizes, unsafeFindings, lint, exempt, unmatchedDrops})
 	return string(data)
 }
 

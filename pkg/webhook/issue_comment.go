@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -730,9 +731,18 @@ func (h *Handler) postCommentReportingError(repo string, pr int, installationID 
 	return nil
 }
 
-// postComment posts a comment on a PR, best effort.
+// postComment posts a comment on a PR, best effort. On a listen-only
+// repository the GitHub client refuses the write by design, so that refusal
+// is logged at Info rather than as a failure; the GitHub request metric also
+// counts it as suppressed.
 func (h *Handler) postComment(repo string, pr int, installationID int64, body string) {
-	if err := h.postCommentReportingError(repo, pr, installationID, body); err != nil {
+	err := h.postCommentReportingError(repo, pr, installationID, body)
+	switch {
+	case err == nil:
+	case errors.Is(err, ghclient.ErrListenOnlyRepository):
+		h.logger.Info("comment not posted: repository is listen-only",
+			"repo", repo, "pr", pr, "installation_id", installationID)
+	default:
 		h.logger.Error("failed to post comment",
 			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)
 	}
