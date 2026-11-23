@@ -145,7 +145,7 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 		// body, which discloses them on both of its own branches.
 		if cmd.Output != OutputFormatJSON {
 			templates.WriteExemptTables(planResult.ExemptTables)
-			templates.WriteUnmatchedDropTables(planResult.UnmatchedDropTables)
+			templates.WriteUnmatchedDropTables(shownUnmatchedDropTables(planResult))
 		}
 		return nil
 	}

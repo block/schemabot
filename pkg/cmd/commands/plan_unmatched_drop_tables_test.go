@@ -2,6 +2,8 @@ package commands
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/presentation"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -132,17 +135,147 @@ func TestWritePlanBody_UnmatchedDropTablesReported(t *testing.T) {
 	}
 }
 
-// Two environments with the same DDL but different unmatched entries do not
-// read the same, so they render as separate sections.
-func TestOutputMultiEnvPlanResult_UnmatchedDropTablesDivergeSections(t *testing.T) {
-	staging := planWithTablesAndEngine("spirit", createUsers())
-	staging.UnmatchedDropTables = []string{"_jobs_olds"}
-	production := planWithTablesAndEngine("spirit", createUsers())
+// Staging has already applied the drop of _jobs_old, so its plan is clean and
+// reports the entry as naming no table, while production still has the table
+// and plans the drop. The output shows production's drop and does not tell the
+// reader to remove the entry that drop depends on; the typo both environments
+// report stays under each section.
+func TestOutputMultiEnvPlanResult_UnmatchedDropTablesNotReportedBesideAnotherEnvironmentsDrop(t *testing.T) {
+	staging := &apitypes.PlanResponse{Engine: "spirit", UnmatchedDropTables: []string{"_jobs_old", "_jobs_olds"}}
+	production := planWithTablesAndEngine("spirit", &apitypes.TableChangeResponse{
+		TableName: "_jobs_old", DDL: "DROP TABLE `_jobs_old`;", ChangeType: "drop", IsUnsafe: true, UnsafeReason: "DROP TABLE removes all data",
+	})
+	production.UnmatchedDropTables = []string{"_jobs_olds"}
 
 	out := stripAnsi(captureStdout(func() {
 		outputMultiEnvPlanResult(map[string]*apitypes.PlanResponse{"staging": staging, "production": production}, "testdb", "testdb")
 	}))
 
-	assert.NotContains(t, out, "Staging & Production")
-	assert.Equal(t, 1, strings.Count(out, cliUnmatchedDropLine), out)
+	assert.Contains(t, out, "DROP TABLE `_jobs_old`", out)
+	assert.NotContains(t, out, `entry "_jobs_old" names no table`, out)
+	assert.Equal(t, 2, strings.Count(out, cliUnmatchedDropLine+"\n"), out)
+}
+
+// Apply against a target with nothing to reconcile returns before the plan
+// body, so it reports an entry that names no table itself, once.
+func TestApplyCmd_UnmatchedDropTablesReportedOnCleanPlan(t *testing.T) {
+	plan := &apitypes.PlanResponse{Engine: "mysql", UnmatchedDropTables: []string{"_jobs_olds"}}
+	body, err := json.Marshal(plan)
+	require.NoError(t, err)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/plan" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, writeErr := w.Write(body)
+		require.NoError(t, writeErr)
+	}))
+	t.Cleanup(server.Close)
+
+	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "staging", NoLock: true}
+	out := stripAnsi(captureStdout(func() { _ = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
+
+	assert.Contains(t, out, "No changes. Your schema is up-to-date.", out)
+	assert.Equal(t, 1, strings.Count(out, cliUnmatchedDropLine+"\n"), out)
+}
+
+// dropJobsOld is the DROP of the leftover _jobs_old a target still has.
+func dropJobsOld() []*apitypes.SchemaChangeResponse {
+	return []*apitypes.SchemaChangeResponse{{
+		Namespace: "orders",
+		TableChanges: []*apitypes.TableChangeResponse{{
+			TableName: "_jobs_old", Namespace: "orders", DDL: "DROP TABLE `_jobs_old`", ChangeType: "drop",
+			IsUnsafe: true, UnsafeReason: "DROP TABLE removes all data",
+		}},
+	}}
+}
+
+// A rollout plan reports no unmatched drop_tables entry: the primary's entries
+// say nothing about the other targets, and here the other target drops the
+// table the primary reports as missing. The output shows that target's DROP
+// and no line telling the reader to remove the entry it depends on, in the
+// plan layout, the apply layout, and a multi-environment plan.
+func TestWritePlanBody_RolloutReportsNoUnmatchedDropTables(t *testing.T) {
+	rollout := func() *apitypes.PlanResponse {
+		return &apitypes.PlanResponse{
+			Database: "orders",
+			Engine:   "spirit",
+			Changes:  []*apitypes.SchemaChangeResponse{},
+			Rollout: &apitypes.PlanRolloutResponse{
+				Members:     2,
+				Independent: true,
+				Groups: []*apitypes.PlanMemberGroupResponse{
+					{Members: paymentsTargets(1, 1), Primary: true, Changes: []*apitypes.SchemaChangeResponse{}},
+					{Members: paymentsTargets(2, 2), Changes: dropJobsOld()},
+				},
+			},
+			UnmatchedDropTables: []string{"_jobs_old", "_jobs_olds"},
+		}
+	}
+
+	for name, isApply := range map[string]bool{"plan": false, "apply": true} {
+		t.Run(name, func(t *testing.T) {
+			out := stripAnsi(captureStdout(func() { writePlanBody(rollout(), isApply) }))
+			assert.Contains(t, out, "DROP TABLE `_jobs_old`", out)
+			assert.NotContains(t, out, "names no table", out)
+		})
+	}
+
+	t.Run("multi-environment", func(t *testing.T) {
+		staging := &apitypes.PlanResponse{Engine: "spirit", UnmatchedDropTables: []string{"_jobs_olds"}}
+		out := stripAnsi(captureStdout(func() {
+			outputMultiEnvPlanResult(map[string]*apitypes.PlanResponse{"staging": staging, "production": rollout()}, "orders", "orders")
+		}))
+		assert.Contains(t, out, "DROP TABLE `_jobs_old`", out)
+		assert.NotContains(t, out, "names no table", out)
+	})
+}
+
+// Apply against a rollout with nothing to reconcile on any target returns
+// before the plan body, and like the body it reports no unmatched entry.
+func TestApplyCmd_RolloutReportsNoUnmatchedDropTablesOnCleanPlan(t *testing.T) {
+	plan := &apitypes.PlanResponse{
+		Engine:  "mysql",
+		Changes: []*apitypes.SchemaChangeResponse{},
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     2,
+			Independent: true,
+			Groups:      []*apitypes.PlanMemberGroupResponse{{Members: paymentsTargets(1, 2), Primary: true, Changes: []*apitypes.SchemaChangeResponse{}}},
+		},
+		UnmatchedDropTables: []string{"_jobs_olds"},
+	}
+	body, err := json.Marshal(plan)
+	require.NoError(t, err)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/plan" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, writeErr := w.Write(body)
+		require.NoError(t, writeErr)
+	}))
+	t.Cleanup(server.Close)
+
+	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "staging", NoLock: true}
+	out := stripAnsi(captureStdout(func() { _ = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
+
+	assert.Contains(t, out, "No changes. Your schema is up-to-date.", out)
+	assert.NotContains(t, out, "names no table", out)
+}
+
+// A drop_tables list with many entries that name no table names the first
+// ones and counts the rest, the same entries the PR comment names.
+func TestWritePlanBody_ManyUnmatchedDropTablesAreCounted(t *testing.T) {
+	plan := &apitypes.PlanResponse{Engine: "spirit"}
+	for i := range 400 {
+		plan.UnmatchedDropTables = append(plan.UnmatchedDropTables, fmt.Sprintf("_jobs_old_%04d", i))
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
+	assert.Equal(t, presentation.UnmatchedDropTablesListLimit, strings.Count(out, "names no table on the target, so this plan drops nothing for it."), out)
+	assert.Contains(t, out, `drop_tables entry "_jobs_old_0019" names no table`)
+	assert.NotContains(t, out, "_jobs_old_0020")
+	assert.Contains(t, out, "⚠️  380 more drop_tables entries name no table on the target, so this plan drops nothing for them. Fix the names, or remove the entries whose tables are already gone.\n", out)
 }
