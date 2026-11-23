@@ -858,7 +858,8 @@ type atomicPollState struct {
 	consecutiveCutoverFailures int
 
 	// consecutiveErrors tracks progress poll failures to fail fast when the
-	// engine is unreachable (e.g., branch deleted mid-apply).
+	// engine is unreachable (e.g., branch deleted mid-apply), and paces the
+	// next poll while they last (progressPollWait).
 	consecutiveErrors int
 
 	// lostWork measures how long the engine has been reporting no active
@@ -1107,10 +1108,10 @@ func (c *LocalClient) lostEngineWorkPendingBudget(eng engine.Engine) time.Durati
 // inside that window.
 func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.Apply, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState) taskAction {
 	eng := c.getEngine()
-	ticker := time.NewTicker(c.taskPollInterval())
-	defer ticker.Stop()
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 
+	// consecutiveErrors counts failed polls in a row; it bounds the drive and
+	// paces its next poll (progressPollWait).
 	var consecutiveErrors int
 	// terminalWriteFailures counts consecutive failed writes of the task's
 	// terminal state. It is separate from consecutiveErrors because every
@@ -1143,7 +1144,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			logger.Info("drive context cancelled while polling; handing the apply back for another driver to claim",
 				"task_id", task.TaskIdentifier, "table", task.TableName)
 			return taskHandover
-		case <-ticker.C:
+		case <-time.After(c.progressPollWait(consecutiveErrors)):
 			if !parked.runFullPoll(ctx, c.storage, apply, time.Now(), logger) {
 				continue
 			}

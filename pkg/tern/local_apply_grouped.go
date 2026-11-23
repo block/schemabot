@@ -714,8 +714,6 @@ func (w *acceptedEngineWork) haltUnlessPolled() {
 // its own context to learn why it stopped.
 func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, options map[string]string, releaseAtCutoverBarrier bool) error {
 	eng := c.getEngine()
-	ticker := time.NewTicker(c.taskPollInterval())
-	defer ticker.Stop()
 
 	// Seed revertSkipped from the durable signal so a driver that picks this apply
 	// up after a restart treats skip-revert as already accepted: it won't re-attempt
@@ -743,7 +741,7 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 			c.logger.Info("drive context cancelled while polling; handing the apply back for another driver to claim",
 				apply.IdentityLogAttrs()...)
 			return nil
-		case <-ticker.C:
+		case <-time.After(c.progressPollWait(ps.consecutiveErrors)):
 			if !ps.parked.runFullPoll(ctx, c.storage, apply, time.Now(), c.logger.With(apply.IdentityLogAttrs()...)) {
 				continue
 			}
@@ -784,7 +782,7 @@ func applyQuiesceDecision(projectedApplyState string) (quiesce, retryablePause, 
 func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState, options map[string]string, releaseAtCutoverBarrier bool) bool {
 	// Bind identity once for all decisions and state transitions in this progress tick.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
-	// The poll loop's select can pick a ready ticker over an equally ready
+	// The poll loop's select can pick a fired poll timer over an equally ready
 	// ctx.Done(), so a tick can begin after the drive has been cancelled. Every
 	// engine call and storage write it made would fail on that context.
 	if c.driveCancelled(ctx, apply, "before a progress tick") {
