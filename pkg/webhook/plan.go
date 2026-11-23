@@ -1213,9 +1213,20 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 	}
 
 	if errors.Is(err, ghclient.ErrMultipleConfigs) {
-		h.logger.Warn("schema request: multiple configs found", logFields...)
+		var multipleConfigsErr *ghclient.MultipleConfigsError
+		if errors.As(err, &multipleConfigsErr) {
+			for _, candidate := range multipleConfigsErr.Candidates {
+				data.AvailableConfigs = append(data.AvailableConfigs, templates.AvailableConfigData{
+					Database:   candidate.Database,
+					SchemaPath: candidate.SchemaDir,
+				})
+			}
+			h.logger.Warn("schema request: multiple configs found",
+				append(logFields, "databases", multipleConfigsErr.Databases())...)
+		} else {
+			h.logger.Warn("schema request: multiple configs found without candidate details; the comment lists no databases", logFields...)
+		}
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "multiple_configs")
-		data.AvailableDatabases = templates.FormatAvailableDatabases(err.Error())
 		h.postComment(repo, pr, installationID, templates.RenderMultipleConfigs(data))
 		return true
 	}
