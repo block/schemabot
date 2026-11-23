@@ -762,9 +762,12 @@ a data plane that fails the read or does not answer. Retry after a short wait.
 If it keeps failing, the cause is in the server logs and can be a configuration
 error that only an operator can fix. A server with no configuration for the
 apply's deployment answers `404` with `error_code` `deployment_not_found`, which
-retrying does not fix.
+retrying does not fix. When the server cannot read the apply or its tasks from
+its own storage, or the apply has no deployment recorded, the route answers
+`500` with `error_code` `storage_error` and a fixed message that names the apply
+and leaves the cause in the server logs; clients retry it as a transient failure.
 `schemabot status <apply_id>` prints "No schema change found" only for the
-unknown `apply_id`. It reports the other two answers as errors and exits
+unknown `apply_id`. It reports every other error answer as an error and exits
 non-zero.
 
 <details>

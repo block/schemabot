@@ -56,10 +56,11 @@ func progressTasksReadFailedMessage(applyID string) string {
 }
 
 // progressDeploymentMissingMessage is what a progress request answers when an
-// active apply has no stored deployment to route to. A retry cannot fix it, so
-// the message points at the server log instead.
+// active apply has no stored deployment to route to. The answer keeps the
+// retryable storage_error code it has always carried, so the message names the
+// cause and who can fix it without telling the client whether to retry.
 func progressDeploymentMissingMessage(applyID string) string {
-	return fmt.Sprintf("progress for apply %s is unavailable: the apply has no stored deployment; see server logs", applyID)
+	return fmt.Sprintf("progress for apply %s is unavailable: SchemaBot has no deployment recorded for it; a SchemaBot operator can find the cause in the server log", applyID)
 }
 
 // changeTypeToString converts a proto change type for progress responses.

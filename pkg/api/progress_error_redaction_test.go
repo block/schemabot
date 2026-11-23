@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -74,7 +75,7 @@ func TestProgressByApplyIDStorageFailuresAnswerFixedMessages(t *testing.T) {
 				return apply
 			},
 			client:  &mockTernClient{},
-			wantMsg: "progress for apply apply-no-deployment is unavailable: the apply has no stored deployment; see server logs",
+			wantMsg: "progress for apply apply-no-deployment is unavailable: SchemaBot has no deployment recorded for it; a SchemaBot operator can find the cause in the server log",
 			wantLog: "active apply is missing stored deployment metadata",
 		},
 	}
@@ -113,13 +114,37 @@ func TestProgressByApplyIDStorageFailuresAnswerFixedMessages(t *testing.T) {
 			assert.NotContains(t, w.Body.String(), "10.0.0.5")
 			assert.NotContains(t, w.Body.String(), "user:pass")
 
-			assert.Contains(t, logs.String(), tc.wantLog)
-			assert.Contains(t, logs.String(), "apply_id="+apply.ApplyIdentifier)
+			record := logRecordContaining(t, logs.String(), tc.wantLog)
+			assert.Contains(t, record, "apply_id="+apply.ApplyIdentifier)
+			if tc.applies == nil {
+				// The apply is in scope, so the record carries its triage
+				// identifiers, not only the apply ID.
+				assert.Contains(t, record, "database="+apply.Database)
+				assert.Contains(t, record, "environment="+apply.Environment)
+				assert.Contains(t, record, "database_type="+apply.DatabaseType)
+			}
 			if tc.applies != nil || tc.tasksErr != nil {
-				assert.Contains(t, logs.String(), "user:pass@db.internal", "the raw error belongs in the server log")
+				assert.Contains(t, record, "user:pass@db.internal", "the raw error belongs in the server log")
+			} else {
+				assert.Contains(t, record, `error="apply \"`+apply.ApplyIdentifier+`\" is missing stored deployment metadata"`, "the cause belongs in the server log")
 			}
 		})
 	}
+}
+
+// logRecordContaining returns the one text log record whose message contains
+// msg, so assertions check that record's own attributes rather than another
+// line that happens to carry the same value.
+func logRecordContaining(t *testing.T, logs, msg string) string {
+	t.Helper()
+	var matches []string
+	for line := range strings.SplitSeq(logs, "\n") {
+		if strings.Contains(line, msg) {
+			matches = append(matches, line)
+		}
+	}
+	require.Len(t, matches, 1, "log records containing %q:\n%s", msg, logs)
+	return matches[0]
 }
 
 // A server config with an environment that has no route cannot be listed. The
@@ -142,7 +167,7 @@ func TestHandleDatabaseListConfigFailureAnswersFixedMessage(t *testing.T) {
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
 
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?name=leakdb", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -151,6 +176,9 @@ func TestHandleDatabaseListConfigFailureAnswersFixedMessage(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Equal(t, "failed to list databases; see server logs", resp.Error)
 	assert.NotContains(t, w.Body.String(), "leakdb")
-	assert.Contains(t, logs.String(), "database list failed")
-	assert.Contains(t, logs.String(), "leakdb")
+	record := logRecordContaining(t, logs.String(), "database list failed")
+	assert.Contains(t, record, "name=leakdb", "the record carries the request's filters")
+	assert.Contains(t, record, "database_type=")
+	assert.Contains(t, record, "app=")
+	assert.Contains(t, record, "error=", "the record carries the cause")
 }
