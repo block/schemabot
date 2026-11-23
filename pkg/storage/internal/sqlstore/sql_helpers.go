@@ -147,9 +147,15 @@ const (
 )
 
 // checkRowsAffected checks that at least one row was affected by the result.
-// Returns notFoundErr if no rows were affected.
-func checkRowsAffected(result sql.Result, notFoundErr error) error {
-	rowsAffected, _ := result.RowsAffected()
+// Returns notFoundErr if no rows were affected, and a wrapped error when the
+// driver cannot report the count: the caller cannot tell whether the row exists,
+// so it must not read that as "not found". op names the statement, such as
+// "deleting plan 42", so the error says which row count could not be read.
+func checkRowsAffected(result sql.Result, notFoundErr error, op string) error {
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read rows affected %s: %w", op, err)
+	}
 	if rowsAffected == 0 {
 		return notFoundErr
 	}
