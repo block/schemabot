@@ -80,6 +80,13 @@ func TestCommand(t *testing.T) {
 	assert.Equal(t, "acme schemabot start apply-1 --profile prod -e development",
 		Command("start", "apply-1"), "a routing flag the caller does not pass is still appended")
 
+	SetRoute(Flag{"--environment", "development"})
+	assert.Equal(t, "acme schemabot start apply-1 -e staging",
+		Command("start", "apply-1", "-e", "staging"), "a recorded long spelling is not repeated after the short one")
+	SetRoute(Flag{"-e", "development"})
+	assert.Equal(t, "acme schemabot start apply-1 --environment=staging",
+		Command("start", "apply-1", "--environment=staging"), "a recorded short spelling is not repeated after the long one")
+
 	SetRoute(Flag{"--profile", "bad\nname"}, Flag{"--context", "west"})
 	assert.Equal(t, "acme schemabot progress apply-1 --context west", Command("progress", "apply-1"),
 		"a value with a control character has no shell spelling and is left out")

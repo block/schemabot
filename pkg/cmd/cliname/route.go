@@ -2,6 +2,7 @@ package cliname
 
 import (
 	"log/slog"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"unicode"
@@ -27,7 +28,9 @@ type Flag struct {
 // CLI records its own with Globals.RouteFlags after parsing; a wrapper that adds
 // a routing flag of its own appends it and calls SetRoute again. Callers must
 // never pass a credential: everything recorded here is printed. An empty route
-// clears it.
+// clears it. A hint that already passes a recorded flag, under any spelling the
+// CLI accepts for it (flagSpellings), keeps its own value and does not get the
+// recorded one.
 func SetRoute(flags ...Flag) {
 	recorded := append([]Flag(nil), flags...)
 	route.Store(&recorded)
@@ -66,12 +69,34 @@ func Command(args ...string) string {
 	return strings.Join(parts, " ")
 }
 
-// passesFlag reports whether args already pass the flag name, either as its
-// own word ("-e", "staging") or joined to its value ("-e=staging").
+// flagSpellings lists the spellings of one routing flag that the CLI accepts
+// interchangeably. A hint that passes either spelling already names the flag,
+// whichever spelling the route recorded: commands take the environment as -e
+// or --environment, and a hint that passes -e staging must not also get a
+// recorded --environment development.
+var flagSpellings = [][]string{
+	{"-e", "--environment"},
+}
+
+// spellings returns every spelling of the flag name, the name itself first.
+func spellings(name string) []string {
+	for _, group := range flagSpellings {
+		if slices.Contains(group, name) {
+			return group
+		}
+	}
+	return []string{name}
+}
+
+// passesFlag reports whether args already pass the flag name under any of its
+// spellings, either as its own word ("-e", "staging") or joined to its value
+// ("--environment=staging").
 func passesFlag(args []string, name string) bool {
-	for _, arg := range args {
-		if arg == name || strings.HasPrefix(arg, name+"=") {
-			return true
+	for _, spelling := range spellings(name) {
+		for _, arg := range args {
+			if arg == spelling || strings.HasPrefix(arg, spelling+"=") {
+				return true
+			}
 		}
 	}
 	return false
