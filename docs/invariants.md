@@ -750,10 +750,11 @@ that would clear the block without the divergence behind it being addressed.
 
 *Enforced:* stale-check reconciliation (`pkg/webhook/check_records.go`), aggregate re-evaluation
 (`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), the re-plan a settled
-apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`), and
+apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`),
 the plan that settles the rows a database left on earlier commits under an old type, and removes
 those it left in an environment it no longer has, which no later plan would store again (`settleLeftBehindChecks` in
-`pkg/webhook/pull_request.go`).
+`pkg/webhook/pull_request.go`), and the durable delivery retry that re-runs a plan refused by the
+GitHub quota reserve once the quota resets (`pkg/webhook/durable_dispatch.go`).
 A concurrent stale publication can leave an obsolete blocker without arming these retries;
 that case requires another fold ([publication concurrency](check-runs.md#publication-concurrency)).
 
