@@ -155,6 +155,10 @@ type Handler struct {
 	// refusing to complete a delivery after lease loss) can be exercised
 	// deterministically. Production code never sets it.
 	durableWebhookProcessOverride func(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error)
+	// durableWebhookRetryJitterOverride is a test seam that replaces
+	// durableWebhookRetryJitter so the random spread on a retry wait is
+	// deterministic. Production code never sets it.
+	durableWebhookRetryJitterOverride func(limit time.Duration) time.Duration
 
 	// inProcessWebhookCount tracks the detached goSafe goroutines that
 	// non-durable event paths (issue_comment, participant_nudge, check_run,

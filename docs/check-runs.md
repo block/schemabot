@@ -1138,10 +1138,13 @@ GitHub:
 
 A merged PR cannot reopen, so a merge skips the read.
 
-The retry is limited to five attempts, one minute apart. A GitHub outage that
-lasts longer, a suspended or removed App installation, or a deleted repository
-uses up those attempts. The lock then stays held and blocks other PRs on that
-database until an operator runs `schemabot unlock`.
+The retry is limited to five attempts. The wait between them doubles: one,
+two, four, then eight minutes, at least fifteen minutes in all. Each wait
+also gets a random extra of up to a quarter of its length, so deliveries
+that failed together do not all retry at the same moment. A GitHub outage
+that lasts longer, a suspended or removed App installation, or a deleted
+repository uses up those attempts. The lock then stays held and blocks other
+PRs on that database until an operator runs `schemabot unlock`.
 
 The read is made once, before cleanup starts. A PR that reopens while cleanup
 is already running is not seen by that cleanup, which finishes as if the PR

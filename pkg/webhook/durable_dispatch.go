@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"runtime/debug"
 	"strconv"
@@ -18,7 +19,14 @@ import (
 )
 
 const (
-	durableWebhookRetryDelay = time.Minute
+	// durableWebhookRetryBaseDelay is the wait before the first retry of a
+	// failed delivery. Each later retry doubles the wait, up to
+	// durableWebhookRetryMaxDelay (see durableWebhookRetryDelay).
+	durableWebhookRetryBaseDelay = time.Minute
+
+	// durableWebhookRetryMaxDelay caps the doubling, so a larger attempt
+	// budget cannot push a retry out indefinitely.
+	durableWebhookRetryMaxDelay = 10 * time.Minute
 
 	// durableSupersedeHeadCheckTimeout bounds the live-head fetch that gates
 	// claim-time coalescing. The fetch runs before the delivery's heartbeat
@@ -48,6 +56,46 @@ const (
 	// rescheduled forever.
 	quotaReserveUnchargedWindow = 3 * time.Hour
 )
+
+// durableWebhookRetryDelay returns how long to wait before retrying a delivery
+// that has just failed its attempt-th claim (attempts are 1-based: the first
+// failure follows the first claim). The wait doubles with each attempt from
+// durableWebhookRetryBaseDelay and is capped at durableWebhookRetryMaxDelay, so
+// the retries that remain after a few quick failures reach past a GitHub outage
+// instead of all landing inside it. A non-positive attempt is treated as the
+// first.
+func durableWebhookRetryDelay(attempt int) time.Duration {
+	delay := durableWebhookRetryBaseDelay
+	for range attempt - 1 {
+		delay *= 2
+		if delay >= durableWebhookRetryMaxDelay {
+			return durableWebhookRetryMaxDelay
+		}
+	}
+	return delay
+}
+
+// durableWebhookRetryJitter returns a random duration between zero and limit,
+// inclusive.
+func durableWebhookRetryJitter(limit time.Duration) time.Duration {
+	if limit <= 0 {
+		return 0
+	}
+	return rand.N(limit + 1)
+}
+
+// durableWebhookRetryWait returns how long a delivery that has just failed its
+// attempt-th claim waits before its retry: durableWebhookRetryDelay plus a
+// random extra of up to a quarter of that delay, which jitter picks given
+// that quarter as its limit. The extra spreads out deliveries that failed
+// together, so they do not all retry at the same moment against a recovering
+// GitHub API and the shared installation quota. The wait is never shorter
+// than durableWebhookRetryDelay. The cap applies before the extra is added,
+// so the longest wait is a quarter more than durableWebhookRetryMaxDelay.
+func durableWebhookRetryWait(attempt int, jitter func(limit time.Duration) time.Duration) time.Duration {
+	delay := durableWebhookRetryDelay(attempt)
+	return delay + jitter(delay/4)
+}
 
 // StartDurableWebhookDispatch starts the durable webhook driver pool. The pool
 // is opt-in so direct handler tests and embedders keep the legacy request-path
@@ -402,7 +450,14 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			markErr = store.MarkFailedUncharged(finishCtx, event.ID, event.LeaseToken, processErr.Error(), retryAt)
 			outcome = "quota_reserve_deferred"
 		case event.Attempts < maxDurableWebhookAttempts:
-			retryAt = now.Add(durableWebhookRetryDelay)
+			// event.Attempts already counts this claim, so the first failure
+			// waits the base delay and each later one waits twice as long,
+			// plus a random spread.
+			jitter := durableWebhookRetryJitter
+			if h.durableWebhookRetryJitterOverride != nil {
+				jitter = h.durableWebhookRetryJitterOverride
+			}
+			retryAt = now.Add(durableWebhookRetryWait(event.Attempts, jitter))
 			if refusedByQuotaReserve {
 				// Past the uncharged window the delivery still waits for the
 				// reset, but the refusal spends an attempt (see
@@ -469,10 +524,22 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		if refusedByQuotaReserve {
 			h.logQuotaReserveRetry(driverID, event, refusal, retryAt, outcome)
 		}
-		h.logger.Warn("durable webhook driver recorded delivery failure",
+		// An uncharged refusal gave back the attempt its claim consumed, so
+		// log the count the row now holds, as logQuotaReserveRetry does.
+		attempts := event.Attempts
+		if outcome == "quota_reserve_deferred" {
+			attempts--
+		}
+		recordedAttrs := []any{
 			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
-			"disposition", outcome, "error", processErr)
+			"head_sha", event.HeadSHA, "attempts", attempts,
+			"disposition", outcome, "error", processErr,
+		}
+		if !retryAt.IsZero() {
+			recordedAttrs = append(recordedAttrs, "retry_at", retryAt.UTC().Format(time.RFC3339))
+		}
+		h.logger.Warn("durable webhook driver recorded delivery failure", recordedAttrs...)
 		return
 	}
 	if heartbeatErr != nil {
