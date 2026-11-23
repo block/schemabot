@@ -92,7 +92,12 @@ func (f directApplyLockPinFixture) newService(t *testing.T, store storage.Storag
 	return New(store, cfg, map[string]tern.Client{"eu/production": &mockTernClient{isRemote: true}}, logger)
 }
 
+// postDirectApply bounds the request by directApplyLockPinDeadline, so a
+// handler stalled in a database call fails the test instead of waiting for the
+// package timeout.
 func postDirectApply(ctx context.Context, svc *Service) *httptest.ResponseRecorder {
+	ctx, cancel := context.WithTimeout(ctx, directApplyLockPinDeadline)
+	defer cancel()
 	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/apply",
 		strings.NewReader(`{"plan_id":"plan-direct-apply","environment":"production","caller":"cli:alice@laptop"}`))
 	rec := httptest.NewRecorder()
