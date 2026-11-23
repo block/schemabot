@@ -228,6 +228,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentApplyPlanDowngraded())
 	case PreviewCommentApplyPlanChangeGateRefused:
 		fmt.Print(webhooktemplates.PreviewCommentApplyPlanChangeGateRefused())
+	case PreviewCommentApplyPlanRefusalUnposted:
+		fmt.Print(webhooktemplates.PreviewCommentApplyPlanRefusalUnposted())
 	case PreviewCommentApplyProgress:
 		fmt.Print(webhooktemplates.PreviewCommentApplyProgress())
 	case PreviewCommentApplyEstimateExceeded:

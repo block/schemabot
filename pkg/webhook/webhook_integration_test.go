@@ -382,6 +382,10 @@ type planFlowResult struct {
 	// operator never received.
 	FailCommentPost atomic.Bool
 
+	// FailCommentPostContaining makes only the comment POSTs whose body holds
+	// this text fail, so a test can lose one comment of a flow and keep the rest.
+	FailCommentPostContaining atomic.Pointer[string]
+
 	// baseFiles is what the default branch holds, as repository path to blob
 	// SHA. It starts as the schema directory carrying the config at a blob of
 	// its own, so resolving a PR's schema file at the default branch tip walks
@@ -1007,7 +1011,7 @@ func setupFakeGitHubForPlanInRepository(t *testing.T, mux *http.ServeMux, schema
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		result.comments <- body.Body
-		if result.FailCommentPost.Load() {
+		if failing := result.FailCommentPostContaining.Load(); result.FailCommentPost.Load() || (failing != nil && strings.Contains(body.Body, *failing)) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(`{"message":"Server Error"}`))

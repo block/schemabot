@@ -165,6 +165,7 @@ const (
 	PreviewCommentApplyPlanUnsafe              PreviewType = "comment_apply_plan_unsafe"               // Locked apply-plan with unsafe warning
 	PreviewCommentApplyPlanDowngraded          PreviewType = "comment_apply_plan_downgraded"           // Locked apply-plan downgraded to manual confirmation
 	PreviewCommentApplyPlanChangeGateRefused   PreviewType = "comment_apply_plan_change_gate_refused"  // Locked apply-plan edited after a change gate refused the apply
+	PreviewCommentApplyPlanRefusalUnposted     PreviewType = "comment_apply_plan_refusal_unposted"     // Same, when the refusal comment did not post
 	PreviewCommentApplyProgress                PreviewType = "comment_apply_progress"                  // Apply in progress (1 done, 1 running, 1 pending)
 	PreviewCommentApplyEstimateExceeded        PreviewType = "comment_apply_estimate_exceeded"         // Apply in progress after row estimate was exceeded
 	PreviewCommentApplyCompleted               PreviewType = "comment_apply_completed"                 // Apply completed (all tables done)

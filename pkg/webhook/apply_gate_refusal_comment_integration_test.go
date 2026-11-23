@@ -5,6 +5,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -96,6 +97,86 @@ func TestE2EAutomaticApplyRefusedByAFreezeEditsItsComment(t *testing.T) {
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)
+}
+
+// The edited footer points at the refusal comment, so when that comment did not
+// post, the footer says why nothing ran and what to comment to see the reason,
+// rather than pointing at a comment that does not exist.
+func TestE2EAutomaticApplyRefusedByAFreezeNamesTheNextStepWhenTheRefusalDoesNotPost(t *testing.T) {
+	dbName := "webhook_apply_frozen_unposted"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	freezeDatabase(t, svc, dbName, driftEnv, "incident 48")
+
+	var edits <-chan gateRefusalEdit
+	apply := runRolloutWebhookWithFiles(t, svc, dbName,
+		buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e " + driftEnv, isPR: true}, nil),
+		map[string]string{"users.sql": usersWithEmailSchema},
+		func(mux *http.ServeMux, result *planFlowResult) {
+			edits = recordCommentEdits(mux, http.StatusOK)
+			refusalHeading := "## ❄️ Apply Blocked by a Freeze"
+			result.FailCommentPostContaining.Store(&refusalHeading)
+		})
+
+	awaitCommentContaining(t, apply, "**Applying automatically**")
+	awaitCommentContaining(t, apply, "## ❄️ Apply Blocked by a Freeze\n")
+
+	edit := awaitCapture(t, edits, "the announcing comment to be edited", func(gateRefusalEdit) bool { return true })
+	assert.Equal(t, "99", edit.ID)
+	assert.Contains(t, edit.Body, "**Not applied** — a change gate refused this apply, and SchemaBot could not post why. Comment `schemabot apply -e "+driftEnv+"` again to see the reason.\n")
+	assert.NotContains(t, edit.Body, "see the comment below", "no refusal comment exists to point at")
+	assert.Contains(t, edit.Body, "🔓 **Lock released**", "the lock was released, so the claim stays")
+	assert.NotContains(t, edit.Body, "Applying automatically")
+
+	requireNoApplies(t, svc, dbName)
+	requireNoApplyLock(t, svc, dbName)
+}
+
+// refuseLockRelease fails every conditional lock release, the way a storage
+// outage after the gate refused the apply leaves the pinned lock held.
+type refuseLockRelease struct {
+	storage.Storage
+}
+
+func (s refuseLockRelease) Locks() storage.LockStore { return refusedReleaseLocks{s.Storage.Locks()} }
+
+type refusedReleaseLocks struct{ storage.LockStore }
+
+func (refusedReleaseLocks) ReleaseIfPendingPlanID(context.Context, string, string, string, string) (bool, error) {
+	return false, errors.New("storage unavailable")
+}
+
+// The lock line is a claim, so the edited comment makes it only when the
+// refusal released the lock. When the release fails the lock stays held, and
+// the comment says neither that it was released nor that it is still acquired,
+// while the refusal footer is unchanged.
+func TestE2EAutomaticApplyRefusedByAFreezeMakesNoLockClaimWhenTheReleaseFails(t *testing.T) {
+	dbName := "webhook_apply_frozen_lock_held"
+	svc := setupE2ERolloutServiceWithStorage(t, dbName, []deploymentSpec{
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent, func(st storage.Storage) storage.Storage { return refuseLockRelease{st} })
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	freezeDatabase(t, svc, dbName, driftEnv, "incident 49")
+
+	var edits <-chan gateRefusalEdit
+	apply := runRolloutWebhookWithFiles(t, svc, dbName,
+		buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e " + driftEnv, isPR: true}, nil),
+		map[string]string{"users.sql": usersWithEmailSchema},
+		func(mux *http.ServeMux, _ *planFlowResult) { edits = recordCommentEdits(mux, http.StatusOK) })
+
+	awaitCommentContaining(t, apply, "## ❄️ Apply Blocked by a Freeze\n")
+	edit := awaitCapture(t, edits, "the announcing comment to be edited", func(gateRefusalEdit) bool { return true })
+	assert.Contains(t, edit.Body, "**Not applied** — see the comment below for why.\n")
+	assert.NotContains(t, edit.Body, "Lock released", "the lock is still held")
+	assert.NotContains(t, edit.Body, "Lock acquired")
+
+	requireNoApplies(t, svc, dbName)
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	assert.NotNil(t, lock, "the failed release left the lock held")
 }
 
 // The edit is cosmetic: GitHub refusing it changes nothing the operator acts

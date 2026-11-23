@@ -94,6 +94,7 @@ func previewCommentAllOutput() {
 		{"SCHEMA CHANGE APPLY (AUTOMATIC)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlan()) }},
 		{"SCHEMA CHANGE APPLY (DOWNGRADED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanDowngraded()) }},
 		{"SCHEMA CHANGE APPLY (REFUSED BY A CHANGE GATE)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanChangeGateRefused()) }},
+		{"SCHEMA CHANGE APPLY (REFUSED BY A CHANGE GATE, REFUSAL NOT POSTED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanRefusalUnposted()) }},
 		{"SCHEMA CHANGE APPLY (UNSAFE + ALLOWED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanUnsafe()) }},
 		{"UNSAFE CHANGES BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentUnsafeBlocked()) }},
 		{"DROP COLUMN BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentDropColumnBlocked()) }},
@@ -326,6 +327,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"SCHEMA CHANGE APPLY (WITH OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanOptions()) }},
 		{"SCHEMA CHANGE APPLY (DOWNGRADED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanDowngraded()) }},
 		{"SCHEMA CHANGE APPLY (REFUSED BY A CHANGE GATE)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanChangeGateRefused()) }},
+		{"SCHEMA CHANGE APPLY (REFUSED BY A CHANGE GATE, REFUSAL NOT POSTED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanRefusalUnposted()) }},
 		{"SCHEMA CHANGE APPLY (VITESS + OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessApplyPlan()) }},
 		{"APPLY STARTED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStarted()) }},
 		// Blocked applies: the apply command was rejected before starting

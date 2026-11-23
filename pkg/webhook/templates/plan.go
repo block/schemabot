@@ -274,6 +274,16 @@ type PlanCommentData struct {
 	// the comment posted after this one says which.
 	RefusedByChangeGate bool
 
+	// LockReleased and RefusalPosted say what a refused comment may claim. The
+	// lock line reads released only when this refusal released it: a failed
+	// release or a lock re-pinned to a newer intent leaves it held, and then the
+	// comment makes no lock claim at all. The footer points at the comment below
+	// only when the refusal posted; otherwise it is self-contained, saying it did
+	// not apply and how to see the reason. Both are read only with
+	// RefusedByChangeGate.
+	LockReleased  bool
+	RefusalPosted bool
+
 	RecoveredApplyOwnedCheckState bool
 
 	// DeploymentDrift is the review-time rollup of how every configured
@@ -601,7 +611,9 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 
 	switch {
 	case data.IsLocked && data.RefusedByChangeGate:
-		sb.WriteString("\n🔓 **Lock released**\n")
+		if data.LockReleased {
+			sb.WriteString("\n🔓 **Lock released**\n")
+		}
 	case data.IsLocked && data.LockOwner != "":
 		fmt.Fprintf(&sb, "\n🔒 **Lock acquired by** `%s`", caller.Short(data.LockOwner))
 		if data.LockAcquired != "" {
@@ -746,6 +758,16 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	sb.WriteString("\n---\n\n")
 
 	switch {
+	case data.IsLocked && data.RefusedByChangeGate && !data.RefusalPosted:
+		// The comment this footer would point at never posted, so the footer
+		// carries the next step itself (UX-4).
+		rerun := ApplyCommand(data.Environment, data.ScopedDatabase, ApplyCommandOptions{
+			Target:       data.Target,
+			Tenant:       data.Tenant,
+			DeferCutover: data.DeferCutover && !data.NoCutoverToDefer,
+			SkipRevert:   data.SkipRevert,
+		})
+		fmt.Fprintf(&sb, "**Not applied** — a change gate refused this apply, and SchemaBot could not post why. Comment `%s` again to see the reason.\n", rerun)
 	case data.IsLocked && data.RefusedByChangeGate:
 		sb.WriteString("**Not applied** — see the comment below for why.\n")
 	case data.IsLocked:
