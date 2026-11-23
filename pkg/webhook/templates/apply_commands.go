@@ -612,16 +612,44 @@ func RenderLocksAlreadyReleased() string {
 	return sb.String()
 }
 
-// RenderCannotUnlock renders a comment when unlock is blocked by an active apply.
+// RenderCannotUnlock renders a comment when unlock is blocked by an apply that
+// has not settled. Each case names only an action the apply accepts (UX-4). A
+// stopped apply still holds its lock, so stopping is never offered as the way
+// out: a stopped apply is resumed or cancelled. An apply in its revert window
+// has cut over and refuses cancel, so it is reverted or skip-reverted. A
+// revert or skip-revert in progress, and a finished apply whose operation is
+// still running, refuse cancel too and release the lock on their own, so they
+// are waited for. Any other active apply is waited for or cancelled.
 func RenderCannotUnlock(database, environment, applyID, applyState string) string {
 	var sb strings.Builder
 
 	writeEnvironmentTitle(&sb, glyph.Attention+" Cannot Unlock", environment)
 	writeDBLine(&sb, database)
 	sb.WriteString("\n")
+	switch {
+	case state.IsState(applyState, state.Apply.Stopped):
+		fmt.Fprintf(&sb, "Apply `%s` is stopped and still holds this lock.\n\n", applyID)
+		fmt.Fprintf(&sb, "Resume it with `schemabot start %s -e %s` or cancel it with `schemabot cancel %s -e %s`, then unlock again.\n",
+			applyID, environment, applyID, environment)
+		return sb.String()
+	case state.IsState(applyState, state.Apply.RevertWindow):
+		fmt.Fprintf(&sb, "Apply `%s` has passed its cutover and is in its revert window, so it still holds this lock.\n\n", applyID)
+		fmt.Fprintf(&sb, "Revert it with `schemabot revert %s -e %s` or keep the change with `schemabot skip-revert %s -e %s`, then unlock again.\n",
+			applyID, environment, applyID, environment)
+		return sb.String()
+	case state.IsState(applyState, state.Apply.Reverting, state.Apply.SkippingRevert):
+		fmt.Fprintf(&sb, "Apply `%s` is finishing its revert window (state: `%s`) and still holds this lock.\n\n", applyID, applyState)
+		sb.WriteString("It releases the lock when it finishes, which it does on its own. Wait for it, then unlock again.\n")
+		return sb.String()
+	case state.IsTerminalApplyState(applyState):
+		fmt.Fprintf(&sb, "Apply `%s` has ended (state: `%s`), but one of its operations is still running and holds this lock.\n\n", applyID, applyState)
+		sb.WriteString("Wait for that operation to finish, then unlock again.\n")
+		return sb.String()
+	}
 	fmt.Fprintf(&sb, "An apply is currently active (apply ID: `%s`, state: `%s`).\n\n",
 		applyID, applyState)
-	sb.WriteString("Wait for it to complete or stop it first.\n")
+	fmt.Fprintf(&sb, "Wait for it to complete, or cancel it with `schemabot cancel %s -e %s`, then unlock again.\n",
+		applyID, environment)
 
 	return sb.String()
 }

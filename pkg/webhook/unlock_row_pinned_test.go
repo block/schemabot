@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
@@ -52,7 +53,7 @@ func (s *replacedLockStore) replaceOnce() {
 	s.held = s.replacement
 }
 
-func (s *replacedLockStore) ReleaseByID(_ context.Context, id int64, database, dbType, owner, pendingPlanID string) error {
+func (s *replacedLockStore) ReleaseByIDIfUnused(_ context.Context, id int64, database, dbType, owner, pendingPlanID string) error {
 	s.replaceOnce()
 	switch {
 	case s.held == nil || s.held.DatabaseName != database || s.held.DatabaseType != dbType:
@@ -237,6 +238,147 @@ func TestUnlockLeavesLockAcquiredAgainForNewPlanHeld(t *testing.T) {
 			assert.NotContains(t, body, "Released by @testuser")
 		})
 	}
+}
+
+// An unlock's active-apply check finds nothing running on orders, and the
+// release then finds an apply recording the vetted lock row: one that became
+// durable after the check, or a stopped apply the check treats as finished.
+// The lock still protects that apply, so it stays held, and the command
+// answers with the apply holding it and what to do: wait for or cancel an
+// active apply, resume or cancel a stopped one. It is the command's answer,
+// so the delivery is not retried and no other answer follows it.
+func TestUnlockKeepsLockAnUnsettledApplyRecords(t *testing.T) {
+	tests := []struct {
+		name       string
+		applyState string
+		wantBody   []string
+	}{
+		{
+			name:       "apply started after the active-apply check",
+			applyState: state.Apply.Running,
+			wantBody: []string{
+				"An apply is currently active (apply ID: `apply-orders-1`, state: `running`).",
+				"Wait for it to complete, or cancel it with `schemabot cancel apply-orders-1 -e staging`, then unlock again.",
+			},
+		},
+		{
+			name:       "stopped apply",
+			applyState: state.Apply.Stopped,
+			wantBody: []string{
+				"Apply `apply-orders-1` is stopped and still holds this lock.",
+				"Resume it with `schemabot start apply-orders-1 -e staging` or cancel it with `schemabot cancel apply-orders-1 -e staging`, then unlock again.",
+			},
+		},
+		{
+			name:       "apply in its revert window",
+			applyState: state.Apply.RevertWindow,
+			wantBody: []string{
+				"Apply `apply-orders-1` has passed its cutover and is in its revert window, so it still holds this lock.",
+				"Revert it with `schemabot revert apply-orders-1 -e staging` or keep the change with `schemabot skip-revert apply-orders-1 -e staging`, then unlock again.",
+			},
+		},
+		{
+			name:       "revert in progress",
+			applyState: state.Apply.Reverting,
+			wantBody: []string{
+				"Apply `apply-orders-1` is finishing its revert window (state: `reverting`) and still holds this lock.",
+				"Wait for it, then unlock again.",
+			},
+		},
+		{
+			name:       "skip-revert in progress",
+			applyState: state.Apply.SkippingRevert,
+			wantBody: []string{
+				"(state: `skipping_revert`)",
+				"Wait for it, then unlock again.",
+			},
+		},
+		{
+			name:       "ended apply with an operation still running",
+			applyState: state.Apply.Failed,
+			wantBody: []string{
+				"Apply `apply-orders-1` has ended (state: `failed`), but one of its operations is still running and holds this lock.",
+				"Wait for that operation to finish, then unlock again.",
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := recordComments(t, mux)
+			lockStore := &unlockTestLockStore{
+				locks: []*storage.Lock{withLockID(prOwnedOrdersLock(), 41)},
+				releaseErrs: map[string]error{"orders": &storage.LockInUseError{
+					LockID: 41,
+					Apply: &storage.Apply{
+						ApplyIdentifier: "apply-orders-1",
+						Database:        "orders",
+						DatabaseType:    storage.DatabaseTypeMySQL,
+						Environment:     "staging",
+						Repository:      "octocat/hello-world",
+						PullRequest:     1,
+						State:           tc.applyState,
+					},
+				}},
+			}
+			st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+			h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+			retry, err := h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+
+			require.NoError(t, err)
+			assert.False(t, retry, "a lock kept for an apply is the command's answer")
+			assert.Equal(t, 1, lockStore.releaseCalls)
+			assert.Empty(t, lockStore.released, "the lock the apply records must stay held")
+			body := requireComment(t, comments, "cannot-unlock answer")
+			assert.Contains(t, body, "Cannot Unlock")
+			assert.Contains(t, body, "`orders`")
+			for _, want := range tc.wantBody {
+				assert.Contains(t, body, want)
+			}
+			assert.NotContains(t, body, "stop it")
+			assert.Empty(t, comments, "the cannot-unlock answer must be the command's only comment")
+		})
+	}
+}
+
+// An unlock matches two locks: one an active apply records, so it is kept,
+// and one a concurrent operation already released. The command answers only
+// with the refusal for the kept lock, never also with "every lock was already
+// released", which would be false for the lock still held.
+func TestUnlockKeptLockAndAlreadyReleasedLockAnswersOnlyWithTheRefusal(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := recordComments(t, mux)
+	billing := withLockID(prOwnedOrdersLock(), 42)
+	billing.DatabaseName = "billing"
+	lockStore := &unlockTestLockStore{
+		locks: []*storage.Lock{withLockID(prOwnedOrdersLock(), 41), billing},
+		releaseErrs: map[string]error{
+			"orders": &storage.LockInUseError{LockID: 41, Apply: &storage.Apply{
+				ApplyIdentifier: "apply-orders-1",
+				Database:        "orders",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+				Repository:      "octocat/hello-world",
+				PullRequest:     1,
+				State:           state.Apply.Running,
+			}},
+			"billing": storage.ErrLockNotFound,
+		},
+	}
+	st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+	h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+	retry, err := h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+
+	require.NoError(t, err)
+	assert.False(t, retry)
+	assert.Equal(t, 2, lockStore.releaseCalls)
+	assert.Empty(t, lockStore.released)
+	body := requireComment(t, comments, "cannot-unlock answer")
+	assert.Contains(t, body, "Cannot Unlock")
+	assert.Contains(t, body, "apply-orders-1")
+	assert.Empty(t, comments, "the kept lock must not be followed by 'every lock was already released'")
 }
 
 func withLockID(lock *storage.Lock, id int64) *storage.Lock {
