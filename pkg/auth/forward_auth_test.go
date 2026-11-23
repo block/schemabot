@@ -1037,6 +1037,38 @@ func TestForwardAuth_MeshLoopbackSourceStillNeedsTheProxySPIFFE(t *testing.T) {
 	assert.Nil(t, captured.user)
 }
 
+// With both trust anchors, the CIDR check runs first. A mesh source inside the
+// trusted networks is verified, a port-forward inside them stays break-glass,
+// and a loopback source outside them is refused before either.
+func TestForwardAuth_MeshLoopbackSourceWithBothTrustAnchors(t *testing.T) {
+	cfg := meshSourceConfig()
+	cfg.TrustedProxyCIDRs = []string{"127.0.0.1/32", "127.0.0.6/32"}
+	tests := []struct {
+		name       string
+		remoteAddr string
+		wantCode   int
+		verified   bool
+	}{
+		{name: "istio inbound source", remoteAddr: "127.0.0.6:48375", wantCode: http.StatusOK, verified: true},
+		{name: "port-forward", remoteAddr: "127.0.0.1:52000", wantCode: http.StatusOK, verified: false},
+		{name: "loopback source outside the networks", remoteAddr: "127.0.0.7:52000", wantCode: http.StatusUnauthorized},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, captured := newForwardAuth(t, cfg)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, meshWrite(t, tc.remoteAddr, true))
+			require.Equal(t, tc.wantCode, rec.Code)
+			if tc.wantCode != http.StatusOK {
+				assert.Nil(t, captured.user)
+				return
+			}
+			require.NotNil(t, captured.user)
+			assert.Equal(t, tc.verified, captured.verified)
+		})
+	}
+}
+
 // Without the setting, every loopback source stays break-glass, as before.
 func TestForwardAuth_MeshLoopbackSourceUnverifiedByDefault(t *testing.T) {
 	cfg := meshSourceConfig()
@@ -1126,6 +1158,7 @@ func TestNewForwardAuthAuthorizer_RejectsBadMeshLoopbackSources(t *testing.T) {
 		{name: "network", cfg: auth.ForwardAuthConfig{TrustedProxySPIFFE: []string{ingressSVID}, TrustedMeshLoopbackSources: []string{"127.0.0.0/8"}}, wantErr: "not an IP address"},
 		{name: "not loopback", cfg: auth.ForwardAuthConfig{TrustedProxySPIFFE: []string{ingressSVID}, TrustedMeshLoopbackSources: []string{"10.0.0.6"}}, wantErr: "not a loopback address"},
 		{name: "IPv6 mesh source is not loopback", cfg: auth.ForwardAuthConfig{TrustedProxySPIFFE: []string{ingressSVID}, TrustedMeshLoopbackSources: []string{"::6"}}, wantErr: "not a loopback address"},
+		{name: "outside the trusted networks", cfg: auth.ForwardAuthConfig{TrustedProxySPIFFE: []string{ingressSVID}, TrustedProxyCIDRs: []string{"127.0.0.1/32"}, TrustedMeshLoopbackSources: []string{"127.0.0.6"}}, wantErr: "outside every trusted_proxy_cidrs network"},
 		{name: "no SPIFFE trust", cfg: auth.ForwardAuthConfig{TrustedProxyCIDRs: []string{"127.0.0.0/8"}, TrustedMeshLoopbackSources: []string{"127.0.0.6"}}, wantErr: "requires trusted_proxy_spiffe"},
 	}
 	for _, tc := range tests {

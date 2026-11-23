@@ -242,6 +242,9 @@ func NewForwardAuthAuthorizer(cfg ForwardAuthConfig, logger *slog.Logger) (*Forw
 	if len(meshSources) > 0 && len(spiffe) == 0 {
 		return nil, ErrMeshSourcesNeedSPIFFE
 	}
+	if err := CheckMeshSourcesInTrustedNetworks(meshSources, nets); err != nil {
+		return nil, err
+	}
 	if len(gateways) > 0 {
 		logger.Warn("forward-auth honoring gateway-forwarded caller identity: every listed gateway must strip inbound copies of the caller header before setting it from the verified client certificate",
 			"caller_header", callerHeader, "gateways", len(gateways), "read_service_callers", len(readServices))
@@ -406,6 +409,23 @@ func (a *ForwardAuthAuthorizer) breakGlassSource(r *http.Request) bool {
 // network namespace can connect from it. The XFCC SPIFFE check is the only
 // check of who sent the request.
 var ErrMeshSourcesNeedSPIFFE = fmt.Errorf("forward_auth trusted_mesh_loopback_sources requires trusted_proxy_spiffe: any process in the pod can connect from a mesh source address, so only the XFCC SPIFFE check shows who sent the request")
+
+// CheckMeshSourcesInTrustedNetworks refuses a mesh source that the CIDR check
+// would never admit. With trusted_proxy_cidrs set, that check runs before
+// anything else, so a request from a mesh source outside every listed network
+// is refused with a 401 even when its XFCC names the proxy. No networks means
+// SPIFFE-only trust, where every source passes the CIDR step.
+func CheckMeshSourcesInTrustedNetworks(sources []net.IP, nets []*net.IPNet) error {
+	if len(nets) == 0 {
+		return nil
+	}
+	for _, ip := range sources {
+		if !slices.ContainsFunc(nets, func(n *net.IPNet) bool { return n.Contains(ip) }) {
+			return fmt.Errorf("forward_auth trusted_mesh_loopback_sources entry %q is outside every trusted_proxy_cidrs network: the CIDR check runs first, so requests from it would be refused; add %s/32 to trusted_proxy_cidrs", ip.String(), ip.String())
+		}
+	}
+	return nil
+}
 
 // ParseTrustedMeshLoopbackSources parses trusted_mesh_loopback_sources. Each
 // entry must be one loopback IP. 127.0.0.1 and ::1 are refused because a

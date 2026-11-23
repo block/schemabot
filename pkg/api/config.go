@@ -2947,7 +2947,12 @@ func (f *ForwardAuthSettings) validate() error {
 	if len(meshSources) > 0 && len(trimmedSPIFFE) == 0 {
 		return auth.ErrMeshSourcesNeedSPIFFE
 	}
-	return nil
+	nets := make([]*net.IPNet, 0, len(trimmedCIDRs))
+	for _, c := range trimmedCIDRs {
+		_, network, _ := net.ParseCIDR(c) // validated above
+		nets = append(nets, network)
+	}
+	return auth.CheckMeshSourcesInTrustedNetworks(meshSources, nets)
 }
 
 // Comment renderers reserve a fixed amount of headroom under GitHub's comment

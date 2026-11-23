@@ -1004,6 +1004,9 @@ trusted_mesh_loopback_sources: [127.0.0.6]
 
 A request from a listed address must still pass the SPIFFE check. The
 setting requires `trusted_proxy_spiffe` and refuses `127.0.0.1` and `::1`.
+If you also set `trusted_proxy_cidrs`, add each listed address to it (for
+example `127.0.0.6/32`): the CIDR check runs first, and SchemaBot refuses to
+start with a listed address outside those networks.
 
 Listing an address trusts every process in the pod's network namespace like
 the proxy. Any of them can connect from `127.0.0.6` and send an XFCC header
