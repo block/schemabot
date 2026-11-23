@@ -156,6 +156,9 @@ type ShardProgress struct {
 	// standing in for its rows in the rolled-up total
 	// (TableProgress.RowsTotalPlanned). Nil otherwise.
 	PlannedRows *int64
+	// CopiesNoRows is true when every change the shard runs on the table
+	// copies no rows, so a running shard reads as applying.
+	CopiesNoRows bool
 }
 
 // Display-only task states. These are not persisted apply states (see pkg/applystate)
@@ -269,6 +272,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 
 				ChecksumRowsChecked: sh.ChecksumRowsChecked,
 				ChecksumRowsTotal:   sh.ChecksumRowsTotal,
+				CopiesNoRows:        sh.CopiesNoRows,
 			})
 			// Table-level ETA: the table's own estimate (MySQL/Spirit), or
 			// the slowest shard's for a sharded (Vitess) table.

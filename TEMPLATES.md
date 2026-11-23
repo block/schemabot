@@ -11245,7 +11245,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-**Status**: In Progress — 1 of 4 changes applied
+**Status**: In Progress — 1 of 4 changes applied (done on 1 of 6 shards)
 
 **Shards**: 1 completed, 1 running table copy, 4 waiting for cdb_resolute_lookup/-
 

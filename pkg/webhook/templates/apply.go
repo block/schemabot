@@ -1244,19 +1244,20 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		renderRunningTable(sb, dialect, table, budget)
 	}
 
-	renderShardSummary(sb, table, budget)
+	renderShardSummary(sb, table, presentation.RunningCopying, budget)
 
 	sb.WriteString("\n")
 }
 
 // renderShardSummary lists a sharded table's shards while it is in flight. A
 // settled table's line already says where it ended, so the listing stays out
-// of the way then.
-func renderShardSummary(sb *strings.Builder, table TableProgressData, budget *ddlBlockBudget) {
+// of the way then. runningWord names the shards working on the change
+// (presentation.RunningWord).
+func renderShardSummary(sb *strings.Builder, table TableProgressData, runningWord string, budget *ddlBlockBudget) {
 	if !presentation.ListsParts(table.Status) {
 		return // completed/pending/cancelled/failed: no breakdown, stay quiet
 	}
-	writeMemberList(sb, presentation.ShardNoun, table.Shards, presentation.PendingQueued, budget)
+	writeMemberList(sb, presentation.ShardNoun, table.Shards, presentation.PendingQueued, runningWord, budget)
 }
 
 // writeMemberList lists a table's members, the shards of a sharded table or
@@ -1267,14 +1268,20 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData, budget *dd
 // names only its failures and slowest members, leaving the rest to the counts,
 // rather than growing a line per member. A comment that would not fit otherwise keeps only the line counting them
 // (ddlBlockBudget.listsMembers). pendingWord names the members still to run
-// (presentation.PendingWord), in the count and on their lines alike.
-func writeMemberList(sb *strings.Builder, noun presentation.Noun, members []ShardProgressData, pendingWord string, budget *ddlBlockBudget) {
+// (presentation.PendingWord), in the count and on their lines alike, and
+// runningWord names the members working on it (presentation.RunningWord).
+func writeMemberList(sb *strings.Builder, noun presentation.Noun, members []ShardProgressData, pendingWord, runningWord string, budget *ddlBlockBudget) {
 	if len(members) <= 1 {
 		return
 	}
-	part := func(i int) presentation.Part { return members[i].part() }
+	part := func(i int) presentation.Part {
+		p := members[i].part()
+		p.RunningLabel = runningWord
+		return p
+	}
 	c := presentation.CountParts(len(members), func(i int) string { return members[i].Status })
 	c.PendingLabel = pendingWord
+	c.RunningLabel = runningWord
 	fmt.Fprintf(sb, "- %s: %d (%s)\n", ui.CapitalizeFirst(noun.Plural), len(members), strings.Join(c.Phrases(), ", "))
 	if !budget.listsMembers() {
 		return

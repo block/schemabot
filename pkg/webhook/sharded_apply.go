@@ -183,6 +183,9 @@ type shardedPlanView struct {
 	// no size of their own, since the plan's figure is the whole table's, so
 	// the comment reads it here and shows it on the table's line.
 	tableSizes map[shardedTableKey]plannedTableSize
+	// plannedChanges is each table's change in the stored plan, which a
+	// table reads its copy label from until a shard records its own change.
+	plannedChanges map[shardedTableKey]presentation.TableChange
 }
 
 // shardedTableKey names one table of a sharded apply.
@@ -209,6 +212,19 @@ func (p *shardedPlanView) plannedSize(namespace, table string) (*int64, int) {
 		return nil, 0
 	}
 	return &size.bytes, size.shards
+}
+
+// plannedChange returns the table's change in the stored plan, or nil when
+// the stored plan does not list the table.
+func (p *shardedPlanView) plannedChange(namespace, table string) *presentation.TableChange {
+	if p == nil {
+		return nil
+	}
+	change, ok := p.plannedChanges[shardedTableKey{namespace, table}]
+	if !ok {
+		return nil
+	}
+	return &change
 }
 
 // vschemaDiff returns the namespace's rendered VSchema diff, or "" when the
@@ -254,12 +270,18 @@ func resolveShardedPlanView(ctx context.Context, stor storage.Storage, apply *st
 		return nil
 	}
 
-	view := &shardedPlanView{vschemaDiffs: map[string]string{}, finalizeOnly: map[string]bool{}, tableSizes: map[shardedTableKey]plannedTableSize{}}
+	view := &shardedPlanView{
+		vschemaDiffs:   map[string]string{},
+		finalizeOnly:   map[string]bool{},
+		tableSizes:     map[shardedTableKey]plannedTableSize{},
+		plannedChanges: map[shardedTableKey]presentation.TableChange{},
+	}
 	for namespace, nsData := range plan.Namespaces {
 		if nsData == nil {
 			continue
 		}
 		for _, tc := range nsData.Tables {
+			view.plannedChanges[shardedTableKey{namespace, tc.Table}] = presentation.TableChange{DDLAction: tc.Operation}
 			if tc.EstimatedBytes != nil {
 				view.tableSizes[shardedTableKey{namespace, tc.Table}] = plannedTableSize{bytes: *tc.EstimatedBytes, shards: tc.ShardCount}
 			}
@@ -398,6 +420,7 @@ func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, release
 				ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
 				PauseOnFailure:    op.OnFailure == storage.OnFailurePause,
 				Released:          released,
+				CopiesNoRows:      presentation.TasksCopyNoRows(tasksByOp[op.ID]),
 				Error:             shardOperationError(op, tasksByOp[op.ID]),
 			})
 		}
@@ -413,6 +436,7 @@ func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, release
 			Error:            s.Error,
 			StoppedAtCutover: s.Presentation == presentation.StateStoppedAtCutover,
 			EndedBy:          s.EndedBy,
+			Landed:           s.Landed,
 		})
 	}
 	return out
@@ -430,6 +454,7 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 	var order []keyspaceTable
 	shardsByTable := make(map[keyspaceTable][]templates.ShardProgressData)
 	copiesByTable := make(map[keyspaceTable][]presentation.ShardCopy)
+	changesByTable := make(map[keyspaceTable][][]presentation.TableChange)
 	for _, op := range ops {
 		ns, shard, table, ok := state.ShardWorkKey(op.OperationKey)
 		if !ok {
@@ -440,6 +465,7 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 		if _, seen := copiesByTable[key]; !seen {
 			order = append(order, key)
 		}
+		changesByTable[key] = append(changesByTable[key], presentation.TaskTableChanges(tasksByOp[op.ID]))
 		sp := shardOperationCopy(op, tasksByOp[op.ID])
 		copiesByTable[key] = append(copiesByTable[key], sp)
 		shardsByTable[key] = append(shardsByTable[key], templates.ShardProgressData{
@@ -465,6 +491,7 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 			ShardsReporting: rollup.ShardsReporting,
 			EstimatedBytes:  estimatedBytes,
 			PlannedShards:   plannedShards,
+			CopiesNoRows:    presentation.ShardedTableCopiesNoRows(changesByTable[key], view.plannedChange(key.namespace, key.table)),
 			Shards:          shardsByTable[key],
 		})
 	}

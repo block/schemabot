@@ -2053,6 +2053,10 @@ type ShardProgressResponse struct {
 	// Non-zero only while the shard is checksumming (verifying copied data).
 	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`
 	ChecksumRowsTotal   int64 `json:"checksum_rows_total,omitempty"`
+	// CopiesNoRows is true when every change this shard runs on the table
+	// copies no rows (a CREATE TABLE, a DROP TABLE, or an instant ALTER), so
+	// a running shard reads as applying rather than running a table copy.
+	CopiesNoRows bool `json:"copies_no_rows,omitempty"`
 }
 
 // ApplyHistoryResponse represents a single apply in the history.

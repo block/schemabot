@@ -117,6 +117,13 @@ type Operation struct {
 	// the derivation reads it through holdState to agree with the claim.
 	Retrying bool
 
+	// CopiesNoRows is true when none of the row's table changes copies rows
+	// (ChangeCopiesRows): a CREATE TABLE, a DROP TABLE or an instant ALTER.
+	// A running row then reads as applying rather than as copying a table.
+	// Left false, a running row reads as copying, the label a change that may
+	// copy has always carried.
+	CopiesNoRows bool
+
 	// Error is the operation's error detail, set when State is failed.
 	Error string
 
@@ -152,6 +159,15 @@ func (o Operation) holdState() string {
 		return state.ApplyOperation.FailedRetryable
 	}
 	return o.State
+}
+
+// runningLabel names a running row: copying its table, or applying a change
+// that copies no rows.
+func runningLabel(copiesNoRows bool) string {
+	if copiesNoRows {
+		return RunningApplying
+	}
+	return "running table copy"
 }
 
 // pausesOnFailure reports whether a terminal-failed earlier sibling holds this
@@ -621,7 +637,7 @@ func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 		}
 		d.set(StateCompleted, "completed", "✅", false)
 	case state.ApplyOperation.Running:
-		d.set(StateRunningCopy, "running table copy", "🔄", true)
+		d.set(StateRunningCopy, runningLabel(op.CopiesNoRows), "🔄", true)
 	case state.ApplyOperation.CuttingOver:
 		d.set(StateCuttingOver, "cutting over", "🔁", true)
 	case state.ApplyOperation.Failed:
