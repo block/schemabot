@@ -123,6 +123,7 @@ const (
 	PreviewCommentPlanExemptTables             PreviewType = "comment_plan_exempt_tables"              // Plan with ignored live tables disclosed
 	PreviewCommentPlanIgnoreTables             PreviewType = "comment_plan_ignore_tables"              // Clean plan with a live table withheld by ignore_tables
 	PreviewCommentPlanDropTables               PreviewType = "comment_plan_drop_tables"                // Plan dropping a leftover "_" table named by drop_tables
+	PreviewCommentPlanDropTablesUnmatched      PreviewType = "comment_plan_drop_tables_unmatched"      // Clean plan whose drop_tables entry names no table
 	PreviewCommentPlanWhoCanApply              PreviewType = "comment_plan_who_can_apply"              // Plan listing who can run the apply under PR command authorization
 	PreviewCommentPlanColumnOnlyAlter          PreviewType = "comment_plan_column_only_alter"          // Plan whose alter is metadata-only, so no table-size section renders
 	PreviewCommentPlanManyTables               PreviewType = "comment_plan_many_tables"                // Plan touching more tables than the size section lists inline

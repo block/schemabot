@@ -366,6 +366,7 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WriteNoChanges()
 	}
 	templates.WriteExemptTables(result.ExemptTables)
+	templates.WriteUnmatchedDropTables(result.UnmatchedDropTables)
 }
 
 // rendersNamespaceChanges reports whether the plan has DDL, a VSchema change,
@@ -544,6 +545,7 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 	if w.empty() {
 		templates.WriteNoChanges()
 		templates.WriteExemptTables(result.ExemptTables)
+		templates.WriteUnmatchedDropTables(result.UnmatchedDropTables)
 		return
 	}
 	writeChangeDetail(result, w, isApply)
@@ -564,6 +566,7 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WritePlanSummary(w.allChanges)
 	}
 	templates.WriteExemptTables(result.ExemptTables)
+	templates.WriteUnmatchedDropTables(result.UnmatchedDropTables)
 }
 
 // writePlanGuidance links the guides for the lint findings the output shows.
@@ -720,8 +723,9 @@ func sortEnvironments(envs []string) {
 // Two plans fingerprint the same when their sections would read the same: the
 // same statements under the same namespaces, the same VSchema updates and
 // finalizes, the same unsafe findings, the same advisory lint, and the same
-// exempt-table disclosure. The unsafe and lint verdicts are part of it because
-// they come from each environment's live pre-state, not from the statement: an
+// exempt-table and unmatched drop_tables disclosures. The unsafe and lint
+// verdicts are part of it because they come from each environment's live
+// pre-state, not from the statement: an
 // index made invisible in staging but not yet in production gives both the
 // same DROP INDEX and only production a finding, and folding production under
 // staging's clean section would hide it. Whatever writePlanBody renders has to
@@ -781,6 +785,7 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	sort.Strings(unsafeFindings)
 	sort.Strings(lint)
 	sort.Strings(exempt)
+	unmatchedDrops := slices.Sorted(slices.Values(result.UnmatchedDropTables))
 
 	data, _ := json.Marshal(struct {
 		DDLs      []string `json:"ddls"`
@@ -789,7 +794,8 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 		Unsafe    []string `json:"unsafe"`
 		Lint      []string `json:"lint"`
 		Exempt    []string `json:"exempt"`
-	}{ddls, vschemas, finalizes, unsafeFindings, lint, exempt})
+		Unmatched []string `json:"unmatched_drop_tables"`
+	}{ddls, vschemas, finalizes, unsafeFindings, lint, exempt, unmatchedDrops})
 	return string(data)
 }
 

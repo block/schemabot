@@ -544,6 +544,15 @@ consent as any other drop (`--allow-unsafe`). On a deployment with
 `_pending_drops` rather than dropping it outright, so it can be recovered until
 the retention period ends.
 
+An entry that names no table on the target plans nothing, and the PR plan
+comment and `plan` and `apply` output say so, one line per entry:
+
+> ⚠️ `drop_tables` entry `_events_olds` names no table on the target, so this plan drops nothing for it. Fix the name, or remove the entry if the table is already gone.
+
+That is usually a typo, a name wrapped in backticks, the wrong case, or a table
+already dropped. Without the line, the table you meant would still be listed
+under its naming convention and the plan would look clean.
+
 ### Rules
 
 - MySQL only. A plan of a PostgreSQL database, or of one the PlanetScale

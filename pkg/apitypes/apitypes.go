@@ -975,6 +975,13 @@ type PlanResponse struct {
 	// on the response to the plan request only; a stored plan does not retain
 	// it. Empty when nothing was exempted, which is the ordinary case.
 	ExemptTables []*ExemptTablesResponse `json:"exempt_tables,omitempty"`
+	// UnmatchedDropTables lists the drop_tables entries that name no live
+	// table on the target, in the order the config lists them, so the plan
+	// says the entry drops nothing instead of reading as if the table were
+	// seen and kept. Like ExemptTables it describes the target at planning
+	// time and a stored plan does not retain it. Empty when every entry
+	// matched or the config lists none.
+	UnmatchedDropTables []string `json:"unmatched_drop_tables,omitempty"`
 	// Rollout describes the plan of every member of the rollout when the
 	// environment fans out to more than one: the members grouped by the plan
 	// each runs, and the members that need attention before an apply can run

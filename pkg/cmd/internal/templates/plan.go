@@ -520,6 +520,19 @@ func WriteExemptTables(groups []*apitypes.ExemptTablesResponse) {
 	}
 }
 
+// WriteUnmatchedDropTables writes one line per drop_tables entry that names
+// no live table on the target, so the plan says the entry drops nothing
+// instead of reading as if the table were seen and kept. No-op when every
+// entry matched, which is the ordinary case.
+func WriteUnmatchedDropTables(entries []string) {
+	for _, entry := range entries {
+		fmt.Println(glyph.Attention + "  " + presentation.UnmatchedDropTablesEntry("drop_tables", fmt.Sprintf("%q", entry)))
+	}
+	if len(entries) > 0 {
+		fmt.Println()
+	}
+}
+
 // UnsafeChange is a type alias for the shared unsafe change type.
 type UnsafeChange = apitypes.UnsafeChange
 
