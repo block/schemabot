@@ -137,6 +137,28 @@ func (r replannedChanges) record(key driftChangeKey, change replannedChange) {
 // re-applying. Without this an operator only learns what drifted, not what to do.
 const driftRecoveryHint = "to recover, re-plan against the current live schema to refresh the reviewed plan, then re-apply"
 
+// missingSchemaFilesRecoveryHint gives the next step for a shard dispatch that
+// arrived without the reviewed schema files. Every current control plane
+// sends them, so the dispatch came from one older than this data plane.
+const missingSchemaFilesRecoveryHint = "to recover, upgrade the SchemaBot server that dispatched it so it sends the reviewed schema files with each shard, then plan and apply again"
+
+// refuseShardDispatchWithoutSchemaFiles refuses a shard dispatch that carries
+// no schema files, on every path that admits one: attaching to an existing
+// apply, creating an apply from a stored plan row, and materializing the plan
+// from the dispatch. Without the reviewed schema there is nothing to re-plan
+// the shard against, so the change would run unjudged against the shard's
+// live schema. The gate counts namespaces, not files: a namespace declared
+// empty (every table dropped) is still a reviewed schema to re-plan against.
+// The refusal is permanent, since a redispatch of the same request carries
+// the same nothing; the caller logs it with the dispatch's identifiers.
+func (c *LocalClient) refuseShardDispatchWithoutSchemaFiles(req *ternv1.ApplyRequest, shard string) error {
+	if len(req.SchemaFiles) > 0 {
+		return nil
+	}
+	return engine.NewPermanentError("shard dispatch for plan %s (database %q, target %q, shard %q) carries no schema files to re-plan against, so it was refused rather than run on this shard unchecked against its live schema; %s",
+		req.PlanId, c.config.Database, req.Target, shard, missingSchemaFilesRecoveryHint)
+}
+
 // verifyMaterializedPlanMatchesLiveSchema fails closed unless the reviewed DDL a
 // dispatch carries exactly matches what this deployment would independently plan
 // against its own live schema. A non-primary deployment never planned locally,
@@ -181,6 +203,9 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 			return replannedChanges{}, fmt.Errorf("drift guard: %w", err)
 		}
 		targetShard = shard
+		if err := c.refuseShardDispatchWithoutSchemaFiles(req, targetShard); err != nil {
+			return replannedChanges{}, err
+		}
 	}
 
 	result, err := c.replanForDispatch(ctx, req, schemaFiles)
@@ -290,15 +315,10 @@ func (c *LocalClient) replanForDispatch(ctx context.Context, req *ternv1.ApplyRe
 // live schema, which is what the check exists to prevent. The control plane
 // stamps the reviewed schema files on every shard dispatch, so a dispatch
 // without them comes from a dispatcher this deployment does not agree with,
-// and a redispatch of the same request cannot clear the refusal. logAttrs
-// identify the apply and operation for that refusal's log line.
-func (c *LocalClient) verifyShardDispatchAgainstLiveSchema(ctx context.Context, req *ternv1.ApplyRequest, scope *dispatchScope, logAttrs []any) error {
-	if len(req.SchemaFiles) == 0 {
-		c.logger.Warn("shard dispatch carries no schema files to re-plan against; refusing it rather than running a change on this shard that nothing judged against its live schema",
-			append(logAttrs,
-				"plan_id", req.PlanId,
-				"shard", scope.shard)...)
-		return engine.NewPermanentError("shard dispatch for plan %s (database %q, target %q, shard %q) carries no schema files to re-plan against; refusing it rather than running a change on this shard that nothing judged against its live schema", req.PlanId, c.config.Database, req.Target, scope.shard)
+// and a redispatch of the same request cannot clear the refusal.
+func (c *LocalClient) verifyShardDispatchAgainstLiveSchema(ctx context.Context, req *ternv1.ApplyRequest, scope *dispatchScope) error {
+	if err := c.refuseShardDispatchWithoutSchemaFiles(req, scope.shard); err != nil {
+		return err
 	}
 	schemaFiles, err := c.normalizeSchemaFiles(protoToSchemaFiles(req.SchemaFiles))
 	if err != nil {

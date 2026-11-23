@@ -3254,7 +3254,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	// This runs before the blocked and unsafe-change gates so they judge the
 	// verdicts this shard's re-plan set.
 	if scope.shard != "" {
-		if err := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope, append(apply.LogAttrs(), "operation_key", operationKey)); err != nil {
+		if err := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope); err != nil {
 			return c.replayConcurrentAttachOrFail(ctx, req, apply, operationKey,
 				fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err))
 		}
@@ -3388,7 +3388,7 @@ func (c *LocalClient) replayConcurrentAttachOrFail(ctx context.Context, req *ter
 		return nil, errors.Join(verifyErr, fmt.Errorf("re-read operation %s after its drift check failed: %w", operationKey, err))
 	}
 	if winner == nil {
-		c.logger.Warn("Apply: refusing shard dispatch whose drift check failed; dispatch is rejected",
+		c.logger.Warn("Apply: refusing shard dispatch that failed its check against the live schema; dispatch is rejected",
 			append(apply.LogAttrs(),
 				"operation_key", operationKey,
 				"idempotency_key", req.IdempotencyKey,
@@ -3570,7 +3570,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			"environment", req.Environment,
 			"idempotency_key", req.IdempotencyKey,
 		}
-		if verifyErr := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope, dispatchAttrs); verifyErr != nil {
+		if verifyErr := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope); verifyErr != nil {
 			// A same-key dispatch that created the apply while this one was
 			// between its key lookup and its re-plan may already have run the
 			// change, and then the re-plan no longer lists it and reads as
@@ -3590,7 +3590,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 					append(existing.LogAttrs(), "idempotency_key", req.IdempotencyKey, "shard", scope.shard)...)
 				return c.dispatchIntoExistingApply(ctx, req, existing, plan, scope, "create_race")
 			}
-			c.logger.Warn("Apply: refusing shard dispatch whose drift check failed; dispatch is rejected",
+			c.logger.Warn("Apply: refusing shard dispatch that failed its check against the live schema; dispatch is rejected",
 				append(dispatchAttrs, "plan_id", req.PlanId, "shard", scope.shard, "error", verifyErr)...)
 			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, verifyErr)
 		}

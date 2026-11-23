@@ -1928,8 +1928,10 @@ those changes: when that comment cannot be posted, `rollback` withdraws its pin 
 applying deployment's own re-planned unsafe verdicts, stamped onto the materialized plan and the
 dispatch scope, a shard dispatch attaching or creating from a stored plan row re-planned against
 its own shard and stamped with that shard's verdict, and a shard dispatch this deployment cannot
-re-plan (it carries no schema files) refused before any of its work is admitted
-(`verifyShardDispatchAgainstLiveSchema` and `restoreDispatchedUnsafeVerdicts` in
+re-plan (it carries no schema files) refused before any of its work is admitted, whether it
+attaches, creates from a stored plan row or materializes the plan
+(`refuseShardDispatchWithoutSchemaFiles`, `verifyShardDispatchAgainstLiveSchema` and
+`restoreDispatchedUnsafeVerdicts` in
 `pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeDDLChangesWithoutOptIn` in
 `pkg/tern/local_client.go`), and the applying deployment's own re-planned VSchema deletions and
 mutations added to the ones the dispatch carried (`stampReplannedVSchema` in
