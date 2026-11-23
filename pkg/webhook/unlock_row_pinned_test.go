@@ -269,6 +269,38 @@ func TestUnlockKeepsLockAnUnsettledApplyRecords(t *testing.T) {
 				"Resume it with `schemabot start apply-orders-1 -e staging` or cancel it with `schemabot cancel apply-orders-1 -e staging`, then unlock again.",
 			},
 		},
+		{
+			name:       "apply in its revert window",
+			applyState: state.Apply.RevertWindow,
+			wantBody: []string{
+				"Apply `apply-orders-1` has passed its cutover and is in its revert window, so it still holds this lock.",
+				"Revert it with `schemabot revert apply-orders-1 -e staging` or keep the change with `schemabot skip-revert apply-orders-1 -e staging`, then unlock again.",
+			},
+		},
+		{
+			name:       "revert in progress",
+			applyState: state.Apply.Reverting,
+			wantBody: []string{
+				"Apply `apply-orders-1` is finishing its revert window (state: `reverting`) and still holds this lock.",
+				"Wait for it, then unlock again.",
+			},
+		},
+		{
+			name:       "skip-revert in progress",
+			applyState: state.Apply.SkippingRevert,
+			wantBody: []string{
+				"(state: `skipping_revert`)",
+				"Wait for it, then unlock again.",
+			},
+		},
+		{
+			name:       "ended apply with an operation still running",
+			applyState: state.Apply.Failed,
+			wantBody: []string{
+				"Apply `apply-orders-1` has ended (state: `failed`), but one of its operations is still running and holds this lock.",
+				"Wait for that operation to finish, then unlock again.",
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
