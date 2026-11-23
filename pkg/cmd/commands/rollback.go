@@ -150,9 +150,10 @@ func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	}
 
 	var lockCreated bool
+	var lockID int64
 	err = withLoading("Acquiring database lock...", true, func() error {
-		var lockErr error
-		_, lockCreated, lockErr = client.AcquireLock(ep, database, dbType, owner, "", 0)
+		acquired, created, lockErr := client.AcquireLock(ep, database, dbType, owner, "", 0)
+		lockCreated, lockID = created, acquiredLockID(acquired)
 		return lockErr
 	})
 	if errors.Is(err, client.ErrLockHeld) {
@@ -177,7 +178,7 @@ func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	// on every member, though not which members those are.
 	_, err = applyAndWatch(ctx, ep, planResult, true, database, environment, owner, "", "rollback", cmd.DeferCutover, false, false, cmd.AllowUnsafe, "", cmd.Watch, OutputFormatInteractive, 0)
 	if err != nil && lockCreated && neverSubmitted(err) {
-		return releaseUnsubmittedLock(ep, database, dbType, owner, err)
+		return releaseUnsubmittedLock(ep, database, dbType, owner, lockID, err)
 	}
 	return err
 }

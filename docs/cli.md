@@ -602,7 +602,14 @@ work before releasing it. `apply` and `rollback` release a lock they took
 themselves when the schema change was never submitted: the server refused it,
 or you pressed Ctrl-C before it was sent. A server error or a lost connection
 leaves it unknown whether the apply started, so the lock stays held. A lock
-you already held before the command started also stays held. Locks span the
+you already held before the command started also stays held. The release, and
+the one `apply --yield` sends once its apply settles, names the lock the
+command took, so a lock another of your commands started an apply under stays
+held for that apply, and a lock released and taken again since stays with
+whoever holds it now; the command says which happened. A server too old to
+name the lock gets no release at all: the command keeps the lock and tells you
+to check `schemabot locks` and run `schemabot unlock` if nothing of yours runs
+under it. Locks span the
 database's environments; forcing one away from its owner is an administrative
 action, not a routine retry.
 See [locks](schema-intelligence.md#check-locks) for the inspection request and

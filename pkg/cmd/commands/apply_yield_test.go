@@ -46,7 +46,7 @@ func yieldTestServerWithProgress(t *testing.T, progressJSON string) (*httptest.S
 		case "POST /api/plan":
 			body = planBody
 		case "POST /api/locks/acquire":
-			body = []byte(`{"lock":{"database":"testdb","database_type":"mysql"}}`)
+			body = []byte(acquireFoundLock)
 		case "POST /api/apply":
 			body = []byte(`{"accepted":true,"apply_id":"` + yieldTestApplyID + `"}`)
 		case "GET /api/progress/apply/" + yieldTestApplyID:
@@ -58,6 +58,9 @@ func yieldTestServerWithProgress(t *testing.T, progressJSON string) (*httptest.S
 			body = []byte(progressJSON)
 		case "DELETE /api/locks":
 			releases.Add(1)
+			var sent map[string]any
+			assert.NoError(t, json.NewDecoder(r.Body).Decode(&sent), "decode the lock release request")
+			assert.Equal(t, float64(acquiredLockRowID), sent["id"], "the release names the lock row the acquire reported")
 			body = []byte(`{}`)
 		default:
 			// The active-apply preflight and the free-lock lookup both read a
@@ -195,7 +198,9 @@ func TestYieldLock_ReleaseFailureKeepsLockAndReturnsError(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	var yieldErr error
-	out := stripAnsi(captureStdout(func() { yieldErr = yieldLock(server.URL, "testdb", "mysql", "owner", "staging", yieldTestApplyID) }))
+	out := stripAnsi(captureStdout(func() {
+		yieldErr = yieldLock(server.URL, "testdb", "mysql", "owner", "staging", yieldTestApplyID, acquiredLockRowID)
+	}))
 
 	require.ErrorContains(t, yieldErr, "release lock for testdb")
 	assert.Contains(t, out, "Lock kept for testdb (mysql) despite --yield: the server did not release it (")
@@ -205,10 +210,88 @@ func TestYieldLock_ReleaseFailureKeepsLockAndReturnsError(t *testing.T) {
 
 func TestYieldLock_EmptyApplyIDReturnsError(t *testing.T) {
 	var yieldErr error
-	out := stripAnsi(captureStdout(func() { yieldErr = yieldLock("unused", "testdb", "mysql", "owner", "staging", "") }))
+	out := stripAnsi(captureStdout(func() { yieldErr = yieldLock("unused", "testdb", "mysql", "owner", "staging", "", acquiredLockRowID) }))
 
 	require.EqualError(t, yieldErr, "release lock for testdb: the server returned no apply ID")
 	assert.Contains(t, out, "the server returned no apply ID to check")
+}
+
+// settledYieldServer answers a completed apply's progress and a lock release
+// with releaseStatus and releaseBody, and counts the releases it is sent.
+func settledYieldServer(t *testing.T, releaseStatus int, releaseBody string) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var releases atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "GET /api/progress/apply/" + yieldTestApplyID:
+			_, err := w.Write([]byte(`{"state":"completed","apply_id":"` + yieldTestApplyID + `"}`))
+			assert.NoError(t, err)
+		case "DELETE /api/locks":
+			releases.Add(1)
+			w.WriteHeader(releaseStatus)
+			_, err := w.Write([]byte(releaseBody))
+			assert.NoError(t, err)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server, &releases
+}
+
+// runSettledYield yields lockID after a completed apply against server and
+// returns the output and error.
+func runSettledYield(server *httptest.Server, lockID int64) (string, error) {
+	var yieldErr error
+	out := stripAnsi(captureStdout(func() {
+		yieldErr = yieldLock(server.URL, "testdb", "mysql", "owner", "staging", yieldTestApplyID, lockID)
+	}))
+	return out, yieldErr
+}
+
+// This apply has completed, but another command of the same owner found the
+// same lock and its apply still runs under it. --yield keeps the lock for that
+// apply and names it, rather than taking the lock out from under it.
+func TestYieldLock_KeepsALockAnotherCommandsApplyRunsUnder(t *testing.T) {
+	server, releases := settledYieldServer(t, http.StatusConflict, lockInUseAnswer)
+
+	out, err := runSettledYield(server, acquiredLockRowID)
+
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), releases.Load(), out)
+	assert.Contains(t, out, "🔒 Lock kept for testdb (mysql): apply apply-b2c3d4e5 (running) runs under it.\n"+
+		"   Watch that apply: schemabot progress apply-b2c3d4e5 -e staging\n")
+	assert.NotContains(t, out, "Lock released")
+}
+
+// The lock this apply took was released and taken again since. --yield leaves
+// the lock held now in place and says this command released nothing.
+func TestYieldLock_LeavesALockTakenAgainSinceInPlace(t *testing.T) {
+	server, releases := settledYieldServer(t, http.StatusConflict, lockReplacedAnswer)
+
+	out, err := runSettledYield(server, acquiredLockRowID)
+
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), releases.Load(), out)
+	assert.Contains(t, out, "🔒 Lock for testdb (mysql) was released and taken again since this command took it, so it was left in place.\n"+
+		"   This command released nothing. See who holds it: schemabot locks\n")
+	assert.NotContains(t, out, "Lock released")
+}
+
+// A server too old to report the lock row leaves --yield no release that
+// spares another command's apply, so it keeps the lock, sends no release, and
+// shows how to check and release it.
+func TestYieldLock_KeepsTheLockWhenTheServerReportsNoLockID(t *testing.T) {
+	server, releases := settledYieldServer(t, http.StatusOK, `{"status":"released"}`)
+
+	out, err := runSettledYield(server, 0)
+
+	require.NoError(t, err)
+	assert.Zero(t, releases.Load(), out)
+	assert.Contains(t, out, "🔒 Lock kept for testdb (mysql): the server did not say which lock this command took, so releasing it could remove a lock another command uses.\n"+
+		"   See who holds it: schemabot locks\n"+
+		"   If no apply of yours runs under it, release it: schemabot unlock -d testdb -t mysql\n")
 }
 
 func TestLockKeptReason_NoActiveChange(t *testing.T) {

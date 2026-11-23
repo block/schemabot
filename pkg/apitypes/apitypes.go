@@ -98,6 +98,8 @@ const (
 	ErrCodeActiveApplyExists       = "active_apply_exists"       // Another active apply already exists for the target
 	ErrCodeSourcePolicyDenied      = "source_policy_denied"      // Source repo/path is not authorized for the database
 	ErrCodeLockNotOwned            = "lock_not_owned"            // Lock release denied because the caller is not the owner
+	ErrCodeLockInUse               = "lock_in_use"               // Lock release pinned to a lock row refused: an apply that can still change records that row as its lock; lock_holder names it
+	ErrCodeLockReplaced            = "lock_replaced"             // Lock release pinned to a lock row refused: a different lock now holds the database; nothing was released
 	ErrCodeRateLimited             = "rate_limited"              // Caller or target exceeded its request budget; retry after the advertised delay
 	ErrCodeUnsafeOptInRequired     = "unsafe_opt_in_required"    // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
 	ErrCodePlanBlocked             = "plan_blocked"              // Plan carries a change the engine refuses; no retry or option can apply it
@@ -148,6 +150,21 @@ type ErrorResponse struct {
 	// approver other than the requester approves it, and the caller then
 	// repeats the command.
 	OverrideRequest *FreezeOverrideRequest `json:"override_request,omitempty"`
+
+	// LockHolder is the apply that kept a lock_in_use lock release from
+	// releasing the lock.
+	LockHolder *LockHolder `json:"lock_holder,omitempty"`
+}
+
+// LockHolder is an apply that records a lock row as its lock and can still
+// change, so a release pinned to that row keeps the lock.
+type LockHolder struct {
+	// ApplyID is the apply's identifier, such as "apply-a1b2c3d4".
+	ApplyID string `json:"apply_id"`
+	// State is the apply's state, such as "running" or "stopped".
+	State string `json:"state"`
+	// Environment is the environment the apply runs in.
+	Environment string `json:"environment,omitempty"`
 }
 
 // ChangeGateBlocker is one reason a change gate refused an apply, start or

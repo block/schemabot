@@ -53,6 +53,18 @@ func previewUnsubmittedLockNotReleasedOutput() {
 	WriteUnsubmittedLockHeldByAnotherOwner("testapp", "mysql")
 }
 
+func previewLockInUseOutput() {
+	WriteLockInUse("testapp", "mysql", "apply-b2c3d4e5", "running", "staging")
+}
+
+func previewLockReplacedOutput() {
+	WriteLockReplaced("testapp", "mysql")
+}
+
+func previewLockKeptWithoutIDOutput() {
+	WriteLockKeptWithoutID("testapp", "mysql")
+}
+
 func previewLocksListOutput() {
 	locks := []LockData{
 		{

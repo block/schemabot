@@ -176,7 +176,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **operation** (locks): `acquire`, `release`
 
-**status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `no_acquirer` (a scoped acquire refused because there is no verified acquirer to record; the log line carries the reason), `error`
+**status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `no_acquirer` (a scoped acquire refused because there is no verified acquirer to record; the log line carries the reason), `in_use` (a release that named a lock row kept it because an apply that can still change runs under it; the log line names the apply), `error`
 
 **event_type** (webhooks): `create`, `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `pull_request_review_comment`, `check_run`, `check_suite`, `ping`, `push`
 

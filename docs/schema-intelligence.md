@@ -2352,7 +2352,8 @@ The successful source below has no log entries yet:
 
 `GET /api/locks` lists every database lock currently held and who holds it (a
 PR or a CLI operator), which is how a dashboard shows what is claimed before it
-shows what is running.
+shows what is running. `id` identifies the lock itself: a lock released and
+taken again, even by the same owner, gets a new one.
 
 <details>
 <summary>List locks</summary>
@@ -2367,6 +2368,7 @@ Response excerpt (illustrative values):
 {
   "locks": [
     {
+      "id": 7,
       "database": "shop",
       "database_type": "mysql",
       "owner": "example/store#42",
