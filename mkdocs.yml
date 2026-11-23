@@ -129,8 +129,8 @@ extra:
       online table copies otherwise, throttling, cutover, and primary key
       choices.
     postgresql.md: >-
-      What SchemaBot supports on PostgreSQL today through pg-sprite, which is
-      in early alpha, and which tables and changes it refuses.
+      What SchemaBot supports on PostgreSQL today through pg-sprite, while
+      support is in alpha, and which tables and changes it refuses.
     vitess.md: >-
       Run Vitess schema changes on PlanetScale through branches and deploy
       requests, with per-shard progress and the token permissions SchemaBot

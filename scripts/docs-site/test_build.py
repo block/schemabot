@@ -142,6 +142,25 @@ class StagingTests(unittest.TestCase):
         BUILD["check_list_indentation"]("```yaml\nenvironments:\n\n  - staging\n```\n", "docs/guide.md")
 
 
+class StagingDirTests(unittest.TestCase):
+    def test_a_directory_inside_build_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(BUILD["staging_dir"]("build/docs-site/src", root), (root / "build/docs-site/src").resolve())
+
+    def test_a_source_directory_is_refused_before_anything_is_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            guide = root / "docs" / "guide.md"
+            guide.parent.mkdir()
+            guide.write_text("# Guide\n")
+            for docs_dir in ("docs", ".", "build", "build/../docs", "/tmp"):
+                with self.subTest(docs_dir=docs_dir):
+                    with self.assertRaisesRegex(BuildError, "docs_dir must be a directory inside build/"):
+                        BUILD["staging_dir"](docs_dir, root)
+            self.assertEqual(guide.read_text(), "# Guide\n")
+
+
 class NavTests(unittest.TestCase):
     NAV = [{"Home": "index.md"}, {"Guides": ["cli.md", {"Auth": "auth.md"}]}]
 

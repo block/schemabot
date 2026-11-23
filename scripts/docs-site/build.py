@@ -62,6 +62,17 @@ class BuildError(Exception):
     """A problem in the docs that must be fixed before the site can build."""
 
 
+def staging_dir(docs_dir: str, repo_root: Path) -> Path:
+    """Return the directory the pages are staged in, which the build deletes and
+    recreates. It must sit strictly inside the repository's build/ tree, so an
+    edit to docs_dir can never point the delete at source files."""
+    build_root = (repo_root / "build").resolve()
+    staged = (repo_root / docs_dir).resolve()
+    if not staged.is_relative_to(build_root) or staged == build_root:
+        raise BuildError(f"mkdocs.yml docs_dir must be a directory inside build/, not {docs_dir!r}: the build deletes it")
+    return staged
+
+
 @dataclass(frozen=True)
 class Page:
     """One page of the site, in navigation order."""
@@ -374,7 +385,7 @@ def main(argv: list[str]) -> int:
     try:
         config = load_config(CONFIG_PATH)
         # MkDocs reads the pages from docs_dir, so they are always staged there.
-        staged_dir = REPO_ROOT / config["docs_dir"]
+        staged_dir = staging_dir(config["docs_dir"], REPO_ROOT)
         html_dir = Path(args.out) if args.out else REPO_ROOT / config["site_dir"]
         if config.get("use_directory_urls", True) is not True:
             raise BuildError("mkdocs.yml must keep use_directory_urls on; HTML links assume page/ URLs")
