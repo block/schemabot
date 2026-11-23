@@ -1070,7 +1070,8 @@ resets to one second after any successful batch. It is not an end-to-end deliver
 each row can take ten seconds to send and another ten seconds to record acceptance,
 in addition to storage reads and the wait for earlier batches. Shutdown cancels the
 sender and waits at most five seconds. No sender election, consumer, retention
-cleanup, or backfill runs. Published rows remain in storage.
+cleanup, or backfill runs. Published rows are retained indefinitely as an audit trail;
+the outbox table grows by design.
 
 A panic while processing a notification records a quarantine token and an apply-log
 diagnostic in one storage transaction. The payload is retained, the notification
