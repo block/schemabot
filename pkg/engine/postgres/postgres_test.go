@@ -87,6 +87,21 @@ func TestExecutionVerdict(t *testing.T) {
 				Disposition: router.DispositionExecute, ExecSQL: []string{"ALTER TABLE public.users ADD COLUMN email text"}},
 		},
 		{
+			name: "native safe with autocommit-each-step execution",
+			statement: pgplan.Statement{Route: planner.RouteNative, Backend: router.BackendNative,
+				Disposition: router.DispositionExecute, ExecSQL: []string{"ALTER TABLE public.users ADD COLUMN email text"},
+				Execution: planner.ExecutionAutocommit},
+		},
+		{
+			name: "native safe with an unrecognized execution kind",
+			statement: pgplan.Statement{Route: planner.RouteNative, Backend: router.BackendNative,
+				Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"},
+				Execution: planner.Execution("future-execution")},
+			wantMode:         engine.ExecutionModeBlocked,
+			wantReason:       `statement for table "users" has an unrecognized execution kind "future-execution"`,
+			wantUnrecognized: &unrecognizedPlannerVocabulary{kind: "execution", value: "future-execution"},
+		},
+		{
 			name: "copy and swap the engine does not carry",
 			statement: pgplan.Statement{Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap,
 				Disposition: router.DispositionUnavailable},

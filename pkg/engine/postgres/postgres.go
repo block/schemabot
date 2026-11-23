@@ -597,10 +597,10 @@ type stepVerdict struct {
 
 // unrecognizedPlannerVocabulary names a planner value outside the set this
 // build renders in its own words: kind says which vocabulary grew (the plan
-// contract, a disposition, or a create shape cause) and value is the entry
-// the planner returned. The operator sees a blocked placeholder either way;
-// this record exists so the server log names the value and the schema file
-// behind it.
+// contract, an execution kind, a disposition, or a create shape cause) and
+// value is the entry the planner returned. The operator sees a blocked
+// placeholder either way; this record exists so the server log names the
+// value and the schema file behind it.
 type unrecognizedPlannerVocabulary struct {
 	kind  string
 	value string
@@ -1357,16 +1357,26 @@ func singleLine(s string) string {
 
 // executionVerdict maps one planned statement to the verdict the operator
 // reviews. A planner value outside the vocabulary this mapping knows — a plan
-// contract, a disposition, or a create shape cause the planner added after the
-// mapping was written — still renders a blocked placeholder, and is reported
-// on the verdict so the caller can log it with the identifiers this function
-// does not have.
+// contract, an execution kind, a disposition, or a create shape cause the
+// planner added after the mapping was written — still renders a blocked
+// placeholder, and is reported on the verdict so the caller can log it with
+// the identifiers this function does not have.
 func executionVerdict(formatVersion int, statement pgplan.Statement, table string, crossNamespaceForeignKeys []string) stepVerdict {
 	if formatVersion != pgplan.FormatVersion {
 		return stepVerdict{
 			mode:         engine.ExecutionModeBlocked,
 			reason:       fmt.Sprintf("statement for table %q has an unrecognized plan contract", table),
 			unrecognized: &unrecognizedPlannerVocabulary{kind: "plan_contract", value: strconv.Itoa(formatVersion)},
+		}
+	}
+	// The planner's contract requires a consumer to refuse an execution kind
+	// it does not know, so a kind added upstream blocks the statement here
+	// instead of being run as plain native steps the apply path may refuse.
+	if !isRunnableExecution(statement.Execution) {
+		return stepVerdict{
+			mode:         engine.ExecutionModeBlocked,
+			reason:       fmt.Sprintf("statement for table %q has an unrecognized execution kind %q", table, statement.Execution),
+			unrecognized: &unrecognizedPlannerVocabulary{kind: "execution", value: string(statement.Execution)},
 		}
 	}
 	if statement.Disposition == router.DispositionExecute && statement.Route == planner.RouteNative &&
@@ -1429,6 +1439,20 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		verdict := blocked(fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table))
 		verdict.unrecognized = &unrecognizedPlannerVocabulary{kind: "disposition", value: string(statement.Disposition)}
 		return verdict
+	}
+}
+
+// isRunnableExecution reports whether the apply path runs steps carrying this
+// execution kind the way the kind requires. An empty kind is a statement with
+// no steps to run. Autocommit-each-step is what the apply path does for every
+// rendered step: each runs as its own statement, never inside one enclosing
+// transaction block.
+func isRunnableExecution(execution planner.Execution) bool {
+	switch execution {
+	case "", planner.ExecutionAutocommit:
+		return true
+	default:
+		return false
 	}
 }
 
