@@ -214,6 +214,11 @@ type ApplyStatusCommentData struct {
 	// saved and a new apply resumes them.
 	StoppedAtCutover presentation.StoppedAtCutover
 
+	// StoppedByFreeze names the freeze that stopped the apply, nil when an
+	// operator stopped it or it is not stopped. A stopped comment says so
+	// above its resume command.
+	StoppedByFreeze *apitypes.FreezeStopRef
+
 	// SkipRevert reports whether the apply was started with --skip-revert (the
 	// apply's durable skip-revert option). Before cutover it is listed on the
 	// options line beside DeferCutover, as the plan listed it.
@@ -1119,7 +1124,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		// the source before cutover. On a large table this can run for hours, so
 		// show how far the verification has progressed once Spirit reports a total.
 		if table.ChecksumRowsTotal > 0 {
-			pct := ui.ClampPercent(int(table.ChecksumRowsChecked * 100 / table.ChecksumRowsTotal))
+			pct := ui.ChecksumDisplayPercent(table.ChecksumRowsChecked, table.ChecksumRowsTotal)
 			fmt.Fprintf(sb, "**%s**: %s \U0001f50d Checksumming to verify data (%s)%s\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(pct),
 				ui.FormatRowCopyPercent(pct, table.ChecksumRowsChecked, table.ChecksumRowsTotal), ui.ThrottledSuffix(table.Throttled))
 			writeDDLLine(sb, dialect, table.DDL, budget)
@@ -1239,19 +1244,20 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		renderRunningTable(sb, dialect, table, budget)
 	}
 
-	renderShardSummary(sb, table, budget)
+	renderShardSummary(sb, table, presentation.RunningCopying, budget)
 
 	sb.WriteString("\n")
 }
 
 // renderShardSummary lists a sharded table's shards while it is in flight. A
 // settled table's line already says where it ended, so the listing stays out
-// of the way then.
-func renderShardSummary(sb *strings.Builder, table TableProgressData, budget *ddlBlockBudget) {
+// of the way then. runningWord names the shards working on the change
+// (presentation.RunningWord).
+func renderShardSummary(sb *strings.Builder, table TableProgressData, runningWord string, budget *ddlBlockBudget) {
 	if !presentation.ListsParts(table.Status) {
 		return // completed/pending/cancelled/failed: no breakdown, stay quiet
 	}
-	writeMemberList(sb, presentation.ShardNoun, table.Shards, presentation.PendingQueued, budget)
+	writeMemberList(sb, presentation.ShardNoun, table.Shards, presentation.PendingQueued, runningWord, budget)
 }
 
 // writeMemberList lists a table's members, the shards of a sharded table or
@@ -1262,14 +1268,20 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData, budget *dd
 // names only its failures and slowest members, leaving the rest to the counts,
 // rather than growing a line per member. A comment that would not fit otherwise keeps only the line counting them
 // (ddlBlockBudget.listsMembers). pendingWord names the members still to run
-// (presentation.PendingWord), in the count and on their lines alike.
-func writeMemberList(sb *strings.Builder, noun presentation.Noun, members []ShardProgressData, pendingWord string, budget *ddlBlockBudget) {
+// (presentation.PendingWord), in the count and on their lines alike, and
+// runningWord names the members working on it (presentation.RunningWord).
+func writeMemberList(sb *strings.Builder, noun presentation.Noun, members []ShardProgressData, pendingWord, runningWord string, budget *ddlBlockBudget) {
 	if len(members) <= 1 {
 		return
 	}
-	part := func(i int) presentation.Part { return members[i].part() }
+	part := func(i int) presentation.Part {
+		p := members[i].part()
+		p.RunningLabel = runningWord
+		return p
+	}
 	c := presentation.CountParts(len(members), func(i int) string { return members[i].Status })
 	c.PendingLabel = pendingWord
+	c.RunningLabel = runningWord
 	fmt.Fprintf(sb, "- %s: %d (%s)\n", ui.CapitalizeFirst(noun.Plural), len(members), strings.Join(c.Phrases(), ", "))
 	if !budget.listsMembers() {
 		return
@@ -1535,6 +1547,7 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:",
 			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To cancel it:")
 	case state.Apply.Stopped:
+		writeStoppedByFreeze(sb, data.StoppedByFreeze)
 		writeMemberFooterAction(sb, data, "Paused — to resume from where it stopped:", AppendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.Cancelled:
 		sb.WriteString("\n---\n\n")
@@ -1677,6 +1690,7 @@ func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, compl
 	}
 
 	writeSummaryTableList(sb, data, budget)
+	writeStoppedByFreeze(sb, data.StoppedByFreeze)
 	writeMemberFooterAction(sb, data, "Paused — to resume from where it stopped:", AppendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 }
 

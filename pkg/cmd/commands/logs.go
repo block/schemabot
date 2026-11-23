@@ -74,19 +74,22 @@ func (cmd *LogsCmd) Run(ctx context.Context, g *Globals) error {
 	case cmd.Follow:
 		return followLogs(ctx, ep, cmd.Database, cmd.Environment, cmd.ApplyID, scope, cmd.Limit)
 	case cmd.Deployment != "":
-		return showDeploymentLogs(ep, cmd.ApplyID, cmd.Deployment, scope, cmd.Limit, cmd.JSON)
+		return showDeploymentLogs(ctx, ep, cmd.ApplyID, cmd.Deployment, scope, cmd.Limit, cmd.JSON)
 	default:
-		return showLogs(ep, cmd.Database, cmd.Environment, cmd.ApplyID, scope, cmd.Limit, cmd.JSON)
+		return showLogs(ctx, ep, cmd.Database, cmd.Environment, cmd.ApplyID, scope, cmd.Limit, cmd.JSON)
 	}
 }
 
-func showDeploymentLogs(endpoint, applyID, deployment string, scope client.LogScope, limit int, outputJSON bool) error {
+func showDeploymentLogs(ctx context.Context, endpoint, applyID, deployment string, scope client.LogScope, limit int, outputJSON bool) error {
 	var result *apitypes.DeploymentLogsResponse
 	err := withLoading("Loading data-plane logs...", !outputJSON, func() error {
 		var loadErr error
-		result, loadErr = client.GetDeploymentLogs(endpoint, applyID, deployment, scope, limit)
+		result, loadErr = client.GetDeploymentLogsCtx(ctx, endpoint, applyID, deployment, scope, limit)
 		return loadErr
 	})
+	if endedByInterrupt(ctx, err) {
+		return interrupted(ctx)
+	}
 	if err != nil {
 		return err
 	}
@@ -135,14 +138,18 @@ func deploymentLogSourceLabel(target string, operations []*apitypes.LogOperation
 	return ui.TerminalSafeLine(label)
 }
 
-// showLogs displays logs once and exits.
-func showLogs(endpoint, database, environment, applyID string, scope client.LogScope, limit int, outputJSON bool) error {
+// showLogs displays logs once and exits. Ctrl-C abandons the read and exits
+// with ExitInterrupted, since the command never reached its output.
+func showLogs(ctx context.Context, endpoint, database, environment, applyID string, scope client.LogScope, limit int, outputJSON bool) error {
 	var result *apitypes.LogsResponse
 	err := withLoading("Loading logs...", !outputJSON, func() error {
 		var loadErr error
-		result, loadErr = client.GetLogs(endpoint, database, environment, applyID, scope, limit)
+		result, loadErr = client.GetLogsCtx(ctx, endpoint, database, environment, applyID, scope, limit)
 		return loadErr
 	})
+	if endedByInterrupt(ctx, err) {
+		return interrupted(ctx)
+	}
 	if err != nil {
 		return err
 	}
@@ -193,7 +200,7 @@ func followLogs(ctx context.Context, endpoint, database, environment, applyID st
 
 	state := &followState{}
 	fetch := func(limit int) (*apitypes.LogsResponse, error) {
-		return client.GetLogs(endpoint, database, environment, applyID, scope, limit)
+		return client.GetLogsCtx(ctx, endpoint, database, environment, applyID, scope, limit)
 	}
 	emit := func(result *apitypes.LogsResponse, initial bool) {
 		switch {
@@ -228,7 +235,7 @@ func followDeploymentLogs(ctx context.Context, endpoint, applyID, deployment str
 
 	state := newDeploymentFollowState()
 	fetch := func(limit int) (*apitypes.DeploymentLogsResponse, error) {
-		return client.GetDeploymentLogs(endpoint, applyID, deployment, scope, limit)
+		return client.GetDeploymentLogsCtx(ctx, endpoint, applyID, deployment, scope, limit)
 	}
 	// The loop-wide initial flag is unused here: each source owes the
 	// truncation notice to its own first successful read, which for a source
@@ -418,6 +425,8 @@ var defaultFollowPacing = followPacing{interval: followInterval, retryWait: prog
 // already shown; it is told whether it is rendering the initial window, which
 // is the only one bounded by the operator's own limit. The initial fetch must
 // succeed — a broken endpoint should fail the command, not tail nothing.
+// fetch is expected to abandon its read once ctx is cancelled, so an interrupt
+// ends the tail at once rather than after the in-flight read answers.
 //
 // Later polls follow the rule the progress watches use. A transient failure
 // warns and is retried with backoff, so a tail during an incident survives a
@@ -429,6 +438,11 @@ var defaultFollowPacing = followPacing{interval: followInterval, retryWait: prog
 func runFollowLoop[T any](ctx context.Context, fetch func(limit int) (T, error), emit func(result T, initial bool), initialLimit int, pacing followPacing) error {
 	result, err := fetch(initialLimit)
 	if err != nil {
+		if ctx.Err() != nil {
+			// Ctrl-C during the first read ends the tail like any other
+			// interrupt, not as a failed read.
+			return nil
+		}
 		return fmt.Errorf("fetch initial log window: %w", err)
 	}
 	emit(result, true)

@@ -25,6 +25,10 @@ const (
 	StatementInsert
 	StatementUpdate
 	StatementDelete
+	// StatementAlterType changes an existing type, such as adding a label to
+	// a PostgreSQL enum type. It is a schema change on a type, not on a
+	// table, so its name is the type's.
+	StatementAlterType
 )
 
 // String returns the human-readable name for a StatementType.
@@ -54,6 +58,8 @@ func (t StatementType) String() string {
 		return "UPDATE"
 	case StatementDelete:
 		return "DELETE"
+	case StatementAlterType:
+		return "ALTER TYPE"
 	default:
 		// A value with no name of its own is printed by number so it stays
 		// distinguishable from StatementUnknown in diagnostics.
@@ -70,7 +76,7 @@ func (t StatementType) IsDDL() bool {
 	switch t {
 	case StatementAlterTable, StatementCreateTable, StatementDropTable,
 		StatementRenameTable, StatementTruncateTable, StatementCreateIndex,
-		StatementDropIndex, StatementCreateView:
+		StatementDropIndex, StatementCreateView, StatementAlterType:
 		return true
 	default:
 		return false
@@ -97,6 +103,8 @@ func StatementTypeToOp(t StatementType) string {
 		return "drop_index"
 	case StatementCreateView:
 		return "create_view"
+	case StatementAlterType:
+		return "alter_type"
 	default:
 		return "unknown"
 	}
@@ -122,6 +130,8 @@ func OpToStatementType(op string) StatementType {
 		return StatementDropIndex
 	case "create_view":
 		return StatementCreateView
+	case "alter_type":
+		return StatementAlterType
 	default:
 		return StatementUnknown
 	}

@@ -2,7 +2,6 @@ package webhook
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -206,11 +205,11 @@ func runControlCommand[R any](
 	resp, err := execute(ctx, request)
 	if err != nil {
 		h.logControlCommandError(actionName, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
-		post := h.postCommandError
 		if isChangeGateError(err) {
-			post = h.postChangeGateRefusal
+			h.postChangeGateRefusal(repo, pr, installationID, actionName, result.Environment, requestedBy, err)
+			return nil
 		}
-		post(repo, pr, installationID, actionName, result.Environment, requestedBy, controlErrorMessage(err, actionName, h.deploymentTenant()))
+		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, err.Error())
 		return nil
 	}
 	if resp == nil {
@@ -267,16 +266,6 @@ func (h *Handler) withPullRequestOverrideRequester(ctx context.Context, client *
 	return api.WithPullRequestOverrideRequester(ctx, api.PullRequestRequester{
 		Login: requestedBy, Repository: repo, PullRequest: pr, Author: info.User,
 	})
-}
-
-// controlErrorMessage renders a failed control command for the PR. A freeze
-// refusal reads as it does for an apply; other errors post as they are.
-// command and tenant are as changeGateRefusalDetail takes them.
-func controlErrorMessage(err error, command, tenant string) string {
-	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
-		return changeGateRefusalDetail(refused, command, tenant)
-	}
-	return err.Error()
 }
 
 // handleStopCommand handles the "schemabot stop <apply-id> -e <env>" PR
@@ -427,7 +416,7 @@ func (h *Handler) recordStartAcknowledged(ctx context.Context, repo string, pr i
 // held back until the start's acknowledgement landed, naming the stopper when
 // the stop request records a GitHub user.
 func (h *Handler) postStartWithdrawnAfterAcknowledgement(ctx context.Context, repo string, pr int, installationID int64, apply *storage.Apply, attrs []any) {
-	stoppedBy := ""
+	stoppedBy, stoppedByFreeze := "", ""
 	stop, err := h.service.Storage().ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationStop)
 	switch {
 	case err != nil:
@@ -437,12 +426,14 @@ func (h *Handler) postStartWithdrawnAfterAcknowledgement(ctx context.Context, re
 		h.logger.Warn("no stop request found for a withdrawn start; telling the PR without naming who stopped it", attrs...)
 	default:
 		stoppedBy = actorFromCaller(stop.RequestedBy)
+		stoppedByFreeze, _ = storage.FreezeFromStopCaller(stop.RequestedBy)
 	}
 	h.logger.Info("start was withdrawn by a stop before its acknowledgement landed; telling the PR after the acknowledgement", attrs...)
 	h.postComment(repo, pr, installationID, templates.RenderStartWithdrawn(templates.StartWithdrawnData{
-		ApplyID:     apply.ApplyIdentifier,
-		Environment: apply.Environment,
-		StoppedBy:   stoppedBy,
+		ApplyID:         apply.ApplyIdentifier,
+		Environment:     apply.Environment,
+		StoppedBy:       stoppedBy,
+		StoppedByFreeze: stoppedByFreeze,
 	}))
 }
 
@@ -580,10 +571,12 @@ func (h *Handler) reportQueuedStartWithdrawn(apply *storage.Apply, caller string
 	}
 	repo, pr, installationID := apply.Repository, apply.PullRequest, apply.InstallationID
 	attrs := []any{"apply_id", apply.ApplyIdentifier, "repo", repo, "pr", pr, "environment", apply.Environment}
+	stoppedByFreeze, _ := storage.FreezeFromStopCaller(caller)
 	body := templates.RenderStartWithdrawn(templates.StartWithdrawnData{
-		ApplyID:     apply.ApplyIdentifier,
-		Environment: apply.Environment,
-		StoppedBy:   actorFromCaller(caller),
+		ApplyID:         apply.ApplyIdentifier,
+		Environment:     apply.Environment,
+		StoppedBy:       actorFromCaller(caller),
+		StoppedByFreeze: stoppedByFreeze,
 	})
 	h.goSafe(repo, pr, installationID, "", func() {
 		ctx, cancel := h.commandContext(context.Background(), commandTimeout)

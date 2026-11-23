@@ -1055,6 +1055,11 @@ func (scope LogScope) setQuery(values url.Values) {
 // scope narrows the read to one target or shard. The response carries the
 // newest limit entries plus whether older ones exist beyond the window.
 func GetLogs(endpoint, database, environment, applyID string, scope LogScope, limit int) (*apitypes.LogsResponse, error) {
+	return GetLogsCtx(context.Background(), endpoint, database, environment, applyID, scope, limit)
+}
+
+// GetLogsCtx is like GetLogs but accepts a context for timeout/cancellation control.
+func GetLogsCtx(ctx context.Context, endpoint, database, environment, applyID string, scope LogScope, limit int) (*apitypes.LogsResponse, error) {
 	if database == "" && applyID == "" {
 		return nil, fmt.Errorf("database or apply_id is required")
 	}
@@ -1080,7 +1085,7 @@ func GetLogs(endpoint, database, environment, applyID string, scope LogScope, li
 	}
 
 	var result apitypes.LogsResponse
-	if err := doGetInto(endpoint, path, &result); err != nil {
+	if err := doGetIntoCtx(ctx, endpoint, path, &result); err != nil {
 		return nil, err
 	}
 	if err := scope.requireEchoed(result.Target, result.Shard); err != nil {
@@ -1114,6 +1119,11 @@ func requireEchoedScope(kind, flag, requested, echoed string) error {
 // one source per remote read. scope keeps only the sources of one target or
 // shard, and each source's entries for it.
 func GetDeploymentLogs(endpoint, applyID, deployment string, scope LogScope, limit int) (*apitypes.DeploymentLogsResponse, error) {
+	return GetDeploymentLogsCtx(context.Background(), endpoint, applyID, deployment, scope, limit)
+}
+
+// GetDeploymentLogsCtx is like GetDeploymentLogs but accepts a context for timeout/cancellation control.
+func GetDeploymentLogsCtx(ctx context.Context, endpoint, applyID, deployment string, scope LogScope, limit int) (*apitypes.DeploymentLogsResponse, error) {
 	values := url.Values{}
 	values.Set("apply_id", applyID)
 	values.Set("deployment", deployment)
@@ -1122,7 +1132,7 @@ func GetDeploymentLogs(endpoint, applyID, deployment string, scope LogScope, lim
 		values.Set("limit", strconv.Itoa(limit))
 	}
 	var result apitypes.DeploymentLogsResponse
-	if err := doGetInto(endpoint, "/api/logs?"+values.Encode(), &result); err != nil {
+	if err := doGetIntoCtx(ctx, endpoint, "/api/logs?"+values.Encode(), &result); err != nil {
 		return nil, err
 	}
 	if err := scope.requireEchoed(result.Target, result.Shard); err != nil {

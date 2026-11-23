@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -185,6 +186,10 @@ func (s *recordingWebhookEventStore) MarkFailed(context.Context, int64, string, 
 	return errors.New("MarkFailed not implemented by recordingWebhookEventStore")
 }
 
+func (s *recordingWebhookEventStore) MarkFailedUncharged(context.Context, int64, string, string, time.Time) error {
+	return errors.New("MarkFailedUncharged not implemented by recordingWebhookEventStore")
+}
+
 func (s *recordingWebhookEventStore) MarkFailedPermanent(context.Context, int64, string, string) error {
 	return errors.New("MarkFailedPermanent not implemented by recordingWebhookEventStore")
 }
@@ -357,6 +362,7 @@ type scriptedWebhookEventStore struct {
 
 	completed       chan scriptedWebhookOutcome
 	failed          chan scriptedWebhookFailure
+	failedUncharged chan scriptedWebhookFailure
 	failedPermanent chan scriptedWebhookPermanentFailure
 	released        chan scriptedWebhookOutcome
 }
@@ -385,6 +391,7 @@ func newScriptedWebhookEventStore(queue ...*storage.WebhookEvent) *scriptedWebho
 		queue:                      queue,
 		completed:                  make(chan scriptedWebhookOutcome, 8),
 		failed:                     make(chan scriptedWebhookFailure, 8),
+		failedUncharged:            make(chan scriptedWebhookFailure, 8),
 		failedPermanent:            make(chan scriptedWebhookPermanentFailure, 8),
 		released:                   make(chan scriptedWebhookOutcome, 8),
 	}
@@ -459,6 +466,11 @@ func (s *scriptedWebhookEventStore) MarkFailed(_ context.Context, id int64, leas
 		return s.markFailedErr
 	}
 	s.failed <- scriptedWebhookFailure{id: id, leaseToken: leaseToken, errMsg: errMsg, retryAfter: retryAfter}
+	return nil
+}
+
+func (s *scriptedWebhookEventStore) MarkFailedUncharged(_ context.Context, id int64, leaseToken string, errMsg string, retryAfter time.Time) error {
+	s.failedUncharged <- scriptedWebhookFailure{id: id, leaseToken: leaseToken, errMsg: errMsg, retryAfter: &retryAfter}
 	return nil
 }
 
@@ -1135,6 +1147,194 @@ func TestDurableWebhookHeartbeatLossSkipsCompletion(t *testing.T) {
 
 	require.Empty(t, store.completed, "lease-lost delivery must not be marked completed")
 	require.Empty(t, store.failed, "delivery must be left processing so lease expiry hands it to another driver")
+}
+
+func TestDurableWebhookRetryDelay(t *testing.T) {
+	tests := []struct {
+		name    string
+		attempt int
+		want    time.Duration
+	}{
+		{"non-positive attempt is treated as the first", 0, time.Minute},
+		{"negative attempt is treated as the first", -3, time.Minute},
+		{"first failure waits the base delay", 1, time.Minute},
+		{"second failure doubles it", 2, 2 * time.Minute},
+		{"third failure doubles again", 3, 4 * time.Minute},
+		{"fourth failure is the last retry the budget allows", 4, 8 * time.Minute},
+		{"doubling stops at the cap", 5, durableWebhookRetryMaxDelay},
+		{"a very large attempt stays at the cap", 1 << 30, durableWebhookRetryMaxDelay},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, durableWebhookRetryDelay(tt.attempt))
+		})
+	}
+}
+
+// Every retry the attempt budget allows must wait longer than the one before,
+// and the whole schedule must still fit the budget: the last claim (the
+// terminal one) schedules no retry.
+func TestDurableWebhookRetryDelayGrowsAcrossTheAttemptBudget(t *testing.T) {
+	var previous, total time.Duration
+	for attempt := 1; attempt < maxDurableWebhookAttempts; attempt++ {
+		delay := durableWebhookRetryDelay(attempt)
+		assert.Greater(t, delay, previous, "attempt %d must wait longer than the one before", attempt)
+		previous = delay
+		total += delay
+	}
+	assert.Greater(t, total, 10*time.Minute, "the retries must outlast a ten minute GitHub outage")
+}
+
+// The random extra on a retry wait stays between zero and its limit, so a
+// wait is never shorter than the backoff delay and never more than a quarter
+// longer.
+func TestDurableWebhookRetryJitterStaysWithinItsLimit(t *testing.T) {
+	assert.Zero(t, durableWebhookRetryJitter(0))
+	assert.Zero(t, durableWebhookRetryJitter(-time.Second))
+	limit := durableWebhookRetryDelay(1) / 4
+	for range 1000 {
+		jitter := durableWebhookRetryJitter(limit)
+		require.GreaterOrEqual(t, jitter, time.Duration(0))
+		require.LessOrEqual(t, jitter, limit)
+	}
+}
+
+// The retry wait is the backoff delay plus the random extra, which is given a
+// quarter of the delay as its limit. The cap applies before the extra, so the
+// longest wait is a quarter more than the cap.
+func TestDurableWebhookRetryWaitAddsUpToAQuarterOfTheDelay(t *testing.T) {
+	noJitter := func(time.Duration) time.Duration { return 0 }
+	fullJitter := func(limit time.Duration) time.Duration { return limit }
+	for attempt := 1; attempt <= maxDurableWebhookAttempts; attempt++ {
+		delay := durableWebhookRetryDelay(attempt)
+		assert.Equal(t, delay, durableWebhookRetryWait(attempt, noJitter), "attempt %d with no extra", attempt)
+		assert.Equal(t, delay+delay/4, durableWebhookRetryWait(attempt, fullJitter), "attempt %d with the full extra", attempt)
+	}
+	assert.Equal(t, durableWebhookRetryMaxDelay*5/4, durableWebhookRetryWait(1<<30, fullJitter))
+}
+
+// The driver stores a later retry time after each consecutive failure of the
+// same delivery, following durableWebhookRetryDelay plus up to a quarter more.
+func TestDurableWebhookDriverBacksOffBetweenRetries(t *testing.T) {
+	for attempt := 1; attempt < maxDurableWebhookAttempts; attempt++ {
+		t.Run(fmt.Sprintf("failure_%d", attempt), func(t *testing.T) {
+			event := durablePullRequestEvent(t)
+			event.Attempts = attempt - 1 // FindNext claim increments to attempt
+			store := newScriptedWebhookEventStore(event)
+			h := newDurableDriverHandler(t, store, nil, nil)
+			h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+				return true, errors.New("github unavailable")
+			}
+
+			before := time.Now()
+			h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+			after := time.Now()
+
+			var failure scriptedWebhookFailure
+			select {
+			case failure = <-store.failed:
+			default:
+				require.FailNow(t, "expected the failed delivery to be marked for retry")
+			}
+			require.NotNil(t, failure.retryAfter, "a failure under the attempt cap must stay retryable")
+			delay := durableWebhookRetryDelay(attempt)
+			longest := delay + delay/4
+			assert.False(t, failure.retryAfter.Before(before.Add(delay)), "retry must wait at least %s", delay)
+			assert.False(t, failure.retryAfter.After(after.Add(longest)), "retry must not wait longer than %s", longest)
+		})
+	}
+}
+
+// The driver adds the random extra to the backoff delay when it stores the
+// retry time, using the delivery's attempt to pick the delay.
+func TestDurableWebhookDriverSpreadsRetriesWithJitter(t *testing.T) {
+	const attempt = 3
+	event := durablePullRequestEvent(t)
+	event.Attempts = attempt - 1 // FindNext claim increments to attempt
+	store := newScriptedWebhookEventStore(event)
+	h := newDurableDriverHandler(t, store, nil, nil)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return true, errors.New("github unavailable")
+	}
+	var gotLimit time.Duration
+	h.durableWebhookRetryJitterOverride = func(limit time.Duration) time.Duration {
+		gotLimit = limit
+		return limit
+	}
+
+	before := time.Now()
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+	after := time.Now()
+
+	var failure scriptedWebhookFailure
+	select {
+	case failure = <-store.failed:
+	default:
+		require.FailNow(t, "expected the failed delivery to be marked for retry")
+	}
+	require.NotNil(t, failure.retryAfter)
+	delay := durableWebhookRetryDelay(attempt)
+	assert.Equal(t, delay/4, gotLimit, "the extra is limited to a quarter of the delay")
+	want := delay + delay/4
+	assert.False(t, failure.retryAfter.Before(before.Add(want)), "retry must wait the delay plus the extra, %s", want)
+	assert.False(t, failure.retryAfter.After(after.Add(want)), "retry must wait the delay plus the extra, %s", want)
+}
+
+// The failure log tells an operator how many attempts the delivery has used
+// and when it runs next, and carries the head SHA it was planning. A terminal
+// failure has no next run, so it logs no retry time.
+func TestDurableWebhookDriverLogsAttemptsAndRetryTime(t *testing.T) {
+	tests := []struct {
+		name          string
+		priorAttempts int
+		wantRetry     bool
+	}{
+		{name: "retrying", priorAttempts: 2, wantRetry: true},
+		{name: "terminal at the attempt cap", priorAttempts: maxDurableWebhookAttempts - 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			event := durablePullRequestEvent(t)
+			event.Attempts = tc.priorAttempts
+			store := newScriptedWebhookEventStore(event)
+			h := newDurableDriverHandler(t, store, nil, nil)
+			var logs bytes.Buffer
+			h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+			h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+				return true, errors.New("github unavailable")
+			}
+
+			require.True(t, h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0"))
+
+			var failure scriptedWebhookFailure
+			select {
+			case failure = <-store.failed:
+			default:
+				require.FailNow(t, "expected the failed delivery to be marked failed")
+			}
+			var matched int
+			for line := range strings.Lines(logs.String()) {
+				var entry map[string]any
+				require.NoError(t, json.Unmarshal([]byte(line), &entry))
+				if entry["msg"] != "durable webhook driver recorded delivery failure" {
+					continue
+				}
+				matched++
+				assert.Equal(t, event.HeadSHA, entry["head_sha"])
+				assert.Equal(t, float64(tc.priorAttempts+1), entry["attempts"])
+				if tc.wantRetry {
+					require.NotNil(t, failure.retryAfter)
+					assert.Equal(t, "retrying", entry["disposition"])
+					assert.Equal(t, failure.retryAfter.UTC().Format(time.RFC3339), entry["retry_at"])
+				} else {
+					require.Nil(t, failure.retryAfter)
+					assert.Equal(t, "failed", entry["disposition"])
+					assert.NotContains(t, entry, "retry_at")
+				}
+			}
+			assert.Equal(t, 1, matched, "exactly one delivery failure log line: %s", logs.String())
+		})
+	}
 }
 
 func TestDurableWebhookDriverStopsRetryingAtAttemptCap(t *testing.T) {

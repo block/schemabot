@@ -193,6 +193,12 @@ type PlanCommentData struct {
 	// ExemptTables lists live tables excluded from a plan verdict by namespace.
 	ExemptTables []ExemptTablesData
 
+	// UnmatchedDropTables lists the drop_tables entries that name no live
+	// table on the target, in the order the config lists them. Each plans no
+	// drop, so the comment says so rather than reading as if the table were
+	// seen and kept.
+	UnmatchedDropTables []string
+
 	// ApplyAuthorization lists who may run the apply the comment offers. Nil
 	// when PR command authorization is off or the reader may run the apply.
 	ApplyAuthorization *ApplyAuthorizationData
@@ -630,10 +636,11 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// apply, which runs each of those targets' own plans.
 	if totalChanges == 0 && !targetPlans {
 		writeNoChangesDetected(&sb, data)
-		if len(data.IgnoredNamespaces) > 0 || hasExemptTables(data.ExemptTables) {
+		if len(data.IgnoredNamespaces) > 0 || hasExemptTables(data.ExemptTables) || len(data.shownUnmatchedDropTables()) > 0 {
 			sb.WriteString("\n")
 			writeIgnoredNamespaces(&sb, data.IgnoredNamespaces)
 			writeExemptTables(&sb, data.ExemptTables)
+			writeUnmatchedDropTables(&sb, data.shownUnmatchedDropTables())
 		}
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
@@ -1248,6 +1255,7 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 		sb.WriteString("\n")
 		writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 		writeExemptTables(sb, data.ExemptTables)
+		writeUnmatchedDropTables(sb, data.shownUnmatchedDropTables())
 		return
 	}
 
@@ -1258,9 +1266,11 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", text)
 
 	// Disclosed directly under the plan summary so the exclusion reads as
-	// part of the plan result: what was counted, then what was withheld.
+	// part of the plan result: what was counted, then what was withheld,
+	// then which drop_tables entries planned nothing.
 	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 	writeExemptTables(sb, data.ExemptTables)
+	writeUnmatchedDropTables(sb, data.shownUnmatchedDropTables())
 }
 
 // planSummaryText renders what a plan would do as the plan summary counts it,
@@ -1418,6 +1428,89 @@ func planExemptTables(data MultiEnvPlanCommentData, env string) []ExemptTablesDa
 
 func exemptTablesEqual(a, b ExemptTablesData) bool {
 	return a.Namespace == b.Namespace && a.Reason == b.Reason && slices.Equal(a.Tables, b.Tables)
+}
+
+// writeUnmatchedDropTables renders one line per drop_tables entry that names
+// no live table on the target, naming the first entries of a long list and
+// counting the rest. The entry comes from the repository's config, so it
+// renders as inline code whatever characters it holds. No-op when every entry
+// matched, which is the ordinary case.
+func writeUnmatchedDropTables(sb *strings.Builder, entries []string) {
+	shown, more := presentation.UnmatchedDropTableEntries(entries)
+	for _, entry := range shown {
+		fmt.Fprintf(sb, glyph.Attention+" %s\n\n", presentation.UnmatchedDropTablesEntry("`drop_tables`", inlineCode(entry)))
+	}
+	if more > 0 {
+		fmt.Fprintf(sb, glyph.Attention+" %s\n\n", presentation.UnmatchedDropTablesMore("`drop_tables`", more))
+	}
+}
+
+// shownUnmatchedDropTables is the unmatched drop_tables entries the plan
+// reports. A rollout plan reports none: the entries describe the primary
+// target alone, while every other member is planned with the same list and
+// drops a table it still has, so a line saying the entry drops nothing could
+// sit beside that member's DROP and tell the reader to remove the entry the
+// drop depends on.
+func (d PlanCommentData) shownUnmatchedDropTables() []string {
+	if d.DeploymentDrift != nil {
+		return nil
+	}
+	return d.UnmatchedDropTables
+}
+
+// writeMultiEnvUnmatchedDropTables renders the unmatched drop_tables lines for
+// the all-environments-clean path, where no per-environment sections exist to
+// carry them. RenderMultiEnvPlanComment has already narrowed every plan to the
+// entries no environment matched, so the environments agree and the lines
+// render once.
+func writeMultiEnvUnmatchedDropTables(sb *strings.Builder, data MultiEnvPlanCommentData) {
+	for _, env := range data.Environments {
+		if plan := data.Plans[env]; plan != nil {
+			writeUnmatchedDropTables(sb, plan.shownUnmatchedDropTables())
+			return
+		}
+	}
+}
+
+// multiEnvHasUnmatchedDropTables reports whether any environment's plan has a
+// drop_tables entry that names no table.
+func multiEnvHasUnmatchedDropTables(data MultiEnvPlanCommentData) bool {
+	for _, env := range data.Environments {
+		if plan := data.Plans[env]; plan != nil && len(plan.shownUnmatchedDropTables()) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// withUnmatchedDropTablesInEveryPlan copies plans with each one's unmatched
+// drop_tables entries narrowed to those every environment's plan reports, so
+// no section tells the reader to remove an entry another environment still
+// drops a table for (see presentation.UnmatchedDropTablesInEveryPlan). A
+// rollout plan reports no entries, so beside one nothing is reported.
+func withUnmatchedDropTablesInEveryPlan(data MultiEnvPlanCommentData) map[string]*PlanCommentData {
+	var lists [][]string
+	for _, env := range data.Environments {
+		switch plan := data.Plans[env]; {
+		case data.Errors[env] != "":
+			// A failed plan says nothing about which tables its target has.
+			lists = append(lists, nil)
+		case plan != nil:
+			lists = append(lists, plan.shownUnmatchedDropTables())
+		}
+	}
+	common := presentation.UnmatchedDropTablesInEveryPlan(lists)
+	narrowed := make(map[string]*PlanCommentData, len(data.Plans))
+	for env, plan := range data.Plans {
+		if plan == nil {
+			narrowed[env] = nil
+			continue
+		}
+		copied := *plan
+		copied.UnmatchedDropTables = common
+		narrowed[env] = &copied
+	}
+	return narrowed
 }
 
 // multiEnvHasIgnoredNamespaces reports whether any environment's plan excluded
@@ -1588,8 +1681,10 @@ func SummarizeChanges(data PlanCommentData) string {
 
 	parts := ui.AssemblePlanSummary(counts, totalStatements,
 		func(count int, noun, op string) string {
-			if noun == "index" {
-				return fmt.Sprintf("%d index %s", count, pluralize(op, count))
+			// Table work reads bare ("3 alters"); index and type work names
+			// its noun so it never reads as table work ("1 type alter").
+			if noun != "table" {
+				return fmt.Sprintf("%d %s %s", count, noun, pluralize(op, count))
 			}
 			return fmt.Sprintf("%d %s", count, pluralize(op, count))
 		},
@@ -3746,6 +3841,7 @@ type MultiEnvPlanCommentData struct {
 // RenderMultiEnvPlanComment renders a combined plan comment showing all environments.
 // If all environments have identical plans, deduplicates into a single section.
 func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
+	data.Plans = withUnmatchedDropTablesInEveryPlan(data)
 	note := RenderUnmanagedSchemaPlanNote(data.UnmanagedEnvironments, data.UnmanagedSchema)
 	if note == "" {
 		return renderMultiEnvPlanCommentWithin(data, 0)
@@ -3852,10 +3948,11 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 	// unchanged.
 	if envsWithChanges == 0 && !hasErrors && !AnyEnvHasDriftToShow(data) && !AnyEnvHasBaseSchemaNotice(data) {
 		sb.WriteString("✅ **No schema changes detected** for any environment.\n")
-		if multiEnvHasIgnoredNamespaces(data) || multiEnvHasExemptTables(data) {
+		if multiEnvHasIgnoredNamespaces(data) || multiEnvHasExemptTables(data) || multiEnvHasUnmatchedDropTables(data) {
 			sb.WriteString("\n")
 			writeMultiEnvIgnoredNamespaces(&sb, data)
 			writeMultiEnvExemptTables(&sb, data)
+			writeMultiEnvUnmatchedDropTables(&sb, data)
 		}
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
@@ -4025,6 +4122,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 		sb.WriteString(noChangesDetected + "\n\n")
 		writeIgnoredNamespaces(sb, plan.IgnoredNamespaces)
 		writeExemptTables(sb, plan.ExemptTables)
+		writeUnmatchedDropTables(sb, plan.shownUnmatchedDropTables())
 		return
 	}
 

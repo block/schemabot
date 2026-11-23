@@ -56,6 +56,34 @@ type Freeze struct {
 
 	// InEffect reports whether the freeze blocks changes now.
 	InEffect bool `json:"in_effect"`
+
+	// StopSweep reports the stops that setting the freeze issued. Only the
+	// response to creating a freeze with running "stop" that is in effect at
+	// once has it.
+	StopSweep *FreezeStopSweep `json:"stop_sweep,omitempty"`
+}
+
+// FreezeStopSweep reports the durable stop a freeze with running "stop"
+// issued, when it was set, on every apply in its scope that was pending or
+// running. Each stop is recorded with the freeze as its requester.
+type FreezeStopSweep struct {
+	// Stopped are the applies SchemaBot recorded a stop for.
+	Stopped []string `json:"stopped"`
+
+	// NotStopped are the applies in scope that SchemaBot did not stop, with
+	// why.
+	NotStopped []FreezeUnstoppedApply `json:"not_stopped,omitempty"`
+
+	// Error is set when SchemaBot could not list the applies in scope, so it
+	// stopped none of them.
+	Error string `json:"error,omitempty"`
+}
+
+// FreezeUnstoppedApply is an apply in a freeze's scope that the freeze's stop
+// sweep did not stop.
+type FreezeUnstoppedApply struct {
+	ApplyID string `json:"apply_id"`
+	Reason  string `json:"reason"`
 }
 
 // FreezeListResponse lists freezes (GET /api/freezes).

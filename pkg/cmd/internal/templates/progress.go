@@ -3,7 +3,6 @@ package templates
 import (
 	"fmt"
 	"log/slog"
-	"math"
 	"sort"
 	"strings"
 	"time"
@@ -159,6 +158,7 @@ func WriteProgress(data ProgressData) {
 	if data.State == state.Apply.Failed && data.ErrorMessage != "" {
 		fmt.Printf("\n  %s%s%s\n", ANSIRed, data.ErrorMessage, ANSIReset)
 	}
+	writeStoppedByFreeze(data)
 	if data.Sharded {
 		if note := ShardedStoppedAtCutoverNote(data.State, data.Operations, data.Tables, data.Released); note != "" {
 			fmt.Printf("\n  ⏹️ %s\n", note)
@@ -474,15 +474,10 @@ func FormatTableProgressWithActivityBar(t TableProgress, activityBar string) str
 }
 
 // runningWord names t's parts while they work on its change: copying, unless
-// the change copies no rows, which a CREATE TABLE, a DROP TABLE and an instant
-// ALTER do not. The table's own line says "Applying..." for those, and its
-// parts read the same way.
+// the change copies no rows (presentation.ChangeCopiesRows). The table's own
+// line says "Applying..." for those, and its parts read the same way.
 func runningWord(t TableProgress) string {
-	switch ddl.OpToStatementType(t.ChangeType) {
-	case ddl.StatementCreateTable, ddl.StatementDropTable:
-		return presentation.RunningApplying
-	}
-	return presentation.RunningWord(!isInstantAlter(t))
+	return presentation.RunningWord(presentation.ChangeCopiesRows(t.ChangeType, t.IsInstant))
 }
 
 // isInstantAlter reports whether the table should be described as applying
@@ -606,10 +601,9 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// source. On a large table this can run for hours, so show how far the
 		// verification has progressed once Spirit has reported a total.
 		if t.ChecksumRowsTotal > 0 {
-			checksumPct := int(math.Round(float64(t.ChecksumRowsChecked) * 100 / float64(t.ChecksumRowsTotal)))
-			pct := ui.RowCopyDisplayPercent(checksumPct, t.ChecksumRowsChecked)
+			pct := ui.ChecksumDisplayPercent(t.ChecksumRowsChecked, t.ChecksumRowsTotal)
 			writeTableLine(&b, t, "%s 🔍 Checksumming to verify data (%s%s)%s", ui.ProgressBarRowCopy(pct),
-				ui.FormatRowCopyPercent(checksumPct, t.ChecksumRowsChecked, t.ChecksumRowsTotal), shardCoverageSuffix(t), ui.ThrottledSuffix(t.Throttled))
+				ui.FormatRowCopyPercent(pct, t.ChecksumRowsChecked, t.ChecksumRowsTotal), shardCoverageSuffix(t), ui.ThrottledSuffix(t.Throttled))
 			if t.DDL != "" {
 				b.WriteString(formatTableDDL(t))
 			}

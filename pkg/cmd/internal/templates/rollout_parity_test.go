@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -129,6 +130,50 @@ func prTableReading(t *testing.T, targets []parityTarget) (percent, rows string)
 		Model: presentation.Derive(ops), ApplyID: "apply-7f3c", Environment: "production", Details: details,
 	})
 	return tableReading(t, out, prTableLine)
+}
+
+// The CLI and the PR comment draw the same checksum bar for one table: the bar
+// fills only once every row is verified, and shows a first segment as soon as
+// verification has begun, on both surfaces (UX-5). Before Spirit reports a
+// total there is nothing to measure against, so both draw a full activity bar
+// with an open-ended label.
+func TestChecksumBarReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
+	cases := []struct {
+		name           string
+		checked, total int64
+		filled         int
+		// label follows "Checksumming to verify data" on both surfaces.
+		label string
+	}{
+		{name: "in its final stretch", checked: 997_500, total: 1_000_000, filled: 19, label: " (99.75%)"},
+		{name: "just begun", checked: 4, total: 1_000, filled: 1, label: " (0.40%)"},
+		{name: "every row verified", checked: 1_000_000, total: 1_000_000, filled: 20, label: " (100.00%)"},
+		// Rounding draws two segments here and truncation one.
+		{name: "9.6 percent", checked: 96, total: 1_000, filled: 1, label: " (9.60%)"},
+		{name: "past the estimated total", checked: 1_200_000, total: 1_000_000, filled: 20, label: " (100.00%)"},
+		{name: "total not yet reported", checked: 0, total: 0, filled: 20, label: "..."},
+		{name: "rows reported without a total", checked: 500, total: 0, filled: 20, label: "..."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cli := FormatTableProgress(TableProgress{
+				TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
+				ChecksumRowsChecked: tc.checked, ChecksumRowsTotal: tc.total,
+			})
+			pr := webhooktemplates.RenderApplyStatusComment(webhooktemplates.ApplyStatusCommentData{
+				Database: "payments", State: state.Apply.Running, ApplyID: "apply-7f3c", Environment: "production",
+				Engine: storage.EngineSpirit,
+				Tables: []webhooktemplates.TableProgressData{{
+					TableName: "orders", DDL: addRegion, Status: state.Task.Checksumming,
+					ChecksumRowsChecked: tc.checked, ChecksumRowsTotal: tc.total,
+				}},
+			})
+			want := strings.Repeat(ui.ColorBlue, tc.filled) + strings.Repeat(ui.ColorEmpty, 20-tc.filled) +
+				" 🔍 Checksumming to verify data" + tc.label
+			assert.Contains(t, cli, want, "CLI checksum bar")
+			assert.Contains(t, pr, want, "PR comment checksum bar")
+		})
+	}
 }
 
 func tableReading(t *testing.T, out string, tableLine *regexp.Regexp) (percent, rows string) {
