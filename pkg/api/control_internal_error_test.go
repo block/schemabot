@@ -170,6 +170,14 @@ func TestControlRoutesAnswerNotAttemptedBeforeTheOperation(t *testing.T) {
 			wantRetry: true,
 		},
 		{
+			name:      "apply lookup fails",
+			applies:   &staticApplyStore{err: errors.New(sensitiveControlFailure)},
+			setup:     func(*Service) {},
+			wantMsg:   controlNotAttemptedMessage("cutover", "apply-internal-error"),
+			wantLog:   "failed to load apply for control request",
+			wantRetry: true,
+		},
+		{
 			name:      "apply store not available",
 			applies:   nil,
 			setup:     func(*Service) {},
@@ -234,8 +242,10 @@ func TestControlRoutesKeepRefusalTextOn4xx(t *testing.T) {
 // answer carries the refusal and where the rollback's ignore_tables came from,
 // whether the engine ran locally or on a remote data plane, and without the
 // gRPC status. A refused drop of a withheld table is SchemaBot's own refusal
-// and keeps its text too. Any other engine failure can carry driver text, so
-// it answers the fixed message and stays in the server log.
+// and keeps its text too, and so does a rollback source plan or apply that
+// SchemaBot finds invalid before it asks the engine. Any other engine failure
+// can carry driver text, so it answers the fixed message and stays in the
+// server log.
 func TestRollbackPlanAnswerCarriesOnlyRefusals(t *testing.T) {
 	ignored, err := engine.NewIgnoredTables([]string{"flyway_schema_history"})
 	require.NoError(t, err)
@@ -251,10 +261,15 @@ func TestRollbackPlanAnswerCarriesOnlyRefusals(t *testing.T) {
 			}},
 		}},
 	}
+	uncapturedSource := rollbackSourcePlan()
+	uncapturedSource.Namespaces["payments"].OriginalFilesCaptured = false
 	tests := []struct {
 		name        string
 		client      *mockTernClient
+		source      *storage.Plan
+		setupApply  func(*storage.Apply)
 		wantContain []string
+		wantExact   string
 		wantFixed   bool
 	}{
 		{
@@ -273,6 +288,18 @@ func TestRollbackPlanAnswerCarriesOnlyRefusals(t *testing.T) {
 			wantContain: []string{"ignore_tables withholds", "Upgrade that deployment to a build that supports ignore_tables"},
 		},
 		{
+			name:      "source plan has no captured schema files",
+			client:    &mockTernClient{},
+			source:    uncapturedSource,
+			wantExact: `rollback plan failed: rollback source plan is invalid: no original schema files available for rollback namespace "payments"`,
+		},
+		{
+			name:       "source apply has no recorded deployment",
+			client:     &mockTernClient{},
+			setupApply: func(apply *storage.Apply) { apply.Deployment = "" },
+			wantExact:  `rollback plan failed: rollback source apply is invalid: apply "apply_rollback" is missing stored deployment metadata`,
+		},
+		{
 			name:      "engine failure",
 			client:    &mockTernClient{planErr: status.Error(codes.Internal, sensitiveControlFailure)},
 			wantFixed: true,
@@ -280,7 +307,14 @@ func TestRollbackPlanAnswerCarriesOnlyRefusals(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			svc, apply := newRollbackExemptServiceWithClient(&rollbackSourcePlanStore{source: rollbackSourcePlan()}, tc.client)
+			source := tc.source
+			if source == nil {
+				source = rollbackSourcePlan()
+			}
+			svc, apply := newRollbackExemptServiceWithClient(&rollbackSourcePlanStore{source: source}, tc.client)
+			if tc.setupApply != nil {
+				tc.setupApply(apply)
+			}
 			var logBuf bytes.Buffer
 			svc.logger = slog.New(slog.NewJSONHandler(&logBuf, nil))
 			_, planErr := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
@@ -299,6 +333,10 @@ func TestRollbackPlanAnswerCarriesOnlyRefusals(t *testing.T) {
 				assert.NotContains(t, resp.Error, "recorded ignore_tables")
 				line := requireLogLine(t, decodeLogLines(t, logBuf.Bytes()), "rollback plan failed")
 				assert.Contains(t, line["error"], "user:pass")
+				return
+			}
+			if tc.wantExact != "" {
+				assert.Equal(t, tc.wantExact, resp.Error)
 				return
 			}
 			assert.True(t, strings.HasPrefix(resp.Error, `rollback plan failed: rollback plan for database "payments" (staging): `), resp.Error)
