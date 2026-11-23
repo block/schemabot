@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	gomysql "github.com/block/mysql"
+	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
@@ -2821,6 +2822,13 @@ type ForwardAuthSettings struct {
 	// through a trusted gateway. Service callers never get the write tier.
 	ReadServiceSPIFFE []string `yaml:"read_service_spiffe,omitempty"`
 
+	// TrustedMeshLoopbackSources lists loopback addresses a service-mesh
+	// sidecar delivers requests from, such as Istio's 127.0.0.6. A
+	// request from one that passed the SPIFFE check has its identity verified;
+	// any other loopback source, such as a kubectl port-forward, stays
+	// break-glass. Requires TrustedProxySPIFFE, and refuses 127.0.0.1 and ::1.
+	TrustedMeshLoopbackSources []string `yaml:"trusted_mesh_loopback_sources,omitempty"`
+
 	// OperatorEnvironments lists the environments in which per-database
 	// operator grants (databases.*.operator_groups) may mutate. The policy is
 	// instance-wide: which environments accept scoped direct writes is a
@@ -2932,7 +2940,19 @@ func (f *ForwardAuthSettings) validate() error {
 	if len(trimmedGateways) > 0 && len(trimmedSPIFFE) == 0 {
 		return fmt.Errorf("forward_auth trusted_gateway_spiffe requires SPIFFE-anchored proxy trust (trusted_proxy_spiffe): with CIDR-only trust the service-caller lane is unreachable")
 	}
-	return nil
+	meshSources, err := auth.ParseTrustedMeshLoopbackSources(f.TrustedMeshLoopbackSources)
+	if err != nil {
+		return err
+	}
+	if len(meshSources) > 0 && len(trimmedSPIFFE) == 0 {
+		return auth.ErrMeshSourcesNeedSPIFFE
+	}
+	nets := make([]*net.IPNet, 0, len(trimmedCIDRs))
+	for _, c := range trimmedCIDRs {
+		_, network, _ := net.ParseCIDR(c) // validated above
+		nets = append(nets, network)
+	}
+	return auth.CheckMeshSourcesInTrustedNetworks(meshSources, nets)
 }
 
 // Comment renderers reserve a fixed amount of headroom under GitHub's comment
