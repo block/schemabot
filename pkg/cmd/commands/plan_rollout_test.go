@@ -975,6 +975,60 @@ func TestApplyCmd_SuggestedCommandsQuoteTheirArguments(t *testing.T) {
 	})
 }
 
+// A wrapper that routes on -e records it as a routing flag, and the rerun a
+// refusal offers names the environment the plan was made for. The rerun's own
+// -e stands alone: the recorded one would send the operator's pasted command to
+// a different environment than the refusal is about, and name -e twice.
+func TestApplyCmd_SuggestedCommandsDoNotRepeatTheRecordedEnvironment(t *testing.T) {
+	cliname.SetRoute(cliname.Flag{Name: "-e", Value: "development"}, cliname.Flag{Name: "--profile", Value: "prod"})
+	t.Cleanup(func() { cliname.SetRoute() })
+
+	drop := []*apitypes.SchemaChangeResponse{{
+		Namespace: "orders",
+		TableChanges: []*apitypes.TableChangeResponse{{
+			TableName: "legacy", Namespace: "orders", DDL: "DROP TABLE `legacy`", ChangeType: "drop", IsUnsafe: true, UnsafeReason: "drops a table",
+		}},
+	}}
+	schemaDir := writeTestSchemaDir(t)
+
+	t.Run("unsafe retry", func(t *testing.T) {
+		server, _ := rolloutPlanServer(t, &apitypes.PlanResponse{PlanID: "plan-orders-1", Engine: "mysql", Changes: drop})
+		cmd := ApplyCmd{SchemaDir: schemaDir, Environment: "staging", NoLock: true, AutoApprove: true}
+		out := stripAnsi(captureStdout(func() { _ = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
+		assert.Contains(t, out, cliname.Name()+" apply -s "+schemaDir+" -e staging --allow-unsafe --profile prod\n", "%s", out)
+		assert.NotContains(t, out, "-e development", "%s", out)
+
+		cmd.Output = OutputFormatJSON
+		var runErr error
+		captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) })
+		require.Error(t, runErr)
+		assert.Contains(t, runErr.Error(), cliname.Name()+" apply -s "+schemaDir+" -e staging --allow-unsafe --profile prod")
+		assert.NotContains(t, runErr.Error(), "-e development")
+	})
+
+	t.Run("narrowed rollout rerun", func(t *testing.T) {
+		server, _ := rolloutPlanServer(t, &apitypes.PlanResponse{
+			PlanID: "plan-orders-1",
+			Engine: "mysql",
+			Rollout: &apitypes.PlanRolloutResponse{
+				Members:     2,
+				Independent: true,
+				Groups: []*apitypes.PlanMemberGroupResponse{
+					{Members: paymentsTargets(1, 1), Primary: true, Changes: []*apitypes.SchemaChangeResponse{}},
+					{Members: paymentsTargets(2, 2), Changes: drop},
+				},
+				Refused: []*apitypes.PlanMemberRefusalResponse{
+					{Member: "prod/payments-002", Target: "payments-002", Reason: apitypes.PlanMemberNeedsTarget, Detail: "drops a table", AllowUnsafe: true},
+				},
+			},
+		})
+		cmd := ApplyCmd{SchemaDir: schemaDir, Environment: "staging", NoLock: true, AutoApprove: true}
+		out := stripAnsi(captureStdout(func() { _ = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
+		assert.Contains(t, out, cliname.Name()+" apply -s "+schemaDir+" -e staging --target payments-002 --allow-unsafe --profile prod\n", "%s", out)
+		assert.NotContains(t, out, "-e development", "%s", out)
+	})
+}
+
 // Apply creation refuses an apply of a multi-target rollout that spans
 // several deployments, and --defer-cutover on one that does not. The CLI
 // refuses both from the plan, before it checks or takes the lock and before
