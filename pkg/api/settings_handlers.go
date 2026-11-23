@@ -89,6 +89,16 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The key is measured before it is logged or checked further, so an
+	// oversized key is never echoed into the logs or the response.
+	if len(req.Key) > storage.MaxSettingKeyBytes {
+		s.logger.Warn("refused settings write to a key longer than storage holds", "key_bytes", len(req.Key),
+			"max_key_bytes", storage.MaxSettingKeyBytes, "caller", cmp.Or(resolveCaller(r.Context(), ""), "unknown"))
+		s.writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("setting key is %d bytes; the limit is %d bytes", len(req.Key), storage.MaxSettingKeyBytes))
+		return
+	}
+
 	// Storage can treat a key with an accented or full-width letter, or an
 	// invisible character, as naming another key's row. Printable ASCII keys
 	// differ to storage only by letter case, which the check below allows for.
@@ -108,6 +118,17 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 			"caller", cmp.Or(resolveCaller(r.Context(), ""), "unknown"))
 		s.writeError(w, http.StatusBadRequest,
 			fmt.Sprintf("%q is kept by SchemaBot itself and cannot be set through the settings API", req.Key))
+		return
+	}
+
+	// Storage rejects a value past its column, which would reach the caller as
+	// a 500; refuse it here and say what the limit is.
+	if len(req.Value) > storage.MaxSettingValueBytes {
+		s.logger.Warn("refused settings write of a value larger than storage holds", "key", req.Key,
+			"value_bytes", len(req.Value), "max_value_bytes", storage.MaxSettingValueBytes,
+			"caller", cmp.Or(resolveCaller(r.Context(), ""), "unknown"))
+		s.writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("setting value is %d bytes; the limit is %d bytes", len(req.Value), storage.MaxSettingValueBytes))
 		return
 	}
 
