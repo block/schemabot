@@ -682,6 +682,17 @@ func TestFormatTableProgress_TableSizeBesideRows(t *testing.T) {
 	assert.NotContains(t, FormatTableProgress(queued), "Rows:")
 }
 
+// A queued table's planned-rows line sits on its own detail line, indented
+// under the table like every other detail, and is left out when the plan has
+// no row estimate.
+func TestQueuedTableCarriesItsPlannedRowsLine(t *testing.T) {
+	rows, size := int64(1_200_000), int64(3_000_000_000)
+	out := FormatTableProgress(TableProgress{TableName: "orders", ChangeType: "alter", Status: state.Apply.Pending, EstimatedRows: &rows, EstimatedBytes: &size})
+	assert.Contains(t, out, "\n"+indentDetail+"Rows: ~1.2M · ~3.0 GB\n")
+	none := FormatTableProgress(TableProgress{TableName: "orders", ChangeType: "alter", Status: state.Apply.Pending})
+	assert.NotContains(t, none, "Rows:")
+}
+
 // A table applying its accumulated changes names the catch-up phase rather
 // than rendering a bare full bar — its copy is done but the engine is still
 // draining the changes that piled up on the source, which can run for hours on
@@ -799,6 +810,47 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 	assert.NotContains(t, completed, ui.MySQLThrottleDocURL)
 	assert.NotContains(t, notThrottled, ui.MySQLThrottleDocURL)
 	assert.NotContains(t, completed, "Throttled", "a terminal table never renders a stale throttle flag")
+}
+
+// Every phase the engine's throttler paces carries "(throttled)" at the end of
+// its header, so a throttled table never reads as stalled in any of them, and
+// the annotation goes away once the flag clears.
+func TestThrottledHeaderEveryPhase(t *testing.T) {
+	copying := func(mod func(*TableProgress)) TableProgress {
+		tp := TableProgress{TableName: "orders", ChangeType: "alter", Status: state.Apply.Running, Throttled: true}
+		mod(&tp)
+		return tp
+	}
+	cases := map[string]TableProgress{
+		"checksum with a total": copying(func(tp *TableProgress) {
+			tp.Status = state.Apply.Checksumming
+			tp.ChecksumRowsChecked, tp.ChecksumRowsTotal = 500, 1000
+		}),
+		"checksum without a total": copying(func(tp *TableProgress) { tp.Status = state.Apply.Checksumming }),
+		"starting copy":            copying(func(tp *TableProgress) { tp.RowsTotal = 1000 }),
+		"copying":                  copying(func(tp *TableProgress) { tp.RowsTotal, tp.RowsCopied, tp.PercentComplete = 1000, 450, 45 }),
+		"applying instantly":       copying(func(tp *TableProgress) { tp.IsInstant = true }),
+		"applying create":          copying(func(tp *TableProgress) { tp.ChangeType = "create" }),
+		"running without rows":     copying(func(tp *TableProgress) {}),
+		"estimate exceeded":        copying(func(tp *TableProgress) { tp.RowsTotal = 1000; tp.RowsCopied = 1500; tp.PercentComplete = 100 }),
+		"sharded phase": copying(func(tp *TableProgress) {
+			tp.Status = state.Apply.Checksumming
+			tp.RowsTotal, tp.RowsCopied, tp.PercentComplete = 1000, 1000, 100
+			tp.Shards = []ShardProgress{{Shard: "-80", Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, PercentComplete: 100}, {Shard: "80-", Status: state.Task.Running, RowsCopied: 500, RowsTotal: 1000, PercentComplete: 50}}
+		}),
+		"across targets": copying(func(tp *TableProgress) {
+			tp.AcrossTargets = true
+			tp.Shards = []ShardProgress{{Shard: "t1", Status: state.Task.Running, RowsCopied: 500, RowsTotal: 1000, PercentComplete: 50}, {Shard: "t2", Status: state.Task.Pending}}
+		}),
+	}
+	for name, tp := range cases {
+		t.Run(name, func(t *testing.T) {
+			header, _, _ := strings.Cut(strings.TrimLeft(FormatTableProgress(tp), "\n"), "\n")
+			assert.True(t, strings.HasSuffix(header, " (throttled)"), "header %q", header)
+			tp.Throttled = false
+			assert.NotContains(t, FormatTableProgress(tp), "(throttled)")
+		})
+	}
 }
 
 // Interactive throttle hints point at the throttle reference the way a PR
