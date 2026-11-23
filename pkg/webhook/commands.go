@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -105,6 +106,25 @@ func CommandNames() []string {
 		names = append(names, s.Name)
 	}
 	return names
+}
+
+// CommandFlags returns the canonical spelling of every flag the PR comment
+// parser recognizes, sorted.
+//
+// Exported so the agent skill's command policy can be checked against it: a
+// flag an agent could add to a comment changes what that comment asks for, so
+// each one needs a stated rule for who may post it.
+func CommandFlags() []string {
+	var flags []string
+	for _, table := range []map[string]string{booleanFlags, valueFlags} {
+		for _, canonical := range table {
+			if !slices.Contains(flags, canonical) {
+				flags = append(flags, canonical)
+			}
+		}
+	}
+	slices.Sort(flags)
+	return flags
 }
 
 // specByName indexes commandSpecs for O(1) lookup by command word.
