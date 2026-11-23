@@ -3623,10 +3623,10 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	if err := s.refuseMultiTargetRollback(ctx, apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
 		return nil, err
 	}
-	// A deployment missing from the server configuration fails the same way on
-	// every attempt, so that answer is terminal. Any other failure to build the
-	// client, such as a DSN or token that did not resolve, can clear on a later
-	// attempt, so it stays retryable. The raw cause can carry DSN or host
+	// A deployment missing from the server configuration, or configured in a way
+	// that can never produce a client, fails the same way on every attempt, so
+	// that answer is terminal. A secrets lookup for the DSN or token that failed
+	// can clear on a later attempt, so it stays retryable. The raw cause can carry DSN or host
 	// fragments and goes only to the server log; the returned error carries a
 	// message SchemaBot wrote, because the webhook posts it to the PR.
 	client, err := s.TernClient(deployment, apply.Environment)

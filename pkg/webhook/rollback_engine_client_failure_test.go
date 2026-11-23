@@ -1,7 +1,7 @@
 package webhook
 
 import (
-	"path/filepath"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -9,25 +9,34 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
 )
 
 // rollbackFakeDSN stands in for connection details an engine client failure
-// can carry. It names the DSN file the server cannot read, so it is in the raw
-// error and must never reach the PR.
+// can carry. The failing secrets lookup names it, so it is in the raw error and
+// must never reach the PR.
 const rollbackFakeDSN = "user:pw@tcp(10.0.0.5:3306)"
 
-// rollbackEngineClientConfig configures deployment "brokendb" with a DSN file
-// that does not exist, so its engine client cannot be built, and leaves
-// deployment "ghost" out of the configuration.
+// rollbackFlakyResolver is a secrets prefix whose lookups always fail, the way
+// a secrets backend does during an outage.
+const rollbackFlakyResolver = "rollbackwebhookflaky"
+
+// rollbackEngineClientConfig configures deployment "brokendb" with a DSN whose
+// secrets lookup fails, so its engine client cannot be built until the backend
+// recovers, and leaves deployment "ghost" out of the configuration.
 func rollbackEngineClientConfig(t *testing.T) *api.ServerConfig {
 	t.Helper()
+	secrets.Register(rollbackFlakyResolver, func(string) (string, error) {
+		return "", errors.New("secrets backend timed out reading " + rollbackFakeDSN)
+	})
+	t.Cleanup(func() { secrets.Unregister(rollbackFlakyResolver) })
 	return &api.ServerConfig{
 		Databases: map[string]api.DatabaseConfig{
 			"brokendb": {
 				Type: storage.DatabaseTypeMySQL,
 				Environments: map[string]api.EnvironmentConfig{
-					"staging": {DSN: "file:" + filepath.Join(t.TempDir(), rollbackFakeDSN)},
+					"staging": {DSN: rollbackFlakyResolver + ":orders"},
 				},
 			},
 		},

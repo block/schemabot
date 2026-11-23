@@ -283,11 +283,11 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 	if err != nil {
 		releaseErr := h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
 		// ExecuteRollbackPlanForApply classifies its own failures: transient
-		// infrastructure (storage reads/writes, remote unavailability, an
-		// engine client that could not be built) stays retryable, while data
-		// invariant violations, a deployment missing from the server
-		// configuration, and deterministic engine rejections come back
-		// terminal. Its engine client failures carry a message SchemaBot
+		// infrastructure (storage reads/writes, remote unavailability, a
+		// secrets lookup for the engine client that failed) stays retryable,
+		// while data invariant violations, a deployment missing from or
+		// misconfigured in the server configuration, and deterministic engine
+		// rejections come back terminal. Its engine client failures carry a message SchemaBot
 		// wrote, never the raw cause.
 		retryable := !api.IsTerminalControlError(err)
 		h.logger.Error("rollback plan failed", "repo", repo, "pr", pr, "apply_id", applyID, "retryable", retryable, "error", err)
