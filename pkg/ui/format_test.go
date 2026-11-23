@@ -155,6 +155,13 @@ func TestRowCopyDisplayPercent(t *testing.T) {
 	assert.Equal(t, 100, RowCopyDisplayPercent(145, 42))
 }
 
+func TestRecoveringCopyingRows(t *testing.T) {
+	assert.True(t, RecoveringCopyingRows(1_000, 0))
+	assert.True(t, RecoveringCopyingRows(1_000, 99))
+	assert.False(t, RecoveringCopyingRows(1_000, 100), "a finished copy is not still copying")
+	assert.False(t, RecoveringCopyingRows(0, 40), "no row total yet, so no copy to report")
+}
+
 func TestChecksumDisplayPercent(t *testing.T) {
 	// No total yet, or nothing verified: an empty bar.
 	assert.Equal(t, 0, ChecksumDisplayPercent(0, 0))

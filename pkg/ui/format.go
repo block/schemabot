@@ -260,6 +260,15 @@ func RowCopyDisplayPercent(pct int, rowsCopied int64) int {
 	return displayPercent
 }
 
+// RecoveringCopyingRows reports whether a table that is recovering after a
+// restart is still copying rows, so its progress reads as a row copy rather
+// than a bare "recovering". It is when the engine has a row total and the copy
+// has not reached 100%. The CLI and the PR comment both render a recovering
+// table by this test.
+func RecoveringCopyingRows(rowsTotal int64, percentComplete int) bool {
+	return rowsTotal > 0 && percentComplete < 100
+}
+
 // ChecksumDisplayPercent returns the whole-number percentage for a checksum's
 // progress bar from the rows it has verified of its total. It rounds down, so
 // the bar fills only once every row is verified and never reads as finished
