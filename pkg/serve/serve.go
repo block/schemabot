@@ -1478,6 +1478,14 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	if err != nil {
 		return webhookRuntime{}, fmt.Errorf("resolve GitHub repo-webhook secret: %w", err)
 	}
+	previousWebhookSecret, err := serverConfig.GitHub.ResolvePreviousWebhookSecret()
+	if err != nil {
+		return webhookRuntime{}, fmt.Errorf("resolve GitHub previous webhook secret: %w", err)
+	}
+	previousRepoWebhookSecret, err := serverConfig.GitHub.ResolvePreviousRepoWebhookSecret()
+	if err != nil {
+		return webhookRuntime{}, fmt.Errorf("resolve GitHub previous repo-webhook secret: %w", err)
+	}
 
 	ghClient := ghclient.NewClient(creds.AppID, []byte(creds.PrivateKey), logger,
 		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs),
@@ -1486,6 +1494,8 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		ghclient.WithQuotaReserve(serverConfig.GitHub.QuotaReserve))
 	handlerOpts := append([]webhook.HandlerOption{
 		webhook.WithRepoWebhookSecret([]byte(repoWebhookSecret)),
+		webhook.WithPreviousWebhookSecret([]byte(previousWebhookSecret)),
+		webhook.WithPreviousRepoWebhookSecret([]byte(previousRepoWebhookSecret)),
 		webhook.WithDurableWebhookDispatch(),
 		webhook.WithWebhookReconciler(),
 	}, webhookReconcileSynthesisOptions(logger)...)
@@ -1497,7 +1507,9 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	logger.Info("GitHub webhook endpoint registered",
 		"app_id", creds.AppID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs,
 		"quota_reserve", serverConfig.GitHub.QuotaReserve,
-		"repo_webhook_dispatch", repoWebhookSecret != "")
+		"repo_webhook_dispatch", repoWebhookSecret != "",
+		"previous_webhook_secret_accepted", previousWebhookSecret != "",
+		"previous_repo_webhook_secret_accepted", previousRepoWebhookSecret != "")
 	return webhookRuntime{
 		startDurableWebhookDispatch:    handler.StartDurableWebhookDispatch,
 		stopDurableWebhookDispatch:     handler.StopDurableWebhookDispatch,
@@ -1553,6 +1565,7 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 	clients := make(map[string]ghclient.GitHubClientFactory, len(appsByID))
 	quotaProbes := make([]*ghclient.QuotaProbe, 0, len(appsByID))
 	secretsByApp := make(map[string][]byte, len(appsByID))
+	previousSecretsByApp := make(map[string][]byte, len(appsByID))
 	appByID := make(map[int64]string, len(appsByID))
 
 	// Iterate App names in sorted order so startup log output is
@@ -1595,12 +1608,20 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 		secretsByApp[e.name] = []byte(secret)
 		appByID[e.id] = e.name
 
+		previousSecret, err := e.cfg.ResolvePreviousWebhookSecret()
+		if err != nil {
+			return webhookRuntime{}, fmt.Errorf("resolve previous webhook secret for app %q: %w", e.name, err)
+		}
+		previousSecretsByApp[e.name] = []byte(previousSecret)
+
 		logger.Info("registered GitHub App",
 			"app_name", e.name, "app_id", e.id, "trusted_check_app_slugs", e.cfg.TrustedCheckAppSlugs,
-			"quota_reserve", e.cfg.QuotaReserve)
+			"quota_reserve", e.cfg.QuotaReserve,
+			"previous_webhook_secret_accepted", previousSecret != "")
 	}
 
 	handlerOpts := append([]webhook.HandlerOption{
+		webhook.WithPreviousWebhookSecrets(previousSecretsByApp),
 		webhook.WithDurableWebhookDispatch(),
 		webhook.WithWebhookReconciler(),
 	}, webhookReconcileSynthesisOptions(logger)...)

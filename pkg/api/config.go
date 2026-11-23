@@ -638,6 +638,14 @@ type GitHubConfig struct {
 	// Supports secret references: env:VAR, file:/path, secretsmanager:name#key.
 	WebhookSecret string `yaml:"webhook-secret"`
 
+	// PreviousWebhookSecret is the webhook secret being rotated out. While it
+	// is set, a delivery signed with it is accepted as well as one signed with
+	// WebhookSecret, so deliveries are not refused in the window between
+	// deploying the new secret and changing it on GitHub. Remove it once
+	// GitHub signs with the new secret. Requires WebhookSecret. Supports
+	// secret references: env:VAR, file:/path, secretsmanager:name#key.
+	PreviousWebhookSecret string `yaml:"previous-webhook-secret,omitempty"`
+
 	// RepoWebhookSecret is the HMAC secret for validating repository-level
 	// webhook deliveries (registered directly on a repo, as opposed to the
 	// App's own webhook). When set, the handler additionally accepts
@@ -647,6 +655,12 @@ type GitHubConfig struct {
 	// dispatch (the default). Supports secret references: env:VAR, file:/path,
 	// secretsmanager:name#key.
 	RepoWebhookSecret string `yaml:"repo-webhook-secret,omitempty"`
+
+	// PreviousRepoWebhookSecret is the repo-webhook secret being rotated out,
+	// accepted alongside RepoWebhookSecret the same way PreviousWebhookSecret
+	// is accepted alongside WebhookSecret. Requires RepoWebhookSecret.
+	// Supports secret references: env:VAR, file:/path, secretsmanager:name#key.
+	PreviousRepoWebhookSecret string `yaml:"previous-repo-webhook-secret,omitempty"`
 
 	// CheckName is the base name for aggregate GitHub Check Runs published by
 	// this App. Environment-scoped deployments append the environment in
@@ -846,6 +860,31 @@ func (g *GitHubConfig) ResolveWebhookSecret() (string, error) {
 // dispatch is not configured.
 func (g *GitHubConfig) ResolveRepoWebhookSecret() (string, error) {
 	return secrets.Resolve(g.RepoWebhookSecret, "")
+}
+
+// ResolvePreviousWebhookSecret resolves the webhook secret being rotated out.
+// Empty when no rotation is in progress.
+func (g *GitHubConfig) ResolvePreviousWebhookSecret() (string, error) {
+	return secrets.Resolve(g.PreviousWebhookSecret, "")
+}
+
+// ResolvePreviousRepoWebhookSecret resolves the repo-webhook secret being
+// rotated out. Empty when no rotation is in progress.
+func (g *GitHubConfig) ResolvePreviousRepoWebhookSecret() (string, error) {
+	return secrets.Resolve(g.PreviousRepoWebhookSecret, "")
+}
+
+// validatePreviousWebhookSecrets refuses a previous secret configured without
+// the secret it is being rotated to, which would leave the old secret as the
+// only one accepted.
+func (g *GitHubConfig) validatePreviousWebhookSecrets(scope string) error {
+	if g.PreviousWebhookSecret != "" && g.WebhookSecret == "" {
+		return fmt.Errorf("%s: previous-webhook-secret is set but webhook-secret is not; set webhook-secret to the new secret", scope)
+	}
+	if g.PreviousRepoWebhookSecret != "" && g.RepoWebhookSecret == "" {
+		return fmt.Errorf("%s: previous-repo-webhook-secret is set but repo-webhook-secret is not; set repo-webhook-secret to the new secret", scope)
+	}
+	return nil
 }
 
 // GitHubAppConfig is one entry in ServerConfig.Apps. It carries the same
@@ -3103,7 +3142,7 @@ func (c *ServerConfig) validateNoLocalRemoteRouteCollision() error {
 //   - If apps: is NOT set, repos must not declare github_app (it would be a
 //     silently ignored field, which we want to fail closed on).
 func (c *ServerConfig) validateGitHubAppsConfig() error {
-	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != "" || c.GitHub.CheckName != "" || len(c.GitHub.TrustedCheckAppSlugs) > 0 || c.GitHub.PromotionCheckName != "" || c.GitHub.QuotaReserve != 0
+	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != "" || c.GitHub.PreviousWebhookSecret != "" || c.GitHub.CheckName != "" || len(c.GitHub.TrustedCheckAppSlugs) > 0 || c.GitHub.PromotionCheckName != "" || c.GitHub.QuotaReserve != 0
 	hasApps := c.Apps != nil
 
 	if hasGitHub && hasApps {
@@ -3120,6 +3159,12 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 		if err := c.GitHub.validateQuotaReserve("github"); err != nil {
 			return err
 		}
+	}
+	// Checked outside hasGitHub: a lone previous-repo-webhook-secret does not
+	// count as configuring github:, and it must still be refused rather than
+	// ignored.
+	if err := c.GitHub.validatePreviousWebhookSecrets("github"); err != nil {
+		return err
 	}
 
 	if hasApps {

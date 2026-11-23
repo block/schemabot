@@ -4944,6 +4944,28 @@ func TestServerConfig_AppsValidation(t *testing.T) {
 			wantErrSub: "github quota-reserve must not be negative, got -1",
 		},
 		{
+			name: "single-app github: rotating both webhook secrets is accepted",
+			github: GitHubConfig{
+				AppID: "42", PrivateKey: "env:PK", WebhookSecret: "env:WS", PreviousWebhookSecret: "env:OLD_WS",
+				RepoWebhookSecret: "env:RWS", PreviousRepoWebhookSecret: "env:OLD_RWS",
+			},
+			repos: map[string]RepoConfig{"org/repo": {}},
+		},
+		{
+			name: "single-app github: previous webhook secret without the new one is rejected",
+			github: GitHubConfig{
+				AppID: "42", PrivateKey: "env:PK", PreviousWebhookSecret: "env:OLD_WS",
+			},
+			repos:      map[string]RepoConfig{"org/repo": {}},
+			wantErrSub: "github: previous-webhook-secret is set but webhook-secret is not",
+		},
+		{
+			name:       "previous repo-webhook secret without the new one is rejected even with nothing else under github:",
+			github:     GitHubConfig{PreviousRepoWebhookSecret: "env:OLD_RWS"},
+			repos:      map[string]RepoConfig{"org/repo": {}},
+			wantErrSub: "github: previous-repo-webhook-secret is set but repo-webhook-secret is not",
+		},
+		{
 			name: "app with a negative quota reserve is rejected",
 			apps: map[string]GitHubAppConfig{
 				"app-a": {

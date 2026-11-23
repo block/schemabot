@@ -318,6 +318,22 @@ If `webhook-secret` is set in the config, SchemaBot validates the `X-Hub-Signatu
 
 If the secret is not set, signature validation is skipped (useful for local development).
 
+### Rotating the webhook secret
+
+GitHub signs each delivery with one secret, and changing it on GitHub takes effect immediately. To rotate without refusing deliveries, keep the old secret in the config as `previous-webhook-secret` while the change rolls out. SchemaBot accepts a delivery signed with either secret.
+
+1. Deploy the new secret as `webhook-secret` and the old one as `previous-webhook-secret`.
+2. Change the webhook secret in the GitHub App settings to the new secret.
+3. Once SchemaBot stops logging `webhook delivery verified with the secret being rotated out`, remove `previous-webhook-secret` and deploy again.
+
+```yaml
+github:
+  webhook-secret: "env:GITHUB_WEBHOOK_SECRET"                    # the new secret
+  previous-webhook-secret: "env:GITHUB_PREVIOUS_WEBHOOK_SECRET"  # the old secret, removed after step 3
+```
+
+`previous-repo-webhook-secret` does the same for `repo-webhook-secret`. In multi-App mode, each entry under `apps:` accepts its own `previous-webhook-secret`. A previous secret without the matching current secret fails startup.
+
 ## Repository-level Webhooks (optional)
 
 A single deployment can also accept deliveries from a **repository-level webhook** (a webhook configured directly on a repo, rather than on the GitHub App). This lets several SchemaBot deployments that share one GitHub App all receive the same repo's events. Set a separate secret for these deliveries:
