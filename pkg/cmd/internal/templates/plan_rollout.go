@@ -140,9 +140,10 @@ func wrapNames(names []string, more, indent int) []string {
 // whose change its engine refuses is told to change the schema files, since no
 // apply runs it. Every other member gets the narrowed apply that runs it under
 // its own plan and its own consent. reruns holds one command per refused
-// member that a narrowed apply runs, without the binary name. Past
+// member that a narrowed apply runs, as its words without the binary name, one
+// shell-escaped word per element. Past
 // memberNamesInlineLimit the rest are counted rather than spelled out.
-func WriteRolloutApplyRefused(noun presentation.Noun, refused []*apitypes.PlanMemberRefusalResponse, reruns []string) {
+func WriteRolloutApplyRefused(noun presentation.Noun, refused []*apitypes.PlanMemberRefusalResponse, reruns [][]string) {
 	fmt.Printf("%s Apply blocked: an apply of the whole rollout cannot run the plan of %d %s\n\n", glyph.Refused, len(refused), noun.Label(len(refused)))
 	shown := min(len(refused), memberNamesInlineLimit)
 	for _, r := range refused[:shown] {
@@ -173,7 +174,7 @@ func WriteRolloutApplyRefused(noun presentation.Noun, refused []*apitypes.PlanMe
 	fmt.Println()
 	shownReruns := min(len(reruns), memberNamesInlineLimit)
 	for _, rerun := range reruns[:shownReruns] {
-		fmt.Printf("  %s\n", cliname.Command(rerun))
+		fmt.Printf("  %s\n", cliname.Command(rerun...))
 	}
 	if rest := len(reruns) - shownReruns; rest > 0 {
 		fmt.Printf("  and the same for %d more %s\n", rest, noun.Label(rest))
