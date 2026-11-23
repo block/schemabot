@@ -929,7 +929,7 @@ schemabot plan -e staging
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
-ALTER TABLE users ALTER COLUMN email TYPE bigint;
+ALTER TABLE users ADD COLUMN order_ref text UNIQUE;
 ```
 
 ```sql
@@ -937,7 +937,7 @@ ALTER TABLE orders ADD COLUMN notes text;
 ```
 
 ⛔ **Cannot apply**: 1 change the engine refuses to execute
-- `users`: statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned
+- `users`: statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change
   - statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit
 
 An apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
@@ -1366,7 +1366,7 @@ schemabot apply -e staging
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
-ALTER TABLE users ALTER COLUMN email TYPE bigint;
+ALTER TABLE users ADD COLUMN order_ref text UNIQUE;
 ```
 
 ```sql
@@ -1378,7 +1378,7 @@ ALTER TABLE orders ADD COLUMN notes text;
 ---
 
 **⛔ Apply rejected**: 1 planned change the engine refuses to execute
-- `users`: statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned
+- `users`: statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change
   - statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit
 
 Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
