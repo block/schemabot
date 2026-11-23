@@ -328,11 +328,14 @@ reports the latest trustworthy installation budget, without a repository label.
 Group by `github_app`, `installation_id`, and `resource`, taking the minimum
 across replicas. Snapshots require a named App, positive installation ID, valid
 remaining/limit headers, and a reset time after the response was received.
-They disappear from collection when older than 120 seconds. A snapshot whose
-window resets stays exported until a newer reading replaces it or it ages out:
-GitHub restores the full budget at the reset, so the allowance read before it
-only understates the budget until the next reading, and a routine hourly reset
-never turns an installation that is being read into an unknown budget. Repeated scrapes,
+They disappear from collection when older than 120 seconds, and not before:
+a snapshot whose window resets stays exported until a newer reading replaces
+it or it ages out, so a routine hourly reset never turns an installation that
+is being read into an unknown budget. A snapshot is a reading of bounded age,
+not a lower bound on the budget: requests made since it was read, by this
+replica or any other consumer of the installation, are not in it, across a
+reset or not. A headroom threshold should leave room for what the
+installation can spend within the export age. Repeated scrapes,
 local quota refusals and secondary cooldown waits do not refresh observation age.
 Within one window the lowest allowance seen is kept, in any receipt order, even
 when GitHub later reports more; a later response with more remaining still

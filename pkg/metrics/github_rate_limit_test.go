@@ -110,8 +110,8 @@ func TestGitHubQuotaSnapshotRegistryFreshness(t *testing.T) {
 // An installation's hourly window resets between two quota probe reads. The
 // installation was read seconds before the reset and is read again a probe
 // interval later, so its budget is never unknown: across the reset it keeps
-// exporting the allowance read before it, which is no more than the full
-// budget GitHub restores, and the next read replaces it with the new window.
+// exporting the allowance read before it until the next read replaces it with
+// the new window.
 // An installation that is not read again still turns unobserved once that
 // reading ages out, so a stalled probe or a failing read keeps a quota gate
 // closed.
