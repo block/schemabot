@@ -100,10 +100,13 @@ that keeps one PostgreSQL session per client connection. A transaction-mode
 pooler can move the schema change's session settings, such as its
 `statement_timeout`, onto another client's backend. SchemaBot does not check a
 target's connection for a pooler, so make sure each target DSN points at a
-direct or session-mode endpoint. Only the storage DSN is checked: startup
-refuses a transaction-mode pooler there it can detect, because SchemaBot
-coordinates its instances with session-scoped advisory locks. Your application
-keeps whatever pooling it already uses.
+direct or session-mode endpoint. The storage DSN needs the same kind of
+endpoint, because SchemaBot coordinates its instances with session-scoped
+advisory locks. Startup checks that the storage connection keeps its session
+and refuses to start when the check shows it does not, but a passing check is
+not proof, so choose a direct or session-mode endpoint either way (see
+[SchemaBot storage](#schemabot-storage)). Your application keeps whatever
+pooling it already uses.
 
 ## What pg-sprite does
 
@@ -1139,9 +1142,12 @@ recovery path re-plans, then clears its in-memory progress so stale state from
 one apply cannot be reported for another.
 
 This recovery guarantee does not make the DDL resumable within a statement or
-create-set task. Each statement or sequence step is one PostgreSQL transaction:
-it commits or fails, and recovery re-plans against the live target before
-further work. A privilege refusal is a permanent failed task, includes the
+create-set task. Each ordinary DDL statement or sequence step is one PostgreSQL
+transaction: it commits or fails, and recovery re-plans against the live
+target before further work. A concurrent index build is the exception: it runs
+outside a transaction, so an interrupted build can leave an invalid index,
+which the next drive removes once it can prove the build abandoned (see
+[Index builds](#index-builds)). A privilege refusal is a permanent failed task, includes the
 required provisioning advice, and leaves the target unchanged.
 
 Rollback captures the same live table set the forward plan manages. Tables
@@ -1216,8 +1222,10 @@ storage DSN and bootstrap behavior.
 
 The storage DSN must reach an endpoint that gives each connection its own
 PostgreSQL session, because SchemaBot coordinates its instances with
-session-scoped advisory locks. Startup refuses a transaction-mode pooled
-connection string rather than run without that coordination. See
+session-scoped advisory locks. Startup checks that the connection keeps its
+session and refuses to start when the check shows it does not. A passing check
+is not proof, so choose a direct or session-mode endpoint even when startup
+accepts the DSN. See
 [Configuration → PostgreSQL storage needs a session-per-connection endpoint](configuration.md#postgresql-storage-needs-a-session-per-connection-endpoint).
 
 ## Supabase compatibility tests
