@@ -408,8 +408,15 @@ type planFlowResult struct {
 	// this text fail, so a test can lose one comment of a flow and keep the rest.
 	FailCommentPostContaining atomic.Pointer[string]
 
-	// postedComments are the comments the fake accepted, each under an ID of
-	// its own, so a test can tell which comment a later edit targets.
+	// DistinctCommentIDs makes the fake answer each accepted comment with an
+	// ID of its own (100, 101, ...) instead of 99, so a test can tell which
+	// comment a later edit targets. It is opt-in: with distinct IDs a
+	// superseded plan comment is really deleted, which tests that count
+	// requests do not expect.
+	DistinctCommentIDs atomic.Bool
+
+	// postedComments are the comments the fake accepted, with the ID each was
+	// answered with.
 	postedMu       sync.Mutex
 	postedComments []postedComment
 
@@ -1045,7 +1052,10 @@ func setupFakeGitHubForPlanInRepository(t *testing.T, mux *http.ServeMux, schema
 			return
 		}
 		result.postedMu.Lock()
-		id := int64(100 + len(result.postedComments))
+		id := int64(99)
+		if result.DistinctCommentIDs.Load() {
+			id = int64(100 + len(result.postedComments))
+		}
 		result.postedComments = append(result.postedComments, postedComment{ID: id, Body: body.Body})
 		result.postedMu.Unlock()
 		w.WriteHeader(http.StatusCreated)

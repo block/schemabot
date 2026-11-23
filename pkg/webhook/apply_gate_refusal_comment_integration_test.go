@@ -30,9 +30,10 @@ type gateRefusalEdit struct {
 }
 
 // recordCommentEdits serves comment edits on the fake GitHub, answering with
-// status, and returns what it receives. The fake answers each posted comment
-// with an ID of its own, so an edit's ID names the comment it targets.
-func recordCommentEdits(mux *http.ServeMux, status int) <-chan gateRefusalEdit {
+// status, and returns what it receives. It also has the fake answer each posted
+// comment with an ID of its own, so an edit's ID names the comment it targets.
+func recordCommentEdits(mux *http.ServeMux, result *planFlowResult, status int) <-chan gateRefusalEdit {
+	result.DistinctCommentIDs.Store(true)
 	edits := make(chan gateRefusalEdit, 10)
 	mux.HandleFunc("PATCH /repos/octocat/hello-world/issues/comments/{id}", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -82,7 +83,9 @@ func TestE2EAutomaticApplyRefusedByAFreezeEditsItsComment(t *testing.T) {
 	apply := runRolloutWebhookWithFiles(t, svc, dbName,
 		buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e " + driftEnv, isPR: true}, nil),
 		map[string]string{"users.sql": usersWithEmailSchema},
-		func(mux *http.ServeMux, _ *planFlowResult) { edits = recordCommentEdits(mux, http.StatusOK) })
+		func(mux *http.ServeMux, result *planFlowResult) {
+			edits = recordCommentEdits(mux, result, http.StatusOK)
+		})
 
 	announced := awaitCommentContaining(t, apply, "**Applying automatically**")
 	assert.Contains(t, announced, "🔒 **Lock acquired by**")
@@ -118,7 +121,7 @@ func TestE2EAutomaticApplyRefusedByAFreezeNamesTheNextStepWhenTheRefusalDoesNotP
 		buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e " + driftEnv, isPR: true}, nil),
 		map[string]string{"users.sql": usersWithEmailSchema},
 		func(mux *http.ServeMux, result *planFlowResult) {
-			edits = recordCommentEdits(mux, http.StatusOK)
+			edits = recordCommentEdits(mux, result, http.StatusOK)
 			refusalHeading := "## ❄️ Apply Blocked by a Freeze"
 			result.FailCommentPostContaining.Store(&refusalHeading)
 		})
@@ -171,7 +174,9 @@ func TestE2EAutomaticApplyRefusedByAFreezeMakesNoLockClaimWhenTheReleaseFails(t 
 	apply := runRolloutWebhookWithFiles(t, svc, dbName,
 		buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e " + driftEnv, isPR: true}, nil),
 		map[string]string{"users.sql": usersWithEmailSchema},
-		func(mux *http.ServeMux, _ *planFlowResult) { edits = recordCommentEdits(mux, http.StatusOK) })
+		func(mux *http.ServeMux, result *planFlowResult) {
+			edits = recordCommentEdits(mux, result, http.StatusOK)
+		})
 
 	awaitCommentContaining(t, apply, "## ❄️ Apply Blocked by a Freeze\n")
 	edit := awaitCapture(t, edits, "the announcing comment to be edited", func(gateRefusalEdit) bool { return true })
@@ -198,7 +203,9 @@ func TestE2EAutomaticApplyRefusedByAFreezeSurvivesAFailedEdit(t *testing.T) {
 	apply := runRolloutWebhookWithFiles(t, svc, dbName,
 		buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e " + driftEnv, isPR: true}, nil),
 		map[string]string{"users.sql": usersWithEmailSchema},
-		func(mux *http.ServeMux, _ *planFlowResult) { edits = recordCommentEdits(mux, http.StatusNotFound) })
+		func(mux *http.ServeMux, result *planFlowResult) {
+			edits = recordCommentEdits(mux, result, http.StatusNotFound)
+		})
 
 	awaitCommentContaining(t, apply, "## ❄️ Apply Blocked by a Freeze\n")
 	awaitCapture(t, edits, "the edit attempt", func(gateRefusalEdit) bool { return true })
@@ -226,7 +233,7 @@ func TestE2EApplyConfirmRefusedByAFreezeEditsNoComment(t *testing.T) {
 	client.BaseURL = baseURL
 	result := setupFakeGitHubForPlan(t, mux, map[string]string{"users.sql": confirmEnvironmentUsersSQL},
 		fmt.Sprintf("database: %s\ntype: mysql\n", dbName), dbName)
-	edits := recordCommentEdits(mux, http.StatusOK)
+	edits := recordCommentEdits(mux, result, http.StatusOK)
 	h := newE2EHandler(t, svc, client)
 
 	rr := httptest.NewRecorder()
