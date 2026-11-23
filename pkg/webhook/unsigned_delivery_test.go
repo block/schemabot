@@ -12,11 +12,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const unsignedDeliveryWarning = "webhook signature verification is skipped because no webhook secret is configured"
-
-// An embedder that builds the handler with an empty webhook secret still has
-// unsigned deliveries accepted. Without the explicit opt-in the handler warns,
-// once per handler, naming the option; with the opt-in it skips silently.
+// An embedder that builds the handler with an empty webhook secret cannot
+// prove any delivery came from GitHub, so every delivery is refused with the
+// same answer as a bad signature, and the log names the missing secret. Only
+// the explicit opt-in for tests and local harnesses accepts it unsigned.
 func TestUnsignedDeliveryWithoutSecret(t *testing.T) {
 	deliver := func(t *testing.T, h *Handler) *httptest.ResponseRecorder {
 		t.Helper()
@@ -28,31 +27,20 @@ func TestUnsignedDeliveryWithoutSecret(t *testing.T) {
 		return rec
 	}
 
-	t.Run("without the option the delivery is accepted and the warning names the option", func(t *testing.T) {
+	t.Run("without the option the delivery is refused and the log names the missing secret", func(t *testing.T) {
 		var logs bytes.Buffer
 		logger := slog.New(slog.NewTextHandler(&logs, nil))
 		h := NewHandler(nil, nil, nil, logger)
 
 		rec := deliver(t, h)
-		require.Equal(t, http.StatusOK, rec.Code)
-		assert.Contains(t, rec.Body.String(), "event type 'ping' ignored")
-		assert.Contains(t, logs.String(), "level=WARN")
-		assert.Contains(t, logs.String(), unsignedDeliveryWarning)
-		assert.Contains(t, logs.String(), "WithInsecureSkipSignatureVerification")
+		require.Equal(t, http.StatusUnauthorized, rec.Code)
+		assert.Contains(t, rec.Body.String(), "invalid webhook dispatch")
+		assert.NotContains(t, rec.Body.String(), "secret", "the response must not say which check failed")
+		assert.Contains(t, logs.String(), "auth_status=missing_webhook_secret")
 		assert.Contains(t, logs.String(), "delivery_id=delivery-1")
 	})
 
-	t.Run("the warning is logged once per handler", func(t *testing.T) {
-		var logs bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&logs, nil))
-		h := NewHandler(nil, nil, nil, logger)
-
-		require.Equal(t, http.StatusOK, deliver(t, h).Code)
-		require.Equal(t, http.StatusOK, deliver(t, h).Code)
-		assert.Equal(t, 1, strings.Count(logs.String(), unsignedDeliveryWarning))
-	})
-
-	t.Run("with the option the delivery is accepted and nothing is warned", func(t *testing.T) {
+	t.Run("with the option the delivery is accepted unsigned", func(t *testing.T) {
 		var logs bytes.Buffer
 		logger := slog.New(slog.NewTextHandler(&logs, nil))
 		h := NewHandler(nil, nil, nil, logger, WithInsecureSkipSignatureVerification())
@@ -60,8 +48,7 @@ func TestUnsignedDeliveryWithoutSecret(t *testing.T) {
 		rec := deliver(t, h)
 		require.Equal(t, http.StatusOK, rec.Code)
 		assert.Contains(t, rec.Body.String(), "event type 'ping' ignored")
-		assert.NotContains(t, logs.String(), unsignedDeliveryWarning)
-		assert.NotContains(t, logs.String(), "level=WARN")
+		assert.NotContains(t, logs.String(), "missing_webhook_secret")
 	})
 }
 

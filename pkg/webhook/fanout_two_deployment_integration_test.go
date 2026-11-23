@@ -182,9 +182,10 @@ func TestE2EFanOutStopOwnerActsSiblingSilent(t *testing.T) {
 	participantFanOutConfig(service.Config(), "tenant-a")
 	service.RegisterTernClient(database, "staging", &stopCommandTernClient{remote: true})
 	owner := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:                            testLogger(),
 	}
 	sibling, siblingComments := siblingFanOutHandler(t)
 

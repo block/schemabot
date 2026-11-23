@@ -111,9 +111,10 @@ func TestE2EStopCommandRecordsDurableRequest(t *testing.T) {
 	service := apiServiceForStopCommandTest(t, store, database)
 	service.RegisterTernClient(database, "staging", &stopCommandTernClient{remote: true})
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:                            testLogger(),
 	}
 
 	postStopCommand(t, h, applyIdentifier, "alice")
@@ -185,9 +186,10 @@ func TestE2ECancelCommandRecordsDurableRequest(t *testing.T) {
 	service := apiServiceForStopCommandTest(t, store, database)
 	service.RegisterTernClient(database, "staging", &stopCommandTernClient{remote: true})
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:                            testLogger(),
 	}
 
 	postCancelCommand(t, h, applyIdentifier, "alice")
@@ -273,9 +275,10 @@ func TestE2EStopCommandQueuesDeferredCutoverLocalApplyWithoutRunner(t *testing.T
 	})
 	service.RegisterTernClient(database, "staging", localClient)
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:                            testLogger(),
 	}
 
 	postStopCommand(t, h, applyIdentifier, "alice")
@@ -356,9 +359,10 @@ func TestE2EStartCommandRecordsDurableRequest(t *testing.T) {
 	service := apiServiceForStopCommandTest(t, store, database)
 	service.RegisterTernClient(database, "staging", &stopCommandTernClient{})
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:                            testLogger(),
 	}
 
 	postStartCommand(t, h, applyIdentifier, "alice")
@@ -473,9 +477,10 @@ func TestE2EStartAcknowledgementDelayedPastAWithdrawal(t *testing.T) {
 	})
 
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:                            testLogger(),
 	}
 	service.OnQueuedStartWithdrawn = h.reportQueuedStartWithdrawn
 
@@ -553,9 +558,10 @@ func TestE2EStartCommandRejectsCompletedApply(t *testing.T) {
 	service := apiServiceForStopCommandTest(t, store, database)
 	service.RegisterTernClient(database, "staging", &stopCommandTernClient{})
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:                            testLogger(),
 	}
 
 	postStartCommand(t, h, applyIdentifier, "alice")
@@ -626,9 +632,10 @@ func TestE2ECutoverCommandRecordsDurableRequest(t *testing.T) {
 	service := apiServiceForStopCommandTest(t, store, database)
 	service.RegisterTernClient(database, "staging", &stopCommandTernClient{remote: true})
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:                            testLogger(),
 	}
 
 	postCutoverCommand(t, h, applyIdentifier, "alice")
@@ -703,9 +710,10 @@ func TestE2ESkipRevertCommandAcceptsApplyID(t *testing.T) {
 	service := apiServiceForStopCommandTest(t, store, database)
 	service.RegisterTernClient(database, "staging", &stopCommandTernClient{remote: true})
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:                            testLogger(),
 	}
 
 	postSkipRevertCommand(t, h, applyIdentifier, "alice")
@@ -778,9 +786,10 @@ func TestE2ERevertCommandRevertsApply(t *testing.T) {
 	ternClient := &stopCommandTernClient{remote: true}
 	service.RegisterTernClient(database, "staging", ternClient)
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:                            testLogger(),
 	}
 
 	postRevertCommand(t, h, applyIdentifier, "alice")
@@ -868,9 +877,10 @@ func TestE2ECutoverCommandRejectsPendingStop(t *testing.T) {
 	ternClient := &stopCommandTernClient{remote: true}
 	service.RegisterTernClient(database, "staging", ternClient)
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:                            testLogger(),
 	}
 
 	postCutoverCommand(t, h, applyIdentifier, "cutter")

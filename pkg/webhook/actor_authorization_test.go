@@ -503,9 +503,10 @@ func TestWebhookApplyScopedControlCommandBlocksUnauthorizedActor(t *testing.T) {
 	})
 	service := api.New(&actorAuthStorage{apply: apply, locks: &actorAuthLockStore{}}, cfg, nil, testLogger())
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:                            testLogger(),
 	}
 
 	for _, command := range []string{action.Stop, action.Cancel, action.Start} {
@@ -972,9 +973,10 @@ func actorAuthTestHandler(cfg *api.ServerConfig, installClient *ghclient.Install
 func actorAuthStorageTestHandler(cfg *api.ServerConfig, store storage.Storage, installClient *ghclient.InstallationClient) *Handler {
 	service := api.New(store, cfg, nil, testLogger())
 	return &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:                            testLogger(),
 	}
 }
 

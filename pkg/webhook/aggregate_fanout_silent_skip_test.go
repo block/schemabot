@@ -88,9 +88,10 @@ func newFanOutSkipHandler(t *testing.T, cfg *api.ServerConfig) (*Handler, *http.
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	installClient.SetConfigDirHints(cfg)
 	h := &Handler{
-		service:   api.New(&emptyStorage{}, cfg, nil, testLogger()),
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           api.New(&emptyStorage{}, cfg, nil, testLogger()),
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:                            testLogger(),
 	}
 	return h, mux, comments
 }

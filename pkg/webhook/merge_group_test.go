@@ -86,9 +86,10 @@ func mergeGroupTestHandlerWithMux(t *testing.T, allowedEnvironments []string, re
 	}, nil, testLogger())
 
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:                            testLogger(),
 	}
 	return h, created, mux
 }
@@ -203,9 +204,10 @@ func TestWebhookMergeGroupUpdatesExistingCheck(t *testing.T) {
 		Repos:               map[string]api.RepoConfig{"octocat/hello-world": {}},
 	}, nil, testLogger())
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:                            testLogger(),
 	}
 
 	rr := httptest.NewRecorder()

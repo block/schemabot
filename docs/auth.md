@@ -190,16 +190,14 @@ without an interactive login. If your proxy protects `/api/*`, give `/webhook`
 a separate route that accepts GitHub deliveries and lets SchemaBot verify
 their signatures. This does not require making the API public.
 
-Always configure the webhook secret for a shared installation. Without it,
-the single-App configuration currently skips signature verification and
-accepts unsigned deliveries, and the webhook handler logs a warning that names
-the missing secret. A future release will refuse unsigned deliveries when no
-secret is set. A program that embeds the `pkg/webhook` handler and wants to
-accept unsigned deliveries on purpose, such as a test or a local harness, passes
-`webhook.WithInsecureSkipSignatureVerification()` when it builds the handler,
-which silences the warning. The `schemabot serve` command already refuses to
-start without a webhook secret. A signed delivery proves where the event came
-from; it does not grant the comment author permission to apply a change.
+Always configure the webhook secret. The `schemabot serve` command refuses to
+start without one, and a webhook handler built without one refuses every
+delivery with `401`, logging `auth_status=missing_webhook_secret`. A program
+that embeds the `pkg/webhook` handler and wants to accept unsigned deliveries
+on purpose, such as a test or a local harness, passes
+`webhook.WithInsecureSkipSignatureVerification()` when it builds the handler.
+A signed delivery proves where the event came from; it does not grant the
+comment author permission to apply a change.
 
 Set command permissions and check the connection below. You can configure
 CLI and API access separately if you need those interfaces too.

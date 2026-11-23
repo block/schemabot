@@ -98,7 +98,7 @@ func TestWebhookRejectsOversizedBody(t *testing.T) {
 }
 
 func TestWebhookIgnoresUnknownEvents(t *testing.T) {
-	h := &Handler{logger: testLogger()} // No secret — skip validation
+	h := &Handler{logger: testLogger(), insecureSkipSignatureVerification: true} // No secret, so the test opts in to unsigned deliveries
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(`{}`))
 	req.Header.Set("X-GitHub-Event", "deployment")
@@ -423,9 +423,10 @@ func TestHandleSchemaRequestErrorRendersConfigNotAuthorized(t *testing.T) {
 
 			installClient := ghclient.NewInstallationClient(client, testLogger())
 			h := &Handler{
-				service:   api.New(nil, tc.config, nil, testLogger()),
-				ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
-				logger:    testLogger(),
+				insecureSkipSignatureVerification: true,
+				service:                           api.New(nil, tc.config, nil, testLogger()),
+				ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+				logger:                            testLogger(),
 			}
 
 			h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "", "hubot", "apply", &schemaConfigOutsideAllowedDirsError{
@@ -477,9 +478,10 @@ func TestCheckRunRerequestIgnoresStaleHeadSHA(t *testing.T) {
 	}, nil, testLogger())
 
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, factory),
+		logger:                            testLogger(),
 	}
 
 	req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{
@@ -538,9 +540,10 @@ func newTestHandlerWithStorage(t *testing.T, st storage.Storage) (*Handler, chan
 	}, nil, testLogger())
 
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, factory),
+		logger:                            testLogger(),
 	}
 	drainWebhookWorkOnCleanup(t, h)
 	return h, comments, reactions
@@ -1449,9 +1452,10 @@ func TestWebhookRepoAllowlistRejectsUnregisteredRepo(t *testing.T) {
 	}, nil, testLogger())
 
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, factory),
+		logger:                            testLogger(),
 	}
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -1494,9 +1498,10 @@ func TestWebhookRepoAllowlistAllowsRegisteredRepo(t *testing.T) {
 	}, nil, testLogger())
 
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, factory),
+		logger:                            testLogger(),
 	}
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -1530,9 +1535,10 @@ func TestWebhookRepoAllowlistEmptyAllowsAll(t *testing.T) {
 	}, nil, testLogger())
 
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, factory),
+		logger:                            testLogger(),
 	}
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -1556,8 +1562,9 @@ func TestWebhookRepoAllowlistPullRequestRejectsUnregistered(t *testing.T) {
 	}, nil, testLogger())
 
 	h := &Handler{
-		service: service,
-		logger:  testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		logger:                            testLogger(),
 	}
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "opened"}, nil)
@@ -1642,9 +1649,10 @@ func TestSchemaErrorGuidanceUsesServerStrataSetting(t *testing.T) {
 			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
 			installClient := ghclient.NewInstallationClient(client, testLogger())
 			h := &Handler{
-				service:   api.New(nil, &api.ServerConfig{ExperimentalStrataEnabled: enabled}, nil, testLogger()),
-				ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
-				logger:    testLogger(),
+				insecureSkipSignatureVerification: true,
+				service:                           api.New(nil, &api.ServerConfig{ExperimentalStrataEnabled: enabled}, nil, testLogger()),
+				ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+				logger:                            testLogger(),
 			}
 			for _, requestErr := range []error{ghclient.ErrNoConfig, ghclient.ErrInvalidConfig} {
 				h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "", "hubot", "plan", requestErr, false)

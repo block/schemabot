@@ -266,9 +266,10 @@ func TestHandleRollbackCommandStorageUnavailablePostsError(t *testing.T) {
 
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	h := &Handler{
-		service:   api.New(nil, &api.ServerConfig{}, nil, testLogger()),
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           api.New(nil, &api.ServerConfig{}, nil, testLogger()),
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:                            testLogger(),
 	}
 
 	h.handleRollbackCommand("octocat/hello-world", 1, 12345, "hubot", CommandResult{

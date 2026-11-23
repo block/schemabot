@@ -412,9 +412,10 @@ func newControlOverrideFixture(t *testing.T, applyIdentifier, database string, c
 	service.Config().Freeze.GitHubTeams = []string{approveTeam}
 	service.Config().Freeze.OverridePolicy = api.FreezeOverridePolicyApproval
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:                            testLogger(),
 	}
 	drainWebhookWorkOnCleanup(t, h)
 	return &controlOverrideFixture{handler: h, store: store, comments: comments, applyID: applyIdentifier,
