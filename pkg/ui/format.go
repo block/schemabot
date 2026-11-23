@@ -180,6 +180,9 @@ func VSchemaStatusLabel(status string) string {
 // FormatETA formats a duration in seconds as a human-readable string, using the
 // two largest non-zero units so a long copy stays readable.
 // Examples: 45 → "45s", 195 → "3m 15s", 3700 → "1h 1m", 180000 → "2d 2h"
+//
+// FormatDurationSeconds is the other seconds-based formatter. It stops at hours
+// instead of reporting days.
 func FormatETA(seconds int64) string {
 	const (
 		minute = 60
@@ -343,8 +346,12 @@ func FormatTimeAgo(t time.Time) string {
 	return fmt.Sprintf("%d days ago", days)
 }
 
-// FormatHumanDuration formats a duration in a human-readable way.
+// FormatHumanDuration formats an elapsed duration in a human-readable way,
+// using at most the two largest units and leaving out a unit that is zero.
 // Examples: 500ms → "< 1s", 45s → "45s", 90s → "1m 30s", 2h → "2h"
+//
+// FormatExactDuration is the other duration formatter. It keeps every non-zero
+// unit, so it shows the minutes of a duration that runs a day or longer.
 func FormatHumanDuration(d time.Duration) string {
 	if d < time.Second {
 		return "< 1s"
@@ -382,6 +389,81 @@ func FormatHumanDuration(d time.Duration) string {
 		return fmt.Sprintf("%dw", weeks)
 	}
 	return fmt.Sprintf("%dw %dd", weeks, remainDays)
+}
+
+// FormatDurationSeconds formats a number of seconds that remain, such as the
+// time left in a revert window or a shard's copy ETA. Its largest unit is
+// hours (it never reports days), and it always shows the smaller unit, so one
+// minute reads "1m 0s". Zero and negative values read "< 1s".
+// Examples: 0 → "< 1s", 45 → "45s", 60 → "1m 0s", 3661 → "1h 1m", 90000 → "25h 0m"
+//
+// FormatETA is the other seconds-based formatter. It reports days and writes
+// zero as "0s", so the two differ for a copy that runs a day or longer.
+func FormatDurationSeconds(seconds int64) string {
+	if seconds <= 0 {
+		return "< 1s"
+	}
+	if seconds < 60 {
+		return fmt.Sprintf("%ds", seconds)
+	}
+	if seconds < 3600 {
+		return fmt.Sprintf("%dm %ds", seconds/60, seconds%60)
+	}
+	return fmt.Sprintf("%dh %dm", seconds/3600, (seconds%3600)/60)
+}
+
+// FormatExactDuration formats a duration with seconds under an hour and minutes
+// at every larger scale, and leaves out any unit that is zero. It truncates to whole seconds first, so a
+// duration under a second reads "0s". From a week up it leads with weeks. A
+// negative duration reads as negative seconds ("-90s"); callers pass a
+// duration that has already been checked to be positive.
+// Examples: 45s → "45s", 5m → "5m", 25h → "1d 1h", 25h1m → "1d 1h 1m", 8d3h4m → "1w 1d 3h 4m"
+//
+// FormatHumanDuration is the other duration formatter. It stops at the two
+// largest units, so it drops the minutes from a duration of a day or longer, and
+// it writes a duration under a second as "< 1s".
+func FormatExactDuration(d time.Duration) string {
+	d = d.Truncate(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		m := int(d.Minutes())
+		s := int(d.Seconds()) % 60
+		if s > 0 {
+			return fmt.Sprintf("%dm %ds", m, s)
+		}
+		return fmt.Sprintf("%dm", m)
+	}
+	totalHours := int(d.Hours())
+	if totalHours < 24 {
+		m := int(d.Minutes()) % 60
+		if m > 0 {
+			return fmt.Sprintf("%dh %dm", totalHours, m)
+		}
+		return fmt.Sprintf("%dh", totalHours)
+	}
+	totalDays := totalHours / 24
+	hours := totalHours % 24
+	m := int(d.Minutes()) % 60
+	var parts []string
+	if totalDays >= 7 {
+		weeks := totalDays / 7
+		days := totalDays % 7
+		parts = append(parts, fmt.Sprintf("%dw", weeks))
+		if days > 0 {
+			parts = append(parts, fmt.Sprintf("%dd", days))
+		}
+	} else {
+		parts = append(parts, fmt.Sprintf("%dd", totalDays))
+	}
+	if hours > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", hours))
+	}
+	if m > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", m))
+	}
+	return strings.Join(parts, " ")
 }
 
 // CapitalizeFirst capitalizes the first letter of a string.

@@ -145,7 +145,7 @@ func WriteProgress(data ProgressData) {
 			if expires, err := time.Parse(time.RFC3339, expiresStr); err == nil {
 				remaining := time.Until(expires)
 				if remaining > 0 {
-					rows = append(rows, BoxRow{"Revert expires in", FormatDurationSeconds(int64(remaining.Seconds()))})
+					rows = append(rows, BoxRow{"Revert expires in", ui.FormatDurationSeconds(int64(remaining.Seconds()))})
 				}
 			}
 		}

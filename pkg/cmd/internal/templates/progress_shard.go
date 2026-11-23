@@ -140,7 +140,7 @@ func formatShardLine(s ShardProgress, pendingWord, runningWord string) string {
 		return fmt.Sprintf(indentShardLine+"%s%s %s%s: %s\n", ANSIGreen, glyph, s.Shard, ANSIReset, detail)
 	case state.Task.Running:
 		if s.ETASeconds > 0 {
-			detail += " · ETA: " + FormatDurationSeconds(s.ETASeconds)
+			detail += " · ETA: " + ui.FormatDurationSeconds(s.ETASeconds)
 		}
 		return fmt.Sprintf(indentShardLine+"%s%s %s%s: %s\n", ANSICyan, glyph, s.Shard, ANSIReset, detail)
 	case state.Task.WaitingForCutover, state.Task.CuttingOver:
@@ -155,18 +155,4 @@ func formatShardLine(s ShardProgress, pendingWord, runningWord string) string {
 	default:
 		return fmt.Sprintf(indentShardLine+"%s%s %s: %s%s\n", ANSIDim, glyph, s.Shard, detail, ANSIReset)
 	}
-}
-
-// FormatDurationSeconds formats seconds into a human-readable duration.
-func FormatDurationSeconds(seconds int64) string {
-	if seconds <= 0 {
-		return "< 1s"
-	}
-	if seconds < 60 {
-		return fmt.Sprintf("%ds", seconds)
-	}
-	if seconds < 3600 {
-		return fmt.Sprintf("%dm %ds", seconds/60, seconds%60)
-	}
-	return fmt.Sprintf("%dh %dm", seconds/3600, (seconds%3600)/60)
 }
