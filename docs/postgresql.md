@@ -439,7 +439,10 @@ verdict.
 
 The plan comment lists the table and SchemaBot's reason for the refusal. When
 the create path refuses a statement's shape, that reason names the offending
-clause and how to remove or work around it. For a PostgreSQL plan, the plan
+clause and how to remove or work around it. When pg-sprite's planner refuses a
+statement as written, the reason says what about the statement takes the lock
+or breaks running code, and the steps that make the same change safely, from
+the remedy pg-sprite names for it. For a PostgreSQL plan, the plan
 Check Run concludes unsuccessfully, and an apply attempt is rejected before
 any apply or task is queued. Rewrite the declarative change into an eligible
 form or use a separately reviewed operational process; flags do not override

@@ -226,11 +226,11 @@ func TestExecutionVerdictEmptyCreateShapeCause(t *testing.T) {
 // table, so a code added upstream fails with the code's name.
 var rewriteRequiredSentences = map[suggest.Guidance]string{
 	suggest.GuidanceSplitStatement:              `statement for table "users" combines several changes that each need their own safer form; make one of the changes in the schema file, apply it, then make the next`,
-	suggest.GuidanceAddColumnThenConstraint:     `statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint as its own change`,
-	suggest.GuidancePrevalidatedCheck:           `statement for table "users" attaches a partition, which scans it while the parent table is locked; outside SchemaBot, add a CHECK constraint to the partition that matches its bound and validate it, then re-plan, and drop that CHECK once the partition is attached`,
-	suggest.GuidanceNotNullScaffold:             `statement for table "users" sets NOT NULL, which scans the table while it is locked; outside SchemaBot, add a CHECK (column IS NOT NULL) constraint as NOT VALID and validate it, then re-plan`,
-	suggest.GuidanceNameConstraintThenValidate:  `statement for table "users" adds a constraint, which checks every row while the table is locked; outside SchemaBot, add the constraint with a name as NOT VALID and then validate it, then re-plan`,
-	suggest.GuidanceUniqueIndexThenConstraint:   `statement for table "users" adds a primary key or unique constraint, which builds its index while the table is locked; outside SchemaBot, build a unique index on the same columns with CREATE UNIQUE INDEX CONCURRENTLY and attach it with ADD CONSTRAINT ... USING INDEX, then re-plan`,
+	suggest.GuidanceAddColumnThenConstraint:     `statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change`,
+	suggest.GuidancePrevalidatedCheck:           `statement for table "users" attaches a partition, which scans it while the parent table is locked; outside SchemaBot, add a CHECK constraint to the partition that matches its bound as NOT VALID and commit it, then validate it in its own transaction and re-plan, and drop that CHECK once the partition is attached`,
+	suggest.GuidanceNotNullScaffold:             `statement for table "users" sets NOT NULL, which scans the table while it is locked; outside SchemaBot, add a CHECK (column IS NOT NULL) constraint as NOT VALID and commit it, then validate it in its own transaction and re-plan`,
+	suggest.GuidanceNameConstraintThenValidate:  `statement for table "users" adds a constraint, which checks every row while the table is locked; outside SchemaBot, add the constraint with a name as NOT VALID and commit it, then validate it in its own transaction and re-plan`,
+	suggest.GuidanceUniqueIndexThenConstraint:   `statement for table "users" adds a primary key or unique constraint, which builds its index while the table is locked; outside SchemaBot, build a unique index on the same columns with CREATE UNIQUE INDEX CONCURRENTLY, keeping the statement's INCLUDE, NULLS NOT DISTINCT, WITH (...) and TABLESPACE, and attach it with ADD CONSTRAINT ... USING INDEX, keeping any DEFERRABLE and INITIALLY DEFERRED, then re-plan`,
 	suggest.GuidanceExpandContractColumn:        `statement for table "users" renames a column, which breaks running application code that still uses the old name; add the new column, have the application write to both and backfill it, switch reads to the new column, then drop the old column as its own change`,
 	suggest.GuidanceCoordinatedTableRename:      `statement for table "users" renames a table, which breaks running application code that still uses the old name; run the rename outside SchemaBot together with the application deploy that uses the new name, or keep the old name readable through a view until every instance has moved, then re-plan`,
 	suggest.GuidanceCoordinatedConstraintRename: `statement for table "users" renames an index that backs a constraint, which also renames the constraint and breaks application code that still names the old one; run the rename outside SchemaBot together with the application deploy that stops using the old constraint name, then re-plan`,
@@ -701,6 +701,30 @@ func TestTableChangesDerivesTiersForBlockedSteps(t *testing.T) {
 	// The planner's own reason is the specific one, so a step it already
 	// blocked keeps it even when the shape has no tier of its own.
 	assert.Equal(t, `statement for table "users" requires an execution path SchemaBot's PostgreSQL support does not provide yet`, changes[2].ModeReason)
+}
+
+// TestTableChangesCarriesGuidancePerStatement proves each blocked step on a
+// table shows the remedy for its own statement: two statements the planner
+// refuses for different reasons each get their own sentence, and neither is
+// recorded as vocabulary SchemaBot does not know.
+func TestTableChangesCarriesGuidancePerStatement(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	exists := true
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	report.TableExists = &exists
+	report.Statements = []pgplan.Statement{
+		{SQL: "ALTER TABLE public.users ADD COLUMN ref text UNIQUE", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRewriteRequired, Guidance: suggest.GuidanceAddColumnThenConstraint},
+		{SQL: "ALTER TABLE public.users RENAME COLUMN name TO full_name", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRewriteRequired, Guidance: suggest.GuidanceExpandContractColumn},
+	}
+
+	changes, _, unrecognized, err := tableChanges(report, nil, parser)
+	require.NoError(t, err)
+	require.Len(t, changes, 2)
+	assert.Empty(t, unrecognized)
+	assert.Equal(t, rewriteRequiredSentences[suggest.GuidanceAddColumnThenConstraint], changes[0].ModeReason)
+	assert.Equal(t, rewriteRequiredSentences[suggest.GuidanceExpandContractColumn], changes[1].ModeReason)
 }
 
 // TestBlockMissingPrivilegesNamesGrantOnPlannerBlockedPlan runs the planner's
