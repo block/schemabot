@@ -25,6 +25,7 @@ type memoryOutbox struct {
 	quarantined   map[int64]bool
 	quarantineErr error
 	markErr       error
+	markPanic     bool
 	listErr       error
 	oldestErr     error
 	maxIDErr      error
@@ -56,6 +57,9 @@ func (m *memoryOutbox) ListUnpublished(_ context.Context, afterID int64, limit i
 }
 
 func (m *memoryOutbox) MarkPublished(_ context.Context, id int64) error {
+	if m.markPanic && id == 1 {
+		panic("mark fault")
+	}
 	if m.markErr != nil {
 		return m.markErr
 	}
@@ -227,62 +231,67 @@ func (m *memoryOutbox) Quarantine(_ context.Context, id int64) error {
 // A panicking notification is isolated durably, while later rows deliver and
 // a fresh sender observes the same exclusion without losing backlog visibility.
 func TestSenderPanicQuarantine(t *testing.T) {
-	reader := metric.NewManualReader()
-	provider := metric.NewMeterProvider(metric.WithReader(reader))
-	previous := otel.GetMeterProvider()
-	otel.SetMeterProvider(provider)
-	t.Cleanup(func() {
-		otel.SetMeterProvider(previous)
-		require.NoError(t, provider.Shutdown(context.WithoutCancel(t.Context())))
-	})
-	store := newMemoryOutbox(t, 2)
-	var output bytes.Buffer
-	var attempts []string
-	publisher := publisherFunc(func(_ context.Context, payload json.RawMessage) error {
-		var message storage.ApplyCompletedEvent
-		require.NoError(t, json.Unmarshal(payload, &message))
-		attempts = append(attempts, message.ID)
-		if message.ID == "apply_1" {
-			panic("publisher fault")
-		}
-		return nil
-	})
-	logger := slog.New(slog.NewJSONHandler(&output, nil))
-	sender := NewSender(store, publisher, logger)
-	require.NoError(t, sender.sendBatch(t.Context()))
-	require.NoError(t, sender.sendBatch(t.Context()))
-	require.NoError(t, NewSender(store, publisher, logger).sendBatch(t.Context()))
-	assert.Equal(t, []string{"apply_1", "apply_2"}, attempts)
-	assert.True(t, store.quarantined[1])
-	assert.False(t, store.published[1])
-	assert.True(t, store.published[2])
-	assert.Contains(t, output.String(), `"apply_id":"apply_1"`)
-	var data metricdata.ResourceMetrics
-	require.NoError(t, reader.Collect(t.Context(), &data))
-	var panicCount int64
-	var oldestAge int64
-	for _, scope := range data.ScopeMetrics {
-		for _, instrument := range scope.Metrics {
-			switch instrument.Name {
-			case "schemabot.panic.recovered_total":
-				sum, ok := instrument.Data.(metricdata.Sum[int64])
-				require.True(t, ok)
-				for _, point := range sum.DataPoints {
-					operation, ok := point.Attributes.Value("operation")
-					require.True(t, ok)
-					assert.Equal(t, "completion_sender", operation.AsString())
-					panicCount += point.Value
+	for _, markPanic := range []bool{false, true} {
+		t.Run(fmt.Sprintf("MarkPanic=%v", markPanic), func(t *testing.T) {
+			reader := metric.NewManualReader()
+			provider := metric.NewMeterProvider(metric.WithReader(reader))
+			previous := otel.GetMeterProvider()
+			otel.SetMeterProvider(provider)
+			t.Cleanup(func() {
+				otel.SetMeterProvider(previous)
+				require.NoError(t, provider.Shutdown(context.WithoutCancel(t.Context())))
+			})
+			store := newMemoryOutbox(t, 2)
+			store.markPanic = markPanic
+			var output bytes.Buffer
+			var attempts []string
+			publisher := publisherFunc(func(_ context.Context, payload json.RawMessage) error {
+				var message storage.ApplyCompletedEvent
+				require.NoError(t, json.Unmarshal(payload, &message))
+				attempts = append(attempts, message.ID)
+				if message.ID == "apply_1" && !markPanic {
+					panic("publisher fault")
 				}
-			case "schemabot.outbox.oldest_unpublished_age":
-				gauge, ok := instrument.Data.(metricdata.Gauge[int64])
-				require.True(t, ok)
-				require.Len(t, gauge.DataPoints, 1)
-				oldestAge = gauge.DataPoints[0].Value
+				return nil
+			})
+			logger := slog.New(slog.NewJSONHandler(&output, nil))
+			sender := NewSender(store, publisher, logger)
+			require.NoError(t, sender.sendBatch(t.Context()))
+			require.NoError(t, sender.sendBatch(t.Context()))
+			require.NoError(t, NewSender(store, publisher, logger).sendBatch(t.Context()))
+			assert.Equal(t, []string{"apply_1", "apply_2"}, attempts)
+			assert.True(t, store.quarantined[1])
+			assert.False(t, store.published[1])
+			assert.True(t, store.published[2])
+			assert.Contains(t, output.String(), `"apply_id":"apply_1"`)
+			var data metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(t.Context(), &data))
+			var panicCount int64
+			var oldestAge int64
+			for _, scope := range data.ScopeMetrics {
+				for _, instrument := range scope.Metrics {
+					switch instrument.Name {
+					case "schemabot.panic.recovered_total":
+						sum, ok := instrument.Data.(metricdata.Sum[int64])
+						require.True(t, ok)
+						for _, point := range sum.DataPoints {
+							operation, ok := point.Attributes.Value("operation")
+							require.True(t, ok)
+							assert.Equal(t, "completion_sender", operation.AsString())
+							panicCount += point.Value
+						}
+					case "schemabot.outbox.oldest_unpublished_age":
+						gauge, ok := instrument.Data.(metricdata.Gauge[int64])
+						require.True(t, ok)
+						require.Len(t, gauge.DataPoints, 1)
+						oldestAge = gauge.DataPoints[0].Value
+					}
+				}
 			}
-		}
+			assert.Equal(t, int64(1), panicCount)
+			assert.GreaterOrEqual(t, oldestAge, int64(60), "quarantine is still unaccepted intent")
+		})
 	}
-	assert.Equal(t, int64(1), panicCount)
-	assert.GreaterOrEqual(t, oldestAge, int64(60), "quarantine is still unaccepted intent")
 }
 
 func TestSenderQuarantineFailureRemainsVisible(t *testing.T) {

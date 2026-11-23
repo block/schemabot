@@ -123,6 +123,24 @@ func TestOutboxEvents(t *testing.T, h Harness) {
 		assert.Len(t, metadata.QuarantineToken, 36)
 	})
 
+	t.Run("PublishedQuarantine", func(t *testing.T) {
+		store := h.NewStorage(t)
+		apply := createOutboxApply(t, store, state.Apply.Running)
+		apply.State = state.Apply.Completed
+		require.NoError(t, store.Applies().Update(t.Context(), apply))
+		events, err := store.OutboxEvents().ListUnpublished(t.Context(), 0, 10)
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		require.NoError(t, store.OutboxEvents().MarkPublished(t.Context(), events[0].ID))
+		require.NoError(t, store.OutboxEvents().Quarantine(t.Context(), events[0].ID))
+		logs, err := store.ApplyLogs().GetByApply(t.Context(), apply.ID)
+		require.NoError(t, err)
+		assert.Empty(t, logs, "a prefetched copy cannot quarantine an already published notification")
+		oldest, err := store.OutboxEvents().OldestUnpublishedAt(t.Context())
+		require.NoError(t, err)
+		assert.Nil(t, oldest)
+	})
+
 	t.Run("HistoricalCompletedRefresh", func(t *testing.T) {
 		store := h.NewStorage(t)
 		apply := createOutboxApply(t, store, state.Apply.Completed)

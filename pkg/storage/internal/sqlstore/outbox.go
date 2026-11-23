@@ -121,7 +121,8 @@ func (s *outboxStore) Quarantine(ctx context.Context, id int64) error {
 		return nil
 	}
 	if published.Valid {
-		return fmt.Errorf("quarantine notification %d: transport acceptance was already recorded", id)
+		slog.DebugContext(ctx, "completion notification already published; no quarantine recorded", "outbox_id", id)
+		return nil
 	}
 	token := uuid.NewString()
 	if _, err := tx.ExecContext(ctx, `UPDATE outbox_events SET quarantine_token = ? WHERE id = ?`, token, id); err != nil {

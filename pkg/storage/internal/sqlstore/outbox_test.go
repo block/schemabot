@@ -302,6 +302,29 @@ func testNotificationQuarantine(t *testing.T, newStore func(*testing.T) *Storage
 	logs, err = store.ApplyLogs().GetByApply(ctx, apply.ID)
 	require.NoError(t, err)
 	require.Len(t, logs, 1)
+	// A diagnostic failure aborts the documented release, not just quarantine.
+	drop := "ALTER TABLE apply_logs DROP CONSTRAINT reject_notification_release"
+	if _, mysql := original.(MySQLDialect); mysql {
+		drop = "ALTER TABLE apply_logs DROP CHECK reject_notification_release"
+	}
+	_, err = store.db.ExecContext(ctx, `ALTER TABLE apply_logs ADD CONSTRAINT reject_notification_release CHECK (message <> 'Completion notification released after operator repair.')`)
+	require.NoError(t, err)
+	constraintPresent := true
+	defer func() {
+		if constraintPresent {
+			_, err := store.db.ExecContext(t.Context(), drop)
+			assert.NoError(t, err)
+		}
+	}()
+	assert.False(t, releaseNotificationForTest(t, ctx, restarted, event.ID, firstToken, true, "reject_notification_release"))
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT quarantine_token FROM outbox_events WHERE id = ?`, event.ID).Scan(&token))
+	assert.Equal(t, firstToken, token.String)
+	logs, err = store.ApplyLogs().GetByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, logs, 1)
+	_, err = store.db.ExecContext(ctx, drop)
+	require.NoError(t, err)
+	constraintPresent = false
 	assert.True(t, releaseNotificationForTest(t, ctx, restarted, event.ID, firstToken, true))
 	events, err = restarted.OutboxEvents().ListUnpublished(ctx, 0, 10)
 	require.NoError(t, err)
@@ -324,7 +347,7 @@ func testNotificationQuarantine(t *testing.T, newStore func(*testing.T) *Storage
 
 // Execute the runbook SQL itself, substituting only its fictional incident.
 // MySQL requires interactive count checks; PostgreSQL checks inside its DO block.
-func releaseNotificationForTest(t *testing.T, ctx context.Context, store *Storage, id int64, token string, commit bool) bool {
+func releaseNotificationForTest(t *testing.T, ctx context.Context, store *Storage, id int64, token string, commit bool, expectedError ...string) bool {
 	t.Helper()
 	doc, err := os.ReadFile("../../../../docs/configuration.md")
 	require.NoError(t, err)
@@ -376,6 +399,10 @@ func releaseNotificationForTest(t *testing.T, ctx context.Context, store *Storag
 				}
 			default:
 				_, err := tx.ExecContext(ctx, statement)
+				if err != nil && len(expectedError) == 1 {
+					require.ErrorContains(t, err, expectedError[0])
+					return false
+				}
 				require.NoError(t, err)
 			}
 		}
@@ -384,10 +411,15 @@ func releaseNotificationForTest(t *testing.T, ctx context.Context, store *Storag
 		script = strings.TrimSpace(strings.TrimSuffix(script, "COMMIT;"))
 		_, err := tx.ExecContext(ctx, script)
 		if err != nil {
-			require.ErrorContains(t, err, "Expected one release diagnostic, got 0")
+			if len(expectedError) == 1 {
+				require.ErrorContains(t, err, expectedError[0])
+			} else {
+				require.ErrorContains(t, err, "Expected one release diagnostic, got 0")
+			}
 			return false
 		}
 	}
+	require.Empty(t, expectedError, "release unexpectedly succeeded")
 	if !commit {
 		return false
 	}

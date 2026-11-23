@@ -1079,7 +1079,10 @@ exclude quarantined rows, including after restart; copies already selected by an
 sender can still execute once. Every sender must run a version that honors quarantine;
 an older binary does not exclude these rows during a rolling upgrade. Ordinary transport errors remain retryable without an
 attempt limit. A failed quarantine write is logged as a containment failure and leaves
-the row eligible for a later scan. Panic values and stacks remain in server logs.
+the row eligible for a later scan. Panic values and stacks remain in server logs. A panic while recording acceptance
+also quarantines the notification if it is still unpublished; releasing it can resend
+a message already accepted by SQS. Receivers must deduplicate that replay too.
+If another sender already recorded acceptance, quarantine is a logged no-op.
 
 The recovered-panic counter uses the `completion_sender` operation. Quarantined intent
 still contributes to the oldest-unpublished-age metric. After repairing the publisher,
