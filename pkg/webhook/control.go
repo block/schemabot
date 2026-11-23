@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -188,13 +189,26 @@ func runControlCommand[R any](
 	}
 
 	caller := formatGitHubCaller(requestedBy, repo, pr)
-	resp, err := execute(ctx, apitypes.ControlRequest{
+	request := apitypes.ControlRequest{
 		ApplyID:     result.ApplyID,
 		Environment: result.Environment,
 		Caller:      caller,
-	})
+	}
+	if result.OverrideGiven {
+		request.Override = result.Override
+		ctx = h.withPullRequestOverrideRequester(ctx, client, repo, pr, installationID, requestedBy)
+	} else {
+		// The commenter is who the gate admits on an approved override. Only
+		// asking for one needs the author, so a plain command skips that read.
+		ctx = api.WithPullRequestOverrideRequester(ctx, api.PullRequestRequester{Login: requestedBy, Repository: repo, PullRequest: pr})
+	}
+	resp, err := execute(ctx, request)
 	if err != nil {
 		h.logControlCommandError(actionName, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
+		if isChangeGateError(err) {
+			h.postChangeGateRefusal(repo, pr, installationID, actionName, result.Environment, requestedBy, err)
+			return nil
+		}
 		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, err.Error())
 		return nil
 	}
@@ -225,6 +239,33 @@ func runControlCommand[R any](
 		return nil
 	}
 	return resp
+}
+
+// withPullRequestOverrideRequester marks ctx with the commenter asking for an
+// override, for a start or cutover. Unlike an apply, the command has no fresh
+// read of the pull request, so the author comes from FetchPullRequest: the
+// delivery's cached read when the actor check already made one, otherwise a
+// new read. If the author cannot be read, ctx stays as it is: the gate
+// records no request, and the refusal says so.
+// client is nil when actor authorization is off.
+func (h *Handler) withPullRequestOverrideRequester(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, requestedBy string) context.Context {
+	if client == nil {
+		var err error
+		if client, err = h.clientForRepo(repo, installationID); err != nil {
+			h.logger.Warn("override not requested: cannot resolve the GitHub client to read the pull request's author",
+				"repo", repo, "pr", pr, "requested_by", requestedBy, "error", err)
+			return ctx
+		}
+	}
+	info, err := client.FetchPullRequest(ctx, repo, pr)
+	if err != nil || info.User == "" {
+		h.logger.Warn("override not requested: cannot read the pull request's author",
+			"repo", repo, "pr", pr, "requested_by", requestedBy, "error", err)
+		return ctx
+	}
+	return api.WithPullRequestOverrideRequester(ctx, api.PullRequestRequester{
+		Login: requestedBy, Repository: repo, PullRequest: pr, Author: info.User,
+	})
 }
 
 // handleStopCommand handles the "schemabot stop <apply-id> -e <env>" PR
@@ -375,7 +416,7 @@ func (h *Handler) recordStartAcknowledged(ctx context.Context, repo string, pr i
 // held back until the start's acknowledgement landed, naming the stopper when
 // the stop request records a GitHub user.
 func (h *Handler) postStartWithdrawnAfterAcknowledgement(ctx context.Context, repo string, pr int, installationID int64, apply *storage.Apply, attrs []any) {
-	stoppedBy := ""
+	stoppedBy, stoppedByFreeze := "", ""
 	stop, err := h.service.Storage().ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationStop)
 	switch {
 	case err != nil:
@@ -385,12 +426,14 @@ func (h *Handler) postStartWithdrawnAfterAcknowledgement(ctx context.Context, re
 		h.logger.Warn("no stop request found for a withdrawn start; telling the PR without naming who stopped it", attrs...)
 	default:
 		stoppedBy = actorFromCaller(stop.RequestedBy)
+		stoppedByFreeze, _ = storage.FreezeFromStopCaller(stop.RequestedBy)
 	}
 	h.logger.Info("start was withdrawn by a stop before its acknowledgement landed; telling the PR after the acknowledgement", attrs...)
 	h.postComment(repo, pr, installationID, templates.RenderStartWithdrawn(templates.StartWithdrawnData{
-		ApplyID:     apply.ApplyIdentifier,
-		Environment: apply.Environment,
-		StoppedBy:   stoppedBy,
+		ApplyID:         apply.ApplyIdentifier,
+		Environment:     apply.Environment,
+		StoppedBy:       stoppedBy,
+		StoppedByFreeze: stoppedByFreeze,
 	}))
 }
 
@@ -528,10 +571,12 @@ func (h *Handler) reportQueuedStartWithdrawn(apply *storage.Apply, caller string
 	}
 	repo, pr, installationID := apply.Repository, apply.PullRequest, apply.InstallationID
 	attrs := []any{"apply_id", apply.ApplyIdentifier, "repo", repo, "pr", pr, "environment", apply.Environment}
+	stoppedByFreeze, _ := storage.FreezeFromStopCaller(caller)
 	body := templates.RenderStartWithdrawn(templates.StartWithdrawnData{
-		ApplyID:     apply.ApplyIdentifier,
-		Environment: apply.Environment,
-		StoppedBy:   actorFromCaller(caller),
+		ApplyID:         apply.ApplyIdentifier,
+		Environment:     apply.Environment,
+		StoppedBy:       actorFromCaller(caller),
+		StoppedByFreeze: stoppedByFreeze,
 	})
 	h.goSafe(repo, pr, installationID, "", func() {
 		ctx, cancel := h.commandContext(context.Background(), commandTimeout)

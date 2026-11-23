@@ -81,6 +81,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.environment.freeze_open_seconds` | Gauge | environment | Age in seconds of the oldest open-ended freeze in effect, `0` when none is. Planned freezes have an end time and are not counted. Alert on it to catch a forgotten incident freeze. |
 | `schemabot.environment.frozen_collection_failures` | Counter | environment | Failed freeze snapshots (liveness signal for the frozen gauge) |
 | `schemabot.change_gate.refusals` | Counter | environment, gate, checkpoint | Applies, starts and cutovers refused by a change gate, once per blocking gate (`freeze`) |
+| `schemabot.change_gate.overrides` | Counter | environment, gate, checkpoint | Applies, starts and cutovers an approved override request let through a change gate, once per overridden gate |
 | `schemabot.change_gate.errors` | Counter | environment, checkpoint | Change gate checks that failed, refusing the change with a retryable 503 (`start`, `resume`, `cutover`) |
 | `schemabot.webhook.check_suite_recovery_total` | Counter | environment, repository, outcome | Durable check_suite recovery outcomes (`covered`, `synthesized`, `resynthesized`, `already_queued` per candidate PR; `no_pr_at_ingress`, `no_open_pr`, `truncated` per delivery) |
 | `schemabot.webhook.inbox_dispatch_lag_seconds` | Histogram | environment, event_type, repository | Time from webhook receipt to the delivery's first dispatch claim |
@@ -181,13 +182,13 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **action** (webhooks): common GitHub actions for the subscribed webhook events, such as `created`, `opened`, `synchronize`, `submitted`, `edited`, `closed`, `requested`, `completed` (omitted for events without actions like `ping` and `push`)
 
-**status** (webhooks): `processed`, `invalid_signature`, `ignored`, `repo_not_configured`, `app_repo_mismatch`, `installation_resolution_failed`, `durable_enqueue_failed`, `durable_command_not_ready`, `durable_command_routing_blocked`, `durable_command_unrouted`, `durable_dispatch_started`, `durable_dispatch_retrying`, `durable_dispatch_failed`, `durable_dispatch_failed_permanent`, `durable_dispatch_completed`, `durable_dispatch_superseded`
+**status** (webhooks): `processed`, `invalid_signature`, `ignored`, `repo_not_configured`, `app_repo_mismatch`, `installation_resolution_failed`, `durable_enqueue_failed`, `durable_command_not_ready`, `durable_command_routing_blocked`, `durable_command_unrouted`, `durable_dispatch_started`, `durable_dispatch_retrying`, `durable_dispatch_quota_reserve_deferred`, `durable_dispatch_failed`, `durable_dispatch_failed_permanent`, `durable_dispatch_completed`, `durable_dispatch_superseded`
 
 **state** (webhook inbox): `pending`, `processing`, `failed_retryable`, `completed`, `failed`, `failed_permanent`, `superseded`, `unknown`
 
-**outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `superseded`, `released`, `lease_lost`, `finish_error`, `unknown`
+**outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `quota_reserve_deferred`, `superseded`, `released`, `lease_lost`, `finish_error`, `unknown`
 
-**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_combined_status`, `get_team`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
+**operation** (GitHub API): `add_comment_reaction`, `compare_commits`, `create_check_run`, `create_installation_access_token`, `create_issue_comment`, `delete_issue_comment`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_branch_rules`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_issue_comment`, `fetch_pull_request`, `fetch_rate_limit`, `fetch_ref`, `fetch_repository`, `fetch_repository_installation`, `get_combined_status`, `get_team`, `get_team_membership`, `graphql_branch_protection`, `graphql_merge_queue_entries`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_app_installations`, `list_check_runs_for_ref`, `list_issue_timeline`, `list_matching_refs`, `list_pr_files`, `list_pull_requests`, `list_pull_requests_for_commit`, `list_reviews`, `list_team_members`, `remove_issue_label`, `request_reviewers`, `unknown`, `update_check_run`
 
 **category** (GitHub API): `auth`, `read`, `write`, `unknown`
 
@@ -329,10 +330,21 @@ across replicas. Snapshots require a named App, positive installation ID, valid
 remaining/limit headers, and a future reset time. They disappear from collection
 when older than 120 seconds or when their reset time passes. Repeated scrapes,
 local quota refusals and secondary cooldown waits do not refresh observation age.
-Older reset windows and delayed larger allowances within a window cannot replace
-a depleted snapshot. Within one window, a lower allowance wins even when it is
-recorded out of receipt order; its original receipt time still controls expiry.
-A new window can increase the allowance.
+Within one window the lowest allowance seen is kept, in any receipt order, even
+when GitHub later reports more; a later response with more remaining still
+refreshes the observation time, so an installation that is read keeps its
+snapshot exported. Expiry follows the latest receipt in the window, and a
+response recorded late never moves it later than its own receipt time. When a
+response reports a different reset time, the one received most recently says
+which window is current, and a new window can increase the allowance. That
+holds when the reset time moves earlier too: GitHub can report one reset time
+and then an earlier one for the rest of the window, and the snapshot follows
+the newer readings instead of ageing out on the first. A response received
+before the current snapshot never replaces it with another window. Each reset
+time that has not yet passed keeps its own lowest allowance, so a window that
+becomes current again still exports the depletion already seen in it, whatever
+order the responses are recorded in. The number of reset times kept per
+installation is bounded; past the bound the least recently reported is dropped.
 
 Webhook traffic refreshes a snapshot from the headers of every response, and
 the server's GitHub quota probe refreshes it while there is no traffic: once a
@@ -565,10 +577,11 @@ Reason values:
 | `missing_database_config` | The target database is not configured. |
 | `freeze_allow` | Freeze write allowed via `freeze.groups` membership. |
 | `not_freeze_admin` | Freeze write denied: caller is in neither `write_groups` nor `freeze.groups`. |
+| `not_freeze_approver` | Freeze override approval denied: caller is not in `freeze.groups`; `write_groups` do not approve. |
 
 Operation names mirror the mutating endpoints (`plan`, `apply`, control
 operations, `lock_acquire`/`lock_release`/`lock_force_release`, and the
-admin-only `checks_*`, `settings_set`, and the freeze writes `freeze_create`/`freeze_lift`). Unrecognized
+admin-only `checks_*`, `settings_set`, and the freeze writes `freeze_create`/`freeze_lift`/`freeze_override_approve`). Unrecognized
 operation, status, or reason values are recorded as `unknown` to keep
 cardinality bounded. `database` and `environment` use the `unknown` sentinel
 when the operation has no such dimension (admin-only operations have no single

@@ -179,7 +179,8 @@ func TestFreezeGroupAdmittedThroughServerHandler(t *testing.T) {
 		},
 		Freeze: api.FreezeConfig{Groups: []string{"incident-commanders"}},
 	}
-	svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
+	overrides := &approverRecordingOverrides{}
+	svc := api.New(overrideStorage{Storage: mysqlstore.New(nil), overrides: overrides}, cfg, nil, logger)
 	webhook, err := buildWebhookRuntime(cfg, svc, logger)
 	require.NoError(t, err)
 	authz, err := buildServerAuthorizer(t.Context(), cfg, logger)
@@ -197,6 +198,35 @@ func TestFreezeGroupAdmittedThroughServerHandler(t *testing.T) {
 	}
 	assert.Equal(t, http.StatusBadRequest, post("/api/freezes"))
 	assert.Equal(t, http.StatusForbidden, post("/api/settings"))
+	// Approving an override is the third freeze write: the middleware admits
+	// ida, the handler verifies her and reaches storage's approval.
+	assert.Equal(t, http.StatusNotFound, post("/api/freezes/overrides/ovr-1/approve"))
+	assert.Equal(t, "ida", overrides.approver)
+}
+
+// overrideStorage swaps in a fake override store so the approve route can
+// reach storage without a database.
+type overrideStorage struct {
+	storage.Storage
+	overrides storage.FreezeOverrideStore
+}
+
+func (s overrideStorage) FreezeOverrides() storage.FreezeOverrideStore { return s.overrides }
+
+// approverRecordingOverrides holds one request asked for outside a pull
+// request, records who approved it and then reports it gone.
+type approverRecordingOverrides struct {
+	storage.FreezeOverrideStore
+	approver string
+}
+
+func (o *approverRecordingOverrides) Get(_ context.Context, identifier string) (*storage.FreezeOverrideRequest, error) {
+	return &storage.FreezeOverrideRequest{Identifier: identifier, RequestedBy: "rita"}, nil
+}
+
+func (o *approverRecordingOverrides) Approve(_ context.Context, _, approver string) (*storage.FreezeOverrideRequest, error) {
+	o.approver = approver
+	return nil, storage.ErrFreezeOverrideNotFound
 }
 
 // Configuring the service-caller lane (trusted_gateway_spiffe +
@@ -412,6 +442,27 @@ func TestBuildWebhookRuntimeGitHubAppID(t *testing.T) {
 	t.Run("unresolvable app-id reference starts with the webhook endpoint disabled", func(t *testing.T) {
 		nonexistent := filepath.Join(t.TempDir(), "nonexistent-app-id")
 		startsDisabled(t, &api.ServerConfig{GitHub: api.GitHubConfig{AppID: "file:" + nonexistent, PrivateKey: "some-key", WebhookSecret: "secret"}})
+	})
+}
+
+// A server with GitHub App credentials but an empty webhook secret could never
+// prove a delivery came from GitHub, so it refuses to start in single-App and
+// in multi-App mode rather than serving the webhook endpoint unverified.
+func TestBuildWebhookRuntimeRefusesEmptyWebhookSecret(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+
+	t.Run("single App", func(t *testing.T) {
+		cfg := &api.ServerConfig{GitHub: api.GitHubConfig{AppID: "123", PrivateKey: "some-key", WebhookSecret: ""}}
+		_, err := buildWebhookRuntime(cfg, api.New(mysqlstore.New(nil), cfg, nil, logger), logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "webhook secret is empty")
+	})
+
+	t.Run("multi App", func(t *testing.T) {
+		cfg := &api.ServerConfig{Apps: map[string]api.GitHubAppConfig{"a": {AppID: "1001", PrivateKey: "k", WebhookSecret: ""}}}
+		_, err := buildWebhookRuntime(cfg, api.New(mysqlstore.New(nil), cfg, nil, logger), logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "webhook secret resolved to empty value")
 	})
 }
 

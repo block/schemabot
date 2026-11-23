@@ -290,7 +290,7 @@ func (e *Engine) withholdIgnoredTables(ignored engine.IgnoredTables, req *engine
 			names[i] = ts.Name
 		}
 		if err := ignored.RefuseDeclared(ks, names); err != nil {
-			return nil, err
+			return nil, &engine.PlanRefusedError{Err: err}
 		}
 
 		live, ok := currentSchema[ks]

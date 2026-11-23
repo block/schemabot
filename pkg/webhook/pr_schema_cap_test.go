@@ -74,7 +74,7 @@ func newSchemaCapTestFixture(t *testing.T, configs, local int, policy api.PRSche
 	}
 	store := &schemaCapTestStore{durableWebhookTestStorage: durableWebhookTestStorage{settings: settings}, plans: plans}
 	service := api.New(store, cfg, map[string]tern.Client{"remote/staging": planner}, logger)
-	h := NewHandler(service, &fakeClientFactory{client: client}, nil, logger)
+	h := NewHandler(service, &fakeClientFactory{client: client}, nil, logger, WithInsecureSkipSignatureVerification())
 	f := &schemaCapTestFixture{Handler: h, client: client, mux: mux, settings: settings, plans: plans}
 	f.head.Store("head")
 	f.base.Store("main")
@@ -249,8 +249,8 @@ func TestPRSchemaCapApplyRefusalReleasesOnlyAutomaticIntent(t *testing.T) {
 			}
 			schema := &ghclient.SchemaRequestResult{Database: "db0", Type: "mysql", SchemaPath: "db0",
 				HeadSHA: "head", SchemaFiles: planRetryTestRequest().SchemaFiles}
-			f.executeApply(t.Context(), f.client, schemaCapTestRepo, 1, schema, "staging", 42, "author", CommandResult{},
-				tt.storedPlan, nil, "original-plan", nil)
+			f.executeApply(t.Context(), f.client, schemaCapTestRepo, 1, schema, nil, "staging", 42, "author", CommandResult{},
+				tt.storedPlan, nil, "original-plan", nil, nil)
 			require.Equal(t, 1, admissions)
 			require.Equal(t, tt.wantReleased, locks.releasedIfPending)
 			require.Empty(t, locks.released)

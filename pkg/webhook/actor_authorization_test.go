@@ -939,7 +939,7 @@ func (s *actorAuthLockStore) ReleaseIfPendingPlanID(_ context.Context, _, _, _, 
 	return true, nil
 }
 
-func (s *actorAuthLockStore) ReleaseByID(_ context.Context, _ int64, database, _, _, _ string) error {
+func (s *actorAuthLockStore) ReleaseByIDIfUnused(_ context.Context, _ int64, database, _, _, _ string) error {
 	if s.releaseErr != nil {
 		return s.releaseErr
 	}

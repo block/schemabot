@@ -613,6 +613,79 @@ For changes that need PR approval and merge checks, use the
 [PR workflow](pre-merge-workflow.md). Direct CLI access is a separate path;
 it does not create a PR review trail.
 
+### Freeze an environment
+
+An environment freeze holds new schema changes in its scope until it ends or
+someone lifts it. Setting or lifting one is a write, and
+[`freeze.groups`](configuration.md#freeze-groups-forward-auth) members may do
+so without any other write access.
+
+```console
+$ schemabot freeze -e production --reason "SEV-1234 payments latency"
+$ schemabot freeze -e production --reason "holiday freeze" --planned \
+    --start 2026-12-20T00:00:00Z --end 2027-01-03T00:00:00Z
+$ schemabot freeze list -e production
+$ schemabot freeze show freeze-abc123
+$ schemabot unfreeze freeze-abc123 --reason "SEV resolved"
+```
+
+`--deployment` and `--database` narrow a freeze and repeat; without them it
+covers the whole environment. `--running` says what happens to applies
+already pending or running in scope: `continue` (the default) lets them finish,
+and `stop` stops each one when the freeze is set, including a rollout paused
+after a failure, and withdraws a start queued on a stopped apply. The confirmation lists the applies it asked to stop; a stop
+takes effect as its driver delivers it, so confirm each one with
+`schemabot status <apply-id>`. The CLI waits up to 15 minutes for the
+confirmation, since each stop can wait on its engine. It also lists any apply it could not stop, which
+keeps running, with the reason and what to do: a PlanetScale apply has no stop,
+and cancel ends it permanently. While a `stop` freeze is in effect, SchemaBot
+also stops an apply instead of starting work on it that has not started, so a
+planned `stop` freeze holds what has not started once it begins. A PlanetScale
+deploy queued before the freeze waits until it ends. A planned `stop` freeze
+stops an apply already running when it starts only at the apply's next
+checkpoint: when a rollout starts its next deployment, or when SchemaBot
+recovers a drive that crashed or failed. An apply that reaches neither keeps
+running. `schemabot status <apply-id>`, the watch view and the pull request
+comment say which freeze stopped an apply, and once that freeze has ended, that
+a plain start resumes it. A stopped apply resumes with
+`schemabot start` once the freeze ends, or with an approved
+override. Times are RFC3339 and print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
+and the recent ones.
+
+A second person approves a request to let one change through a freeze. Read it
+with `freeze override <ovr-id>` and approve it with `freeze approve <ovr-id>`.
+Only a verified member of `freeze.groups` other than the requester may approve.
+A request asked for on a pull request is approved there instead, by a
+`freeze.github_teams` member commenting `schemabot freeze approve <ovr-id>`.
+Each command prints the server's reason when it refuses.
+
+A freeze refuses every `apply`, `start` and `cutover` it covers unless an
+approved override for you covers that change. Asking for one with `--override`
+is not enough on its own: until it is approved, the command exits 1 with
+nothing started:
+
+```console
+$ schemabot apply -s schema -e production
+❄️ production is frozen. This change did not start.
+   freeze-abc  SEV-1234 payments latency  (until lifted)
+To ask for an override, run the same command with --override "<reason>".
+```
+
+`--override "<reason>"` on `apply`, `start` and `cutover` asks a freeze
+approver to let that one change through. It needs a verified caller, and the
+reason is at most 500 characters. The refusal then names the request:
+
+```console
+$ schemabot apply -s schema -e production --override "SEV-1234 fix the index"
+❄️ production is frozen. This change did not start.
+   freeze-abc  SEV-1234 payments latency  (until lifted)
+Override requested: ovr-123. A freeze approver other than you must run 'schemabot freeze approve ovr-123', then run this command again.
+```
+
+Once an approver approves it, run the same command again: the approval admits
+it, and it runs instead of exiting 1. When SchemaBot could not check the
+freezes, nothing started and the command says to try again.
+
 ## Follow and control a change
 
 An apply can outlive your terminal. Keep its apply ID to inspect it or
@@ -692,6 +765,26 @@ $ schemabot cutover apply-example-73 -e staging
 
 Keep watching until the state is `Completed`; acceptance alone does not mean
 the swap has finished.
+
+When a [freeze](#freeze-an-environment) covers the change, **Enter** in the watch is
+refused like the command, and the change does not start. The watch's keys
+send no override reason, so the refusal names the exact command that asks for
+one and stays on screen while the watch keeps following the apply:
+
+```console
+Press Enter to proceed with cutover (or ESC to detach)
+
+❄️ production is frozen. This cutover did not start.
+   freeze-abc  SEV-1234 payments latency  (until lifted)
+To ask for an override, run:
+  schemabot cutover apply-example-73 -e production --override "<reason>"
+Once a freeze approver other than you approves it, press Enter to try again.
+```
+
+Run that command from another terminal. Once an approver approves the
+request, press **Enter** in the watch again; the approval admits it with no
+reason attached. **Enter** on a waiting deploy works the same way and names
+`schemabot start`.
 
 ![CLI progress shows copying, deferred cutover, and completion](../assets/cli-cutover.gif)
 
@@ -908,9 +1001,9 @@ before running it. Recreating a dropped column cannot recover its old data.
 
 ```console
 $ schemabot logs apply-example-73
-11:47:07 [INF] Apply queued: apply-example-73
-11:47:07 [INF] [orders] Starting spirit migration
-11:47:07 [INF] [orders] acquired advisory lock
+2026-03-15 11:47:07 UTC [INF] Apply queued: apply-example-73
+2026-03-15 11:47:07 UTC [INF] [orders] Starting spirit migration
+2026-03-15 11:47:07 UTC [INF] [orders] acquired advisory lock
 ...
 ```
 
@@ -925,7 +1018,8 @@ cannot reach is retried with backoff, the same way the watchers retry, and
 following stops with a non-zero exit once polls have kept failing for a few
 minutes in a row. Run the same `logs` command again to keep following: it
 prints the newest entries again and does not resume from the last line shown.
-Ctrl-C ends following normally.
+Ctrl-C ends following normally. Without `-f`, Ctrl-C abandons the read and
+exits 130, as other commands do when interrupted before their output.
 
 With `--deployment`, a source whose logs could not be read is reported as a
 warning while the other sources keep printing. That warning does not end
@@ -942,9 +1036,9 @@ a whole, such as state changes.
 
 ```console
 $ schemabot logs apply-example-73 --target shop-002
-11:47:07 [INF] Apply queued: apply-example-73
-11:48:12 [INF] [orders] acquired advisory lock
-11:52:40 [INF] [orders] Table complete
+2026-03-15 11:47:07 UTC [INF] Apply queued: apply-example-73
+2026-03-15 11:48:12 UTC [INF] [orders] acquired advisory lock
+2026-03-15 11:52:40 UTC [INF] [orders] Table complete
 ...
 ```
 

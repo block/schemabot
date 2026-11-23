@@ -1090,8 +1090,17 @@ func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClie
 		if err == nil {
 			return dr, nil
 		}
-		if strings.Contains(err.Error(), "approved") {
-			return nil, fmt.Errorf("deploy request #%d could not be deployed: PlanetScale deploy request approvals are not supported — disable 'Require administrator approval for deploy requests' in the PlanetScale database settings", number)
+		if transientAttempts == 0 && isApprovalRequiredError(err) {
+			// PlanetScale answered the first deploy attempt that it will not
+			// deploy this request until it is approved, and repeating the call
+			// cannot change that. The deploy never started, so nothing needs
+			// adopting: the failure is permanent, and the operator is told how
+			// to proceed. The same answer to a retry proves nothing, since an
+			// earlier attempt may have started the deploy, so it falls through
+			// to adoptDeployAfterError like any other refusal of a retry.
+			e.logger.Error("PlanetScale refused the deploy because the deploy request requires approval; failing the apply, since SchemaBot does not support deploy request approvals",
+				"database", database, "deploy_request", number, "error", err)
+			return nil, &engine.PermanentError{Err: &approvalRequiredError{number: number, cause: err}}
 		}
 		switch {
 		case isDeployStillValidatingError(err):

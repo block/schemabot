@@ -312,6 +312,83 @@ func TestGitHubRateLimitContextFromRequestClassifiesRESTRoutes(t *testing.T) {
 		repository string
 	}{
 		{
+			name:       "fetch repository",
+			method:     http.MethodGet,
+			url:        "https://api.github.com/repos/octocat/hello-world",
+			operation:  metrics.GitHubOperationFetchRepository,
+			repository: "octocat/hello-world",
+		},
+		{
+			name:       "fetch repository installation",
+			method:     http.MethodGet,
+			url:        "https://api.github.com/repos/octocat/hello-world/installation",
+			operation:  metrics.GitHubOperationFetchRepositoryInstallation,
+			repository: "octocat/hello-world",
+		},
+		{
+			name:       "fetch issue comment",
+			method:     http.MethodGet,
+			url:        "https://api.github.com/repos/octocat/hello-world/issues/comments/42",
+			operation:  metrics.GitHubOperationFetchIssueComment,
+			repository: "octocat/hello-world",
+		},
+		{
+			name:       "list issue timeline",
+			method:     http.MethodGet,
+			url:        "https://api.github.com/repos/octocat/hello-world/issues/7/timeline?per_page=100",
+			operation:  metrics.GitHubOperationListIssueTimeline,
+			repository: "octocat/hello-world",
+		},
+		{
+			name:       "remove issue label",
+			method:     http.MethodDelete,
+			url:        "https://api.github.com/repos/octocat/hello-world/issues/7/labels/schema-exception",
+			operation:  metrics.GitHubOperationRemoveIssueLabel,
+			repository: "octocat/hello-world",
+		},
+		{
+			name:       "remove issue label containing an encoded slash",
+			method:     http.MethodDelete,
+			url:        "https://api.github.com/repos/octocat/hello-world/issues/7/labels/schema%2Fexception",
+			operation:  metrics.GitHubOperationRemoveIssueLabel,
+			repository: "octocat/hello-world",
+		},
+		{
+			name:       "list open pull requests",
+			method:     http.MethodGet,
+			url:        "https://api.github.com/repos/octocat/hello-world/pulls?state=open&sort=updated",
+			operation:  metrics.GitHubOperationListPullRequests,
+			repository: "octocat/hello-world",
+		},
+		{
+			name:       "list pull requests for commit",
+			method:     http.MethodGet,
+			url:        "https://api.github.com/repos/octocat/hello-world/commits/abc123/pulls",
+			operation:  metrics.GitHubOperationListPullRequestsForCommit,
+			repository: "octocat/hello-world",
+		},
+		{
+			name:       "compare commits across a slashed branch",
+			method:     http.MethodGet,
+			url:        "https://api.github.com/repos/octocat/hello-world/compare/main...feature/add-email",
+			operation:  metrics.GitHubOperationCompareCommits,
+			repository: "octocat/hello-world",
+		},
+		{
+			name:       "fetch branch ref",
+			method:     http.MethodGet,
+			url:        "https://api.github.com/repos/octocat/hello-world/git/ref/heads/feature/add-email",
+			operation:  metrics.GitHubOperationFetchRef,
+			repository: "octocat/hello-world",
+		},
+		{
+			name:       "list merge queue refs",
+			method:     http.MethodGet,
+			url:        "https://api.github.com/repos/octocat/hello-world/git/matching-refs/heads/gh-readonly-queue/",
+			operation:  metrics.GitHubOperationListMatchingRefs,
+			repository: "octocat/hello-world",
+		},
+		{
 			name:       "fetch pull request",
 			method:     http.MethodGet,
 			url:        "https://api.github.com/repos/octocat/hello-world/pulls/1",
@@ -667,5 +744,15 @@ func TestGitHubTransportQuotaSnapshots(t *testing.T) {
 				assert.Zero(t, ages)
 			}
 		})
+	}
+}
+
+// Every route the transport names is counted as a read, a write, or an auth
+// request, never as unknown, so its 404s are classified and it lands in the
+// right quota dashboards.
+func TestGitHubRoutePatternsHaveARequestCategory(t *testing.T) {
+	for _, pattern := range githubRoutePatterns {
+		assert.NotEqual(t, metrics.GitHubRequestCategoryUnknown, gitHubRequestCategory(pattern.operation),
+			"%s %s (%s)", pattern.method, pattern.path, pattern.operation)
 	}
 }

@@ -38,7 +38,7 @@ func TestFormatApplyStatusComment_ShardedAttributionFromCaller(t *testing.T) {
 		tasks = append(tasks, &storage.Task{ID: oid, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: shard, DDL: "ALTER TABLE `mutes` ADD INDEX a"})
 	}
 
-	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "")
+	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil)
 
 	assert.Contains(t, out, "by @morgo at", "attribution shows the clean username")
 	assert.NotContains(t, out, "github:", "the raw structured caller is not rendered")
@@ -99,7 +99,7 @@ func TestFormatApplyStatusComment_ShardedFailedSurfacesError(t *testing.T) {
 	}
 	tasks := []*storage.Task{task(1, 1, "-40"), task(2, 2, "40-80"), task(3, 3, "80-c0"), task(4, 4, "c0-")}
 
-	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "")
+	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil)
 
 	assert.Contains(t, out, "## Schema Change Status", "uses the stable in-place status headline")
 	assert.Contains(t, out, "**Shards**:", "counts shards, not deployments")
@@ -126,7 +126,7 @@ func TestFormatApplyStatusComment_ShardedFailureFallsBackToTaskError(t *testing.
 	oid := int64(1)
 	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: "-40", DDL: "ALTER ...", ErrorMessage: gotZero}}
 
-	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil, nil, "", "")
+	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil, nil, "", "", nil)
 
 	assert.Contains(t, out, gotZero, "the task error is surfaced when the operation row has none")
 }
@@ -354,7 +354,7 @@ func TestCommentObserverResolvedDiffReachesShardedComment(t *testing.T) {
 	}}
 
 	o := &CommentObserver{stor: &stubPlanStorage{plan: plan}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, o.resolveShardedPlan(apply, ops), "", "")
+	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, o.resolveShardedPlan(apply, ops), "", "", nil)
 
 	assert.Contains(t, body, "### VSchema")
 	assert.Contains(t, body, "```diff\n+ vindex hash\n```",
@@ -449,7 +449,7 @@ func TestFormatApplyStatusComment_MultiKeyspaceRendersKeyspaceSections(t *testin
 		mk(5, "contacts_sharded/group_finalizer", state.ApplyOperation.Pending),
 	}
 
-	out := formatApplyStatusComment(apply, ops, false, nil, nil, nil, nil, "", "")
+	out := formatApplyStatusComment(apply, ops, false, nil, nil, nil, nil, "", "", nil)
 
 	assert.NotContains(t, out, "**Deployments**:", "must not fall back to the deployment-unit layout")
 	assert.Contains(t, out, "#### Keyspace `contacts`")
@@ -517,7 +517,7 @@ func TestFormatApplySummaryComment_ShardedRendersVerdict(t *testing.T) {
 	}
 	tasks := []*storage.Task{task(1, 1, "-40"), task(2, 2, "80-")}
 
-	out := formatApplySummaryComment(apply, ops, false, tasks, nil, nil, nil, "", "")
+	out := formatApplySummaryComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil)
 
 	assert.Contains(t, out, "## ✅ Schema Change Applied — Staging")
 	assert.NotContains(t, out, "Schema Change Status", "the summary is a verdict, not a status snapshot")
@@ -544,7 +544,7 @@ func TestFormatApplySummaryComment_ShardedVSchemaSection(t *testing.T) {
 		mk(3, "cdb_resolute_sharded/group_finalizer"),
 	}
 
-	out := formatApplySummaryComment(apply, ops, false, nil, nil, nil, nil, "", "")
+	out := formatApplySummaryComment(apply, ops, false, nil, nil, nil, nil, "", "", nil)
 
 	assert.Contains(t, out, "## ✅ Schema Change Applied — Staging")
 	assert.Contains(t, out, "### VSchema")
@@ -573,7 +573,7 @@ func TestFormatApplySummaryComment_ShardedApplyLevelErrorSurfaced(t *testing.T) 
 	}
 	ops := []*storage.ApplyOperation{op(1, "-40"), op(2, "80-")}
 
-	out := formatApplySummaryComment(apply, ops, false, nil, nil, nil, nil, "", "")
+	out := formatApplySummaryComment(apply, ops, false, nil, nil, nil, nil, "", "", nil)
 
 	assert.Contains(t, out, "## ❌ Schema Change Failed — Staging")
 	assert.Contains(t, out, "> ❌ **Failure:** finalize vschema: apply vschema to keyspace: context deadline exceeded",
@@ -816,7 +816,7 @@ func TestShardedCommentShowsGeneratedVSchemaChangeAsFinalize(t *testing.T) {
 	require.NotNil(t, view)
 	assert.Equal(t, map[string]bool{"ks": true}, view.finalizeOnly)
 
-	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, view, "", "")
+	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, view, "", "", nil)
 	assert.NotContains(t, body, "VSchema")
 }
 
@@ -857,14 +857,14 @@ func finalizesOnly(keyspace string) *shardedPlanView {
 // counts and no finalize section.
 func TestFormatApplyComment_SingleShardStrataReadsLikeMySQL(t *testing.T) {
 	apply, ops, tasks := singleShardStrataApply(state.Apply.Running, state.ApplyOperation.Running, state.ApplyOperation.Pending)
-	status := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "", "")
+	status := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "", "", nil)
 	assert.Contains(t, status, "**Keyspace `shop_001`**")
 	assert.Contains(t, status, "CREATE TABLE `orders`")
 	assert.NotContains(t, status, "**Shards**:")
 	assert.NotContains(t, status, "Finalize")
 
 	apply, ops, tasks = singleShardStrataApply(state.Apply.Completed, state.ApplyOperation.Completed, state.ApplyOperation.Completed)
-	summary := formatApplySummaryComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "", "")
+	summary := formatApplySummaryComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "", "", nil)
 	assert.Contains(t, summary, "Apply details (1 table)")
 	assert.Contains(t, summary, "CREATE TABLE `orders`")
 	assert.NotContains(t, summary, "**Shards**:")
@@ -878,7 +878,7 @@ func TestFormatApplySummaryComment_SingleShardStrataShowsAFailedFinalize(t *test
 	apply, ops, tasks := singleShardStrataApply(state.Apply.Failed, state.ApplyOperation.Completed, state.ApplyOperation.Failed)
 	ops[1].ErrorMessage = finalizeErr
 
-	out := formatApplySummaryComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "", "")
+	out := formatApplySummaryComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "", "", nil)
 
 	assert.Contains(t, out, finalizeErr)
 	assert.Contains(t, out, "CREATE TABLE `orders`")
@@ -1089,4 +1089,83 @@ func TestShardedTableStatusesByKeyspaceCarriesEachShardsCopyAndVerifyFigures(t *
 		{Shard: "-80", Status: state.Task.Checksumming, PercentComplete: 100, RowsCopied: 1000, RowsTotal: 1000, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000},
 		{Shard: "80-", Status: state.Task.Running, PercentComplete: 50, RowsCopied: 500, RowsTotal: 1000},
 	}, tables[0].Shards)
+}
+
+// A sharded CREATE TABLE is part-way through: one shard has landed and the
+// other is dispatched, its operation running while its task row still says
+// pending until the next progress poll. The comment reads the table as
+// applying across its shards, never as queued or as a row copy, and counts the
+// dispatched shard as applying.
+func TestBuildShardedApplyData_DispatchedCreateReadsAsApplying(t *testing.T) {
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "cdb_resolute_sharded/-80/mutes", state.ApplyOperation.Completed),
+		mk(2, "cdb_resolute_sharded/80-/mutes", state.ApplyOperation.Running),
+	}
+	task := func(id, opID int64, shard, taskState string) *storage.Task {
+		oid := opID
+		return &storage.Task{
+			ID: id, ApplyID: 1, ApplyOperationID: &oid, Shard: shard,
+			Namespace: "cdb_resolute_sharded", TableName: "mutes", DDLAction: "create", State: taskState,
+		}
+	}
+	tasks := []*storage.Task{
+		task(1, 1, "-80", state.Task.Completed),
+		task(2, 2, "80-", state.Task.Pending),
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running}
+
+	data := buildShardedApplyData(apply, ops, false, tasks, nil, "")
+
+	require.Len(t, data.Keyspaces, 1)
+	require.Len(t, data.Keyspaces[0].Tables, 1)
+	table := data.Keyspaces[0].Tables[0]
+	assert.Equal(t, state.Task.Running, table.Status, "a dispatched shard is under way, not queued")
+	assert.True(t, table.CopiesNoRows, "a CREATE TABLE copies no rows")
+	require.Len(t, table.Shards, 2)
+	assert.Equal(t, state.ApplyOperation.Running, table.Shards[1].Status)
+	require.Len(t, data.Keyspaces[0].Shards, 2)
+	assert.Equal(t, "applying", data.Keyspaces[0].Shards[1].Label)
+
+	out := templates.RenderShardedApplyComment(data)
+	assert.Contains(t, out, "**`mutes`**: 🔄 Applying\n")
+	assert.Contains(t, out, "**Shards**: 1 completed, 1 applying")
+	assert.Contains(t, out, "- Shards: 2 (1 applying, 1 complete)\n")
+	assert.NotContains(t, out, "Queued")
+	assert.NotContains(t, out, "running table copy")
+	assert.NotContains(t, out, "copying")
+}
+
+// A sharded table reads by the shards that have recorded their changes, and
+// by the stored plan only while none has. -80 has no tasks yet and 80- runs an
+// instant ALTER, so `orders` copies no rows. No shard of `mutes` has a task
+// yet and the plan creates it, so it copies no rows either. The CLI reads both
+// tables by the same rule (presentation.ShardedTableCopiesNoRows).
+func TestShardedTableStatusesReadATableFromItsReportedShardsThenItsPlan(t *testing.T) {
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "ks/-80/orders", state.ApplyOperation.Pending),
+		mk(2, "ks/80-/orders", state.ApplyOperation.Running),
+		mk(3, "ks/-80/mutes", state.ApplyOperation.Running),
+		mk(4, "ks/80-/mutes", state.ApplyOperation.Pending),
+	}
+	tasksByOp := map[int64][]*storage.Task{
+		2: {{State: state.Task.Running, DDLAction: "alter", IsInstant: true}},
+	}
+	view := &shardedPlanView{plannedChanges: map[shardedTableKey]presentation.TableChange{
+		{namespace: "ks", table: "orders"}: {DDLAction: "alter"},
+		{namespace: "ks", table: "mutes"}:  {DDLAction: "create"},
+	}}
+
+	tables := shardedTableStatusesByKeyspace(ops, tasksByOp, view)["ks"]
+
+	require.Len(t, tables, 2)
+	assert.Equal(t, "orders", tables[0].Table)
+	assert.True(t, tables[0].CopiesNoRows, "the shard without tasks does not outvote the instant ALTER")
+	assert.Equal(t, "mutes", tables[1].Table)
+	assert.True(t, tables[1].CopiesNoRows, "with no tasks yet, the planned CREATE TABLE decides")
 }

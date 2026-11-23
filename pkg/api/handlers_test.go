@@ -197,6 +197,7 @@ type mockStorageWithApplyStores struct {
 	controls   storage.ControlRequestStore
 	operations storage.ApplyOperationStore
 	freezes    storage.FreezeStore
+	overrides  storage.FreezeOverrideStore
 }
 
 func (m *mockStorageWithApplyStores) Plans() storage.PlanStore         { return m.plans }
@@ -346,6 +347,23 @@ type staticApplyStore struct {
 	apply   *storage.Apply
 	applies []*storage.Apply
 	err     error
+}
+
+// GetInProgress returns the store's applies, as the SQL store returns the
+// applies not yet terminal.
+func (s *staticApplyStore) GetInProgress(context.Context) ([]*storage.Apply, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.apply != nil {
+		return append([]*storage.Apply{s.apply}, s.applies...), nil
+	}
+	return s.applies, nil
+}
+
+// GetUnsettled returns the store's applies, as GetInProgress does.
+func (s *staticApplyStore) GetUnsettled(ctx context.Context) ([]*storage.Apply, error) {
+	return s.GetInProgress(ctx)
 }
 
 func (s *staticApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
@@ -1149,9 +1167,30 @@ type mockTernClient struct {
 	observerApplyID          int64
 	observer                 tern.ProgressObserver
 	isRemote                 bool
+	// resolveNamespacesMu guards resolveNamespacesReqs: a shared schema check
+	// resolves each peer's namespaces, possibly through one client.
+	resolveNamespacesMu   sync.Mutex
+	resolveNamespacesReqs []*ternv1.ResolveNamespacesRequest
+	// resolveNamespacesHook answers ResolveNamespaces. When nil, each
+	// namespace resolves to itself, the way an unpinned target resolves it.
+	resolveNamespacesHook func(context.Context, *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error)
 }
 
 func (m *mockTernClient) Health(ctx context.Context) error { return m.healthErr }
+func (m *mockTernClient) ResolveNamespaces(ctx context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error) {
+	m.resolveNamespacesMu.Lock()
+	m.resolveNamespacesReqs = append(m.resolveNamespacesReqs, req)
+	hook := m.resolveNamespacesHook
+	m.resolveNamespacesMu.Unlock()
+	if hook != nil {
+		return hook(ctx, req)
+	}
+	schemas := make(map[string]string, len(req.Namespaces))
+	for _, ns := range req.Namespaces {
+		schemas[ns] = ns
+	}
+	return &ternv1.ResolveNamespacesResponse{Schemas: schemas}, nil
+}
 func (m *mockTernClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
 	// A multi-target pull fans its members out concurrently, so several
 	// goroutines record through this one client.

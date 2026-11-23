@@ -187,6 +187,10 @@ func TestRunExecutesEveryRegisteredCase(t *testing.T) {
 			executed[CaseNotReadyDistinguishable]++
 			return NotReadyFixture{Invoke: func(context.Context) error { return engine.NewNotReadyError("not ready") }}
 		},
+		StartUnsupported:      markControl(CaseStartUnsupported),
+		CutoverUnsupported:    markControl(CaseCutoverUnsupported),
+		RevertUnsupported:     markControl(CaseRevertUnsupported),
+		SkipRevertUnsupported: markControl(CaseSkipRevertUnsupported),
 	})
 	for _, c := range contractCases {
 		assert.Equal(t, 1, executed[c.name], "registered case %q did not execute exactly once", c.name)
@@ -255,17 +259,17 @@ func (f fakeEngine) Cancel(_ context.Context, req *engine.ControlRequest) (*engi
 }
 func (f fakeEngine) Start(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	f.recorder.record("Start")
-	return nil, nil
+	return nil, engine.NewUnsupportedOperationError("start is not supported")
 }
 func (f fakeEngine) Cutover(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	f.recorder.record("Cutover")
-	return nil, nil
+	return nil, engine.NewUnsupportedOperationError("cutover is not supported")
 }
 func (f fakeEngine) Revert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	f.recorder.record("Revert")
-	return nil, nil
+	return nil, engine.NewUnsupportedOperationError("revert is not supported")
 }
 func (f fakeEngine) SkipRevert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	f.recorder.record("SkipRevert")
-	return nil, nil
+	return nil, engine.NewUnsupportedOperationError("skip-revert is not supported")
 }

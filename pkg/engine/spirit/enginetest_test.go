@@ -35,7 +35,9 @@ func spiritControlRequest() *engine.ControlRequest {
 // Spirit's contract-suite run. Spirit tracks its schema change in-process, so
 // "nonexistent" means no tracked change in this process, and "already
 // completed" means the tracked change reached its completed state before the
-// command arrived.
+// command arrived. Spirit has no revert window, so it declines revert and
+// skip-revert for every change; the fixtures address a completed change, the
+// one an operator would ask to revert.
 func TestEngineConformance(t *testing.T) {
 	enginetest.Run(t, enginetest.Harness{
 		CancelAlreadyCompleted: func(t *testing.T) enginetest.ControlFixture {
@@ -90,8 +92,22 @@ func TestEngineConformance(t *testing.T) {
 				},
 			}
 		},
+		RevertUnsupported: func(t *testing.T) enginetest.ControlFixture {
+			return enginetest.ControlFixture{
+				Engine: engineWithTrackedChange(engine.StateCompleted, ""),
+				Req:    spiritControlRequest(),
+			}
+		},
+		SkipRevertUnsupported: func(t *testing.T) enginetest.ControlFixture {
+			return enginetest.ControlFixture{
+				Engine: engineWithTrackedChange(engine.StateCompleted, ""),
+				Req:    spiritControlRequest(),
+			}
+		},
 		Skips: map[enginetest.Case]string{
 			enginetest.CaseNotReadyDistinguishable: "Spirit drives schema changes in-process against a direct MySQL connection: there is no remote backend that could accept an operation later but not yet, so no operation is ever rejected as not-ready.",
+			enginetest.CaseStartUnsupported:        "Spirit supports start: it resumes a stopped schema change from its checkpoint table.",
+			enginetest.CaseCutoverUnsupported:      "Spirit supports cutover: it runs a deferred cutover by dropping its sentinel table.",
 		},
 	})
 }

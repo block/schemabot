@@ -1162,13 +1162,14 @@ func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, in
 
 	inFlight := h.inFlightAppliesForClosedPR(ctx, repo, pr, applies)
 
-	if err := h.releaseLocksForClosedPR(ctx, repo, pr, inFlight); err != nil {
+	keptForApply, err := h.releaseLocksForClosedPR(ctx, repo, pr, inFlight)
+	if err != nil {
 		return false, fmt.Errorf("release locks for closed PR %s#%d: %w", repo, pr, err)
 	}
 
-	if len(inFlight) > 0 {
-		h.logger.Info("check state retained for closed PR until all applies reach a terminal state",
-			"repo", repo, "pr", pr, "in_flight_databases", len(inFlight))
+	if len(inFlight) > 0 || keptForApply > 0 {
+		h.logger.Info("check state retained for closed PR until all of its applies settle",
+			"repo", repo, "pr", pr, "in_flight_databases", len(inFlight), "locks_kept_for_applies", keptForApply)
 		return true, nil
 	}
 
@@ -1296,15 +1297,24 @@ func (h *Handler) inFlightAppliesForClosedPR(ctx context.Context, repo string, p
 // again, so it releases a lock only if the PR is still closed and still holds
 // it.
 //
+// The in-flight map comes from an applies read made before the release, so it
+// cannot see an apply that records a listed lock and becomes durable after that
+// read. Each release therefore re-checks under the lock row's lock and keeps
+// the lock while an apply recording it has not settled, a stopped apply
+// included. Such a lock is in flight exactly as one the read found, so it is
+// counted in the returned keptForApply rather than reported as an error: the
+// caller keeps the PR's check state and completes, and a retry would only find
+// the same apply again.
+//
 // Every release is attempted even if an earlier one fails, and the failures
 // are joined and returned so a caller with a retry mechanism re-attempts the
 // still-held locks. Each attempt re-lists the PR's locks first, and a released
 // lock's row is deleted, so a retry converges.
-func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr int, inFlight map[closedPRDatabase]bool) error {
+func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr int, inFlight map[closedPRDatabase]bool) (keptForApply int, err error) {
 	locks, err := h.service.Storage().Locks().GetByPR(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to look up locks for closed PR; no locks released", "repo", repo, "pr", pr, "error", err)
-		return fmt.Errorf("look up locks for closed PR %s#%d: %w", repo, pr, err)
+		return 0, fmt.Errorf("look up locks for closed PR %s#%d: %w", repo, pr, err)
 	}
 	var releaseErrs []error
 	for _, lock := range locks {
@@ -1313,11 +1323,21 @@ func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr i
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType)
 			continue
 		}
-		err := h.service.Storage().Locks().ReleaseByID(ctx, lock.ID, lock.DatabaseName, lock.DatabaseType, lock.Owner, lock.PendingPlanID)
+		err := h.service.Storage().Locks().ReleaseByIDIfUnused(ctx, lock.ID, lock.DatabaseName, lock.DatabaseType, lock.Owner, lock.PendingPlanID)
+		var inUse *storage.LockInUseError
 		switch {
 		case err == nil:
 			h.logger.Info("released lock on PR close",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName)
+		case errors.As(err, &inUse):
+			// An apply recording the listed lock row became durable after
+			// cleanup read the PR's applies, or is stopped and has not
+			// settled. Either way it is in flight for this lock.
+			keptForApply++
+			h.logger.Warn("lock retained on PR close because an apply recording it has not settled; this cleanup pass deletes no check state",
+				append(inUse.Apply.LogAttrs(),
+					"closed_repo", repo, "closed_pr", pr, "lock_owner", lock.Owner,
+					"listed_pending_plan_id", lock.PendingPlanID, "error", err)...)
 		case isVettedLockGone(err):
 			h.logger.Info("lock already released before PR close cleanup reached it",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
@@ -1340,7 +1360,7 @@ func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr i
 			releaseErrs = append(releaseErrs, fmt.Errorf("release lock on %s (%s): %w", lock.DatabaseName, lock.DatabaseType, err))
 		}
 	}
-	return errors.Join(releaseErrs...)
+	return keptForApply, errors.Join(releaseErrs...)
 }
 
 // checkDatabaseKey identifies the database a per-database stored check row
@@ -1380,7 +1400,7 @@ func checkDatabaseKeysForConfigs(configs []ghclient.DiscoveredConfig) map[checkD
 // cleanupStaleChecks updates checks for databases no longer in the PR. A row is
 // still affected only when the PR plans a database with the same name and type.
 // A row under a database's old type, for a database the PR now plans under a
-// new type, is left for that plan to settle (see settleChecksReplacedByNewType).
+// new type, is left for that plan to settle (see settleLeftBehindChecks).
 // When the PR plans databases, cleanup leaves the aggregate to their plans, so a
 // caller passing affected databases must launch those plans only after this
 // returns.
@@ -1519,34 +1539,52 @@ func checkDatabaseKeyStrings(keys map[checkDatabaseKey]bool) []string {
 	return out
 }
 
-// settleChecksReplacedByNewType settles the rows a database left under its old
-// type once the plan of its new type has stored results. A plan calls it after
-// storing its rows and before folding the aggregate, so the old row blocks the
-// aggregate, from its earlier commit, for as long as the result that replaces
-// it does not exist. That holds for every fold, not only the plan's own: a
-// second database still planning keeps the aggregate open through its own old
-// row.
+// settleLeftBehindChecks settles the rows a planned database left behind on
+// an earlier commit that no plan on this commit will store again: rows under
+// a type the database no longer has, and rows in an environment the database
+// no longer has. A plan calls it after storing its rows and before folding the
+// aggregate, so a left-behind row blocks the aggregate, from its earlier
+// commit, for as long as it might still be replaced. That holds for every
+// fold, not only the plan's own: a second database still planning keeps the
+// aggregate open through its own old row.
 //
-// Whether a result replaces a row is read from stored check state, not from
-// what the calling plan stored, so a plan of one environment and a plan of
-// every environment settle the same rows. A row is settled in an environment
+// A row under an old type is settled once the plan of the new type has stored
+// results. Whether a result replaces it is read from stored check state, not
+// from what the calling plan stored, so a plan of one environment and a plan
+// of every environment settle the same rows. It is settled in an environment
 // where a row under the new type is stored on headSHA, and in an environment
 // this deployment does not plan the database in, since nothing will replace it
-// there. Anywhere else the row keeps blocking until a later plan stores that
-// environment. Settling follows stale cleanup: a started apply keeps its row
-// blocking, and a plan-only row passes.
+// there. Anywhere else it keeps blocking until a later plan stores that
+// environment.
 //
-// A plan that finishes after the PR moved to a newer commit settles nothing,
-// because the newer commit's cleanup and plans own those rows. The PR head is
-// read only when there is an old-type row to settle, so a plan of a database
-// whose type never changed adds no GitHub call.
-func (h *Handler) settleChecksReplacedByNewType(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, databaseName, databaseType string) error {
+// A row under the database's current type is settled only when its
+// environment is no longer one this deployment plans the database in, for
+// example after an operator removes the environment from the database's
+// server config. No plan can store that environment again, so without this
+// the row would hold the aggregate open for good. The environments come from
+// the server config, never from the PR, so a PR cannot drop an environment to
+// clear its own gate. A row in an environment the database still has is left
+// for that environment's next plan. Such a row is settled only once a result
+// of an environment the database is planned in is stored on headSHA, so a
+// plan whose own write failed cannot leave the aggregate with no result of
+// the database at all.
+//
+// Settling follows stale cleanup: a started apply keeps its row blocking. A
+// plan-only row under an old type passes. A plan-only row in an environment
+// the database no longer has is removed rather than passed, so the PR is left
+// as if the environment had never been configured: if an operator lists the
+// environment again, its missing result reads as it would for any newly
+// configured environment, and never as a pass. A plan that finishes after the
+// PR moved to a newer commit settles nothing, because the newer commit's
+// cleanup and plans own those rows. The PR head is read only when there is a row to settle, so a
+// plan with nothing left behind adds no GitHub call.
+func (h *Handler) settleLeftBehindChecks(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, databaseName, databaseType string) error {
 	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
 	if err != nil {
-		return fmt.Errorf("load checks for %s#%d to settle %s rows under types other than %s: %w", repo, pr, databaseName, databaseType, err)
+		return fmt.Errorf("load checks for %s#%d to settle rows %s left on earlier commits: %w", repo, pr, databaseName, err)
 	}
 	planned := newCheckDatabaseKey(databaseName, databaseType)
-	var oldTypeChecks []*storage.Check
+	var oldTypeChecks, earlierCommitChecks []*storage.Check
 	replacedEnvironments := map[string]bool{}
 	for _, check := range checks {
 		if isAggregateCheck(check) {
@@ -1559,7 +1597,9 @@ func (h *Handler) settleChecksReplacedByNewType(ctx context.Context, client *ghc
 		if key.databaseType == planned.databaseType {
 			if check.HeadSHA == headSHA {
 				replacedEnvironments[storage.CanonicalKey(check.Environment)] = true
+				continue
 			}
+			earlierCommitChecks = append(earlierCommitChecks, check)
 			continue
 		}
 		if check.HeadSHA == headSHA {
@@ -1571,29 +1611,46 @@ func (h *Handler) settleChecksReplacedByNewType(ctx context.Context, client *ghc
 		}
 		oldTypeChecks = append(oldTypeChecks, check)
 	}
-	if len(oldTypeChecks) == 0 {
-		h.logger.Debug("plan of a database leaves no rows under an old type to settle",
+	if len(oldTypeChecks) == 0 && len(earlierCommitChecks) == 0 {
+		h.logger.Debug("plan of a database leaves no rows on earlier commits to settle",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "database", databaseName, "database_type", databaseType)
+		return nil
+	}
+
+	environments, err := h.allowedDatabaseEnvironments(databaseName)
+	if err != nil {
+		return fmt.Errorf("resolve environments of %s to settle the rows it left on earlier commits of %s#%d: %w", databaseName, repo, pr, err)
+	}
+	plannedEnvironments := make(map[string]bool, len(environments))
+	for _, environment := range environments {
+		plannedEnvironments[storage.CanonicalKey(environment)] = true
+	}
+	removedEnvironmentChecks := checksOutsideEnvironments(earlierCommitChecks, plannedEnvironments)
+	if len(removedEnvironmentChecks) > 0 && !storesResultInEnvironments(replacedEnvironments, plannedEnvironments) {
+		// The plan's own result was not stored, so settling these rows could
+		// leave the aggregate passing with no result of this database on this
+		// commit. They keep blocking until a plan whose result is stored.
+		h.logger.Warn("checks in environments the database is no longer planned in keep blocking because no result of an environment it is planned in is stored on this commit",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "database", databaseName, "database_type", databaseType,
+			"planned_environments", environments, "rows_in_removed_environments", len(removedEnvironmentChecks))
+		removedEnvironmentChecks = nil
+	}
+	if len(oldTypeChecks) == 0 && len(removedEnvironmentChecks) == 0 {
+		h.logger.Debug("plan of a database leaves its rows on earlier commits to the plans of their environments",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "database", databaseName, "database_type", databaseType,
+			"rows_on_earlier_commits", len(earlierCommitChecks))
 		return nil
 	}
 
 	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
-		return fmt.Errorf("verify head of %s#%d before settling %s rows under types other than %s on %s: %w", repo, pr, databaseName, databaseType, headSHA, err)
+		return fmt.Errorf("verify head of %s#%d before settling rows %s left on earlier commits, on %s: %w", repo, pr, databaseName, headSHA, err)
 	}
 	if prInfo.HeadSHA != headSHA {
-		h.logger.Info("plan of a database's new type settles no rows because the PR moved to a newer commit",
+		h.logger.Info("plan of a database settles no rows it left on earlier commits because the PR moved to a newer commit",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "current_head_sha", prInfo.HeadSHA,
 			"database", databaseName, "database_type", databaseType)
 		return nil
-	}
-	environments, err := h.allowedDatabaseEnvironments(databaseName)
-	if err != nil {
-		return fmt.Errorf("resolve environments of %s to settle its rows under types other than %s on %s#%d: %w", databaseName, databaseType, repo, pr, err)
-	}
-	plannedEnvironments := make(map[string]bool, len(environments))
-	for _, environment := range environments {
-		plannedEnvironments[storage.CanonicalKey(environment)] = true
 	}
 	for _, check := range oldTypeChecks {
 		environment := storage.CanonicalKey(check.Environment)
@@ -1611,7 +1668,77 @@ func (h *Handler) settleChecksReplacedByNewType(ctx context.Context, client *ghc
 			"previous_status", check.Status, "previous_conclusion", check.Conclusion, "apply_id", check.ApplyID)
 		h.settleStaleCheckState(ctx, repo, pr, headSHA, check)
 	}
+	for _, check := range removedEnvironmentChecks {
+		h.logger.Info("settling check in an environment the database is no longer planned in",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"planned_environments", environments,
+			"previous_head_sha", check.HeadSHA,
+			"previous_status", check.Status, "previous_conclusion", check.Conclusion, "apply_id", check.ApplyID)
+		if checkHasStartedApply(check) {
+			h.blockStaleStartedApplyCheckState(ctx, repo, pr, headSHA, check)
+			continue
+		}
+		h.removeStalePlanOnlyCheckState(ctx, repo, pr, headSHA, check)
+	}
 	return nil
+}
+
+// removeStalePlanOnlyCheckState removes a plan-only row in an environment the
+// database no longer has. The delete is guarded in storage: a row an apply
+// claimed, or one a newer write moved, after this plan read it is kept.
+func (h *Handler) removeStalePlanOnlyCheckState(ctx context.Context, repo string, pr int, headSHA string, check *storage.Check) {
+	readHeadSHA := check.HeadSHA
+	removed, err := h.service.Storage().Checks().DeleteStalePlanOnly(ctx, check, readHeadSHA)
+	status := "success"
+	switch {
+	case err != nil:
+		status = "error"
+		h.logger.Error("failed to remove check in an environment the database is no longer planned in; the row keeps blocking the aggregate",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"read_head_sha", readHeadSHA, "error", err)
+	case !removed:
+		status = "noop"
+		h.logger.Info("check in an environment the database is no longer planned in left to the apply or newer write that changed it after this plan read it",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"read_head_sha", readHeadSHA)
+	}
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:    "stale_check_cleanup",
+		Repository:   repo,
+		Database:     check.DatabaseName,
+		DatabaseType: check.DatabaseType,
+		Environment:  check.Environment,
+		Status:       status,
+	})
+}
+
+// checksOutsideEnvironments returns the rows whose environment is not one of
+// environments, keyed by storage.CanonicalKey.
+func checksOutsideEnvironments(checks []*storage.Check, environments map[string]bool) []*storage.Check {
+	var outside []*storage.Check
+	for _, check := range checks {
+		if !environments[storage.CanonicalKey(check.Environment)] {
+			outside = append(outside, check)
+		}
+	}
+	return outside
+}
+
+// storesResultInEnvironments reports whether any environment in stored is one
+// of environments. Both are keyed by storage.CanonicalKey.
+func storesResultInEnvironments(stored, environments map[string]bool) bool {
+	for environment := range stored {
+		if environments[environment] {
+			return true
+		}
+	}
+	return false
 }
 
 // settleStaleCheckState moves a row nothing will replace onto headSHA. A row a
@@ -1690,6 +1817,7 @@ func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo str
 
 func (h *Handler) markStalePlanOnlyCheckStateSuccessful(ctx context.Context, repo string, pr int, headSHA string, check *storage.Check) bool {
 	priorApplyID := check.ApplyID
+	readHeadSHA := check.HeadSHA
 	check.HeadSHA = headSHA
 	check.Conclusion = checkConclusionSuccess
 	check.HasChanges = false
@@ -1700,7 +1828,9 @@ func (h *Handler) markStalePlanOnlyCheckStateSuccessful(ctx context.Context, rep
 
 	// The success write is guarded against in-flight apply-owned rows: an apply
 	// that started after this cleanup read the row must keep blocking the PR.
-	marked, err := h.service.Storage().Checks().MarkStalePlanSuccessful(ctx, check)
+	// It is also pinned to the head the row was read at, so a newer commit's
+	// write that moved the row first is not pulled back to this older commit.
+	marked, err := h.service.Storage().Checks().MarkStalePlanSuccessful(ctx, check, readHeadSHA)
 	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "stale_check_cleanup",
@@ -1718,6 +1848,17 @@ func (h *Handler) markStalePlanOnlyCheckStateSuccessful(ctx context.Context, rep
 		return false
 	}
 
+	if !marked && h.stalePlanCheckMovedByNewerWrite(ctx, repo, pr, headSHA, readHeadSHA, check) {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "stale_check_cleanup",
+			Repository:   repo,
+			Database:     check.DatabaseName,
+			DatabaseType: check.DatabaseType,
+			Environment:  check.Environment,
+			Status:       "noop",
+		})
+		return false
+	}
 	if !marked {
 		// A concurrent apply claimed the row between the cleanup read and this
 		// write. Leave it in_progress and apply-owned so it keeps blocking until
@@ -1746,6 +1887,41 @@ func (h *Handler) markStalePlanOnlyCheckStateSuccessful(ctx context.Context, rep
 		Environment:  check.Environment,
 		Status:       "success",
 	})
+	return true
+}
+
+// stalePlanCheckMovedByNewerWrite reports whether a plan-only row the stale
+// success write skipped was moved to another commit, by a write newer than
+// this cleanup's read, rather than claimed by an apply. Such a row belongs to
+// that newer write. An apply-owned row, or one that cannot be re-read, reports
+// false, so the caller keeps treating it as blocking.
+func (h *Handler) stalePlanCheckMovedByNewerWrite(ctx context.Context, repo string, pr int, headSHA, readHeadSHA string, check *storage.Check) bool {
+	stored, err := h.service.Storage().Checks().Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	if err != nil {
+		h.logger.Error("failed to re-read stale plan check after its success write was skipped; the row is treated as claimed by an apply and keeps blocking",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"read_head_sha", readHeadSHA, "error", err)
+		return false
+	}
+	if stored == nil {
+		h.logger.Warn("stale plan check was deleted after cleanup read it; nothing is left to settle",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"read_head_sha", readHeadSHA)
+		return true
+	}
+	if checkHasStartedApply(stored) || stored.HeadSHA == readHeadSHA || stored.HeadSHA == headSHA {
+		return false
+	}
+	h.logger.Info("stale plan check left to the newer write that moved it to another commit after cleanup read it",
+		"repo", repo, "pr", pr, "head_sha", headSHA,
+		"database", check.DatabaseName, "database_type", check.DatabaseType,
+		"environment", check.Environment, "check_id", check.ID,
+		"read_head_sha", readHeadSHA, "stored_head_sha", stored.HeadSHA,
+		"stored_status", stored.Status, "stored_conclusion", stored.Conclusion)
 	return true
 }
 

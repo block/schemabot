@@ -214,6 +214,11 @@ type ApplyStatusCommentData struct {
 	// saved and a new apply resumes them.
 	StoppedAtCutover presentation.StoppedAtCutover
 
+	// StoppedByFreeze names the freeze that stopped the apply, nil when an
+	// operator stopped it or it is not stopped. A stopped comment says so
+	// above its resume command.
+	StoppedByFreeze *apitypes.FreezeStopRef
+
 	// SkipRevert reports whether the apply was started with --skip-revert (the
 	// apply's durable skip-revert option). Before cutover it is listed on the
 	// options line beside DeferCutover, as the plan listed it.
@@ -608,7 +613,7 @@ func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentD
 	if command == "cancel" {
 		prefix = cancelPrefix
 	}
-	writeMemberFooterAction(sb, data, prefix, appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment), data.Tenant))
+	writeMemberFooterAction(sb, data, prefix, AppendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment), data.Tenant))
 }
 
 // writeMemberFooterAction writes a footer action, unless the comment is one
@@ -1119,14 +1124,14 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		// the source before cutover. On a large table this can run for hours, so
 		// show how far the verification has progressed once Spirit reports a total.
 		if table.ChecksumRowsTotal > 0 {
-			pct := ui.ClampPercent(int(table.ChecksumRowsChecked * 100 / table.ChecksumRowsTotal))
+			pct := ui.ChecksumDisplayPercent(table.ChecksumRowsChecked, table.ChecksumRowsTotal)
 			fmt.Fprintf(sb, "**%s**: %s \U0001f50d Checksumming to verify data (%s)%s\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(pct),
-				ui.FormatRowCopyPercent(pct, table.ChecksumRowsChecked, table.ChecksumRowsTotal), throttledSuffix(table))
+				ui.FormatRowCopyPercent(pct, table.ChecksumRowsChecked, table.ChecksumRowsTotal), ui.ThrottledSuffix(table.Throttled))
 			writeDDLLine(sb, dialect, table.DDL, budget)
 			fmt.Fprintf(sb, "- Rows verified: %s / %s\n",
 				ui.FormatNumber(ui.ClampRows(table.ChecksumRowsChecked, table.ChecksumRowsTotal)), ui.FormatNumber(table.ChecksumRowsTotal))
 		} else {
-			fmt.Fprintf(sb, "**%s**: %s \U0001f50d Checksumming to verify data...%s\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(100), throttledSuffix(table))
+			fmt.Fprintf(sb, "**%s**: %s \U0001f50d Checksumming to verify data...%s\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(100), ui.ThrottledSuffix(table.Throttled))
 			writeDDLLine(sb, dialect, table.DDL, budget)
 		}
 		writeThrottleTooltip(sb, table)
@@ -1150,7 +1155,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.Recovering:
-		if recoveringIsCopyingRows(table) {
+		if ui.RecoveringCopyingRows(table.RowsTotal, table.PercentComplete) {
 			pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied)
 			bar := ui.ProgressBarRowCopy(pct)
 			fmt.Fprintf(sb, "**%s**: %s Row copy in progress (%s)\n", inlineCode(table.TableName), bar,
@@ -1239,19 +1244,20 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		renderRunningTable(sb, dialect, table, budget)
 	}
 
-	renderShardSummary(sb, table, budget)
+	renderShardSummary(sb, table, presentation.RunningCopying, budget)
 
 	sb.WriteString("\n")
 }
 
 // renderShardSummary lists a sharded table's shards while it is in flight. A
 // settled table's line already says where it ended, so the listing stays out
-// of the way then.
-func renderShardSummary(sb *strings.Builder, table TableProgressData, budget *ddlBlockBudget) {
+// of the way then. runningWord names the shards working on the change
+// (presentation.RunningWord).
+func renderShardSummary(sb *strings.Builder, table TableProgressData, runningWord string, budget *ddlBlockBudget) {
 	if !presentation.ListsParts(table.Status) {
 		return // completed/pending/cancelled/failed: no breakdown, stay quiet
 	}
-	writeMemberList(sb, presentation.ShardNoun, table.Shards, presentation.PendingQueued, budget)
+	writeMemberList(sb, presentation.ShardNoun, table.Shards, presentation.PendingQueued, runningWord, budget)
 }
 
 // writeMemberList lists a table's members, the shards of a sharded table or
@@ -1262,14 +1268,20 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData, budget *dd
 // names only its failures and slowest members, leaving the rest to the counts,
 // rather than growing a line per member. A comment that would not fit otherwise keeps only the line counting them
 // (ddlBlockBudget.listsMembers). pendingWord names the members still to run
-// (presentation.PendingWord), in the count and on their lines alike.
-func writeMemberList(sb *strings.Builder, noun presentation.Noun, members []ShardProgressData, pendingWord string, budget *ddlBlockBudget) {
+// (presentation.PendingWord), in the count and on their lines alike, and
+// runningWord names the members working on it (presentation.RunningWord).
+func writeMemberList(sb *strings.Builder, noun presentation.Noun, members []ShardProgressData, pendingWord, runningWord string, budget *ddlBlockBudget) {
 	if len(members) <= 1 {
 		return
 	}
-	part := func(i int) presentation.Part { return members[i].part() }
+	part := func(i int) presentation.Part {
+		p := members[i].part()
+		p.RunningLabel = runningWord
+		return p
+	}
 	c := presentation.CountParts(len(members), func(i int) string { return members[i].Status })
 	c.PendingLabel = pendingWord
+	c.RunningLabel = runningWord
 	fmt.Fprintf(sb, "- %s: %d (%s)\n", ui.CapitalizeFirst(noun.Plural), len(members), strings.Join(c.Phrases(), ", "))
 	if !budget.listsMembers() {
 		return
@@ -1289,7 +1301,7 @@ func renderRunningTable(sb *strings.Builder, dialect schema.Dialect, table Table
 	defer writeThrottleTooltip(sb, table)
 	if table.RowsTotal > 0 {
 		if ui.EstimateExceeded(table.RowsCopied, table.RowsTotal) {
-			fmt.Fprintf(sb, "**%s**: %s Finalizing copy%s\n", inlineCode(table.TableName), ui.ProgressBarActivity(), throttledSuffix(table))
+			fmt.Fprintf(sb, "**%s**: %s Finalizing copy%s\n", inlineCode(table.TableName), ui.ProgressBarActivity(), ui.ThrottledSuffix(table.Throttled))
 			writeDDLLine(sb, dialect, table.DDL, budget)
 			fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(table.RowsCopied))
 			fmt.Fprintf(sb, "- "+glyph.Info+" _%s_\n", ui.EstimateExceededTooltip)
@@ -1301,33 +1313,21 @@ func renderRunningTable(sb *strings.Builder, dialect schema.Dialect, table Table
 			// Row total is known but the copy hasn't reported progress yet
 			// (VReplication / Spirit ramp-up). A 0% bar reads as stuck, so show
 			// a starting indicator and the row total instead.
-			fmt.Fprintf(sb, "**%s**: ⏳ Starting copy...%s\n", inlineCode(table.TableName), throttledSuffix(table))
+			fmt.Fprintf(sb, "**%s**: ⏳ Starting copy...%s\n", inlineCode(table.TableName), ui.ThrottledSuffix(table.Throttled))
 			writeDDLLine(sb, dialect, table.DDL, budget)
 			writeRowsAndETA(sb, table)
 			return
 		}
 		bar := ui.ProgressBarRowCopy(pct)
 		fmt.Fprintf(sb, "**%s**: %s %s%s\n", inlineCode(table.TableName), bar,
-			ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal), throttledSuffix(table))
+			ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal), ui.ThrottledSuffix(table.Throttled))
 		writeDDLLine(sb, dialect, table.DDL, budget)
 		writeRowsAndETA(sb, table)
 	} else {
 		// No row data yet (initializing or instant DDL)
-		fmt.Fprintf(sb, "**%s**: Running...%s\n", inlineCode(table.TableName), throttledSuffix(table))
+		fmt.Fprintf(sb, "**%s**: Running...%s\n", inlineCode(table.TableName), ui.ThrottledSuffix(table.Throttled))
 		writeDDLLine(sb, dialect, table.DDL, budget)
 	}
-}
-
-// throttledSuffix annotates a paced-phase header when the engine's throttler
-// is holding the phase back, so a slow bar reads as deliberate backpressure —
-// slowed, not stopped — right where the eye checks progress, and never to be
-// confused with an operator stop. The drive clears the stored flag when the
-// throttle lifts, so the annotation disappears on the next refresh.
-func throttledSuffix(table TableProgressData) string {
-	if !table.Throttled {
-		return ""
-	}
-	return " (throttled)"
 }
 
 // writeThrottleTooltip explains the header's "(throttled)" annotation with the
@@ -1376,10 +1376,6 @@ func cancelledTablePhrase(table TableProgressData) string {
 	}
 }
 
-func recoveringIsCopyingRows(table TableProgressData) bool {
-	return table.RowsTotal > 0 && table.PercentComplete < 100
-}
-
 // recoveringCopyPercent returns the least-progressed recovering table's copy
 // percent as display text, so the recovery summary never overstates how far
 // the slowest table has come.
@@ -1388,7 +1384,7 @@ func recoveringCopyPercent(tables []TableProgressData) (string, bool) {
 	text := ""
 	found := false
 	for _, table := range tables {
-		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || !recoveringIsCopyingRows(table) {
+		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || !ui.RecoveringCopyingRows(table.RowsTotal, table.PercentComplete) {
 			continue
 		}
 		if frac := ui.RowCopyFraction(table.PercentComplete, table.RowsCopied, table.RowsTotal); !found || frac < fraction {
@@ -1473,15 +1469,13 @@ func countTablesWithDDL(tables []TableProgressData) int {
 }
 
 // writePlannedRows writes the rows line of a table no engine has reported on
-// yet: the plan's row estimate and size, both approximate, so the work ahead
-// is visible before the copy starts. span names the targets the estimate
+// yet (presentation.PlannedRowsText). span names the targets the estimate
 // covers when it is summed across several. It writes nothing when the plan
 // had no row estimate.
 func writePlannedRows(sb *strings.Builder, estimatedRows, estimatedBytes *int64, span string) {
-	if estimatedRows == nil {
-		return
+	if text := presentation.PlannedRowsText(estimatedRows, estimatedBytes, span); text != "" {
+		fmt.Fprintf(sb, "- %s\n", text)
 	}
-	fmt.Fprintf(sb, "- Rows: %s%s%s\n", ui.FormatApproxRows(*estimatedRows), span, ui.FormatTableSizeClause(estimatedBytes))
 }
 
 // writeRowsAndETA writes the rows copied / total line with optional ETA.
@@ -1515,10 +1509,10 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	}
 	switch data.State {
 	case state.Apply.WaitingForDeploy:
-		writeFooterAction(sb, "To deploy:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeFooterAction(sb, "To deploy:", AppendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.WaitingForCutover:
 		if data.DeferCutover {
-			writeFooterAction(sb, "To proceed with cutover:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+			writeFooterAction(sb, "To proceed with cutover:", AppendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 		} else {
 			sb.WriteString("\n---\n\n")
 			sb.WriteString("SchemaBot triggers cutover automatically — no action needed.\n")
@@ -1553,16 +1547,17 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:",
 			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To cancel it:")
 	case state.Apply.Stopped:
-		writeMemberFooterAction(sb, data, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeStoppedByFreeze(sb, data.StoppedByFreeze)
+		writeMemberFooterAction(sb, data, "Paused — to resume from where it stopped:", AppendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.Cancelled:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.\n")
 	case state.Apply.Failed:
-		writeMemberFooterAction(sb, data, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+		writeMemberFooterAction(sb, data, "To retry:", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case state.Apply.RevertWindow:
 		// Skip-revert (finalize) is the common path, so it leads; revert (undo) follows.
-		writeMemberFooterAction(sb, data, "To skip revert and keep changes:", appendTenantFlag(fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
-		fmt.Fprintf(sb, "\nTo revert:\n```\n%s\n```\n", appendTenantFlag(fmt.Sprintf("schemabot revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeMemberFooterAction(sb, data, "To skip revert and keep changes:", AppendTenantFlag(fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		fmt.Fprintf(sb, "\nTo revert:\n```\n%s\n```\n", AppendTenantFlag(fmt.Sprintf("schemabot revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.SkippingRevert:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Skip-revert was requested — closing the revert window and making this schema change permanent. This can no longer be reverted.\n")
@@ -1674,7 +1669,7 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 	}
 
 	writeSummaryTableList(sb, data, budget)
-	writeMemberFooterAction(sb, data, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+	writeMemberFooterAction(sb, data, "To retry:", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 }
 
 // writeTablesStoppedAtCutover explains, under a failed apply's error, the
@@ -1695,7 +1690,8 @@ func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, compl
 	}
 
 	writeSummaryTableList(sb, data, budget)
-	writeMemberFooterAction(sb, data, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+	writeStoppedByFreeze(sb, data.StoppedByFreeze)
+	writeMemberFooterAction(sb, data, "Paused — to resume from where it stopped:", AppendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 }
 
 // writeSummaryCancelled renders the terminal summary for a cancelled schema

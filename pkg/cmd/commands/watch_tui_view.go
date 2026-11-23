@@ -200,6 +200,9 @@ func (m WatchModel) progressSections() (string, string) {
 		}
 		f.WriteString(templates.FormatApplyStopped())
 		f.WriteString("\n")
+		if text := templates.StoppedByFreezeText(m.stoppedByFreeze, m.applyID, m.environment); text != "" {
+			f.WriteString(m.wrapToWindow("⏹️ "+text) + "\n")
+		}
 		if m.applyID != "" {
 			f.WriteString(templates.FormatNextCommand(templates.ResumeLabel, templates.ControlCommand("start", m.applyID, m.environment)))
 		} else {
@@ -267,6 +270,8 @@ func (m WatchModel) progressSections() (string, string) {
 		f.WriteString(dimStyle.Render("ESC to detach"))
 		f.WriteString("\n")
 	}
+
+	f.WriteString(m.changeGateFooter())
 
 	// Fetch error during active progress (mid-flight). State and tables are
 	// preserved from the last successful poll; the error tells the user

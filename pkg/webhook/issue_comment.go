@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -58,6 +59,8 @@ const (
 	issueCommentGateDeferCutover        issueCommentGateBlockReason = "defer-cutover flag unsupported for command"
 	issueCommentGateDatabase            issueCommentGateBlockReason = "database flag unsupported for command"
 	issueCommentGateTarget              issueCommentGateBlockReason = "target flag unsupported for command"
+	issueCommentGateOverride            issueCommentGateBlockReason = "override flag unsupported for command"
+	issueCommentGateOverrideReason      issueCommentGateBlockReason = "override reason invalid"
 )
 
 // issueCommentGateBlock evaluates the routing and usage gates shared by the
@@ -104,6 +107,14 @@ func (h *Handler) issueCommentGateBlock(repo string, result CommandResult, parse
 	}
 	if !commandSupportsTargetFlag(result.Action) && parser.HasTargetFlag(commentBody) {
 		return issueCommentGateTarget
+	}
+	if !commandSupportsOverrideFlag(result.Action) && parser.HasOverrideFlag(commentBody) {
+		return issueCommentGateOverride
+	}
+	if result.OverrideGiven {
+		if _, err := api.ValidateOverrideReason(result.Override); err != nil {
+			return issueCommentGateOverrideReason
+		}
 	}
 	return issueCommentGatePass
 }
@@ -487,6 +498,24 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
+	if gateReason == issueCommentGateOverride || gateReason == issueCommentGateOverrideReason {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping override flag reply for unscoped fan-out; the leader posts it once",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
+			return
+		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
+		if gateReason == issueCommentGateOverride {
+			h.postComment(repo, pr, installationID, templates.RenderUnsupportedOverrideFlag(result.Action))
+		} else {
+			_, err := api.ValidateOverrideReason(result.Override)
+			h.postComment(repo, pr, installationID, templates.RenderInvalidOverrideReason(result.Action, err.Error()))
+		}
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
+		return
+	}
+
 	// The branches above match the shared ladder's reasons one-for-one. A
 	// reason none of them recognized means a gate was added to the ladder
 	// without a request-path branch — the ladder said to block, so block:
@@ -584,6 +613,11 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.handleCutoverCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "cutover started"})
+	case action.Freeze:
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
+			h.handleFreezeApproveCommand(repo, pr, installationID, requestedBy, result)
+		})
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "freeze approve started"})
 	case action.SkipRevert:
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleSkipRevertCommand(repo, pr, installationID, requestedBy, result)
@@ -633,7 +667,9 @@ func (h *Handler) fansOutUnscopedCommand(repo string) bool {
 //     lives in exactly one deployment's storage — non-owners silently skip the
 //     lookup miss (see silentOnUnscopedFanOut) and only the owner acts;
 //   - rollback-confirm routes by the pinned pending rollback plan for the
-//     PR/environment, held only by the deployment that posted the plan.
+//     PR/environment, held only by the deployment that posted the plan;
+//   - freeze approve routes by the override request identifier, which lives
+//     in exactly one deployment's storage; the others skip the lookup miss.
 //
 // An action outside the set requires an explicit -t until a single-owner
 // discriminator is established for it.
@@ -642,7 +678,8 @@ func actionFansOutUnscoped(a string) bool {
 	case action.Plan, action.Apply, action.ApplyConfirm, action.Unlock,
 		action.Rollback, action.RollbackConfirm,
 		action.Stop, action.Cancel, action.Start, action.Release,
-		action.Cutover, action.SkipRevert, action.Revert:
+		action.Cutover, action.SkipRevert, action.Revert,
+		action.Freeze:
 		return true
 	default:
 		return false
@@ -680,26 +717,51 @@ func unscopedCommandFansOut(result CommandResult) bool {
 // failure would leave the record claiming they were shown something they never
 // saw.
 func (h *Handler) postCommentReportingError(repo string, pr int, installationID int64, body string) error {
+	_, err := h.postCommentReportingID(repo, pr, installationID, body)
+	return err
+}
+
+// postCommentReportingID is postCommentReportingError for a caller that may
+// edit the comment later, so it also returns the posted comment's ID.
+func (h *Handler) postCommentReportingID(repo string, pr int, installationID int64, body string) (int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
-		return fmt.Errorf("create GitHub client to comment on %s#%d: %w", repo, pr, err)
+		return 0, fmt.Errorf("create GitHub client to comment on %s#%d: %w", repo, pr, err)
 	}
 
-	if _, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, "", body)); err != nil {
-		return fmt.Errorf("post comment on %s#%d: %w", repo, pr, err)
+	commentID, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, "", body))
+	if err != nil {
+		return 0, fmt.Errorf("post comment on %s#%d: %w", repo, pr, err)
 	}
-	return nil
+	return commentID, nil
 }
 
-// postComment posts a comment on a PR, best effort.
+// postComment posts a comment on a PR, best effort. On a listen-only
+// repository the GitHub client refuses the write by design, so that refusal
+// is logged at Info rather than as a failure; the GitHub request metric also
+// counts it as suppressed.
 func (h *Handler) postComment(repo string, pr int, installationID int64, body string) {
-	if err := h.postCommentReportingError(repo, pr, installationID, body); err != nil {
+	h.postCommentBestEffortID(repo, pr, installationID, body)
+}
+
+// postCommentBestEffortID is postComment for a caller that may edit the comment
+// later. It returns the posted comment's ID, or zero when the post did not
+// land, which the caller treats as nothing to edit.
+func (h *Handler) postCommentBestEffortID(repo string, pr int, installationID int64, body string) int64 {
+	commentID, err := h.postCommentReportingID(repo, pr, installationID, body)
+	switch {
+	case err == nil:
+	case errors.Is(err, ghclient.ErrListenOnlyRepository):
+		h.logger.Info("comment not posted: repository is listen-only",
+			"repo", repo, "pr", pr, "installation_id", installationID)
+	default:
 		h.logger.Error("failed to post comment",
 			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)
 	}
+	return commentID
 }
 
 // postAndTrackComment creates a PR comment and stores its ID in apply_comments.

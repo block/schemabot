@@ -87,3 +87,18 @@ func TestFreezeOverrideRequestIsPersonOf(t *testing.T) {
 	request.PRAuthor = ""
 	assert.False(t, request.IsPersonOf(""), "no author is nobody")
 }
+
+// A request belongs to the pull request domain by either marker, so a request
+// that names a pull request or a GitHub requester is approved only there.
+func TestFreezeOverrideRequestFromPullRequest(t *testing.T) {
+	assert.Equal(t, "github:carol", GitHubIdentity("carol"))
+	assert.True(t, IsGitHubIdentity("github:carol"))
+	assert.True(t, IsGitHubIdentity(" github:carol"))
+	assert.True(t, IsGitHubIdentity("GitHub:carol"))
+	assert.False(t, IsGitHubIdentity("carol@example.com"))
+	assert.False(t, IsGitHubIdentity("githubcarol"))
+
+	assert.True(t, (&FreezeOverrideRequest{RequestedBy: "github:carol"}).FromPullRequest())
+	assert.True(t, (&FreezeOverrideRequest{RequestedBy: "carol", PullRequest: 7}).FromPullRequest())
+	assert.False(t, (&FreezeOverrideRequest{RequestedBy: "carol@example.com"}).FromPullRequest())
+}

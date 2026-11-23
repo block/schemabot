@@ -19,6 +19,9 @@ func previewShardStatuses(ops []presentation.Operation) []ShardStatus {
 		out = append(out, ShardStatus{
 			Shard: d.Deployment, Emoji: d.Emoji, Label: d.Label, State: d.State, Error: d.Error,
 			StoppedAtCutover: d.Presentation == presentation.StateStoppedAtCutover, EndedBy: d.EndedBy,
+			// Each sample shard runs one operation, so its state says
+			// whether the shard has landed.
+			Landed: presentation.OperationLanded(d.State),
 		})
 	}
 	return out

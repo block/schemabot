@@ -461,6 +461,33 @@ Upgrade SchemaBot servers and data planes before adding a pattern. An older buil
 
 Declaring a table in a schema file *and* ignoring it is a contradiction SchemaBot refuses, at onboard time before anything is written and at plan time thereafter. That includes a pattern that matches a declared table. The refusal ignores case, since some databases fold table names to lower case. Two spellings count as the same table when one lower-cases or Unicode-folds to the other, for plain entries and patterns alike, so a few non-ASCII spellings that were distinct before patterns, such as the long s `ſ` and `s`, now collide. The error names the entries to remove, and for a pattern, the declared tables it matches, so you can narrow it.
 
+### Databases that share a schema
+
+Two databases can split one schema between them. One example is an app whose unsharded tables live in shard 0's schema, next to that shard's copy of the sharded tables. One database holds the unsharded tables, and the other holds the sharded tables in every shard's schema. On the cluster where they meet, each database's plan sees the other's tables as undeclared, so each `schemabot.yaml` lists the other's tables under `ignore_tables`:
+
+```yaml
+# shop/schemabot.yaml           # shop_sharded/schemabot.yaml
+database: shop                  database: shop_sharded
+type: mysql                     type: mysql
+ignore_tables:                  ignore_tables:
+  - orders                        - sequences
+  - order_items
+```
+
+A pull request that adds a table to one database has to add it to the other's `ignore_tables` too. Otherwise its own plan passes, and the missing entry only shows up later, as a `DROP TABLE` in the other database's plan. So SchemaBot checks every plan and apply from a pull request for this.
+
+Two databases share a schema when, in the same environment, both have a target on the same cluster behind the same deployment, and a namespace of each is stored in one schema there. SchemaBot asks that deployment's data plane which schema each namespace addresses on the target, because only the data plane knows the target's connection. A MySQL target whose DSN names a database stores every namespace in that database. A target with a `schema_overrides` entry stores the namespace under the override's name. Otherwise each namespace is its own schema, so `shop` and `shop_sharded` on the same cluster share nothing. For each table that one database declares in a shared schema, the other must withhold it, by name or by pattern. If it does not, the environment's check fails. The error names the table, the database whose `ignore_tables` is missing it, and the file to add it to. The other database's files are read from the pull request's head, so a pull request that adds the table and the entry together passes.
+
+- A table that both databases declare in one schema also fails the check, whatever the lists say. Each table belongs to one of them. This holds when the two declare it under different namespaces that the target stores in one schema. A pair that declares the same table name under two namespaces the target stores as two schemas passes, because those are two separate tables.
+- A database cannot withhold a table it declares itself. `ignore_tables` applies to every namespace of a database, so when the other database declares a table in a shared schema and this one declares a table of the same name in another of its namespaces, no entry can keep it out. The check fails and names both namespaces. Rename one of the two tables, or store the two namespaces in different schemas.
+- Every data plane that serves one of the targets must be able to report which schema each namespace addresses. A data plane from a release that cannot fails the environment, and the comment names the deployment to upgrade. Any other failure to get the answer fails the environment too, and the server logs have the cause.
+- Entries match case exactly. A target that folds table names stores `Refunds` as `refunds`, so a table declared with capital letters needs an entry for its lower-case spelling as well, or a pattern that matches both. The error names every spelling still missing.
+- The other database's files must come from a directory its own `allowed_dirs` allow, the same source policy its own plans pass. If they do not, or if SchemaBot cannot read them, the environment fails. It does not pass a pair it could not compare. A `schemabot.yaml` found elsewhere in the repository is refused the same way.
+- A database whose `schemabot.yaml` is in another repository is managed from there, so it is not compared. SchemaBot skips it when the database accepts no schema changes from this repository, or when a search of the repository read every config it found and none was for that database. A miss that skipped an unreadable config fails the environment.
+- An apply also needs the branch to have every base branch change to the other database's `schemabot.yaml` and schema files. The comparison read them at the pull request's head, so a branch missing a newer change to them is refused as stale, like a branch missing a change to the database's own schema. Merge or rebase the base branch and apply again.
+- A plan narrowed with `--target` runs the check too. The disagreement is in the schema files, so it fails the environment's check whichever target the plan named.
+- The CLI plans one database from a local directory and does not run this check.
+
 ### Exclusions are disclosed
 
 Every plan that withheld tables says so: the PR plan comment renders an
@@ -516,6 +543,26 @@ consent as any other drop (`--allow-unsafe`). On a deployment with
 [pending drops](pending-drops.md) enabled, the apply moves the table into
 `_pending_drops` rather than dropping it outright, so it can be recovered until
 the retention period ends.
+
+An entry that names no table on the target plans nothing, and the PR plan
+comment and `plan` and `apply` output say so, one line per entry:
+
+> ⚠️ `drop_tables` entry `_events_olds` names no table on the target, so this plan drops nothing for it. Fix the name, or remove the entry if the table is already gone.
+
+That is usually a typo, a name wrapped in backticks, the wrong case, or a table
+already dropped. Without the line, the table you meant would still be listed
+under its naming convention and the plan would look clean.
+
+When a plan covers several environments, an entry is listed only when no
+environment's plan has the table. Once the drop has landed in staging and not
+yet in production, staging's plan is clean and production's still drops the
+table, so the entry is not listed: it is still needed for production. The
+first 20 entries get a line each, and one more line counts the rest.
+
+A plan of an environment that rolls out to several targets lists no such
+entries, and neither does a plan of several environments that includes one.
+The planner reports them for the primary target alone, and another
+target may still have the table and plan its drop.
 
 ### Rules
 

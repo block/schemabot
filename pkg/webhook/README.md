@@ -165,7 +165,7 @@ See [Check Runs](../../docs/check-runs.md) for the current lifecycle, `apply_id`
 ## Command Syntax
 
 ```text
-schemabot <command> [args] [-e <environment>] [-d <database>] [--defer-cutover] [--allow-unsafe] [--skip-revert] [--enable-revert]
+schemabot <command> [args] [-e <environment>] [-d <database>] [--defer-cutover] [--allow-unsafe] [--skip-revert] [--enable-revert] [--override "<reason>"]
 ```
 
 | Command | `-e` required | Description |
@@ -180,12 +180,56 @@ schemabot <command> [args] [-e <environment>] [-d <database>] [--defer-cutover] 
 | `skip-revert` | Yes | Make changes permanent |
 | `rollback <apply-id>` | Yes | Generate rollback plan |
 | `rollback-confirm` | Yes | Execute rollback |
+| `freeze approve <ovr-id>` | No (the request names it) | Approve a freeze override request from the pull request it was made on |
 | `fix-lint` | No | Auto-fix lint warnings |
 | `help` | No | Show command reference |
 
 PR comments for `stop`, `cutover`, `revert`, and `skip-revert` are parsed so
 SchemaBot can return a clear "not yet available" response. Use the CLI for
 those operator controls today.
+
+### Freeze override
+
+`apply`, `apply-confirm`, `start` and `cutover` take `--override "<reason>"` (also
+`--override=<reason>` and single quotes). Quotes group only this flag's value;
+without them the reason is the next word. When a freeze refuses the command,
+SchemaBot records an override request for the commenter and the pull request's
+author, and the comment names it. The reason is trimmed, must not be blank, and
+is at most 500 characters. `apply-confirm` takes it because an apply that must
+discard an unfinished copy stops for that confirmation before the freeze gate
+runs. A refused `apply-confirm` releases the pending confirmation, so the
+comment tells the commenter to run `apply` again and then `apply-confirm`.
+`rollback` and `revert` do not take the flag, and rollbacks skip the freeze
+gate.
+
+A request from a pull request is recorded as `github:<login>` for both the
+commenter and the author, and only a pull request approves it: the API route
+refuses it, since a GitHub login cannot be matched to an API subject. The
+command that approves it is `schemabot freeze approve <ovr-id>`, commented on
+that pull request by a member of a `freeze.github_teams` team
+(`handleFreezeApproveCommand`). It takes no `-e` and does not plan or check
+anything; the delivery's signature is the only authorization it needs, since
+approvers are their own list and not the admins and operators of PR commands.
+`api.Service.ApprovePullRequestOverride` decides it: the ID's shape, the team
+(read through the repository's installation, refusing when it cannot be read),
+that the request came from this pull request, and storage's refusals of the
+requester, the author, an approved request and an expired one. Approval is
+recorded as `github:<login>`. On an aggregate repo the request lives in one
+deployment, so the others stay silent on an unknown ID; the refusal therefore
+names the approve command with the deployment's `--tenant`, so a pasted
+command is always answered.
+
+A refusal is its own comment (`templates.RenderChangeGateRefusal`). It lists
+each freeze with how long it holds (`ui.FreezeUntil`, the phrase the API and
+the CLI use too) and its reason. Without `--override`, a command that takes the
+flag is told how to ask for one and which teams (`freeze.github_teams`) may
+approve it; with no team configured, nobody can approve a pull request's
+request, so the comment offers none. With a recorded request, it shows the
+reason the approver sees, @-mentions the approver teams, gives the approve
+command, and says the commenter then runs the command again, since an approved
+override admits only the person who asked. Freeze and override reasons are a
+person's text, written so a mention in them notifies nobody
+(`templates.markdownReason`).
 
 ## Error Handling
 

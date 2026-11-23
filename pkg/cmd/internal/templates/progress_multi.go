@@ -27,6 +27,7 @@ func writeMultiDeploymentProgress(data ProgressData) {
 
 	writeMultiDeploymentHeader(data, model, groups)
 	writeMultiDeploymentFirstFailure(model.FirstFailure)
+	writeStoppedByFreeze(data)
 	if note := RolloutStoppedAtCutoverNote(model, groups); note != "" {
 		fmt.Printf("\n  ⏹️ %s\n", note)
 	}

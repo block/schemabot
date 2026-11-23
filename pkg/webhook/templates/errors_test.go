@@ -535,3 +535,11 @@ func TestPlanRefusalDetails(t *testing.T) {
 	assert.NotContains(t, hostile, "\n")
 	assert.Contains(t, hostile, "`` plan`1 ## injected ``")
 }
+
+// A detail is clamped to the default bound.
+func TestRenderGenericErrorDetailLimit(t *testing.T) {
+	detail := strings.Repeat("a", 600) + " END"
+	clamped := RenderGenericError(SchemaErrorData{CommandName: "apply", ErrorDetail: detail})
+	assert.NotContains(t, clamped, "END")
+	assert.Contains(t, clamped, "…")
+}

@@ -48,7 +48,7 @@ func newDurableIssueCommentEnqueueHandler(t *testing.T, events storage.WebhookEv
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{}, nil, logger)
-	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch())
+	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 }
 
 // TestIssueCommentGateBlockParity pins the shared gate ladder reason by
@@ -100,6 +100,9 @@ func TestIssueCommentGateBlockParity(t *testing.T) {
 		{name: "rollback misplaced defer-cutover", comment: "schemabot rollback apply_123 -e production --defer-cutover -t alpha", want: issueCommentGateDeferCutover},
 		{name: "unsupported database", comment: "schemabot stop -e production -d accounts -t alpha", want: issueCommentGateDatabase},
 		{name: "unsupported target", comment: "schemabot apply-confirm -e production --target payments-002 -t alpha", want: issueCommentGateTarget},
+		{name: "unsupported override", comment: `schemabot rollback apply_123 -e production --override "fix" -t alpha`, want: issueCommentGateOverride},
+		{name: "override passes on apply", comment: `schemabot apply -e production --override "fix" -t alpha`, want: issueCommentGatePass},
+		{name: "blank override reason", comment: `schemabot apply -e production --override "" -t alpha`, want: issueCommentGateOverrideReason},
 		{name: "narrowed plan missing environment", comment: "schemabot plan --target payments-002 -t alpha", want: issueCommentGateMissingEnvironment},
 	}
 	for _, tt := range tests {
@@ -657,7 +660,7 @@ func (s *cancelOnLookupLockStore) GetByPR(_ context.Context, _ string, _ int) ([
 	return s.locks, nil
 }
 
-func (s *cancelOnLookupLockStore) ReleaseByID(ctx context.Context, _ int64, _, _, _, _ string) error {
+func (s *cancelOnLookupLockStore) ReleaseByIDIfUnused(ctx context.Context, _ int64, _, _, _, _ string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}

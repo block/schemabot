@@ -52,6 +52,19 @@ func RenderUnsupportedTargetFlag(action string) string {
 	return fmt.Sprintf("The `--target` flag is not supported for `%s`. Only `plan` and `apply` take it.", action)
 }
 
+// RenderUnsupportedOverrideFlag renders the message posted when `--override`
+// is supplied to a command that no freeze can refuse.
+func RenderUnsupportedOverrideFlag(action string) string {
+	return fmt.Sprintf("The `--override` flag is not supported for `%s`. Only `apply`, `apply-confirm`, `start` and `cutover` take it.", action)
+}
+
+// RenderInvalidOverrideReason renders the message posted when the reason
+// after `--override` is blank or too long. problem is the validator's text,
+// which names only lengths.
+func RenderInvalidOverrideReason(action, problem string) string {
+	return fmt.Sprintf("Could not read `--override` on `%s`: %s. Give the reason in quotes, like `--override \"fix the index\"`.", action, problem)
+}
+
 // RenderTargetMissingEnv renders the message posted when `--target` is given
 // without `-e`. A target is a member of one environment's rollout, so the
 // usage line keeps the target the caller typed and asks only for the
@@ -80,6 +93,9 @@ type StartWithdrawnData struct {
 	// StoppedBy is the GitHub user who sent the stop, empty when the stop's
 	// caller is not a GitHub user.
 	StoppedBy string
+	// StoppedByFreeze is the freeze whose stop withdrew the start, empty when
+	// a person sent the stop.
+	StoppedByFreeze string
 }
 
 // CancelCommandAcceptedData contains data for a PR comment cancel acknowledgement.
@@ -163,6 +179,12 @@ func RenderStartWithdrawn(data StartWithdrawnData) string {
 		fmt.Sprintf("**Environment**: `%s`\n", data.Environment)
 	if data.StoppedBy != "" {
 		body += fmt.Sprintf("**Stopped by**: @%s\n", data.StoppedBy)
+	}
+	if data.StoppedByFreeze != "" {
+		body += fmt.Sprintf("**Stopped by**: freeze %s\n", inlineCode(data.StoppedByFreeze))
+		body += "\nA freeze that stops schema changes in this environment took effect before the start requested earlier did, so the start was withdrawn. " +
+			"The schema change stays stopped. Start it again after the freeze ends or is lifted, or add `--override` and your reason to the start command to ask a freeze approver to let it through.\n"
+		return body
 	}
 	body += "\nA stop arrived before the start requested earlier took effect, so the start was withdrawn. The schema change stays stopped; start it again to resume.\n"
 	return body

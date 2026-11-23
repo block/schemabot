@@ -246,6 +246,12 @@ type APIError struct {
 	ErrorCode string // Error code from API response (e.g., "not_found", "storage_error")
 	Message   string
 
+	// Blockers and OverrideRequest are set on a change_gate_refused answer:
+	// what refused the change, and the override request SchemaBot recorded for
+	// the caller, if any.
+	Blockers        []apitypes.ChangeGateBlocker
+	OverrideRequest *apitypes.FreezeOverrideRequest
+
 	// RetryAfterSeconds is the delay the server asked the client to wait, set
 	// only on responses that advertise one. Read it through RetryAfter rather
 	// than on its own, so a retry is never scheduled without it.
@@ -443,8 +449,9 @@ func doPostIntoWithClient(ctx context.Context, client *http.Client, endpoint, pa
 
 	// Control endpoints answer 202 Accepted when the request is durably
 	// recorded and the apply owner completes it asynchronously; the body
-	// carries the same JSON shape as a 200 and is equally a success.
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+	// carries the same JSON shape as a 200 and is equally a success. Creating a
+	// freeze answers 201 Created with the new freeze in the body.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusCreated {
 		return parseAPIError(resp, respBody)
 	}
 
@@ -524,6 +531,8 @@ func parseAPIError(resp *http.Response, body []byte) *APIError {
 	if json.Unmarshal(body, &errResp) == nil {
 		apiErr.ErrorCode = errResp.ErrorCode
 		apiErr.RetryAfterSeconds = errResp.RetryAfterSeconds
+		apiErr.Blockers = errResp.Blockers
+		apiErr.OverrideRequest = errResp.OverrideRequest
 	}
 	return apiErr
 }
@@ -692,6 +701,13 @@ var requestEffects = map[string]requestEffect{
 	"/api/locks":         shownBy("locks"),
 	"/api/locks/acquire": shownBy("locks"),
 
+	// Freeze routes carry an ID, so effectOf looks them up by these prefixes.
+	// Setting or lifting a freeze shows in the freeze list, and an override
+	// approval in the override request itself.
+	"/api/freezes":            shownBy("freeze list"),
+	"/api/freezes/":           shownBy("freeze list"),
+	"/api/freezes/overrides/": shownBy("freeze override <ovr-id>"),
+
 	// Changes that no single command shows.
 	"/api/checks/synthesize":    changesWithoutCommand,
 	"/api/storage/schema/apply": changesWithoutCommand,
@@ -709,6 +725,12 @@ func effectOf(method, path string) requestEffect {
 	// The endpoint may carry a path of its own ahead of the API path.
 	if i := strings.LastIndex(path, "/api/"); i >= 0 {
 		path = path[i:]
+	}
+	switch {
+	case strings.HasPrefix(path, "/api/freezes/overrides/"):
+		path = "/api/freezes/overrides/"
+	case strings.HasPrefix(path, "/api/freezes/"):
+		path = "/api/freezes/"
 	}
 	if effect, ok := requestEffects[path]; ok {
 		return effect

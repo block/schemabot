@@ -499,9 +499,9 @@ func TestE2EReplanDiscardingCopyDowngradesToConfirm(t *testing.T) {
 	// dispatch re-plans.
 	seedCopyArtifacts(t, dbName)
 
-	h.executeApply(t.Context(), installClient, repo, pr, schemaResult, "staging", 1, "testuser",
+	h.executeApply(t.Context(), installClient, repo, pr, schemaResult, nil, "staging", 1, "testuser",
 		CommandResult{Action: action.Apply, Environment: "staging", Found: true, IsMention: true},
-		storedPlan, storedPlan, planResp.PlanID, nil)
+		storedPlan, storedPlan, planResp.PlanID, nil, nil)
 
 	select {
 	case body := <-result.comments:

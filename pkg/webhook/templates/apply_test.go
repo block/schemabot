@@ -499,6 +499,40 @@ func TestRenderApplyStatusComment_ThrottledChecksumming(t *testing.T) {
 	assert.Contains(t, result, "- ℹ️ _Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget ([docs](https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling))_")
 }
 
+// Every phase the engine's throttler paces carries "(throttled)" at the end of
+// its header, so a throttled table never reads as stalled in any of them, and
+// the annotation goes away once the flag clears.
+func TestThrottledHeaderEveryPhase(t *testing.T) {
+	mk := func(mod func(*TableProgressData)) TableProgressData {
+		tb := TableProgressData{TableName: "orders", Status: state.Task.Running, Throttled: true}
+		mod(&tb)
+		return tb
+	}
+	cases := map[string]TableProgressData{
+		"checksum with a total": mk(func(tb *TableProgressData) {
+			tb.Status = state.Task.Checksumming
+			tb.ChecksumRowsChecked, tb.ChecksumRowsTotal = 500, 1000
+		}),
+		"checksum without a total": mk(func(tb *TableProgressData) { tb.Status = state.Task.Checksumming }),
+		"starting copy":            mk(func(tb *TableProgressData) { tb.RowsTotal = 1000 }),
+		"copying":                  mk(func(tb *TableProgressData) { tb.RowsTotal, tb.RowsCopied, tb.PercentComplete = 1000, 450, 45 }),
+		"running without rows":     mk(func(tb *TableProgressData) {}),
+		"finalizing copy":          mk(func(tb *TableProgressData) { tb.RowsTotal = 1000; tb.RowsCopied = 1500; tb.PercentComplete = 100 }),
+	}
+	for name, tb := range cases {
+		t.Run(name, func(t *testing.T) {
+			var sb strings.Builder
+			renderTableProgress(&sb, "", tb, state.Apply.Running, 0, "", nil)
+			header, _, _ := strings.Cut(sb.String(), "\n")
+			assert.True(t, strings.HasSuffix(header, " (throttled)"), "header %q", header)
+			tb.Throttled = false
+			sb.Reset()
+			renderTableProgress(&sb, "", tb, state.Apply.Running, 0, "", nil)
+			assert.NotContains(t, sb.String(), "(throttled)")
+		})
+	}
+}
+
 func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 	tests := []struct {
 		name                string
@@ -1753,6 +1787,14 @@ func TestRenderApplyStatusComment_TableSizeBesideRows(t *testing.T) {
 			assert.Contains(t, result, tt.want)
 		})
 	}
+}
+
+// A queued table the plan had no row estimate for shows no rows line at all,
+// rather than an empty or zero estimate.
+func TestQueuedTableWithoutAnEstimateHasNoRowsLine(t *testing.T) {
+	out := RenderApplyStatusComment(ApplyStatusCommentData{ApplyID: "a1", Database: "app", Environment: "staging", State: state.Apply.Pending, Engine: "Spirit",
+		Tables: []TableProgressData{{TableName: "orders", Status: state.Task.Pending, DDL: "ALTER TABLE `orders` ADD COLUMN `note` text"}}})
+	assert.NotContains(t, out, "Rows:")
 }
 
 func TestRenderApplyStatusComment_CuttingOver(t *testing.T) {

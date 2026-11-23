@@ -14,6 +14,7 @@ linters:
     - usetesting      # enforce t.Context() over context.Background() in tests
     - unparam         # unused/constant function parameters and results
     - depguard        # banned imports (see settings)
+    - forbidigo       # banned calls (see settings)
   settings:
     # SchemaBot links exactly one MySQL driver. The deny list is what keeps that
     # true: nothing about a second one fails to compile, and the way it breaks
@@ -27,6 +28,17 @@ linters:
               desc: 'import github.com/block/mysql instead (registered as driver name "block-mysql"). Two MySQL drivers in one binary define two field-identical but distinct *mysql.MySQLError types, and errors.As against one returns false for the other, so a classifier keeps compiling and silently stops recognizing deadlocks. Read codes through pkg/mysqlerr.'
             - pkg: github.com/go-mysql/hotswap-dsn-driver
               desc: 'use mysqlconn.OpenReloadable, which reloads credentials per pool on block/mysql. That driver embeds upstream go-sql-driver/mysql and cannot be pointed at the fork.'
+    # Tests use testify (see AGENTS.md). Setting forbid replaces forbidigo's
+    # default fmt.Print* patterns, so only the calls listed here are banned.
+    # analyze-types matches a call by the type it is made on, not by the name
+    # of the variable, so a helper's tb.Fatal and a subtest's sub.Fatalf are
+    # banned along with t.Fatal.
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: ^testing\.(T|TB|B|F)\.Fatalf?$
+          pkg: ^testing$
+          msg: 'use testify instead: require.NoError, require.Equal and the like for a check, or require.FailNow(t, msg) to stop the test with a message.'
     errcheck:
       exclude-functions:
         - (io.Closer).Close          # bodyclose linter handles HTTP resp.Body; other Close() checked by closeandlog analyzer
@@ -40,6 +52,14 @@ linters:
       - path: _test\.go
         linters:
           - unparam
+      # The raw Fatal ban covers only packages already converted to testify.
+      # Widen this path as each package is converted. The text matcher limits
+      # the exclusion to that ban by its message, so any other forbidigo
+      # pattern applies to the whole repository.
+      - path-except: ^pkg/webhook/
+        linters:
+          - forbidigo
+        text: use testify instead
 formatters:
   enable:
     - gofmt

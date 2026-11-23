@@ -18,10 +18,13 @@ import (
 
 // namespaceSelectingTernClient answers the primary's plan and every member's
 // diff with the same engine, recording which namespaces each request carried.
-// The plan carries planChanges, and the diff no changes.
+// The plan carries planChanges, and the diff no changes. With planIDPrefix
+// set, each database's plan gets an identifier of its own, so one fake can
+// serve several databases or environments without their plans colliding.
 type namespaceSelectingTernClient struct {
 	tern.Client
 	mu             sync.Mutex
+	planIDPrefix   string
 	planChanges    []*ternv1.SchemaChange
 	planNamespaces []string
 	diffNamespaces []string
@@ -31,7 +34,11 @@ func (c *namespaceSelectingTernClient) Plan(_ context.Context, req *ternv1.PlanR
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.planNamespaces = slices.Sorted(maps.Keys(req.GetSchemaFiles()))
-	return &ternv1.PlanResponse{PlanId: "plan-primary", Engine: ternv1.Engine_ENGINE_SPIRIT, Changes: c.planChanges}, nil
+	planID := "plan-primary"
+	if c.planIDPrefix != "" {
+		planID = c.planIDPrefix + "-" + req.GetDatabase()
+	}
+	return &ternv1.PlanResponse{PlanId: planID, Engine: ternv1.Engine_ENGINE_SPIRIT, Changes: c.planChanges}, nil
 }
 
 func (c *namespaceSelectingTernClient) PlanDiff(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
@@ -39,6 +46,16 @@ func (c *namespaceSelectingTernClient) PlanDiff(_ context.Context, req *ternv1.P
 	defer c.mu.Unlock()
 	c.diffNamespaces = slices.Sorted(maps.Keys(req.GetSchemaFiles()))
 	return &ternv1.PlanDiffResponse{Engine: ternv1.Engine_ENGINE_SPIRIT}, nil
+}
+
+// ResolveNamespaces answers like a data plane whose targets name no database:
+// each namespace is its own schema.
+func (c *namespaceSelectingTernClient) ResolveNamespaces(_ context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error) {
+	schemas := make(map[string]string, len(req.GetNamespaces()))
+	for _, namespace := range req.GetNamespaces() {
+		schemas[namespace] = namespace
+	}
+	return &ternv1.ResolveNamespacesResponse{Schemas: schemas}, nil
 }
 
 func (c *namespaceSelectingTernClient) IsRemote() bool   { return true }

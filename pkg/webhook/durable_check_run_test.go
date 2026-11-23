@@ -75,7 +75,7 @@ func TestDurableCheckRunCompletionQueuesAndAcks(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, aggregateLeaderConfig(), nil, logger)
 	clientFactory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
-	h := NewHandler(service, clientFactory, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, clientFactory, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{action: "completed", checkName: "SchemaBot Tenant B", headSHA: "head-sha", pr: 7}, nil)
 	req.Header.Set(headerDeliveryID, "delivery-check-run-completed-1")
@@ -109,7 +109,7 @@ func TestDurableCheckRunCompletionDeduplicatesDelivery(t *testing.T) {
 	events := newRecordingWebhookEventStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, aggregateLeaderConfig(), nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	for range 2 {
 		req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{action: "completed", checkName: "SchemaBot Tenant B", headSHA: "head-sha", pr: 7}, nil)
@@ -132,7 +132,7 @@ func TestDurableCheckRunCompletionSkipsNonLeaderRepo(t *testing.T) {
 	events := newRecordingWebhookEventStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{Repos: map[string]api.RepoConfig{"octocat/hello-world": {}}}, nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{action: "completed", checkName: "SchemaBot Tenant B", headSHA: "head-sha", pr: 7}, nil)
 	req.Header.Set(headerDeliveryID, "delivery-check-run-completed-1")
@@ -155,7 +155,7 @@ func TestDurableCheckRunRerequestQueuesAndAcks(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{}, nil, logger)
 	clientFactory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
-	h := NewHandler(service, clientFactory, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, clientFactory, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{action: "rerequested", headSHA: "head-sha", pr: 7}, nil)
 	req.Header.Set(headerDeliveryID, "delivery-check-run-1")
@@ -189,7 +189,7 @@ func TestDurableCheckRunRerequestDeduplicatesDelivery(t *testing.T) {
 	events := newRecordingWebhookEventStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{}, nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	for range 2 {
 		req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{action: "rerequested"}, nil)
@@ -212,7 +212,7 @@ func TestDurableCheckRunRerequestSkipsNonSchemaBotCheck(t *testing.T) {
 	events := newRecordingWebhookEventStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{}, nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{action: "rerequested", checkName: "Some Other Check"}, nil)
 	req.Header.Set(headerDeliveryID, "delivery-check-run-1")

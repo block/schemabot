@@ -41,7 +41,7 @@ runtime safety guarantees that hold whichever engine runs the change.
 
 ## Declarative Schema
 
-SchemaBot uses declarative schema files — you describe the desired end state in SQL, and SchemaBot computes the DDL needed to get there. See the [README](../README.md#how-it-works) for examples.
+SchemaBot uses declarative schema files — you describe the desired end state in SQL, and SchemaBot computes the DDL needed to get there. See the [README](../README.md#quick-start) for examples.
 
 Schema files are organized by [namespace](namespaces.md) (MySQL schema name or Vitess keyspace) in a directory with a `schemabot.yaml` config.
 

@@ -22,6 +22,12 @@ const GitHubOperationRateLimitSnapshot = "rate_limit_snapshot"
 // again more often than this.
 const GitHubRateLimitSnapshotMaxAge = 120 * time.Second
 
+// maxGitHubQuotaWindowsPerIdentity bounds how many unexpired reset times the
+// recorder keeps for one installation and resource. GitHub normally reports one
+// or two; the bound keeps the per-response scan small, under the shared lock,
+// if reset times ever jitter between responses.
+const maxGitHubQuotaWindowsPerIdentity = 8
+
 // Like the global OTel provider, the active recorder is installed once during
 // telemetry setup. Each provider's callback owns its own state and lifetime.
 var activeGitHubRateLimits atomic.Pointer[githubRateLimitRecorder]
@@ -52,7 +58,15 @@ type githubQuotaProbeTargets struct {
 type githubRateLimitRecorder struct {
 	mu          sync.Mutex
 	diagnostics map[attribute.Distinct]githubRateLimitDiagnostic
-	snapshots   map[githubRateLimitIdentity]GitHubRateLimitSample
+	// snapshots holds each identity's current window: the one GitHub reported
+	// on the most recently received response. It is derived from windows.
+	snapshots map[githubRateLimitIdentity]GitHubRateLimitSample
+	// windows holds, per identity, the lowest remaining seen for every reset
+	// time that has not yet passed, keyed by reset time in Unix nanoseconds.
+	// Keeping each one separately means a window that becomes current again
+	// still carries the depletion already observed in it, whatever order the
+	// responses are recorded in.
+	windows map[githubRateLimitIdentity]map[int64]GitHubRateLimitSample
 	// probeTargets is keyed by App ID rather than by the App label, so a probe
 	// whose label changes (the slug is learned after startup) replaces its
 	// earlier entry instead of leaving it behind.
@@ -68,6 +82,7 @@ func RegisterGitHubRateLimitMetrics(provider otelmetric.MeterProvider) error {
 	recorder := &githubRateLimitRecorder{
 		diagnostics:  make(map[attribute.Distinct]githubRateLimitDiagnostic),
 		snapshots:    make(map[githubRateLimitIdentity]GitHubRateLimitSample),
+		windows:      make(map[githubRateLimitIdentity]map[int64]GitHubRateLimitSample),
 		probeTargets: make(map[int64]githubQuotaProbeTargets),
 		now:          time.Now,
 	}
@@ -159,26 +174,81 @@ func (r *githubRateLimitRecorder) record(sample GitHubRateLimitSample) {
 		return
 	}
 	key := githubRateLimitIdentity{sample.GitHubApp, sample.InstallationID, sample.Resource}
-	if previous, ok := r.snapshots[key]; ok {
-		if sample.ResetAt.Before(previous.ResetAt) {
-			slog.Debug("Ignoring older GitHub quota window", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID)
+	windows := r.windows[key]
+	if windows == nil {
+		windows = make(map[int64]GitHubRateLimitSample)
+		r.windows[key] = windows
+	}
+	reset := sample.ResetAt.UnixNano()
+	previousWindow, seenWindow := windows[reset]
+	if seenWindow {
+		merged, changed := sameWindowGitHubRateLimitSnapshot(previousWindow, sample)
+		if !changed {
+			slog.Debug("Ignoring GitHub quota observation that is neither lower nor newer", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource)
 			return
 		}
-		// Within one window, depletion takes precedence over receipt order.
-		// Keep the lower observation's original timestamp so recording it late
-		// cannot extend its export lifetime.
-		if sample.ResetAt.Equal(previous.ResetAt) {
-			if sample.Remaining > previous.Remaining {
-				slog.Debug("Ignoring out-of-order GitHub quota allowance", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID)
-				return
-			}
-			if sample.Remaining == previous.Remaining && !sample.ObservedAt.After(previous.ObservedAt) {
-				slog.Debug("Ignoring older identical GitHub quota observation", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID)
-				return
-			}
+		if merged.Remaining < sample.Remaining {
+			slog.Debug("Keeping lower GitHub quota allowance from earlier in the window", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource, "remaining", merged.Remaining, "reported_remaining", sample.Remaining)
+		}
+		windows[reset] = merged
+	} else {
+		windows[reset] = sample
+	}
+	current := currentGitHubQuotaWindow(windows)
+	pruneGitHubQuotaWindows(windows, current)
+	previous, hadPrevious := r.snapshots[key]
+	switch {
+	case !current.ResetAt.Equal(sample.ResetAt):
+		slog.Debug("Recorded GitHub quota window from an earlier response; a newer response's window stays current", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource, "reset_at", sample.ResetAt, "current_reset_at", current.ResetAt)
+	case hadPrevious && current.ResetAt.Before(previous.ResetAt) && seenWindow:
+		// GitHub can alternate between two reset times; the switch was logged
+		// at Info the first time this reset time was seen.
+		slog.Debug("GitHub quota window moved back to an earlier reset already seen; following the newer response", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource, "reset_at", current.ResetAt, "previous_reset_at", previous.ResetAt, "remaining", current.Remaining, "previous_remaining", previous.Remaining)
+	case hadPrevious && current.ResetAt.Before(previous.ResetAt):
+		slog.Info("GitHub reported an earlier quota reset than the last response; following the newer response", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource, "reset_at", current.ResetAt, "previous_reset_at", previous.ResetAt, "remaining", current.Remaining, "previous_remaining", previous.Remaining)
+	}
+	r.snapshots[key] = current
+}
+
+// currentGitHubQuotaWindow returns the window reported on the most recently
+// received response, using supersedesGitHubQuotaWindow to order them. windows
+// is never empty: record inserts the incoming sample before calling it.
+func currentGitHubQuotaWindow(windows map[int64]GitHubRateLimitSample) GitHubRateLimitSample {
+	var current GitHubRateLimitSample
+	first := true
+	for _, window := range windows {
+		if first || supersedesGitHubQuotaWindow(current, window) {
+			current = window
+			first = false
 		}
 	}
-	r.snapshots[key] = sample
+	return current
+}
+
+// pruneGitHubQuotaWindows drops windows that had reset by the newest receipt,
+// then, past maxGitHubQuotaWindowsPerIdentity, the windows least recently
+// reported, which are the least likely to become current again. The current
+// window is never dropped: a trustworthy snapshot always resets after it was
+// received, and it is the most recently reported.
+func pruneGitHubQuotaWindows(windows map[int64]GitHubRateLimitSample, current GitHubRateLimitSample) {
+	for reset, window := range windows {
+		if !window.ResetAt.After(current.ObservedAt) {
+			delete(windows, reset)
+		}
+	}
+	for len(windows) > maxGitHubQuotaWindowsPerIdentity {
+		var oldestReset int64
+		var oldest GitHubRateLimitSample
+		first := true
+		for reset, window := range windows {
+			if first || supersedesGitHubQuotaWindow(window, oldest) {
+				oldestReset, oldest = reset, window
+				first = false
+			}
+		}
+		slog.Debug("Dropping least recently reported GitHub quota window past the per-installation bound", "github_app", oldest.GitHubApp, "installation_id", oldest.InstallationID, "resource", oldest.Resource, "reset_at", oldest.ResetAt, "observed_at", oldest.ObservedAt)
+		delete(windows, oldestReset)
+	}
 }
 
 // snapshotExportable reports whether a snapshot still stands for the
@@ -239,6 +309,46 @@ func SetGitHubQuotaProbeTargets(appID int64, githubApp string, installations []i
 		unresolved:    unresolved,
 		reportedAt:    recorder.now(),
 	}
+}
+
+// supersedesGitHubQuotaWindow reports whether sample, which reports a different
+// quota window than previous, replaces it. The response received most recently
+// says which window is current, whichever way its reset time moved: GitHub can
+// report one reset time and then an earlier one for the rest of the window, and
+// holding on to the first would stop the installation's budget from being
+// refreshed until it ages out. A window last reported on an earlier response
+// is kept with its lowest remaining but is not current. Between responses
+// received at the same instant, the later window wins.
+func supersedesGitHubQuotaWindow(previous, sample GitHubRateLimitSample) bool {
+	switch {
+	case sample.ObservedAt.After(previous.ObservedAt):
+		return true
+	case sample.ObservedAt.Equal(previous.ObservedAt):
+		return sample.ResetAt.After(previous.ResetAt)
+	default:
+		return false
+	}
+}
+
+// sameWindowGitHubRateLimitSnapshot combines two observations of one quota
+// window. Depletion takes precedence over receipt order, so the lower
+// remaining is kept even when GitHub later reports more. Freshness follows the
+// later receipt, since either response proves the installation was observed
+// at its receipt time: an installation read every minute never ages out, and
+// a response recorded late cannot extend export lifetime past the newest
+// receipt. changed reports whether the result differs from previous.
+func sameWindowGitHubRateLimitSnapshot(previous, sample GitHubRateLimitSample) (merged GitHubRateLimitSample, changed bool) {
+	merged = previous
+	if sample.Remaining < previous.Remaining {
+		merged = sample
+		changed = true
+	}
+	merged.ObservedAt = previous.ObservedAt
+	if sample.ObservedAt.After(previous.ObservedAt) {
+		merged.ObservedAt = sample.ObservedAt
+		changed = true
+	}
+	return merged, changed
 }
 
 func validGitHubRateLimitSnapshot(sample GitHubRateLimitSample) bool {

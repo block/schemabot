@@ -105,6 +105,7 @@ func TestEnginePlanIgnoreTablesRefusesDeclaredTable(t *testing.T) {
 	assert.Contains(t, err.Error(), "flyway_schema_history")
 	assert.Contains(t, err.Error(), `namespace "public"`)
 	assert.Contains(t, err.Error(), "Remove the entry or the schema file")
+	assert.True(t, engine.IsPlanRefused(err), "the schema files are refused as written, not the engine failing")
 
 	assert.True(t, testutil.PostgresTableExists(t, db, "public", "flyway_schema_history"),
 		"a refused plan must never touch the target")

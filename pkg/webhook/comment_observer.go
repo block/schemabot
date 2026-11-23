@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/clock"
 	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
@@ -810,7 +811,7 @@ func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*stor
 			"apply_id", o.applyID, "error", opsErr)
 		body = formatProgressComment(apply, tasks, shardsByTable, o.tenant)
 	} else {
-		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveShardedPlan(apply, ops), o.tenant, o.cliName)
+		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveShardedPlan(apply, ops), o.tenant, o.cliName, o.resolveStoppedByFreeze(apply))
 	}
 	return body + controlRejectionSection(context.Background(), o.stor, o.logger, apply, body)
 }
@@ -833,6 +834,16 @@ func (o *CommentObserver) resolveReleased(apply *storage.Apply, ops []*storage.A
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return releasedForApply(ctx, o.stor, apply, ops, o.logger)
+}
+
+// resolveStoppedByFreeze names the freeze that stopped the apply, for the
+// stopped comment. It uses a short, independent deadline so a slow storage
+// read degrades to an ordinary stopped comment rather than blocking the
+// update.
+func (o *CommentObserver) resolveStoppedByFreeze(apply *storage.Apply) *apitypes.FreezeStopRef {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return api.StoppedByFreeze(ctx, o.stor, o.logger, apply)
 }
 
 // resolveShardedPlan loads what the stored plan says about a sharded apply's
@@ -885,13 +896,14 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 		display = o.resolveDisplay(apply, ops)
 		view = o.resolveShardedPlan(apply, ops)
 	}
+	stoppedByFreeze := api.StoppedByFreeze(ctx, o.stor, o.logger, apply)
 	rejections := loadControlRejections(ctx, o.stor, o.logger, apply)
 	renderBody := func(apply *storage.Apply) string {
 		var body string
 		if opsErr != nil {
 			body = formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
 		} else {
-			body = formatApplySummaryComment(apply, ops, released, tasks, display, shardsByTable, view, o.tenant, o.cliName)
+			body = formatApplySummaryComment(apply, ops, released, tasks, display, shardsByTable, view, o.tenant, o.cliName, stoppedByFreeze)
 		}
 		return body + renderControlRejections(rejections, o.logger, apply, body)
 	}

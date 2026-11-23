@@ -385,11 +385,16 @@ func successfulNoOpPlanResult(check *storage.Check) bool {
 // this call (whether this call wrote it or it already was), and false only when a
 // started apply still owns it.
 //
+// The update also pins the head the caller read the row at. A row a newer
+// write moved to a head that is neither readHeadSHA nor check.HeadSHA, such as
+// a newer commit's plan settling it first, belongs to that write and is left
+// alone, so a slower settle for an older commit cannot pull it back.
+//
 // This deliberately clears a review-time deployment drift block too: once a later
 // commit removes the database from the PR and no apply has started, the reviewed
 // plan is no longer part of the merge gate, so the plan-only drift block should
 // stop blocking. A started apply still owns the row and is left untouched.
-func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check) (bool, error) {
+func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check, readHeadSHA string) (bool, error) {
 	canonicalizeCheck(check)
 	targets, withWork := rolloutTargetsKeptWithSummary(check)
 	var checkRunID any
@@ -412,9 +417,10 @@ func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
 		  AND status != ? AND apply_id IS NULL
+		  AND head_sha IN (?, ?)
 	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary, targets, withWork,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
-		checkStatusInProgress)
+		checkStatusInProgress, readHeadSHA, check.HeadSHA)
 	if err != nil {
 		return false, fmt.Errorf("mark stale plan check successful for %s#%d %s/%s/%s: %w",
 			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, err)
@@ -429,10 +435,10 @@ func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage
 	}
 
 	// Under changed-rows semantics, RowsAffected is 0 both when the guard
-	// excluded the row (an apply claimed it) and when the row already held the
-	// exact plan-only success values this call would have written. Re-read the
-	// row to tell these apart so an already-successful row is treated as success
-	// rather than left blocking.
+	// excluded the row (an apply claimed it, or a newer write moved it) and when
+	// the row already held the exact plan-only success values this call would
+	// have written. Re-read the row to tell these apart so an already-successful
+	// row is treated as success rather than left blocking.
 	current, err := s.Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
 	if err != nil {
 		return false, fmt.Errorf("re-read stale plan check after no-op update for %s#%d %s/%s/%s: %w",
@@ -442,7 +448,7 @@ func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage
 		return false, fmt.Errorf("stale plan check vanished after no-op update for %s#%d %s/%s/%s",
 			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
 	}
-	return isPlanOnlySuccessful(current), nil
+	return isPlanOnlySuccessful(current) && current.HeadSHA == check.HeadSHA, nil
 }
 
 // BlockStaleStartedApply records that the schema change a started apply owns
@@ -1014,10 +1020,34 @@ func (s *checkStore) GetByDatabase(ctx context.Context, repo, environment, dbTyp
 func (s *checkStore) Delete(ctx context.Context, id int64) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM checks WHERE id = ?`, id)
 	if err != nil {
-		return err
+		return fmt.Errorf("delete check %d: %w", id, err)
 	}
 
-	return checkRowsAffected(result, storage.ErrCheckNotFound)
+	return checkRowsAffected(result, storage.ErrCheckNotFound, fmt.Sprintf("deleting check %d", id))
+}
+
+// DeleteStalePlanOnly removes a plan-only row no plan can store again. The
+// delete is one guarded statement, so an apply that claimed the row, or a
+// newer write that moved it off the head the caller read it at, after the
+// caller read it keeps the row. A row already gone counts as removed.
+func (s *checkStore) DeleteStalePlanOnly(ctx context.Context, check *storage.Check, readHeadSHA string) (bool, error) {
+	canonicalizeCheck(check)
+	target := fmt.Sprintf("%s#%d %s/%s/%s",
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	if _, err := s.db.ExecContext(ctx, `
+		DELETE FROM checks
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		  AND status != ? AND apply_id IS NULL AND head_sha = ?
+	`, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		checkStatusInProgress, readHeadSHA); err != nil {
+		return false, fmt.Errorf("delete stale plan-only check %s read at %s: %w", target, readHeadSHA, err)
+	}
+	current, err := s.Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	if err != nil {
+		return false, fmt.Errorf("re-read stale plan-only check %s after delete: %w", target, err)
+	}
+	return current == nil, nil
 }
 
 // DeleteByPRRetainingBlockingApplyOwned removes stored check state for a

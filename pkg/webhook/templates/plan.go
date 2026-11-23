@@ -193,6 +193,12 @@ type PlanCommentData struct {
 	// ExemptTables lists live tables excluded from a plan verdict by namespace.
 	ExemptTables []ExemptTablesData
 
+	// UnmatchedDropTables lists the drop_tables entries that name no live
+	// table on the target, in the order the config lists them. Each plans no
+	// drop, so the comment says so rather than reading as if the table were
+	// seen and kept.
+	UnmatchedDropTables []string
+
 	// ApplyAuthorization lists who may run the apply the comment offers. Nil
 	// when PR command authorization is off or the reader may run the apply.
 	ApplyAuthorization *ApplyAuthorizationData
@@ -258,6 +264,25 @@ type PlanCommentData struct {
 	// comment. Nil when a disclosure above already explains the cause, never a
 	// signal that the apply is proceeding.
 	PausedApplyCause *PausedApplyCauseData
+
+	// RefusedByChangeGate marks the locked comment of an automatic apply that a
+	// change gate refused after the comment was posted. The comment announced an
+	// apply that never ran, so it is edited to say so: the footer no longer
+	// promises one and the lock line no longer claims a lock the refusal
+	// released. The body still shows the plan as it was posted. The gate is not
+	// named, since a refusal and a gate that could not decide both land here and
+	// the comment posted after this one says which.
+	RefusedByChangeGate bool
+
+	// LockReleased and RefusalPosted say what a refused comment may claim. The
+	// lock line reads released only when this refusal released it: a failed
+	// release or a lock re-pinned to a newer intent leaves it held, and then the
+	// comment makes no lock claim at all. The footer points at the comment below
+	// only when the refusal posted; otherwise it is self-contained, saying it did
+	// not apply and how to see the reason. Both are read only with
+	// RefusedByChangeGate.
+	LockReleased  bool
+	RefusalPosted bool
 
 	RecoveredApplyOwnedCheckState bool
 
@@ -584,7 +609,12 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	writePlanMetadata(&sb, data)
 	writePlanAttribution(&sb, data)
 
-	if data.IsLocked && data.LockOwner != "" {
+	switch {
+	case data.IsLocked && data.RefusedByChangeGate:
+		if data.LockReleased {
+			sb.WriteString("\n🔓 **Lock released**\n")
+		}
+	case data.IsLocked && data.LockOwner != "":
 		fmt.Fprintf(&sb, "\n🔒 **Lock acquired by** `%s`", caller.Short(data.LockOwner))
 		if data.LockAcquired != "" {
 			fmt.Fprintf(&sb, " at %s", data.LockAcquired)
@@ -630,10 +660,11 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// apply, which runs each of those targets' own plans.
 	if totalChanges == 0 && !targetPlans {
 		writeNoChangesDetected(&sb, data)
-		if len(data.IgnoredNamespaces) > 0 || hasExemptTables(data.ExemptTables) {
+		if len(data.IgnoredNamespaces) > 0 || hasExemptTables(data.ExemptTables) || len(data.shownUnmatchedDropTables()) > 0 {
 			sb.WriteString("\n")
 			writeIgnoredNamespaces(&sb, data.IgnoredNamespaces)
 			writeExemptTables(&sb, data.ExemptTables)
+			writeUnmatchedDropTables(&sb, data.shownUnmatchedDropTables())
 		}
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
@@ -727,6 +758,28 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	sb.WriteString("\n---\n\n")
 
 	switch {
+	case data.IsLocked && data.RefusedByChangeGate && !data.RefusalPosted:
+		// The comment this footer would point at never posted, so the footer
+		// carries the next step itself (UX-4). The next step is a retry, which
+		// starts the apply once the gate allows it, so the footer says so before
+		// the reader copies it. The copyable command never carries
+		// --allow-unsafe: an apply that consented to unsafe changes asks for
+		// that consent again in the words every other apply instruction uses.
+		rerun := ApplyCommand(data.Environment, data.ScopedDatabase, ApplyCommandOptions{
+			Target:       data.Target,
+			Tenant:       data.Tenant,
+			DeferCutover: data.DeferCutover && !data.NoCutoverToDefer,
+			SkipRevert:   data.SkipRevert,
+		})
+		sb.WriteString("**Not applied** — a change gate refused this apply, and SchemaBot could not post why.\n\n")
+		sb.WriteString("Commenting the apply again retries it. If the gate still refuses it, SchemaBot posts why. If the gate now allows it, **the apply starts**.\n\n")
+		if consent, ok := retryUnsafeConsent(data); ok {
+			writeUnsafeConsentCommand(&sb, "To retry", consent, rerun)
+		} else {
+			fmt.Fprintf(&sb, "To retry, comment:\n```\n%s\n```\n", rerun)
+		}
+	case data.IsLocked && data.RefusedByChangeGate:
+		sb.WriteString("**Not applied** — see the comment below for why.\n")
 	case data.IsLocked:
 		applyConfirmCmd := scopedApplyCommand("schemabot apply-confirm", data.Environment, data.ScopedDatabase, ApplyCommandOptions{
 			Tenant:       data.Tenant,
@@ -743,7 +796,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			sb.WriteString("**Confirmation required** — review the plan above, then confirm manually:\n")
 			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)
 			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
-			unlockCmd := appendTenantFlag(appendDatabaseFlag("schemabot unlock", data.ScopedDatabase), data.Tenant)
+			unlockCmd := AppendTenantFlag(appendDatabaseFlag("schemabot unlock", data.ScopedDatabase), data.Tenant)
 			fmt.Fprintf(&sb, "```\n%s\n```\n", unlockCmd)
 		} else {
 			// Automatic apply is proceeding. No unlock hint — it's noise on the
@@ -753,7 +806,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	case data.MemberApplyRefusal != "":
 		writeMemberApplyRefusal(&sb, data.MemberApplyRefusalTarget, data.MemberApplyRefusal)
 	case data.applyFailsOnRefusedChange():
-		writeRefusedChangeReplan(&sb, "this plan", appendTenantFlag(appendTargetFlag(appendDatabaseFlag(fmt.Sprintf("schemabot plan -e %s", data.Environment), data.ScopedDatabase), data.Target), data.Tenant))
+		writeRefusedChangeReplan(&sb, "this plan", AppendTenantFlag(appendTargetFlag(appendDatabaseFlag(fmt.Sprintf("schemabot plan -e %s", data.Environment), data.ScopedDatabase), data.Target), data.Tenant))
 	default:
 		applyCmd := appendTargetFlag(appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase), data.Target)
 		if data.Tenant != "" {
@@ -812,7 +865,7 @@ func writeRefusedChangeReplan(sb *strings.Builder, plan, planCommand string) {
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
 func writeApplyInstruction(sb *strings.Builder, command string, data PlanCommentData) {
 	if consent, ok := planUnsafeConsent(data); ok {
-		writeUnsafeConsentCommand(sb, "▶️ **To apply**", consent, command, false)
+		writeUnsafeConsentCommand(sb, "▶️ **To apply**", consent, command)
 		return
 	}
 	sb.WriteString("▶️ **To apply**, comment:\n")
@@ -939,8 +992,14 @@ func planUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
 	if data.AllowUnsafe || data.applyFailsOnRefusedChange() {
 		return unsafeConsent{}, false
 	}
-	// The flag consents to every target's disclosed unsafe changes, not only
-	// the reviewed plan's, so the instruction counts and names them all.
+	return disclosedUnsafeConsent(data)
+}
+
+// disclosedUnsafeConsent is what --allow-unsafe consents to on the comment,
+// and false when the comment discloses no unsafe change. The flag consents to
+// every target's disclosed unsafe changes, not only the reviewed plan's, so
+// the instruction counts and names them all.
+func disclosedUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
 	var changes []UnsafeChangeData
 	if data.HasUnsafeChanges {
 		changes = append(changes, data.UnsafeChanges...)
@@ -950,6 +1009,17 @@ func planUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
 		return unsafeConsent{}, false
 	}
 	return newUnsafeConsent(changes, data.DatabaseType, data.IsMySQL, !unsafeCountCoversEveryTarget(data.DeploymentDrift)), true
+}
+
+// retryUnsafeConsent is the consent a retry of a refused apply must give
+// again, and false when the refused apply gave none. Unlike planUnsafeConsent,
+// it counts the changes because the apply carried --allow-unsafe: the retry
+// command leaves the flag out, so the reader types it again.
+func retryUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
+	if !data.AllowUnsafe {
+		return unsafeConsent{}, false
+	}
+	return disclosedUnsafeConsent(data)
 }
 
 // applyInstructionCarriesDropSteps reports whether the comment's footer offers
@@ -966,20 +1036,20 @@ func (d PlanCommentData) applyInstructionCarriesDropSteps() bool {
 	return ok
 }
 
-// writeUnsafeConsentCommand renders the consent instruction and command after
-// lead, such as "▶️ **To apply**". When there are drop steps, it renders them
-// in order with the consent instruction and command as the final step.
-func writeUnsafeConsentCommand(sb *strings.Builder, lead string, consent unsafeConsent, command string, includeFlag bool) {
-	instruction := consent.instruction(includeFlag)
-	if includeFlag {
-		command += " --allow-unsafe"
-	}
-	if len(consent.dropSteps) == 0 {
+// writeUnsafeConsentCommand leads into a command that requires the operator
+// to type the consent flag.
+func writeUnsafeConsentCommand(sb *strings.Builder, lead string, consent unsafeConsent, command string) {
+	writeConsentCommand(sb, lead, consent.dropSteps, consent.instruction(false), command)
+}
+
+// writeConsentCommand renders any prerequisites before the consent instruction.
+func writeConsentCommand(sb *strings.Builder, lead string, dropSteps []string, instruction, command string) {
+	if len(dropSteps) == 0 {
 		fmt.Fprintf(sb, "%s, %s:\n", lead, instruction)
 		fmt.Fprintf(sb, "```\n%s\n```\n", command)
 		return
 	}
-	writeUnsafeConsentSteps(sb, lead, consent.dropSteps, instruction, command)
+	writeUnsafeConsentSteps(sb, lead, dropSteps, instruction, command)
 }
 
 // writeUnsafeConsentSteps writes the lead as the heading of a numbered list:
@@ -1252,6 +1322,7 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 		sb.WriteString("\n")
 		writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 		writeExemptTables(sb, data.ExemptTables)
+		writeUnmatchedDropTables(sb, data.shownUnmatchedDropTables())
 		return
 	}
 
@@ -1262,9 +1333,11 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", text)
 
 	// Disclosed directly under the plan summary so the exclusion reads as
-	// part of the plan result: what was counted, then what was withheld.
+	// part of the plan result: what was counted, then what was withheld,
+	// then which drop_tables entries planned nothing.
 	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 	writeExemptTables(sb, data.ExemptTables)
+	writeUnmatchedDropTables(sb, data.shownUnmatchedDropTables())
 }
 
 // planSummaryText renders what a plan would do as the plan summary counts it,
@@ -1422,6 +1495,89 @@ func planExemptTables(data MultiEnvPlanCommentData, env string) []ExemptTablesDa
 
 func exemptTablesEqual(a, b ExemptTablesData) bool {
 	return a.Namespace == b.Namespace && a.Reason == b.Reason && slices.Equal(a.Tables, b.Tables)
+}
+
+// writeUnmatchedDropTables renders one line per drop_tables entry that names
+// no live table on the target, naming the first entries of a long list and
+// counting the rest. The entry comes from the repository's config, so it
+// renders as inline code whatever characters it holds. No-op when every entry
+// matched, which is the ordinary case.
+func writeUnmatchedDropTables(sb *strings.Builder, entries []string) {
+	shown, more := presentation.UnmatchedDropTableEntries(entries)
+	for _, entry := range shown {
+		fmt.Fprintf(sb, glyph.Attention+" %s\n\n", presentation.UnmatchedDropTablesEntry("`drop_tables`", inlineCode(entry)))
+	}
+	if more > 0 {
+		fmt.Fprintf(sb, glyph.Attention+" %s\n\n", presentation.UnmatchedDropTablesMore("`drop_tables`", more))
+	}
+}
+
+// shownUnmatchedDropTables is the unmatched drop_tables entries the plan
+// reports. A rollout plan reports none: the entries describe the primary
+// target alone, while every other member is planned with the same list and
+// drops a table it still has, so a line saying the entry drops nothing could
+// sit beside that member's DROP and tell the reader to remove the entry the
+// drop depends on.
+func (d PlanCommentData) shownUnmatchedDropTables() []string {
+	if d.DeploymentDrift != nil {
+		return nil
+	}
+	return d.UnmatchedDropTables
+}
+
+// writeMultiEnvUnmatchedDropTables renders the unmatched drop_tables lines for
+// the all-environments-clean path, where no per-environment sections exist to
+// carry them. RenderMultiEnvPlanComment has already narrowed every plan to the
+// entries no environment matched, so the environments agree and the lines
+// render once.
+func writeMultiEnvUnmatchedDropTables(sb *strings.Builder, data MultiEnvPlanCommentData) {
+	for _, env := range data.Environments {
+		if plan := data.Plans[env]; plan != nil {
+			writeUnmatchedDropTables(sb, plan.shownUnmatchedDropTables())
+			return
+		}
+	}
+}
+
+// multiEnvHasUnmatchedDropTables reports whether any environment's plan has a
+// drop_tables entry that names no table.
+func multiEnvHasUnmatchedDropTables(data MultiEnvPlanCommentData) bool {
+	for _, env := range data.Environments {
+		if plan := data.Plans[env]; plan != nil && len(plan.shownUnmatchedDropTables()) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// withUnmatchedDropTablesInEveryPlan copies plans with each one's unmatched
+// drop_tables entries narrowed to those every environment's plan reports, so
+// no section tells the reader to remove an entry another environment still
+// drops a table for (see presentation.UnmatchedDropTablesInEveryPlan). A
+// rollout plan reports no entries, so beside one nothing is reported.
+func withUnmatchedDropTablesInEveryPlan(data MultiEnvPlanCommentData) map[string]*PlanCommentData {
+	var lists [][]string
+	for _, env := range data.Environments {
+		switch plan := data.Plans[env]; {
+		case data.Errors[env] != "":
+			// A failed plan says nothing about which tables its target has.
+			lists = append(lists, nil)
+		case plan != nil:
+			lists = append(lists, plan.shownUnmatchedDropTables())
+		}
+	}
+	common := presentation.UnmatchedDropTablesInEveryPlan(lists)
+	narrowed := make(map[string]*PlanCommentData, len(data.Plans))
+	for env, plan := range data.Plans {
+		if plan == nil {
+			narrowed[env] = nil
+			continue
+		}
+		copied := *plan
+		copied.UnmatchedDropTables = common
+		narrowed[env] = &copied
+	}
+	return narrowed
 }
 
 // multiEnvHasIgnoredNamespaces reports whether any environment's plan excluded
@@ -1592,8 +1748,10 @@ func SummarizeChanges(data PlanCommentData) string {
 
 	parts := ui.AssemblePlanSummary(counts, totalStatements,
 		func(count int, noun, op string) string {
-			if noun == "index" {
-				return fmt.Sprintf("%d index %s", count, pluralize(op, count))
+			// Table work reads bare ("3 alters"); index and type work names
+			// its noun so it never reads as table work ("1 type alter").
+			if noun != "table" {
+				return fmt.Sprintf("%d %s %s", count, noun, pluralize(op, count))
 			}
 			return fmt.Sprintf("%d %s", count, pluralize(op, count))
 		},
@@ -3750,6 +3908,7 @@ type MultiEnvPlanCommentData struct {
 // RenderMultiEnvPlanComment renders a combined plan comment showing all environments.
 // If all environments have identical plans, deduplicates into a single section.
 func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
+	data.Plans = withUnmatchedDropTablesInEveryPlan(data)
 	note := RenderUnmanagedSchemaPlanNote(data.UnmanagedEnvironments, data.UnmanagedSchema)
 	if note == "" {
 		return renderMultiEnvPlanCommentWithin(data, 0)
@@ -3856,10 +4015,11 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 	// unchanged.
 	if envsWithChanges == 0 && !hasErrors && !AnyEnvHasDriftToShow(data) && !AnyEnvHasBaseSchemaNotice(data) {
 		sb.WriteString("✅ **No schema changes detected** for any environment.\n")
-		if multiEnvHasIgnoredNamespaces(data) || multiEnvHasExemptTables(data) {
+		if multiEnvHasIgnoredNamespaces(data) || multiEnvHasExemptTables(data) || multiEnvHasUnmatchedDropTables(data) {
 			sb.WriteString("\n")
 			writeMultiEnvIgnoredNamespaces(&sb, data)
 			writeMultiEnvExemptTables(&sb, data)
+			writeMultiEnvUnmatchedDropTables(&sb, data)
 		}
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
@@ -4029,6 +4189,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 		sb.WriteString(noChangesDetected + "\n\n")
 		writeIgnoredNamespaces(sb, plan.IgnoredNamespaces)
 		writeExemptTables(sb, plan.ExemptTables)
+		writeUnmatchedDropTables(sb, plan.shownUnmatchedDropTables())
 		return
 	}
 
@@ -4173,7 +4334,7 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		}
 	case len(envsWithChanges) == 1:
 		if consent, ok := planUnsafeConsent(*data.Plans[envsWithChanges[0]]); ok {
-			writeUnsafeConsentCommand(sb, "▶️ **To apply** these changes", consent, command("schemabot apply", envsWithChanges[0]), false)
+			writeUnsafeConsentCommand(sb, "▶️ **To apply** these changes", consent, command("schemabot apply", envsWithChanges[0]))
 		} else {
 			sb.WriteString("▶️ **To apply** these changes, comment:\n")
 			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
@@ -4244,7 +4405,7 @@ func TenantCommand(baseCommand, environment, tenant string) string {
 // one lifted from another.
 func scopedCommand(baseCommand, environment, database, tenant string) string {
 	command := appendDatabaseFlag(fmt.Sprintf("%s -e %s", baseCommand, environment), database)
-	return appendTenantFlag(command, tenant)
+	return AppendTenantFlag(command, tenant)
 }
 
 // ApplyCommandOptions are the flags an apply or apply-confirm command carries
@@ -4304,7 +4465,7 @@ func writeRerunCommand(sb *strings.Builder, lead, consent, command, gap string) 
 // them.
 func scopedApplyCommand(baseCommand, environment, database string, opts ApplyCommandOptions) string {
 	command := appendDatabaseFlag(fmt.Sprintf("%s -e %s", baseCommand, environment), database)
-	command = appendTenantFlag(appendTargetFlag(command, opts.Target), opts.Tenant)
+	command = AppendTenantFlag(appendTargetFlag(command, opts.Target), opts.Tenant)
 	if opts.AllowUnsafe {
 		command += " --allow-unsafe"
 	}
@@ -4317,11 +4478,11 @@ func scopedApplyCommand(baseCommand, environment, database string, opts ApplyCom
 	return command
 }
 
-// appendTenantFlag appends the --tenant flag to a pasteable command hint when
+// AppendTenantFlag appends the --tenant flag to a pasteable command hint when
 // tenant is set. In tenant mode, commands without an explicit tenant target
 // are ignored, so every command hint a user may copy-paste must carry the
 // deployment's tenant.
-func appendTenantFlag(command, tenant string) string {
+func AppendTenantFlag(command, tenant string) string {
 	if tenant == "" {
 		return command
 	}

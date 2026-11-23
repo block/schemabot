@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/state/statetest"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -71,29 +72,32 @@ func TestFormatTableSizeClause(t *testing.T) {
 	assert.Empty(t, FormatTableSizeClause(nil))
 }
 
+// Every task state has a pinned place in the table listing, so a state added
+// to pkg/state fails here until the listing says where it goes. States the
+// priority does not name, and statuses it does not recognize, list with
+// pending.
 func TestTableStatePriority(t *testing.T) {
-	tests := []struct {
-		state    string
-		expected int
-	}{
-		{state.Task.Running, 0},
-		{state.Task.CuttingOver, 0},
-		{state.Task.WaitingForCutover, 1},
-		{state.Task.Recovering, 1},
-		{state.Task.Pending, 2},
-		{state.Task.Failed, 3},
-		{state.Task.Stopped, 3},
-		{state.Task.Completed, 4},
-		{state.Task.Cancelled, 4},
-		{state.Task.Reverted, 4},
-		{"unknown_state", 2}, // default
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.state, func(t *testing.T) {
-			assert.Equal(t, tt.expected, TableStatePriority(tt.state))
-		})
-	}
+	task := state.Task
+	statetest.AssertRanks(t, statetest.Every(t, state.Task), map[string]int{
+		task.Running:           0,
+		task.CatchingUp:        0,
+		task.Checksumming:      0,
+		task.PostChecksum:      0,
+		task.CuttingOver:       0,
+		task.WaitingForCutover: 1,
+		task.Recovering:        1,
+		task.FailedRetryable:   1,
+		task.Pending:           2,
+		task.WaitingForDeploy:  2,
+		task.RevertWindow:      2,
+		task.Reverting:         2,
+		task.Failed:            3,
+		task.Stopped:           3,
+		task.Completed:         4,
+		task.Cancelled:         4,
+		task.Reverted:          4,
+	}, TableStatePriority)
+	assert.Equal(t, 2, TableStatePriority("unknown_state"))
 }
 
 func TestVSchemaStatusLabel(t *testing.T) {
@@ -149,6 +153,33 @@ func TestRowCopyDisplayPercent(t *testing.T) {
 	assert.Equal(t, 1, RowCopyDisplayPercent(-3, 42))
 	assert.Equal(t, 2, RowCopyDisplayPercent(2, 42))
 	assert.Equal(t, 100, RowCopyDisplayPercent(145, 42))
+}
+
+func TestRecoveringCopyingRows(t *testing.T) {
+	assert.True(t, RecoveringCopyingRows(1_000, 0))
+	assert.True(t, RecoveringCopyingRows(1_000, 99))
+	assert.False(t, RecoveringCopyingRows(1_000, 100), "a finished copy is not still copying")
+	assert.False(t, RecoveringCopyingRows(0, 40), "no row total yet, so no copy to report")
+}
+
+func TestChecksumDisplayPercent(t *testing.T) {
+	// No total yet, or nothing verified: an empty bar.
+	assert.Equal(t, 0, ChecksumDisplayPercent(0, 0))
+	assert.Equal(t, 0, ChecksumDisplayPercent(500, 0))
+	assert.Equal(t, 0, ChecksumDisplayPercent(0, 1_000_000))
+
+	// At least 1% once verification has begun, so the bar shows it started.
+	assert.Equal(t, 1, ChecksumDisplayPercent(4, 1_000))
+	assert.Equal(t, 1, ChecksumDisplayPercent(1, 1_000_000))
+
+	// Rounded down, so a checksum in its final stretch never fills the bar.
+	assert.Equal(t, 21, ChecksumDisplayPercent(321_450, 1_466_232))
+	assert.Equal(t, 99, ChecksumDisplayPercent(997_500, 1_000_000))
+	assert.Equal(t, 99, ChecksumDisplayPercent(999_999, 1_000_000))
+	assert.Equal(t, 100, ChecksumDisplayPercent(1_000_000, 1_000_000))
+
+	// A verified count past the estimated total stays at 100%.
+	assert.Equal(t, 100, ChecksumDisplayPercent(1_200_000, 1_000_000))
 }
 
 func TestRowCopyFraction(t *testing.T) {

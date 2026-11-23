@@ -580,8 +580,8 @@ type FreezeOverrideRequest struct {
 	ID          int64
 	Identifier  string
 	Environment string
-	// Action is the change the request lets through; TargetID is the plan
-	// an apply would run, or the apply a cutover or start would act on.
+	// Action is the change the request lets through; TargetID is the schema
+	// an apply asks for, or the apply a cutover or start would act on.
 	Action   string
 	TargetID string
 	Database string
@@ -651,6 +651,28 @@ func (r *FreezeOverrideRequest) Covers(blockers []string) bool {
 		}
 	}
 	return true
+}
+
+// GitHubIdentityPrefix marks an identity from a pull request command. SchemaBot
+// cannot map a GitHub login to a forward-auth subject, so the two never compare
+// equal by name; the prefix keeps each in its own domain.
+const GitHubIdentityPrefix = "github:"
+
+// GitHubIdentity returns the identity of a GitHub login in the pull request
+// domain.
+func GitHubIdentity(login string) string { return GitHubIdentityPrefix + login }
+
+// IsGitHubIdentity reports whether who is in the pull request domain. The
+// prefix matches in any case, as people do (IsPersonOf), so "GitHub:dave" is
+// in the domain too.
+func IsGitHubIdentity(who string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(who)), GitHubIdentityPrefix)
+}
+
+// FromPullRequest reports whether the request was asked for on a pull request,
+// so only a pull request approves it. Either marker puts it there.
+func (r *FreezeOverrideRequest) FromPullRequest() bool {
+	return r.PullRequest > 0 || IsGitHubIdentity(r.RequestedBy)
 }
 
 // IsPersonOf reports whether who is the request's requester or its pull
@@ -2053,6 +2075,11 @@ type ApplyOptions struct {
 	// options: the rollback option above is the caller's to set.
 	PinnedRollback bool `json:"pinned_rollback,omitempty"`
 
+	// FreezeOverride is the identifier of the approved freeze override request
+	// that let this apply past a freeze at creation. It is recorded at
+	// creation and never read from caller options.
+	FreezeOverride string `json:"freeze_override,omitempty"`
+
 	// NarrowedTo is the MemberID (deployment/target) of the one rollout member
 	// a narrowed apply ran on. Empty for an apply of the whole rollout. It is
 	// recorded at creation and never read from caller options, so a rollback
@@ -2474,12 +2501,41 @@ const ForwardingControlRequestCaller = "tern-grpc"
 // SchemaBot.
 const EndedOperationStopCaller = "schemabot"
 
+// freezeStopCallerPrefix starts the requester recorded for the stop a freeze
+// with running policy FreezeRunningStop issues on an admitted apply. The rest
+// is the freeze's identifier.
+const freezeStopCallerPrefix = "freeze:"
+
+// FreezeStopCaller is the requester recorded for the stop that the freeze
+// with this identifier issues. No operator issued it, so it names the freeze,
+// and status can say which freeze stopped the apply.
+func FreezeStopCaller(freezeID string) string {
+	return freezeStopCallerPrefix + freezeID
+}
+
+// IsFreezeStopCaller reports whether requestedBy is in the form SchemaBot
+// reserves for the stop a freeze issues.
+func IsFreezeStopCaller(requestedBy string) bool {
+	return strings.HasPrefix(requestedBy, freezeStopCallerPrefix)
+}
+
+// FreezeFromStopCaller returns the identifier of the freeze that issued a
+// stop, when requestedBy is a FreezeStopCaller.
+func FreezeFromStopCaller(requestedBy string) (string, bool) {
+	freezeID, ok := strings.CutPrefix(requestedBy, freezeStopCallerPrefix)
+	if !ok || freezeID == "" {
+		return "", false
+	}
+	return freezeID, true
+}
+
 // ControlRequestNamesAnOperator reports whether a requester identifies the
 // operator who issued the command. Only such a value is worth showing in the
 // PR notice, whose whole purpose is telling an operator which of their commands
 // did not take effect.
 func ControlRequestNamesAnOperator(requestedBy string) bool {
-	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller && requestedBy != EndedOperationStopCaller
+	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller && requestedBy != EndedOperationStopCaller &&
+		!IsFreezeStopCaller(requestedBy)
 }
 
 // IsMirroredRemoteRejection reports whether this row exists only to carry

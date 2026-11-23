@@ -68,7 +68,7 @@ func TestUpdateCheckRecordForApplyStart_ConvergesWhenApplyAlreadyTerminal(t *tes
 	require.NoError(t, err)
 	installClient := ghclient.NewInstallationClient(ghClient, logger)
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// The driver already drove the apply to completion.
 	apply := &storage.Apply{
@@ -166,7 +166,7 @@ func TestUpdateCheckRecordForApplyStart_KeepsInProgressForRunningApply(t *testin
 	require.NoError(t, err)
 	installClient := ghclient.NewInstallationClient(ghClient, logger)
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-claim-running",
@@ -248,7 +248,7 @@ func TestUpdateCheckRecordForApplyStart_ApplyRowNamesTheTargetsItRan(t *testing.
 	require.NoError(t, err)
 	installClient := ghclient.NewInstallationClient(ghClient, logger)
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-claim-rollout-summary",
@@ -376,7 +376,7 @@ func TestUpdateCheckRecordForApplyStart_RollbackOnConcludedAggregatePublishesFre
 	})
 	installClient := ghclient.NewInstallationClientWithSlug(ghClient, logger, "schemabot")
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// The original apply completed; its per-database check and the aggregate
 	// Check Run both concluded success.

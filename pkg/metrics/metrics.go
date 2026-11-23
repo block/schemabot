@@ -605,6 +605,8 @@ var knownDirectWriteAuthOperations = map[string]bool{
 	"freeze_create":      true,
 	"freeze_lift":        true,
 
+	"freeze_override_approve": true,
+
 	"storage_schema_plan":  true,
 	"storage_schema_apply": true,
 }
@@ -627,6 +629,7 @@ var knownDirectWriteAuthReasons = map[string]bool{
 	"missing_database_config": true,
 	"freeze_allow":            true,
 	"not_freeze_admin":        true,
+	"not_freeze_approver":     true,
 	"unknown":                 true,
 }
 
@@ -1590,31 +1593,42 @@ const (
 	gitHubMetricValueUnknown = "unknown"
 
 	GitHubOperationAddCommentReaction            = "add_comment_reaction"
+	GitHubOperationCompareCommits                = "compare_commits"
 	GitHubOperationCreateCheckRun                = "create_check_run"
-	GitHubOperationCreateIssueComment            = "create_issue_comment"
 	GitHubOperationCreateInstallationAccessToken = "create_installation_access_token"
+	GitHubOperationCreateIssueComment            = "create_issue_comment"
 	GitHubOperationDeleteIssueComment            = "delete_issue_comment"
 	GitHubOperationEditIssueComment              = "edit_issue_comment"
 	GitHubOperationFetchAppSlug                  = "fetch_app_slug"
 	GitHubOperationFetchBlob                     = "fetch_blob"
+	GitHubOperationFetchBranchRules              = "fetch_branch_rules"
 	GitHubOperationFetchDiff                     = "fetch_diff"
 	GitHubOperationFetchFileContent              = "fetch_file_content"
 	GitHubOperationFetchGitTree                  = "fetch_git_tree"
-	GitHubOperationFetchBranchRules              = "fetch_branch_rules"
-	GitHubOperationGraphQLBranchProtection       = "graphql_branch_protection"
+	GitHubOperationFetchIssueComment             = "fetch_issue_comment"
 	GitHubOperationFetchPullRequest              = "fetch_pull_request"
 	GitHubOperationFetchRateLimit                = "fetch_rate_limit"
+	GitHubOperationFetchRef                      = "fetch_ref"
+	GitHubOperationFetchRepository               = "fetch_repository"
+	GitHubOperationFetchRepositoryInstallation   = "fetch_repository_installation"
 	GitHubOperationGetCombinedStatus             = "get_combined_status"
 	GitHubOperationGetTeam                       = "get_team"
 	GitHubOperationGetTeamMembership             = "get_team_membership"
+	GitHubOperationGraphQLBranchProtection       = "graphql_branch_protection"
+	GitHubOperationGraphQLMergeQueueEntries      = "graphql_merge_queue_entries"
 	GitHubOperationGraphQLMinimizeComment        = "graphql_minimize_comment"
 	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
 	GitHubOperationGraphQLTreeEntries            = "graphql_tree_entries"
 	GitHubOperationListAppInstallations          = "list_app_installations"
 	GitHubOperationListCheckRunsForRef           = "list_check_runs_for_ref"
+	GitHubOperationListIssueTimeline             = "list_issue_timeline"
+	GitHubOperationListMatchingRefs              = "list_matching_refs"
 	GitHubOperationListPRFiles                   = "list_pr_files"
+	GitHubOperationListPullRequests              = "list_pull_requests"
+	GitHubOperationListPullRequestsForCommit     = "list_pull_requests_for_commit"
 	GitHubOperationListReviews                   = "list_reviews"
 	GitHubOperationListTeamMembers               = "list_team_members"
+	GitHubOperationRemoveIssueLabel              = "remove_issue_label"
 	GitHubOperationRequestReviewers              = "request_reviewers"
 	GitHubOperationUnknown                       = gitHubMetricValueUnknown
 	GitHubOperationUpdateCheckRun                = "update_check_run"
@@ -1803,31 +1817,42 @@ func logUnknownGitHubMetricLabel(label, value string) {
 func isKnownGitHubOperation(operation string) bool {
 	switch operation {
 	case GitHubOperationAddCommentReaction,
+		GitHubOperationCompareCommits,
 		GitHubOperationCreateCheckRun,
-		GitHubOperationCreateIssueComment,
 		GitHubOperationCreateInstallationAccessToken,
+		GitHubOperationCreateIssueComment,
 		GitHubOperationDeleteIssueComment,
 		GitHubOperationEditIssueComment,
 		GitHubOperationFetchAppSlug,
 		GitHubOperationFetchBlob,
+		GitHubOperationFetchBranchRules,
 		GitHubOperationFetchDiff,
 		GitHubOperationFetchFileContent,
 		GitHubOperationFetchGitTree,
-		GitHubOperationFetchBranchRules,
-		GitHubOperationGraphQLBranchProtection,
+		GitHubOperationFetchIssueComment,
 		GitHubOperationFetchPullRequest,
 		GitHubOperationFetchRateLimit,
+		GitHubOperationFetchRef,
+		GitHubOperationFetchRepository,
+		GitHubOperationFetchRepositoryInstallation,
 		GitHubOperationGetCombinedStatus,
 		GitHubOperationGetTeam,
 		GitHubOperationGetTeamMembership,
+		GitHubOperationGraphQLBranchProtection,
+		GitHubOperationGraphQLMergeQueueEntries,
 		GitHubOperationGraphQLMinimizeComment,
 		GitHubOperationGraphQLStatusCheckRollup,
 		GitHubOperationGraphQLTreeEntries,
 		GitHubOperationListAppInstallations,
 		GitHubOperationListCheckRunsForRef,
+		GitHubOperationListIssueTimeline,
+		GitHubOperationListMatchingRefs,
 		GitHubOperationListPRFiles,
+		GitHubOperationListPullRequests,
+		GitHubOperationListPullRequestsForCommit,
 		GitHubOperationListReviews,
 		GitHubOperationListTeamMembers,
+		GitHubOperationRemoveIssueLabel,
 		GitHubOperationRequestReviewers,
 		GitHubOperationUnknown,
 		GitHubOperationUpdateCheckRun:
@@ -2135,6 +2160,18 @@ func RecordChangeGateRefusal(ctx context.Context, environment, gate, checkpoint 
 	)
 }
 
+// RecordChangeGateOverride counts applies, starts and cutovers a change gate
+// would have refused that an approved override request let through, once per
+// gate that blocked the attempt.
+func RecordChangeGateOverride(ctx context.Context, environment, gate, checkpoint string) {
+	addCounter(ctx, "schemabot.change_gate.overrides",
+		"Total number of applies, starts and cutovers let through a change gate by an approved override", "{override}",
+		EnvironmentAttribute(environment),
+		attribute.String("gate", gate),
+		attribute.String("checkpoint", checkpoint),
+	)
+}
+
 // RecordChangeGateError counts change gate checks that failed, so the apply,
 // start or cutover was refused without knowing whether a gate blocks it.
 func RecordChangeGateError(ctx context.Context, environment, checkpoint string) {
@@ -2207,6 +2244,10 @@ func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo
 //     find the delivery in the driver logs and inspect its last_error.
 //   - "retrying": processing failed retryably; the row waits for its retry
 //     window.
+//   - "quota_reserve_deferred": the installation's GitHub quota reserve
+//     refused a read the processing needed; the row waits for the quota to
+//     reset and the claim's attempt was refunded. A sustained rate means
+//     plans are outrunning the installation's quota.
 //   - "superseded": the claimed auto-plan delivery was discarded without
 //     processing because a newer covering delivery exists for the same pull
 //     request; the successor performs the work.
@@ -2218,14 +2259,15 @@ func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo
 //     outcome; the row stays processing until lease expiry hands it to
 //     another driver — investigate storage health.
 var knownWebhookDispatchOutcomes = map[string]bool{
-	"completed":        true,
-	"failed":           true,
-	"failed_permanent": true,
-	"retrying":         true,
-	"superseded":       true,
-	"released":         true,
-	"lease_lost":       true,
-	"finish_error":     true,
+	"completed":              true,
+	"failed":                 true,
+	"failed_permanent":       true,
+	"retrying":               true,
+	"quota_reserve_deferred": true,
+	"superseded":             true,
+	"released":               true,
+	"lease_lost":             true,
+	"finish_error":           true,
 }
 
 // RecordWebhookDispatchDuration records how long one dispatch claim held a

@@ -75,7 +75,7 @@ func TestCheckPublicationLeavesStorageConnectionAvailable(t *testing.T) {
 
 			client, mux := setupGitHubServer(t)
 			install := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
-			h := NewHandler(svc, &fakeClientFactory{client: install}, nil, testLogger())
+			h := NewHandler(svc, &fakeClientFactory{client: install}, nil, testLogger(), WithInsecureSkipSignatureVerification())
 			entered := make(chan struct{}, 1)
 			release := make(chan struct{})
 			var releaseOnce sync.Once

@@ -142,6 +142,12 @@ type ErrorResponse struct {
 	// Blockers lists what refused a change_gate_refused apply, start or
 	// cutover.
 	Blockers []ChangeGateBlocker `json:"blockers,omitempty"`
+
+	// OverrideRequest is the override request SchemaBot recorded when it
+	// refused a change for a caller who gave an override reason. A freeze
+	// approver other than the requester approves it, and the caller then
+	// repeats the command.
+	OverrideRequest *FreezeOverrideRequest `json:"override_request,omitempty"`
 }
 
 // ChangeGateBlocker is one reason a change gate refused an apply, start or
@@ -899,6 +905,9 @@ type ApplyRequest struct {
 	// rollout-wide apply of an environment with more than one member from a
 	// caller that does not set it.
 	RendersRollout bool `json:"renders_rollout,omitempty"`
+	// Override is the reason to ask for a freeze override when a freeze
+	// refuses the apply. At most 500 characters after trimming.
+	Override string `json:"override,omitempty"`
 }
 
 // ControlRequest is the HTTP request body for control operations
@@ -907,6 +916,11 @@ type ControlRequest struct {
 	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id"`
 	Caller      string `json:"caller,omitempty"`
+	// Override is the reason to ask for a freeze override when a freeze
+	// refuses a start or cutover. A caller outside the HTTP routes sets it
+	// and validates it: the routes read the same field from their own
+	// request types and validate it themselves.
+	Override string `json:"override,omitempty"`
 }
 
 // =============================================================================
@@ -961,6 +975,13 @@ type PlanResponse struct {
 	// on the response to the plan request only; a stored plan does not retain
 	// it. Empty when nothing was exempted, which is the ordinary case.
 	ExemptTables []*ExemptTablesResponse `json:"exempt_tables,omitempty"`
+	// UnmatchedDropTables lists the drop_tables entries that name no live
+	// table on the target, in the order the config lists them, so the plan
+	// says the entry drops nothing instead of reading as if the table were
+	// seen and kept. Like ExemptTables it describes the target at planning
+	// time and a stored plan does not retain it. Empty when every entry
+	// matched or the config lists none.
+	UnmatchedDropTables []string `json:"unmatched_drop_tables,omitempty"`
 	// Rollout describes the plan of every member of the rollout when the
 	// environment fans out to more than one: the members grouped by the plan
 	// each runs, and the members that need attention before an apply can run
@@ -1910,6 +1931,22 @@ type ProgressResponse struct {
 	// VSchema change. Operations still lists every shard and finalizer row,
 	// but a client renders the apply as one change, the way its PR comments do.
 	Sharded bool `json:"sharded,omitempty"`
+	// StoppedByFreeze names the freeze that stopped this apply, set only while
+	// the apply is stopped and the stop that stopped it was a freeze's (one
+	// with running "stop"), not an operator's.
+	StoppedByFreeze *FreezeStopRef `json:"stopped_by_freeze,omitempty"`
+}
+
+// FreezeStopRef names the freeze that stopped an apply.
+type FreezeStopRef struct {
+	ID string `json:"id"`
+	// Reason is the freeze's reason, empty when SchemaBot could not read the
+	// freeze.
+	Reason string `json:"reason,omitempty"`
+	// Ended is true once the freeze has ended or been lifted, by the database
+	// clock, so a plain start resumes the apply. It is false while the
+	// freeze is in effect, and when SchemaBot could not read the freeze.
+	Ended bool `json:"ended,omitempty"`
 }
 
 // ProgressOperationResponse represents progress for one deployment operation.
@@ -2023,6 +2060,10 @@ type ShardProgressResponse struct {
 	// Non-zero only while the shard is checksumming (verifying copied data).
 	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`
 	ChecksumRowsTotal   int64 `json:"checksum_rows_total,omitempty"`
+	// CopiesNoRows is true when every change this shard runs on the table
+	// copies no rows (a CREATE TABLE, a DROP TABLE, or an instant ALTER), so
+	// a running shard reads as applying rather than running a table copy.
+	CopiesNoRows bool `json:"copies_no_rows,omitempty"`
 }
 
 // ApplyHistoryResponse represents a single apply in the history.

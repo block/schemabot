@@ -676,7 +676,7 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 			installClient := ghclient.NewInstallationClient(client, logger)
 			factory := &fakeClientFactory{client: installClient}
 
-			h := NewHandler(svc, factory, nil, logger)
+			h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 			req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 				action:  "opened",
@@ -763,7 +763,7 @@ func TestE2EParticipantSilentOnNonSchemaPR(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:  "opened",
@@ -974,7 +974,7 @@ func TestE2EPassingAggregateSynchronizeUpdatesNewSHA(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// Step 1: PR opened with sha1
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
@@ -1246,7 +1246,7 @@ func TestE2EPassingAggregateOnSQLWithoutSchemabotYAML(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:  "opened",
@@ -1324,7 +1324,7 @@ func TestE2EPassingAggregateWithoutAllowedEnvs(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:  "opened",
@@ -1376,7 +1376,7 @@ func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:  "opened",

@@ -89,7 +89,7 @@ func TestE2EPRCloseCleanup(t *testing.T) {
 	require.NoError(t, err)
 
 	factory, _ := prClosedGitHub(t, "closed", 0)
-	h := NewHandler(svc, factory, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+	h := NewHandler(svc, factory, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})), WithInsecureSkipSignatureVerification())
 	drainWebhookWorkOnCleanup(t, h)
 
 	// Close the PR while the apply is running. Cleanup is invoked directly (not
@@ -166,7 +166,7 @@ func TestE2EPRCloseCleanupSkipsReopenedPR(t *testing.T) {
 	}))
 
 	reopened, _ := prClosedGitHub(t, "open", 0)
-	h := NewHandler(svc, reopened, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+	h := NewHandler(svc, reopened, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})), WithInsecureSkipSignatureVerification())
 	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false)
 	require.NoError(t, err)
 	require.False(t, ran, "cleanup reports that it did not run for a PR that is open again")
@@ -180,7 +180,7 @@ func TestE2EPRCloseCleanupSkipsReopenedPR(t *testing.T) {
 	require.NotNil(t, check, "stored check state must stay while the PR is open")
 
 	closed, _ := prClosedGitHub(t, "closed", 0)
-	h = NewHandler(svc, closed, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+	h = NewHandler(svc, closed, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})), WithInsecureSkipSignatureVerification())
 	ran, err = h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false)
 	require.NoError(t, err)
 	require.True(t, ran, "cleanup runs for a PR that is still closed")
@@ -298,15 +298,23 @@ func seedPlanCheck(t *testing.T, svc *api.Service, headSHA, environment, dbType,
 
 // finishStrataPlan does what the end of a database's plan under Strata does on
 // headSHA: it stores the plan's result for each environment in stored, settles
-// the rows the database left under its old type, and folds the aggregate.
+// the rows the database left on earlier commits, and folds the aggregate.
 func finishStrataPlan(t *testing.T, h *Handler, svc *api.Service, headSHA, dbName string, stored []string, checkRunID int64, hasChanges bool, conclusion string) {
 	t.Helper()
+	finishPlan(t, h, svc, headSHA, storage.DatabaseTypeStrata, dbName, stored, checkRunID, hasChanges, conclusion)
+}
+
+// finishPlan does what the end of a database's plan under dbType does on
+// headSHA: it stores the plan's result for each environment in stored, settles
+// the rows the database left on earlier commits, and folds the aggregate.
+func finishPlan(t *testing.T, h *Handler, svc *api.Service, headSHA, dbType, dbName string, stored []string, checkRunID int64, hasChanges bool, conclusion string) {
+	t.Helper()
 	for _, env := range stored {
-		seedPlanCheck(t, svc, headSHA, env, storage.DatabaseTypeStrata, dbName, checkRunID, hasChanges, conclusion)
+		seedPlanCheck(t, svc, headSHA, env, dbType, dbName, checkRunID, hasChanges, conclusion)
 	}
 	ghClient, err := h.clientForRepo("octocat/hello-world", 0)
 	require.NoError(t, err)
-	require.NoError(t, h.settleChecksReplacedByNewType(t.Context(), ghClient, "octocat/hello-world", 1, headSHA, dbName, storage.DatabaseTypeStrata))
+	require.NoError(t, h.settleLeftBehindChecks(t.Context(), ghClient, "octocat/hello-world", 1, headSHA, dbName, dbType))
 	h.updateAggregateCheck(t.Context(), ghClient, "octocat/hello-world", 1, headSHA)
 }
 
@@ -482,7 +490,7 @@ func TestE2EStaleCheckCleanupDatabaseTypeChangedPlanOnSupersededCommitSettlesNot
 	h := newE2EHandler(t, svc, client)
 	ghClient, err := h.clientForRepo("octocat/hello-world", 0)
 	require.NoError(t, err)
-	require.NoError(t, h.settleChecksReplacedByNewType(ctx, ghClient, "octocat/hello-world", 1, "newsha222", dbName, storage.DatabaseTypeStrata))
+	require.NoError(t, h.settleLeftBehindChecks(ctx, ghClient, "octocat/hello-world", 1, "newsha222", dbName, storage.DatabaseTypeStrata))
 
 	mysqlCheck, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", storage.DatabaseTypeMySQL, dbName)
 	require.NoError(t, err)
@@ -507,7 +515,224 @@ func TestE2EStaleCheckCleanupPlanWithoutOldTypeRowsReadsNoPullRequest(t *testing
 	h := newE2EHandler(t, svc, client)
 	ghClient, err := h.clientForRepo("octocat/hello-world", 0)
 	require.NoError(t, err)
-	require.NoError(t, h.settleChecksReplacedByNewType(t.Context(), ghClient, "octocat/hello-world", 1, "newsha222", dbName, storage.DatabaseTypeMySQL))
+	require.NoError(t, h.settleLeftBehindChecks(t.Context(), ghClient, "octocat/hello-world", 1, "newsha222", dbName, storage.DatabaseTypeMySQL))
+}
+
+// newFakeGitHubWithHead serves a PR whose head is headSHA and captures the
+// Check Runs SchemaBot creates or updates.
+func newFakeGitHubWithHead(t *testing.T, headSHA string) (*gh.Client, chan checkRunCapture) {
+	t.Helper()
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	return client, setupFakeGitHubHeadAndCheckRuns(t, mux, headSHA)
+}
+
+// An operator removes the sandbox environment from a database's server config
+// while a PR is open. The PR's earlier commit planned the database in staging,
+// sandbox, and production, and the sandbox plan failed. The new commit's plan
+// stores only staging and production, so no plan will ever store sandbox
+// again. The plan removes the plan-only sandbox row, and the aggregate folds
+// to the plan's real result instead of staying in progress for good. Removing
+// the row rather than passing it means that if sandbox is configured again,
+// its missing result reads like any newly configured environment, never as a
+// pass.
+func TestE2EPlanRemovesPlanOnlyCheckInEnvironmentRemovedFromConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		hasChanges bool
+		conclusion string
+	}{
+		{name: "clean plans pass", hasChanges: false, conclusion: checkConclusionSuccess},
+		{name: "pending changes need action", hasChanges: true, conclusion: checkConclusionActionRequired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dbName := "webhook_removed_env_plan_only"
+			svc := setupE2EService(t, dbName)
+			configureE2EServiceEnvironments(t, svc, dbName, "staging", "production")
+			seedPlanCheck(t, svc, "oldsha111", "staging", storage.DatabaseTypeMySQL, dbName, 100, true, checkConclusionActionRequired)
+			seedPlanCheck(t, svc, "oldsha111", "sandbox", storage.DatabaseTypeMySQL, dbName, 101, false, checkConclusionFailure)
+			seedPlanCheck(t, svc, "oldsha111", "production", storage.DatabaseTypeMySQL, dbName, 102, true, checkConclusionActionRequired)
+			client, checkRuns := newFakeGitHubWithHead(t, "newsha222")
+			h := newE2EHandler(t, svc, client)
+
+			finishPlan(t, h, svc, "newsha222", storage.DatabaseTypeMySQL, dbName, []string{"staging", "production"}, 103, tc.hasChanges, tc.conclusion)
+
+			requireNoStoredCheck(t, svc, "sandbox", storage.DatabaseTypeMySQL, dbName)
+
+			cr := requireAggregateCheckRun(t, checkRuns)
+			assert.Equal(t, "newsha222", cr.HeadSHA)
+			assert.Equal(t, checkStatusCompleted, cr.Status)
+			assert.Equal(t, tc.conclusion, cr.Conclusion, "the aggregate folds the staging and production plans")
+			waitForStoredAggregate(t, svc, "octocat/hello-world", 1, checkStatusCompleted, tc.conclusion)
+		})
+	}
+}
+
+// The same removal of the sandbox environment, run through `schemabot plan`.
+// The plan stores staging and production, removes the plan-only sandbox row
+// before its fold, and the aggregate reports the plan's pending changes.
+func TestE2EMultiEnvPlanRemovesCheckInEnvironmentRemovedFromConfig(t *testing.T) {
+	dbName := "webhook_plan_settles_removed_env"
+	svc := setupE2EServiceMultiEnv(t, dbName)
+	seedPlanCheck(t, svc, "oldsha111", "sandbox", storage.DatabaseTypeMySQL, dbName, 101, false, checkConclusionFailure)
+	h, result := newPlanHandler(t, svc, dbName)
+
+	runPlanCommand(t, h, result, "schemabot plan")
+
+	cr := requireAggregateCheckRun(t, result.checkRuns)
+	assert.Equal(t, "abc123", cr.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, cr.Status)
+	assert.Equal(t, checkConclusionActionRequired, cr.Conclusion, "the aggregate folds the plan's pending changes")
+	requireNoStoredCheck(t, svc, "sandbox", storage.DatabaseTypeMySQL, dbName)
+}
+
+// An apply had started in sandbox before the operator removed sandbox from the
+// database's server config. The live sandbox database may already have
+// changed, so the plan on the new commit moves the row onto that commit as a
+// block (schema_removed_after_apply_started) that keeps the apply's ownership,
+// and the aggregate does not pass.
+func TestE2EPlanKeepsStartedApplyInEnvironmentRemovedFromConfigBlocking(t *testing.T) {
+	dbName := "webhook_removed_env_apply"
+	svc := setupE2EService(t, dbName)
+	configureE2EServiceEnvironments(t, svc, dbName, "staging", "production")
+	ctx := t.Context()
+	applyID, err := svc.Storage().Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-before-env-removed",
+		Database:        dbName,
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "sandbox",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Running,
+		Engine:          "spirit",
+	})
+	require.NoError(t, err)
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  "sandbox",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		DatabaseName: dbName,
+		CheckRunID:   100,
+		ApplyID:      applyID,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+	}))
+	client, checkRuns := newFakeGitHubWithHead(t, "newsha222")
+	h := newE2EHandler(t, svc, client)
+
+	finishPlan(t, h, svc, "newsha222", storage.DatabaseTypeMySQL, dbName, []string{"staging", "production"}, 101, false, checkConclusionSuccess)
+
+	sandbox := requireStoredCheck(t, svc, "sandbox", storage.DatabaseTypeMySQL, dbName)
+	assert.Equal(t, "newsha222", sandbox.HeadSHA)
+	assert.Equal(t, checkStatusInProgress, sandbox.Status)
+	assert.Empty(t, sandbox.Conclusion)
+	assert.Equal(t, applyID, sandbox.ApplyID, "the started apply keeps ownership of its row")
+	assert.Equal(t, schemaRemovedAfterApplyBlock.blockingReason, sandbox.BlockingReason)
+
+	cr := requireAggregateCheckRun(t, checkRuns)
+	assert.Equal(t, "newsha222", cr.HeadSHA)
+	assert.Equal(t, checkStatusInProgress, cr.Status)
+	assert.Empty(t, cr.Conclusion, "a started apply in the removed environment must keep the aggregate blocking")
+}
+
+// The operator removed sandbox from the database's server config, and a plan
+// finishes only after the PR has moved to a newer commit. The plan settles
+// nothing: the newer commit's plans own the rows, and a write from the older
+// plan would move them onto a commit the PR no longer points at.
+func TestE2EPlanOnSupersededCommitSettlesNoCheckInEnvironmentRemovedFromConfig(t *testing.T) {
+	dbName := "webhook_removed_env_superseded"
+	svc := setupE2EService(t, dbName)
+	configureE2EServiceEnvironments(t, svc, dbName, "staging", "production")
+	seedPlanCheck(t, svc, "oldsha111", "sandbox", storage.DatabaseTypeMySQL, dbName, 100, false, checkConclusionFailure)
+	seedPlanCheck(t, svc, "newsha222", "staging", storage.DatabaseTypeMySQL, dbName, 101, false, checkConclusionSuccess)
+	seedPlanCheck(t, svc, "newsha222", "production", storage.DatabaseTypeMySQL, dbName, 102, false, checkConclusionSuccess)
+	client, _ := newFakeGitHubWithHead(t, "newsha333")
+	h := newE2EHandler(t, svc, client)
+	ghClient, err := h.clientForRepo("octocat/hello-world", 0)
+	require.NoError(t, err)
+
+	require.NoError(t, h.settleLeftBehindChecks(t.Context(), ghClient, "octocat/hello-world", 1, "newsha222", dbName, storage.DatabaseTypeMySQL))
+
+	sandbox := requireStoredCheck(t, svc, "sandbox", storage.DatabaseTypeMySQL, dbName)
+	assert.Equal(t, "oldsha111", sandbox.HeadSHA, "a plan on a superseded commit must not move the row")
+	assert.Equal(t, checkConclusionFailure, sandbox.Conclusion)
+}
+
+// The operator removed sandbox from the database's server config, and the
+// plan of staging on the new commit could not store its result. Settling the
+// sandbox row then would leave the aggregate with no result of the database
+// on this commit at all, so the row stays on its earlier commit and keeps the
+// aggregate open until a plan whose result is stored.
+func TestE2EPlanWithUnstoredResultSettlesNoCheckInEnvironmentRemovedFromConfig(t *testing.T) {
+	dbName := "webhook_removed_env_unstored"
+	svc := setupE2EService(t, dbName)
+	configureE2EServiceEnvironments(t, svc, dbName, "staging")
+	seedPlanCheck(t, svc, "oldsha111", "sandbox", storage.DatabaseTypeMySQL, dbName, 100, false, checkConclusionFailure)
+	client, checkRuns := newFakeGitHubWithHead(t, "newsha222")
+	h := newE2EHandler(t, svc, client)
+
+	finishPlan(t, h, svc, "newsha222", storage.DatabaseTypeMySQL, dbName, nil, 101, false, checkConclusionSuccess)
+
+	sandbox := requireStoredCheck(t, svc, "sandbox", storage.DatabaseTypeMySQL, dbName)
+	assert.Equal(t, "oldsha111", sandbox.HeadSHA, "without a stored result on this commit the row is not settled")
+	assert.Equal(t, checkConclusionFailure, sandbox.Conclusion)
+	cr := requireAggregateCheckRun(t, checkRuns)
+	assert.Equal(t, "newsha222", cr.HeadSHA)
+	assert.NotEqual(t, checkConclusionSuccess, cr.Conclusion, "the aggregate must not pass without a stored result of the database")
+}
+
+// A database's plan stores staging on the new commit while its production row
+// is still on the earlier commit. Production is still in the database's
+// server config, so the row is left for production's next plan and is not a
+// row to settle: the plan does not read the PR head from GitHub, and a GitHub
+// that cannot serve the PR does not fail the plan's settle step.
+func TestE2EPlanWithRowsOnlyInConfiguredEnvironmentsReadsNoPullRequest(t *testing.T) {
+	dbName := "webhook_removed_env_none"
+	svc := setupE2EService(t, dbName)
+	configureE2EServiceEnvironments(t, svc, dbName, "staging", "production")
+	seedPlanCheck(t, svc, "oldsha111", "production", storage.DatabaseTypeMySQL, dbName, 100, true, checkConclusionActionRequired)
+	seedPlanCheck(t, svc, "newsha222", "staging", storage.DatabaseTypeMySQL, dbName, 101, true, checkConclusionActionRequired)
+
+	server := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	h := newE2EHandler(t, svc, client)
+	ghClient, err := h.clientForRepo("octocat/hello-world", 0)
+	require.NoError(t, err)
+	require.NoError(t, h.settleLeftBehindChecks(t.Context(), ghClient, "octocat/hello-world", 1, "newsha222", dbName, storage.DatabaseTypeMySQL))
+
+	production := requireStoredCheck(t, svc, "production", storage.DatabaseTypeMySQL, dbName)
+	assert.Equal(t, "oldsha111", production.HeadSHA)
+	assert.Equal(t, checkConclusionActionRequired, production.Conclusion)
+}
+
+// The operator plans one environment with `schemabot plan -e staging` on a
+// PR's new commit. Production is still in the database's server config, so
+// its row on the earlier commit is not settled: it keeps the aggregate open
+// until production's own plan stores a result on this commit.
+func TestE2EPlanOneEnvironmentKeepsConfiguredEnvironmentBlocking(t *testing.T) {
+	dbName := "webhook_plan_env_keeps_configured_env"
+	svc := setupE2EServiceMultiEnv(t, dbName)
+	seedPlanCheck(t, svc, "oldsha111", "production", storage.DatabaseTypeMySQL, dbName, 100, true, checkConclusionActionRequired)
+	h, result := newPlanHandler(t, svc, dbName)
+
+	runPlanCommand(t, h, result, "schemabot plan -e staging")
+
+	cr := requireAggregateCheckRun(t, result.checkRuns)
+	assert.Equal(t, "abc123", cr.HeadSHA)
+	assert.Equal(t, checkStatusInProgress, cr.Status, "the production row on the earlier commit keeps the aggregate open")
+	assert.Empty(t, cr.Conclusion)
+	assert.Equal(t, "abc123", requireStoredCheck(t, svc, "staging", storage.DatabaseTypeMySQL, dbName).HeadSHA)
+	production := requireStoredCheck(t, svc, "production", storage.DatabaseTypeMySQL, dbName)
+	assert.Equal(t, "oldsha111", production.HeadSHA, "production is still configured, so its row is left for production's next plan")
+	assert.Equal(t, checkConclusionActionRequired, production.Conclusion)
 }
 
 // seedOldTypeChecks stores a plan-only row under a database's previous type,
@@ -527,6 +752,13 @@ func requireStoredCheck(t *testing.T, svc *api.Service, env, dbType, dbName stri
 	require.NoError(t, err)
 	require.NotNil(t, check, "expected stored check state for %s/%s/%s", env, dbType, dbName)
 	return check
+}
+
+func requireNoStoredCheck(t *testing.T, svc *api.Service, env, dbType, dbName string) {
+	t.Helper()
+	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, env, dbType, dbName)
+	require.NoError(t, err)
+	require.Nil(t, check, "expected no stored check state for %s/%s/%s", env, dbType, dbName)
 }
 
 // newPlanHandler serves a PR whose schemabot.yaml plans dbName as MySQL, and

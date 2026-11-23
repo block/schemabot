@@ -599,6 +599,12 @@ type ApplyRequest struct {
 	// operator the plan every rollout member runs. It is not operator consent;
 	// see apitypes.ApplyRequest.RendersRollout.
 	RendersRollout bool `json:"renders_rollout,omitempty"`
+	// Override is the reason to ask for a freeze override when a freeze
+	// refuses the apply; see apitypes.ApplyRequest.Override.
+	Override string `json:"override,omitempty"`
+	// freezeOverride is the approved override request that admitted this
+	// apply, set by the server after the change gates and never by a caller.
+	freezeOverride string
 	// viaHTTP is set by POST /api/apply, the one entry point whose caller has
 	// to say it rendered the rollout. The webhook and the trusted enqueue path
 	// call the service in process and leave it unset.
@@ -1542,6 +1548,11 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "environment is required")
 		return
 	}
+	override, ok := s.overrideReasonFromRequest(w, r, req.Override)
+	if !ok {
+		return
+	}
+	req.Override = override
 
 	if !s.authorizeDirectWriteForStoredPlan(w, r, "apply", req.PlanID, req.Environment) {
 		return
@@ -2155,18 +2166,26 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		// A rollback undoes a change, so the change gates never hold it. Only
 		// the webhook's pinned rollback is known to be one: the rollback
 		// option is the caller's to set.
-		gatedCtx, err := s.checkChangeGates(ctx, changeGateInput{
+		gatedCtx, override, err := s.checkChangeGates(ctx, changeGateInput{
 			Checkpoint:  changeGateCheckpointStart,
 			Environment: req.Environment,
 			Deployments: s.changeGateDeployments(plan.Database, req.Environment, plan.Deployment, req.Target != ""),
 			Database:    plan.Database,
 			Repository:  plan.Repository,
+			Action:      storage.FreezeOverrideActionApply,
+			ResolveTargetID: func(ctx context.Context) (string, error) {
+				return s.applyOverrideTargetFor(ctx, plan, req)
+			},
+			Override: strings.TrimSpace(req.Override),
 		}, resolveCaller(ctx, req.Caller))
 		if err != nil {
 			recordApplyError("change gate", err)
 			return nil, 0, err
 		}
 		admitCtx = gatedCtx
+		if override != nil {
+			req.freezeOverride = override.Identifier
+		}
 	}
 	applyIdentifier, storedApplyID, err := s.enqueueApply(admitCtx, plan, req, options, attachObserver)
 	if err != nil {
@@ -2285,6 +2304,8 @@ func (s *Service) createStoredApply(
 	// A pinned rollback is recorded so its later start or cutover passes the
 	// change gates as its creation did.
 	applyOpts.PinnedRollback = isPinnedRollback(plan, req)
+	// Only the server records the override that admitted the apply.
+	applyOpts.FreezeOverride = req.freezeOverride
 
 	// Attribute the apply to the authenticated caller when the request carried a
 	// real identity (API auth enabled); see resolveCaller.
@@ -3589,12 +3610,12 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	}
 	schemaFiles, err := rollbackSchemaFiles(plan)
 	if err != nil {
-		return nil, terminalControlf("rollback source plan is invalid: %w", err)
+		return nil, authoredTerminalControlf("rollback source plan is invalid: %w", err)
 	}
 
 	deployment, err := storedDeploymentForApply(apply)
 	if err != nil {
-		return nil, terminalControlf("rollback source apply is invalid: %w", err)
+		return nil, authoredTerminalControlf("rollback source apply is invalid: %w", err)
 	}
 	if plan.Target == "" {
 		return nil, terminalControlf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
@@ -3602,12 +3623,18 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	if err := s.refuseMultiTargetRollback(ctx, apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
 		return nil, err
 	}
-	// Client resolution is a config lookup: a deployment that cannot resolve a
-	// Tern client resolves the same way on every attempt, so the failure is
-	// terminal until an operator fixes the routing configuration.
+	// A deployment missing from the server configuration, or configured in a way
+	// that can never produce a client, fails the same way on every attempt, so
+	// that answer is terminal. A secrets lookup for the DSN or token that failed
+	// can clear on a later attempt, so it stays retryable. The raw cause can carry DSN or host
+	// fragments and goes only to the server log; the returned error carries a
+	// message SchemaBot wrote, because the webhook posts it to the PR.
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
-		return nil, terminalControlf("database %q (%s): %w", apply.Database, apply.Environment, err)
+		s.logger.Error("failed to create Tern client",
+			append(apply.LogAttrs(),
+				"operation", "rollback_plan", "error", err)...)
+		return nil, controlTernClientFailure(apply, deployment, err)
 	}
 
 	prNumber := int32(apply.PullRequest)
@@ -3661,11 +3688,19 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 				Err:        err,
 			}
 		}
-		return nil, terminalControlf("rollback plan for database %q (%s): %w%s",
-			apply.Database, apply.Environment, err, recordedIgnoreTablesNote(req.IgnoreTables))
+		failure := &terminalControlError{err: fmt.Errorf("rollback plan for database %q (%s): %w%s",
+			apply.Database, apply.Environment, err, recordedIgnoreTablesNote(req.IgnoreTables))}
+		// A refusal is the engine's answer for whoever edits the schema
+		// files, so the requester sees it. Any other Plan failure can carry
+		// driver or transport text and stays in the server log.
+		if isPlanRefusal(err) {
+			failure.shown = fmt.Sprintf("rollback plan for database %q (%s): %s%s",
+				apply.Database, apply.Environment, planRefusalReason(err), recordedIgnoreTablesNote(req.IgnoreTables))
+		}
+		return nil, failure
 	}
 	if err := s.refuseDropsOfWithheldTables(req, resp, deployment); err != nil {
-		return nil, terminalControlf("rollback plan for database %q (%s): %w", apply.Database, apply.Environment, err)
+		return nil, authoredTerminalControlf("rollback plan for database %q (%s): %w", apply.Database, apply.Environment, err)
 	}
 	s.normalizeExecutionVerdicts(resp, apply.Database, deployment)
 	route := storedPlanRoute{
@@ -3892,4 +3927,17 @@ func isPlanRefusal(err error) bool {
 		return true
 	}
 	return grpcstatus.Code(err) == grpccodes.FailedPrecondition
+}
+
+// planRefusalReason is a refusal's own text, without the gRPC status prefix a
+// remote data plane's answer carries. It reads the status itself, since
+// grpcstatus.FromError puts the whole wrapped text back into the message.
+func planRefusalReason(err error) string {
+	var remote interface{ GRPCStatus() *grpcstatus.Status }
+	if errors.As(err, &remote) {
+		if st := remote.GRPCStatus(); st != nil {
+			return st.Message()
+		}
+	}
+	return err.Error()
 }

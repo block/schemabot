@@ -339,9 +339,9 @@ func TestE2EReplanNewlyDirectDowngradesToConfirm(t *testing.T) {
 	shown := f.engineRoutedPlan(t)
 	f.pinLock(t, f.directPlan.PlanID)
 
-	f.h.executeApply(t.Context(), f.client, "octocat/hello-world", 1, f.schemaResult, "staging", 1, "testuser",
+	f.h.executeApply(t.Context(), f.client, "octocat/hello-world", 1, f.schemaResult, nil, "staging", 1, "testuser",
 		CommandResult{Action: action.Apply, Environment: "staging", Found: true, IsMention: true, AllowUnsafe: true},
-		shown, shown, f.directPlan.PlanID, nil)
+		shown, shown, f.directPlan.PlanID, nil, nil)
 
 	body := f.awaitComment(t, "Confirmation required")
 	requireNewlyDirectDisclosure(t, body)

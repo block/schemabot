@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -126,19 +127,28 @@ func TestWriteControlError_LogsCarryFullApplyAttrs(t *testing.T) {
 }
 
 // A control request is answered from the Tern client of the deployment stored
-// on its apply. When SchemaBot cannot build that client, for example because
-// the deployment's DSN file is unreadable, the request answers 503 so durable
-// callers retry once the outage clears, and the message is fixed because the
-// raw error names the DSN source and stays in the server log. A deployment
-// that is missing from the server configuration answers 404, since retrying
-// cannot change that. Each answer carries the error code clients decide a
-// retry from, and neither message repeats the failure's own text.
+// on its apply. When SchemaBot cannot build that client because the secrets
+// lookup for the deployment's DSN failed, the request answers 503 so durable
+// callers retry once the backend recovers, and the message is fixed because
+// the raw error names the DSN source and stays in the server log. When the DSN
+// names a file that does not exist, every retry fails the same way, so the
+// request answers a terminal 500 that says an operator has to fix the
+// configuration. A deployment that is missing from the server configuration
+// answers 404, since retrying cannot change that. Each answer carries the
+// error code clients decide a retry from, and no message repeats the
+// failure's own text.
 func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 	missingDSNFile := filepath.Join(t.TempDir(), "missing-dsn-file")
+	const flakyResolver = "controlflaky"
+	secrets.Register(flakyResolver, func(string) (string, error) {
+		return "", errors.New("secrets backend timed out reading flaky-dsn-secret")
+	})
+	t.Cleanup(func() { secrets.Unregister(flakyResolver) })
 
 	tests := []struct {
 		name          string
 		deployment    string
+		dsn           string
 		wantStatus    int
 		wantMessage   string
 		wantCode      string
@@ -151,13 +161,26 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 		{
 			name:          "client cannot be built",
 			deployment:    "brokendb",
+			dsn:           flakyResolver + ":orders",
 			wantStatus:    http.StatusServiceUnavailable,
 			wantMessage:   controlEngineUnavailableMessage,
 			wantCode:      apitypes.ErrCodeEngineUnavailable,
 			wantRetryable: true,
 			wantInternal:  true,
 			wantLogged:    true,
-			wantLogDetail: "resolve DSN for brokendb/staging",
+			wantLogDetail: "flaky-dsn-secret",
+		},
+		{
+			name:       "client configuration cannot work",
+			deployment: "brokendb",
+			dsn:        "file:" + missingDSNFile,
+			wantStatus: http.StatusInternalServerError,
+			wantMessage: `the server configuration for database "testdb" (deployment="brokendb", environment="staging") cannot produce a client for the schema change engine, so retrying will not help. ` +
+				"A SchemaBot operator can find the cause in the server log and fix the configuration",
+			wantTerminal:  true,
+			wantInternal:  true,
+			wantLogged:    true,
+			wantLogDetail: "missing-dsn-file",
 		},
 		{
 			name:         "named deployment not in the server configuration",
@@ -177,7 +200,7 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 		},
 	}
 
-	newService := func(deployment string, logger *slog.Logger) *Service {
+	newService := func(deployment, dsn string, logger *slog.Logger) *Service {
 		apply := activeTestApply("apply-client-failure")
 		apply.Deployment = deployment
 		return New(&mockStorageWithApplyStores{
@@ -189,7 +212,7 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 				"brokendb": {
 					Type: storage.DatabaseTypeMySQL,
 					Environments: map[string]EnvironmentConfig{
-						"staging": {DSN: "file:" + missingDSNFile},
+						"staging": {DSN: dsn},
 					},
 				},
 			},
@@ -201,7 +224,7 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 		t.Run(tc.name+"/http", func(t *testing.T) {
 			for _, route := range []string{"/api/cutover", "/api/stop"} {
 				var logBuf bytes.Buffer
-				svc := newService(tc.deployment, slog.New(slog.NewJSONHandler(&logBuf, nil)))
+				svc := newService(tc.deployment, tc.dsn, slog.New(slog.NewJSONHandler(&logBuf, nil)))
 				mux := http.NewServeMux()
 				svc.ConfigureRoutes(mux)
 
@@ -236,7 +259,7 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 			}
 			for operation, execute := range executors {
 				var logBuf bytes.Buffer
-				svc := newService(tc.deployment, slog.New(slog.NewJSONHandler(&logBuf, nil)))
+				svc := newService(tc.deployment, tc.dsn, slog.New(slog.NewJSONHandler(&logBuf, nil)))
 
 				err := execute(svc)
 
@@ -254,7 +277,7 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 
 // assertTernClientFailureLogged checks that the server log keeps the raw
 // client-construction error for triage, with the operation that was asked for,
-// when a request was answered with the fixed 503 message.
+// when a request was answered without the raw error.
 func assertTernClientFailureLogged(t *testing.T, logs []byte, wantRawError bool, detail, operation string) {
 	t.Helper()
 	if !wantRawError {
@@ -265,7 +288,6 @@ func assertTernClientFailureLogged(t *testing.T, logs []byte, wantRawError bool,
 	assert.Equal(t, "apply-client-failure", line["apply_id"], operation)
 	assert.Equal(t, "brokendb", line["deployment"], operation)
 	assert.Contains(t, line["error"], detail, operation)
-	assert.Contains(t, line["error"], "missing-dsn-file", operation)
 }
 
 // A client-construction failure must not be mistaken for a missing

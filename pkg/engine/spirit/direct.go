@@ -12,7 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/block/mysql"
@@ -536,14 +538,22 @@ func verdictApplies(stmtType ddl.StatementType) bool {
 // definition.
 func (v *ExecutionVerdicts) record(ctx context.Context, change *engine.TableChange, currentCreateTable string) error {
 	logger := v.engine.logger
-	reason, refused, err := check.StatementRefusal(ctx, change.DDL, currentCreateTable, logger)
+	reason, kind, err := classifyRefusal(ctx, logger, v.target, v.policy, v.database, change.Table, change.DDL, currentCreateTable)
 	if err != nil {
 		return fmt.Errorf("execution verdict for table %q in database %q: %w", change.Table, v.database, err)
 	}
-	if !refused {
+	if kind == notRefused {
 		return nil
 	}
 	decision := v.engine.resolveRefusedMode(ctx, v.target, v.policy, v.database, change.Table, reason)
+	if kind == tableRefused && decision.mode != engine.ExecutionModeDirect {
+		// Not a verdict: the engine may still complete the statement with
+		// MySQL's native DDL, so the plan leaves it on the default path, as
+		// the apply's routing does.
+		logger.Info("plan leaves a statement on a table the copy process refuses on the schema change engine's default path",
+			"database", v.database, "table", change.Table, "reason", reason, "direct_execution", decision.modeReason)
+		return nil
+	}
 	change.ExecutionMode = decision.mode
 	change.ModeReason = decision.modeReason
 	if decision.mode == engine.ExecutionModeDirect {
@@ -632,6 +642,68 @@ type alterRouting struct {
 	direct       []directRouted
 }
 
+// refusalKind says which of the engine's checks refuses a statement, which
+// decides what SchemaBot may conclude from the refusal.
+type refusalKind int
+
+const (
+	// notRefused: the engine runs the statement on its default path.
+	notRefused refusalKind = iota
+	// statementRefused: the engine refuses the statement itself, whatever
+	// MySQL could do with it (check.StatementRefusal). It runs directly when
+	// the policy permits, and is blocked otherwise.
+	statementRefused
+	// tableRefused: the copy process refuses the table as it stands on the
+	// target, because it is either end of a foreign key or has triggers
+	// (check.TableRefusal). For a single-table change the engine first tries
+	// MySQL's native DDL, which can still complete the statement, so this is
+	// not a certain refusal: the statement runs directly when the policy
+	// permits, and otherwise stays on the default path, as it would without
+	// the check.
+	tableRefused
+)
+
+// classifyRefusal judges stmt on table against the target. The statement
+// checks run first, against currentCreateTable; a statement they accept is
+// then judged by the table checks, which read the target's foreign keys and
+// triggers. The table checks run only under an enabled policy, since a table
+// refusal changes nothing without one. An error says the statement could not
+// be judged and is never a refusal. A failed read of the table checks carries
+// a fixed operator message naming the table and the check, since the raw
+// cause names target infrastructure and an apply that fails here has not
+// started any statement.
+func classifyRefusal(ctx context.Context, logger *slog.Logger, target *lazyTargetDB, policy directPolicy, database, table, stmt, currentCreateTable string) (string, refusalKind, error) {
+	reason, refused, err := check.StatementRefusal(ctx, stmt, currentCreateTable, logger)
+	if err != nil {
+		return "", notRefused, err
+	}
+	if refused {
+		return reason, statementRefused, nil
+	}
+	if !policy.Enabled {
+		return "", notRefused, nil
+	}
+	db, err := target.get(ctx)
+	if err != nil {
+		return "", notRefused, tableCheckReadError(table, fmt.Errorf("connect to the target: %w", err))
+	}
+	reason, refused, err = check.TableRefusal(ctx, db, database, table, check.Options{}, logger)
+	if err != nil {
+		return "", notRefused, tableCheckReadError(table, err)
+	}
+	if refused {
+		return reason, tableRefused, nil
+	}
+	return "", notRefused, nil
+}
+
+// tableCheckReadError is the failure of reading table's foreign keys and
+// triggers to decide its route. The message is fixed so a pull request never
+// shows the target's own error text; cause keeps it for the server logs.
+func tableCheckReadError(table string, cause error) error {
+	return engine.OperatorErrorf(cause, "SchemaBot could not read the foreign keys and triggers of table %q on the target to choose how to run its statement, so no statement ran; see the server logs for the reason.", table)
+}
+
 // routeAlterStatements re-evaluates the plan-time refusal predicate per
 // statement at apply time, so a schema or policy change between plan and
 // apply can never smuggle a refused statement past the policy: statements
@@ -675,22 +747,37 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 				"database", database, "table", table, "error", err)
 			return alterRouting{}, engine.OperatorErrorf(err, "SchemaBot could not read the current definition of table %q on the target; see the server logs for the reason.", table)
 		}
-		reason, refused, err := check.StatementRefusal(ctx, stmt, currentCreateTable, logger)
+		reason, kind, err := classifyRefusal(ctx, logger, target, policy, database, table, stmt, currentCreateTable)
 		if err != nil {
+			if ctx.Err() != nil {
+				return alterRouting{}, fmt.Errorf("route ALTER statement for table %q: %w", table, err)
+			}
 			// The engine could not judge the statement — typically the current
-			// definition no longer describes a column the statement redeclares.
-			// That is not a refusal, so it must not be routed as one.
-			logger.Error("routing failed: the engine cannot classify the statement against the current table definition",
+			// definition no longer describes a column the statement redeclares,
+			// or the target could not be read. That is not a refusal, so it
+			// must not be routed as one.
+			logger.Error("routing failed: the engine cannot classify the statement against the target",
 				"database", database, "table", table, "error", err)
 			return alterRouting{}, fmt.Errorf("route ALTER statement for table %q: %w", table, err)
 		}
-		if !refused {
+		if kind == notRefused {
 			routing.spiritAlters = append(routing.spiritAlters, stmt)
 			routing.spiritTables = append(routing.spiritTables, table)
 			continue
 		}
 
 		decision := e.resolveRefusedMode(ctx, target, policy, database, table, reason)
+		if kind == tableRefused && decision.mode != engine.ExecutionModeDirect {
+			// The copy process refuses the table, but the engine may still
+			// complete the statement with MySQL's native DDL, so a table
+			// direct execution cannot take stays on the engine's default
+			// path, exactly as it would without the check.
+			logger.Info("statement on a table the copy process refuses stays on the schema change engine; direct execution cannot take it",
+				"database", database, "table", table, "reason", reason, "direct_execution", decision.modeReason)
+			routing.spiritAlters = append(routing.spiritAlters, stmt)
+			routing.spiritTables = append(routing.spiritTables, table)
+			continue
+		}
 		if decision.mode != engine.ExecutionModeDirect {
 			metrics.RecordDirectExecution(ctx, database, decision.outcome)
 			// A refusal reason is the schema change engine's own account of why
@@ -716,45 +803,56 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 }
 
 // openDirectExecutionDB opens the pool direct statements run on, with the
-// policy's lock bound set as session variables on every connection it opens.
-// dbconn.ForceExec takes the statement's connection from the pool itself, so
-// the bound has to be a property of the pool rather than a SET on one
-// connection. The same pool serves the kill's performance_schema reads and
-// KILLs on other connections while the statement waits, so it is capped at
+// session settings Spirit gives its own connections to the target and the
+// policy's lock bound, set on every connection it opens. dbconn.ForceExec
+// takes the statement's connection from the pool itself, so the settings have
+// to be properties of the pool rather than a SET on one connection. The same
+// pool serves the kill's performance_schema reads and KILLs on other
+// connections while the statement waits, so it is capped at
 // directExecutionPoolSize rather than one.
-func openDirectExecutionDB(ctx context.Context, dsn string, lockWaitSeconds int64) (*sql.DB, error) {
-	cfg, err := mysql.ParseDSN(dsn)
+//
+// The pool is opened with the configuration ForceExec runs under (see
+// directForceExecConfig), which makes its sessions strict. mysqlconn settles
+// TLS and the transport timeouts first, as for every connection SchemaBot
+// makes to a target; dbconn keeps that TLS configuration and adds its session
+// settings.
+func openDirectExecutionDB(ctx context.Context, dsn string, cfg *dbconn.DBConfig) (*sql.DB, error) {
+	connDSN, err := mysqlconn.ConnectionDSN(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("parse target DSN: %w", err)
+		return nil, fmt.Errorf("prepare target DSN: %w", err)
 	}
-	if cfg.Params == nil {
-		cfg.Params = make(map[string]string)
-	}
-	bound := strconv.FormatInt(lockWaitSeconds, 10)
-	cfg.Params["lock_wait_timeout"] = bound
-	cfg.Params["innodb_lock_wait_timeout"] = bound
-	db, err := mysqlconn.Open(cfg.FormatDSN())
+	// NewContext pings, which opens the first connection: that is where MySQL
+	// accepts or rejects the session lock bound and sql_mode.
+	db, err := dbconn.NewContext(ctx, connDSN, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("open target database: %w", err)
-	}
-	db.SetMaxOpenConns(directExecutionPoolSize)
-	// The ping opens the first connection, which is where MySQL accepts or
-	// rejects the session lock bound.
-	if err := db.PingContext(ctx); err != nil {
-		utils.CloseAndLog(db)
-		return nil, fmt.Errorf("ping target database with session lock wait timeouts of %ds: %w", lockWaitSeconds, err)
+		return nil, fmt.Errorf("open target database with session lock wait timeouts of %ds: %w", cfg.LockWaitTimeout, err)
 	}
 	return db, nil
 }
 
 // directForceExecConfig is the dbconn configuration direct statements run
-// under: Spirit's kill (once the statement has waited 90% of the lock wait),
-// both lock waits taken from the policy, and directMaxAttempts attempts.
+// under, used both to open their pool and for ForceExec: Spirit's kill (once
+// the statement has waited 90% of the lock wait), both lock waits taken from
+// the policy, directMaxAttempts attempts, and a strict sql_mode.
+//
+// Strict mode is what keeps a direct statement from rewriting data. The plan
+// does not flag a narrowing change as unsafe, because Spirit's copy refuses a
+// row that would change. A direct statement runs as native DDL with whatever
+// algorithm MySQL picks, and in a non-strict session a rebuild that narrows a
+// column truncates the values that no longer fit, and NULLs become ” under a
+// new NOT NULL, each with only a warning. Strict mode makes MySQL refuse the
+// statement and leave the table as it was. It leaves zero dates alone, so a
+// table holding them can still be altered.
 func directForceExecConfig(lockWaitSeconds int64) *dbconn.DBConfig {
 	cfg := dbconn.NewDBConfig()
 	cfg.LockWaitTimeout = int(lockWaitSeconds)
 	cfg.InnodbLockWaitTimeout = int(lockWaitSeconds)
 	cfg.MaxRetries = directMaxAttempts
+	cfg.MaxOpenConnections = directExecutionPoolSize
+	// mysqlconn interpolates parameters client-side for every connection
+	// SchemaBot makes; dbconn would otherwise turn it back off.
+	cfg.InterpolateParams = true
+	cfg.StrictSQLMode = true
 	return cfg
 }
 
@@ -771,7 +869,8 @@ func directForceExecConfig(lockWaitSeconds int64) *dbconn.DBConfig {
 func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTargetDB, database string, stmts []directRouted, policy directPolicy) bool {
 	logger := e.changeLogger()
 	lockWaitSeconds := policy.lockAcquisitionTimeoutSeconds()
-	db, err := openDirectExecutionDB(ctx, target.dsn, lockWaitSeconds)
+	forceExecConfig := directForceExecConfig(lockWaitSeconds)
+	db, err := openDirectExecutionDB(ctx, target.dsn, forceExecConfig)
 	if err != nil {
 		if ctx.Err() != nil {
 			logger.Info("schema change stopped while connecting for direct execution",
@@ -786,7 +885,6 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 		return false
 	}
 	defer utils.CloseAndLog(db)
-	forceExecConfig := directForceExecConfig(lockWaitSeconds)
 	for _, ds := range stmts {
 		progress := e.trackDirectStatement(ds.table, ds.stmt)
 		logger.Info("executing statement directly as native MySQL DDL",
@@ -821,15 +919,24 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 				// SYSTEM_USER, as does any KILL after a grant routing confirmed
 				// is revoked. Spirit logs which of these it hit through the kill
 				// logger above.
-				logger.Error("direct execution failed: statement could not acquire the table's metadata lock; the force-kill did not clear the blocker",
-					"database", database, "table", ds.table, "lock_wait_timeout_seconds", lockWaitSeconds,
-					"max_attempts", forceExecConfig.MaxRetries, "error", err)
-				// The table name comes from the plan and the timeout from this
-				// deployment's own configuration, so this sentence is safe to
-				// show on the pull request that asked for the change.
-				e.setSchemaChangeFailed(engine.OperatorErrorf(err,
-					"Table %q is busy: the change could not acquire the metadata lock. Each attempt waits up to %ds, and SchemaBot makes up to %d attempts, killing the transactions blocking the lock between them. It stops after the first attempt that meets a session it will not or cannot kill: a session holding an explicit LOCK TABLES, a transaction too large to roll back safely, or a session of a SYSTEM_USER account, which only a user that also has SYSTEM_USER may kill. Retry when those sessions have finished; the server log names the session that blocked the change.",
-					ds.table, lockWaitSeconds, forceExecConfig.MaxRetries))
+				// A statement on a table linked by a foreign key can also wait
+				// for the linked tables' metadata locks. The kill is scoped to
+				// the altered table, so a transaction open on a linked table is
+				// never killed, and the attempt that waited for it is the last.
+				linked, linkErr := foreignKeyLinkedTables(ctx, db, database, ds.table)
+				if linkErr != nil {
+					logger.Warn("could not read the tables linked to the busy table by a foreign key; the failure message names only the table itself",
+						"database", database, "table", ds.table, "error", linkErr)
+				}
+				logger.Error("direct execution failed: statement could not acquire the metadata locks it needs; the force-kill did not clear the blocker",
+					"database", database, "table", ds.table, "foreign_key_linked_tables", linked,
+					"lock_wait_timeout_seconds", lockWaitSeconds, "max_attempts", forceExecConfig.MaxRetries, "error", err)
+				// The table names come from the plan and the target's own
+				// dictionary, and the timeout from this deployment's own
+				// configuration, so this message is safe to show on the pull
+				// request that asked for the change.
+				e.setSchemaChangeFailed(engine.OperatorErrorf(err, "%s",
+					busyTableMessage(ds.table, lockWaitSeconds, forceExecConfig.MaxRetries, linked)))
 				return false
 			}
 			logger.Error("direct execution failed",
@@ -843,6 +950,60 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 		e.emitTableLog(ds.table, "statement completed as native MySQL DDL")
 	}
 	return true
+}
+
+// busyTableMessage is the operator message for a direct statement that could
+// not acquire its metadata locks within its attempts. linked names the tables
+// joined to table by a foreign key, whose metadata locks the statement may also
+// wait for and whose holders SchemaBot never kills.
+func busyTableMessage(table string, lockWaitSeconds int64, attempts int, linked []string) string {
+	msg := fmt.Sprintf("Table %q is busy: the change could not acquire the metadata lock. Each attempt waits up to %ds, and SchemaBot makes up to %d attempts, killing the transactions blocking the lock between them. It stops after the first attempt that meets a session it will not or cannot kill: a session holding an explicit LOCK TABLES, a transaction too large to roll back safely, or a session of a SYSTEM_USER account, which only a user that also has SYSTEM_USER may kill.",
+		table, lockWaitSeconds, attempts)
+	if len(linked) == 0 {
+		return msg + " Retry when those sessions have finished; the server log names the session that blocked the change."
+	}
+	quoted := make([]string, len(linked))
+	for i, name := range linked {
+		quoted[i] = strconv.Quote(name)
+	}
+	return msg + fmt.Sprintf(" The change can also wait for the metadata locks of %s, linked to %q by a foreign key. SchemaBot never kills a transaction holding one of those, and stops at the first attempt that waits for one. Retry when those sessions have finished; the server log names any session on %q that blocked the change.",
+		strings.Join(quoted, ", "), table, table)
+}
+
+// foreignKeyLinkedTables returns the tables joined to table by a foreign key in
+// either direction, in name order: the tables it references and the tables
+// that reference it. A self-referencing foreign key links no other table, so it
+// is left out. A table in another schema is named schema.table.
+func foreignKeyLinkedTables(ctx context.Context, db *sql.DB, database, table string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT UNIQUE_CONSTRAINT_SCHEMA, REFERENCED_TABLE_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS
+		WHERE CONSTRAINT_SCHEMA = ? AND TABLE_NAME = ?
+		  AND NOT (UNIQUE_CONSTRAINT_SCHEMA = ? AND REFERENCED_TABLE_NAME = ?)
+		UNION
+		SELECT CONSTRAINT_SCHEMA, TABLE_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS
+		WHERE UNIQUE_CONSTRAINT_SCHEMA = ? AND REFERENCED_TABLE_NAME = ?
+		  AND NOT (CONSTRAINT_SCHEMA = ? AND TABLE_NAME = ?)`,
+		database, table, database, table, database, table, database, table)
+	if err != nil {
+		return nil, fmt.Errorf("read the foreign keys linking table %q: %w", table, err)
+	}
+	defer utils.CloseAndLog(rows)
+	var linked []string
+	for rows.Next() {
+		var schema, name string
+		if err := rows.Scan(&schema, &name); err != nil {
+			return nil, fmt.Errorf("read the foreign keys linking table %q: %w", table, err)
+		}
+		if schema != database {
+			name = schema + "." + name
+		}
+		linked = append(linked, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read the foreign keys linking table %q: %w", table, err)
+	}
+	slices.Sort(linked)
+	return linked, nil
 }
 
 // emitTableLog routes an operator-facing message for a table to the apply log

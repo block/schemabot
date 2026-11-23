@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -77,6 +78,14 @@ const DefaultDeployment = "default"
 // whether a dynamic fallback (a default client) may serve the target.
 var errTernDeploymentNotConfigured = errors.New("tern deployment not configured")
 
+// errTernClientConfig marks a Tern client the server configuration can never
+// produce: an empty or malformed endpoint, a token in the wrong shape, an
+// invalid revert window, or a DSN or token file that does not exist. Every
+// attempt fails the same way until an operator fixes the configuration. A
+// failed call to a secrets backend or custom resolver is not marked, since a
+// later attempt can succeed.
+var errTernClientConfig = errors.New("tern client configuration is invalid")
+
 // Endpoint returns the Tern endpoint for the given deployment and environment.
 // For single-deployment deployments, use DefaultDeployment ("default") as the deployment.
 func (c TernConfig) Endpoint(deployment, environment string) (string, error) {
@@ -95,7 +104,7 @@ func (c TernConfig) Endpoint(deployment, environment string) (string, error) {
 	}
 
 	if endpoint == "" {
-		return "", fmt.Errorf("endpoint not configured for %s/%s", deployment, environment)
+		return "", fmt.Errorf("endpoint not configured for %s/%s: %w", deployment, environment, errTernClientConfig)
 	}
 
 	return endpoint, nil
@@ -177,10 +186,15 @@ type Service struct {
 	engineFactories map[string]tern.EngineFactory
 
 	// Operator loop management.
-	operatorMu     sync.Mutex
-	stopRecovery   chan struct{}
-	cancelRecovery context.CancelFunc
-	operatorWake   chan struct{}
+	operatorMu sync.Mutex
+	// freezeHeldOps are the operations this pod held back unstarted under a
+	// stop freeze, each with when its start claims may take it again
+	// (skipHeldOperation).
+	freezeHeldOpsMu sync.Mutex
+	freezeHeldOps   map[int64]time.Time
+	stopRecovery    chan struct{}
+	cancelRecovery  context.CancelFunc
+	operatorWake    chan struct{}
 	// reservedDriverWake is the reserved driver's own wake channel, set when
 	// the pool reserves one (see reservedDriverID). The reserved driver skips
 	// deferred-cutover work, so a wake for that work must never be spent on it:
@@ -645,7 +659,9 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 		Logger:  s.logger,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create tern client for %s: %w", key, err)
+		// The client dials lazily, so a failure here is the address itself,
+		// such as one without a port, never an unreachable engine.
+		return nil, fmt.Errorf("create tern client for %s: %w: %w", key, errTernClientConfig, err)
 	}
 
 	s.ternClients[key] = client
@@ -725,18 +741,28 @@ func (s *Service) SetDefaultTernClient(client tern.Client) {
 // (ref resolved to a different value, e.g. via env:/file:/secretsmanager:) is
 // safe to print; for a literal we redact it, since the config key alone is
 // enough for triage.
+// markMissingSecretFile marks a DSN or token source naming a file that does not
+// exist as a configuration error. Any other resolution failure, such as a
+// secrets backend call, is left unmarked so a later attempt can succeed.
+func markMissingSecretFile(err error) error {
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: %w", errTernClientConfig, err)
+	}
+	return err
+}
+
 func malformedTokenError(key, ref, resolved, requirement string) error {
 	if resolved != ref {
-		return fmt.Errorf("token for %s resolved from %q %s", key, ref, requirement)
+		return fmt.Errorf("token for %s resolved from %q %s: %w", key, ref, requirement, errTernClientConfig)
 	}
-	return fmt.Errorf("token for %s (literal value redacted) %s", key, requirement)
+	return fmt.Errorf("token for %s (literal value redacted) %s: %w", key, requirement, errTernClientConfig)
 }
 
 func (s *Service) newLocalTernClient(key, database, dbType string, envConfig EnvironmentConfig) (tern.Client, error) {
 	// Resolve target DSN (handles env:, file: prefixes and structured DSN sources)
 	targetDSN, err := envConfig.ResolveDSN(dbType)
 	if err != nil {
-		return nil, fmt.Errorf("resolve DSN for %s: %w", key, err)
+		return nil, fmt.Errorf("resolve DSN for %s: %w", key, markMissingSecretFile(err))
 	}
 
 	// Resolve PlanetScale token if configured. Token validation is intentionally
@@ -747,7 +773,7 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	if envConfig.TokenSecretRef != "" {
 		token, err := secrets.Resolve(envConfig.TokenSecretRef, "")
 		if err != nil {
-			return nil, fmt.Errorf("resolve token for %s: %w", key, err)
+			return nil, fmt.Errorf("resolve token for %s: %w", key, markMissingSecretFile(err))
 		}
 		parts := strings.SplitN(token, ":", 2)
 		if len(parts) != 2 {
@@ -768,10 +794,10 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	if envConfig.RevertWindowDuration != "" {
 		d, err := time.ParseDuration(envConfig.RevertWindowDuration)
 		if err != nil {
-			return nil, fmt.Errorf("parse revert_window_duration %q for %s: %w", envConfig.RevertWindowDuration, key, err)
+			return nil, fmt.Errorf("parse revert_window_duration %q for %s: %w: %w", envConfig.RevertWindowDuration, key, errTernClientConfig, err)
 		}
 		if d <= 0 {
-			return nil, fmt.Errorf("revert_window_duration %q for %s must be positive (omit it to use the engine default)", envConfig.RevertWindowDuration, key)
+			return nil, fmt.Errorf("revert_window_duration %q for %s must be positive (omit it to use the engine default): %w", envConfig.RevertWindowDuration, key, errTernClientConfig)
 		}
 		revertWindow = d
 		// Revert is engine-dependent: only Vitess/PlanetScale honors a revert
@@ -1006,6 +1032,8 @@ func (s *Service) apiRoutes() []apiRoute {
 		{"GET /api/freezes", s.handleFreezeList},
 		{"GET /api/freezes/{id}", s.handleFreezeGet},
 		{"POST /api/freezes/{id}/lift", s.handleFreezeLift},
+		{"GET /api/freezes/overrides/{id}", s.handleFreezeOverrideGet},
+		{"POST /api/freezes/overrides/{id}/approve", s.handleFreezeOverrideApprove},
 
 		// GitHub webhook endpoint — registered externally via RegisterWebhook
 	}

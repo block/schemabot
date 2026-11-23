@@ -130,17 +130,29 @@ func (s *freezeOverrideStore) Approve(ctx context.Context, identifier, approver 
 // ListApproved returns the approved, unexpired requests for one change, most
 // recently approved first.
 func (s *freezeOverrideStore) ListApproved(ctx context.Context, target storage.FreezeOverrideTarget) ([]*storage.FreezeOverrideRequest, error) {
+	return s.listForTarget(ctx, target, "approved", "approved_at IS NOT NULL", "approved_at DESC, id DESC")
+}
+
+// ListPending returns the unapproved, unexpired requests for one change,
+// newest first.
+func (s *freezeOverrideStore) ListPending(ctx context.Context, target storage.FreezeOverrideTarget) ([]*storage.FreezeOverrideRequest, error) {
+	return s.listForTarget(ctx, target, "pending", "approved_at IS NULL", "id DESC")
+}
+
+// listForTarget lists one change's unexpired requests in one approval state.
+// state, where and order are constants, never caller input.
+func (s *freezeOverrideStore) listForTarget(ctx context.Context, target storage.FreezeOverrideTarget, state, where, order string) ([]*storage.FreezeOverrideRequest, error) {
 	now := s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+freezeOverrideColumns+`
 		FROM freeze_override_requests
 		WHERE environment = ? AND action = ? AND target_id = ?
-			AND approved_at IS NOT NULL AND expires_at > `+now+`
-		ORDER BY approved_at DESC, id DESC
+			AND `+where+` AND expires_at > `+now+`
+		ORDER BY `+order+`
 	`, storage.CanonicalKey(target.Environment), target.Action, target.TargetID)
 	if err != nil {
-		return nil, fmt.Errorf("list approved freeze override requests for %s %s in %s: %w",
-			target.Action, target.TargetID, target.Environment, err)
+		return nil, fmt.Errorf("list %s freeze override requests for %s %s in %s: %w",
+			state, target.Action, target.TargetID, target.Environment, err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -148,14 +160,14 @@ func (s *freezeOverrideStore) ListApproved(ctx context.Context, target storage.F
 	for rows.Next() {
 		request, err := scanFreezeOverride(rows)
 		if err != nil {
-			return nil, fmt.Errorf("list approved freeze override requests for %s %s in %s: %w",
-				target.Action, target.TargetID, target.Environment, err)
+			return nil, fmt.Errorf("list %s freeze override requests for %s %s in %s: %w",
+				state, target.Action, target.TargetID, target.Environment, err)
 		}
 		requests = append(requests, request)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list approved freeze override requests for %s %s in %s: %w",
-			target.Action, target.TargetID, target.Environment, err)
+		return nil, fmt.Errorf("list %s freeze override requests for %s %s in %s: %w",
+			state, target.Action, target.TargetID, target.Environment, err)
 	}
 	return requests, nil
 }

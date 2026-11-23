@@ -520,6 +520,24 @@ func WriteExemptTables(groups []*apitypes.ExemptTablesResponse) {
 	}
 }
 
+// WriteUnmatchedDropTables writes one line per drop_tables entry that names
+// no live table on the target, so the plan says the entry drops nothing
+// instead of reading as if the table were seen and kept. No-op when every
+// entry matched, which is the ordinary case. A long list names the first
+// entries and counts the rest, as the PR comment does.
+func WriteUnmatchedDropTables(entries []string) {
+	shown, more := presentation.UnmatchedDropTableEntries(entries)
+	for _, entry := range shown {
+		fmt.Println(glyph.Attention + "  " + presentation.UnmatchedDropTablesEntry("drop_tables", fmt.Sprintf("%q", entry)))
+	}
+	if more > 0 {
+		fmt.Println(glyph.Attention + "  " + presentation.UnmatchedDropTablesMore("drop_tables", more))
+	}
+	if len(entries) > 0 {
+		fmt.Println()
+	}
+}
+
 // UnsafeChange is a type alias for the shared unsafe change type.
 type UnsafeChange = apitypes.UnsafeChange
 
@@ -568,11 +586,13 @@ func WriteChangeNotice(severity, heading string, changes []UnsafeChange) {
 // The apply was refused, so Refused attaches to the refusal itself — the heading
 // names the blocked apply, not the unsafeness of the changes.
 //
-// rerun is the command that permits them, without the binary name. The caller
-// builds it because it is the one that knows which flags addressed the target:
-// a suggested command that dropped them would name a different database than
-// the refusal is about, and it is meant to be copied and run.
-func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun string) {
+// rerun is the words of the command that permits them, without the binary name,
+// one shell-escaped word per element so Command can see which flags it already
+// passes. The caller builds it because it is the one that knows which flags
+// addressed the target: a suggested command that dropped them would name a
+// different database than the refusal is about, and it is meant to be copied
+// and run.
+func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun []string) {
 	if len(changes) > 0 {
 		fmt.Printf(glyph.Refused+" Apply blocked: %d unsafe change(s) detected\n", countUnsafeFindings(changes))
 		writeUnsafeChangesList(changes)
@@ -580,7 +600,7 @@ func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun string) {
 	}
 	fmt.Println(glyph.Escalation + " To proceed with these destructive changes, re-run with --allow-unsafe:")
 	fmt.Println()
-	fmt.Printf("  %s\n", cliname.Command(rerun))
+	fmt.Printf("  %s\n", cliname.Command(rerun...))
 	fmt.Println()
 }
 
@@ -588,10 +608,10 @@ func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun string) {
 // refusal with nowhere to print the list, such as JSON output: the same count
 // and findings, and the command that permits them, starting with the binary
 // name so it runs as pasted. rerun is built as for WriteUnsafeChangesBlocked.
-func UnsafeChangesBlockedSummary(changes []UnsafeChange, rerun string) string {
+func UnsafeChangesBlockedSummary(changes []UnsafeChange, rerun []string) string {
 	findings := unsafeFindingLines(changes)
 	return fmt.Sprintf("apply blocked: %d unsafe change(s) detected (%s); to proceed with these destructive changes, re-run with: %s",
-		len(findings), strings.Join(findings, "; "), cliname.Command(rerun))
+		len(findings), strings.Join(findings, "; "), cliname.Command(rerun...))
 }
 
 // WriteUnsafeWarningAllowed writes a warning when destructive changes are

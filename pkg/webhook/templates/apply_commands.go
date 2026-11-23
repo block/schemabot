@@ -280,7 +280,11 @@ func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, reje
 	}
 
 	consent := newUnsafeConsent(data.UnsafeChanges, data.DatabaseType, data.IsMySQL, !unsafeCountCoversEveryTarget(data.DeploymentDrift))
-	writeUnsafeConsentCommand(sb, fmt.Sprintf("**%s To proceed with these destructive changes**", glyph.Escalation), consent, command, includeFlag)
+	if includeFlag {
+		command += " --allow-unsafe"
+	}
+	lead := fmt.Sprintf("**%s To proceed with these destructive changes**", glyph.Escalation)
+	writeConsentCommand(sb, lead, consent.dropSteps, consent.instruction(includeFlag), command)
 }
 
 // RenderBlockedChangesApplyRejected renders the rejection comment for an
@@ -412,9 +416,9 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 
 	if isCLI {
 		fmt.Fprintf(&sb, "Ask the lock holder to run `%s` from their CLI, or force-unlock with:\n", cliCommand(data.CLIName, cliUnlockArgs(data.Database, data.DatabaseType)))
-		fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag("schemabot unlock -d "+data.Database+" --force", data.Tenant))
+		fmt.Fprintf(&sb, "```\n%s\n```\n", AppendTenantFlag("schemabot unlock -d "+data.Database+" --force", data.Tenant))
 	} else {
-		sb.WriteString(otherPRLockReleaseHint(appendTenantFlag("schemabot unlock", data.Tenant), data.LockedApply) + "\n")
+		sb.WriteString(otherPRLockReleaseHint(AppendTenantFlag("schemabot unlock", data.Tenant), data.LockedApply) + "\n")
 	}
 
 	return offerSupportChannel(sb.String())
@@ -466,14 +470,14 @@ func RenderApplyInProgress(data ApplyLockConflictData) string {
 
 	applyAgain := data.ApplyAgainCommand
 	if applyAgain == "" {
-		applyAgain = appendTenantFlag("schemabot apply -e "+data.Environment, data.Tenant)
+		applyAgain = AppendTenantFlag("schemabot apply -e "+data.Environment, data.Tenant)
 	}
 	applyEnvironment := data.ApplyEnvironment
 	if applyEnvironment == "" {
 		applyEnvironment = data.Environment
 	}
 	control := func(verb string) string {
-		return appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", verb, data.ApplyID, applyEnvironment), data.Tenant)
+		return AppendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", verb, data.ApplyID, applyEnvironment), data.Tenant)
 	}
 	// An apply in another environment is named by it, since the heading
 	// names the requested one.
@@ -610,16 +614,44 @@ func RenderLocksAlreadyReleased() string {
 	return sb.String()
 }
 
-// RenderCannotUnlock renders a comment when unlock is blocked by an active apply.
+// RenderCannotUnlock renders a comment when unlock is blocked by an apply that
+// has not settled. Each case names only an action the apply accepts (UX-4). A
+// stopped apply still holds its lock, so stopping is never offered as the way
+// out: a stopped apply is resumed or cancelled. An apply in its revert window
+// has cut over and refuses cancel, so it is reverted or skip-reverted. A
+// revert or skip-revert in progress, and a finished apply whose operation is
+// still running, refuse cancel too and release the lock on their own, so they
+// are waited for. Any other active apply is waited for or cancelled.
 func RenderCannotUnlock(database, environment, applyID, applyState string) string {
 	var sb strings.Builder
 
 	writeEnvironmentTitle(&sb, glyph.Attention+" Cannot Unlock", environment)
 	writeDBLine(&sb, database)
 	sb.WriteString("\n")
+	switch {
+	case state.IsState(applyState, state.Apply.Stopped):
+		fmt.Fprintf(&sb, "Apply `%s` is stopped and still holds this lock.\n\n", applyID)
+		fmt.Fprintf(&sb, "Resume it with `schemabot start %s -e %s` or cancel it with `schemabot cancel %s -e %s`, then unlock again.\n",
+			applyID, environment, applyID, environment)
+		return sb.String()
+	case state.IsState(applyState, state.Apply.RevertWindow):
+		fmt.Fprintf(&sb, "Apply `%s` has passed its cutover and is in its revert window, so it still holds this lock.\n\n", applyID)
+		fmt.Fprintf(&sb, "Revert it with `schemabot revert %s -e %s` or keep the change with `schemabot skip-revert %s -e %s`, then unlock again.\n",
+			applyID, environment, applyID, environment)
+		return sb.String()
+	case state.IsState(applyState, state.Apply.Reverting, state.Apply.SkippingRevert):
+		fmt.Fprintf(&sb, "Apply `%s` is finishing its revert window (state: `%s`) and still holds this lock.\n\n", applyID, applyState)
+		sb.WriteString("It releases the lock when it finishes, which it does on its own. Wait for it, then unlock again.\n")
+		return sb.String()
+	case state.IsTerminalApplyState(applyState):
+		fmt.Fprintf(&sb, "Apply `%s` has ended (state: `%s`), but one of its operations is still running and holds this lock.\n\n", applyID, applyState)
+		sb.WriteString("Wait for that operation to finish, then unlock again.\n")
+		return sb.String()
+	}
 	fmt.Fprintf(&sb, "An apply is currently active (apply ID: `%s`, state: `%s`).\n\n",
 		applyID, applyState)
-	sb.WriteString("Wait for it to complete or stop it first.\n")
+	fmt.Fprintf(&sb, "Wait for it to complete, or cancel it with `schemabot cancel %s -e %s`, then unlock again.\n",
+		applyID, environment)
 
 	return sb.String()
 }
@@ -710,6 +742,10 @@ type BaseSchemaFreshnessRejectionData struct {
 	Environment       string
 	SchemaPath        string
 	VerificationError bool
+	// SharedSchemaPeer names the database whose files changed on the base
+	// branch when SchemaPath is that database's, not this one's. This
+	// database's ignore_tables were compared with that database's files.
+	SharedSchemaPeer string
 }
 
 // RenderBaseSchemaFreshnessRejection renders the path-scoped base freshness
@@ -721,10 +757,14 @@ func RenderBaseSchemaFreshnessRejection(data BaseSchemaFreshnessRejectionData) s
 	writeEnvironmentTitle(&sb, glyph.Attention+" Apply rejected — base schema is newer", data.Environment)
 	writeDBLine(&sb, data.Database)
 	sb.WriteString("\n")
-	if data.VerificationError {
+	switch {
+	case data.VerificationError:
 		sb.WriteString("SchemaBot could not verify whether this PR includes the current base branch's schema changes. The apply was rejected to avoid reverting a change that may already be on the base branch.\n\n")
 		sb.WriteString("Retry the command. If verification continues to fail, contact a SchemaBot operator.\n")
-	} else {
+	case data.SharedSchemaPeer != "":
+		fmt.Fprintf(&sb, "The base branch contains newer changes to %s, the schema of %s, which shares a schema with this database. This PR was compared with the older version of it.\n\n", inlineCode(data.SchemaPath), inlineCode(data.SharedSchemaPeer))
+		sb.WriteString("Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.\n")
+	default:
 		fmt.Fprintf(&sb, "The base branch contains newer changes to the schema directory %s that are not included in this PR. Applying this branch could revert those changes.\n\n", inlineCode(data.SchemaPath))
 		sb.WriteString("Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.\n")
 	}

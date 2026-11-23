@@ -37,6 +37,10 @@ type controlOperationHTTPError struct {
 
 type terminalControlError struct {
 	err error
+	// shown is the text a 5xx answer carries: text SchemaBot wrote for the
+	// requester. Empty when the error carries a cause SchemaBot did not
+	// write, which goes to the server log instead.
+	shown string
 }
 
 func (e *terminalControlError) Error() string {
@@ -76,9 +80,23 @@ func controlConflictCodef(code, format string, args ...any) error {
 
 // terminalControlf marks a control failure that retrying the same request
 // cannot repair: an internal data invariant violation or a deterministic
-// downstream rejection.
+// downstream rejection. Its text is shown to the requester only when no
+// argument is an error: an error can carry storage, driver, or engine text
+// whichever verb formats it.
 func terminalControlf(format string, args ...any) error {
-	return &terminalControlError{err: fmt.Errorf(format, args...)}
+	err := fmt.Errorf(format, args...)
+	shown := err.Error()
+	if slices.ContainsFunc(args, func(arg any) bool { _, isErr := arg.(error); return isErr }) {
+		shown = ""
+	}
+	return &terminalControlError{err: err, shown: shown}
+}
+
+// authoredTerminalControlf is terminalControlf for a message SchemaBot wrote
+// in full, including the errors it wraps, so the whole text is shown.
+func authoredTerminalControlf(format string, args ...any) error {
+	err := fmt.Errorf(format, args...)
+	return &terminalControlError{err: err, shown: err.Error()}
 }
 
 // controlOperationErrorCode is the error code a rejection carries, empty for
@@ -363,7 +381,79 @@ func (s *Service) logControlOperationForApply(ctx context.Context, apply *storag
 	}
 }
 
+// logFreezeOverrideForApply writes the apply log entry for a start or cutover
+// that an approved override request let past a freeze. It does nothing when no
+// override admitted the change.
+func (s *Service) logFreezeOverrideForApply(ctx context.Context, apply *storage.Apply, caller, eventType string, request *storage.FreezeOverrideRequest) {
+	if request == nil {
+		return
+	}
+	s.logControlOperationForApply(ctx, apply, caller, eventType, fmt.Sprintf(
+		"Freeze override %s admitted this change: requested by %s, approved by %s, covering %s",
+		request.Identifier, request.RequestedBy, request.ApprovedBy, strings.Join(request.Blockers, ", ")))
+}
+
+// controlInternalFailureMessage is what a control request answers when it fails
+// inside SchemaBot after the request was accepted for processing. The cause
+// can carry DSN or host fragments, storage or driver text, or an engine RPC
+// error, so it goes to the server log and never to the requester. The request
+// may already have been recorded, so the message tells the requester to check
+// the schema change before sending it again. Planning a rollback records no
+// request, so for it the message says no rollback was started.
+func controlInternalFailureMessage(opName string, apply *storage.Apply) string {
+	subject := opName + " failed"
+	if apply != nil {
+		subject += " for apply " + apply.ApplyIdentifier
+	}
+	effect := "The request may already be recorded, so check the schema change's status before sending it again."
+	if opName == "rollback plan" {
+		effect = "No rollback was started."
+	}
+	return subject + ": SchemaBot hit an internal error. " + effect +
+		" A SchemaBot operator can find the cause in the server log."
+}
+
+// controlNotAttemptedMessage is what a control request answers when SchemaBot
+// fails to load the apply or its routing before it attempts the operation. The
+// cause goes to the server log. Nothing was recorded, so the requester can send
+// the request again.
+func controlNotAttemptedMessage(operation, applyIdentifier string) string {
+	return fmt.Sprintf("The %s was not attempted for apply %q because of an internal SchemaBot error, so nothing was changed. "+
+		"Retry in a moment. If it keeps failing, a SchemaBot operator can find the cause in the server log.",
+		strings.ReplaceAll(operation, "_", "-"), applyIdentifier)
+}
+
+// controlMissingDeploymentMessage is what a control request answers when the
+// stored apply has no deployment to route it to. Nothing was changed, and
+// sending it again meets the same record, so it does not suggest a retry.
+func controlMissingDeploymentMessage(operation, applyIdentifier string) string {
+	return fmt.Sprintf("The %s was not attempted for apply %q because SchemaBot has no deployment recorded for it, so nothing was changed. "+
+		"Sending it again will fail the same way. A SchemaBot operator can find the apply in the server log.",
+		strings.ReplaceAll(operation, "_", "-"), applyIdentifier)
+}
+
+// authoredControlFailureMessage returns the text a 5xx control error shows the
+// requester, which SchemaBot wrote and which carries the next step. A typed
+// HTTP failure, such as the engine-unavailable 503, shows the message it was
+// built with, and a terminal control error shows its shown text. It reads the
+// text from the typed error itself, so anything an outer wrap added stays out
+// of it.
+func authoredControlFailureMessage(err error) (string, bool) {
+	if httpErr, ok := errors.AsType[*controlOperationHTTPError](err); ok {
+		return httpErr.err.Error(), true
+	}
+	terminalErr, ok := errors.AsType[*terminalControlError](err)
+	if !ok || terminalErr.shown == "" {
+		return "", false
+	}
+	return terminalErr.shown, true
+}
+
 // writeControlError logs and writes an HTTP error for a control operation.
+// A 5xx answer carries a fixed message, because the error behind it is not
+// SchemaBot's to show a requester, unless SchemaBot wrote the message itself;
+// a 5xx answer also keeps its error code, so a client can tell a retryable
+// engine-unavailable 503 apart. A rejection carries its own text.
 func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply *storage.Apply, err error) {
 	if s.writeChangeGateError(w, opName, err) {
 		return
@@ -375,7 +465,14 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply 
 	}
 	if status >= http.StatusInternalServerError {
 		s.logger.Error(opName+" failed", attrs...)
-		s.writeError(w, status, opName+" failed: "+err.Error())
+		// The code is what tells a client that an engine-unavailable 503 is
+		// worth retrying.
+		code := controlOperationErrorCode(err)
+		if authored, ok := authoredControlFailureMessage(err); ok {
+			s.writeErrorCode(w, status, code, opName+" failed: "+authored)
+			return
+		}
+		s.writeErrorCode(w, status, code, controlInternalFailureMessage(opName, apply))
 	} else {
 		s.logger.Warn(opName+" rejected", attrs...)
 		s.writeErrorCode(w, status, controlOperationErrorCode(err), opName+" rejected: "+err.Error())
@@ -435,20 +532,20 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, o
 
 	applyIdentifier := *applyID
 	if s.storage == nil {
-		s.logger.Error("storage not available for control request", "path", r.URL.Path, "apply_id", applyIdentifier, "environment", *environment)
-		s.writeError(w, http.StatusInternalServerError, "storage is not available")
+		s.logger.Error("storage not available for control request", "path", r.URL.Path, "operation", operation, "apply_id", applyIdentifier, "environment", *environment)
+		s.writeError(w, http.StatusInternalServerError, controlNotAttemptedMessage(operation, applyIdentifier))
 		return nil, nil, "", false
 	}
 	applyStore := s.storage.Applies()
 	if applyStore == nil {
-		s.logger.Error("apply store not available for control request", "path", r.URL.Path, "apply_id", applyIdentifier, "environment", *environment)
-		s.writeError(w, http.StatusInternalServerError, "apply store is not available")
+		s.logger.Error("apply store not available for control request", "path", r.URL.Path, "operation", operation, "apply_id", applyIdentifier, "environment", *environment)
+		s.writeError(w, http.StatusInternalServerError, controlNotAttemptedMessage(operation, applyIdentifier))
 		return nil, nil, "", false
 	}
 	apply, err := applyStore.GetByApplyIdentifier(r.Context(), applyIdentifier)
 	if err != nil {
-		s.logger.Error("failed to load apply for control request", "path", r.URL.Path, "apply_id", applyIdentifier, "environment", *environment, "error", err)
-		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to look up apply %q: %v", applyIdentifier, err))
+		s.logger.Error("failed to load apply for control request", "path", r.URL.Path, "operation", operation, "apply_id", applyIdentifier, "environment", *environment, "error", err)
+		s.writeError(w, http.StatusInternalServerError, controlNotAttemptedMessage(operation, applyIdentifier))
 		return nil, nil, "", false
 	}
 	if apply == nil {
@@ -468,8 +565,8 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, o
 	if err != nil {
 		s.logger.Error("control request apply is missing stored deployment metadata",
 			append(apply.LogAttrs(),
-				"error", err)...)
-		s.writeError(w, http.StatusInternalServerError, err.Error())
+				"operation", operation, "path", r.URL.Path, "error", err)...)
+		s.writeError(w, http.StatusInternalServerError, controlMissingDeploymentMessage(operation, applyIdentifier))
 		return nil, nil, "", false
 	}
 
@@ -534,8 +631,8 @@ func (s *Service) controlTarget(ctx context.Context, operation, applyIdentifier,
 // controlEngineUnavailableMessage is what a control request answers when the
 // Tern client for its apply's deployment cannot be built. The cause can carry
 // DSN or host fragments, so it goes to the server log and never to the
-// requester. The message does not promise that a retry will succeed, because
-// the cause can also be a configuration error that only an operator can fix.
+// requester. It is used only for a failure that a later attempt can clear,
+// such as a secrets backend call that failed.
 const controlEngineUnavailableMessage = "SchemaBot could not connect to the schema change engine for this deployment. " +
 	"Retry in a moment. If it keeps failing, a SchemaBot operator can find the cause in the server log."
 
@@ -548,17 +645,25 @@ const controlEngineUnavailableMessage = "SchemaBot could not connect to the sche
 // environment, never from the failure's text, so nothing a later wrap adds to
 // that text can reach the requester.
 //
-// Any other failure means the client could not be built, for example because
-// a DSN or token did not resolve or the gRPC client did not start. That is a
-// 503 with the engine-unavailable code, which clients treat as retryable. A
-// configuration entry that exists but can never produce a client lands here
-// too, because it cannot be told apart from an outage at this point. Nothing
-// is recorded for a request answered this way, so a retry cannot wedge an
-// apply, and a caller that retries must bound its attempts.
+// A configuration entry that can never produce a client (errTernClientConfig)
+// is terminal too: a 500 with no retry code, telling the requester that an
+// operator has to fix the server configuration. Its message is built the same
+// way, from the apply alone.
+//
+// Any other failure means a call that can succeed later did not, such as a
+// secrets backend lookup for the DSN or token. That is a 503 with the
+// engine-unavailable code, which clients treat as retryable. Nothing is
+// recorded for a request answered this way, so a retry cannot wedge an apply,
+// and a caller that retries must bound its attempts.
 func controlTernClientFailure(apply *storage.Apply, deployment string, err error) error {
 	if errors.Is(err, errTernDeploymentNotConfigured) {
 		return controlHTTPCodeErrorf(http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound,
 			"no tern client configured for database %q (deployment=%q, environment=%q) — add this database to the server config",
+			apply.Database, deployment, apply.Environment)
+	}
+	if errors.Is(err, errTernClientConfig) {
+		return terminalControlf("the server configuration for database %q (deployment=%q, environment=%q) cannot produce a client for the schema change engine, so retrying will not help. "+
+			"A SchemaBot operator can find the cause in the server log and fix the configuration",
 			apply.Database, deployment, apply.Environment)
 	}
 	return controlHTTPCodeErrorf(http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable,
@@ -642,12 +747,19 @@ type CutoverRequest struct {
 	ApplyID     string `json:"apply_id"`
 	Environment string `json:"environment"`
 	Caller      string `json:"caller,omitempty"`
+	// Override is the reason to ask for a freeze override when a freeze
+	// refuses the cutover. At most 500 characters after trimming.
+	Override string `json:"override,omitempty"`
 }
 
 // handleCutover handles POST /api/cutover requests.
 func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 	var req CutoverRequest
 	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, "cutover", &req, &req.ApplyID, &req.Environment)
+	if !ok {
+		return
+	}
+	override, ok := s.overrideReasonFromRequest(w, r, req.Override)
 	if !ok {
 		return
 	}
@@ -662,7 +774,7 @@ func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, httpStatus, err := s.executeCutoverForApply(r.Context(), client, apply, ternApplyID, req.Caller)
+	resp, httpStatus, err := s.executeCutoverForApply(r.Context(), client, apply, ternApplyID, req.Caller, override)
 	if err != nil {
 		s.writeControlError(w, "cutover", apply, err)
 		return
@@ -681,7 +793,7 @@ func (s *Service) ExecuteCutover(ctx context.Context, req apitypes.ControlReques
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, err
 	}
-	resp, _, err := s.executeCutoverForApply(ctx, client, apply, ternApplyID, req.Caller)
+	resp, _, err := s.executeCutoverForApply(ctx, client, apply, ternApplyID, req.Caller, strings.TrimSpace(req.Override))
 	return resp, err
 }
 
@@ -689,7 +801,7 @@ func (s *Service) ExecuteCutover(ctx context.Context, req apitypes.ControlReques
 // returned HTTP status is meaningful only when err == nil; every error path
 // returns a zero status, and callers must derive the response status from the
 // error (e.g. via writeControlError).
-func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.ControlResponse, int, error) {
+func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller, override string) (*apitypes.ControlResponse, int, error) {
 	caller = resolveCaller(ctx, caller)
 	controlStore := s.storage.ControlRequests()
 	if controlStore == nil {
@@ -790,7 +902,7 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 	}
 	// The change gates run only for a cutover this command would start: a
 	// request already pending or a cutover in progress was answered above.
-	admitCtx, err := s.checkChangeGatesForApply(ctx, changeGateCheckpointCutover, apply, caller)
+	admitCtx, overridden, err := s.checkChangeGatesForApply(ctx, changeGateCheckpointCutover, apply, caller, override)
 	if err != nil {
 		status := "rejected"
 		if controlOperationHTTPStatus(err) >= http.StatusInternalServerError {
@@ -842,6 +954,7 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		message = "Cutover requested by user while cutover request already pending"
 	}
 	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCutoverTriggered, message)
+	s.logFreezeOverrideForApply(ctx, apply, caller, storage.LogEventCutoverTriggered, overridden)
 	s.logger.Info("cutover request queued for operator",
 		append(apply.LogAttrs(),
 			"requested_by", caller)...)
@@ -1245,6 +1358,21 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "the caller %q is reserved for SchemaBot's own stop; send the stop under your own name", caller)
 	}
+	// Status reads a stop sent under a freeze's caller as that freeze's stop,
+	// so only the freeze may send one.
+	if storage.IsFreezeStopCaller(caller) {
+		s.logger.Warn("refused a stop sent under the caller SchemaBot reserves for a freeze's stop",
+			append(apply.LogAttrs(), "caller", caller)...)
+		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "the caller %q is reserved for the stop a freeze issues; send the stop under your own name", caller)
+	}
+	return s.stopApply(ctx, client, apply, ternApplyID, environment, caller)
+}
+
+// stopApply records durable stop intent for an apply under a caller already
+// resolved and checked, and attempts an immediate local stop. Its returns are
+// those of executeStopForApply.
+func (s *Service) stopApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) (*apitypes.StopResponse, int, error) {
 	if apply.Engine == storage.EnginePlanetScale {
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "stop is not supported for this schema change; use cancel to permanently cancel it")
@@ -1260,12 +1388,16 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 	}
 	metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
-		logMessage := "Stop requested by user"
+		requester := "user"
+		if freezeID, byFreeze := storage.FreezeFromStopCaller(caller); byFreeze {
+			requester = "freeze " + freezeID
+		}
+		logMessage := "Stop requested by " + requester
 		switch responseStatus {
 		case stopResponseStatusAlreadyRequested:
-			logMessage = "Stop requested by user while stop request already pending"
+			logMessage = "Stop requested by " + requester + " while stop request already pending"
 		case apitypes.ControlStatusStartWithdrawn:
-			logMessage = "Stop requested by user withdrew the queued start; schema change stays stopped"
+			logMessage = "Stop requested by " + requester + " withdrew the queued start; schema change stays stopped"
 		}
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested, logMessage)
 		switch responseStatus {
@@ -1932,6 +2064,9 @@ type StartRequest struct {
 	ApplyID     string `json:"apply_id"`
 	Environment string `json:"environment"`
 	Caller      string `json:"caller,omitempty"`
+	// Override is the reason to ask for a freeze override when a freeze
+	// refuses the start. At most 500 characters after trimming.
+	Override string `json:"override,omitempty"`
 }
 
 type startControlRequestMetadata struct {
@@ -1940,6 +2075,25 @@ type startControlRequestMetadata struct {
 	// start was accepted. Duplicate start calls use this metadata so clients see
 	// the same "already complete" count as the original request.
 	SkippedCount int64 `json:"skipped_count,omitempty"`
+	// FreezeOverride is the approved freeze override request that admitted
+	// this start, so the claim checkpoint honors that request and no other.
+	FreezeOverride string `json:"freeze_override,omitempty"`
+}
+
+// admittingFreezeOverrideKey carries, to the write that records a start, the
+// approved freeze override request that admitted it.
+type admittingFreezeOverrideKey struct{}
+
+func withAdmittingFreezeOverride(ctx context.Context, request *storage.FreezeOverrideRequest) context.Context {
+	if request == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, admittingFreezeOverrideKey{}, request.Identifier)
+}
+
+func admittingFreezeOverride(ctx context.Context) string {
+	id, _ := ctx.Value(admittingFreezeOverrideKey{}).(string)
+	return id
 }
 
 const (
@@ -1954,7 +2108,11 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	resp, httpStatus, err := s.executeStartForApply(r.Context(), client, apply, req.Caller)
+	override, ok := s.overrideReasonFromRequest(w, r, req.Override)
+	if !ok {
+		return
+	}
+	resp, httpStatus, err := s.executeStartForApply(r.Context(), client, apply, req.Caller, override)
 	if err != nil {
 		s.writeControlError(w, "start", apply, err)
 		return
@@ -1970,7 +2128,7 @@ func (s *Service) ExecuteStart(ctx context.Context, req apitypes.ControlRequest)
 	if err != nil {
 		return nil, err
 	}
-	resp, _, err := s.executeStartForApply(ctx, client, apply, req.Caller)
+	resp, _, err := s.executeStartForApply(ctx, client, apply, req.Caller, strings.TrimSpace(req.Override))
 	return resp, err
 }
 
@@ -1978,7 +2136,7 @@ func (s *Service) ExecuteStart(ctx context.Context, req apitypes.ControlRequest)
 // HTTP status is meaningful only when err == nil; every error path returns a
 // zero status, and callers must derive the response status from the error (e.g.
 // via writeControlError).
-func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) (*apitypes.StartResponse, int, error) {
+func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, apply *storage.Apply, caller, override string) (*apitypes.StartResponse, int, error) {
 	caller = resolveCaller(ctx, caller)
 	if err := validateStartRequestState(apply); err != nil {
 		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, "rejected")
@@ -2011,9 +2169,11 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 	// The gate's context goes to the write that records the start, which
 	// refuses it if a freeze was created since the check.
 	admitCtx := ctx
+	var overridden *storage.FreezeOverrideRequest
 	resumeGate := func() error {
-		gatedCtx, err := s.checkChangeGatesForApply(ctx, changeGateCheckpointResume, apply, caller)
-		admitCtx = gatedCtx
+		gatedCtx, approved, err := s.checkChangeGatesForApply(ctx, changeGateCheckpointResume, apply, caller, override)
+		admitCtx = withAdmittingFreezeOverride(gatedCtx, approved)
+		overridden = approved
 		return err
 	}
 	switch {
@@ -2062,6 +2222,7 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 	metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStartRequested, "Start requested by user")
+		s.logFreezeOverrideForApply(ctx, apply, caller, storage.LogEventStartRequested, overridden)
 		if queuedForOperator {
 			s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 		}
@@ -2365,8 +2526,9 @@ func (s *Service) persistStartRequestForOperator(ctx context.Context, apply *sto
 
 func (s *Service) createStartControlRequest(ctx context.Context, apply *storage.Apply, caller string, startedCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
 	return s.createControlRequest(ctx, apply, storage.ControlOperationStart, caller, startControlRequestMetadata{
-		StartedCount: startedCount,
-		SkippedCount: skippedCount,
+		StartedCount:   startedCount,
+		SkippedCount:   skippedCount,
+		FreezeOverride: admittingFreezeOverride(ctx),
 	})
 }
 
