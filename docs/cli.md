@@ -556,6 +556,11 @@ A targeted apply checks for a schema change already in progress on its
 target's deployment, which every target of a `targets:` list shares, and
 refuses to start while one is queued or running there.
 
+`rollback` runs the same check on its database and environment, before it asks
+for confirmation or takes a lock, and gives the same refusal. If the check
+itself cannot run, `apply` and `rollback` both go on, since the server refuses
+a conflicting apply when it is created, and log that the check did not run.
+
 A rollback of a rollout-wide apply is made against the first target the apply
 ran from. If the rollout order changed since, the rollback is refused rather
 than reverting that one target alone: restore the order the apply ran under,

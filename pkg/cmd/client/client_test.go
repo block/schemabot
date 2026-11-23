@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -216,6 +217,110 @@ func TestCheckActiveSchemaChangeFoldsKeysBeforeComparing(t *testing.T) {
 			assert.Equal(t, "running", active.State)
 		})
 	}
+}
+
+// pagedActiveServer serves active applies in pages of the given size from
+// apply-1 on, echoing starting_after as a paging server does, and records each
+// request's starting_after. The matching apply is the one named busy; every
+// other apply belongs to another database.
+func pagedActiveServer(t *testing.T, total, pageSize int, busy string, requests *[]string) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		after := r.URL.Query().Get("starting_after")
+		*requests = append(*requests, after)
+		start := 0
+		if after != "" {
+			_, err := fmt.Sscanf(after, "apply-%d", &start)
+			assert.NoError(t, err)
+		}
+		resp := apitypes.StatusResponse{Limit: pageSize, StartingAfter: after}
+		for n := start + 1; n <= total && len(resp.Applies) < pageSize; n++ {
+			id := fmt.Sprintf("apply-%d", n)
+			database := "billing"
+			if id == busy {
+				database = "orders"
+			}
+			resp.Applies = append(resp.Applies, &apitypes.ActiveApplyResponse{ApplyID: id, Database: database, Environment: "staging", State: "running"})
+		}
+		resp.HasMore = start+len(resp.Applies) < total
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(t, json.NewEncoder(w).Encode(resp))
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// The preflight keeps reading while the server reports more active applies, so
+// a busy database whose apply is not on the first page is still found.
+func TestCheckActiveSchemaChangeFindsAnApplyOnALaterPage(t *testing.T) {
+	var requests []string
+	server := pagedActiveServer(t, 5, 2, "apply-5", &requests)
+
+	active, err := CheckActiveSchemaChange(server.URL, "orders", "staging")
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	assert.Equal(t, "apply-5", active.ApplyID)
+	assert.Equal(t, "running", active.State)
+	assert.Equal(t, []string{"", "apply-2", "apply-4"}, requests, "each page continues after the last apply of the one before")
+}
+
+// Having read every page without finding the database is the only way the
+// preflight reports it idle.
+func TestCheckActiveSchemaChangeReportsIdleOnlyAfterReadingEveryPage(t *testing.T) {
+	var requests []string
+	server := pagedActiveServer(t, 5, 2, "", &requests)
+
+	active, err := CheckActiveSchemaChange(server.URL, "orders", "staging")
+	require.NoError(t, err)
+	assert.Nil(t, active)
+	assert.Equal(t, []string{"", "apply-2", "apply-4"}, requests)
+}
+
+// A server that predates paging ignores starting_after and serves its first page
+// again. That page is not the one after the anchor, so the preflight errors
+// rather than reporting a database idle that it never saw the rest of.
+func TestCheckActiveSchemaChangeErrorsWhenTheServerIgnoresPaging(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"has_more":true,"applies":[` +
+			`{"apply_id":"apply-1","database":"billing","environment":"staging","state":"running"}]}`))
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	active, err := CheckActiveSchemaChange(server.URL, "orders", "staging")
+	require.Error(t, err)
+	assert.Nil(t, active)
+	assert.Contains(t, err.Error(), "the server did not continue after apply apply-1")
+}
+
+// A page that reports more applies but lists none gives nothing to continue
+// from, which is an error and not an idle database.
+func TestCheckActiveSchemaChangeErrorsWhenAMorePageIsEmpty(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"has_more":true,"applies":[]}`))
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	active, err := CheckActiveSchemaChange(server.URL, "orders", "staging")
+	require.Error(t, err)
+	assert.Nil(t, active)
+	assert.Contains(t, err.Error(), "listed none to continue from")
+}
+
+// The page bound ends an endless listing with an error rather than a silent
+// "no active schema change".
+func TestCheckActiveSchemaChangeErrorsAtThePageBound(t *testing.T) {
+	var requests []string
+	server := pagedActiveServer(t, maxActiveSchemaChangePages+5, 1, "", &requests)
+
+	active, err := CheckActiveSchemaChange(server.URL, "orders", "staging")
+	require.Error(t, err)
+	assert.Nil(t, active)
+	assert.Contains(t, err.Error(), "stopped without reading them all")
+	assert.Len(t, requests, maxActiveSchemaChangePages)
 }
 
 func TestReadSchemaFiles_RegularDirectories(t *testing.T) {
