@@ -1610,7 +1610,10 @@ type ApplyHistoryData struct {
 // DatabaseHistoryData contains data for rendering database history.
 type DatabaseHistoryData struct {
 	Database string
-	Applies  []ApplyHistoryData
+	// Environment is the environment the history was filtered to; empty when
+	// it covers every environment.
+	Environment string
+	Applies     []ApplyHistoryData
 }
 
 // databaseHistoryColumns returns the columns the history table renders, in order.
@@ -1628,7 +1631,7 @@ func databaseHistoryColumns() []statusColumn[ApplyHistoryData] {
 // WriteDatabaseHistory writes the database history output.
 func WriteDatabaseHistory(data DatabaseHistoryData) {
 	if len(data.Applies) == 0 {
-		fmt.Printf("%sNo schema changes found for database '%s'%s\n", ANSIDim, data.Database, ANSIReset)
+		fmt.Printf("%s%s%s\n", ANSIDim, emptyHistoryLine(data.Database, data.Environment), ANSIReset)
 		return
 	}
 
@@ -1639,6 +1642,17 @@ func WriteDatabaseHistory(data DatabaseHistoryData) {
 
 	fmt.Println()
 	fmt.Printf("%sUse '%s' to view details%s\n", ANSIDim, cliname.Command("status", "<apply_id>"), ANSIReset)
+}
+
+// emptyHistoryLine says that no apply has been recorded for the database, in
+// the environment when the history was filtered to one. It speaks of applies,
+// not schema changes, so it does not read as a claim that the database has no
+// schema or is unknown.
+func emptyHistoryLine(database, environment string) string {
+	if environment == "" {
+		return fmt.Sprintf("No applies recorded for database '%s'", database)
+	}
+	return fmt.Sprintf("No applies recorded for database '%s' in %s", database, environment)
 }
 
 // stateColorFunc returns an ANSI color function for the given state.
