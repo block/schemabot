@@ -493,7 +493,9 @@ waiting out a boot budget measured in minutes for a database the instance will n
 way down, every wait on background work carries a bound of its own, so shutdown ends when those
 bounds are spent rather than when the slowest goroutine decides to return. An instance that cannot
 finish starting exits non-zero rather than lingering, so the platform restarts it instead of
-routing to it.
+routing to it. An instance that cannot take every port it serves on exits before it serves
+anything, claims work, registers its drivers or runs a repair pass, so its exit leaves nothing
+for a peer to take back.
 
 Stopping at a bound is safe because the instance is on its way out and nothing abandoned at one is
 lost: the work left behind stops when the process does, so the target it still holds is released by
@@ -510,7 +512,8 @@ a routine restart becomes an interrupted schema change with no bound on how long
 locked. *Enforced:* the bounded waits on the close path (`pkg/drain`, used by `pkg/api/operator.go`,
 `pkg/api/shutdown.go`, `pkg/webhook/durable_dispatch.go`, and `pkg/serve/serve.go`) and the
 signal-scoped startup context (`pkg/serve/serve.go`, `pkg/cmd/commands/serve.go`), which reaches an
-in-flight storage convergence as the deliberate stop AV-13 permits.
+in-flight storage convergence as the deliberate stop AV-13 permits; binding every listener before
+any serves or `Server.Start` runs (`serveUntilShutdown` in `pkg/serve/serve.go`).
 
 ### AV-15: A pull request's GitHub cost grows with its schema inputs, not with the rest of the PR
 
