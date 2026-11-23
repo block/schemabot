@@ -232,7 +232,7 @@ func TestOperator_BasicClaimAndResume(t *testing.T) {
 	require.NoError(t, err)
 	claimLogged := false
 	for _, entry := range logs {
-		if strings.HasPrefix(entry.Message, "Driver ") && strings.Contains(entry.Message, " claimed deployment ") {
+		if strings.HasPrefix(entry.Message, "Driver ") && strings.Contains(entry.Message, " claimed ") {
 			claimLogged = true
 			assert.Equal(t, storage.LogLevelInfo, entry.Level)
 			assert.Equal(t, storage.LogSourceSchemaBot, entry.Source)

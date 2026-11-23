@@ -278,13 +278,15 @@ func TestGRPCClient_ShardDriveReportsWholeApplyProgressOnce(t *testing.T) {
 	assert.Equal(t, "901", wholeApplyWarnings[0].attrs["remote_operation_id"])
 	assert.Equal(t, "commerce/-80/users", wholeApplyWarnings[0].attrs["operation_key"])
 
-	var applyLogWarnings []string
+	var applyLogWarnings []*storage.ApplyLog
 	for _, entry := range logStore.logs {
 		if entry.Level == storage.LogLevelWarn && strings.Contains(entry.Message, "read from the whole remote apply") {
-			applyLogWarnings = append(applyLogWarnings, entry.Message)
+			applyLogWarnings = append(applyLogWarnings, entry)
 		}
 	}
 	require.Len(t, applyLogWarnings, 1, "the apply log carries the whole-apply read once, beside the shard-named task lines")
 	assert.Equal(t, "Progress for commerce/-80/users is read from the whole remote apply, so its task state changes can show a sibling's progress: "+
-		"the data plane does not scope progress to an operation; upgrade the data plane to read this operation's progress alone", applyLogWarnings[0])
+		"the data plane does not scope progress to an operation; upgrade the data plane to read this operation's progress alone", applyLogWarnings[0].Message)
+	assert.Empty(t, applyLogWarnings[0].OldState, "the warning changes no state, so the entry carries no state pair")
+	assert.Empty(t, applyLogWarnings[0].NewState, "the warning changes no state, so the entry carries no state pair")
 }

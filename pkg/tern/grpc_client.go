@@ -705,9 +705,12 @@ func remoteTaskStateChangeMessage(task *storage.Task) string {
 	return fmt.Sprintf("Remote task %s on shard %s changed state", task.TableName, task.Shard)
 }
 
+// logApplyWarning records a warning that changes no state, so the entry
+// carries no state pair: the log readers render one beside the message
+// whenever both states are set.
 func (c *GRPCClient) logApplyWarning(ctx context.Context, apply *storage.Apply, message string) {
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError,
-		message, apply.State, apply.State)
+		message, "", "")
 }
 
 func remoteApplyStateDescription(remoteState ternv1.State) string {
