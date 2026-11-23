@@ -83,7 +83,9 @@ func TestRenderPlanComment_ChangeGateRefusedNamesTheNextStepWhenTheRefusalDidNot
 	}
 
 	unposted := RenderPlanComment(data)
-	assert.Contains(t, unposted, "**Not applied** — a change gate refused this apply, and SchemaBot could not post why. Comment `schemabot apply -e staging` again to see the reason.\n")
+	assert.Contains(t, unposted, "**Not applied** — a change gate refused this apply, and SchemaBot could not post why.\n\n"+
+		"Commenting the apply again retries it. If the gate still refuses it, SchemaBot posts why. If the gate now allows it, **the apply starts**.\n\n"+
+		"To retry, comment:\n```\nschemabot apply -e staging\n```\n")
 	assert.NotContains(t, unposted, "see the comment below", "no comment below exists to point at")
 	assert.NotContains(t, unposted, "Applying automatically")
 
@@ -91,7 +93,20 @@ func TestRenderPlanComment_ChangeGateRefusedNamesTheNextStepWhenTheRefusalDidNot
 	data.Tenant = "acme"
 	data.Target = "us"
 	scoped := RenderPlanComment(data)
-	assert.Contains(t, scoped, "Comment `schemabot apply -e staging -d testapp --target us --tenant acme` again to see the reason.")
+	assert.Contains(t, scoped, "To retry, comment:\n```\nschemabot apply -e staging -d testapp --target us --tenant acme\n```\n")
+
+	// An apply that consented to unsafe changes is retried with a command
+	// that leaves --allow-unsafe out, so the reader gives the consent again.
+	data.AllowUnsafe = true
+	data.HasUnsafeChanges = true
+	data.UnsafeChanges = []UnsafeChangeData{{Table: "orders", Reason: "DROP COLUMN"}}
+	unsafe := RenderPlanComment(data)
+	assert.Contains(t, unsafe, "To retry:\n1. Deploy application code that no longer reads from or writes to the dropped column.\n"+
+		"2. Add `--allow-unsafe` to confirm 1 unsafe change on `orders`:\n"+
+		"   ```\n   schemabot apply -e staging -d testapp --target us --tenant acme\n   ```\n",
+		"the retry asks for the consent again in the words every apply instruction uses")
+	assert.NotContains(t, unsafe, "apply -e staging -d testapp --target us --tenant acme --allow-unsafe", "the copyable retry never carries the consent")
+	data.AllowUnsafe, data.HasUnsafeChanges, data.UnsafeChanges = false, false, nil
 
 	data.RefusalPosted = true
 	assert.Contains(t, RenderPlanComment(data), "**Not applied** — see the comment below for why.\n")

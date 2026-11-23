@@ -4726,7 +4726,14 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-**Not applied** — a change gate refused this apply, and SchemaBot could not post why. Comment `schemabot apply -e staging` again to see the reason.
+**Not applied** — a change gate refused this apply, and SchemaBot could not post why.
+
+Commenting the apply again retries it. If the gate still refuses it, SchemaBot posts why. If the gate now allows it, **the apply starts**.
+
+To retry, comment:
+```
+schemabot apply -e staging
+```
 
 </details>
 

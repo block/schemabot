@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"testing"
 	"time"
 
@@ -29,8 +30,8 @@ type gateRefusalEdit struct {
 }
 
 // recordCommentEdits serves comment edits on the fake GitHub, answering with
-// status, and returns what it receives. The fake answers every posted comment
-// with ID 99, so that is the ID an edit of a posted comment carries.
+// status, and returns what it receives. The fake answers each posted comment
+// with an ID of its own, so an edit's ID names the comment it targets.
 func recordCommentEdits(mux *http.ServeMux, status int) <-chan gateRefusalEdit {
 	edits := make(chan gateRefusalEdit, 10)
 	mux.HandleFunc("PATCH /repos/octocat/hello-world/issues/comments/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -88,7 +89,10 @@ func TestE2EAutomaticApplyRefusedByAFreezeEditsItsComment(t *testing.T) {
 	awaitCommentContaining(t, apply, "## ❄️ Apply Blocked by a Freeze\n")
 
 	edit := awaitCapture(t, edits, "the announcing comment to be edited", func(gateRefusalEdit) bool { return true })
-	assert.Equal(t, "99", edit.ID, "the edit targets the comment the apply posted")
+	announcementID := apply.PostedCommentID(t, "**Applying automatically**")
+	refusalID := apply.PostedCommentID(t, "## ❄️ Apply Blocked by a Freeze\n")
+	require.NotEqual(t, announcementID, refusalID, "the fake answers each comment with its own ID")
+	assert.Equal(t, strconv.FormatInt(announcementID, 10), edit.ID, "the edit targets the comment the apply posted, not the refusal")
 	assert.Contains(t, edit.Body, "**Not applied** — see the comment below for why.\n")
 	assert.Contains(t, edit.Body, "🔓 **Lock released**")
 	assert.NotContains(t, edit.Body, "Applying automatically")
@@ -123,8 +127,10 @@ func TestE2EAutomaticApplyRefusedByAFreezeNamesTheNextStepWhenTheRefusalDoesNotP
 	awaitCommentContaining(t, apply, "## ❄️ Apply Blocked by a Freeze\n")
 
 	edit := awaitCapture(t, edits, "the announcing comment to be edited", func(gateRefusalEdit) bool { return true })
-	assert.Equal(t, "99", edit.ID)
-	assert.Contains(t, edit.Body, "**Not applied** — a change gate refused this apply, and SchemaBot could not post why. Comment `schemabot apply -e "+driftEnv+"` again to see the reason.\n")
+	assert.Equal(t, strconv.FormatInt(apply.PostedCommentID(t, "**Applying automatically**"), 10), edit.ID)
+	assert.Contains(t, edit.Body, "**Not applied** — a change gate refused this apply, and SchemaBot could not post why.\n")
+	assert.Contains(t, edit.Body, "If the gate now allows it, **the apply starts**.", "the retry is labeled as one that can start the apply")
+	assert.Contains(t, edit.Body, "To retry, comment:\n```\nschemabot apply -e "+driftEnv+"\n```\n")
 	assert.NotContains(t, edit.Body, "see the comment below", "no refusal comment exists to point at")
 	assert.Contains(t, edit.Body, "🔓 **Lock released**", "the lock was released, so the claim stays")
 	assert.NotContains(t, edit.Body, "Applying automatically")

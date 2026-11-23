@@ -352,6 +352,28 @@ func newE2EHandler(t *testing.T, svc *api.Service, client *gh.Client) *Handler {
 
 // fakeGitHubForPlan sets up httptest handlers that simulate the GitHub API for a plan flow.
 // Returns the captured comment bodies and check run payloads.
+// postedComment is one comment the fake GitHub accepted, with the ID it
+// answered.
+type postedComment struct {
+	ID   int64
+	Body string
+}
+
+// PostedCommentID returns the ID the fake answered for the first accepted
+// comment whose body holds want, failing the test when none does.
+func (r *planFlowResult) PostedCommentID(t *testing.T, want string) int64 {
+	t.Helper()
+	r.postedMu.Lock()
+	defer r.postedMu.Unlock()
+	for _, c := range r.postedComments {
+		if strings.Contains(c.Body, want) {
+			return c.ID
+		}
+	}
+	require.Failf(t, "no accepted comment", "no accepted comment contains %q", want)
+	return 0
+}
+
 type planFlowResult struct {
 	comments  chan string
 	reactions chan string
@@ -385,6 +407,11 @@ type planFlowResult struct {
 	// FailCommentPostContaining makes only the comment POSTs whose body holds
 	// this text fail, so a test can lose one comment of a flow and keep the rest.
 	FailCommentPostContaining atomic.Pointer[string]
+
+	// postedComments are the comments the fake accepted, each under an ID of
+	// its own, so a test can tell which comment a later edit targets.
+	postedMu       sync.Mutex
+	postedComments []postedComment
 
 	// baseFiles is what the default branch holds, as repository path to blob
 	// SHA. It starts as the schema directory carrying the config at a blob of
@@ -1017,8 +1044,12 @@ func setupFakeGitHubForPlanInRepository(t *testing.T, mux *http.ServeMux, schema
 			_, _ = w.Write([]byte(`{"message":"Server Error"}`))
 			return
 		}
+		result.postedMu.Lock()
+		id := int64(100 + len(result.postedComments))
+		result.postedComments = append(result.postedComments, postedComment{ID: id, Body: body.Body})
+		result.postedMu.Unlock()
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 
 	// Capture reactions
