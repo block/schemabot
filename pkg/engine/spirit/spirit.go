@@ -741,16 +741,17 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	// A table the config withholds that a schema file also declares is a
 	// contradiction the diff below would resolve as a CREATE TABLE for a table
 	// that already exists. Refuse in namespace order so the error names the
-	// same namespace on every run.
+	// same namespace on every run. Each is a refusal of the schema files as
+	// written, which the person who edits them fixes.
 	for _, namespace := range slices.Sorted(maps.Keys(declaredByNamespace)) {
 		if err := ignored.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
-			return nil, err
+			return nil, &engine.PlanRefusedError{Err: err}
 		}
 		if err := drops.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
-			return nil, err
+			return nil, &engine.PlanRefusedError{Err: err}
 		}
 		if err := refuseDeclaredSkippedTables(namespace, declaredByNamespace[namespace], current); err != nil {
-			return nil, err
+			return nil, &engine.PlanRefusedError{Err: err}
 		}
 	}
 
