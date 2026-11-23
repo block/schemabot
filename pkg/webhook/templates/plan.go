@@ -265,6 +265,15 @@ type PlanCommentData struct {
 	// signal that the apply is proceeding.
 	PausedApplyCause *PausedApplyCauseData
 
+	// RefusedByChangeGate marks the locked comment of an automatic apply that a
+	// change gate refused after the comment was posted. The comment announced an
+	// apply that never ran, so it is edited to say so: the footer no longer
+	// promises one and the lock line no longer claims a lock the refusal
+	// released. The body still shows the plan as it was posted. The gate is not
+	// named, since a refusal and a gate that could not decide both land here and
+	// the comment posted after this one says which.
+	RefusedByChangeGate bool
+
 	RecoveredApplyOwnedCheckState bool
 
 	// DeploymentDrift is the review-time rollup of how every configured
@@ -590,7 +599,10 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	writePlanMetadata(&sb, data)
 	writePlanAttribution(&sb, data)
 
-	if data.IsLocked && data.LockOwner != "" {
+	switch {
+	case data.IsLocked && data.RefusedByChangeGate:
+		sb.WriteString("\n🔓 **Lock released**\n")
+	case data.IsLocked && data.LockOwner != "":
 		fmt.Fprintf(&sb, "\n🔒 **Lock acquired by** `%s`", caller.Short(data.LockOwner))
 		if data.LockAcquired != "" {
 			fmt.Fprintf(&sb, " at %s", data.LockAcquired)
@@ -734,6 +746,8 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	sb.WriteString("\n---\n\n")
 
 	switch {
+	case data.IsLocked && data.RefusedByChangeGate:
+		sb.WriteString("**Not applied** — see the comment below for why.\n")
 	case data.IsLocked:
 		applyConfirmCmd := scopedApplyCommand("schemabot apply-confirm", data.Environment, data.ScopedDatabase, ApplyCommandOptions{
 			Tenant:       data.Tenant,

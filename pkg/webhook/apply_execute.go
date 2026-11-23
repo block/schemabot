@@ -21,6 +21,15 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
+// autoApplyComment is the "Schema Change Apply" comment an automatic apply
+// posted before dispatch, with the data it was rendered from. A change gate
+// that refuses the apply after the comment is up re-renders it from Data, so
+// the comment stops announcing an apply that will not run.
+type autoApplyComment struct {
+	ID   int64
+	Data templates.PlanCommentData
+}
+
 // executeApply re-plans for drift detection and executes the apply. This is the shared
 // execution core used by both handleApplyConfirmCommand and handleApplyCommand.
 //
@@ -40,12 +49,16 @@ import (
 // the consent this re-plan is checked against: the plan decided whether to
 // stop, and the same decision is made again here, copy by copy, against the
 // targets as they are now.
+//
+// autoComment is the comment the automatic path posted announcing the apply,
+// nil on apply-confirm, whose comment never promised one, and when that post
+// did not land.
 func (h *Handler) executeApply(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, schemaResult *ghclient.SchemaRequestResult, sharedSchemaPeers []sharedSchemaPeerInputs,
 	environment string, installationID int64, requestedBy string,
 	result CommandResult, storedPlan, disclosedPlan *storage.Plan, expectedPendingPlanID string,
-	disclosedCopies []storage.DisclosedCopy,
+	disclosedCopies []storage.DisclosedCopy, autoComment *autoApplyComment,
 ) {
 	database := schemaResult.Database
 	dbType := schemaResult.Type
@@ -621,6 +634,10 @@ func (h *Handler) executeApply(
 			cancel()
 			h.logger.Info("apply refused by a change gate", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
 			h.postChangeGateRefusal(repo, pr, installationID, actionName, environment, requestedBy, err)
+			// The refusal is posted first: it is what the operator acts on, and
+			// the edited footer points at it, so the edit never waits on it or
+			// stands without it.
+			h.markAutoApplyCommentRefused(ctx, client, repo, pr, database, dbType, environment, autoComment)
 			return
 		}
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
@@ -1554,4 +1571,30 @@ func normalizePlanNamespace(namespace string) string {
 		return "default"
 	}
 	return namespace
+}
+
+// markAutoApplyCommentRefused edits the comment an automatic apply posted
+// before a change gate refused it, so its footer says the apply did not run
+// instead of "Applying automatically". It is best effort: a failed edit leaves
+// the refusal comment, which is posted either way, as the correct record. A
+// nil comment, the apply-confirm path, has nothing to edit.
+func (h *Handler) markAutoApplyCommentRefused(
+	ctx context.Context, client *ghclient.InstallationClient,
+	repo string, pr int, database, dbType, environment string, comment *autoApplyComment,
+) {
+	if comment == nil {
+		return
+	}
+	data := comment.Data
+	data.RefusedByChangeGate = true
+
+	editCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	// The post wrapped the body with an empty environment, so the edit does too.
+	body := h.renderPRComment(repo, pr, "", templates.RenderPlanComment(data))
+	if err := client.EditIssueComment(editCtx, repo, comment.ID, body); err != nil {
+		h.logger.Error("failed to edit the automatic apply comment after a change gate refused the apply; it still says the apply is running",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "comment_id", comment.ID, "error", err)
+	}
 }

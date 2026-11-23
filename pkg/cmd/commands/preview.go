@@ -105,7 +105,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentDropColumnBlocked, templates.PreviewCommentDropIndexBlocked,
 		templates.PreviewCommentLintErrorsBlocked,
 		templates.PreviewCommentApplyPlan, templates.PreviewCommentApplyPlanOptions,
-		templates.PreviewCommentApplyPlanUnsafe,
+		templates.PreviewCommentApplyPlanUnsafe, templates.PreviewCommentApplyPlanChangeGateRefused,
 		templates.PreviewCommentApplyProgress, templates.PreviewCommentApplyCompleted,
 		templates.PreviewCommentApplyEstimateExceeded,
 		templates.PreviewCommentApplyFailed,
