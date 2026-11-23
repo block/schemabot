@@ -54,7 +54,11 @@ type Engine interface {
 	// Cancel terminates a running schema change permanently.
 	Cancel(ctx context.Context, req *ControlRequest) (*ControlResult, error)
 
-	// Start resumes a stopped schema change.
+	// Start resumes a stopped schema change, or starts the deploy of one
+	// waiting for it. A *PermanentError means the engine did not start the
+	// change and a retry cannot succeed; its message names the operator's next
+	// step. Return any other error when the engine cannot tell whether the
+	// change started.
 	Start(ctx context.Context, req *ControlRequest) (*ControlResult, error)
 
 	// Cutover triggers the final table swap.
