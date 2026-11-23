@@ -29,6 +29,7 @@ const applyOperationColumns = `id, apply_id, plan_id, deployment, operation_key,
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
 type applyOperationStore struct {
+	events     *changeEventRecorder
 	db         *rebindDB
 	dialect    Dialect
 	identity   identityInserter
@@ -288,7 +289,14 @@ func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, err
 	if err != nil {
 		return fmt.Errorf("%s (id=%d): %w", errContext, id, err)
 	}
-	return s.checkUpdatedOrExists(ctx, result, id, guard, false)
+	if err := s.checkUpdatedOrExists(ctx, result, id, guard, false); err != nil {
+		return err
+	}
+	if len(setArgs) > 0 && assignments[0].Column == "state" {
+		newState, _ := setArgs[0].(string)
+		s.events.finishOperation(ctx, id, newState)
+	}
+	return nil
 }
 
 // UpdateState transitions a child row to the given state.
@@ -2360,6 +2368,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		if rows == 0 {
 			return nil, nil
 		}
+		ad.StartsAttempt = true
 	case state.ApplyOperation.Stopped:
 		// Stopped → resuming: a stopped operation whose parent apply has a
 		// pending start or cancel request is claimable, mirroring the
@@ -2394,6 +2403,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		if rows == 0 {
 			return nil, nil
 		}
+		ad.StartsAttempt = ad.StartedAt == nil
 	default:
 		// Re-leasing a row that already started with a stale active heartbeat:
 		// crash recovery. The row keeps its current (active) state and is driven
@@ -2462,6 +2472,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			}
 			if bumped > 0 {
 				ad.Attempt++
+				ad.StartsAttempt = true
 			}
 
 			underOperationLease, err := redispatchDrivesUnderOperationLease(ctx, tx, ad)

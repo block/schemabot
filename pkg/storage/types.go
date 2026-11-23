@@ -1801,6 +1801,9 @@ type DriverPool struct {
 // user-facing handle for the whole rollout. applies.state is derived from
 // the child rows' states via the existing state.DeriveApplyState().
 type ApplyOperation struct {
+	// StartsAttempt is set only on the snapshot returned by a fresh work claim.
+	StartsAttempt bool
+
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
 	ID int64
 
@@ -2026,6 +2029,11 @@ func (op *ApplyOperation) Lease() OperationLease {
 // ApplyOptions contains durable user and engine options for an apply.
 // Stored as JSON in the database for flexibility across engine types.
 type ApplyOptions struct {
+	// ChangeEventApp is the managed app label forwarded to a remote worker for
+	// change events. It is stored on the worker's apply and kept out of engine
+	// options.
+	ChangeEventApp string `json:"change_event_app,omitempty"`
+
 	// AllowUnsafe permits destructive changes (DROP TABLE, DROP COLUMN).
 	AllowUnsafe bool `json:"allow_unsafe,omitempty"`
 

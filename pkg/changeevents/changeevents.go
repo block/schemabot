@@ -1,0 +1,206 @@
+// Package changeevents delivers configurable, best-effort schema change events.
+package changeevents
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"text/template"
+	"time"
+)
+
+const (
+	OperationStarted  = "operation.started"
+	OperationFinished = "operation.finished"
+	ApplyFinished     = "apply.finished"
+
+	queueCapacity      = 128
+	sendTimeout        = 3 * time.Second
+	dropReportInterval = time.Minute
+)
+
+// Destination selects and formats events sent to one HTTP endpoint.
+type Destination struct {
+	URL          string   `yaml:"url"`
+	Environments []string `yaml:"environments"`
+	Events       []string `yaml:"events"`
+	Body         string   `yaml:"body"`
+}
+
+// Event is a value snapshot offered after a lifecycle boundary.
+type Event struct {
+	Type            string
+	App             string
+	Environment     string
+	OccurredAtNanos int64
+	Description     string
+}
+
+type delivery struct {
+	destination Destination
+	template    *template.Template
+	queue       chan Event
+	drops       atomic.Uint64
+}
+
+// Sender queues events for independent destinations. A nil Sender is disabled.
+type Sender struct {
+	deliveries []*delivery
+	cancel     context.CancelFunc
+	ctx        context.Context
+}
+
+// New validates the destinations and starts one sender per destination.
+func New(destinations []Destination, logger *slog.Logger) (*Sender, error) {
+	if len(destinations) == 0 {
+		return nil, nil
+	}
+	sender := &Sender{}
+	for i, dest := range destinations {
+		parsed, err := url.Parse(dest.URL)
+		if err != nil || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return nil, fmt.Errorf("change_events[%d]: expected an HTTP(S) URL without credentials or a fragment", i)
+		}
+		if len(dest.Environments) == 0 || slices.ContainsFunc(dest.Environments, func(env string) bool { return strings.TrimSpace(env) == "" }) {
+			return nil, fmt.Errorf("change_events[%d]: environments must name at least one environment", i)
+		}
+		if len(dest.Events) == 0 {
+			return nil, fmt.Errorf("change_events[%d]: events must select at least one event", i)
+		}
+		for _, kind := range dest.Events {
+			switch kind {
+			case OperationStarted, OperationFinished, ApplyFinished:
+			default:
+				return nil, fmt.Errorf("change_events[%d]: unknown event %q", i, kind)
+			}
+		}
+		if strings.TrimSpace(dest.Body) == "" {
+			return nil, fmt.Errorf("change_events[%d]: body template is empty", i)
+		}
+		tmpl, err := template.New("event").Option("missingkey=error").Funcs(template.FuncMap{
+			"json": func(value any) (string, error) {
+				encoded, err := json.Marshal(value)
+				return string(encoded), err
+			},
+		}).Parse(dest.Body)
+		if err != nil {
+			return nil, fmt.Errorf("change_events[%d]: parse body template: %w", i, err)
+		}
+		dest.Environments = slices.Clone(dest.Environments)
+		dest.Events = slices.Clone(dest.Events)
+		sender.deliveries = append(sender.deliveries, &delivery{
+			destination: dest, template: tmpl, queue: make(chan Event, queueCapacity),
+		})
+	}
+	sender.ctx, sender.cancel = context.WithCancel(context.Background())
+	client := &http.Client{
+		Timeout:       sendTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	for i, dest := range sender.deliveries {
+		go dest.run(sender.ctx, client, logger.With("change_event_destination", i))
+	}
+	return sender, nil
+}
+
+func (d *delivery) accepts(kind, env string) bool {
+	return slices.Contains(d.destination.Events, kind) && slices.Contains(d.destination.Environments, env)
+}
+
+// Selects reports whether a destination selects this event in any environment.
+func (s *Sender) Selects(kind string) bool {
+	return s != nil && slices.ContainsFunc(s.deliveries, func(d *delivery) bool {
+		return slices.Contains(d.destination.Events, kind)
+	})
+}
+
+// Enabled reports whether a destination selects the event and environment.
+func (s *Sender) Enabled(kind, env string) bool {
+	return s != nil && slices.ContainsFunc(s.deliveries, func(d *delivery) bool {
+		return d.accepts(kind, env)
+	})
+}
+
+// Offer queues an event without waiting for a receiver or calling the logger.
+func (s *Sender) Offer(event Event) {
+	if s == nil || s.ctx.Err() != nil {
+		return
+	}
+	for _, d := range s.deliveries {
+		if !d.accepts(event.Type, event.Environment) {
+			continue
+		}
+		select {
+		case d.queue <- event:
+		default:
+			d.drops.Add(1)
+		}
+	}
+}
+
+// Close cancels outstanding delivery and abandons queued events.
+func (s *Sender) Close() {
+	if s != nil {
+		s.cancel()
+	}
+}
+
+func (d *delivery) run(ctx context.Context, client *http.Client, logger *slog.Logger) {
+	reportDrops := func() {
+		if count := d.drops.Swap(0); count > 0 {
+			logger.Warn("change event queue full", "dropped", count)
+		}
+	}
+	ticker := time.NewTicker(dropReportInterval)
+	defer ticker.Stop()
+	defer reportDrops()
+	for ctx.Err() == nil {
+		select {
+		case event := <-d.queue:
+			if err := d.send(ctx, client, event); err != nil && ctx.Err() == nil {
+				logger.Warn("change event delivery failed", "event", event.Type, "environment", event.Environment, "error", err)
+			}
+		case <-ticker.C:
+			reportDrops()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (d *delivery) send(ctx context.Context, client *http.Client, event Event) error {
+	var body bytes.Buffer
+	if err := d.template.Execute(&body, event); err != nil {
+		return fmt.Errorf("render body: %w", err)
+	}
+	if !json.Valid(body.Bytes()) {
+		return fmt.Errorf("rendered body is invalid JSON")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.destination.URL, &body)
+	if err != nil {
+		return fmt.Errorf("create change event request")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		// A url.Error includes the configured URL, which can contain a token.
+		requestErr := &url.Error{}
+		if errors.As(err, &requestErr) {
+			err = requestErr.Err
+		}
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP status %d", resp.StatusCode)
+	}
+	return nil
+}

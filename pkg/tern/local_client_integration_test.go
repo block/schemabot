@@ -4823,8 +4823,9 @@ func TestLocalClient_ApplyPersistsBranchOptionForQueuedDrive(t *testing.T) {
 		Type:        storage.DatabaseTypeMySQL,
 		Environment: localClientTestEnvironment,
 		Options: map[string]string{
-			"branch":        "reuse-me",
-			"defer_cutover": "true",
+			"branch":             "reuse-me",
+			"defer_cutover":      "true",
+			changeEventAppOption: "managed-app",
 		},
 	})
 	require.NoError(t, err)
@@ -4836,11 +4837,13 @@ func TestLocalClient_ApplyPersistsBranchOptionForQueuedDrive(t *testing.T) {
 	storedOpts := stored.GetOptions()
 	assert.Equal(t, "reuse-me", storedOpts.Branch, "the dispatched branch option must be persisted on the apply")
 	assert.True(t, storedOpts.DeferCutover, "the dispatched defer_cutover option must be persisted on the apply")
+	assert.Equal(t, "managed-app", storedOpts.ChangeEventApp)
 
 	driveQueuedApply(t, stor, client, resp.ApplyId)
 
 	require.NotEmpty(t, eng.applyRequests, "the queued drive must reach the engine")
 	engineOptions := eng.applyRequests[len(eng.applyRequests)-1].Options
+	assert.NotContains(t, engineOptions, changeEventAppOption)
 	assert.Equal(t, resp.ApplyId, eng.applyRequests[len(eng.applyRequests)-1].ApplyIdentifier,
 		"the queued drive's engine request must name its apply")
 	assert.Equal(t, "reuse-me", engineOptions["branch"],

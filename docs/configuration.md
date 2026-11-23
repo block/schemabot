@@ -12,6 +12,7 @@
 - [Hybrid Mode](#hybrid-mode)
 - [Drivers](#drivers)
 - [Metrics](#metrics)
+- [Change Events](#change-events)
 - [Rate Limits](#rate-limits)
 - [Pending Drops](#pending-drops)
 - [Direct Execution](#direct-execution)
@@ -1018,6 +1019,45 @@ The cap applies only to *starting* new operations — a first start, a resume af
 **The cap is a steady-state bound, not a hard admission limit.** Each claim evaluates the count independently, so drivers polling in the same instant can all read the same pre-claim value and admit together — a pod restart or rolling deploy, where every driver's first poll lands at once, is the shape that produces it. The transient ceiling is the number of drivers claiming in that window; once those leases commit, the next claim counts them and the cap binds again. Size against the steady-state number, and do not treat the cap as a guarantee that an apply can never briefly exceed it.
 
 A multi-shard apply started with a manual `--defer-cutover` keeps its drivers while it waits: unlike the automatic barrier park, a manually deferred operation holds its claim and keeps heartbeating, so it stays counted. Its cutover is accepted only once every operation waits, which takes a cap no smaller than the apply's width, so a deferred apply that would hold more operations at once than `max_drivers_per_apply` is [refused at the start](#deferred-cutover-capacity). Run it without `--defer-cutover`, or raise `max_drivers_per_apply` to at least its width.
+
+## Change Events
+
+Use `change_events` to send JSON lifecycle events to HTTP destinations. Each
+destination selects its environments and events. A server with no destinations
+configured sends no events.
+
+```yaml
+change_events:
+  - url: https://events.example.com/schema
+    environments: [production]
+    events: [operation.started, operation.finished, apply.finished]
+    body: |
+      {"app":{{json .App}},"environment":{{json .Environment}},
+       "timestamp":{{.OccurredAtNanos}},"description":{{json .Description}}}
+```
+
+Templates receive `.Type`, `.App`, `.Environment`, `.OccurredAtNanos`, and
+`.Description`. Use the `json` function to encode string values. `.App` comes
+from the database registration's `app` field and falls back to the logical
+database name when no application is registered.
+
+- The executing worker reports `operation.started` when a fresh attempt reaches
+  the engine. It reports `operation.finished` when a drive that called the engine
+  commits the attempt outcome. A drive that only reconciles a stored outcome
+  after a takeover may omit the operation finish. An automatic retry opens a
+  new attempt.
+- The control plane reports `apply.finished` when the apply records a final
+  outcome. The description includes the apply ID and deployment outcomes.
+  This covers applies initiated from a pull request or the CLI.
+
+Each server configures its own destinations. For a remote apply, configure the
+worker to report operation events and the control plane to report the aggregate
+outcome. Worker events use the executing deployment's apply and operation IDs.
+The worker receives the managed app label in the existing dispatch options.
+
+Delivery is best effort. Each destination has a bounded queue and a short HTTP
+timeout. Full queues drop events, delivery failures are logged, and there are no
+delivery retries. Shutting down the server can discard events still in memory.
 
 ## Rate Limits
 

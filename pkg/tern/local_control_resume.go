@@ -1944,6 +1944,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 // are loaded scoped to the operation rather than the whole apply, so a driver
 // can advance one deployment independently of its siblings.
 func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	ctx = withChangeDispatchApply(ctx, apply)
 	if err := c.guardDriveScope(apply); err != nil {
 		return err
 	}
@@ -2018,6 +2019,7 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 // operation, so an empty result fails closed the same way ResumeApplyOperation
 // does rather than failing the whole parent apply.
 func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	ctx = withChangeDispatchApply(ctx, apply)
 	if apply == nil {
 		return fmt.Errorf("stored apply is required to drive apply_operation %d cutover", applyOperationID)
 	}

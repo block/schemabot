@@ -1393,6 +1393,10 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 	}
 	client, cleanup := testCapturingGRPCClient(t, server)
 	defer cleanup()
+	client.changeEventApp = func(database string) string {
+		assert.Equal(t, "testdb", database)
+		return "managed-app"
+	}
 
 	apply := &storage.Apply{
 		ID:              7,
@@ -1442,6 +1446,7 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 	assert.Equal(t, "testdb", req.Database)
 	assert.Equal(t, "testdb-target", req.Target)
 	assert.Equal(t, "true", req.Options["defer_cutover"])
+	assert.Equal(t, "managed-app", req.Options[changeEventAppOption])
 	require.Len(t, req.DdlChanges, 1)
 	assert.Equal(t, "users", req.DdlChanges[0].TableName)
 	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_ALTER, req.DdlChanges[0].ChangeType)

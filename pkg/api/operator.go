@@ -1305,8 +1305,8 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	//   - dualLeaseCtx carries both for the engine run, which writes both the
 	//     operation's tasks and the parent applies row.
 	applyLeaseCtx := storage.WithApplyLease(ctx, applyLease)
-	operationLeaseCtx := storage.WithOperationLease(ctx, opLease)
-	dualLeaseCtx := storage.WithOperationLease(applyLeaseCtx, opLease)
+	operationLeaseCtx := storage.WithOperationChangeAttempt(storage.WithOperationLease(ctx, opLease), op)
+	dualLeaseCtx := storage.WithApplyLease(operationLeaseCtx, applyLease)
 
 	// The claimed operation row's deployment is the authoritative routing key
 	// for the drive: RoutingClient.ResumeApplyOperation reloads the operation
@@ -1658,7 +1658,7 @@ func (s *Service) forgetResumeObserverGeneration(applyID int64, generation uint6
 // drive — the driver owns only its operation row and tasks; the parent state and
 // the once-only terminal summary are this method's projection responsibility.
 func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease, cutover bool) claimOutcome {
-	operationLeaseCtx := storage.WithOperationLease(ctx, opLease)
+	operationLeaseCtx := storage.WithOperationChangeAttempt(storage.WithOperationLease(ctx, opLease), op)
 
 	apply, err := s.storage.Applies().Get(operationLeaseCtx, op.ApplyID)
 	if err != nil {

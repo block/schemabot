@@ -8,6 +8,7 @@ package sqlstore
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/storage"
@@ -15,6 +16,7 @@ import (
 
 // Storage implements the storage.Storage interface over database/sql.
 type Storage struct {
+	changeEvents    *changeEventRecorder
 	db              *rebindDB
 	locks           *lockStore
 	plans           *planStore
@@ -86,17 +88,26 @@ func NewWithDependencies(deps Dependencies) *Storage {
 	if maxDriversPerApply <= 0 {
 		maxDriversPerApply = storage.DefaultMaxDriversPerApply
 	}
+	var events *changeEventRecorder
+	if deps.Options.ChangeEvents != nil {
+		logger := deps.Options.ChangeEventLog
+		if logger == nil {
+			logger = slog.Default()
+		}
+		events = &changeEventRecorder{db: rdb, sender: deps.Options.ChangeEvents, app: deps.Options.ChangeEventApp, logger: logger}
+	}
 	return &Storage{
+		changeEvents:    events,
 		db:              rdb,
 		locks:           &lockStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 		plans:           &planStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier},
-		applies:         &applyStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
+		applies:         &applyStore{events: events, db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
 		tasks:           &taskStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
 		applyLogs:       &applyLogStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity},
 		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier, dialect: deps.Dialect, locker: deps.Locker},
 		applyComments:   &applyCommentStore{db: rdb, dialect: deps.Dialect},
 		planComments:    &planCommentStore{db: rdb, identity: deps.Identity, dialect: deps.Dialect},
-		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier, maxDriversPerApply: maxDriversPerApply},
+		applyOperations: &applyOperationStore{events: events, db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier, maxDriversPerApply: maxDriversPerApply},
 		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		settings:        &settingsStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		freezes:         &freezeStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
