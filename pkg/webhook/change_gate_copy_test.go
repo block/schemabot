@@ -86,7 +86,7 @@ func TestPostChangeGateRefusal(t *testing.T) {
 		Environment: "production",
 		Blockers:    []apitypes.ChangeGateBlocker{{Gate: "freeze", ID: "frz-1", Reason: "rpc error: code = Unavailable during the outage"}},
 	}
-	h.postChangeGateRefusal("octocat/hello-world", 1, 12345, action.Apply, "production", "alice", refused)
+	assert.True(t, h.postChangeGateRefusal("octocat/hello-world", 1, 12345, action.Apply, "production", "alice", refused), "a refusal that posted is reported as posted")
 	body := posted()
 	assert.Contains(t, body, "## ❄️ Apply Blocked by a Freeze\n")
 	assert.Contains(t, body, "*Requested by @alice")
@@ -94,9 +94,46 @@ func TestPostChangeGateRefusal(t *testing.T) {
 	assert.NotContains(t, body, "could not reach")
 
 	unavailable := &api.ChangeGateUnavailableError{Gate: "freeze", Err: errors.New("storage down")}
-	h.postChangeGateRefusal("octocat/hello-world", 1, 12345, action.Apply, "production", "alice", unavailable)
+	assert.True(t, h.postChangeGateRefusal("octocat/hello-world", 1, 12345, action.Apply, "production", "alice", unavailable))
 	body = posted()
 	assert.Contains(t, body, "Apply Failed")
 	assert.Contains(t, body, "> "+unavailable.UserMessage())
 	assert.NotContains(t, body, "storage down")
+}
+
+// The caller edits an earlier comment to point at the refusal, so the refusal
+// reports whether it landed: a rejected POST is not posted, for a freeze
+// refusal and for a gate that could not decide alike.
+func TestPostChangeGateRefusalReportsAFailedPost(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	h := &Handler{
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
+	}
+
+	refused := &api.ChangeGateRefusedError{
+		Environment: "production",
+		Blockers:    []apitypes.ChangeGateBlocker{{Gate: "freeze", ID: "frz-1", Reason: "outage"}},
+	}
+	assert.False(t, h.postChangeGateRefusal("octocat/hello-world", 1, 12345, action.Apply, "production", "alice", refused))
+	unavailable := &api.ChangeGateUnavailableError{Gate: "freeze", Err: errors.New("storage down")}
+	assert.False(t, h.postChangeGateRefusal("octocat/hello-world", 1, 12345, action.Apply, "production", "alice", unavailable))
+}
+
+// A lock stays held when its release fails or its pending intent changed, so
+// the release reports whether this call freed it, which the refused comment's
+// lock line is conditioned on.
+func TestReleaseApplyLockIfIntentUnchangedReportsWhetherTheLockWasReleased(t *testing.T) {
+	client, _ := setupGitHubServer(t)
+	release := func(locks *rollbackConfirmTestLockStore) bool {
+		h := unlockTestHandler(t, &rollbackConfirmTestStorage{locks: locks}, ghclient.NewInstallationClient(client, testLogger()))
+		return h.releaseApplyLockIfIntentUnchanged(t.Context(), "octocat/hello-world", 1, "orders", "mysql", "staging", "plan-1", "change gate refused")
+	}
+
+	assert.True(t, release(&rollbackConfirmTestLockStore{}), "released")
+	assert.False(t, release(&rollbackConfirmTestLockStore{releaseNoOp: true}), "a lock re-pinned to a newer intent is preserved")
+	assert.False(t, release(&rollbackConfirmTestLockStore{releaseErr: errors.New("storage write failed")}), "a failed release leaves the lock held")
 }

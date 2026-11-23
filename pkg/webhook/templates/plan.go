@@ -265,6 +265,25 @@ type PlanCommentData struct {
 	// signal that the apply is proceeding.
 	PausedApplyCause *PausedApplyCauseData
 
+	// RefusedByChangeGate marks the locked comment of an automatic apply that a
+	// change gate refused after the comment was posted. The comment announced an
+	// apply that never ran, so it is edited to say so: the footer no longer
+	// promises one and the lock line no longer claims a lock the refusal
+	// released. The body still shows the plan as it was posted. The gate is not
+	// named, since a refusal and a gate that could not decide both land here and
+	// the comment posted after this one says which.
+	RefusedByChangeGate bool
+
+	// LockReleased and RefusalPosted say what a refused comment may claim. The
+	// lock line reads released only when this refusal released it: a failed
+	// release or a lock re-pinned to a newer intent leaves it held, and then the
+	// comment makes no lock claim at all. The footer points at the comment below
+	// only when the refusal posted; otherwise it is self-contained, saying it did
+	// not apply and how to see the reason. Both are read only with
+	// RefusedByChangeGate.
+	LockReleased  bool
+	RefusalPosted bool
+
 	RecoveredApplyOwnedCheckState bool
 
 	// DeploymentDrift is the review-time rollup of how every configured
@@ -590,7 +609,12 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	writePlanMetadata(&sb, data)
 	writePlanAttribution(&sb, data)
 
-	if data.IsLocked && data.LockOwner != "" {
+	switch {
+	case data.IsLocked && data.RefusedByChangeGate:
+		if data.LockReleased {
+			sb.WriteString("\n🔓 **Lock released**\n")
+		}
+	case data.IsLocked && data.LockOwner != "":
 		fmt.Fprintf(&sb, "\n🔒 **Lock acquired by** `%s`", caller.Short(data.LockOwner))
 		if data.LockAcquired != "" {
 			fmt.Fprintf(&sb, " at %s", data.LockAcquired)
@@ -734,6 +758,28 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	sb.WriteString("\n---\n\n")
 
 	switch {
+	case data.IsLocked && data.RefusedByChangeGate && !data.RefusalPosted:
+		// The comment this footer would point at never posted, so the footer
+		// carries the next step itself (UX-4). The next step is a retry, which
+		// starts the apply once the gate allows it, so the footer says so before
+		// the reader copies it. The copyable command never carries
+		// --allow-unsafe: an apply that consented to unsafe changes asks for
+		// that consent again in the words every other apply instruction uses.
+		rerun := ApplyCommand(data.Environment, data.ScopedDatabase, ApplyCommandOptions{
+			Target:       data.Target,
+			Tenant:       data.Tenant,
+			DeferCutover: data.DeferCutover && !data.NoCutoverToDefer,
+			SkipRevert:   data.SkipRevert,
+		})
+		sb.WriteString("**Not applied** — a change gate refused this apply, and SchemaBot could not post why.\n\n")
+		sb.WriteString("Commenting the apply again retries it. If the gate still refuses it, SchemaBot posts why. If the gate now allows it, **the apply starts**.\n\n")
+		if consent, ok := retryUnsafeConsent(data); ok {
+			writeUnsafeConsentCommand(&sb, "To retry", consent, rerun)
+		} else {
+			fmt.Fprintf(&sb, "To retry, comment:\n```\n%s\n```\n", rerun)
+		}
+	case data.IsLocked && data.RefusedByChangeGate:
+		sb.WriteString("**Not applied** — see the comment below for why.\n")
 	case data.IsLocked:
 		applyConfirmCmd := scopedApplyCommand("schemabot apply-confirm", data.Environment, data.ScopedDatabase, ApplyCommandOptions{
 			Tenant:       data.Tenant,
@@ -948,8 +994,14 @@ func planUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
 	if data.AllowUnsafe || data.applyFailsOnRefusedChange() {
 		return unsafeConsent{}, false
 	}
-	// The flag consents to every target's disclosed unsafe changes, not only
-	// the reviewed plan's, so the instruction counts and names them all.
+	return disclosedUnsafeConsent(data)
+}
+
+// disclosedUnsafeConsent is what --allow-unsafe consents to on the comment,
+// and false when the comment discloses no unsafe change. The flag consents to
+// every target's disclosed unsafe changes, not only the reviewed plan's, so
+// the instruction counts and names them all.
+func disclosedUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
 	var changes []UnsafeChangeData
 	if data.HasUnsafeChanges {
 		changes = append(changes, data.UnsafeChanges...)
@@ -959,6 +1011,17 @@ func planUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
 		return unsafeConsent{}, false
 	}
 	return newUnsafeConsent(changes, data.DatabaseType, data.IsMySQL, !unsafeCountCoversEveryTarget(data.DeploymentDrift)), true
+}
+
+// retryUnsafeConsent is the consent a retry of a refused apply must give
+// again, and false when the refused apply gave none. Unlike planUnsafeConsent,
+// it counts the changes because the apply carried --allow-unsafe: the retry
+// command leaves the flag out, so the reader types it again.
+func retryUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
+	if !data.AllowUnsafe {
+		return unsafeConsent{}, false
+	}
+	return disclosedUnsafeConsent(data)
 }
 
 // applyInstructionCarriesDropSteps reports whether the comment's footer offers
