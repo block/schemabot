@@ -1,6 +1,7 @@
 package github
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,8 +12,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
@@ -226,24 +229,24 @@ func TestCachedBlobContentKeepsOnlySuccessfulReadsPerRepository(t *testing.T) {
 	ic := NewInstallationClient(nil, discardLogger())
 	sha := gitBlobSHA(usersTable)
 	var fetches int
-	fetch := func() (string, error) {
+	fetch := func(context.Context) (string, error) {
 		fetches++
 		return usersTable, nil
 	}
 
-	_, err := ic.cachedBlobContent("octocat/hello-world", sha, func() (string, error) {
+	_, err := ic.cachedBlobContent(t.Context(), "octocat/hello-world", sha, func(context.Context) (string, error) {
 		return "", errors.New("GitHub is unavailable")
 	})
 	require.Error(t, err)
 
 	for range 2 {
-		content, err := ic.cachedBlobContent("octocat/hello-world", sha, fetch)
+		content, err := ic.cachedBlobContent(t.Context(), "octocat/hello-world", sha, fetch)
 		require.NoError(t, err)
 		assert.Equal(t, usersTable, content)
 	}
 	assert.Equal(t, 1, fetches, "the read after a failed one reaches GitHub, and the one after that is served from the cache")
 
-	content, err := ic.cachedBlobContent("octocat/other", sha, fetch)
+	content, err := ic.cachedBlobContent(t.Context(), "octocat/other", sha, fetch)
 	require.NoError(t, err)
 	assert.Equal(t, usersTable, content)
 	assert.Equal(t, 2, fetches, "the same blob in another repository is read from that repository")
@@ -320,4 +323,217 @@ func TestBlobContentCacheStartsOverAtItsLimit(t *testing.T) {
 	cache.put(repo, gitBlobSHA(tooLarge), tooLarge)
 	assert.False(t, held(cache, tooLarge), "an entry larger than the limit is not held")
 	assert.True(t, held(cache, last), "and it does not empty the cache")
+}
+
+// blobReadTestDeadline bounds every wait in the shared blob read tests.
+const blobReadTestDeadline = 5 * time.Second
+
+// gatedSchemaFile serves schema/users.sql through the Contents API and holds
+// every read until release is called, so a test can line up the callers that
+// miss on the file while the first read is in progress. The first read reports
+// on started. answer writes the response to each read, numbered from one.
+type gatedSchemaFile struct {
+	ic      *InstallationClient
+	reads   atomic.Int64
+	started chan struct{}
+	release func()
+}
+
+func newGatedSchemaFile(t *testing.T, answer func(read int64, ref string, w http.ResponseWriter)) *gatedSchemaFile {
+	t.Helper()
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	released := make(chan struct{})
+	g := &gatedSchemaFile{
+		ic:      NewInstallationClient(client, discardLogger()),
+		started: make(chan struct{}, 1),
+		release: sync.OnceFunc(func() { close(released) }),
+	}
+	t.Cleanup(g.release)
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema/users.sql", func(w http.ResponseWriter, r *http.Request) {
+		read := g.reads.Add(1)
+		if read == 1 {
+			g.started <- struct{}{}
+		}
+		select {
+		case <-released:
+			answer(read, r.URL.Query().Get("ref"), w)
+		case <-r.Context().Done():
+		}
+	})
+	return g
+}
+
+func writeUsersFile(t *testing.T, w http.ResponseWriter, content string) {
+	t.Helper()
+	require.NoError(t, json.NewEncoder(w).Encode(gh.RepositoryContent{
+		Type: new("file"), Name: new("users.sql"), Path: new("schema/users.sql"), Encoding: new("base64"),
+		Content: new(base64.StdEncoding.EncodeToString([]byte(content))),
+	}))
+}
+
+type blobReadResult struct {
+	content string
+	err     error
+}
+
+// readInBackground reads schema/users.sql at ref through the blob cache under
+// the key sha, as a listing at ref that reported that SHA would.
+func (g *gatedSchemaFile) readInBackground(ctx context.Context, sha, ref string) <-chan blobReadResult {
+	done := make(chan blobReadResult, 1)
+	go func() {
+		content, err := g.ic.cachedBlobContent(ctx, "octocat/hello-world", sha, func(ctx context.Context) (string, error) {
+			return g.ic.FetchFileContent(ctx, "octocat/hello-world", "schema/users.sql", ref)
+		})
+		done <- blobReadResult{content: content, err: err}
+	}()
+	return done
+}
+
+// joinRead starts a read that reports once it waits on the read already in
+// progress, and returns when it does.
+func (g *gatedSchemaFile) joinRead(t *testing.T, ctx context.Context, sha, ref string) <-chan blobReadResult {
+	t.Helper()
+	waiter := policyWaitContext{Context: ctx, waiting: make(chan struct{}, 1)}
+	done := g.readInBackground(waiter, sha, ref)
+	receivePolicyTestResult(t, ctx, waiter.waiting)
+	return done
+}
+
+// Two environments of one push, or two pushes that share a schema file, read
+// the same blob at the same time. GitHub is asked for it once, and both
+// callers get its content.
+func TestCachedBlobContentSharesOneReadBetweenConcurrentMisses(t *testing.T) {
+	deadline, cancel := context.WithTimeout(t.Context(), blobReadTestDeadline)
+	defer cancel()
+	firstPush, secondPush := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	g := newGatedSchemaFile(t, func(_ int64, _ string, w http.ResponseWriter) { writeUsersFile(t, w, usersTable) })
+	sha := gitBlobSHA(usersTable)
+
+	first := g.readInBackground(deadline, sha, firstPush)
+	receivePolicyTestResult(t, deadline, g.started)
+	second := g.joinRead(t, deadline, sha, secondPush)
+	g.release()
+
+	for _, done := range []<-chan blobReadResult{first, second} {
+		result := receivePolicyTestResult(t, deadline, done)
+		require.NoError(t, result.err)
+		assert.Equal(t, usersTable, result.content)
+	}
+	assert.Equal(t, int64(1), g.reads.Load(), "concurrent misses on one blob make one GitHub read")
+}
+
+// The caller that started the shared read gives up while it is in progress.
+// It returns its own context's error at once, and the read continues for the
+// caller still waiting on it, so GitHub is still asked only once.
+func TestCachedBlobContentReadSurvivesTheCallerThatStartedIt(t *testing.T) {
+	deadline, cancel := context.WithTimeout(t.Context(), blobReadTestDeadline)
+	defer cancel()
+	push := strings.Repeat("a", 40)
+	g := newGatedSchemaFile(t, func(_ int64, _ string, w http.ResponseWriter) { writeUsersFile(t, w, usersTable) })
+	sha := gitBlobSHA(usersTable)
+
+	starterCtx, cancelStarter := context.WithCancel(deadline)
+	defer cancelStarter()
+	starter := g.readInBackground(starterCtx, sha, push)
+	receivePolicyTestResult(t, deadline, g.started)
+	waiter := g.joinRead(t, deadline, sha, push)
+
+	cancelStarter()
+	assert.ErrorIs(t, receivePolicyTestResult(t, deadline, starter).err, context.Canceled,
+		"the caller that gave up returns while the read is still held")
+	g.release()
+
+	result := receivePolicyTestResult(t, deadline, waiter)
+	require.NoError(t, result.err)
+	assert.Equal(t, usersTable, result.content)
+	assert.Equal(t, int64(1), g.reads.Load())
+}
+
+// A shared read that fails fails every caller waiting on it, and is not kept:
+// the next caller reads the blob from GitHub again.
+func TestCachedBlobContentDoesNotKeepAFailedSharedRead(t *testing.T) {
+	deadline, cancel := context.WithTimeout(t.Context(), blobReadTestDeadline)
+	defer cancel()
+	push := strings.Repeat("a", 40)
+	g := newGatedSchemaFile(t, func(read int64, _ string, w http.ResponseWriter) {
+		if read == 1 {
+			http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+			return
+		}
+		writeUsersFile(t, w, usersTable)
+	})
+	sha := gitBlobSHA(usersTable)
+
+	first := g.readInBackground(deadline, sha, push)
+	receivePolicyTestResult(t, deadline, g.started)
+	second := g.joinRead(t, deadline, sha, push)
+	g.release()
+	for _, done := range []<-chan blobReadResult{first, second} {
+		result := receivePolicyTestResult(t, deadline, done)
+		assert.True(t, IsNotFoundError(result.err), "every waiter gets the shared failure: %v", result.err)
+	}
+
+	result := receivePolicyTestResult(t, deadline, g.readInBackground(deadline, sha, push))
+	require.NoError(t, result.err)
+	assert.Equal(t, usersTable, result.content)
+	assert.Equal(t, int64(2), g.reads.Load(), "the caller after a failed read reads again")
+}
+
+// The shared read keeps the client's retries: GitHub answers the first attempt
+// with a server error, the read retries inside the flight, and both waiting
+// callers get the content from the one read.
+func TestCachedBlobContentSharedReadRetriesUnavailableGitHub(t *testing.T) {
+	t.Cleanup(SetUnavailableReadRetryDelayForTest(time.Millisecond))
+	deadline, cancel := context.WithTimeout(t.Context(), blobReadTestDeadline)
+	defer cancel()
+	push := strings.Repeat("a", 40)
+	g := newGatedSchemaFile(t, func(read int64, _ string, w http.ResponseWriter) {
+		if read == 1 {
+			http.Error(w, `{"message":"Service Unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+		writeUsersFile(t, w, usersTable)
+	})
+	sha := gitBlobSHA(usersTable)
+
+	first := g.readInBackground(deadline, sha, push)
+	receivePolicyTestResult(t, deadline, g.started)
+	second := g.joinRead(t, deadline, sha, push)
+	g.release()
+
+	for _, done := range []<-chan blobReadResult{first, second} {
+		result := receivePolicyTestResult(t, deadline, done)
+		require.NoError(t, result.err)
+		assert.Equal(t, usersTable, result.content)
+	}
+	assert.Equal(t, int64(2), g.reads.Load(), "one shared read: the failed attempt and its retry")
+}
+
+// A symbolic link to a file is listed under the link's own blob SHA, while a
+// read returns the target's content at that commit. Two pushes that changed
+// the target read the link at the same time under one key. Each gets its own
+// commit's content: the caller whose read was shared reads the file again.
+func TestCachedBlobContentReadsASymlinkedFileAtEachCommitConcurrently(t *testing.T) {
+	deadline, cancel := context.WithTimeout(t.Context(), blobReadTestDeadline)
+	defer cancel()
+	firstPush, secondPush := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	targetAt := map[string]string{
+		firstPush:  usersTable,
+		secondPush: "CREATE TABLE users (id INT, email VARCHAR(255));",
+	}
+	g := newGatedSchemaFile(t, func(_ int64, ref string, w http.ResponseWriter) { writeUsersFile(t, w, targetAt[ref]) })
+	linkBlob := gitBlobSHA("../shared/users.sql")
+
+	first := g.readInBackground(deadline, linkBlob, firstPush)
+	receivePolicyTestResult(t, deadline, g.started)
+	second := g.joinRead(t, deadline, linkBlob, secondPush)
+	g.release()
+
+	firstResult := receivePolicyTestResult(t, deadline, first)
+	require.NoError(t, firstResult.err)
+	assert.Equal(t, targetAt[firstPush], firstResult.content)
+	secondResult := receivePolicyTestResult(t, deadline, second)
+	require.NoError(t, secondResult.err)
+	assert.Equal(t, targetAt[secondPush], secondResult.content, "the second push gets its own commit's content")
+	assert.Equal(t, int64(2), g.reads.Load())
 }
