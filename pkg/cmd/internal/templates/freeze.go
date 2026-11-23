@@ -40,10 +40,7 @@ func freezeScope(f apitypes.Freeze) string {
 // freezeUntil is the end of a freeze's window; one with no end lasts until
 // someone lifts it.
 func freezeUntil(f apitypes.Freeze) string {
-	if f.EndsAt == nil {
-		return "until lifted"
-	}
-	return "until " + freezeTime(*f.EndsAt)
+	return ui.FreezeUntil(f.EndsAt)
 }
 
 // WriteFreezeCreated writes the confirmation of a new freeze.
@@ -57,16 +54,50 @@ func WriteFreezeCreated(f apitypes.Freeze) {
 		freezeKind(f.Kind), freezeUntil(f), ui.TerminalSafeLine(f.CreatedBy), ui.TerminalSafeLine(f.Reason))
 	fmt.Printf("   Scope:           %s\n", freezeScope(f))
 	fmt.Printf("   Starts:          %s\n", freezeTime(f.StartsAt))
-	fmt.Printf("   Running applies: %s\n", freezeRunning(f.Running))
+	fmt.Printf("   Running applies: %s\n", freezeRunning(f))
+	writeFreezeStopSweep(f.StopSweep)
 }
 
-// freezeRunning shows the recorded running policy. SchemaBot does not act on
-// stop yet, so a responder must not read it as applies having stopped.
-func freezeRunning(policy string) string {
-	if policy == "stop" {
-		return ui.TerminalSafeLine(policy) + " (recorded; running applies are not stopped yet, use 'schemabot stop')"
+// freezeRunning shows the running policy, and for stop, what setting the
+// freeze did to the applies already running, so a responder never reads it
+// as more than happened.
+func freezeRunning(f apitypes.Freeze) string {
+	policy := ui.TerminalSafeLine(f.Running)
+	if f.Running != "stop" {
+		return policy
 	}
-	return ui.TerminalSafeLine(policy)
+	if !f.InEffect {
+		return policy + " (applies running when it starts are not stopped; use 'schemabot stop')"
+	}
+	return policy
+}
+
+// writeFreezeStopSweep lists the applies a stop freeze asked to stop when it
+// was set, and the ones it did not, each with the reason. A stop is a durable
+// request its driver delivers, so the applies listed may still be writing as
+// this prints; status confirms each one has stopped. An apply not stopped
+// keeps running, and its reason says what to do, since the remedy differs:
+// one engine has no stop at all.
+func writeFreezeStopSweep(sweep *apitypes.FreezeStopSweep) {
+	if sweep == nil {
+		return
+	}
+	if sweep.Error != "" {
+		fmt.Printf("   Stop requested:  none. %s\n", ui.TerminalSafeLine(sweep.Error))
+		return
+	}
+	switch {
+	case len(sweep.Stopped) > 0:
+		fmt.Printf("   Stop requested:  %s\n", ui.TerminalSafeLine(strings.Join(sweep.Stopped, ", ")))
+		fmt.Printf("                    Confirm each one has stopped with '%s'.\n", cliname.Command("status", "<apply-id>"))
+	case len(sweep.NotStopped) == 0:
+		fmt.Println("   Stop requested:  none; no schema change in scope was pending or running")
+	default:
+		fmt.Println("   Stop requested:  none")
+	}
+	for _, unstopped := range sweep.NotStopped {
+		fmt.Printf("   Not stopped:     %s keeps running: %s\n", ui.TerminalSafeLine(unstopped.ApplyID), ui.TerminalSafeLine(unstopped.Reason))
+	}
 }
 
 // WriteFreezeLifted writes the confirmation of a lifted freeze.
@@ -189,13 +220,9 @@ func ChangeGateRefusedText(d ChangeGateRefusedData) []string {
 	if d.Operation == "cutover" {
 		outcome = "This cutover did not start."
 	}
-	lines := []string{fmt.Sprintf("✗ %s is frozen. %s", ui.TerminalSafeLine(d.Environment), outcome)}
+	lines := []string{fmt.Sprintf("%s %s is frozen. %s", glyph.Frozen, ui.TerminalSafeLine(d.Environment), outcome)}
 	for _, b := range d.Blockers {
-		until := "until lifted"
-		if b.EndsAt != nil {
-			until = "until " + freezeTime(*b.EndsAt)
-		}
-		lines = append(lines, fmt.Sprintf("   %s  %s  (%s)", ui.TerminalSafeLine(b.ID), ui.TerminalSafeLine(b.Reason), until))
+		lines = append(lines, fmt.Sprintf("   %s  %s  (%s)", ui.TerminalSafeLine(b.ID), ui.TerminalSafeLine(b.Reason), ui.FreezeUntil(b.EndsAt)))
 	}
 	switch {
 	case d.OverrideRequest != nil:
@@ -228,5 +255,32 @@ func ChangeGateRefusedText(d ChangeGateRefusedData) []string {
 func WriteChangeGateRefused(d ChangeGateRefusedData) {
 	for _, line := range ChangeGateRefusedText(d) {
 		fmt.Println(line)
+	}
+}
+
+// StoppedByFreezeText is what status says about an apply a freeze with
+// running "stop" stopped (AZ-11): which freeze, and how the apply resumes:
+// after the freeze ends or with an override while it is in effect, and with a
+// plain start once it has ended. It is empty when no freeze stopped the
+// apply. StoppedByFreezeNote in pkg/webhook/templates tells the PR the same.
+func StoppedByFreezeText(freeze *apitypes.FreezeStopRef, applyID, environment string) string {
+	if freeze == nil || freeze.ID == "" {
+		return ""
+	}
+	text := "Stopped by freeze " + ui.TerminalSafeLine(freeze.ID)
+	if freeze.Reason != "" {
+		text += " (" + ui.TerminalSafeLine(freeze.Reason) + ")"
+	}
+	start := cliname.Command("start", ui.TerminalSafeLine(applyID), "-e", ui.TerminalSafeLine(environment))
+	if freeze.Ended {
+		return text + fmt.Sprintf(", which has ended. Run '%s' to resume it.", start)
+	}
+	return text + fmt.Sprintf(". Run '%s' after the freeze ends or is lifted, or add --override \"<reason>\" to ask a freeze approver to let it through.", start)
+}
+
+// writeStoppedByFreeze writes StoppedByFreezeText below the status box.
+func writeStoppedByFreeze(data ProgressData) {
+	if text := StoppedByFreezeText(data.StoppedByFreeze, data.ApplyID, data.Environment); text != "" {
+		fmt.Printf("\n  ⏹️ %s\n", text)
 	}
 }

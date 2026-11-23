@@ -12,15 +12,17 @@ import "fmt"
 // and drops on existing tables are counted in their own buckets, one per
 // statement, so a plan names the index work it will run without reporting
 // the table as created or altered; indexes that ship inside a greenfield
-// create set are part of that create and are not counted again. Statements
-// outside every named bucket (types, extensions, comments) are counted as
-// other so a mixed plan still names them.
+// create set are part of that create and are not counted again. A type is
+// counted once per type however many labels the plan adds to it. Statements
+// outside every named bucket (extensions, comments) are counted as other so a
+// mixed plan still names them.
 type PlanCounts struct {
 	Created        int
 	Altered        int
 	Dropped        int
 	IndexesCreated int
 	IndexesDropped int
+	TypesAltered   int
 	Other          int
 
 	countedTables map[planTableKey]struct{}
@@ -36,18 +38,19 @@ type planTableKey struct {
 }
 
 // AddTable counts a classified statement. op is the lowercase operation
-// ("create", "alter", "drop", "create_index", "drop_index"). A table-level op
-// is counted once per (namespace, op, table); an index op is counted once per
-// statement, since each names a distinct index and the table it belongs to
-// is not what the count reports. Any other op is counted as an other
-// statement.
+// ("create", "alter", "drop", "create_index", "drop_index", "alter_type"). A
+// table-level op is counted once per (namespace, op, table), and "alter_type"
+// once per (namespace, type), with the type's name passed as table; an index
+// op is counted once per statement, since each names a distinct index and the
+// table it belongs to is not what the count reports. Any other op is counted
+// as an other statement.
 //
 // A table-level statement with no table name cannot be judged a duplicate of
 // anything, so it is counted rather than keyed: merging every nameless change
 // into one would under-report on the surface that received it.
 func (c *PlanCounts) AddTable(namespace, op, table string) {
 	switch op {
-	case "create", "alter", "drop":
+	case "create", "alter", "drop", "alter_type":
 	case "create_index":
 		c.IndexesCreated++
 		return
@@ -75,6 +78,8 @@ func (c *PlanCounts) AddTable(namespace, op, table string) {
 		c.Altered++
 	case "drop":
 		c.Dropped++
+	case "alter_type":
+		c.TypesAltered++
 	}
 }
 
@@ -122,7 +127,7 @@ func PluralizeNoun(noun string, count int) string {
 
 // AssemblePlanSummary applies the shared clause ordering and fallback rules
 // while allowing each surface to supply its own wording. countedClause
-// renders one typed bucket from its count, its noun ("table" or "index") and
+// renders one typed bucket from its count, its noun ("table", "index" or "type") and
 // its operation ("create", "alter", "drop"); ddlClause renders the other
 // statements, or the raw total when nothing was typed.
 func AssemblePlanSummary(counts PlanCounts, rawTotal int, countedClause func(count int, noun, op string) string, ddlClause func(int, bool) string) []string {
@@ -137,6 +142,7 @@ func AssemblePlanSummary(counts PlanCounts, rawTotal int, countedClause func(cou
 		{counts.Dropped, "table", "drop"},
 		{counts.IndexesCreated, "index", "create"},
 		{counts.IndexesDropped, "index", "drop"},
+		{counts.TypesAltered, "type", "alter"},
 	} {
 		if item.count > 0 {
 			parts = append(parts, countedClause(item.count, item.noun, item.op))

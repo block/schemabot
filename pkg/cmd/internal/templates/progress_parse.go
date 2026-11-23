@@ -39,6 +39,9 @@ type ProgressData struct {
 	// renders as one change, the way its PR comments do, however many shard
 	// and finalizer rows it has.
 	Sharded bool
+	// StoppedByFreeze names the freeze that stopped the apply, nil when an
+	// operator stopped it or it is not stopped.
+	StoppedByFreeze *apitypes.FreezeStopRef
 }
 
 // RendersOperationSections reports whether progress renders a section per
@@ -153,6 +156,9 @@ type ShardProgress struct {
 	// standing in for its rows in the rolled-up total
 	// (TableProgress.RowsTotalPlanned). Nil otherwise.
 	PlannedRows *int64
+	// CopiesNoRows is true when every change the shard runs on the table
+	// copies no rows, so a running shard reads as applying.
+	CopiesNoRows bool
 }
 
 // Display-only task states. These are not persisted apply states (see pkg/applystate)
@@ -180,6 +186,8 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		Metadata:       result.Metadata,
 		Released:       result.Released,
 		Sharded:        result.Sharded,
+
+		StoppedByFreeze: result.StoppedByFreeze,
 	}
 	if step, err := apitypes.ParseProgressStep(result.Metadata); err != nil {
 		slog.Warn("progress output omits the statement position because the progress metadata is malformed", "apply_id", result.ApplyID, "error", err)
@@ -264,6 +272,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 
 				ChecksumRowsChecked: sh.ChecksumRowsChecked,
 				ChecksumRowsTotal:   sh.ChecksumRowsTotal,
+				CopiesNoRows:        sh.CopiesNoRows,
 			})
 			// Table-level ETA: the table's own estimate (MySQL/Spirit), or
 			// the slowest shard's for a sharded (Vitess) table.

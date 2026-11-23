@@ -178,6 +178,24 @@ type LockStore interface {
 	// pending plan.
 	ReleaseByID(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error
 
+	// ReleaseByIDIfUnused releases the lock like ReleaseByID, and also only
+	// while no apply whose outcome can still change records the row as its
+	// lock. A stopped apply keeps the lock, since it can be resumed under it,
+	// and so does a terminal apply with an operation still in progress. Only
+	// applies that record this row count: an apply still running under an
+	// older row of the same database, left behind by a force release, does
+	// not keep the current owner's lock, so a caller that also refuses while
+	// any apply runs on the database checks that itself.
+	// The row is held for the decision, so an apply created under the row in
+	// a transaction that locks it either commits before the check and keeps
+	// the lock, or fails without creating the apply. A create that waited for
+	// the release can fail with a deadlock or serialization error rather than
+	// ErrLockIntentChanged. It returns nil
+	// when it released the lock; a *LockInUseError, matching ErrLockInUse and
+	// naming the apply, when it kept the lock for that apply; and the errors
+	// ReleaseByID returns when the row no longer holds the lock as given.
+	ReleaseByIDIfUnused(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error
+
 	// ReleaseIfPendingPlanID releases a lock only while both its owner and
 	// pending plan still match. A mismatch is a no-op so a superseding apply or
 	// rollback intent owned by the same PR remains intact.
@@ -255,12 +273,15 @@ type CheckStore interface {
 	// from in_progress to a successful no-op plan result. Returns true when recovery occurred.
 	RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, check *Check) (bool, error)
 
-	// MarkStalePlanSuccessful marks plan-only stored check state successful when
-	// the database it covers is no longer in the PR. It fails closed: the update
-	// is skipped when the row is in_progress or owns an apply ID, so a started
-	// apply that began after stale cleanup read the row keeps blocking the PR.
-	// Returns true when the row was marked successful.
-	MarkStalePlanSuccessful(ctx context.Context, check *Check) (bool, error)
+	// MarkStalePlanSuccessful marks plan-only stored check state successful on
+	// check.HeadSHA when nothing will replace the row. It fails closed: the
+	// update is skipped when the row is in_progress or owns an apply ID, so a
+	// started apply that began after stale cleanup read the row keeps blocking
+	// the PR. readHeadSHA is the head the caller read the row at; a row a newer
+	// write moved to any head other than readHeadSHA or check.HeadSHA belongs to
+	// that write and is left alone. Returns true when the row is plan-only
+	// successful on check.HeadSHA after the call.
+	MarkStalePlanSuccessful(ctx context.Context, check *Check, readHeadSHA string) (bool, error)
 
 	// BlockStaleStartedApply records that the schema change a started apply
 	// owns is gone from the PR: it moves the row onto headSHA with check's
@@ -340,6 +361,13 @@ type CheckStore interface {
 
 	// Delete removes stored check state by ID.
 	Delete(ctx context.Context, id int64) error
+
+	// DeleteStalePlanOnly removes check's plan-only row when no plan can store
+	// it again. It fails closed: a row that is in_progress or owns an apply ID
+	// is kept, and so is a row a newer write moved off readHeadSHA, the head the
+	// caller read it at. Returns true when no row is stored for check's key
+	// after the call.
+	DeleteStalePlanOnly(ctx context.Context, check *Check, readHeadSHA string) (bool, error)
 
 	// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a
 	// closed PR, retaining apply-owned rows the close must not unblock. Once
@@ -666,6 +694,17 @@ type WebhookEventStore interface {
 	// recoverable: the reconciler may synthesize a recovery delivery for its
 	// head, and GitHub Redeliver reopens it.
 	MarkFailed(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error
+
+	// MarkFailedUncharged marks a claimed event retryable after retryAfter,
+	// like MarkFailed with a retry time, and refunds the attempt its claim
+	// consumed. Drivers use it when the delivery could not run yet for a
+	// reason that has a known end, such as a GitHub quota that resets at a
+	// known time, so waiting for that end does not spend the retry budget.
+	// The caller bounds how often a delivery is rescheduled this way. Unlike
+	// Release it keeps started_at, since processing did begin. Repeating the
+	// call with the same lease token refunds nothing more and returns nil.
+	// Returns ErrWebhookEventLeaseLost when the lease token is stale.
+	MarkFailedUncharged(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter time.Time) error
 
 	// MarkFailedPermanent dead-letters a claimed event: the driver proved the
 	// delivery can never succeed for its head, so no retry, reconciler
@@ -2034,6 +2073,16 @@ type ApplyOperationStore interface {
 	// longer matches (another writer rotated or cleared it), in which case the
 	// row has moved on and needs nothing from the caller.
 	ReleaseClaim(ctx context.Context, lease OperationLease) (bool, error)
+
+	// ReturnUnstartedClaim hands back an operation a driver claimed to start
+	// but will not start, as it was before the claim: an operation claimed out
+	// of pending goes back to pending with no started_at, and one claimed out
+	// of stopped goes back to stopped. claimedFrom is that earlier state,
+	// pending or stopped. Unlike ReleaseClaim, the row does not re-enter as
+	// active work a later claim would drive without starting it again. The
+	// write is guarded on the lease token and on the state the claim moved
+	// the row to; it reports false when either no longer matches.
+	ReturnUnstartedClaim(ctx context.Context, lease OperationLease, claimedFrom string) (bool, error)
 
 	// ReleaseFinishedClaim hands back the lease on an operation whose drive has
 	// ended. A drive that finishes leaves its lease in place, so the row it

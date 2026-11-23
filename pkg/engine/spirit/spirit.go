@@ -793,6 +793,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			NoChanges:             true,
 			ExistingCopiesChecked: true,
 			ExemptTables:          exemptTables,
+			UnmatchedDropTables:   current.unmatched,
 		}, nil
 	}
 
@@ -929,6 +930,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		ExistingCopies:        existingCopies,
 		ExistingCopiesChecked: copiesChecked,
 		ExemptTables:          exemptTables,
+		UnmatchedDropTables:   current.unmatched,
 	}, nil
 }
 
@@ -1409,6 +1411,9 @@ type liveSchema struct {
 	// reclaimed is the drop_tables entries in tables only because the list
 	// named them: the naming conventions would otherwise have kept them out.
 	reclaimed []string
+	// unmatched is the drop_tables entries that name no live table, in the
+	// order the config lists them, for the plan to report: they drop nothing.
+	unmatched []string
 	// lowerCaseTableNames is the target's @@lower_case_table_names, which
 	// decides whether the diff compares table names case-insensitively.
 	lowerCaseTableNames int
@@ -1466,6 +1471,7 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		}
 		tables = append(tables, ts)
 	}
+	var unmatched []string
 	if !drops.Empty() {
 		// Every listed table that exists is in tables by now: the loader
 		// returned it, or it was read back in above.
@@ -1473,7 +1479,7 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		for _, ts := range tables {
 			liveNames = append(liveNames, ts.Name)
 		}
-		if unmatched := drops.Unmatched(liveNames); len(unmatched) > 0 {
+		if unmatched = drops.Unmatched(liveNames); len(unmatched) > 0 {
 			e.logger.Info("drop_tables entries name no table on the target, so the plan drops nothing for them",
 				"database", database, "entries", unmatched)
 		}
@@ -1524,6 +1530,7 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		underscore:          underscore,
 		archive:             archive,
 		reclaimed:           reclaimed,
+		unmatched:           unmatched,
 		lowerCaseTableNames: lowerCaseTableNames,
 	}, nil
 }

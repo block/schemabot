@@ -1174,9 +1174,14 @@ lists, and comments still go out, and so do the same file and tree reads when
 SchemaBot makes them to decide what a Check Run says, such as which
 environments a pull request's configs cover. A plan that needs a refused read
 fails closed: the pull request's SchemaBot check does not pass until a plan
-succeeds after the reset. A refused plan is retried on the usual schedule, not
-at the reset, so push or re-run the check after the reset if it is still
-failing.
+succeeds after the reset. When a refused read stops SchemaBot from finding a
+pull request's configs, or from running an `apply` command, SchemaBot retries
+it when the quota resets, and for three hours after the event arrived that wait
+does not use up its retry attempts. After those three hours each refusal uses
+one of the event's five attempts, so an event the quota keeps refusing at every
+hourly reset stops being retried about eight hours after it arrived, and its
+check stays failing until the next push or check re-run. A read refused while one database is being
+planned still fails that plan until the next push or check re-run.
 
 ```yaml
 github:
@@ -2636,7 +2641,7 @@ Do not require the staging ConfigMap to contain production targets, or the produ
 
 ### Freeze groups (forward-auth)
 
-An environment freeze marks an environment, or some of its deployments and databases, as frozen until it ends or someone lifts it. While a freeze is in effect, SchemaBot refuses every new apply, start and cutover it covers, unless a second person approved an override for that change. Each freeze records a running policy: `continue`, the default, lets applies that started before the freeze finish, and `stop` is recorded for a later release that will stop them. Today SchemaBot stops no running apply under either policy. Whether a freeze is in effect is decided by the database clock, so every pod agrees. A freeze is stored by the instance that serves its environment. `write_groups` members may set and lift freezes. To let others, such as incident commanders, do so without any other write, list their forwarded groups in `freeze.groups`:
+An environment freeze marks an environment, or some of its deployments and databases, as frozen until it ends or someone lifts it. While a freeze is in effect, SchemaBot refuses every new apply, start and cutover it covers, unless a second person approved an override for that change. Each freeze records a running policy: `continue`, the default, lets applies that started before the freeze finish, and `stop` stops every pending, running or paused apply it covers when the freeze is set, and withdraws a start queued on a stopped one, recording the freeze as the stop's requester. While a `stop` freeze is in effect, SchemaBot stops an apply instead of starting work on it that has not started, and holds a PlanetScale deploy queued before the freeze until the freeze ends. Status and the pull request comment name the freeze that stopped an apply. A planned `stop` freeze stops an apply already running when it starts only at the apply's next checkpoint: when a rollout starts its next deployment, or when SchemaBot recovers a drive that crashed or failed. An apply that reaches neither keeps running. Whether a freeze is in effect is decided by the database clock, so every pod agrees. A freeze is stored by the instance that serves its environment. `write_groups` members may set and lift freezes. To let others, such as incident commanders, do so without any other write, list their forwarded groups in `freeze.groups`:
 
 ```yaml
 auth:

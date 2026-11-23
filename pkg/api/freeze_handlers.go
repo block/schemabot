@@ -57,7 +57,20 @@ func (s *Service) handleFreezeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logger.Info("environment freeze set", freezeLogArgs(created, created.CreatedBy)...)
-	s.writeJSON(w, http.StatusCreated, freezeResponse(created, now))
+	response := freezeResponse(created, now)
+	if created.Running == storage.FreezeRunningStop {
+		// The sweep stops each covered apply in turn, and a stop can wait on
+		// an engine, so the responder's report may outlive the server-wide
+		// write timeout.
+		if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(freezeStopSweepWriteBudget)); err != nil {
+			s.logger.Warn("failed to extend the write deadline for the freeze's stop sweep; the server-wide write timeout still applies",
+				append(freezeLogArgs(created, created.CreatedBy), "error", err)...)
+		}
+	}
+	// The freeze is stored, so it already refuses new changes. A caller that
+	// goes away mid-sweep must not leave the rest of its scope running.
+	response.StopSweep = s.stopAppliesForFreeze(context.WithoutCancel(r.Context()), created, now)
+	s.writeJSON(w, http.StatusCreated, response)
 }
 
 // freezeFromRequest validates a create request and fills its defaults.

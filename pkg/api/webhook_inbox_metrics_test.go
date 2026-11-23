@@ -53,6 +53,10 @@ func (f *fakeWebhookEventStore) MarkFailed(context.Context, int64, string, strin
 	return errors.New("unused")
 }
 
+func (f *fakeWebhookEventStore) MarkFailedUncharged(context.Context, int64, string, string, time.Time) error {
+	return errors.New("unused")
+}
+
 func (f *fakeWebhookEventStore) MarkFailedPermanent(context.Context, int64, string, string) error {
 	return errors.New("unused")
 }

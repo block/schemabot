@@ -155,6 +155,10 @@ type Handler struct {
 	// refusing to complete a delivery after lease loss) can be exercised
 	// deterministically. Production code never sets it.
 	durableWebhookProcessOverride func(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error)
+	// durableWebhookRetryJitterOverride is a test seam that replaces
+	// durableWebhookRetryJitter so the random spread on a retry wait is
+	// deterministic. Production code never sets it.
+	durableWebhookRetryJitterOverride func(limit time.Duration) time.Duration
 
 	// inProcessWebhookCount tracks the detached goSafe goroutines that
 	// non-durable event paths (issue_comment, participant_nudge, check_run,
@@ -973,9 +977,10 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
 		display := resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops, nil)
 		view := h.shardedPlans.resolve(ctx, h.service.Storage(), apply, ops)
+		stoppedByFreeze := h.service.StoppedByFreeze(ctx, apply)
 		rejections := loadControlRejections(ctx, h.service.Storage(), h.logger, apply)
 		renderBody := func(apply *storage.Apply) string {
-			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, view, h.deploymentTenant(), h.cliName())
+			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, view, h.deploymentTenant(), h.cliName(), stoppedByFreeze)
 			return body + renderControlRejections(rejections, h.logger, apply, body)
 		}
 		summaryBody := summaryWithFailureLogs(ctx, h.service.Storage(), h.engineLogReader(), h.logger, apply, renderBody)

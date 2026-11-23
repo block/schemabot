@@ -248,6 +248,9 @@ func TestPostgresParserClassify(t *testing.T) {
 		{"create index names the indexed table", "CREATE INDEX idx_users_email ON users (email)", StatementCreateIndex, "users"},
 		{"drop index has no table name", "DROP INDEX idx_users_email", StatementDropIndex, ""},
 		{"create view", "CREATE VIEW active_users AS SELECT id FROM users", StatementCreateView, "active_users"},
+		{"alter type add value names the type", "ALTER TYPE order_status ADD VALUE 'paid' BEFORE 'shipped'", StatementAlterType, "order_status"},
+		{"alter type schema-qualified returns bare name", "ALTER TYPE app.order_status ADD VALUE 'paid'", StatementAlterType, "order_status"},
+		{"alter type rename value names the type", "ALTER TYPE app.order_status RENAME VALUE 'paid' TO 'settled'", StatementAlterType, "order_status"},
 		{"insert", "INSERT INTO users (id) VALUES (1)", StatementInsert, "users"},
 		{"update", "UPDATE users SET email = 'x'", StatementUpdate, "users"},
 		{"delete", "DELETE FROM users WHERE id = 1", StatementDelete, "users"},
@@ -369,6 +372,13 @@ func TestPostgresParserCanonicalizeUnqualified(t *testing.T) {
 	t.Run("alter table drops the qualifier on its relation and on an added foreign key", func(t *testing.T) {
 		got := p.CanonicalizeUnqualified(`ALTER TABLE "app-region-a".orders ADD COLUMN export_prefix text, ADD CONSTRAINT orders_customer_fkey FOREIGN KEY (customer_id) REFERENCES "app-region-a".customers (id)`)
 		assert.Equal(t, "ALTER TABLE orders ADD COLUMN export_prefix text, ADD CONSTRAINT orders_customer_fkey FOREIGN KEY (customer_id) REFERENCES customers (id)", got)
+	})
+
+	t.Run("alter type reduces to the bare type name", func(t *testing.T) {
+		regionA := p.CanonicalizeUnqualified(`ALTER TYPE "app-region-a".order_status ADD VALUE 'paid' BEFORE 'shipped'`)
+		regionB := p.CanonicalizeUnqualified(`ALTER TYPE "app-region-b".order_status ADD VALUE 'paid' BEFORE 'shipped'`)
+		assert.Equal(t, regionA, regionB)
+		assert.Equal(t, "ALTER TYPE order_status ADD VALUE 'paid' BEFORE 'shipped'", regionA)
 	})
 
 	t.Run("drop table and drop index reduce to the bare object name", func(t *testing.T) {
