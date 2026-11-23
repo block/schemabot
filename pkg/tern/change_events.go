@@ -12,11 +12,13 @@ func (c *GRPCClient) changeEventDispatch(apply *storage.Apply, scope applyTaskSc
 		return nil
 	}
 	dispatch := &ternv1.ChangeEventDispatch{
-		ApplyId: apply.ApplyIdentifier, Deployment: scope.operation.Deployment,
+		ApplyId: apply.ApplyIdentifier, App: apply.Database, Deployment: scope.operation.Deployment,
 		OperationIds: scope.deploymentOperationIDs, PullRequestUrl: apply.ChangeEventPullRequestURL(),
 	}
 	if c.changeEventApp != nil {
-		dispatch.App = c.changeEventApp(apply.Database)
+		if app := c.changeEventApp(apply.Database); app != "" {
+			dispatch.App = app
+		}
 	}
 	if !scope.usesOperationRemoteResume() {
 		dispatch.AttemptOffset = int32(scope.operation.Attempt)
