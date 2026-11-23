@@ -30,7 +30,10 @@ type OutboxEvent struct {
 // deliver the same event; publication is recorded only after transport acceptance.
 type OutboxStore interface {
 	MaxID(ctx context.Context) (int64, error)
+	// ListUnpublished excludes quarantined intent from future delivery batches.
 	ListUnpublished(ctx context.Context, afterID int64, limit int) ([]*OutboxEvent, error)
+	// Quarantine atomically isolates an unaccepted notification and records an apply log.
+	Quarantine(ctx context.Context, id int64) error
 	MarkPublished(ctx context.Context, id int64) error
 	OldestUnpublishedAt(ctx context.Context) (*time.Time, error)
 }

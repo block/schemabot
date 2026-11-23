@@ -1,6 +1,7 @@
 package notifications
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,17 +14,22 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 type memoryOutbox struct {
-	events     []*storage.OutboxEvent
-	published  map[int64]bool
-	markErr    error
-	listErr    error
-	oldestErr  error
-	maxIDErr   error
-	limits     []int
-	batchSizes []int
+	events        []*storage.OutboxEvent
+	published     map[int64]bool
+	quarantined   map[int64]bool
+	quarantineErr error
+	markErr       error
+	listErr       error
+	oldestErr     error
+	maxIDErr      error
+	limits        []int
+	batchSizes    []int
 }
 
 func (m *memoryOutbox) MaxID(context.Context) (int64, error) {
@@ -38,7 +44,7 @@ func (m *memoryOutbox) ListUnpublished(_ context.Context, afterID int64, limit i
 	m.limits = append(m.limits, limit)
 	var events []*storage.OutboxEvent
 	for _, event := range m.events {
-		if event.ID > afterID && !m.published[event.ID] {
+		if event.ID > afterID && !m.published[event.ID] && !m.quarantined[event.ID] {
 			events = append(events, event)
 			if len(events) == limit {
 				break
@@ -74,7 +80,7 @@ func (f publisherFunc) Publish(ctx context.Context, payload json.RawMessage) err
 
 func newMemoryOutbox(t *testing.T, count int) *memoryOutbox {
 	t.Helper()
-	outbox := &memoryOutbox{published: make(map[int64]bool)}
+	outbox := &memoryOutbox{published: make(map[int64]bool), quarantined: make(map[int64]bool)}
 	for i := 1; i <= count; i++ {
 		payload, err := json.Marshal(storage.ApplyCompletedEvent{ID: fmt.Sprintf("apply_%d", i), Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "production", CompletedAt: time.Now().UTC()})
 		require.NoError(t, err)
@@ -208,4 +214,141 @@ func TestSenderStorageErrorsRemainVisible(t *testing.T) {
 	store.listErr = nil
 	store.oldestErr = errors.New("age unavailable")
 	require.ErrorContains(t, sender.sendBatch(t.Context()), "age unavailable")
+}
+
+func (m *memoryOutbox) Quarantine(_ context.Context, id int64) error {
+	if m.quarantineErr != nil {
+		return m.quarantineErr
+	}
+	m.quarantined[id] = true
+	return nil
+}
+
+// A panicking notification is isolated durably, while later rows deliver and
+// a fresh sender observes the same exclusion without losing backlog visibility.
+func TestSenderPanicQuarantine(t *testing.T) {
+	reader := metric.NewManualReader()
+	provider := metric.NewMeterProvider(metric.WithReader(reader))
+	previous := otel.GetMeterProvider()
+	otel.SetMeterProvider(provider)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(previous)
+		require.NoError(t, provider.Shutdown(context.WithoutCancel(t.Context())))
+	})
+	store := newMemoryOutbox(t, 2)
+	var output bytes.Buffer
+	var attempts []string
+	publisher := publisherFunc(func(_ context.Context, payload json.RawMessage) error {
+		var message storage.ApplyCompletedEvent
+		require.NoError(t, json.Unmarshal(payload, &message))
+		attempts = append(attempts, message.ID)
+		if message.ID == "apply_1" {
+			panic("publisher fault")
+		}
+		return nil
+	})
+	logger := slog.New(slog.NewJSONHandler(&output, nil))
+	sender := NewSender(store, publisher, logger)
+	require.NoError(t, sender.sendBatch(t.Context()))
+	require.NoError(t, sender.sendBatch(t.Context()))
+	require.NoError(t, NewSender(store, publisher, logger).sendBatch(t.Context()))
+	assert.Equal(t, []string{"apply_1", "apply_2"}, attempts)
+	assert.True(t, store.quarantined[1])
+	assert.False(t, store.published[1])
+	assert.True(t, store.published[2])
+	assert.Contains(t, output.String(), `"apply_id":"apply_1"`)
+	var data metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &data))
+	var panicCount int64
+	var oldestAge int64
+	for _, scope := range data.ScopeMetrics {
+		for _, instrument := range scope.Metrics {
+			switch instrument.Name {
+			case "schemabot.panic.recovered_total":
+				sum, ok := instrument.Data.(metricdata.Sum[int64])
+				require.True(t, ok)
+				for _, point := range sum.DataPoints {
+					operation, ok := point.Attributes.Value("operation")
+					require.True(t, ok)
+					assert.Equal(t, "completion_sender", operation.AsString())
+					panicCount += point.Value
+				}
+			case "schemabot.outbox.oldest_unpublished_age":
+				gauge, ok := instrument.Data.(metricdata.Gauge[int64])
+				require.True(t, ok)
+				require.Len(t, gauge.DataPoints, 1)
+				oldestAge = gauge.DataPoints[0].Value
+			}
+		}
+	}
+	assert.Equal(t, int64(1), panicCount)
+	assert.GreaterOrEqual(t, oldestAge, int64(60), "quarantine is still unaccepted intent")
+}
+
+func TestSenderQuarantineFailureRemainsVisible(t *testing.T) {
+	store := newMemoryOutbox(t, 2)
+	store.quarantineErr = errors.New("diagnostic storage unavailable")
+	var output bytes.Buffer
+	publisher := publisherFunc(func(_ context.Context, payload json.RawMessage) error {
+		var message storage.ApplyCompletedEvent
+		require.NoError(t, json.Unmarshal(payload, &message))
+		if message.ID == "apply_1" {
+			panic("publisher fault")
+		}
+		return nil
+	})
+	sender := NewSender(store, publisher, slog.New(slog.NewJSONHandler(&output, nil)))
+	require.Error(t, sender.sendBatch(t.Context()))
+	assert.False(t, store.quarantined[1])
+	assert.False(t, store.published[1])
+	assert.True(t, store.published[2])
+	assert.Contains(t, output.String(), "completion notification quarantine failed")
+	assert.Contains(t, output.String(), "diagnostic storage unavailable")
+}
+
+func TestSenderFailureIdentityLogs(t *testing.T) {
+	for _, malformed := range []bool{false, true} {
+		for _, markFailure := range []bool{false, true} {
+			t.Run(fmt.Sprintf("Malformed=%v/MarkFailure=%v", malformed, markFailure), func(t *testing.T) {
+				store := newMemoryOutbox(t, 1)
+				if malformed {
+					store.events[0].Payload = json.RawMessage(`{"secret":"do-not-log",`)
+				}
+				if markFailure {
+					store.markErr = errors.New("mark unavailable")
+				}
+				var output bytes.Buffer
+				publisher := publisherFunc(func(context.Context, json.RawMessage) error {
+					if markFailure {
+						return nil
+					}
+					return errors.New("transport unavailable")
+				})
+				sender := NewSender(store, publisher, slog.New(slog.NewJSONHandler(&output, nil)))
+				require.Error(t, sender.sendBatch(t.Context()))
+				log := output.String()
+				assert.Contains(t, log, `"outbox_id":1`)
+				assert.NotContains(t, log, "do-not-log")
+				if malformed {
+					assert.Contains(t, log, "identity_decode_error")
+				} else {
+					assert.Contains(t, log, `"apply_id":"apply_1"`)
+					assert.Contains(t, log, `"database":"orders"`)
+					assert.Contains(t, log, `"database_type":"mysql"`)
+					assert.Contains(t, log, `"environment":"production"`)
+				}
+			})
+		}
+	}
+	// A malformed diagnostic payload is still handed to the transport unchanged.
+	store := newMemoryOutbox(t, 1)
+	store.events[0].Payload = json.RawMessage(`invalid-json`)
+	var sent json.RawMessage
+	sender := NewSender(store, publisherFunc(func(_ context.Context, payload json.RawMessage) error {
+		sent = payload
+		return nil
+	}), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, sender.sendBatch(t.Context()))
+	assert.Equal(t, store.events[0].Payload, sent)
+	assert.True(t, store.published[1])
 }

@@ -5,6 +5,7 @@ CREATE TABLE outbox_events (
   payload jsonb NOT NULL,
   created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   published_at timestamp DEFAULT NULL,
+  quarantine_token varchar(36) DEFAULT NULL,
   PRIMARY KEY (id)
 );
 CREATE INDEX idx_outbox_events_unpublished ON outbox_events (published_at, created_at, id);

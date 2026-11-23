@@ -4,9 +4,12 @@ package sqlstore
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +20,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/storagetest"
 	"github.com/block/schemabot/pkg/testutil"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -213,4 +217,180 @@ func assertRestartedSenderDelivers(t *testing.T, store *Storage, applyIdentifier
 		require.NoError(c, err)
 		assert.Empty(c, events)
 	}, leaseStealRaceDeadline, 10*time.Millisecond)
+}
+
+type rejectQuarantineDiagnosticBinder struct{ binder }
+
+func (b rejectQuarantineDiagnosticBinder) Rebind(query string) string {
+	if strings.Contains(query, "INSERT INTO apply_logs") {
+		return "INSERT INTO nonexistent_notification_diagnostic (message) VALUES ('rejected')"
+	}
+	return b.binder.Rebind(query)
+}
+
+// A quarantine survives storage reconstruction, excludes future delivery and
+// remains unaccepted. Release targets the observed incident only; a later
+// quarantine cannot be released with the first incident's token.
+func TestMySQLNotificationQuarantine(t *testing.T) {
+	testNotificationQuarantine(t, func(t *testing.T) *Storage {
+		t.Helper()
+		clearTables(t)
+		return NewMySQL(testDB)
+	})
+}
+
+// PostgreSQL shares the same quarantine and guarded release transaction
+// semantics, including rollback when the durable diagnostic cannot be written.
+func TestPostgresNotificationQuarantine(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "outbox_quarantine")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	testNotificationQuarantine(t, func(t *testing.T) *Storage {
+		t.Helper()
+		clearPostgresTables(t, db)
+		return NewPostgres(db)
+	})
+}
+
+func testNotificationQuarantine(t *testing.T, newStore func(*testing.T) *Storage) {
+	t.Helper()
+	store := newStore(t)
+	ctx, cancel := context.WithTimeout(t.Context(), leaseStealRaceDeadline)
+	defer cancel()
+	lock := storagetest.CreateLock(t, store, "outbox_quarantine", storage.DatabaseTypeMySQL)
+	apply := storagetest.CreateApplyWithStateAndEnv(t, store, lock, "apply_quarantine", 0, state.Apply.Running, "staging")
+	apply.State = state.Apply.Completed
+	require.NoError(t, store.Applies().Update(ctx, apply))
+	events, err := store.OutboxEvents().ListUnpublished(ctx, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	event := events[0]
+	original := store.db.binder
+	store.db.binder = rejectQuarantineDiagnosticBinder{original}
+	require.ErrorContains(t, store.OutboxEvents().Quarantine(ctx, event.ID), "record quarantine diagnostic")
+	store.db.binder = original
+	var token sql.NullString
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT quarantine_token FROM outbox_events WHERE id = ?`, event.ID).Scan(&token))
+	assert.False(t, token.Valid, "a missing diagnostic rolls back the marker")
+	logs, err := store.ApplyLogs().GetByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Empty(t, logs)
+	require.NoError(t, store.OutboxEvents().Quarantine(ctx, event.ID))
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT quarantine_token FROM outbox_events WHERE id = ?`, event.ID).Scan(&token))
+	require.True(t, token.Valid)
+	firstToken := token.String
+	var restarted *Storage
+	if _, mysql := original.(MySQLDialect); mysql {
+		restarted = NewMySQL(store.db.pool)
+	} else {
+		restarted = NewPostgres(store.db.pool)
+	}
+	events, err = restarted.OutboxEvents().ListUnpublished(ctx, 0, 10)
+	require.NoError(t, err)
+	assert.Empty(t, events)
+	oldest, err := restarted.OutboxEvents().OldestUnpublishedAt(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, oldest)
+	assert.WithinDuration(t, event.CreatedAt, *oldest, time.Second)
+	assert.False(t, releaseNotificationForTest(t, ctx, restarted, event.ID, "stale-incident", true))
+	assert.False(t, releaseNotificationForTest(t, ctx, restarted, event.ID, firstToken, false), "operator rollback preserves quarantine and diagnostic atomicity")
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT quarantine_token FROM outbox_events WHERE id = ?`, event.ID).Scan(&token))
+	assert.Equal(t, firstToken, token.String)
+	logs, err = store.ApplyLogs().GetByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, logs, 1)
+	assert.True(t, releaseNotificationForTest(t, ctx, restarted, event.ID, firstToken, true))
+	events, err = restarted.OutboxEvents().ListUnpublished(ctx, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	assert.JSONEq(t, string(event.Payload), string(events[0].Payload))
+	require.NoError(t, restarted.OutboxEvents().Quarantine(ctx, event.ID))
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT quarantine_token FROM outbox_events WHERE id = ?`, event.ID).Scan(&token))
+	assert.NotEqual(t, firstToken, token.String, "incident identity does not depend on timestamp precision")
+	assert.False(t, releaseNotificationForTest(t, ctx, restarted, event.ID, firstToken, true))
+	logs, err = store.ApplyLogs().GetByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, logs, 3, "two quarantines and one committed release")
+	stored, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Completed, stored.State)
+	var published sql.NullTime
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT published_at FROM outbox_events WHERE id = ?`, event.ID).Scan(&published))
+	assert.False(t, published.Valid)
+}
+
+// Execute the runbook SQL itself, substituting only its fictional incident.
+// MySQL requires interactive count checks; PostgreSQL checks inside its DO block.
+func releaseNotificationForTest(t *testing.T, ctx context.Context, store *Storage, id int64, token string, commit bool) bool {
+	t.Helper()
+	doc, err := os.ReadFile("../../../../docs/configuration.md")
+	require.NoError(t, err)
+	mysql := false
+	if _, ok := store.db.binder.(MySQLDialect); ok {
+		mysql = true
+	}
+	heading := "#### PostgreSQL storage"
+	if mysql {
+		heading = "#### MySQL storage"
+	}
+	_, section, found := strings.Cut(string(doc), heading)
+	require.True(t, found)
+	section, _, _ = strings.Cut(section, "\n## ")
+	section, _, _ = strings.Cut(section, "\n#### ")
+	var blocks []string
+	for {
+		_, rest, ok := strings.Cut(section, "```sql\n")
+		if !ok {
+			break
+		}
+		block, rest, ok := strings.Cut(rest, "```")
+		require.True(t, ok)
+		blocks = append(blocks, block)
+		section = rest
+	}
+	require.NotEmpty(t, blocks)
+	script := strings.Join(blocks, "\n")
+	script = strings.ReplaceAll(script, "123", fmt.Sprint(id))
+	script = strings.ReplaceAll(script, "11111111-1111-4111-8111-111111111111", token)
+	tx, err := store.db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer rollbackTx(ctx, tx, "release notification in test")
+	if mysql {
+		for statement := range strings.SplitSeq(script, ";") {
+			statement = strings.TrimSpace(statement)
+			switch {
+			case statement == "", statement == "START TRANSACTION", statement == "COMMIT":
+				continue
+			case strings.HasPrefix(statement, "SELECT `id`"):
+				rows, err := tx.QueryContext(ctx, statement)
+				require.NoError(t, err)
+				utils.CloseAndLog(rows)
+			case strings.HasPrefix(statement, "SELECT ROW_COUNT()"):
+				var count int64
+				require.NoError(t, tx.QueryRowContext(ctx, statement).Scan(&count))
+				if count != 1 {
+					return false
+				}
+			default:
+				_, err := tx.ExecContext(ctx, statement)
+				require.NoError(t, err)
+			}
+		}
+	} else {
+		script = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(script), "BEGIN;"))
+		script = strings.TrimSpace(strings.TrimSuffix(script, "COMMIT;"))
+		_, err := tx.ExecContext(ctx, script)
+		if err != nil {
+			require.ErrorContains(t, err, "Expected one release diagnostic, got 0")
+			return false
+		}
+	}
+	if !commit {
+		return false
+	}
+	require.NoError(t, tx.Commit())
+	return true
 }

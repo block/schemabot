@@ -2,11 +2,13 @@ package notifications
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/panicsafe"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -78,8 +80,8 @@ func (s *Sender) sendBatch(ctx context.Context) error {
 			return fmt.Errorf("stop completion notification batch: %w", err)
 		}
 		s.afterID = event.ID
-		if err := s.publish(ctx, event); err != nil {
-			s.logger.Warn("completion notification remains pending", "outbox_id", event.ID, "error", err)
+		if err := s.publishContained(ctx, event); err != nil {
+			s.logger.Warn("completion notification remains pending", append(s.eventLogAttrs(event), "error", err)...)
 			failed = true
 		}
 	}
@@ -105,8 +107,8 @@ func (s *Sender) sendBatch(ctx context.Context) error {
 
 func (s *Sender) publish(ctx context.Context, event *storage.OutboxEvent) error {
 	sendCtx, cancel := context.WithTimeout(ctx, operationTimeout)
+	defer cancel()
 	err := s.publisher.Publish(sendCtx, event.Payload)
-	cancel()
 	if err != nil {
 		return fmt.Errorf("publish notification %d: %w", event.ID, err)
 	}
@@ -114,6 +116,38 @@ func (s *Sender) publish(ctx context.Context, event *storage.OutboxEvent) error 
 	defer cancel()
 	if err := s.store.MarkPublished(markCtx, event.ID); err != nil {
 		return fmt.Errorf("mark accepted notification %d published: %w", event.ID, err)
+	}
+	return nil
+}
+
+// eventLogAttrs uses the immutable event identity without logging its payload.
+// A diagnostic decode failure must not prevent transport from accepting it.
+func (s *Sender) eventLogAttrs(event *storage.OutboxEvent) []any {
+	attrs := []any{"outbox_id", event.ID}
+	var completion storage.ApplyCompletedEvent
+	if err := json.Unmarshal(event.Payload, &completion); err != nil {
+		return append(attrs, "identity_decode_error", err)
+	}
+	identity := &storage.Apply{ApplyIdentifier: completion.ID, Database: completion.Database,
+		DatabaseType: completion.DatabaseType, Environment: completion.Environment,
+		Repository: completion.Repository, PullRequest: completion.PullRequest}
+	return append(attrs, identity.IdentityLogAttrs()...)
+}
+
+func (s *Sender) publishContained(ctx context.Context, event *storage.OutboxEvent) error {
+	recovered, err := panicsafe.Catch(func() error { return s.publish(ctx, event) })
+	if recovered == nil {
+		return err
+	}
+	s.logger.Error("completion notification panicked; attempting durable quarantine",
+		append(s.eventLogAttrs(event), "panic", fmt.Sprint(recovered.Value), "stack", string(recovered.Stack))...)
+	metrics.RecordRecoveredPanic(context.WithoutCancel(ctx), "completion_sender")
+	quarantineCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), operationTimeout)
+	defer cancel()
+	if err := s.store.Quarantine(quarantineCtx, event.ID); err != nil {
+		s.logger.Error("completion notification quarantine failed; a later scan can retry this notification",
+			append(s.eventLogAttrs(event), "error", err)...)
+		return fmt.Errorf("persist panic quarantine for notification %d: %w", event.ID, err)
 	}
 	return nil
 }

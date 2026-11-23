@@ -282,6 +282,10 @@ boundary in `pkg/panicsafe/panicsafe.go`, applied around webhook work units
 around enumeration, `pkg/targetprobe/targetprobe.go` around each target), and the GitHub quota
 probe (`pkg/github/quota_probe.go` around the installation list and each budget read); the contained drive
 panic becomes a permanent `failed` in `failClaimedApplyAfterDrivePanic` (`pkg/api/operator.go`).
+Completion notification panics are isolated by `publishContained`
+(`pkg/notifications/sender.go`); `Quarantine` (`pkg/storage/internal/sqlstore/outbox.go`)
+atomically records notification-only quarantine and its durable apply-log diagnostic.
+The outer sender boundary (`pkg/serve/serve.go`) contains non-row panics.
 
 ### AV-6: Mixed versions are survivable by contract, not by guesswork
 
@@ -1098,6 +1102,15 @@ to the settle (`expireRetryable`, `pkg/storage/internal/sqlstore/applies.go`), p
 dialects by the storage parity suite (`pkg/storage/storagetest/ended_operation_applies.go`). The
 drive tail leaves SchemaBot's stop pending for the settle (`completeLandedStopForHeldOpenApply`,
 `pkg/api/operator.go`).
+
+### ST-12: Completion and notification intent commit together
+
+A winning update from a persisted non-completed apply state to `completed` commits
+its notification intent in the same transaction. If recording intent fails, completion
+rolls back. Creation in an initial completed state and same-state refreshes are not
+transitions. *Enforced:* `updateOnce`, `completeDerivedState`, and
+`enqueueApplyCompleted` (`pkg/storage/internal/sqlstore/applies.go`,
+`pkg/storage/internal/sqlstore/outbox.go`).
 
 ## Ownership and leases (OW)
 

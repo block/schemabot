@@ -87,6 +87,42 @@ func TestOutboxEvents(t *testing.T, h Harness) {
 		})
 	}
 
+	t.Run("Quarantine", func(t *testing.T) {
+		store := h.NewStorage(t)
+		apply := createOutboxApply(t, store, state.Apply.Running)
+		apply.State = state.Apply.Completed
+		require.NoError(t, store.Applies().Update(t.Context(), apply))
+		events, err := store.OutboxEvents().ListUnpublished(t.Context(), 0, 10)
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		event := events[0]
+		require.NoError(t, store.OutboxEvents().Quarantine(t.Context(), event.ID))
+		require.NoError(t, store.OutboxEvents().Quarantine(t.Context(), event.ID))
+		events, err = store.OutboxEvents().ListUnpublished(t.Context(), 0, 10)
+		require.NoError(t, err)
+		assert.Empty(t, events)
+		oldest, err := store.OutboxEvents().OldestUnpublishedAt(t.Context())
+		require.NoError(t, err)
+		require.NotNil(t, oldest)
+		assert.WithinDuration(t, event.CreatedAt, *oldest, time.Second)
+		stored, err := store.Applies().Get(t.Context(), apply.ID)
+		require.NoError(t, err)
+		assert.Equal(t, state.Apply.Completed, stored.State)
+		logs, err := store.ApplyLogs().GetByApply(t.Context(), apply.ID)
+		require.NoError(t, err)
+		require.Len(t, logs, 1)
+		assert.Equal(t, storage.LogLevelError, logs[0].Level)
+		assert.Equal(t, storage.LogEventError, logs[0].EventType)
+		assert.Equal(t, "Completion notification quarantined after a panic. Repair the publisher before explicitly releasing this notification.", logs[0].Message)
+		var metadata struct {
+			OutboxID        int64  `json:"outbox_id"`
+			QuarantineToken string `json:"quarantine_token"`
+		}
+		require.NoError(t, json.Unmarshal(logs[0].Metadata, &metadata))
+		assert.Equal(t, event.ID, metadata.OutboxID)
+		assert.Len(t, metadata.QuarantineToken, 36)
+	})
+
 	t.Run("HistoricalCompletedRefresh", func(t *testing.T) {
 		store := h.NewStorage(t)
 		apply := createOutboxApply(t, store, state.Apply.Completed)
