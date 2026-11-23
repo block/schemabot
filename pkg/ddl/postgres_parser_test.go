@@ -248,6 +248,9 @@ func TestPostgresParserClassify(t *testing.T) {
 		{"create index names the indexed table", "CREATE INDEX idx_users_email ON users (email)", StatementCreateIndex, "users"},
 		{"drop index has no table name", "DROP INDEX idx_users_email", StatementDropIndex, ""},
 		{"create view", "CREATE VIEW active_users AS SELECT id FROM users", StatementCreateView, "active_users"},
+		{"alter type add value names the type", "ALTER TYPE order_status ADD VALUE 'paid' BEFORE 'shipped'", StatementAlterType, "order_status"},
+		{"alter type schema-qualified returns bare name", "ALTER TYPE app.order_status ADD VALUE 'paid'", StatementAlterType, "order_status"},
+		{"alter type rename value names the type", "ALTER TYPE app.order_status RENAME VALUE 'paid' TO 'settled'", StatementAlterType, "order_status"},
 		{"insert", "INSERT INTO users (id) VALUES (1)", StatementInsert, "users"},
 		{"update", "UPDATE users SET email = 'x'", StatementUpdate, "users"},
 		{"delete", "DELETE FROM users WHERE id = 1", StatementDelete, "users"},
@@ -369,6 +372,13 @@ func TestPostgresParserCanonicalizeUnqualified(t *testing.T) {
 	t.Run("alter table drops the qualifier on its relation and on an added foreign key", func(t *testing.T) {
 		got := p.CanonicalizeUnqualified(`ALTER TABLE "app-region-a".orders ADD COLUMN export_prefix text, ADD CONSTRAINT orders_customer_fkey FOREIGN KEY (customer_id) REFERENCES "app-region-a".customers (id)`)
 		assert.Equal(t, "ALTER TABLE orders ADD COLUMN export_prefix text, ADD CONSTRAINT orders_customer_fkey FOREIGN KEY (customer_id) REFERENCES customers (id)", got)
+	})
+
+	t.Run("alter type reduces to the bare type name", func(t *testing.T) {
+		regionA := p.CanonicalizeUnqualified(`ALTER TYPE "app-region-a".order_status ADD VALUE 'paid' BEFORE 'shipped'`)
+		regionB := p.CanonicalizeUnqualified(`ALTER TYPE "app-region-b".order_status ADD VALUE 'paid' BEFORE 'shipped'`)
+		assert.Equal(t, regionA, regionB)
+		assert.Equal(t, "ALTER TYPE order_status ADD VALUE 'paid' BEFORE 'shipped'", regionA)
 	})
 
 	t.Run("drop table and drop index reduce to the bare object name", func(t *testing.T) {
@@ -795,6 +805,12 @@ func TestPostgresAddColumnManualReason(t *testing.T) {
 			columnName: "external_id",
 			wantReason: "volatility cannot be proven",
 		},
+		{
+			name:       "typecast volatile function default",
+			createDDL:  "CREATE TABLE applies (id bigint, external_id text DEFAULT gen_random_uuid()::text)",
+			columnName: "external_id",
+			wantReason: "volatility cannot be proven",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -971,6 +987,12 @@ func TestPostgresCostScalesWithTableSize(t *testing.T) {
 		{"add column only", `ALTER TABLE mutes ADD COLUMN reason varchar(255)`, false},
 		{"add column with constant default", `ALTER TABLE mutes ADD COLUMN state text DEFAULT 'active'`, false},
 		{"add column with cast constant default", `ALTER TABLE mutes ADD COLUMN payload jsonb DEFAULT '{}'::jsonb`, false},
+		{"add column with current_timestamp default", `ALTER TABLE mutes ADD COLUMN created_at timestamptz DEFAULT CURRENT_TIMESTAMP`, false},
+		{"add not null column with current_date default", `ALTER TABLE mutes ADD COLUMN day date NOT NULL DEFAULT CURRENT_DATE`, false},
+		{"add column with cast current_timestamp default", `ALTER TABLE mutes ADD COLUMN day date DEFAULT CURRENT_TIMESTAMP::date`, false},
+		{"add column with precision localtimestamp default", `ALTER TABLE mutes ADD COLUMN seen_at timestamp DEFAULT LOCALTIMESTAMP(3)`, false},
+		{"add column with function call default", `ALTER TABLE mutes ADD COLUMN created_at timestamptz DEFAULT now()`, true},
+		{"add column with cast volatile function default", `ALTER TABLE mutes ADD COLUMN token text DEFAULT gen_random_uuid()::text`, true},
 		{"drop column", `ALTER TABLE mutes DROP COLUMN reason`, false},
 		{"set default", `ALTER TABLE mutes ALTER COLUMN count SET DEFAULT 0`, false},
 		{"drop not null", `ALTER TABLE mutes ALTER COLUMN reason DROP NOT NULL`, false},

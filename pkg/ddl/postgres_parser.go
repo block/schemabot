@@ -428,11 +428,14 @@ func alterCmdScalesWithTableSize(cmd *pgproto.AlterTableCmd) bool {
 // addColumnScalesWithTableSize reports whether adding this column forces a
 // table rewrite or scan: an inline PRIMARY KEY or UNIQUE builds an index, a
 // generated, identity, or serial column is computed for every existing row, a
-// non-constant DEFAULT is evaluated per row, an inline CHECK is validated
-// against every existing row even though the new column is NULL in all of
-// them, and a REFERENCES column with a DEFAULT validates every existing row
-// against the referenced table. A plain column with no DEFAULT (or a constant
-// one), including a nullable REFERENCES column without one, is metadata-only.
+// DEFAULT not provably non-volatile may be evaluated per row, an inline CHECK
+// is validated against every existing row even though the new column is NULL
+// in all of them, and a REFERENCES column with a DEFAULT validates every
+// existing row against the referenced table. A plain column with no DEFAULT,
+// or with one PostgreSQL evaluates once and stores in the catalog (a
+// constant, a cast of one, or CURRENT_TIMESTAMP and the other SQL value
+// functions), including a nullable REFERENCES column without one, is
+// metadata-only.
 func addColumnScalesWithTableSize(col *pgproto.ColumnDef) bool {
 	if postgresSerialType(col.GetTypeName()) {
 		return true
@@ -447,7 +450,7 @@ func addColumnScalesWithTableSize(col *pgproto.ColumnDef) bool {
 			return true
 		case pgproto.ConstrType_CONSTR_DEFAULT:
 			hasDefault = true
-			if !isConstantExpr(constraint.GetRawExpr()) {
+			if !postgresNonVolatileExpression(constraint.GetRawExpr()) {
 				return true
 			}
 		case pgproto.ConstrType_CONSTR_FOREIGN:
@@ -458,21 +461,6 @@ func addColumnScalesWithTableSize(col *pgproto.ColumnDef) bool {
 		}
 	}
 	return foreignKey && hasDefault
-}
-
-// isConstantExpr reports whether a default-value expression is a bare
-// constant, possibly wrapped in type casts (DEFAULT 'x'::jsonb). Anything
-// else — a function call, an operator expression — may be volatile, and a
-// volatile default forces a full-table rewrite on ADD COLUMN.
-func isConstantExpr(node *pgproto.Node) bool {
-	switch expr := node.GetNode().(type) {
-	case *pgproto.Node_AConst:
-		return true
-	case *pgproto.Node_TypeCast:
-		return isConstantExpr(expr.TypeCast.GetArg())
-	default:
-		return false
-	}
 }
 
 // classifyPostgresNode maps one parsed statement node onto the pkg/ddl-owned
@@ -520,6 +508,10 @@ func classifyPostgresNode(node *pgproto.Node) (StatementType, string) {
 		return StatementCreateIndex, x.IndexStmt.GetRelation().GetRelname()
 	case *pgproto.Node_ViewStmt:
 		return StatementCreateView, x.ViewStmt.GetView().GetRelname()
+	case *pgproto.Node_AlterEnumStmt:
+		// ALTER TYPE ... ADD VALUE and RENAME VALUE name the type as a
+		// qualified-name component list; the last component is its own name.
+		return StatementAlterType, lastNameComponent(x.AlterEnumStmt.GetTypeName())
 	case *pgproto.Node_InsertStmt:
 		return StatementInsert, x.InsertStmt.GetRelation().GetRelname()
 	case *pgproto.Node_UpdateStmt:
@@ -543,6 +535,15 @@ func firstDropObjectName(drop *pgproto.DropStmt) string {
 		return items[len(items)-1].GetString_().GetSval()
 	}
 	return ""
+}
+
+// lastNameComponent returns the bare object name from a qualified-name
+// component list such as a type name.
+func lastNameComponent(items []*pgproto.Node) string {
+	if len(items) == 0 {
+		return ""
+	}
+	return items[len(items)-1].GetString_().GetSval()
 }
 
 // Canonicalize implements StatementParser. It round-trips the statement
@@ -576,6 +577,7 @@ func (postgresStatementParser) CanonicalizeUnqualified(ddl string) string {
 		}
 		unqualifyRelations(stmt.ProtoReflect(), own)
 		unqualifyDropObjects(stmt.GetDropStmt(), own)
+		unqualifyEnumType(stmt.GetAlterEnumStmt(), own)
 	})
 }
 
@@ -622,6 +624,8 @@ func ownSchema(stmt *pgproto.Node) string {
 		if objects := n.DropStmt.GetObjects(); len(objects) > 0 {
 			return qualifiedNameSchema(objects[0].GetList().GetItems())
 		}
+	case *pgproto.Node_AlterEnumStmt:
+		return qualifiedNameSchema(n.AlterEnumStmt.GetTypeName())
 	}
 	return ""
 }
@@ -692,6 +696,19 @@ func unqualifyDropObjects(drop *pgproto.DropStmt, own string) {
 		if items := list.GetItems(); qualifiedNameSchema(items) == own {
 			list.Items = items[len(items)-1:]
 		}
+	}
+}
+
+// unqualifyEnumType reduces the type an ALTER TYPE changes to its bare name
+// when it lives in schema own. The type name is a qualified-name component
+// list rather than a relation reference, so the relation walk does not reach
+// it.
+func unqualifyEnumType(alter *pgproto.AlterEnumStmt, own string) {
+	if alter == nil {
+		return
+	}
+	if items := alter.GetTypeName(); qualifiedNameSchema(items) == own {
+		alter.TypeName = items[len(items)-1:]
 	}
 }
 

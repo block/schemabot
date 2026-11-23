@@ -22,7 +22,10 @@ const pollInterval = 2 * time.Second
 // maxPollInterval is the ceiling for exponential backoff on consecutive errors.
 const maxPollInterval = 30 * time.Second
 
-var callStartAPI = client.CallStartAPI
+var (
+	callStartAPI   = client.CallStartAPI
+	callCutoverAPI = client.CallCutoverAPI
+)
 
 // fetchErrorBackoff is the wait before the next progress poll after this many
 // consecutive failed fetches: the base interval doubled per failure, capped at
@@ -85,7 +88,7 @@ func (m WatchModel) triggerDeploy() tea.Cmd {
 
 func (m WatchModel) triggerCutover() tea.Cmd {
 	return func() tea.Msg {
-		result, err := client.CallCutoverAPI(m.endpoint, m.environment, m.applyID)
+		result, err := callCutoverAPI(m.endpoint, m.environment, m.applyID)
 		if err != nil {
 			return cutoverResultMsg{success: false, err: err}
 		}
@@ -153,6 +156,7 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 		released:     data.Released,
 		sharded:      data.Sharded,
 		deferCutover: data.Options["defer_cutover"] == "true",
+		stoppedBy:    data.StoppedByFreeze,
 		errorMsg:     data.ErrorMessage,
 		applyID:      result.ApplyID,
 		database:     result.Database,

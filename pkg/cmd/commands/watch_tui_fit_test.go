@@ -6,9 +6,11 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
@@ -160,4 +162,36 @@ func TestRolloutViewAcknowledgesAPendingStop(t *testing.T) {
 		m.tables[i].Status = state.Task.Stopped
 	}
 	assert.NotContains(t, m.View(), "Stopping")
+}
+
+// A stop freeze's note is wrapped to the terminal's width, so its last
+// sentences, how to wait for the freeze or start with --override, are on
+// screen rather than cut off at the window's edge.
+func TestStoppedByFreezeNoteWrapsToTheWindow(t *testing.T) {
+	freeze := &apitypes.FreezeStopRef{ID: "freeze-a1b2c3", Reason: "SEV-1234"}
+	for _, tc := range []struct {
+		name  string
+		model WatchModel
+	}{
+		{"SingleDeployment", WatchModel{initialized: true, state: state.Apply.Stopped, applyID: "apply-abc123", environment: "staging",
+			tables: []templates.TableProgress{{TableName: "orders", Status: state.Task.Stopped}}}},
+		{"Rollout", tallRollout(2)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := tc.model
+			m.state = state.Apply.Stopped
+			for i := range m.operations {
+				m.operations[i].State = state.ApplyOperation.Stopped
+			}
+			m.stoppedByFreeze = freeze
+			m.windowWidth, m.windowHeight = 70, 80
+
+			view := stripANSI(m.View())
+
+			assert.Contains(t, strings.ReplaceAll(view, "\n", " "), "--override")
+			for line := range strings.SplitSeq(view, "\n") {
+				assert.LessOrEqual(t, ansi.StringWidth(line), 70, "no line is wider than the window: %q", line)
+			}
+		})
+	}
 }

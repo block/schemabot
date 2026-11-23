@@ -185,6 +185,10 @@ func (s *recordingWebhookEventStore) MarkFailed(context.Context, int64, string, 
 	return errors.New("MarkFailed not implemented by recordingWebhookEventStore")
 }
 
+func (s *recordingWebhookEventStore) MarkFailedUncharged(context.Context, int64, string, string, time.Time) error {
+	return errors.New("MarkFailedUncharged not implemented by recordingWebhookEventStore")
+}
+
 func (s *recordingWebhookEventStore) MarkFailedPermanent(context.Context, int64, string, string) error {
 	return errors.New("MarkFailedPermanent not implemented by recordingWebhookEventStore")
 }
@@ -357,6 +361,7 @@ type scriptedWebhookEventStore struct {
 
 	completed       chan scriptedWebhookOutcome
 	failed          chan scriptedWebhookFailure
+	failedUncharged chan scriptedWebhookFailure
 	failedPermanent chan scriptedWebhookPermanentFailure
 	released        chan scriptedWebhookOutcome
 }
@@ -385,6 +390,7 @@ func newScriptedWebhookEventStore(queue ...*storage.WebhookEvent) *scriptedWebho
 		queue:                      queue,
 		completed:                  make(chan scriptedWebhookOutcome, 8),
 		failed:                     make(chan scriptedWebhookFailure, 8),
+		failedUncharged:            make(chan scriptedWebhookFailure, 8),
 		failedPermanent:            make(chan scriptedWebhookPermanentFailure, 8),
 		released:                   make(chan scriptedWebhookOutcome, 8),
 	}
@@ -459,6 +465,11 @@ func (s *scriptedWebhookEventStore) MarkFailed(_ context.Context, id int64, leas
 		return s.markFailedErr
 	}
 	s.failed <- scriptedWebhookFailure{id: id, leaseToken: leaseToken, errMsg: errMsg, retryAfter: retryAfter}
+	return nil
+}
+
+func (s *scriptedWebhookEventStore) MarkFailedUncharged(_ context.Context, id int64, leaseToken string, errMsg string, retryAfter time.Time) error {
+	s.failedUncharged <- scriptedWebhookFailure{id: id, leaseToken: leaseToken, errMsg: errMsg, retryAfter: &retryAfter}
 	return nil
 }
 

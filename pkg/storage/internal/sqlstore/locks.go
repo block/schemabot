@@ -341,15 +341,19 @@ func (s *lockStore) Release(ctx context.Context, database, dbType, owner string)
 		WHERE database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+`
 	`, database, dbType, owner)
 	if err != nil {
-		return err
+		return fmt.Errorf("release lock for %s/%s owner=%s: %w", database, dbType, owner, err)
 	}
 
-	rowsAffected, _ := result.RowsAffected()
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read rows affected releasing lock for %s/%s owner=%s: %w", database, dbType, owner, err)
+	}
 	if rowsAffected == 0 {
 		// Check if lock exists at all
 		existing, err := s.Get(ctx, database, dbType)
 		if err != nil {
-			return err
+			return fmt.Errorf("read lock after release affected no rows for %s/%s owner=%s: %w",
+				database, dbType, owner, err)
 		}
 		if existing == nil {
 			return storage.ErrLockNotFound
@@ -446,14 +450,25 @@ func (s *lockStore) ReleaseByIDIfUnused(ctx context.Context, id int64, database,
 		return fmt.Errorf("lock row for %s: %w", op, err)
 	}
 
-	statePredicate, stateArgs := nonTerminalApplyStatePredicate("state")
+	// Unsettled, not merely non-terminal: a stopped apply is terminal but can
+	// be resumed under the lock it recorded, so it still uses the lock. A
+	// terminal parent with an operation still in progress uses it too: that
+	// operation is still being driven and its drive can reopen the parent
+	// (OW-5, ST-1), as checkNoInProgressRolloutForTargets holds for targets.
+	statePredicate, stateArgs := unsettledApplyStatePredicate("a.state")
+	inProgress, inProgressArgs := operationInProgressPredicate(s.dialect, "busy")
+	args := append([]any{id}, stateArgs...)
+	args = append(args, inProgressArgs...)
 	holder, err := scanApply(tx.QueryRowContext(ctx, `
-		SELECT `+applyColumns+`
-		FROM applies
-		WHERE lock_id = ? AND `+statePredicate+`
-		ORDER BY created_at DESC, id DESC
+		SELECT `+applyColumnsForApplyAlias+`
+		FROM applies a
+		WHERE a.lock_id = ? AND (`+statePredicate+` OR EXISTS (
+			SELECT 1 FROM apply_operations busy
+			WHERE busy.apply_id = a.id AND `+inProgress+`
+		))
+		ORDER BY a.created_at DESC, a.id DESC
 		LIMIT 1
-	`, append([]any{id}, stateArgs...)...))
+	`, args...))
 	if err != nil {
 		return fmt.Errorf("read applies recording the lock for %s: %w", op, err)
 	}
@@ -482,12 +497,14 @@ func (s *lockStore) ReleaseIfPendingPlanID(ctx context.Context, database, dbType
 		WHERE database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+` AND pending_plan_id = ?
 	`, database, dbType, owner, pendingPlanID)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("release lock for %s/%s owner=%s pending plan %s: %w",
+			database, dbType, owner, pendingPlanID, err)
 	}
 
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("read rows affected releasing lock for %s/%s owner=%s pending plan %s: %w",
+			database, dbType, owner, pendingPlanID, err)
 	}
 	return rowsAffected > 0, nil
 }
@@ -528,10 +545,17 @@ func (s *lockStore) ForceRelease(ctx context.Context, database, dbType string) e
 		WHERE database_name = ? AND database_type = ?
 	`, database, dbType)
 	if err != nil {
-		return err
+		return fmt.Errorf("force release lock for %s/%s: %w", database, dbType, err)
 	}
 
-	return checkRowsAffected(result, storage.ErrLockNotFound)
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read rows affected force releasing lock for %s/%s: %w", database, dbType, err)
+	}
+	if rowsAffected == 0 {
+		return storage.ErrLockNotFound
+	}
+	return nil
 }
 
 // Get returns a lock by database name and type, or nil if not found.
@@ -544,7 +568,11 @@ func (s *lockStore) Get(ctx context.Context, database, dbType string) (*storage.
 		WHERE database_name = ? AND database_type = ?
 	`, database, dbType)
 
-	return scanLock(row)
+	lock, err := scanLock(row)
+	if err != nil {
+		return nil, fmt.Errorf("get lock for %s/%s: %w", database, dbType, err)
+	}
+	return lock, nil
 }
 
 // List returns all active locks.
@@ -555,7 +583,7 @@ func (s *lockStore) List(ctx context.Context) ([]*storage.Lock, error) {
 		ORDER BY created_at DESC
 	`)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("query all locks: %w", err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -643,7 +671,10 @@ func scanLocks(rows *sql.Rows) ([]*storage.Lock, error) {
 		}
 		locks = append(locks, lock)
 	}
-	return locks, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate lock rows: %w", err)
+	}
+	return locks, nil
 }
 
 // scanLockInto scans lock data from any scanner (Row or Rows).
@@ -661,7 +692,7 @@ func scanLockInto(s scanner) (*storage.Lock, error) {
 		&lock.CreatedAt, &lock.UpdatedAt,
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("scan lock row: %w", err)
 	}
 
 	if len(disclosedCopies) > 0 {

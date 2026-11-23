@@ -251,7 +251,7 @@ jobs:
             postgres:16 \
             postgres:17 \
             ministackorg/ministack:1.5.10 \
-            testcontainers/ryuk:0.13.0
+            testcontainers/ryuk:0.14.0
       - name: "Pre-pull Supabase PostgreSQL"
         if: matrix.shard == 'pkg/engine'
         run: scripts/ci/prepull-images.sh supabase/postgres:17.6.1.136@sha256:f371b5f3f2ac0a05703f33d6e6134515fb2498cab708fb948a0aeb7481467c00
@@ -447,7 +447,7 @@ jobs:
         run: |
           scripts/ci/prepull-images.sh \
             mysql:8.0 \
-            testcontainers/ryuk:0.13.0 \
+            testcontainers/ryuk:0.14.0 \
             --dockerfile deploy/local/Dockerfile.localscale
       - name: "Build LocalScale image"
         run: |

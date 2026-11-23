@@ -214,6 +214,11 @@ type ApplyStatusCommentData struct {
 	// saved and a new apply resumes them.
 	StoppedAtCutover presentation.StoppedAtCutover
 
+	// StoppedByFreeze names the freeze that stopped the apply, nil when an
+	// operator stopped it or it is not stopped. A stopped comment says so
+	// above its resume command.
+	StoppedByFreeze *apitypes.FreezeStopRef
+
 	// SkipRevert reports whether the apply was started with --skip-revert (the
 	// apply's durable skip-revert option). Before cutover it is listed on the
 	// options line beside DeferCutover, as the plan listed it.
@@ -1119,7 +1124,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		// the source before cutover. On a large table this can run for hours, so
 		// show how far the verification has progressed once Spirit reports a total.
 		if table.ChecksumRowsTotal > 0 {
-			pct := ui.ClampPercent(int(table.ChecksumRowsChecked * 100 / table.ChecksumRowsTotal))
+			pct := ui.ChecksumDisplayPercent(table.ChecksumRowsChecked, table.ChecksumRowsTotal)
 			fmt.Fprintf(sb, "**%s**: %s \U0001f50d Checksumming to verify data (%s)%s\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(pct),
 				ui.FormatRowCopyPercent(pct, table.ChecksumRowsChecked, table.ChecksumRowsTotal), throttledSuffix(table))
 			writeDDLLine(sb, dialect, table.DDL, budget)
@@ -1553,6 +1558,7 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:",
 			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To cancel it:")
 	case state.Apply.Stopped:
+		writeStoppedByFreeze(sb, data.StoppedByFreeze)
 		writeMemberFooterAction(sb, data, "Paused — to resume from where it stopped:", AppendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.Cancelled:
 		sb.WriteString("\n---\n\n")
@@ -1695,6 +1701,7 @@ func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, compl
 	}
 
 	writeSummaryTableList(sb, data, budget)
+	writeStoppedByFreeze(sb, data.StoppedByFreeze)
 	writeMemberFooterAction(sb, data, "Paused — to resume from where it stopped:", AppendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 }
 

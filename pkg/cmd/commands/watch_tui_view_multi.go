@@ -60,6 +60,7 @@ func (m WatchModel) multiDeploymentProgressSections() (string, string) {
 		f.WriteString(footer + "\n")
 	}
 	m.writeMultiDeploymentFooter(&f, model, view.StopByKey)
+	f.WriteString(m.changeGateFooter())
 	return header.String() + body, f.String()
 }
 
@@ -194,6 +195,9 @@ func (m WatchModel) writeMultiDeploymentOutcome(b *strings.Builder, model presen
 		b.WriteString("\n")
 	case state.IsState(model.State, state.Apply.Stopped):
 		b.WriteString(templates.FormatApplyStopped() + outcomeCounts(model, groups) + "\n")
+		if text := templates.StoppedByFreezeText(m.stoppedByFreeze, m.applyID, m.environment); text != "" {
+			b.WriteString(m.wrapToWindow("⏹️ "+text) + "\n")
+		}
 	case state.IsState(model.State, state.Apply.Failed):
 		b.WriteString(templates.FormatApplyFailedHeadline() + outcomeCounts(model, groups) + "\n")
 	case state.IsState(model.State, state.Apply.Cancelled):
