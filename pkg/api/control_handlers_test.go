@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -273,6 +274,94 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 			}
 		})
 	}
+}
+
+// An in-process control request names its environment the way the HTTP routes
+// accept it: spelling case does not change which environment is meant. Every
+// in-process control operation therefore answers a mixed-case environment
+// exactly as it answers the lowercase one, and a different environment is still
+// refused.
+func TestExecuteControlOperationsFoldEnvironmentCase(t *testing.T) {
+	executors := map[string]func(svc *Service, req apitypes.ControlRequest) error{
+		"stop": func(svc *Service, req apitypes.ControlRequest) error {
+			_, err := svc.ExecuteStop(t.Context(), req)
+			return err
+		},
+		"cancel": func(svc *Service, req apitypes.ControlRequest) error {
+			_, err := svc.ExecuteCancel(t.Context(), req)
+			return err
+		},
+		"start": func(svc *Service, req apitypes.ControlRequest) error {
+			_, err := svc.ExecuteStart(t.Context(), req)
+			return err
+		},
+		"cutover": func(svc *Service, req apitypes.ControlRequest) error {
+			_, err := svc.ExecuteCutover(t.Context(), req)
+			return err
+		},
+		"release": func(svc *Service, req apitypes.ControlRequest) error {
+			_, err := svc.ExecuteRelease(t.Context(), req)
+			return err
+		},
+		"revert": func(svc *Service, req apitypes.ControlRequest) error {
+			_, err := svc.ExecuteRevert(t.Context(), req)
+			return err
+		},
+		"skip-revert": func(svc *Service, req apitypes.ControlRequest) error {
+			_, err := svc.ExecuteSkipRevert(t.Context(), req)
+			return err
+		},
+	}
+	outcome := func(err error) string {
+		if err == nil {
+			return "accepted"
+		}
+		return err.Error()
+	}
+
+	for operation, execute := range executors {
+		t.Run(operation, func(t *testing.T) {
+			run := func(environment string) error {
+				svc := newControlTestService(&mockTernClient{}, activeTestApply("apply-env-case"))
+				return execute(svc, apitypes.ControlRequest{ApplyID: "apply-env-case", Environment: environment})
+			}
+
+			lowercase := run("staging")
+			mixedCase := run("StAgInG")
+
+			assert.NotContains(t, outcome(mixedCase), "belongs to environment")
+			assert.Equal(t, outcome(lowercase), outcome(mixedCase),
+				"a mixed-case environment must get the answer the lowercase spelling gets")
+
+			err := run("production")
+			require.Error(t, err)
+			assert.Equal(t, http.StatusBadRequest, ControlOperationHTTPStatus(err))
+			assert.Contains(t, err.Error(), `apply "apply-env-case" belongs to environment "staging", not "production"`)
+		})
+	}
+}
+
+// A stop sent from the PR-comment path under a mixed-case environment reaches
+// the data plane under the apply's own canonical environment.
+func TestExecuteStopSendsCanonicalEnvironmentToDataPlane(t *testing.T) {
+	mock := &mockTernClient{stopResp: &ternv1.StopResponse{Accepted: true, StoppedCount: 1}}
+	apply := activeTestApply("apply-stop-env-case")
+	task := &storage.Task{ID: 20, TaskIdentifier: "task-stop-env-case", ApplyID: apply.ID, State: state.Task.Running}
+	svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
+
+	resp, err := svc.ExecuteStop(t.Context(), apitypes.ControlRequest{
+		ApplyID:     "apply-stop-env-case",
+		Environment: "StAgInG",
+		Caller:      "github:stopper@octocat/hello-world#1",
+	})
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	require.NotNil(t, mock.stopReq, "the immediate stop reaches the data plane")
+	assert.Equal(t, "staging", mock.stopReq.Environment)
+	pending, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.NotNil(t, pending, "the durable stop request is recorded")
 }
 
 // assertTernClientFailureLogged checks that the server log keeps the raw

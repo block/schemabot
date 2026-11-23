@@ -159,8 +159,11 @@ type RollbackSourceRequest struct {
 // ValidateRollbackSourceApply rejects rollback requests that cannot be mapped
 // unambiguously to the rollback planner's current source apply. Until rollback
 // planning targets a selected apply directly, only the latest completed source
-// apply with stored original schema is safe to roll back.
+// apply with stored original schema is safe to roll back. The environment is
+// folded with the same function the rollback plan route uses, so both entry
+// points accept the same spellings.
 func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackSourceRequest) (*storage.Apply, *storage.Plan, error) {
+	req.Environment = storage.CanonicalKey(req.Environment)
 	if req.ApplyIdentifier == "" {
 		return nil, nil, controlHTTPErrorf(http.StatusBadRequest, "apply_id is required")
 	}
@@ -500,7 +503,12 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, o
 	return client, apply, resolvedApplyID, true
 }
 
+// controlTarget resolves the apply, environment check, and Tern client for an
+// in-process control request. The environment is folded with the same function
+// the HTTP prelude uses, so a spelling that one entry point accepts is accepted
+// by the other.
 func (s *Service) controlTarget(ctx context.Context, operation, applyIdentifier, environment string) (tern.Client, *storage.Apply, string, error) {
+	environment = storage.CanonicalKey(environment)
 	if applyIdentifier == "" {
 		return nil, nil, "", controlHTTPErrorf(http.StatusBadRequest, "apply_id is required")
 	}
@@ -1255,7 +1263,7 @@ func (s *Service) ExecuteStop(ctx context.Context, req apitypes.ControlRequest) 
 	if err != nil {
 		return nil, err
 	}
-	resp, _, err := s.executeStopForApply(ctx, client, apply, ternApplyID, req.Environment, req.Caller)
+	resp, _, err := s.executeStopForApply(ctx, client, apply, ternApplyID, apply.Environment, req.Caller)
 	return resp, err
 }
 
