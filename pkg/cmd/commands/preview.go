@@ -81,6 +81,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentPlanUnmanagedSchema,
 		templates.PreviewCommentPlanIgnoreTables,
 		templates.PreviewCommentPlanDropTables,
+		templates.PreviewCommentPlanDropTablesUnmatched,
 		templates.PreviewCommentPlanWhoCanApply,
 		templates.PreviewCommentPlanDirect,
 		templates.PreviewCommentPlanCopyDiscarded, templates.PreviewCommentPlanCopyDiscardedApplying,

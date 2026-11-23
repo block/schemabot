@@ -575,6 +575,14 @@ type PlanResult struct {
 	// ExemptTables lists live tables intentionally excluded from a plan verdict,
 	// grouped by namespace and carrying the engine-agnostic reason for exemption.
 	ExemptTables []*ExemptTables
+
+	// UnmatchedDropTables lists the request's drop_tables entries that name no
+	// live table on the target, in the order the config lists them: a typo, a
+	// case mismatch, or a table already dropped. Such an entry plans nothing,
+	// and only the engine can tell, because a listed table that exists is
+	// planned as a drop and a missing one appears nowhere in the plan. Empty
+	// when every entry matched or the request carried none.
+	UnmatchedDropTables []string
 }
 
 // ExemptTables describes live tables exempt from a plan verdict in one namespace.

@@ -190,6 +190,31 @@ func PreviewCommentPlanDropTables() string {
 	})
 }
 
+// PreviewCommentPlanDropTablesUnmatched renders the plan a repository gets
+// when its drop_tables entry has a typo. The entry names no table, so the
+// plan drops nothing and is otherwise clean, with the leftover the entry
+// meant still disclosed as skipped by its leading underscore; the comment
+// names the entry so the clean plan does not read as if the leftover was
+// seen and kept.
+func PreviewCommentPlanDropTablesUnmatched() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		ExemptTables: []ExemptTablesData{{
+			Namespace: "testapp",
+			Tables:    []string{"_events_old"},
+			Reason:    engine.ExemptReasonLeadingUnderscore,
+		}},
+		UnmatchedDropTables: []string{"_events_olds"},
+	})
+}
+
 // previewBytes returns a pointer to a sample byte estimate.
 //
 //go:fix inline

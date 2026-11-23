@@ -1831,6 +1831,15 @@ and the server logs a warning naming the entry. The plan request carries the
 entries as `drop_tables`, and they are persisted with the plan, so a resume or
 drift check of that plan proposes the same drops.
 
+A `drop_tables` entry that names no live table on the target plans nothing.
+The planner reports it in `unmatched_drop_tables`, in the order the config
+lists the entries, and the PR comment and CLI print one line per entry for the
+first 20 and count the rest in one more line. On a plan with a `rollout`, the
+field describes the primary target only, and neither the PR comment nor the
+CLI prints it. Like
+`exempt_tables`, the field is carried on the response to the plan request only
+and is omitted when every entry matched.
+
 Response excerpt from the plan request (illustrative values):
 
 ```json
@@ -1849,8 +1858,18 @@ Response excerpt from the plan request (illustrative values):
       "tables": ["events_archive_2025_01", "orders_archive_2024"],
       "reason": "archive naming"
     }
-  ]
+  ],
+  "unmatched_drop_tables": ["_orders_olds"]
 }
+```
+
+`schemabot plan` prints the same plan's disclosure lines as:
+
+```text
+ℹ️  Ignored tables in namespace app (leading underscore): _orders_old
+ℹ️  Ignored tables in namespace app (archive naming): events_archive_2025_01, orders_archive_2024
+
+⚠️  drop_tables entry "_orders_olds" names no table on the target, so this plan drops nothing for it. Fix the name, or remove the entry if the table is already gone.
 ```
 
 The list defaults to 20 plans per page and caps a page at 200, newest first.

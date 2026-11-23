@@ -1624,6 +1624,9 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 			PlanId:       result.PlanID,
 			Engine:       c.protoEngine(),
 			ExemptTables: protoExemptTables(result.ExemptTables),
+			// An entry that names no table drops nothing, so a clean plan
+			// is also where it has to be reported.
+			UnmatchedDropTables: result.UnmatchedDropTables,
 		}, nil
 	}
 
@@ -1666,13 +1669,14 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 
 	changes, violations, protoShards := c.planResultToProtoChanges(result)
 	return &ternv1.PlanResponse{
-		PlanId:         result.PlanID,
-		Engine:         c.protoEngine(),
-		Changes:        changes,
-		LintViolations: violations,
-		Shards:         protoShards,
-		ExistingCopies: c.protoExistingCopies(result, c.runningCopiesForPlan(ctx, result, req.Environment, localPlanTarget(req, c.config.Database))),
-		ExemptTables:   protoExemptTables(result.ExemptTables),
+		PlanId:              result.PlanID,
+		Engine:              c.protoEngine(),
+		Changes:             changes,
+		LintViolations:      violations,
+		Shards:              protoShards,
+		ExistingCopies:      c.protoExistingCopies(result, c.runningCopiesForPlan(ctx, result, req.Environment, localPlanTarget(req, c.config.Database))),
+		ExemptTables:        protoExemptTables(result.ExemptTables),
+		UnmatchedDropTables: result.UnmatchedDropTables,
 	}, nil
 }
 
@@ -2106,7 +2110,7 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 
 	// Copies are checked only when every namespace's plan checked its own.
 	result := &engine.PlanResult{PlanID: engine.NewPlanID(), NoChanges: true, ExistingCopiesChecked: true}
-	for _, namespace := range namespaces {
+	for i, namespace := range namespaces {
 		creds, err := c.credentialsForMySQLNamespace(namespace)
 		if err != nil {
 			return nil, err
@@ -2120,6 +2124,16 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 		result.ExistingCopies = append(result.ExistingCopies, nsResult.ExistingCopies...)
 		result.ExistingCopiesChecked = result.ExistingCopiesChecked && nsResult.ExistingCopiesChecked
 		result.ExemptTables = append(result.ExemptTables, nsResult.ExemptTables...)
+		// Every namespace is planned with the whole drop_tables list, so an
+		// entry is unmatched only when no namespace's database has the table:
+		// one that names a table in any of them plans a drop there.
+		if i == 0 {
+			result.UnmatchedDropTables = slices.Clone(nsResult.UnmatchedDropTables)
+		} else {
+			result.UnmatchedDropTables = slices.DeleteFunc(result.UnmatchedDropTables, func(entry string) bool {
+				return !slices.Contains(nsResult.UnmatchedDropTables, entry)
+			})
+		}
 		if !nsResult.NoChanges || len(nsResult.Changes) > 0 {
 			result.NoChanges = false
 		}
