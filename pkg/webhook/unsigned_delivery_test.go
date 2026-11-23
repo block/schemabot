@@ -64,3 +64,27 @@ func TestUnsignedDeliveryWithoutSecret(t *testing.T) {
 		assert.NotContains(t, logs.String(), "level=WARN")
 	})
 }
+
+// The opt-in for unsigned deliveries only applies when no secret is
+// configured. A handler given both still verifies every delivery against the
+// secret, so a forged or unsigned delivery is refused rather than accepted.
+func TestInsecureOptionDoesNotOverrideConfiguredSecret(t *testing.T) {
+	secret := []byte("configured-secret")
+	body := `{"zen":"keep it simple"}`
+	h := NewHandler(nil, nil, secret, testLogger(), WithInsecureSkipSignatureVerification())
+
+	deliver := func(sig string) int {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(body))
+		req.Header.Set("X-GitHub-Event", "ping")
+		if sig != "" {
+			req.Header.Set(headerSignature256, sig)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	assert.Equal(t, http.StatusUnauthorized, deliver(""), "unsigned delivery")
+	assert.Equal(t, http.StatusUnauthorized, deliver(signWebhookBody([]byte("other-secret"), []byte(body))), "wrongly signed delivery")
+	assert.Equal(t, http.StatusOK, deliver(signWebhookBody(secret, []byte(body))), "correctly signed delivery")
+}
