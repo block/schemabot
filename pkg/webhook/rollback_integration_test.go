@@ -1166,8 +1166,8 @@ func (s *recordingCheckStore) RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Con
 	return updated, err
 }
 
-func (s *recordingCheckStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check) (bool, error) {
-	updated, err := s.CheckStore.MarkStalePlanSuccessful(ctx, check)
+func (s *recordingCheckStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check, readHeadSHA string) (bool, error) {
+	updated, err := s.CheckStore.MarkStalePlanSuccessful(ctx, check, readHeadSHA)
 	if err == nil && updated {
 		s.record("mark_stale_plan_successful", check.DatabaseName, check.Status, check.Conclusion)
 	}

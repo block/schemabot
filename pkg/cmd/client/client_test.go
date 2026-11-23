@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -594,4 +595,61 @@ func TestScopedLogReadRefusesAnotherShardsAnswer(t *testing.T) {
 	require.EqualError(t, err, `the server answered a read of shard "-80" with shard "80-"'s logs`)
 	_, err = GetDeploymentLogs(server.URL, "apply-a", "region-a", LogScope{Shard: "-80"}, 10)
 	require.EqualError(t, err, `the server answered a read of shard "-80" with shard "80-"'s logs`)
+}
+
+// Cancelling the context abandons a log read that is still waiting on the
+// server, so a followed tail ends as soon as the operator interrupts it rather
+// than when the server answers or the request times out.
+func TestLogReadsStopWhenTheContextIsCancelled(t *testing.T) {
+	// cancelDeadline bounds how long a cancelled read may take to return. The
+	// server never answers on its own, so a read that ignores the context
+	// would wait for the client's request timeout instead.
+	const cancelDeadline = 5 * time.Second
+
+	reads := map[string]func(ctx context.Context, endpoint string) error{
+		"GetLogsCtx": func(ctx context.Context, endpoint string) error {
+			_, err := GetLogsCtx(ctx, endpoint, "", "", "apply-a", LogScope{}, 10)
+			return err
+		},
+		"GetDeploymentLogsCtx": func(ctx context.Context, endpoint string) error {
+			_, err := GetDeploymentLogsCtx(ctx, endpoint, "apply-a", "region-a", LogScope{}, 10)
+			return err
+		},
+	}
+	for name, read := range reads {
+		t.Run(name, func(t *testing.T) {
+			arrived := make(chan struct{}, 1)
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				arrived <- struct{}{}
+				select {
+				case <-r.Context().Done():
+				case <-release:
+				}
+			}))
+			t.Cleanup(server.Close)
+			// Cleanups run last-registered first, so the handler is released
+			// before the server waits for it to return.
+			t.Cleanup(func() { close(release) })
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- read(ctx, server.URL) }()
+
+			select {
+			case <-arrived:
+			case <-time.After(cancelDeadline):
+				require.FailNow(t, "the log read never reached the server")
+			}
+			cancel()
+
+			select {
+			case err := <-done:
+				require.ErrorIs(t, err, context.Canceled)
+			case <-time.After(cancelDeadline):
+				require.FailNow(t, "the log read kept waiting on the server after its context was cancelled")
+			}
+		})
+	}
 }

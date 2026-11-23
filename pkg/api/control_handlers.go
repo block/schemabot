@@ -387,7 +387,9 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply 
 	}
 	if status >= http.StatusInternalServerError {
 		s.logger.Error(opName+" failed", attrs...)
-		s.writeError(w, status, opName+" failed: "+err.Error())
+		// The code is what tells a client that an engine-unavailable 503 is
+		// worth retrying.
+		s.writeErrorCode(w, status, controlOperationErrorCode(err), opName+" failed: "+err.Error())
 	} else {
 		s.logger.Warn(opName+" rejected", attrs...)
 		s.writeErrorCode(w, status, controlOperationErrorCode(err), opName+" rejected: "+err.Error())
@@ -546,8 +548,8 @@ func (s *Service) controlTarget(ctx context.Context, operation, applyIdentifier,
 // controlEngineUnavailableMessage is what a control request answers when the
 // Tern client for its apply's deployment cannot be built. The cause can carry
 // DSN or host fragments, so it goes to the server log and never to the
-// requester. The message does not promise that a retry will succeed, because
-// the cause can also be a configuration error that only an operator can fix.
+// requester. It is used only for a failure that a later attempt can clear,
+// such as a secrets backend call that failed.
 const controlEngineUnavailableMessage = "SchemaBot could not connect to the schema change engine for this deployment. " +
 	"Retry in a moment. If it keeps failing, a SchemaBot operator can find the cause in the server log."
 
@@ -560,17 +562,25 @@ const controlEngineUnavailableMessage = "SchemaBot could not connect to the sche
 // environment, never from the failure's text, so nothing a later wrap adds to
 // that text can reach the requester.
 //
-// Any other failure means the client could not be built, for example because
-// a DSN or token did not resolve or the gRPC client did not start. That is a
-// 503 with the engine-unavailable code, which clients treat as retryable. A
-// configuration entry that exists but can never produce a client lands here
-// too, because it cannot be told apart from an outage at this point. Nothing
-// is recorded for a request answered this way, so a retry cannot wedge an
-// apply, and a caller that retries must bound its attempts.
+// A configuration entry that can never produce a client (errTernClientConfig)
+// is terminal too: a 500 with no retry code, telling the requester that an
+// operator has to fix the server configuration. Its message is built the same
+// way, from the apply alone.
+//
+// Any other failure means a call that can succeed later did not, such as a
+// secrets backend lookup for the DSN or token. That is a 503 with the
+// engine-unavailable code, which clients treat as retryable. Nothing is
+// recorded for a request answered this way, so a retry cannot wedge an apply,
+// and a caller that retries must bound its attempts.
 func controlTernClientFailure(apply *storage.Apply, deployment string, err error) error {
 	if errors.Is(err, errTernDeploymentNotConfigured) {
 		return controlHTTPCodeErrorf(http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound,
 			"no tern client configured for database %q (deployment=%q, environment=%q) — add this database to the server config",
+			apply.Database, deployment, apply.Environment)
+	}
+	if errors.Is(err, errTernClientConfig) {
+		return terminalControlf("the server configuration for database %q (deployment=%q, environment=%q) cannot produce a client for the schema change engine, so retrying will not help. "+
+			"A SchemaBot operator can find the cause in the server log and fix the configuration",
 			apply.Database, deployment, apply.Environment)
 	}
 	return controlHTTPCodeErrorf(http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable,

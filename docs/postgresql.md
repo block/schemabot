@@ -51,6 +51,7 @@ riskier way of running it.
 - Adding an index to an existing table, built with `CREATE INDEX CONCURRENTLY`.
   A running build can be cancelled.
 - Creating a table together with its indexes.
+- Adding labels to an existing enum type (see [Enum types](#enum-types)).
 - Row-level security policies on an existing table.
 - `schemabot init` and `schemabot pull` for an existing database, and
   PostgreSQL as the database that stores SchemaBot's own state.
@@ -65,6 +66,8 @@ riskier way of running it.
   table that has one.
 - **Dropping a table.** SchemaBot never runs `DROP TABLE` on PostgreSQL, and
   there is no pending-drops quarantine.
+- **Creating an enum type**, or removing or reordering its labels. Only label
+  additions run.
 - **Controls on a running change.** `stop`, `start`, `cutover`, deferred
   cutover, `revert`, and `skip-revert` are not available. `cancel` works only
   on an index build.
@@ -261,6 +264,7 @@ dedicated owner role, read [Table ownership](#table-ownership) before the first
 | `ALTER TABLE` that rewrites the table, such as most column type changes | Blocked. It needs a copy of the table, which SchemaBot does not run on PostgreSQL yet |
 | `CREATE INDEX` on an existing table | Runs as `CREATE INDEX CONCURRENTLY`, bounded by `postgres.concurrent_index_max_duration` (24 hours by default). It can be cancelled |
 | A new table, with its indexes | Runs together: the table, then its indexes, built without `CONCURRENTLY` because nothing reads the table yet. See [Greenfield tables](#greenfield-tables) |
+| A new label on an existing enum type | Runs as `ALTER TYPE ... ADD VALUE`, one label per step, before the table changes. Creating a type or removing a label fails the plan. See [Enum types](#enum-types) |
 | Row-level security policies on an existing table | Run in one transaction, after you explicitly approve them, because they change who can read rows. See [Row-level security](#row-level-security) |
 | Adding or dropping a foreign key | Shown in the plan, but blocked. See [Blocked plans](#blocked-plans) |
 | A table with no schema file, or a deleted file | Blocked as a `DROP TABLE`, except archive tables and `ignore_tables` entries. SchemaBot never drops a PostgreSQL table |
@@ -534,6 +538,50 @@ partitioned parent therefore fail with pg-sprite's typed refusal rather than a
 raw server error; they remain outside the supported SchemaBot envelope even if
 a plan is otherwise shown as native.
 
+### Enum types
+
+A schema file may declare one enum type and nothing else, with unqualified
+`CREATE TYPE ... AS ENUM` and its labels in order:
+
+```sql
+CREATE TYPE order_status AS ENUM ('new', 'paid', 'shipped', 'delivered');
+```
+
+The plan compares the file with the live type of that name in the namespace:
+
+- A type that carries every label the file lists plans no change.
+- Each label the type lacks plans one `ALTER TYPE ... ADD VALUE`, placed
+  `BEFORE` the next live label when the file lists it ahead of one.
+  SchemaBot applies them: each label is its own step, run in the order the
+  plan lists it and committed before the next step starts.
+- The engine role must be a member of the role that owns the type, as for
+  an in-place `ALTER TABLE`. When it is not, the plan blocks the steps and
+  names the grant. The apply checks again before it adds each label.
+- PostgreSQL cannot drop or move an enum label, so a file that no longer
+  lists a live label, or lists the labels in another order, fails the plan.
+  So does a type that does not exist yet, or a name that holds another kind
+  of type. Rename a label with `ALTER TYPE ... RENAME VALUE` or keep it in
+  the file, and create a new type with `CREATE TYPE` outside SchemaBot.
+
+Label additions run before the table changes in the same namespace, and
+adding a label locks only the type, never a table that uses it. A table is
+planned against the live type, so a table change that names a label the
+type does not carry yet, such as a column default, fails the plan even when
+the same plan adds the label. Apply the label first, then the table change
+that uses it.
+
+If another change adds a label after the plan was made, the apply stops at
+that step with a refusal that names the label and says to re-plan. A fresh
+plan then shows what is still missing. The same holds when another change
+renames or removes the label a step places its new label `BEFORE` or
+`AFTER`: the step is refused, not retried, names both labels, and says to
+re-plan. pg-sprite
+also refuses a step whose type name now resolves to a different type, and
+nothing is added.
+
+Two files in one namespace that declare the same type fail the plan. An enum
+type is not a table, so it never counts as an undeclared table to drop.
+
 ## Blocked plans
 
 SchemaBot blocks every planner verdict that is not a native execution verdict.
@@ -541,7 +589,9 @@ This includes changes that require copy-and-swap, require a rewrite before
 they can be planned safely, are refused by pg-sprite, or carry an unrecognized
 planner contract or verdict. A native verdict is also blocked when its
 statement shape is outside the `ALTER TABLE`, `CREATE TABLE`, and
-`CREATE INDEX` set accepted by the apply path's shape check. The admitted set
+`CREATE INDEX` set accepted by the apply path's shape check. A label
+addition planned from an enum types file is checked on its own path instead
+(see [Enum types](#enum-types)). The admitted set
 is defined by the pinned
 pg-sprite version, not by SchemaBot: when a pg-sprite upgrade widens the
 shapes its engine executes, SchemaBot's plan and apply gates widen with the
@@ -1110,7 +1160,9 @@ an unrenderable ignored table or undeclared archive does not prevent capture.
 Managed RLS tables still prevent capture until recovery can restore their
 complete access rules alongside sibling tables. Capture never strips policies to
 mark a plan rollback-capable, and a catalog read failure or cancellation still
-ends planning. [RV-7](invariants.md#rv-7-rollback-needs-the-originals)
+ends planning. Rollback never removes an enum label: capture covers tables
+only, and PostgreSQL cannot drop a label. A label the plan added stays on its
+type after rollback, while the plan's table changes are reversed. [RV-7](invariants.md#rv-7-rollback-needs-the-originals)
 requires complete originals before rollback can proceed; missing originals in
 older plans are never reconstructed from the current target.
 

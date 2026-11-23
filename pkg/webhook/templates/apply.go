@@ -1124,7 +1124,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		// the source before cutover. On a large table this can run for hours, so
 		// show how far the verification has progressed once Spirit reports a total.
 		if table.ChecksumRowsTotal > 0 {
-			pct := ui.ClampPercent(int(table.ChecksumRowsChecked * 100 / table.ChecksumRowsTotal))
+			pct := ui.ChecksumDisplayPercent(table.ChecksumRowsChecked, table.ChecksumRowsTotal)
 			fmt.Fprintf(sb, "**%s**: %s \U0001f50d Checksumming to verify data (%s)%s\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(pct),
 				ui.FormatRowCopyPercent(pct, table.ChecksumRowsChecked, table.ChecksumRowsTotal), throttledSuffix(table))
 			writeDDLLine(sb, dialect, table.DDL, budget)
