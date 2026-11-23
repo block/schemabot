@@ -3606,6 +3606,114 @@ If SchemaBot should manage them, ask a SchemaBot operator to add the directory t
 </details>
 
 <details>
+<summary><a name="freeze-apply-refused"></a><strong>Freeze: Apply Refused</strong></summary>
+
+
+## ❄️ Apply Blocked by a Freeze
+
+**Environment**: `production`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+`production` is frozen, so this command did not run. Nothing changed.
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `frz-7f3a` | until lifted | SEV-1234: payments latency, page `@payments-oncall` |
+
+### What you can do
+
+- **Wait for the freeze to end**, then run the same command again.
+- **Ask for an override** if this change can't wait. Run the same command with `--override "<why it can't wait>"`. A freeze approver other than you and the PR author must approve it: a member of `acme/freeze-approvers` or `acme/sre`.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="freeze-cutover-refused-by-two-freezes"></a><strong>Freeze: Cutover Refused By Two Freezes</strong></summary>
+
+
+## ❄️ Cutover Blocked by Freezes
+
+**Environment**: `production`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+`production` is frozen, so this command did not run. Nothing changed.
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `frz-7f3a` | until lifted | SEV-1234: payments latency |
+| `frz-91c2` | until 2026-01-15T18:00:00Z | Holiday change freeze |
+
+### What you can do
+
+- **Wait for the freezes to end**, then run the same command again.
+- **Ask for an override** if this change can't wait. Run the same command with `--override "<why it can't wait>"`. A freeze approver other than you and the PR author must approve it: a member of `acme/freeze-approvers` or `acme/sre`.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="freeze-override-requested"></a><strong>Freeze: Override Requested</strong></summary>
+
+
+## ❄️ Apply Blocked by a Freeze
+
+**Environment**: `production`
+
+*Requested by @carol at 2026-01-15 14:30:00 UTC*
+
+`production` is frozen, so this command did not run. Nothing changed.
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `frz-7f3a` | until lifted | SEV-1234: payments latency |
+
+### Override requested
+
+Override request `ovr-0123456789abcdef` is waiting for a freeze approver.
+
+**Reason the approver sees:** Index that fixes SEV-1234.
+
+**Freeze approvers**:
+- @acme/freeze-approvers
+- @acme/sre
+
+1. A freeze approver other than @carol and other than the PR author (@alice) comments:
+   ```
+   schemabot freeze approve ovr-0123456789abcdef --tenant acme
+   ```
+2. Then @carol runs this command again.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="freeze-applyconfirm-refused"></a><strong>Freeze: Apply-confirm Refused</strong></summary>
+
+
+## ❄️ Apply-confirm Blocked by a Freeze
+
+**Environment**: `production`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+`production` is frozen, so this command did not run. Nothing was applied, and the pending confirmation was released.
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `frz-91c2` | until 2026-01-15T18:00:00Z | Holiday change freeze |
+
+### What you can do
+
+- **Wait for the freeze to end**, then run `apply` again, then `apply-confirm`.
+- **Ask for an override** if this change can't wait. Run `apply` again, then run `apply-confirm` with `--override "<why it can't wait>"`. A freeze approver other than you and the PR author must approve it: a member of `acme/freeze-approvers` or `acme/sre`.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="missing-e-flag"></a><strong>Missing -e Flag</strong></summary>
 
 
@@ -6535,6 +6643,93 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 </details>
 
 <details>
+<summary><a name="stopped-by-a-freeze"></a><strong>Stopped By A Freeze</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Stopped
+
+📊 1/2 complete · 1 stopped
+
+**Schema `testapp`**
+
+**`users`**: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 72.00%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+- Rows: 1,055,687 / 1,466,232 · ~391 MB
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+> ⏹️ Stopped by freeze `freeze-a1b2c3` (SEV-1234: checkout errors). Start it again after the freeze ends or is lifted. To start it while the freeze is in effect, add `--override` and your reason to the start command, then have a freeze approver approve the request.
+
+---
+
+Paused — to resume from where it stopped:
+```
+schemabot start apply-a1b2c3d4e5f6 -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="stopped-by-a-freeze-that-has-ended"></a><strong>Stopped By A Freeze That Has Ended</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Stopped
+
+**Schema `testapp`**
+
+**`orders`**: ⏹️ Stopped (not started)
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+> ⏹️ Stopped by freeze `freeze-a1b2c3` (SEV-1234: checkout errors), which has ended. Start it again to resume it.
+
+---
+
+Paused — to resume from where it stopped:
+```
+schemabot start apply-a1b2c3d4e5f6 -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="start-withdrawn-by-a-freeze"></a><strong>Start Withdrawn By A Freeze</strong></summary>
+
+
+## Start Withdrawn
+
+**Apply**: `apply-a1b2c3d4e5f6`
+**Environment**: `staging`
+**Stopped by**: freeze `freeze-a1b2c3`
+
+A freeze that stops schema changes in this environment took effect before the start requested earlier did, so the start was withdrawn. The schema change stays stopped. Start it again after the freeze ends or is lifted, or add `--override` and your reason to the start command to ask a freeze approver to let it through.
+
+</details>
+
+<details>
 <summary><a name="resuming"></a><strong>Resuming</strong></summary>
 
 
@@ -8075,6 +8270,30 @@ The new apply will only process tables that haven't completed.
 ⏹️ Apply stopped
 To resume from where it stopped:
   schemabot start <apply_id> -e staging
+
+```
+</details>
+
+<details>
+<summary><a name="mysql-stopped-by-a-freeze"></a><strong>MySQL: Stopped By A Freeze</strong></summary>
+
+```
+
+┌────────────────────────────────────┐
+│  Apply ID:     apply-a1b2c3d4e5f6  │
+│  Database:     testapp             │
+│  Environment:  staging             │
+│  State:        Stopped             │
+└────────────────────────────────────┘
+
+  ⏹️ Stopped by freeze freeze-a1b2c3 (SEV-1234: checkout errors). Run 'schemabot start apply-a1b2c3d4e5f6 -e staging' after the freeze ends or is lifted, or add --override "<reason>" to ask a freeze approver to let it through.
+
+
+  ── testapp ──
+
+     ~ users: ⏹️ Stopped (not started)
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+
 
 ```
 </details>

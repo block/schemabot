@@ -570,12 +570,73 @@ func TestLocks(t *testing.T, h Harness) {
 		require.NotNil(t, stored, "a lock an unfinished apply records must stay held")
 		assert.Equal(t, held.ID, stored.ID)
 
+		running.State = state.Apply.Stopped
+		require.NoError(t, store.Applies().Update(ctx, running))
+		err = store.Locks().ReleaseByIDIfUnused(ctx, held.ID, "in_use_db", storage.DatabaseTypeMySQL, "testuser", "")
+		require.ErrorAs(t, err, &inUse, "a stopped apply can be resumed under its lock, so it keeps the lock")
+		assert.Equal(t, "apply_in_use_running", inUse.Apply.ApplyIdentifier)
+		assert.Equal(t, state.Apply.Stopped, inUse.Apply.State)
+
 		running.State = state.Apply.Completed
 		require.NoError(t, store.Applies().Update(ctx, running))
 		require.NoError(t, store.Locks().ReleaseByIDIfUnused(ctx, held.ID, "IN_USE_DB", "MYSQL", "testuser", ""))
 		stored, err = store.Locks().Get(ctx, "in_use_db", storage.DatabaseTypeMySQL)
 		require.NoError(t, err)
 		assert.Nil(t, stored, "the lock is released once every apply recording it is terminal")
+	})
+
+	// A rollout records failed after one deployment fails while another
+	// deployment's operation is still running. That operation is still being
+	// driven and can reopen the rollout, so the lock it runs under stays held
+	// until the operation settles.
+	t.Run("ReleaseByIDIfUnused_KeptWhileAnOperationRuns", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		held := CreateLock(t, store, "op_in_use_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateAndEnv(t, store, held, "apply_failed_with_running_op", 1, state.Apply.Pending, "production")
+		failedOp, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: rollout.ID, Deployment: "region-a", OperationKey: "schema"})
+		require.NoError(t, err)
+		runningOp, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: rollout.ID, Deployment: "region-b", OperationKey: "schema"})
+		require.NoError(t, err)
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, failedOp, state.ApplyOperation.Failed))
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, runningOp, state.ApplyOperation.Running))
+		rollout.State = state.Apply.Failed
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		err = store.Locks().ReleaseByIDIfUnused(ctx, held.ID, "op_in_use_db", storage.DatabaseTypeMySQL, "testuser", "")
+		var inUse *storage.LockInUseError
+		require.ErrorAs(t, err, &inUse, "a running operation keeps the lock its failed parent recorded")
+		assert.Equal(t, "apply_failed_with_running_op", inUse.Apply.ApplyIdentifier)
+		assert.Equal(t, state.Apply.Failed, inUse.Apply.State)
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, runningOp))
+		require.NoError(t, store.Locks().ReleaseByIDIfUnused(ctx, held.ID, "op_in_use_db", storage.DatabaseTypeMySQL, "testuser", ""),
+			"the lock is released once no operation of the failed parent is in progress")
+		stored, err := store.Locks().Get(ctx, "op_in_use_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Nil(t, stored)
+	})
+
+	// Only applies that record the lock row keep it. An apply still running
+	// under an older row of the same database, left behind when that row was
+	// force released, does not keep the row its database was locked under
+	// since.
+	t.Run("ReleaseByIDIfUnused_ApplyOnOlderRowDoesNotKeepLock", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		old := CreateLock(t, store, "older_row_db", storage.DatabaseTypeMySQL)
+		CreateApplyWithStateAndEnv(t, store, old, "apply_on_older_row", 1, state.Apply.Running, "production")
+		require.NoError(t, store.Locks().ForceRelease(ctx, "older_row_db", storage.DatabaseTypeMySQL))
+		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{DatabaseName: "older_row_db", DatabaseType: storage.DatabaseTypeMySQL, Owner: "testuser"}))
+		current, err := store.Locks().Get(ctx, "older_row_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, current)
+		require.NotEqual(t, old.ID, current.ID)
+
+		require.NoError(t, store.Locks().ReleaseByIDIfUnused(ctx, current.ID, "older_row_db", storage.DatabaseTypeMySQL, "testuser", ""))
+		stored, err := store.Locks().Get(ctx, "older_row_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Nil(t, stored)
 	})
 
 	// A lock no apply records is released, and an unfinished apply under

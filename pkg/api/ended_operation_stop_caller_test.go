@@ -30,3 +30,19 @@ func TestExecuteStopForApply_RefusesTheCallerSchemaBotReserves(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, httpErr.status)
 	assert.Contains(t, err.Error(), `the caller "schemabot" is reserved for SchemaBot's own stop`)
 }
+
+// A stop sent under a freeze's caller is refused, so no client can make its
+// stop read as one a freeze issued.
+func TestExecuteStopForApply_RefusesAFreezeCaller(t *testing.T) {
+	svc := &Service{logger: slog.New(slog.DiscardHandler)}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "orders", Environment: "staging", Engine: storage.EngineSpirit, State: state.Apply.Running}
+
+	resp, _, err := svc.executeStopForApply(t.Context(), nil, apply, apply.ApplyIdentifier, apply.Environment, storage.FreezeStopCaller("freeze-abc"))
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	var httpErr *controlOperationHTTPError
+	require.True(t, errors.As(err, &httpErr))
+	assert.Equal(t, http.StatusBadRequest, httpErr.status)
+	assert.Contains(t, err.Error(), `the caller "freeze:freeze-abc" is reserved for the stop a freeze issues`)
+}

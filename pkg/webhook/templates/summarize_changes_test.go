@@ -93,6 +93,21 @@ func TestSummarizeChanges(t *testing.T) {
 		assert.Equal(t, "1 create, 1 alter", SummarizeChanges(data))
 	})
 
+	t.Run("counts labels added to a PostgreSQL enum type as one type alter", func(t *testing.T) {
+		data := PlanCommentData{
+			DatabaseType: "postgres",
+			Changes: []KeyspaceChangeData{{
+				Keyspace: "orders",
+				Statements: []string{
+					"ALTER TABLE b ADD COLUMN raw bytea",
+					"ALTER TYPE orders.order_status ADD VALUE 'paid' BEFORE 'shipped'",
+					"ALTER TYPE orders.order_status ADD VALUE 'delivered'",
+				},
+			}},
+		}
+		assert.Equal(t, "1 alter, 1 type alter", SummarizeChanges(data))
+	})
+
 	t.Run("counts a PostgreSQL create set as one create", func(t *testing.T) {
 		data := PlanCommentData{
 			DatabaseType: "postgres",

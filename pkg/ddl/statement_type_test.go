@@ -24,6 +24,7 @@ func TestStatementTypeIsDDL(t *testing.T) {
 		{statement: StatementCreateIndex, isDDL: true},
 		{statement: StatementDropIndex, isDDL: true},
 		{statement: StatementCreateView, isDDL: true},
+		{statement: StatementAlterType, isDDL: true},
 		{statement: StatementUnknown, isDDL: false},
 		{statement: StatementInsert, isDDL: false},
 		{statement: StatementUpdate, isDDL: false},
@@ -61,6 +62,7 @@ func TestTableStatementOperationRoundTrip(t *testing.T) {
 	}{
 		{statement: StatementTruncateTable, op: "truncate"},
 		{statement: StatementCreateView, op: "create_view"},
+		{statement: StatementAlterType, op: "alter_type"},
 	}
 
 	for _, tt := range tests {

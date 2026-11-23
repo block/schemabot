@@ -1,15 +1,19 @@
 package client
 
 import (
+	"context"
 	"net/url"
 
 	"github.com/block/schemabot/pkg/apitypes"
 )
 
-// CreateFreeze sets an environment freeze.
+// CreateFreeze sets an environment freeze. A freeze with running "stop"
+// stops every covered apply before it answers, so the request uses the
+// long-running operator client: the default timeout would hide the report of
+// what it stopped.
 func CreateFreeze(endpoint string, req apitypes.CreateFreezeRequest) (*apitypes.Freeze, error) {
 	var result apitypes.Freeze
-	if err := doPostInto(endpoint, "/api/freezes", req, &result); err != nil {
+	if err := doSlowPostIntoCtx(context.Background(), endpoint, "/api/freezes", req, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil

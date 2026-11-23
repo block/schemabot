@@ -310,6 +310,45 @@ func TestUnlockKeepsLockAnUnsettledApplyRecords(t *testing.T) {
 	}
 }
 
+// An unlock matches two locks: one an active apply records, so it is kept,
+// and one a concurrent operation already released. The command answers only
+// with the refusal for the kept lock, never also with "every lock was already
+// released", which would be false for the lock still held.
+func TestUnlockKeptLockAndAlreadyReleasedLockAnswersOnlyWithTheRefusal(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := recordComments(t, mux)
+	billing := withLockID(prOwnedOrdersLock(), 42)
+	billing.DatabaseName = "billing"
+	lockStore := &unlockTestLockStore{
+		locks: []*storage.Lock{withLockID(prOwnedOrdersLock(), 41), billing},
+		releaseErrs: map[string]error{
+			"orders": &storage.LockInUseError{LockID: 41, Apply: &storage.Apply{
+				ApplyIdentifier: "apply-orders-1",
+				Database:        "orders",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+				Repository:      "octocat/hello-world",
+				PullRequest:     1,
+				State:           state.Apply.Running,
+			}},
+			"billing": storage.ErrLockNotFound,
+		},
+	}
+	st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+	h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+	retry, err := h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+
+	require.NoError(t, err)
+	assert.False(t, retry)
+	assert.Equal(t, 2, lockStore.releaseCalls)
+	assert.Empty(t, lockStore.released)
+	body := requireComment(t, comments, "cannot-unlock answer")
+	assert.Contains(t, body, "Cannot Unlock")
+	assert.Contains(t, body, "apply-orders-1")
+	assert.Empty(t, comments, "the kept lock must not be followed by 'every lock was already released'")
+}
+
 func withLockID(lock *storage.Lock, id int64) *storage.Lock {
 	lock.ID = id
 	return lock

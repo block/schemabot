@@ -260,6 +260,20 @@ func RowCopyDisplayPercent(pct int, rowsCopied int64) int {
 	return displayPercent
 }
 
+// ChecksumDisplayPercent returns the whole-number percentage for a checksum's
+// progress bar from the rows it has verified of its total. It rounds down, so
+// the bar fills only once every row is verified and never reads as finished
+// beside a percent that says otherwise, and like RowCopyDisplayPercent it
+// reports at least 1% once verification has begun. The percent beside the bar
+// renders through FormatRowCopyPercent from the same counts. With no total it
+// reports 0.
+func ChecksumDisplayPercent(rowsChecked, rowsTotal int64) int {
+	if rowsTotal <= 0 {
+		return 0
+	}
+	return RowCopyDisplayPercent(int(rowsChecked*100/rowsTotal), rowsChecked)
+}
+
 // RowCopyFraction returns row-copy progress as a float percent in [0, 100],
 // preferring the exact fraction computed from the row counts over the
 // engine's whole-number percent, which has already lost the precision. With

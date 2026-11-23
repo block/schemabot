@@ -552,6 +552,25 @@ func (s *webhookEventStore) MarkFailed(ctx context.Context, id int64, leaseToken
 	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
 }
 
+// MarkFailedUncharged marks a claimed event retryable after retryAfter and
+// refunds the attempt the claim consumed. The write is limited to a row still
+// in processing, so a repeat with the same lease token matches nothing, and
+// checkWebhookEventLeaseResult reports it as success because the token is
+// retained: the attempt is refunded once. started_at is kept, since
+// processing did begin.
+func (s *webhookEventStore) MarkFailedUncharged(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter time.Time) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, last_error = ?, retry_after = ?,
+			attempts = GREATEST(attempts - 1, 0), updated_at = NOW()
+		WHERE id = ? AND lease_token = ? AND state = ?
+	`, storage.WebhookEventFailedRetryable, nullString(errMsg), retryAfter, id, leaseToken, storage.WebhookEventProcessing)
+	if err != nil {
+		return fmt.Errorf("mark webhook event %d failed without charging an attempt: %w", id, err)
+	}
+	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
+}
+
 // MarkFailedPermanent dead-letters a claimed event whose failure the driver
 // proved deterministic for its head: the row leaves every retry and
 // reconciler-synthesis path (HasEventForHead reports the head covered) and is

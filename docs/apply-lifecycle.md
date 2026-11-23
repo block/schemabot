@@ -201,7 +201,7 @@ frees its driver, and runs its cutover once the retry succeeds. Under `barrier` 
 `rolling` they wait to start. An operation that fails every time holds them
 for its whole budget and then fails, and `on_failure` decides what the rest
 of the rollout does ([Multi-Target
-Environment](configuration.md#multi-target-environment-preview)). Stop or
+Environment](configuration.md#multi-target-environment)). Stop or
 cancel the apply to end it sooner. A member that pauses on a transient failure
 after a sibling has already failed for good, under an `on_failure` that holds
 the rollout open as `running_degraded`, is retried and charged the same way: its

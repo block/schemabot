@@ -144,8 +144,8 @@ func (s *settingsStore) Delete(ctx context.Context, key string) error {
 		DELETE FROM settings WHERE setting_key = ?
 	`, key)
 	if err != nil {
-		return err
+		return fmt.Errorf("delete setting %s: %w", key, err)
 	}
 
-	return checkRowsAffected(result, storage.ErrSettingNotFound)
+	return checkRowsAffected(result, storage.ErrSettingNotFound, "deleting setting "+key)
 }

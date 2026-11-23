@@ -34,7 +34,10 @@ func TestLockStore_ReleaseByIDIfUnusedWaitsForApplyCreate(t *testing.T) {
 // commits it sees the apply and keeps the lock instead of deleting it from
 // under a running apply.
 func testReleaseByIDIfUnusedWaitsForApplyCreate(t *testing.T, newStore func(t *testing.T) *Storage, rowWaiting lockWaiter) {
-	ctx := t.Context()
+	// The bounded waits below do not cover a database call that stalls, so
+	// every call shares the race deadline too.
+	ctx, cancel := context.WithTimeout(t.Context(), startTakeoverRaceDeadline)
+	defer cancel()
 	store := newStore(t)
 	lock := &storage.Lock{
 		DatabaseName:  "release_race_db",

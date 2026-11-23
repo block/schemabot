@@ -1588,8 +1588,10 @@ func SummarizeChanges(data PlanCommentData) string {
 
 	parts := ui.AssemblePlanSummary(counts, totalStatements,
 		func(count int, noun, op string) string {
-			if noun == "index" {
-				return fmt.Sprintf("%d index %s", count, pluralize(op, count))
+			// Table work reads bare ("3 alters"); index and type work names
+			// its noun so it never reads as table work ("1 type alter").
+			if noun != "table" {
+				return fmt.Sprintf("%d %s %s", count, noun, pluralize(op, count))
 			}
 			return fmt.Sprintf("%d %s", count, pluralize(op, count))
 		},
