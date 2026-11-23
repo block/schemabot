@@ -123,6 +123,7 @@ const (
 	PreviewCommentPlanExemptTables             PreviewType = "comment_plan_exempt_tables"              // Plan with ignored live tables disclosed
 	PreviewCommentPlanIgnoreTables             PreviewType = "comment_plan_ignore_tables"              // Clean plan with a live table withheld by ignore_tables
 	PreviewCommentPlanDropTables               PreviewType = "comment_plan_drop_tables"                // Plan dropping a leftover "_" table named by drop_tables
+	PreviewCommentPlanDropTablesUnmatched      PreviewType = "comment_plan_drop_tables_unmatched"      // Clean plan whose drop_tables entry names no table
 	PreviewCommentPlanWhoCanApply              PreviewType = "comment_plan_who_can_apply"              // Plan listing who can run the apply under PR command authorization
 	PreviewCommentPlanColumnOnlyAlter          PreviewType = "comment_plan_column_only_alter"          // Plan whose alter is metadata-only, so no table-size section renders
 	PreviewCommentPlanManyTables               PreviewType = "comment_plan_many_tables"                // Plan touching more tables than the size section lists inline
@@ -163,6 +164,8 @@ const (
 	PreviewCommentApplyPlanOptions             PreviewType = "comment_apply_plan_options"              // Locked apply-plan with options
 	PreviewCommentApplyPlanUnsafe              PreviewType = "comment_apply_plan_unsafe"               // Locked apply-plan with unsafe warning
 	PreviewCommentApplyPlanDowngraded          PreviewType = "comment_apply_plan_downgraded"           // Locked apply-plan downgraded to manual confirmation
+	PreviewCommentApplyPlanChangeGateRefused   PreviewType = "comment_apply_plan_change_gate_refused"  // Locked apply-plan edited after a change gate refused the apply
+	PreviewCommentApplyPlanRefusalUnposted     PreviewType = "comment_apply_plan_refusal_unposted"     // Same, when the refusal comment did not post
 	PreviewCommentApplyProgress                PreviewType = "comment_apply_progress"                  // Apply in progress (1 done, 1 running, 1 pending)
 	PreviewCommentApplyEstimateExceeded        PreviewType = "comment_apply_estimate_exceeded"         // Apply in progress after row estimate was exceeded
 	PreviewCommentApplyCompleted               PreviewType = "comment_apply_completed"                 // Apply completed (all tables done)

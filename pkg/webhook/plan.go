@@ -1679,18 +1679,19 @@ func planTableSizes(schema *ghclient.SchemaRequestResult, sc *apitypes.SchemaCha
 // buildPlanCommentData converts plan results into template data.
 func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy, agentHint, cliName string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
-		Database:          schema.Database,
-		Environment:       environment,
-		Tenant:            tenant,
-		AgentHint:         agentHint,
-		CLIName:           cliName,
-		HeadSHA:           schema.HeadSHA,
-		Repository:        schema.Repository,
-		RequestedBy:       requestedBy,
-		DatabaseType:      schema.Type,
-		IsMySQL:           schema.Type == "mysql",
-		IgnoredNamespaces: schema.IgnoredNamespaces,
-		PlanID:            planResp.PlanID,
+		Database:            schema.Database,
+		Environment:         environment,
+		Tenant:              tenant,
+		AgentHint:           agentHint,
+		CLIName:             cliName,
+		HeadSHA:             schema.HeadSHA,
+		Repository:          schema.Repository,
+		RequestedBy:         requestedBy,
+		DatabaseType:        schema.Type,
+		IsMySQL:             schema.Type == "mysql",
+		IgnoredNamespaces:   schema.IgnoredNamespaces,
+		PlanID:              planResp.PlanID,
+		UnmatchedDropTables: planResp.UnmatchedDropTables,
 	}
 	for _, group := range planResp.ExemptTables {
 		if group == nil {

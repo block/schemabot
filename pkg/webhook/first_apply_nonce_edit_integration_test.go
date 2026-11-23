@@ -111,7 +111,7 @@ func newFirstApplyRepo(t *testing.T, svc *api.Service, dbName string, schemaFile
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
-	return NewHandler(svc, factory, nil, logger), result
+	return NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification()), result
 }
 
 // requireNextComment returns the next comment the fake GitHub received, failing

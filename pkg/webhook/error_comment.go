@@ -32,38 +32,47 @@ func (h *Handler) postCommandError(
 	repo string, pr int, installationID int64,
 	commandName, environment, requestedBy, errorDetail string,
 ) {
-	h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
+	h.postCommandErrorLanded(repo, pr, installationID, commandName, environment, requestedBy, errorDetail)
+}
+
+// postCommandErrorLanded is postCommandError reporting whether the comment
+// landed, for a caller whose own message points at it.
+func (h *Handler) postCommandErrorLanded(
+	repo string, pr int, installationID int64,
+	commandName, environment, requestedBy, errorDetail string,
+) bool {
+	return h.postCommentBestEffortID(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 		RequestedBy:  requestedBy,
 		Timestamp:    templates.NowFunc().UTC().Format("2006-01-02 15:04:05"),
 		Environment:  environment,
 		Environments: h.deploymentEnvironmentScope(environment),
 		CommandName:  commandName,
 		ErrorDetail:  userFacingErrorDetail(errorDetail),
-	}))
+	})) != 0
 }
 
 // postChangeGateRefusal posts a change gate's answer to a PR command, for an
 // err that isChangeGateError accepts. A freeze refusal gets its own comment,
 // which SchemaBot writes itself: what is frozen, until when and why, and what
 // the commenter can do next. A gate that could not decide posts its fixed
-// message as a command error.
+// message as a command error. It reports whether that comment landed, for a
+// caller whose own message points at it.
 func (h *Handler) postChangeGateRefusal(
 	repo string, pr int, installationID int64,
 	commandName, environment, requestedBy string, err error,
-) {
+) bool {
 	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
 		var approvers []string
 		if config, ok := h.serverConfig(); ok {
 			approvers = config.Freeze.GitHubTeams
 		}
-		h.postComment(repo, pr, installationID, templates.RenderChangeGateRefusal(changeGateRefusalData(refused, commandName, h.deploymentTenant(), requestedBy, approvers)))
-		return
+		return h.postCommentBestEffortID(repo, pr, installationID, templates.RenderChangeGateRefusal(changeGateRefusalData(refused, commandName, h.deploymentTenant(), requestedBy, approvers))) != 0
 	}
 	message := "SchemaBot could not check for freezes, so this did not start. Try again."
 	if unavailable, ok := errors.AsType[*api.ChangeGateUnavailableError](err); ok {
 		message = unavailable.UserMessage()
 	}
-	h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, message)
+	return h.postCommandErrorLanded(repo, pr, installationID, commandName, environment, requestedBy, message)
 }
 
 // deploymentEnvironmentScope returns the environments this deployment
