@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/block/pg-sprite/pkg/diffplan"
+	"github.com/block/pg-sprite/pkg/executor"
 	"github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
@@ -39,26 +40,41 @@ func parseDesiredFiles(namespace string, files map[string]string) (map[string]st
 	for _, filename := range sortedKeys(files) {
 		desired, err := statement.ParseDesiredFile(files[filename])
 		if err != nil {
-			return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+			return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 		}
 		parsed[filename] = desired
 	}
 	return parsed, nil
 }
 
-// plannerRefusal reports a planner decline of the declared schema as a plan
-// refusal. pg-sprite names each decline with a sentinel: a change no ALTER can
-// converge, a foreign key to a table the target lacks, a partition or
-// inheritance declaration, and a constraint repeated within one file. Each is
-// fixed by editing the schema files. Any other failure, such as a lost
-// connection or a missing privilege, is returned as it came.
+// plannerRefusal reports a decline of the declared schema as a plan refusal.
+// pg-sprite names each decline with a sentinel: a file its parser does not
+// admit (two tables, a statement a desired file may not hold, partitions, an
+// enum type mixed with other statements or carrying a bad label), a shape the
+// planner refuses while it builds the table (a partition or inheritance
+// declaration, a constraint repeated within one file, an expression whose text
+// never settles), a change no ALTER can converge, a foreign key to a table the
+// target lacks, and policies that read each other back. Each is fixed by
+// editing the schema files. Any other failure, such as a syntax error, a lost
+// connection, or a missing privilege, is returned as it came.
+//
+// pg-sprite keeps the closed set of these refusals in its migrate package,
+// which also carries its schema change runner, so the sentinels are named here
+// until a lighter pg-sprite package exports a predicate over that set.
 func plannerRefusal(err error) error {
 	switch {
-	case errors.Is(err, schemadiff.ErrUnsupportedChange),
-		errors.Is(err, schemadiff.ErrReferencedTableNotFound),
+	case errors.Is(err, statement.ErrMultipleCreateTables),
+		errors.Is(err, statement.ErrDisallowedStatement),
+		errors.Is(err, statement.ErrDesiredPartitions),
+		errors.Is(err, statement.ErrEnumTypeAlone),
+		errors.Is(err, statement.ErrEnumLabel),
 		errors.Is(err, schemadiff.ErrDesiredPartitionOf),
 		errors.Is(err, schemadiff.ErrDesiredInherits),
-		errors.Is(err, schemadiff.ErrDesiredConstraintMerged):
+		errors.Is(err, schemadiff.ErrDesiredConstraintMerged),
+		errors.Is(err, schemadiff.ErrExpressionUnsettled),
+		errors.Is(err, schemadiff.ErrUnsupportedChange),
+		errors.Is(err, schemadiff.ErrReferencedTableNotFound),
+		errors.Is(err, executor.ErrPolicyRecursion):
 		return &engine.PlanRefusedError{Err: err}
 	}
 	return err

@@ -187,7 +187,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		// A plan narrowed to one target speaks for that target only, so its
 		// failure (an unknown target included) answers on the comment and leaves
 		// the environment's check as its last plan of every target recorded it.
-		h.logger.Error("plan narrowed to one target failed; leaving the environment's check unchanged",
+		api.PlanFailureLog(h.logger, err)("plan narrowed to one target failed; leaving the environment's check unchanged",
 			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
 			"deployment", deployment, "environment", environment, "target", target, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, userFacingError(err))
@@ -195,7 +195,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 	if err != nil {
-		h.logger.Error("plan execution failed",
+		api.PlanFailureLog(h.logger, err)("plan execution failed",
 			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
 			"deployment", deployment, "environment", environment, "target", target, "error", err)
 		userError := userFacingError(err)
@@ -887,7 +887,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			continue
 		}
 		if err != nil {
-			h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "env", env, "error", err)
+			api.PlanFailureLog(h.logger, err)("plan execution failed", "repo", repo, "pr", pr, "env", env, "error", err)
 			planFailed(env, err)
 			continue
 		}

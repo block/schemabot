@@ -33,13 +33,13 @@ func TestExecutePlanLogsARefusedPlanAtWarn(t *testing.T) {
 			name:      "remote refusal",
 			planErr:   status.Error(codes.FailedPrecondition, "the schema files drop table orders_seq"),
 			wantLevel: "WARN",
-			wantMsg:   "ExecutePlan: engine refused the plan; the PR's schema files must change before it can plan",
+			wantMsg:   "ExecutePlan: engine refused the plan; it plans once the change the refusal names is made to the schema files or the target",
 		},
 		{
 			name:      "local refusal",
 			planErr:   fmt.Errorf("plan namespace: %w", &engine.PlanRefusedError{Err: errors.New("the schema files drop table orders_seq")}),
 			wantLevel: "WARN",
-			wantMsg:   "ExecutePlan: engine refused the plan; the PR's schema files must change before it can plan",
+			wantMsg:   "ExecutePlan: engine refused the plan; it plans once the change the refusal names is made to the schema files or the target",
 		},
 		{
 			name:      "server fault",
@@ -65,6 +65,37 @@ func TestExecutePlanLogsARefusedPlanAtWarn(t *testing.T) {
 			assert.Equal(t, "production", entry["environment"])
 			assert.Equal(t, "eu", entry["deployment"])
 			assert.Equal(t, storage.DatabaseTypeMySQL, entry["type"])
+		})
+	}
+}
+
+// The plan handler and the webhook log a failed plan once more after
+// ExecutePlan returns it. A refusal, local or from a remote data plane, is
+// logged there at Warn too, so an alert on Error logs does not fire for it;
+// every other failure stays at Error.
+func TestPlanFailureLogLevel(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		wantLevel string
+	}{
+		{"remote refusal", fmt.Errorf("plan diff on deployment %q: %w", "eu", status.Error(codes.FailedPrecondition, "the schema files drop table orders_seq")), "WARN"},
+		{"local refusal", fmt.Errorf("plan namespace: %w", &engine.PlanRefusedError{Err: errors.New("the schema files drop table orders_seq")}), "WARN"},
+		{"server fault", status.Error(codes.Internal, "read shard schema: timeout"), "ERROR"},
+		{"plain error", errors.New("connection reset by peer"), "ERROR"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, nil))
+
+			PlanFailureLog(logger, tt.err)("plan failed", "database", "orders", "error", tt.err)
+
+			var entry map[string]any
+			require.NoError(t, json.Unmarshal(logs.Bytes(), &entry))
+			assert.Equal(t, tt.wantLevel, entry["level"])
+			assert.Equal(t, "plan failed", entry["msg"])
+			assert.Equal(t, "orders", entry["database"])
 		})
 	}
 }

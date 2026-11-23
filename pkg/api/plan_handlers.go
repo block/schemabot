@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net/http"
 	"slices"
@@ -746,7 +747,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "plan rejected: "+err.Error())
 			return
 		}
-		s.logger.Error("plan failed", "database", req.Database, "error", err)
+		PlanFailureLog(s.logger, err)("plan failed", "database", req.Database, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
 		return
 	}
@@ -758,7 +759,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 	// error says which step failed.
 	rollout, err := s.planRollout(r.Context(), req, primaryPlan, resp)
 	if err != nil {
-		s.logger.Error("plan failed: the rollout's member plans could not be completed", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
+		PlanFailureLog(s.logger, err)("plan failed: the rollout's member plans could not be completed", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
 		return
 	}
@@ -1026,7 +1027,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			"error", err,
 		}
 		if isPlanRefusal(err) {
-			s.logger.Warn("ExecutePlan: engine refused the plan; the PR's schema files must change before it can plan", planFailureAttrs...)
+			s.logger.Warn("ExecutePlan: engine refused the plan; it plans once the change the refusal names is made to the schema files or the target", planFailureAttrs...)
 		} else {
 			s.logger.Error("ExecutePlan: client.Plan failed", planFailureAttrs...)
 		}
@@ -3906,11 +3907,22 @@ func validateSchemaFiles(schemaFiles map[string]*ternv1.SchemaFiles) (warning st
 
 // isPlanRefusal reports whether a Plan failure is the engine declining the
 // declared schema as written, from a local engine or from a remote data plane
-// that answered FailedPrecondition. The PR author fixes it by changing the
-// schema files, so it is not a SchemaBot fault and is not logged as an error.
+// that answered FailedPrecondition. The operator resolves it with the change
+// the refusal names, to the schema files or the target, so it is not a
+// SchemaBot fault and is not logged as an error.
 func isPlanRefusal(err error) bool {
 	if engine.IsPlanRefused(err) {
 		return true
 	}
 	return grpcstatus.Code(err) == grpccodes.FailedPrecondition
+}
+
+// PlanFailureLog returns the log call for a failed plan: Warn for a plan the
+// engine refused, which the operator acts on and SchemaBot did not cause, and
+// Error for every other failure.
+func PlanFailureLog(logger *slog.Logger, err error) func(msg string, args ...any) {
+	if isPlanRefusal(err) {
+		return logger.Warn
+	}
+	return logger.Error
 }

@@ -268,8 +268,14 @@ func (c planWithEngineClient) Plan(ctx context.Context, req *ternv1.PlanRequest)
 	return nil, err
 }
 
+func (c planWithEngineClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	_, err := c.local.planWithEngine(ctx, req, req.GetDatabase(), c.files)
+	return nil, err
+}
+
 // A refusal the engine path returns for a declared schema reaches the remote
-// caller as FailedPrecondition with its message intact, so the operator who
+// caller as FailedPrecondition with its message intact, through Plan and
+// through the PlanDiff a rollout member is planned with, so the operator who
 // sees it is told what to change and the data plane is not reported as failing.
 func TestServerPlanMapsEnginePathRefusalToFailedPrecondition(t *testing.T) {
 	local, err := NewLocalClient(LocalConfig{
@@ -283,13 +289,21 @@ func TestServerPlanMapsEnginePathRefusalToFailedPrecondition(t *testing.T) {
 		files: schema.SchemaFiles{"orders": {Files: map[string]string{"orders.sql": "CREATE TABLE orders (id INT)"}}},
 	}, slog.Default())
 
-	_, err = server.Plan(t.Context(), &ternv1.PlanRequest{
+	req := &ternv1.PlanRequest{
 		Database:             "orders",
 		UnselectedNamespaces: []string{"ns_1"},
-	})
+	}
+	const refusal = "a targets entry that selects namespaces is not supported for MySQL targets whose DSN names a database"
+
+	_, err = server.Plan(t.Context(), req)
 	require.Error(t, err)
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
-	assert.Contains(t, status.Convert(err).Message(), "a targets entry that selects namespaces is not supported for MySQL targets whose DSN names a database")
+	assert.Contains(t, status.Convert(err).Message(), refusal)
+
+	_, err = server.PlanDiff(t.Context(), req)
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, status.Convert(err).Message(), refusal)
 }
 
 func TestServerApplyScopedRPCsRequireApplyID(t *testing.T) {

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/block/pg-sprite/pkg/executor"
 	"github.com/block/pg-sprite/pkg/schemadiff"
+	"github.com/block/pg-sprite/pkg/statement"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -82,11 +84,18 @@ func planRequestWithFiles(files map[string]string) *engine.PlanRequest {
 // lost connection or a missing privilege, stays an ordinary error.
 func TestPlannerRefusalTypesOnlyPlannerDeclines(t *testing.T) {
 	declines := []error{
+		statement.ErrMultipleCreateTables,
+		statement.ErrDisallowedStatement,
+		statement.ErrDesiredPartitions,
+		statement.ErrEnumTypeAlone,
+		statement.ErrEnumLabel,
 		schemadiff.ErrUnsupportedChange,
 		schemadiff.ErrReferencedTableNotFound,
 		schemadiff.ErrDesiredPartitionOf,
 		schemadiff.ErrDesiredInherits,
 		schemadiff.ErrDesiredConstraintMerged,
+		schemadiff.ErrExpressionUnsettled,
+		executor.ErrPolicyRecursion,
 	}
 	for _, decline := range declines {
 		t.Run(decline.Error(), func(t *testing.T) {
@@ -110,5 +119,39 @@ func TestPlannerRefusalTypesOnlyPlannerDeclines(t *testing.T) {
 		err := plannerRefusal(lost)
 		assert.False(t, engine.IsPlanRefused(err))
 		assert.Equal(t, lost, err)
+	})
+}
+
+// A schema file the desired-file parser does not admit is refused before any
+// database is read, and the refusal is typed like a planner decline, because
+// the remedy is the same: change the file. A file that does not parse at all
+// is an input error, not a refusal, and stays an ordinary error.
+func TestPlanRefusesFileThePlannerDoesNotAdmit(t *testing.T) {
+	refused := map[string]struct {
+		sql     string
+		wantErr string
+	}{
+		"two tables in one file": {
+			sql:     "CREATE TABLE a (id bigint PRIMARY KEY); CREATE TABLE b (id bigint PRIMARY KEY)",
+			wantErr: "desired schema must contain exactly one CREATE TABLE",
+		},
+		"a change statement in it": {
+			sql:     "DROP TABLE a",
+			wantErr: "statement kind not allowed in a desired schema: DROP TABLE a",
+		},
+	}
+	for name, tc := range refused {
+		t.Run(name, func(t *testing.T) {
+			_, err := planSchemas(t.Context(), nil, planRequestWithFiles(map[string]string{"a.sql": tc.sql}), DefaultNativeSafeTableSizeLimitBytes, "")
+			require.Error(t, err)
+			assert.True(t, engine.IsPlanRefused(err), "the refusal must be typed")
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+
+	t.Run("a syntax error is not a refusal", func(t *testing.T) {
+		_, err := planSchemas(t.Context(), nil, planRequestWithFiles(map[string]string{"a.sql": "CREATE TABLE a (id bigint PRIMARY KEY"}), DefaultNativeSafeTableSizeLimitBytes, "")
+		require.Error(t, err)
+		assert.False(t, engine.IsPlanRefused(err))
 	})
 }
