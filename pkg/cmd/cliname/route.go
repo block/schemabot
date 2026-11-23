@@ -46,9 +46,16 @@ func Route() []Flag {
 // given, so a caller can pass a placeholder such as <environment>; the routing
 // values came from the operator and are rendered so a shell passes them through
 // unchanged.
+//
+// A routing flag the caller already passes is left out, so the caller's value
+// stands alone: a wrapper that routes on -e would otherwise turn a hint
+// written as "start <id> -e <environment>" into one naming -e twice.
 func Command(args ...string) string {
 	parts := append([]string{Name()}, args...)
 	for _, flag := range Route() {
+		if passesFlag(args, flag.Name) {
+			continue
+		}
 		rendered, ok := renderFlag(flag)
 		if !ok {
 			slog.Debug("leaving a routing flag with a control character out of command hints", "flag", flag.Name)
@@ -57,6 +64,17 @@ func Command(args ...string) string {
 		parts = append(parts, rendered)
 	}
 	return strings.Join(parts, " ")
+}
+
+// passesFlag reports whether args already pass the flag name, either as its
+// own word ("-e", "staging") or joined to its value ("-e=staging").
+func passesFlag(args []string, name string) bool {
+	for _, arg := range args {
+		if arg == name || strings.HasPrefix(arg, name+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 // renderFlag renders a routing flag for a shell. A value that starts with a
