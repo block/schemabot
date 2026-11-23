@@ -522,12 +522,12 @@ func TestThrottledHeaderEveryPhase(t *testing.T) {
 	for name, tb := range cases {
 		t.Run(name, func(t *testing.T) {
 			var sb strings.Builder
-			renderTableProgress(&sb, "", tb, state.Apply.Running, 0, "", nil)
+			renderTableProgress(&sb, "", tb, state.Apply.Running, 0, "", apitypes.BuildWork{}, nil)
 			header, _, _ := strings.Cut(sb.String(), "\n")
 			assert.True(t, strings.HasSuffix(header, " (throttled)"), "header %q", header)
 			tb.Throttled = false
 			sb.Reset()
-			renderTableProgress(&sb, "", tb, state.Apply.Running, 0, "", nil)
+			renderTableProgress(&sb, "", tb, state.Apply.Running, 0, "", apitypes.BuildWork{}, nil)
 			assert.NotContains(t, sb.String(), "(throttled)")
 		})
 	}

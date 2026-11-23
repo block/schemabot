@@ -54,5 +54,5 @@ func TestWriteProgressRendersConcurrentIndexBuildWork(t *testing.T) {
 	})
 	out := captureStdout(t, func() { WriteProgress(data) })
 	assert.Contains(t, out, "step 2 of 3 · CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)\n"+
-		"building index: 25% of blocks (2,500/10,000) · attempt 2\n")
+		"building index: 2,500 of 10,000 blocks · attempt 2\n")
 }

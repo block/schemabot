@@ -92,6 +92,10 @@ type TableProgress struct {
 	RowsTotal       int64
 	PercentComplete int
 	ETASeconds      int64
+	// IndexBuild is true while the apply's engine reports a concurrent index
+	// build in flight. The build has no rows to count, so a running table
+	// draws its bar from PercentComplete, the engine's whole-build percent.
+	IndexBuild bool
 	// EstimatedBytes is the table's on-disk size when it was planned, shown
 	// beside the row counts. Nil when the plan had no estimate.
 	EstimatedBytes *int64
@@ -280,6 +284,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 				tp.ETASeconds = sh.ETASeconds
 			}
 		}
+		tp.IndexBuild = data.BuildWork.IsConcurrentIndexBuild()
 		data.Tables = append(data.Tables, tp)
 	}
 

@@ -74,7 +74,7 @@ func TestFormatApplyStatusComment_RendersStoredBuildWork(t *testing.T) {
 
 	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "", "", nil)
 	assert.Contains(t, out, "step 2 of 3 · `CREATE INDEX CONCURRENTLY idx_orders_status ON orders (status)`\n"+
-		"building index: 12,000/50,000 tuples\n")
+		"building index: 12,000 of 50,000 tuples\n")
 }
 
 // Each deployment of a fanned-out apply renders the build work persisted on its
@@ -96,7 +96,7 @@ func TestFormatApplyStatusComment_RendersBuildWorkPerDeployment(t *testing.T) {
 	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "", "", nil)
 	assert.Contains(t, out, "**Deployments**: 2 running")
 	assert.Equal(t, 1, strings.Count(out, "\nwaiting on 2 of 3 lockers\n"))
-	assert.Equal(t, 1, strings.Count(out, "\nbuilding index: 25% of blocks (1/4)\n"))
+	assert.Equal(t, 1, strings.Count(out, "\nbuilding index: 1 of 4 blocks\n"))
 }
 
 // A malformed build counter drops the build work line but keeps the readable

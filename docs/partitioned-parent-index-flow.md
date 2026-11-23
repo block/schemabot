@@ -327,7 +327,7 @@ shows, for example:
 
 ```text
 Building index on partition 3 of 12 (events_2026_03)
-building index: 25% of blocks (2,500/10,000)
+building index: 2,500 of 10,000 blocks
 ```
 
 The table and partition text is sanitized and clamped before reaching GitHub.

@@ -5,11 +5,11 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
-	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -917,11 +917,15 @@ func FormatRolloutFooter(v RolloutView) string {
 		return b.String()
 	}
 	if !v.StopByKey {
-		verb, label := "stop", "To stop this schema change"
-		if strings.EqualFold(v.Engine, storage.EnginePlanetScale) {
-			verb, label = "cancel", "To cancel this schema change"
+		// A rollout's members run their own statements, so the view has no
+		// single build to name and an engine that cancels only a build offers
+		// nothing here, as the PR comment's rollout footer does.
+		switch command := presentation.StopCommand(v.Engine, apitypes.BuildWork{}, 0); command {
+		case presentation.StopCommandStop:
+			writeRolloutCommand(&b, "To stop this schema change", applyCommand(command))
+		case presentation.StopCommandCancel:
+			writeRolloutCommand(&b, "To cancel this schema change", applyCommand(command))
 		}
-		writeRolloutCommand(&b, label, applyCommand(verb))
 	}
 	if v.Model.RetryWaitsOnActiveApply() {
 		fmt.Fprintf(&b, "%s\n", presentation.RetryOnceSettledNote)

@@ -62,17 +62,35 @@ func formatPhaseWork(phase indexphase.Phase, work apitypes.BuildWork) string {
 	return ""
 }
 
+// formatBlocks and formatTuples show the phase's raw counters without a
+// percent of their own: the progress bar carries the whole-build percent, and a
+// second, phase-local percent beside it would read as a contradiction. A done
+// count past its total, which the server can report as the scan finishes, is
+// shown as the total.
 func formatBlocks(label string, work apitypes.BuildWork) string {
 	if work.BlocksTotal == 0 {
 		return ""
 	}
-	pct := ClampPercent(int(work.BlocksDone * 100 / work.BlocksTotal))
-	return fmt.Sprintf("%s: %d%% of blocks (%s/%s)", label, pct, FormatNumber(work.BlocksDone), FormatNumber(work.BlocksTotal))
+	return fmt.Sprintf("%s: %s of %s blocks", label, FormatNumber(min(work.BlocksDone, work.BlocksTotal)), FormatNumber(work.BlocksTotal))
 }
 
 func formatTuples(label string, work apitypes.BuildWork) string {
 	if work.TuplesTotal == 0 {
 		return ""
 	}
-	return fmt.Sprintf("%s: %s/%s tuples", label, FormatNumber(work.TuplesDone), FormatNumber(work.TuplesTotal))
+	return fmt.Sprintf("%s: %s of %s tuples", label, FormatNumber(min(work.TuplesDone, work.TuplesTotal)), FormatNumber(work.TuplesTotal))
+}
+
+// IndexBuildProgress renders the progress of a running concurrent index build:
+// a bar and the engine's whole-build percent, which counts every phase of the
+// build rather than only the current one. Before the build reports any
+// progress it shows a starting indicator instead, because a 0% bar reads as
+// stuck, the same way a row copy that has not started does. The PR comment and
+// the CLI both render the build through this, so they show the same number.
+func IndexBuildProgress(percent int) string {
+	pct := ClampPercent(percent)
+	if pct == 0 {
+		return "⏳ Starting index build..."
+	}
+	return fmt.Sprintf("%s %d%%", ProgressBarRowCopy(pct), pct)
 }

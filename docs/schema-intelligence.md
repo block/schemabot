@@ -1101,10 +1101,13 @@ outstanding, and a sort names itself; the line is labelled `building index`
 until validation starts and `validating index` after. PostgreSQL carries a
 completed phase's counters into the next phase, so only the counter the
 current phase owns is shown, and the attempt is included after a retry. For
-example: `building index: 25% of blocks (2,500/10,000) · attempt 2` while the
+example: `building index: 2,500 of 10,000 blocks · attempt 2` while the
 heap is scanned, then `building index: sorting live tuples`, then
-`building index: 12,000/50,000 tuples`, and later
-`validating index: 93% of blocks (930/1,000)` or `waiting on 2 of 3 lockers`.
+`building index: 12,000 of 50,000 tuples`, and later
+`validating index: 930 of 1,000 blocks` or `waiting on 2 of 3 lockers`.
+The table's row draws a progress bar from its `percent_complete`, which for an
+index build is the whole build's percent across every phase. The phase line
+shows raw counters only, so it never shows a second percent beside the bar.
 
 The numbers come from the engine while the apply is active, so they are as
 fresh as the last poll. Once the apply is terminal, the same endpoint answers

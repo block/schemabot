@@ -825,6 +825,11 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if statusLower != "" && statusLower != "running" && statusLower != "row_copy" {
 			fmt.Fprintf(&b, indentDetail+"Status: %s\n", t.Status)
 		}
+	case t.IndexBuild:
+		writeTableLine(&b, t, "%s%s", ui.IndexBuildProgress(t.PercentComplete), ui.ThrottledSuffix(t.Throttled))
+		if t.DDL != "" {
+			b.WriteString(formatTableDDL(t))
+		}
 	default:
 		// No row copy data — CREATE/DROP, instant DDL, or VSchema-only.
 		// Show a full blue bar with a state label.

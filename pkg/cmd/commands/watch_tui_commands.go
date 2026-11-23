@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -105,7 +106,13 @@ func (m WatchModel) triggerCutover() tea.Cmd {
 	}
 }
 
+// triggerStop sends what the s (or c) key offers. PlanetScale's stop cancels
+// its deploy request, so it keeps the stop endpoint; an engine with no stop
+// whose key offers cancel sends cancel.
 func (m WatchModel) triggerStop() tea.Cmd {
+	if m.stopCommand() == presentation.StopCommandCancel && !m.isPlanetScale() {
+		return m.triggerCancel()
+	}
 	return func() tea.Msg {
 		result, err := client.CallStopAPI(m.endpoint, m.environment, m.applyID)
 		if err != nil {
@@ -121,6 +128,24 @@ func (m WatchModel) triggerStop() tea.Cmd {
 		}
 
 		// Pass through informational message (e.g. "Schema change already completed")
+		return stopResultMsg{success: true, message: result.ErrorMessage}
+	}
+}
+
+// triggerCancel cancels the apply for the c key.
+func (m WatchModel) triggerCancel() tea.Cmd {
+	return func() tea.Msg {
+		result, err := client.CallCancelAPI(m.endpoint, m.environment, m.applyID)
+		if err != nil {
+			return stopResultMsg{success: false, err: err}
+		}
+		if !result.Accepted {
+			errMsg := result.ErrorMessage
+			if errMsg == "" {
+				errMsg = "cancel not accepted"
+			}
+			return stopResultMsg{success: false, err: fmt.Errorf("%s", errMsg)}
+		}
 		return stopResultMsg{success: true, message: result.ErrorMessage}
 	}
 }
@@ -163,6 +188,8 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 		environment:  result.Environment,
 		engine:       result.Engine,
 		metadata:     result.Metadata,
+		buildWork:    data.BuildWork,
+		stepsTotal:   data.StepsTotal,
 	}
 }
 

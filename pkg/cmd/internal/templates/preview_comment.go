@@ -403,6 +403,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"SECOND TABLE POST-CHECKSUM", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPostChecksum()) }},
 		{"THIRD TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyThirdRunning()) }},
 		// PostgreSQL: several statements on one table, each its own row
+		{"POSTGRESQL: INDEX BUILD RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPostgresIndexBuild()) }},
 		{"POSTGRESQL: MULTI-STATEMENT TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPostgresMultiStatement()) }},
 		// Sharded tables: compact per-shard summary (inline for few, collapsed for many)
 		{"SHARDED: SHARD PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyShardProgress()) }},

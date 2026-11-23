@@ -40,7 +40,7 @@ func TestRenderApplyStatusCommentBuildWork(t *testing.T) {
 		metadata["blocks_done"], metadata["blocks_total"] = "2500", "10000"
 		out := RenderApplyStatusComment(ApplyStatusFromProgress(&apitypes.ProgressResponse{State: state.Apply.Running, Metadata: metadata}, ""))
 		assert.Contains(t, out, "step 2 of 3 · `CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)`\n"+
-			"building index: 25% of blocks (2,500/10,000)\n")
+			"building index: 2,500 of 10,000 blocks\n")
 	})
 
 	t.Run("lockers wait and retry", func(t *testing.T) {
