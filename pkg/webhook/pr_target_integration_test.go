@@ -35,7 +35,7 @@ func TestExcludedPRPreservesConfirmation(t *testing.T) {
 	serveUnrequiredTarget(t, mux)
 	comments := make(chan string, 4)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
-	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}, nil, testLogger())
+	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}, nil, testLogger(), WithInsecureSkipSignatureVerification())
 	plan := &storage.Plan{PlanIdentifier: "plan-preserved-target", CreatedAt: time.Now().UTC(), Database: database, DatabaseType: "mysql", Repository: "octocat/hello-world", PullRequest: 1, HeadSHA: "same-head", Environment: "staging"}
 	_, err := svc.Storage().Plans().Create(t.Context(), plan)
 	require.NoError(t, err)
@@ -85,7 +85,7 @@ func TestExcludedPRRecordsAcceptedApplyOutcomeWithoutPublishing(t *testing.T) {
 		writes.Add(1)
 		w.WriteHeader(http.StatusInternalServerError)
 	})
-	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}, nil, testLogger())
+	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}, nil, testLogger(), WithInsecureSkipSignatureVerification())
 	apply := &storage.Apply{ApplyIdentifier: "apply-preserved-target", Database: database, DatabaseType: "mysql", Environment: "staging", Repository: "octocat/hello-world", PullRequest: 1, InstallationID: 12345, State: state.Apply.Pending, Engine: storage.EngineSpirit}
 	id, err := svc.Storage().Applies().Create(t.Context(), apply)
 	require.NoError(t, err)
@@ -145,7 +145,7 @@ func TestRetargetedCommandPreservesConfirmationBeforePlanResponses(t *testing.T)
 				require.NoError(t, err)
 			})
 			ic := ghclient.NewInstallationClient(client, testLogger())
-			h := NewHandler(svc, &fakeClientFactory{client: ic}, nil, testLogger())
+			h := NewHandler(svc, &fakeClientFactory{client: ic}, nil, testLogger(), WithInsecureSkipSignatureVerification())
 			if phase == "confirmation freshness" {
 				retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", database, 12345, "alice", CommandResult{})
 				require.NoError(t, err)
@@ -213,7 +213,7 @@ func TestApplyAcceptanceRechecksCachedBranchPolicy(t *testing.T) {
 				require.NoError(t, err)
 			})
 			ic := ghclient.NewInstallationClient(client, testLogger())
-			h := NewHandler(svc, &fakeClientFactory{client: ic}, nil, testLogger())
+			h := NewHandler(svc, &fakeClientFactory{client: ic}, nil, testLogger(), WithInsecureSkipSignatureVerification())
 
 			ctx := ghclient.WithPRInfoCache(t.Context())
 			info, err := ic.FetchPullRequestNoCache(ctx, "octocat/hello-world", 1)

@@ -74,7 +74,7 @@ func newSchemaCapTestFixture(t *testing.T, configs, local int, policy api.PRSche
 	}
 	store := &schemaCapTestStore{durableWebhookTestStorage: durableWebhookTestStorage{settings: settings}, plans: plans}
 	service := api.New(store, cfg, map[string]tern.Client{"remote/staging": planner}, logger)
-	h := NewHandler(service, &fakeClientFactory{client: client}, nil, logger)
+	h := NewHandler(service, &fakeClientFactory{client: client}, nil, logger, WithInsecureSkipSignatureVerification())
 	f := &schemaCapTestFixture{Handler: h, client: client, mux: mux, settings: settings, plans: plans}
 	f.head.Store("head")
 	f.base.Store("main")

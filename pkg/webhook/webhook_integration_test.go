@@ -347,7 +347,7 @@ func newE2EHandler(t *testing.T, svc *api.Service, client *gh.Client) *Handler {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")
 	factory := &fakeClientFactory{client: installClient}
-	return NewHandler(svc, factory, nil, logger)
+	return NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 }
 
 // fakeGitHubForPlan sets up httptest handlers that simulate the GitHub API for a plan flow.

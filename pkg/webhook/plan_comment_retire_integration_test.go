@@ -229,7 +229,7 @@ func setupPlanCommentHandler(t *testing.T, repo string, deleteUnactioned bool) (
 	svc := api.New(st, cfg, map[string]tern.Client{}, logger)
 	t.Cleanup(func() { _ = svc.Close() })
 
-	return NewHandler(svc, factory, nil, logger), st, fake
+	return NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification()), st, fake
 }
 
 // createRunningApplyForHead records a plan and a running apply for the given

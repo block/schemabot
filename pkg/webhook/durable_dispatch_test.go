@@ -242,7 +242,7 @@ func TestDurablePullRequestWebhookQueuesAndAcks(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{}, nil, logger)
 	clientFactory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
-	h := NewHandler(service, clientFactory, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, clientFactory, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "opened", headSHA: "head-sha"}, nil)
 	req.Header.Set(headerDeliveryID, "delivery-1")
@@ -276,7 +276,7 @@ func TestDurablePullRequestWebhookCanonicalizesRepository(t *testing.T) {
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{"mixedcase/sample-repo": {}},
 	}, nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action: "opened", repo: "MixedCase/Sample-Repo", headSHA: "MixedCaseSHA", headRef: "MixedCaseBranch",
@@ -304,7 +304,7 @@ func TestDurablePullRequestWebhookDeduplicatesDelivery(t *testing.T) {
 	events := newRecordingWebhookEventStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{}, nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	for range 2 {
 		req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "synchronize"}, nil)
@@ -500,7 +500,7 @@ func newDurableDriverHandler(t *testing.T, store storage.WebhookEventStore, conf
 	if factory == nil {
 		factory = &fakeClientFactory{}
 	}
-	return NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch())
+	return NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 }
 
 // newDurableDriverHarness builds a durable-dispatch Handler backed by a stub
@@ -535,7 +535,7 @@ func newDurableDriverHarness(
 		config = &api.ServerConfig{}
 	}
 	service := api.New(st, config, nil, logger)
-	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch()), comments
+	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification()), comments
 }
 
 func durablePullRequestEvent(t *testing.T) *storage.WebhookEvent {
@@ -974,7 +974,7 @@ func TestDurablePullRequestWebhookDefersOnlySynchronize(t *testing.T) {
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 			service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{}, nil, logger)
 			h := NewHandler(service, &fakeClientFactory{}, nil, logger,
-				WithDurableWebhookDispatch(), WithSynchronizeQuietPeriod(tc.quietPeriod))
+				WithDurableWebhookDispatch(), WithSynchronizeQuietPeriod(tc.quietPeriod), WithInsecureSkipSignatureVerification())
 
 			req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: tc.action, beforeSHA: "previous-head", headSHA: "head-sha"}, nil)
 			req.Header.Set(headerDeliveryID, "delivery-1")

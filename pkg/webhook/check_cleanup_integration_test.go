@@ -89,7 +89,7 @@ func TestE2EPRCloseCleanup(t *testing.T) {
 	require.NoError(t, err)
 
 	factory, _ := prClosedGitHub(t, "closed", 0)
-	h := NewHandler(svc, factory, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+	h := NewHandler(svc, factory, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})), WithInsecureSkipSignatureVerification())
 	drainWebhookWorkOnCleanup(t, h)
 
 	// Close the PR while the apply is running. Cleanup is invoked directly (not
@@ -166,7 +166,7 @@ func TestE2EPRCloseCleanupSkipsReopenedPR(t *testing.T) {
 	}))
 
 	reopened, _ := prClosedGitHub(t, "open", 0)
-	h := NewHandler(svc, reopened, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+	h := NewHandler(svc, reopened, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})), WithInsecureSkipSignatureVerification())
 	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false)
 	require.NoError(t, err)
 	require.False(t, ran, "cleanup reports that it did not run for a PR that is open again")
@@ -180,7 +180,7 @@ func TestE2EPRCloseCleanupSkipsReopenedPR(t *testing.T) {
 	require.NotNil(t, check, "stored check state must stay while the PR is open")
 
 	closed, _ := prClosedGitHub(t, "closed", 0)
-	h = NewHandler(svc, closed, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+	h = NewHandler(svc, closed, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})), WithInsecureSkipSignatureVerification())
 	ran, err = h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false)
 	require.NoError(t, err)
 	require.True(t, ran, "cleanup runs for a PR that is still closed")
