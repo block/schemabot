@@ -429,8 +429,9 @@ func listenForServe(ctx context.Context, name, port string) (net.Listener, error
 // serveUntilShutdown serves a built server on Run's listeners until runCtx ends
 // or a listener fails, then shuts it down.
 //
-// Every listener is bound before Start launches the background work, so a port
-// that is already in use fails the run while the process holds no claim.
+// Every listener is bound before any of them serves and before Start launches
+// the background work, so a port that is already in use fails the run while the
+// process has accepted no request and holds no claim.
 //
 // The background work runs under a context of its own rather than runCtx. The
 // operator's drives end on that context, and a drive that ends before Close
@@ -444,45 +445,63 @@ func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os
 	defer cancelBackground()
 	defer utils.CloseAndLog(srv)
 
-	// Optionally start a gRPC server for the Tern proto (used by
+	// Optionally serve the Tern proto over gRPC (used by
 	// docker-compose.grpc.yml). Embedders attach to their own server instead.
+	var grpcServer *grpc.Server
 	if grpcPort != "" {
-		grpcServer := newTernGRPCServer(srv.logger)
+		grpcServer = newTernGRPCServer(srv.logger)
 		if err := srv.RegisterGRPC(runCtx, grpcServer); err != nil {
 			return fmt.Errorf("register grpc tern service: %w", err)
 		}
-		var lc net.ListenConfig
-		listener, err := lc.Listen(runCtx, "tcp", ":"+grpcPort)
-		if err != nil {
-			return fmt.Errorf("listen on port %s: %w", grpcPort, err)
-		}
-		go func() {
-			srv.logger.Info("starting gRPC server", "port", grpcPort)
-			// Serve returns ErrServerStopped on GracefulStop during normal
-			// shutdown; that is expected, not an error worth alerting on.
-			if err := grpcServer.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
-				srv.logger.Error("gRPC server error", "port", grpcPort, "error", err)
-			}
-		}()
-		defer stopGRPCServer(grpcServer, srv.logger, grpcDrainTimeout)
 	}
 
-	// Bind the HTTP and metrics ports before any background work starts. A port
-	// that is already taken must end the process before the operator has claimed
-	// an apply, a webhook delivery or a lease, not after it has started driving
-	// them.
-	httpListener, err := listenForServe(runCtx, "http", port)
+	// Bind every port before anything serves or any background work starts. A
+	// port that is already taken must end the process before it has accepted an
+	// RPC or claimed an apply, a webhook delivery or a lease. Until a server
+	// serves a listener, nothing else closes it, so a failed bind closes the
+	// ones already bound.
+	var bound []net.Listener
+	bind := func(name, port string) (net.Listener, error) {
+		listener, err := listenForServe(runCtx, name, port)
+		if err != nil {
+			for _, earlier := range bound {
+				err = errors.Join(err, earlier.Close())
+			}
+			return nil, err
+		}
+		bound = append(bound, listener)
+		return listener, nil
+	}
+	var grpcListener net.Listener
+	if grpcServer != nil {
+		listener, err := bind("grpc", grpcPort)
+		if err != nil {
+			return err
+		}
+		grpcListener = listener
+	}
+	httpListener, err := bind("http", port)
+	if err != nil {
+		return err
+	}
+	// Metrics get their own listener so scrapers never traverse the API port
+	// (see ServerConfig.MetricsPort).
+	metricsPort := strconv.Itoa(srv.cfg.MetricsListenPort())
+	metricsListener, err := bind("metrics", metricsPort)
 	if err != nil {
 		return err
 	}
 
-	// Metrics get their own listener so scrapers never traverse the API port
-	// (see ServerConfig.MetricsPort).
-	metricsPort := strconv.Itoa(srv.cfg.MetricsListenPort())
-	metricsListener, err := listenForServe(runCtx, "metrics", metricsPort)
-	if err != nil {
-		// Nothing serves the HTTP listener yet, so no server will close it.
-		return errors.Join(err, httpListener.Close())
+	if grpcServer != nil {
+		go func() {
+			srv.logger.Info("starting gRPC server", "port", grpcPort)
+			// Serve returns ErrServerStopped on GracefulStop during normal
+			// shutdown; that is expected, not an error worth alerting on.
+			if err := grpcServer.Serve(grpcListener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+				srv.logger.Error("gRPC server error", "port", grpcPort, "error", err)
+			}
+		}()
+		defer stopGRPCServer(grpcServer, srv.logger, grpcDrainTimeout)
 	}
 
 	// Start background loops (operator, health monitor, pending-drops cleaner,
@@ -1177,6 +1196,10 @@ func (s *Server) MetricsHandler() http.Handler {
 // interrupted terminal comments and checks and must not be cut short by a request context)
 // until Close bounds it; it runs before the operator so recovered applies attach
 // observers first.
+//
+// The operator starts claiming work as soon as Start returns, so an embedder
+// binds its own listeners before calling it: a process that then fails to bind
+// would exit holding claims a peer has to wait out.
 func (s *Server) Start(ctx context.Context) {
 	s.reconcile = s.webhook.StartTerminalOutcomeReconciliation(ctx, s.logger)
 	if s.targetResolver != nil {
