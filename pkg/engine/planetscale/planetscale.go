@@ -827,18 +827,42 @@ func isDeployStillValidatingError(err error) bool {
 
 // isApprovalRequiredError reports whether a failed deploy call is PlanetScale
 // answering that the deploy request must be approved before it can be
-// deployed. Only an answer from the PlanetScale API counts, never a transport
-// failure whose text happens to mention approval, because the caller treats
-// the match as proof that no deploy started.
+// deployed. Only a definitive refusal from the PlanetScale API counts: an
+// answer the SDK types as not found, permission denied or an invalid request.
+// A transport failure, or an internal, malformed or retry answer, never counts
+// even when its text mentions approval, because the caller treats the match
+// as proof that no deploy started.
 //
 // The planetscale-go client gives this rejection no error code of its own: it
-// arrives as a *ps.Error whose Code does not name it, so the message text is
-// the only signal. This should become a typed check once the client exposes
-// the error code.
+// arrives as a permission refusal, so the message text is the only signal.
+// This should become a typed check once the client exposes the error code.
 func isApprovalRequiredError(err error) bool {
 	var psErr *ps.Error
-	return errors.As(err, &psErr) && strings.Contains(psErr.Error(), "approved")
+	if !errors.As(err, &psErr) {
+		return false
+	}
+	switch psErr.Code {
+	case ps.ErrNotFound, ps.ErrPermission, ps.ErrInvalid:
+		return strings.Contains(psErr.Error(), "must be approved")
+	default:
+		return false
+	}
 }
+
+// approvalRequiredError is PlanetScale's refusal to deploy a deploy request
+// that needs approval. Its message is SchemaBot's own and tells the operator
+// what to change; the API's answer stays on the chain for errors.Is and the
+// logs, but out of the text an operator reads.
+type approvalRequiredError struct {
+	number uint64
+	cause  error
+}
+
+func (e *approvalRequiredError) Error() string {
+	return fmt.Sprintf("deploy request #%d could not be deployed: PlanetScale deploy request approvals are not supported. Turn off 'Require administrator approval for deploy requests' in the PlanetScale database settings, then re-plan and apply", e.number)
+}
+
+func (e *approvalRequiredError) Unwrap() error { return e.cause }
 
 // isRetryablePSError returns true if the error is a transient PlanetScale
 // condition that may succeed on retry. Uses the SDK's typed error codes

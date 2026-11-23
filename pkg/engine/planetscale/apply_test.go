@@ -896,7 +896,9 @@ type resumeDeployClient struct {
 	deployCalls  int
 	lastDeploy   *ps.PerformDeployRequest
 	deployResult *ps.DeployRequest
-	autoCutover  bool
+	// deployErr, when set, is the answer to every deploy call.
+	deployErr   error
+	autoCutover bool
 	// pendingGets is how many Get calls report the deploy request as still
 	// computing its schema diff before the recovered state is served.
 	pendingGets int
@@ -946,6 +948,9 @@ func (c *resumeDeployClient) GetDeployRequest(_ context.Context, req *ps.GetDepl
 func (c *resumeDeployClient) DeployDeployRequest(_ context.Context, req *ps.PerformDeployRequest) (*ps.DeployRequest, error) {
 	c.deployCalls++
 	c.lastDeploy = req
+	if c.deployErr != nil {
+		return nil, c.deployErr
+	}
 	if c.deployResult != nil {
 		return c.deployResult, nil
 	}

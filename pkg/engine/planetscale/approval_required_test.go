@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
@@ -67,8 +68,119 @@ func TestDeployDeployRequest_ApprovalRequiredIsPermanent(t *testing.T) {
 	assert.Contains(t, err.Error(), "PlanetScale deploy request approvals are not supported")
 	assert.Contains(t, err.Error(), "Turn off 'Require administrator approval for deploy requests'")
 	assert.Contains(t, err.Error(), "then re-plan and apply")
+	assert.NotContains(t, err.Error(), "Deploy request must be approved before deploying.", "the API's answer stays on the chain but out of the message")
 	assert.Equal(t, 1, client.deployCalls)
 	assert.Equal(t, 0, client.getCalls)
+}
+
+// An approval refusal that answers a retry proves nothing about the earlier
+// attempt, which may have started the deploy before its response was lost.
+// The refusal is not permanent: the deploy request is re-read, and a started
+// deploy is adopted while one that still reads ready is reported as an
+// unknown outcome for recovery to settle.
+func TestDeployDeployRequest_ApprovalRefusalAnsweringARetryIsNotPermanent(t *testing.T) {
+	shortenKeyspaceRetries(t, time.Millisecond, time.Second)
+
+	t.Run("re-read shows the deploy queued", func(t *testing.T) {
+		e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+		queued := &ps.DeployRequest{Number: 9, DeploymentState: deployState.Queued}
+		client := &deployOutcomeUnknownClient{
+			earlierDeployErrs: []error{&ps.Error{Code: ps.ErrInternal}},
+			deployErr:         approvalRequiredFromAPI(t),
+			reread:            queued,
+		}
+
+		dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 9, false, nil)
+
+		require.NoError(t, err)
+		assert.Same(t, queued, dr)
+		assert.Equal(t, 2, client.deployCalls)
+		assert.Equal(t, 1, client.getCalls)
+	})
+
+	t.Run("re-read still reads ready", func(t *testing.T) {
+		e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+		refusal := approvalRequiredFromAPI(t)
+		client := &deployOutcomeUnknownClient{
+			earlierDeployErrs: []error{&ps.Error{Code: ps.ErrInternal}},
+			deployErr:         refusal,
+			reread:            &ps.DeployRequest{Number: 9, DeploymentState: deployState.Ready},
+		}
+
+		dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 9, false, nil)
+
+		require.Error(t, err)
+		assert.Nil(t, dr)
+		assert.ErrorIs(t, err, refusal)
+		var permanent *engine.PermanentError
+		assert.False(t, errors.As(err, &permanent))
+		assert.True(t, engine.IsOutcomeUnknown(err))
+		assert.True(t, engine.IsRetryable(err))
+		assert.Equal(t, 2, client.deployCalls)
+		assert.Equal(t, 1, client.getCalls)
+	})
+}
+
+// Only a definitive refusal proves the deploy did not start. An answer the
+// SDK types as one to retry, or does not type at all, is not an approval
+// refusal even when its text says the deploy request must be approved, so it
+// keeps the handling of any unrefused deploy failure.
+func TestDeployDeployRequest_ApprovalTextOnAnUndefinitiveAnswerIsNotPermanent(t *testing.T) {
+	shortenKeyspaceRetries(t, time.Millisecond, time.Second)
+	tests := []struct {
+		name      string
+		body      string
+		wantCalls int
+	}{
+		{name: "an answer to retry", body: `{"code":"unprocessable","message":"Deploy request must be approved before deploying."}`, wantCalls: maxRetries},
+		{name: "an answer the SDK does not type", body: `{"code":"internal","message":"Deploy request must be approved before deploying."}`, wantCalls: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+			deployErr := deployErrorFromAPI(t, http.StatusUnprocessableEntity, tt.body)
+			client := &deployOutcomeUnknownClient{
+				deployErr: deployErr,
+				reread:    &ps.DeployRequest{Number: 9, DeploymentState: deployState.Ready},
+			}
+
+			dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 9, false, nil)
+
+			require.Error(t, err)
+			assert.Nil(t, dr)
+			assert.ErrorIs(t, err, deployErr)
+			var permanent *engine.PermanentError
+			assert.False(t, errors.As(err, &permanent))
+			assert.True(t, engine.IsOutcomeUnknown(err))
+			assert.Equal(t, tt.wantCalls, client.deployCalls)
+			assert.Equal(t, 1, client.getCalls)
+		})
+	}
+}
+
+// Resuming an apply whose deploy request is ready but never deployed shares
+// the deploy call with a fresh apply, so an approval refusal there fails the
+// apply permanently too, rather than as a failed reattach that would be
+// retried.
+func TestResumeExistingDeployRequest_ApprovalRequiredIsPermanent(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	client := &resumeDeployClient{
+		recovered: &ps.DeployRequest{DeploymentState: deployState.Ready, HtmlURL: "https://app/dr/42"},
+		deployErr: approvalRequiredFromAPI(t),
+	}
+	meta := &psMetadata{BranchName: "schemabot-testdb-abc", DeployRequestID: 42}
+
+	result, err := e.resumeExistingDeployRequest(t.Context(), client, "org", resumeRequest(t, meta, ""), meta)
+
+	require.Error(t, err)
+	assert.Nil(t, result)
+	var permanent *engine.PermanentError
+	require.ErrorAs(t, err, &permanent)
+	assert.False(t, errors.Is(err, engine.ErrReattachFailed))
+	assert.False(t, engine.IsRetryable(err))
+	assert.False(t, engine.IsOutcomeUnknown(err))
+	assert.Contains(t, err.Error(), "deploy request #42 could not be deployed: PlanetScale deploy request approvals are not supported")
+	assert.Equal(t, 1, client.deployCalls)
 }
 
 // Starting a deferred deploy shares the deploy call with a fresh apply, so an
@@ -149,6 +261,7 @@ func TestDeployDeployRequest_UnrelatedRefusalKeepsItsType(t *testing.T) {
 	}{
 		{name: "an invalid request from the API", deployErr: deployErrorFromAPI(t, http.StatusBadRequest, `{"code":"bad_request","message":"Deploy request is not in a deployable state."}`)},
 		{name: "a permission refusal that is not about approval", deployErr: deployErrorFromAPI(t, http.StatusForbidden, `{"code":"unauthorized","message":"You are not authorized to perform this action"}`)},
+		{name: "a permission refusal that mentions approval without requiring it", deployErr: deployErrorFromAPI(t, http.StatusForbidden, `{"code":"unauthorized","message":"Only approved members of this organization can deploy."}`)},
 		{name: "a transport failure whose text mentions approval", deployErr: errors.New("read tcp: connection reset while the deploy request was approved")},
 	}
 	for _, tt := range tests {
