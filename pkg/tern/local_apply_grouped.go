@@ -1043,18 +1043,17 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		if _, err := eng.Start(withDriveWorkOwner(ctx), controlReq); err != nil {
 			// A permanent refusal can never succeed on retry, and the apply stays
 			// at waiting-for-deploy until something changes, so retrying every
-			// poll would only repeat the log line. Fail the apply and say what
-			// to do next. Any other error is retried at the next progress tick.
+			// poll would only repeat the log line. Any other error is retried at
+			// the next progress tick.
 			var permanent *engine.PermanentError
 			if errors.As(err, &permanent) {
-				logger.Error("auto-deploy failed with permanent error",
+				if c.failPermanentDeployRefusal(ctx, logger, eng, apply, tasks, creds, resumeState, ps, err) {
+					return true
+				}
+			} else {
+				logger.Error("auto-deploy failed; retrying at the next progress tick",
 					append(apply.MutableLogAttrs(), "error", err)...)
-				ps.terminalErr = c.failApplyAndNotify(ctx, apply, tasks,
-					fmt.Sprintf("deploy could not start: %v. Fix the cause, then run a new plan and apply.", err))
-				return true
 			}
-			logger.Error("auto-deploy failed; retrying at the next progress tick",
-				append(apply.MutableLogAttrs(), "error", err)...)
 		}
 	}
 
@@ -1506,6 +1505,38 @@ func (s settledTaskSet) add(task *storage.Task) { s[task] = struct{}{} }
 func (s settledTaskSet) contains(task *storage.Task) bool {
 	_, ok := s[task]
 	return ok
+}
+
+// failPermanentDeployRefusal fails the apply after the engine refused its
+// automatic deploy start with a permanent error. Engine.Start promises that a
+// permanent refusal started nothing, but failing an apply whose deploy is in
+// fact running would leave that deploy with nothing tracking it, so the drive
+// reads progress once more and fails the apply only while the engine still
+// reports the change waiting for its deploy. When the read fails or the engine
+// reports any other state, the apply is left as it is and the next progress
+// tick acts on what the engine reports then. The engine's message names the
+// operator's next step, so the failure message carries it unchanged. Returns
+// true when the apply was settled and this owner must exit the drive.
+func (c *LocalClient) failPermanentDeployRefusal(ctx context.Context, logger *slog.Logger, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState, startErr error) bool {
+	result, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
+		Database:    apply.Database,
+		Credentials: creds,
+		ResumeState: resumeState,
+	})
+	if err != nil {
+		logger.Warn("auto-deploy was refused with a permanent error, but the progress check confirming nothing started failed; the apply is not failed and the drive retries at the next progress tick",
+			append(apply.MutableLogAttrs(), "start_error", startErr, "error", err)...)
+		return false
+	}
+	if result.State != engine.StateWaitingForDeploy {
+		logger.Warn("auto-deploy was refused with a permanent error, but the engine no longer reports the change waiting for its deploy; the apply is not failed and the drive follows the engine's state at the next progress tick",
+			append(apply.MutableLogAttrs(), "start_error", startErr, "engine_state", result.State)...)
+		return false
+	}
+	logger.Error("auto-deploy failed with permanent error",
+		append(apply.MutableLogAttrs(), "error", startErr)...)
+	ps.terminalErr = c.failApplyAndNotify(ctx, apply, tasks, fmt.Sprintf("deploy could not start: %v", startErr))
+	return true
 }
 
 // autoTriggerCutover fires the engine cutover for a drive that is not
