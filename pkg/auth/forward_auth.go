@@ -377,7 +377,10 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 // caller, not verified by the proxy. The reason lets operators alert on
 // break-glass usage that would otherwise be indistinguishable from proxied
 // traffic. A configured mesh source (TrustedMeshLoopbackSources) is the
-// exception: the sidecar delivered that request, so it is proxied traffic.
+// exception: the sidecar delivers proxied traffic from it. Listing one trusts
+// every process in the pod's network namespace like the proxy, since any of
+// them can connect from that address. Such a request still needs the proxy's
+// SPIFFE ID in XFCC.
 const reasonLoopbackSource = "loopback_source"
 
 // breakGlassSource reports whether the request came from a loopback address
@@ -399,9 +402,10 @@ func (a *ForwardAuthAuthorizer) breakGlassSource(r *http.Request) bool {
 }
 
 // ErrMeshSourcesNeedSPIFFE refuses mesh sources without SPIFFE trust. A mesh
-// source address says only that the sidecar delivered the request; the
-// sidecar's XFCC naming the proxy is what says who sent it.
-var ErrMeshSourcesNeedSPIFFE = fmt.Errorf("forward_auth trusted_mesh_loopback_sources requires trusted_proxy_spiffe: the source address shows the sidecar delivered the request, and only the XFCC SPIFFE check shows it came from the proxy")
+// source address does not identify the sender: any process in the pod's
+// network namespace can connect from it. The XFCC SPIFFE check is the only
+// check of who sent the request.
+var ErrMeshSourcesNeedSPIFFE = fmt.Errorf("forward_auth trusted_mesh_loopback_sources requires trusted_proxy_spiffe: any process in the pod can connect from a mesh source address, so only the XFCC SPIFFE check shows who sent the request")
 
 // ParseTrustedMeshLoopbackSources parses trusted_mesh_loopback_sources. Each
 // entry must be one loopback IP. 127.0.0.1 and ::1 are refused because a

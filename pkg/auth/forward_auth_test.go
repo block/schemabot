@@ -2,6 +2,7 @@ package auth_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -11,6 +12,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/block/schemabot/pkg/auth"
 )
@@ -988,6 +993,7 @@ func TestForwardAuth_MeshLoopbackSourceIsVerifiedAndPortForwardIsNot(t *testing.
 		verified   bool
 	}{
 		{name: "istio inbound source", remoteAddr: "127.0.0.6:48375", verified: true},
+		{name: "istio inbound source as IPv4-mapped IPv6", remoteAddr: "[::ffff:127.0.0.6]:48375", verified: true},
 		{name: "port-forward", remoteAddr: "127.0.0.1:52000", verified: false},
 		{name: "port-forward over IPv6", remoteAddr: "[::1]:52000", verified: false},
 		{name: "another loopback source", remoteAddr: "127.0.0.7:52000", verified: false},
@@ -1019,9 +1025,10 @@ func TestForwardAuth_MeshLoopbackSourceIsVerifiedAndPortForwardIsNot(t *testing.
 	}
 }
 
-// A mesh source proves only that the sidecar delivered the request. The XFCC
-// SPIFFE check still decides whether the proxy sent it, so a mesh-source
-// request without the proxy's SPIFFE ID is refused.
+// A mesh source address does not identify the sender: any process in the pod
+// can connect from it. The XFCC SPIFFE check still decides whether the proxy
+// sent the request, so a mesh-source request without the proxy's SPIFFE ID is
+// refused.
 func TestForwardAuth_MeshLoopbackSourceStillNeedsTheProxySPIFFE(t *testing.T) {
 	handler, captured := newForwardAuth(t, meshSourceConfig())
 	rec := httptest.NewRecorder()
@@ -1041,6 +1048,72 @@ func TestForwardAuth_MeshLoopbackSourceUnverifiedByDefault(t *testing.T) {
 	assert.False(t, captured.verified)
 }
 
+// The gateway lane verifies its service caller whatever the source, so a mesh
+// source changes only the auth-decision reason there: a gateway read the
+// sidecar delivered from a listed mesh source is not counted as break-glass,
+// while one from 127.0.0.1 still is.
+func TestForwardAuth_GatewayReasonForMeshLoopbackSource(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		wantReason string
+	}{
+		{name: "istio inbound source", remoteAddr: "127.0.0.6:48375", wantReason: ""},
+		{name: "port-forward", remoteAddr: "127.0.0.1:52000", wantReason: "loopback_source"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			previous := otel.GetMeterProvider()
+			otel.SetMeterProvider(provider)
+			t.Cleanup(func() {
+				otel.SetMeterProvider(previous)
+				require.NoError(t, provider.Shutdown(context.WithoutCancel(t.Context())))
+			})
+
+			cfg := serviceCallerConfig()
+			cfg.TrustedMeshLoopbackSources = []string{"127.0.0.6"}
+			handler, captured := newForwardAuth(t, cfg)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+			req.RemoteAddr = tc.remoteAddr
+			req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+			req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.NotNil(t, captured.user)
+			assert.Equal(t, callerSVID, captured.user.Subject)
+			assert.True(t, captured.verified, "the gateway lane verifies its caller from any source")
+			assert.Equal(t, map[string]int64{tc.wantReason: 1}, authDecisionReasons(t, reader))
+		})
+	}
+}
+
+// authDecisionReasons sums the schemabot.auth_decisions.total counter by its
+// reason attribute.
+func authDecisionReasons(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
+	t.Helper()
+	var collected metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &collected))
+	reasons := map[string]int64{}
+	for _, scope := range collected.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != "schemabot.auth_decisions.total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok, "auth decisions must be an int64 sum")
+			for _, point := range sum.DataPoints {
+				reason, _ := point.Attributes.Value(attribute.Key("reason"))
+				reasons[reason.AsString()] += point.Value
+			}
+		}
+	}
+	return reasons
+}
+
 func TestNewForwardAuthAuthorizer_RejectsBadMeshLoopbackSources(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -1049,6 +1122,7 @@ func TestNewForwardAuthAuthorizer_RejectsBadMeshLoopbackSources(t *testing.T) {
 	}{
 		{name: "port-forward source", cfg: auth.ForwardAuthConfig{TrustedProxySPIFFE: []string{ingressSVID}, TrustedMeshLoopbackSources: []string{"127.0.0.1"}}, wantErr: "port-forward"},
 		{name: "IPv6 port-forward source", cfg: auth.ForwardAuthConfig{TrustedProxySPIFFE: []string{ingressSVID}, TrustedMeshLoopbackSources: []string{"::1"}}, wantErr: "port-forward"},
+		{name: "IPv4-mapped port-forward source", cfg: auth.ForwardAuthConfig{TrustedProxySPIFFE: []string{ingressSVID}, TrustedMeshLoopbackSources: []string{"::ffff:127.0.0.1"}}, wantErr: "port-forward"},
 		{name: "network", cfg: auth.ForwardAuthConfig{TrustedProxySPIFFE: []string{ingressSVID}, TrustedMeshLoopbackSources: []string{"127.0.0.0/8"}}, wantErr: "not an IP address"},
 		{name: "not loopback", cfg: auth.ForwardAuthConfig{TrustedProxySPIFFE: []string{ingressSVID}, TrustedMeshLoopbackSources: []string{"10.0.0.6"}}, wantErr: "not a loopback address"},
 		{name: "IPv6 mesh source is not loopback", cfg: auth.ForwardAuthConfig{TrustedProxySPIFFE: []string{ingressSVID}, TrustedMeshLoopbackSources: []string{"::6"}}, wantErr: "not a loopback address"},

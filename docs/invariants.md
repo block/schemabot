@@ -2130,9 +2130,10 @@ classification (`pkg/auth/tiers.go`), with structural sweep tests over the route
 
 ### AZ-3: Identity comes from a verified lane
 
-Forwarded identity headers are trusted only from explicitly listed proxies, a forwarded user
-identity on the identity-header lane from a loopback source other than a listed mesh sidecar
-address (a port-forward) is admitted but never verified, a gateway-verified
+Forwarded identity headers are trusted only from explicitly listed proxies. A user identity
+forwarded from a loopback source other than a listed mesh sidecar address, such as a
+port-forward, is admitted but never verified; listing a mesh sidecar address trusts every process
+in the pod's network namespace like the proxy. A gateway-verified
 service caller never reaches the write tier by self-asserting user headers, and every write and
 control action is attributed to the verified caller rather than to any client-supplied caller
 string. A client-supplied string never proves ownership either: a scoped operator releases a lock

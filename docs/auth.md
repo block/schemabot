@@ -1004,8 +1004,13 @@ trusted_mesh_loopback_sources: [127.0.0.6]
 
 A request from a listed address must still pass the SPIFFE check. The
 setting requires `trusted_proxy_spiffe` and refuses `127.0.0.1` and `::1`.
-List an address only when every peer the sidecar admits is a proxy that sets
-the identity headers and XFCC itself.
+
+Listing an address trusts every process in the pod's network namespace like
+the proxy. Any of them can connect from `127.0.0.6` and send an XFCC header
+that names the proxy, as it already can from the pod IP under SPIFFE-only
+trust. List an address only when nothing else in the pod sends requests to
+SchemaBot, and every peer the sidecar admits is a proxy that sets the
+identity headers and XFCC itself.
 
 #### Service mesh setup
 
