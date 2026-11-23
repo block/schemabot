@@ -151,6 +151,7 @@ type PendingObserverHandle struct {
 
 type Service struct {
 	storage           storage.Storage
+	changeEvents      *storage.ChangeEvents
 	config            *ServerConfig
 	ternClients       map[string]tern.Client // keyed by "deployment/environment", lazily created
 	defaultTernClient tern.Client            // fallback for any deployment/environment without a static or gRPC client (e.g. a TargetRouter)
@@ -654,9 +655,10 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 	// Create gRPC client lazily
 	// Pass storage so GRPCClient can manage applies (heartbeats, progress tracking)
 	client, err := tern.NewGRPCClient(tern.Config{
-		Address: address,
-		Storage: s.storage,
-		Logger:  s.logger,
+		Address:        address,
+		Storage:        s.storage,
+		Logger:         s.logger,
+		ChangeEventApp: s.config.ChangeEventApp,
 	})
 	if err != nil {
 		// The client dials lazily, so a failure here is the address itself,

@@ -151,6 +151,7 @@ type GRPCClient struct {
 	address           string          // dial address for logging/debugging
 	storage           storage.Storage // SchemaBot's storage for apply/task management
 	logger            *slog.Logger    // base logger; drives bind apply identity via applyLogger
+	changeEventApp    func(database string) string
 
 	// Observer support — same pattern as LocalClient.
 	// For GRPCClient, the observer is notified by the local progress poller,
@@ -208,6 +209,9 @@ type Config struct {
 	// MaxRecvMsgBytes bounds a single response message. Zero or negative
 	// selects DefaultMaxRecvMsgBytes.
 	MaxRecvMsgBytes int
+
+	// ChangeEventApp resolves the registered application for remote event correlation.
+	ChangeEventApp func(database string) string
 }
 
 // DefaultMaxRecvMsgBytes bounds a single response from a Tern deployment. The
@@ -394,6 +398,7 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 		address:           config.Address,
 		storage:           config.Storage,
 		logger:            config.Logger,
+		changeEventApp:    config.ChangeEventApp,
 	}, nil
 }
 
@@ -2069,6 +2074,7 @@ type applyTaskScope struct {
 	// send it as the generation manifest so the data plane knows the whole
 	// generation from the first dispatch. Empty for whole-apply scopes.
 	deploymentOperationKeys []string
+	deploymentOperationIDs  map[string]int64
 
 	// memberTarget is the claimed operation's target when its deployment
 	// addresses more than one target, and empty otherwise. The targets of such
@@ -2500,6 +2506,7 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 	}
 	found := false
 	deploymentOperationKeys := make([]string, 0, len(ops))
+	deploymentOperationIDs := make(map[string]int64)
 	for _, op := range ops {
 		if op.ID == applyOperationID {
 			found = true
@@ -2514,6 +2521,7 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 		// it is always declared, whatever shape its row is in.
 		if op.ID == applyOperationID || !op.IsConvergedPlaceholder() {
 			deploymentOperationKeys = append(deploymentOperationKeys, op.OperationKey)
+			deploymentOperationIDs[op.OperationKey] = op.ID
 		}
 	}
 	if !found {
@@ -2533,6 +2541,7 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 		multiOperation:          len(ops) > 1,
 		operationLeaseOnly:      operationLeaseOnly(ctx),
 		deploymentOperationKeys: deploymentOperationKeys,
+		deploymentOperationIDs:  deploymentOperationIDs,
 		memberTarget:            memberTarget,
 	}, nil
 }
@@ -3251,6 +3260,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			// No TargetShards: the VSchema is namespace-level, not per shard.
 			IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
 			GenerationOperationKeys: scope.generationOperationKeys(),
+			ChangeEventDispatch:     c.changeEventDispatch(apply, scope),
 			IgnoreTables:            plan.IgnoreTables(),
 			DropTables:              plan.DropTables(),
 			DirectExecution:         DirectExecutionPolicyProto(driveOptions.DirectExecution),
@@ -4212,6 +4222,7 @@ func (c *GRPCClient) dispatchRemoteApply(ctx context.Context, apply *storage.App
 		TargetShards:            targetShards,
 		IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
 		GenerationOperationKeys: scope.generationOperationKeys(),
+		ChangeEventDispatch:     c.changeEventDispatch(apply, scope),
 		IgnoreTables:            plan.IgnoreTables(),
 		DropTables:              plan.DropTables(),
 		// Restated as a field rather than left to ride in Options: the data

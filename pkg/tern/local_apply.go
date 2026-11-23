@@ -878,6 +878,7 @@ func (c *LocalClient) pauseStaleApplyForRetry(ctx context.Context, t, settledFro
 	if op != nil {
 		req.OperationID = op.ID
 		req.OperationLeaseToken = op.LeaseToken
+		ctx = storage.WithApplyChangeEventSnapshot(ctx, apply, []*storage.ApplyOperation{op})
 	}
 	moved, err := c.storage.Applies().MarkStaleApplyRetryable(ctx, req)
 	if err != nil {

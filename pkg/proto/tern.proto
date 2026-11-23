@@ -932,6 +932,19 @@ message ApplyRequest {
   // plan's own record travels rather than the current config, so the
   // comparison is against what was reviewed.
   repeated string drop_tables = 16;
+  // Observability metadata only. The data plane stores the first dispatch's
+  // correlation so a later claim can report under the control plane's IDs.
+  ChangeEventDispatch change_event_dispatch = 17;
+}
+
+message ChangeEventDispatch {
+  string apply_id = 1;
+  string app = 2;
+  string deployment = 3;
+  map<string, int64> operation_ids = 4;
+  string pull_request_url = 5;
+  // Used for legacy dispatches whose idempotency key rotates with every retry.
+  int32 attempt_offset = 6;
 }
 
 // ApplyConflict names the active work that refused an apply, in the terms a

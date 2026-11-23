@@ -49,10 +49,11 @@ const (
 
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
-	db         *rebindDB
-	dialect    Dialect
-	identity   identityInserter
-	classifier ErrorClassifier
+	db           *rebindDB
+	dialect      Dialect
+	identity     identityInserter
+	classifier   ErrorClassifier
+	changeEvents *storage.ChangeEvents
 	// locker serializes concurrent applies against the same target with a
 	// session-scoped advisory lock held on the pinned apply connection. It must
 	// match the storage database's family.
@@ -1639,12 +1640,33 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 	// attempt + 1: a driver's in-memory copy goes stale the moment the stored
 	// budget is adjusted out-of-band mid-drive, and persisting it absolutely
 	// would silently reset that adjustment and re-open expired recovery.
-	result, err := writeTx.tx.ExecContext(ctx, fmt.Sprintf(`
+	query := fmt.Sprintf(`
 		UPDATE applies
 		SET state = ?, error_message = ?,
 		    external_id = ?%s, started_at = ?, completed_at = ?, updated_at = NOW()
 		WHERE id = ?%s%s
-	`, optionsUpdate, leasePredicate, finishedPredicate), args...)
+	`, optionsUpdate, leasePredicate, finishedPredicate)
+	// The state predicate lets the terminal transition's writer distinguish
+	// its committed verdict from repeat updates to the same verdict. A miss
+	// falls through to the normal write and its existing lease/guard checks.
+	if s.changeEvents != nil && state.IsState(apply.State, state.SettledApplyStates...) {
+		changed, err := writeTx.tx.ExecContext(ctx, query+" AND state <> ?", append(args, apply.State)...)
+		if err != nil {
+			return fmt.Errorf("update terminal apply %d: %w", apply.ID, err)
+		}
+		rows, err := changed.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("read terminal apply %d rows affected: %w", apply.ID, err)
+		}
+		if rows > 0 {
+			if err := writeTx.commit(); err != nil {
+				return fmt.Errorf("commit terminal update apply %d: %w", apply.ID, err)
+			}
+			s.changeEvents.OfferApplyFinished(ctx, apply, apply.State)
+			return nil
+		}
+	}
+	result, err := writeTx.tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("update apply %d: %w", apply.ID, err)
 	}
@@ -1808,6 +1830,9 @@ func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expe
 		return false, fmt.Errorf("read derived apply state rows affected for apply %d: %w", applyID, err)
 	}
 	if rows > 0 {
+		if !state.IsState(expectedState, newState) {
+			s.changeEvents.OfferApplyFinished(ctx, nil, newState)
+		}
 		return true, nil
 	}
 
@@ -2949,6 +2974,9 @@ func (s *applyStore) MarkStaleApplyRetryable(ctx context.Context, req storage.St
 		moved, err = s.markStaleApplyRetryableOnce(ctx, req)
 		return err
 	})
+	if moved && err == nil {
+		s.changeEvents.OfferRecoveredOperationFinished(ctx, req.OperationID, state.ApplyOperation.FailedRetryable)
+	}
 	return moved, err
 }
 

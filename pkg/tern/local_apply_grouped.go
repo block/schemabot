@@ -1292,7 +1292,8 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			}
 		}
 		ensureApplyFailureMessage(apply, tasks)
-		swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, apply.State, apply.ErrorMessage, apply.StartedAt, apply.CompletedAt)
+		writeCtx := storage.WithApplyChangeEventSnapshot(ctx, apply, nil)
+		swapped, err := c.storage.Applies().UpdateDerivedState(writeCtx, apply.ID, expectedState, apply.State, apply.ErrorMessage, apply.StartedAt, apply.CompletedAt)
 		if err != nil {
 			// A cancelled drive is why the write failed, so the error describes
 			// the driver and not the outcome; the drive hands the apply back.

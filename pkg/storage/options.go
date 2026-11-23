@@ -4,6 +4,9 @@ package storage
 // the storage layer itself enforces — things a claim query or a store decides,
 // not anything the caller could apply on its own.
 type Options struct {
+	// ChangeEvents receives aggregate outcomes from successful storage commits.
+	ChangeEvents *ChangeEvents
+
 	// MaxDriversPerApply caps how many operation leases one apply may hold at
 	// once. Zero or negative selects DefaultMaxDriversPerApply; there is no
 	// uncapped mode, because an uncapped claim path is what lets one wide
@@ -21,6 +24,11 @@ func WithMaxDriversPerApply(n int) Option {
 	return func(o *Options) {
 		o.MaxDriversPerApply = n
 	}
+}
+
+// WithChangeEvents installs the optional post-commit change event publisher.
+func WithChangeEvents(publisher *ChangeEvents) Option {
+	return func(o *Options) { o.ChangeEvents = publisher }
 }
 
 // BuildOptions applies opts over the defaults and returns the resolved settings.

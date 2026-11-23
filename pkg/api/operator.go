@@ -1304,6 +1304,7 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	//     longer serialize on the shared parent token.
 	//   - dualLeaseCtx carries both for the engine run, which writes both the
 	//     operation's tasks and the parent applies row.
+	ctx = s.withOperationChangeEvents(ctx, apply, op)
 	applyLeaseCtx := storage.WithApplyLease(ctx, applyLease)
 	operationLeaseCtx := storage.WithOperationLease(ctx, opLease)
 	dualLeaseCtx := storage.WithOperationLease(applyLeaseCtx, opLease)
@@ -1698,6 +1699,8 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 				"driver", driverID, "apply_operation_id", op.ID,
 				"operation_deployment", op.Deployment, "operation", stoppedParentRequest)...)
 	}
+
+	operationLeaseCtx = s.withOperationChangeEvents(operationLeaseCtx, apply, op)
 
 	// The claimed operation row's deployment is the authoritative routing key; an
 	// empty deployment is a corrupt row with no routing key, so fail closed.
@@ -2949,6 +2952,7 @@ func (s *Service) reconcileClaimedOperationFromTerminalParent(ctx context.Contex
 			"driver", driverID,
 			"apply_operation_id", op.ID,
 			"operation_deployment", op.Deployment)...)
+	ctx = s.withOperationChangeEvents(ctx, parent, op)
 	marked, err := s.markOperationFromApplyState(ctx, driverID, op, parent)
 	if err != nil {
 		s.logger.Error("operator: failed to reconcile apply_operation from terminal parent; derived apply state not updated",
@@ -4407,6 +4411,9 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		completedAt = nil
 	}
 
+	if s.changeEvents != nil && state.IsState(derived, state.SettledApplyStates...) {
+		ctx = storage.WithApplyChangeEventSnapshot(ctx, apply, ops)
+	}
 	swapped, err := s.storage.Applies().UpdateDerivedState(ctx, apply.ID, apply.State, derived, errorMessage, startedAt, completedAt)
 	if err != nil {
 		return applyProjectionResult{}, fmt.Errorf("update derived apply state for apply %s (%d) to %q: %w", apply.ApplyIdentifier, apply.ID, derived, err)

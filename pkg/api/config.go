@@ -21,6 +21,7 @@ import (
 
 	gomysql "github.com/block/mysql"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/changeevents"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
@@ -55,6 +56,9 @@ type ServerConfig struct {
 	// If not specified, falls back to the STORAGE_DSN environment variable,
 	// then to MYSQL_DSN (legacy name, honored for every dialect).
 	Storage StorageConfig `yaml:"storage"`
+
+	// ChangeEvents configures optional best-effort lifecycle notifications.
+	ChangeEvents []changeevents.Destination `yaml:"change_events,omitempty"`
 
 	// Auth configures API authentication. When Type is empty or "none" (the
 	// default), authentication is disabled and all requests are allowed,
@@ -2429,6 +2433,9 @@ func (c *ServerConfig) validateTargetTableOwners() error {
 
 // Validate checks the configuration for required fields and consistency.
 func (c *ServerConfig) Validate() error {
+	if err := changeevents.Validate(c.ChangeEvents); err != nil {
+		return err
+	}
 	if err := c.ValidateExperimentalStrata(); err != nil {
 		return err
 	}

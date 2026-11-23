@@ -335,6 +335,7 @@ func (s *Service) runRetryableExpiryPass(ctx context.Context) {
 	// apply at a time.
 	for _, expiration := range expired {
 		apply := expiration.Apply
+		s.offerReapedApplyFinished(ctx, apply)
 		s.logger.Error("operator: retryable apply expired",
 			append(apply.LogAttrs(),
 				"attempt", apply.Attempt,
@@ -515,6 +516,7 @@ func (s *Service) reportApplySettledForEndedOperation(ctx context.Context, settl
 
 	// No driver holds the apply, so this pass is the one that publishes the
 	// outcome to the PR and completes its Check Run.
+	s.offerReapedApplyFinished(ctx, apply)
 	s.publishTerminalSummary(ctx, apply, "publisher", "ended_operation_settle", "ended_operation_id", ended.ID)
 }
 

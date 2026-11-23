@@ -1893,6 +1893,10 @@ type ApplyOperation struct {
 	// apply (OW-5).
 	Attempt int
 
+	// StartsAttempt is set on the claim snapshot for a first dispatch or a
+	// deliberate retry. Lease takeovers and explicit resumes keep the attempt.
+	StartsAttempt bool
+
 	// AlreadyConverged is true for an operation recorded completed when its
 	// apply was created, because its target already held the change and had
 	// nothing left to run. It is set only at creation, on a completed row no
@@ -2026,6 +2030,10 @@ func (op *ApplyOperation) Lease() OperationLease {
 // ApplyOptions contains durable user and engine options for an apply.
 // Stored as JSON in the database for flexibility across engine types.
 type ApplyOptions struct {
+	// ChangeEventDispatch is execution-site correlation received over the
+	// dispatch RPC. It is durable metadata and is never sent to an engine.
+	ChangeEventDispatch *ChangeEventDispatch `json:"change_event_dispatch,omitempty"`
+
 	// AllowUnsafe permits destructive changes (DROP TABLE, DROP COLUMN).
 	AllowUnsafe bool `json:"allow_unsafe,omitempty"`
 

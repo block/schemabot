@@ -30,6 +30,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/changeevents"
 	"github.com/block/schemabot/pkg/drain"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
@@ -578,11 +579,12 @@ type Server struct {
 	// target resolver is configured. It is owned here (not by the service) so
 	// Close releases it; the resolver-backed dataPlaneClient is the service's
 	// default client and is closed by svc.Close.
-	grpcClient tern.Client
-	webhook    webhookRuntime
-	telemetry  *api.Telemetry
-	authz      auth.Authorizer
-	engines    map[string]tern.EngineFactory
+	grpcClient        tern.Client
+	webhook           webhookRuntime
+	telemetry         *api.Telemetry
+	changeEventSender *changeevents.Sender
+	authz             auth.Authorizer
+	engines           map[string]tern.EngineFactory
 	// probeCancel and probeDone are set by Start when a startup target probe is
 	// launched; Close cancels the probe and waits on probeDone so an in-flight
 	// probe never outlives the resolver and clients svc.Close tears down.
@@ -750,12 +752,30 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		logger.Info("registered database", "name", name, "type", dbCfg.Type, "environments", envs)
 	}
 
-	// Create service with dependencies
-	store, err := newStore(dialect, db, storage.WithMaxDriversPerApply(cfg.MaxDriversPerApply))
+	sender, err := changeevents.NewSender(ctx, cfg.ChangeEvents, logger)
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if !success {
+			sender.Close()
+		}
+	}()
+	var publisher *storage.ChangeEvents
+	if sender != nil {
+		publisher = &storage.ChangeEvents{Sink: sender, Accepts: sender.Accepts, AppFor: cfg.ChangeEventApp, Logger: logger}
+	}
+
+	// Create service with dependencies
+	store, err := newStore(dialect, db, storage.WithMaxDriversPerApply(cfg.MaxDriversPerApply), storage.WithChangeEvents(publisher))
+	if err != nil {
+		return nil, err
+	}
+	if publisher != nil {
+		publisher.Journal, _ = store.ApplyLogs().(storage.OperationDispatchJournal)
+	}
 	svc := api.New(store, cfg, nil, logger)
+	svc.SetChangeEvents(publisher)
 	defer func() {
 		if !success {
 			utils.CloseAndLog(svc)
@@ -821,20 +841,21 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		targetResolver = router.Resolver()
 	}
 	srv := &Server{
-		cfg:             cfg,
-		svc:             svc,
-		storage:         store,
-		logger:          logger,
-		dataPlaneClient: dataPlaneClient,
-		targetResolver:  targetResolver,
-		webhook:         webhookRuntime,
-		telemetry:       telemetry,
-		authz:           authz,
-		engines:         o.engines,
-		dialect:         dialect,
-		storageDSN:      storageDSN,
-		version:         version,
-		localHosted:     o.localHosted,
+		cfg:               cfg,
+		svc:               svc,
+		storage:           store,
+		logger:            logger,
+		dataPlaneClient:   dataPlaneClient,
+		targetResolver:    targetResolver,
+		webhook:           webhookRuntime,
+		telemetry:         telemetry,
+		changeEventSender: sender,
+		authz:             authz,
+		engines:           o.engines,
+		dialect:           dialect,
+		storageDSN:        storageDSN,
+		version:           version,
+		localHosted:       o.localHosted,
 	}
 
 	if err := srv.registerStorageSchema(svc); err != nil {
@@ -1280,6 +1301,7 @@ func (s *Server) stopTargetProbe() {
 // anything another process cannot redo or reclaim, which is what makes stopping
 // the right move when the wait is the thing holding the process open.
 func (s *Server) Close() error {
+	s.changeEventSender.Close()
 	s.stopTargetProbe()
 	s.webhook.stopQuotaProbes()
 	s.svc.StopPendingDropsCleaner()

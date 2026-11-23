@@ -634,6 +634,7 @@ func (c *LocalClient) applyWithEngine(ctx context.Context, eng engine.Engine, re
 	ctx = withDriveWorkOwner(ctx)
 	req = applyRequestWithStatedDirectExecution(req)
 	if !c.remapsPostgresNamespaces() {
+		storage.OfferOperationStarted(ctx)
 		return eng.Apply(ctx, req)
 	}
 	// Remapping rewrites the caller's request, so it is done on a copy: the
@@ -656,6 +657,7 @@ func (c *LocalClient) applyWithEngine(ctx context.Context, eng engine.Engine, re
 		return nil, fmt.Errorf("prepare PostgreSQL apply schema files: %w", err)
 	}
 	requestCopy.SchemaFiles = physicalFiles
+	storage.OfferOperationStarted(ctx)
 	return eng.Apply(ctx, &requestCopy)
 }
 
@@ -3674,6 +3676,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// state projection holds the apply's success verdict on until every
 	// declared operation has attached and finished.
 	applyIdentifier := engine.NewApplyID()
+	applyOpts.ChangeEventDispatch = storedChangeEventDispatch(req.GetChangeEventDispatch())
 	apply := &storage.Apply{
 		ApplyIdentifier:       applyIdentifier,
 		PlanID:                plan.ID,
@@ -3686,7 +3689,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		Caller:                caller,
 		Engine:                eng.Name(),
 		State:                 state.Apply.Pending,
-		Options:               optionsJSON,
+		Options:               storage.MarshalApplyOptions(applyOpts),
 		IdempotencyKey:        req.IdempotencyKey,
 		ExpectedOperationKeys: normalizedManifest(req.GenerationOperationKeys),
 		CreatedAt:             now,

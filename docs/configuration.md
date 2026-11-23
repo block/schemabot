@@ -11,6 +11,7 @@
 - [Environment Order](#environment-order)
 - [Hybrid Mode](#hybrid-mode)
 - [Drivers](#drivers)
+- [Change Events](#change-events)
 - [Metrics](#metrics)
 - [Rate Limits](#rate-limits)
 - [Pending Drops](#pending-drops)
@@ -965,6 +966,30 @@ drivers: 4
 Increase `drivers` when one SchemaBot server should make operator progress across independent databases or environments concurrently. More drivers help high-scale installations with many schema changes because each driver can claim and resume a different target during the same operator tick. The operator still excludes overlapping work for the same database and environment, so this improves concurrency across independent targets, not parallel execution against one target.
 
 A driver claim means selecting one stale apply and refreshing its heartbeat in the same storage transaction. That heartbeat refresh is the driver's lease while it reloads state and drives the apply to a terminal state.
+
+## Change Events
+
+Set `change_events` to send lifecycle notifications to one or more HTTP endpoints. Each destination selects specific environments and event types. The optional configuration is empty by default.
+
+```yaml
+change_events:
+  - url: https://events.example.com/schema-changes
+    environments: [production]
+    events: [operation.started, operation.finished, apply.finished]
+    body: |
+      {"source":"schemabot","app":{{json .App}},"environment":{{json .Environment}},
+       "timestamp":{{.OccurredAtNanos}},"description":{{json .Description}}}
+```
+
+SchemaBot renders the body as a Go text template and posts JSON. Templates can use `.Type`, `.App`, `.Environment`, `.OccurredAtNanos`, and `.Description`. Use `json` to encode values such as names and descriptions safely. The app comes from the managed database's `app` setting and defaults to the database name. The description carries the apply ID, outcome when available, and caller and PR link when present.
+
+- `operation.started` is offered by the worker immediately before an attempt first dispatches to the schema engine.
+- `operation.finished` is offered by the worker after the operation's outcome commits, including a retryable failure. A lease takeover keeps the attempt number, and a deliberate retry increments it. Resuming a stopped copy continues its existing attempt. A dispatch marker in the apply log lets a replacement worker keep the attempt identity.
+- `apply.finished` is offered by the control plane after the final aggregate outcome commits. A resumable stop leaves that outcome open. Its description reports deployment outcomes and covers CLI and PR applies.
+
+Enable operation events on the servers that run the engines. A remote dispatch carries the control-plane identifiers so the data plane can use them in its worker events. Both peers must support correlation for remote worker events. A control plane that also runs operations locally can select all three event types.
+
+Delivery uses an independent in-memory queue of 128 events per destination and a three-second HTTP timeout. Workers log send failures and queue drops. Events may arrive out of order or be lost on failure, saturation, or shutdown. HTTP proxy settings, including `NO_PROXY`, apply. Configure a destination you trust to receive the application and caller information.
 
 ## Metrics
 
