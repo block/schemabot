@@ -44,10 +44,12 @@ func (e *QuotaReservedError) Unwrap() error {
 	return ErrGitHubQuotaReserved
 }
 
-// quotaResetHorizon bounds how far ahead a reported reset time is believed.
+// QuotaResetHorizon bounds how far ahead a reported reset time is believed.
 // GitHub's core quota resets every hour, so a reset further out than this is
 // a garbled header, and accepting it would hold the reserve until that time.
-const quotaResetHorizon = 2 * time.Hour
+// The durable webhook driver uses the same bound for how long it waits to
+// retry a delivery the reserve refused.
+const QuotaResetHorizon = 2 * time.Hour
 
 // checkPublicationReadsKey marks a context whose GitHub reads decide which
 // Check Run to post.
@@ -185,7 +187,7 @@ func (t *quotaReserveTransport) settle(req *http.Request, resp *http.Response) {
 // observe records the core quota a response reports. Responses can arrive out
 // of order, so a later reset window replaces the state, the same window keeps
 // the lowest remaining count (it only falls within a window), and an earlier
-// window is ignored. A reset further out than quotaResetHorizon is ignored as
+// window is ignored. A reset further out than QuotaResetHorizon is ignored as
 // a garbled header.
 func (t *quotaReserveTransport) observe(req *http.Request, resp *http.Response) {
 	if gitHubRateLimitResource(githubRateLimitResourceFromHeaders(req, resp)) != metrics.GitHubRateLimitResourceCore {
@@ -197,7 +199,7 @@ func (t *quotaReserveTransport) observe(req *http.Request, resp *http.Response) 
 		return
 	}
 	resetAt := time.Unix(reset, 0)
-	if horizon := t.now().Add(quotaResetHorizon); resetAt.After(horizon) {
+	if horizon := t.now().Add(QuotaResetHorizon); resetAt.After(horizon) {
 		slog.WarnContext(req.Context(), "ignoring a GitHub core quota report whose reset time is further out than GitHub's hourly window; the quota reserve keeps its previous reading",
 			"installation_id", t.installationID, "remaining", remaining,
 			"reset_time", resetAt.UTC().Format(time.RFC3339), "horizon", horizon.UTC().Format(time.RFC3339))

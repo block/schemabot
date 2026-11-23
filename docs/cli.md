@@ -1018,7 +1018,8 @@ cannot reach is retried with backoff, the same way the watchers retry, and
 following stops with a non-zero exit once polls have kept failing for a few
 minutes in a row. Run the same `logs` command again to keep following: it
 prints the newest entries again and does not resume from the last line shown.
-Ctrl-C ends following normally.
+Ctrl-C ends following normally. Without `-f`, Ctrl-C abandons the read and
+exits 130, as other commands do when interrupted before their output.
 
 With `--deployment`, a source whose logs could not be read is reported as a
 warning while the other sources keep printing. That warning does not end
