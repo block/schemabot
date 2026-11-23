@@ -183,6 +183,9 @@ type shardedPlanView struct {
 	// no size of their own, since the plan's figure is the whole table's, so
 	// the comment reads it here and shows it on the table's line.
 	tableSizes map[shardedTableKey]plannedTableSize
+	// plannedChanges is each table's change in the stored plan, which a
+	// table reads its copy label from until a shard records its own change.
+	plannedChanges map[shardedTableKey]presentation.TableChange
 }
 
 // shardedTableKey names one table of a sharded apply.
@@ -209,6 +212,19 @@ func (p *shardedPlanView) plannedSize(namespace, table string) (*int64, int) {
 		return nil, 0
 	}
 	return &size.bytes, size.shards
+}
+
+// plannedChange returns the table's change in the stored plan, or nil when
+// the stored plan does not list the table.
+func (p *shardedPlanView) plannedChange(namespace, table string) *presentation.TableChange {
+	if p == nil {
+		return nil
+	}
+	change, ok := p.plannedChanges[shardedTableKey{namespace, table}]
+	if !ok {
+		return nil
+	}
+	return &change
 }
 
 // vschemaDiff returns the namespace's rendered VSchema diff, or "" when the
@@ -254,12 +270,18 @@ func resolveShardedPlanView(ctx context.Context, stor storage.Storage, apply *st
 		return nil
 	}
 
-	view := &shardedPlanView{vschemaDiffs: map[string]string{}, finalizeOnly: map[string]bool{}, tableSizes: map[shardedTableKey]plannedTableSize{}}
+	view := &shardedPlanView{
+		vschemaDiffs:   map[string]string{},
+		finalizeOnly:   map[string]bool{},
+		tableSizes:     map[shardedTableKey]plannedTableSize{},
+		plannedChanges: map[shardedTableKey]presentation.TableChange{},
+	}
 	for namespace, nsData := range plan.Namespaces {
 		if nsData == nil {
 			continue
 		}
 		for _, tc := range nsData.Tables {
+			view.plannedChanges[shardedTableKey{namespace, tc.Table}] = presentation.TableChange{DDLAction: tc.Operation}
 			if tc.EstimatedBytes != nil {
 				view.tableSizes[shardedTableKey{namespace, tc.Table}] = plannedTableSize{bytes: *tc.EstimatedBytes, shards: tc.ShardCount}
 			}
@@ -398,7 +420,7 @@ func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, release
 				ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
 				PauseOnFailure:    op.OnFailure == storage.OnFailurePause,
 				Released:          released,
-				CopiesNoRows:      tasksCopyNoRows(tasksByOp[op.ID]),
+				CopiesNoRows:      presentation.TasksCopyNoRows(tasksByOp[op.ID]),
 				Error:             shardOperationError(op, tasksByOp[op.ID]),
 			})
 		}
@@ -432,10 +454,7 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 	var order []keyspaceTable
 	shardsByTable := make(map[keyspaceTable][]templates.ShardProgressData)
 	copiesByTable := make(map[keyspaceTable][]presentation.ShardCopy)
-	// A table copies no rows only once some shard's tasks say so and none
-	// says otherwise; a table with no tasks yet reads as copying.
-	reportsNoRowCopy := make(map[keyspaceTable]bool)
-	reportsRowCopy := make(map[keyspaceTable]bool)
+	changesByTable := make(map[keyspaceTable][][]presentation.TableChange)
 	for _, op := range ops {
 		ns, shard, table, ok := state.ShardWorkKey(op.OperationKey)
 		if !ok {
@@ -446,13 +465,7 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 		if _, seen := copiesByTable[key]; !seen {
 			order = append(order, key)
 		}
-		if tasks := tasksByOp[op.ID]; len(tasks) > 0 {
-			if tasksCopyNoRows(tasks) {
-				reportsNoRowCopy[key] = true
-			} else {
-				reportsRowCopy[key] = true
-			}
-		}
+		changesByTable[key] = append(changesByTable[key], presentation.TaskTableChanges(tasksByOp[op.ID]))
 		sp := shardOperationCopy(op, tasksByOp[op.ID])
 		copiesByTable[key] = append(copiesByTable[key], sp)
 		shardsByTable[key] = append(shardsByTable[key], templates.ShardProgressData{
@@ -478,7 +491,7 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 			ShardsReporting: rollup.ShardsReporting,
 			EstimatedBytes:  estimatedBytes,
 			PlannedShards:   plannedShards,
-			CopiesNoRows:    reportsNoRowCopy[key] && !reportsRowCopy[key],
+			CopiesNoRows:    presentation.ShardedTableCopiesNoRows(changesByTable[key], view.plannedChange(key.namespace, key.table)),
 			Shards:          shardsByTable[key],
 		})
 	}
@@ -502,16 +515,6 @@ func shardOperationCopy(op *storage.ApplyOperation, tasks []*storage.Task) prese
 		})
 	}
 	return presentation.ShardOperationCopy(op.State, copies)
-}
-
-// tasksCopyNoRows reports whether an operation's tasks are all table changes
-// that copy no rows (presentation.ChangesCopyNoRows).
-func tasksCopyNoRows(tasks []*storage.Task) bool {
-	changes := make([]presentation.TableChange, 0, len(tasks))
-	for _, t := range tasks {
-		changes = append(changes, presentation.TableChange{DDLAction: t.DDLAction, Instant: t.IsInstant})
-	}
-	return presentation.ChangesCopyNoRows(changes)
 }
 
 // shardOperationError is a shard operation's error. When the row carries no

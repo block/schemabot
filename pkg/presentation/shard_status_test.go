@@ -87,6 +87,28 @@ func TestDeriveShardsReadsAChangeThatCopiesNoRowsAsApplying(t *testing.T) {
 		ShardCounts([]string{shards[0].Label, shards[1].Label, shards[2].Label}))
 }
 
+// A shard's label follows the changes it is running. On -80 a CREATE TABLE
+// runs while another table is still queued with no tasks, and on 80- a CREATE
+// TABLE runs after a sibling's table copy has finished. Neither the queued
+// table nor the finished copy makes the shard read as a table copy, so the
+// count matches the table lines above it.
+func TestDeriveShardsLabelsAShardByTheChangesItIsRunning(t *testing.T) {
+	shards := DeriveShards(state.Apply.Running, []ShardWork{
+		{Keyspace: "shop_001", Shard: "-80", Operations: []Operation{
+			{State: state.ApplyOperation.Running, Parallel: true, CopiesNoRows: true},
+			{State: state.ApplyOperation.Pending, Parallel: true},
+		}},
+		{Keyspace: "shop_001", Shard: "80-", Operations: []Operation{
+			{State: state.ApplyOperation.Completed, Parallel: true},
+			{State: state.ApplyOperation.Running, Parallel: true, CopiesNoRows: true},
+		}},
+	})
+
+	require.Len(t, shards, 2)
+	assert.Equal(t, RunningApplying, shards[0].Label, "the queued table does not decide")
+	assert.Equal(t, RunningApplying, shards[1].Label, "the finished table copy does not decide")
+}
+
 // A shard has landed only once every table change it runs has landed. A
 // shard whose first table waits out its revert window while a second table's
 // change is still queued reads by its revert window state, but it is not done.

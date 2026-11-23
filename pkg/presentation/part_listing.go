@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -109,6 +110,52 @@ func ChangesCopyNoRows(changes []TableChange) bool {
 		}
 	}
 	return true
+}
+
+// TasksCopyNoRows reports whether a shard operation's stored tasks are all
+// table changes that copy no rows (ChangesCopyNoRows). The progress API and
+// the PR comment both read a shard's tasks through it.
+func TasksCopyNoRows(tasks []*storage.Task) bool {
+	return ChangesCopyNoRows(TaskTableChanges(tasks))
+}
+
+// TaskTableChanges is the table change each of a shard operation's stored
+// tasks runs.
+func TaskTableChanges(tasks []*storage.Task) []TableChange {
+	changes := make([]TableChange, 0, len(tasks))
+	for _, t := range tasks {
+		changes = append(changes, TableChange{DDLAction: t.DDLAction, Instant: t.IsInstant})
+	}
+	return changes
+}
+
+// ShardedTableCopiesNoRows reports whether a table rolled up across shards
+// copies no rows, so it reads as applying rather than copying. The CLI and
+// the PR comment both read a sharded table by this rule. shardChanges holds
+// each shard's recorded changes to the table. The shards that have recorded
+// any decide: the table copies no rows when at least one has and none of
+// those changes copies rows. A shard that has recorded nothing yet does not
+// decide. When no shard has recorded a change, the table reads from planned,
+// its change in the stored plan, which carries no instant flag. With no
+// planned change either, it reads as copying, since nothing says otherwise.
+func ShardedTableCopiesNoRows(shardChanges [][]TableChange, planned *TableChange) bool {
+	recorded := false
+	for _, changes := range shardChanges {
+		if len(changes) == 0 {
+			continue
+		}
+		recorded = true
+		if !ChangesCopyNoRows(changes) {
+			return false
+		}
+	}
+	if recorded {
+		return true
+	}
+	if planned == nil {
+		return false
+	}
+	return !ChangeCopiesRows(planned.DDLAction, planned.Instant)
 }
 
 // PendingWord names the parts still to run of a rollout that has or has not

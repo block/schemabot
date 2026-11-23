@@ -1137,3 +1137,35 @@ func TestBuildShardedApplyData_DispatchedCreateReadsAsApplying(t *testing.T) {
 	assert.NotContains(t, out, "running table copy")
 	assert.NotContains(t, out, "copying")
 }
+
+// A sharded table reads by the shards that have recorded their changes, and
+// by the stored plan only while none has. -80 has no tasks yet and 80- runs an
+// instant ALTER, so `orders` copies no rows. No shard of `mutes` has a task
+// yet and the plan creates it, so it copies no rows either. The CLI reads both
+// tables by the same rule (presentation.ShardedTableCopiesNoRows).
+func TestShardedTableStatusesReadATableFromItsReportedShardsThenItsPlan(t *testing.T) {
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "ks/-80/orders", state.ApplyOperation.Pending),
+		mk(2, "ks/80-/orders", state.ApplyOperation.Running),
+		mk(3, "ks/-80/mutes", state.ApplyOperation.Running),
+		mk(4, "ks/80-/mutes", state.ApplyOperation.Pending),
+	}
+	tasksByOp := map[int64][]*storage.Task{
+		2: {{State: state.Task.Running, DDLAction: "alter", IsInstant: true}},
+	}
+	view := &shardedPlanView{plannedChanges: map[shardedTableKey]presentation.TableChange{
+		{namespace: "ks", table: "orders"}: {DDLAction: "alter"},
+		{namespace: "ks", table: "mutes"}:  {DDLAction: "create"},
+	}}
+
+	tables := shardedTableStatusesByKeyspace(ops, tasksByOp, view)["ks"]
+
+	require.Len(t, tables, 2)
+	assert.Equal(t, "orders", tables[0].Table)
+	assert.True(t, tables[0].CopiesNoRows, "the shard without tasks does not outvote the instant ALTER")
+	assert.Equal(t, "mutes", tables[1].Table)
+	assert.True(t, tables[1].CopiesNoRows, "with no tasks yet, the planned CREATE TABLE decides")
+}

@@ -407,3 +407,25 @@ func TestChangeCopiesRows(t *testing.T) {
 	assert.True(t, ChangeCopiesRows("", false))
 	assert.True(t, ChangeCopiesRows("", true))
 }
+
+// A table rolled up across shards reads as applying only when the shards that
+// have recorded their changes all copy no rows. A shard with nothing recorded
+// yet does not decide, and the plan's change decides only when no shard has
+// recorded one.
+func TestShardedTableCopiesNoRows(t *testing.T) {
+	instant := []TableChange{{DDLAction: "alter", Instant: true}}
+	copying := []TableChange{{DDLAction: "alter"}}
+	plannedAlter := &TableChange{DDLAction: "alter"}
+	plannedCreate := &TableChange{DDLAction: "create"}
+
+	assert.True(t, ShardedTableCopiesNoRows([][]TableChange{nil, instant}, plannedAlter),
+		"a shard with nothing recorded does not outvote one running an instant ALTER")
+	assert.False(t, ShardedTableCopiesNoRows([][]TableChange{instant, copying}, nil),
+		"one shard copying rows makes the table a table copy")
+	assert.True(t, ShardedTableCopiesNoRows([][]TableChange{nil, nil}, plannedCreate),
+		"with nothing recorded, a planned CREATE TABLE copies no rows")
+	assert.False(t, ShardedTableCopiesNoRows([][]TableChange{nil, nil}, plannedAlter),
+		"a planned ALTER carries no instant flag, so it reads as a table copy")
+	assert.False(t, ShardedTableCopiesNoRows([][]TableChange{nil}, nil),
+		"with nothing recorded or planned, the table reads as copying")
+}

@@ -156,6 +156,9 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 	}
 	var ddls []string
 	copies := make([]presentation.ShardCopy, 0, len(tableOps))
+	shardChanges := make([][]presentation.TableChange, 0, len(tableOps))
+	var reportedRows []*apitypes.TableProgressResponse
+	var standIn *apitypes.TableProgressResponse
 	for _, op := range tableOps {
 		_, shard, _, _ := state.ShardWorkKey(op.OperationKey)
 		sc := presentation.ShardOperationCopy(op.State, taskCopies(tasksByOp[op.ID]))
@@ -170,19 +173,20 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 
 			ChecksumRowsChecked: sc.ChecksumRowsChecked,
 			ChecksumRowsTotal:   sc.ChecksumRowsTotal,
-			CopiesNoRows:        tasksCopyNoRows(tasksByOp[op.ID]),
+			CopiesNoRows:        presentation.TasksCopyNoRows(tasksByOp[op.ID]),
 		})
+		shardChanges = append(shardChanges, presentation.TaskTableChanges(tasksByOp[op.ID]))
 		shardRows := rowsByOp[op.ID]
-		reported := len(shardRows) > 0
-		if !reported {
+		reportedRows = append(reportedRows, shardRows...)
+		if len(shardRows) == 0 {
 			if planned := plannedShardChange(plan, namespace, shard, table); planned != nil {
 				shardRows = []*apitypes.TableProgressResponse{{ChangeType: planned.Operation, DDL: planned.DDL}}
+				if standIn == nil {
+					standIn = shardRows[0]
+				}
 			}
 		}
 		for _, r := range shardRows {
-			if row.ChangeType == "" || (reported && copiesRowsWhereTableDoesNot(row, r)) {
-				row.ChangeType, row.IsInstant = r.ChangeType, r.IsInstant
-			}
 			if r.DDL != "" && !slices.Contains(ddls, r.DDL) {
 				ddls = append(ddls, r.DDL)
 			}
@@ -193,6 +197,12 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 		}
 	}
 	row.DDL = strings.Join(ddls, "\n")
+	var planned *presentation.TableChange
+	if pt := plannedTable(plan, namespace, table); pt != nil {
+		planned = &presentation.TableChange{DDLAction: pt.Operation}
+	}
+	row.ChangeType, row.IsInstant = shardedTableChange(reportedRows, standIn,
+		presentation.ShardedTableCopiesNoRows(shardChanges, planned))
 
 	rollup := presentation.RollUpShardedTable(copies)
 	row.Status = rollup.Status
@@ -325,22 +335,24 @@ func (s *Service) storedPlanForShardedProgress(ctx context.Context, apply *stora
 	return plan
 }
 
-// tasksCopyNoRows reports whether a shard operation's tasks are all table
-// changes that copy no rows (presentation.ChangesCopyNoRows), the same fact
-// the PR comment reads from the same tasks.
-func tasksCopyNoRows(tasks []*storage.Task) bool {
-	changes := make([]presentation.TableChange, 0, len(tasks))
-	for _, t := range tasks {
-		changes = append(changes, presentation.TableChange{DDLAction: t.DDLAction, Instant: t.IsInstant})
+// shardedTableChange is the change a rolled-up table row names. The CLI reads
+// the table's running word from it (presentation.ChangeCopiesRows), so it is
+// a change that reads as copying exactly when the table does by
+// presentation.ShardedTableCopiesNoRows, the rule the PR comment reads it by:
+// the first reported change that agrees with copiesNoRows. A stand-in from the
+// plan is used only when no shard has reported, and its instant flag is
+// unknown, so it never decides that a reported table copies no rows.
+func shardedTableChange(reported []*apitypes.TableProgressResponse, standIn *apitypes.TableProgressResponse, copiesNoRows bool) (changeType string, isInstant bool) {
+	for _, r := range reported {
+		if presentation.ChangeCopiesRows(r.ChangeType, r.IsInstant) != copiesNoRows {
+			return r.ChangeType, r.IsInstant
+		}
 	}
-	return presentation.ChangesCopyNoRows(changes)
-}
-
-// copiesRowsWhereTableDoesNot reports whether a shard's reported change copies
-// rows while the table row's change so far does not. The table row then takes
-// that shard's change, so the table reads as a table copy whenever any of its
-// shards runs one, not only when the first shard listed does.
-func copiesRowsWhereTableDoesNot(table, shard *apitypes.TableProgressResponse) bool {
-	return presentation.ChangeCopiesRows(shard.ChangeType, shard.IsInstant) &&
-		!presentation.ChangeCopiesRows(table.ChangeType, table.IsInstant)
+	if len(reported) > 0 {
+		return reported[0].ChangeType, reported[0].IsInstant
+	}
+	if standIn != nil {
+		return standIn.ChangeType, false
+	}
+	return "", false
 }

@@ -67,7 +67,7 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 			ContinueOnFailure: first.ContinueOnFailure,
 			PauseOnFailure:    first.PauseOnFailure,
 			Released:          first.Released,
-			CopiesNoRows:      shardCopiesNoRows(sw.Operations),
+			CopiesNoRows:      shardCopiesNoRows(sw.Operations, sw.Operations[best].State),
 			Error:             sw.Operations[best].Error,
 			EndedBy:           shardEndedBy(sw.Operations, best, shardOf),
 		})
@@ -93,12 +93,15 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 	return out
 }
 
-// shardCopiesNoRows reports whether none of a shard's table changes copies
-// rows, so a running shard reads as applying only when every change it runs
-// does.
-func shardCopiesNoRows(ops []Operation) bool {
+// shardCopiesNoRows reports whether the shard's operations in the state its
+// status names (shardState) all copy no rows, so a running shard reads as
+// applying only when every change it is running does. Operations in another
+// state, such as a table still queued or one whose copy already finished, do
+// not decide, so the shard's label matches the lines of the tables it is
+// running.
+func shardCopiesNoRows(ops []Operation, shardState string) bool {
 	for _, op := range ops {
-		if !op.CopiesNoRows {
+		if op.State == shardState && !op.CopiesNoRows {
 			return false
 		}
 	}

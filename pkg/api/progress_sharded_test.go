@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -140,6 +141,31 @@ func TestProgressByApplyIDSaysWhichShardsCopyNoRows(t *testing.T) {
 	assert.False(t, table.Shards[1].CopiesNoRows, "80- runs a table copy")
 	assert.Equal(t, "alter", table.ChangeType)
 	assert.False(t, table.IsInstant, "a table with a shard copying rows is not instant")
+}
+
+// A table whose first listed shard has no tasks yet reads from the shards
+// that have reported, not from the plan's stand-in for the first shard, which
+// carries no instant flag. -80 is still pending and 80- runs an instant ALTER,
+// so the table names the instant ALTER and the CLI reads it as applying, as
+// the PR comment does.
+func TestProgressByApplyIDReadsAShardedTableFromItsReportedShards(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		shardOp(1, "shop_001/-80/orders", state.ApplyOperation.Pending),
+		shardOp(2, "shop_001/80-/orders", state.ApplyOperation.Running),
+	}
+	instant := shardTask(2, state.Task.Running, 0, 0)
+	instant.IsInstant = true
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {
+		Tables: []storage.TableChange{{Table: "orders", Operation: "alter", DDL: shardedTestDDL}},
+	}}}
+
+	resp := shardedProgress(t, ops, []*storage.Task{instant}, &staticPlanStore{plan: plan})
+
+	require.Len(t, resp.Tables, 1)
+	table := resp.Tables[0]
+	assert.Equal(t, "alter", table.ChangeType)
+	assert.True(t, table.IsInstant, "the one shard that reported runs an instant ALTER")
+	assert.False(t, presentation.ChangeCopiesRows(table.ChangeType, table.IsInstant))
 }
 
 // While a sharded apply's operations attach one dispatch at a time, it reads
