@@ -125,7 +125,7 @@ func TestApplyPrintsTheFreezeRefusal(t *testing.T) {
 			require.ErrorIs(t, err, ErrSilent, "main must not print a second line")
 			assert.Equal(t, 1, ExitCodeFor(err))
 			assert.Len(t, *applies, 1)
-			assert.Contains(t, out, "✗ production is frozen. This change did not start.\n")
+			assert.Contains(t, out, "❄️ production is frozen. This change did not start.\n")
 			assert.Contains(t, out, "   freeze-abc  SEV-1234 payments latency  (until lifted)\n")
 			assert.Contains(t, out, "   freeze-def  holiday freeze  (until 2026-11-22T10:00:00Z)\n")
 			for _, line := range tc.want {
@@ -177,7 +177,7 @@ func TestStartAndCutoverFreezeRefusal(t *testing.T) {
 			func(o string) func(*Globals) error {
 				return (&StartCmd{ControlFlags: controlTestFlags(), Override: o}).Run
 			},
-			"✗ staging is frozen. This change did not start.",
+			"❄️ staging is frozen. This change did not start.",
 		},
 		"cutover": {
 			state.Apply.WaitingForCutover, "/api/cutover",
@@ -186,7 +186,7 @@ func TestStartAndCutoverFreezeRefusal(t *testing.T) {
 					return (&CutoverCmd{ControlFlags: controlTestFlags(), Override: o}).Run(t.Context(), g)
 				}
 			},
-			"✗ staging is frozen. This cutover did not start.",
+			"❄️ staging is frozen. This cutover did not start.",
 		},
 	}
 	for name, tc := range cases {

@@ -9,13 +9,14 @@ import (
 	"net/http"
 	"slices"
 	"strings"
-	"time"
+	"unicode"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // changeGateCheckpoint names where in a change's life the change gates run.
@@ -29,6 +30,10 @@ const (
 	changeGateCheckpointResume changeGateCheckpoint = "resume"
 	// changeGateCheckpointCutover runs before a deferred cutover is recorded.
 	changeGateCheckpointCutover changeGateCheckpoint = "cutover"
+	// changeGateCheckpointClaim runs when a driver claims an operation it
+	// would start: one that has not started, or a stopped one a start
+	// resumes. Only freezes with running "stop" act here.
+	changeGateCheckpointClaim changeGateCheckpoint = "claim"
 )
 
 // changeGateInput is what a change gate decides on.
@@ -136,6 +141,29 @@ func (s *Service) changeGateDeployments(database, environment, deployment string
 	return deployments
 }
 
+// applyChangeGateDeployments lists the deployments an existing apply runs on:
+// its own and its stored operations', with the configured rollout added for
+// an apply not narrowed to one member. An operation keeps running on a
+// deployment later dropped from the rollout configuration, so the stored
+// operations count too.
+func (s *Service) applyChangeGateDeployments(ctx context.Context, apply *storage.Apply) ([]string, error) {
+	deployments := s.changeGateDeployments(apply.Database, apply.Environment, apply.Deployment, apply.GetOptions().NarrowedTo != "")
+	operations := s.storage.ApplyOperations()
+	if operations == nil {
+		return deployments, nil
+	}
+	stored, err := operations.ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list operations of apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	for _, operation := range stored {
+		if operation.Deployment != "" && !slices.Contains(deployments, operation.Deployment) {
+			deployments = append(deployments, operation.Deployment)
+		}
+	}
+	return deployments, nil
+}
+
 // checkChangeGatesForApply runs the change gates for a start or cutover of an
 // existing apply. A pinned PR rollback passes, as it did at creation. The
 // deployments checked are the apply's own and its stored operations', with
@@ -149,20 +177,12 @@ func (s *Service) checkChangeGatesForApply(ctx context.Context, checkpoint chang
 	if apply.GetOptions().PinnedRollback {
 		return ctx, nil, nil
 	}
-	deployments := s.changeGateDeployments(apply.Database, apply.Environment, apply.Deployment, apply.GetOptions().NarrowedTo != "")
-	if operations := s.storage.ApplyOperations(); operations != nil {
-		stored, err := operations.ListByApply(ctx, apply.ID)
-		if err != nil {
-			metrics.RecordChangeGateError(ctx, apply.Environment, string(checkpoint))
-			s.logger.Error("change gate could not read the apply's operations, so the change was refused",
-				append(apply.LogAttrs(), "checkpoint", string(checkpoint), "caller", caller, "error", err)...)
-			return ctx, nil, &ChangeGateUnavailableError{Checkpoint: checkpoint, Gate: "operations", Err: fmt.Errorf("list operations of apply %s: %w", apply.ApplyIdentifier, err)}
-		}
-		for _, operation := range stored {
-			if operation.Deployment != "" && !slices.Contains(deployments, operation.Deployment) {
-				deployments = append(deployments, operation.Deployment)
-			}
-		}
+	deployments, err := s.applyChangeGateDeployments(ctx, apply)
+	if err != nil {
+		metrics.RecordChangeGateError(ctx, apply.Environment, string(checkpoint))
+		s.logger.Error("change gate could not read the apply's operations, so the change was refused",
+			append(apply.LogAttrs(), "checkpoint", string(checkpoint), "caller", caller, "error", err)...)
+		return ctx, nil, &ChangeGateUnavailableError{Checkpoint: checkpoint, Gate: "operations", Err: err}
 	}
 	action := storage.FreezeOverrideActionStart
 	if checkpoint == changeGateCheckpointCutover {
@@ -507,35 +527,84 @@ type ChangeGateRefusedError struct {
 func (e *ChangeGateRefusedError) Error() string {
 	message := e.Blocked()
 	if e.OverrideRequest != nil {
-		message += fmt.Sprintf("; override request %s needs a freeze approver other than you", e.OverrideRequest.Identifier)
+		message += fmt.Sprintf(" Override request %s needs a freeze approver other than you.", e.OverrideRequest.Identifier)
 		if e.OverrideReasonKept {
-			message += fmt.Sprintf(" (you asked for it earlier, and it keeps that reason: %q)", e.OverrideRequest.Reason)
+			message += fmt.Sprintf(" You asked for it earlier, and it keeps that reason: %q.", e.OverrideRequest.Reason)
 		}
 	}
 	if e.OverrideUnrecorded {
-		message += "; no override was requested, because asking for one needs a verified caller"
+		message += " No override was requested, because asking for one needs a verified caller."
 	}
 	return message
 }
 
-// Blocked is the refusal without what it says about an override request: what
-// blocks the change, and that it clears when the blockers end.
+// Blocked is the refusal without what it says about an override request:
+// what blocks the change and until when, and when to retry, as whole
+// sentences. Each blocker's end and reason are their own sentences, so a
+// reason never runs into the text around it. For example:
+//
+//	production is frozen by freeze frz-1 until lifted. Reason: SEV-1234. Retry after it ends or is lifted.
 func (e *ChangeGateRefusedError) Blocked() string {
-	return e.BlockedWith(func(reason string) string { return reason })
+	var b strings.Builder
+	switch len(e.Blockers) {
+	case 0:
+		b.WriteString(e.Environment + " is frozen.")
+	case 1:
+		blocker := e.Blockers[0]
+		fmt.Fprintf(&b, "%s is frozen by %s %s %s.", e.Environment, blocker.Gate, blocker.ID, blockerUntil(blocker))
+		writeBlockerReason(&b, blocker.Reason)
+	default:
+		fmt.Fprintf(&b, "%s is frozen by %d freezes.", e.Environment, len(e.Blockers))
+		for _, blocker := range e.Blockers {
+			fmt.Fprintf(&b, " %s %s lasts %s.", capitalizeFirst(blocker.Gate), blocker.ID, blockerUntil(blocker))
+			writeBlockerReason(&b, blocker.Reason)
+		}
+	}
+	if len(e.Blockers) > 1 {
+		b.WriteString(" Retry after they end or are lifted.")
+	} else {
+		b.WriteString(" Retry after it ends or is lifted.")
+	}
+	return b.String()
 }
 
-// BlockedWith is Blocked with each blocker's reason written by reason, for a
-// caller that renders the refusal where a person's text needs escaping.
-func (e *ChangeGateRefusedError) BlockedWith(reason func(string) string) string {
-	parts := make([]string, 0, len(e.Blockers))
-	for _, blocker := range e.Blockers {
-		until := "until lifted"
-		if blocker.EndsAt != nil {
-			until = "until " + blocker.EndsAt.UTC().Format(time.RFC3339)
+// blockerUntil says when a blocker ends, in the words every surface uses.
+func blockerUntil(blocker apitypes.ChangeGateBlocker) string {
+	return ui.FreezeUntil(blocker.EndsAt)
+}
+
+// writeBlockerReason writes a blocker's reason as its own sentence, and
+// nothing for a reason with no visible text. A reason that already ends a
+// sentence gets no extra period.
+func writeBlockerReason(b *strings.Builder, reason string) {
+	reason = strings.TrimSpace(strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Cf, r) {
+			return -1
 		}
-		parts = append(parts, fmt.Sprintf("%s %s (%s, %s)", blocker.Gate, blocker.ID, reason(blocker.Reason), until))
+		return r
+	}, reason))
+	if reason == "" {
+		return
 	}
-	return fmt.Sprintf("blocked in %s by %s; try again after it ends or is lifted", e.Environment, strings.Join(parts, "; "))
+	b.WriteString(" Reason: " + reason)
+	if !endsSentence(reason) {
+		b.WriteString(".")
+	}
+}
+
+// endsSentence reports whether text already ends a sentence, so no period is
+// added after it. A clamped reason ends in "…".
+func endsSentence(text string) bool {
+	return strings.HasSuffix(text, ".") || strings.HasSuffix(text, "!") ||
+		strings.HasSuffix(text, "?") || strings.HasSuffix(text, "…")
+}
+
+// capitalizeFirst upper-cases a gate name's first letter to start a sentence.
+func capitalizeFirst(word string) string {
+	if word == "" {
+		return word
+	}
+	return strings.ToUpper(word[:1]) + word[1:]
 }
 
 // ChangeGateUnavailableError reports a change gate that could not decide. The

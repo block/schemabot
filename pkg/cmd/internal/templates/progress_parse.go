@@ -39,6 +39,9 @@ type ProgressData struct {
 	// renders as one change, the way its PR comments do, however many shard
 	// and finalizer rows it has.
 	Sharded bool
+	// StoppedByFreeze names the freeze that stopped the apply, nil when an
+	// operator stopped it or it is not stopped.
+	StoppedByFreeze *apitypes.FreezeStopRef
 }
 
 // RendersOperationSections reports whether progress renders a section per
@@ -180,6 +183,8 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		Metadata:       result.Metadata,
 		Released:       result.Released,
 		Sharded:        result.Sharded,
+
+		StoppedByFreeze: result.StoppedByFreeze,
 	}
 	if step, err := apitypes.ParseProgressStep(result.Metadata); err != nil {
 		slog.Warn("progress output omits the statement position because the progress metadata is malformed", "apply_id", result.ApplyID, "error", err)

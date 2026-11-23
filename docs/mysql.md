@@ -122,9 +122,13 @@ use deferred cutover.
 ### Review the direct change before it runs
 
 The PR plan lists the direct statements and explains why Spirit cannot run them.
-The PR apply flow requires a separate confirmation against that disclosure,
-even when other changes would apply automatically. Unsafe-change consent is
-still required where applicable. See the [PR confirmation workflow](direct-execution.md#operator-consent-in-the-pr-workflow).
+The server's direct-execution policy is the approval, so `schemabot apply` runs
+them with the rest of the plan and asks for no separate confirmation. If the
+re-plan at `apply` or `apply-confirm` routes a statement to direct execution
+that the plan comment showed running through Spirit, the apply pauses for
+`apply-confirm` against a comment that discloses it. A direct statement that is also an unsafe
+change, such as dropping a primary key, still needs `--allow-unsafe`. See
+[direct execution in the PR workflow](direct-execution.md#in-the-pr-workflow).
 
 The plan saves the policy used to make its decision. Applying that stored plan
 uses the saved policy, even if the server configuration changes during review.
@@ -525,7 +529,7 @@ databases:
           - shop-004
 ```
 
-The schema files are the source of truth for every target. Each target is planned by diffing its own live schema against the files, and runs its own Spirit change, against the plan made for it. Targets are not compared against each other, so a target that needs more work than the others, such as an index it is missing, simply gets a longer plan. One target's DDL is never run against another. [How targets are planned](configuration.md#how-targets-are-planned) shows an example. The plan comment on a pull request covers every target: it shows the change once, sizes the table across the targets, and says how many targets the change rolls out to. [Multi-target environments](configuration.md#multi-target-environment-preview) has the full configuration, including per-target namespaces and rollout order.
+The schema files are the source of truth for every target. Each target is planned by diffing its own live schema against the files, and runs its own Spirit change, against the plan made for it. Targets are not compared against each other, so a target that needs more work than the others, such as an index it is missing, simply gets a longer plan. One target's DDL is never run against another. [How targets are planned](configuration.md#how-targets-are-planned) shows an example. The plan comment on a pull request covers every target: it shows the change once, sizes the table across the targets, and says how many targets the change rolls out to. [Multi-target environments](configuration.md#multi-target-environment) has the full configuration, including per-target namespaces and rollout order.
 
 ### Apply every target at once
 

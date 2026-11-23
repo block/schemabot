@@ -630,10 +630,26 @@ $ schemabot unfreeze freeze-abc123 --reason "SEV resolved"
 ```
 
 `--deployment` and `--database` narrow a freeze and repeat; without them it
-covers the whole environment. `--running` records `continue` (the default) or
-`stop` for applies already running in scope. SchemaBot does not act on `stop`
-yet, so stop a running apply with `schemabot stop`. Times are RFC3339 and
-print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
+covers the whole environment. `--running` says what happens to applies
+already pending or running in scope: `continue` (the default) lets them finish,
+and `stop` stops each one when the freeze is set, including a rollout paused
+after a failure, and withdraws a start queued on a stopped apply. The confirmation lists the applies it asked to stop; a stop
+takes effect as its driver delivers it, so confirm each one with
+`schemabot status <apply-id>`. The CLI waits up to 15 minutes for the
+confirmation, since each stop can wait on its engine. It also lists any apply it could not stop, which
+keeps running, with the reason and what to do: a PlanetScale apply has no stop,
+and cancel ends it permanently. While a `stop` freeze is in effect, SchemaBot
+also stops an apply instead of starting work on it that has not started, so a
+planned `stop` freeze holds what has not started once it begins. A PlanetScale
+deploy queued before the freeze waits until it ends. A planned `stop` freeze
+stops an apply already running when it starts only at the apply's next
+checkpoint: when a rollout starts its next deployment, or when SchemaBot
+recovers a drive that crashed or failed. An apply that reaches neither keeps
+running. `schemabot status <apply-id>`, the watch view and the pull request
+comment say which freeze stopped an apply, and once that freeze has ended, that
+a plain start resumes it. A stopped apply resumes with
+`schemabot start` once the freeze ends, or with an approved
+override. Times are RFC3339 and print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
 and the recent ones.
 
 A second person approves a request to let one change through a freeze. Read it
@@ -650,7 +666,7 @@ nothing started:
 
 ```console
 $ schemabot apply -s schema -e production
-✗ production is frozen. This change did not start.
+❄️ production is frozen. This change did not start.
    freeze-abc  SEV-1234 payments latency  (until lifted)
 To ask for an override, run the same command with --override "<reason>".
 ```
@@ -661,7 +677,7 @@ reason is at most 500 characters. The refusal then names the request:
 
 ```console
 $ schemabot apply -s schema -e production --override "SEV-1234 fix the index"
-✗ production is frozen. This change did not start.
+❄️ production is frozen. This change did not start.
    freeze-abc  SEV-1234 payments latency  (until lifted)
 Override requested: ovr-123. A freeze approver other than you must run 'schemabot freeze approve ovr-123', then run this command again.
 ```
@@ -749,6 +765,26 @@ $ schemabot cutover apply-example-73 -e staging
 
 Keep watching until the state is `Completed`; acceptance alone does not mean
 the swap has finished.
+
+When a [freeze](#freeze-an-environment) covers the change, **Enter** in the watch is
+refused like the command, and the change does not start. The watch's keys
+send no override reason, so the refusal names the exact command that asks for
+one and stays on screen while the watch keeps following the apply:
+
+```console
+Press Enter to proceed with cutover (or ESC to detach)
+
+❄️ production is frozen. This cutover did not start.
+   freeze-abc  SEV-1234 payments latency  (until lifted)
+To ask for an override, run:
+  schemabot cutover apply-example-73 -e production --override "<reason>"
+Once a freeze approver other than you approves it, press Enter to try again.
+```
+
+Run that command from another terminal. Once an approver approves the
+request, press **Enter** in the watch again; the approval admits it with no
+reason attached. **Enter** on a waiting deploy works the same way and names
+`schemabot start`.
 
 ![CLI progress shows copying, deferred cutover, and completion](../assets/cli-cutover.gif)
 
@@ -982,7 +1018,8 @@ cannot reach is retried with backoff, the same way the watchers retry, and
 following stops with a non-zero exit once polls have kept failing for a few
 minutes in a row. Run the same `logs` command again to keep following: it
 prints the newest entries again and does not resume from the last line shown.
-Ctrl-C ends following normally.
+Ctrl-C ends following normally. Without `-f`, Ctrl-C abandons the read and
+exits 130, as other commands do when interrupted before their output.
 
 With `--deployment`, a source whose logs could not be read is reported as a
 warning while the other sources keep printing. That warning does not end

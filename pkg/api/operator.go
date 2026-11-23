@@ -1042,12 +1042,18 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int, stop <-chan 
 const reservedDriverID = 0
 
 // operationClaimOptions returns the filter driverID's operation claims run
-// under: the reserved driver skips deferred-cutover work (see reservedDriverID).
+// under: the reserved driver skips deferred-cutover work (see
+// reservedDriverID), and every driver skips the operations this pod recently
+// held back unstarted under a stop freeze (skipHeldOperation).
 func (s *Service) operationClaimOptions(driverID int) []storage.OperationClaimOption {
-	if driverID != reservedDriverID || s.operatorDrivers.Load() < 2 {
-		return nil
+	var opts []storage.OperationClaimOption
+	if driverID == reservedDriverID && s.operatorDrivers.Load() >= 2 {
+		opts = append(opts, storage.SkipDeferredCutoverWork())
 	}
-	return []storage.OperationClaimOption{storage.SkipDeferredCutoverWork()}
+	if held := s.heldOperationIDs(); len(held) > 0 {
+		opts = append(opts, storage.SkipOperations(held...))
+	}
+	return opts
 }
 
 // claimGateClosedBeforeRung reports whether StopClaiming closed the claim gate
@@ -1084,10 +1090,7 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 		return claimFellThrough
 	}
 	defer s.markDriverBusy(ctx)()
-	if claimStartsOperation(op) {
-		s.wakeIdleDriver(driverID, op)
-	}
-	if len(claimOptions) > 0 {
+	if storage.BuildOperationClaimFilter(claimOptions...).SkipDeferredCutoverWork {
 		// A driver skipping deferred-cutover work claims a deferred apply's
 		// operation only to deliver its pending stop or cancel, so its drive
 		// hands the apply back once that is done (handBackDeferredCutoverDrive).
@@ -1147,6 +1150,17 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 				"driver", driverID, "lease_owner", owner)...)
 		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_missing")
 		return claimSpent
+	}
+	// The claim checkpoint: a stop freeze in effect holds an operation that
+	// has not started, so the driver stops the apply instead (AZ-11).
+	if s.holdClaimForStopFreeze(ctx, driverID, apply, op, opLease) {
+		return claimSpent
+	}
+	// Peers are woken only for a start the checkpoint admitted: a held
+	// operation goes back claimable, and waking a peer for it would only hand
+	// it the same claim to return.
+	if claimStartsOperation(op) {
+		s.wakeIdleDriver(driverID, op)
 	}
 	mode, err := tern.DecideApplyDriveMode(ctx, s.storage, apply, ops)
 	if err != nil {
