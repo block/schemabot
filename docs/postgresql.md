@@ -983,6 +983,11 @@ Recognize each outcome by its signal:
   Applying the same plan again meets the same refusal.
 - **Retryable failure:** the apply names what it is waiting for, such as a
   build that is still running, and SchemaBot retries it on the next drive.
+- **Changed since review:** a column or constraint the plan drops was replaced
+  after the plan was reviewed, so the drop does not run. An automatic apply
+  posts a new comment with the re-plan, naming the tables that changed.
+  Confirming it approves a plan nobody has reviewed yet, so the agent asks the
+  user first, as the command policy says for `apply-confirm`.
 
 When SchemaBot blocks or refuses a change, the agent:
 
