@@ -2403,6 +2403,34 @@ func TestProgressDecimalsNeverRegressWithinAWholePercent(t *testing.T) {
 	assert.Equal(t, "21.88", pollRunningIndexBuild(t, eng).Metadata["percent"], "the record kept the later reading")
 }
 
+// An apply builds an index in step 2 of 4, runs an ALTER TABLE in step 3, and
+// builds a second index in step 4. While step 3 runs, the apply reports no
+// precise percent, because the build it described has ended. Step 4's build
+// starts its own percent from its first reading instead of being held at the
+// first build's 21.88.
+func TestPrecisePercentBelongsToTheIndexBuildInFlight(t *testing.T) {
+	eng := New()
+	row := heapScanRow
+	tracker := claimRunningIndexBuild(t, eng, &publishedIndexProgressSession{row: &row})
+	require.Equal(t, "21.88", pollRunningIndexBuild(t, eng).Metadata["percent"])
+
+	tracker.StartStep(3, progress.OperationBrief, "ALTER TABLE public.widgets ADD COLUMN note text")
+	got := pollRunningIndexBuild(t, eng)
+	assert.Equal(t, "3", got.Metadata["step"])
+	assert.NotContains(t, got.Metadata, "percent", "another step is in flight")
+	assert.NotContains(t, pollRunningIndexBuild(t, eng).Metadata, "percent", "the record no longer carries the first build's percent")
+
+	early := heapScanRow
+	early.blocksDone = 4
+	tracker.StartStep(4, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY widgets_note_idx ON public.widgets (note)")
+	tracker.SetConcurrentBuild(&publishedIndexProgressSession{row: &early}, 43)
+	got = pollRunningIndexBuild(t, eng)
+	assert.Equal(t, "4", got.Metadata["step"])
+	assert.Equal(t, "3.50", got.Metadata["percent"], "the second build reports its own reading")
+	assert.Equal(t, 3, got.Progress)
+	assert.Equal(t, "3.50", pollRunningIndexBuild(t, eng).Metadata["percent"], "the record keeps the second build's reading")
+}
+
 // Two polls clone the record while it still reads 0%. The first stores a
 // reading of 0.10%; the second finds no progress row and derives nothing. The
 // second poll adopts the stored 0.10% instead of showing the build as just
@@ -3849,18 +3877,22 @@ func TestChangedRowSecurityReviewRequiresNewPlan(t *testing.T) {
 }
 
 // TestSetRunningPercentRoundsDown proves the apply and its table carry
-// pg-sprite's percent as a whole number rounded down, so a step pg-sprite
-// places just below the end never reads as finished.
+// pg-sprite's percent as a whole number rounded down, and the metadata carries
+// it rounded down to hundredths, so a step pg-sprite places just below the end
+// never reads as finished.
 func TestSetRunningPercentRoundsDown(t *testing.T) {
 	cases := []struct {
-		name    string
-		percent float64
-		want    int
+		name        string
+		percent     float64
+		want        int
+		wantPrecise string
 	}{
-		{name: "a fraction rounds down", percent: 21.9, want: 21},
-		{name: "the highest running percent stays below 100", percent: 99.9, want: 99},
-		{name: "a whole percent is kept", percent: 50, want: 50},
-		{name: "zero is a reading", percent: 0, want: 0},
+		{name: "a fraction rounds down", percent: 21.9, want: 21, wantPrecise: "21.90"},
+		{name: "hundredths are kept as reported", percent: 21.88, want: 21, wantPrecise: "21.88"},
+		{name: "the highest running percent stays below 100", percent: 99.99, want: 99, wantPrecise: "99.99"},
+		{name: "finer precision rounds down to hundredths", percent: 99.996, want: 99, wantPrecise: "99.99"},
+		{name: "a whole percent is kept", percent: 50, want: 50, wantPrecise: "50.00"},
+		{name: "zero is a reading", percent: 0, want: 0, wantPrecise: "0.00"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3868,6 +3900,7 @@ func TestSetRunningPercentRoundsDown(t *testing.T) {
 			setRunningPercent(result, tc.percent)
 			assert.Equal(t, tc.want, result.Progress)
 			assert.Equal(t, tc.want, result.Tables[0].Progress)
+			assert.Equal(t, tc.wantPrecise, result.Metadata["percent"])
 		})
 	}
 }

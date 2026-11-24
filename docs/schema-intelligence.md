@@ -754,7 +754,7 @@ one operation, each entry in `operations` also carries its own `metadata`: the
 display fields its driver last recorded for that operation, such as a
 PostgreSQL operation's `executor_operation` and `percent` while it builds an
 index. `percent` is the whole-build percent with two decimals, for example
-`"35.45"`, and is present only while the build runs. Read an
+`"35.45"`, and is present only while the index build is the step in flight. Read an
 operation's own fields from there and match a table to its operation by
 `deployment` and `operation_key`.
 `engine` names the engine running the apply, in one of two forms depending on

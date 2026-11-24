@@ -1995,15 +1995,17 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 // loop's poll path mutates only the engine's in-memory record, while operator
 // reads use stored rows that only the drive persists.
 //
-// The percent never regresses within a record. A record hosts one build —
-// a concurrent index apply is a single statement, and the executor's
-// bounded retries apply to transactional statements, not to a build — and
-// pg-sprite's percent only advances as the build moves through its phases,
-// so a poll whose row derives a lower percent than the record carries read the
-// server before a poller that has already carried a later row forward. The
-// tracker serializes the reads but not the write-backs, so the earlier
-// reading lands here second; it adopts the record's percent rather than
-// pinning a position the build has left behind.
+// The percent never regresses within an executor step. A build is one step —
+// the executor's bounded retries apply to transactional statements, not to a
+// build — and pg-sprite's percent only advances as the build moves through
+// its phases, so a poll whose row derives a lower percent than the record
+// carries read the server before a poller that has already carried a later
+// row forward. The tracker serializes the reads but not the write-backs, so
+// the earlier reading lands here second; it adopts the record's percent
+// rather than pinning a position the build has left behind. A reading from a
+// different step starts that step's own percent, and a poll that reports a
+// step other than an index build removes the precise percent from the
+// record.
 func (e *Engine) retainRunningPercent(key string, source, result *engine.ProgressResult) {
 	if len(result.Tables) == 0 {
 		return
@@ -2014,22 +2016,39 @@ func (e *Engine) retainRunningPercent(key string, source, result *engine.Progres
 	if tracked == nil || tracked.result != source || len(source.Tables) == 0 {
 		return
 	}
-	if runningPercentBehind(result, source) {
+	if !readsAnotherStep(result, tracked.percentStep) && runningPercentBehind(result, source) {
 		result.Progress = source.Progress
 		result.Tables[0].Progress = source.Tables[0].Progress
-		if precise, ok := source.Metadata[runningPercentMetadataKey]; ok {
+		if precise, ok := source.Metadata[runningPercentMetadataKey]; ok && !reportsStepOtherThanIndexBuild(result.Metadata) {
 			result.Metadata[runningPercentMetadataKey] = precise
 		}
 		return
 	}
 	source.Progress = result.Progress
 	source.Tables[0].Progress = result.Tables[0].Progress
-	if precise, ok := result.Metadata[runningPercentMetadataKey]; ok {
+	precise, ok := result.Metadata[runningPercentMetadataKey]
+	switch {
+	case ok:
 		if source.Metadata == nil {
 			source.Metadata = make(map[string]string)
 		}
 		source.Metadata[runningPercentMetadataKey] = precise
+		tracked.percentStep = result.Metadata["step"]
+	case reportsStepOtherThanIndexBuild(result.Metadata):
+		delete(source.Metadata, runningPercentMetadataKey)
 	}
+}
+
+// readsAnotherStep reports whether a poll read its precise percent from a
+// different executor step than the one the record's percent came from. Each
+// step's percent starts again from zero, so a second index build in the same
+// apply is not held at the first build's final reading.
+func readsAnotherStep(result *engine.ProgressResult, percentStep string) bool {
+	if _, ok := result.Metadata[runningPercentMetadataKey]; !ok {
+		return false
+	}
+	step := result.Metadata["step"]
+	return percentStep != "" && step != "" && step != percentStep
 }
 
 // runningPercentBehind reports whether a poll's percent trails the running
@@ -2144,7 +2163,7 @@ func executorProgressMetadata(ctx context.Context, tracker buildTracker, result 
 	if percent := snapshot.Detail.Percent; percent != nil && snapshot.Detail.Operation == progress.OperationConcurrentIndex && !result.State.IsTerminal() {
 		setRunningPercent(result, *percent)
 	}
-	if result.State.IsTerminal() {
+	if result.State.IsTerminal() || reportsStepOtherThanIndexBuild(metadata) {
 		delete(metadata, runningPercentMetadataKey)
 	}
 	if err != nil {
@@ -2156,17 +2175,31 @@ func executorProgressMetadata(ctx context.Context, tracker buildTracker, result 
 // runningPercentMetadataKey is the metadata key that carries pg-sprite's
 // percent for a running index build with its decimals, so a large build
 // visibly moves between polls while its whole percent stands still. It is
-// present only while the build runs.
+// present only while the executor reports a concurrent index build as the
+// step in flight, and it is removed once another step or a terminal state is
+// reported.
 const runningPercentMetadataKey = "percent"
+
+// reportsStepOtherThanIndexBuild reports whether the executor names a step in
+// flight that is not a concurrent index build. A poll that names no step has
+// no reading of its own and keeps the record's last-known position.
+func reportsStepOtherThanIndexBuild(metadata map[string]string) bool {
+	operation, ok := metadata["executor_operation"]
+	return ok && operation != string(progress.OperationConcurrentIndex)
+}
 
 // setRunningPercent writes pg-sprite's percent for the running step onto both
 // the apply and its single table, so the two never disagree, and records it
-// with two decimals in the metadata. pg-sprite reports a percent below 100; the
-// whole percent is rounded down, so a running step never reads as finished.
+// with two decimals in the metadata. Both are rounded down, the decimals to
+// hundredths, so a running step never reads as finished whatever precision
+// pg-sprite reports it with. The small offset keeps a value pg-sprite already
+// rounded to hundredths, such as 21.88, from flooring to 21.87 because its
+// binary form sits just below it.
 func setRunningPercent(result *engine.ProgressResult, percent float64) {
 	if len(result.Tables) == 0 {
 		return
 	}
+	percent = math.Floor(percent*100+1e-6) / 100
 	whole := int(math.Floor(percent))
 	result.Progress = whole
 	result.Tables[0].Progress = whole
