@@ -492,7 +492,16 @@ func TestWriteDatabaseHistoryEmpty(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteDatabaseHistory(DatabaseHistoryData{Database: "new-db"})
 	})
-	assert.Equal(t, ANSIDim+"No schema changes found for database 'new-db'"+ANSIReset+"\n", output)
+	assert.Equal(t, ANSIDim+"No applies recorded for database 'new-db'"+ANSIReset+"\n", output)
+}
+
+// TestWriteDatabaseHistoryEmptyNamesTheEnvironment pins that a history filtered
+// to one environment says which environment had no applies.
+func TestWriteDatabaseHistoryEmptyNamesTheEnvironment(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteDatabaseHistory(DatabaseHistoryData{Database: "orders", Environment: "staging"})
+	})
+	assert.Equal(t, ANSIDim+"No applies recorded for database 'orders' in staging"+ANSIReset+"\n", output)
 }
 
 // TestWriteStatusListColoredStateCellBytes pins the colored STATE cell's
