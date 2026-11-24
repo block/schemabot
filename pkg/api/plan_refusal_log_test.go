@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -14,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -96,6 +98,51 @@ func TestPlanFailureLogLevel(t *testing.T) {
 			assert.Equal(t, tt.wantLevel, entry["level"])
 			assert.Equal(t, "plan failed", entry["msg"])
 			assert.Equal(t, "orders", entry["database"])
+		})
+	}
+}
+
+// The primary plans, and a rollout member's data plane answers its PlanDiff
+// with a failure. Either way the member blocks the rollout: the plan lists it
+// as unplanned. A refusal reaches the handler still typed, so its log line is
+// at Warn with the refusal's text; a data plane fault stays at Error.
+func TestPlanHandlerLogsARefusedRolloutMemberAtWarn(t *testing.T) {
+	const refusal = "the schema files drop table orders_seq; remove the drop or list the table under drop_tables"
+	tests := []struct {
+		name      string
+		diffErr   error
+		wantLevel string
+	}{
+		{"remote refusal", status.Error(codes.FailedPrecondition, refusal), "WARN"},
+		{"server fault", status.Error(codes.Internal, "read shard schema: timeout"), "ERROR"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &mockTernClient{
+				isRemote:    true,
+				planResp:    reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+				planDiffErr: tt.diffErr,
+			}
+			svc := multiTargetService(t, client, &recordingPlanStore{})
+			var logs bytes.Buffer
+			svc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+			request := planDiffReq(t)
+			request.RendersRollout = true
+
+			rec := postJSON(t, svc.handlePlan, "/api/plan", request)
+
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			var resp apitypes.PlanResponse
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+			require.NotNil(t, resp.Rollout)
+			require.Len(t, resp.Rollout.Attention, 1)
+			assert.Equal(t, "eu/testapp-002", resp.Rollout.Attention[0].Member)
+			assert.Equal(t, apitypes.PlanMemberUnplanned, resp.Rollout.Attention[0].Reason, "the member blocks the rollout")
+
+			line := requireLogLine(t, decodeLogLines(t, logs.Bytes()), "plan deployment diff failed; deployment will block the review rollup")
+			assert.Equal(t, tt.wantLevel, line["level"])
+			assert.Equal(t, "testapp-002", line["target"])
+			assert.Contains(t, line["error"], status.Convert(tt.diffErr).Message())
 		})
 	}
 }
