@@ -35,6 +35,9 @@ type ChangeGateRefusalData struct {
 	// Approvers are the GitHub teams, as org/team, whose members may approve
 	// an override from this pull request. Empty means nobody can.
 	Approvers []string
+	// OverrideOnReason says the server's override policy admits a change on
+	// the commenter's own reason, with no approver.
+	OverrideOnReason bool
 }
 
 // RefusingFreeze is one freeze that holds the environment.
@@ -144,7 +147,8 @@ func writeRefusingFreezes(b *strings.Builder, freezes []RefusingFreeze) {
 
 // writeRefusalNextSteps writes what the commenter can do when no override was
 // asked for: wait, and, for a command that takes --override when a team can
-// approve one, ask for one. The approver teams are named, not mentioned:
+// approve one, ask for one. Under the reason policy it offers the override
+// with no approval instead. The approver teams are named, not mentioned:
 // nobody has asked them for anything yet, and a freeze can refuse many pull
 // requests at once.
 func writeRefusalNextSteps(b *strings.Builder, data ChangeGateRefusalData) {
@@ -153,13 +157,20 @@ func writeRefusalNextSteps(b *strings.Builder, data ChangeGateRefusalData) {
 	// The CLI always names --override, because an API request can be
 	// approved through the API. A pull request's request can be approved only
 	// from the pull request, by a member of an approver team, so with no team
-	// the comment offers no override nobody could approve.
-	if !data.TakesOverride || len(data.Approvers) == 0 {
+	// the comment offers no override nobody could approve. Under the reason
+	// policy nobody needs to approve, so the override is offered whatever the
+	// teams.
+	if !data.TakesOverride || (len(data.Approvers) == 0 && !data.OverrideOnReason) {
 		return
 	}
 	ask := "Run the same command with `" + overridePlaceholder + "`."
 	if data.CommandName == action.ApplyConfirm {
 		ask = "Run `apply` again, then run `apply-confirm` with `" + overridePlaceholder + "`."
+	}
+	if data.OverrideOnReason {
+		fmt.Fprintf(b, "- **Go ahead with a reason** if this change can't wait. %s "+
+			"SchemaBot lets it through and records your reason. No approval is needed.\n", ask)
+		return
 	}
 	teams := make([]string, 0, len(data.Approvers))
 	for _, team := range data.Approvers {

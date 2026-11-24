@@ -656,28 +656,32 @@ a plain start resumes it. A stopped apply resumes with
 override. Times are RFC3339 and print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
 and the recent ones.
 
-A second person approves a request to let one change through a freeze. Read it
-with `freeze override <ovr-id>` and approve it with `freeze approve <ovr-id>`.
+On a server whose `freeze.override_policy` is `approval`, a second person
+approves a request to let one change through a freeze. Read it with
+`freeze override <ovr-id>` and approve it with `freeze approve <ovr-id>`.
 Only a verified member of `freeze.groups` other than the requester may approve.
 A request asked for on a pull request is approved there instead, by a
 `freeze.github_teams` member commenting `schemabot freeze approve <ovr-id>`.
 Each command prints the server's reason when it refuses.
 
 A freeze refuses every `apply`, `start` and `cutover` it covers unless an
-approved override for you covers that change. Asking for one with `--override`
-is not enough on its own: until it is approved, the command exits 1 with
+override for you covers that change. Without one, the command exits 1 with
 nothing started:
 
 ```console
 $ schemabot apply -s schema -e production
 ❄️ production is frozen. This change did not start.
    freeze-abc  Holiday code freeze  (until lifted)
-To ask for an override, run the same command with --override "<reason>".
+If this change can't wait, run the same command with --override "<reason>".
 ```
 
-`--override "<reason>"` on `apply`, `start` and `cutover` asks a freeze
-approver to let that one change through. It needs a verified caller, and the
-reason is at most 500 characters. The refusal then names the request:
+`--override "<reason>"` on `apply`, `start` and `cutover` overrides the freeze
+for that one change. It needs a verified caller, and the reason is at most 500
+characters. Under the default `freeze.override_policy`, `reason`, the command
+runs at once and SchemaBot records the reason. The reason covers that command
+only: run it again during the freeze and give `--override` again. On a server
+set to `approval`,
+it asks a freeze approver instead, and the refusal names the request:
 
 ```console
 $ schemabot apply -s schema -e production --override "Hotfix: checkout needs the gift_note column"
@@ -780,15 +784,17 @@ Press Enter to proceed with cutover (or ESC to detach)
 
 ❄️ production is frozen. This cutover did not start.
    freeze-abc  Holiday code freeze  (until lifted)
-To ask for an override, run:
+If this change can't wait, override the freeze with a reason:
   schemabot cutover apply-example-73 -e production --override "<reason>"
-Once a freeze approver other than you approves it, press Enter to try again.
+Run that in another terminal: it starts the change at once, and this watch follows it.
 ```
 
-Run that command from another terminal. Once an approver approves the
-request, press **Enter** in the watch again; the approval admits it with no
-reason attached. **Enter** on a waiting deploy works the same way and names
-`schemabot start`.
+Run that command from another terminal. Under the default override policy it
+starts the change at once, and the watch follows it. On a server set to
+`approval` it records a request instead, and the last line says so: once an
+approver approves it, press **Enter** in the watch again, and the approval
+admits it with no reason attached. **Enter** on a waiting deploy works the same
+way and names `schemabot start`.
 
 ![CLI progress shows copying, deferred cutover, and completion](../assets/cli-cutover.gif)
 

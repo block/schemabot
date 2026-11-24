@@ -82,6 +82,23 @@ func TestRenderChangeGateRefusalNextSteps(t *testing.T) {
 		assert.NotContains(t, rendered, "override")
 	})
 
+	// Under the reason policy the commenter's reason admits the change, so
+	// the comment offers it with no approver, teams or not.
+	t.Run("the reason policy offers an override with no approval", func(t *testing.T) {
+		for _, approvers := range [][]string{{"acme/freeze-approvers"}, nil} {
+			data := refusalData(action.Apply)
+			data.Approvers = approvers
+			data.OverrideOnReason = true
+			rendered := RenderChangeGateRefusal(data)
+			assert.Contains(t, rendered, "- **Go ahead with a reason** if this change can't wait. Run the same command with `--override \"<why it can't wait>\"`. "+
+				"SchemaBot lets it through and records your reason. No approval is needed.\n")
+			assert.NotContains(t, rendered, "approver")
+		}
+		data := refusalData(action.Revert)
+		data.OverrideOnReason = true
+		assert.NotContains(t, RenderChangeGateRefusal(data), "override", "a command without --override only waits")
+	})
+
 	t.Run("an unrecorded request says to retry instead", func(t *testing.T) {
 		data := refusalData(action.Apply)
 		data.OverrideUnrecorded = true

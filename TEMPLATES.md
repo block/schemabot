@@ -3198,7 +3198,7 @@ schemabot apply -e staging --allow-unsafe
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 | `schemabot freeze approve <ovr-id>` | Approve a freeze override request asked for on this PR |
 
-**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess), `--target <target>` one target of the rollout (plan and apply), `--override "<reason>"` ask a freeze approver to let the change through a freeze (apply, apply-confirm, start and cutover)
+**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess), `--target <target>` one target of the rollout (plan and apply), `--override "<reason>"` override a freeze with a reason (apply, apply-confirm, start and cutover)
 
 **Quick start**: `plan` → `apply`
 <!-- schemabot:offer-support-channel -->
@@ -3230,7 +3230,7 @@ That command wasn't recognized. Available commands:
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 | `schemabot freeze approve <ovr-id>` | Approve a freeze override request asked for on this PR |
 
-**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess), `--target <target>` one target of the rollout (plan and apply), `--override "<reason>"` ask a freeze approver to let the change through a freeze (apply, apply-confirm, start and cutover)
+**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess), `--target <target>` one target of the rollout (plan and apply), `--override "<reason>"` override a freeze with a reason (apply, apply-confirm, start and cutover)
 
 **Quick start**: `plan` → `apply`
 <!-- schemabot:offer-support-channel -->
@@ -3787,7 +3787,7 @@ That command wasn't recognized. Available commands:
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 | `schemabot freeze approve <ovr-id>` | Approve a freeze override request asked for on this PR |
 
-**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess), `--target <target>` one target of the rollout (plan and apply), `--override "<reason>"` ask a freeze approver to let the change through a freeze (apply, apply-confirm, start and cutover)
+**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess), `--target <target>` one target of the rollout (plan and apply), `--override "<reason>"` override a freeze with a reason (apply, apply-confirm, start and cutover)
 
 **Quick start**: `plan` → `apply`
 <!-- schemabot:offer-support-channel -->
@@ -6824,7 +6824,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
-> ⏹️ Stopped by freeze `freeze-a1b2c3` (SEV-1234: checkout errors). Start it again after the freeze ends or is lifted. To start it while the freeze is in effect, add `--override` and your reason to the start command, then have a freeze approver approve the request.
+> ⏹️ Stopped by freeze `freeze-a1b2c3` (SEV-1234: checkout errors). Start it again after the freeze ends or is lifted. To start it while the freeze is in effect, add `--override` and your reason to the start command if it can't wait.
 
 ---
 
@@ -6877,7 +6877,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 **Environment**: `staging`
 **Stopped by**: freeze `freeze-a1b2c3`
 
-A freeze that stops schema changes in this environment took effect before the start requested earlier did, so the start was withdrawn. The schema change stays stopped. Start it again after the freeze ends or is lifted, or add `--override` and your reason to the start command to ask a freeze approver to let it through.
+A freeze that stops schema changes in this environment took effect before the start requested earlier did, so the start was withdrawn. The schema change stays stopped. Start it again after the freeze ends or is lifted, or add `--override` and your reason to the start command if it can't wait.
 
 </details>
 
@@ -8438,7 +8438,7 @@ To resume from where it stopped:
 │  State:        Stopped             │
 └────────────────────────────────────┘
 
-  ⏹️ Stopped by freeze freeze-a1b2c3 (SEV-1234: checkout errors). Run 'schemabot start apply-a1b2c3d4e5f6 -e staging' after the freeze ends or is lifted, or add --override "<reason>" to ask a freeze approver to let it through.
+  ⏹️ Stopped by freeze freeze-a1b2c3 (SEV-1234: checkout errors). Run 'schemabot start apply-a1b2c3d4e5f6 -e staging' after the freeze ends or is lifted, or add --override "<reason>" if it can't wait.
 
 
   ── testapp ──

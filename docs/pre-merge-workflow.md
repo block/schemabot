@@ -216,11 +216,12 @@ records the desired state the databases already run.
   that started before the freeze can keep running unless it stops them. The
   refusal lists the freezes that hold it, up to ten, and counts the rest.
   Run the same command again once the freeze is lifted. If the change can't
-  wait, run it with `--override "<reason>"`: a freeze approver other than you
-  and the PR author approves it on the PR, and your next apply runs. See
-  [freeze an environment](freeze.md#ask-for-an-override)
+  wait, run it with `--override "<reason>"`. By default your reason lets it
+  through at once. A server set to the `approval` override policy waits for a
+  freeze approver other than you and the PR author, and then your next apply
+  runs. See [freeze an environment](freeze.md#ask-for-an-override)
 
-![The PR author asks for an override, the freeze refuses the apply and records the request, a second person approves it, and the next apply runs and the PR merges](../assets/pr-freeze-demo.gif)
+![The freeze refuses the apply, the PR author comments the same command with an override reason, and the apply runs at once and the PR merges](../assets/pr-freeze-reason-demo.gif)
 
 See [schema freshness](configuration.md#base-branch-schema-freshness) for how
 the gate scopes these checks to the relevant schema directory.

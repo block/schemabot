@@ -602,7 +602,7 @@ type ApplyRequest struct {
 	Override string `json:"override,omitempty"`
 	// freezeOverride is the approved override request that admitted this
 	// apply, set by the server after the change gates and never by a caller.
-	freezeOverride string
+	freezeOverride *storage.FreezeOverrideRequest
 	// viaHTTP is set by POST /api/apply, the one entry point whose caller has
 	// to say it rendered the rollout. The webhook and the trusted enqueue path
 	// call the service in process and leave it unset.
@@ -2221,7 +2221,7 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		}
 		admitCtx = gatedCtx
 		if override != nil {
-			req.freezeOverride = override.Identifier
+			req.freezeOverride = override
 		}
 	}
 	applyIdentifier, storedApplyID, err := s.enqueueApply(admitCtx, plan, req, options, attachObserver)
@@ -2342,7 +2342,9 @@ func (s *Service) createStoredApply(
 	// change gates as its creation did.
 	applyOpts.PinnedRollback = isPinnedRollback(plan, req)
 	// Only the server records the override that admitted the apply.
-	applyOpts.FreezeOverride = req.freezeOverride
+	if req.freezeOverride != nil {
+		applyOpts.FreezeOverride = req.freezeOverride.Identifier
+	}
 
 	// Attribute the apply to the authenticated caller when the request carried a
 	// real identity (API auth enabled); see resolveCaller.
@@ -2509,6 +2511,7 @@ func (s *Service) createStoredApply(
 			s.logger.Warn("failed to log queued apply", "apply_id", applyIdentifier, "error", err)
 		}
 	}
+	s.logFreezeOverrideForApply(ctx, apply, caller, storage.LogEventInfo, req.freezeOverride)
 
 	return apply, storedApplyID, nil
 }

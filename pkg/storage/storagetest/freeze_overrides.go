@@ -182,6 +182,52 @@ func TestFreezeOverrides(t *testing.T, h Harness) {
 		assert.Equal(t, 1, succeeded)
 	})
 
+	t.Run("CreateOnReason_StoresTheRequestApprovedByItsRequester", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		request := overrideRequest("production", "plan-1", time.Now().UTC().Add(time.Hour))
+		created, err := store.FreezeOverrides().CreateOnReason(ctx, request)
+		require.NoError(t, err)
+		assert.Equal(t, "alice", created.ApprovedBy, "the requester's reason admits it")
+		require.NotNil(t, created.ApprovedAt)
+		assert.True(t, created.OnReason())
+		assert.Equal(t, "SEV-1234 hotfix index", created.Reason, "the reason stays for audit")
+
+		target := storage.FreezeOverrideTarget{Environment: "production", Action: storage.FreezeOverrideActionApply, TargetID: "plan-1"}
+		approved, err := store.FreezeOverrides().ListApproved(ctx, target)
+		require.NoError(t, err)
+		require.Len(t, approved, 1)
+		assert.Equal(t, request.Identifier, approved[0].Identifier)
+		pending, err := store.FreezeOverrides().ListPending(ctx, target)
+		require.NoError(t, err)
+		assert.Empty(t, pending)
+
+		_, err = store.FreezeOverrides().Approve(ctx, request.Identifier, "bob")
+		require.ErrorIs(t, err, storage.ErrFreezeOverrideAlreadyApproved, "there is nothing left to approve")
+	})
+
+	t.Run("CreateOnReason_KeepsCreatesRules", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		now, err := store.Freezes().Now(ctx)
+		require.NoError(t, err)
+
+		reasonless := overrideRequest("production", "plan-1", now.Add(time.Hour))
+		reasonless.Reason = "  "
+		_, err = store.FreezeOverrides().CreateOnReason(ctx, reasonless)
+		require.ErrorContains(t, err, "reason is required")
+
+		tooLate := overrideRequest("production", "plan-1", now.Add(storage.FreezeOverrideMaxLifetime+time.Hour))
+		_, err = store.FreezeOverrides().CreateOnReason(ctx, tooLate)
+		require.ErrorIs(t, err, storage.ErrFreezeOverrideLifetime)
+
+		for _, request := range []*storage.FreezeOverrideRequest{reasonless, tooLate} {
+			_, err = store.FreezeOverrides().Get(ctx, request.Identifier)
+			require.ErrorIs(t, err, storage.ErrFreezeOverrideNotFound, "a refused request is never stored")
+		}
+	})
+
 	t.Run("ListApproved", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

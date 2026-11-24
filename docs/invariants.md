@@ -2267,30 +2267,21 @@ apply that includes every deployment its stored operations run on. "In effect" i
 database clock, so every pod agrees at the edges of a freeze. A pull request rollback is never held, at creation or at a later start or
 cutover, nor is a stop, a cancel or a revert. When SchemaBot cannot read the freezes, or the override
 requests below, it refuses the change with a retryable error, never letting it through unchecked.
-A freeze refuses a change unless an approved override request covers every blocker on it. The
-requester, who must be verified, runs the apply, start or cutover with an override reason, and
-SchemaBot records a request and refuses, naming it. Asking again before approval names the same request
-(`requestOverride`), which keeps its first reason; the refusal says so when the new reason differs. A verified member of `freeze.groups` who is not the requester approves it;
-write groups do not grant approval, and with no freeze group configured nobody approves, so nobody
-overrides alone, admins included. Storage also refuses the pull request's author once a request
-records one. A request from a pull request records its commenter and author as `github:<login>`,
-which storage cannot match to a forward-auth subject, so an approval must come from the same
-identity domain: `handleFreezeOverrideApprove` refuses a request where `FromPullRequest` holds, and
-`AuthorizeFreezeApprove` refuses a subject that starts with `github:`. The reverse holds too:
-`ApprovePullRequestOverride` approves only a request where `FromPullRequest` holds, and only from
-the pull request it names, as `github:<login>` of a `freeze.github_teams` member. The requester repeats the
-command and it is admitted; only the requester runs on an approval (`approvedOverride`), and anyone
-else asks for their own. A request also belongs to where it was asked for (`sameOverrideOrigin`):
-the same change on another pull request records and needs its own, so one pull request's author
-cannot approve a request on another and so admit their own. An approval covers one environment, one action and one target and expires
-after 24 hours. Within that window the requester may use it more than once, for example to re-apply
-the same schema after a stop. For an apply the target is the
-database and, for each rollout member it runs, the schema and the `ignore_tables` and
-`drop_tables` that member's plan was reviewed under (`applyOverrideTarget`), not the plan,
-because a repeated command plans afresh. A change to what any member would run, or a rollout
-that gains a member, needs a new approval. For a
-start or a cutover it is the apply. A blocker the request does not name refuses again and needs a
-new request.
+A freeze refuses a change unless an override covers every blocker on it. Only a verified
+requester asks for one, by giving an override reason with the apply, start or cutover. An override
+covers one environment, one action and one target: for an apply, the database and, for each rollout
+member, the schema and the table lists its plan was reviewed under, not the plan, because a repeated
+command plans afresh; for a start or a cutover, the apply. A change to what any member would run, a
+rollout that gains a member, or a blocker the override does not name needs a new override.
+An override admitted on its requester's reason admits only the command that gave the reason and the
+work that command starts. A later command, a retry of the same change included, gives its own reason.
+Any other override admits a change only once a second person approves it, and only for its
+requester, for at most 24 hours. Nobody approves their own request or one on a pull request they
+wrote, and an approval comes from the identity domain the request was asked in: a forward-auth
+subject approves a request from the CLI, and a GitHub team member approves a request from the pull
+request it names, which no other pull request shares. With no approver configured, nobody overrides
+alone, admins included. Which of the two kinds a server records is its override policy
+([freeze.md](freeze.md#choose-the-override-policy)).
 A PR rollback is known by a `pinned_rollback` option the server records when it creates the apply.
 A rollback created by an earlier version has none, so a freeze holds its later start or cutover;
 lifting the freeze lets it through.
@@ -2313,9 +2304,14 @@ recorded in `executeStartForApply` and before a cutover is recorded in `executeC
 (`pkg/storage/internal/sqlstore/control_requests.go`). A call-graph test
 (`pkg/api/change_gate_completeness_test.go`) fails on any path that creates an apply or records a
 start or cutover without passing a function that runs the gates. The override check is
-`approvedOverride` (`pkg/api/change_gate.go`), which reads `ListApproved` and admits only a request
-whose `Covers` names every blocker. The approver rules are `AuthorizeFreezeApprove`
-(`pkg/api/freeze_authorization.go`) and `Approve` (`pkg/storage/internal/sqlstore/freeze_overrides.go`).
+`approvedOverride` (`pkg/api/change_gate.go`), which reads `ListApproved`, skips every override
+admitted on a reason, and admits only a request whose `Covers` names every blocker and whose origin
+matches (`sameOverrideOrigin`). The target is `applyOverrideTarget`. An override admitted on a reason
+is stored by `overrideOnReason` through `CreateOnReason`, and the work it starts keeps it at claim
+through `approvedOverridesForApply`; the policy is `FreezeConfig.OverrideOnReason`. Under approval,
+`requestOverride` records the request, and the approver rules are `AuthorizeFreezeApprove`
+(`pkg/api/freeze_authorization.go`), `handleFreezeOverrideApprove`, `ApprovePullRequestOverride`
+and `Approve` (`pkg/storage/internal/sqlstore/freeze_overrides.go`).
 
 ### AZ-11: A stop freeze stops the admitted changes it covers
 

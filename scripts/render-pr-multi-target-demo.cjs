@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Render the multi-target PR timelines (every target, --target, a stopped
-// and resumed rollout, and an apply a second person lets through a freeze) with one reusable browser session. Requires Playwright and ImageMagick.
+// and resumed rollout, an apply a second person lets through a freeze, and
+// one its author lets through on a reason) with one reusable browser session. Requires Playwright and ImageMagick.
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {execFileSync}=require('node:child_process');
 const {pathToFileURL}=require('node:url');
@@ -27,6 +28,11 @@ const scenarios=[
    [9,'#checks',['1 apply pending','Merging is blocked']],[19,'#approve-body',['schemabot freeze approve ovr-123']],
    [19,'#approved-body',['approved','ovr-123','can now re-run the command']],[26.5,'#progress-body',['Complete']],
    [32,'#checks',['All checks have passed','Pull request successfully merged']]]},
+ // The default override policy: the author's reason lets the apply through.
+ {name:'freezeReason',page:'pr-freeze-reason-demo.html',gif:'assets/pr-freeze-reason-demo.gif',timing:freezeTiming,intro:0,length:26,
+  checks:[[8,'#refusal-body',['Apply Blocked by a Freeze','freeze-abc','Go ahead with a reason','No approval is needed']],[8,'#apply-body',['Not applied']],
+   [8,'#checks',['1 apply pending','Merging is blocked']],[17,'#command2-body',['--override','Hotfix: checkout needs the gift_note column']],
+   [19,'#progress-body',['Complete']],[24,'#checks',['All checks have passed','Pull request successfully merged']]]},
  {name:'stop',page:'pr-multi-target-stop-demo.html',gif:'assets/pr-multi-target-stop-demo.gif',timing:stopTiming,intro:0,length:32,
   checks:[[0,'#checks',['Apply in progress','Merging is blocked']],
    [10,'#stopped-body',['Schema Change Stopped','3 stopped','schemabot start apply-example-91 -e production']],

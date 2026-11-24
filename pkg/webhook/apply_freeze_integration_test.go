@@ -47,6 +47,7 @@ func TestE2EApplyIsRefusedDuringAFreeze(t *testing.T) {
 	})
 
 	svc.Config().Freeze.GitHubTeams = []string{"acme/freeze-approvers"}
+	svc.Config().Freeze.OverridePolicy = api.FreezeOverridePolicyApproval
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
 	refusal := awaitCommentContaining(t, apply, "| `"+freezeID+"` | until lifted | incident 42 |")
 	assert.Contains(t, refusal, "## ❄️ Apply Blocked by a Freeze\n")
@@ -84,6 +85,7 @@ func TestE2EApplyConfirmIsRefusedDuringAFreeze(t *testing.T) {
 	})
 
 	svc.Config().Freeze.GitHubTeams = []string{"acme/freeze-approvers"}
+	svc.Config().Freeze.OverridePolicy = api.FreezeOverridePolicyApproval
 	result := sendApplyConfirm(t, svc, dbName, "schemabot apply-confirm -e staging")
 	refusal := awaitCommentContaining(t, result, "| `"+freezeID+"` | until lifted | incident 43 |")
 	assert.Contains(t, refusal, "Nothing was applied, and the pending confirmation was released.")
@@ -127,6 +129,7 @@ func TestE2ERollbackConfirmRunsDuringAFreeze(t *testing.T) {
 	})
 
 	svc.Config().Freeze.GitHubTeams = []string{"acme/freeze-approvers"}
+	svc.Config().Freeze.OverridePolicy = api.FreezeOverridePolicyApproval
 	sendComment("schemabot rollback-confirm -e staging")
 	awaitCapture(t, result.comments, "the rollback to complete", func(body string) bool {
 		assert.NotContains(t, body, "Blocked by", "a freeze does not hold a pull request's rollback")

@@ -35,7 +35,7 @@ type ApplyCmd struct {
 	SkipRevert   bool          `help:"Skip revert window after completion (Vitess only)" name:"skip-revert"`
 	Branch       string        `help:"Reuse existing PlanetScale branch (syncs with main, skips branch creation)" name:"branch"`
 	AllowUnsafe  bool          `help:"Allow destructive changes (DROP TABLE, DROP COLUMN, etc.)" name:"allow-unsafe"`
-	Override     string        `help:"Reason to ask a freeze approver to let this change through a freeze" name:"override"`
+	Override     string        `help:"Why this change can't wait. It lets the change through a freeze, or asks a freeze approver to, as the server's override policy says" name:"override"`
 	Force        bool          `help:"Force acquire lock (breaks existing lock from another owner)"`
 	Yield        bool          `help:"Release the lock once the apply has finished (kept while it is still running or stopped)"`
 	NoLock       bool          `help:"Don't hold a database lock during the operation" name:"no-lock"`

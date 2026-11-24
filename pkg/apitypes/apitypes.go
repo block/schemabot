@@ -149,6 +149,12 @@ type ErrorResponse struct {
 	// approver other than the requester approves it, and the caller then
 	// repeats the command.
 	OverrideRequest *FreezeOverrideRequest `json:"override_request,omitempty"`
+
+	// OverrideOnReason says the server's override policy lets a change
+	// through on its requester's reason, with no approver: a
+	// change_gate_refused command repeated with --override runs at once. A
+	// server that predates the policy omits it, and always asks an approver.
+	OverrideOnReason bool `json:"override_on_reason,omitempty"`
 }
 
 // ChangeGateBlocker is one reason a change gate refused an apply, start or

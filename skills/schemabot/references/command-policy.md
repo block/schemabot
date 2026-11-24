@@ -27,7 +27,7 @@ Production usually requires an approved PR. The command comment is the act that 
 
 - A command carrying `--allow-unsafe`. Accepting a destructive change is a human decision. Show the change and the command and let the human post it.
 - A command carrying `--skip-revert`. It gives up the Vitess revert window before anyone has seen the change land, which is the same decision as `skip-revert` made up front.
-- A command carrying `--override`. When a freeze refuses a command, SchemaBot says to run it again with `--override` and a reason. That asks a freeze approver to let the change through, and the reason is recorded as the user's. Tell the user about the freeze and let them decide whether to ask.
+- A command carrying `--override`. When a freeze refuses a command, SchemaBot says to run it again with `--override` and a reason. By default that lets the change through the freeze at once, on a server set to `approval` it asks a freeze approver, and either way the reason is recorded as the user's. Tell the user about the freeze and let them decide whether to override it.
 - `unlock --force`. It releases a database's lock even when no PR holds it, such as the lock of an apply started from the CLI, in any environment.
 
 ## Ask before posting these, in any environment

@@ -179,7 +179,12 @@ func WriteFreezeOverrideApproved(r apitypes.FreezeOverrideRequest) {
 // WriteFreezeOverride writes one freeze override request.
 func WriteFreezeOverride(r apitypes.FreezeOverrideRequest) {
 	status := "waiting for approval"
-	if r.ApprovedAt != nil {
+	switch {
+	case r.ApprovedAt != nil && strings.EqualFold(strings.TrimSpace(r.ApprovedBy), strings.TrimSpace(r.RequestedBy)):
+		// Only the reason override policy stores a request approved by its
+		// own requester.
+		status = fmt.Sprintf("admitted on its requester's reason at %s", freezeTime(*r.ApprovedAt))
+	case r.ApprovedAt != nil:
 		status = fmt.Sprintf("approved by %s at %s", ui.TerminalSafeLine(r.ApprovedBy), freezeTime(*r.ApprovedAt))
 	}
 	fmt.Printf("Override request %s: %s\n", ui.TerminalSafeLine(r.ID), status)
@@ -240,10 +245,10 @@ func ChangeGateRefusedText(d ChangeGateRefusedData) []string {
 	case !d.OverrideAsked && d.OverrideCommand != "":
 		// The command gets a line of its own so a narrow watch, which cuts
 		// wide lines rather than wrapping them, still shows it whole.
-		lines = append(lines, "To ask for an override, run:",
+		lines = append(lines, "If this change can't wait, override the freeze with a reason:",
 			fmt.Sprintf(`  %s --override "<reason>"`, ui.TerminalSafeLine(d.OverrideCommand)))
 	case !d.OverrideAsked:
-		lines = append(lines, `To ask for an override, run the same command with --override "<reason>".`)
+		lines = append(lines, `If this change can't wait, run the same command with --override "<reason>".`)
 	default:
 		lines = append(lines, "No override request was recorded. SchemaBot said: "+ui.TerminalSafeLine(d.Message))
 	}
@@ -275,7 +280,7 @@ func StoppedByFreezeText(freeze *apitypes.FreezeStopRef, applyID, environment st
 	if freeze.Ended {
 		return text + fmt.Sprintf(", which has ended. Run '%s' to resume it.", start)
 	}
-	return text + fmt.Sprintf(". Run '%s' after the freeze ends or is lifted, or add --override \"<reason>\" to ask a freeze approver to let it through.", start)
+	return text + fmt.Sprintf(". Run '%s' after the freeze ends or is lifted, or add --override \"<reason>\" if it can't wait.", start)
 }
 
 // writeStoppedByFreeze writes StoppedByFreezeText below the status box.
