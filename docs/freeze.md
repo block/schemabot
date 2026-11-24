@@ -205,7 +205,7 @@ refused, because nobody could tell who asked.
 
 ### From a pull request
 
-![The PR author asks for an override, the freeze refuses the apply and records the request, a second person approves it, and the next apply runs and the PR merges](../assets/pr-freeze-demo.gif)
+![The freeze refuses the apply, the PR author comments the same command with an override reason, and the apply runs at once and the PR merges](../assets/pr-freeze-reason-demo.gif)
 
 Comment the command with the flag:
 
@@ -227,6 +227,8 @@ schemabot freeze approve ovr-8c41d2e9a7f03b56
 
 SchemaBot replies with who approved which change. Then comment the original
 command again.
+
+![Under the approval policy, the PR author asks for an override, the freeze refuses the apply and records the request, a second person approves it, and the next apply runs and the PR merges](../assets/pr-freeze-demo.gif)
 
 ### What an override covers
 

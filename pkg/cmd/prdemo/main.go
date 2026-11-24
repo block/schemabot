@@ -262,7 +262,7 @@ func main() {
 		narrowed.Progress = append(narrowed.Progress, narrowedComment(narrowedTo, percent, 0, false))
 	}
 
-	out := map[string]any{"multiTarget": fanOut, "target": narrowed, "stop": stopDemo(), "freeze": freezeDemo()}
+	out := map[string]any{"multiTarget": fanOut, "target": narrowed, "stop": stopDemo(), "freeze": freezeDemo(), "freezeReason": freezeReasonDemo()}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", " ")
 	if err := enc.Encode(out); err != nil {
@@ -320,7 +320,8 @@ func stopDemo() stopScenario {
 	return demo
 }
 
-// freezeScenario is an apply that asks for a freeze override. The freeze
+// freezeScenario is an apply that asks for a freeze override under the
+// approval override policy. The freeze
 // refuses it, so the apply comment says it did not run and the refusal below
 // names the override request. A second person, a freeze approver, approves
 // it, and the author's next apply runs as usual.
@@ -387,6 +388,40 @@ func freezeDemo() freezeScenario {
 		Summary:  instantComment(true),
 	}
 	return demo
+}
+
+// freezeReasonScenario is an apply under the default override policy,
+// reason. The freeze refuses the plain apply, and the refusal offers to go
+// ahead with a reason. The author comments the same command with --override,
+// and it runs at once, with no approver.
+type freezeReasonScenario struct {
+	Command  string `json:"command"`
+	Plan     string `json:"plan"`
+	Apply    string `json:"apply"`
+	Refused  string `json:"refused"`
+	Refusal  string `json:"refusal"`
+	Rerun    string `json:"rerun"`
+	Complete string `json:"complete"`
+	Summary  string `json:"summary"`
+}
+
+func freezeReasonDemo() freezeReasonScenario {
+	const reason = "Hotfix: checkout needs the gift_note column"
+	return freezeReasonScenario{
+		Command: "schemabot apply -e production",
+		Plan:    freezePlanComment(false, false),
+		Apply:   freezePlanComment(true, false),
+		Refused: freezePlanComment(true, true),
+		Refusal: templates.RenderChangeGateRefusal(templates.ChangeGateRefusalData{
+			CommandName: action.Apply, TakesOverride: true, Environment: environment, RequestedBy: requestedBy,
+			Timestamp:        startedAt.Format("2006-01-02 15:04:05"),
+			Freezes:          []templates.RefusingFreeze{{ID: "freeze-abc", Reason: "Holiday code freeze"}},
+			OverrideOnReason: true,
+		}),
+		Rerun:    `schemabot apply -e production --override "` + reason + `"`,
+		Complete: instantComment(false),
+		Summary:  instantComment(true),
+	}
 }
 
 // instantComment renders the freeze recording's apply once it has completed:
