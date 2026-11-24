@@ -52,6 +52,7 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	database := rm.database
 	tables := rm.tables
 	checkpointWindow := e.stopCheckpointWindow
+	exit := rm.run.exit()
 	e.mu.Unlock()
 
 	logger := e.schemaChangeLogger(rm)
@@ -64,7 +65,7 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 		// that lands is never reported stopped twice over. With no runner
 		// alive the wait returns at once; a runner that will not come down
 		// bounds this stop at its caller's context, and the caller retries.
-		if err := waitForInterruptedRunner(ctx, rm, logger, "stop", database, tables); err != nil {
+		if err := waitForInterruptedRunner(ctx, exit, logger, "stop", database, tables); err != nil {
 			return nil, err
 		}
 		if err := settleAfterRunnerExit(e, rm, logger, "stop", database, tables); err != nil {
@@ -111,6 +112,7 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 		rm.cancelFunc()
 	}
 	rm.state = engine.StateStopped
+	exit = rm.run.exit()
 	e.mu.Unlock()
 
 	logger.Info("stop requested, waiting for goroutine",
@@ -118,7 +120,7 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 		"tables", tables,
 	)
 
-	if err := waitForInterruptedRunner(ctx, rm, logger, "stop", database, tables); err != nil {
+	if err := waitForInterruptedRunner(ctx, exit, logger, "stop", database, tables); err != nil {
 		return nil, err
 	}
 	if err := settleAfterRunnerExit(e, rm, logger, "stop", database, tables); err != nil {
@@ -144,16 +146,16 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 // once the runner has returned. Until then the engine starts no other run on
 // the target: Start refuses to resume the change, and Apply drains the tracked
 // change before it installs a new one.
-func waitForInterruptedRunner(ctx context.Context, rm *runningSchemaChange, logger *slog.Logger, operation, database string, tables []string) error {
-	err := waitForRunExit(ctx, rm)
+func waitForInterruptedRunner(ctx context.Context, exit runExit, logger *slog.Logger, operation, database string, tables []string) error {
+	err := exit.wait(ctx)
 	if err == nil {
 		return nil
 	}
-	if rm.active.Load() == 0 {
-		// A context that had already ended can end the wait before it has
-		// observed anything, so the wait ending says nothing about a runner
-		// by itself. With no run goroutine executing there is no runner left
-		// to wait out, and the stop or cancel goes on as it would have.
+	if exit.returned() {
+		// The runner can return between the context ending and this check,
+		// so the wait ending says nothing about a runner by itself. With the
+		// run returned there is no runner left to wait out, and the stop or
+		// cancel goes on as it would have.
 		logger.Debug(operation+" wait ended at the caller's context with no runner alive; nothing to wait out",
 			"database", database,
 			"tables", tables,
@@ -300,6 +302,7 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 		rm.cancelFunc()
 	}
 	rm.state = engine.StateCancelled
+	exit := rm.run.exit()
 	e.mu.Unlock()
 
 	logger := e.schemaChangeLogger(rm)
@@ -307,7 +310,7 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 		"database", database,
 		"tables", tables,
 	)
-	if err := waitForInterruptedRunner(ctx, rm, logger, "cancel", database, tables); err != nil {
+	if err := waitForInterruptedRunner(ctx, exit, logger, "cancel", database, tables); err != nil {
 		return nil, err
 	}
 	if err := settleAfterRunnerExit(e, rm, logger, "cancel", database, tables); err != nil {
@@ -380,6 +383,9 @@ func (e *Engine) dropCancelledArtifacts(ctx context.Context, rm *runningSchemaCh
 // - the DDL statement being executed
 // When Run() is called, Spirit checks for a checkpoint and resumes if found.
 func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	// The state and the previous run are checked, and the resumed run is
+	// claimed, in one critical section, so of two starts that race only one
+	// resumes the change and the other finds it already running.
 	e.mu.Lock()
 	rm := e.runningSchemaChange
 	if rm == nil {
@@ -387,19 +393,11 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 		return nil, fmt.Errorf("no schema change to resume - use Apply to start a new one")
 	}
 	state := rm.state
-	host := rm.host
-	username := rm.username
-	password := rm.password
 	database := rm.database
 	tables := rm.tables
-	originalDDLs := rm.originalDDLs
-	combinedStatement := rm.combinedStatement
-	deferCutover := rm.deferCutover
-	directExecPolicy := rm.directPolicy
-	runnerAlive := rm.active.Load() != 0
-	e.mu.Unlock()
 
 	if state == engine.StateRunning {
+		e.mu.Unlock()
 		return &engine.ControlResult{
 			Accepted: true,
 			Message:  "Already running",
@@ -407,10 +405,12 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 	}
 
 	if state != engine.StateStopped {
+		e.mu.Unlock()
 		return nil, fmt.Errorf("cannot resume schema change in state %s", state)
 	}
 
-	if runnerAlive {
+	if rm.run.alive() {
+		e.mu.Unlock()
 		// Stopped is provisional while the runner the stop interrupted is
 		// still returning, as after a stop whose wait ended at its caller's
 		// context. A resume now would run beside that runner on the same
@@ -423,32 +423,38 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 		return nil, fmt.Errorf("start on database %s tables %v: the stopped runner has not returned; send the start again once it has", database, tables)
 	}
 
+	host := rm.host
+	username := rm.username
+	password := rm.password
 	// Verify we have credentials for resume
 	if host == "" || username == "" {
+		e.mu.Unlock()
 		return nil, fmt.Errorf("credentials not available for resume")
 	}
-
-	e.schemaChangeLogger(rm).Info("resuming schema change",
-		"database", database,
-		"tables", tables,
-	)
+	originalDDLs := rm.originalDDLs
+	combinedStatement := rm.combinedStatement
+	deferCutover := rm.deferCutover
+	directExecPolicy := rm.directPolicy
 
 	// The resumed run's cancel is published with its running state, before
 	// the run starts, so a halt that finds the run active always reaches it.
 	bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	e.mu.Lock()
 	rm.state = engine.StateRunning
 	rm.cancelFunc = cancel
 	rm.owner = engine.WorkOwnerFromContext(ctx)
-	e.mu.Unlock()
-
-	rm.goRun(func() {
+	rm.run.start(func() {
 		defer cancel()
 		if !e.stoppedStatementsEnded(bgCtx, host, username, password, database) {
 			return
 		}
 		e.resumeSchemaChange(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover, directExecPolicy)
 	})
+	e.mu.Unlock()
+
+	e.schemaChangeLogger(rm).Info("resuming schema change",
+		"database", database,
+		"tables", tables,
+	)
 
 	return &engine.ControlResult{
 		Accepted: true,

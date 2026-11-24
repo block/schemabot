@@ -105,6 +105,7 @@ const (
 	ErrCodeDeferredCutoverCapacity = "deferred_cutover_capacity" // --defer-cutover refused: the apply would hold more drivers at its cutover than are left for deferred work; apply without the flag
 	ErrCodeChangeGateRefused       = "change_gate_refused"       // Apply, start or cutover refused by a change gate, such as a freeze; the blockers say why
 	ErrCodeChangeGateUnavailable   = "change_gate_unavailable"   // SchemaBot could not check the change gates, so nothing started; retry
+	ErrCodeLockChanged             = "lock_changed"              // Apply refused: the database lock it would record was released, or released and taken again, while it was queued; nothing was stored
 )
 
 var retryableErrorCodes = map[string]bool{

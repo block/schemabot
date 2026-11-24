@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -199,7 +198,7 @@ func (s *Service) handleChecksSynthesize(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var req ChecksSynthesizeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
@@ -479,7 +478,7 @@ func (s *Service) handleChecksScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req ChecksScanRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}

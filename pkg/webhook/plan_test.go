@@ -1156,8 +1156,7 @@ func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {
 	assert.Contains(t, rendered, "**⛔ Apply rejected**: 1 unsafe change detected")
 	assert.Contains(t, rendered, "`users`")
 	assert.Contains(t, rendered, "DROP TABLE removes all data")
-	assert.Contains(t, rendered, "**🚨 To proceed with these destructive changes**:\n1. Deploy application code that no longer reads from or writes to the dropped table.\n2. Add `--allow-unsafe` to confirm 1 unsafe change on `users`:\n   ```\n   schemabot apply -e staging\n   ```\n")
-	assert.NotContains(t, rendered, "--allow-unsafe\n```", "consenting to destroy data takes typing the flag, so the pasteable command leaves it out")
+	assert.Contains(t, rendered, "**🚨 To proceed with these destructive changes**:\n1. Deploy application code that no longer reads from or writes to the dropped table.\n2. Post this command to confirm 1 unsafe change on `users`:\n   ```\n   schemabot apply -e staging --allow-unsafe\n   ```\n")
 }
 
 // A table can carry several lint violations in one engine-joined reason
@@ -1288,7 +1287,7 @@ func TestRenderUnsafeChangesBlocked_CustomDatabaseTypeHeader(t *testing.T) {
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "## Schema Change Plan")
-	assertPasteableCommand(t, rendered, "schemabot apply -e staging")
+	assertPasteableCommand(t, rendered, "schemabot apply -e staging --allow-unsafe")
 }
 
 func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) {
@@ -1310,7 +1309,7 @@ func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) 
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "**Tenant**: `alpha`")
-	assertPasteableCommand(t, rendered, "schemabot apply -e staging --tenant alpha")
+	assertPasteableCommand(t, rendered, "schemabot apply -e staging --tenant alpha --allow-unsafe")
 }
 
 // A plan comment's copy-paste commands name a database only where a bare

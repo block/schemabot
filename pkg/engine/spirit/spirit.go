@@ -187,21 +187,86 @@ type runningSchemaChange struct {
 	username   string
 	password   string
 
-	// For waiting on schema change to finish. active counts the run goroutines
-	// still executing, so a halt can tell work that is still running from work
-	// that has already ended.
-	wg     sync.WaitGroup
-	active atomic.Int32
+	// run follows the goroutine executing the schema change, so a halt, drain,
+	// stop, or start can tell work that is still running from work that has
+	// already ended, and wait for it to return. Guarded by Engine.mu.
+	run runTracker
 }
 
-// goRun runs the schema change's background work, tracked by both wg and
-// active.
-func (rm *runningSchemaChange) goRun(run func()) {
-	rm.active.Add(1)
-	rm.wg.Go(func() {
-		defer rm.active.Add(-1)
+// runTracker follows the current run of a schema change: the goroutine Apply
+// starts, or the one Start resumes it in. Each run gets its own done channel,
+// made and published in the same Engine.mu critical section that decides the
+// run may start, and closed by the run goroutine as the last thing it does.
+// A waiter takes the channel under Engine.mu and selects on it and its own
+// context, so a waiter that gives up leaves nothing behind that a later run
+// could collide with. Its zero value tracks no run. Guarded by Engine.mu.
+type runTracker struct {
+	// done is closed when the current run returns. It is nil until the first
+	// run starts.
+	done chan struct{}
+}
+
+// start claims a new run and launches it. The caller must hold Engine.mu, in
+// the same critical section in which it checked that no earlier run is alive.
+func (t *runTracker) start(run func()) {
+	done := make(chan struct{})
+	t.done = done
+	go func() {
+		defer close(done)
 		run()
-	})
+	}()
+}
+
+// alive reports whether the current run has not returned yet. The caller must
+// hold Engine.mu.
+func (t *runTracker) alive() bool {
+	return !t.exit().returned()
+}
+
+// exit returns the handle a waiter uses to wait for the current run to return.
+// The caller must hold Engine.mu; the handle itself is used without it.
+func (t *runTracker) exit() runExit {
+	return runExit{done: t.done}
+}
+
+// runExit is a waiter's handle on one run's return. A handle on no run reads
+// as already returned.
+type runExit struct {
+	done <-chan struct{}
+}
+
+// returned reports whether the run has returned.
+func (x runExit) returned() bool {
+	if x.done == nil {
+		return true
+	}
+	select {
+	case <-x.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// wait waits for the run to return, or for ctx to end. A run that has already
+// returned wins over a context that has already ended.
+func (x runExit) wait(ctx context.Context) error {
+	if x.returned() {
+		return nil
+	}
+	select {
+	case <-x.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// waitWithoutBound waits for the run to return, however long it takes.
+func (x runExit) waitWithoutBound() {
+	if x.done != nil {
+		<-x.done
+	}
 }
 
 // Compile-time check that Engine implements the interface.
@@ -379,28 +444,40 @@ func (e *Engine) RegistersWorkSynchronously() bool {
 // Drain waits without a bound, for a caller that owns the engine outright. A
 // drive waits through DrainContext instead, so it never outlives its claim.
 func (e *Engine) Drain() {
-	rm, raceWindow := e.trackedForDrain()
+	rm, exit, raceWindow := e.trackedForDrain()
 	if rm == nil {
 		return
 	}
-	rm.wg.Wait()
-	e.releaseDrained(rm, raceWindow)
+	for {
+		exit.waitWithoutBound()
+		next, resumed := e.releaseDrained(rm, exit, raceWindow)
+		if !resumed {
+			return
+		}
+		exit = next
+	}
 }
 
 // DrainContext is Drain bounded by ctx. When ctx ends before the schema change
 // exits, it returns an error and leaves the change tracked, so the engine
-// still reports it as holding the target.
+// still reports it as holding the target. A run that Start resumes while the
+// drain waits is waited for within the same ctx.
 func (e *Engine) DrainContext(ctx context.Context) error {
-	rm, raceWindow := e.trackedForDrain()
+	rm, exit, raceWindow := e.trackedForDrain()
 	if rm == nil {
 		return nil
 	}
-	if err := waitForRunExit(ctx, rm); err != nil {
-		database, tables := e.runTarget(rm)
-		return fmt.Errorf("drain schema change on database %s tables %v: still running after %w", database, tables, err)
+	for {
+		if err := exit.wait(ctx); err != nil {
+			database, tables := e.runTarget(rm)
+			return fmt.Errorf("drain schema change on database %s tables %v: still running after %w", database, tables, err)
+		}
+		next, resumed := e.releaseDrained(rm, exit, raceWindow)
+		if !resumed {
+			return nil
+		}
+		exit = next
 	}
-	e.releaseDrained(rm, raceWindow)
-	return nil
 }
 
 // runTarget reads the database and tables of a run that may still be running.
@@ -411,16 +488,24 @@ func (e *Engine) runTarget(rm *runningSchemaChange) (string, []string) {
 	return rm.database, rm.tables
 }
 
-// trackedForDrain returns the schema change a drain waits for, if any.
-func (e *Engine) trackedForDrain() (*runningSchemaChange, func()) {
+// trackedForDrain returns the schema change a drain waits for, if any, and the
+// handle on its current run's return.
+func (e *Engine) trackedForDrain() (*runningSchemaChange, runExit, func()) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.runningSchemaChange, e.drainRaceWindow
+	rm := e.runningSchemaChange
+	if rm == nil {
+		return nil, runExit{}, e.drainRaceWindow
+	}
+	return rm, rm.run.exit(), e.drainRaceWindow
 }
 
-// releaseDrained stops tracking rm once its run has exited, keeping its
-// outcome for a later progress poll.
-func (e *Engine) releaseDrained(rm *runningSchemaChange, raceWindow func()) {
+// releaseDrained stops tracking rm once the run the drain waited for, exited,
+// has returned, keeping its outcome for a later progress poll. When Start has
+// resumed rm in a new run since the drain took exited, rm stays tracked and
+// releaseDrained returns the new run's handle with resumed set, so the drain
+// waits for that run before it releases anything.
+func (e *Engine) releaseDrained(rm *runningSchemaChange, exited runExit, raceWindow func()) (next runExit, resumed bool) {
 	if raceWindow != nil {
 		raceWindow()
 	}
@@ -433,13 +518,25 @@ func (e *Engine) releaseDrained(rm *runningSchemaChange, raceWindow func()) {
 		e.mu.Unlock()
 		e.schemaChangeLogger(rm).Debug("drained schema change is no longer tracked; leaving the engine's current state in place",
 			"database", rm.database, "tables", rm.tables)
-		return
+		return runExit{}, false
+	}
+	if current := rm.run.exit(); current != exited {
+		// Start resumed the change after the waited-for run returned. The
+		// resumed run is still working on the target, so releasing rm now
+		// would hide it from an ownership halt (OW-3) and let the caller
+		// proceed as if the target had drained.
+		database, tables := rm.database, rm.tables
+		e.mu.Unlock()
+		e.schemaChangeLogger(rm).Debug("drained schema change was resumed while the drain waited; waiting for the resumed run",
+			"database", database, "tables", tables)
+		return current, true
 	}
 	if retainsDrainedOutcome(rm.state) {
 		e.drainedOutcome = newDrainedOutcome(rm)
 	}
 	e.runningSchemaChange = nil
 	e.mu.Unlock()
+	return runExit{}, false
 }
 
 // installRunningSchemaChange publishes rm as the engine's tracked schema
@@ -452,6 +549,17 @@ func (e *Engine) installRunningSchemaChange(rm *runningSchemaChange) {
 	e.runningSchemaChange = rm
 	e.drainedOutcome = nil
 	e.mu.Unlock()
+}
+
+// installAndRun publishes rm like installRunningSchemaChange and starts its
+// run in the same critical section, so no halt, drain, or progress poll can
+// find the change published without the run that executes it.
+func (e *Engine) installAndRun(rm *runningSchemaChange, run func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.runningSchemaChange = rm
+	e.drainedOutcome = nil
+	rm.run.start(run)
 }
 
 // drainedOutcome is the retained result of a schema change that reached a
@@ -580,7 +688,8 @@ func (e *Engine) halt(ctx context.Context, selected func(*runningSchemaChange) b
 		e.mu.Unlock()
 		return nil
 	}
-	if rm.active.Load() == 0 {
+	exit := rm.run.exit()
+	if exit.returned() {
 		database, tables, state := rm.database, rm.tables, rm.state
 		e.mu.Unlock()
 		e.schemaChangeLogger(rm).Debug("schema change has already ended; nothing to halt",
@@ -600,7 +709,7 @@ func (e *Engine) halt(ctx context.Context, selected func(*runningSchemaChange) b
 	// it would write progress for work that is over, and cancelling would cut
 	// short a teardown that releases the table on its own. Wait for it instead.
 	if outcome.IsTerminal() {
-		return waitForSchemaChangeExit(ctx, rm, database, tables)
+		return waitForSchemaChangeExit(ctx, exit, database, tables)
 	}
 
 	// Checkpoint before cancelling. Spirit checkpoints on its own interval, so
@@ -617,7 +726,7 @@ func (e *Engine) halt(ctx context.Context, selected func(*runningSchemaChange) b
 		cancelRun()
 	}
 
-	if err := waitForSchemaChangeExit(ctx, rm, database, tables); err != nil {
+	if err := waitForSchemaChangeExit(ctx, exit, database, tables); err != nil {
 		return err
 	}
 	logger.Info("schema change halted; the target's lock is released and the apply stays active for another driver",
@@ -625,33 +734,14 @@ func (e *Engine) halt(ctx context.Context, selected func(*runningSchemaChange) b
 	return nil
 }
 
-// waitForSchemaChangeExit waits for the change's run goroutines to return. It
-// waits off the calling goroutine so a runner that will not come down bounds
-// the caller at ctx rather than blocking it forever; the wait goroutine ends
-// with the runner it is waiting on.
-func waitForSchemaChangeExit(ctx context.Context, rm *runningSchemaChange, database string, tables []string) error {
-	if err := waitForRunExit(ctx, rm); err != nil {
+// waitForSchemaChangeExit waits for the change's run to return, bounded by ctx,
+// so a runner that will not come down bounds the caller at ctx rather than
+// blocking it forever.
+func waitForSchemaChangeExit(ctx context.Context, exit runExit, database string, tables []string) error {
+	if err := exit.wait(ctx); err != nil {
 		return fmt.Errorf("halt schema change on database %s tables %v: still running after %w; the target may still be locked", database, tables, err)
 	}
 	return nil
-}
-
-// waitForRunExit waits off the calling goroutine for the change's run
-// goroutines to return, or for ctx to end. The wait goroutine ends with the
-// runner it is waiting on.
-func waitForRunExit(ctx context.Context, rm *runningSchemaChange) error {
-	done := make(chan struct{})
-	go func() {
-		rm.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 // Plan computes the schema changes needed by diffing current schema against desired.
@@ -681,7 +771,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("plan database %s: %w", database, err)
 	}
 	if err := drops.RefuseIgnored(ignored); err != nil {
-		return nil, fmt.Errorf("plan database %s: %w", database, err)
+		return nil, &engine.PlanRefusedError{Err: fmt.Errorf("plan database %s: %w", database, err)}
 	}
 	current, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored, drops)
 	if err != nil {
@@ -726,7 +816,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 					return nil, fmt.Errorf("SQL usage error in %s/%s: %w", namespace, filename, err)
 				}
 				if err := declared.Declare(namespace+"/"+filename, ct.TableName); err != nil {
-					return nil, err
+					return nil, &engine.PlanRefusedError{Err: err}
 				}
 				// The diff names a live table the way it exists, so every
 				// lookup below keys the declaration by that spelling.
@@ -744,14 +834,8 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	// same namespace on every run. Each is a refusal of the schema files as
 	// written, which the person who edits them fixes.
 	for _, namespace := range slices.Sorted(maps.Keys(declaredByNamespace)) {
-		if err := ignored.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
-			return nil, &engine.PlanRefusedError{Err: err}
-		}
-		if err := drops.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
-			return nil, &engine.PlanRefusedError{Err: err}
-		}
-		if err := refuseDeclaredSkippedTables(namespace, declaredByNamespace[namespace], current); err != nil {
-			return nil, &engine.PlanRefusedError{Err: err}
+		if err := refuseDeclaredTables(namespace, declaredByNamespace[namespace], ignored, drops, current); err != nil {
+			return nil, err
 		}
 	}
 
@@ -962,6 +1046,20 @@ func exemptLiveTables(ignored engine.IgnoredTables, req *engine.PlanRequest, dat
 	return groups
 }
 
+// refuseDeclaredTables refuses the tables a namespace's schema files declare
+// that the config or the naming conventions withhold from the diff. Each is a
+// plan refusal: the schema files or the config must change before the same
+// request can plan.
+func refuseDeclaredTables(namespace string, declared []string, ignored engine.IgnoredTables, drops engine.DroppedTables, live *liveSchema) error {
+	if err := ignored.RefuseDeclared(namespace, declared); err != nil {
+		return &engine.PlanRefusedError{Err: err}
+	}
+	if err := drops.RefuseDeclared(namespace, declared); err != nil {
+		return &engine.PlanRefusedError{Err: err}
+	}
+	return refuseDeclaredSkippedTables(namespace, declared, live)
+}
+
 // refuseDeclaredSkippedTables refuses a schema file that declares a live table
 // a naming convention keeps out of the diff. The diff never sees the live
 // table, so it would propose CREATE TABLE for a table that already exists, and
@@ -981,8 +1079,8 @@ func refuseDeclaredSkippedTables(namespace string, declared []string, live *live
 		if !ok {
 			continue
 		}
-		return fmt.Errorf("a schema file in namespace %q declares table %q, which the MySQL planner never manages because %s. Rename the table, or remove its schema file",
-			namespace, table, why)
+		return &engine.PlanRefusedError{Err: fmt.Errorf("a schema file in namespace %q declares table %q, which the MySQL planner never manages because %s. Rename the table, or remove its schema file",
+			namespace, table, why)}
 	}
 	return nil
 }
@@ -1077,9 +1175,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		owner:           engine.WorkOwnerFromContext(ctx),
 		applyIdentifier: req.ApplyIdentifier,
 	}
-	e.installRunningSchemaChange(rm)
-
-	rm.goRun(func() {
+	e.installAndRun(rm, func() {
 		defer cancel()
 		if !e.stoppedStatementsEnded(bgCtx, host, username, password, database) {
 			return
@@ -1163,9 +1259,18 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 
 	state := progressState(rm, spiritState)
 
-	// If state was overridden and message is still the default fallback, update message to match
+	// A stop still waiting for its runner says so. Otherwise, if state was
+	// overridden and message is still the default fallback, update message to
+	// match.
 	defaultMessage := fmt.Sprintf("Schema change %s", rm.state)
-	if state != rm.state && message == defaultMessage {
+	switch {
+	case state == engine.StateRunning && rm.state == engine.StateStopped:
+		// progressState reports a stopped change as running only while its
+		// stop awaits the runner. Reading that from state, instead of checking
+		// the runner again, keeps the state and the message on one
+		// observation of a runner that can return at any moment.
+		message = stoppingMessage
+	case state != rm.state && message == defaultMessage:
 		message = fmt.Sprintf("Schema change %s", state)
 	}
 
@@ -1306,6 +1411,21 @@ func tableInPacedPhase(copyComplete bool, spiritState status.State) bool {
 	return !copyComplete || spiritState == status.Checksum
 }
 
+// stopAwaitsRunner reports whether the change is marked stopped while the
+// runner the stop interrupted has not returned, as after a stop whose wait
+// ended at its caller's context. The runner can still finish the change on its
+// way out, so stopped is not yet settled and Start refuses to resume it. A
+// progress poll reports such a change as running, the state an engine reports
+// for work still in motion, so no caller reads the stop as settled while the
+// runner can still change the target. The caller must hold e.mu.
+func stopAwaitsRunner(rm *runningSchemaChange) bool {
+	return rm.state == engine.StateStopped && rm.run.alive()
+}
+
+// stoppingMessage is the progress message for a change whose stop is still
+// waiting for the runner it interrupted.
+const stoppingMessage = "Stopping: waiting for the interrupted runner to return"
+
 // spiritPostCopyPhase reports whether the runner is in one of the active
 // phases between finishing the row copy and finishing the cutover: applying
 // the accumulated changeset, restoring deferred indexes, analyzing, verifying
@@ -1326,9 +1446,14 @@ func spiritPostCopyPhase(s status.State) bool {
 // progressState resolves the state reported for a progress poll. The tracked
 // state is authoritative for terminal outcomes: they are recorded before the
 // runner is closed, so a runner observed mid-teardown never changes the
-// recorded outcome. Spirit's status only refines a non-terminal state, e.g.
-// surfacing the sentinel wait for a deferred cutover.
+// recorded outcome. The one exception is a stop still waiting for the runner
+// it interrupted (stopAwaitsRunner), which reports running until that runner
+// returns. Spirit's status only refines a non-terminal state, e.g. surfacing
+// the sentinel wait for a deferred cutover. The caller must hold e.mu.
 func progressState(rm *runningSchemaChange, spiritState status.State) engine.State {
+	if stopAwaitsRunner(rm) {
+		return engine.StateRunning
+	}
 	state := rm.state
 	if !state.IsTerminal() && spiritState == status.WaitingOnSentinelTable && rm.deferCutover {
 		state = engine.StateWaitingForCutover
