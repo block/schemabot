@@ -179,10 +179,11 @@ func TestEnginePullSchemaExcludesPartitionChildren(t *testing.T) {
 	eng := NewForTarget(0, 0, "pull_partition_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
 
-	require.Error(t, err)
-	assert.Nil(t, response)
-	assert.Contains(t, err.Error(), `schema "app" table "events"`)
-	assert.NotContains(t, err.Error(), "events_2026")
+	require.NoError(t, err)
+	tables := response.Namespaces["app"].GetTables()
+	assert.Equal(t, []string{"events"}, sortedKeys(tables), "only the partitioned parent is exported")
+	assert.Contains(t, tables["events"], "PARTITION BY RANGE (created_at)")
+	assert.NotContains(t, tables["events"], "events_2026")
 }
 
 // Views are outside the table baseline, so ordinary and materialized views do
@@ -2270,9 +2271,10 @@ func TestEngineHaltForShutdownEndsAParkedConcurrentBuild(t *testing.T) {
 // recovery that clears the abandoned entry but whose build then fails
 // reports the failure, never a completion: the abandoned invalid index is
 // removed, the unique build fails on duplicate rows and leaves its own
-// invalid index under the name, and the apply fails retryable naming that
-// index — while the catalog still shows it invalid, the state a completion
-// would have misreported as the index the schema declares.
+// invalid index under the name, and the apply is refused naming that index —
+// while the catalog still shows it invalid, the state a completion would have
+// misreported as the index the schema declares. The refusal is permanent: a
+// rerun meets the same duplicate rows, so the operator corrects them first.
 func TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "recovery_failure_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
@@ -2291,10 +2293,11 @@ func TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion(t *testing.T) 
 	require.NoError(t, err)
 	progress := awaitPostgresProgress(t, eng, "orders")
 	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
-	assert.Equal(t, "failed", progress.Metadata["phase"])
-	assert.True(t, progress.Retryable, "a build that fails after the recovery is operational; the drive must offer the retry")
-	assert.Contains(t, progress.ErrorMessage, "orders_ref_key")
-	assert.Contains(t, progress.ErrorMessage, "invalid index")
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "a build the table's rows violate fails the same way on every rerun")
+	assert.Equal(t, `recovering abandoned invalid index "public"."orders_ref_key" failed: `+
+		`the table's rows cannot be indexed by index "public"."orders_ref_key", and the failed build left it invalid on the target; `+
+		`correct the rows, then re-run; the rerun removes the invalid index once it proves no build holds it`, progress.ErrorMessage)
 	assert.NotContains(t, progress.ErrorMessage, "ref-collision", "the server's unique-violation text never reaches the operator surface")
 
 	var valid bool
