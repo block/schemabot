@@ -678,7 +678,9 @@ If this change can't wait, run the same command with --override "<reason>".
 `--override "<reason>"` on `apply`, `start` and `cutover` overrides the freeze
 for that one change. It needs a verified caller, and the reason is at most 500
 characters. Under the default `freeze.override_policy`, `reason`, the command
-runs at once and SchemaBot records the reason. On a server set to `approval`,
+runs at once and SchemaBot records the reason. The reason covers that command
+only: run it again during the freeze and give `--override` again. On a server
+set to `approval`,
 it asks a freeze approver instead, and the refusal names the request:
 
 ```console

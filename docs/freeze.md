@@ -153,7 +153,7 @@ specific.
 What happens next depends on the server's
 [override policy](#choose-the-override-policy):
 
-- **`reason`, the default:** the change runs at once. SchemaBot stores the override, approved by you on your reason, and the apply's log says the change was admitted on it.
+- **`reason`, the default:** the change runs at once. SchemaBot stores the override, approved by you on your reason, and the apply's log says the change was admitted on it. The reason covers that one command and the work it starts, nothing more. Any later command the freeze holds, a retry of the same change included, needs its own `--override`, like a deploy override.
 - **`approval`:** it takes two people, the person who asks and a freeze approver who is someone else. SchemaBot still refuses the change, records a request, and the approver approves it. Then you run the command again. The rest of this section shows that flow.
 
 On a pull request, the refusal comment says which policy applies: "Go ahead with a reason" for `reason`, "Ask for an override" with the approver teams for `approval`.
@@ -230,17 +230,20 @@ command again.
 
 ![Under the approval policy, the PR author asks for an override, the freeze refuses the apply and records the request, a second person approves it, and the next apply runs and the PR merges](../assets/pr-freeze-demo.gif)
 
-### What an override covers
+### What an approved override covers
 
-Under either policy:
+Under `approval`, an approved request covers:
 
 - **One change:** the action (`apply`, `start` or `cutover`) and what it acts on. For an apply, that is the schema each member is asked to reach, not the plan, because running the command again plans afresh. A different schema for the same database needs its own request.
 - **One person:** the requester. Anyone else whose change the freeze holds asks for their own.
 - **Only the freezes that refused it.** If another freeze starts before you run the command again, the approval no longer covers every freeze in the way, and the change is refused again.
 - **At most 24 hours.** Within that window the requester may use it more than once, for example to start the same apply again after a stop. An expired request can't be approved; ask again.
 
-Under `approval`, asking again while your request waits for approval keeps
-the first request and its first reason, and the refusal says so.
+Asking again while your request waits for approval keeps the first request
+and its first reason, and the refusal says so.
+
+Under `reason` none of this carries over: each command the freeze holds
+gives its own reason.
 
 ## Use the API
 
@@ -610,10 +613,9 @@ The default treats a freeze as a pause that people honor: it stops changes
 until someone decides theirs can't wait and says why. The reason is still
 required and still audited. SchemaBot stores the override approved by its
 requester, with the reason, and the apply's log says the change was admitted
-on the requester's reason. Everything else holds under either policy. The
-override covers only the change, the person and the freezes it was given
-for, and lasts at most 24 hours. A caller SchemaBot can't verify gets no
-override.
+on the requester's reason. The reason admits only the command that gave it:
+a retry, or a later `start` or `cutover`, gives its own. A caller SchemaBot
+can't verify gets no override under either policy.
 
 Set `approval` when every exception needs a second person:
 

@@ -208,9 +208,9 @@ func (s *Service) checkChangeGatesForApply(ctx context.Context, checkpoint chang
 // environment, action and target that names every one of them. The request is
 // returned with the admitting context so the caller can record it. Without
 // one, a caller who gave an override reason has a request recorded. Under the
-// default override policy the refusal carries it for someone else to approve;
-// under the reason policy it is stored approved by the caller and admits the
-// change at once. Any storage error on that path is
+// approval override policy the refusal carries it for someone else to
+// approve; under the reason policy, the default, it is stored approved by the
+// caller and admits this command at once, and no later one. Any storage error on that path is
 // *ChangeGateUnavailableError: an override never gets past a gate that could
 // not decide.
 //
@@ -325,12 +325,12 @@ func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, call
 	return ctx, nil, refusal
 }
 
-// approvedOverride returns the first approved, unexpired override request for
-// the change that names every blocker and that the caller asked for, or nil
-// when there is none. Only the requester runs on an approval: anyone else asks
-// for their own. Within its window the requester may use it more than once,
-// for example to re-apply the same schema after a stop. A server without
-// override storage has none to find.
+// approvedOverride returns the first override request a second person
+// approved for the change that is unexpired, names every blocker and that the
+// caller asked for, or nil when there is none. Only the requester runs on an
+// approval: anyone else asks for their own. Within its window the requester
+// may use it more than once, for example to re-apply the same schema after a
+// stop. A server without override storage has none to find.
 func (s *Service) approvedOverride(ctx context.Context, in changeGateInput, blockers []apitypes.ChangeGateBlocker) (*storage.FreezeOverrideRequest, error) {
 	overrides := s.storage.FreezeOverrides()
 	if overrides == nil {
@@ -347,13 +347,13 @@ func (s *Service) approvedOverride(ctx context.Context, in changeGateInput, bloc
 		return nil, fmt.Errorf("list approved overrides for %s %s in %s: %w", in.Action, in.TargetID, in.Environment, err)
 	}
 	ids := changeGateBlockerIDs(blockers)
-	// An override admitted on its own reason counts only while the policy
-	// allows that. A server switched back to approval honors only overrides a
-	// second person approved, so one recorded before the switch admits no new
-	// command. Work it already admitted keeps it (approvedOverridesForApply).
-	onReason := s.config == nil || s.config.Freeze.OverrideOnReason()
+	// An override admitted on its requester's reason covers only the command
+	// that gave the reason: a later command gives its own --override, under
+	// either policy. So it never carries over to a retry, and a server switched
+	// back to approval honors only overrides a second person approved. Work it
+	// already admitted keeps it (approvedOverridesForApply).
 	for _, request := range approved {
-		if request.OnReason() && !onReason {
+		if request.OnReason() {
 			continue
 		}
 		if request.Covers(ids) && storage.CanonicalKey(request.RequestedBy) == storage.CanonicalKey(caller) && sameOverrideOrigin(ctx, request) {

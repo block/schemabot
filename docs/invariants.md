@@ -2270,8 +2270,10 @@ requests below, it refuses the change with a retryable error, never letting it t
 A freeze refuses a change unless an approved override request covers every blocker on it. The
 requester, who must be verified, runs the apply, start or cutover with an override reason. Under
 the default `freeze.override_policy`, `reason`, that reason admits the change at once: SchemaBot
-stores the request approved by its requester (`overrideOnReason`), and the rules below on what an
-approval covers still hold. Under `approval`, the rest of this paragraph applies: SchemaBot records
+stores the request approved by its requester (`overrideOnReason`). That request admits only the
+command that gave the reason and the work it starts (`approvedOverridesForApply`); `approvedOverride`
+never returns one, so a later command, a retry of the same change included, gives its own reason, and
+the window below does not apply to it. Under `approval`, the rest of this paragraph applies: SchemaBot records
 a request and refuses, naming it. Asking again before approval names the same request
 (`requestOverride`), which keeps its first reason; the refusal says so when the new reason differs. A verified member of `freeze.groups` who is not the requester approves it;
 write groups do not grant approval, and with no freeze group configured nobody approves, so nobody

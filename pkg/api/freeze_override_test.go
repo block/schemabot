@@ -645,8 +645,8 @@ func TestFreezeOverrideNeedsAVerifiedRequester(t *testing.T) {
 // Under the reason override policy, the default, an operator's own reason
 // admits the change at once, like an audited deploy override. The request is stored approved by
 // its requester, with the reason, the apply records it, and the override is
-// counted. A repeated command reuses it. Without a reason the change is still
-// refused.
+// counted. Without a reason the change is still refused, and the reason does
+// not carry over: a retry gives its own, like a deploy override.
 func TestFreezeOverrideOnReasonLetsAnApplyThrough(t *testing.T) {
 	reader := newFreezeMetricsReader(t)
 	svc, applies := newGateApplyTestService(t, gateTestFreeze("freeze-incident"))
@@ -680,15 +680,20 @@ func TestFreezeOverrideOnReasonLetsAnApplyThrough(t *testing.T) {
 		"the apply log records the reason that admitted it")
 
 	applies.apply = nil
+	rec = postAs(t, mux, overrideRequester, "/api/apply", `{"plan_id":"plan-1","environment":"staging"}`)
+	require.Equal(t, http.StatusConflict, rec.Code, "a reason covers only the command that gave it, not a retry")
+	assert.Nil(t, applies.apply)
+
 	rec = postAs(t, mux, overrideRequester, "/api/apply", overrideApplyBody)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	assert.Equal(t, 1, store.count(), "a repeated command reuses the override")
+	assert.Equal(t, 2, store.count(), "a retry with its own reason records its own override")
+	assert.NotEqual(t, id, applies.apply.GetOptions().FreezeOverride)
 
 	other := &auth.User{Subject: "sam", Groups: []string{"schema-admins"}}
 	rec = postAs(t, mux, other, "/api/apply", `{"plan_id":"plan-1","environment":"staging"}`)
-	require.Equal(t, http.StatusConflict, rec.Code, "an override admits only its requester")
+	require.Equal(t, http.StatusConflict, rec.Code, "another person's override never admits sam")
 
-	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 2}, changeGateCounters(t, reader, "schemabot.change_gate.refusals"))
+	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 3}, changeGateCounters(t, reader, "schemabot.change_gate.refusals"))
 	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 2}, changeGateCounters(t, reader, "schemabot.change_gate.overrides"))
 }
 
