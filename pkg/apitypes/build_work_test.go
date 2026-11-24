@@ -46,6 +46,20 @@ func TestParseBuildWork(t *testing.T) {
 		assert.Equal(t, BuildWork{}, work)
 	})
 
+	t.Run("precise percent", func(t *testing.T) {
+		work, err := ParseBuildWork(map[string]string{"executor_operation": "concurrent-index-build", "percent": "35.45"})
+		require.NoError(t, err)
+		assert.Equal(t, BuildWork{Operation: "concurrent-index-build", Percent: 35.45, HasPercent: true}, work)
+	})
+
+	t.Run("malformed percent", func(t *testing.T) {
+		for _, raw := range []string{"", "most", "NaN", "-0.5", "100.01"} {
+			work, err := ParseBuildWork(map[string]string{"executor_operation": "concurrent-index-build", "percent": raw})
+			require.Error(t, err, "percent %q", raw)
+			assert.Equal(t, BuildWork{}, work, "percent %q", raw)
+		}
+	})
+
 	t.Run("other operation keeps its counters", func(t *testing.T) {
 		work, err := ParseBuildWork(map[string]string{"executor_operation": "alter-table", "attempt": "3"})
 		require.NoError(t, err)

@@ -6231,7 +6231,7 @@ step 1 of 1 · `CREATE INDEX CONCURRENTLY idx_users_email_created ON public.user
 
 **Schema `public`**
 
-**`users`**: 🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 25%
+**`users`**: 🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 25.37%
 
 ```sql
 CREATE INDEX CONCURRENTLY idx_users_email_created ON users USING btree (email, created_at);
@@ -6268,7 +6268,7 @@ step 2 of 3 · `CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON public.users
 
 **Schema `public`**
 
-**`users`**: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 10%
+**`users`**: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 10.42%
 
 ```sql
 CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);

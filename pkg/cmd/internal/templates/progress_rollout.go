@@ -548,7 +548,9 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 // count, then its DDL and where each target stands.
 func formatIndexBuildAcrossTargets(t TableProgress) string {
 	var b strings.Builder
-	writeTableLine(&b, t, "%s%s", ui.IndexBuildProgress(t.PercentComplete), ui.ThrottledSuffix(t.Throttled))
+	// The percent across targets is a whole-number mean of each target's whole
+	// percent, so it has no decimals to show.
+	writeTableLine(&b, t, "%s%s", ui.IndexBuildProgress(t.PercentComplete, apitypes.BuildWork{}), ui.ThrottledSuffix(t.Throttled))
 	if t.DDL != "" {
 		b.WriteString(formatTableDDL(t))
 	}

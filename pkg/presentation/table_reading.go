@@ -185,7 +185,7 @@ func readRunning(f TableFacts) TableReading {
 		// The engine's whole-build percent draws the bar. The current phase's
 		// counters sit under the statement and carry no percent of their own,
 		// so the table never shows two.
-		r := TableReading{Label: ui.IndexBuildProgress(f.PercentComplete)}
+		r := TableReading{Label: ui.IndexBuildProgress(f.PercentComplete, f.BuildWork)}
 		if line := ui.FormatBuildWork(f.BuildWork); line != "" {
 			r.Details = []TableDetail{{Text: line}}
 		}
