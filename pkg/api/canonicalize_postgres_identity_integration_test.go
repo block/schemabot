@@ -130,6 +130,26 @@ func TestCanonicalizePostgresIdentityKeys_CollisionNamesConstraint(t *testing.T)
 	assert.ErrorContains(t, err, "differ only by case")
 }
 
+// The same collision refusal on a unique key that spans several folded
+// columns: two check rows for one PR whose repository, environment, database
+// type and database spellings differ only by case must fail the fold naming
+// the violated index rather than collapse into one row.
+func TestCanonicalizePostgresIdentityKeys_MultiColumnKeyCollision(t *testing.T) {
+	db := startCanonicalizeStorage(t)
+
+	_, err := db.ExecContext(t.Context(),
+		`INSERT INTO checks (repository, pull_request, head_sha, environment, database_type, database_name, status)
+		 VALUES ('Org/Repo', 7, 'abc123', 'Staging', 'MySQL', 'Shared', 'queued'),
+		        ('org/repo', 7, 'abc123', 'staging', 'mysql', 'shared', 'queued')`)
+	require.NoError(t, err)
+
+	err = CanonicalizePostgresIdentityKeys(t.Context(), db, slog.New(slog.DiscardHandler))
+	require.Error(t, err)
+	assert.ErrorContains(t, err, `storage table "checks"`)
+	assert.ErrorContains(t, err, `unique index "idx_checks_check_key"`)
+	assert.ErrorContains(t, err, "differ only by case")
+}
+
 // Pointing the canonicalization at a database with none of the storage
 // tables fails up front: folding arbitrary tables' columns on a mistyped DSN
 // must be impossible.
