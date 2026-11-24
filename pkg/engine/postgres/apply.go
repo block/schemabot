@@ -2033,15 +2033,24 @@ func (e *Engine) retainRunningPercent(key string, source, result *engine.Progres
 }
 
 // runningPercentBehind reports whether a poll's percent trails the running
-// record's. The precise percent decides when both carry one, because two
-// readings in the same whole percent differ only in their decimals.
+// record's. Within one whole percent the precise percent decides, because two
+// readings there differ only in their decimals. A poll that derived no precise
+// percent of its own trails a record that carries one: it cloned the record
+// before an overlapping poll stored that reading, so it adopts the reading
+// rather than show the build as just starting.
 func runningPercentBehind(result, source *engine.ProgressResult) bool {
-	if result.Progress < source.Progress {
-		return true
+	if result.Progress != source.Progress {
+		return result.Progress < source.Progress
+	}
+	sourcePrecise, sourceOK := preciseRunningPercent(source.Metadata)
+	if !sourceOK {
+		return false
 	}
 	resultPrecise, resultOK := preciseRunningPercent(result.Metadata)
-	sourcePrecise, sourceOK := preciseRunningPercent(source.Metadata)
-	return resultOK && sourceOK && resultPrecise < sourcePrecise
+	if !resultOK {
+		return true
+	}
+	return resultPrecise < sourcePrecise
 }
 
 // preciseRunningPercent reads back the precise percent setRunningPercent

@@ -2403,6 +2403,27 @@ func TestProgressDecimalsNeverRegressWithinAWholePercent(t *testing.T) {
 	assert.Equal(t, "21.90", pollRunningIndexBuild(t, eng).Metadata["percent"], "the record kept the later reading")
 }
 
+// Two polls clone the record while it still reads 0%. The first stores a
+// reading of 0.10%; the second finds no progress row and derives nothing. The
+// second poll adopts the stored 0.10% instead of showing the build as just
+// starting.
+func TestOverlappingPollWithNoReadingKeepsTheStoredDecimals(t *testing.T) {
+	eng := New()
+	source := &engine.ProgressResult{State: engine.StateRunning, Tables: []engine.TableProgress{{Table: "widgets"}}}
+	eng.progress = map[string]*trackedApply{"task-a": {result: source}}
+
+	reading := &engine.ProgressResult{State: engine.StateRunning, Tables: []engine.TableProgress{{Table: "widgets"}}, Metadata: map[string]string{}}
+	setRunningPercent(reading, 0.1)
+	eng.retainRunningPercent("task-a", source, reading)
+	require.Equal(t, "0.10", source.Metadata["percent"])
+
+	noReading := &engine.ProgressResult{State: engine.StateRunning, Tables: []engine.TableProgress{{Table: "widgets"}}, Metadata: map[string]string{}}
+	eng.retainRunningPercent("task-a", source, noReading)
+	assert.Equal(t, "0.10", noReading.Metadata["percent"])
+	assert.Equal(t, 0, noReading.Progress)
+	assert.Equal(t, "0.10", source.Metadata["percent"], "the record keeps the reading")
+}
+
 func TestProgressStraddlingATerminalPublishDoesNotFloorToTheRetiredRecord(t *testing.T) {
 	eng := New()
 	validation := indexProgressRow{phase: "index validation: scanning table", blocksDone: 40, blocksTotal: 40}
