@@ -388,6 +388,12 @@ func (s *Service) logFreezeOverrideForApply(ctx context.Context, apply *storage.
 	if request == nil {
 		return
 	}
+	if request.OnReason() {
+		s.logControlOperationForApply(ctx, apply, caller, eventType, fmt.Sprintf(
+			"Freeze override %s admitted this change on the requester's reason: requested by %s, covering %s, reason %q",
+			request.Identifier, request.RequestedBy, strings.Join(request.Blockers, ", "), request.Reason))
+		return
+	}
 	s.logControlOperationForApply(ctx, apply, caller, eventType, fmt.Sprintf(
 		"Freeze override %s admitted this change: requested by %s, approved by %s, covering %s",
 		request.Identifier, request.RequestedBy, request.ApprovedBy, strings.Join(request.Blockers, ", ")))

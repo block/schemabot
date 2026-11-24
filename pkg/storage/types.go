@@ -574,9 +574,10 @@ const FreezeOverrideReasonMax = 500
 const FreezeOverrideMaxLifetime = 24 * time.Hour
 
 // FreezeOverrideRequest asks to let one change through the freezes that hold
-// it. Nobody overrides alone: a second person approves the request, and the
-// change goes ahead only while every blocker it meets is one the request
-// names.
+// it. Under the default override policy nobody overrides alone: a second
+// person approves the request. Under the reason policy the request is stored
+// approved by its requester, on their reason. Either way the change goes
+// ahead only while every blocker it meets is one the request names.
 type FreezeOverrideRequest struct {
 	ID          int64
 	Identifier  string
@@ -681,6 +682,13 @@ func (r *FreezeOverrideRequest) FromPullRequest() bool {
 func (r *FreezeOverrideRequest) IsPersonOf(who string) bool {
 	who = CanonicalKey(strings.TrimSpace(who))
 	return who == CanonicalKey(r.RequestedBy) || (r.PRAuthor != "" && who == CanonicalKey(r.PRAuthor))
+}
+
+// OnReason reports whether the request was admitted on its requester's own
+// reason, under the reason override policy, rather than approved by someone
+// else. Approve refuses the requester, so only CreateOnReason stores one.
+func (r *FreezeOverrideRequest) OnReason() bool {
+	return r.ApprovedAt != nil && CanonicalKey(r.ApprovedBy) == CanonicalKey(r.RequestedBy)
 }
 
 // Setting represents an admin-level SchemaBot setting.

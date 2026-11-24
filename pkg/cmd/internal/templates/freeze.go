@@ -179,7 +179,12 @@ func WriteFreezeOverrideApproved(r apitypes.FreezeOverrideRequest) {
 // WriteFreezeOverride writes one freeze override request.
 func WriteFreezeOverride(r apitypes.FreezeOverrideRequest) {
 	status := "waiting for approval"
-	if r.ApprovedAt != nil {
+	switch {
+	case r.ApprovedAt != nil && strings.EqualFold(strings.TrimSpace(r.ApprovedBy), strings.TrimSpace(r.RequestedBy)):
+		// Only the reason override policy stores a request approved by its
+		// own requester.
+		status = fmt.Sprintf("admitted on its requester's reason at %s", freezeTime(*r.ApprovedAt))
+	case r.ApprovedAt != nil:
 		status = fmt.Sprintf("approved by %s at %s", ui.TerminalSafeLine(r.ApprovedBy), freezeTime(*r.ApprovedAt))
 	}
 	fmt.Printf("Override request %s: %s\n", ui.TerminalSafeLine(r.ID), status)

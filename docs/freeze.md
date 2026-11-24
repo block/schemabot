@@ -22,7 +22,9 @@ lifts it. Use one for a code freeze around a holiday or a launch, or to keep
 production still during an incident. While a freeze holds, SchemaBot refuses
 every new `apply`, `start` and `cutover` it covers, and work that already
 started keeps running. A change that can't wait goes through only when a
-second person approves an override for it.
+second person approves an override for it, or, on a server whose
+[override policy](#let-a-reason-admit-an-override) is `reason`, on the
+requester's own recorded reason.
 
 ![Freeze production, an apply the freeze refuses with nothing started, then lift the freeze](../assets/cli-freeze.gif)
 
@@ -143,8 +145,10 @@ again. That is a passing storage problem, not a freeze.
 
 ## Ask for an override
 
-An override lets one change through the freezes that refused it. It takes two
-people: the person who asks, and a freeze approver who is someone else.
+An override lets one change through the freezes that refused it. By default
+it takes two people: the person who asks, and a freeze approver who is
+someone else. A server can instead let the requester's reason admit the
+change on its own; see [Let a reason admit an override](#let-a-reason-admit-an-override).
 
 ### From the CLI
 
@@ -514,7 +518,7 @@ freeze that stopped an apply. Once that freeze ends, a plain
 
 Three rules hold everywhere:
 
-- **Nobody approves their own request.** An override always takes two people.
+- **Nobody approves their own request.** Under the default override policy an override always takes two people. Under the [`reason` policy](#let-a-reason-admit-an-override) nobody approves: the requester's recorded reason admits the change.
 - **Write access does not approve.** `write_groups` may set and lift freezes, but only a freeze approver may approve an override.
 - **Approve where it was asked.** A request asked for on a pull request is approved on that pull request, and a request asked for on the CLI or API is approved there. SchemaBot refuses an approval from the other side and says where to go.
 
@@ -578,3 +582,28 @@ from a pull request, and the refusal says so.
 
 See [freeze groups](configuration.md#freeze-groups-forward-auth) for every
 rule, and [GitHub App setup](github-app-setup.md) for the permission.
+
+### Let a reason admit an override
+
+`freeze.override_policy` decides what `--override "<reason>"` does when a
+freeze refuses a change:
+
+| Policy | What `--override` does |
+|---|---|
+| `approval` (the default) | Records a request that a freeze approver other than the requester and the PR author must approve. The requester then runs the command again. |
+| `reason` | Admits the change at once on the requester's reason, with no approver, like an audited deploy override. |
+
+```yaml
+freeze:
+  override_policy: reason
+```
+
+Use `reason` when a freeze should stop changes by default but trust each
+person to decide that theirs can't wait, as long as they say why. The reason
+is still required and still audited: SchemaBot stores the override approved
+by its requester, with the reason, and the apply's log says the change was
+admitted on the requester's reason. Everything else holds under either
+policy. The override covers only the change, the person and the freezes it
+was given for, and lasts at most 24 hours. A caller SchemaBot can't verify
+gets no override. A freeze refusal on a pull request tells the commenter to go
+ahead with a reason instead of asking an approver.

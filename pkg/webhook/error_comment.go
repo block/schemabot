@@ -63,10 +63,14 @@ func (h *Handler) postChangeGateRefusal(
 ) bool {
 	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
 		var approvers []string
+		onReason := false
 		if config, ok := h.serverConfig(); ok {
 			approvers = config.Freeze.GitHubTeams
+			onReason = config.Freeze.OverrideOnReason()
 		}
-		return h.postCommentBestEffortID(repo, pr, installationID, templates.RenderChangeGateRefusal(changeGateRefusalData(refused, commandName, h.deploymentTenant(), requestedBy, approvers))) != 0
+		data := changeGateRefusalData(refused, commandName, h.deploymentTenant(), requestedBy, approvers)
+		data.OverrideOnReason = onReason
+		return h.postCommentBestEffortID(repo, pr, installationID, templates.RenderChangeGateRefusal(data)) != 0
 	}
 	message := "SchemaBot could not check for freezes, so this did not start. Try again."
 	if unavailable, ok := errors.AsType[*api.ChangeGateUnavailableError](err); ok {

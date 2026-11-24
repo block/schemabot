@@ -30,6 +30,16 @@ type freezeOverrideStore struct {
 
 // Create records a request and returns it as stored.
 func (s *freezeOverrideStore) Create(ctx context.Context, request *storage.FreezeOverrideRequest) (*storage.FreezeOverrideRequest, error) {
+	return s.create(ctx, request, false)
+}
+
+// CreateOnReason records a request approved by its requester at creation.
+func (s *freezeOverrideStore) CreateOnReason(ctx context.Context, request *storage.FreezeOverrideRequest) (*storage.FreezeOverrideRequest, error) {
+	return s.create(ctx, request, true)
+}
+
+// create records a request, approved by its requester when onReason is set.
+func (s *freezeOverrideStore) create(ctx context.Context, request *storage.FreezeOverrideRequest, onReason bool) (*storage.FreezeOverrideRequest, error) {
 	if err := request.Validate(); err != nil {
 		return nil, fmt.Errorf("create freeze override request: %w", err)
 	}
@@ -45,15 +55,25 @@ func (s *freezeOverrideStore) Create(ctx context.Context, request *storage.Freez
 	if err != nil {
 		return nil, fmt.Errorf("encode blockers of freeze override request %s: %w", request.Identifier, err)
 	}
+	// A request admitted on its reason is approved by its requester as it is
+	// written, by the same clock Approve uses.
+	approvedBy, approvedAt := "NULL", "NULL"
+	if onReason {
+		approvedBy, approvedAt = "?", s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)
+	}
+	args := []any{request.Identifier, storage.CanonicalKey(request.Environment), request.Action, request.TargetID,
+		storage.CanonicalKey(request.Database), storage.CanonicalKey(request.Repository), request.PullRequest,
+		nullString(strings.TrimSpace(request.PRAuthor)), string(blockers), strings.TrimSpace(request.Reason),
+		strings.TrimSpace(request.RequestedBy), freezeTime(request.ExpiresAt)}
+	if onReason {
+		args = append(args, strings.TrimSpace(request.RequestedBy))
+	}
 	id, err := s.identity.InsertID(ctx, s.db, `
 		INSERT INTO freeze_override_requests (
 			override_identifier, environment, action, target_id, database_name, repository,
-			pull_request, pr_author, blockers, reason, requested_by, expires_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, request.Identifier, storage.CanonicalKey(request.Environment), request.Action, request.TargetID,
-		storage.CanonicalKey(request.Database), storage.CanonicalKey(request.Repository), request.PullRequest,
-		nullString(strings.TrimSpace(request.PRAuthor)), string(blockers), strings.TrimSpace(request.Reason),
-		strings.TrimSpace(request.RequestedBy), freezeTime(request.ExpiresAt))
+			pull_request, pr_author, blockers, reason, requested_by, expires_at, approved_by, approved_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, `+approvedBy+`, `+approvedAt+`)
+	`, args...)
 	if err != nil {
 		if s.classifier.IsDuplicateKey(err) {
 			return nil, fmt.Errorf("create freeze override request %s: %w", request.Identifier, storage.ErrFreezeOverrideExists)

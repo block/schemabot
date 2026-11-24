@@ -2660,6 +2660,13 @@ The middleware admits `freeze.groups` members to write-tier endpoints, and the f
 The CLI sets, lists, shows and lifts freezes and approves override requests, and asks for an override with `--override` on `apply`, `start` and `cutover`: see [Freeze an environment](cli.md#freeze-an-environment), and the [freeze guide](freeze.md) for the whole workflow.
 A PR author can ask for an override of a freeze from the pull request: `schemabot apply -e production --override "reason"`, and the same flag on `schemabot apply-confirm`, `schemabot start` and `schemabot cutover`. When a freeze refuses the command, SchemaBot records an override request for the commenter and the PR author, and the comment names the request and how it is approved. The request is recorded as `github:<login>`, and an approval has to come from the same identity domain: the API route (`POST /api/freezes/overrides/{id}/approve`) refuses a request asked for on a pull request, and refuses an approver whose forwarded subject starts with `github:`. The identity rule holds both ways: a request asked for through the API or CLI is approved only there, and a request asked for on a pull request only on that pull request.
 
+`freeze.override_policy` decides what an override reason does. `approval`, the default, records a request that a freeze approver must approve, as described here. `reason` admits the change on the requester's own reason, with no approver: SchemaBot stores the override already approved by its requester, keeps the reason for audit, and the refusal comment on a pull request says to go ahead with a reason. Under either policy the reason is required, the caller must be verified, and the override covers one change for one person for at most 24 hours. Any other value is a startup error. See [Let a reason admit an override](freeze.md#let-a-reason-admit-an-override).
+
+```yaml
+freeze:
+  override_policy: reason
+```
+
 A freeze approver approves from the pull request by commenting `schemabot freeze approve ovr-...` on the pull request where the request was made. Who may is set by `freeze.github_teams`, a list of GitHub teams as `org/team-slug`:
 
 ```yaml

@@ -2272,7 +2272,10 @@ requester, who must be verified, runs the apply, start or cutover with an overri
 SchemaBot records a request and refuses, naming it. Asking again before approval names the same request
 (`requestOverride`), which keeps its first reason; the refusal says so when the new reason differs. A verified member of `freeze.groups` who is not the requester approves it;
 write groups do not grant approval, and with no freeze group configured nobody approves, so nobody
-overrides alone, admins included. Storage also refuses the pull request's author once a request
+overrides alone, admins included. That two-person rule is the default `freeze.override_policy`,
+`approval`. A server that sets `reason` opts out of it on purpose: the requester's reason admits
+the change at once, stored as a request approved by its requester (`overrideOnReason`), and every
+other rule here still holds. Storage also refuses the pull request's author once a request
 records one. A request from a pull request records its commenter and author as `github:<login>`,
 which storage cannot match to a forward-auth subject, so an approval must come from the same
 identity domain: `handleFreezeOverrideApprove` refuses a request where `FromPullRequest` holds, and
@@ -2315,7 +2318,8 @@ recorded in `executeStartForApply` and before a cutover is recorded in `executeC
 start or cutover without passing a function that runs the gates. The override check is
 `approvedOverride` (`pkg/api/change_gate.go`), which reads `ListApproved` and admits only a request
 whose `Covers` names every blocker. The approver rules are `AuthorizeFreezeApprove`
-(`pkg/api/freeze_authorization.go`) and `Approve` (`pkg/storage/internal/sqlstore/freeze_overrides.go`).
+(`pkg/api/freeze_authorization.go`) and `Approve` (`pkg/storage/internal/sqlstore/freeze_overrides.go`);
+the policy is `FreezeConfig.OverrideOnReason`, and `CreateOnReason` stores an override admitted on its reason.
 
 ### AZ-11: A stop freeze stops the admitted changes it covers
 

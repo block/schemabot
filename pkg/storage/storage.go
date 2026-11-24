@@ -453,6 +453,13 @@ type FreezeOverrideStore interface {
 	// Create records a request and returns it as stored.
 	Create(ctx context.Context, request *FreezeOverrideRequest) (*FreezeOverrideRequest, error)
 
+	// CreateOnReason records a request that its requester's reason admits,
+	// for a server whose override policy needs no second approver. It is
+	// stored approved by its requester at creation, by the database clock,
+	// so every later check finds it as an approved override. Its other
+	// rules are Create's.
+	CreateOnReason(ctx context.Context, request *FreezeOverrideRequest) (*FreezeOverrideRequest, error)
+
 	// Get returns the request with this identifier, or
 	// ErrFreezeOverrideNotFound.
 	Get(ctx context.Context, identifier string) (*FreezeOverrideRequest, error)
