@@ -1073,124 +1073,48 @@ sender and waits at most five seconds. No sender election, consumer, retention
 cleanup, or backfill runs. Published rows are retained indefinitely as an audit trail;
 the outbox table grows by design.
 
-A panic while processing a notification records a quarantine token and an apply-log
-diagnostic in one storage transaction. The payload is retained, the notification
-remains unpublished, and the completed apply is unchanged. Later delivery batches
-exclude quarantined rows, including after restart; copies already selected by another
-sender can still execute once. Every sender must run a version that honors quarantine;
-an older binary does not exclude these rows during a rolling upgrade. Ordinary transport errors remain retryable without an
-attempt limit. A failed quarantine write is logged as a containment failure and leaves
-the row eligible for a later scan. Panic values and stacks remain in server logs. A panic while recording acceptance
-also quarantines the notification if it is still unpublished; releasing it can resend
-a message already accepted by SQS. Receivers must deduplicate that replay too.
-If another sender already recorded acceptance, quarantine is a logged no-op.
+Storage bootstrap supports fresh databases, empty development outbox tables without
+`status`, and existing status-bearing tables. A populated pre-release outbox table
+without `status` is unsupported: convergence refuses it before changing its schema
+or rows, on every attempt. It does not default old accepted or held intent back to
+pending, convert data, or offer a hand-edited storage remedy.
 
-The recovered-panic counter uses the `completion_sender` operation. Quarantined intent
-still contributes to the oldest-unpublished-age metric. After repairing the publisher,
-an operator can [release one inspected notification](#release-a-quarantined-notification)
-through its storage database. No automatic release runs.
+Each retained row has one authoritative `status`: `pending`, `published`,
+`quarantined`, or `skipped`. Only pending rows enter new delivery batches.
+`published_at` records actual transport acceptance and `quarantine_token` identifies
+an incident; neither detail selects a row for delivery. Rows in every state are
+retained indefinitely.
+
+A panic while processing a pending notification atomically changes its status to
+`quarantined`, records a fresh incident token and writes an apply-log diagnostic.
+The payload and completed apply are unchanged. Ordinary transport errors leave
+intent pending and retry without an attempt limit. A failed quarantine transaction
+leaves it pending and logs a containment failure. Panic values and stacks stay in
+server logs. The recovered-panic counter uses the `completion_sender` operation.
+
+Quarantine and permanent skip exclude future selections, not copies already
+prefetched or sends already in flight. A later successful send records
+`published_at` but changes status to `published` only while it is still `pending`;
+`quarantined` and `skipped` remain held with their audit details intact. If acceptance
+is recorded first, a later panic cannot quarantine that published row. A panic
+while recording acceptance can leave the row quarantined even though SQS accepted
+it; a future authorized release could resend it. Receivers must deduplicate.
+Stopping and draining all senders is necessary to rule out in-flight sends.
+
+**There is no release or skip operation in this version.** Quarantined rows stay
+held until an authorized SchemaBot release operation exists, even after repairing
+the publisher. The `skipped` state is reserved for an explicit permanent-skip
+operation; disabling delivery never skips intent. Operators must not edit
+SchemaBot's storage by hand. Release and skip API/CLI operations, with normal
+authorization and atomic apply-log auditing, are follow-up work.
 
 While delivery is enabled, `schemabot.outbox.oldest_unpublished_age` records the
-oldest pending row's age in seconds, or zero when drained. A growing value calls
-for checking sender logs, quarantined notifications, queue permissions, and SQS reachability. A failed
-storage read does not record a misleading zero.
-
-### Release a quarantined notification
-
-Only an operator with direct access to SchemaBot's storage database performs this
-procedure, after inspecting the panic and repairing its cause. Do not run it against
-a target database. Inspect the row and the corresponding `apply_logs` diagnostic first:
-
-```sql
-SELECT id, apply_id, quarantine_token, published_at
-FROM outbox_events
-WHERE id = 123;
-```
-
-Use the actual outbox ID and its observed quarantine token in **every** statement
-below; `123` and `11111111-1111-4111-8111-111111111111` are fictional examples.
-The token identifies the incident independently of timestamp precision. A later
-quarantine receives a different token, so an old release cannot clear it. Release
-only one unpublished row. Never modify `published_at` to discard intent.
-
-#### MySQL storage
-
-Run these steps on the same connection, one block at a time. Do not use a client
-option that continues after SQL errors. On any error or unexpected result, execute
-`ROLLBACK;` and stop. Do not proceed to the next block unless the affected-row count
-is exactly `1`.
-
-```sql
-START TRANSACTION;
-SELECT `id`, `apply_id`, `quarantine_token`, `published_at`
-FROM `outbox_events`
-WHERE `id` = 123 FOR UPDATE;
-
-INSERT INTO `apply_logs` (`apply_id`, `level`, `event_type`, `source`, `message`, `metadata`)
-SELECT `apply_id`, 'info', 'info', 'schemabot',
-       'Completion notification released after operator repair.',
-       '{"outbox_id":123,"quarantine_token":"11111111-1111-4111-8111-111111111111"}'
-FROM `outbox_events`
-WHERE `id` = 123 AND `published_at` IS NULL
-  AND `quarantine_token` = '11111111-1111-4111-8111-111111111111';
-SELECT ROW_COUNT() AS release_diagnostics;
-```
-
-Require one locked row matching the inspected incident and `release_diagnostics = 1`.
-Otherwise execute `ROLLBACK;` and stop.
-
-```sql
-UPDATE `outbox_events` SET `quarantine_token` = NULL
-WHERE `id` = 123 AND `published_at` IS NULL
-  AND `quarantine_token` = '11111111-1111-4111-8111-111111111111';
-SELECT ROW_COUNT() AS released_notifications;
-```
-
-Require `released_notifications = 1`; otherwise execute `ROLLBACK;` and stop.
-Only after both counts equal `1`, execute:
-
-```sql
-COMMIT;
-```
-
-#### PostgreSQL storage
-
-The block checks both affected-row counts and raises an exception on mismatch,
-which aborts the transaction. On any error execute `ROLLBACK;`, inspect the row
-again, and stop rather than retrying with an uninspected token.
-
-```sql
-BEGIN;
-DO $$
-DECLARE
-  affected bigint;
-BEGIN
-  PERFORM id FROM outbox_events WHERE id = 123 FOR UPDATE;
-  INSERT INTO apply_logs (apply_id, level, event_type, source, message, metadata)
-  SELECT apply_id, 'info', 'info', 'schemabot',
-         'Completion notification released after operator repair.',
-         '{"outbox_id":123,"quarantine_token":"11111111-1111-4111-8111-111111111111"}'::jsonb
-  FROM outbox_events
-  WHERE id = 123 AND published_at IS NULL
-    AND quarantine_token = '11111111-1111-4111-8111-111111111111';
-  GET DIAGNOSTICS affected = ROW_COUNT;
-  IF affected <> 1 THEN
-    RAISE EXCEPTION 'Expected one release diagnostic, got %', affected;
-  END IF;
-  UPDATE outbox_events SET quarantine_token = NULL
-  WHERE id = 123 AND published_at IS NULL
-    AND quarantine_token = '11111111-1111-4111-8111-111111111111';
-  GET DIAGNOSTICS affected = ROW_COUNT;
-  IF affected <> 1 THEN
-    RAISE EXCEPTION 'Expected one released notification, got %', affected;
-  END IF;
-END $$;
-COMMIT;
-```
-
-After commit, a sender can deliver the retained payload. Its published mark is
-recorded only after transport acceptance. The release diagnostic and marker change
-commit together; rollback preserves the quarantine and writes no release diagnostic.
+true oldest-created age across `pending` and `quarantined` rows, or zero when
+neither exists. `published` and `skipped` do not contribute, including a skipped row
+with no acceptance timestamp. A quarantined row still contributes if an in-flight
+send later records acceptance: its disposition is still held. A growing value calls
+for checking sender logs, quarantined notifications, queue permissions and SQS
+reachability. A failed storage read does not record a misleading zero.
 
 ## Rate Limits
 

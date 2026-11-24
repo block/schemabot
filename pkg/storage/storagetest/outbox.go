@@ -113,7 +113,7 @@ func TestOutboxEvents(t *testing.T, h Harness) {
 		require.Len(t, logs, 1)
 		assert.Equal(t, storage.LogLevelError, logs[0].Level)
 		assert.Equal(t, storage.LogEventError, logs[0].EventType)
-		assert.Equal(t, "Completion notification quarantined after a panic. Repair the publisher before explicitly releasing this notification.", logs[0].Message)
+		assert.Equal(t, "Completion notification quarantined after a panic. It remains held until an authorized release operation is available.", logs[0].Message)
 		var metadata struct {
 			OutboxID        int64  `json:"outbox_id"`
 			QuarantineToken string `json:"quarantine_token"`

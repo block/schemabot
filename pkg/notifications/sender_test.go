@@ -22,7 +22,7 @@ import (
 type memoryOutbox struct {
 	events        []*storage.OutboxEvent
 	published     map[int64]bool
-	quarantined   map[int64]bool
+	status        map[int64]string
 	quarantineErr error
 	markErr       error
 	markPanic     bool
@@ -45,7 +45,7 @@ func (m *memoryOutbox) ListUnpublished(_ context.Context, afterID int64, limit i
 	m.limits = append(m.limits, limit)
 	var events []*storage.OutboxEvent
 	for _, event := range m.events {
-		if event.ID > afterID && !m.published[event.ID] && !m.quarantined[event.ID] {
+		if event.ID > afterID && m.status[event.ID] == storage.OutboxStatusPending {
 			events = append(events, event)
 			if len(events) == limit {
 				break
@@ -64,16 +64,22 @@ func (m *memoryOutbox) MarkPublished(_ context.Context, id int64) error {
 		return m.markErr
 	}
 	m.published[id] = true
+	if m.status[id] == storage.OutboxStatusPending {
+		m.status[id] = storage.OutboxStatusPublished
+	}
 	return nil
 }
 
 func (m *memoryOutbox) OldestUnpublishedAt(context.Context) (*time.Time, error) {
+	var oldest *time.Time
 	for _, event := range m.events {
-		if !m.published[event.ID] {
-			return &event.CreatedAt, m.oldestErr
+		if m.status[event.ID] == storage.OutboxStatusPending || m.status[event.ID] == storage.OutboxStatusQuarantined {
+			if oldest == nil || event.CreatedAt.Before(*oldest) {
+				oldest = &event.CreatedAt
+			}
 		}
 	}
-	return nil, m.oldestErr
+	return oldest, m.oldestErr
 }
 
 type publisherFunc func(context.Context, json.RawMessage) error
@@ -84,8 +90,9 @@ func (f publisherFunc) Publish(ctx context.Context, payload json.RawMessage) err
 
 func newMemoryOutbox(t *testing.T, count int) *memoryOutbox {
 	t.Helper()
-	outbox := &memoryOutbox{published: make(map[int64]bool), quarantined: make(map[int64]bool)}
+	outbox := &memoryOutbox{published: make(map[int64]bool), status: make(map[int64]string)}
 	for i := 1; i <= count; i++ {
+		outbox.status[int64(i)] = storage.OutboxStatusPending
 		payload, err := json.Marshal(storage.ApplyCompletedEvent{ID: fmt.Sprintf("apply_%d", i), Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "production", CompletedAt: time.Now().UTC()})
 		require.NoError(t, err)
 		outbox.events = append(outbox.events, &storage.OutboxEvent{ID: int64(i), Payload: payload, CreatedAt: time.Now().Add(-time.Minute)})
@@ -224,7 +231,9 @@ func (m *memoryOutbox) Quarantine(_ context.Context, id int64) error {
 	if m.quarantineErr != nil {
 		return m.quarantineErr
 	}
-	m.quarantined[id] = true
+	if m.status[id] == storage.OutboxStatusPending {
+		m.status[id] = storage.OutboxStatusQuarantined
+	}
 	return nil
 }
 
@@ -260,7 +269,7 @@ func TestSenderPanicQuarantine(t *testing.T) {
 			require.NoError(t, sender.sendBatch(t.Context()))
 			require.NoError(t, NewSender(store, publisher, logger).sendBatch(t.Context()))
 			assert.Equal(t, []string{"apply_1", "apply_2"}, attempts)
-			assert.True(t, store.quarantined[1])
+			assert.Equal(t, storage.OutboxStatusQuarantined, store.status[1])
 			assert.False(t, store.published[1])
 			assert.True(t, store.published[2])
 			assert.Contains(t, output.String(), `"apply_id":"apply_1"`)
@@ -289,7 +298,7 @@ func TestSenderPanicQuarantine(t *testing.T) {
 				}
 			}
 			assert.Equal(t, int64(1), panicCount)
-			assert.GreaterOrEqual(t, oldestAge, int64(60), "quarantine is still unaccepted intent")
+			assert.GreaterOrEqual(t, oldestAge, int64(60), "quarantined intent remains in the backlog")
 		})
 	}
 }
@@ -308,7 +317,7 @@ func TestSenderQuarantineFailureRemainsVisible(t *testing.T) {
 	})
 	sender := NewSender(store, publisher, slog.New(slog.NewJSONHandler(&output, nil)))
 	require.Error(t, sender.sendBatch(t.Context()))
-	assert.False(t, store.quarantined[1])
+	assert.Equal(t, storage.OutboxStatusPending, store.status[1])
 	assert.False(t, store.published[1])
 	assert.True(t, store.published[2])
 	assert.Contains(t, output.String(), "completion notification quarantine failed")
@@ -360,4 +369,38 @@ func TestSenderFailureIdentityLogs(t *testing.T) {
 	require.NoError(t, sender.sendBatch(t.Context()))
 	assert.Equal(t, store.events[0].Payload, sent)
 	assert.True(t, store.published[1])
+}
+
+// A disposition changed after prefetch suppresses future batches, not the send
+// already selected. Acceptance remains visible without clearing a hold or skip.
+func TestSenderPrefetchedDisposition(t *testing.T) {
+	for _, disposition := range []string{storage.OutboxStatusQuarantined, storage.OutboxStatusSkipped} {
+		t.Run(disposition, func(t *testing.T) {
+			store := newMemoryOutbox(t, 2)
+			var accepted []string
+			publisher := publisherFunc(func(_ context.Context, payload json.RawMessage) error {
+				var message storage.ApplyCompletedEvent
+				require.NoError(t, json.Unmarshal(payload, &message))
+				accepted = append(accepted, message.ID)
+				if message.ID == "apply_1" {
+					store.status[1] = disposition
+				}
+				return nil
+			})
+			sender := NewSender(store, publisher, slog.New(slog.DiscardHandler))
+			require.NoError(t, sender.sendBatch(t.Context()))
+			require.NoError(t, sender.sendBatch(t.Context()))
+			assert.Equal(t, []string{"apply_1", "apply_2"}, accepted)
+			assert.Equal(t, disposition, store.status[1])
+			assert.True(t, store.published[1], "actual acceptance is retained")
+			oldest, err := store.OldestUnpublishedAt(t.Context())
+			require.NoError(t, err)
+			if disposition == storage.OutboxStatusSkipped {
+				assert.Nil(t, oldest)
+			} else {
+				require.NotNil(t, oldest)
+				assert.Equal(t, store.events[0].CreatedAt, *oldest)
+			}
+		})
+	}
 }

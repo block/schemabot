@@ -6,10 +6,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +18,6 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/storagetest"
 	"github.com/block/schemabot/pkg/testutil"
-	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -229,8 +226,7 @@ func (b rejectQuarantineDiagnosticBinder) Rebind(query string) string {
 }
 
 // A quarantine survives storage reconstruction, excludes future delivery and
-// remains unaccepted. Release targets the observed incident only; a later
-// quarantine cannot be released with the first incident's token.
+// remains held with its original incident token and diagnostic.
 func TestMySQLNotificationQuarantine(t *testing.T) {
 	testNotificationQuarantine(t, func(t *testing.T) *Storage {
 		t.Helper()
@@ -239,8 +235,8 @@ func TestMySQLNotificationQuarantine(t *testing.T) {
 	})
 }
 
-// PostgreSQL shares the same quarantine and guarded release transaction
-// semantics, including rollback when the durable diagnostic cannot be written.
+// PostgreSQL shares the same quarantine transaction semantics, including
+// rollback when the durable diagnostic cannot be written.
 func TestPostgresNotificationQuarantine(t *testing.T) {
 	dsn, fixtureDB := testutil.StartPostgres(t, "outbox_quarantine")
 	db, err := postgresconn.Open(dsn)
@@ -273,14 +269,18 @@ func testNotificationQuarantine(t *testing.T, newStore func(*testing.T) *Storage
 	require.ErrorContains(t, store.OutboxEvents().Quarantine(ctx, event.ID), "record quarantine diagnostic")
 	store.db.binder = original
 	var token sql.NullString
-	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT quarantine_token FROM outbox_events WHERE id = ?`, event.ID).Scan(&token))
-	assert.False(t, token.Valid, "a missing diagnostic rolls back the marker")
+	var status string
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT status, quarantine_token FROM outbox_events WHERE id = ?`, event.ID).Scan(&status, &token))
+	assert.Equal(t, storage.OutboxStatusPending, status)
+	assert.False(t, token.Valid, "a missing diagnostic rolls back the disposition and token")
 	logs, err := store.ApplyLogs().GetByApply(ctx, apply.ID)
 	require.NoError(t, err)
 	assert.Empty(t, logs)
 	require.NoError(t, store.OutboxEvents().Quarantine(ctx, event.ID))
 	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT quarantine_token FROM outbox_events WHERE id = ?`, event.ID).Scan(&token))
 	require.True(t, token.Valid)
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT status FROM outbox_events WHERE id = ?`, event.ID).Scan(&status))
+	assert.Equal(t, storage.OutboxStatusQuarantined, status)
 	firstToken := token.String
 	var restarted *Storage
 	if _, mysql := original.(MySQLDialect); mysql {
@@ -295,134 +295,84 @@ func testNotificationQuarantine(t *testing.T, newStore func(*testing.T) *Storage
 	require.NoError(t, err)
 	require.NotNil(t, oldest)
 	assert.WithinDuration(t, event.CreatedAt, *oldest, time.Second)
-	assert.False(t, releaseNotificationForTest(t, ctx, restarted, event.ID, "stale-incident", true))
-	assert.False(t, releaseNotificationForTest(t, ctx, restarted, event.ID, firstToken, false), "operator rollback preserves quarantine and diagnostic atomicity")
-	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT quarantine_token FROM outbox_events WHERE id = ?`, event.ID).Scan(&token))
-	assert.Equal(t, firstToken, token.String)
-	logs, err = store.ApplyLogs().GetByApply(ctx, apply.ID)
-	require.NoError(t, err)
-	require.Len(t, logs, 1)
-	// A diagnostic failure aborts the documented release, not just quarantine.
-	drop := "ALTER TABLE apply_logs DROP CONSTRAINT reject_notification_release"
-	if _, mysql := original.(MySQLDialect); mysql {
-		drop = "ALTER TABLE apply_logs DROP CHECK reject_notification_release"
-	}
-	_, err = store.db.ExecContext(ctx, `ALTER TABLE apply_logs ADD CONSTRAINT reject_notification_release CHECK (message <> 'Completion notification released after operator repair.')`)
-	require.NoError(t, err)
-	constraintPresent := true
-	defer func() {
-		if constraintPresent {
-			_, err := store.db.ExecContext(t.Context(), drop)
-			assert.NoError(t, err)
-		}
-	}()
-	assert.False(t, releaseNotificationForTest(t, ctx, restarted, event.ID, firstToken, true, "reject_notification_release"))
-	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT quarantine_token FROM outbox_events WHERE id = ?`, event.ID).Scan(&token))
-	assert.Equal(t, firstToken, token.String)
-	logs, err = store.ApplyLogs().GetByApply(ctx, apply.ID)
-	require.NoError(t, err)
-	require.Len(t, logs, 1)
-	_, err = store.db.ExecContext(ctx, drop)
-	require.NoError(t, err)
-	constraintPresent = false
-	assert.True(t, releaseNotificationForTest(t, ctx, restarted, event.ID, firstToken, true))
-	events, err = restarted.OutboxEvents().ListUnpublished(ctx, 0, 10)
-	require.NoError(t, err)
-	require.Len(t, events, 1)
-	assert.JSONEq(t, string(event.Payload), string(events[0].Payload))
+	// Repeated quarantine retains the incident token and its single diagnostic.
 	require.NoError(t, restarted.OutboxEvents().Quarantine(ctx, event.ID))
 	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT quarantine_token FROM outbox_events WHERE id = ?`, event.ID).Scan(&token))
-	assert.NotEqual(t, firstToken, token.String, "incident identity does not depend on timestamp precision")
-	assert.False(t, releaseNotificationForTest(t, ctx, restarted, event.ID, firstToken, true))
+	assert.Equal(t, firstToken, token.String)
 	logs, err = store.ApplyLogs().GetByApply(ctx, apply.ID)
 	require.NoError(t, err)
-	require.Len(t, logs, 3, "two quarantines and one committed release")
+	require.Len(t, logs, 1)
 	stored, err := store.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
 	assert.Equal(t, state.Apply.Completed, stored.State)
 	var published sql.NullTime
 	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT published_at FROM outbox_events WHERE id = ?`, event.ID).Scan(&published))
 	assert.False(t, published.Valid)
+	testNotificationStatuses(t, store)
 }
 
-// Execute the runbook SQL itself, substituting only its fictional incident.
-// MySQL requires interactive count checks; PostgreSQL checks inside its DO block.
-func releaseNotificationForTest(t *testing.T, ctx context.Context, store *Storage, id int64, token string, commit bool, expectedError ...string) bool {
+// Status alone selects delivery and backlog. Acceptance racing a hold or skip
+// preserves disposition, retained payload and incident/audit details.
+func testNotificationStatuses(t *testing.T, store *Storage) {
 	t.Helper()
-	doc, err := os.ReadFile("../../../../docs/configuration.md")
+	ctx, cancel := context.WithTimeout(t.Context(), leaseStealRaceDeadline)
+	defer cancel()
+	_, err := store.db.ExecContext(ctx, `DELETE FROM outbox_events`)
 	require.NoError(t, err)
-	mysql := false
-	if _, ok := store.db.binder.(MySQLDialect); ok {
-		mysql = true
-	}
-	heading := "#### PostgreSQL storage"
-	if mysql {
-		heading = "#### MySQL storage"
-	}
-	_, section, found := strings.Cut(string(doc), heading)
-	require.True(t, found)
-	section, _, _ = strings.Cut(section, "\n## ")
-	section, _, _ = strings.Cut(section, "\n#### ")
-	var blocks []string
-	for {
-		_, rest, ok := strings.Cut(section, "```sql\n")
-		if !ok {
-			break
+	var ids []int64
+	for i, status := range []string{storage.OutboxStatusSkipped, storage.OutboxStatusPublished, storage.OutboxStatusPending, storage.OutboxStatusQuarantined} {
+		// Insertion order differs from timestamp order. Earlier excluded rows
+		// cannot set the backlog age, nor can a pending row's smaller ID.
+		created := time.Date(2026, 1, 4, 0, 0, 0, 0, time.UTC)
+		if status == storage.OutboxStatusQuarantined {
+			created = created.Add(-time.Hour)
+		} else if status != storage.OutboxStatusPending {
+			created = created.Add(-24 * time.Hour)
 		}
-		block, rest, ok := strings.Cut(rest, "```")
-		require.True(t, ok)
-		blocks = append(blocks, block)
-		section = rest
+		_, err := store.db.ExecContext(ctx, `INSERT INTO outbox_events (apply_id, event_type, payload, status, created_at, quarantine_token) VALUES (?, ?, ?, ?, ?, ?)`, 1, applyCompletedEventType, `{"id":"apply_status"}`, status, created, "retained-incident")
+		require.NoError(t, err)
+		id, err := store.OutboxEvents().MaxID(ctx)
+		require.NoError(t, err)
+		ids = append(ids, id)
+		if i == 2 {
+			events, err := store.OutboxEvents().ListUnpublished(ctx, 0, 10)
+			require.NoError(t, err)
+			require.Len(t, events, 1)
+			assert.Equal(t, id, events[0].ID, "retained token is not a state flag")
+		}
 	}
-	require.NotEmpty(t, blocks)
-	script := strings.Join(blocks, "\n")
-	script = strings.ReplaceAll(script, "123", fmt.Sprint(id))
-	script = strings.ReplaceAll(script, "11111111-1111-4111-8111-111111111111", token)
-	tx, err := store.db.BeginTx(ctx, nil)
+	assertBacklog := func() {
+		t.Helper()
+		oldest, err := store.OutboxEvents().OldestUnpublishedAt(ctx)
+		require.NoError(t, err)
+		require.NotNil(t, oldest)
+		assert.Equal(t, time.Date(2026, 1, 3, 23, 0, 0, 0, time.UTC), oldest.UTC())
+	}
+	assertBacklog()
+	for i, disposition := range []string{storage.OutboxStatusSkipped, storage.OutboxStatusPublished, storage.OutboxStatusPublished, storage.OutboxStatusQuarantined} {
+		id := ids[i]
+		require.NoError(t, store.OutboxEvents().MarkPublished(ctx, id))
+		var status, token, payload string
+		var first, second sql.NullTime
+		require.NoError(t, store.db.QueryRowContext(ctx, `SELECT status, quarantine_token, payload, published_at FROM outbox_events WHERE id = ?`, id).Scan(&status, &token, &payload, &first))
+		assert.Equal(t, disposition, status)
+		assert.Equal(t, "retained-incident", token)
+		assert.JSONEq(t, `{"id":"apply_status"}`, payload)
+		require.True(t, first.Valid)
+		require.NoError(t, store.OutboxEvents().MarkPublished(ctx, id))
+		require.NoError(t, store.OutboxEvents().Quarantine(ctx, id), "a stale panic cannot overwrite a non-pending disposition")
+		require.NoError(t, store.db.QueryRowContext(ctx, `SELECT status, quarantine_token, published_at FROM outbox_events WHERE id = ?`, id).Scan(&status, &token, &second))
+		assert.Equal(t, disposition, status)
+		assert.Equal(t, "retained-incident", token)
+		assert.Equal(t, first, second, "repeat marks preserve first recorded acceptance")
+	}
+	assertBacklog()
+	events, err := store.OutboxEvents().ListUnpublished(ctx, 0, 10)
 	require.NoError(t, err)
-	defer rollbackTx(ctx, tx, "release notification in test")
-	if mysql {
-		for statement := range strings.SplitSeq(script, ";") {
-			statement = strings.TrimSpace(statement)
-			switch {
-			case statement == "", statement == "START TRANSACTION", statement == "COMMIT":
-				continue
-			case strings.HasPrefix(statement, "SELECT `id`"):
-				rows, err := tx.QueryContext(ctx, statement)
-				require.NoError(t, err)
-				utils.CloseAndLog(rows)
-			case strings.HasPrefix(statement, "SELECT ROW_COUNT()"):
-				var count int64
-				require.NoError(t, tx.QueryRowContext(ctx, statement).Scan(&count))
-				if count != 1 {
-					return false
-				}
-			default:
-				_, err := tx.ExecContext(ctx, statement)
-				if err != nil && len(expectedError) == 1 {
-					require.ErrorContains(t, err, expectedError[0])
-					return false
-				}
-				require.NoError(t, err)
-			}
-		}
-	} else {
-		script = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(script), "BEGIN;"))
-		script = strings.TrimSpace(strings.TrimSuffix(script, "COMMIT;"))
-		_, err := tx.ExecContext(ctx, script)
-		if err != nil {
-			if len(expectedError) == 1 {
-				require.ErrorContains(t, err, expectedError[0])
-			} else {
-				require.ErrorContains(t, err, "Expected one release diagnostic, got 0")
-			}
-			return false
-		}
-	}
-	require.Empty(t, expectedError, "release unexpectedly succeeded")
-	if !commit {
-		return false
-	}
-	require.NoError(t, tx.Commit())
-	return true
+	assert.Empty(t, events)
+	_, err = store.db.ExecContext(ctx, `DELETE FROM outbox_events WHERE status = ?`, storage.OutboxStatusQuarantined)
+	require.NoError(t, err)
+	oldest, err := store.OutboxEvents().OldestUnpublishedAt(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, oldest, "skipped and published are excluded even though their rows remain")
 }
