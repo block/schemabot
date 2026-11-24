@@ -1107,20 +1107,21 @@ The top-level `metadata` has one slot per key, so on a multi-deployment apply it
 carries the first-created deployment's position; the CLI's per-deployment view
 omits the position rather than show one deployment's under every heading.
 
-While the running statement is a concurrent index build, the next line shows
-the server's build work for the phase in flight. A scan reports its blocks,
-the tuple load reports its tuples, a wait reports the lockers still
-outstanding, and a sort names itself; the line is labelled `building index`
-until validation starts and `validating index` after. PostgreSQL carries a
-completed phase's counters into the next phase, so only the counter the
-current phase owns is shown, and the attempt is included after a retry. For
-example: `building index: 2,500 of 10,000 blocks · attempt 2` while the
-heap is scanned, then `building index: sorting live tuples`, then
-`building index: 12,000 of 50,000 tuples`, and later
-`validating index: 930 of 1,000 blocks` or `waiting on 2 of 3 lockers`.
-The table's row draws a progress bar from its `percent_complete`, which for an
-index build is the whole build's percent across every phase. The phase line
-shows raw counters only, so it never shows a second percent beside the bar.
+While the running statement is a concurrent index build, its table draws a
+progress bar from its `percent_complete`, which for an index build is the
+whole build's percent across every phase. Under the table's statement, where
+a row copy shows its rows, a detail line shows the server's build work for the
+phase in flight. A scan reports its blocks, the tuple load reports its tuples,
+a wait reports the lockers still outstanding, and a sort names itself; the line
+is labelled `Building index` until validation starts and `Validating index`
+after. PostgreSQL carries a completed phase's counters into the next phase, so
+only the counter the current phase owns is shown, and the attempt is included
+after a retry. For example: `Building index: 2,500 of 10,000 blocks · attempt 2`
+while the heap is scanned, then `Building index: sorting live tuples`, then
+`Building index: 12,000 of 50,000 tuples`, and later
+`Validating index: 930 of 1,000 blocks` or `Waiting on 2 of 3 lockers`. The
+detail line shows raw counters only, so it never shows a second percent beside
+the bar.
 When the build is rolled out across targets, the table's line draws one bar
 from the mean of its targets' percents, counting a finished target as 100 and
 a queued one as 0, and stays below 100 until every target is done.

@@ -72,9 +72,11 @@ func TestFormatApplyStatusComment_RendersStoredBuildWork(t *testing.T) {
 		BlocksDone: 10000, BlocksTotal: 10000, TuplesDone: 12000, TuplesTotal: 50000,
 	}, displayByOp[1].BuildWork)
 
-	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "", "", nil)
-	assert.Contains(t, out, "step 2 of 3 · `CREATE INDEX CONCURRENTLY idx_orders_status ON orders (status)`\n"+
-		"building index: 12,000 of 50,000 tuples\n")
+	tasks := []*storage.Task{{ApplyOperationID: new(int64(1)), TableName: "orders",
+		DDL: "CREATE INDEX CONCURRENTLY idx_orders_status ON orders (status)", State: state.Task.Running, ProgressPercent: 40}}
+	out := formatApplyStatusComment(runningApply(), ops, false, tasks, displayByOp, nil, nil, "", "", nil)
+	assert.Contains(t, out, "step 2 of 3 · `CREATE INDEX CONCURRENTLY idx_orders_status ON orders (status)`\n\n")
+	assert.Contains(t, out, "```\n- Building index: 12,000 of 50,000 tuples\n")
 }
 
 // Each deployment of a fanned-out apply renders the build work persisted on its
@@ -93,10 +95,14 @@ func TestFormatApplyStatusComment_RendersBuildWorkPerDeployment(t *testing.T) {
 	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops, nil)
 	require.Len(t, displayByOp, 2)
 
-	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "", "", nil)
+	tasks := []*storage.Task{
+		{ApplyOperationID: new(int64(1)), TableName: "t", DDL: "CREATE INDEX CONCURRENTLY idx ON t (c)", State: state.Task.Running},
+		{ApplyOperationID: new(int64(2)), TableName: "t", DDL: "CREATE INDEX CONCURRENTLY idx ON t (c)", State: state.Task.Running},
+	}
+	out := formatApplyStatusComment(runningApply(), ops, false, tasks, displayByOp, nil, nil, "", "", nil)
 	assert.Contains(t, out, "**Deployments**: 2 running")
-	assert.Equal(t, 1, strings.Count(out, "\nwaiting on 2 of 3 lockers\n"))
-	assert.Equal(t, 1, strings.Count(out, "\nbuilding index: 1 of 4 blocks\n"))
+	assert.Equal(t, 1, strings.Count(out, "\n- Waiting on 2 of 3 lockers\n"))
+	assert.Equal(t, 1, strings.Count(out, "\n- Building index: 1 of 4 blocks\n"))
 }
 
 // A malformed build counter drops the build work line but keeps the readable
@@ -111,7 +117,7 @@ func TestFormatApplyStatusComment_KeepsPositionWhenBuildWorkIsMalformed(t *testi
 
 	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "", "", nil)
 	assert.Contains(t, out, "step 2 of 3 · `CREATE INDEX CONCURRENTLY idx ON t (c)`\n")
-	assert.NotContains(t, out, "building index")
+	assert.NotContains(t, out, "Building index")
 }
 
 // Stored progress metadata that cannot be decoded, or that carries an

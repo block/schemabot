@@ -34,24 +34,30 @@ func postgresProgress(ddl string, percent int32, metadata map[string]string) *ap
 
 // An operator following a PostgreSQL index build from the terminal and from
 // the PR sees one bar with one percent: both surfaces draw the engine's
-// whole-build percent from the same table row, and the phase line under the
-// step carries counters only, so neither surface shows a second percent.
+// whole-build percent from the same table row. The current phase's counters
+// sit where a row copy puts its rows, on a detail line under the table's
+// statement, and carry no percent of their own, so neither surface shows a
+// second percent.
 func TestIndexBuildProgressReadsTheSameOnEverySurface(t *testing.T) {
 	resp := postgresProgress("CREATE INDEX CONCURRENTLY idx_users_email ON users (email)", 25, map[string]string{
 		"executor_operation": "concurrent-index-build", "server_phase": "building index: scanning table",
 		"blocks_done": "30000", "blocks_total": "48000",
 	})
 	want := ui.IndexBuildProgress(25)
+	const counters = "Building index: 30,000 of 48,000 blocks"
 
-	data := ParseProgressResponse(resp)
-	require.Len(t, data.Tables, 1)
-	cli := FormatTableProgress(data.Tables[0])
+	cli := renderRollout(t, ParseProgressResponse(resp))
 	pr := webhooktemplates.RenderApplyStatusComment(webhooktemplates.ApplyStatusFromProgress(resp, "octocat"))
 
 	assert.Contains(t, cli, "users: "+want+"\n")
 	assert.Contains(t, pr, "**`users`**: "+want+"\n")
-	assert.Contains(t, pr, "building index: 30,000 of 48,000 blocks\n")
-	assert.NotContains(t, pr, "62%", "the phase line must not show a phase-local percent beside the bar")
+	assert.Regexp(t, `CREATE INDEX CONCURRENTLY idx_users_email ON users USING btree \(email\);?\n\s+• `+counters+"\n", cli,
+		"CLI: the counters follow the statement as a detail line")
+	assert.Regexp(t, "```\n- "+counters+"\n", pr, "PR comment: the counters follow the statement as a detail line")
+	assert.Equal(t, 1, strings.Count(cli, counters), "CLI shows the counters once")
+	assert.Equal(t, 1, strings.Count(pr, counters), "PR comment shows the counters once")
+	assert.NotContains(t, cli, "62%", "the counters must not show a phase-local percent beside the bar")
+	assert.NotContains(t, pr, "62%", "the counters must not show a phase-local percent beside the bar")
 }
 
 // A PostgreSQL statement that is not an index build has no percent to show,
@@ -61,7 +67,7 @@ func TestPostgresPlainDDLDrawsNoBar(t *testing.T) {
 
 	data := ParseProgressResponse(resp)
 	require.Len(t, data.Tables, 1)
-	assert.False(t, data.Tables[0].IndexBuild)
+	assert.False(t, data.Tables[0].BuildWork.IsConcurrentIndexBuild())
 	assert.NotContains(t, FormatTableProgress(data.Tables[0]), "index build")
 
 	pr := webhooktemplates.RenderApplyStatusComment(webhooktemplates.ApplyStatusFromProgress(resp, "octocat"))

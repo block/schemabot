@@ -343,9 +343,6 @@ func writeApplyStep(sb *strings.Builder, data ApplyStatusCommentData) {
 		fmt.Fprintf(sb, " · `%s`", statement)
 	}
 	sb.WriteString("\n")
-	if line := ui.FormatBuildWork(data.BuildWork); line != "" {
-		fmt.Fprintf(sb, "%s\n", line)
-	}
 }
 
 // writeApplyStatusHeader writes the headline for an in-place apply status
@@ -1313,7 +1310,8 @@ func writeMemberList(sb *strings.Builder, noun presentation.Noun, members []Shar
 // renderRunningTable renders a table that is actively copying rows, or, with
 // no row count, building an index or applying a change that copies no rows.
 // The build work is the apply's: a concurrent index build has no rows to
-// count, so its bar is the engine's whole-build percent.
+// count, so its bar is the engine's whole-build percent, and the current
+// phase's counters take the detail line a row copy gives its rows.
 func renderRunningTable(sb *strings.Builder, dialect schema.Dialect, table TableProgressData, work apitypes.BuildWork, budget *ddlBlockBudget) {
 	defer writeThrottleTooltip(sb, table)
 	switch {
@@ -1344,6 +1342,9 @@ func renderRunningTable(sb *strings.Builder, dialect schema.Dialect, table Table
 	case work.IsConcurrentIndexBuild():
 		fmt.Fprintf(sb, "**%s**: %s%s\n", inlineCode(table.TableName), ui.IndexBuildProgress(table.PercentComplete), ui.ThrottledSuffix(table.Throttled))
 		writeDDLLine(sb, dialect, table.DDL, budget)
+		if line := ui.FormatBuildWork(work); line != "" {
+			fmt.Fprintf(sb, "- %s\n", line)
+		}
 	default:
 		// No row data yet (initializing or instant DDL)
 		fmt.Fprintf(sb, "**%s**: Running...%s\n", inlineCode(table.TableName), ui.ThrottledSuffix(table.Throttled))

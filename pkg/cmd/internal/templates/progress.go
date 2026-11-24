@@ -250,9 +250,6 @@ func writeProgressStep(data ProgressData) {
 		fmt.Printf(" · %s", statement)
 	}
 	fmt.Println()
-	if line := ui.FormatBuildWork(data.BuildWork); line != "" {
-		fmt.Println(line)
-	}
 }
 
 // FormatNamespacedTables returns tables grouped by keyspace as a string, collapsing
@@ -536,7 +533,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	if coverage, ok := awaitsResume(t); ok {
 		return formatResumingTable(t, coverage)
 	}
-	if t.AcrossTargets && t.IndexBuild {
+	if t.AcrossTargets && t.BuildWork.IsConcurrentIndexBuild() {
 		return formatIndexBuildAcrossTargets(t)
 	}
 	if keepsAcrossTargetsBar(t) {
@@ -828,10 +825,13 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if statusLower != "" && statusLower != "running" && statusLower != "row_copy" {
 			fmt.Fprintf(&b, indentDetail+"Status: %s\n", t.Status)
 		}
-	case t.IndexBuild:
+	case t.BuildWork.IsConcurrentIndexBuild():
 		writeTableLine(&b, t, "%s%s", ui.IndexBuildProgress(t.PercentComplete), ui.ThrottledSuffix(t.Throttled))
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
+		}
+		if line := ui.FormatBuildWork(t.BuildWork); line != "" {
+			b.WriteString(indentDetail + line + "\n")
 		}
 	default:
 		// No row copy data — CREATE/DROP, instant DDL, or VSchema-only.

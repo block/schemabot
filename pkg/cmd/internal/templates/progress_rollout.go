@@ -446,8 +446,10 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 			if t.Throttled && !rolled.Throttled {
 				rolled.Throttled, rolled.ThrottleReason = true, t.ThrottleReason
 			}
-			if t.IndexBuild && state.IsState(status, state.Task.Running) {
-				rolled.IndexBuild = true
+			if t.BuildWork.IsConcurrentIndexBuild() && state.IsState(status, state.Task.Running) {
+				// Marks the line as an index build. Its counters are one
+				// target's, so the rolled-up line draws only the bar.
+				rolled.BuildWork = t.BuildWork
 			}
 			break
 		}
@@ -468,7 +470,7 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 		rolled.RowsTotalPlanned = true
 	}
 	switch {
-	case rolled.IndexBuild:
+	case rolled.BuildWork.IsConcurrentIndexBuild():
 		// An index build has no rows to sum, so its percent is the build's
 		// across its targets, as the PR comment's line reads it.
 		parts := make([]presentation.Part, len(rolled.Shards))

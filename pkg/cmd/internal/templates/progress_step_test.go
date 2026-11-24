@@ -43,16 +43,22 @@ func TestWriteProgressClampsStatementToOneBoundedLine(t *testing.T) {
 	assert.NotContains(t, stepLine, "\x1b")
 }
 
+// The step line names the statement in flight, and the index build's counters
+// sit on the running table's detail line, where a row copy puts its rows.
 func TestWriteProgressRendersConcurrentIndexBuildWork(t *testing.T) {
+	const statement = "CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"
 	data := ParseProgressResponse(&apitypes.ProgressResponse{
 		State: state.Apply.Running,
 		Metadata: map[string]string{
-			"step": "2", "steps_total": "3", "statement": "CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)",
+			"step": "2", "steps_total": "3", "statement": statement,
 			"executor_operation": "concurrent-index-build", "server_phase": "building index: scanning table",
 			"blocks_done": "2500", "blocks_total": "10000", "attempt": "2",
 		},
+		Tables: []*apitypes.TableProgressResponse{{
+			TableName: "orders", DDL: statement, ChangeType: "create", Status: state.Task.Running, PercentComplete: 40,
+		}},
 	})
 	out := captureStdout(t, func() { WriteProgress(data) })
-	assert.Contains(t, out, "step 2 of 3 · CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)\n"+
-		"building index: 2,500 of 10,000 blocks · attempt 2\n")
+	assert.Contains(t, out, "step 2 of 3 · "+statement+"\n\n")
+	assert.Contains(t, out, "• Building index: 2,500 of 10,000 blocks · attempt 2\n")
 }

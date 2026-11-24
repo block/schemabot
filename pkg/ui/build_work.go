@@ -8,9 +8,11 @@ import (
 	"github.com/block/schemabot/pkg/engine/postgres/indexphase"
 )
 
-// FormatBuildWork formats one plain-prose line of concurrent index build work.
-// It returns an empty string for other operations, for a phase the engine does
-// not know, or when the phase's counters are not yet published.
+// FormatBuildWork formats the detail line of a running concurrent index build,
+// the line both surfaces write under the table's statement where a row copy
+// writes its rows. It returns an empty string for other operations, for a
+// phase the engine does not know, or when the phase's counters are not yet
+// published.
 //
 // The line describes the current server phase only, reading the one counter
 // pair indexphase says that phase owns: a scan reports its blocks under the
@@ -35,7 +37,7 @@ func FormatBuildWork(work apitypes.BuildWork) string {
 	if work.Attempt > 1 {
 		parts = append(parts, fmt.Sprintf("attempt %d", work.Attempt))
 	}
-	return strings.Join(parts, " · ")
+	return CapitalizeFirst(strings.Join(parts, " · "))
 }
 
 func formatPhaseWork(phase indexphase.Phase, work apitypes.BuildWork) string {
