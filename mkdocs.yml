@@ -82,6 +82,7 @@ nav:
       - check-runs.md
       - apply-lifecycle.md
       - direct-execution.md
+      - freeze.md
       - pending-drops.md
       - throttle.md
       - storage-schema.md
@@ -165,6 +166,10 @@ extra:
     direct-execution.md: >-
       How MySQL statements the online copy cannot run, such as dropping a
       primary key, run directly on small tables and are blocked on large ones.
+    freeze.md: >-
+      Hold new schema changes in an environment during a code freeze or an
+      incident, and let an urgent change through with a second person's
+      approval.
     pending-drops.md: >-
       An opt-in quarantine for MySQL that renames a dropped table instead of
       destroying it, so it can be restored until a retention period ends.
