@@ -246,11 +246,13 @@ type APIError struct {
 	ErrorCode string // Error code from API response (e.g., "not_found", "storage_error")
 	Message   string
 
-	// Blockers and OverrideRequest are set on a change_gate_refused answer:
-	// what refused the change, and the override request SchemaBot recorded for
-	// the caller, if any.
-	Blockers        []apitypes.ChangeGateBlocker
-	OverrideRequest *apitypes.FreezeOverrideRequest
+	// Blockers, OverrideRequest and OverrideOnReason are set on a
+	// change_gate_refused answer: what refused the change, the override
+	// request SchemaBot recorded for the caller, if any, and whether a repeat
+	// with an override reason runs with no approver.
+	Blockers         []apitypes.ChangeGateBlocker
+	OverrideRequest  *apitypes.FreezeOverrideRequest
+	OverrideOnReason bool
 
 	// RetryAfterSeconds is the delay the server asked the client to wait, set
 	// only on responses that advertise one. Read it through RetryAfter rather
@@ -533,6 +535,7 @@ func parseAPIError(resp *http.Response, body []byte) *APIError {
 		apiErr.RetryAfterSeconds = errResp.RetryAfterSeconds
 		apiErr.Blockers = errResp.Blockers
 		apiErr.OverrideRequest = errResp.OverrideRequest
+		apiErr.OverrideOnReason = errResp.OverrideOnReason
 	}
 	return apiErr
 }

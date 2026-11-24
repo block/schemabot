@@ -786,13 +786,15 @@ Press Enter to proceed with cutover (or ESC to detach)
    freeze-abc  Holiday code freeze  (until lifted)
 If this change can't wait, override the freeze with a reason:
   schemabot cutover apply-example-73 -e production --override "<reason>"
-Once a freeze approver other than you approves it, press Enter to try again.
+Run that in another terminal: it starts the change at once, and this watch follows it.
 ```
 
-Run that command from another terminal. Once an approver approves the
-request, press **Enter** in the watch again; the approval admits it with no
-reason attached. **Enter** on a waiting deploy works the same way and names
-`schemabot start`.
+Run that command from another terminal. Under the default override policy it
+starts the change at once, and the watch follows it. On a server set to
+`approval` it records a request instead, and the last line says so: once an
+approver approves it, press **Enter** in the watch again, and the approval
+admits it with no reason attached. **Enter** on a waiting deploy works the same
+way and names `schemabot start`.
 
 ![CLI progress shows copying, deferred cutover, and completion](../assets/cli-cutover.gif)
 

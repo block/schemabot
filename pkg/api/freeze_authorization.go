@@ -48,10 +48,14 @@ const FreezeOverridePolicyApproval = "approval"
 const FreezeOverridePolicyReason = "reason"
 
 // OverrideOnReason reports whether an override reason admits a change on its
-// own, with no second approver: true unless the policy is
-// FreezeOverridePolicyApproval.
+// own, with no second approver: true for the default and
+// FreezeOverridePolicyReason, false for anything else.
 func (c FreezeConfig) OverrideOnReason() bool {
-	return strings.TrimSpace(c.OverridePolicy) != FreezeOverridePolicyApproval
+	// Only the default and reason admit on a reason. Validate refuses any
+	// other value, and one that reaches here unvalidated, a typo included,
+	// falls back to approval rather than opening self-service overrides.
+	policy := strings.TrimSpace(c.OverridePolicy)
+	return policy == "" || policy == FreezeOverridePolicyReason
 }
 
 // DirectWriteReasonNotFreezeAdmin denies a freeze write to a caller in

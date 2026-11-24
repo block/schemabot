@@ -300,7 +300,8 @@ func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, call
 	for _, gate := range distinctChangeGateNames(blockers) {
 		metrics.RecordChangeGateRefusal(ctx, in.Environment, gate, string(in.Checkpoint))
 	}
-	refusal := &ChangeGateRefusedError{Checkpoint: in.Checkpoint, Environment: in.Environment, Blockers: blockers}
+	refusal := &ChangeGateRefusedError{Checkpoint: in.Checkpoint, Environment: in.Environment, Blockers: blockers,
+		OverrideOnReason: s.config == nil || s.config.Freeze.OverrideOnReason()}
 	if onReason {
 		// The caller is unverified, or the pull request's author is unknown,
 		// so the reason could not be recorded against anyone.
@@ -398,9 +399,10 @@ func (s *Service) requestOverride(ctx context.Context, in changeGateInput, block
 
 // overrideOnReason records an override that the caller's reason admits, for
 // the reason override policy, and returns nil when it may not record one (see
-// newOverrideRequest). The request is stored approved by its requester, so a
-// repeated command, a resume and a later checkpoint find it through
-// approvedOverride like any approved request.
+// newOverrideRequest). The request is stored approved by its requester and
+// admits only this command: the work it starts keeps it at the claim
+// checkpoint (approvedOverridesForApply), and approvedOverride never returns
+// it, so a later command gives its own reason.
 func (s *Service) overrideOnReason(ctx context.Context, in changeGateInput, blockers []apitypes.ChangeGateBlocker) (*storage.FreezeOverrideRequest, error) {
 	overrides := s.storage.FreezeOverrides()
 	if overrides == nil {
@@ -592,6 +594,9 @@ type ChangeGateRefusedError struct {
 	// is not verified, by a pull request command with no known author, or
 	// to a server with no override storage: no request was recorded.
 	OverrideUnrecorded bool
+	// OverrideOnReason reports the server's override policy: a repeat with
+	// an override reason runs at once, with no approver.
+	OverrideOnReason bool
 }
 
 func (e *ChangeGateRefusedError) Error() string {
@@ -728,6 +733,7 @@ func (s *Service) writeChangeGateError(w http.ResponseWriter, opName string, err
 	response := apitypes.ErrorResponse{Error: opName + " rejected: " + err.Error(), ErrorCode: code}
 	if refused, isRefusal := errors.AsType[*ChangeGateRefusedError](err); isRefusal {
 		response.Blockers = refused.Blockers
+		response.OverrideOnReason = refused.OverrideOnReason
 		if refused.OverrideRequest != nil {
 			overrideRequest := freezeOverrideResponse(refused.OverrideRequest)
 			response.OverrideRequest = &overrideRequest

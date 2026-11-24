@@ -574,9 +574,10 @@ const FreezeOverrideReasonMax = 500
 const FreezeOverrideMaxLifetime = 24 * time.Hour
 
 // FreezeOverrideRequest asks to let one change through the freezes that hold
-// it. Under the default override policy nobody overrides alone: a second
-// person approves the request. Under the reason policy the request is stored
-// approved by its requester, on their reason. Either way the change goes
+// it. Under the approval override policy nobody overrides alone: a second
+// person approves the request. Under the reason policy, the default, the
+// request is stored approved by its requester, on their reason, and admits
+// only the command that gave it. Either way the change goes
 // ahead only while every blocker it meets is one the request names.
 type FreezeOverrideRequest struct {
 	ID          int64
