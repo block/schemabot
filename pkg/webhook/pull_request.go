@@ -1118,7 +1118,13 @@ func (h *Handler) aggregateMessagesForAllEnvironments(message string) map[string
 //
 // The live state is read once, before anything is released or deleted. A
 // reopen that lands after that read, while cleanup is still running, is not
-// seen by this pass.
+// seen by this pass, so the pass acts only on what it listed. The PR's
+// removable stored check state is listed before any lock is released, and the
+// delete removes a listed row only while it is still exactly as listed. A row
+// an apply or plan wrote again after the listing, such as one a reopened PR's
+// `apply` stored with its new lock, is kept, and the pass returns an error the
+// same way it does for a lock held again, so a retry starts from a fresh live
+// read.
 //
 // The returned bool reports whether cleanup ran. It is false, with a nil
 // error, when the PR is open again and nothing was touched.
@@ -1162,6 +1168,22 @@ func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, in
 
 	inFlight := h.inFlightAppliesForClosedPR(ctx, repo, pr, applies)
 
+	// List the stored check state this close removes before releasing any
+	// lock: once a lock is released, a reopened PR can take it again and
+	// store its new plan's check state under the same keys, and the delete
+	// below must not remove that.
+	removable, err := h.service.Storage().Checks().ListRemovableOnPRClose(ctx, repo, pr, merged)
+	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "pr_close_cleanup",
+			Repository: repo,
+			Status:     "error",
+		})
+		h.logger.Error("PR close cleanup skipped: cannot list the PR's stored check state; all locks and check state are retained",
+			"repo", repo, "pr", pr, "merged", merged, "error", err)
+		return false, fmt.Errorf("list removable checks for closed PR %s#%d (merged=%t): %w", repo, pr, merged, err)
+	}
+
 	keptForApply, err := h.releaseLocksForClosedPR(ctx, repo, pr, inFlight)
 	if err != nil {
 		return false, fmt.Errorf("release locks for closed PR %s#%d: %w", repo, pr, err)
@@ -1173,16 +1195,17 @@ func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, in
 		return true, nil
 	}
 
-	// Delete stored check state for this PR. Apply-owned rows that still block
-	// survive the delete at the storage layer: in-flight rows (even if the
-	// applies table missed the in-flight work above) and terminal rows whose
-	// conclusion is not success, such as a schema change removed from the PR
-	// after its apply started. Those blocks require operator reconciliation
-	// and must persist across a close and reopen. On an unmerged close,
-	// apply-owned rows that concluded successfully survive too: the stored
-	// success may predate a commit that removed the applied change, so
-	// reopen-time cleanup must re-verify it before the row can stop blocking.
-	if err := h.service.Storage().Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, repo, pr, merged); err != nil {
+	// Delete the stored check state listed above. Apply-owned rows that still
+	// block were never listed: in-flight rows (even if the applies table missed
+	// the in-flight work above) and terminal rows whose conclusion is not
+	// success, such as a schema change removed from the PR after its apply
+	// started. Those blocks require operator reconciliation and must persist
+	// across a close and reopen. On an unmerged close, apply-owned rows that
+	// concluded successfully are not listed either: the stored success may
+	// predate a commit that removed the applied change, so reopen-time cleanup
+	// must re-verify it before the row can stop blocking.
+	kept, err := h.service.Storage().Checks().DeleteListedIfUnchanged(ctx, removable)
+	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "pr_close_cleanup",
 			Repository: repo,
@@ -1190,6 +1213,21 @@ func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, in
 		})
 		h.logger.Error("failed to delete checks for closed PR", "repo", repo, "pr", pr, "merged", merged, "error", err)
 		return false, fmt.Errorf("delete checks for closed PR %s#%d (merged=%t): %w", repo, pr, merged, err)
+	}
+	if len(kept) > 0 {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "pr_close_cleanup",
+			Repository: repo,
+			Status:     "error",
+		})
+		for _, check := range kept {
+			h.logger.Warn("stored check state written again since PR close cleanup listed it is kept; this cleanup pass returns an error so a retry re-reads the live PR",
+				"repo", repo, "pr", pr, "merged", merged,
+				"environment", check.Environment, "database_type", check.DatabaseType, "database", check.DatabaseName,
+				"check_id", check.ID, "check_run_id", check.CheckRunID, "head_sha", check.HeadSHA,
+				"apply_id", check.ApplyID, "check_status", check.Status, "conclusion", check.Conclusion)
+		}
+		return false, fmt.Errorf("%d stored check rows for closed PR %s#%d were written again after close cleanup listed them and are kept", len(kept), repo, pr)
 	}
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 		Operation:  "pr_close_cleanup",

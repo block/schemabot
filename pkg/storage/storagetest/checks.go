@@ -50,7 +50,12 @@ func TestChecks(t *testing.T, h Harness) {
 		checks, err = store.Checks().GetByPR(ctx, "MIXEDCASE/SAMPLE-REPO", 123)
 		require.NoError(t, err)
 		require.Len(t, checks, 1)
-		require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "MixedCase/Sample-Repo", 123, false))
+		removable, err := store.Checks().ListRemovableOnPRClose(ctx, "MixedCase/Sample-Repo", 123, false)
+		require.NoError(t, err)
+		require.Len(t, removable, 1)
+		kept, err := store.Checks().DeleteListedIfUnchanged(ctx, removable)
+		require.NoError(t, err)
+		assert.Empty(t, kept)
 		checks, err = store.Checks().GetByPR(ctx, "mixedcase/sample-repo", 123)
 		require.NoError(t, err)
 		assert.Empty(t, checks)
@@ -1368,7 +1373,7 @@ func TestChecks(t *testing.T, h Harness) {
 		assert.Zero(t, stored.ApplyID)
 	})
 
-	t.Run("DeleteByPRRetainingBlockingApplyOwned", func(t *testing.T) {
+	t.Run("ListRemovableOnPRClose_RetainsBlockingApplyOwned", func(t *testing.T) {
 		for _, merged := range []bool{true, false} {
 			t.Run(map[bool]string{true: "Merged", false: "Unmerged"}[merged], func(t *testing.T) {
 				ctx := t.Context()
@@ -1383,17 +1388,23 @@ func TestChecks(t *testing.T, h Harness) {
 				for _, row := range rows {
 					require.NoError(t, store.Checks().Upsert(ctx, row))
 				}
-				require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 123, merged))
+				removable, err := store.Checks().ListRemovableOnPRClose(ctx, "org/repo", 123, merged)
+				require.NoError(t, err)
+				if merged {
+					assert.Equal(t, []string{"plan_only", "successful"}, checkDatabaseNames(removable), "a merged close removes plan-only rows and apply-owned rows that concluded successfully")
+				} else {
+					assert.Equal(t, []string{"plan_only"}, checkDatabaseNames(removable), "an unmerged close removes plan-only rows only")
+				}
+				kept, err := store.Checks().DeleteListedIfUnchanged(ctx, removable)
+				require.NoError(t, err)
+				assert.Empty(t, kept, "rows unchanged since the listing are deleted, not kept")
+
 				remaining, err := store.Checks().GetByPR(ctx, "org/repo", 123)
 				require.NoError(t, err)
-				names := make([]string, len(remaining))
-				for i, row := range remaining {
-					names[i] = row.DatabaseName
-				}
 				if merged {
-					assert.Equal(t, []string{"applying", "blocking"}, names, "an in_progress apply-owned row is retained on a merged close even when concluded success")
+					assert.Equal(t, []string{"applying", "blocking"}, checkDatabaseNames(remaining), "an in_progress apply-owned row is retained on a merged close even when concluded success")
 				} else {
-					assert.Equal(t, []string{"applying", "blocking", "successful"}, names)
+					assert.Equal(t, []string{"applying", "blocking", "successful"}, checkDatabaseNames(remaining))
 				}
 
 				otherPR, err := store.Checks().GetByPR(ctx, "org/repo", 456)
@@ -1401,6 +1412,98 @@ func TestChecks(t *testing.T, h Harness) {
 				require.Len(t, otherPR, 1, "closing one PR must not touch another PR's stored check state")
 			})
 		}
+	})
+
+	// A close lists the PR's plan-only rows, and before the delete runs the PR
+	// reopens: its apply stores a new plan result on one listed row and an
+	// apply claims another, a third listed row is deleted by someone else, and
+	// a database new to the PR gets its first row. The delete removes only the
+	// listed row still exactly as listed, and reports the two written again
+	// as kept with their current values.
+	t.Run("DeleteListedIfUnchanged_KeepsRowsWrittenSinceTheListing", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		planRow := func(database, headSHA string, checkRunID int64) *storage.Check {
+			return &storage.Check{
+				Repository: "org/repo", PullRequest: 123, HeadSHA: headSHA,
+				Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: database,
+				CheckRunID: checkRunID, HasChanges: true, Status: "completed", Conclusion: "action_required",
+			}
+		}
+		for _, database := range []string{"untouched", "replanned", "claimed", "gone"} {
+			require.NoError(t, store.Checks().Upsert(ctx, planRow(database, "sha-closed", 100)))
+		}
+		removable, err := store.Checks().ListRemovableOnPRClose(ctx, "org/repo", 123, false)
+		require.NoError(t, err)
+		require.Equal(t, []string{"untouched", "replanned", "claimed", "gone"}, checkDatabaseNames(removable), "rows are listed in the order they were created")
+
+		require.NoError(t, store.Checks().Upsert(ctx, planRow("replanned", "sha-reopened", 200)))
+		claim := planRow("claimed", "sha-closed", 100)
+		claim.ApplyID = 7
+		claim.Status = "in_progress"
+		claim.Conclusion = ""
+		require.NoError(t, store.Checks().Upsert(ctx, claim))
+		gone, err := store.Checks().Get(ctx, "org/repo", 123, "staging", storage.DatabaseTypeMySQL, "gone")
+		require.NoError(t, err)
+		require.NotNil(t, gone)
+		require.NoError(t, store.Checks().Delete(ctx, gone.ID))
+		require.NoError(t, store.Checks().Upsert(ctx, planRow("added", "sha-reopened", 300)))
+
+		kept, err := store.Checks().DeleteListedIfUnchanged(ctx, removable)
+		require.NoError(t, err)
+		require.Equal(t, []string{"replanned", "claimed"}, checkDatabaseNames(kept), "rows written since the listing are kept and reported")
+		for _, row := range kept {
+			switch row.DatabaseName {
+			case "claimed":
+				assert.Equal(t, int64(7), row.ApplyID, "a kept row is reported with its current values")
+				assert.Equal(t, "in_progress", row.Status)
+			case "replanned":
+				assert.Equal(t, "sha-reopened", row.HeadSHA, "a kept row is reported with its current values")
+				assert.Equal(t, int64(200), row.CheckRunID)
+			}
+		}
+
+		remaining, err := store.Checks().GetByPR(ctx, "org/repo", 123)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"added", "claimed", "replanned"}, checkDatabaseNames(remaining),
+			"only the listed row still as listed is deleted; a row inserted since the listing is not touched")
+	})
+
+	// A close lists the PR's aggregate row, and before the delete runs a
+	// reopen refolds the aggregate: only its render changes, in the same
+	// second as the listed write, so every other column still matches. The
+	// delete keeps the row, because the render is compared with the rest.
+	t.Run("DeleteListedIfUnchanged_KeepsARenderOnlyRewriteInTheSameSecond", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		aggregate := func(render string) *storage.Check {
+			return &storage.Check{
+				Repository: "org/repo", PullRequest: 123, HeadSHA: "sha-closed",
+				Environment: "staging", DatabaseType: "aggregate", DatabaseName: "aggregate",
+				CheckRunID: 100, HasChanges: true, Status: "completed", Conclusion: "action_required",
+				AggregateRender: []byte(render),
+			}
+		}
+		require.NoError(t, store.Checks().Upsert(ctx, aggregate(`{"targets": 1}`)))
+		removable, err := store.Checks().ListRemovableOnPRClose(ctx, "org/repo", 123, false)
+		require.NoError(t, err)
+		require.Len(t, removable, 1)
+		assert.JSONEq(t, `{"targets": 1}`, string(removable[0].AggregateRender), "the listing carries the render it compares")
+
+		require.NoError(t, store.Checks().Upsert(ctx, aggregate(`{"targets": 2}`)))
+		current, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "aggregate", "aggregate")
+		require.NoError(t, err)
+		require.NotNil(t, current)
+		// The rewrite landed in the listed write's second.
+		removable[0].UpdatedAt = current.UpdatedAt
+
+		kept, err := store.Checks().DeleteListedIfUnchanged(ctx, removable)
+		require.NoError(t, err)
+		require.Len(t, kept, 1, "a render-only rewrite is kept and reported")
+		assert.JSONEq(t, `{"targets": 2}`, string(kept[0].AggregateRender))
+		render, err := store.Checks().GetAggregateRender(ctx, "org/repo", 123, "staging", "aggregate", "aggregate")
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"targets": 2}`, string(render), "the rewritten aggregate is not deleted")
 	})
 
 	t.Run("Upsert_DBError", func(t *testing.T) {
@@ -1474,9 +1577,23 @@ func TestChecks(t *testing.T, h Harness) {
 		require.Error(t, err)
 	})
 	t.Run("Delete_DBError", func(t *testing.T) { require.Error(t, h.NewUnreachableStorage(t).Checks().Delete(t.Context(), 1)) })
-	t.Run("DeleteByPRRetainingBlockingApplyOwned_DBError", func(t *testing.T) {
-		require.Error(t, h.NewUnreachableStorage(t).Checks().DeleteByPRRetainingBlockingApplyOwned(t.Context(), "org/repo", 123, false))
+	t.Run("ListRemovableOnPRClose_DBError", func(t *testing.T) {
+		_, err := h.NewUnreachableStorage(t).Checks().ListRemovableOnPRClose(t.Context(), "org/repo", 123, false)
+		require.Error(t, err)
 	})
+	t.Run("DeleteListedIfUnchanged_DBError", func(t *testing.T) {
+		_, err := h.NewUnreachableStorage(t).Checks().DeleteListedIfUnchanged(t.Context(), []*storage.Check{{ID: 1, Repository: "org/repo", PullRequest: 123}})
+		require.Error(t, err)
+	})
+}
+
+// checkDatabaseNames returns the database name of each row, in order.
+func checkDatabaseNames(checks []*storage.Check) []string {
+	names := make([]string, len(checks))
+	for i, check := range checks {
+		names[i] = check.DatabaseName
+	}
+	return names
 }
 
 // getCheck reads the staging per-database row for databaseName on org/repo#123
