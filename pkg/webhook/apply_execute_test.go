@@ -561,7 +561,7 @@ func TestPlanDriftCause(t *testing.T) {
 		},
 	}
 
-	cause := planDriftCause(planResp, storedPlan)
+	cause := planDriftCause(planResp, storedPlan, nil)
 
 	assert.Equal(t, "Schema changes differ from the plan this apply was started from", cause.Heading)
 	assert.Equal(t, []string{
@@ -601,6 +601,48 @@ func TestTargetPlanDriftEntries(t *testing.T) {
 	assert.Empty(t, targetPlanDriftEntries(nil, &storage.Plan{}, "us"), "a target with nothing to do then or now has no entry")
 }
 
+// A target whose statements drifted can also carry an unchanged statement whose
+// object was replaced. Its entries name that table next to the drifted
+// statements, so the statement drift never hides the replaced object.
+func TestTargetPlanDriftEntriesNameChangedObjectsBesideStatementDrift(t *testing.T) {
+	dropLegacy := storage.TableChange{Table: "users", Operation: "alter", DDL: "ALTER TABLE `users` DROP COLUMN `legacy`"}
+	plan := func(record string, extra ...storage.TableChange) *storage.Plan {
+		drop := dropLegacy
+		drop.Metadata = map[string]string{"recorded_object": record}
+		return &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"mydb": {Tables: append([]storage.TableChange{drop}, extra...)},
+		}}
+	}
+	addNote := storage.TableChange{Table: "orders", Operation: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `note` text"}
+
+	assert.Equal(t, []string{
+		"Target `us`: `orders` (alter) is no longer planned",
+		"Target `us`: `users`: a statement now acts on an object that changed after the plan was posted",
+	}, targetPlanDriftEntries(plan("legacy text", addNote), plan("legacy jsonb"), "us"))
+	assert.Equal(t, []string{"Target `us`: `orders` (alter) is no longer planned"},
+		targetPlanDriftEntries(plan("legacy text", addNote), plan("legacy text"), "us"),
+		"an unchanged object adds no entry")
+}
+
+// A single target's statement drift names the tables whose objects changed
+// under an unchanged statement after the drifted statements.
+func TestPlanDriftCauseNamesChangedObjects(t *testing.T) {
+	cause := planDriftCause(
+		&apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{{Namespace: "mydb", TableChanges: []*apitypes.TableChangeResponse{
+			{TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` DROP COLUMN `legacy`"},
+		}}}},
+		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"mydb": {Tables: []storage.TableChange{
+			{Table: "users", Operation: "alter", DDL: "ALTER TABLE `users` DROP COLUMN `legacy`"},
+			{Table: "orders", Operation: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `note` text"},
+		}}}},
+		[]string{"users"},
+	)
+	assert.Equal(t, []string{
+		"`orders` (alter) is no longer planned",
+		"`users`: a statement now acts on an object that changed after the plan was posted",
+	}, cause.Entries)
+}
+
 // A re-plan that differs in dozens of changes has already made its point, and
 // listing every one buries the statements the operator came to read.
 func TestPlanDriftCauseCapsTheEntryList(t *testing.T) {
@@ -616,6 +658,7 @@ func TestPlanDriftCauseCapsTheEntryList(t *testing.T) {
 	cause := planDriftCause(
 		&apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{{Namespace: "mydb", TableChanges: tableChanges}}},
 		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"mydb": {}}},
+		nil,
 	)
 
 	assert.Len(t, cause.Entries, planDriftEntryCap+1)
@@ -639,6 +682,7 @@ func TestPlanDriftCauseReportsAnAmendedStatementOnce(t *testing.T) {
 				{Table: "orders", Operation: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `notes` varchar(255)"},
 			}},
 		}},
+		nil,
 	)
 
 	assert.Equal(t, []string{
@@ -661,6 +705,7 @@ func TestPlanDriftCauseNamesTheNamespaceOnlyWhenItDisambiguates(t *testing.T) {
 				{Table: "orders", Operation: "create", DDL: "CREATE TABLE `orders` (`id` bigint)"},
 			}},
 		}},
+		nil,
 	)
 	assert.Equal(t, []string{
 		"`orders` in `shard_a` (create) is new",
@@ -674,6 +719,7 @@ func TestPlanDriftCauseNamesTheNamespaceOnlyWhenItDisambiguates(t *testing.T) {
 			}},
 		}},
 		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"mydb": {}}},
+		nil,
 	)
 	assert.Equal(t, []string{
 		"`orders` (create) is new",

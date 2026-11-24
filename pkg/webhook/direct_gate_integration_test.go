@@ -395,9 +395,10 @@ func TestE2EReplanWithChangedObjectsStopsAndConfirmApplies(t *testing.T) {
 // An automatic apply's re-plan can drop a statement the posted comment showed,
 // as when someone applies part of the change by hand first, while the engine
 // also records a different object for a statement it kept. The apply stops
-// against a comment that shows the re-plan, and the pending confirmation moves
-// onto that re-plan, so confirming the new comment applies the change instead
-// of meeting the posted plan's statements and record and stopping again.
+// against a comment that shows the re-plan and names both differences, so the
+// statement drift never hides the replaced object. The pending confirmation
+// moves onto that re-plan, so confirming the new comment applies the change
+// instead of meeting the posted plan's statements and record and stopping again.
 func TestE2EReplanWithDDLDriftStopsAndConfirmApplies(t *testing.T) {
 	f := setupNewlyDirectFixture(t, "webhook_direct_replan_ddl_drift")
 	shown, err := f.svc.Storage().Plans().Get(t.Context(), f.directPlan.PlanID)
@@ -418,6 +419,9 @@ func TestE2EReplanWithDDLDriftStopsAndConfirmApplies(t *testing.T) {
 		shown, shown, f.directPlan.PlanID, nil, nil)
 
 	body := f.awaitComment(t, "Confirmation required")
+	assert.Contains(t, body, "Schema changes differ from the plan this apply was started from")
+	assert.Contains(t, body, "- `users`: a statement now acts on an object that changed after the plan was posted\n",
+		"the statement drift does not hide the unchanged statement whose object changed")
 	assert.Contains(t, body, "schemabot apply-confirm -e staging --allow-unsafe")
 	requireNoApplies(t, f.svc, f.dbName)
 	assert.NotEqual(t, f.directPlan.PlanID, f.pendingPlanID(t),

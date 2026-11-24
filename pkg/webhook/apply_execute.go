@@ -402,29 +402,15 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// Automatic apply DDL drift check: if the re-plan DDL differs from the stored auto-plan,
-	// downgrade to manual confirmation so the user reviews the new plan.
-	if storedPlan != nil && !ddlMatchesStoredPlan(planResp, storedPlan) {
-		h.logger.Info("automatic apply downgraded: DDL drift detected",
-			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			planDriftCause(planResp, storedPlan), rolloutPreview, runsMemberWork); err != nil {
-			h.logger.Error("failed to post the DDL-drift downgrade comment, so the pending confirmation was not moved",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-				"environment", environment, "error", err)
-			return
-		}
-		h.moveConfirmationToShownReplan(ctx, repo, pr, installationID, database, dbType, environment, actionName, requestedBy,
-			expectedPendingPlanID, planResp.PlanID, rolloutDisclosedCopies(planResp, rollout, runsMemberWork), repinRefusal,
-			"DDL drift", "The schema changes differ from the posted plan")
-		return
-	}
-	// The statements match, but the engine records what each one acts on at
-	// plan time, and an object replaced since the stored plan was posted
-	// leaves the statement unchanged. The posted comment covered the objects
-	// the stored plan recorded, so a re-plan that reaches others is shown again
-	// and confirmed by hand. An automatic apply that cannot make the comparison
-	// releases the lock it took, as its other failures past the hand-off do.
+	// An automatic apply is held to the plan its comment posted: the
+	// statements, and the objects the engine recorded each one acting on at
+	// plan time. An object replaced since the plan was posted leaves its
+	// statement unchanged, so the re-plan is compared on both, and a re-plan
+	// that differs in either is shown again and confirmed by hand. The comment
+	// names every difference, so a statement drift elsewhere in the plan never
+	// hides an unchanged statement whose object was replaced. An automatic
+	// apply that cannot make the comparison releases the lock it took, as its
+	// other failures past the hand-off do.
 	if storedPlan != nil {
 		const unverifiedReplan = "SchemaBot could not verify the plan this apply would run, so nothing was applied. Retry the command, and see server logs if it persists."
 		current, err := h.service.Storage().Plans().Get(ctx, planResp.PlanID)
@@ -444,12 +430,29 @@ func (h *Handler) executeApply(
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, unverifiedReplan)
 			return
 		}
-		if tables := objectsChangedSinceReview(storedPlan, current); len(tables) > 0 {
+		changedTables := objectsChangedSinceReview(storedPlan, current)
+		if !ddlMatchesStoredPlan(planResp, storedPlan) {
+			h.logger.Info("automatic apply downgraded: DDL drift detected",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "posted_plan_id", storedPlan.PlanIdentifier, "tables_with_changed_objects", changedTables)
+			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+				planDriftCause(planResp, storedPlan, changedTables), rolloutPreview, runsMemberWork); err != nil {
+				h.logger.Error("failed to post the DDL-drift downgrade comment, so the pending confirmation was not moved",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+					"environment", environment, "error", err)
+				return
+			}
+			h.moveConfirmationToShownReplan(ctx, repo, pr, installationID, database, dbType, environment, actionName, requestedBy,
+				expectedPendingPlanID, planResp.PlanID, rolloutDisclosedCopies(planResp, rollout, runsMemberWork), repinRefusal,
+				"DDL drift", "The schema changes differ from the posted plan")
+			return
+		}
+		if len(changedTables) > 0 {
 			h.logger.Info("automatic apply downgraded: a statement now acts on objects the posted plan did not record",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-				"plan_id", planResp.PlanID, "posted_plan_id", storedPlan.PlanIdentifier, "tables", tables)
+				"plan_id", planResp.PlanID, "posted_plan_id", storedPlan.PlanIdentifier, "tables", changedTables)
 			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-				objectsChangedCause(tables), rolloutPreview, runsMemberWork); err != nil {
+				objectsChangedCause(changedTables), rolloutPreview, runsMemberWork); err != nil {
 				h.logger.Error("failed to post the comment showing the changed objects, so the pending confirmation was not moved",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -844,6 +847,9 @@ func targetPlanDriftEntries(was, is *storage.Plan, name string) []string {
 		tablePrefix, subject = fmt.Sprintf("Target `%s`: ", name), fmt.Sprintf("Target `%s`", name)
 	}
 	if entries := planDriftEntries(planDriftStatements(isIDs), planDriftStatements(wasIDs), tablePrefix); len(entries) > 0 {
+		if was != nil && is != nil {
+			entries = append(entries, changedObjectEntries(objectsChangedSinceReview(was, is), tablePrefix)...)
+		}
 		return entries
 	}
 	switch {
@@ -1362,11 +1368,11 @@ func planDriftStatements(identities map[planChangeIdentity]int) map[planDriftCha
 // and a removed one — the pair would name the same table and operation twice,
 // once as present and once as absent, and the field that tells them apart is
 // the one deliberately left out.
-func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *templates.PausedApplyCauseData {
+func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan, changedTables []string) *templates.PausedApplyCauseData {
 	now := planDriftStatements(responsePlanIdentities(planResp))
 	started := planDriftStatements(storedPlanIdentities(storedPlan))
 
-	entries := planDriftEntries(now, started, "")
+	entries := append(planDriftEntries(now, started, ""), changedObjectEntries(changedTables, "")...)
 
 	if len(entries) > planDriftEntryCap {
 		remaining := len(entries) - planDriftEntryCap
@@ -1378,6 +1384,18 @@ func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *
 		Heading: "Schema changes differ from the plan this apply was started from",
 		Entries: entries,
 	}
+}
+
+// changedObjectEntries names, among the entries of a statement drift, each
+// table with an unchanged statement that now acts on an object the posted plan
+// did not record. The statement reads the same in both plans, so without its
+// own entry the replaced object would go unmentioned.
+func changedObjectEntries(tables []string, prefix string) []string {
+	entries := make([]string, 0, len(tables))
+	for _, table := range tables {
+		entries = append(entries, fmt.Sprintf("%s`%s`: a statement now acts on an object that changed after the plan was posted", prefix, table))
+	}
+	return entries
 }
 
 // objectsChangedCause names the tables whose statements now act on objects the
