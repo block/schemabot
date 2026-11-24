@@ -276,8 +276,8 @@ tracks the engine more closely than this page does.
 The engine badges on the [README](../README.md) are claims about capability, and this is where
 they are defined. An engine is **GA** when it can do the two things below.
 
-An engine is **beta** when it cannot do both yet, but runs a defined set of changes and blocks
-every change outside that set in the plan, with the reason, before anything touches the database.
+An engine is **beta** when it is not GA yet but runs a set of changes its guide lists, and blocks
+every other change in the plan, with the reason, before anything touches the database.
 What is not GA yet is listed in the engine's guide rather than left for you to discover against a
 database.
 
