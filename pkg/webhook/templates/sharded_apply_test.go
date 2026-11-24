@@ -1097,8 +1097,8 @@ func TestRenderShardedApplyComment_PartialLandingStatesCoverage(t *testing.T) {
 					},
 				}},
 				Shards: []ShardStatus{
-					{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
-					{Shard: "40-80", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+					{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed, Landed: true},
+					{Shard: "40-80", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed, Landed: true},
 					{Shard: "80-c0", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
 					{Shard: "c0-", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
 				},
@@ -1109,6 +1109,8 @@ func TestRenderShardedApplyComment_PartialLandingStatesCoverage(t *testing.T) {
 
 	betweenWaves := RenderShardedApplyComment(mixed(state.Task.Pending, state.Task.Pending))
 	assert.Contains(t, betweenWaves, "**`mutes`**: ⏳ Queued — applied on 2 of 4 shards")
+	assert.Contains(t, betweenWaves, "**Status**: In Progress — 0 of 1 change applied (done on 2 of 4 shards)",
+		"a change counts only once it lands everywhere, so the status line says how far it has got")
 	assert.NotContains(t, betweenWaves, "| Shard | Status |",
 		"a routine wave rollout does not promote the per-shard table")
 
@@ -1120,6 +1122,13 @@ func TestRenderShardedApplyComment_PartialLandingStatesCoverage(t *testing.T) {
 			"a %s aggregate's shard summary already carries the breakdown", status)
 		assert.Containsf(t, inFlight, "- Shards: 4 (", "a %s aggregate lists its shards", status)
 	}
+
+	// A shard that reads as its revert window operation while another of its
+	// changes is still queued has not landed, so it does not count.
+	halfLanded := mixed(state.Task.Pending, state.Task.Pending)
+	halfLanded.Keyspaces[0].Shards[1] = ShardStatus{Shard: "40-80", Emoji: "⏪", Label: "revert window", State: state.ApplyOperation.RevertWindow}
+	assert.Contains(t, RenderShardedApplyComment(halfLanded), "(done on 1 of 4 shards)",
+		"a shard counts as done only once every change it runs has landed")
 }
 
 // A table that changes on only some of the keyspace's shards names them above
@@ -1274,4 +1283,38 @@ func TestRenderShardedApplySummary_FirstFailureSkipsShardsStoppedAtCutover(t *te
 	assert.Contains(t, got, "**First failure:** shard <code>-80</code> — duplicate key name")
 	assert.NotContains(t, got, "**First failure:** shard <code>-</code>")
 	assert.Contains(t, got, "> ⏹️ 1 shard stopped at the cutover because <code>shop_b/-80</code> failed. Its copy is saved, so applying again resumes it.")
+}
+
+// A running table whose change copies no rows, such as a CREATE TABLE, reads
+// as applying rather than as a row copy, and its shard list says the same.
+func TestRenderShardedApplyComment_ChangeThatCopiesNoRowsReadsAsApplying(t *testing.T) {
+	data := func(copiesNoRows bool) ShardedApplyData {
+		return ShardedApplyData{
+			State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+			ApplyID: "apply-x",
+			Keyspaces: []ShardedKeyspace{{
+				Keyspace: "cdb_resolute_sharded",
+				Tables: []ShardedTableStatus{{
+					Table: "mutes", Status: state.Task.Running, CopiesNoRows: copiesNoRows,
+					Shards: []ShardProgressData{
+						{Shard: "-80", Status: state.Task.Completed},
+						{Shard: "80-", Status: state.Task.Running},
+					},
+				}},
+				Shards: []ShardStatus{
+					{Shard: "-80", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+					{Shard: "80-", Emoji: "🔄", Label: "applying", State: state.ApplyOperation.Running},
+				},
+				Cells: []ShardCell{mutesCell("-80"), mutesCell("80-")},
+			}},
+		}
+	}
+
+	create := RenderShardedApplyComment(data(true))
+	assert.Contains(t, create, "**`mutes`**: 🔄 Applying\n")
+	assert.NotContains(t, create, "Row copy in progress")
+	assert.Contains(t, create, "**Shards**: 1 completed, 1 applying")
+
+	alter := RenderShardedApplyComment(data(false))
+	assert.Contains(t, alter, "**`mutes`**: 🔄 Row copy in progress\n")
 }

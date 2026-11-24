@@ -77,7 +77,7 @@ func storageSchemaEngineLabel(dialect string) string {
 // writeStorageSchemaBody writes everything under the header: the statements,
 // the disposition of the ones that will not simply run, the summary, and any
 // hint naming the next step.
-func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, rerun string, hints []string) error {
+func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, rerun []string, hints []string) error {
 	if report.Converged {
 		// No hints under a converged plan: every one of them names a next step,
 		// and there is no next step to take.
@@ -205,7 +205,7 @@ func storageSchemaSummaryTables(changes []templates.DDLChange) []templates.DDLCh
 }
 
 // outputStorageSchemaPlan prints a storage plan the way `plan` prints one.
-func outputStorageSchemaPlan(report *apitypes.StorageSchemaReport, isApply bool, rerun string, hints []string) error {
+func outputStorageSchemaPlan(report *apitypes.StorageSchemaReport, isApply bool, rerun []string, hints []string) error {
 	writeStorageSchemaHeader(report, isApply)
 	// Before the statements, because it changes how they should be read, and
 	// before the body's converged short-circuit, because a convergence still
@@ -233,7 +233,7 @@ func outputStorageSchemaPlan(report *apitypes.StorageSchemaReport, isApply bool,
 // announcing it above the count of what ran would tell an operator they are
 // about to queue for a lock they already queued for. The re-read below says
 // the live version of the same fact instead.
-func outputStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaReport, withPlan bool, rerun string) error {
+func outputStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaReport, withPlan bool, rerun []string) error {
 	if withPlan {
 		writeStorageSchemaHeader(planned, true)
 		if err := writeStorageSchemaBody(planned, true, rerun, nil); err != nil {

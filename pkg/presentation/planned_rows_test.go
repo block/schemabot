@@ -24,6 +24,16 @@ func TestCopyStillAhead(t *testing.T) {
 	}
 }
 
+// The planned rows line carries the row estimate, the targets it spans, and
+// the table's size, and is empty when the plan had no row estimate.
+func TestPlannedRowsText(t *testing.T) {
+	rows := int64(1_200_000)
+	bytes := int64(3_000_000_000)
+	assert.Equal(t, "Rows: ~1.2M", PlannedRowsText(&rows, nil, ""))
+	assert.Equal(t, "Rows: ~1.2M across 3 targets · ~3.0 GB", PlannedRowsText(&rows, &bytes, PlannedRowsSpan(3)))
+	assert.Empty(t, PlannedRowsText(nil, &bytes, ""))
+}
+
 // A planned row count names how many targets it is summed across without
 // claiming they are all of the rollout's, and reads naturally for one.
 func TestPlannedRowsSpan(t *testing.T) {

@@ -30,6 +30,10 @@ const (
 	// exits with on a second signal, so a script sees one status for an
 	// interrupt however the command took it, and never mistakes it for the
 	// apply having failed or for it having completed.
+	//
+	// A log tail (`logs -f`) is the exception. Its only usual outcome is the
+	// operator stopping it, since it never ends on its own except by failing,
+	// so Ctrl-C is its normal end and it exits 0.
 	ExitInterrupted = 130
 )
 

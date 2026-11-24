@@ -34,6 +34,19 @@ func PlannedRowsSpan(targets int) string {
 	return " across " + TargetNoun.Count(targets)
 }
 
+// PlannedRowsText is the rows line of a table no engine has reported on yet:
+// "Rows: ~1.2M · ~3.0 GB", the plan's row estimate and size, both approximate,
+// so the work ahead is visible before the copy starts. span names the targets
+// the estimate is summed across (PlannedRowsSpan), or is empty for one. It is
+// empty when the plan had no row estimate. The CLI and the PR comment each add
+// their own line prefix and newline.
+func PlannedRowsText(estimatedRows, estimatedBytes *int64, span string) string {
+	if estimatedRows == nil {
+		return ""
+	}
+	return fmt.Sprintf("Rows: %s%s%s", ui.FormatApproxRows(*estimatedRows), span, ui.FormatTableSizeClause(estimatedBytes))
+}
+
 // TargetsTableSizeClause is a table's planned size on the rows line of a
 // table rolled up across targets: " · ~575 GB". The size is every target's,
 // so beside rows that leave some targets out (partial) it names the full span

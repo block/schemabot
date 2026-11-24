@@ -15,6 +15,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/caller"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
@@ -40,6 +41,28 @@ const (
 // only an operator can fix.
 const progressEngineUnavailableMessage = "SchemaBot could not read this apply's progress from its schema change engine. " +
 	"Retry in a moment. If it keeps failing, a SchemaBot operator can find the cause in the server log."
+
+// progressApplyLookupFailedMessage is what a progress request answers when
+// SchemaBot cannot read the apply from storage. The storage error can carry
+// connection details, so it goes to the server log and never to the client.
+func progressApplyLookupFailedMessage(applyID string) string {
+	return fmt.Sprintf("progress for apply %s failed: could not read the apply from storage; see server logs, then retry", applyID)
+}
+
+// progressTasksReadFailedMessage is what a progress request answers when
+// SchemaBot cannot read an apply's tasks from storage. The storage error stays
+// in the server log.
+func progressTasksReadFailedMessage(applyID string) string {
+	return fmt.Sprintf("progress for apply %s failed: could not read its tasks from storage; see server logs, then retry", applyID)
+}
+
+// progressDeploymentMissingMessage is what a progress request answers when an
+// active apply has no stored deployment to route to. The answer keeps the
+// retryable storage_error code it has always carried, so the message names the
+// cause and who can fix it without telling the client whether to retry.
+func progressDeploymentMissingMessage(applyID string) string {
+	return fmt.Sprintf("progress for apply %s is unavailable: SchemaBot has no deployment recorded for it; a SchemaBot operator can find the cause in the server log", applyID)
+}
 
 // changeTypeToString converts a proto change type for progress responses.
 // Unmapped values stay empty because progress omits unavailable change types.
@@ -209,6 +232,9 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 				ETASeconds:      sh.EtaSeconds,
 				PercentComplete: pct,
 				CutoverAttempts: sh.CutoverAttempts,
+				// The data plane reports one statement per table, which
+				// every shard it lists runs.
+				CopiesNoRows: !presentation.ChangeCopiesRows(tpr.ChangeType, tpr.IsInstant),
 			})
 		}
 		httpResp.Tables = append(httpResp.Tables, tpr)
@@ -383,7 +409,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	apply, err := s.storage.Applies().GetByApplyIdentifier(r.Context(), applyID)
 	if err != nil {
 		s.logger.Error("failed to get apply", "apply_id", applyID, "error", err)
-		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to get apply: "+err.Error())
+		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, progressApplyLookupFailedMessage(applyID))
 		return
 	}
 	if apply == nil {
@@ -397,7 +423,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 			s.logger.Error("failed to read apply progress from storage",
 				append(apply.LogAttrs(),
 					"error", err)...)
-			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
+			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, progressTasksReadFailedMessage(applyID))
 			return
 		}
 		s.writeJSON(w, http.StatusOK, httpResp)
@@ -445,7 +471,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		s.logger.Error("active apply is missing stored deployment metadata",
 			append(apply.LogAttrs(),
 				"error", err)...)
-		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, err.Error())
+		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, progressDeploymentMissingMessage(applyID))
 		return
 	}
 	s.logger.Debug("progress by apply-id: resolving client", apply.LogAttrs()...)
@@ -476,7 +502,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 			s.logger.Error("failed to read queued remote apply progress from storage",
 				append(apply.LogAttrs(),
 					"error", err)...)
-			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
+			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, progressTasksReadFailedMessage(applyID))
 			return
 		}
 		s.writeJSON(w, http.StatusOK, httpResp)
@@ -804,8 +830,12 @@ func (s *Service) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(r.URL.Query().Get("name"))
 	resp, err := databaseListResponse(config, databaseType, name, app)
 	if err != nil {
-		s.logger.Error("database list failed", "error", err)
-		s.writeError(w, http.StatusInternalServerError, "failed to list databases: "+err.Error())
+		s.logger.Error("database list failed",
+			"database_type", databaseType,
+			"app", app,
+			"name", name,
+			"error", err)
+		s.writeError(w, http.StatusInternalServerError, "failed to list databases; see server logs")
 		return
 	}
 	s.writeJSON(w, http.StatusOK, resp)

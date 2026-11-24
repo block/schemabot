@@ -21,6 +21,15 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
+// autoApplyComment is the "Schema Change Apply" comment an automatic apply
+// posted before dispatch, with the data it was rendered from. A change gate
+// that refuses the apply after the comment is up re-renders it from Data, so
+// the comment stops announcing an apply that will not run.
+type autoApplyComment struct {
+	ID   int64
+	Data templates.PlanCommentData
+}
+
 // executeApply re-plans for drift detection and executes the apply. This is the shared
 // execution core used by both handleApplyConfirmCommand and handleApplyCommand.
 //
@@ -40,12 +49,16 @@ import (
 // the consent this re-plan is checked against: the plan decided whether to
 // stop, and the same decision is made again here, copy by copy, against the
 // targets as they are now.
+//
+// autoComment is the comment the automatic path posted announcing the apply,
+// nil on apply-confirm, whose comment never promised one, and when that post
+// did not land.
 func (h *Handler) executeApply(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, schemaResult *ghclient.SchemaRequestResult, sharedSchemaPeers []sharedSchemaPeerInputs,
 	environment string, installationID int64, requestedBy string,
 	result CommandResult, storedPlan, disclosedPlan *storage.Plan, expectedPendingPlanID string,
-	disclosedCopies []storage.DisclosedCopy,
+	disclosedCopies []storage.DisclosedCopy, autoComment *autoApplyComment,
 ) {
 	database := schemaResult.Database
 	dbType := schemaResult.Type
@@ -617,10 +630,14 @@ func (h *Handler) executeApply(
 			// would otherwise stay held. The release is conditional on that
 			// pin, so a lock repinned meanwhile stays.
 			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			h.releaseApplyLockIfIntentUnchanged(releaseCtx, repo, pr, database, dbType, environment, expectedPendingPlanID, "change gate refused")
+			lockReleased := h.releaseApplyLockIfIntentUnchanged(releaseCtx, repo, pr, database, dbType, environment, expectedPendingPlanID, "change gate refused")
 			cancel()
 			h.logger.Info("apply refused by a change gate", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-			h.postChangeGateRefusal(repo, pr, installationID, actionName, environment, requestedBy, err)
+			refusalPosted := h.postChangeGateRefusal(repo, pr, installationID, actionName, environment, requestedBy, err)
+			// The refusal is posted first: it is what the operator acts on, and
+			// the edited footer points at it, so the edit never waits on it. A
+			// refusal that did not land leaves the edit to carry the next step.
+			h.markAutoApplyCommentRefused(ctx, client, repo, pr, database, dbType, environment, autoComment, lockReleased, refusalPosted)
 			return
 		}
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
@@ -1207,14 +1224,17 @@ func (h *Handler) reportRepinRefused(err error, repo string, pr int, installatio
 // whose pending plan has since changed — e.g. a rollback plan re-pinned it while
 // the gate ran — belongs to that newer intent and is preserved. The reason names
 // the gate that triggered the release so logs distinguish the call sites.
-func (h *Handler) releaseApplyLockIfIntentUnchanged(ctx context.Context, repo string, pr int, database, dbType, environment, expectedPendingPlanID, reason string) {
+// It reports whether this call released the lock, for a caller that tells the
+// operator the lock is gone: a failed release and a preserved lock both leave
+// it held, and most callers have nothing to say about either.
+func (h *Handler) releaseApplyLockIfIntentUnchanged(ctx context.Context, repo string, pr int, database, dbType, environment, expectedPendingPlanID, reason string) bool {
 	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
 	released, relErr := h.service.Storage().Locks().ReleaseIfPendingPlanID(ctx, database, dbType, lockOwner, expectedPendingPlanID)
 	if relErr != nil {
 		h.logger.Error("failed to release apply lock after pre-execution rejection",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 			"environment", environment, "reason", reason, "error", relErr)
-		return
+		return false
 	}
 	if !released {
 		h.logger.Info("preserved apply lock after pre-execution rejection because its pending intent changed",
@@ -1222,6 +1242,7 @@ func (h *Handler) releaseApplyLockIfIntentUnchanged(ctx context.Context, repo st
 			"environment", environment, "reason", reason,
 			"expected_pending_plan_id", expectedPendingPlanID)
 	}
+	return released
 }
 
 // planChangeIdentity is the drift-comparison key for a single table change. A
@@ -1554,4 +1575,35 @@ func normalizePlanNamespace(namespace string) string {
 		return "default"
 	}
 	return namespace
+}
+
+// markAutoApplyCommentRefused edits the comment an automatic apply posted
+// before a change gate refused it, so its footer says the apply did not run
+// instead of "Applying automatically". It is best effort: a failed edit leaves
+// the refusal comment, which is posted either way, as the correct record. A
+// nil comment, the apply-confirm path, has nothing to edit. The edit claims only
+// what happened: the lock released only when this refusal released it, and the
+// refusal comment below only when it posted.
+func (h *Handler) markAutoApplyCommentRefused(
+	ctx context.Context, client *ghclient.InstallationClient,
+	repo string, pr int, database, dbType, environment string, comment *autoApplyComment,
+	lockReleased, refusalPosted bool,
+) {
+	if comment == nil {
+		return
+	}
+	data := comment.Data
+	data.RefusedByChangeGate = true
+	data.LockReleased = lockReleased
+	data.RefusalPosted = refusalPosted
+
+	editCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	// The post wrapped the body with an empty environment, so the edit does too.
+	body := h.renderPRComment(repo, pr, "", templates.RenderPlanComment(data))
+	if err := client.EditIssueComment(editCtx, repo, comment.ID, body); err != nil {
+		h.logger.Error("failed to edit the automatic apply comment after a change gate refused the apply; it still says the apply is running",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "comment_id", comment.ID, "error", err)
+	}
 }

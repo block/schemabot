@@ -125,7 +125,7 @@ func newSharedSchemaHarness(t *testing.T, unshardedConfig string, extraFiles map
 	installClient.SetConfigDirHints(serverConfig)
 	return &sharedSchemaHarness{
 		store:      st,
-		handler:    NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger),
+		handler:    NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger, WithInsecureSkipSignatureVerification()),
 		github:     result,
 		mux:        mux,
 		production: production,

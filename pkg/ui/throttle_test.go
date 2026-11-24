@@ -6,6 +6,11 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestThrottledSuffix(t *testing.T) {
+	assert.Equal(t, " (throttled)", ThrottledSuffix(true))
+	assert.Empty(t, ThrottledSuffix(false))
+}
+
 // TestThrottleTip verifies that every throttle signal the engine can emit maps
 // to a short operator-facing tip, composite reasons collapse shared meanings,
 // and any unrecognized signal suppresses the whole tip so the raw reason

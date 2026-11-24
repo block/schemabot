@@ -187,7 +187,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		// A plan narrowed to one target speaks for that target only, so its
 		// failure (an unknown target included) answers on the comment and leaves
 		// the environment's check as its last plan of every target recorded it.
-		h.logger.Error("plan narrowed to one target failed; leaving the environment's check unchanged",
+		api.PlanFailureLog(h.logger, err)("plan narrowed to one target failed; leaving the environment's check unchanged",
 			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
 			"deployment", deployment, "environment", environment, "target", target, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, userFacingError(err))
@@ -195,7 +195,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 	if err != nil {
-		h.logger.Error("plan execution failed",
+		api.PlanFailureLog(h.logger, err)("plan execution failed",
 			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
 			"deployment", deployment, "environment", environment, "target", target, "error", err)
 		userError := userFacingError(err)
@@ -887,7 +887,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			continue
 		}
 		if err != nil {
-			h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "env", env, "error", err)
+			api.PlanFailureLog(h.logger, err)("plan execution failed", "repo", repo, "pr", pr, "env", env, "error", err)
 			planFailed(env, err)
 			continue
 		}
@@ -1688,18 +1688,19 @@ func (h *Handler) commandPlanCommentData(schemaResult *ghclient.SchemaRequestRes
 // buildPlanCommentData converts plan results into template data.
 func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy, agentHint, cliName string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
-		Database:          schema.Database,
-		Environment:       environment,
-		Tenant:            tenant,
-		AgentHint:         agentHint,
-		CLIName:           cliName,
-		HeadSHA:           schema.HeadSHA,
-		Repository:        schema.Repository,
-		RequestedBy:       requestedBy,
-		DatabaseType:      schema.Type,
-		IsMySQL:           schema.Type == "mysql",
-		IgnoredNamespaces: schema.IgnoredNamespaces,
-		PlanID:            planResp.PlanID,
+		Database:            schema.Database,
+		Environment:         environment,
+		Tenant:              tenant,
+		AgentHint:           agentHint,
+		CLIName:             cliName,
+		HeadSHA:             schema.HeadSHA,
+		Repository:          schema.Repository,
+		RequestedBy:         requestedBy,
+		DatabaseType:        schema.Type,
+		IsMySQL:             schema.Type == "mysql",
+		IgnoredNamespaces:   schema.IgnoredNamespaces,
+		PlanID:              planResp.PlanID,
+		UnmatchedDropTables: planResp.UnmatchedDropTables,
 	}
 	for _, group := range planResp.ExemptTables {
 		if group == nil {

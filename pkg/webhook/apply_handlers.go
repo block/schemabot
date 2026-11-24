@@ -765,20 +765,26 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// lands. A failed post releases the lock and stays retryable, as a pending
 	// confirmation whose comment never appeared does; the stored check keeps
 	// blocking merge on the pending changes meanwhile.
+	// The comment's ID and data ride into executeApply so a change gate that
+	// refuses the apply can edit the footer this comment posts, which promises
+	// an apply that then never starts.
+	var autoComment *autoApplyComment
 	if runsMemberWork {
-		if postErr := h.postCommentReportingError(repo, pr, installationID, templates.RenderPlanComment(commentData)); postErr != nil {
+		commentID, postErr := h.postCommentReportingID(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		if postErr != nil {
 			h.logger.Error("failed to post the comment disclosing the other targets' plans, so nothing was dispatched; releasing the lock",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "plan_id", planResp.PlanID, "error", postErr)
 			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "automatic apply disclosure post failure")
 			return true, fmt.Errorf("apply command disclosure of the other targets' plans %s#%d: %w", repo, pr, postErr)
 		}
-	} else {
-		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		autoComment = &autoApplyComment{ID: commentID, Data: commentData}
+	} else if commentID := h.postCommentBestEffortID(repo, pr, installationID, templates.RenderPlanComment(commentData)); commentID != 0 {
+		autoComment = &autoApplyComment{ID: commentID, Data: commentData}
 	}
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
-	h.executeApply(ctx, client, repo, pr, schemaResult, sharedSchemaPeers, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopies)
+	h.executeApply(ctx, client, repo, pr, schemaResult, sharedSchemaPeers, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopies, autoComment)
 	return false, nil
 }
 
@@ -1152,7 +1158,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 
 	disclosedCopies := disclosureDescribesThisApply(existingLock, storedPlan, environment)
 
-	h.executeApply(ctx, client, repo, pr, schemaResult, sharedSchemaPeers, environment, installationID, requestedBy, result, nil, storedPlan, existingLock.PendingPlanID, disclosedCopies)
+	h.executeApply(ctx, client, repo, pr, schemaResult, sharedSchemaPeers, environment, installationID, requestedBy, result, nil, storedPlan, existingLock.PendingPlanID, disclosedCopies, nil)
 	return false, nil
 }
 
@@ -1493,17 +1499,31 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	// released and acquired again while they ran (for example another PR's
 	// pending-confirmation apply lock) is a different row and stays held, as
 	// does the same row acquired again for a new plan. The active-apply check
-	// is the one decision the pin does not carry: an apply that becomes durable
-	// after the check leaves the lock row unchanged, so the delete still
-	// matches. That apply's own deployment reservation keeps a second apply
-	// out; the lock row is the operator-visible signal, not the exclusion.
+	// above reads applies before the release, so an apply that records this
+	// lock row and becomes durable after that read would leave the row
+	// unchanged. The release therefore re-checks under the row's lock and
+	// keeps the lock while any apply recording it has not settled, a stopped
+	// apply included, and the command answers with the apply holding it.
 	// A failed release is logged and the loop continues so one failure does
 	// not strand the remaining locks; the collected errors make the delivery
 	// retryable, and a re-drive only sees the locks that are still held.
 	var releaseErrs []error
-	var released, alreadyGone, reacquired int
+	var released, alreadyGone, reacquired, inUse int
 	for _, lock := range locks {
-		err := h.service.Storage().Locks().ReleaseByID(ctx, lock.ID, lock.DatabaseName, lock.DatabaseType, lock.Owner, lock.PendingPlanID)
+		err := h.service.Storage().Locks().ReleaseByIDIfUnused(ctx, lock.ID, lock.DatabaseName, lock.DatabaseType, lock.Owner, lock.PendingPlanID)
+		var inUseErr *storage.LockInUseError
+		if errors.As(err, &inUseErr) {
+			// An apply recording this lock row has not settled, so the lock
+			// still protects it. This is the command's answer for this lock,
+			// not a failure to retry.
+			inUse++
+			h.logger.Warn("unlock refused: an apply recording the lock has not settled; the lock stays held",
+				append(inUseErr.Apply.LogAttrs(),
+					"command_repo", repo, "command_pr", pr, "lock_owner", lock.Owner, "force", result.Force, "error", err)...)
+			h.postComment(repo, pr, installationID, templates.RenderCannotUnlock(
+				lock.DatabaseName, inUseErr.Apply.Environment, inUseErr.Apply.ApplyIdentifier, inUseErr.Apply.State))
+			continue
+		}
 		if isLockAcquiredSinceVetting(err) {
 			// The database is locked again since the lookup — the same row with
 			// a new pending plan, or a new row after the vetted one was released
@@ -1550,11 +1570,12 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 		h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, unlockStaleCommandMessage)
 		return false, nil
 	}
-	if released == 0 && alreadyGone > 0 {
+	if released == 0 && inUse == 0 && alreadyGone > 0 {
 		// Every matched lock was released by a concurrent operation before this
 		// command could act. The per-lock skips stay silent, so without an
 		// aggregate answer the acked command would end without any comment;
-		// an acknowledged command must always answer.
+		// an acknowledged command must always answer. A lock kept for an apply
+		// already answered with its own comment, and was not released.
 		h.logger.Info("unlock: every matched lock was already released concurrently",
 			"repo", repo, "pr", pr, "already_gone", alreadyGone)
 		h.postComment(repo, pr, installationID, templates.RenderLocksAlreadyReleased())

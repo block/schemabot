@@ -56,7 +56,7 @@ func TestE2EApplyWithChanges(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	postedAt := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -129,7 +129,7 @@ func TestE2EApplyRejectedOnClosedPR(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging",
@@ -183,7 +183,7 @@ func TestE2EApplyConfirmRejectedOnClosedPR(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply-confirm -e staging",
@@ -237,7 +237,7 @@ func TestE2EApplyRejectedOnMergedPR(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging",
@@ -289,7 +289,7 @@ func TestE2EApplyNoChanges(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging",
@@ -513,7 +513,7 @@ func TestE2EApplyLockConflictDifferentPR(t *testing.T) {
 			installClient := ghclient.NewInstallationClient(client, logger)
 			factory := &fakeClientFactory{client: installClient}
 
-			h := NewHandler(svc, factory, nil, logger)
+			h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 			req := buildWebhookRequest(t, webhookPayloadOpts{
 				comment: "schemabot apply -e staging",
@@ -562,7 +562,7 @@ func TestE2EApplyConfirmNoLock(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// apply-confirm without a prior apply (no lock)
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -659,7 +659,7 @@ func TestE2EUnlock(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot unlock",
@@ -754,7 +754,7 @@ func TestE2EUnlockForceInfersDatabaseForCLILock(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot unlock --force",
@@ -859,7 +859,7 @@ func TestE2EUnlockDoesNotPassAggregateWithPendingChanges(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot unlock",
@@ -933,7 +933,7 @@ func TestE2EApplyConfirmExecutesApply(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply-confirm -e staging",
@@ -1039,7 +1039,7 @@ func TestE2EUnlockNoLocks(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot unlock",
@@ -1167,7 +1167,7 @@ func commentApplyWhileThisPRApplies(t *testing.T, dbName, planHeadSHA string, sh
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging --allow-unsafe",
@@ -1222,7 +1222,7 @@ func TestE2EApplyConfirmLockConflict(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply-confirm -e staging",
@@ -1274,7 +1274,7 @@ func TestE2EApplyConfirmNoChanges(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply-confirm -e staging",
@@ -1385,7 +1385,7 @@ func TestE2EUnlockBlockedByActiveApply(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot unlock",
@@ -1447,7 +1447,7 @@ func TestE2EApplyStaleLockReacquire(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging",
@@ -3283,7 +3283,7 @@ func TestE2EApplyStoresServerSideTarget(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging",

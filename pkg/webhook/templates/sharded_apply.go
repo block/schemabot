@@ -139,6 +139,11 @@ type ShardedTableStatus struct {
 	// shards attached so far. Zero when the plan does not record it.
 	PlannedShards int
 
+	// CopiesNoRows is true when the table's change copies no rows
+	// (presentation.ChangeCopiesRows), so a running table reads as applying
+	// rather than as copying rows.
+	CopiesNoRows bool
+
 	// Shards is the per-shard state (and percent while copying) in resolved
 	// order, rendered as the compact one-line summary while the table is in
 	// flight.
@@ -159,6 +164,11 @@ type ShardStatus struct {
 	// failure it names is EndedBy's.
 	StoppedAtCutover bool
 	EndedBy          string
+	// Landed is true once every table change the shard runs has landed.
+	// State names only the shard's most attention-worthy operation, which
+	// can be a landed one while another table's change on the shard is
+	// still queued.
+	Landed bool
 }
 
 // ShardCell is one (shard, table) operation: the statements that table runs
@@ -347,7 +357,30 @@ func writeShardedStatusLine(sb *strings.Builder, data ShardedApplyData) {
 	if data.Rollback {
 		verb = "rolled back"
 	}
-	fmt.Fprintf(sb, "\n**Status**: %s — %d of %d %s %s\n", word, applied, total, noun, verb)
+	fmt.Fprintf(sb, "\n**Status**: %s — %d of %d %s %s%s\n", word, applied, total, noun, verb, shardsLandedSuffix(data))
+}
+
+// shardsLandedSuffix qualifies the status line while the apply's changes have
+// landed on some shards but not all: a change counts only once it has landed
+// on every shard, so without it an apply most of the way through would read as
+// not started. Rolled back applies and applies with only one shard need none.
+func shardsLandedSuffix(data ShardedApplyData) string {
+	if data.Rollback {
+		return ""
+	}
+	landed, total := 0, 0
+	for _, ks := range data.Keyspaces {
+		for _, sh := range ks.Shards {
+			total++
+			if sh.Landed {
+				landed++
+			}
+		}
+	}
+	if total < 2 || landed == 0 || landed == total {
+		return ""
+	}
+	return fmt.Sprintf(" (done on %d of %d shards)", landed, total)
 }
 
 // shardedChangeFraction counts the apply's changes and how many have landed. A
@@ -604,6 +637,9 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, budget *dd
 		writeShardedTablePhaseProgress(sb, t, writeDDL)
 	default:
 		phrase := shardedTableStatusPhrase(status)
+		if status == state.Task.Running && t.CopiesNoRows {
+			phrase = "🔄 Applying"
+		}
 		if landed := landedShardCount(t.Shards); landed > 0 && landed < len(t.Shards) && !presentation.ListsParts(status) {
 			if status == state.Task.Cancelled {
 				// The pure-cancelled parenthetical ("not started") would be false
@@ -619,7 +655,7 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, budget *dd
 		sb.WriteString(line + "\n")
 		writeDDL()
 	}
-	renderShardSummary(sb, TableProgressData{TableName: t.Table, Status: t.Status, Shards: t.Shards}, budget)
+	renderShardSummary(sb, TableProgressData{TableName: t.Table, Status: t.Status, Shards: t.Shards}, presentation.RunningWord(!t.CopiesNoRows), budget)
 }
 
 // keepsShardedProgressBar reports whether a sharded table past its row copy

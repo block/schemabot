@@ -102,13 +102,25 @@ func TestBlockedTaskError(t *testing.T) {
 // the reviewed ALTER: built from task rows, so it carries no execution-mode
 // verdict.
 func alterUsersEmailDispatch(planID string, targetShards ...string) *ternv1.ApplyRequest {
-	return &ternv1.ApplyRequest{
+	return withShardSchemaFiles(&ternv1.ApplyRequest{
 		PlanId:       planID,
 		TargetShards: targetShards,
 		DdlChanges: []*ternv1.TableChange{
 			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
 		},
+	})
+}
+
+// withShardSchemaFiles stamps the reviewed schema files on a shard dispatch,
+// as the control plane does for every one, so the shard can be re-planned
+// against them. A whole-deployment dispatch is returned unchanged.
+func withShardSchemaFiles(req *ternv1.ApplyRequest) *ternv1.ApplyRequest {
+	if len(req.TargetShards) > 0 {
+		req.SchemaFiles = map[string]*ternv1.SchemaFiles{
+			"testapp": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}},
+		}
 	}
+	return req
 }
 
 // A statement the primary's target admitted can be one this deployment's own
@@ -239,13 +251,13 @@ func dropUsersLegacyIDReplan(shard string) *engine.PlanResult {
 // dropUsersLegacyIDDispatch is the dispatch for the dropped column as task rows
 // build it: no unsafe flag travels with it.
 func dropUsersLegacyIDDispatch(planID string, targetShards ...string) *ternv1.ApplyRequest {
-	return &ternv1.ApplyRequest{
+	return withShardSchemaFiles(&ternv1.ApplyRequest{
 		PlanId:       planID,
 		TargetShards: targetShards,
 		DdlChanges: []*ternv1.TableChange{
 			{TableName: "users", Ddl: "ALTER TABLE `users` DROP COLUMN `legacy_id`", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
 		},
-	}
+	})
 }
 
 // A dispatched column drop carries no unsafe flag, and its operation is an
