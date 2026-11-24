@@ -77,7 +77,7 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 		// nothing on the apply.
 		logger.Info("PostgreSQL cancel not attempted: the caller gave up before the build was signalled",
 			"task_id", key, "reason", err)
-		return nil, fmt.Errorf("cancel PostgreSQL concurrent index build for apply %q: caller gave up before signalling: %w", key, err)
+		return nil, fmt.Errorf("cancel PostgreSQL index build for apply %q: caller gave up before signalling: %w", key, err)
 	}
 	// The intent is visible to the drive before the signal goes out, since the
 	// build can return cancelled before CancelBuild does.
@@ -102,7 +102,7 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 				logger.Info("PostgreSQL cancel caller gave up and the build backend was not signalled; the apply is unchanged",
 					"task_id", key, "reason", err, "caller_error", callerErr)
 			}
-			return nil, fmt.Errorf("cancel PostgreSQL concurrent index build for apply %q: %w (caller gave up: %w)", key, err, callerErr)
+			return nil, fmt.Errorf("cancel PostgreSQL index build for apply %q: %w (caller gave up: %w)", key, err, callerErr)
 		}
 		// Whatever kept the signal from a running statement — no build
 		// tracked yet, a build that already returned, a backend this role
@@ -131,7 +131,7 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 	case <-done:
 		return e.settledCancel(key, tracked)
 	case <-settle.Done():
-		return nil, fmt.Errorf("cancel PostgreSQL concurrent index build for apply %q: the build was signalled but has not settled: %w", key, settle.Err())
+		return nil, fmt.Errorf("cancel PostgreSQL index build for apply %q: the build was signalled but has not settled: %w", key, settle.Err())
 	}
 }
 
@@ -148,7 +148,7 @@ func (e *Engine) settledCancel(key string, tracked *trackedApply) (*engine.Contr
 	case engine.StateCompleted:
 		return nil, engine.NewAlreadyCompletedError("cancel rejected: the PostgreSQL schema change for apply %q completed before the cancel took effect", key)
 	case engine.StateCancelled:
-		return &engine.ControlResult{Accepted: true, Message: "Concurrent index build cancelled"}, nil
+		return &engine.ControlResult{Accepted: true, Message: "Index build cancelled"}, nil
 	case engine.StateFailed:
 		logger.Info("PostgreSQL cancel accepted over a schema change that had already failed",
 			"task_id", key, "detail", detail)

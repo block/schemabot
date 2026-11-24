@@ -565,7 +565,7 @@ func TestOutsideCancelWhileOperatorCancelWaits(t *testing.T) {
 				}
 				require.NoError(t, got.err)
 				assert.True(t, got.result.Accepted)
-				assert.Equal(t, "Concurrent index build cancelled", got.result.Message)
+				assert.Equal(t, "Index build cancelled", got.result.Message)
 				assert.True(t, requestedCancel(t, eng))
 			})
 		})
@@ -707,7 +707,7 @@ func TestCancelThatSendsNothingDoesNotWithdrawAnOverlappingCancel(t *testing.T) 
 			}
 			require.NoError(t, got.err)
 			assert.True(t, got.result.Accepted)
-			assert.Equal(t, "Concurrent index build cancelled", got.result.Message)
+			assert.Equal(t, "Index build cancelled", got.result.Message)
 			assert.Equal(t, engine.StateCancelled, drive.publishedState())
 			assert.True(t, requestedCancel(t, eng))
 		})

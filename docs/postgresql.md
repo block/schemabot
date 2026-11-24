@@ -387,8 +387,11 @@ under a deadline of the same bound. The table size ceiling does not apply.
 The build resumes. A partition whose index is already built and attached is
 kept, so applying the same plan again after a failure, a cancel, or a
 shutdown builds only the partitions that are left. A build that runs past its
-deadline fails retryable for this reason, and its detail names
-`postgres.concurrent_index_max_duration`.
+deadline after it finished at least one partition fails retryable for this
+reason. A build that runs past its deadline before it finished any partition
+fails without a retry, since applying again would spend the same deadline on
+the same partition: raise `postgres.concurrent_index_max_duration` and apply
+again. Both details name the option.
 
 The plan refuses shapes the build cannot run, such as a `TABLESPACE` clause,
 `IF NOT EXISTS`, or an unnamed index. If the table is no longer partitioned

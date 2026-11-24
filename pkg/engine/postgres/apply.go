@@ -537,9 +537,10 @@ func classifyApplyFailure(err error, table string) applyFailure {
 	}
 	var partitionedBoundErr *partitionedIndexBoundError
 	if errors.As(err, &partitionedBoundErr) {
-		// Unlike a concurrent build that runs past its bound, a partitioned
-		// build keeps the partitions it finished, so a retry spends the
-		// bound on the partitions left rather than starting over.
+		// A partitioned build keeps the partitions it finished, so a run
+		// that finished at least one (a run that finished none is refused
+		// above) spends its retry on the partitions left rather than
+		// starting over.
 		return applyFailure{detail: partitionedBoundErr.Error() + "; the retry resumes from the partitions already built", retryable: true}
 	}
 	var budgetErr *executor.BudgetError
@@ -907,6 +908,15 @@ func refusalForCause(err error, table string) *refusal {
 	var boundErr *concurrentIndexBoundError
 	if errors.As(err, &boundErr) {
 		return &refusal{reason: "concurrent-index-bound-exceeded", cause: boundErr.Error(),
+			remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
+	}
+	// A partitioned build that ran past its bound without finishing a
+	// partition made no progress a retry could keep, so retrying unchanged
+	// spends the same bound on the same partition again. It is refused like
+	// the concurrent build's overrun and names the same option.
+	var partitionedBoundErr *partitionedIndexBoundError
+	if errors.As(err, &partitionedBoundErr) && partitionedBoundErr.partitionsBuilt == 0 {
+		return &refusal{reason: "partitioned-index-bound-exceeded", cause: partitionedBoundErr.Error(),
 			remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
 	}
 	var budgetErr *executor.BudgetError
@@ -1791,10 +1801,17 @@ func buildPartitionedIndex(ctx context.Context, cfg dbconn.Config, pool *pgxpool
 		// The deadline is the outcome, whatever the executor was doing when
 		// it fired, so the bound error does not carry the executor's error
 		// for the classifiers to read; the log does.
-		logger.Warn("PostgreSQL partitioned index build ran past its bound; the retry resumes from the partitions already built",
-			"namespace", change.namespace, "table", change.table, "bound", change.concurrentIndexMaxDuration, "error", err)
+		built := len(report.Worked)
+		if built == 0 {
+			logger.Warn("PostgreSQL partitioned index build ran past its bound before it finished any partition; the apply is refused until the bound is raised",
+				"namespace", change.namespace, "table", change.table, "bound", change.concurrentIndexMaxDuration, "error", err)
+		} else {
+			logger.Warn("PostgreSQL partitioned index build ran past its bound; the retry resumes from the partitions already built",
+				"namespace", change.namespace, "table", change.table, "bound", change.concurrentIndexMaxDuration,
+				"partitions_built", built, "error", err)
+		}
 		return fmt.Errorf("build PostgreSQL index on partitioned table %q: %w", change.table,
-			&partitionedIndexBoundError{bound: change.concurrentIndexMaxDuration})
+			&partitionedIndexBoundError{bound: change.concurrentIndexMaxDuration, partitionsBuilt: built})
 	}
 	return fmt.Errorf("build PostgreSQL index on partitioned table %q: %w", change.table,
 		nameConcurrentIndexBound(err, change.concurrentIndexMaxDuration, time.Since(start)))
@@ -1809,11 +1826,17 @@ func partitionedBuildRanPastBound(driveCtx, buildCtx context.Context) bool {
 
 // partitionedIndexBoundError reports that a partitioned index build ran past
 // the concurrent index bound before every partition had its index.
+// partitionsBuilt is how many partitions this run gave an index, which
+// decides whether a retry can make progress.
 type partitionedIndexBoundError struct {
-	bound time.Duration
+	bound           time.Duration
+	partitionsBuilt int
 }
 
 func (e *partitionedIndexBoundError) Error() string {
+	if e.partitionsBuilt == 0 {
+		return fmt.Sprintf("the partitioned index build ran past %s (%s) before it finished any partition", concurrentIndexBoundOption, e.bound)
+	}
 	return fmt.Sprintf("the partitioned index build ran past %s (%s) before every partition had its index", concurrentIndexBoundOption, e.bound)
 }
 
