@@ -26,6 +26,8 @@ const (
 	headSHA     = "abcdef1234567890abcdef1234567890abcdef12"
 	lockOwner   = "example/shop#42"
 	addIndex    = "ALTER TABLE `orders` ADD INDEX `idx_status`(`status`)"
+	// The freeze recording adds a column, which MySQL applies instantly.
+	addColumn = "ALTER TABLE `orders` ADD COLUMN `gift_note` varchar(255)"
 )
 
 var (
@@ -38,8 +40,10 @@ var (
 
 func member(target string) string { return deployment + "/" + target }
 
-func changes() []templates.KeyspaceChangeData {
-	return []templates.KeyspaceChangeData{{Keyspace: database, Statements: []string{addIndex + ";"}}}
+func changes() []templates.KeyspaceChangeData { return changesOf(addIndex) }
+
+func changesOf(ddl string) []templates.KeyspaceChangeData {
+	return []templates.KeyspaceChangeData{{Keyspace: database, Statements: []string{ddl + ";"}}}
 }
 
 func bytesOf(target string) *int64 {
@@ -321,26 +325,25 @@ func stopDemo() stopScenario {
 // names the override request. A second person, a freeze approver, approves
 // it, and the author's next apply runs as usual.
 type freezeScenario struct {
-	Command  string   `json:"command"`
-	Plan     string   `json:"plan"`
-	Apply    string   `json:"apply"`
-	Refused  string   `json:"refused"`
-	Refusal  string   `json:"refusal"`
-	Approver string   `json:"approver"`
-	Approve  string   `json:"approve"`
-	Approved string   `json:"approved"`
-	Rerun    string   `json:"rerun"`
-	Progress []string `json:"progress"`
-	Complete string   `json:"complete"`
-	Summary  string   `json:"summary"`
+	Command  string `json:"command"`
+	Plan     string `json:"plan"`
+	Apply    string `json:"apply"`
+	Refused  string `json:"refused"`
+	Refusal  string `json:"refusal"`
+	Approver string `json:"approver"`
+	Approve  string `json:"approve"`
+	Approved string `json:"approved"`
+	Rerun    string `json:"rerun"`
+	Complete string `json:"complete"`
+	Summary  string `json:"summary"`
 }
 
-// singlePlanComment is the plan comment of the one-target database the freeze
+// freezePlanComment is the plan comment of the one-target database the freeze
 // recording uses. refused marks an apply comment a change gate refused.
-func singlePlanComment(locked, refused bool) string {
+func freezePlanComment(locked, refused bool) string {
 	data := templates.PlanCommentData{
 		Database: database, SchemaName: database, Environment: environment, HeadSHA: headSHA,
-		Repository: repository, RequestedBy: requestedBy, IsMySQL: true, DatabaseType: "mysql", Changes: changes(),
+		Repository: repository, RequestedBy: requestedBy, IsMySQL: true, DatabaseType: "mysql", Changes: changesOf(addColumn),
 	}
 	if locked {
 		data.IsLocked = true
@@ -353,42 +356,21 @@ func singlePlanComment(locked, refused bool) string {
 	return templates.RenderPlanComment(data)
 }
 
-// singleComment renders the progress comment of the one-target apply, or its
-// summary once it has completed and summary is set.
-func singleComment(percent int, elapsed time.Duration, summary bool) string {
-	data := templates.ApplyStatusCommentData{
-		Database:    database,
-		Environment: environment,
-		State:       operationState(percent, false),
-		Engine:      "Spirit",
-		ApplyID:     "apply-example-93",
-		StartedAt:   startedAt.Format(time.RFC3339),
-		Tables:      []templates.TableProgressData{tableProgress("shop-001", percent, false)},
-	}
-	if data.State == state.Apply.Completed {
-		data.CompletedAt = startedAt.Add(elapsed).Format(time.RFC3339)
-	}
-	if summary {
-		return templates.RenderApplySummaryComment(data)
-	}
-	return templates.RenderApplyStatusComment(data)
-}
-
 func freezeDemo() freezeScenario {
 	const (
 		overrideID = "ovr-123"
-		reason     = "SEV-1234 fix: this index ends the slow orders query"
+		reason     = "Hotfix: checkout needs the gift_note column"
 		approver   = "monalisa"
 	)
 	demo := freezeScenario{
 		Command: `schemabot apply -e production --override "` + reason + `"`,
-		Plan:    singlePlanComment(false, false),
-		Apply:   singlePlanComment(true, false),
-		Refused: singlePlanComment(true, true),
+		Plan:    freezePlanComment(false, false),
+		Apply:   freezePlanComment(true, false),
+		Refused: freezePlanComment(true, true),
 		Refusal: templates.RenderChangeGateRefusal(templates.ChangeGateRefusalData{
 			CommandName: action.Apply, TakesOverride: true, Environment: environment, RequestedBy: requestedBy,
 			Timestamp: startedAt.Format("2006-01-02 15:04:05"),
-			Freezes:   []templates.RefusingFreeze{{ID: "freeze-abc", Reason: "SEV-1234 payments latency"}},
+			Freezes:   []templates.RefusingFreeze{{ID: "freeze-abc", Reason: "Holiday code freeze"}},
 			Override: &templates.RefusalOverrideRequest{
 				ID: overrideID, Requester: requestedBy, Author: requestedBy, Reason: reason,
 			},
@@ -401,11 +383,29 @@ func freezeDemo() freezeScenario {
 			RequestedBy: requestedBy, Reason: reason, ExpiresAt: startedAt.Add(24 * time.Hour),
 		}),
 		Rerun:    "schemabot apply -e production",
-		Complete: singleComment(100, 6*time.Minute, false),
-		Summary:  singleComment(100, 6*time.Minute, true),
-	}
-	for _, percent := range []int{5, 16, 28, 40, 52, 64, 76, 88, 98, cuttingOver} {
-		demo.Progress = append(demo.Progress, singleComment(percent, 0, false))
+		Complete: instantComment(false),
+		Summary:  instantComment(true),
 	}
 	return demo
+}
+
+// instantComment renders the freeze recording's apply once it has completed:
+// the column add is instant, so there is no row copy to follow.
+func instantComment(summary bool) string {
+	data := templates.ApplyStatusCommentData{
+		Database:    database,
+		Environment: environment,
+		State:       state.Apply.Completed,
+		Engine:      "Spirit",
+		ApplyID:     "apply-example-94",
+		StartedAt:   startedAt.Format(time.RFC3339),
+		CompletedAt: startedAt.Add(2 * time.Second).Format(time.RFC3339),
+		Tables: []templates.TableProgressData{{
+			TableName: "orders", DDL: addColumn, Status: state.Task.Completed, PercentComplete: 100, IsInstant: true, Started: true,
+		}},
+	}
+	if summary {
+		return templates.RenderApplySummaryComment(data)
+	}
+	return templates.RenderApplyStatusComment(data)
 }

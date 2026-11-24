@@ -323,7 +323,7 @@ func freezeDemo() Demo {
 	}) + applyPrompt()
 	freeze := apitypes.Freeze{
 		ID: "freeze-abc", Environment: "production", Kind: "on_demand", Running: "continue",
-		StartsAt: time.Date(2026, 1, 15, 14, 30, 0, 0, time.UTC), Reason: "SEV-1234 payments latency",
+		StartsAt: time.Date(2026, 1, 15, 14, 30, 0, 0, time.UTC), Reason: "Holiday code freeze",
 		CreatedBy: "alice", Source: "cli", InEffect: true,
 	}
 	created := capture(func() { t.WriteFreezeCreated(freeze) })
@@ -336,13 +336,13 @@ func freezeDemo() Demo {
 	}
 	lifted := capture(func() { t.WriteFreezeLifted(freeze) })
 	frames := []Frame{
-		{3, `schemabot freeze -e production --reason "SEV-1234 payments latency"`, "An incident starts: freeze production", created},
+		{3, `schemabot freeze -e production --reason "Holiday code freeze"`, "Start a holiday code freeze", created},
 		{2, "schemabot apply -s ./schema -e production", "A schema change is ready to ship", confirm + "▌"},
 		{0.8, "", "", confirm + "yes"},
 		{4, "", "The freeze refuses it; nothing starts", confirm + "yes\n" + refused},
-		{4, `schemabot unfreeze freeze-abc --reason "SEV resolved"`, "The incident is over: lift the freeze", lifted},
+		{4, `schemabot unfreeze freeze-abc --reason "Holidays are over"`, "The holidays are over: lift the freeze", lifted},
 	}
-	return Demo{Name: "cli-freeze", Title: "Freeze production during an incident", Height: 740, Bar: "shop · production", Frames: frames}
+	return Demo{Name: "cli-freeze", Title: "Freeze production for a code freeze or an incident", Height: 740, Bar: "shop · production", Frames: frames}
 }
 
 // Read the confirmation text from the actual apply command so this fixture
