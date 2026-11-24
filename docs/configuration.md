@@ -12,7 +12,7 @@
 - [Hybrid Mode](#hybrid-mode)
 - [Drivers](#drivers)
 - [Metrics](#metrics)
-- [Apply Outcome Notifications](#apply-outcome-notifications)
+- [Apply completion notifications](#apply-completion-notifications)
 - [Rate Limits](#rate-limits)
 - [Pending Drops](#pending-drops)
 - [Direct Execution](#direct-execution)
