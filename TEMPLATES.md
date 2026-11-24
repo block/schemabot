@@ -17,7 +17,7 @@ DDL code fences are sized to be longer than any backtick run in their content.
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 CREATE TABLE `users` (
@@ -75,7 +75,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `products` ADD COLUMN `discount_cents` bigint DEFAULT NULL;
@@ -101,7 +101,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `accounts` ADD INDEX `idx_tenant_id`(`tenant_id`);
@@ -299,7 +299,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `products`
@@ -345,7 +345,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 CREATE TABLE `ledger_entries` (
@@ -402,7 +402,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 CREATE TABLE `users` (
@@ -458,7 +458,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 CREATE TABLE `users` (
@@ -516,7 +516,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Started at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Started at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 CREATE TABLE `users` (
@@ -574,7 +574,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `PostgreSQL`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 #### Schema Name: `app`
 ```sql
@@ -603,7 +603,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ✅ **No schema changes detected**
 
@@ -622,7 +622,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 DROP TABLE `_events_old`;
@@ -655,7 +655,7 @@ DROP TABLE `_events_old`;
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `orders` DROP INDEX `idx_legacy_status`;
@@ -706,7 +706,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`);
@@ -739,7 +739,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 CREATE TABLE `customers` (
@@ -778,7 +778,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
@@ -865,7 +865,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `users`
@@ -907,7 +907,7 @@ schemabot plan -e staging
 
 **Database**: `testapp` | **Type**: `PostgreSQL`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE users ALTER COLUMN email TYPE bigint;
@@ -943,7 +943,7 @@ schemabot plan -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
 
@@ -979,7 +979,7 @@ If a transaction holds a table's metadata lock past a short wait, SchemaBot kill
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `orders` DROP COLUMN `legacy_ref`;
@@ -1014,7 +1014,7 @@ ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 CREATE TABLE `loans` (
@@ -1101,7 +1101,7 @@ DROP TABLE `refund_backfill`;
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `orders` DROP COLUMN `notes`;
@@ -1139,7 +1139,7 @@ A plan diffs this PR's schema files against the live database, so a change anoth
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -1170,7 +1170,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
 
@@ -1198,7 +1198,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
 
@@ -1236,7 +1236,7 @@ schemabot unlock
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
 
@@ -1274,7 +1274,7 @@ schemabot unlock
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -1309,7 +1309,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -1344,7 +1344,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `PostgreSQL`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE users ALTER COLUMN email TYPE bigint;
@@ -1374,7 +1374,7 @@ Fix what each reason names — rewrite an unsupported change, or provision the s
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp` | **Tenant**: `alpha`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 CREATE TABLE `users` (
@@ -1428,7 +1428,7 @@ schemabot apply -e staging --tenant alpha
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ✅ **No schema changes detected**
 
@@ -1568,7 +1568,7 @@ Choose one:
 
 **Database**: `commerce` | **Type**: `Vitess`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 #### Keyspace: `commerce`
 #### VSchema
@@ -1660,7 +1660,7 @@ schemabot apply -e staging
 
 **Database**: `commerce` | **Type**: `Vitess`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 #### Keyspace: `commerce_sharded`
 #### VSchema
@@ -1718,7 +1718,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `PostgreSQL`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 CREATE TABLE sessions (
@@ -1759,7 +1759,7 @@ schemabot apply -e staging
 
 **Database**: `commerce` | **Type**: `Vitess`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -1852,7 +1852,7 @@ ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
 
 **Database**: `myapp` | **Type**: `MySQL`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 #### Schema Name: `app_primary`
 ```sql
@@ -1897,7 +1897,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ### Staging & Production
 
@@ -1962,7 +1962,7 @@ schemabot apply -e production
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ### Staging
 
@@ -2026,7 +2026,7 @@ schemabot apply -e production
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ### Staging
 
@@ -2096,7 +2096,7 @@ schemabot plan -e production
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Started at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Started at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ### Staging & Production
 
@@ -2165,7 +2165,7 @@ schemabot apply -e production
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 **Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
@@ -2221,7 +2221,7 @@ schemabot apply -e production
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 **Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
@@ -2281,7 +2281,7 @@ schemabot apply -e production
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ⚠️ **Deployment drift detected** — some deployments no longer match this plan, so the plan check is failing closed:
 
@@ -2341,7 +2341,7 @@ schemabot apply -e production
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ⚠️ **Could not verify deployment drift** — the plan check is failing closed until it can be confirmed.
 
@@ -2397,7 +2397,7 @@ schemabot apply -e production
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ⚠️ **This branch is missing newer changes from `main` to `schema/staging`.** This plan could undo them, and apply is blocked until the branch has them. Merge `main` into this branch to plan again.
 
@@ -2457,7 +2457,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ⚠️ **Could not check whether `main` has newer changes to this schema.** Apply checks again before it runs.
 
@@ -2517,7 +2517,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 CREATE TABLE `users` (
@@ -2568,7 +2568,7 @@ schemabot apply -e production
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 CREATE TABLE `users` (
@@ -2619,7 +2619,7 @@ schemabot apply -e production
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ### 2 of 3 targets
 
@@ -2660,7 +2660,7 @@ schemabot apply -e production
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ### 28 of 32 targets
 
@@ -2755,7 +2755,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ### 124 of 128 targets
 
@@ -2888,7 +2888,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
 
@@ -2953,7 +2953,7 @@ schemabot unlock
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
@@ -2987,7 +2987,7 @@ schemabot apply -e production
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
@@ -3021,7 +3021,7 @@ schemabot apply -e production
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ⚠️ **Some targets could not be planned** — every target must have a plan before an apply can run, so the plan check is failing closed:
 
@@ -3061,7 +3061,7 @@ schemabot apply -e production
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `customers` DROP COLUMN `nickname`;
@@ -3092,7 +3092,7 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
@@ -3123,7 +3123,7 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 ALTER TABLE `orders` MODIFY COLUMN `id` int NOT NULL AUTO_INCREMENT;
@@ -3286,7 +3286,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 CREATE TABLE `users` (
@@ -4211,7 +4211,7 @@ Apply in progress on 3 of 4 targets: 1 done
 
 **Database**: `testapp`
 
-*Released by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Released by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 The database is now available for schema changes.
 
@@ -4453,7 +4453,7 @@ No active locks.
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -4503,7 +4503,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -4555,7 +4555,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -4621,7 +4621,7 @@ schemabot unlock
 
 **Database**: `commerce` | **Type**: `Vitess`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -4714,7 +4714,7 @@ ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 **Status**: Queued
 
@@ -4730,7 +4730,7 @@ This schema change starts automatically, and this comment updates once it does.
 
 **Database**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 Another PR currently holds the lock for this database.
 
@@ -4750,7 +4750,7 @@ The lock is released when that PR is merged or closed, or when `schemabot unlock
 
 **Database**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 A CLI session currently holds the lock for this database.
 
@@ -4773,7 +4773,7 @@ schemabot unlock -d testapp --force
 
 **Database**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 This PR's apply `apply-a1b2c3d4e5f6` is still running (state: `running`), so a second apply cannot start.
 
@@ -4792,7 +4792,7 @@ schemabot apply -e staging
 
 **Database**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 This PR's apply `apply-a1b2c3d4e5f6` is still running (state: `running`), so a second apply cannot start.
 
@@ -4807,7 +4807,7 @@ It is already applying this PR's latest commit. Follow its progress comment for 
 ## ⛔ Apply Blocked: PR Is Closed — Staging
 
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 This PR is closed, so its schema changes can never merge. SchemaBot only applies schema changes from open PRs.
 
@@ -4823,7 +4823,7 @@ Reopen this PR, or open a new PR with the schema change, and apply from there.
 ## ⛔ Apply Blocked: PR Is Merged — Staging
 
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 This PR is already merged, so applies can no longer run from it. SchemaBot only applies schema changes from open PRs.
 
@@ -5131,7 +5131,7 @@ Add `development` to `environment_order` (the server-wide list, or this database
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 Schema changes require approval from an authorized reviewer before applying.
 
@@ -5156,7 +5156,7 @@ Schema changes require approval from an authorized reviewer before applying.
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 Schema changes require approval from an authorized reviewer before applying.
 
@@ -5178,7 +5178,7 @@ Schema changes require approval from an authorized reviewer before applying.
 
 **Database**: `testapp` | **Environment**: `production`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 Schema changes require approval from an authorized reviewer before applying.
 
@@ -5204,7 +5204,7 @@ Schema changes require approval from an authorized reviewer before applying.
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 @jdoe approved an earlier commit, but this PR's change to `schema/testapp/orders.sql` is different now. That approval no longer counts, so the latest commit needs a new approval.
 
@@ -5246,7 +5246,7 @@ ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL;
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 @jdoe approved an earlier commit, but this PR's change to `schema/testapp/orders.sql` is different now. This PR targets `release-1.2`, not `main`, so changes that reach `release-1.2` also count as changes to this PR. That approval no longer counts, so the latest commit needs a new approval.
 
@@ -5271,7 +5271,7 @@ ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL;
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 @jdoe approved an earlier commit. `schema/testapp/orders.sql` has not changed since then, but the base branch it builds on has, so applying it now would run different DDL. That approval no longer counts, so the latest commit needs a new approval.
 
@@ -5313,7 +5313,7 @@ ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL;
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 **This apply needs an approval of the latest commit.** @jdoe approved an earlier commit. An earlier approval still counts when the PR's schema change is the same at the latest commit, but SchemaBot hit an error checking that, so that approval does not count. Operators can find the error in the server logs.
 
@@ -5473,7 +5473,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -5603,7 +5603,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -5652,7 +5652,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -5700,7 +5700,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -5749,7 +5749,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -5798,7 +5798,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -5846,7 +5846,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -5894,7 +5894,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -5942,7 +5942,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -5992,7 +5992,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -6040,7 +6040,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -6087,7 +6087,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -6136,7 +6136,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -6148,7 +6148,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `commerce` | **Apply ID**: `apply-7aa13cf03496454b`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 **Status**: In Progress
 
@@ -6174,7 +6174,7 @@ To stop this schema change:
 schemabot stop apply-7aa13cf03496454b -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -6186,7 +6186,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `commerce` | **Apply ID**: `apply-7aa13cf03496454b`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 **Status**: In Progress
 
@@ -6213,7 +6213,7 @@ To stop this schema change:
 schemabot stop apply-7aa13cf03496454b -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -6282,7 +6282,7 @@ To cancel this schema change:
 schemabot cancel apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -6323,7 +6323,7 @@ To cancel this schema change:
 schemabot cancel apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -6361,7 +6361,7 @@ To cancel this schema change:
 schemabot cancel apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -6409,7 +6409,7 @@ An error interrupted this schema change. SchemaBot retries automatically and mar
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -6457,7 +6457,7 @@ An error interrupted this schema change. SchemaBot retries automatically and mar
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -6756,7 +6756,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -6839,7 +6839,7 @@ To proceed with cutover:
 schemabot cutover apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -6884,7 +6884,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 SchemaBot triggers cutover automatically — no action needed.
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -6932,7 +6932,7 @@ To proceed with cutover:
 schemabot cutover apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -6971,7 +6971,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -7024,7 +7024,7 @@ To revert:
 schemabot revert apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -7069,7 +7069,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 Skip-revert was requested — closing the revert window and making this schema change permanent. This can no longer be reverted.
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -7110,7 +7110,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -7247,7 +7247,7 @@ To revert:
 schemabot revert apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 
 </details>
@@ -7290,7 +7290,7 @@ To revert:
 schemabot revert apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 
 </details>
@@ -7330,7 +7330,7 @@ To proceed with cutover:
 schemabot cutover apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 
 </details>
@@ -7370,7 +7370,7 @@ To proceed with cutover:
 schemabot cutover apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 
 </details>
@@ -8010,7 +8010,7 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 
 **Database**: `testapp` | **Type**: `MySQL`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 ```sql
 DROP TABLE `audit_log`;
@@ -8045,7 +8045,7 @@ schemabot unlock
 
 **Database**: `testapp` | **Type**: `MySQL`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 ```sql
 DROP TABLE `audit_log`;
@@ -8104,7 +8104,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -9949,7 +9949,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e production
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -10033,7 +10033,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e production
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -10121,7 +10121,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e production
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -10156,7 +10156,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e production
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -10301,7 +10301,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e production
 ```
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -10817,7 +10817,7 @@ schemabot apply -e production
 
 **Database**: `cdb_resolute` | **Type**: `Strata`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 #### Keyspace: `cdb_resolute_sharded`
 Shards diverge — what applies where:
@@ -10859,7 +10859,7 @@ schemabot apply -e production
 
 **Database**: `cdb_resolute` | **Type**: `Strata`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 #### Keyspace: `cdb_resolute_sharded`
 **shards `-20`, `20-40`, `40-60`, `60-80`, `80-a0`, `a0-c0`, `c0-e0`, `e0-`**
@@ -10888,7 +10888,7 @@ schemabot apply -e production
 
 **Database**: `cdb_resolute` | **Type**: `Strata`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 #### Keyspace: `cdb_resolute_sharded`
 <details>
@@ -10926,7 +10926,7 @@ schemabot apply -e production
 
 **Database**: `cdb_resolute` | **Type**: `Strata`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 #### Keyspace: `cdb_resolute_sharded`
 <details>
@@ -10985,7 +10985,7 @@ schemabot apply -e production
 
 **Database**: `cdb_resolute` | **Type**: `Strata`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ### Staging
 
@@ -11031,7 +11031,7 @@ schemabot apply -e production
 
 **Database**: `cdb_resolute` | **Type**: `Strata`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 #### Keyspace: `cdb_resolute_sharded`
 Shards diverge — what applies where:
@@ -11074,7 +11074,7 @@ schemabot apply -e production
 
 **Database**: `cdb_resolute` | **Type**: `Strata`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 #### Keyspace: `cdb_resolute_sharded`
 Shards diverge — what applies where:
@@ -11118,7 +11118,7 @@ ALTER TABLE `mutes`
 
 **Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 **Status**: In Progress — 0 of 1 change applied
 
@@ -11138,7 +11138,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
   - ○ `80-c0`: queued
   - ○ `c0-`: queued
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -11150,7 +11150,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 **Status**: Failed — 0 of 1 change applied
 
@@ -11190,7 +11190,7 @@ schemabot apply -e production
 
 **Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 **Status**: In Progress — 0 of 1 change applied
 
@@ -11231,7 +11231,7 @@ Shards diverge — grouped by change:
 | --- | --- |
 | `40-80` | ⏳ waiting for -40 |
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -11243,7 +11243,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
 **Status**: In Progress — 1 of 4 changes applied
 
@@ -11279,7 +11279,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 **`cdb_resolute_sharded`**: Pending
 
 
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 

@@ -838,7 +838,7 @@ func (h *Handler) rejectBlockedChanges(
 	planResp *apitypes.PlanResponse, environment, requestedBy, actionName string, result CommandResult, expectedPendingPlanID string,
 ) {
 	database, dbType := schemaResult.Database, schemaResult.Type
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 	commentData.ScopedDatabase = result.Database
 	commentData.Target = narrowedTarget(planResp, result.Target)
 	h.logger.Info("apply rejected: re-plan contains engine-blocked changes",
@@ -1098,7 +1098,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy string,
 	cause *templates.PausedApplyCauseData, rolloutPreview *templates.DeploymentDriftData, runsMemberWork bool,
 ) error {
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 	commentData.ScopedDatabase = result.Database
 	commentData.Target = narrowedTarget(planResp, result.Target)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, rolloutPreview, repo, pr, environment)
