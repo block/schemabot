@@ -37,9 +37,8 @@ own state. See [SchemaBot storage](#schemabot-storage) for that distinction.
 ## Beta status
 
 PostgreSQL support is in **beta**. SchemaBot runs the changes listed under
-"What works today" and blocks everything else when you plan it, with the
-reason, before anything touches your database. It never falls back to a
-riskier way of running a change.
+"What works today" and refuses everything else with the reason, in most cases
+when you plan it. It never falls back to a riskier way of running a change.
 [What GA, beta, and alpha mean](engines.md#what-ga-beta-and-alpha-mean)
 explains the levels. Changes run through
 [pg-sprite](https://github.com/block/pg-sprite#readme), which is itself an
@@ -76,8 +75,28 @@ early release.
   `stop`, `start`, `cutover`, deferred cutover, `revert`, and `skip-revert`
   are not available. See
   [Unsupported workflow features](#unsupported-workflow-features).
+- **An index on a partitioned table's parent.** The plan is blocked, because
+  the index has to be built one partition at a time and SchemaBot does not
+  run that build yet. Some other changes to a partitioned parent are refused
+  when the apply runs; see [Partitioned tables](#partitioned-tables).
+- **Row-level security beyond existing tables.** Declaring it on a new table,
+  or changing policies and structure in the same plan, is blocked. A plan for
+  a namespace with managed row-level security cannot be rolled back. See
+  [Row-level security](#row-level-security).
 - **Pulling every table shape.** `pull` refuses some tables, listed under
   [Schema pull](#schema-pull), rather than writing a partial schema.
+
+**A passing plan is not a promise that the apply will succeed.** Some checks
+can only run against the live table, when the apply starts:
+
+- A statement the planner expected to be quick that turns out to rewrite the
+  table is cancelled by its time budget, and nothing is changed.
+- A table that grew past the size limit after the plan is refused.
+- A plan with several statements is not atomic. They run in order, so if one
+  fails, the ones before it stay applied. Keep a change to one statement when
+  a half-applied plan would be unsafe to leave in place.
+
+[Apply-time refusals](#apply-time-refusals) lists every check that runs then.
 
 ## Schema pull
 

@@ -52,7 +52,7 @@ stay put, where this page moves as engines gain features.
 | | Spirit (MySQL) | PlanetScale (Vitess) | pg-sprite (PostgreSQL) |
 |---|---|---|---|
 | **Cheap native path tried first** | yes, instant DDL | yes, instant DDL | yes, attempted under budgets that cancel a rewrite |
-| **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | planned; meanwhile a rewrite is refused above a size limit and cancelled by its budget below it |
+| **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | planned; meanwhile a predicted rewrite is blocked at plan, and a mispredicted one is cancelled by its budget |
 | **Escape hatch for refused statements** | direct execution: on by default, size-bounded | none, excluded by design | none, native execution is already the only path |
 | **`stop`** | yes | no | planned |
 | **`start`** | yes | deferred deploys only | planned |
@@ -259,9 +259,11 @@ described above, and it is not on the PostgreSQL roadmap today.
 
 Until the copy lands, a PostgreSQL change is kept safe by bounding work rather than pacing it. Only
 a small set of statement shapes is allowed at all, which is why a `DROP TABLE` never reaches the
-database. Above the configured table size limit, anything that might rewrite is refused before it
-runs. Below it, the bounded attempt described above is what stands in for a copy: the change is
-tried once, and a rewrite is cancelled by its own budget rather than allowed to hold a lock. Some
+database. A statement the planner predicts will rewrite the table is blocked at plan time, whatever
+the table's size, and any other `ALTER TABLE` is refused above the configured table size limit.
+Below it, the bounded attempt described above is what stands in for a copy: the change is tried
+once, and if the prediction was wrong and it does rewrite, its own budget cancels it rather than
+letting it hold a lock. Some
 statements skip the gamble because PostgreSQL has a genuinely online form of them, and the planner
 substitutes it: an index build becomes `CREATE INDEX CONCURRENTLY`, and a constraint is added `NOT
 VALID` and then validated. The constraint steps still sit under the size limit, which is checked
@@ -275,14 +277,15 @@ tracks the engine more closely than this page does.
 
 Every engine in the [README](../README.md) carries a badge: GA, beta, or alpha. The badge tells
 you how much of your schema that engine can change today. It is not a safety rating. At every
-level, an engine refuses a change it cannot run safely and tells you why before anything touches
-your database.
+level, an engine refuses a change it cannot run safely and tells you why, rather than running it
+anyway.
 
 - **GA** engines can change any table, however large, and keep you in control while a change
   runs. The two requirements below spell out what that takes.
-- **Beta** engines handle a clear, documented set of changes. Anything outside that set is blocked
-  when you plan it, with the reason, so you find out on the pull request rather than in
-  production. The engine's guide lists everything that is not GA yet.
+- **Beta** engines handle a clear, documented set of changes. Anything outside that set is refused
+  with the reason, and most of it is blocked when you plan it, so you find out on the pull
+  request rather than in production. The engine's guide lists what is not GA yet, including the
+  checks that can only run once the change does.
 - **Alpha** engines are experimental and still being built. Expect significant changes between
   releases, both in what they can do and in how they work. Their guide may not list every gap
   yet, so read it before you rely on one.
