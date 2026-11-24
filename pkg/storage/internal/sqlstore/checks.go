@@ -2,6 +2,7 @@
 package sqlstore
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"database/sql"
@@ -21,6 +22,11 @@ const checkColumns = `id, repository, pull_request, head_sha,
 	check_run_id, apply_id, has_changes, status, conclusion,
 	blocking_reason, error_message, change_summary, rollout_targets, rollout_targets_with_work,
 	created_at, updated_at`
+
+// removableCheckColumns is checkColumns with the aggregate render, for the
+// close cleanup listing and its delete. The render is compared with the rest,
+// so a rewrite that changes only an aggregate's render is kept.
+const removableCheckColumns = checkColumns + `, aggregate_render`
 
 const (
 	checkStatusInProgress         = "in_progress"
@@ -1087,7 +1093,7 @@ func (s *checkStore) ListRemovableOnPRClose(ctx context.Context, repo string, pr
 	repo = storage.CanonicalKey(repo)
 	if merged {
 		rows, err := s.db.QueryContext(ctx, `
-			SELECT `+checkColumns+`
+			SELECT `+removableCheckColumns+`
 			FROM checks
 			WHERE repository = ? AND pull_request = ?
 			  AND (apply_id IS NULL OR (status != ? AND conclusion = ?))
@@ -1097,11 +1103,11 @@ func (s *checkStore) ListRemovableOnPRClose(ctx context.Context, repo string, pr
 			return nil, fmt.Errorf("list removable checks for merged closed PR %s#%d: %w", repo, pr, err)
 		}
 		defer utils.CloseAndLog(rows)
-		return scanChecks(rows)
+		return scanRemovableChecks(rows)
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT `+checkColumns+`
+		SELECT `+removableCheckColumns+`
 		FROM checks
 		WHERE repository = ? AND pull_request = ?
 		  AND apply_id IS NULL
@@ -1111,7 +1117,7 @@ func (s *checkStore) ListRemovableOnPRClose(ctx context.Context, repo string, pr
 		return nil, fmt.Errorf("list plan-only checks for unmerged closed PR %s#%d: %w", repo, pr, err)
 	}
 	defer utils.CloseAndLog(rows)
-	return scanChecks(rows)
+	return scanRemovableChecks(rows)
 }
 
 // DeleteListedIfUnchanged deletes each listed row only while it is still the
@@ -1153,8 +1159,8 @@ func (s *checkStore) DeleteListedIfUnchanged(ctx context.Context, listed []*stor
 		for _, row := range ordered {
 			target := fmt.Sprintf("%s#%d %s/%s/%s (check %d)",
 				row.Repository, row.PullRequest, row.Environment, row.DatabaseType, row.DatabaseName, row.ID)
-			current, err := scanCheckInto(tx.QueryRowContext(ctx, `
-				SELECT `+checkColumns+`
+			current, err := scanRemovableCheck(tx.QueryRowContext(ctx, `
+				SELECT `+removableCheckColumns+`
 				FROM checks
 				WHERE id = ?
 				FOR UPDATE
@@ -1204,6 +1210,7 @@ func checkRowUnchanged(listed, current *storage.Check) bool {
 		listed.ChangeSummary == current.ChangeSummary &&
 		listed.RolloutTargets == current.RolloutTargets &&
 		listed.RolloutTargetsWithWork == current.RolloutTargetsWithWork &&
+		bytes.Equal(listed.AggregateRender, current.AggregateRender) &&
 		listed.CreatedAt.Equal(current.CreatedAt) &&
 		listed.UpdatedAt.Equal(current.UpdatedAt)
 }
@@ -1230,19 +1237,47 @@ func scanChecks(rows *sql.Rows) ([]*storage.Check, error) {
 	return checks, rows.Err()
 }
 
-// scanCheckInto scans check data from any scanner (Row or Rows).
-func scanCheckInto(s scanner) (*storage.Check, error) {
+// scanRemovableChecks scans rows selected with removableCheckColumns.
+func scanRemovableChecks(rows *sql.Rows) ([]*storage.Check, error) {
+	var checks []*storage.Check
+	for rows.Next() {
+		check, err := scanRemovableCheck(rows)
+		if err != nil {
+			return nil, err
+		}
+		checks = append(checks, check)
+	}
+	return checks, rows.Err()
+}
+
+// scanRemovableCheck scans a row selected with removableCheckColumns.
+func scanRemovableCheck(s scanner) (*storage.Check, error) {
+	var render sql.NullString
+	check, err := scanCheckInto(s, &render)
+	if err != nil {
+		return nil, err
+	}
+	if render.Valid && render.String != "" {
+		check.AggregateRender = []byte(render.String)
+	}
+	return check, nil
+}
+
+// scanCheckInto scans check data from any scanner (Row or Rows). extra
+// receives any columns selected after checkColumns.
+func scanCheckInto(s scanner, extra ...any) (*storage.Check, error) {
 	var check storage.Check
 	var checkRunID, applyID sql.NullInt64
 	var conclusion, blockingReason, errorMessage, changeSummary sql.NullString
 
-	err := s.Scan(
+	dest := []any{
 		&check.ID, &check.Repository, &check.PullRequest, &check.HeadSHA,
 		&check.Environment, &check.DatabaseType, &check.DatabaseName,
 		&checkRunID, &applyID, &check.HasChanges, &check.Status, &conclusion,
 		&blockingReason, &errorMessage, &changeSummary, &check.RolloutTargets, &check.RolloutTargetsWithWork,
 		&check.CreatedAt, &check.UpdatedAt,
-	)
+	}
+	err := s.Scan(append(dest, extra...)...)
 	if err != nil {
 		return nil, err
 	}

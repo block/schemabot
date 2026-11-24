@@ -1469,6 +1469,43 @@ func TestChecks(t *testing.T, h Harness) {
 			"only the listed row still as listed is deleted; a row inserted since the listing is not touched")
 	})
 
+	// A close lists the PR's aggregate row, and before the delete runs a
+	// reopen refolds the aggregate: only its render changes, in the same
+	// second as the listed write, so every other column still matches. The
+	// delete keeps the row, because the render is compared with the rest.
+	t.Run("DeleteListedIfUnchanged_KeepsARenderOnlyRewriteInTheSameSecond", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		aggregate := func(render string) *storage.Check {
+			return &storage.Check{
+				Repository: "org/repo", PullRequest: 123, HeadSHA: "sha-closed",
+				Environment: "staging", DatabaseType: "aggregate", DatabaseName: "aggregate",
+				CheckRunID: 100, HasChanges: true, Status: "completed", Conclusion: "action_required",
+				AggregateRender: []byte(render),
+			}
+		}
+		require.NoError(t, store.Checks().Upsert(ctx, aggregate(`{"targets": 1}`)))
+		removable, err := store.Checks().ListRemovableOnPRClose(ctx, "org/repo", 123, false)
+		require.NoError(t, err)
+		require.Len(t, removable, 1)
+		assert.JSONEq(t, `{"targets": 1}`, string(removable[0].AggregateRender), "the listing carries the render it compares")
+
+		require.NoError(t, store.Checks().Upsert(ctx, aggregate(`{"targets": 2}`)))
+		current, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "aggregate", "aggregate")
+		require.NoError(t, err)
+		require.NotNil(t, current)
+		// The rewrite landed in the listed write's second.
+		removable[0].UpdatedAt = current.UpdatedAt
+
+		kept, err := store.Checks().DeleteListedIfUnchanged(ctx, removable)
+		require.NoError(t, err)
+		require.Len(t, kept, 1, "a render-only rewrite is kept and reported")
+		assert.JSONEq(t, `{"targets": 2}`, string(kept[0].AggregateRender))
+		render, err := store.Checks().GetAggregateRender(ctx, "org/repo", 123, "staging", "aggregate", "aggregate")
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"targets": 2}`, string(render), "the rewritten aggregate is not deleted")
+	})
+
 	t.Run("Upsert_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
 		err := store.Checks().Upsert(t.Context(), &storage.Check{
