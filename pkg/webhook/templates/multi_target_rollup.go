@@ -80,13 +80,26 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 			writeDDL()
 		} else {
 			strip := targetStrip(line.listed, line.listedTargets)
-			writeTargetTableLine(sb, line.table.TableName, line.listed, strip, settled, budget, writeDDL)
+			writeTargetTableLine(sb, line.table.TableName, line.listed, strip, settled, lineRunsIndexBuild(data, line), budget, writeDDL)
 		}
 		sb.WriteString("\n")
 		restorePlan()
 		restoreScope()
 	}
 	writeFailedTargets(sb, data.Model, g)
+}
+
+// lineRunsIndexBuild reports whether a target running the line's table is in
+// a concurrent index build, read from that target's own operation, since an
+// operation's build work says nothing about its siblings.
+func lineRunsIndexBuild(data MultiDeploymentApplyData, line targetTableLine) bool {
+	for k, i := range line.members {
+		detail := memberDetail(data.Details, i)
+		if detail != nil && detail.BuildWork.IsConcurrentIndexBuild() && state.IsState(line.cells[k].Status, state.Task.Running) {
+			return true
+		}
+	}
+	return false
 }
 
 // lineAwaitsResume reports whether a table line of a resuming apply is one the
@@ -307,8 +320,9 @@ func rankTargetTableLines(lines []targetTableLine) {
 // each target's state under the rows, the way the sharded comment lays out a
 // table and its shards. Once the rollout has settled, a target still pending
 // on the table never starts it, so the line says not started rather than
-// queued.
-func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, settled bool, budget *ddlBlockBudget, writeDDL func()) {
+// queued. A running index build has no rows to sum, so while indexBuild is set
+// its line leads with the build's percent across its targets instead.
+func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, settled, indexBuild bool, budget *ddlBlockBudget, writeDDL func()) {
 	var done, queued, failed, retrying int
 	// cancelled counts the targets where a cancel stopped the table part-way
 	// through, and neverStarted the targets where it was cancelled before it
@@ -343,6 +357,12 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	pendingWord := presentation.PendingWord(settled)
 	coverage := presentation.TargetCoverage(done, running, pending, failed, retrying, presentation.RunningCopying, pendingWord)
 	status := rollupTaskStatus(cells)
+	if indexBuild && running > 0 {
+		fmt.Fprintf(sb, "**%s**: %s\n", name, ui.IndexBuildProgress(presentation.IndexBuildPercentAcrossTargets(parts)))
+		writeDDL()
+		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, presentation.RunningApplying, budget)
+		return
+	}
 	if keepsTargetProgressBar(cells, status, done, pending, settled) {
 		percent := presentation.PercentAcrossTargets(parts, 0)
 		// With the rows to copy known, the bar leads from the copy's start,

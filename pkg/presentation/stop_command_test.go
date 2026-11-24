@@ -29,6 +29,9 @@ func TestStopCommand(t *testing.T) {
 		{name: "postgres cancels an index build before the step total arrives", engine: storage.EnginePostgres, work: build, want: StopCommandCancel},
 		{name: "postgres offers nothing for an index build among several statements", engine: storage.EnginePostgres, work: build, stepsTotal: 3, want: StopCommandNone},
 		{name: "postgres offers nothing for plain DDL", engine: storage.EnginePostgres, stepsTotal: 1, want: StopCommandNone},
+		{name: "the progress API's postgres name cancels an index build", engine: "PostgreSQL", work: build, stepsTotal: 1, want: StopCommandCancel},
+		{name: "the progress API's postgres name offers nothing for plain DDL", engine: "PostgreSQL", stepsTotal: 1, want: StopCommandNone},
+		{name: "the progress API's planetscale name cancels", engine: "PlanetScale", want: StopCommandCancel},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

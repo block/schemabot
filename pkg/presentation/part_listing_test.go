@@ -429,3 +429,29 @@ func TestShardedTableCopiesNoRows(t *testing.T) {
 	assert.False(t, ShardedTableCopiesNoRows([][]TableChange{nil}, nil),
 		"with nothing recorded or planned, the table reads as copying")
 }
+
+// An index build across targets reads as the mean of each target's whole-build
+// percent. A completed target counts in full, a target that is queued or
+// halted counts as nothing, and the table never reads complete until every
+// target has completed.
+func TestIndexBuildPercentAcrossTargets(t *testing.T) {
+	running := func(pct int) Part { return Part{Status: state.Task.Running, PercentComplete: pct} }
+	tests := []struct {
+		name  string
+		parts []Part
+		want  int
+	}{
+		{name: "no targets", want: 0},
+		{name: "two builds at a quarter", parts: []Part{running(25), running(25)}, want: 25},
+		{name: "one done, one halfway", parts: []Part{{Status: state.Task.Completed}, running(50)}, want: 75},
+		{name: "a queued target counts as nothing", parts: []Part{running(60), {Status: state.Task.Pending}}, want: 30},
+		{name: "a failed target counts as nothing", parts: []Part{running(80), {Status: state.Task.Failed, PercentComplete: 90}}, want: 40},
+		{name: "a percent past complete is clamped", parts: []Part{running(140)}, want: 99},
+		{name: "every target done", parts: []Part{{Status: state.Task.Completed}, {Status: state.Task.RevertWindow}}, want: 100},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, IndexBuildPercentAcrossTargets(tt.parts))
+		})
+	}
+}

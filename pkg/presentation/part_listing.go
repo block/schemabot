@@ -796,6 +796,33 @@ func AcrossTargetsPercent(pct int, exact bool, copied, total int64) string {
 	return ui.FormatRowCopyPercent(pct, copied, total)
 }
 
+// IndexBuildPercentAcrossTargets is how far a concurrent index build is across
+// every target that runs it. A build has no rows to count, and each target
+// reports its own whole-build percent instead, so the table's percent is their
+// mean: a completed target counts in full, a running target by its percent,
+// and every other target as nothing yet. Like PercentAcrossTargets, it stops
+// short of complete until every target has completed.
+func IndexBuildPercentAcrossTargets(parts []Part) int {
+	if len(parts) == 0 {
+		return 0
+	}
+	sum, done := 0, 0
+	for _, p := range parts {
+		switch state.NormalizeTaskStatus(p.Status) {
+		case state.Task.Completed, state.Task.RevertWindow:
+			sum += 100
+			done++
+		case state.Task.Running:
+			sum += ui.ClampPercent(p.PercentComplete)
+		}
+	}
+	percent := sum / len(parts)
+	if done < len(parts) {
+		percent = min(percent, 99)
+	}
+	return percent
+}
+
 // PercentAcrossTargets is how far a table is across every target that runs it,
 // for the bar that leads its line until every target completes. While every
 // target's rows are known, it is the rows copied over the rows to copy across

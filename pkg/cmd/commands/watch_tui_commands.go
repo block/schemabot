@@ -106,11 +106,10 @@ func (m WatchModel) triggerCutover() tea.Cmd {
 	}
 }
 
-// triggerStop sends what the s (or c) key offers. PlanetScale's stop cancels
-// its deploy request, so it keeps the stop endpoint; an engine with no stop
-// whose key offers cancel sends cancel.
+// triggerStop sends the command the watcher offers: cancel where the engine
+// can only cancel, and stop everywhere else.
 func (m WatchModel) triggerStop() tea.Cmd {
-	if m.stopCommand() == presentation.StopCommandCancel && !m.isPlanetScale() {
+	if m.stopCommand() == presentation.StopCommandCancel {
 		return m.triggerCancel()
 	}
 	return func() tea.Msg {

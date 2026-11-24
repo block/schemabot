@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/presentation"
@@ -356,30 +357,45 @@ func (m WatchModel) formatFooter() string {
 	}
 }
 
-// stopCommand names the command the s (or c) key sends for the work in
-// flight, or none where the engine can end none of it.
+// stopCommand names the command the watcher offers for the work in flight:
+// stop on the s key, cancel on the c key, or none where the engine can end
+// none of it. The apply's build work speaks for one operation, so an apply
+// with several reads as having none, the way the rollout footers read it.
 func (m WatchModel) stopCommand() string {
-	return presentation.StopCommand(m.engine, m.buildWork, m.stepsTotal)
+	work := m.buildWork
+	if len(m.operations) > 1 {
+		work = apitypes.BuildWork{}
+	}
+	return presentation.StopCommand(m.engine, work, m.stepsTotal)
 }
 
-// isPlanetScale returns true if the current apply is using the PlanetScale engine.
+// keyRequestsStopCommand reports whether key is the one bound to the command
+// the watcher offers: s for stop and c for cancel. A stop is never turned into
+// a cancel (CO-8), so s does nothing where the engine can only cancel.
+func (m WatchModel) keyRequestsStopCommand(key string) bool {
+	switch m.stopCommand() {
+	case presentation.StopCommandStop:
+		return key == "s"
+	case presentation.StopCommandCancel:
+		return key == "c"
+	default:
+		return false
+	}
+}
+
 // stopAwaitingConfirmation reports whether the operator pressed s and the
 // server has not yet reported the apply stopped or cancelled.
 func (m WatchModel) stopAwaitingConfirmation() bool {
 	return m.stopTriggered && !state.IsState(m.state, state.Apply.Stopped, state.Apply.Cancelled)
 }
 
-// stopPendingLabel names what the s (or c) key requested: a cancel ends the
+// stopPendingLabel names what the s or c key requested: a cancel ends the
 // apply for good, a stop parks it at its checkpoint.
 func (m WatchModel) stopPendingLabel() string {
 	if m.stopCommand() == presentation.StopCommandCancel {
 		return "Cancelling..."
 	}
 	return "Stopping..."
-}
-
-func (m WatchModel) isPlanetScale() bool {
-	return strings.EqualFold(m.engine, "PlanetScale") || strings.EqualFold(m.engine, "planetscale")
 }
 
 // elapsed returns a formatted elapsed time string for the status line.

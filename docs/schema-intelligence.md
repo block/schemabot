@@ -713,7 +713,9 @@ deployment can address several targets, each running its own copy of the change,
 so several rows for the same table share a deployment and differ in their
 target. The pair is read from the stored task's operation row, so a
 single-target apply reports its one member the same way, and a row the server
-cannot match to a stored task carries neither field.
+cannot match to a stored task carries neither field. Such a row also carries
+`operation_key`, naming the operation that runs it, since one target can run
+several operations when a rollout goes table by table.
 A sharded apply lists one operation per shard and table it changes, plus each
 keyspace's finalizer, and the response sets `sharded: true`. Its `tables` are
 then rolled up across the shards: one entry per keyspace table, with `status`
@@ -747,6 +749,12 @@ engine reports them: PostgreSQL applies report their position through `phase`,
 `step`, `steps_total`, and `statement`; PlanetScale applies report deploy
 request fields such as `branch_name` and `deploy_request_url`. Spirit applies
 currently report progress on the table entries and do not report position fields.
+The top-level `metadata` has one slot per key, so when an apply has more than
+one operation, each entry in `operations` also carries its own `metadata`: the
+display fields its driver last recorded for that operation, such as a
+PostgreSQL operation's `executor_operation` while it builds an index. Read an
+operation's own fields from there and match a table to its operation by
+`deployment` and `operation_key`.
 `engine` names the engine running the apply, in one of two forms depending on
 where the response comes from. While the data plane reports the apply's
 progress, it is the engine's display name: `Spirit`, `PlanetScale`, `Strata`, or
@@ -833,15 +841,16 @@ Response excerpt (illustrative values):
   "engine": "spirit",
   "state": "running",
   "operations": [
-    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "parallel"},
-    {"deployment": "commerce-a", "target": "shop-002", "state": "running", "cutover_policy": "parallel"},
-    {"deployment": "commerce-a", "target": "shop-003", "state": "completed", "cutover_policy": "parallel", "already_converged": true}
+    {"deployment": "commerce-a", "operation_key": "shop-001", "target": "shop-001", "state": "completed", "cutover_policy": "parallel"},
+    {"deployment": "commerce-a", "operation_key": "shop-002", "target": "shop-002", "state": "running", "cutover_policy": "parallel"},
+    {"deployment": "commerce-a", "operation_key": "shop-003", "target": "shop-003", "state": "completed", "cutover_policy": "parallel", "already_converged": true}
   ],
   "tables": [
     {
       "table_name": "orders",
       "deployment": "commerce-a",
       "target": "shop-001",
+      "operation_key": "shop-001",
       "ddl": "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)",
       "status": "completed",
       "estimated_bytes": 2400000000,
@@ -852,6 +861,7 @@ Response excerpt (illustrative values):
       "table_name": "orders",
       "deployment": "commerce-a",
       "target": "shop-002",
+      "operation_key": "shop-002",
       "ddl": "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)",
       "status": "running",
       "rows_copied": 2000000,
@@ -1108,6 +1118,9 @@ heap is scanned, then `building index: sorting live tuples`, then
 The table's row draws a progress bar from its `percent_complete`, which for an
 index build is the whole build's percent across every phase. The phase line
 shows raw counters only, so it never shows a second percent beside the bar.
+When the build is rolled out across targets, the table's line draws one bar
+from the mean of its targets' percents, counting a finished target as 100 and
+a queued one as 0, and stays below 100 until every target is done.
 
 The numbers come from the engine while the apply is active, so they are as
 fresh as the last poll. Once the apply is terminal, the same endpoint answers

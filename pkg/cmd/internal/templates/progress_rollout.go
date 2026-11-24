@@ -446,6 +446,9 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 			if t.Throttled && !rolled.Throttled {
 				rolled.Throttled, rolled.ThrottleReason = true, t.ThrottleReason
 			}
+			if t.IndexBuild && state.IsState(status, state.Task.Running) {
+				rolled.IndexBuild = true
+			}
 			break
 		}
 	}
@@ -464,7 +467,16 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 		rolled.RowsTotal += planned
 		rolled.RowsTotalPlanned = true
 	}
-	if rolled.RowsTotal > 0 {
+	switch {
+	case rolled.IndexBuild:
+		// An index build has no rows to sum, so its percent is the build's
+		// across its targets, as the PR comment's line reads it.
+		parts := make([]presentation.Part, len(rolled.Shards))
+		for i, s := range rolled.Shards {
+			parts[i] = shardPart(s)
+		}
+		rolled.PercentComplete = presentation.IndexBuildPercentAcrossTargets(parts)
+	case rolled.RowsTotal > 0:
 		rolled.PercentComplete = int(min(rolled.RowsCopied, rolled.RowsTotal) * 100 / rolled.RowsTotal)
 	}
 	return rolled
@@ -527,6 +539,19 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 	writeThrottleTooltip(&b, t)
 	b.WriteString(formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t), runningWord(t)))
 	return b.String(), true
+}
+
+// formatIndexBuildAcrossTargets writes a table whose targets are building an
+// index: the bar for the build across its targets, which has no rows to
+// count, then its DDL and where each target stands.
+func formatIndexBuildAcrossTargets(t TableProgress) string {
+	var b strings.Builder
+	writeTableLine(&b, t, "%s%s", ui.IndexBuildProgress(t.PercentComplete), ui.ThrottledSuffix(t.Throttled))
+	if t.DDL != "" {
+		b.WriteString(formatTableDDL(t))
+	}
+	b.WriteString(formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t), presentation.RunningApplying))
+	return b.String()
 }
 
 // stoppedRowsAcrossTargets sums the rows a stopped table's targets copied, for

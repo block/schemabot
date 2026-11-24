@@ -536,6 +536,9 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	if coverage, ok := awaitsResume(t); ok {
 		return formatResumingTable(t, coverage)
 	}
+	if t.AcrossTargets && t.IndexBuild {
+		return formatIndexBuildAcrossTargets(t)
+	}
 	if keepsAcrossTargetsBar(t) {
 		if out, ok := formatAcrossTargetsProgress(t); ok {
 			return out

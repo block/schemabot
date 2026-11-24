@@ -92,9 +92,10 @@ type TableProgress struct {
 	RowsTotal       int64
 	PercentComplete int
 	ETASeconds      int64
-	// IndexBuild is true while the apply's engine reports a concurrent index
-	// build in flight. The build has no rows to count, so a running table
-	// draws its bar from PercentComplete, the engine's whole-build percent.
+	// IndexBuild is true while the operation that runs this table reports a
+	// concurrent index build in flight. The build has no rows to count, so a
+	// running table draws its bar from PercentComplete, the engine's
+	// whole-build percent.
 	IndexBuild bool
 	// EstimatedBytes is the table's on-disk size when it was planned, shown
 	// beside the row counts. Nil when the plan had no estimate.
@@ -205,7 +206,14 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 	}
 	dialect := schema.DialectForDatabaseType(result.DatabaseType)
 
+	workByOperation := make(map[presentation.OperationRef]apitypes.BuildWork, len(result.Operations))
 	for _, op := range result.Operations {
+		if work, err := apitypes.ParseBuildWork(op.Metadata); err != nil {
+			slog.Warn("progress output omits an operation's build work because its progress metadata is malformed",
+				"apply_id", result.ApplyID, "deployment", op.Deployment, "operation_key", op.OperationKey, "error", err)
+		} else {
+			workByOperation[presentation.OperationRef{Deployment: op.Deployment, OperationKey: op.OperationKey}] = work
+		}
 		data.Operations = append(data.Operations, ProgressOperation{
 			Deployment:          op.Deployment,
 			OperationKey:        op.OperationKey,
@@ -284,11 +292,22 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 				tp.ETASeconds = sh.ETASeconds
 			}
 		}
-		tp.IndexBuild = data.BuildWork.IsConcurrentIndexBuild()
+		tp.IndexBuild = tableBuildWork(data.BuildWork, workByOperation, len(result.Operations), tbl).IsConcurrentIndexBuild()
 		data.Tables = append(data.Tables, tp)
 	}
 
 	return data
+}
+
+// tableBuildWork is the work in flight on the operation that runs tbl. The
+// top-level metadata speaks for one operation, so it is the table's only when
+// the apply has one operation; with several, the table reads its own
+// operation's, and a table no listed operation claims has none.
+func tableBuildWork(applyWork apitypes.BuildWork, byOperation map[presentation.OperationRef]apitypes.BuildWork, operations int, tbl *apitypes.TableProgressResponse) apitypes.BuildWork {
+	if operations <= 1 {
+		return applyWork
+	}
+	return byOperation[presentation.OperationRef{Deployment: tbl.Deployment, OperationKey: tbl.OperationKey}]
 }
 
 // firstOperationError returns the error of the first operation, in resolved

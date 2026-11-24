@@ -178,8 +178,8 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		case "s", "c":
-			// Stop (Spirit) or cancel (PlanetScale) the schema change
-			if m.stopKeyAvailable() && !m.stopTriggered {
+			// Stop or cancel the schema change, whichever its engine accepts
+			if m.stopKeyAvailable() && !m.stopTriggered && m.keyRequestsStopCommand(msg.String()) {
 				m.stopTriggered = true
 				return m, m.triggerStop()
 			}
@@ -327,8 +327,8 @@ func (m WatchModel) cuttingOver() bool {
 	return state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
 }
 
-// stopKeyAvailable reports whether the apply is in a state the s (or c) key
-// stops, so a footer advertises the key exactly where pressing it acts. An
+// stopKeyAvailable reports whether the apply is in a state the s or c key
+// ends, so a footer advertises the key exactly where pressing it acts. An
 // engine that can end none of the work in flight offers no key.
 func (m WatchModel) stopKeyAvailable() bool {
 	if m.cuttingOver() || m.stopCommand() == presentation.StopCommandNone {
