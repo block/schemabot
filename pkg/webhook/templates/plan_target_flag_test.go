@@ -58,7 +58,7 @@ func TestUnsafeRefusalNarrowedToOneTarget(t *testing.T) {
 	data.UnsafeChanges = []UnsafeChangeData{{Table: "users", Reason: "drops a column", ChangeType: "drop"}}
 	rendered := RenderUnsafeChangesBlocked(data)
 
-	assert.Contains(t, fencedCommands(t, rendered), "schemabot apply -e production --target payments-002")
+	assert.Contains(t, fencedCommands(t, rendered), "schemabot apply -e production --target payments-002 --allow-unsafe")
 }
 
 // A comment that covers the whole rollout carries no target anywhere.

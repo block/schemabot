@@ -1885,19 +1885,21 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups, opera
 			"write_groups", len(fa.WriteGroups),
 			"operator_groups", len(operatorGroups),
 			"trusted_gateway_spiffe", len(fa.TrustedGatewaySPIFFE),
-			"read_service_spiffe", len(fa.ReadServiceSPIFFE))
+			"read_service_spiffe", len(fa.ReadServiceSPIFFE),
+			"trusted_mesh_loopback_sources", len(fa.TrustedMeshLoopbackSources))
 		authz, err := auth.NewForwardAuthAuthorizer(auth.ForwardAuthConfig{
-			UserHeader:           fa.UserHeader,
-			GroupsHeader:         fa.GroupsHeader,
-			GroupsDelimiter:      fa.GroupsDelimiter,
-			TrustedProxySPIFFE:   fa.TrustedProxySPIFFE,
-			TrustedProxyCIDRs:    fa.TrustedProxyCIDRs,
-			ReadGroups:           fa.ReadGroups,
-			WriteGroups:          fa.WriteGroups,
-			OperatorGroups:       operatorGroups,
-			TrustedGatewaySPIFFE: fa.TrustedGatewaySPIFFE,
-			CallerSPIFFEHeader:   fa.CallerSPIFFEHeader,
-			ReadServiceSPIFFE:    fa.ReadServiceSPIFFE,
+			UserHeader:                 fa.UserHeader,
+			GroupsHeader:               fa.GroupsHeader,
+			GroupsDelimiter:            fa.GroupsDelimiter,
+			TrustedProxySPIFFE:         fa.TrustedProxySPIFFE,
+			TrustedProxyCIDRs:          fa.TrustedProxyCIDRs,
+			ReadGroups:                 fa.ReadGroups,
+			WriteGroups:                fa.WriteGroups,
+			OperatorGroups:             operatorGroups,
+			TrustedGatewaySPIFFE:       fa.TrustedGatewaySPIFFE,
+			CallerSPIFFEHeader:         fa.CallerSPIFFEHeader,
+			ReadServiceSPIFFE:          fa.ReadServiceSPIFFE,
+			TrustedMeshLoopbackSources: fa.TrustedMeshLoopbackSources,
 		}, logger)
 		if err != nil {
 			return nil, err

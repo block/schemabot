@@ -10,6 +10,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
@@ -522,12 +523,12 @@ func TestThrottledHeaderEveryPhase(t *testing.T) {
 	for name, tb := range cases {
 		t.Run(name, func(t *testing.T) {
 			var sb strings.Builder
-			renderTableProgress(&sb, "", tb, state.Apply.Running, 0, "", nil)
+			renderTableProgress(&sb, "", tb, state.Apply.Running, 0, "", apitypes.BuildWork{}, nil)
 			header, _, _ := strings.Cut(sb.String(), "\n")
 			assert.True(t, strings.HasSuffix(header, " (throttled)"), "header %q", header)
 			tb.Throttled = false
 			sb.Reset()
-			renderTableProgress(&sb, "", tb, state.Apply.Running, 0, "", nil)
+			renderTableProgress(&sb, "", tb, state.Apply.Running, 0, "", apitypes.BuildWork{}, nil)
 			assert.NotContains(t, sb.String(), "(throttled)")
 		})
 	}
@@ -626,8 +627,8 @@ func TestRenderUnsafeChangesBlockedIncludesDropIndexGuidance(t *testing.T) {
 	assert.Contains(t, rendered, "**"+glyph.Escalation+" To proceed with these destructive changes**:\n"+
 		"1. Deploy application code that no longer reads from or writes to the dropped column.\n"+
 		"2. Make the dropped index invisible, then verify application queries no longer rely on it for safe performance.\n"+
-		"3. Add `--allow-unsafe` to confirm 2 unsafe changes on `customers`:\n"+
-		"   ```\n   schemabot apply -e staging\n   ```\n")
+		"3. Post this command to confirm 2 unsafe changes on `customers`:\n"+
+		"   ```\n   schemabot apply -e staging --allow-unsafe\n   ```\n")
 	assert.NotContains(t, rendered, glyph.Tip+" Before allowing", "the steps lead into the command, not a tip of their own")
 	assert.NotContains(t, rendered, "reads from or writes to the dropped index")
 }
@@ -1878,6 +1879,54 @@ func TestRenderApplySummaryComment_StartedAtUsesApplyStart(t *testing.T) {
 
 	assert.Contains(t, result, "*Started at 2026-06-16 19:42:00 UTC*")
 	assert.NotContains(t, result, "*Started at 2026-06-16 20:00:00 UTC*")
+}
+
+// Every apply comment edits itself in place as the apply runs, so the line
+// naming who applied it carries the apply's start time rather than the time of
+// the latest edit. The "Last updated" footer is what shows the edit time.
+func TestApplyCommentsShowAppliedByAtTheApplyStart(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 20:00:00 UTC") // render time, ~18m after start
+	const (
+		startedAt = "2026-06-16T19:42:00Z"
+		appliedBy = "*Applied by @mona at 2026-06-16 19:42:00 UTC*"
+		editTime  = "*Applied by @mona at 2026-06-16 20:00:00 UTC*"
+	)
+	cases := map[string]string{
+		"single database": RenderApplyStatusComment(ApplyStatusCommentData{
+			Database: "testapp", Environment: "staging", State: state.Apply.Running,
+			RequestedBy: "mona", StartedAt: startedAt,
+		}),
+		"sharded": RenderShardedApplyComment(ShardedApplyData{
+			Database: "testapp", Environment: "staging", State: state.Apply.Running,
+			ApplyID: "apply-x", RequestedBy: "mona", StartedAt: startedAt,
+		}),
+		"multi deployment": RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+			Model:   presentation.Derive([]presentation.Operation{rollingOp("us", so.Running)}),
+			ApplyID: "apply-123", Environment: "production", RequestedBy: "mona", StartedAt: startedAt,
+		}),
+	}
+	for name, out := range cases {
+		t.Run(name, func(t *testing.T) {
+			assert.Contains(t, out, appliedBy)
+			assert.NotContains(t, out, editTime)
+		})
+	}
+}
+
+// The locked apply comment says when the command was posted, not when the
+// comment rendered: planning and lock acquisition both happen after the
+// request, so the request time reads no later than the lock time.
+func TestRenderPlanComment_RequestedAtIsWhenTheCommandWasPosted(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 19:42:30 UTC") // render time, after planning
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		RequestedBy: "mona", RequestedAt: time.Date(2026, 6, 16, 19, 42, 0, 0, time.UTC),
+		IsLocked: true, LockOwner: "octo/repo#7", LockAcquired: "2026-06-16 19:42:20 UTC",
+	})
+
+	assert.Contains(t, out, "*Requested by @mona at 2026-06-16 19:42:00 UTC*")
+	assert.Contains(t, out, "at 2026-06-16 19:42:20 UTC")
+	assert.NotContains(t, out, "19:42:30")
 }
 
 // The duration is decoration: valid timestamps render it, and a completed

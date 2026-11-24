@@ -815,11 +815,7 @@ func writeShardedMetadata(sb *strings.Builder, data ShardedApplyData, renderedAt
 		fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID),
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
-	attributionAt := renderedAt
-	if data.RequestedBy == "" {
-		attributionAt = startedAtDisplay(data.StartedAt, renderedAt)
-	}
-	writeAppliedByOrTimestampAt(sb, data.RequestedBy, attributionAt)
+	writeAppliedByOrTimestampAt(sb, data.RequestedBy, startedAtDisplay(data.StartedAt, renderedAt))
 }
 
 // groupShardsBySignature buckets shards whose change set is identical. The

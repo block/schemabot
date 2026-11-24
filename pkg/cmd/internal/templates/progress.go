@@ -250,9 +250,6 @@ func writeProgressStep(data ProgressData) {
 		fmt.Printf(" · %s", statement)
 	}
 	fmt.Println()
-	if line := ui.FormatBuildWork(data.BuildWork); line != "" {
-		fmt.Println(line)
-	}
 }
 
 // FormatNamespacedTables returns tables grouped by keyspace as a string, collapsing
@@ -535,6 +532,9 @@ func formatResumingTable(t TableProgress, coverage string) string {
 func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel string) string {
 	if coverage, ok := awaitsResume(t); ok {
 		return formatResumingTable(t, coverage)
+	}
+	if t.AcrossTargets && t.BuildWork.IsConcurrentIndexBuild() {
+		return formatIndexBuildAcrossTargets(t)
 	}
 	if keepsAcrossTargetsBar(t) {
 		if out, ok := formatAcrossTargetsProgress(t); ok {
@@ -824,6 +824,14 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		statusLower := strings.ToLower(t.Status)
 		if statusLower != "" && statusLower != "running" && statusLower != "row_copy" {
 			fmt.Fprintf(&b, indentDetail+"Status: %s\n", t.Status)
+		}
+	case t.BuildWork.IsConcurrentIndexBuild():
+		writeTableLine(&b, t, "%s%s", ui.IndexBuildProgress(t.PercentComplete), ui.ThrottledSuffix(t.Throttled))
+		if t.DDL != "" {
+			b.WriteString(formatTableDDL(t))
+		}
+		if line := ui.FormatBuildWork(t.BuildWork); line != "" {
+			b.WriteString(indentDetail + line + "\n")
 		}
 	default:
 		// No row copy data — CREATE/DROP, instant DDL, or VSchema-only.
@@ -1587,7 +1595,10 @@ type ApplyHistoryData struct {
 // DatabaseHistoryData contains data for rendering database history.
 type DatabaseHistoryData struct {
 	Database string
-	Applies  []ApplyHistoryData
+	// Environment is the environment the history was filtered to; empty when
+	// it covers every environment.
+	Environment string
+	Applies     []ApplyHistoryData
 }
 
 // databaseHistoryColumns returns the columns the history table renders, in order.
@@ -1605,7 +1616,7 @@ func databaseHistoryColumns() []statusColumn[ApplyHistoryData] {
 // WriteDatabaseHistory writes the database history output.
 func WriteDatabaseHistory(data DatabaseHistoryData) {
 	if len(data.Applies) == 0 {
-		fmt.Printf("%sNo schema changes found for database '%s'%s\n", ANSIDim, data.Database, ANSIReset)
+		fmt.Printf("%s%s%s\n", ANSIDim, emptyHistoryLine(data.Database, data.Environment), ANSIReset)
 		return
 	}
 
@@ -1616,6 +1627,17 @@ func WriteDatabaseHistory(data DatabaseHistoryData) {
 
 	fmt.Println()
 	fmt.Printf("%sUse '%s' to view details%s\n", ANSIDim, cliname.Command("status", "<apply_id>"), ANSIReset)
+}
+
+// emptyHistoryLine says that no apply has been recorded for the database, in
+// the environment when the history was filtered to one. It speaks of applies,
+// not schema changes, so it does not read as a claim that the database has no
+// schema or is unknown.
+func emptyHistoryLine(database, environment string) string {
+	if environment == "" {
+		return fmt.Sprintf("No applies recorded for database '%s'", database)
+	}
+	return fmt.Sprintf("No applies recorded for database '%s' in %s", database, environment)
 }
 
 // stateColorFunc returns an ANSI color function for the given state.

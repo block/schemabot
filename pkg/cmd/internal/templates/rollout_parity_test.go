@@ -24,13 +24,15 @@ type parityTarget struct {
 	copied, total int64
 	eta           int64
 	estimatedRows *int64
+	throttled     bool
 }
 
 // The CLI and the PR comment read a table rolled up across targets the same
 // way: for one rollout, the percent beside the table's bar and its rows line
 // are the same text on both, whether targets have completed, are copying, are
 // queued with or without the plan's estimate, or are queued with rows already
-// reported (UX-7).
+// reported, and both mark the line when the throttler holds a target back
+// (UX-7).
 func TestRolledUpTableReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
 	completed := func(copied int64) parityTarget {
 		return parityTarget{opState: state.ApplyOperation.Completed, status: state.Task.Completed, copied: copied, total: 1000}
@@ -71,6 +73,12 @@ func TestRolledUpTableReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
 			percent: "25%",
 			rows:    "Rows: 500 / ~2k · ETA: ≥ 2m 0s",
 		},
+		{
+			name:    "a throttled target",
+			targets: []parityTarget{{opState: state.ApplyOperation.Running, status: state.Task.Running, copied: 420, total: 1000, eta: 120, throttled: true}, completed(990)},
+			percent: "71.00%" + ui.ThrottledSuffix(true),
+			rows:    "Rows: 1,420 / 2,000 · ETA: 2m 0s",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -85,8 +93,8 @@ func TestRolledUpTableReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
 }
 
 var (
-	cliTableLine  = regexp.MustCompile(`(?m)^\s*~ orders: \S+ (\S+)$`)
-	prTableLine   = regexp.MustCompile("(?m)^\\*\\*`orders`\\*\\*: \\S+ (\\S+)$")
+	cliTableLine  = regexp.MustCompile(`(?m)^\s*~ orders: \S+ (\S+(?: \(throttled\))?)$`)
+	prTableLine   = regexp.MustCompile("(?m)^\\*\\*`orders`\\*\\*: \\S+ (\\S+(?: \\(throttled\\))?)$")
 	rolledRowLine = regexp.MustCompile(`(?m)^\s*[•-] (Rows: .*)$`)
 )
 
@@ -98,7 +106,7 @@ func cliTableReading(t *testing.T, targets []parityTarget) (percent, rows string
 	for i, target := range targets {
 		rollout[i] = rolloutTarget{
 			opState: target.opState, status: target.status, rowsCopied: target.copied, rowsTotal: target.total,
-			eta: target.eta, estimatedRows: target.estimatedRows,
+			eta: target.eta, estimatedRows: target.estimatedRows, throttled: target.throttled,
 		}
 	}
 	return tableReading(t, renderRollout(t, targetRolloutData(rollout)), cliTableLine)
@@ -123,6 +131,7 @@ func prTableReading(t *testing.T, targets []parityTarget) (percent, rows string)
 			Tables: []webhooktemplates.TableProgressData{{
 				TableName: "orders", DDL: addRegion, Status: target.status,
 				RowsCopied: target.copied, RowsTotal: target.total, ETASeconds: target.eta, EstimatedRows: target.estimatedRows,
+				Throttled: target.throttled,
 			}},
 		}
 	}

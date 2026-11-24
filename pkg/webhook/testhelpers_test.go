@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/require"
@@ -239,6 +240,9 @@ type webhookPayloadOpts struct {
 	userType  string // "User" or "Bot"
 	userLogin string
 	isPR      bool // whether the issue has a pull_request field
+	// createdAt is when the comment was posted. Zero leaves the field out of
+	// the payload.
+	createdAt time.Time
 }
 
 // buildWebhookRequest constructs a valid issue_comment webhook POST request with HMAC signature.
@@ -255,16 +259,20 @@ func buildWebhookRequest(t *testing.T, opts webhookPayloadOpts, secret []byte) *
 		opts.repo = "octocat/hello-world"
 	}
 
-	payload := map[string]any{
-		"action": "created",
-		"comment": map[string]any{
-			"id":   42,
-			"body": opts.comment,
-			"user": map[string]any{
-				"login": opts.userLogin,
-				"type":  opts.userType,
-			},
+	comment := map[string]any{
+		"id":   42,
+		"body": opts.comment,
+		"user": map[string]any{
+			"login": opts.userLogin,
+			"type":  opts.userType,
 		},
+	}
+	if !opts.createdAt.IsZero() {
+		comment["created_at"] = opts.createdAt.UTC().Format(time.RFC3339)
+	}
+	payload := map[string]any{
+		"action":  "created",
+		"comment": comment,
 		"repository": map[string]any{
 			"full_name": opts.repo,
 		},

@@ -300,7 +300,8 @@ operator's typo rather than a peer on a different release, and ignoring it would
 *Enforced:* the additive-only proto and storage-schema rules, checked before a tag
 ([release.md](release.md)); strict decoding on the HTTP API handlers
 (`pkg/api/control_handlers.go`, `pkg/api/freeze_handlers.go`, `pkg/api/lock_handlers.go`,
-`pkg/api/plan_handlers.go`, `pkg/api/settings_handlers.go`, `pkg/api/storage_schema_handlers.go`) and on config load
+`pkg/api/plan_handlers.go`, `pkg/api/settings_handlers.go`, `pkg/api/storage_schema_handlers.go`,
+`pkg/api/webhook_ops_handlers.go`) and on config load
 (`pkg/api/config.go`).
 
 ### AV-7: An acknowledged delivery is a promise
@@ -2130,7 +2131,10 @@ classification (`pkg/auth/tiers.go`), with structural sweep tests over the route
 
 ### AZ-3: Identity comes from a verified lane
 
-Forwarded identity headers are trusted only from explicitly listed proxies, a gateway-verified
+Forwarded identity headers are trusted only from explicitly listed proxies. A user identity
+forwarded from a loopback source other than a listed mesh sidecar address, such as a
+port-forward, is admitted but never verified; listing a mesh sidecar address trusts every process
+in the pod's network namespace like the proxy. A gateway-verified
 service caller never reaches the write tier by self-asserting user headers, and every write and
 control action is attributed to the verified caller rather than to any client-supplied caller
 string. A client-supplied string never proves ownership either: a scoped operator releases a lock

@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1156,8 +1157,7 @@ func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {
 	assert.Contains(t, rendered, "**⛔ Apply rejected**: 1 unsafe change detected")
 	assert.Contains(t, rendered, "`users`")
 	assert.Contains(t, rendered, "DROP TABLE removes all data")
-	assert.Contains(t, rendered, "**🚨 To proceed with these destructive changes**:\n1. Deploy application code that no longer reads from or writes to the dropped table.\n2. Add `--allow-unsafe` to confirm 1 unsafe change on `users`:\n   ```\n   schemabot apply -e staging\n   ```\n")
-	assert.NotContains(t, rendered, "--allow-unsafe\n```", "consenting to destroy data takes typing the flag, so the pasteable command leaves it out")
+	assert.Contains(t, rendered, "**🚨 To proceed with these destructive changes**:\n1. Deploy application code that no longer reads from or writes to the dropped table.\n2. Post this command to confirm 1 unsafe change on `users`:\n   ```\n   schemabot apply -e staging --allow-unsafe\n   ```\n")
 }
 
 // A table can carry several lint violations in one engine-joined reason
@@ -1288,7 +1288,7 @@ func TestRenderUnsafeChangesBlocked_CustomDatabaseTypeHeader(t *testing.T) {
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "## Schema Change Plan")
-	assertPasteableCommand(t, rendered, "schemabot apply -e staging")
+	assertPasteableCommand(t, rendered, "schemabot apply -e staging --allow-unsafe")
 }
 
 func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) {
@@ -1310,7 +1310,7 @@ func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) 
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "**Tenant**: `alpha`")
-	assertPasteableCommand(t, rendered, "schemabot apply -e staging --tenant alpha")
+	assertPasteableCommand(t, rendered, "schemabot apply -e staging --tenant alpha --allow-unsafe")
 }
 
 // A plan comment's copy-paste commands name a database only where a bare
@@ -1542,4 +1542,25 @@ func TestSourcePolicyRefusalHoldingEachFailure(t *testing.T) {
 func assertPasteableCommand(t *testing.T, comment, cmd string) {
 	t.Helper()
 	assert.Regexp(t, "(?m)^ *```\n *"+regexp.QuoteMeta(cmd)+"\n *```$", comment)
+}
+
+// Every plan comment an apply command posts (the locked comment, the
+// confirmation downgrade, the no-change and blocked-change replies) shows the
+// time the command was posted, not the time the comment rendered, so a slow
+// re-plan does not move the "Requested by" line.
+func TestCommandPlanCommentData_StampsRequestTime(t *testing.T) {
+	h := &Handler{}
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "mysql"}
+	planResp := &apitypes.PlanResponse{PlanID: "plan_abc123"}
+	requestedAt := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
+	result := CommandResult{Tenant: "default", RequestedAt: requestedAt}
+
+	data := h.commandPlanCommentData(schema, planResp, "staging", "jdoe", result)
+
+	assert.Equal(t, requestedAt, data.RequestedAt)
+	assert.Equal(t, "default", data.Tenant)
+	assert.Equal(t, "jdoe", data.RequestedBy)
+	assert.Equal(t, "plan_abc123", data.PlanID)
+	assert.Contains(t, templates.RenderPlanComment(data), "at 2026-02-03 04:05:06 UTC")
+	assert.Contains(t, templates.RenderBlockedChangesApplyRejected(data), "at 2026-02-03 04:05:06 UTC")
 }

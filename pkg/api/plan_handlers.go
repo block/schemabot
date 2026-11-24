@@ -2,9 +2,9 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net/http"
 	"slices"
@@ -181,9 +181,7 @@ func (e *RemoteDeploymentUnavailableError) Unwrap() error {
 // handlePullSchema handles POST /api/pull requests.
 func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 	var req apitypes.PullSchemaRequest
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
@@ -627,9 +625,7 @@ type ApplyRequest struct {
 // handlePlan handles POST /api/plan requests.
 func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 	var req PlanRequest
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
@@ -746,7 +742,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "plan rejected: "+err.Error())
 			return
 		}
-		s.logger.Error("plan failed", "database", req.Database, "error", err)
+		PlanFailureLog(s.logger, err)("plan failed", "database", req.Database, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
 		return
 	}
@@ -758,7 +754,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 	// error says which step failed.
 	rollout, err := s.planRollout(r.Context(), req, primaryPlan, resp)
 	if err != nil {
-		s.logger.Error("plan failed: the rollout's member plans could not be completed", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
+		PlanFailureLog(s.logger, err)("plan failed: the rollout's member plans could not be completed", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
 		return
 	}
@@ -1026,7 +1022,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			"error", err,
 		}
 		if isPlanRefusal(err) {
-			s.logger.Warn("ExecutePlan: engine refused the plan; the PR's schema files must change before it can plan", planFailureAttrs...)
+			s.logger.Warn("ExecutePlan: engine refused the plan; it plans once the change the refusal names is made to the schema files or the target", planFailureAttrs...)
 		} else {
 			s.logger.Error("ExecutePlan: client.Plan failed", planFailureAttrs...)
 		}
@@ -1532,9 +1528,7 @@ func storedNarrowingConflicts(stored, planned string) bool {
 // which the CLI reads as an unknown outcome and keeps its lock for.
 func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 	var req ApplyRequest
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
@@ -1596,6 +1590,12 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, ok := errors.AsType[*DropTablesInUseError](err); ok {
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "apply rejected: "+err.Error())
+			return
+		}
+		if released, ok := errors.AsType[*applyLockReleasedError](err); ok {
+			s.logger.Warn("apply rejected: the database lock it would record was released or acquired again while it was being queued; no apply was created",
+				"plan_id", req.PlanID, "database", released.Database, "environment", req.Environment, "error", released.Err)
+			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeLockChanged, "apply rejected: "+err.Error())
 			return
 		}
 		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
@@ -1681,6 +1681,11 @@ const applyMetricStatusRejected = "rejected"
 
 func applyMetricStatusForError(err error) string {
 	if errors.Is(err, storage.ErrActiveApplyExists) {
+		return "conflict"
+	}
+	// A lock released while the apply was being queued is a race with the
+	// operator who released it, not a server failure.
+	if _, ok := errors.AsType[*applyLockReleasedError](err); ok {
 		return "conflict"
 	}
 	if isPlanAdmissionRefusal(err) {
@@ -1857,6 +1862,38 @@ func isApplyCreationStorageRefusal(err error) bool {
 	}
 	return errors.Is(err, storage.ErrLockIntentChanged)
 }
+
+// isRecordedLockGone reports whether storing an apply failed because the lock
+// row it would record was released, or released and acquired again, after
+// apply creation read it. Storage locks that row in the transaction that
+// creates the apply, so a release that checks for applies before it deletes
+// the row cannot interleave with the create; the create refuses instead.
+func isRecordedLockGone(err error) bool {
+	if errors.Is(err, storage.ErrLockNotFound) {
+		return true
+	}
+	return errors.Is(err, storage.ErrLockReplaced)
+}
+
+// applyLockReleasedError refuses an apply whose database lock was released,
+// or released and acquired again, while the apply was being queued. No apply
+// was created.
+type applyLockReleasedError struct {
+	Database string
+	Err      error
+}
+
+// Error names which of the two happened, since they need different next steps:
+// a released lock has to be taken again, and a lock taken again may now be
+// someone else's.
+func (e *applyLockReleasedError) Error() string {
+	if errors.Is(e.Err, storage.ErrLockReplaced) {
+		return fmt.Sprintf("the lock on database %q was released and taken again while this apply was being queued, so nothing was queued; check who holds it with `schemabot locks`, then apply again", e.Database)
+	}
+	return fmt.Sprintf("the lock on database %q was released while this apply was being queued, so nothing was queued; take the lock again, then apply again", e.Database)
+}
+
+func (e *applyLockReleasedError) Unwrap() error { return e.Err }
 
 // PlanNotFoundError identifies an apply that names a plan SchemaBot has no
 // record of. It matches storage.ErrPlanNotFound, and carries the plan
@@ -2443,6 +2480,9 @@ func (s *Service) createStoredApply(
 	// apply exists, and handleApply's callers treat a 4xx as proof it does not.
 	storedApplyID, err := s.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)
 	if err != nil {
+		if isRecordedLockGone(err) {
+			return nil, 0, &applyLockReleasedError{Database: plan.Database, Err: err}
+		}
 		if isApplyCreationStorageRefusal(err) {
 			return nil, 0, fmt.Errorf("store apply and tasks: %w", err)
 		}
@@ -3920,13 +3960,24 @@ func validateSchemaFiles(schemaFiles map[string]*ternv1.SchemaFiles) (warning st
 
 // isPlanRefusal reports whether a Plan failure is the engine declining the
 // declared schema as written, from a local engine or from a remote data plane
-// that answered FailedPrecondition. The PR author fixes it by changing the
-// schema files, so it is not a SchemaBot fault and is not logged as an error.
+// that answered FailedPrecondition. The operator resolves it with the change
+// the refusal names, to the schema files or the target, so it is not a
+// SchemaBot fault and is not logged as an error.
 func isPlanRefusal(err error) bool {
 	if engine.IsPlanRefused(err) {
 		return true
 	}
 	return grpcstatus.Code(err) == grpccodes.FailedPrecondition
+}
+
+// PlanFailureLog returns the log call for a failed plan: Warn for a plan the
+// engine refused, which the operator acts on and SchemaBot did not cause, and
+// Error for every other failure.
+func PlanFailureLog(logger *slog.Logger, err error) func(msg string, args ...any) {
+	if isPlanRefusal(err) {
+		return logger.Warn
+	}
+	return logger.Error
 }
 
 // planRefusalReason is a refusal's own text, without the gRPC status prefix a

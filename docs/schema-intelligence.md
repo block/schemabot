@@ -713,7 +713,9 @@ deployment can address several targets, each running its own copy of the change,
 so several rows for the same table share a deployment and differ in their
 target. The pair is read from the stored task's operation row, so a
 single-target apply reports its one member the same way, and a row the server
-cannot match to a stored task carries neither field.
+cannot match to a stored task carries neither field. A matched row also carries
+`operation_key`, naming the operation that runs it, since one target can run
+several operations when a rollout goes table by table.
 A sharded apply lists one operation per shard and table it changes, plus each
 keyspace's finalizer, and the response sets `sharded: true`. Its `tables` are
 then rolled up across the shards: one entry per keyspace table, with `status`
@@ -747,6 +749,12 @@ engine reports them: PostgreSQL applies report their position through `phase`,
 `step`, `steps_total`, and `statement`; PlanetScale applies report deploy
 request fields such as `branch_name` and `deploy_request_url`. Spirit applies
 currently report progress on the table entries and do not report position fields.
+The top-level `metadata` has one slot per key, so when an apply has more than
+one operation, each entry in `operations` also carries its own `metadata`: the
+display fields its driver last recorded for that operation, such as a
+PostgreSQL operation's `executor_operation` while it builds an index. Read an
+operation's own fields from there and match a table to its operation by
+`deployment` and `operation_key`.
 `engine` names the engine running the apply, in one of two forms depending on
 where the response comes from. While the data plane reports the apply's
 progress, it is the engine's display name: `Spirit`, `PlanetScale`, `Strata`, or
@@ -775,9 +783,12 @@ a data plane that fails the read or does not answer. Retry after a short wait.
 If it keeps failing, the cause is in the server logs and can be a configuration
 error that only an operator can fix. A server with no configuration for the
 apply's deployment answers `404` with `error_code` `deployment_not_found`, which
-retrying does not fix.
+retrying does not fix. When the server cannot read the apply or its tasks from
+its own storage, or the apply has no deployment recorded, the route answers
+`500` with `error_code` `storage_error` and a fixed message that names the apply
+and leaves the cause in the server logs; clients retry it as a transient failure.
 `schemabot status <apply_id>` prints "No schema change found" only for the
-unknown `apply_id`. It reports the other two answers as errors and exits
+unknown `apply_id`. It reports every other error answer as an error and exits
 non-zero.
 
 <details>
@@ -833,15 +844,16 @@ Response excerpt (illustrative values):
   "engine": "spirit",
   "state": "running",
   "operations": [
-    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "parallel"},
-    {"deployment": "commerce-a", "target": "shop-002", "state": "running", "cutover_policy": "parallel"},
-    {"deployment": "commerce-a", "target": "shop-003", "state": "completed", "cutover_policy": "parallel", "already_converged": true}
+    {"deployment": "commerce-a", "operation_key": "shop-001", "target": "shop-001", "state": "completed", "cutover_policy": "parallel"},
+    {"deployment": "commerce-a", "operation_key": "shop-002", "target": "shop-002", "state": "running", "cutover_policy": "parallel"},
+    {"deployment": "commerce-a", "operation_key": "shop-003", "target": "shop-003", "state": "completed", "cutover_policy": "parallel", "already_converged": true}
   ],
   "tables": [
     {
       "table_name": "orders",
       "deployment": "commerce-a",
       "target": "shop-001",
+      "operation_key": "shop-001",
       "ddl": "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)",
       "status": "completed",
       "estimated_bytes": 2400000000,
@@ -852,6 +864,7 @@ Response excerpt (illustrative values):
       "table_name": "orders",
       "deployment": "commerce-a",
       "target": "shop-002",
+      "operation_key": "shop-002",
       "ddl": "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)",
       "status": "running",
       "rows_copied": 2000000,
@@ -1094,17 +1107,24 @@ The top-level `metadata` has one slot per key, so on a multi-deployment apply it
 carries the first-created deployment's position; the CLI's per-deployment view
 omits the position rather than show one deployment's under every heading.
 
-While the running statement is a concurrent index build, the next line shows
-the server's build work for the phase in flight. A scan reports its blocks,
-the tuple load reports its tuples, a wait reports the lockers still
-outstanding, and a sort names itself; the line is labelled `building index`
-until validation starts and `validating index` after. PostgreSQL carries a
-completed phase's counters into the next phase, so only the counter the
-current phase owns is shown, and the attempt is included after a retry. For
-example: `building index: 25% of blocks (2,500/10,000) · attempt 2` while the
-heap is scanned, then `building index: sorting live tuples`, then
-`building index: 12,000/50,000 tuples`, and later
-`validating index: 93% of blocks (930/1,000)` or `waiting on 2 of 3 lockers`.
+While the running statement is a concurrent index build, its table draws a
+progress bar from its `percent_complete`, which for an index build is the
+whole build's percent across every phase. Under the table's statement, where
+a row copy shows its rows, a detail line shows the server's build work for the
+phase in flight. A scan reports its blocks, the tuple load reports its tuples,
+a wait reports the lockers still outstanding, and a sort names itself; the line
+is labelled `Building index` until validation starts and `Validating index`
+after. PostgreSQL carries a completed phase's counters into the next phase, so
+only the counter the current phase owns is shown, and the attempt is included
+after a retry. For example: `Building index: 2,500 of 10,000 blocks · attempt 2`
+while the heap is scanned, then `Building index: sorting live tuples`, then
+`Building index: 12,000 of 50,000 tuples`, and later
+`Validating index: 930 of 1,000 blocks` or `Waiting on 2 of 3 lockers`. The
+detail line shows raw counters only, so it never shows a second percent beside
+the bar.
+When the build is rolled out across targets, the table's line draws one bar
+from the mean of its targets' percents, counting a finished target as 100 and
+a queued one as 0, and stays below 100 until every target is done.
 
 The numbers come from the engine while the apply is active, so they are as
 fresh as the last poll. Once the apply is terminal, the same endpoint answers

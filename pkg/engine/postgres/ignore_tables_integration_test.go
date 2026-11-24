@@ -102,6 +102,7 @@ func TestEnginePlanIgnoreTablesRefusesDeclaredTable(t *testing.T) {
 		IgnoreTables: []string{"flyway_schema_history"},
 	})
 	require.Error(t, err, "Plan() must refuse a table that is both withheld and declared")
+	assert.True(t, engine.IsPlanRefused(err))
 	assert.Contains(t, err.Error(), "flyway_schema_history")
 	assert.Contains(t, err.Error(), `namespace "public"`)
 	assert.Contains(t, err.Error(), "Remove the entry or the schema file")
@@ -158,6 +159,7 @@ func TestEnginePlanIgnoreTablesPatternWithholdsRuntimeTableFamily(t *testing.T) 
 		IgnoreTables: []string{`/^relay_\d+_feed$/`},
 	})
 	require.Error(t, err, "Plan() must refuse a pattern that matches a declared table")
+	assert.True(t, engine.IsPlanRefused(err))
 	assert.Contains(t, err.Error(), `ignore_tables entry "/^relay_\d+_feed$/" matches "relay_1_feed", which a schema file in namespace "public" declares`)
 
 	for _, table := range []string{"users", "relay_1_feed", "relay_22_feed", "relay_feed_settings"} {

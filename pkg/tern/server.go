@@ -286,7 +286,7 @@ func planErrorCode(err error) codes.Code {
 func (s *Server) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
 	resp, err := s.client.PlanDiff(ctx, req)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(planErrorCode(err), err.Error())
 	}
 	return resp, nil
 }

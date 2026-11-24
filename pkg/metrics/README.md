@@ -327,8 +327,15 @@ should be investigated before relying on branch-protection state.
 reports the latest trustworthy installation budget, without a repository label.
 Group by `github_app`, `installation_id`, and `resource`, taking the minimum
 across replicas. Snapshots require a named App, positive installation ID, valid
-remaining/limit headers, and a future reset time. They disappear from collection
-when older than 120 seconds or when their reset time passes. Repeated scrapes,
+remaining/limit headers, and a reset time after the response was received.
+They disappear from collection when older than 120 seconds, and not before:
+a snapshot whose window resets stays exported until a newer reading replaces
+it or it ages out, so a routine hourly reset never turns an installation that
+is being read into an unknown budget. A snapshot is a reading of bounded age,
+not a lower bound on the budget: requests made since it was read, by this
+replica or any other consumer of the installation, are not in it, across a
+reset or not. A headroom threshold should leave room for what the
+installation can spend within the export age. Repeated scrapes,
 local quota refusals and secondary cooldown waits do not refresh observation age.
 Within one window the lowest allowance seen is kept, in any receipt order, even
 when GitHub later reports more; a later response with more remaining still
@@ -365,7 +372,8 @@ repositories may serve any repository, so its probe reads every active
 installation of the App instead (`operation="list_app_installations"`).
 
 `schemabot.github.rate_limit.unobserved_installations` makes a missing budget
-visible. It counts the probe's installations with no exportable snapshot, plus
+visible. It counts the probe's installations with no snapshot read within the
+export age (a reset does not count: see above), plus
 each configured owner whose installation the probe could not resolve on its
 last pass, plus one when the last pass could not list the App's installations
 at all, plus one when the probe has not reported its targets within the
