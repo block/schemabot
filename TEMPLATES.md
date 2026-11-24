@@ -11282,7 +11282,7 @@ ALTER TABLE `mutes`
 
 #### Keyspace `cdb_resolute_sharded`
 
-**`mutes`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% (1 of 4 shards)
+**`mutes`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.38% (1 of 4 shards)
 
 ```sql
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
@@ -11415,7 +11415,7 @@ ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);
 
 #### Keyspace `cdb_resolute_lookup`
 
-**`outcomes_lookup`**: 🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 27%
+**`outcomes_lookup`**: 🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 27.00%
 
 ```sql
 ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);

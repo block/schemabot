@@ -55,8 +55,9 @@ type TableReading struct {
 	Bar   string
 	Label string
 	// Activity marks a copy that has passed its row estimate. Its label
-	// reads ActivityLabel, and a surface that animates may draw its own bar
-	// and label in place of Bar and Label.
+	// reads ActivityLabel then ShardCoverageSuffix, and a surface that
+	// animates may draw its own bar and label in place of Bar and
+	// ActivityLabel.
 	Activity bool
 	// Throttled marks a change the engine's throttler is holding back. The
 	// headline says so after the label.
@@ -132,7 +133,7 @@ func readChecksum(f TableFacts) TableReading {
 	pct := ui.ChecksumDisplayPercent(f.ChecksumRowsChecked, f.ChecksumRowsTotal)
 	return TableReading{
 		Bar:   ui.ProgressBarRowCopy(pct),
-		Label: fmt.Sprintf("🔍 Checksumming to verify data (%s%s)", ui.FormatRowCopyPercent(pct, f.ChecksumRowsChecked, f.ChecksumRowsTotal), shardCoverageSuffix(f)),
+		Label: fmt.Sprintf("🔍 Checksumming to verify data (%s%s)", ui.FormatRowCopyPercent(pct, f.ChecksumRowsChecked, f.ChecksumRowsTotal), ShardCoverageSuffix(f)),
 		Details: []TableDetail{{Text: fmt.Sprintf("Rows verified: %s / %s",
 			ui.FormatNumber(ui.ClampRows(f.ChecksumRowsChecked, f.ChecksumRowsTotal)), ui.FormatNumber(f.ChecksumRowsTotal))}},
 	}
@@ -143,8 +144,10 @@ func readRunning(f TableFacts) TableReading {
 	switch {
 	case f.RowsTotal > 0 && ui.EstimateExceeded(f.RowsCopied, f.RowsTotal):
 		// The copy has passed the engine's estimate, so a percentage would
-		// read as done while rows are still moving.
-		return TableReading{Bar: ui.ProgressBarActivity(), Label: ActivityLabel, Activity: true, Details: []TableDetail{
+		// read as done while rows are still moving. While some shards have
+		// not reported, the label names the ones the copy covers, so it does
+		// not read as the whole table wrapping up.
+		return TableReading{Bar: ui.ProgressBarActivity(), Label: ActivityLabel + ShardCoverageSuffix(f), Activity: true, Details: []TableDetail{
 			{Text: fmt.Sprintf("Rows copied: %s so far", ui.FormatNumber(f.RowsCopied))},
 			{Text: ui.EstimateExceededTooltip, Note: true},
 		}}
@@ -157,7 +160,7 @@ func readRunning(f TableFacts) TableReading {
 	case f.RowsTotal > 0:
 		return TableReading{
 			Bar:     ui.ProgressBarRowCopy(ui.RowCopyDisplayPercent(f.PercentComplete, f.RowsCopied)),
-			Label:   ui.FormatRowCopyPercent(f.PercentComplete, f.RowsCopied, f.RowsTotal) + shardCoverageSuffix(f),
+			Label:   ui.FormatRowCopyPercent(f.PercentComplete, f.RowsCopied, f.RowsTotal) + ShardCoverageSuffix(f),
 			Details: []TableDetail{{Text: RowsLine(f)}},
 		}
 	case f.BuildWork.IsConcurrentIndexBuild():
@@ -224,9 +227,9 @@ func RowsLine(f TableFacts) string {
 	return text
 }
 
-// shardCoverageSuffix names the shards a percentage covers when only some
+// ShardCoverageSuffix names the shards a table's figures cover when only some
 // have reported.
-func shardCoverageSuffix(f TableFacts) string {
+func ShardCoverageSuffix(f TableFacts) string {
 	if !f.partialShards() {
 		return ""
 	}

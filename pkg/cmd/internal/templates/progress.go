@@ -779,12 +779,13 @@ func DocsLine(url string) string {
 // reads it (presentation.ReadInFlightTable): the bar and label beside the
 // table name, its statement, then the detail lines. A copy that has passed its
 // row estimate takes the caller's activity bar and label, which the watch view
-// animates.
+// animates, followed by the shards the copy covers.
 func writeInFlightTable(b *strings.Builder, t TableProgress, activityBar, activityLabel string) {
-	r := presentation.ReadInFlightTable(tableFacts(t))
+	f := tableFacts(t)
+	r := presentation.ReadInFlightTable(f)
 	headline := r.Headline()
 	if r.Activity {
-		headline = activityBar + " " + activityLabel + ui.ThrottledSuffix(r.Throttled)
+		headline = activityBar + " " + activityLabel + presentation.ShardCoverageSuffix(f) + ui.ThrottledSuffix(r.Throttled)
 	}
 	writeTableLine(b, t, "%s", headline)
 	if t.DDL != "" {

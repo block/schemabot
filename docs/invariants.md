@@ -1760,7 +1760,8 @@ renders the same rollouts through both surfaces and fails when they read differe
 
 While an engine works on a table's change, the table has one reading: the label beside its name,
 and the detail lines under its statement. This holds while the engine copies rows, builds an
-index, verifies a copy, catches up on changes, or applies a change that reports no progress. Each
+index, verifies a copy, catches up on changes, or applies a change that reports no progress, and
+whether the table runs on one target or copies across shards. Each
 engine reports its progress as the same table facts, and that reading is derived once from those
 facts and rendered by the CLI and the PR comment alike. So an operator watching two engines' schema
 changes sees the same phase named the same way, with the same figures in the same place. Only
@@ -1768,7 +1769,8 @@ markup and the bar's drawing may differ between surfaces. *Enforced:* the shared
 (`ReadInFlightTable` in `pkg/presentation/table_reading.go`), and a test that renders every phase
 for every engine in `storage.Engines` through both surfaces and fails when they read differently
 (`TestInFlightTableReadsTheSameOnEverySurface` in `pkg/cmd/internal/templates`), with
-`TestEnginesListsEveryEngineConstant` in `pkg/storage` keeping that list complete.
+`TestEnginesListsEveryEngineConstant` in `pkg/storage` keeping that list complete, and its sharded
+counterpart for a table copying across shards (`TestShardedInFlightTableReadsTheSameOnEverySurface`).
 
 ## Recovery (RC)
 
