@@ -257,11 +257,10 @@ func pruneGitHubQuotaWindows(windows map[int64]GitHubRateLimitSample, current Gi
 // A snapshot whose window has reset since stays exported until a newer reading
 // replaces it or it ages out. Like any snapshot, it is a reading no older than
 // the export age, not a bound on the budget now: requests made since, by this
-// replica or any other consumer of the installation, are not in it. A reset
-// only bounds how stale it can be the same way the export age always does.
-// Dropping it at the reset instead would report a budget that
-// was read moments ago as unknown until the next quota probe pass, which
-// fails a quota gate at every routine reset. An installation that stops being
+// replica or any other consumer of the installation, are not in it. Dropping
+// it at the reset instead would report a budget that was read moments ago as
+// unknown until the next quota probe pass, which fails a quota gate at every
+// routine reset. An installation that stops being
 // read still turns unknown, because its snapshot ages out.
 func snapshotExportable(sample GitHubRateLimitSample, now time.Time) bool {
 	elapsed := now.Sub(sample.ObservedAt)
