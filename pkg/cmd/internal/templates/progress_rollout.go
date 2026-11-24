@@ -803,27 +803,16 @@ var inFlightRollupOrder = []string{
 // the earliest phase any target is in, so the table never reads further along
 // than its slowest target. The targets that failed are named in the
 // per-target lines and the attention list beneath it. With nothing in
-// flight, a failure or halt comes first, then queued, then complete.
+// flight, presentation.RollupTaskStatus decides, as it does for the PR
+// comment. Reading in-flight work ahead of a failure is the one place this
+// differs from the PR comment, which puts a failure first.
 func rollupTaskStatus(statuses []string) string {
 	for _, phase := range inFlightRollupOrder {
 		if slices.Contains(statuses, phase) {
 			return phase
 		}
 	}
-	for _, halting := range []string{state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled} {
-		if slices.Contains(statuses, halting) {
-			return halting
-		}
-	}
-	for _, s := range statuses {
-		if s != state.Task.Pending && s != state.Task.Completed {
-			return s
-		}
-	}
-	if slices.Contains(statuses, state.Task.Pending) {
-		return state.Task.Pending
-	}
-	return state.Task.Completed
+	return presentation.RollupTaskStatus(statuses)
 }
 
 // writeTargetAttention names each failed or retrying target with its error
