@@ -1100,6 +1100,18 @@ func TestCatalogAndRowRefusalsNameTheirRemedies(t *testing.T) {
 		{code: executor.CodeDataFault, reason: "data-fault",
 			cause:  `the rows of "users" do not fit the shape the planned statement gives them`,
 			remedy: "correct the data or the statement, then re-plan against the current schema"},
+		{code: executor.CodeDroppedIndexDrift, reason: "planned-object-drift",
+			cause:  `the index or constraint the planned statement for "users" names changed after planning`,
+			remedy: "re-plan against the current schema"},
+		{code: executor.CodeDroppedObjectDrift, reason: "planned-object-drift",
+			cause:  `the index or constraint the planned statement for "users" names changed after planning`,
+			remedy: "re-plan against the current schema"},
+		{code: executor.CodeDroppedObjectHasDescendants, reason: "dropped-object-has-descendants",
+			cause:  `the planned drop on "users" would also reach unreviewed partitions or child tables`,
+			remedy: "make the drop outside SchemaBot on the whole table tree, then re-plan against the current schema"},
+		{code: executor.CodeDroppedIndexReplaced, reason: "dropped-index-replaced",
+			cause:  `the index drop on "users" removed an index created after review under the reviewed index's name`,
+			remedy: "inspect the table's indexes and recreate the dropped one if it should stay, then re-plan against the current schema"},
 	}
 	for _, tt := range tests {
 		t.Run(string(tt.code), func(t *testing.T) {
@@ -1113,6 +1125,69 @@ func TestCatalogAndRowRefusalsNameTheirRemedies(t *testing.T) {
 			assert.False(t, r.provisionable, "nothing to provision answers %q", tt.code)
 		})
 	}
+}
+
+// An index build on a partitioned table that the target's partition tree or
+// configuration rules out creates nothing, and an unchanged retry meets the
+// same tree. Each is a permanent refusal whose remedy names what has to
+// change first. A build that ran out of passes while partitions kept
+// appearing is the exception: a rerun resumes it, so it stays retryable.
+func TestPartitionedIndexBuildOutcomesNameTheirRemedies(t *testing.T) {
+	tests := []struct {
+		code          executor.Code
+		reason        string
+		cause         string
+		remedy        string
+		provisionable bool
+	}{
+		{code: executor.CodePartitionedIndexNameTaken, reason: "partitioned-index-name-taken",
+			cause:  `a name the index build on partitioned table "users" needs is held by another relation`,
+			remedy: "rename the index in the schema file and re-plan, or drop or rename the relation that holds the name"},
+		{code: executor.CodeForeignTablePartition, reason: "foreign-table-partition",
+			cause:  `a partition of "users" is a foreign table, which cannot have an index; nothing was created`,
+			remedy: "detach the foreign table partition, or leave the index out of the schema file, then re-plan against the current schema"},
+		{code: executor.CodeUniqueIndexPartitionKey, reason: "unique-index-partition-key",
+			cause:  `the unique index on "users" does not include every partition key column`,
+			remedy: "add the partition key columns to the index in the schema file, then re-plan against the current schema"},
+		{code: executor.CodeTableLockUnconfirmed, reason: "insufficient-privileges",
+			cause:         `the connected role cannot see other sessions' start times, which the index build on "users" needs`,
+			remedy:        "grant the role pg_read_all_stats, then re-run",
+			provisionable: true},
+		{code: executor.CodePartitionDetachPending, reason: "partition-detach-pending",
+			cause:  `a partition of "users" has an unfinished concurrent detach`,
+			remedy: "finish the detach with ALTER TABLE ... DETACH PARTITION ... FINALIZE, then re-run"},
+		{code: executor.CodePartitionedIndexTablespace, reason: "unsupported-statement-shape",
+			cause:  `the index on "users" names a TABLESPACE, which the partitions' indexes would not use`,
+			remedy: "remove the TABLESPACE clause from the schema file, then re-plan against the current schema"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.code), func(t *testing.T) {
+			r, known := refusalForOutcome(tt.code, "users")
+			require.True(t, known)
+			require.NotNil(t, r, "outcome %q must not fall into the retryable tail", tt.code)
+			assert.True(t, tt.code.Permanent(), "the engine marks %q permanent", tt.code)
+			assert.Equal(t, tt.reason, r.reason)
+			assert.Equal(t, tt.cause, r.cause)
+			assert.Equal(t, tt.remedy, r.remedy)
+			assert.Equal(t, tt.provisionable, r.provisionable)
+		})
+	}
+
+	unsettled, known := refusalForOutcome(executor.CodePartitionedIndexUnsettled, "users")
+	assert.True(t, known)
+	assert.Nil(t, unsettled, "a build that a rerun resumes must stay retryable")
+}
+
+// A reviewed index drop that ran, but whose check of which index it removed
+// failed, must not be retried blindly: the retry would drop whatever holds
+// the name now.
+func TestDropOutcomeUnknownFailsClosed(t *testing.T) {
+	r, known := refusalForOutcome(executor.CodeDropOutcomeUnknown, "users")
+	require.True(t, known)
+	require.NotNil(t, r, "an unknown drop outcome must not fall into the retryable tail")
+	assert.Equal(t, "drop-outcome-unknown", r.reason)
+	assert.Equal(t, `an index drop on "users" ran, and which index it removed could not be confirmed`, r.cause)
+	assert.Equal(t, "inspect the table's indexes before re-running", r.remedy)
 }
 
 // The unverified cause carries only the table name, so like the collision
@@ -1223,6 +1298,12 @@ func TestEveryRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 		"create name mismatch":       {cause: &executor.CreateNameMismatchError{Schema: "public", Table: widest, Missing: []string{widest}, Unclaimed: []string{widest}}},
 		"statement budget exhausted": {cause: &executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Second}, pastFirstStep: true, typedSentence: true},
 		"invalid index on another table": {cause: &executor.InvalidIndexError{Schema: widest, Index: widest, Table: widest, Cleanup: executor.ErrInvalidIndexOnOtherTable},
+			pastFirstStep: true, namesIndex: true},
+		"invalid index the rows violate": {cause: &executor.InvalidIndexError{Schema: widest, Index: widest, Table: widest,
+			Build: &pgconn.PgError{Code: "23505"}, Cleanup: executor.ErrBuildLeftInvalidIndex},
+			pastFirstStep: true, namesIndex: true},
+		"invalid index the rows violate, not proven its own": {cause: &executor.InvalidIndexError{Schema: widest, Index: widest, Table: widest,
+			Build: &pgconn.PgError{Code: "23505"}, Cleanup: executor.ErrAbandonmentUnproven},
 			pastFirstStep: true, namesIndex: true},
 		"invalid index the server will not drop": {cause: &executor.InvalidIndexError{Schema: widest, Index: widest, Table: widest, Cleanup: executor.ErrInvalidIndexNotDroppable},
 			pastFirstStep: true, namesIndex: true},
@@ -2523,6 +2604,10 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 		// Keep the outcome vocabulary total. pg-sprite requires catalog inspection
 		// before retrying an unknown commit outcome.
 		executor.CodeRowSecurityOutcomeUnknown: "inspect the catalog before deciding whether to retry",
+		// The drop ran and the check of which index it removed failed.
+		// SchemaBot's retry re-runs the drop against whatever holds the name
+		// now, so the apply waits for an operator to read the catalog.
+		executor.CodeDropOutcomeUnknown: "a retry replays a drop that already ran",
 	}
 	for _, code := range executor.Codes() {
 		t.Run(string(code), func(t *testing.T) {

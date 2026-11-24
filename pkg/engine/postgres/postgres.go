@@ -1378,6 +1378,9 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 			unrecognized: &unrecognizedPlannerVocabulary{kind: "plan_contract", value: strconv.Itoa(formatVersion)},
 		}
 	}
+	if verdict, ok := executionContractVerdict(statement.Execution, table); !ok {
+		return verdict
+	}
 	if statement.Disposition == router.DispositionExecute && statement.Route == planner.RouteNative &&
 		statement.Backend == router.BackendNative && len(statement.ExecSQL) > 0 {
 		return stepVerdict{}
@@ -1451,6 +1454,37 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 	}
 }
 
+// executionContractVerdict checks the execution contract the planner attached
+// to a statement's steps, which says how they must run. SchemaBot runs a
+// statement's steps one at a time, each in its own transaction, so that
+// contract, or no steps at all, leaves the verdict to the disposition and
+// reports ok. Any other contract is a blocked verdict, since running its
+// steps one at a time is not what the contract asks for:
+//
+//   - A partitioned index build's one step is a CREATE INDEX on a partitioned
+//     table that must not run as written, because the plain statement builds
+//     every partition's index under a lock that blocks writes to the whole
+//     table. SchemaBot does not drive the partition-by-partition build yet.
+//   - A contract this build does not know is reported as vocabulary that
+//     moved, so the caller logs it.
+func executionContractVerdict(execution planner.Execution, table string) (stepVerdict, bool) {
+	switch execution {
+	case "", planner.ExecutionAutocommit:
+		return stepVerdict{}, true
+	case planner.ExecutionPartitionedIndexBuild:
+		return stepVerdict{
+			mode:   engine.ExecutionModeBlocked,
+			reason: fmt.Sprintf("statement for table %q builds an index on a partitioned table, which has to be built one partition at a time; SchemaBot's PostgreSQL support does not run that build yet", table),
+		}, false
+	default:
+		return stepVerdict{
+			mode:         engine.ExecutionModeBlocked,
+			reason:       fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table),
+			unrecognized: &unrecognizedPlannerVocabulary{kind: "execution", value: string(execution)},
+		}, false
+	}
+}
+
 // createShapeRefusalReason renders the create path's typed refusal cause in
 // SchemaBot's words, naming the clause the author wrote and what to do about
 // it. The mapping covers the planner's whole closed set of causes, so the
@@ -1487,6 +1521,10 @@ func createShapeRefusalReason(cause executor.CreateShapeCause, table string) (st
 	}
 	return fmt.Sprintf("statement for table %q %s", table, reason), true
 }
+
+// rebuildWithoutIntegerKeyReason is the sentence for a change that needs a
+// table rebuild on a table without an integer primary key.
+const rebuildWithoutIntegerKeyReason = "has to rebuild the table, which needs an integer primary key the table does not have, and SchemaBot's PostgreSQL support does not run table rebuilds yet; make the change outside SchemaBot"
 
 // rewriteRequiredReason renders the planner's typed guidance for a statement
 // that must not run as written, in SchemaBot's words, naming what the
@@ -1528,6 +1566,13 @@ func rewriteRequiredReason(guidance suggest.Guidance, table string) (string, boo
 		// destructive-change refusal. The case keeps the mapping complete
 		// for the day the planner attaches it here.
 		reason = "drops a column and adds it back, which discards every value the column holds; change the column's type in place with ALTER COLUMN ... TYPE ... USING ..., which converts its values"
+	case suggest.GuidanceAddIntegerPrimaryKey:
+		// Carried by the refusal of a table rebuild on a table with no
+		// primary key. Adding the key would not make the change run here,
+		// since SchemaBot does not run table rebuilds on PostgreSQL yet, so
+		// the sentence names both gaps and sends the change outside
+		// SchemaBot rather than to a re-plan that would refuse it again.
+		reason = rebuildWithoutIntegerKeyReason
 	default:
 		return "", false
 	}

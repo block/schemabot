@@ -219,6 +219,47 @@ func TestExecutionVerdictEmptyCreateShapeCause(t *testing.T) {
 	}, "users", nil))
 }
 
+// An index build on a partitioned table has to run one partition at a time;
+// run as the plain statement it would lock the whole partition tree against
+// writes. SchemaBot does not drive that build, so a plan carrying it blocks
+// the statement in SchemaBot's words instead of running the native step.
+func TestExecutionVerdictBlocksPartitionedIndexBuild(t *testing.T) {
+	assert.Equal(t, stepVerdict{
+		mode:   engine.ExecutionModeBlocked,
+		reason: `statement for table "events" builds an index on a partitioned table, which has to be built one partition at a time; SchemaBot's PostgreSQL support does not run that build yet`,
+	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
+		Disposition: router.DispositionExecute,
+		Route:       planner.RouteNative,
+		Backend:     router.BackendNative,
+		Execution:   planner.ExecutionPartitionedIndexBuild,
+		ExecSQL:     []string{"CREATE INDEX events_created_at_idx ON public.events (created_at)"},
+	}, "events", nil))
+}
+
+// Every execution contract the planner can attach either runs as SchemaBot's
+// per-step native path or is blocked in SchemaBot's words; only a contract
+// outside the planner's closed set is reported as vocabulary that moved.
+func TestExecutionContractVerdictCoversEveryExecution(t *testing.T) {
+	for _, execution := range planner.Executions() {
+		t.Run(string(execution), func(t *testing.T) {
+			verdict, runs := executionContractVerdict(execution, "users")
+			assert.Nil(t, verdict.unrecognized, "a contract the planner names must have a sentence of its own")
+			if !runs {
+				assert.Equal(t, engine.ExecutionModeBlocked, verdict.mode)
+				assert.NotEmpty(t, verdict.reason)
+			}
+		})
+	}
+
+	verdict, runs := executionContractVerdict(planner.Execution("unknown"), "users")
+	assert.False(t, runs)
+	assert.Equal(t, stepVerdict{
+		mode:         engine.ExecutionModeBlocked,
+		reason:       `statement for table "users" has an unrecognized planner verdict`,
+		unrecognized: &unrecognizedPlannerVocabulary{kind: "execution", value: "unknown"},
+	}, verdict)
+}
+
 // rewriteRequiredSentences is the operator-facing sentence for every guidance
 // code the planner can attach to a statement it will not run as written,
 // keyed by the code so each one is pinned to its own remedy. The test below
@@ -235,6 +276,7 @@ var rewriteRequiredSentences = map[suggest.Guidance]string{
 	suggest.GuidanceCoordinatedTableRename:      `statement for table "users" renames a table, which breaks running application code that still uses the old name; run the rename outside SchemaBot together with the application deploy that uses the new name, or keep the old name readable through a view until every instance has moved, then re-plan`,
 	suggest.GuidanceCoordinatedConstraintRename: `statement for table "users" renames an index that backs a constraint, which also renames the constraint and breaks application code that still names the old one; run the rename outside SchemaBot together with the application deploy that stops using the old constraint name, then re-plan`,
 	suggest.GuidanceAlterColumnTypeInPlace:      `statement for table "users" drops a column and adds it back, which discards every value the column holds; change the column's type in place with ALTER COLUMN ... TYPE ... USING ..., which converts its values`,
+	suggest.GuidanceAddIntegerPrimaryKey:        `statement for table "users" has to rebuild the table, which needs an integer primary key the table does not have, and SchemaBot's PostgreSQL support does not run table rebuilds yet; make the change outside SchemaBot`,
 }
 
 // Every guidance code the planner can attach to a statement it will not run
