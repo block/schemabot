@@ -1036,6 +1036,12 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	assert.Contains(t, change.ModeReason, `statement for table "users":`)
 	assert.Contains(t, change.ModeReason, "1-byte threshold")
 	assert.Contains(t, change.ModeReason, "SchemaBot's ceiling for a native-safe apply")
+	// The blocked table still shows the size the ceiling measured; the
+	// refusal carries no row estimate, so the row count is omitted.
+	var size int64
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT pg_catalog.pg_total_relation_size('public.users'::regclass)").Scan(&size))
+	assert.Equal(t, &size, change.EstimatedBytes)
+	assert.Nil(t, change.EstimatedRows)
 }
 
 // TestEnginePlanTableSizeRefusalKeepsTableNameVerbatim proves the size verdict

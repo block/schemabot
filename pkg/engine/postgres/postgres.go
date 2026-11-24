@@ -398,6 +398,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		if err != nil {
 			return nil, fmt.Errorf("compare live tables against schema files in namespace %q: %w", namespace, err)
 		}
+		sizeDroppedTables(ctx, pool, req.Database, namespace, drops)
 		schemaChange.TableChanges = append(schemaChange.TableChanges, drops...)
 		if len(exempt) > 0 {
 			slices.Sort(exempt)
@@ -892,8 +893,10 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 	if isGreenfieldTable(report) {
 		return changes, nil
 	}
-	_, err := checkTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)
+	proof, err := checkTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)
 	if err == nil {
+		// The size the ceiling measured is also the plan's display estimate.
+		attachTableSize(changes, report.Table, sizeFromPreflight(database, report.Schema, proof))
 		return changes, nil
 	}
 	r := classifyRefusal(err, report.Table)
@@ -928,6 +931,9 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 			}
 			return nil, err
 		}
+		// The refused table is blocked, and its plan still shows the size
+		// the ceiling measured.
+		attachTableSize(changes, report.Table, sizeFromSizeRefusal(database, report.Schema, report.Table, sizeErr))
 		return changes, nil
 	}
 	if fullyBlocked {
