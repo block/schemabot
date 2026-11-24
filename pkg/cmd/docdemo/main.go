@@ -74,8 +74,13 @@ const ddl = "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"
 // fixture. Init's first fetch seeds the model; subsequent requests have the apply
 // ID supplied by that response. No private model fields or UI strings are copied.
 func live(p int, phase string, throttled bool, key string) string {
+	return liveIn("staging", p, phase, throttled, key)
+}
+
+// liveIn is live for an apply in the given environment.
+func liveIn(environment string, p int, phase string, throttled bool, key string) string {
 	response := apitypes.ProgressResponse{
-		ApplyID: "apply-example-73", Database: "shop", DatabaseType: "mysql", Environment: "staging", Engine: "Spirit", State: phase,
+		ApplyID: "apply-example-73", Database: "shop", DatabaseType: "mysql", Environment: environment, Engine: "Spirit", State: phase,
 		Tables: []*apitypes.TableProgressResponse{{TableName: "orders", Keyspace: "shop", ChangeType: "alter", DDL: ddl,
 			Status: phase, RowsCopied: int64(p) * 100000, RowsTotal: 10000000, PercentComplete: int32(p), ETASeconds: int64(100-p) * 12,
 			Throttled: throttled, ThrottleReason: "commit-latency 120ms >= 100ms"}},
@@ -94,7 +99,7 @@ func live(p int, phase string, throttled bool, key string) string {
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				panic(err)
 			}
-			if request.ApplyID != "apply-example-73" || request.Environment != "staging" {
+			if request.ApplyID != "apply-example-73" || request.Environment != environment {
 				panic("wrong cutover target")
 			}
 			if r.URL.Path == "/api/cutover" {
@@ -110,7 +115,7 @@ func live(p int, phase string, throttled bool, key string) string {
 		panic("unexpected fixture request: " + r.Method + " " + r.URL.Path)
 	}))
 	defer server.Close()
-	model := commands.NewWatchModel(server.URL, "shop", "staging", true)
+	model := commands.NewWatchModel(server.URL, "shop", environment, true)
 	batch := model.Init()().(tea.BatchMsg)
 	updated, _ := model.Update(batch[0]())
 	if key == "enter" {
@@ -309,6 +314,47 @@ func vitessDemo() Demo {
 		Frame{3, "", "The watcher confirms completion", vitess(state.Apply.Completed, nil, false)},
 	)
 	return Demo{Name: "cli-vitess", Title: "One deploy request. Progress across every shard.", Height: 740, Frames: frames}
+}
+
+// freezeDemo shows the core freeze workflow: a freeze refuses an apply, and
+// once it is lifted the same apply runs.
+func freezeDemo() Demo {
+	confirm := capture(func() {
+		t.WritePlanHeader(t.PlanHeaderData{Database: "shop", SchemaName: "schema", IsMySQL: true, IsApply: true})
+		changes := []t.DDLChange{{TableName: "orders", ChangeType: "alter", DDL: ddl}}
+		t.WriteEnvironmentHeader("production")
+		t.WriteNamespaceChanges([]t.NamespaceChange{{Namespace: "shop", Changes: changes}}, true, "shop", schema.DialectMySQL)
+		t.WritePlanSummary(changes)
+	}) + applyPrompt()
+	freeze := apitypes.Freeze{
+		ID: "freeze-abc", Environment: "production", Kind: "on_demand", Running: "continue",
+		StartsAt: time.Date(2026, 1, 15, 14, 30, 0, 0, time.UTC), Reason: "SEV-1234 payments latency",
+		CreatedBy: "alice", Source: "cli", InEffect: true,
+	}
+	created := capture(func() { t.WriteFreezeCreated(freeze) })
+	refused := capture(func() {
+		t.WriteChangeGateRefused(t.ChangeGateRefusedData{Environment: "production", Operation: "apply",
+			Blockers: []apitypes.ChangeGateBlocker{{Gate: "freeze", ID: freeze.ID, Reason: freeze.Reason}}})
+	})
+	if !strings.Contains(refused, "production is frozen. This change did not start.") {
+		panic("freeze refusal changed: " + refused)
+	}
+	lifted := capture(func() { t.WriteFreezeLifted(freeze) })
+	apply := "schemabot apply -s ./schema -e production"
+	frames := []Frame{
+		{3, `schemabot freeze -e production --reason "SEV-1234 payments latency"`, "An incident starts: freeze production", created},
+		{2, apply, "A schema change is ready to ship", confirm + "▌"},
+		{0.8, "", "", confirm + "yes"},
+		{4, "", "The freeze refuses it; nothing starts", confirm + "yes\n" + refused},
+		{3, `schemabot unfreeze freeze-abc --reason "SEV resolved"`, "The incident is over: lift the freeze", lifted},
+		{2, apply, "Run the same apply again", confirm + "▌"},
+		{0.8, "", "", confirm + "yes"},
+		{1.5, "", "With no freeze in effect, the apply starts", liveIn("production", 10, state.Apply.Running, false, "")},
+		{1, "", "", liveIn("production", 40, state.Apply.Running, false, "")},
+		{1, "", "", liveIn("production", 70, state.Apply.Running, false, "")},
+		{4, "", "The change is complete", liveIn("production", 100, state.Apply.Completed, false, "")},
+	}
+	return Demo{Name: "cli-freeze", Title: "Freeze production. Lift it to ship.", Height: 740, Bar: "shop · production", Frames: frames}
 }
 
 // Read the confirmation text from the actual apply command so this fixture
@@ -1016,7 +1062,7 @@ func main() {
 	}
 	stopFrames = append(stopFrames, Frame{3, "", "The watcher confirms completion", live(100, state.Apply.Completed, false, "")})
 	demos = append(demos, Demo{Name: "cli-stop", Title: "Stop and resume a change.", Frames: stopFrames})
-	demos = append(demos, vitessDemo(), rollbackDemo(), rolloutDemo(), targetDemo(), rolloutStopDemo())
+	demos = append(demos, vitessDemo(), rollbackDemo(), rolloutDemo(), targetDemo(), rolloutStopDemo(), freezeDemo())
 	fleetLines := busyFleet(now)
 	pull := capture(func() {
 		// The capture pipe is not a TTY; this frame represents an interactive terminal.

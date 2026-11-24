@@ -13,6 +13,7 @@ import (
 
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -257,7 +258,7 @@ func main() {
 		narrowed.Progress = append(narrowed.Progress, narrowedComment(narrowedTo, percent, 0, false))
 	}
 
-	out := map[string]any{"multiTarget": fanOut, "target": narrowed, "stop": stopDemo()}
+	out := map[string]any{"multiTarget": fanOut, "target": narrowed, "stop": stopDemo(), "freeze": freezeDemo()}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", " ")
 	if err := enc.Encode(out); err != nil {
@@ -311,6 +312,80 @@ func stopDemo() stopScenario {
 	}
 	for _, percents := range resumed {
 		demo.Resumed = append(demo.Resumed, rolloutComment(percents, 0, false))
+	}
+	return demo
+}
+
+// freezeScenario is an apply a freeze refuses, run again once the freeze is
+// lifted. The refused apply edits its apply comment to say it did not run and
+// posts the refusal below it; the second apply runs as usual.
+type freezeScenario struct {
+	Command  string   `json:"command"`
+	Plan     string   `json:"plan"`
+	Apply    string   `json:"apply"`
+	Refused  string   `json:"refused"`
+	Refusal  string   `json:"refusal"`
+	Progress []string `json:"progress"`
+	Complete string   `json:"complete"`
+	Summary  string   `json:"summary"`
+}
+
+// singlePlanComment is the plan comment of the one-target database the freeze
+// recording uses. refused marks an apply comment a change gate refused.
+func singlePlanComment(locked, refused bool) string {
+	data := templates.PlanCommentData{
+		Database: database, SchemaName: database, Environment: environment, HeadSHA: headSHA,
+		Repository: repository, RequestedBy: requestedBy, IsMySQL: true, DatabaseType: "mysql", Changes: changes(),
+	}
+	if locked {
+		data.IsLocked = true
+		data.LockOwner = lockOwner
+		data.LockAcquired = startedAt.Format("2006-01-02 15:04:05 UTC")
+	}
+	if refused {
+		data.RefusedByChangeGate, data.LockReleased, data.RefusalPosted = true, true, true
+	}
+	return templates.RenderPlanComment(data)
+}
+
+// singleComment renders the progress comment of the one-target apply, or its
+// summary once it has completed and summary is set.
+func singleComment(percent int, elapsed time.Duration, summary bool) string {
+	data := templates.ApplyStatusCommentData{
+		Database:    database,
+		Environment: environment,
+		State:       operationState(percent, false),
+		Engine:      "Spirit",
+		ApplyID:     "apply-example-93",
+		StartedAt:   startedAt.Format(time.RFC3339),
+		Tables:      []templates.TableProgressData{tableProgress("shop-001", percent, false)},
+	}
+	if data.State == state.Apply.Completed {
+		data.CompletedAt = startedAt.Add(elapsed).Format(time.RFC3339)
+	}
+	if summary {
+		return templates.RenderApplySummaryComment(data)
+	}
+	return templates.RenderApplyStatusComment(data)
+}
+
+func freezeDemo() freezeScenario {
+	demo := freezeScenario{
+		Command: "schemabot apply -e production",
+		Plan:    singlePlanComment(false, false),
+		Apply:   singlePlanComment(true, false),
+		Refused: singlePlanComment(true, true),
+		Refusal: templates.RenderChangeGateRefusal(templates.ChangeGateRefusalData{
+			CommandName: action.Apply, TakesOverride: true, Environment: environment, RequestedBy: requestedBy,
+			Timestamp: startedAt.Format("2006-01-02 15:04:05"),
+			Freezes:   []templates.RefusingFreeze{{ID: "freeze-abc", Reason: "SEV-1234 payments latency"}},
+			Approvers: []string{"example/db-approvers"},
+		}),
+		Complete: singleComment(100, 6*time.Minute, false),
+		Summary:  singleComment(100, 6*time.Minute, true),
+	}
+	for _, percent := range []int{5, 16, 28, 40, 52, 64, 76, 88, 98, cuttingOver} {
+		demo.Progress = append(demo.Progress, singleComment(percent, 0, false))
 	}
 	return demo
 }

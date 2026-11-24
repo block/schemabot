@@ -13,6 +13,7 @@ through the production Go templates and interactive `commands.WatchModel`:
 - `cli-multi-target.gif`: apply an index to an environment with four targets, follow their parallel copies, and watch each run its cutover as its copy finishes
 - `cli-target.gif`: apply the same index to one target with `--target` and follow it to completion
 - `cli-multi-target-stop.gif`: press **s** to stop the four-target rollout part-way, then run `start` and follow every stopped target from its checkpoint to completion
+- `cli-freeze.gif`: freeze production, confirm an apply that the freeze refuses with nothing started, lift the freeze, then run the same apply to completion
 
 They are template-based illustrations, not recordings of a live database.
 Commands are typed by the renderer, long operations are compressed, and the

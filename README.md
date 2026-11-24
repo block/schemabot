@@ -40,7 +40,11 @@ SchemaBot is declarative and GitOps-driven: SQL files in your repository provide
 
 <img src="./assets/cli-ops.gif" width="800" alt="Inspect fleet status, follow one change, and read its logs">
 
-[Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md)
+**Freeze an environment.** During an incident, hold new schema changes until you lift the freeze.
+
+<img src="./assets/cli-freeze.gif" width="800" alt="Freeze production, see an apply refused, lift the freeze, and run the apply">
+
+[Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md) · [Freeze an environment](./docs/cli.md#freeze-an-environment)
 
 Block runs SchemaBot for the majority of its production schema changes, including MySQL tables spanning terabytes and Vitess databases with hundreds of shards.
 

@@ -620,6 +620,8 @@ someone lifts it. Setting or lifting one is a write, and
 [`freeze.groups`](configuration.md#freeze-groups-forward-auth) members may do
 so without any other write access.
 
+![Freeze production, an apply that starts nothing while the freeze holds, then lift the freeze and run the same apply to completion](../assets/cli-freeze.gif)
+
 ```console
 $ schemabot freeze -e production --reason "SEV-1234 payments latency"
 $ schemabot freeze -e production --reason "holiday freeze" --planned \
