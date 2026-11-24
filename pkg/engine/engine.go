@@ -803,6 +803,13 @@ type TableChange struct {
 	// plan stores it with the change, and every path that hands the change to
 	// the engine for apply passes it back unchanged. Empty when the engine
 	// recorded nothing.
+	//
+	// An engine records only the identity of the objects the change acts on,
+	// never a value that differs between two plans of the same objects, such
+	// as a timestamp or a row estimate. SchemaBot relies on that: two plans
+	// of one statement act on the same objects exactly when their records are
+	// equal, so a confirmation given against one plan does not cover a
+	// re-plan whose record differs.
 	Metadata map[string]string
 }
 
