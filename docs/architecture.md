@@ -819,6 +819,9 @@ Two properties matter for display:
 2. Resolves the overall state via `progressState()`: the tracked terminal state
    (`stopped`, `failed`) is authoritative — Spirit's status only refines a
    non-terminal state (e.g. surfacing the sentinel wait for a deferred cutover).
+   A change marked `stopped` whose interrupted runner has not returned yet
+   reports `running` until it has (`stopAwaitsRunner`), since that runner can
+   still change the target on its way out.
 3. Builds per-table `engine.TableProgress` in `buildSpiritTableProgress()`:
    - Each table's `State` is the raw Spirit phase string (`copyRows`, `applyChangeset`, ...).
    - Calculates `Progress` percent (clamped 0–100) and preserves raw `RowsCopied`

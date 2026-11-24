@@ -312,11 +312,7 @@ func writeAggregateMetadata(sb *strings.Builder, data MultiDeploymentApplyData, 
 		fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID),
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
-	attributionAt := renderedAt
-	if data.RequestedBy == "" {
-		attributionAt = startedAtDisplay(data.StartedAt, renderedAt)
-	}
-	writeAppliedByOrTimestampAt(sb, data.RequestedBy, attributionAt)
+	writeAppliedByOrTimestampAt(sb, data.RequestedBy, startedAtDisplay(data.StartedAt, renderedAt))
 }
 
 // writeDeploymentCounts writes the per-status histogram so an operator sees
@@ -437,8 +433,9 @@ func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
 	if !data.Model.OffersRolloutStop() {
 		return
 	}
-	label, command := rolloutStopAction(footer)
-	writeRolloutFooterAction(sb, footerStart, label, command)
+	if label, command, ok := rolloutStopAction(footer); ok {
+		writeRolloutFooterAction(sb, footerStart, label, command)
+	}
 	if data.Model.RetryWaitsOnActiveApply() {
 		fmt.Fprintf(sb, "\n%s\n", presentation.RetryOnceSettledNote)
 	}
@@ -456,14 +453,20 @@ func writeRolloutFooterAction(sb *strings.Builder, footerStart int, label, comma
 }
 
 // rolloutStopAction is the label and command that stop the whole apply, or
-// cancel it on an engine whose control command is cancel.
-func rolloutStopAction(footer ApplyStatusCommentData) (string, string) {
+// cancel it on an engine whose control command is cancel. ok is false where
+// the engine can end none of the work in flight, so no command is offered.
+func rolloutStopAction(footer ApplyStatusCommentData) (string, string, bool) {
 	command := stopOrCancelCommand(footer)
-	label := "To stop this schema change:"
-	if command == "cancel" {
+	var label string
+	switch command {
+	case presentation.StopCommandStop:
+		label = "To stop this schema change:"
+	case presentation.StopCommandCancel:
 		label = "To cancel this schema change:"
+	default:
+		return "", "", false
 	}
-	return label, AppendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, footer.ApplyID, footer.Environment), footer.Tenant)
+	return label, AppendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, footer.ApplyID, footer.Environment), footer.Tenant), true
 }
 
 // rolloutFooterData is the apply-wide comment data the rollout footer renders

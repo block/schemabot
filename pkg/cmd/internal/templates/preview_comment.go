@@ -61,6 +61,7 @@ func previewCommentAllOutput() {
 		{"PLAN COMMENT (EXEMPT TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables()) }},
 		{"PLAN COMMENT (IGNORE TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables()) }},
 		{"PLAN COMMENT (DROP TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDropTables()) }},
+		{"PLAN COMMENT (DROP TABLES ENTRY NAMES NO TABLE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDropTablesUnmatched()) }},
 		{"PLAN COMMENT (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
 		{"PLAN COMMENT (EXISTING PRIMARY KEY WARNING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanPrimaryKeyWarning()) }},
 		{"PLAN COMMENT (NEW PRIMARY KEY ISSUE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanPrimaryKeyIssue()) }},
@@ -92,6 +93,8 @@ func previewCommentAllOutput() {
 		{"RECONCILIATION REQUIRED (COMPLETED)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationCompleted()) }},
 		{"SCHEMA CHANGE APPLY (AUTOMATIC)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlan()) }},
 		{"SCHEMA CHANGE APPLY (DOWNGRADED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanDowngraded()) }},
+		{"SCHEMA CHANGE APPLY (REFUSED BY A CHANGE GATE)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanChangeGateRefused()) }},
+		{"SCHEMA CHANGE APPLY (REFUSED BY A CHANGE GATE, REFUSAL NOT POSTED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanRefusalUnposted()) }},
 		{"SCHEMA CHANGE APPLY (UNSAFE + ALLOWED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanUnsafe()) }},
 		{"UNSAFE CHANGES BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentUnsafeBlocked()) }},
 		{"DROP COLUMN BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentDropColumnBlocked()) }},
@@ -212,6 +215,7 @@ func previewCommentPlanAllOutput() {
 		{"POSTGRES PLAN (EXEMPT TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables()) }},
 		{"MYSQL PLAN (IGNORE TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables()) }},
 		{"MYSQL PLAN (DROP TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDropTables()) }},
+		{"MYSQL PLAN (DROP TABLES ENTRY NAMES NO TABLE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDropTablesUnmatched()) }},
 		{"MYSQL PLAN (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
 		{"MYSQL PLAN (EXISTING PRIMARY KEY WARNING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanPrimaryKeyWarning()) }},
 		{"MYSQL PLAN (NEW PRIMARY KEY ISSUE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanPrimaryKeyIssue()) }},
@@ -322,6 +326,8 @@ func previewCommentApplyFlowAllOutput() {
 		{"SCHEMA CHANGE APPLY (AUTOMATIC)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlan()) }},
 		{"SCHEMA CHANGE APPLY (WITH OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanOptions()) }},
 		{"SCHEMA CHANGE APPLY (DOWNGRADED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanDowngraded()) }},
+		{"SCHEMA CHANGE APPLY (REFUSED BY A CHANGE GATE)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanChangeGateRefused()) }},
+		{"SCHEMA CHANGE APPLY (REFUSED BY A CHANGE GATE, REFUSAL NOT POSTED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanRefusalUnposted()) }},
 		{"SCHEMA CHANGE APPLY (VITESS + OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessApplyPlan()) }},
 		{"APPLY STARTED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStarted()) }},
 		// Blocked applies: the apply command was rejected before starting
@@ -397,6 +403,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"SECOND TABLE POST-CHECKSUM", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPostChecksum()) }},
 		{"THIRD TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyThirdRunning()) }},
 		// PostgreSQL: several statements on one table, each its own row
+		{"POSTGRESQL: INDEX BUILD RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPostgresIndexBuild()) }},
 		{"POSTGRESQL: MULTI-STATEMENT TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPostgresMultiStatement()) }},
 		// Sharded tables: compact per-shard summary (inline for few, collapsed for many)
 		{"SHARDED: SHARD PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyShardProgress()) }},

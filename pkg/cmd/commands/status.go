@@ -347,8 +347,9 @@ func showDatabaseHistory(endpoint, database, environment string, outputJSON, sho
 	}
 
 	templates.WriteDatabaseHistory(templates.DatabaseHistoryData{
-		Database: database,
-		Applies:  applies,
+		Database:    database,
+		Environment: environment,
+		Applies:     applies,
 	})
 
 	return nil

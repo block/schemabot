@@ -178,7 +178,7 @@ func (cmd *StoragePlanCmd) Run(ctx context.Context, g *Globals) error {
 		if err := encoder.Encode(apitypes.StorageSchemaPlanResponse{Report: report}); err != nil {
 			return fmt.Errorf("encode storage schema report: %w", err)
 		}
-	} else if err := outputStorageSchemaPlan(report, false, "", storageSchemaPlanHints(report)); err != nil {
+	} else if err := outputStorageSchemaPlan(report, false, nil, storageSchemaPlanHints(report)); err != nil {
 		return err
 	}
 	if report.Converged {
@@ -506,7 +506,7 @@ func blockUnattendedNamedSchema(selector string, autoApprove bool) error {
 // changes while converging a different schema than the one the refusal was
 // about — and on a cross-release convergence that is the schema of a different
 // release.
-func (cmd *StorageApplyCmd) rerunWithAllowUnsafe() string {
+func (cmd *StorageApplyCmd) rerunWithAllowUnsafe() []string {
 	parts := append([]string{"storage", "apply"}, cmd.targetArgs()...)
 	// A budget the operator chose is part of the run being offered back. An
 	// operator who shortened it to fail fast, and copies a command that drops
@@ -515,7 +515,7 @@ func (cmd *StorageApplyCmd) rerunWithAllowUnsafe() string {
 		parts = append(parts, "--timeout", cmd.Timeout.String())
 	}
 	parts = append(parts, cmd.sourceArgs()...)
-	return strings.Join(append(parts, "--allow-unsafe"), " ")
+	return append(parts, "--allow-unsafe")
 }
 
 // targetArgs renders the flags that address the same storage database again,
@@ -527,7 +527,7 @@ func (f *storageSchemaTargetFlags) targetArgs() []string {
 	var args []string
 	switch {
 	case strings.TrimSpace(f.DSN) != "":
-		args = append(args, "--dsn <the same DSN>")
+		args = append(args, "--dsn", "<the same DSN>")
 	case f.Config != "":
 		args = append(args, "--config", f.Config)
 	case f.Deployment != "":
@@ -550,7 +550,7 @@ func (f *storageSchemaTargetFlags) targetArgs() []string {
 // withPlan prints the plan for an unattended run, which has not printed one
 // yet. The error says the entries are listed above, and on that path nothing
 // has listed them.
-func blockManualStorageApply(report *apitypes.StorageSchemaReport, withPlan bool, rerun string) error {
+func blockManualStorageApply(report *apitypes.StorageSchemaReport, withPlan bool, rerun []string) error {
 	if len(report.Manual) == 0 {
 		return nil
 	}
@@ -583,7 +583,7 @@ func blockManualStorageApply(report *apitypes.StorageSchemaReport, withPlan bool
 // withPlan prints the plan for an unattended run, which has not printed one
 // yet. Naming refused statements without showing them would send the operator
 // back to `storage plan` to find out what was refused.
-func blockDestructiveStorageApply(report *apitypes.StorageSchemaReport, withPlan bool, rerun string) error {
+func blockDestructiveStorageApply(report *apitypes.StorageSchemaReport, withPlan bool, rerun []string) error {
 	if report.DestructiveAllowed || len(report.Destructive) == 0 {
 		return nil
 	}
@@ -841,7 +841,7 @@ func (cmd *StorageApplyCmd) seeWhatIsLeft() string {
 	}
 	plan := append([]string{"storage", "plan"}, cmd.targetArgs()...)
 	plan = append(plan, cmd.sourceArgs()...)
-	return fmt.Sprintf("Run `%s` to see what is left.", cliname.Command(strings.Join(plan, " ")))
+	return fmt.Sprintf("Run `%s` to see what is left.", cliname.Command(plan...))
 }
 
 // converge runs the convergence over whichever path the flags selected, against

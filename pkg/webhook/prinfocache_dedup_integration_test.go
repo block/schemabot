@@ -61,7 +61,7 @@ func TestRollbackConfirmHandlerDoesNotFetchPRForNoLock(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	applyIdentifier := "apply_rbconfirm_dedup"
 	_, err := svc.Storage().Applies().Create(t.Context(), &storage.Apply{

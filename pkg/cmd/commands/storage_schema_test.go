@@ -579,21 +579,21 @@ func TestStorageApplyCmd_RerunCommandAddressesTheSameTarget(t *testing.T) {
 	tests := []struct {
 		name  string
 		cmd   StorageApplyCmd
-		rerun string
+		rerun []string
 	}{
 		{
 			name:  "the server's own storage",
-			rerun: "storage apply --allow-unsafe",
+			rerun: []string{"storage", "apply", "--allow-unsafe"},
 		},
 		{
 			name:  "a data plane's storage",
 			cmd:   StorageApplyCmd{storageSchemaTargetFlags: storageSchemaTargetFlags{Deployment: "shard-a", Environment: "production"}},
-			rerun: "storage apply --deployment shard-a -e production --allow-unsafe",
+			rerun: []string{"storage", "apply", "--deployment", "shard-a", "-e", "production", "--allow-unsafe"},
 		},
 		{
 			name:  "resolved from a config file",
 			cmd:   StorageApplyCmd{storageSchemaTargetFlags: storageSchemaTargetFlags{Config: "/etc/schemabot/config.yaml"}},
-			rerun: "storage apply --config /etc/schemabot/config.yaml --allow-unsafe",
+			rerun: []string{"storage", "apply", "--config", "/etc/schemabot/config.yaml", "--allow-unsafe"},
 		},
 		{
 			name: "a DSN is named, not repeated",
@@ -601,7 +601,7 @@ func TestStorageApplyCmd_RerunCommandAddressesTheSameTarget(t *testing.T) {
 				DSN:     "postgres://schemabot:hunter2@db-1.example:5432/schemabot",
 				Dialect: "postgres",
 			}},
-			rerun: "storage apply --dsn <the same DSN> --dialect postgres --allow-unsafe",
+			rerun: []string{"storage", "apply", "--dsn", "<the same DSN>", "--dialect", "postgres", "--allow-unsafe"},
 		},
 		{
 			name: "a chosen budget is carried over",
@@ -609,7 +609,7 @@ func TestStorageApplyCmd_RerunCommandAddressesTheSameTarget(t *testing.T) {
 				storageSchemaTargetFlags: storageSchemaTargetFlags{Deployment: "shard-a", Environment: "production"},
 				Timeout:                  10 * time.Minute,
 			},
-			rerun: "storage apply --deployment shard-a -e production --timeout 10m0s --allow-unsafe",
+			rerun: []string{"storage", "apply", "--deployment", "shard-a", "-e", "production", "--timeout", "10m0s", "--allow-unsafe"},
 		},
 		{
 			// The refused statements were computed against the named release,
@@ -620,21 +620,21 @@ func TestStorageApplyCmd_RerunCommandAddressesTheSameTarget(t *testing.T) {
 				Release: "v1.5.0",
 				Repo:    "example/mirror",
 			}},
-			rerun: "storage apply --release v1.5.0 --release-repo example/mirror --allow-unsafe",
+			rerun: []string{"storage", "apply", "--release", "v1.5.0", "--release-repo", "example/mirror", "--allow-unsafe"},
 		},
 		{
 			name: "a named checkout travels with the permission",
 			cmd: StorageApplyCmd{storageSchemaSourceFlags: storageSchemaSourceFlags{
 				SchemaDir: "./pkg/schema/mysql",
 			}},
-			rerun: "storage apply --schema-dir ./pkg/schema/mysql --allow-unsafe",
+			rerun: []string{"storage", "apply", "--schema-dir", "./pkg/schema/mysql", "--allow-unsafe"},
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			rerun := tc.cmd.rerunWithAllowUnsafe()
 			assert.Equal(t, tc.rerun, rerun)
-			assert.NotContains(t, rerun, "hunter2", "a suggested command must not print the storage credentials")
+			assert.NotContains(t, strings.Join(rerun, " "), "hunter2", "a suggested command must not print the storage credentials")
 		})
 	}
 }

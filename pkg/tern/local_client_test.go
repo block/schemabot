@@ -703,6 +703,7 @@ type fakeControlEngine struct {
 	cancelCount             int
 	cancelErr               error
 	startCount              int
+	startErr                error
 	cutoverCount            int
 	cutoverResult           *engine.ControlResult
 	cutoverErr              error
@@ -779,6 +780,9 @@ func (e *fakeControlEngine) Cancel(context.Context, *engine.ControlRequest) (*en
 
 func (e *fakeControlEngine) Start(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.startCount++
+	if e.startErr != nil {
+		return nil, e.startErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
@@ -1288,6 +1292,7 @@ func TestPlanWithEngine_RefusesIgnoredNamespacesOnDatabaseScopedMySQLDSN(t *test
 		IgnoredNamespaces: []string{"local_fixtures"},
 	}, "testdb", schema.SchemaFiles{"testdb": {Files: map[string]string{"users.sql": "CREATE TABLE users (id INT)"}}})
 	require.Error(t, err)
+	assert.True(t, engine.IsPlanRefused(err))
 	assert.Contains(t, err.Error(), "ignore_namespaces is not supported for MySQL targets whose DSN names a database")
 	assert.Contains(t, err.Error(), "local_fixtures")
 }
@@ -1309,6 +1314,7 @@ func TestPlanWithEngine_RefusesUnselectedNamespacesOnDatabaseScopedMySQLDSN(t *t
 		UnselectedNamespaces: []string{"ns_1"},
 	}, "orders", schema.SchemaFiles{"ns_0": {Files: map[string]string{"orders.sql": "CREATE TABLE orders (id INT)"}}})
 	require.Error(t, err)
+	assert.True(t, engine.IsPlanRefused(err))
 	assert.Contains(t, err.Error(), "a targets entry that selects namespaces is not supported for MySQL targets whose DSN names a database")
 	assert.Contains(t, err.Error(), "unselected namespaces [ns_1] would have their live tables planned as DROP TABLE")
 }

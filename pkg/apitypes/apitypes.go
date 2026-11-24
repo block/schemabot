@@ -105,6 +105,7 @@ const (
 	ErrCodeDeferredCutoverCapacity = "deferred_cutover_capacity" // --defer-cutover refused: the apply would hold more drivers at its cutover than are left for deferred work; apply without the flag
 	ErrCodeChangeGateRefused       = "change_gate_refused"       // Apply, start or cutover refused by a change gate, such as a freeze; the blockers say why
 	ErrCodeChangeGateUnavailable   = "change_gate_unavailable"   // SchemaBot could not check the change gates, so nothing started; retry
+	ErrCodeLockChanged             = "lock_changed"              // Apply refused: the database lock it would record was released, or released and taken again, while it was queued; nothing was stored
 )
 
 var retryableErrorCodes = map[string]bool{
@@ -975,6 +976,13 @@ type PlanResponse struct {
 	// on the response to the plan request only; a stored plan does not retain
 	// it. Empty when nothing was exempted, which is the ordinary case.
 	ExemptTables []*ExemptTablesResponse `json:"exempt_tables,omitempty"`
+	// UnmatchedDropTables lists the drop_tables entries that name no live
+	// table on the target, in the order the config lists them, so the plan
+	// says the entry drops nothing instead of reading as if the table were
+	// seen and kept. Like ExemptTables it describes the target at planning
+	// time and a stored plan does not retain it. Empty when every entry
+	// matched or the config lists none.
+	UnmatchedDropTables []string `json:"unmatched_drop_tables,omitempty"`
 	// Rollout describes the plan of every member of the rollout when the
 	// environment fans out to more than one: the members grouped by the plan
 	// each runs, and the members that need attention before an apply can run
@@ -1978,6 +1986,12 @@ type ProgressOperationResponse struct {
 	RolloutStep int    `json:"rollout_step,omitempty"`
 	StartedAt   string `json:"started_at,omitempty"`
 	CompletedAt string `json:"completed_at,omitempty"`
+	// Metadata is the progress display metadata this operation's driver last
+	// recorded, such as its statement position and the server's report of the
+	// work in flight. The response's top-level metadata speaks for one
+	// operation only, so a table in a rollout reads its work from here, on the
+	// operation that runs it (TableProgressResponse.OperationKey).
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // ProgressOperationRef names one operation of an apply by its deployment and
@@ -1999,7 +2013,12 @@ type TableProgressResponse struct {
 	// deployment can address several targets, each running its own copy of the
 	// change, so the deployment alone does not say which member's progress this
 	// row reports.
-	Target          string `json:"target,omitempty"`
+	Target string `json:"target,omitempty"`
+	// OperationKey names, with Deployment, the operation that runs this table,
+	// since one target can run several operations. Empty when the table
+	// belongs to no listed operation, and on an operation with the legacy
+	// single-operation key.
+	OperationKey    string `json:"operation_key,omitempty"`
 	Keyspace        string `json:"keyspace,omitempty"`
 	ChangeType      string `json:"change_type,omitempty"` // create, alter, drop
 	Status          string `json:"status"`
@@ -2053,6 +2072,10 @@ type ShardProgressResponse struct {
 	// Non-zero only while the shard is checksumming (verifying copied data).
 	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`
 	ChecksumRowsTotal   int64 `json:"checksum_rows_total,omitempty"`
+	// CopiesNoRows is true when every change this shard runs on the table
+	// copies no rows (a CREATE TABLE, a DROP TABLE, or an instant ALTER), so
+	// a running shard reads as applying rather than running a table copy.
+	CopiesNoRows bool `json:"copies_no_rows,omitempty"`
 }
 
 // ApplyHistoryResponse represents a single apply in the history.

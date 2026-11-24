@@ -31,6 +31,7 @@ func PreviewCommentApplyPostgresMultiStatement() string {
 	tables := samplePostgresMultiStatementTables()
 	tables[0].Status = state.Task.Completed
 	tables[1].Status = state.Task.Running
+	tables[1].PercentComplete = 10
 	tables[2].Status = state.Task.Pending
 	data := samplePostgresApplyData(state.Apply.Running, tables)
 	data.Step, data.StepsTotal = 2, 3
@@ -38,6 +39,25 @@ func PreviewCommentApplyPostgresMultiStatement() string {
 	data.BuildWork = apitypes.BuildWork{
 		Operation: "concurrent-index-build", ServerPhase: "building index: scanning table",
 		BlocksDone: 2500, BlocksTotal: 10000,
+	}
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyPostgresIndexBuild renders a PostgreSQL apply whose only
+// statement is a concurrent index build: the table's bar is the whole build's
+// percent, the line under the step names the phase's own counters, and the
+// footer offers cancel, the one command that can end the build.
+func PreviewCommentApplyPostgresIndexBuild() string {
+	tables := []TableProgressData{{
+		Namespace: "public", TableName: "users", Status: state.Task.Running, PercentComplete: 25,
+		DDL: "CREATE INDEX CONCURRENTLY idx_users_email_created ON users (email, created_at)",
+	}}
+	data := samplePostgresApplyData(state.Apply.Running, tables)
+	data.Step, data.StepsTotal = 1, 1
+	data.Statement = "CREATE INDEX CONCURRENTLY idx_users_email_created ON public.users (email, created_at)"
+	data.BuildWork = apitypes.BuildWork{
+		Operation: "concurrent-index-build", ServerPhase: "building index: scanning table",
+		BlocksDone: 30000, BlocksTotal: 48000,
 	}
 	return RenderApplyStatusComment(data)
 }

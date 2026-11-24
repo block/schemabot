@@ -53,7 +53,7 @@ func newReconcileTestHandlerWithLoggerAndSettings(t *testing.T, logger *slog.Log
 	ghc, mux := setupGitHubServer(t)
 	service := api.New(&durableWebhookTestStorage{webhookEvents: store, settings: settings}, &api.ServerConfig{Repos: repos}, nil, logger)
 	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghc, logger)}
-	h := NewHandler(service, factory, nil, logger, append([]HandlerOption{WithDurableWebhookDispatch(), WithWebhookReconciler()}, opts...)...)
+	h := NewHandler(service, factory, nil, logger, append([]HandlerOption{WithDurableWebhookDispatch(), WithWebhookReconciler(), WithInsecureSkipSignatureVerification()}, opts...)...)
 	// Tests drive consecutive passes back to back on one handler, which the
 	// per-repository scan claim would otherwise skip until the claim expired.
 	// Tests of the claim itself set their own duration.

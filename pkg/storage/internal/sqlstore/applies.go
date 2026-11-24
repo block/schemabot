@@ -930,6 +930,9 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	if err := verifyExpectedLockIntent(ctx, writeTx.tx, apply); err != nil {
 		return 0, err
 	}
+	if err := pinRecordedLock(ctx, writeTx.tx, apply); err != nil {
+		return 0, err
+	}
 	if err := checkFreezeEpochGuard(ctx, writeTx.tx); err != nil {
 		return 0, fmt.Errorf("create apply %s: %w", apply.ApplyIdentifier, err)
 	}
@@ -1217,6 +1220,9 @@ func (s *applyStore) createWithRowsOnce(ctx context.Context, apply *storage.Appl
 	if err := verifyExpectedLockIntent(ctx, writeTx.tx, apply); err != nil {
 		return 0, err
 	}
+	if err := pinRecordedLock(ctx, writeTx.tx, apply); err != nil {
+		return 0, err
+	}
 	if err := checkFreezeEpochGuard(ctx, writeTx.tx); err != nil {
 		return 0, fmt.Errorf("%s %s: %w", opName, apply.ApplyIdentifier, err)
 	}
@@ -1339,6 +1345,50 @@ func verifyExpectedLockIntent(ctx context.Context, tx *rebindTx, apply *storage.
 	}
 	apply.LockID = lockID
 	return nil
+}
+
+// pinRecordedLock locks the lock row an apply records as its lock, in the
+// transaction that inserts the apply, so a release that checks for applies
+// recording the row before it deletes it either sees this apply or deletes
+// the row first and makes this create refuse. An apply with an expected lock
+// owner already locked its row in verifyExpectedLockIntent, and an apply that
+// records no lock has no row to pin.
+//
+// It returns ErrLockNotFound when no lock is held for the apply's database
+// any more, and ErrLockReplaced when a different lock row holds it.
+func pinRecordedLock(ctx context.Context, tx *rebindTx, apply *storage.Apply) error {
+	if apply.ExpectedLockOwner != "" || apply.LockID == 0 {
+		return nil
+	}
+	database := storage.CanonicalKey(apply.Database)
+	databaseType := storage.CanonicalKey(apply.DatabaseType)
+	var lockID int64
+	err := tx.QueryRowContext(ctx, `
+		SELECT id
+		FROM locks
+		WHERE id = ? AND database_name = ? AND database_type = ?
+		FOR UPDATE
+	`, apply.LockID, database, databaseType).Scan(&lockID)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("lock row %d recorded by apply %s for %s/%s: %w", apply.LockID, apply.ApplyIdentifier, apply.Database, apply.DatabaseType, err)
+	}
+	var currentID int64
+	err = tx.QueryRowContext(ctx, `
+		SELECT id FROM locks WHERE database_name = ? AND database_type = ?
+	`, database, databaseType).Scan(&currentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("apply %s records lock row %d for %s/%s, which was released: %w",
+			apply.ApplyIdentifier, apply.LockID, apply.Database, apply.DatabaseType, storage.ErrLockNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("read the lock for %s/%s after apply %s found its lock row %d gone: %w",
+			apply.Database, apply.DatabaseType, apply.ApplyIdentifier, apply.LockID, err)
+	}
+	return fmt.Errorf("apply %s records lock row %d for %s/%s, which lock row %d replaced: %w",
+		apply.ApplyIdentifier, apply.LockID, apply.Database, apply.DatabaseType, currentID, storage.ErrLockReplaced)
 }
 
 func insertApplyTasksAndOperations(ctx context.Context, tx *rebindTx, identity identityInserter, classifier ErrorClassifier, apply *storage.Apply, applyID int64, tasks []*storage.Task, operations []*storage.ApplyOperation) error {
@@ -4153,7 +4203,7 @@ func (s *applyStore) Delete(ctx context.Context, id int64) error {
 	if err != nil {
 		return fmt.Errorf("delete apply %d: %w", id, err)
 	}
-	if err := checkRowsAffected(result, storage.ErrApplyNotFound); err != nil {
+	if err := checkRowsAffected(result, storage.ErrApplyNotFound, fmt.Sprintf("deleting apply %d", id)); err != nil {
 		return err
 	}
 

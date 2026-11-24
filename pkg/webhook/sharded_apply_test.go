@@ -1090,3 +1090,82 @@ func TestShardedTableStatusesByKeyspaceCarriesEachShardsCopyAndVerifyFigures(t *
 		{Shard: "80-", Status: state.Task.Running, PercentComplete: 50, RowsCopied: 500, RowsTotal: 1000},
 	}, tables[0].Shards)
 }
+
+// A sharded CREATE TABLE is part-way through: one shard has landed and the
+// other is dispatched, its operation running while its task row still says
+// pending until the next progress poll. The comment reads the table as
+// applying across its shards, never as queued or as a row copy, and counts the
+// dispatched shard as applying.
+func TestBuildShardedApplyData_DispatchedCreateReadsAsApplying(t *testing.T) {
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "cdb_resolute_sharded/-80/mutes", state.ApplyOperation.Completed),
+		mk(2, "cdb_resolute_sharded/80-/mutes", state.ApplyOperation.Running),
+	}
+	task := func(id, opID int64, shard, taskState string) *storage.Task {
+		oid := opID
+		return &storage.Task{
+			ID: id, ApplyID: 1, ApplyOperationID: &oid, Shard: shard,
+			Namespace: "cdb_resolute_sharded", TableName: "mutes", DDLAction: "create", State: taskState,
+		}
+	}
+	tasks := []*storage.Task{
+		task(1, 1, "-80", state.Task.Completed),
+		task(2, 2, "80-", state.Task.Pending),
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running}
+
+	data := buildShardedApplyData(apply, ops, false, tasks, nil, "")
+
+	require.Len(t, data.Keyspaces, 1)
+	require.Len(t, data.Keyspaces[0].Tables, 1)
+	table := data.Keyspaces[0].Tables[0]
+	assert.Equal(t, state.Task.Running, table.Status, "a dispatched shard is under way, not queued")
+	assert.True(t, table.CopiesNoRows, "a CREATE TABLE copies no rows")
+	require.Len(t, table.Shards, 2)
+	assert.Equal(t, state.ApplyOperation.Running, table.Shards[1].Status)
+	require.Len(t, data.Keyspaces[0].Shards, 2)
+	assert.Equal(t, "applying", data.Keyspaces[0].Shards[1].Label)
+
+	out := templates.RenderShardedApplyComment(data)
+	assert.Contains(t, out, "**`mutes`**: 🔄 Applying\n")
+	assert.Contains(t, out, "**Shards**: 1 completed, 1 applying")
+	assert.Contains(t, out, "- Shards: 2 (1 applying, 1 complete)\n")
+	assert.NotContains(t, out, "Queued")
+	assert.NotContains(t, out, "running table copy")
+	assert.NotContains(t, out, "copying")
+}
+
+// A sharded table reads by the shards that have recorded their changes, and
+// by the stored plan only while none has. -80 has no tasks yet and 80- runs an
+// instant ALTER, so `orders` copies no rows. No shard of `mutes` has a task
+// yet and the plan creates it, so it copies no rows either. The CLI reads both
+// tables by the same rule (presentation.ShardedTableCopiesNoRows).
+func TestShardedTableStatusesReadATableFromItsReportedShardsThenItsPlan(t *testing.T) {
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "ks/-80/orders", state.ApplyOperation.Pending),
+		mk(2, "ks/80-/orders", state.ApplyOperation.Running),
+		mk(3, "ks/-80/mutes", state.ApplyOperation.Running),
+		mk(4, "ks/80-/mutes", state.ApplyOperation.Pending),
+	}
+	tasksByOp := map[int64][]*storage.Task{
+		2: {{State: state.Task.Running, DDLAction: "alter", IsInstant: true}},
+	}
+	view := &shardedPlanView{plannedChanges: map[shardedTableKey]presentation.TableChange{
+		{namespace: "ks", table: "orders"}: {DDLAction: "alter"},
+		{namespace: "ks", table: "mutes"}:  {DDLAction: "create"},
+	}}
+
+	tables := shardedTableStatusesByKeyspace(ops, tasksByOp, view)["ks"]
+
+	require.Len(t, tables, 2)
+	assert.Equal(t, "orders", tables[0].Table)
+	assert.True(t, tables[0].CopiesNoRows, "the shard without tasks does not outvote the instant ALTER")
+	assert.Equal(t, "mutes", tables[1].Table)
+	assert.True(t, tables[1].CopiesNoRows, "with no tasks yet, the planned CREATE TABLE decides")
+}

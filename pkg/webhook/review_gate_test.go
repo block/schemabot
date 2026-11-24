@@ -87,7 +87,7 @@ func setupReviewGateHandler(t *testing.T, config *api.ServerConfig) (*Handler, *
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 	return h, mux
 }
 

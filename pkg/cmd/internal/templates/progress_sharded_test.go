@@ -193,3 +193,60 @@ func TestFormatTableProgressKeepsTheBarAcrossShardsInDifferentPhases(t *testing.
 	assert.Contains(t, output, "Rows: 1,000 / 1,000 across 1 of 4 shards\n", "%s", output)
 	assert.Contains(t, output, "checksumming 25.00% · 250 / 1,000 rows verified", "%s", output)
 }
+
+// A CREATE TABLE across three shards, one landed and two applying, reads the
+// same way in the header's shard count and in the table's shard list: both say
+// applying, and neither calls the create a table copy.
+func TestWriteProgressShardedCreateHeaderAndDetailAgree(t *testing.T) {
+	ops := []*apitypes.ProgressOperationResponse{
+		{Deployment: "data-plane", OperationKey: "shop_001/-40/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyParallel},
+		{Deployment: "data-plane", OperationKey: "shop_001/40-80/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel},
+		{Deployment: "data-plane", OperationKey: "shop_001/80-/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel},
+	}
+	data := ParseProgressResponse(&apitypes.ProgressResponse{
+		ApplyID: "apply-sharded-create", Database: "shop", DatabaseType: storage.DatabaseTypeMySQL,
+		Environment: "staging", State: state.Apply.Running, Sharded: true, Operations: ops,
+		Tables: []*apitypes.TableProgressResponse{{
+			TableName: "orders", Keyspace: "shop_001", Deployment: "data-plane", ChangeType: "create",
+			DDL:    "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))",
+			Status: state.Task.Running,
+			Shards: []*apitypes.ShardProgressResponse{
+				{Shard: "-40", Status: state.Task.Completed, CopiesNoRows: true},
+				{Shard: "40-80", Status: state.Task.Running, CopiesNoRows: true},
+				{Shard: "80-", Status: state.Task.Running, CopiesNoRows: true},
+			},
+		}},
+	})
+	output := captureStdout(t, func() { WriteProgress(data) })
+
+	assert.Contains(t, output, "Shards:       1 completed, 2 applying")
+	assert.Contains(t, output, "Shards: 3 (2 applying, 1 complete)")
+	assert.NotContains(t, output, "running table copy")
+	assert.NotContains(t, output, "copying")
+}
+
+// Each shard reads by its own change: a shard the server reports as copying
+// no rows reads as applying, and a sibling running a table copy of the same
+// table reads as one, as the PR comment shows them.
+func TestWriteProgressShardedReadsEachShardByItsOwnChange(t *testing.T) {
+	ops := []*apitypes.ProgressOperationResponse{
+		{Deployment: "data-plane", OperationKey: "shop_001/-80/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel},
+		{Deployment: "data-plane", OperationKey: "shop_001/80-/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel},
+	}
+	data := ParseProgressResponse(&apitypes.ProgressResponse{
+		ApplyID: "apply-sharded-mixed", Database: "shop", DatabaseType: storage.DatabaseTypeMySQL,
+		Environment: "staging", State: state.Apply.Running, Sharded: true, Operations: ops,
+		Tables: []*apitypes.TableProgressResponse{{
+			TableName: "orders", Keyspace: "shop_001", Deployment: "data-plane", ChangeType: "alter",
+			DDL:    "ALTER TABLE `orders` ADD COLUMN `note` text",
+			Status: state.Task.Running,
+			Shards: []*apitypes.ShardProgressResponse{
+				{Shard: "-80", Status: state.Task.Running, CopiesNoRows: true},
+				{Shard: "80-", Status: state.Task.Running, RowsCopied: 400, RowsTotal: 1000},
+			},
+		}},
+	})
+	output := captureStdout(t, func() { WriteProgress(data) })
+
+	assert.Contains(t, output, "Shards:       1 applying, 1 running table copy")
+}

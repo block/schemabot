@@ -825,6 +825,45 @@ func isDeployStillValidatingError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "validating that these changes are safe to deploy")
 }
 
+// isApprovalRequiredError reports whether a failed deploy call is PlanetScale
+// answering that the deploy request must be approved before it can be
+// deployed. Only a definitive refusal from the PlanetScale API counts: an
+// answer the SDK types as not found, permission denied or an invalid request.
+// A transport failure, or an internal, malformed or retry answer, never counts
+// even when its text mentions approval, because the caller treats the match
+// as proof that no deploy started.
+//
+// The planetscale-go client gives this rejection no error code of its own: it
+// arrives as a permission refusal, so the message text is the only signal.
+// This should become a typed check once the client exposes the error code.
+func isApprovalRequiredError(err error) bool {
+	var psErr *ps.Error
+	if !errors.As(err, &psErr) {
+		return false
+	}
+	switch psErr.Code {
+	case ps.ErrNotFound, ps.ErrPermission, ps.ErrInvalid:
+		return strings.Contains(psErr.Error(), "must be approved")
+	default:
+		return false
+	}
+}
+
+// approvalRequiredError is PlanetScale's refusal to deploy a deploy request
+// that needs approval. Its message is SchemaBot's own and tells the operator
+// what to change; the API's answer stays on the chain for errors.Is and the
+// logs, but out of the text an operator reads.
+type approvalRequiredError struct {
+	number uint64
+	cause  error
+}
+
+func (e *approvalRequiredError) Error() string {
+	return fmt.Sprintf("deploy request #%d could not be deployed: PlanetScale deploy request approvals are not supported. Turn off 'Require administrator approval for deploy requests' in the PlanetScale database settings, then re-plan and apply", e.number)
+}
+
+func (e *approvalRequiredError) Unwrap() error { return e.cause }
+
 // isRetryablePSError returns true if the error is a transient PlanetScale
 // condition that may succeed on retry. Uses the SDK's typed error codes
 // (e.g., ps.ErrRetry for 422, ps.ErrInternal for 500) and falls back to
