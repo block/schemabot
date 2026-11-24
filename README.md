@@ -40,7 +40,11 @@ SchemaBot is declarative and GitOps-driven: SQL files in your repository provide
 
 <img src="./assets/cli-ops.gif" width="800" alt="Inspect fleet status, follow one change, and read its logs">
 
-[Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md)
+**Freeze an environment.** For a code freeze or an incident, hold new schema changes until you lift the freeze.
+
+<img src="./assets/cli-freeze.gif" width="800" alt="Freeze production, see an apply refused, and lift the freeze">
+
+[Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md) · [Freeze an environment](./docs/freeze.md)
 
 Block runs SchemaBot for the majority of its production schema changes, including MySQL tables spanning terabytes and Vitess databases with hundreds of shards.
 
@@ -101,6 +105,7 @@ Guides and reference:
 - [Local examples](./examples/README.md): Run the demo and [connect to its MySQL databases](./examples/README.md#connect-to-mysql)
 - [Pre-merge workflow](./docs/pre-merge-workflow.md): Take a schema change from your first edit to a merged PR
 - [CLI guide](./docs/cli.md): Set up the CLI, inspect your databases, and run changes
+- [Freeze an environment](./docs/freeze.md): Hold schema changes for a code freeze or an incident, and let one through when it can't wait
 - [Schema intelligence](./docs/schema-intelligence.md): Get to know your fleet and what’s changing
 - [Engines](./docs/engines.md): See how changes run on your database engine
 - [MySQL](./docs/mysql.md): Understand online copies, direct execution, and primary key choices

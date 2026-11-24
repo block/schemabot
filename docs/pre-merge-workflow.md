@@ -212,6 +212,15 @@ records the desired state the databases already run.
 - **Stacked on another schema PR?** Your plan includes its changes until they
   are live. Finish the base PR and rebase; do not approve unsafe DDL just to
   get past a finding that belongs to it
+- **Environment frozen?** The apply is refused and starts no new work. Applies
+  that started before the freeze can keep running unless it stops them. The
+  refusal lists the freezes that hold it, up to ten, and counts the rest.
+  Run the same command again once the freeze is lifted. If the change can't
+  wait, run it with `--override "<reason>"`: a freeze approver other than you
+  and the PR author approves it on the PR, and your next apply runs. See
+  [freeze an environment](freeze.md#ask-for-an-override)
+
+![The PR author asks for an override, the freeze refuses the apply and records the request, a second person approves it, and the next apply runs and the PR merges](../assets/pr-freeze-demo.gif)
 
 See [schema freshness](configuration.md#base-branch-schema-freshness) for how
 the gate scopes these checks to the relevant schema directory.
@@ -431,6 +440,7 @@ These gates apply according to your installation’s configuration:
 | Schema freshness | `apply` is refused when the PR head moved since the plan, when the confirmed plan no longer matches the head, or when the base branch's schema directory changed after the PR diverged | [configuration.md](configuration.md#base-branch-schema-freshness) |
 | Database lock | One PR (or CLI operator) holds a database at a time, from `apply` until merge, close, or `unlock`; a competing apply is refused with the holder named | [check-runs.md](check-runs.md#unlock) |
 | Promotion order | Production applies only after the prior environment's check is success | [check-runs.md](check-runs.md#environment-ordering) |
+| Environment freeze | While a freeze is in effect, `apply`, `start` and `cutover` in its scope are refused unless a second person approves an override | [freeze.md](freeze.md) |
 | PR checks gate | When enabled, requires the configured CI checks to pass before applying | [configuration.md](configuration.md#pr-checks-gate) |
 | Review gate | When enabled, requires an approving review from a configured reviewer before applying; the author’s own approval never counts | [configuration.md](configuration.md#review-gate) |
 | Merge gate | The required aggregate check passes when its scope has no unapplied managed schema changes | [check-runs.md](check-runs.md) |

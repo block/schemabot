@@ -616,17 +616,21 @@ it does not create a PR review trail.
 ### Freeze an environment
 
 An environment freeze holds new schema changes in its scope until it ends or
-someone lifts it. Setting or lifting one is a write, and
+someone lifts it. The [freeze guide](freeze.md) explains how freezes work, the
+pull request and API forms, and what an agent may do. Setting or lifting one is
+a write, and
 [`freeze.groups`](configuration.md#freeze-groups-forward-auth) members may do
 so without any other write access.
 
+![Freeze production, an apply the freeze refuses with nothing started, then lift the freeze](../assets/cli-freeze.gif)
+
 ```console
-$ schemabot freeze -e production --reason "SEV-1234 payments latency"
+$ schemabot freeze -e production --reason "Holiday code freeze"
 $ schemabot freeze -e production --reason "holiday freeze" --planned \
     --start 2026-12-20T00:00:00Z --end 2027-01-03T00:00:00Z
 $ schemabot freeze list -e production
 $ schemabot freeze show freeze-abc123
-$ schemabot unfreeze freeze-abc123 --reason "SEV resolved"
+$ schemabot unfreeze freeze-abc123 --reason "Holidays are over"
 ```
 
 `--deployment` and `--database` narrow a freeze and repeat; without them it
@@ -667,7 +671,7 @@ nothing started:
 ```console
 $ schemabot apply -s schema -e production
 ❄️ production is frozen. This change did not start.
-   freeze-abc  SEV-1234 payments latency  (until lifted)
+   freeze-abc  Holiday code freeze  (until lifted)
 To ask for an override, run the same command with --override "<reason>".
 ```
 
@@ -676,9 +680,9 @@ approver to let that one change through. It needs a verified caller, and the
 reason is at most 500 characters. The refusal then names the request:
 
 ```console
-$ schemabot apply -s schema -e production --override "SEV-1234 fix the index"
+$ schemabot apply -s schema -e production --override "Hotfix: checkout needs the gift_note column"
 ❄️ production is frozen. This change did not start.
-   freeze-abc  SEV-1234 payments latency  (until lifted)
+   freeze-abc  Holiday code freeze  (until lifted)
 Override requested: ovr-123. A freeze approver other than you must run 'schemabot freeze approve ovr-123', then run this command again.
 ```
 
@@ -775,7 +779,7 @@ one and stays on screen while the watch keeps following the apply:
 Press Enter to proceed with cutover (or ESC to detach)
 
 ❄️ production is frozen. This cutover did not start.
-   freeze-abc  SEV-1234 payments latency  (until lifted)
+   freeze-abc  Holiday code freeze  (until lifted)
 To ask for an override, run:
   schemabot cutover apply-example-73 -e production --override "<reason>"
 Once a freeze approver other than you approves it, press Enter to try again.
