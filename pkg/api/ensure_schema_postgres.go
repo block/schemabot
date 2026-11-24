@@ -137,9 +137,6 @@ func ensurePostgresSchema(parent context.Context, dsn string, logger *slog.Logge
 	if err := ensureSchemaBudgetAfterLock(ctx, logger, schema.DialectPostgres, database, o.convergenceTimeout); err != nil {
 		return err
 	}
-	if err := refusePopulatedPreStatusOutbox(ctx, lockConn, schema.DialectPostgres); err != nil {
-		return err
-	}
 
 	// Re-check under the lock — another pod may have converged the schema while
 	// this pod waited.

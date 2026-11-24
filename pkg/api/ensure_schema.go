@@ -545,9 +545,6 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 	if err := ensureSchemaBudgetAfterLock(ctx, logger, schema.DialectMySQL, storageDatabase, o.convergenceTimeout); err != nil {
 		return err
 	}
-	if err := refusePopulatedPreStatusOutbox(ctx, lockConn, schema.DialectMySQL); err != nil {
-		return err
-	}
 
 	// Clean up stale Spirit internal tables only while holding the advisory
 	// lock. During a rolling deploy, another pod may be actively applying

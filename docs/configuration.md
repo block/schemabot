@@ -1073,12 +1073,6 @@ sender and waits at most five seconds. No sender election, consumer, retention
 cleanup, or backfill runs. Published rows are retained indefinitely as an audit trail;
 the outbox table grows by design.
 
-Storage bootstrap supports fresh databases, empty development outbox tables without
-`status`, and existing status-bearing tables. A populated pre-release outbox table
-without `status` is unsupported: convergence refuses it before changing its schema
-or rows, on every attempt. It does not default old accepted or held intent back to
-pending, convert data, or offer a hand-edited storage remedy.
-
 Each retained row has one authoritative `status`: `pending`, `published`,
 `quarantined`, or `skipped`. Only pending rows enter new delivery batches.
 `published_at` records actual transport acceptance and `quarantine_token` identifies
