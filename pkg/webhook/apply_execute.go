@@ -439,9 +439,25 @@ func (h *Handler) executeApply(
 				"plan_id", planResp.PlanID, "posted_plan_id", storedPlan.PlanIdentifier, "tables", tables)
 			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
 				objectsChangedCause(tables), rolloutPreview, runsMemberWork); err != nil {
-				h.logger.Error("failed to post the comment showing the changed objects",
+				h.logger.Error("failed to post the comment showing the changed objects, so the pending confirmation was not moved",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
+				return
+			}
+			// The confirmation is held to the objects its plan recorded, so it
+			// must point at the re-plan the comment just showed. Left on the
+			// posted plan, every apply-confirm would meet the old record and
+			// stop again.
+			disclosed := rolloutDisclosedCopies(planResp, rollout, runsMemberWork)
+			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosed); err != nil {
+				if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
+					return
+				}
+				h.logger.Error("failed to re-pin pending confirmation onto the plan that shows the changed objects",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+					"environment", environment, "plan_id", planResp.PlanID, "error", err)
+				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+					"The objects some schema changes act on changed after the plan was posted. SchemaBot stopped the apply but could not record the confirmation; re-run `schemabot apply -e "+environment+"` to review the new plan.")
 			}
 			return
 		}

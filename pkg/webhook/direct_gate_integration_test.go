@@ -354,6 +354,44 @@ func TestE2EReplanNewlyDirectDowngradesToConfirm(t *testing.T) {
 		"the pending confirmation moved onto the re-plan the paused comment renders")
 }
 
+// An automatic apply's re-plan can keep every statement the posted comment
+// showed while the engine records a different object for one of them, as when
+// a dropped column is replaced under the same name. The apply stops against a
+// comment that shows the re-plan, and the pending confirmation moves onto that
+// re-plan, so confirming the new comment applies the change instead of meeting
+// the posted plan's record and stopping again.
+func TestE2EReplanWithChangedObjectsStopsAndConfirmApplies(t *testing.T) {
+	f := setupNewlyDirectFixture(t, "webhook_direct_replan_changed_objects")
+	shown, err := f.svc.Storage().Plans().Get(t.Context(), f.directPlan.PlanID)
+	require.NoError(t, err)
+	require.NotNil(t, shown)
+	for _, ns := range shown.Namespaces {
+		for i := range ns.Tables {
+			ns.Tables[i].Metadata = map[string]string{"recorded_object": "the object the posted plan read"}
+		}
+	}
+	f.pinLock(t, f.directPlan.PlanID)
+
+	f.h.executeApply(t.Context(), f.client, "octocat/hello-world", 1, f.schemaResult, nil, "staging", 1, "testuser",
+		CommandResult{Action: action.Apply, Environment: "staging", Found: true, IsMention: true, AllowUnsafe: true},
+		shown, shown, f.directPlan.PlanID, nil, nil)
+
+	body := f.awaitComment(t, "Confirmation required")
+	assert.Contains(t, body, "The objects these schema changes act on changed after the plan was posted")
+	assert.Contains(t, body, "`users` changed after the plan was posted")
+	assert.Contains(t, body, "schemabot apply-confirm -e staging --allow-unsafe")
+	requireNoApplies(t, f.svc, f.dbName)
+	assert.NotEqual(t, f.directPlan.PlanID, f.pendingPlanID(t),
+		"the pending confirmation moved onto the re-plan the paused comment renders")
+
+	f.comment(t, "schemabot apply-confirm -e staging --allow-unsafe")
+	f.awaitComment(t, "Schema Change Applied")
+	require.Eventually(t, func() bool {
+		return slices.Equal([]string{"id", "tenant_id"}, appPrimaryKeyColumns(t, f.dbName, "users"))
+	}, webhookIntegrationPollDeadline, 200*time.Millisecond,
+		"confirming the comment that shows the re-plan applies it")
+}
+
 // A statement can also move to direct execution between a paused comment and
 // the operator's apply-confirm. The confirmation is checked against the plan
 // its comment rendered, so the confirm stops and discloses the native DDL
