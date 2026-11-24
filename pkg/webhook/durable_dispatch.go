@@ -48,13 +48,20 @@ const (
 	quotaReserveRetryFloor = 10 * time.Second
 
 	// quotaReserveUnchargedWindow is how long after a delivery is received
-	// the quota reserve's refusals cost it no attempt. Within the window a
-	// refused delivery waits for the quota to reset and keeps its retry
-	// budget. After it, the delivery still waits for the reset but each
-	// refusal spends an attempt, so a delivery the reserve refuses at every
-	// reset goes terminal once its attempts run out instead of being
-	// rescheduled forever.
+	// the quota reserve's refusals, and GitHub's primary rate limit, cost it
+	// no attempt. Within the window a refused delivery waits for the quota to
+	// reset and keeps its retry budget. After it, the delivery still waits for
+	// the reset but each refusal spends an attempt, so a delivery that is
+	// refused at every reset goes terminal once its attempts run out instead
+	// of being rescheduled forever.
 	quotaReserveUnchargedWindow = 3 * time.Hour
+
+	// primaryRateLimitRetryJitter is the most a delivery that waited out a
+	// primary rate limit adds to the reset time before it retries. Every
+	// delivery the limit refused for an installation waits for the same reset,
+	// so the extra spreads them out, and it keeps a retry from landing on a
+	// reset that GitHub's clock has not reached yet.
+	primaryRateLimitRetryJitter = 30 * time.Second
 )
 
 // durableWebhookRetryDelay returns how long to wait before retrying a delivery
@@ -427,6 +434,11 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		var retryAt time.Time
 		var refusal *ghclient.QuotaReservedError
 		refusedByQuotaReserve := retry && errors.As(processErr, &refusal)
+		var rateLimitResetAt time.Time
+		rateLimited := false
+		if retry && !refusedByQuotaReserve {
+			rateLimitResetAt, rateLimited = ghclient.PrimaryRateLimitResetAt(processErr)
+		}
 		switch {
 		case !retry:
 			failureReason = durableFailureReason(processErr)
@@ -449,6 +461,13 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			retryAt = quotaReserveRetryAt(refusal.ResetAt, now)
 			markErr = store.MarkFailedUncharged(finishCtx, event.ID, event.LeaseToken, processErr.Error(), retryAt)
 			outcome = "quota_reserve_deferred"
+		case rateLimited && quotaReserveRefusalIsUncharged(event, now):
+			// GitHub refuses every request of the exhausted resource until its
+			// reset, so a retry sooner would be refused the same way. The
+			// delivery waits for the reset and the wait costs no attempt.
+			retryAt = h.primaryRateLimitRetryAt(rateLimitResetAt, now)
+			markErr = store.MarkFailedUncharged(finishCtx, event.ID, event.LeaseToken, processErr.Error(), retryAt)
+			outcome = "rate_limit_deferred"
 		case event.Attempts < maxDurableWebhookAttempts:
 			// event.Attempts already counts this claim, so the first failure
 			// waits the base delay and each later one waits twice as long,
@@ -463,6 +482,11 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 				// reset, but the refusal spends an attempt (see
 				// quotaReserveUnchargedWindow).
 				retryAt = quotaReserveRetryAt(refusal.ResetAt, now)
+			} else if rateLimited {
+				// Past the uncharged window the delivery still waits for the
+				// reset, but the rate limit spends an attempt (see
+				// quotaReserveUnchargedWindow).
+				retryAt = h.primaryRateLimitRetryAt(rateLimitResetAt, now)
 			}
 			markErr = store.MarkFailed(finishCtx, event.ID, event.LeaseToken, processErr.Error(), &retryAt)
 			outcome = "retrying"
@@ -524,10 +548,13 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		if refusedByQuotaReserve {
 			h.logQuotaReserveRetry(driverID, event, refusal, retryAt, outcome)
 		}
+		if rateLimited {
+			h.logPrimaryRateLimitRetry(driverID, event, rateLimitResetAt, retryAt, outcome)
+		}
 		// An uncharged refusal gave back the attempt its claim consumed, so
 		// log the count the row now holds, as logQuotaReserveRetry does.
 		attempts := event.Attempts
-		if outcome == "quota_reserve_deferred" {
+		if outcome == "quota_reserve_deferred" || outcome == "rate_limit_deferred" {
 			attempts--
 		}
 		recordedAttrs := []any{
@@ -1027,6 +1054,46 @@ func (h *Handler) logQuotaReserveRetry(driverID int, event *storage.WebhookEvent
 	default:
 		h.logger.Debug("durable webhook delivery refused by the GitHub quota reserve was not rescheduled",
 			append(attrs, "disposition", outcome)...)
+	}
+}
+
+// primaryRateLimitRetryAt returns when to retry a delivery GitHub's primary
+// rate limit refused until resetAt: the reset as quotaReserveRetryAt bounds
+// it, plus up to primaryRateLimitRetryJitter. The bound on the reset applies
+// before the extra is added, so the longest wait is that much more than
+// ghclient.QuotaResetHorizon.
+func (h *Handler) primaryRateLimitRetryAt(resetAt, now time.Time) time.Time {
+	jitter := durableWebhookRetryJitter
+	if h.durableWebhookRetryJitterOverride != nil {
+		jitter = h.durableWebhookRetryJitterOverride
+	}
+	return quotaReserveRetryAt(resetAt, now).Add(jitter(primaryRateLimitRetryJitter))
+}
+
+// logPrimaryRateLimitRetry records how a delivery that GitHub's primary rate
+// limit refused was rescheduled, with the identifiers needed to find its
+// installation's quota. A refusal that exhausted the delivery's attempts is
+// already logged as terminal, so here it is logged only at debug level.
+func (h *Handler) logPrimaryRateLimitRetry(driverID int, event *storage.WebhookEvent, resetAt, retryAt time.Time, outcome string) {
+	attrs := []any{
+		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+		"head_sha", event.HeadSHA, "installation_id", event.TenantID,
+		"reset_time", resetAt.UTC().Format(time.RFC3339),
+	}
+	if !retryAt.IsZero() {
+		attrs = append(attrs, "retry_at", retryAt.UTC().Format(time.RFC3339))
+	}
+	switch outcome {
+	case "rate_limit_deferred":
+		h.logger.Info("durable webhook delivery was refused by the GitHub primary rate limit; it will be retried when the limit resets without spending an attempt",
+			append(attrs, "attempts", event.Attempts-1)...)
+	case "retrying":
+		h.logger.Warn("durable webhook delivery was refused by the GitHub primary rate limit more than the uncharged window after it was received; it will be retried when the limit resets and this refusal spent an attempt",
+			append(attrs, "attempts", event.Attempts, "uncharged_window", quotaReserveUnchargedWindow)...)
+	default:
+		h.logger.Debug("durable webhook delivery refused by the GitHub primary rate limit was not rescheduled",
+			append(attrs, "attempts", event.Attempts, "disposition", outcome)...)
 	}
 }
 

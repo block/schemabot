@@ -1183,6 +1183,13 @@ hourly reset stops being retried about eight hours after it arrived, and its
 check stays failing until the next push or check re-run. A read refused while one database is being
 planned still fails that plan until the next push or check re-run.
 
+GitHub's own rate limit is handled the same way, whether or not `quota-reserve`
+is set. When GitHub refuses a request because the installation's quota is spent,
+SchemaBot retries the event at the reset time GitHub reports, plus up to 30
+seconds. For three hours after the event arrived that wait does not use up its
+retry attempts, and after that each refusal uses one of the five. A refusal
+that carries no readable reset time is retried on the usual schedule.
+
 ```yaml
 github:
   quota-reserve: 1500  # default: 0 (disabled)
