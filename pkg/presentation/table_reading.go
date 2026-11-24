@@ -168,11 +168,12 @@ func readRunning(f TableFacts) TableReading {
 			{Text: fmt.Sprintf("Rows copied: %s so far", ui.FormatNumber(f.RowsCopied))},
 			{Text: ui.EstimateExceededTooltip, Note: true},
 		}}
-	case f.RowsTotal > 0 && ui.RowCopyDisplayPercent(f.PercentComplete, f.RowsCopied) == 0:
-		// The row total is known but the copy has not reported progress yet,
-		// which can take a while on a large table. A 0% bar reads as stuck,
-		// so the label says the copy is starting and the rows line gives the
-		// total.
+	case f.RowsTotal > 0 && f.RowsCopied == 0:
+		// The row total is known but no rows have moved yet, which can take a
+		// while on a large table. A 0% bar reads as stuck, and a percent the
+		// engine reports before its first rows would sit above a rows line
+		// saying none have moved, so the label says the copy is starting and
+		// the rows line gives the total.
 		return TableReading{Label: "⏳ Starting copy...", Details: []TableDetail{{Text: RowsLine(f)}}}
 	case f.RowsTotal > 0:
 		return TableReading{
