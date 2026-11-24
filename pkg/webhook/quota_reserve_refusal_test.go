@@ -79,6 +79,61 @@ func TestConfigDiscoveryRefusedByQuotaReserveNamesTheReset(t *testing.T) {
 	}
 }
 
+// The reset is named as a UTC minute that is never early: a reset partway
+// through a minute names the next one, and a reset on the minute names that
+// minute.
+func TestQuotaResetTimeNamesAMinuteThatIsNeverEarly(t *testing.T) {
+	aedt := time.FixedZone("AEDT", 11*60*60)
+	assert.Equal(t, "04:05 UTC", quotaResetTime(time.Date(2026, 11, 22, 15, 4, 30, 0, aedt)))
+	assert.Equal(t, "04:04 UTC", quotaResetTime(time.Date(2026, 11, 22, 15, 4, 0, 0, aedt)))
+}
+
+// An auto-plan whose discovery the quota reserve refuses fails the aggregate
+// closed, and the check says who acts at the reset: SchemaBot when the
+// auto-plan runs inside a durable delivery retried then, and the author
+// otherwise.
+func TestAutoPlanDiscoveryRefusedByQuotaReserveSaysWhoRetries(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		durable bool
+		want    string
+	}{
+		{name: "durable delivery retried at the reset", durable: true, want: "It will retry when the quota resets at "},
+		{name: "request path", durable: false, want: "Re-run this check after the quota resets at "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &foldCheckStore{}
+			plain, mux := setupGitHubServer(t)
+			reserve := &refuseSchemaReadsOutsidePublication{}
+			client := gh.NewClient(&http.Client{Transport: reserve})
+			client.BaseURL = plain.BaseURL
+			installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
+			h := &Handler{
+				service:   api.New(&foldStorage{checks: store}, nonAggregateConfig(), nil, testLogger()),
+				ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+				logger:    testLogger(),
+			}
+			serveHeadSHA(t, mux, "abc123")
+			serveAggregateScopeInputs(t, mux, []string{"schemabot.yaml"}, "database: orders\ntype: mysql\n")
+			mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusCreated)
+				_, _ = fmt.Fprint(w, `{"id":39}`)
+			})
+
+			ctx := t.Context()
+			if tc.durable {
+				ctx = withDurableRetryAtQuotaReset(ctx)
+			}
+			_, err := h.dispatchAutoPlanForPR(ctx, installClient, "octocat/hello-world", 1, "abc123", 12345, "pull_request", "opened", "", "delivery-1", autoPlanOptions{})
+
+			require.ErrorIs(t, err, ghclient.ErrGitHubQuotaReserved)
+			require.NotEmpty(t, store.upserted)
+			assert.Equal(t, githubQuotaReservedBlock.blockingReason, store.upserted[0].BlockingReason)
+			assert.Contains(t, store.upserted[0].ErrorMessage, tc.want)
+		})
+	}
+}
+
 // The durable driver marks a claim whose quota reserve refusal it would
 // reschedule for the reset, so the discovery inside it can say SchemaBot
 // retries. A claim at its last attempt past the uncharged window ends instead,
@@ -113,6 +168,37 @@ func TestDurableDriverMarksClaimsItRetriesAtTheQuotaReset(t *testing.T) {
 		})
 	}
 	assert.False(t, durableRetryAtQuotaReset(t.Context()), "work outside the durable driver is never retried at the reset")
+}
+
+// A delivery on its last attempt is claimed just inside the uncharged window,
+// and the quota reserve refuses it after the window has closed. The check
+// already told the author SchemaBot retries at the reset, so the driver keeps
+// that promise: the refusal is rescheduled for the reset without spending an
+// attempt, rather than ending the delivery.
+func TestDurableDriverKeepsTheRetryPromiseWhenARunCrossesTheUnchargedWindow(t *testing.T) {
+	event := durablePullRequestEvent(t)
+	event.Attempts = maxDurableWebhookAttempts - 1
+	event.ReceivedAt = time.Now().Add(-quotaReserveUnchargedWindow + time.Hour)
+	store := newScriptedWebhookEventStore(event)
+	h := newDurableDriverHandler(t, store, nil, nil)
+	resetAt := time.Now().Add(40 * time.Minute).Truncate(time.Second)
+	var marked atomic.Bool
+	h.durableWebhookProcessOverride = func(ctx context.Context, claimed *storage.WebhookEvent) (bool, error) {
+		marked.Store(durableRetryAtQuotaReset(ctx))
+		// The run outlasts the window: move receipt back so the window has
+		// closed by the time the driver records the refusal.
+		claimed.ReceivedAt = claimed.ReceivedAt.Add(-2 * time.Hour)
+		return true, quotaReserveRefusalError(resetAt)
+	}
+
+	require.True(t, h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0"))
+
+	assert.True(t, marked.Load(), "the check says SchemaBot retries at the reset")
+	require.Empty(t, store.failed, "the refusal does not end the delivery the check promised to retry")
+	require.Len(t, store.failedUncharged, 1)
+	failure := <-store.failedUncharged
+	require.NotNil(t, failure.retryAfter)
+	assert.True(t, resetAt.Equal(*failure.retryAfter), "retry at the quota reset %s, got %s", resetAt, failure.retryAfter)
 }
 
 // A stored aggregate blocked by the quota reserve keeps blocking: a fold over
