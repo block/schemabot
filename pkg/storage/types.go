@@ -1312,30 +1312,6 @@ func (p *Plan) FlatDDLChanges() []TableChange {
 	return result
 }
 
-// TableChangeMetadata returns the engine's plan-time Metadata stored with the
-// change a task runs: the change in namespace that names table and carries
-// exactly ddl. It returns nil when no stored change matches or the match
-// carries none, and leaves it to the engine to decide whether the change can
-// run without it. Two matching changes that carry different metadata are an
-// error, because either could be the one the task was created from.
-func (p *Plan) TableChangeMetadata(namespace, table, ddl string) (map[string]string, error) {
-	var (
-		found    bool
-		metadata map[string]string
-	)
-	for _, tc := range p.FlatDDLChanges() {
-		if tc.Namespace != namespace || tc.Table != table || tc.DDL != ddl {
-			continue
-		}
-		if found && !maps.Equal(metadata, tc.Metadata) {
-			return nil, fmt.Errorf("plan %s holds more than one change to table %q in namespace %q with this DDL, and they carry different engine metadata", p.PlanIdentifier, table, namespace)
-		}
-		found = true
-		metadata = tc.Metadata
-	}
-	return maps.Clone(metadata), nil
-}
-
 // RecordIgnoreTables stores the ignore_tables config the plan was reviewed
 // under on every namespace it carries, so a re-plan of this plan — a rollback,
 // a resume, a member's drift check — is asked to withhold the same entries

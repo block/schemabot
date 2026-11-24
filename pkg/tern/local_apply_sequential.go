@@ -275,7 +275,7 @@ func (c *LocalClient) taskChangeMetadata(ctx context.Context, apply *storage.App
 			return nil, fmt.Errorf("plan %d for task %s does not exist", planID, task.TaskIdentifier)
 		}
 	}
-	metadata, err := plan.TableChangeMetadata(task.Namespace, task.TableName, task.DDL)
+	metadata, err := newPlanChangeMetadata(plan, planChangeCanonicalizer(apply, c.logger)).forTask(task)
 	if err != nil {
 		return nil, fmt.Errorf("read engine metadata for task %s: %w", task.TaskIdentifier, err)
 	}

@@ -102,6 +102,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"reflect"
 	"regexp"
@@ -4198,7 +4199,7 @@ func (c *GRPCClient) dispatchRemoteApply(ctx context.Context, apply *storage.App
 	if standDown, err := c.startStoppedDeploymentApplyBeforeAttach(ctx, apply, scope); standDown || err != nil {
 		return err
 	}
-	ddlChanges, err := tasksToProtoTableChanges(tasks, plan)
+	ddlChanges, err := tasksToProtoTableChanges(tasks, plan, planChangeCanonicalizer(apply, c.applyLogger(apply)))
 	if err != nil {
 		errMsg := fmt.Sprintf("queued gRPC apply failed: %v", err)
 		if markErr := c.settleFailedDispatch(ctx, apply, nil, scope, kind, dispatchRefused, errMsg); markErr != nil {
@@ -4502,7 +4503,9 @@ func (c *GRPCClient) prepareDispatchTasks(ctx context.Context, apply *storage.Ap
 
 // planToProtoTableChanges converts every change of a plan to the form a
 // dispatch carries it in, the same shape tasksToProtoTableChanges gives the
-// tasks built from it.
+// tasks built from it, engine metadata included, so a member that builds its
+// plan from a table step's dispatch holds the same plan-time record as one
+// reading its own stored plan.
 func planToProtoTableChanges(plan *storage.Plan) []*ternv1.TableChange {
 	flat := plan.FlatDDLChanges()
 	changes := make([]*ternv1.TableChange, 0, len(flat))
@@ -4512,6 +4515,7 @@ func planToProtoTableChanges(plan *storage.Plan) []*ternv1.TableChange {
 			Ddl:        change.DDL,
 			ChangeType: ternconv.OpToChangeType(change.Operation),
 			Namespace:  change.Namespace,
+			Metadata:   maps.Clone(change.Metadata),
 		})
 	}
 	return changes
@@ -4521,10 +4525,11 @@ func planToProtoTableChanges(plan *storage.Plan) []*ternv1.TableChange {
 // each carrying the engine metadata the plan stored with its change, so a
 // data plane that materializes the plan from the dispatch hands the engine
 // the same plan-time record as one reading its own stored plan.
-func tasksToProtoTableChanges(tasks []*storage.Task, plan *storage.Plan) ([]*ternv1.TableChange, error) {
+func tasksToProtoTableChanges(tasks []*storage.Task, plan *storage.Plan, canon StatementCanonicalizer) ([]*ternv1.TableChange, error) {
+	planMetadata := newPlanChangeMetadata(plan, canon)
 	changes := make([]*ternv1.TableChange, 0, len(tasks))
 	for _, task := range tasks {
-		metadata, err := plan.TableChangeMetadata(task.Namespace, task.TableName, task.DDL)
+		metadata, err := planMetadata.forTask(task)
 		if err != nil {
 			return nil, fmt.Errorf("read engine metadata for task %s: %w", task.TaskIdentifier, err)
 		}

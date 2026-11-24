@@ -2026,7 +2026,7 @@ func TestGroupedResumeChangesGroupsTasksByNamespace(t *testing.T) {
 		{Namespace: "billing", TableName: "invoices", DDL: "ALTER TABLE `invoices` ADD COLUMN `due_at` datetime", DDLAction: "alter"},
 	}
 
-	changes, err := groupedResumeChanges(tasks, nil)
+	changes, err := groupedResumeChanges(tasks, nil, nil)
 	require.NoError(t, err)
 
 	require.Len(t, changes, 2)
@@ -2053,7 +2053,7 @@ func TestGroupedResumeChangesPreservesDDL(t *testing.T) {
 		{Namespace: "commerce", TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter"},
 	}
 
-	changes, err := groupedResumeChanges(tasks, nil)
+	changes, err := groupedResumeChanges(tasks, nil, nil)
 	require.NoError(t, err)
 
 	require.Len(t, changes, 1)
@@ -2073,7 +2073,7 @@ func TestGroupedResumeChangesPreservesMultiNamespaceScopedTasks(t *testing.T) {
 		{Namespace: "routing", TableName: "lookup", DDL: "ALTER TABLE `lookup` ADD COLUMN `region` varchar(32)", DDLAction: "alter"},
 	}
 
-	changes, err := groupedResumeChanges(tasks, nil)
+	changes, err := groupedResumeChanges(tasks, nil, nil)
 	require.NoError(t, err)
 
 	require.Len(t, changes, 2)

@@ -1584,7 +1584,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 			append(apply.LogAttrs(), "error", err)...)
 		return err
 	}
-	changes, err := groupedResumeChanges(tasks, plan)
+	changes, err := groupedResumeChanges(tasks, plan, planChangeCanonicalizer(apply, c.logger))
 	if err != nil {
 		c.logger.Error("failed to rebuild engine changes for grouped resume; current apply owner will exit for operator retry",
 			append(apply.LogAttrs(), "error", err)...)
@@ -1842,7 +1842,8 @@ func (c *LocalClient) groupedResumeState(ctx context.Context, apply *storage.App
 // with vschema_changed so the engine applies its VSchema from the schema files
 // alongside its DDL — or on its own for a VSchema-only namespace that has no DDL
 // tasks. This mirrors how the fresh apply builds changes from the plan.
-func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan) ([]engine.SchemaChange, error) {
+func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan, canon StatementCanonicalizer) ([]engine.SchemaChange, error) {
+	planMetadata := newPlanChangeMetadata(plan, canon)
 	indexByNamespace := make(map[string]int, len(tasks))
 	var changes []engine.SchemaChange
 	ensureNamespace := func(namespace string) int {
@@ -1862,13 +1863,9 @@ func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan) ([]engine.S
 		if task.DDL == "" {
 			continue
 		}
-		var metadata map[string]string
-		if plan != nil {
-			var err error
-			metadata, err = plan.TableChangeMetadata(task.Namespace, task.TableName, task.DDL)
-			if err != nil {
-				return nil, fmt.Errorf("read engine metadata for task %s: %w", task.TaskIdentifier, err)
-			}
+		metadata, err := planMetadata.forTask(task)
+		if err != nil {
+			return nil, fmt.Errorf("read engine metadata for task %s: %w", task.TaskIdentifier, err)
 		}
 		idx := ensureNamespace(task.Namespace)
 		changes[idx].TableChanges = append(changes[idx].TableChanges, engine.TableChange{
