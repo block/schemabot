@@ -501,7 +501,7 @@ func TestE2EReplanDiscardingCopyDowngradesToConfirm(t *testing.T) {
 
 	h.executeApply(t.Context(), installClient, repo, pr, schemaResult, nil, "staging", 1, "testuser",
 		CommandResult{Action: action.Apply, Environment: "staging", Found: true, IsMention: true},
-		storedPlan, storedPlan, planResp.PlanID, nil)
+		storedPlan, storedPlan, planResp.PlanID, nil, nil)
 
 	select {
 	case body := <-result.comments:

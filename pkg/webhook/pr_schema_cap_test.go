@@ -250,7 +250,7 @@ func TestPRSchemaCapApplyRefusalReleasesOnlyAutomaticIntent(t *testing.T) {
 			schema := &ghclient.SchemaRequestResult{Database: "db0", Type: "mysql", SchemaPath: "db0",
 				HeadSHA: "head", SchemaFiles: planRetryTestRequest().SchemaFiles}
 			f.executeApply(t.Context(), f.client, schemaCapTestRepo, 1, schema, nil, "staging", 42, "author", CommandResult{},
-				tt.storedPlan, nil, "original-plan", nil)
+				tt.storedPlan, nil, "original-plan", nil, nil)
 			require.Equal(t, 1, admissions)
 			require.Equal(t, tt.wantReleased, locks.releasedIfPending)
 			require.Empty(t, locks.released)

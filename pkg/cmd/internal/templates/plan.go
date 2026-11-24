@@ -586,11 +586,13 @@ func WriteChangeNotice(severity, heading string, changes []UnsafeChange) {
 // The apply was refused, so Refused attaches to the refusal itself — the heading
 // names the blocked apply, not the unsafeness of the changes.
 //
-// rerun is the command that permits them, without the binary name. The caller
-// builds it because it is the one that knows which flags addressed the target:
-// a suggested command that dropped them would name a different database than
-// the refusal is about, and it is meant to be copied and run.
-func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun string) {
+// rerun is the words of the command that permits them, without the binary name,
+// one shell-escaped word per element so Command can see which flags it already
+// passes. The caller builds it because it is the one that knows which flags
+// addressed the target: a suggested command that dropped them would name a
+// different database than the refusal is about, and it is meant to be copied
+// and run.
+func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun []string) {
 	if len(changes) > 0 {
 		fmt.Printf(glyph.Refused+" Apply blocked: %d unsafe change(s) detected\n", countUnsafeFindings(changes))
 		writeUnsafeChangesList(changes)
@@ -598,7 +600,7 @@ func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun string) {
 	}
 	fmt.Println(glyph.Escalation + " To proceed with these destructive changes, re-run with --allow-unsafe:")
 	fmt.Println()
-	fmt.Printf("  %s\n", cliname.Command(rerun))
+	fmt.Printf("  %s\n", cliname.Command(rerun...))
 	fmt.Println()
 }
 
@@ -606,10 +608,10 @@ func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun string) {
 // refusal with nowhere to print the list, such as JSON output: the same count
 // and findings, and the command that permits them, starting with the binary
 // name so it runs as pasted. rerun is built as for WriteUnsafeChangesBlocked.
-func UnsafeChangesBlockedSummary(changes []UnsafeChange, rerun string) string {
+func UnsafeChangesBlockedSummary(changes []UnsafeChange, rerun []string) string {
 	findings := unsafeFindingLines(changes)
 	return fmt.Sprintf("apply blocked: %d unsafe change(s) detected (%s); to proceed with these destructive changes, re-run with: %s",
-		len(findings), strings.Join(findings, "; "), cliname.Command(rerun))
+		len(findings), strings.Join(findings, "; "), cliname.Command(rerun...))
 }
 
 // WriteUnsafeWarningAllowed writes a warning when destructive changes are

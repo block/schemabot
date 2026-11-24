@@ -765,20 +765,26 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// lands. A failed post releases the lock and stays retryable, as a pending
 	// confirmation whose comment never appeared does; the stored check keeps
 	// blocking merge on the pending changes meanwhile.
+	// The comment's ID and data ride into executeApply so a change gate that
+	// refuses the apply can edit the footer this comment posts, which promises
+	// an apply that then never starts.
+	var autoComment *autoApplyComment
 	if runsMemberWork {
-		if postErr := h.postCommentReportingError(repo, pr, installationID, templates.RenderPlanComment(commentData)); postErr != nil {
+		commentID, postErr := h.postCommentReportingID(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		if postErr != nil {
 			h.logger.Error("failed to post the comment disclosing the other targets' plans, so nothing was dispatched; releasing the lock",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "plan_id", planResp.PlanID, "error", postErr)
 			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "automatic apply disclosure post failure")
 			return true, fmt.Errorf("apply command disclosure of the other targets' plans %s#%d: %w", repo, pr, postErr)
 		}
-	} else {
-		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		autoComment = &autoApplyComment{ID: commentID, Data: commentData}
+	} else if commentID := h.postCommentBestEffortID(repo, pr, installationID, templates.RenderPlanComment(commentData)); commentID != 0 {
+		autoComment = &autoApplyComment{ID: commentID, Data: commentData}
 	}
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
-	h.executeApply(ctx, client, repo, pr, schemaResult, sharedSchemaPeers, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopies)
+	h.executeApply(ctx, client, repo, pr, schemaResult, sharedSchemaPeers, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopies, autoComment)
 	return false, nil
 }
 
@@ -1152,7 +1158,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 
 	disclosedCopies := disclosureDescribesThisApply(existingLock, storedPlan, environment)
 
-	h.executeApply(ctx, client, repo, pr, schemaResult, sharedSchemaPeers, environment, installationID, requestedBy, result, nil, storedPlan, existingLock.PendingPlanID, disclosedCopies)
+	h.executeApply(ctx, client, repo, pr, schemaResult, sharedSchemaPeers, environment, installationID, requestedBy, result, nil, storedPlan, existingLock.PendingPlanID, disclosedCopies, nil)
 	return false, nil
 }
 

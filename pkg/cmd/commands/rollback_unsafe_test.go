@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -86,6 +87,24 @@ func TestRollbackUnsafeChangesRequireAllowUnsafe(t *testing.T) {
 		assert.Contains(t, output, "refunds: DROP TABLE removes all data")
 		assert.Contains(t, output, "rollback apply-example-90 -e production --allow-unsafe")
 		assert.Equal(t, []string{"POST /api/rollback/plan", "GET /api/status"}, requests())
+		assert.Empty(t, applyOptions())
+	})
+
+	t.Run("a recorded wrapper route does not repeat the environment", func(t *testing.T) {
+		// A wrapper that records the environment under its long spelling must
+		// not add it to a retry that already names the environment with -e.
+		cliname.SetRoute(cliname.Flag{Name: "--environment", Value: "development"}, cliname.Flag{Name: "--profile", Value: "prod"})
+		t.Cleanup(func() { cliname.SetRoute() })
+		t.Setenv("SCHEMABOT_TOKEN", "fictional-rollback-test")
+		endpoint, _, applyOptions := rollbackAPIServer(t, dropPlan)
+		var runErr error
+		output := stripAnsi(captureStdout(func() {
+			cmd := RollbackCmd{ApplyID: "apply-example-90", Environment: "production", AutoApprove: true}
+			runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
+		}))
+		require.ErrorIs(t, runErr, ErrSilent)
+		assert.Contains(t, output, "rollback apply-example-90 -e production --allow-unsafe --profile prod")
+		assert.NotContains(t, output, "--environment development")
 		assert.Empty(t, applyOptions())
 	})
 

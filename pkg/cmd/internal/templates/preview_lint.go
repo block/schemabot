@@ -29,7 +29,7 @@ func previewUnsafeBlockedOutput() {
 		{Table: "orders", Reason: "DROP TABLE", ChangeType: "DROP TABLE"},
 		{Table: "products", Reason: "MODIFY COLUMN price_cents: INT → SMALLINT (potential data loss); DROP INDEX idx_category", ChangeType: "MODIFY COLUMN"},
 	}
-	WriteUnsafeChangesBlocked(changes, "apply -s ./schema/testapp -e staging --allow-unsafe")
+	WriteUnsafeChangesBlocked(changes, []string{"apply", "-s", "./schema/testapp", "-e", "staging", "--allow-unsafe"})
 }
 
 func previewUnsafeAllowedOutput() {
