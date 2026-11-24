@@ -256,6 +256,32 @@ func sequentialEngineApplyRequest(applyIdentifier string, task *storage.Task, op
 	return req
 }
 
+// taskChangeMetadata returns the engine metadata the plan stored with the
+// change task runs, so the engine applies the change against its plan-time
+// record. drivePlan is used unless the task names a different plan, which is
+// then loaded.
+func (c *LocalClient) taskChangeMetadata(ctx context.Context, apply *storage.Apply, task *storage.Task, drivePlan *storage.Plan) (map[string]string, error) {
+	plan := drivePlan
+	if plan == nil || (task.PlanID != 0 && task.PlanID != plan.ID) {
+		planID, err := planIDForTasks(apply, []*storage.Task{task})
+		if err != nil {
+			return nil, fmt.Errorf("resolve the plan for task %s: %w", task.TaskIdentifier, err)
+		}
+		plan, err = c.storage.Plans().GetByID(ctx, planID)
+		if err != nil {
+			return nil, fmt.Errorf("load plan %d for task %s: %w", planID, task.TaskIdentifier, err)
+		}
+		if plan == nil {
+			return nil, fmt.Errorf("plan %d for task %s does not exist", planID, task.TaskIdentifier)
+		}
+	}
+	metadata, err := plan.TableChangeMetadata(task.Namespace, task.TableName, task.DDL)
+	if err != nil {
+		return nil, fmt.Errorf("read engine metadata for task %s: %w", task.TaskIdentifier, err)
+	}
+	return metadata, nil
+}
+
 // runEngineTask runs a single DDL on the engine to an outcome: taskContinue
 // (completed), taskFailed, taskStopped, taskAbort, or taskHandover.
 //
@@ -270,7 +296,7 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	var wait heldTargetWait
 	for {
-		action := c.runEngineTaskAttempt(ctx, apply, task, options)
+		action := c.runEngineTaskAttempt(ctx, apply, task, plan, options)
 		if action != taskTargetHeld {
 			c.targetHeld.clear(apply.ID)
 			return action
@@ -575,7 +601,7 @@ func resumeStateNamesNewWork(sent, returned *engine.ResumeState) bool {
 // runEngineTaskAttempt calls the engine for a single DDL, marks the task
 // running, and polls to completion. Besides runEngineTask's outcomes it returns
 // taskTargetHeld when the engine was refused the target.
-func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.Apply, task *storage.Task, options map[string]string) taskAction {
+func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.Apply, task *storage.Task, plan *storage.Plan, options map[string]string) taskAction {
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed before sequential engine apply; current apply owner will exit for operator retry",
@@ -595,6 +621,13 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 	// engine resume key (ResumeState.MigrationContext) so each table's schema
 	// change is tracked independently.
 	request := sequentialEngineApplyRequest(apply.ApplyIdentifier, task, options, taskCreds, logger)
+	metadata, err := c.taskChangeMetadata(ctx, apply, task, plan)
+	if err != nil {
+		logger.Error("task failed to read the engine metadata its plan stored",
+			"task_id", task.TaskIdentifier, "table", task.TableName, "namespace", task.Namespace, "error", err)
+		return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, err.Error()))
+	}
+	request.Changes[0].TableChanges[0].Metadata = metadata
 	needsFiles, err := c.taskNeedsRowSecurityFiles(task)
 	if err != nil {
 		return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, fmt.Sprintf("resolve row security parser: %v", err)))

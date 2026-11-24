@@ -19,6 +19,7 @@ import (
 	"github.com/block/pg-sprite/pkg/executor"
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/progress"
+	"github.com/block/pg-sprite/pkg/schemadiff"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -106,14 +107,17 @@ const (
 )
 
 type nativeApply struct {
-	rowSecurity                *pgstatement.DesiredWithRowSecurity
-	reviewedSecurity           []string
-	namespace                  string
-	table                      string
-	sql                        string
-	steps                      int
-	concurrentIndex            bool
-	enumValueAdd               bool
+	rowSecurity      *pgstatement.DesiredWithRowSecurity
+	reviewedSecurity []string
+	namespace        string
+	table            string
+	sql              string
+	steps            int
+	concurrentIndex  bool
+	enumValueAdd     bool
+	// dropped is the plan's record of the live object the statement drops,
+	// which the apply checks under the table's lock before dropping it.
+	dropped                    *schemadiff.DroppedObject
 	concurrentIndexMaxDuration time.Duration
 	cancelRequested            func() bool
 }
@@ -242,6 +246,7 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: %w", tc.Table, err)
 	}
 	concurrentIndex := false
+	var dropped *schemadiff.DroppedObject
 	if len(statements) == 1 {
 		// The tier derivation above parsed this statement already, so a
 		// parse failure here is an invariant guard; the message stays curated
@@ -250,8 +255,38 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		if err != nil {
 			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
 		}
+		dropped, err = reviewedDropForApply(req.Database, tc, statements[0])
+		if err != nil {
+			return nativeApply{}, err
+		}
 	}
-	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements), concurrentIndex: concurrentIndex}, nil
+	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements), concurrentIndex: concurrentIndex, dropped: dropped}, nil
+}
+
+// reviewedDropForApply returns the plan's record of the object a statement
+// drops. A statement that drops a live object is admitted only with that
+// record: without it the apply could not tell the reviewed object from one
+// that took its name or changed its definition after the plan, so it is
+// refused before any work is queued and the operator re-plans.
+func reviewedDropForApply(database string, tc engine.TableChange, statement string) (*schemadiff.DroppedObject, error) {
+	drops, err := dropsLiveObject(statement)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission could not classify a planned drop", "database", database, "table", tc.Table, "error", err)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
+	}
+	if !drops {
+		return nil, nil
+	}
+	dropped, err := reviewedDropFromMetadata(tc.Metadata)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission rejected the reviewed drop record", "database", database, "table", tc.Table, "error", err)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: the plan's record of the object this statement drops is unreadable; re-plan and apply again", tc.Table)
+	}
+	if dropped == nil {
+		slog.Warn("PostgreSQL apply admission refused a drop the plan did not record", "database", database, "table", tc.Table)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: the plan does not record the object this statement drops, so the apply cannot check it is still the object that was reviewed; re-plan and apply again", tc.Table)
+	}
+	return dropped, nil
 }
 
 // plannedSchemaMatchesTarget refuses an apply whose planned DDL names a
@@ -1508,10 +1543,39 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	// where greenfieldCreateSet keeps the blocking form on purpose — a
 	// table born in the run has no readers, and CONCURRENTLY cannot run
 	// inside its create sequence.
+	if change.dropped != nil {
+		return executeReviewedDrop(ctx, pool, table, change, statement.SQL(), tracker)
+	}
 	if err := executor.ExecuteNativeWithProgress(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	}, executor.DefaultRetryPolicy(), tracker); err != nil {
 		return fmt.Errorf("execute native-safe PostgreSQL statement on table %q: %w", change.table, err)
+	}
+	return nil
+}
+
+// executeReviewedDrop runs a statement that drops a live object through
+// pg-sprite's drop check: under the table's lock, in the transaction that
+// drops it, the object must still have the definition the plan recorded, and
+// when it does not the executor refuses with ErrDroppedObjectDrift and drops
+// nothing. The statement runs under the same lock and statement limits as
+// every other optimistic statement; the concurrent and validation budgets
+// bound step classes a single drop never contains, and are set only because
+// the executor refuses an unbounded budget set.
+func executeReviewedDrop(ctx context.Context, pool *pgxpool.Pool, table preflight.PreflightedTable, change nativeApply, statement string, tracker *progress.Tracker) (err error) {
+	if tracker == nil {
+		return fmt.Errorf("drop reviewed %s %q on PostgreSQL table %q: progress tracker is required", change.dropped.Kind, change.dropped.Name, change.table)
+	}
+	tracker.Start(1, progress.OperationOptimistic)
+	defer func() { tracker.Finish(err) }()
+	at := executor.RunStep{Tracker: tracker, Step: 1}
+	budget := executor.SequenceBudget{
+		Brief:      executor.Budget{LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit},
+		Concurrent: executor.ConcurrentBudget{Overall: optimisticStatementLimit},
+		Validate:   executor.ValidateBudget{LockTimeout: optimisticLockTimeout, Overall: optimisticStatementLimit},
+	}
+	if _, err := executor.RunSequenceAsStep(ctx, pool, table, []string{statement}, budget, executor.DefaultRetryPolicy(), nil, nil, change.dropped, at); err != nil {
+		return fmt.Errorf("drop reviewed %s %q on PostgreSQL table %q: %w", change.dropped.Kind, change.dropped.Name, change.table, err)
 	}
 	return nil
 }

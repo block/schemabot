@@ -4198,13 +4198,21 @@ func (c *GRPCClient) dispatchRemoteApply(ctx context.Context, apply *storage.App
 	if standDown, err := c.startStoppedDeploymentApplyBeforeAttach(ctx, apply, scope); standDown || err != nil {
 		return err
 	}
+	ddlChanges, err := tasksToProtoTableChanges(tasks, plan)
+	if err != nil {
+		errMsg := fmt.Sprintf("queued gRPC apply failed: %v", err)
+		if markErr := c.settleFailedDispatch(ctx, apply, nil, scope, kind, dispatchRefused, errMsg); markErr != nil {
+			return fmt.Errorf("mark queued gRPC apply %s failed after reading the plan's engine metadata: %w", apply.ApplyIdentifier, markErr)
+		}
+		return fmt.Errorf("queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
+	}
 
 	req := &ternv1.ApplyRequest{
 		PlanId:                  plan.PlanIdentifier,
 		Options:                 options,
 		Database:                apply.Database,
 		Type:                    apply.DatabaseType,
-		DdlChanges:              tasksToProtoTableChanges(tasks),
+		DdlChanges:              ddlChanges,
 		SchemaFiles:             schemaFilesToProto(plan.SchemaFiles),
 		Environment:             apply.Environment,
 		Target:                  target,
@@ -4509,17 +4517,26 @@ func planToProtoTableChanges(plan *storage.Plan) []*ternv1.TableChange {
 	return changes
 }
 
-func tasksToProtoTableChanges(tasks []*storage.Task) []*ternv1.TableChange {
+// tasksToProtoTableChanges builds the dispatch's DDL changes from the tasks,
+// each carrying the engine metadata the plan stored with its change, so a
+// data plane that materializes the plan from the dispatch hands the engine
+// the same plan-time record as one reading its own stored plan.
+func tasksToProtoTableChanges(tasks []*storage.Task, plan *storage.Plan) ([]*ternv1.TableChange, error) {
 	changes := make([]*ternv1.TableChange, 0, len(tasks))
 	for _, task := range tasks {
+		metadata, err := plan.TableChangeMetadata(task.Namespace, task.TableName, task.DDL)
+		if err != nil {
+			return nil, fmt.Errorf("read engine metadata for task %s: %w", task.TaskIdentifier, err)
+		}
 		changes = append(changes, &ternv1.TableChange{
 			TableName:  task.TableName,
 			Ddl:        task.DDL,
 			ChangeType: ternconv.OpToChangeType(task.DDLAction),
 			Namespace:  task.Namespace,
+			Metadata:   metadata,
 		})
 	}
-	return changes
+	return changes, nil
 }
 
 // isShardWorkOperation reports whether an operation is sharded work keyed

@@ -111,7 +111,7 @@ func TestLocalClient_SequentialStopReachesEngineWithAcceptedResumeState(t *testi
 	require.NoError(t, err)
 	require.Len(t, tasks, 1)
 
-	action := client.runEngineTaskAttempt(driveCtx, claimed, tasks[0], nil)
+	action := client.runEngineTaskAttempt(driveCtx, claimed, tasks[0], nil, nil)
 
 	assert.Equal(t, taskStopped, action, "the drive stands down for the operator's stop")
 	stored, err := stor.ApplyOperations().GetEngineResumeState(ctx, operation.ID)
@@ -197,7 +197,7 @@ func (f *unrecordedResumeStateFixture) attempt(t *testing.T) (taskAction, *stora
 	tasks[0].State = state.Task.Pending
 	require.NoError(t, f.stor.Tasks().Update(f.ctx, tasks[0]), "the task has not started yet")
 
-	action := f.client.runEngineTaskAttempt(f.ctx, f.claimed, tasks[0], nil)
+	action := f.client.runEngineTaskAttempt(f.ctx, f.claimed, tasks[0], nil, nil)
 
 	stored, err := f.stor.Tasks().GetByApplyID(t.Context(), f.apply.ID)
 	require.NoError(t, err)
