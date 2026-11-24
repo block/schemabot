@@ -103,7 +103,7 @@ func TestE2ERollbackPlanViaWebhook(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// Get the apply identifier for the rollback command
 	storedApply, err := svc.Storage().Applies().Get(ctx, applyID)
@@ -214,7 +214,7 @@ func TestE2ERollbackConfirmNoLock(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	_, err := svc.Storage().Applies().Create(t.Context(), &storage.Apply{
 		ApplyIdentifier: "apply_aabbccdd0012",
@@ -1166,8 +1166,8 @@ func (s *recordingCheckStore) RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Con
 	return updated, err
 }
 
-func (s *recordingCheckStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check) (bool, error) {
-	updated, err := s.CheckStore.MarkStalePlanSuccessful(ctx, check)
+func (s *recordingCheckStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check, readHeadSHA string) (bool, error) {
+	updated, err := s.CheckStore.MarkStalePlanSuccessful(ctx, check, readHeadSHA)
 	if err == nil && updated {
 		s.record("mark_stale_plan_successful", check.DatabaseName, check.Status, check.Conclusion)
 	}
@@ -1445,7 +1445,7 @@ func TestE2ERollbackIgnoredByNonOwningInstance(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	commands := []string{
 		"schemabot rollback apply-aabbccdd0011 -e staging",

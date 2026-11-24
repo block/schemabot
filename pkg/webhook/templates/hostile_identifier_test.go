@@ -54,6 +54,7 @@ func TestHostileIdentifierNeverEscapesItsCodeSpan(t *testing.T) {
 
 	surfaces := map[string]string{
 		"plan comment":                                 RenderPlanComment(plan),
+		"unmatched drop_tables entry":                  RenderPlanComment(PlanCommentData{Database: "testapp", Environment: "staging", IsMySQL: true, UnmatchedDropTables: []string{hostileIdentifier}}),
 		"unsafe changes rejection":                     RenderUnsafeChangesBlocked(plan),
 		"blocked changes rejection":                    RenderBlockedChangesApplyRejected(plan),
 		"apply retry row":                              RenderApplyStatusComment(apply),

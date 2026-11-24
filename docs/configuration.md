@@ -1174,9 +1174,14 @@ lists, and comments still go out, and so do the same file and tree reads when
 SchemaBot makes them to decide what a Check Run says, such as which
 environments a pull request's configs cover. A plan that needs a refused read
 fails closed: the pull request's SchemaBot check does not pass until a plan
-succeeds after the reset. A refused plan is retried on the usual schedule, not
-at the reset, so push or re-run the check after the reset if it is still
-failing.
+succeeds after the reset. When a refused read stops SchemaBot from finding a
+pull request's configs, or from running an `apply` command, SchemaBot retries
+it when the quota resets, and for three hours after the event arrived that wait
+does not use up its retry attempts. After those three hours each refusal uses
+one of the event's five attempts, so an event the quota keeps refusing at every
+hourly reset stops being retried about eight hours after it arrived, and its
+check stays failing until the next push or check re-run. A read refused while one database is being
+planned still fails that plan until the next push or check re-run.
 
 ```yaml
 github:
@@ -2394,7 +2399,8 @@ auth:
     trusted_proxy_spiffe:                 # proxy SPIFFE IDs, read from the Envoy XFCC header
       - spiffe://example.org/ns/ingress/sa/proxy
     trusted_proxy_cidrs:                  # and/or source networks allowed to be the proxy
-      - 127.0.0.1/32
+      - 127.0.0.1/32                      # port-forward break-glass
+      - 127.0.0.6/32                      # the mesh source below
     read_groups: [readers]                # groups granted read (empty = any authenticated caller)
     write_groups: [operators]             # groups granted write (empty = no writes)
     # Optional service-caller lane — read-only access for services calling as
@@ -2404,11 +2410,16 @@ auth:
     read_service_spiffe:                  # caller SPIFFE IDs granted read-tier access
       - spiffe://example.org/ns/reporting/sa/reporting
     caller_spiffe_header: X-Forwarded-Caller-Spiffe-Id   # optional (default)
+    # Optional: loopback addresses a mesh sidecar delivers proxied requests
+    # from. Requires trusted_proxy_spiffe; refuses 127.0.0.1 and ::1. With
+    # trusted_proxy_cidrs set, each entry must be inside one of its networks.
+    trusted_mesh_loopback_sources: [127.0.0.6]
 ```
 
 The authorizer proves the request came from the trusted proxy, then reads the forwarded identity:
 
 - **Trust anchor (required, fail-closed).** With neither `trusted_proxy_cidrs` nor `trusted_proxy_spiffe` set, the server refuses to start. There are three modes: **CIDR only** (trust any request whose source IP is in a trusted network), **SPIFFE only** (trust any request whose XFCC carries a trusted SPIFFE ID), or **both** (require the source CIDR *and* a matching XFCC SPIFFE ID — defense in depth). `X-Forwarded-Client-Cert` (XFCC) is a spoofable HTTP header, so SPIFFE-only is safe only when the proxy sanitizes inbound XFCC and the server is not directly reachable (a service mesh) — the server logs a startup warning in that mode.
+- **Loopback sources.** On the identity-header lane, a request from a loopback address is the break-glass lane by default. A kubectl port-forward arrives that way, so its identity headers are typed by the person running it. Such a request is admitted, but its identity is not verified: features that record who acted, such as freeze attribution and override approval, treat it as unverified, and writes log a warning with reason `loopback_source`. `trusted_mesh_loopback_sources` names the loopback addresses a mesh sidecar delivers proxied requests from, such as Istio's `127.0.0.6` when the sidecar delivers to the pod IP. A request from one of them that passed the SPIFFE check is verified like any other proxied request, while a port-forward from `127.0.0.1` stays break-glass. Listing an address trusts every process in the pod's network namespace like the proxy: any of them can connect from `127.0.0.6` and send an XFCC header that names the proxy, just as it already can from the pod IP under SPIFFE-only trust. List one only when nothing else in the pod sends requests to SchemaBot. Each entry must be one loopback IP. `127.0.0.1` and `::1` are refused, including in IPv4-mapped form, and the setting requires `trusted_proxy_spiffe`: the source address does not identify the sender, so the SPIFFE check is the only check of who sent the request. With `trusted_proxy_cidrs` also set, the CIDR check runs first, so each listed address must be inside one of those networks (`127.0.0.6/32`), or the server refuses to start. Istio's IPv6 source, `::6`, is not a loopback address, so it never needs listing. The service-caller gateway lane verifies its caller whatever the source address; there, the setting changes only whether a request from a listed address is counted with reason `loopback_source`.
 - **Tiers.** Reads are open to any authenticated caller unless `read_groups` is set; writes require membership in `write_groups`, or in a database's `operator_groups` (see [Per-database write scoping](#per-database-write-scoping-forward-auth)). Only the canonical header is read, so a smuggled underscore variant (`X_Forwarded_User`) is ignored.
 - **Service callers (read-only).** `trusted_gateway_spiffe` + `read_service_spiffe` open a second lane for services calling as themselves: a caller-forwarding gateway terminates the caller's mTLS, verifies the client certificate, and forwards the caller's SPIFFE ID in `caller_spiffe_header`. The header is honored only when the XFCC-verified peer is a listed gateway, the forwarded caller must appear in `read_service_spiffe`, and service callers never get the write tier (denied with reason `service_caller_write`). The user and groups headers are never read on this lane, and the identity-header proxy always wins — the gateway lane is consulted only when the request did not arrive through the trusted proxy. `trusted_proxy_cidrs`, when set, gate this lane like everything else: a gateway SVID claimed from outside the trusted networks is never honored. **List a gateway only if it strips inbound copies of the caller header before setting it from the verified certificate** — otherwise any caller could forge an identity through it. The lane fails closed: gateways without callers (or callers without a gateway) refuse to start, the lane requires SPIFFE-anchored proxy trust (`trusted_proxy_spiffe`) — under CIDR-only trust an in-CIDR gateway request would be mistaken for the identity-header proxy, leaving the lane unreachable, so that combination refuses to start too — and an empty config disables the lane entirely.
 
@@ -2636,7 +2647,7 @@ Do not require the staging ConfigMap to contain production targets, or the produ
 
 ### Freeze groups (forward-auth)
 
-An environment freeze marks an environment, or some of its deployments and databases, as frozen until it ends or someone lifts it. While a freeze is in effect, SchemaBot refuses every new apply, start and cutover it covers, unless a second person approved an override for that change. Each freeze records a running policy: `continue`, the default, lets applies that started before the freeze finish, and `stop` stops every pending, running or paused apply it covers when the freeze is set, and withdraws a start queued on a stopped one, recording the freeze as the stop's requester. A planned `stop` freeze does not stop the applies running when it starts. Whether a freeze is in effect is decided by the database clock, so every pod agrees. A freeze is stored by the instance that serves its environment. `write_groups` members may set and lift freezes. To let others, such as incident commanders, do so without any other write, list their forwarded groups in `freeze.groups`:
+An environment freeze marks an environment, or some of its deployments and databases, as frozen until it ends or someone lifts it. While a freeze is in effect, SchemaBot refuses every new apply, start and cutover it covers, unless a second person approved an override for that change. Each freeze records a running policy: `continue`, the default, lets applies that started before the freeze finish, and `stop` stops every pending, running or paused apply it covers when the freeze is set, and withdraws a start queued on a stopped one, recording the freeze as the stop's requester. While a `stop` freeze is in effect, SchemaBot stops an apply instead of starting work on it that has not started, and holds a PlanetScale deploy queued before the freeze until the freeze ends. Status and the pull request comment name the freeze that stopped an apply. A planned `stop` freeze stops an apply already running when it starts only at the apply's next checkpoint: when a rollout starts its next deployment, or when SchemaBot recovers a drive that crashed or failed. An apply that reaches neither keeps running. Whether a freeze is in effect is decided by the database clock, so every pod agrees. A freeze is stored by the instance that serves its environment. `write_groups` members may set and lift freezes. To let others, such as incident commanders, do so without any other write, list their forwarded groups in `freeze.groups`:
 
 ```yaml
 auth:
@@ -2647,7 +2658,7 @@ freeze:
 
 The middleware admits `freeze.groups` members to write-tier endpoints, and the freeze handlers (`POST /api/freezes`, `POST /api/freezes/{id}/lift`) allow them. Approving an override (`POST /api/freezes/overrides/{id}/approve`) is for `freeze.groups` members only, not `write_groups`: the caller must be verified and must not be the requester. Every other mutating handler still requires `write_groups` or a database's `operator_groups`, and database operator grants do not cover freezes, which reach past any one database. Members also get the read tier, deployment-wide. `freeze.groups` requires `auth.type: forward_auth`, and its entries must be unique; either mistake is a startup error. Under other auth types, freezes follow the plain admin write gate.
 
-The CLI sets, lists, shows and lifts freezes and approves override requests, and asks for an override with `--override` on `apply`, `start` and `cutover`: see [Freeze an environment](cli.md#freeze-an-environment).
+The CLI sets, lists, shows and lifts freezes and approves override requests, and asks for an override with `--override` on `apply`, `start` and `cutover`: see [Freeze an environment](cli.md#freeze-an-environment), and the [freeze guide](freeze.md) for the whole workflow.
 A PR author can ask for an override of a freeze from the pull request: `schemabot apply -e production --override "reason"`, and the same flag on `schemabot apply-confirm`, `schemabot start` and `schemabot cutover`. When a freeze refuses the command, SchemaBot records an override request for the commenter and the PR author, and the comment names the request and how it is approved. The request is recorded as `github:<login>`, and an approval has to come from the same identity domain: the API route (`POST /api/freezes/overrides/{id}/approve`) refuses a request asked for on a pull request, and refuses an approver whose forwarded subject starts with `github:`. The identity rule holds both ways: a request asked for through the API or CLI is approved only there, and a request asked for on a pull request only on that pull request.
 
 A freeze approver approves from the pull request by commenting `schemabot freeze approve ovr-...` on the pull request where the request was made. Who may is set by `freeze.github_teams`, a list of GitHub teams as `org/team-slug`:

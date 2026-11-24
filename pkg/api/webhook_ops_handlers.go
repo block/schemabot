@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -199,7 +198,7 @@ func (s *Service) handleChecksSynthesize(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var req ChecksSynthesizeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
@@ -479,7 +478,7 @@ func (s *Service) handleChecksScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req ChecksScanRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
@@ -1065,12 +1064,14 @@ func scanPullRequestsForMissingChecks(ctx context.Context, client webhookMissing
 					continue
 				}
 				var checks []*storage.Check
+				var scopeConfig *ServerConfig
 				if len(scopes) > 0 {
-					checks = scopes[0].config.CheckRowsForEnvironment(stored, incompleteEnvironments[i], repo, pr.Number, pr.HeadSHA)
+					scopeConfig = scopes[0].config
+					checks = scopeConfig.CheckRowsForEnvironment(stored, incompleteEnvironments[i], repo, pr.Number, pr.HeadSHA)
 				} else {
 					checks = checkRowsForScanEnvironment(stored, incompleteEnvironments[i])
 				}
-				scoped := inspectRowsBehindStuckCheck(ctx, store, checks, pr.HeadSHA, logger)
+				scoped := inspectRowsBehindStuckCheck(ctx, scopeConfig, store, checks, pr.HeadSHA, logger)
 				incomplete[i].StoredRows = scoped
 				incomplete[i].WaitingOn = waitingOnForStoredRows(scoped)
 			}
@@ -1147,10 +1148,10 @@ func storedChecksBehindStuckCheck(ctx context.Context, store storage.Storage, re
 	return stored
 }
 
-func inspectRowsBehindStuckCheck(ctx context.Context, store storage.Storage, checks []*storage.Check, headSHA string, logger *slog.Logger) []InspectedCheck {
+func inspectRowsBehindStuckCheck(ctx context.Context, cfg *ServerConfig, store storage.Storage, checks []*storage.Check, headSHA string, logger *slog.Logger) []InspectedCheck {
 	rows := make([]InspectedCheck, 0, len(checks))
 	for _, check := range checks {
-		rows = append(rows, inspectedCheck(ctx, store, check, headSHA, logger))
+		rows = append(rows, inspectedCheck(ctx, cfg, store, check, headSHA, logger))
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].Environment != rows[j].Environment {

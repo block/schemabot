@@ -660,6 +660,7 @@ func TestEngine_Plan_RefusesTableDeclaredTwice(t *testing.T) {
 				Credentials: &engine.Credentials{DSN: dsn},
 			})
 			require.EqualError(t, err, `table "orders" is declared by both schema files "testdb/orders.sql" and "testdb/orders_extras.sql". Declare each table in exactly one schema file`)
+			assert.True(t, engine.IsPlanRefused(err))
 			assert.Nil(t, result)
 		}
 	})
@@ -674,6 +675,7 @@ func TestEngine_Plan_RefusesTableDeclaredTwice(t *testing.T) {
 			Credentials: &engine.Credentials{DSN: dsn},
 		})
 		require.EqualError(t, err, `table "orders" is declared by both schema files "billing/orders.sql" and "testdb/orders.sql". Declare each table in exactly one schema file`)
+		assert.True(t, engine.IsPlanRefused(err))
 		assert.Nil(t, result)
 	})
 }

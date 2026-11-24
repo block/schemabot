@@ -39,7 +39,9 @@ func TestUnsafeChangeHeadings_PlanWarnsApplyRefuses(t *testing.T) {
 	planOut := captureStdout(t, func() { WriteUnsafeChangesWarning(changes) })
 	assert.Contains(t, planOut, glyph.Attention+" Unsafe Changes Detected:")
 
-	applyOut := captureStdout(t, func() { WriteUnsafeChangesBlocked(changes, "apply -s . -e staging --allow-unsafe") })
+	applyOut := captureStdout(t, func() {
+		WriteUnsafeChangesBlocked(changes, []string{"apply", "-s", ".", "-e", "staging", "--allow-unsafe"})
+	})
 	assert.Contains(t, applyOut, glyph.Refused+" Apply blocked: 1 unsafe change(s) detected")
 	assert.Contains(t, applyOut, glyph.Escalation+" To proceed with these destructive changes, re-run with --allow-unsafe:")
 }
@@ -52,7 +54,7 @@ func TestWriteUnsafeChanges_DeclaredReasonsAreNotSplit(t *testing.T) {
 	sentence := "definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT"
 	declared := []UnsafeChange{{Table: "checks", Reason: sentence, Reasons: []string{sentence}}}
 
-	out := captureStdout(t, func() { WriteUnsafeChangesBlocked(declared, "storage apply --allow-unsafe") })
+	out := captureStdout(t, func() { WriteUnsafeChangesBlocked(declared, []string{"storage", "apply", "--allow-unsafe"}) })
 	assert.Contains(t, out, "Apply blocked: 1 unsafe change(s) detected",
 		"the heading counts what the list shows, so both read the findings the same way")
 	assert.Contains(t, out, "  1. checks: "+sentence+"\n")
@@ -61,7 +63,9 @@ func TestWriteUnsafeChanges_DeclaredReasonsAreNotSplit(t *testing.T) {
 	// The engine-reported form is still split, which is what a plan of a user's
 	// database needs: its reason is a concatenation of findings.
 	joined := []UnsafeChange{{Table: "checks", Reason: sentence}}
-	out = captureStdout(t, func() { WriteUnsafeChangesBlocked(joined, "apply -s . -e staging --allow-unsafe") })
+	out = captureStdout(t, func() {
+		WriteUnsafeChangesBlocked(joined, []string{"apply", "-s", ".", "-e", "staging", "--allow-unsafe"})
+	})
 	assert.Contains(t, out, "Apply blocked: 2 unsafe change(s) detected")
 	assert.Contains(t, out, "  2. checks: add it manually or ship the column with a DEFAULT\n")
 }

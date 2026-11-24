@@ -30,6 +30,10 @@ const (
 	changeGateCheckpointResume changeGateCheckpoint = "resume"
 	// changeGateCheckpointCutover runs before a deferred cutover is recorded.
 	changeGateCheckpointCutover changeGateCheckpoint = "cutover"
+	// changeGateCheckpointClaim runs when a driver claims an operation it
+	// would start: one that has not started, or a stopped one a start
+	// resumes. Only freezes with running "stop" act here.
+	changeGateCheckpointClaim changeGateCheckpoint = "claim"
 )
 
 // changeGateInput is what a change gate decides on.

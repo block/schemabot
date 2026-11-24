@@ -102,8 +102,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"reflect"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -115,6 +117,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/engine"
@@ -694,9 +697,23 @@ func (c *GRPCClient) logTaskStateTransition(ctx context.Context, applyID int64, 
 		message, oldState, task.State)
 }
 
+// remoteTaskStateChangeMessage names the table and, on a sharded target, the
+// shard whose task changed state, so a slow or failed shard can be found from
+// the apply's log. The old and new states are carried on the log entry itself
+// and rendered beside the message, so the message does not repeat them.
+func remoteTaskStateChangeMessage(task *storage.Task) string {
+	if task.Shard == "" {
+		return fmt.Sprintf("Remote task %s changed state", task.TableName)
+	}
+	return fmt.Sprintf("Remote task %s on shard %s changed state", task.TableName, task.Shard)
+}
+
+// logApplyWarning records a warning that changes no state, so the entry
+// carries no state pair: the log readers render one beside the message
+// whenever both states are set.
 func (c *GRPCClient) logApplyWarning(ctx context.Context, apply *storage.Apply, message string) {
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError,
-		message, apply.State, apply.State)
+		message, "", "")
 }
 
 func remoteApplyStateDescription(remoteState ternv1.State) string {
@@ -2360,6 +2377,18 @@ func (c *GRPCClient) logProgressReadFromWholeApply(ctx context.Context, apply *s
 			"remote_operation_id", scope.operation.ExternalOperationID,
 			"operation_key", scope.operation.OperationKey,
 			"operation_deployment", scope.operation.Deployment)...)
+	// The apply log names each task's shard on its state changes. When the
+	// answer covers the whole remote apply, a task's state can come from a
+	// sibling operation's matching task, so the apply log says so beside them.
+	c.logApplyWarning(ctx, apply, wholeApplyProgressMessage(scope.operation.OperationKey, reason))
+}
+
+// wholeApplyProgressMessage tells the apply log's reader that an operation's
+// task state changes are read from the whole remote apply, not from the
+// operation alone, and why.
+func wholeApplyProgressMessage(operationKey, reason string) string {
+	return fmt.Sprintf("Progress for %s is read from the whole remote apply, so its task state changes can show a sibling's progress: %s",
+		operationKey, reason)
 }
 
 // remoteProgress polls the remote apply for this drive, scoped to its remote
@@ -3230,10 +3259,12 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 		scope.stampMemberTarget(req, plan)
 		resp, err := c.client.Apply(ctx, req)
 		if err != nil {
-			if isAmbiguousRemoteCallError(err) {
+			if isAmbiguousRemoteCallError(err) || isUnprovenRequestSizeRefusal(err, req) {
 				return fmt.Errorf("%s apply_operation %d (apply %s) has ambiguous remote dispatch outcome: %w", kind, op.ID, apply.ApplyIdentifier, err)
 			}
-			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, err.Error(), isRetryableRemoteApplyError(err), scope); markErr != nil {
+			retryable := isRetryableRemoteApplyError(err)
+			err = explainApplySizeRefusal(err)
+			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, err.Error(), retryable, scope); markErr != nil {
 				return fmt.Errorf("mark %s apply_operation %d failed after remote apply error: %w", kind, op.ID, markErr)
 			}
 			return fmt.Errorf("dispatch %s apply_operation %d (apply %s): %w", kind, op.ID, apply.ApplyIdentifier, err)
@@ -3759,7 +3790,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 			if remoteStartRequested {
 				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply start requested by operator", oldState)
 			} else if oldState != apply.State {
-				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply state refreshed before operator start: %s -> %s", oldState, apply.State), oldState)
+				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply state refreshed before operator start", oldState)
 			}
 		}
 	}
@@ -4168,13 +4199,21 @@ func (c *GRPCClient) dispatchRemoteApply(ctx context.Context, apply *storage.App
 	if standDown, err := c.startStoppedDeploymentApplyBeforeAttach(ctx, apply, scope); standDown || err != nil {
 		return err
 	}
+	ddlChanges, err := tasksToProtoTableChanges(tasks, plan, planChangeCanonicalizer(apply, c.applyLogger(apply)))
+	if err != nil {
+		errMsg := fmt.Sprintf("queued gRPC apply failed: %v", err)
+		if markErr := c.settleFailedDispatch(ctx, apply, nil, scope, kind, dispatchRefused, errMsg); markErr != nil {
+			return fmt.Errorf("mark queued gRPC apply %s failed after reading the plan's engine metadata: %w", apply.ApplyIdentifier, markErr)
+		}
+		return fmt.Errorf("queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
+	}
 
 	req := &ternv1.ApplyRequest{
 		PlanId:                  plan.PlanIdentifier,
 		Options:                 options,
 		Database:                apply.Database,
 		Type:                    apply.DatabaseType,
-		DdlChanges:              tasksToProtoTableChanges(tasks),
+		DdlChanges:              ddlChanges,
 		SchemaFiles:             schemaFilesToProto(plan.SchemaFiles),
 		Environment:             apply.Environment,
 		Target:                  target,
@@ -4192,10 +4231,11 @@ func (c *GRPCClient) dispatchRemoteApply(ctx context.Context, apply *storage.App
 	scope.stampMemberTarget(req, plan)
 	resp, err := c.client.Apply(ctx, req)
 	if err != nil {
-		if isAmbiguousRemoteCallError(err) {
+		if isAmbiguousRemoteCallError(err) || isUnprovenRequestSizeRefusal(err, req) {
 			return dispatchError(kind, dispatchUnanswered, fmt.Errorf("apply queued gRPC apply %s has ambiguous remote dispatch outcome: %w", apply.ApplyIdentifier, err))
 		}
 		failure := classifyRemoteApplyError(err)
+		err = explainApplySizeRefusal(err)
 		if markErr := c.settleFailedDispatch(ctx, apply, tasks, scope, kind, failure, err.Error()); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after remote apply error: %w", apply.ApplyIdentifier, markErr)
 		}
@@ -4309,7 +4349,11 @@ func isRetryableRemoteApplyError(err error) bool {
 	}
 
 	switch st.Code() {
-	case codes.Internal, codes.Unknown, codes.Unavailable, codes.ResourceExhausted, codes.Aborted:
+	case codes.ResourceExhausted:
+		// Throttling clears with time, but a message over the size limit is
+		// refused the same way on every resend.
+		return !isMessageSizeRefusal(err)
+	case codes.Internal, codes.Unknown, codes.Unavailable, codes.Aborted:
 		return true
 	case codes.Canceled, codes.DeadlineExceeded:
 		return false
@@ -4319,6 +4363,70 @@ func isRetryableRemoteApplyError(err error) bool {
 	default:
 		return false
 	}
+}
+
+// messageSizeRefusalPhrases are the texts gRPC uses when it refuses a message
+// over its size limit: the receiving side reports the message it would not
+// read, and the sending side the message it would not send.
+var messageSizeRefusalPhrases = []string{
+	"received message larger than max",
+	"trying to send message larger than max",
+}
+
+// messageSizeRefusalSizes captures the "(size vs. limit)" pair gRPC appends
+// to a size refusal.
+var messageSizeRefusalSizes = regexp.MustCompile(`larger than max \((\d+) vs\. (\d+)\)`)
+
+// isMessageSizeRefusal reports whether err is gRPC refusing a message over its
+// size limit, which ResourceExhausted shares with throttling.
+func isMessageSizeRefusal(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.ResourceExhausted {
+		return false
+	}
+	for _, phrase := range messageSizeRefusalPhrases {
+		if strings.Contains(st.Message(), phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// isUnprovenRequestSizeRefusal reports a size refusal that is not provably of
+// req itself. gRPC uses the same text when the response is over a limit, and
+// a response is only sent after the data plane handled the request, so such a
+// refusal says nothing about whether a remote apply was created. Only a
+// refusal reporting req's own encoded size proves the request never reached a
+// handler. The client sends uncompressed, so that size is proto.Size(req).
+// The server's own send refusal carries a "grpc: " prefix the client's lacks,
+// and is always about the response, so it never proves anything about req.
+func isUnprovenRequestSizeRefusal(err error, req *ternv1.ApplyRequest) bool {
+	if !isMessageSizeRefusal(err) {
+		return false
+	}
+	message := status.Convert(err).Message()
+	if strings.Contains(message, "grpc: trying to send message larger than max") {
+		return true
+	}
+	match := messageSizeRefusalSizes.FindStringSubmatch(message)
+	return match == nil || match[1] != strconv.Itoa(proto.Size(req))
+}
+
+// explainApplySizeRefusal returns err with the request size, the limit it
+// crossed, and what to do about it spelled out when err is a size refusal, and
+// err unchanged otherwise. Callers pass only refusals of the request itself
+// (see isUnprovenRequestSizeRefusal). The apply request carries the plan's
+// schema files and changes, so a resend is the same size and is refused again.
+func explainApplySizeRefusal(err error) error {
+	if !isMessageSizeRefusal(err) {
+		return err
+	}
+	match := messageSizeRefusalSizes.FindStringSubmatch(status.Convert(err).Message())
+	if match == nil {
+		return err
+	}
+	return fmt.Errorf("apply request is %s bytes, over the %s-byte gRPC message size limit, and resending it fails the same way; "+
+		"plan fewer namespaces at a time so each apply's schema files fit: %w", match[1], match[2], err)
 }
 
 func isTerminalRemoteProgressError(err error) bool {
@@ -4395,7 +4503,9 @@ func (c *GRPCClient) prepareDispatchTasks(ctx context.Context, apply *storage.Ap
 
 // planToProtoTableChanges converts every change of a plan to the form a
 // dispatch carries it in, the same shape tasksToProtoTableChanges gives the
-// tasks built from it.
+// tasks built from it, engine metadata included, so a member that builds its
+// plan from a table step's dispatch holds the same plan-time record as one
+// reading its own stored plan.
 func planToProtoTableChanges(plan *storage.Plan) []*ternv1.TableChange {
 	flat := plan.FlatDDLChanges()
 	changes := make([]*ternv1.TableChange, 0, len(flat))
@@ -4405,22 +4515,33 @@ func planToProtoTableChanges(plan *storage.Plan) []*ternv1.TableChange {
 			Ddl:        change.DDL,
 			ChangeType: ternconv.OpToChangeType(change.Operation),
 			Namespace:  change.Namespace,
+			Metadata:   maps.Clone(change.Metadata),
 		})
 	}
 	return changes
 }
 
-func tasksToProtoTableChanges(tasks []*storage.Task) []*ternv1.TableChange {
+// tasksToProtoTableChanges builds the dispatch's DDL changes from the tasks,
+// each carrying the engine metadata the plan stored with its change, so a
+// data plane that materializes the plan from the dispatch hands the engine
+// the same plan-time record as one reading its own stored plan.
+func tasksToProtoTableChanges(tasks []*storage.Task, plan *storage.Plan, canon StatementCanonicalizer) ([]*ternv1.TableChange, error) {
+	planMetadata := newPlanChangeMetadata(plan, canon)
 	changes := make([]*ternv1.TableChange, 0, len(tasks))
 	for _, task := range tasks {
+		metadata, err := planMetadata.forTask(task)
+		if err != nil {
+			return nil, fmt.Errorf("read engine metadata for task %s: %w", task.TaskIdentifier, err)
+		}
 		changes = append(changes, &ternv1.TableChange{
 			TableName:  task.TableName,
 			Ddl:        task.DDL,
 			ChangeType: ternconv.OpToChangeType(task.DDLAction),
 			Namespace:  task.Namespace,
+			Metadata:   metadata,
 		})
 	}
-	return changes
+	return changes, nil
 }
 
 // isShardWorkOperation reports whether an operation is sharded work keyed
@@ -5131,7 +5252,7 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 			return fmt.Errorf("sync task %s from gRPC progress for %s: %w", storedTask.TaskIdentifier, storedApply.ApplyIdentifier, err)
 		}
 		if oldTaskState != storedTask.State {
-			c.logTaskStateTransition(ctx, storedApply.ID, storedTask, fmt.Sprintf("Remote task %s changed state: %s -> %s", storedTask.TableName, oldTaskState, storedTask.State), oldTaskState)
+			c.logTaskStateTransition(ctx, storedApply.ID, storedTask, remoteTaskStateChangeMessage(storedTask), oldTaskState)
 		}
 
 		// Mirror the per-shard progress the data plane reported into control-plane
@@ -5769,7 +5890,7 @@ func (c *GRPCClient) pollRemoteUntilDone(ctx context.Context, apply *storage.App
 				return fmt.Errorf("sync apply %s from gRPC progress: %w", apply.ApplyIdentifier, err)
 			}
 			if persisted && oldApplyState != apply.State {
-				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply changed state: %s -> %s", oldApplyState, apply.State), oldApplyState)
+				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply changed state", oldApplyState)
 			}
 
 			// Park-and-release at the cutover barrier, mirroring the LocalClient

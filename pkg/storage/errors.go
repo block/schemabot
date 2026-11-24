@@ -1,6 +1,9 @@
 package storage
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // Common storage errors.
 var (
@@ -30,6 +33,11 @@ var (
 	// pin was observed, or a row-pinned release finds the row re-acquired for
 	// another plan.
 	ErrLockIntentChanged = errors.New("lock intent changed")
+
+	// ErrLockInUse is returned when a release refuses to delete a lock row
+	// because an apply that has not reached a terminal state records that row
+	// as its lock. The lock stays held. A *LockInUseError carries the apply.
+	ErrLockInUse = errors.New("lock is in use by an apply")
 
 	// ErrCheckNotFound is returned when a check does not exist.
 	ErrCheckNotFound = errors.New("check not found")
@@ -210,4 +218,24 @@ func (e *ActiveApplyError) Error() string {
 
 func (e *ActiveApplyError) Unwrap() error {
 	return ErrActiveApplyExists
+}
+
+// LockInUseError reports the apply that kept a lock row from being released.
+// It matches ErrLockInUse, and carries the apply so a caller can log it with
+// Apply.LogAttrs and tell the operator which apply to wait for.
+type LockInUseError struct {
+	// LockID is the lock row the release was pinned to.
+	LockID int64
+	// Apply is the newest apply that records LockID as its lock and has not
+	// reached a terminal state.
+	Apply *Apply
+}
+
+func (e *LockInUseError) Error() string {
+	return fmt.Sprintf("lock row %d is recorded by apply %s in state %s: %s",
+		e.LockID, e.Apply.ApplyIdentifier, e.Apply.State, ErrLockInUse.Error())
+}
+
+func (e *LockInUseError) Unwrap() error {
+	return ErrLockInUse
 }

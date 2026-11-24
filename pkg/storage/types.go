@@ -378,9 +378,10 @@ type Check struct {
 	// AggregateRender is what an aggregate row's Check Run text was rendered
 	// from, so the text can be rendered again with newer rollout counts
 	// without re-reading the PR. The encoding belongs to the caller. Upsert
-	// writes it, so an Upsert that leaves it empty clears it; other reads do
-	// not load it, and GetAggregateRender returns it. Empty on per-database
-	// rows.
+	// writes it, so an Upsert that leaves it empty clears it. GetAggregateRender
+	// returns it, and ListRemovableOnPRClose loads it so close cleanup can tell
+	// a render-only rewrite from an untouched row; other reads do not load it.
+	// Empty on per-database rows.
 	AggregateRender []byte `json:"-"`
 
 	// CreatedAt is when the check was created.
@@ -761,6 +762,10 @@ const (
 	EnginePostgres    = "postgres"
 )
 
+// Engines lists every engine constant above, for checks that must hold on
+// every engine. TestEnginesListsEveryEngineConstant keeps it complete.
+var Engines = []string{EngineSpirit, EnginePlanetScale, EngineStrata, EnginePostgres}
+
 // ApplyOperationKind constants classify operation rows by scheduling role.
 const (
 	ApplyOperationKindWork           = "work"
@@ -918,6 +923,12 @@ type TableChange struct {
 	// moves, with how each move changes the way values compare. Empty when
 	// the change re-collates no column, or the engine does not report it.
 	CollationChanges []CollationChange `json:"collation_changes,omitempty"`
+
+	// Metadata is what the engine recorded about this change at plan time
+	// and needs back at apply time (engine.TableChange.Metadata). It is
+	// stored with the reviewed plan so the apply runs against what was
+	// reviewed rather than against a fresh read of the target.
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // CollationChange is one existing column a planned change moves onto another

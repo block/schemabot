@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -105,7 +106,12 @@ func (m WatchModel) triggerCutover() tea.Cmd {
 	}
 }
 
+// triggerStop sends the command the watcher offers: cancel where the engine
+// can only cancel, and stop everywhere else.
 func (m WatchModel) triggerStop() tea.Cmd {
+	if m.stopCommand() == presentation.StopCommandCancel {
+		return m.triggerCancel()
+	}
 	return func() tea.Msg {
 		result, err := client.CallStopAPI(m.endpoint, m.environment, m.applyID)
 		if err != nil {
@@ -121,6 +127,24 @@ func (m WatchModel) triggerStop() tea.Cmd {
 		}
 
 		// Pass through informational message (e.g. "Schema change already completed")
+		return stopResultMsg{success: true, message: result.ErrorMessage}
+	}
+}
+
+// triggerCancel cancels the apply for the c key.
+func (m WatchModel) triggerCancel() tea.Cmd {
+	return func() tea.Msg {
+		result, err := client.CallCancelAPI(m.endpoint, m.environment, m.applyID)
+		if err != nil {
+			return stopResultMsg{success: false, err: err}
+		}
+		if !result.Accepted {
+			errMsg := result.ErrorMessage
+			if errMsg == "" {
+				errMsg = "cancel not accepted"
+			}
+			return stopResultMsg{success: false, err: fmt.Errorf("%s", errMsg)}
+		}
 		return stopResultMsg{success: true, message: result.ErrorMessage}
 	}
 }
@@ -156,12 +180,15 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 		released:     data.Released,
 		sharded:      data.Sharded,
 		deferCutover: data.Options["defer_cutover"] == "true",
+		stoppedBy:    data.StoppedByFreeze,
 		errorMsg:     data.ErrorMessage,
 		applyID:      result.ApplyID,
 		database:     result.Database,
 		environment:  result.Environment,
 		engine:       result.Engine,
 		metadata:     result.Metadata,
+		buildWork:    data.BuildWork,
+		stepsTotal:   data.StepsTotal,
 	}
 }
 

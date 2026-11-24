@@ -27,6 +27,7 @@ func TestChangeTypeToStatementType(t *testing.T) {
 		{ternv1.ChangeType_CHANGE_TYPE_RENAME, ddl.StatementRenameTable, true},
 		{ternv1.ChangeType_CHANGE_TYPE_TRUNCATE, ddl.StatementTruncateTable, true},
 		{ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW, ddl.StatementCreateView, true},
+		{ternv1.ChangeType_CHANGE_TYPE_ALTER_TYPE, ddl.StatementAlterType, true},
 		{ternv1.ChangeType(100), ddl.StatementUnknown, false},
 	}
 
@@ -53,6 +54,7 @@ func TestStatementTypeToChangeType(t *testing.T) {
 		{ddl.StatementCreateIndex, ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX},
 		{ddl.StatementDropIndex, ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX},
 		{ddl.StatementCreateView, ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW},
+		{ddl.StatementAlterType, ternv1.ChangeType_CHANGE_TYPE_ALTER_TYPE},
 		{ddl.StatementInsert, ternv1.ChangeType_CHANGE_TYPE_OTHER},
 		{ddl.StatementUpdate, ternv1.ChangeType_CHANGE_TYPE_OTHER},
 		{ddl.StatementDelete, ternv1.ChangeType_CHANGE_TYPE_OTHER},

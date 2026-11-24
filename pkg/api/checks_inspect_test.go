@@ -259,6 +259,51 @@ func TestInspectChecksReportsReconciliationOwedForRetainedBlock(t *testing.T) {
 	assert.False(t, row.SelfConverging)
 }
 
+// A database that dropped its sandbox environment leaves a plan-only sandbox
+// row on an earlier commit. No plan of sandbox can replace it, so checks show
+// names that cause and points at a plan of an environment the database still
+// has, instead of telling the operator to re-plan sandbox.
+func TestInspectChecksReportsRowInEnvironmentNoLongerConfigured(t *testing.T) {
+	t.Parallel()
+
+	const headSHA = "51ab00cccccccccccccccccccccccccccccccccc"
+	store := &inspectStorage{
+		checks: &inspectCheckStore{checks: []*storage.Check{{
+			Repository: "octo/repo", PullRequest: 711, HeadSHA: "0ld5ha0000000000000000000000000000000000",
+			Environment: "sandbox", DatabaseType: "mysql", DatabaseName: "widgets",
+			Status:     checkstate.StatusCompleted,
+			Conclusion: checkstate.ConclusionFailure,
+		}}},
+		applies: &inspectApplyStore{applies: map[int64]*storage.Apply{}},
+	}
+	client := &inspectGitHubClient{prInfo: &ghclient.PullRequestInfo{HeadSHA: headSHA, State: "open"}}
+	cfg := &ServerConfig{
+		AllowedEnvironments: []string{"sandbox", "staging", "production"},
+		Databases: map[string]DatabaseConfig{
+			"widgets": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"staging":    {DSN: "root@tcp(localhost)/widgets"},
+					"production": {DSN: "root@tcp(localhost)/widgets"},
+				},
+			},
+		},
+	}
+
+	response, err := inspectChecks(t.Context(), cfg, store, client,
+		ChecksInspectRequest{Repo: "octo/repo", PullRequest: 711}, discardLogger())
+	require.NoError(t, err)
+
+	require.Len(t, response.Rows, 1)
+	row := response.Rows[0]
+	assert.Equal(t, "sandbox", row.Environment)
+	assert.False(t, row.CoversHead)
+	assert.Equal(t, checkstate.ReasonEnvironmentNotConfigured, row.Reason)
+	assert.True(t, row.Blocking)
+	assert.False(t, row.SelfConverging)
+	assert.Contains(t, row.Remedy, "`schemabot plan -e staging`", "the remedy names the first environment the database is still planned in")
+}
+
 // Rows come back in a stable order, an environment filter narrows them, and
 // the aggregate row is reported alongside the per-database rows rather than
 // hidden: what the aggregate is holding open is the question being asked.

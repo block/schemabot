@@ -231,9 +231,11 @@ func IsUnsupportedOperation(err error) bool {
 // PlanRefusedError wraps an error to indicate the engine declined to plan
 // because the declared schema cannot be applied safely as written, such as a
 // change that would drop a table the database still depends on. It is not a
-// failure of the engine or its backend: planning the same schema files again
-// is refused again, and the remedy is a change to those files, which the
-// wrapped message describes for whoever edits them.
+// failure of the engine or its backend: planning the same schema files against
+// the same target is refused again. The remedy is the operator's, and the
+// wrapped message says what it is: usually a change to those files, and for
+// some refusals a change on the target, such as waiting until a table due to
+// be dropped has gone long enough without a write.
 type PlanRefusedError struct {
 	Err error
 }

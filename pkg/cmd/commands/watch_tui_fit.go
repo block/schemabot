@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/ui"
@@ -89,4 +90,33 @@ func (m WatchModel) hiddenLinesNote(hidden int) string {
 
 func (m WatchModel) statusCommand() string {
 	return "  " + cliname.Command("status", m.applyID, "-e", m.environment)
+}
+
+// wrapToWindow wraps a line to the terminal's width. The renderer truncates
+// a line wider than the window, and fitToWindow counts each line as one row,
+// so a long note is wrapped before either sees it, or its last sentences are
+// cut off. It breaks only at spaces, so a flag such as --override stays
+// whole; a word wider than the window keeps its own line. Before the first
+// window size message it is left as it is.
+func (m WatchModel) wrapToWindow(line string) string {
+	if m.windowWidth <= 0 {
+		return line
+	}
+	var b strings.Builder
+	width := 0
+	for word := range strings.FieldsSeq(line) {
+		wordWidth := ansi.StringWidth(word)
+		switch {
+		case width == 0:
+		case width+1+wordWidth > m.windowWidth:
+			b.WriteString("\n")
+			width = 0
+		default:
+			b.WriteString(" ")
+			width++
+		}
+		b.WriteString(word)
+		width += wordWidth
+	}
+	return b.String()
 }

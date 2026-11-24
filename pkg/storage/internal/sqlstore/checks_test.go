@@ -34,10 +34,10 @@ func TestCheckStore_MarkStalePlanSuccessfulIsIdempotentUnderChangedRows(t *testi
 		Status: "completed", Conclusion: "success",
 	}
 
-	marked, err := store.Checks().MarkStalePlanSuccessful(ctx, success)
+	marked, err := store.Checks().MarkStalePlanSuccessful(ctx, success, "oldsha")
 	require.NoError(t, err)
 	assert.True(t, marked)
-	marked, err = store.Checks().MarkStalePlanSuccessful(ctx, success)
+	marked, err = store.Checks().MarkStalePlanSuccessful(ctx, success, "oldsha")
 	require.NoError(t, err)
 	assert.True(t, marked)
 }
@@ -56,7 +56,7 @@ func TestCheckStore_MarkStalePlanSuccessfulLeavesInProgressApplyBlockingUnderCha
 		Repository: "org/repo", PullRequest: 123, HeadSHA: "newsha",
 		Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "testdb",
 		Status: "completed", Conclusion: "success",
-	})
+	}, "oldsha")
 	require.NoError(t, err)
 	assert.False(t, marked)
 

@@ -187,7 +187,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		// A plan narrowed to one target speaks for that target only, so its
 		// failure (an unknown target included) answers on the comment and leaves
 		// the environment's check as its last plan of every target recorded it.
-		h.logger.Error("plan narrowed to one target failed; leaving the environment's check unchanged",
+		api.PlanFailureLog(h.logger, err)("plan narrowed to one target failed; leaving the environment's check unchanged",
 			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
 			"deployment", deployment, "environment", environment, "target", target, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, userFacingError(err))
@@ -195,7 +195,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 	if err != nil {
-		h.logger.Error("plan execution failed",
+		api.PlanFailureLog(h.logger, err)("plan execution failed",
 			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
 			"deployment", deployment, "environment", environment, "target", target, "error", err)
 		userError := userFacingError(err)
@@ -269,7 +269,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	if checkErr != nil && rolloutStillPending(drift) {
 		h.failClosedOnUnstoredRollout(ctx, client, repo, pr, schemaResult.HeadSHA, environment, drift)
 	} else if headSHA != "" {
-		h.settleChecksReplacedByNewTypeBeforeFold(ctx, client, repo, pr, headSHA, schemaResult.Database, schemaResult.Type)
+		h.settleLeftBehindChecksBeforeFold(ctx, client, repo, pr, headSHA, schemaResult.Database, schemaResult.Type)
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
 
@@ -344,7 +344,7 @@ func (h *Handler) failClosedOnNamespacePlacement(ctx context.Context, client *gh
 			map[string]string{environment: namespacePlacementUnstoredSummary}, namespacePlacementRefusedBlock)
 		return
 	}
-	h.settleChecksReplacedByNewTypeBeforeFold(ctx, client, repo, pr, headSHA, schemaResult.Database, schemaResult.Type)
+	h.settleLeftBehindChecksBeforeFold(ctx, client, repo, pr, headSHA, schemaResult.Database, schemaResult.Type)
 	h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 }
 
@@ -498,7 +498,7 @@ func (h *Handler) recordPlanFailuresAndFold(ctx context.Context, client *ghclien
 	if len(planFailedUnstored) > 0 {
 		foldSeesEveryFailure = h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA, planFailedUnstored, planFailedUnrecordedBlock)
 	}
-	h.settleChecksReplacedByNewTypeBeforeFold(ctx, client, repo, pr, headSHA, schema.Database, schema.Type)
+	h.settleLeftBehindChecksBeforeFold(ctx, client, repo, pr, headSHA, schema.Database, schema.Type)
 	if foldSeesEveryFailure {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	} else {
@@ -887,7 +887,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			continue
 		}
 		if err != nil {
-			h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "env", env, "error", err)
+			api.PlanFailureLog(h.logger, err)("plan execution failed", "repo", repo, "pr", pr, "env", env, "error", err)
 			planFailed(env, err)
 			continue
 		}
@@ -1676,21 +1676,31 @@ func planTableSizes(schema *ghclient.SchemaRequestResult, sc *apitypes.SchemaCha
 	return sizes
 }
 
+// commandPlanCommentData builds the plan comment a command posts, stamped with
+// the time the command was posted. Its "Requested by" line then reads when the
+// operator asked, however long planning took, rather than when it rendered.
+func (h *Handler) commandPlanCommentData(schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, requestedBy string, result CommandResult) templates.PlanCommentData {
+	data := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+	data.RequestedAt = result.RequestedAt
+	return data
+}
+
 // buildPlanCommentData converts plan results into template data.
 func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy, agentHint, cliName string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
-		Database:          schema.Database,
-		Environment:       environment,
-		Tenant:            tenant,
-		AgentHint:         agentHint,
-		CLIName:           cliName,
-		HeadSHA:           schema.HeadSHA,
-		Repository:        schema.Repository,
-		RequestedBy:       requestedBy,
-		DatabaseType:      schema.Type,
-		IsMySQL:           schema.Type == "mysql",
-		IgnoredNamespaces: schema.IgnoredNamespaces,
-		PlanID:            planResp.PlanID,
+		Database:            schema.Database,
+		Environment:         environment,
+		Tenant:              tenant,
+		AgentHint:           agentHint,
+		CLIName:             cliName,
+		HeadSHA:             schema.HeadSHA,
+		Repository:          schema.Repository,
+		RequestedBy:         requestedBy,
+		DatabaseType:        schema.Type,
+		IsMySQL:             schema.Type == "mysql",
+		IgnoredNamespaces:   schema.IgnoredNamespaces,
+		PlanID:              planResp.PlanID,
+		UnmatchedDropTables: planResp.UnmatchedDropTables,
 	}
 	for _, group := range planResp.ExemptTables {
 		if group == nil {
@@ -1833,12 +1843,13 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 	return data
 }
 
-// settleChecksReplacedByNewTypeBeforeFold settles the rows a planned database
-// left under an old type, ahead of the plan's aggregate fold. A row that
-// cannot be settled keeps blocking the aggregate, so the fold still runs.
-func (h *Handler) settleChecksReplacedByNewTypeBeforeFold(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, databaseName, databaseType string) {
-	if err := h.settleChecksReplacedByNewType(ctx, client, repo, pr, headSHA, databaseName, databaseType); err != nil {
-		h.logger.Error("checks under the database's old type keep blocking the aggregate because they could not be settled",
+// settleLeftBehindChecksBeforeFold settles the rows a planned database left
+// on earlier commits, under an old type or in an environment it no longer has,
+// ahead of the plan's aggregate fold. A row that cannot be settled keeps
+// blocking the aggregate, so the fold still runs.
+func (h *Handler) settleLeftBehindChecksBeforeFold(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, databaseName, databaseType string) {
+	if err := h.settleLeftBehindChecks(ctx, client, repo, pr, headSHA, databaseName, databaseType); err != nil {
+		h.logger.Error("checks the database left on earlier commits keep blocking the aggregate because they could not be settled",
 			"repo", repo, "pr", pr, "head_sha", headSHA,
 			"database", databaseName, "database_type", databaseType, "error", err)
 	}

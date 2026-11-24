@@ -40,6 +40,8 @@ type memoryFreezeStore struct {
 	// afterListInEffect runs after ListInEffect has read the freezes, as a
 	// freeze committed between the check and the admission write would.
 	afterListInEffect func()
+	// listInEffectErr, when set, fails ListInEffect.
+	listInEffectErr error
 }
 
 func (m *memoryFreezeStore) Create(_ context.Context, freeze *storage.EnvironmentFreeze) (*storage.EnvironmentFreeze, error) {
@@ -93,6 +95,9 @@ func (m *memoryFreezeStore) Lift(_ context.Context, identifier, liftedBy, reason
 }
 
 func (m *memoryFreezeStore) ListInEffect(_ context.Context, environment string) ([]*storage.EnvironmentFreeze, error) {
+	if m.listInEffectErr != nil {
+		return nil, m.listInEffectErr
+	}
 	at := m.clock.Now().UTC()
 	inEffect := m.filter(environment, func(f *storage.EnvironmentFreeze) bool { return f.InEffectAt(at) })
 	if hook := m.afterListInEffect; hook != nil {

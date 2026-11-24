@@ -37,8 +37,8 @@ type memoryFreezeOverrideStore struct {
 	mu       sync.Mutex
 	clock    clock.Clock
 	requests []*storage.FreezeOverrideRequest
-	// listErr and createErr fail ListApproved and Create.
-	listErr, createErr error
+	// listErr, createErr and getErr fail ListApproved, Create and Get.
+	listErr, createErr, getErr error
 }
 
 func (m *memoryFreezeOverrideStore) Create(_ context.Context, request *storage.FreezeOverrideRequest) (*storage.FreezeOverrideRequest, error) {
@@ -59,6 +59,9 @@ func (m *memoryFreezeOverrideStore) Create(_ context.Context, request *storage.F
 }
 
 func (m *memoryFreezeOverrideStore) Get(_ context.Context, identifier string) (*storage.FreezeOverrideRequest, error) {
+	if m.getErr != nil {
+		return nil, m.getErr
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, request := range m.requests {

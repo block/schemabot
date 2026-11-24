@@ -58,7 +58,7 @@ func TestE2EAutoPlan(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// Send a pull_request "opened" webhook instead of an issue_comment
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
@@ -140,7 +140,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeSkipsComment(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:    "synchronize",
@@ -214,7 +214,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeRefreshesStalePlan(t *testin
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
-	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger)
+	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:    "synchronize",
@@ -274,7 +274,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeWithoutTrackedPlanPostsComme
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
-	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger)
+	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:    "synchronize",
@@ -1021,7 +1021,7 @@ func TestE2EAutoPlanWithLintViolations(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// Send a pull_request "opened" webhook to trigger auto-plan
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
@@ -1108,7 +1108,7 @@ func setupAutoPlanCommentFixture(t *testing.T, dbName string, upToDate bool) *au
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
-	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger)
+	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger, WithInsecureSkipSignatureVerification())
 
 	return &autoPlanCommentFixture{svc: svc, mux: mux, result: result, h: h, deleted: deleted, upToDate: upToDate}
 }
@@ -1375,7 +1375,7 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:  "opened",
@@ -1435,7 +1435,7 @@ func TestE2EAutoPlanBootstrapDoesNotBlockWebhookAck(t *testing.T) {
 		forInstallationErr:     errors.New("github unavailable"),
 	}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:  "opened",
 		headSHA: "abc123",

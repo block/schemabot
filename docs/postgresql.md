@@ -4,6 +4,7 @@
 
 ## Table of Contents
 
+- [Beta status](#beta-status)
 - [Schema pull](#schema-pull)
 - [Row-level security](#row-level-security)
 - [Supported changes](#supported-changes)
@@ -33,6 +34,72 @@ less safe executor: its plan is blocked.
 PostgreSQL target support is separate from using PostgreSQL for SchemaBot's
 own state. See [SchemaBot storage](#schemabot-storage) for that distinction.
 
+## Beta status
+
+PostgreSQL support is in **beta**. SchemaBot runs the changes listed under
+"What works today" and refuses everything else with the reason, in most cases
+when you plan it. It never falls back to a riskier way of running a change.
+[What GA, beta, and alpha mean](engines.md#what-ga-beta-and-alpha-mean)
+explains the levels. Changes run through
+[pg-sprite](https://github.com/block/pg-sprite#readme), which is itself an
+early release.
+
+**What works today:**
+
+- Plans on every pull request and in the CLI, showing the exact SQL. The
+  Check Run passes once the live schema matches the pull request; make it a
+  [required check](check-runs.md#branch-protection-setup) so the pull request
+  cannot merge before then.
+- `ALTER TABLE` changes that don't rewrite the table, such as adding a
+  nullable column or a check constraint, on tables up to the size limit (1 GiB by
+  default).
+- Adding an index to an existing table with `CREATE INDEX CONCURRENTLY`. You
+  can cancel a build that is running.
+- Creating a table together with its indexes.
+- Adding labels to an existing enum type (see [Enum types](#enum-types)).
+- Row-level security policies on an existing table.
+- `schemabot init` and `schemabot pull` for an existing database, and
+  PostgreSQL as the database that stores SchemaBot's own state.
+
+**Not GA yet.** SchemaBot blocks or refuses these; it never runs them:
+
+- **Rewriting a table**, such as changing a column's type or adding a `USING`
+  expression. This needs pg-sprite's copy-and-swap, which is still in
+  preview, so the plan is blocked whatever the table's size.
+- **`ALTER TABLE` on a table larger than the size limit.** Blocked for the
+  same reason.
+- **Foreign keys.** Adding or dropping one is blocked;
+  [Blocked plans](#blocked-plans) explains how to run one yourself.
+- **Dropping a table.** SchemaBot never drops a PostgreSQL table, and there
+  is no pending-drops quarantine to hold one.
+- **Creating an enum type**, or removing or reordering its labels.
+- **Controls on a running change.** You can cancel an index build, but
+  `stop`, `start`, `cutover`, deferred cutover, `revert`, and `skip-revert`
+  are not available. See
+  [Unsupported workflow features](#unsupported-workflow-features).
+- **An index on a partitioned table's parent.** The plan is blocked, because
+  the index has to be built one partition at a time and SchemaBot does not
+  run that build yet. Some other changes to a partitioned parent are refused
+  when the apply runs; see [Partitioned tables](#partitioned-tables).
+- **Row-level security beyond existing tables.** Declaring it on a new table,
+  or changing policies and structure in the same plan, is blocked. A plan for
+  a namespace with managed row-level security cannot be rolled back. See
+  [Row-level security](#row-level-security).
+- **Pulling every table shape.** `pull` refuses some tables, listed under
+  [Schema pull](#schema-pull), rather than writing a partial schema.
+
+**A passing plan is not a promise that the apply will succeed.** Some checks
+can only run against the live table, when the apply starts:
+
+- A statement the planner expected to be quick that turns out to rewrite the
+  table is cancelled by its time budget, and nothing is changed.
+- A table that grew past the size limit after the plan is refused.
+- A plan with several statements is not atomic. They run in order, so if one
+  fails, the ones before it stay applied. Keep a change to one statement when
+  a half-applied plan would be unsafe to leave in place.
+
+[Apply-time refusals](#apply-time-refusals) lists every check that runs then.
+
 ## Schema pull
 
 `schemabot pull` prints the pulled PostgreSQL schema as readable SQL, or as the
@@ -43,10 +110,11 @@ whose schema the reserved list does not name is pulled as if it were an
 application schema, so select the schema explicitly with `--namespace` when the
 database hosts extensions. Only ordinary and partitioned tables are exported;
 views, materialized views, and foreign tables are not, and partition children
-are not exported separately from their parent.
+are not exported separately from their parent. A partitioned parent is
+exported with its `PARTITION BY` clause and without its partitions.
 
 The pull is refused in full if any selected table cannot round-trip through the
-declarative format. This includes partitioned parents, foreign-key relationships,
+declarative format. This includes foreign-key relationships,
 unlogged tables, explicit collations, and sequence defaults that cannot be
 represented safely, as well as tables carrying objects the format does not
 model at all: triggers, table and column comments, non-default
@@ -205,22 +273,26 @@ while PostgreSQL publishes a progress row for a concurrent index build. The
 metadata also carries `step`, `steps_total`, and the sanitized `statement`
 for the statement in flight; `executor_operation`, pg-sprite's class for the
 step (`admitting`, `optimistic`, `brief`, `validate-constraint`,
-`concurrent-index-build`); and `attempt`. Whenever a progress row is
+`concurrent-index-build`); `attempt`; and, while a concurrent index build
+runs, `percent`, the whole-build percent with two decimals. Whenever a progress row is
 published, all six counters — `blocks_done`, `blocks_total`, `tuples_done`,
 `tuples_total`, `lockers_done`, `lockers_total` — are present, zeros
 included: a zero is a reading, and an absent key means PostgreSQL has not
 published a row. PostgreSQL scopes block and tuple counters to phases, but a
 completed phase's values can persist into the next phase. The completed heap
-scan's block counters remain visible while live tuples are sorted, so that
-sorting phase's zero-width band absorbs the carry-over and reports its start.
+scan's block counters remain visible while live tuples are sorted, so the
+counters are read together with `server_phase`, never on their own.
 
 Table progress during a concurrent index build is a whole-build estimate, not
-a phase ratio. Each server phase owns a fixed band of the 0–100 scale in
-PostgreSQL's documented phase order, a phase with block or tuple counters
-interpolates within its band, and a waiting or sorting phase reports the
-band's start. The estimate stays below 100 until the apply completes and never
-moves backwards within a build; a poll that finds no progress row — between
-phases, or while the view cannot be read — keeps the last derived percent.
+a phase ratio. pg-sprite derives it from the server phase and its counters.
+SchemaBot stores it on the table as a whole number rounded down, so it stays
+below 100 until the apply completes, and the PR comment and the CLI show it
+with two decimals from the `percent` metadata, so a large build visibly moves
+between polls. It never moves backwards within a build, decimals included; a
+poll for which pg-sprite reports no percent — between phases, in a phase it
+does not know, or while the view cannot be read — keeps the last one. A build
+running across several targets shows the mean of each target's whole percent,
+without decimals.
 
 A multi-statement plan — several tables changed, or one declarative edit that
 the planner expands into several steps — is not applied atomically. The
@@ -244,6 +316,10 @@ server's own timer is what ends an over-long build — and reports completion
 only once the catalog shows the index valid. A build that fails part-way
 leaves an invalid index; the stored failure names it and is retryable, and
 when the bound is what ended the build it names the option to raise. A build
+that fails on the table's rows, such as duplicate values under a unique
+index, is refused instead, because a retry meets the same rows: correct the
+rows, then re-run, and the rerun removes the invalid index once it proves no
+build holds it. A build
 that runs past the bound and provably leaves nothing behind is refused
 permanently, naming the option, because an identical retry would spend the
 same bound again.
@@ -394,6 +470,50 @@ partitioned parent therefore fail with pg-sprite's typed refusal rather than a
 raw server error; they remain outside the supported SchemaBot envelope even if
 a plan is otherwise shown as native.
 
+### Enum types
+
+A schema file may declare one enum type and nothing else, with unqualified
+`CREATE TYPE ... AS ENUM` and its labels in order:
+
+```sql
+CREATE TYPE order_status AS ENUM ('new', 'paid', 'shipped', 'delivered');
+```
+
+The plan compares the file with the live type of that name in the namespace:
+
+- A type that carries every label the file lists plans no change.
+- Each label the type lacks plans one `ALTER TYPE ... ADD VALUE`, placed
+  `BEFORE` the next live label when the file lists it ahead of one.
+  SchemaBot applies them: each label is its own step, run in the order the
+  plan lists it and committed before the next step starts.
+- The engine role must be a member of the role that owns the type, as for
+  an in-place `ALTER TABLE`. When it is not, the plan blocks the steps and
+  names the grant. The apply checks again before it adds each label.
+- PostgreSQL cannot drop or move an enum label, so a file that no longer
+  lists a live label, or lists the labels in another order, fails the plan.
+  So does a type that does not exist yet, or a name that holds another kind
+  of type. Rename a label with `ALTER TYPE ... RENAME VALUE` or keep it in
+  the file, and create a new type with `CREATE TYPE` outside SchemaBot.
+
+Label additions run before the table changes in the same namespace, and
+adding a label locks only the type, never a table that uses it. A table is
+planned against the live type, so a table change that names a label the
+type does not carry yet, such as a column default, fails the plan even when
+the same plan adds the label. Apply the label first, then the table change
+that uses it.
+
+If another change adds a label after the plan was made, the apply stops at
+that step with a refusal that names the label and says to re-plan. A fresh
+plan then shows what is still missing. The same holds when another change
+renames or removes the label a step places its new label `BEFORE` or
+`AFTER`: the step is refused, not retried, names both labels, and says to
+re-plan. pg-sprite
+also refuses a step whose type name now resolves to a different type, and
+nothing is added.
+
+Two files in one namespace that declare the same type fail the plan. An enum
+type is not a table, so it never counts as an undeclared table to drop.
+
 ## Blocked plans
 
 SchemaBot blocks every planner verdict that is not a native execution verdict.
@@ -401,7 +521,9 @@ This includes changes that require copy-and-swap, require a rewrite before
 they can be planned safely, are refused by pg-sprite, or carry an unrecognized
 planner contract or verdict. A native verdict is also blocked when its
 statement shape is outside the `ALTER TABLE`, `CREATE TABLE`, and
-`CREATE INDEX` set accepted by the apply path's shape check. The admitted set
+`CREATE INDEX` set accepted by the apply path's shape check. A label
+addition planned from an enum types file is checked on its own path instead
+(see [Enum types](#enum-types)). The admitted set
 is defined by the pinned
 pg-sprite version, not by SchemaBot: when a pg-sprite upgrade widens the
 shapes its engine executes, SchemaBot's plan and apply gates widen with the
@@ -414,11 +536,34 @@ verdict.
 
 The plan comment lists the table and SchemaBot's reason for the refusal. When
 the create path refuses a statement's shape, that reason names the offending
-clause and how to remove or work around it. For a PostgreSQL plan, the plan
+clause and how to remove or work around it. When pg-sprite's planner refuses a
+statement as written, the reason says what about the statement takes the lock
+or breaks running code, and the steps that make the same change safely, from
+the remedy pg-sprite names for it. For a PostgreSQL plan, the plan
 Check Run concludes unsuccessfully, and an apply attempt is rejected before
 any apply or task is queued. Rewrite the declarative change into an eligible
 form or use a separately reviewed operational process; flags do not override
 an engine-blocked verdict.
+
+A statement that drops a column, a constraint, or a column's `NOT NULL` runs
+only against the object the plan reviewed. The plan records the object's
+definition as it read it, and the apply checks the live object against that
+record under the table's lock, in the transaction that drops it. When the
+object changed after the plan, for example a column dropped and added again
+under the same name, the apply refuses and drops nothing; re-plan against the
+current schema and review the new plan. A plan that cannot record the object
+it drops is blocked. A deployment that builds its plan from another
+deployment's dispatch keeps the record the plan was reviewed with, and refuses
+the change before any of its tasks run when its own objects do not match that
+record. A column at a different position, or with different dependents, than
+on the primary deployment does not match, so that drop cannot run on that
+deployment from the primary deployment's plan.
+
+A plan approved before this check shipped has no record, so its drops are
+refused. That includes an apply still running at the upgrade: a sequential
+apply whose earlier tasks already ran stops at its first drop. Re-plan any
+approved plan that drops a column, a constraint, or a `NOT NULL` after the
+upgrade, and apply the new plan.
 
 The engine does not execute `DROP TABLE` or other statement kinds outside its
 admitted set. That includes tables that exist on the target but that no schema
@@ -450,7 +595,7 @@ operational process. `schemabot pull` and `schemabot onboard` write the files
 for the tables the plan holds accountable, so onboarding an existing database
 is a pull, not hand-writing every file; the pull refuses a namespace as a
 whole when any of its tables carries objects the format cannot represent
-(triggers, table or column comments, relation options, inheritance, partitioning,
+(triggers, table or column comments, relation options, inheritance,
 or foreign keys on either side), and those tables need a hand-written file or
 a reviewed drop before the rest can be pulled. `CREATE UNLOGGED TABLE`,
 `PARTITION BY` and a child of `INHERITS` flattened to its own columns are all
@@ -583,7 +728,8 @@ change or that depend on the target:
   index built inside one caller-owned envelope under the engine's own
   deadline of the same bound. A build
   that leaves an invalid index behind — including one the bound's timer
-  cancelled — or finds one another backend is visibly still building fails as a
+  cancelled, but not one that failed on the table's rows, which is refused as
+  above — or finds one another backend is visibly still building fails as a
   retryable operational failure naming the index and the next step; the
   invalid index, not the cause that produced it, is the outcome the retry
   acts on, and the next drive recovers the leftover as abandoned. When the
@@ -600,11 +746,13 @@ change or that depend on the target:
   the same naming, as is a build that ran past the bound and provably left
   nothing, whose refusal names `postgres.concurrent_index_max_duration` as
   the option to raise. A
-  parent-level index build on a partitioned table is refused permanently, and
-  so is a target connection pool too small to hold the build's sessions at
-  once — the recovery holds one more session than the build, so a pool sized
-  to the build alone refuses the recovery — since the pool is sized by the
-  target DSN and a retry sees the same pool.
+  parent-level index build on a partitioned table never reaches the apply: the
+  plan blocks it, because the index has to be built one partition at a time
+  and SchemaBot does not run that build yet. A target connection pool too
+  small to hold the build's sessions at once is refused permanently — the
+  recovery holds one more session than the build, so a pool sized to the
+  build alone refuses the recovery — since the pool is sized by the target
+  DSN and a retry sees the same pool.
 - Other operational failures are recorded as retryable when no create-set
   prefix committed and expose a sanitized message; connection and server
   details remain in server logs. A create-set failure after the table commits
@@ -719,7 +867,9 @@ an unrenderable ignored table or undeclared archive does not prevent capture.
 Managed RLS tables still prevent capture until recovery can restore their
 complete access rules alongside sibling tables. Capture never strips policies to
 mark a plan rollback-capable, and a catalog read failure or cancellation still
-ends planning. [RV-7](invariants.md#rv-7-rollback-needs-the-originals)
+ends planning. Rollback never removes an enum label: capture covers tables
+only, and PostgreSQL cannot drop a label. A label the plan added stays on its
+type after rollback, while the plan's table changes are reversed. [RV-7](invariants.md#rv-7-rollback-needs-the-originals)
 requires complete originals before rollback can proceed; missing originals in
 older plans are never reconstructed from the current target.
 

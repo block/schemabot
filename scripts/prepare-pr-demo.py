@@ -10,7 +10,8 @@ m=runpy.run_path(str(root/'scripts/render-pr-mockups.py'))
 sections=m['load_sections']();cache={}
 ddl='ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);'
 def common(s):
- return m['prepare'](s).replace('2026-01-01 00:00:00 UTC','2026-09-01 10:00:00 UTC').replace('2026-03-14 10:30:00 UTC','2026-09-01 10:00:00 UTC')
+ # The recording shows every comment at one demo time, whatever time the preview rendered.
+ return re.sub(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC','2026-09-01 10:00:00 UTC',m['prepare'](s))
 comments={}
 for name,anchor in [('plan','mysql-plan'),('apply','schema-change-apply-automatic')]:
  s=common(sections[anchor]);s=re.sub(r'```sql\n.*?```','```sql\n'+ddl+'\n```',s,count=1,flags=re.S)

@@ -211,21 +211,23 @@ const (
 	ChangeType_CHANGE_TYPE_RENAME       ChangeType = 7
 	ChangeType_CHANGE_TYPE_TRUNCATE     ChangeType = 8
 	ChangeType_CHANGE_TYPE_CREATE_VIEW  ChangeType = 9
+	ChangeType_CHANGE_TYPE_ALTER_TYPE   ChangeType = 10
 )
 
 // Enum value maps for ChangeType.
 var (
 	ChangeType_name = map[int32]string{
-		0: "CHANGE_TYPE_OTHER",
-		1: "CHANGE_TYPE_CREATE",
-		2: "CHANGE_TYPE_ALTER",
-		3: "CHANGE_TYPE_DROP",
-		4: "CHANGE_TYPE_VSCHEMA",
-		5: "CHANGE_TYPE_CREATE_INDEX",
-		6: "CHANGE_TYPE_DROP_INDEX",
-		7: "CHANGE_TYPE_RENAME",
-		8: "CHANGE_TYPE_TRUNCATE",
-		9: "CHANGE_TYPE_CREATE_VIEW",
+		0:  "CHANGE_TYPE_OTHER",
+		1:  "CHANGE_TYPE_CREATE",
+		2:  "CHANGE_TYPE_ALTER",
+		3:  "CHANGE_TYPE_DROP",
+		4:  "CHANGE_TYPE_VSCHEMA",
+		5:  "CHANGE_TYPE_CREATE_INDEX",
+		6:  "CHANGE_TYPE_DROP_INDEX",
+		7:  "CHANGE_TYPE_RENAME",
+		8:  "CHANGE_TYPE_TRUNCATE",
+		9:  "CHANGE_TYPE_CREATE_VIEW",
+		10: "CHANGE_TYPE_ALTER_TYPE",
 	}
 	ChangeType_value = map[string]int32{
 		"CHANGE_TYPE_OTHER":        0,
@@ -238,6 +240,7 @@ var (
 		"CHANGE_TYPE_RENAME":       7,
 		"CHANGE_TYPE_TRUNCATE":     8,
 		"CHANGE_TYPE_CREATE_VIEW":  9,
+		"CHANGE_TYPE_ALTER_TYPE":   10,
 	}
 )
 
@@ -1716,8 +1719,11 @@ type TableChange struct {
 	// deterministically refuses the statement and the apply will fail.
 	ExecutionMode string `protobuf:"bytes,7,opt,name=execution_mode,json=executionMode,proto3" json:"execution_mode,omitempty"`
 	ModeReason    string `protobuf:"bytes,8,opt,name=mode_reason,json=modeReason,proto3" json:"mode_reason,omitempty"`
-	// Engine-agnostic annotations about this change. A VSchema change carries
-	// the namespace's persisted VSchema change-metadata here so a deployment
+	// Engine-agnostic annotations about this change, keyed by names the engine
+	// owns. A table change carries the engine's plan-time record of the objects
+	// its statement depends on, such as the definition of a column it drops,
+	// which the engine checks at apply time. A VSchema change carries the
+	// namespace's persisted VSchema change-metadata. Either way, a deployment
 	// that materializes the plan from a dispatch request runs the same
 	// apply-time safety gates as one reading its own stored plan.
 	Metadata map[string]string `protobuf:"bytes,9,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
@@ -2421,9 +2427,13 @@ type PlanResponse struct {
 	// continue or destroy. Empty when nothing is at stake.
 	ExistingCopies []*ExistingCopy `protobuf:"bytes,7,rep,name=existing_copies,json=existingCopies,proto3" json:"existing_copies,omitempty"`
 	// Live tables intentionally excluded from a plan verdict, grouped by namespace.
-	ExemptTables  []*ExemptTables `protobuf:"bytes,8,rep,name=exempt_tables,json=exemptTables,proto3" json:"exempt_tables,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ExemptTables []*ExemptTables `protobuf:"bytes,8,rep,name=exempt_tables,json=exemptTables,proto3" json:"exempt_tables,omitempty"`
+	// The drop_tables entries that name no live table on the target, in the
+	// order the config lists them. Such an entry plans no drop, so the plan
+	// names it rather than reading as if the table were seen and kept.
+	UnmatchedDropTables []string `protobuf:"bytes,9,rep,name=unmatched_drop_tables,json=unmatchedDropTables,proto3" json:"unmatched_drop_tables,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *PlanResponse) Reset() {
@@ -2508,6 +2518,13 @@ func (x *PlanResponse) GetExistingCopies() []*ExistingCopy {
 func (x *PlanResponse) GetExemptTables() []*ExemptTables {
 	if x != nil {
 		return x.ExemptTables
+	}
+	return nil
+}
+
+func (x *PlanResponse) GetUnmatchedDropTables() []string {
+	if x != nil {
+		return x.UnmatchedDropTables
 	}
 	return nil
 }
@@ -5900,7 +5917,7 @@ const file_tern_proto_rawDesc = "" +
 	"\tShardPlan\x12\x14\n" +
 	"\x05shard\x18\x01 \x01(\tR\x05shard\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12.\n" +
-	"\achanges\x18\x03 \x03(\v2\x14.tern.v1.TableChangeR\achanges\"\x82\x03\n" +
+	"\achanges\x18\x03 \x03(\v2\x14.tern.v1.TableChangeR\achanges\"\xb6\x03\n" +
 	"\fPlanResponse\x12\x17\n" +
 	"\aplan_id\x18\x01 \x01(\tR\x06planId\x12'\n" +
 	"\x06engine\x18\x02 \x01(\x0e2\x0f.tern.v1.EngineR\x06engine\x12/\n" +
@@ -5909,7 +5926,8 @@ const file_tern_proto_rawDesc = "" +
 	"\x06errors\x18\x05 \x03(\tR\x06errors\x12*\n" +
 	"\x06shards\x18\x06 \x03(\v2\x12.tern.v1.ShardPlanR\x06shards\x12>\n" +
 	"\x0fexisting_copies\x18\a \x03(\v2\x15.tern.v1.ExistingCopyR\x0eexistingCopies\x12:\n" +
-	"\rexempt_tables\x18\b \x03(\v2\x15.tern.v1.ExemptTablesR\fexemptTables\"\xeb\x02\n" +
+	"\rexempt_tables\x18\b \x03(\v2\x15.tern.v1.ExemptTablesR\fexemptTables\x122\n" +
+	"\x15unmatched_drop_tables\x18\t \x03(\tR\x13unmatchedDropTables\"\xeb\x02\n" +
 	"\x10PlanDiffResponse\x12'\n" +
 	"\x06engine\x18\x01 \x01(\x0e2\x0f.tern.v1.EngineR\x06engine\x12/\n" +
 	"\achanges\x18\x02 \x03(\v2\x15.tern.v1.SchemaChangeR\achanges\x12?\n" +
@@ -6208,7 +6226,7 @@ const file_tern_proto_rawDesc = "" +
 	"\x11STATE_CATCHING_UP\x10\x13\x12\x16\n" +
 	"\x12STATE_CHECKSUMMING\x10\x14\x12\x17\n" +
 	"\x13STATE_POST_CHECKSUM\x10\x15\x12\x1a\n" +
-	"\x16STATE_FAILED_RETRYABLE\x10\x16*\x8a\x02\n" +
+	"\x16STATE_FAILED_RETRYABLE\x10\x16*\xa6\x02\n" +
 	"\n" +
 	"ChangeType\x12\x15\n" +
 	"\x11CHANGE_TYPE_OTHER\x10\x00\x12\x16\n" +
@@ -6220,7 +6238,9 @@ const file_tern_proto_rawDesc = "" +
 	"\x16CHANGE_TYPE_DROP_INDEX\x10\x06\x12\x16\n" +
 	"\x12CHANGE_TYPE_RENAME\x10\a\x12\x18\n" +
 	"\x14CHANGE_TYPE_TRUNCATE\x10\b\x12\x1b\n" +
-	"\x17CHANGE_TYPE_CREATE_VIEW\x10\t*T\n" +
+	"\x17CHANGE_TYPE_CREATE_VIEW\x10\t\x12\x1a\n" +
+	"\x16CHANGE_TYPE_ALTER_TYPE\x10\n" +
+	"*T\n" +
 	"\x11PullCatalogDetail\x12\x1d\n" +
 	"\x19PULL_CATALOG_DETAIL_BASIC\x10\x00\x12 \n" +
 	"\x1cPULL_CATALOG_DETAIL_DETAILED\x10\x01*|\n" +

@@ -7,8 +7,10 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -200,6 +202,9 @@ func (m WatchModel) progressSections() (string, string) {
 		}
 		f.WriteString(templates.FormatApplyStopped())
 		f.WriteString("\n")
+		if text := templates.StoppedByFreezeText(m.stoppedByFreeze, m.applyID, m.environment); text != "" {
+			f.WriteString(m.wrapToWindow("⏹️ "+text) + "\n")
+		}
 		if m.applyID != "" {
 			f.WriteString(templates.FormatNextCommand(templates.ResumeLabel, templates.ControlCommand("start", m.applyID, m.environment)))
 		} else {
@@ -342,31 +347,55 @@ const cutoverInProgressFooter = "Cutover in progress - please wait..."
 // formatFooter returns the standard footer.
 func (m WatchModel) formatFooter() string {
 	dimStyle := lipgloss.NewStyle().Faint(true)
-	stopHint := templates.StopKeyHint
-	if m.isPlanetScale() {
-		stopHint = "c cancel"
+	switch m.stopCommand() {
+	case presentation.StopCommandCancel:
+		return dimStyle.Render("ESC detach • c cancel")
+	case presentation.StopCommandStop:
+		return dimStyle.Render("ESC detach • " + templates.StopKeyHint)
+	default:
+		return dimStyle.Render("ESC detach")
 	}
-	return dimStyle.Render("ESC detach • " + stopHint)
 }
 
-// isPlanetScale returns true if the current apply is using the PlanetScale engine.
+// stopCommand names the command the watcher offers for the work in flight:
+// stop on the s key, cancel on the c key, or none where the engine can end
+// none of it. The apply's build work speaks for one operation, so an apply
+// with several reads as having none, the way the rollout footers read it.
+func (m WatchModel) stopCommand() string {
+	work := m.buildWork
+	if len(m.operations) > 1 {
+		work = apitypes.BuildWork{}
+	}
+	return presentation.StopCommand(m.engine, work, m.stepsTotal)
+}
+
+// keyRequestsStopCommand reports whether key is the one bound to the command
+// the watcher offers: s for stop and c for cancel. A stop is never turned into
+// a cancel (CO-8), so s does nothing where the engine can only cancel.
+func (m WatchModel) keyRequestsStopCommand(key string) bool {
+	switch m.stopCommand() {
+	case presentation.StopCommandStop:
+		return key == "s"
+	case presentation.StopCommandCancel:
+		return key == "c"
+	default:
+		return false
+	}
+}
+
 // stopAwaitingConfirmation reports whether the operator pressed s and the
 // server has not yet reported the apply stopped or cancelled.
 func (m WatchModel) stopAwaitingConfirmation() bool {
 	return m.stopTriggered && !state.IsState(m.state, state.Apply.Stopped, state.Apply.Cancelled)
 }
 
-// stopPendingLabel names what the s key requested: PlanetScale cancels the
-// deploy request, every other engine stops the copy at its checkpoint.
+// stopPendingLabel names what the s or c key requested: a cancel ends the
+// apply for good, a stop parks it at its checkpoint.
 func (m WatchModel) stopPendingLabel() string {
-	if m.isPlanetScale() {
+	if m.stopCommand() == presentation.StopCommandCancel {
 		return "Cancelling..."
 	}
 	return "Stopping..."
-}
-
-func (m WatchModel) isPlanetScale() bool {
-	return strings.EqualFold(m.engine, "PlanetScale") || strings.EqualFold(m.engine, "planetscale")
 }
 
 // elapsed returns a formatted elapsed time string for the status line.
@@ -398,7 +427,12 @@ func (m WatchModel) detachedView() string {
 		if state.IsState(m.state, state.Apply.WaitingForDeploy) {
 			fmt.Fprintf(&b, "To deploy:   %s\n", templates.ControlCommand("start", m.applyID, m.environment))
 		}
-		fmt.Fprintf(&b, "To stop:     %s\n", templates.ControlCommand("stop", m.applyID, m.environment))
+		switch command := m.stopCommand(); command {
+		case presentation.StopCommandStop:
+			fmt.Fprintf(&b, "To stop:     %s\n", templates.ControlCommand(command, m.applyID, m.environment))
+		case presentation.StopCommandCancel:
+			fmt.Fprintf(&b, "To cancel:   %s\n", templates.ControlCommand(command, m.applyID, m.environment))
+		}
 	} else {
 		fmt.Fprintf(&b, "Find apply:  %s\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 	}

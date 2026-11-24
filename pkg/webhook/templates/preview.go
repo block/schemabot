@@ -190,6 +190,31 @@ func PreviewCommentPlanDropTables() string {
 	})
 }
 
+// PreviewCommentPlanDropTablesUnmatched renders the plan a repository gets
+// when its drop_tables entry has a typo. The entry names no table, so the
+// plan drops nothing and is otherwise clean, with the leftover the entry
+// meant still disclosed as skipped by its leading underscore; the comment
+// names the entry so the clean plan does not read as if the leftover was
+// seen and kept.
+func PreviewCommentPlanDropTablesUnmatched() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		ExemptTables: []ExemptTablesData{{
+			Namespace: "testapp",
+			Tables:    []string{"_events_old"},
+			Reason:    engine.ExemptReasonLeadingUnderscore,
+		}},
+		UnmatchedDropTables: []string{"_events_olds"},
+	})
+}
+
 // previewBytes returns a pointer to a sample byte estimate.
 //
 //go:fix inline
@@ -424,14 +449,14 @@ func PreviewCommentPlanBlockedPostgres() string {
 			{
 				Keyspace: "testapp",
 				Statements: []string{
-					"ALTER TABLE users ALTER COLUMN email TYPE bigint",
+					"ALTER TABLE users ADD COLUMN order_ref text UNIQUE",
 					"ALTER TABLE orders ADD COLUMN notes text",
 				},
 			},
 		},
 		BlockedChanges: []BlockedChangeData{
 			{Table: "users", Reason: engine.JoinBlockedCauses([]string{
-				`statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned`,
+				`statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change`,
 				`statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`,
 			})},
 		},
@@ -815,14 +840,14 @@ func PreviewCommentApplyBlockedRejected() string {
 			{
 				Keyspace: "testapp",
 				Statements: []string{
-					"ALTER TABLE users ALTER COLUMN email TYPE bigint",
+					"ALTER TABLE users ADD COLUMN order_ref text UNIQUE",
 					"ALTER TABLE orders ADD COLUMN notes text",
 				},
 			},
 		},
 		BlockedChanges: []BlockedChangeData{
 			{Table: "users", Reason: engine.JoinBlockedCauses([]string{
-				`statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned`,
+				`statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change`,
 				`statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`,
 			})},
 		},
@@ -2306,6 +2331,50 @@ func PreviewCommentApplyPlanDowngraded() string {
 	})
 }
 
+// PreviewCommentApplyPlanChangeGateRefused renders the locked apply-plan of an
+// automatic apply after a change gate refused it, as the comment reads once its
+// footer is edited. The refusal itself posts as the comment below.
+func PreviewCommentApplyPlanChangeGateRefused() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:            "testapp",
+		SchemaName:          "testapp",
+		Environment:         "staging",
+		HeadSHA:             previewHeadSHA,
+		Repository:          previewRepository,
+		RequestedBy:         previewRequestedBy,
+		IsMySQL:             true,
+		DatabaseType:        "mysql",
+		Changes:             samplePlanChanges(),
+		IsLocked:            true,
+		LockOwner:           "acme/myapp#42",
+		LockAcquired:        "2026-03-14 10:30:00 UTC",
+		RefusedByChangeGate: true,
+		LockReleased:        true,
+		RefusalPosted:       true,
+	})
+}
+
+// PreviewCommentApplyPlanRefusalUnposted renders the same edited
+// comment when the refusal comment did not post and the lock was not released:
+// no lock claim, and a footer that carries the reason to look and the next step.
+func PreviewCommentApplyPlanRefusalUnposted() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:            "testapp",
+		SchemaName:          "testapp",
+		Environment:         "staging",
+		HeadSHA:             previewHeadSHA,
+		Repository:          previewRepository,
+		RequestedBy:         previewRequestedBy,
+		IsMySQL:             true,
+		DatabaseType:        "mysql",
+		Changes:             samplePlanChanges(),
+		IsLocked:            true,
+		LockOwner:           "acme/myapp#42",
+		LockAcquired:        "2026-03-14 10:30:00 UTC",
+		RefusedByChangeGate: true,
+	})
+}
+
 // =============================================================================
 // Vitess Plan Comment Previews
 // =============================================================================
@@ -3049,6 +3118,37 @@ func PreviewCommentApplyStopped() string {
 	tables[1].RowsTotal = 1466232
 	tables[1].PercentComplete = 72
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Stopped, tables))
+}
+
+// PreviewCommentApplyStoppedByFreeze renders the stopped comment of an apply
+// that a freeze with running "stop" stopped: it names the freeze and says how
+// the apply resumes.
+func PreviewCommentApplyStoppedByFreeze() string {
+	tables := sampleApplyTables()[:2]
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Stopped
+	tables[1].RowsCopied = 1055687
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 72
+	data := sampleApplyData(state.Apply.Stopped, tables)
+	data.StoppedByFreeze = &apitypes.FreezeStopRef{ID: "freeze-a1b2c3", Reason: "SEV-1234: checkout errors"}
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyStoppedByEndedFreeze renders the stopped comment of an
+// apply whose freeze has since ended, which says a plain start resumes it.
+func PreviewCommentApplyStoppedByEndedFreeze() string {
+	tables := sampleApplyTables()[:1]
+	tables[0].Status = state.Task.Stopped
+	data := sampleApplyData(state.Apply.Stopped, tables)
+	data.StoppedByFreeze = &apitypes.FreezeStopRef{ID: "freeze-a1b2c3", Reason: "SEV-1234: checkout errors", Ended: true}
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentStartWithdrawnByFreeze renders the comment posted when a
+// freeze with running "stop" withdraws a start no driver had acted on.
+func PreviewCommentStartWithdrawnByFreeze() string {
+	return RenderStartWithdrawn(StartWithdrawnData{ApplyID: "apply-a1b2c3d4e5f6", Environment: "staging", StoppedByFreeze: "freeze-a1b2c3"})
 }
 
 // PreviewCommentApplyResuming renders a sample comment for an apply that has just

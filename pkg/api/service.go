@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -13,6 +14,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/block/spirit/pkg/utils"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/block/schemabot/pkg/clock"
 	"github.com/block/schemabot/pkg/ddl"
@@ -77,6 +81,14 @@ const DefaultDeployment = "default"
 // whether a dynamic fallback (a default client) may serve the target.
 var errTernDeploymentNotConfigured = errors.New("tern deployment not configured")
 
+// errTernClientConfig marks a Tern client the server configuration can never
+// produce: an empty or malformed endpoint, a token in the wrong shape, an
+// invalid revert window, or a DSN or token file that does not exist. Every
+// attempt fails the same way until an operator fixes the configuration. A
+// failed call to a secrets backend or custom resolver is not marked, since a
+// later attempt can succeed.
+var errTernClientConfig = errors.New("tern client configuration is invalid")
+
 // Endpoint returns the Tern endpoint for the given deployment and environment.
 // For single-deployment deployments, use DefaultDeployment ("default") as the deployment.
 func (c TernConfig) Endpoint(deployment, environment string) (string, error) {
@@ -95,7 +107,7 @@ func (c TernConfig) Endpoint(deployment, environment string) (string, error) {
 	}
 
 	if endpoint == "" {
-		return "", fmt.Errorf("endpoint not configured for %s/%s", deployment, environment)
+		return "", fmt.Errorf("endpoint not configured for %s/%s: %w", deployment, environment, errTernClientConfig)
 	}
 
 	return endpoint, nil
@@ -146,8 +158,29 @@ type Service struct {
 	ternClients       map[string]tern.Client // keyed by "deployment/environment", lazily created
 	defaultTernClient tern.Client            // fallback for any deployment/environment without a static or gRPC client (e.g. a TargetRouter)
 	routingTernClient *tern.RoutingClient
-	ternMu            sync.Mutex // protects tern client caches and engineFactories
-	logger            *slog.Logger
+	// ternMu protects the tern client caches, the recorded resolution failures,
+	// the closed flag, and engineFactories. It is held only to read or update
+	// them, never across a DSN or secret lookup or any other network call.
+	ternMu sync.Mutex
+	// ternFailures remembers, per cache key, the last failed local client
+	// resolution until its expiry, guarded by ternMu.
+	ternFailures map[string]ternResolveFailure
+	// engineGeneration counts RegisterEngine calls, guarded by ternMu. A
+	// resolution records its failure only while the generation it started
+	// under is current, so a failure from an attempt that ran before a new
+	// factory was registered is not remembered past that registration.
+	engineGeneration uint64
+	// ternFlight shares one client resolution among concurrent first callers of
+	// the same cache key.
+	ternFlight singleflight.Group
+	// ternClosed is set by Close so a resolution that finishes afterwards closes
+	// its client instead of installing one nothing will ever close. Guarded by
+	// ternMu.
+	ternClosed bool
+	// newLocalTernClientFn builds a local client. Nil means newLocalTernClient;
+	// tests replace it to control when a resolution finishes and how.
+	newLocalTernClientFn func(key, database, dbType string, envConfig EnvironmentConfig) (tern.Client, error)
+	logger               *slog.Logger
 	// checkRunBackfiller replays the auto-plan flow for a PR to recreate
 	// missing Check Runs; wired from the webhook handler at serve startup,
 	// nil when no GitHub webhook runtime exists.
@@ -177,10 +210,15 @@ type Service struct {
 	engineFactories map[string]tern.EngineFactory
 
 	// Operator loop management.
-	operatorMu     sync.Mutex
-	stopRecovery   chan struct{}
-	cancelRecovery context.CancelFunc
-	operatorWake   chan struct{}
+	operatorMu sync.Mutex
+	// freezeHeldOps are the operations this pod held back unstarted under a
+	// stop freeze, each with when its start claims may take it again
+	// (skipHeldOperation).
+	freezeHeldOpsMu sync.Mutex
+	freezeHeldOps   map[int64]time.Time
+	stopRecovery    chan struct{}
+	cancelRecovery  context.CancelFunc
+	operatorWake    chan struct{}
 	// reservedDriverWake is the reserved driver's own wake channel, set when
 	// the pool reserves one (see reservedDriverID). The reserved driver skips
 	// deferred-cutover work, so a wake for that work must never be spent on it:
@@ -524,6 +562,12 @@ func (s *Service) RegisterEngine(databaseType string, factory tern.EngineFactory
 		s.engineFactories = make(map[string]tern.EngineFactory)
 	}
 	s.engineFactories[databaseType] = factory
+	// A remembered failure may be a missing engine for this type; the next
+	// caller resolves again with the factory in place. Bumping the generation
+	// keeps a resolution still running from the old registry from recording
+	// its failure after this.
+	clear(s.ternFailures)
+	s.engineGeneration++
 	return nil
 }
 
@@ -577,18 +621,91 @@ func (s *Service) SetOperatorPollInterval(interval time.Duration) error {
 //
 // The method first checks for config-based database registration (local mode),
 // then uses TernDeployments for gRPC mode.
+//
+// Building a local client resolves its DSN and token, which can call a secrets
+// backend that is slow or down. That work never runs under ternMu, so a slow
+// deployment cannot stall plan and apply traffic for any other. Concurrent
+// first callers of one deployment share a single resolution, and a failed
+// resolution is remembered for ternClientFailureTTL so a broken secret does not
+// make every request repeat the slow lookup.
 func (s *Service) TernClient(deployment, environment string) (tern.Client, error) {
 	if deployment == "" {
 		deployment = DefaultDeployment
 	}
 	key := deployment + "/" + environment
 
+	if client, failure := s.lookupTernClient(key); client != nil {
+		return client, nil
+	} else if failure != nil {
+		return nil, failure
+	}
+
+	result, err, _ := s.ternFlight.Do(key, func() (any, error) {
+		return s.resolveTernClient(key, deployment, environment)
+	})
+	if err != nil {
+		return nil, err
+	}
+	client, ok := result.(tern.Client)
+	if !ok {
+		return nil, fmt.Errorf("resolve tern client for %s: unexpected result type %T", key, result)
+	}
+	return client, nil
+}
+
+// ternClientFailureTTL is how long a failed local client resolution is
+// remembered before the next caller tries again. It is shorter than the 10
+// second bound on one secrets lookup, so a secret fixed at the source takes
+// effect within a few seconds even when nothing invalidates the entry, while a
+// deployment with a broken secret costs at most one slow lookup per interval
+// instead of one per request.
+const ternClientFailureTTL = 5 * time.Second
+
+// ternResolveFailure is a remembered failed local client resolution.
+type ternResolveFailure struct {
+	err       error
+	failedAt  time.Time
+	expiresAt time.Time
+}
+
+// lookupTernClient reads the client cache and the remembered failures under
+// ternMu and does nothing else under it. It returns the cached client, or the
+// cached failure wrapped so the caller can tell it is not a fresh attempt, or
+// neither when the key has to be resolved.
+func (s *Service) lookupTernClient(key string) (tern.Client, error) {
 	s.ternMu.Lock()
 	defer s.ternMu.Unlock()
 
-	// Return existing client if already created
 	if client, ok := s.ternClients[key]; ok {
 		return client, nil
+	}
+	failure, ok := s.ternFailures[key]
+	if !ok {
+		return nil, nil
+	}
+	now := s.clock.Now()
+	if !now.Before(failure.expiresAt) {
+		delete(s.ternFailures, key)
+		return nil, nil
+	}
+	s.logger.Debug("returning the cached tern client failure from the last attempt",
+		"key", key, "failed_ago", now.Sub(failure.failedAt).String(), "retry_in", failure.expiresAt.Sub(now).String())
+	return nil, fmt.Errorf("tern client for %s is unavailable: cached failure from the last attempt %s ago, retrying in %s: %w",
+		key, now.Sub(failure.failedAt).Round(time.Millisecond), failure.expiresAt.Sub(now).Round(time.Millisecond), failure.err)
+}
+
+// resolveTernClient builds and installs the client for key. It runs as the one
+// shared resolution for the key and takes ternMu only briefly, never across a
+// DSN or secret lookup.
+func (s *Service) resolveTernClient(key, deployment, environment string) (tern.Client, error) {
+	// A resolution that finished between the caller's lookup and this flight
+	// has already installed the client or recorded its failure.
+	client, failure := s.lookupTernClient(key)
+	if client != nil {
+		return client, nil
+	}
+	if failure != nil {
+		return nil, failure
 	}
 
 	// Try local mode first (config-based database registration)
@@ -602,16 +719,107 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 			s.logger.Debug("database config does not contain a local DSN, using remote tern deployment",
 				"database", deployment, "environment", environment)
 		default:
-			client, err := s.newLocalTernClient(key, deployment, dbConfig.Type, envConfig)
-			if err != nil {
-				return nil, err
-			}
-			s.ternClients[key] = client
-			s.logger.Info("created local tern client", "key", key, "type", dbConfig.Type, "deployment", deployment)
-			return client, nil
+			return s.createLocalTernClient(key, deployment, environment, dbConfig.Type, envConfig)
 		}
 	}
+	return s.createRemoteTernClient(key, deployment, environment)
+}
 
+// createLocalTernClient builds a local client outside ternMu and installs it. A
+// failure is logged once for this attempt and remembered for
+// ternClientFailureTTL.
+func (s *Service) createLocalTernClient(key, deployment, environment, dbType string, envConfig EnvironmentConfig) (tern.Client, error) {
+	build := s.newLocalTernClientFn
+	if build == nil {
+		build = s.newLocalTernClient
+	}
+	s.ternMu.Lock()
+	generation := s.engineGeneration
+	s.ternMu.Unlock()
+	client, err := build(key, deployment, dbType, envConfig)
+	if err != nil {
+		if registered := s.recordTernFailure(key, deployment, environment, dbType, generation, err); registered != nil {
+			return registered, nil
+		}
+		return nil, err
+	}
+	installed, created, err := s.installTernClient(key, client)
+	if err != nil {
+		return nil, err
+	}
+	if created {
+		s.logger.Info("created local tern client", "key", key, "type", dbType, "deployment", deployment, "environment", environment)
+	}
+	return installed, nil
+}
+
+// recordTernFailure logs a failed local client resolution and remembers it so
+// callers within ternClientFailureTTL get the error without another lookup.
+// generation is the engine registry generation the resolution started under.
+//
+// A client registered for the key while the resolution ran is returned, and
+// the caller serves it instead of the failure, as a successful build would
+// defer to it. A cancelled resolution says nothing about the deployment, and a
+// failure from a registry that RegisterEngine has since replaced may be one
+// the new factory fixes, so both are logged but not remembered.
+func (s *Service) recordTernFailure(key, deployment, environment, dbType string, generation uint64, err error) tern.Client {
+	attrs := []any{"key", key, "deployment", deployment, "environment", environment, "database_type", dbType, "error", err}
+
+	s.ternMu.Lock()
+	if registered, ok := s.ternClients[key]; ok {
+		s.ternMu.Unlock()
+		s.logger.Warn("tern client resolution failed, but a client was registered for this deployment while it ran; serving the registered client", attrs...)
+		return registered
+	}
+	if errors.Is(err, context.Canceled) {
+		s.ternMu.Unlock()
+		s.logger.Warn("tern client resolution was cancelled; the next request resolves it again", attrs...)
+		return nil
+	}
+	if generation != s.engineGeneration {
+		s.ternMu.Unlock()
+		s.logger.Warn("tern client resolution failed while an engine was registered; the failure is not remembered and the next request resolves again", attrs...)
+		return nil
+	}
+	if s.ternFailures == nil {
+		s.ternFailures = make(map[string]ternResolveFailure)
+	}
+	now := s.clock.Now()
+	s.ternFailures[key] = ternResolveFailure{err: err, failedAt: now, expiresAt: now.Add(ternClientFailureTTL)}
+	s.ternMu.Unlock()
+
+	s.logger.Error("tern client resolution failed; requests for this deployment get this failure until the retry time",
+		append(attrs, "cached_for", ternClientFailureTTL.String())...)
+	return nil
+}
+
+// installTernClient stores a newly built client under ternMu. A client already
+// installed for the key (a registered client, or one from an earlier
+// resolution) wins and the new one is closed, and so is a client built after
+// Close. created reports whether the new client is the one now installed.
+func (s *Service) installTernClient(key string, client tern.Client) (installed tern.Client, created bool, err error) {
+	s.ternMu.Lock()
+	if s.ternClosed {
+		s.ternMu.Unlock()
+		utils.CloseAndLog(client)
+		return nil, false, fmt.Errorf("install tern client for %s: service is closed", key)
+	}
+	if existing, ok := s.ternClients[key]; ok {
+		s.ternMu.Unlock()
+		utils.CloseAndLog(client)
+		s.logger.Debug("closed a tern client that lost the install race", "key", key)
+		return existing, false, nil
+	}
+	s.ternClients[key] = client
+	delete(s.ternFailures, key)
+	s.ternMu.Unlock()
+	return client, true, nil
+}
+
+// createRemoteTernClient serves a deployment that has no local DSN: an
+// explicitly configured gRPC endpoint, else the default client. Building a gRPC
+// client dials lazily and makes no network call.
+func (s *Service) createRemoteTernClient(key, deployment, environment string) (tern.Client, error) {
 	// Prefer an explicitly configured gRPC endpoint (TernDeployments) for this
 	// deployment/environment over the dynamic default client.
 	address, err := s.config.TernDeployments.Endpoint(deployment, environment)
@@ -626,9 +834,12 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 			// This lets the durable-apply operator resolve dynamically-routed
 			// targets without a per-request RegisterTernClient. It is shared across
 			// keys (the router resolves per request), so it is not cached here.
-			if s.defaultTernClient != nil {
+			s.ternMu.Lock()
+			defaultClient := s.defaultTernClient
+			s.ternMu.Unlock()
+			if defaultClient != nil {
 				s.logger.Debug("using default tern client for dynamic target resolution", "deployment", deployment, "environment", environment)
-				return s.defaultTernClient, nil
+				return defaultClient, nil
 			}
 			if deployment == DefaultDeployment {
 				return nil, fmt.Errorf("not found in server configuration: %w", errTernDeploymentNotConfigured)
@@ -645,11 +856,13 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 		Logger:  s.logger,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create tern client for %s: %w", key, err)
+		// The client dials lazily, so a failure here is the address itself,
+		// such as one without a port, never an unreachable engine.
+		return nil, fmt.Errorf("create tern client for %s: %w: %w", key, errTernClientConfig, err)
 	}
 
-	s.ternClients[key] = client
-	return client, nil
+	installed, _, err := s.installTernClient(key, client)
+	return installed, err
 }
 
 // RoutingTernClient returns a client that routes requests from server
@@ -690,6 +903,9 @@ func (s *Service) RoutingTernClient() (*tern.RoutingClient, error) {
 // RegisterTernClient registers a tern client for the given deployment and
 // environment. This allows embedders to add clients dynamically as they
 // are created (e.g., lazily per-cluster).
+//
+// Registering also forgets any remembered resolution failure for the key, so a
+// client supplied after a failed lookup takes effect at once.
 func (s *Service) RegisterTernClient(deployment, environment string, client tern.Client) {
 	if deployment == "" {
 		deployment = DefaultDeployment
@@ -698,6 +914,7 @@ func (s *Service) RegisterTernClient(deployment, environment string, client tern
 	s.ternMu.Lock()
 	defer s.ternMu.Unlock()
 	s.ternClients[key] = client
+	delete(s.ternFailures, key)
 }
 
 // SetDefaultTernClient sets a fallback tern client used by TernClient for any
@@ -725,18 +942,28 @@ func (s *Service) SetDefaultTernClient(client tern.Client) {
 // (ref resolved to a different value, e.g. via env:/file:/secretsmanager:) is
 // safe to print; for a literal we redact it, since the config key alone is
 // enough for triage.
+// markMissingSecretFile marks a DSN or token source naming a file that does not
+// exist as a configuration error. Any other resolution failure, such as a
+// secrets backend call, is left unmarked so a later attempt can succeed.
+func markMissingSecretFile(err error) error {
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: %w", errTernClientConfig, err)
+	}
+	return err
+}
+
 func malformedTokenError(key, ref, resolved, requirement string) error {
 	if resolved != ref {
-		return fmt.Errorf("token for %s resolved from %q %s", key, ref, requirement)
+		return fmt.Errorf("token for %s resolved from %q %s: %w", key, ref, requirement, errTernClientConfig)
 	}
-	return fmt.Errorf("token for %s (literal value redacted) %s", key, requirement)
+	return fmt.Errorf("token for %s (literal value redacted) %s: %w", key, requirement, errTernClientConfig)
 }
 
 func (s *Service) newLocalTernClient(key, database, dbType string, envConfig EnvironmentConfig) (tern.Client, error) {
 	// Resolve target DSN (handles env:, file: prefixes and structured DSN sources)
 	targetDSN, err := envConfig.ResolveDSN(dbType)
 	if err != nil {
-		return nil, fmt.Errorf("resolve DSN for %s: %w", key, err)
+		return nil, fmt.Errorf("resolve DSN for %s: %w", key, markMissingSecretFile(err))
 	}
 
 	// Resolve PlanetScale token if configured. Token validation is intentionally
@@ -747,7 +974,7 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	if envConfig.TokenSecretRef != "" {
 		token, err := secrets.Resolve(envConfig.TokenSecretRef, "")
 		if err != nil {
-			return nil, fmt.Errorf("resolve token for %s: %w", key, err)
+			return nil, fmt.Errorf("resolve token for %s: %w", key, markMissingSecretFile(err))
 		}
 		parts := strings.SplitN(token, ":", 2)
 		if len(parts) != 2 {
@@ -768,10 +995,10 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	if envConfig.RevertWindowDuration != "" {
 		d, err := time.ParseDuration(envConfig.RevertWindowDuration)
 		if err != nil {
-			return nil, fmt.Errorf("parse revert_window_duration %q for %s: %w", envConfig.RevertWindowDuration, key, err)
+			return nil, fmt.Errorf("parse revert_window_duration %q for %s: %w: %w", envConfig.RevertWindowDuration, key, errTernClientConfig, err)
 		}
 		if d <= 0 {
-			return nil, fmt.Errorf("revert_window_duration %q for %s must be positive (omit it to use the engine default)", envConfig.RevertWindowDuration, key)
+			return nil, fmt.Errorf("revert_window_duration %q for %s must be positive (omit it to use the engine default): %w", envConfig.RevertWindowDuration, key, errTernClientConfig)
 		}
 		revertWindow = d
 		// Revert is engine-dependent: only Vitess/PlanetScale honors a revert
@@ -811,6 +1038,12 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		return nil, fmt.Errorf("resolve direct_execution metadata for %s: %w", key, err)
 	}
 	maps.Copy(metadata, directMetadata)
+	// RegisterEngine writes the factory registry under ternMu, and the client is
+	// built without that lock, so the client gets a copy taken under it rather
+	// than the shared map.
+	s.ternMu.Lock()
+	engineFactories := maps.Clone(s.engineFactories)
+	s.ternMu.Unlock()
 	client, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:                              database,
 		Type:                                  dbType,
@@ -819,7 +1052,7 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		PostgresNativeSafeTableSizeLimitBytes: s.config.Postgres.NativeSafeTableSizeLimit(),
 		PostgresConcurrentIndexMaxDuration:    s.config.Postgres.ConcurrentIndexMaxDurationOrDefault(),
 		WakeOperator:                          s.wakeOperator,
-		EngineFactories:                       s.engineFactories,
+		EngineFactories:                       engineFactories,
 	}, s.storage, s.logger)
 	if err != nil {
 		return nil, fmt.Errorf("create local tern client for %s: %w", key, err)
@@ -1044,6 +1277,7 @@ func (s *Service) Close() error {
 	s.StopOperatorStuckPendingMonitor()
 
 	s.ternMu.Lock()
+	s.ternClosed = true
 	var errs []error
 	if s.routingTernClient != nil {
 		if err := s.routingTernClient.Close(); err != nil {

@@ -21,11 +21,11 @@ func TestWriteRolloutApplyRefused_CountsRerunsPastTheInlineLimit(t *testing.T) {
 		{members: memberNamesInlineLimit + 2, want: "  and the same for 2 more targets\n"},
 	} {
 		var refused []*apitypes.PlanMemberRefusalResponse
-		var reruns []string
+		var reruns [][]string
 		for i := range tc.members {
 			name := fmt.Sprintf("payments-%03d", i+1)
 			refused = append(refused, &apitypes.PlanMemberRefusalResponse{Member: name, Target: name, Reason: apitypes.PlanMemberNeedsTarget, Detail: "planned against its own schema"})
-			reruns = append(reruns, "apply -e production --target "+name)
+			reruns = append(reruns, []string{"apply", "-e", "production", "--target", name})
 		}
 		out := captureStdout(t, func() { WriteRolloutApplyRefused(presentation.TargetNoun, refused, reruns) })
 		assert.Contains(t, out, tc.want, out)

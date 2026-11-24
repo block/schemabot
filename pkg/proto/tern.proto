@@ -384,6 +384,7 @@ enum ChangeType {
   CHANGE_TYPE_RENAME = 7;
   CHANGE_TYPE_TRUNCATE = 8;
   CHANGE_TYPE_CREATE_VIEW = 9;
+  CHANGE_TYPE_ALTER_TYPE = 10;
 }
 
 // SchemaFiles contains the schema files for a namespace (e.g. schema name for MySQL, keyspace for Vitess).
@@ -675,8 +676,11 @@ message TableChange {
   // deterministically refuses the statement and the apply will fail.
   string execution_mode = 7;
   string mode_reason = 8;
-  // Engine-agnostic annotations about this change. A VSchema change carries
-  // the namespace's persisted VSchema change-metadata here so a deployment
+  // Engine-agnostic annotations about this change, keyed by names the engine
+  // owns. A table change carries the engine's plan-time record of the objects
+  // its statement depends on, such as the definition of a column it drops,
+  // which the engine checks at apply time. A VSchema change carries the
+  // namespace's persisted VSchema change-metadata. Either way, a deployment
   // that materializes the plan from a dispatch request runs the same
   // apply-time safety gates as one reading its own stored plan.
   map<string, string> metadata = 9;
@@ -835,6 +839,10 @@ message PlanResponse {
   repeated ExistingCopy existing_copies = 7;
   // Live tables intentionally excluded from a plan verdict, grouped by namespace.
   repeated ExemptTables exempt_tables = 8;
+  // The drop_tables entries that name no live table on the target, in the
+  // order the config lists them. Such an entry plans no drop, so the plan
+  // names it rather than reading as if the table were seen and kept.
+  repeated string unmatched_drop_tables = 9;
 }
 
 // PlanDiffResponse contains a deployment's desired-vs-live diff. It mirrors

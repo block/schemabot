@@ -182,11 +182,11 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **action** (webhooks): common GitHub actions for the subscribed webhook events, such as `created`, `opened`, `synchronize`, `submitted`, `edited`, `closed`, `requested`, `completed` (omitted for events without actions like `ping` and `push`)
 
-**status** (webhooks): `processed`, `invalid_signature`, `ignored`, `repo_not_configured`, `app_repo_mismatch`, `installation_resolution_failed`, `durable_enqueue_failed`, `durable_command_not_ready`, `durable_command_routing_blocked`, `durable_command_unrouted`, `durable_dispatch_started`, `durable_dispatch_retrying`, `durable_dispatch_failed`, `durable_dispatch_failed_permanent`, `durable_dispatch_completed`, `durable_dispatch_superseded`
+**status** (webhooks): `processed`, `invalid_signature`, `ignored`, `repo_not_configured`, `app_repo_mismatch`, `installation_resolution_failed`, `durable_enqueue_failed`, `durable_command_not_ready`, `durable_command_routing_blocked`, `durable_command_unrouted`, `durable_dispatch_started`, `durable_dispatch_retrying`, `durable_dispatch_quota_reserve_deferred`, `durable_dispatch_failed`, `durable_dispatch_failed_permanent`, `durable_dispatch_completed`, `durable_dispatch_superseded`
 
 **state** (webhook inbox): `pending`, `processing`, `failed_retryable`, `completed`, `failed`, `failed_permanent`, `superseded`, `unknown`
 
-**outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `superseded`, `released`, `lease_lost`, `finish_error`, `unknown`
+**outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `quota_reserve_deferred`, `superseded`, `released`, `lease_lost`, `finish_error`, `unknown`
 
 **operation** (GitHub API): `add_comment_reaction`, `compare_commits`, `create_check_run`, `create_installation_access_token`, `create_issue_comment`, `delete_issue_comment`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_branch_rules`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_issue_comment`, `fetch_pull_request`, `fetch_rate_limit`, `fetch_ref`, `fetch_repository`, `fetch_repository_installation`, `get_combined_status`, `get_team`, `get_team_membership`, `graphql_branch_protection`, `graphql_merge_queue_entries`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_app_installations`, `list_check_runs_for_ref`, `list_issue_timeline`, `list_matching_refs`, `list_pr_files`, `list_pull_requests`, `list_pull_requests_for_commit`, `list_reviews`, `list_team_members`, `remove_issue_label`, `request_reviewers`, `unknown`, `update_check_run`
 
@@ -327,8 +327,15 @@ should be investigated before relying on branch-protection state.
 reports the latest trustworthy installation budget, without a repository label.
 Group by `github_app`, `installation_id`, and `resource`, taking the minimum
 across replicas. Snapshots require a named App, positive installation ID, valid
-remaining/limit headers, and a future reset time. They disappear from collection
-when older than 120 seconds or when their reset time passes. Repeated scrapes,
+remaining/limit headers, and a reset time after the response was received.
+They disappear from collection when older than 120 seconds, and not before:
+a snapshot whose window resets stays exported until a newer reading replaces
+it or it ages out, so a routine hourly reset never turns an installation that
+is being read into an unknown budget. A snapshot is a reading of bounded age,
+not a lower bound on the budget: requests made since it was read, by this
+replica or any other consumer of the installation, are not in it, across a
+reset or not. A headroom threshold should leave room for what the
+installation can spend within the export age. Repeated scrapes,
 local quota refusals and secondary cooldown waits do not refresh observation age.
 Within one window the lowest allowance seen is kept, in any receipt order, even
 when GitHub later reports more; a later response with more remaining still
@@ -365,7 +372,8 @@ repositories may serve any repository, so its probe reads every active
 installation of the App instead (`operation="list_app_installations"`).
 
 `schemabot.github.rate_limit.unobserved_installations` makes a missing budget
-visible. It counts the probe's installations with no exportable snapshot, plus
+visible. It counts the probe's installations with no snapshot read within the
+export age (a reset does not count: see above), plus
 each configured owner whose installation the probe could not resolve on its
 last pass, plus one when the last pass could not list the App's installations
 at all, plus one when the probe has not reported its targets within the
