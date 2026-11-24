@@ -1,7 +1,6 @@
 package spirit
 
 import (
-	"context"
 	"io"
 	"log/slog"
 	"testing"
@@ -56,7 +55,7 @@ func TestStartAfterAStoppingRunReturnsChecksItsStatement(t *testing.T) {
 	rm := &runningSchemaChange{state: engine.StateStopped, host: recorded.host, username: "schemabot", database: recorded.database}
 	eng.runningSchemaChange = rm
 	release := make(chan struct{})
-	rm.goRun(func() {
+	startTestRun(eng, rm, func() {
 		<-release
 		eng.mu.Lock()
 		eng.unconfirmedStatements = append(eng.unconfirmedStatements, recorded)
@@ -68,9 +67,7 @@ func TestStartAfterAStoppingRunReturnsChecksItsStatement(t *testing.T) {
 	assert.True(t, engine.IsRetryable(err), "the refused start can be sent again")
 
 	close(release)
-	exitCtx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	require.NoError(t, waitForRunExit(exitCtx, rm), "the stopped run returns")
+	waitForTestRun(t, eng, rm)
 	_, err = eng.Start(t.Context(), &engine.ControlRequest{})
 	require.NoError(t, err, "Start()")
 
