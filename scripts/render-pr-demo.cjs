@@ -11,7 +11,7 @@ const ENGINES={
  // diffColors are the opening diff's deleted and added line backgrounds.
  mysql:{gif:'assets/pr-workflow-demo.gif',done:'100.00%',diffColors:['FFEBE9','FFCECB','DAFBE1','ACEEBB']},
  // The PostgreSQL diff only adds lines.
- postgres:{gif:'assets/pr-postgres-workflow-demo.gif',done:'100% of blocks',diffColors:['DAFBE1','ACEEBB']},
+ postgres:{gif:'assets/pr-postgres-workflow-demo.gif',done:'95%',diffColors:['DAFBE1','ACEEBB']},
 };
 if(!ENGINES[engine])throw new Error(`Unknown engine ${engine}; expected one of ${Object.keys(ENGINES).join(', ')}`);
 (async()=>{
@@ -56,7 +56,7 @@ if(!ENGINES[engine])throw new Error(`Unknown engine ${engine}; expected one of $
    }
    if(i===(9.5+introSeconds)*fps){
     const text=await page.locator('#progress-body').innerText();
-    if(!text.includes(ENGINES[engine].done)||text.includes('DEMOVALUE'))throw new Error('Progress frame must show 100% with no placeholder text');
+    if(!text.includes(ENGINES[engine].done)||text.includes('DEMOVALUE'))throw new Error(`Progress frame must show ${ENGINES[engine].done} with no placeholder text`);
    }
    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
    const frame=path.join(tmp,`${String(i).padStart(4,'0')}.png`);await page.screenshot({path:frame});frames.push(frame);
@@ -84,6 +84,6 @@ if(!ENGINES[engine])throw new Error(`Unknown engine ${engine}; expected one of $
    held+=Number(delay);
   }
   if(held<200)throw new Error('Final GIF reading pause must last two seconds');
-  console.log('Rendered 451 frames: approximately 22.5 seconds, including the file diff, 100% progress and merge');
+  console.log(`Rendered 451 frames: approximately 22.5 seconds, including the file diff, ${ENGINES[engine].done} progress and merge`);
  } finally {if(browser)await browser.close();fs.rmSync(tmp,{recursive:true,force:true})}
 })().catch(e=>{console.error(e);process.exitCode=1});

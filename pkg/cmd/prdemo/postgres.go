@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine/postgres/indexphase"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -32,6 +33,7 @@ const (
 	addIndex    = "CREATE INDEX CONCURRENTLY idx_email_created ON users USING btree (email, created_at)"
 	runningStmt = "CREATE INDEX CONCURRENTLY idx_email_created ON public.users USING btree (email, created_at)"
 	blocksTotal = 48_000
+	tuplesTotal = 1_200_000
 	// percentStep is how far the build advances between progress updates.
 	percentStep = 4
 )
@@ -69,19 +71,44 @@ func apply(applyState, taskState string) templates.ApplyStatusCommentData {
 	}
 }
 
-// running renders the progress comment with the index build percent of the
-// way through scanning the table.
-func running(percent int) string {
+// running renders the progress comment step percent of the way through the
+// recording's build. The build walks the phases PostgreSQL counts in
+// execution order, so the bar shows the whole-build percent the engine
+// reports and the detail line shows the current phase's counters. A running
+// build never reads 100%: its last counted phase ends below it.
+func running(step int) string {
 	data := apply(state.Apply.Running, state.Task.Running)
 	data.Step, data.StepsTotal = 1, 1
 	data.Statement = runningStmt
-	data.BuildWork = apitypes.BuildWork{
-		Operation:   "concurrent-index-build",
-		ServerPhase: "building index: scanning table",
-		BlocksDone:  blocksTotal * int64(percent) / 100,
-		BlocksTotal: blocksTotal,
+	phase, inBand := buildPhaseAt(step)
+	data.BuildWork = apitypes.BuildWork{Operation: "concurrent-index-build", ServerPhase: phase.Name}
+	switch phase.Counter {
+	case indexphase.Tuples:
+		data.BuildWork.TuplesDone, data.BuildWork.TuplesTotal = int64(inBand*tuplesTotal), tuplesTotal
+	default:
+		data.BuildWork.BlocksDone, data.BuildWork.BlocksTotal = int64(inBand*blocksTotal), blocksTotal
 	}
+	data.Tables[0].PercentComplete = phase.Start + int(inBand*float64(phase.End-phase.Start))
 	return templates.RenderApplyStatusComment(data)
+}
+
+// buildPhaseAt is the counted build phase step percent of the way through the
+// recording, and how far through that phase's band the build is.
+func buildPhaseAt(step int) (indexphase.Phase, float64) {
+	var counted []indexphase.Phase
+	for _, phase := range indexphase.Phases {
+		if phase.End > phase.Start && phase.Name != indexphase.BuildingIndex {
+			counted = append(counted, phase)
+		}
+	}
+	last := counted[len(counted)-1]
+	whole := float64(step) * float64(last.End) / 100
+	for _, phase := range counted {
+		if whole <= float64(phase.End) {
+			return phase, (whole - float64(phase.Start)) / float64(phase.End-phase.Start)
+		}
+	}
+	return last, 1
 }
 
 func main() {
