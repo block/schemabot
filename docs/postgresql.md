@@ -39,7 +39,7 @@ own state. See [SchemaBot storage](#schemabot-storage) for that distinction.
 PostgreSQL support is in **beta**. SchemaBot runs the changes listed below
 and blocks every other change in the plan, with the reason, before anything
 touches the database. Nothing falls back to a riskier way of running it.
-[What GA and beta mean](engines.md#what-ga-and-beta-mean) defines the bar.
+[What GA, beta, and alpha mean](engines.md#what-ga-beta-and-alpha-mean) defines the bar.
 pg-sprite, the engine underneath, is itself an early release; its
 [README](https://github.com/block/pg-sprite#readme) states its own readiness.
 
