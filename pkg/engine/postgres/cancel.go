@@ -30,12 +30,14 @@ const cancelSettleTimeout = 2 * time.Minute
 // signalling is held to the tracker's own bound on the signal's round trip.
 const cancelAttemptSettleTimeout = 30 * time.Second
 
-// Cancel ends this apply's concurrent index build and answers with the
-// outcome the drive settles on. The build backend is signalled through the
-// apply's pg-sprite tracker; when that signal cannot reach a running
-// statement — the build has not started, has already returned, or its
-// backend is not observable or signallable by this role — the drive's own
-// context is cancelled instead, which ends whatever statement it is on. The
+// Cancel ends this apply's index build and answers with the outcome the
+// drive settles on. The build backend is signalled through the apply's
+// pg-sprite tracker; when that signal cannot reach a running statement — the
+// build has not started, has already returned, or its backend is not
+// observable or signallable by this role — the drive's own context is
+// cancelled instead, which ends whatever statement it is on. A partitioned
+// build's drive context is cancelled after a signal too, because the signal
+// reaches only the partition in flight. The
 // durable control request remains the source of operator intent; the
 // tracked apply's cancelRequested only tells the drive that the cancellation
 // it sees is this one.
@@ -68,7 +70,7 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 		e.mu.Unlock()
 		return nil, engine.NewUnsupportedOperationError("cancel is supported for PostgreSQL index builds only: this schema change runs as plain DDL that commits or fails on its own")
 	}
-	tracker, logger, cancelApply, done := tracked.tracker, tracked.logger, tracked.cancelApply, tracked.done
+	tracker, logger, cancelApply, done, partitioned := tracked.tracker, tracked.logger, tracked.cancelApply, tracked.done, tracked.partitionedBuild
 	if err := ctx.Err(); err != nil {
 		e.mu.Unlock()
 		// A caller that has already given up sends nothing and records
@@ -109,6 +111,17 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 		// that has already returned settles on its own.
 		logger.Info("PostgreSQL cancel could not signal the build backend; cancelling the apply's own context instead",
 			"task_id", key, "reason", err)
+		cancelApply()
+	} else if partitioned {
+		// The signal reaches only the partition build in flight, and that
+		// build can finish before the signal lands, which would leave the
+		// next partition to start. Ending the drive's context stops the
+		// build at whatever partition it is on. The partitions already
+		// built keep their index, and a build that had already finished
+		// every partition has published completed, which the settle below
+		// reports.
+		logger.Info("PostgreSQL cancel signalled the partition build in flight; cancelling the apply's own context so no later partition starts",
+			"task_id", key)
 		cancelApply()
 	}
 

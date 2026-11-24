@@ -437,8 +437,10 @@ engine's wait is reported as still running, and the next attempt waits for it
 again.
 
 A cancelled partitioned index build settles as `cancelled` without removing
-anything. The partitions already built keep their index, and applying the
-plan again resumes the build from them.
+anything. The cancel signals the partition build in flight and also ends the
+apply's context, so no later partition starts even when the signalled one
+finishes first. The partitions already built keep their index, and applying
+the plan again resumes the build from them.
 
 On shutdown the engine halts its running concurrent and partitioned index
 builds the same way

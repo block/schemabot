@@ -89,6 +89,11 @@ type trackedApply struct {
 	// PostgreSQL change an operator can cancel, so the shape decides the
 	// answer before any server is asked.
 	cancellableBuild bool
+	// partitionedBuild records that the build runs one concurrent build per
+	// partition. A cancel signal reaches only the partition build in flight,
+	// which can finish before the signal lands, so Cancel also ends the
+	// drive's context to keep the next partition from starting.
+	partitionedBuild bool
 	// percentStep is the executor step the result's precise percent was
 	// read from. A percent measures one step's completion, so the
 	// never-regress floor holds only while later polls report that step.

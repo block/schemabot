@@ -130,6 +130,21 @@ func (c nativeApply) durationBoundedIndexBuild() bool {
 	return c.concurrentIndex || c.partitionedIndex
 }
 
+// buildShape is how an operator cancel reaches the change's work.
+type buildShape struct {
+	// cancellable is set for an index build, concurrent or partition by
+	// partition, the one PostgreSQL change an operator can cancel.
+	cancellable bool
+	// partitioned is set for a partitioned index build, which runs one
+	// concurrent build per partition, so a signal to the build in flight
+	// does not reach the partitions after it.
+	partitioned bool
+}
+
+func (c nativeApply) buildShape() buildShape {
+	return buildShape{cancellable: c.durationBoundedIndexBuild(), partitioned: c.partitionedIndex}
+}
+
 // targetConn carries one background apply's connection inputs: the raw DSN
 // (normalized at open time) and the CA bundle path the pool verifies the
 // target against — empty when the embedded RDS trust or the DSN's own
@@ -183,7 +198,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// engine itself can end the drive — a cancel of last resort, and the
 	// halt on shutdown.
 	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
-	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.durationBoundedIndexBuild(), cancelApply, engine.WorkOwnerFromContext(ctx))
+	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.buildShape(), cancelApply, engine.WorkOwnerFromContext(ctx))
 	conn := targetConn{dsn: req.Credentials.DSN, caCertPath: caPath}
 	e.wg.Go(func() {
 		defer close(done)
@@ -2425,7 +2440,7 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 //
 // The returned channel is the drive's to close once its terminal result is
 // published; Cancel waits on it for the outcome.
-func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger, cancellableBuild bool, cancelApply context.CancelFunc, owner string) chan struct{} {
+func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger, shape buildShape, cancelApply context.CancelFunc, owner string) chan struct{} {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.progress == nil {
@@ -2439,7 +2454,7 @@ func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracke
 	done := make(chan struct{})
 	e.progress[key] = &trackedApply{
 		result: result, tracker: tracker, logger: logger,
-		cancellableBuild: cancellableBuild, cancelApply: cancelApply, done: done,
+		cancellableBuild: shape.cancellable, partitionedBuild: shape.partitioned, cancelApply: cancelApply, done: done,
 		owner: owner,
 	}
 	return done
