@@ -88,3 +88,24 @@ func TestEngineApplyRefusesADropWhoseObjectChangedAfterReview(t *testing.T) {
 	assert.Contains(t, progress.ErrorMessage, `the object the planned drop on "users" removes changed after planning; re-plan against the current schema`)
 	assert.True(t, legacyColumnExists(t, db), "the changed column must be left in place")
 }
+
+// A confirmation holds the re-plan to the record of the objects the reviewed
+// plan acts on, so the record must name the object and nothing else. Planning
+// the same drop twice against an unchanged column records the same object.
+// After someone drops users.legacy and adds a column of the same name and type,
+// the re-plan records a different object, so the confirmation sees the
+// replacement even though the statement reads the same.
+func TestPlanRecordsTheSameDropOnlyForTheSameObject(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "reviewed_drop_replan")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, legacy text)")
+	require.NoError(t, err)
+
+	reviewed := planReviewedDrop(t, dsn)
+	assert.Equal(t, reviewed.Metadata, planReviewedDrop(t, dsn).Metadata, "a re-plan of an unchanged column records the same object")
+
+	_, err = db.ExecContext(t.Context(), "ALTER TABLE public.users DROP COLUMN legacy, ADD COLUMN legacy text")
+	require.NoError(t, err)
+	replanned := planReviewedDrop(t, dsn)
+	assert.Equal(t, reviewed.DDL, replanned.DDL, "the statement reads the same")
+	assert.NotEqual(t, reviewed.Metadata, replanned.Metadata, "a replaced column is a different object")
+}
