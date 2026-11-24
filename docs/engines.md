@@ -7,7 +7,7 @@
 - [Capability matrix](#capability-matrix)
 - [What the terms mean](#what-the-terms-mean)
 - [Why the differences exist](#why-the-differences-exist)
-- [What GA and early alpha mean](#what-ga-and-early-alpha-mean)
+- [What GA and beta mean](#what-ga-and-beta-mean)
 - [Load management](#load-management)
 - [Dropped tables](#dropped-tables)
 - [Reading further](#reading-further)
@@ -271,12 +271,15 @@ is bounded by its own duration budget instead. [postgresql.md](postgresql.md) ha
 the full boundary and is worth reading before you point SchemaBot at a PostgreSQL database; it
 tracks the engine more closely than this page does.
 
-## What GA and early alpha mean
+## What GA and beta mean
 
 The engine badges on the [README](../README.md) are claims about capability, and this is where
-they are defined. An engine is **GA** when it can do the two things below. **Early alpha** means
-it cannot yet, and that what is missing is written on this page rather than left for you to
-discover against a database.
+they are defined. An engine is **GA** when it can do the two things below.
+
+An engine is **beta** when it cannot do both yet, but every change it accepts runs on a path that
+is generally available in the engine underneath it. A change outside that set is blocked in the
+plan, with the reason, before anything touches the database. What is not GA yet is listed in the
+engine's guide rather than left for you to discover against a database.
 
 Maturity is a capability question, not a safety one. An engine below GA is narrower rather than
 looser: fewer classes of change can be executed and fewer operations are available against one

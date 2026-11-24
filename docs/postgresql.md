@@ -4,6 +4,7 @@
 
 ## Table of Contents
 
+- [Beta status](#beta-status)
 - [Schema pull](#schema-pull)
 - [Row-level security](#row-level-security)
 - [Supported changes](#supported-changes)
@@ -32,6 +33,47 @@ less safe executor: its plan is blocked.
 
 PostgreSQL target support is separate from using PostgreSQL for SchemaBot's
 own state. See [SchemaBot storage](#schemabot-storage) for that distinction.
+
+## Beta status
+
+PostgreSQL support is in **beta**. Every change SchemaBot runs on PostgreSQL
+goes through a path pg-sprite marks generally available. A change outside the
+list below is blocked in the plan, with the reason, before anything touches the
+database. Nothing falls back to a riskier way of running it.
+[What GA and beta mean](engines.md#what-ga-and-beta-mean) defines the bar.
+
+**Generally available:**
+
+- Planning on every pull request and in the CLI, with the plan's exact SQL, and
+  a Check Run that blocks the merge until the change is applied.
+- `ALTER TABLE` changes that pg-sprite runs natively, such as adding a nullable
+  column, on tables up to the native-apply ceiling (1 GiB by default).
+- Adding an index to an existing table with `CREATE INDEX CONCURRENTLY`. A
+  running build can be cancelled.
+- Creating a table together with its indexes.
+- Adding labels to an existing enum type (see [Enum types](#enum-types)).
+- Row-level security policies on an existing table.
+- `schemabot init` and `schemabot pull` for an existing database, and
+  PostgreSQL as the database that stores SchemaBot's own state.
+
+**Not GA yet** (blocked in the plan or refused, never run):
+
+- **Changes that rewrite a table**, such as a general column type change or a
+  `USING` expression. These need pg-sprite's copy-and-swap, which is in
+  preview, so SchemaBot blocks the plan instead of running it.
+- **`ALTER TABLE` on a table above the native-apply ceiling.** Blocked, for
+  the same reason.
+- **Foreign keys.** Adding or dropping one is blocked; see
+  [Blocked plans](#blocked-plans).
+- **Dropping a table.** SchemaBot never runs `DROP TABLE` on PostgreSQL, and
+  there is no pending-drops quarantine.
+- **Creating an enum type**, or removing or reordering its labels.
+- **Controls on a running change.** `stop`, `start`, `cutover`, deferred
+  cutover, `revert`, and `skip-revert` are not available, and `cancel` works
+  only on an index build. See
+  [Unsupported workflow features](#unsupported-workflow-features).
+- **Pulling every table shape.** `pull` refuses the shapes listed under
+  [Schema pull](#schema-pull) rather than writing a partial schema.
 
 ## Schema pull
 
