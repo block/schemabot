@@ -358,7 +358,7 @@ func (h *Handler) blockUnsafeWithoutOptIn(ctx context.Context, client *ghclient.
 	if len(planResp.UnsafeChanges()) == 0 && len(memberUnsafe) == 0 {
 		return false
 	}
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 	commentData.ScopedDatabase = result.Database
 	commentData.Target = narrowedTarget(planResp, result.Target)
 	commentData.UnsafeChanges = append(commentData.UnsafeChanges, memberUnsafe...)

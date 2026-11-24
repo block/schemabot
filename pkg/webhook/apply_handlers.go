@@ -476,13 +476,13 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		h.logger.Info("apply: the target the apply was narrowed to has no changes; posting its plan without updating stored check state",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"plan_id", planResp.PlanID, "narrowed_to", planResp.NarrowedTo)
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+		commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 		commentData.ScopedDatabase = result.Database
 		commentData.Target = result.Target
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		return false, nil
 	default:
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+		commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 		commentData.ScopedDatabase = result.Database
 		commentData.DeploymentDrift = rolloutPreview
 		if headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout); checkErr != nil {
@@ -513,7 +513,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// toward --allow-unsafe for a guaranteed failure. No lock is held yet, so
 	// the rejection needs no release.
 	if planResp.HasBlockedChanges() {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+		commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 		commentData.ScopedDatabase = result.Database
 		commentData.Target = narrowedTarget(planResp, result.Target)
 		h.logger.Info("apply rejected: plan contains engine-blocked changes",
@@ -643,7 +643,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// apply proceeds automatically and the unsafe opt-in already solicited
 	// consent for every attributed table, where the re-plan choice the
 	// disclosure coaches is no longer open.
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 	commentData.ScopedDatabase = result.Database
 	commentData.Target = narrowedTarget(planResp, result.Target)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, rolloutPreview, repo, pr, environment)

@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1541,4 +1542,25 @@ func TestSourcePolicyRefusalHoldingEachFailure(t *testing.T) {
 func assertPasteableCommand(t *testing.T, comment, cmd string) {
 	t.Helper()
 	assert.Regexp(t, "(?m)^ *```\n *"+regexp.QuoteMeta(cmd)+"\n *```$", comment)
+}
+
+// Every plan comment an apply command posts (the locked comment, the
+// confirmation downgrade, the no-change and blocked-change replies) shows the
+// time the command was posted, not the time the comment rendered, so a slow
+// re-plan does not move the "Requested by" line.
+func TestCommandPlanCommentData_StampsRequestTime(t *testing.T) {
+	h := &Handler{}
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "mysql"}
+	planResp := &apitypes.PlanResponse{PlanID: "plan_abc123"}
+	requestedAt := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
+	result := CommandResult{Tenant: "default", RequestedAt: requestedAt}
+
+	data := h.commandPlanCommentData(schema, planResp, "staging", "jdoe", result)
+
+	assert.Equal(t, requestedAt, data.RequestedAt)
+	assert.Equal(t, "default", data.Tenant)
+	assert.Equal(t, "jdoe", data.RequestedBy)
+	assert.Equal(t, "plan_abc123", data.PlanID)
+	assert.Contains(t, templates.RenderPlanComment(data), "at 2026-02-03 04:05:06 UTC")
+	assert.Contains(t, templates.RenderBlockedChangesApplyRejected(data), "at 2026-02-03 04:05:06 UTC")
 }
