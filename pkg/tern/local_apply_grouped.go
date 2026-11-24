@@ -63,7 +63,10 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	if err != nil {
 		return c.failApplyAndNotify(ctx, apply, tasks, err.Error())
 	}
-	changes := groupedResumeChanges(tasks, plan)
+	changes, err := groupedResumeChanges(tasks, plan, planChangeCanonicalizer(apply, c.logger))
+	if err != nil {
+		return c.failApplyAndNotify(ctx, apply, tasks, err.Error())
+	}
 
 	// Mark the apply as started before calling the engine. The engine may run
 	// for a long time (branch creation, DDL application, deploy request) and

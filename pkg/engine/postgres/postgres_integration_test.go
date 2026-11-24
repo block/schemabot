@@ -404,7 +404,7 @@ func TestEnginePlanRollbackBaselineMembershipRoundTrip(t *testing.T) {
 			assert.True(t, drop.IsUnsafe, "rollback keeps destructive-change disclosure")
 			assert.NotEmpty(t, drop.UnsafeReason)
 			require.Empty(t, drop.ExecutionMode)
-			rolledBack, err := eng.Apply(ctx, applyRequest(dsn, drop.Table, drop.DDL))
+			rolledBack, err := eng.Apply(ctx, plannedApplyRequest(dsn, drop))
 			require.NoError(t, err)
 			require.True(t, rolledBack.Accepted)
 			require.Equal(t, engine.StateCompleted, awaitPostgresProgress(t, eng, tt.table).State)
@@ -2419,6 +2419,14 @@ func applyRequest(dsn, table, statement string) *engine.ApplyRequest {
 		Credentials: &engine.Credentials{DSN: dsn},
 		ResumeState: &engine.ResumeState{MigrationContext: applyTaskID(table)},
 	}
+}
+
+// plannedApplyRequest is applyRequest for a change a plan returned, carrying
+// the metadata the engine recorded with it as the drive layer does.
+func plannedApplyRequest(dsn string, change engine.TableChange) *engine.ApplyRequest {
+	req := applyRequest(dsn, change.Table, change.DDL)
+	req.Changes[0].TableChanges[0].Metadata = change.Metadata
+	return req
 }
 
 func applyTaskID(table string) string {

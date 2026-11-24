@@ -1719,8 +1719,11 @@ type TableChange struct {
 	// deterministically refuses the statement and the apply will fail.
 	ExecutionMode string `protobuf:"bytes,7,opt,name=execution_mode,json=executionMode,proto3" json:"execution_mode,omitempty"`
 	ModeReason    string `protobuf:"bytes,8,opt,name=mode_reason,json=modeReason,proto3" json:"mode_reason,omitempty"`
-	// Engine-agnostic annotations about this change. A VSchema change carries
-	// the namespace's persisted VSchema change-metadata here so a deployment
+	// Engine-agnostic annotations about this change, keyed by names the engine
+	// owns. A table change carries the engine's plan-time record of the objects
+	// its statement depends on, such as the definition of a column it drops,
+	// which the engine checks at apply time. A VSchema change carries the
+	// namespace's persisted VSchema change-metadata. Either way, a deployment
 	// that materializes the plan from a dispatch request runs the same
 	// apply-time safety gates as one reading its own stored plan.
 	Metadata map[string]string `protobuf:"bytes,9,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`

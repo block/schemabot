@@ -1911,6 +1911,12 @@ the re-plan speaks for a shard-tagged task at all. `remainingPlannedChanges` on 
 path of the PlanetScale engine (`pkg/engine/planetscale/apply.go`) runs only reviewed DDL for the
 tables the branch still lacks, refuses a branch that differs outside the reviewed DDL, and
 validates the branch against the declared schema before creating or adopting the deploy request.
+On PostgreSQL, a statement that drops a column, a constraint, or a NOT NULL runs only with the
+planner's record of that object, which the plan stores with the change and every apply path passes
+back, matching a task to its change by the statement's canonical form (`planChangeMetadata` in
+`pkg/tern/plan_change_metadata.go`); the apply refuses a drop with no record
+and drops nothing when the object no longer matches it under the table's lock
+(`reviewedDropForApply` and `executeReviewedDrop` in `pkg/engine/postgres/apply.go`).
 The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
 and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
