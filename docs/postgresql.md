@@ -481,7 +481,16 @@ record under the table's lock, in the transaction that drops it. When the
 object changed after the plan, for example a column dropped and added again
 under the same name, the apply refuses and drops nothing; re-plan against the
 current schema and review the new plan. A plan that cannot record the object
-it drops is blocked.
+it drops is blocked. A deployment that builds its plan from another
+deployment's dispatch records the object as its own re-plan read it, since the
+same column can sit at a different position or have different dependents
+there.
+
+A plan approved before this check shipped has no record, so its drops are
+refused. That includes an apply still running at the upgrade: a sequential
+apply whose earlier tasks already ran stops at its first drop. Re-plan any
+approved plan that drops a column, a constraint, or a `NOT NULL` after the
+upgrade, and apply the new plan.
 
 The engine does not execute `DROP TABLE` or other statement kinds outside its
 admitted set. That includes tables that exist on the target but that no schema

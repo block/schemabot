@@ -651,6 +651,27 @@ func TestReplannedChangeStampOntoOnlyTightensUnsafe(t *testing.T) {
 	assert.Empty(t, safe.UnsafeReason)
 }
 
+// A re-plan that produces one change twice with records that disagree cannot
+// say which record the change runs against, so materializing it is refused.
+func TestStampReplannedTablesRefusesConflictingEngineMetadata(t *testing.T) {
+	client := newPlanMaterializeClient(&fakePlanStore{})
+	parser, err := client.statementParser()
+	require.NoError(t, err)
+	const statement = "ALTER TABLE `users` DROP COLUMN `legacy_id`"
+	canon, err := canonicalDDLForDrift(parser, statement)
+	require.NoError(t, err)
+	key := driftChangeKey{namespace: client.planNamespace(""), table: "users", operation: "alter", ddl: canon}
+
+	replanned := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
+	replanned.record(key, replannedChange{ddl: statement, metadata: map[string]string{"record": "a"}})
+	replanned.record(key, replannedChange{ddl: statement, metadata: map[string]string{"record": "b"}})
+
+	tables := []storage.TableChange{{Table: "users", Operation: "alter", DDL: statement}}
+	err = client.stampReplannedTables(parser, tables, replanned)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "more than one copy of a change with different engine metadata")
+}
+
 // A blocked verdict on one shard's copy of a table already seen on another
 // shard is deduped out of the namespace-level tables but survives on the shard
 // plan, which is what the admission gate reads.

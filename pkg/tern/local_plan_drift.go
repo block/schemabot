@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -47,33 +48,41 @@ type driftChangeMultiset map[driftChangeKey]int
 
 // replannedChange is one change as this deployment's own re-plan produced it:
 // the statement its engine emitted against this target, the execution-mode
-// verdict on how that statement would run here, and whether its engine judged
-// the statement unsafe.
+// verdict on how that statement would run here, whether its engine judged
+// the statement unsafe, and the engine's plan-time record of this target's
+// objects the statement depends on. metadataConflict marks a key the re-plan
+// produced more than once with records that disagree.
 type replannedChange struct {
-	ddl          string
-	mode         string
-	reason       string
-	unsafe       bool
-	unsafeReason string
+	ddl              string
+	mode             string
+	reason           string
+	unsafe           bool
+	unsafeReason     string
+	metadata         map[string]string
+	metadataConflict bool
 }
 
 // replannedChangeOf reads the re-planned facts back off a plan row's change,
 // so a change carried from the plan row is stamped exactly as the plan row
 // was.
 func replannedChangeOf(tc storage.TableChange) replannedChange {
-	return replannedChange{ddl: tc.DDL, mode: tc.ExecutionMode, reason: tc.ModeReason, unsafe: tc.IsUnsafe, unsafeReason: tc.UnsafeReason}
+	return replannedChange{ddl: tc.DDL, mode: tc.ExecutionMode, reason: tc.ModeReason, unsafe: tc.IsUnsafe, unsafeReason: tc.UnsafeReason, metadata: tc.Metadata}
 }
 
-// stampOnto writes the re-planned facts onto a change. The statement and
-// execution-mode verdict are this target's and replace what the change
-// carried. The unsafe flag is only ever tightened: a re-plan that judges the
-// statement unsafe marks the change unsafe, so the unsafe-change admission
-// gate requires the opt-in for it, and a re-plan that judges it safe leaves a
-// change already marked unsafe as it is.
+// stampOnto writes the re-planned facts onto a change. The statement,
+// execution-mode verdict, and engine metadata are this target's and replace
+// what the change carried. The metadata in particular describes this target's
+// live objects: a dropped column's record names its position and dependents
+// here, which can differ from the primary's, and the engine checks the drop
+// against it exactly. The unsafe flag is only ever tightened: a re-plan that
+// judges the statement unsafe marks the change unsafe, so the unsafe-change
+// admission gate requires the opt-in for it, and a re-plan that judges it
+// safe leaves a change already marked unsafe as it is.
 func (r replannedChange) stampOnto(tc *storage.TableChange) {
 	tc.DDL = r.ddl
 	tc.ExecutionMode = r.mode
 	tc.ModeReason = r.reason
+	tc.Metadata = maps.Clone(r.metadata)
 	if !r.unsafe {
 		return
 	}
@@ -114,13 +123,16 @@ type replannedChanges struct {
 // prevent, and an unsafe flag wins for the same reason: the kept copy takes
 // the unsafe flag and reason of the other copy when only that one is unsafe.
 // Otherwise the first seen stands — the copies canonicalize equal by
-// construction of the key, so either statement is this target's own.
+// construction of the key, so either statement is this target's own. Copies
+// whose engine metadata disagree mark the key conflicting, since either record
+// could be the one the change runs against.
 func (r replannedChanges) record(key driftChangeKey, change replannedChange) {
 	existing, seen := r.byChange[key]
 	if !seen {
 		r.byChange[key] = change
 		return
 	}
+	conflict := existing.metadataConflict || change.metadataConflict || !maps.Equal(existing.metadata, change.metadata)
 	kept, other := existing, change
 	if change.mode == engine.ExecutionModeBlocked && existing.mode != engine.ExecutionModeBlocked {
 		kept, other = change, existing
@@ -128,6 +140,7 @@ func (r replannedChanges) record(key driftChangeKey, change replannedChange) {
 	if other.unsafe && !kept.unsafe {
 		kept.unsafe, kept.unsafeReason = true, other.unsafeReason
 	}
+	kept.metadataConflict = conflict
 	r.byChange[key] = kept
 }
 
@@ -427,7 +440,7 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 			}
 			key := driftChangeKey{ns, shard, tc.Table, ddl.StatementTypeToOp(tc.Operation), canon}
 			ms[key]++
-			replanned.record(key, replannedChange{ddl: tc.DDL, mode: tc.ExecutionMode, reason: tc.ModeReason, unsafe: tc.IsUnsafe, unsafeReason: tc.UnsafeReason})
+			replanned.record(key, replannedChange{ddl: tc.DDL, mode: tc.ExecutionMode, reason: tc.ModeReason, unsafe: tc.IsUnsafe, unsafeReason: tc.UnsafeReason, metadata: tc.Metadata})
 		}
 	}
 	return ms, replanned, nil
@@ -624,6 +637,9 @@ func (c *LocalClient) stampReplannedTables(parser ddl.StatementParser, tables []
 		change, ok := replanned.byChange[driftChangeKey{c.planNamespace(tc.Namespace), replanned.targetShard, tc.Table, tc.Operation, canon}]
 		if !ok {
 			return fmt.Errorf("table %q: no re-planned change for one the drift comparison matched", tc.Table)
+		}
+		if change.metadataConflict {
+			return fmt.Errorf("table %q: this deployment's re-plan holds more than one copy of a change with different engine metadata, so it cannot say which record the change runs against", tc.Table)
 		}
 		change.stampOnto(tc)
 	}

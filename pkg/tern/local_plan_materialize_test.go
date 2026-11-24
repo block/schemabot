@@ -383,6 +383,53 @@ func TestMaterializedPostgresPlanNamesThisDeploymentsSchema(t *testing.T) {
 	assert.Equal(t, local, flat[0].DDL)
 }
 
+// A dropped column's plan-time record describes the column as the planner read
+// it on one target: its position and its dependents. The same column can sit at
+// a different position on another deployment, so a deployment that builds its
+// plan from a dispatch stores its own re-plan's record, not the primary's, and
+// the engine checks the drop against the column this target actually has.
+func TestMaterializedPlanCarriesThisDeploymentsReviewedDrop(t *testing.T) {
+	const dispatched = `ALTER TABLE "svc-database-qa".users DROP COLUMN legacy`
+	const local = `ALTER TABLE "svc-database-us-qa".users DROP COLUMN legacy`
+	primaryRecord := map[string]string{"postgres_reviewed_drop": `{"kind":"column","name":"legacy","definition":"3 legacy text"}`}
+	localRecord := map[string]string{"postgres_reviewed_drop": `{"kind":"column","name":"legacy","definition":"5 legacy text"}`}
+	fake := &namespaceCaptureEngine{planResult: &engine.PlanResult{Changes: []engine.SchemaChange{{
+		Namespace: "svc-database-us-qa",
+		TableChanges: []engine.TableChange{{
+			Table:         "users",
+			Operation:     ddl.StatementAlterTable,
+			DDL:           local,
+			ExecutionMode: engine.ExecutionModeDirect,
+			Metadata:      localRecord,
+		}},
+	}}}}
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 34}
+	c := postgresOverrideClient(fake)
+	c.config.SchemaOverrides = map[string]string{"svc": "svc-database-us-qa"}
+	c.storage = &fakePlanStorage{plans: store}
+
+	got, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+		PlanId:      "plan_pg_reviewed_drop",
+		Environment: "qa",
+		DdlChanges: []*ternv1.TableChange{
+			{TableName: "users", Ddl: dispatched, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "svc", Metadata: primaryRecord},
+		},
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"svc": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint);"}},
+		},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, store.created)
+	ns := store.created.Namespaces["svc"]
+	require.NotNil(t, ns)
+	require.Len(t, ns.Tables, 1)
+	assert.Equal(t, localRecord, ns.Tables[0].Metadata, "the stored record is this deployment's, not the primary's")
+	flat := got.FlatDDLChanges()
+	require.Len(t, flat, 1)
+	assert.Equal(t, localRecord, flat[0].Metadata)
+}
+
 // A dispatched change that already arrives blocked is never run here, so it
 // keeps the reviewed text it was refused with rather than taking a statement
 // from a re-plan that would have run it.

@@ -454,6 +454,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 
 	var failedTask *storage.Task
 	var stoppedByUser bool
+	planMetadata := c.newPlanMetadataCache(apply)
 
 	for i, task := range tasks {
 		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
@@ -582,7 +583,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			fmt.Sprintf("Resuming task %s (sequential %d/%d)", task.TaskIdentifier, i+1, len(tasks)),
 			"", "")
 
-		action = c.runEngineTask(ctx, apply, task, plan, tasks, options)
+		action = c.runEngineTask(ctx, apply, task, plan, tasks, options, planMetadata)
 
 		if action == taskFailed {
 			failedTask = task

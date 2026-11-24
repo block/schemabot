@@ -66,7 +66,7 @@ func TestApplyPathsCarryPlanTimeEngineMetadata(t *testing.T) {
 	t.Run("sequential drive", func(t *testing.T) {
 		c := &LocalClient{logger: slog.New(slog.DiscardHandler)}
 		task := metadataTestTasks()[1]
-		got, err := c.taskChangeMetadata(t.Context(), &storage.Apply{ApplyIdentifier: "apply-1", DatabaseType: storage.DatabaseTypePostgres}, task, plan)
+		got, err := c.taskChangeMetadata(t.Context(), &storage.Apply{ApplyIdentifier: "apply-1", DatabaseType: storage.DatabaseTypePostgres}, task, plan, nil)
 		require.NoError(t, err)
 		assert.Equal(t, recorded, got)
 	})
@@ -185,4 +185,29 @@ func TestApplyPathsRefuseAmbiguousEngineMetadata(t *testing.T) {
 	_, err = groupedResumeChanges(metadataTestTasks(), plan, canon)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "read engine metadata for task task-2")
+}
+
+// A sequential drive reads a plan's metadata through one cache, so a task that
+// names a plan other than the drive's loads and indexes that plan once, however
+// many attempts the drive makes.
+func TestSequentialDriveIndexesEachPlanOnce(t *testing.T) {
+	plan, recorded := metadataTestPlan()
+	loads := 0
+	store := &fakePlanStore{getByIDFn: func(id int64) (*storage.Plan, error) {
+		loads++
+		require.Equal(t, plan.ID, id)
+		return plan, nil
+	}}
+	c := newPlanMaterializeClient(store)
+	apply := &storage.Apply{ApplyIdentifier: "apply-1", DatabaseType: storage.DatabaseTypePostgres}
+	cache := c.newPlanMetadataCache(apply)
+	drivePlan := &storage.Plan{ID: 9, PlanIdentifier: "plan-9"}
+	task := metadataTestTasks()[1]
+
+	for range 3 {
+		got, err := c.taskChangeMetadata(t.Context(), apply, task, drivePlan, cache)
+		require.NoError(t, err)
+		assert.Equal(t, recorded, got)
+	}
+	assert.Equal(t, 1, loads, "the task's plan is loaded once per drive")
 }

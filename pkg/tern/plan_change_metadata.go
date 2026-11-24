@@ -98,3 +98,33 @@ func (ix planChangeMetadata) forTask(task *storage.Task) (map[string]string, err
 	}
 	return maps.Clone(metadata), nil
 }
+
+// planMetadataCache holds the planChangeMetadata index of each plan one
+// sequential drive reads, so the drive canonicalizes a plan's changes once
+// rather than once per task attempt. It is scoped to a single drive, like the
+// canonicalizer it holds, and is not safe for concurrent use.
+type planMetadataCache struct {
+	canon  StatementCanonicalizer
+	byPlan map[int64]planChangeMetadata
+}
+
+// newPlanMetadataCache returns an empty cache for one drive of apply.
+func (c *LocalClient) newPlanMetadataCache(apply *storage.Apply) *planMetadataCache {
+	return &planMetadataCache{canon: planChangeCanonicalizer(apply, c.logger), byPlan: map[int64]planChangeMetadata{}}
+}
+
+// cached returns the index already built for the plan with this ID.
+func (m *planMetadataCache) cached(planID int64) (planChangeMetadata, bool) {
+	index, ok := m.byPlan[planID]
+	return index, ok
+}
+
+// indexFor returns plan's index, building it on first use.
+func (m *planMetadataCache) indexFor(plan *storage.Plan) planChangeMetadata {
+	if index, ok := m.byPlan[plan.ID]; ok {
+		return index
+	}
+	index := newPlanChangeMetadata(plan, m.canon)
+	m.byPlan[plan.ID] = index
+	return index
+}
