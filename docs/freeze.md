@@ -17,8 +17,9 @@
 
 A freeze holds new schema changes in an environment until it ends or someone
 lifts it. Set one during an incident, or plan one ahead for a holiday or a
-launch. While it holds, SchemaBot refuses every `apply`, `start` and `cutover`
-it covers, and nothing changes. A change that can't wait goes through only
+launch. While it holds, SchemaBot refuses every new `apply`, `start` and
+`cutover` it covers. Applies that started before it keep running, unless the
+freeze [stops them](#what-stop-does-to-running-work). A change that can't wait goes through only
 when a second person approves an override for it.
 
 ![Freeze production, an apply that starts nothing while the freeze holds, then lift the freeze and run the same apply to completion](../assets/cli-freeze.gif)
@@ -98,8 +99,9 @@ for every flag.
 
 ## When a freeze refuses your change
 
-A refused command starts nothing, changes nothing, and names each freeze in
-the way and when it ends. On the CLI it exits 1:
+A refused command starts no new work for that change. It names the freezes in
+the way and when each ends; a pull request comment lists up to ten and counts
+the rest. On the CLI it exits 1:
 
 ```console
 $ schemabot apply -s schema -e production

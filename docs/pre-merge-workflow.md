@@ -212,8 +212,9 @@ records the desired state the databases already run.
 - **Stacked on another schema PR?** Your plan includes its changes until they
   are live. Finish the base PR and rebase; do not approve unsafe DDL just to
   get past a finding that belongs to it
-- **Environment frozen?** The apply is refused and nothing changes. The
-  refusal names each freeze and when it ends. Run the same command again once
+- **Environment frozen?** The apply is refused and starts no new work. Applies
+  that started before the freeze can keep running unless it stops them. The
+  refusal lists the freezes that hold it, up to ten, and counts the rest. Run the same command again once
   the freeze is lifted, or ask for an override if the change can't wait. See
   [freeze an environment](freeze.md)
 
