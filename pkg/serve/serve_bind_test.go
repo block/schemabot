@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -80,13 +81,15 @@ func newBindTestServer(t *testing.T, logger *slog.Logger, metricsPort int, metri
 // the server bound again by number could be taken by a test running in another
 // package, and the run would then fail on a listener the test never meant to
 // occupy.
+//
+// The listeners map is filled by holdPorts and never changes afterwards, so it
+// is read without a lock; each listener guards its own state.
 type heldPorts struct {
-	mu        sync.Mutex
 	listeners map[string]*heldListener
 }
 
 // heldListener records whether the server took the listener and whether it was
-// closed afterwards.
+// closed afterwards. mu guards both taken and closed.
 type heldListener struct {
 	net.Listener
 	mu     sync.Mutex
@@ -102,6 +105,26 @@ func (l *heldListener) Close() error {
 		return fmt.Errorf("close held listener on %s: %w", l.Addr(), err)
 	}
 	return nil
+}
+
+// take marks the listener as handed to the server and reports whether it was
+// still free to hand over.
+func (l *heldListener) take() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.taken {
+		return false
+	}
+	l.taken = true
+	return true
+}
+
+// state reports whether the server took the listener and whether it was
+// closed.
+func (l *heldListener) state() (taken, closed bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.taken, l.closed
 }
 
 // holdPorts binds n loopback ports and holds them for the test. Listeners the
@@ -122,10 +145,8 @@ func holdPorts(t *testing.T, n int) (*heldPorts, []int) {
 		ports = append(ports, addr.Port)
 	}
 	t.Cleanup(func() {
-		held.mu.Lock()
-		defer held.mu.Unlock()
 		for _, listener := range held.listeners {
-			if !listener.taken {
+			if taken, _ := listener.state(); !taken {
 				assert.NoError(t, listener.Close())
 			}
 		}
@@ -137,29 +158,28 @@ func holdPorts(t *testing.T, n int) (*heldPorts, []int) {
 // and binds any other port for real, so a port another listener occupies still
 // fails the way it does in production.
 func (h *heldPorts) listen(ctx context.Context, name, port string) (net.Listener, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if listener, ok := h.listeners[port]; ok && !listener.taken {
-		listener.taken = true
+	if listener, ok := h.listeners[port]; ok && listener.take() {
 		return listener, nil
 	}
 	return listenForServe(ctx, name, port)
 }
 
-// requireReleased fails the test if the server took the listener for port and
-// did not close it, which would leave the failed run holding a socket.
-func (h *heldPorts) requireReleased(t *testing.T, port int, name string) {
+// requireReleased checks what a failed run did with the listener for port.
+// A port bound before the failing one must have been taken and then closed,
+// so the failed run holds no socket; a port after it must never have been
+// taken, since binding stops at the first failure.
+func (h *heldPorts) requireReleased(t *testing.T, port int, name string, boundBeforeFailure bool) {
 	t.Helper()
 
-	h.mu.Lock()
 	listener, ok := h.listeners[strconv.Itoa(port)]
-	h.mu.Unlock()
 	require.True(t, ok, "the %s port is one the test holds", name)
-	listener.mu.Lock()
-	defer listener.mu.Unlock()
-	if listener.taken {
-		assert.True(t, listener.closed, "the run closes the %s listener it bound once it has failed", name)
+	taken, closed := listener.state()
+	if !boundBeforeFailure {
+		assert.False(t, taken, "the run must not bind the %s port after an earlier bind failed", name)
+		return
 	}
+	assert.True(t, taken, "the run binds the %s port before the one that is taken", name)
+	assert.True(t, closed, "the run closes the %s listener it bound once it has failed", name)
 }
 
 // A second `schemabot serve` starts while another process already holds its
@@ -176,10 +196,13 @@ func TestServeFailsOnTakenPortBeforeStartingBackgroundWork(t *testing.T) {
 		name string
 		// taken says which of the three listeners finds its port occupied.
 		taken string
+		// boundBefore names the listeners the run binds before the taken one,
+		// in the order gRPC, HTTP, metrics.
+		boundBefore []string
 	}{
 		{name: "grpc port in use", taken: "grpc"},
-		{name: "http port in use", taken: "http"},
-		{name: "metrics port in use", taken: "metrics"},
+		{name: "http port in use", taken: "http", boundBefore: []string{"grpc"}},
+		{name: "metrics port in use", taken: "metrics", boundBefore: []string{"grpc", "http"}},
 	}
 
 	for _, tt := range tests {
@@ -219,7 +242,7 @@ func TestServeFailsOnTakenPortBeforeStartingBackgroundWork(t *testing.T) {
 
 			for name, port := range ports {
 				if name != tt.taken {
-					held.requireReleased(t, port, name)
+					held.requireReleased(t, port, name, slices.Contains(tt.boundBefore, name))
 				}
 			}
 
