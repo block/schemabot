@@ -6216,6 +6216,41 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 </details>
 
 <details>
+<summary><a name="postgresql-index-build-running"></a><strong>PostgreSQL: Index Build Running</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
+
+**Status**: In Progress
+
+step 1 of 1 · `CREATE INDEX CONCURRENTLY idx_users_email_created ON public.users (email, created_at)`
+
+**Schema `public`**
+
+**`users`**: 🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 25%
+
+```sql
+CREATE INDEX CONCURRENTLY idx_users_email_created ON users USING btree (email, created_at);
+```
+- Building index: 30,000 of 48,000 blocks
+
+
+---
+
+To cancel this schema change:
+```
+schemabot cancel apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="postgresql-multistatement-table-running"></a><strong>PostgreSQL: Multi-statement Table Running</strong></summary>
 
 
@@ -6228,17 +6263,17 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 **Status**: In Progress
 
 step 2 of 3 · `CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON public.users (last_seen_at)`
-building index: 25% of blocks (2,500/10,000)
 
-📊 1/3 complete · 1 running · 1 queued
+📊 1/3 complete · 1 running (10%) · 1 queued
 
 **Schema `public`**
 
-**`users`**: Running...
+**`users`**: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 10%
 
 ```sql
 CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);
 ```
+- Building index: 2,500 of 10,000 blocks
 
 **`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -6252,13 +6287,6 @@ ALTER TABLE users ADD COLUMN last_seen_at timestamptz;
 ALTER TABLE sessions ADD COLUMN payload jsonb;
 ```
 
-
----
-
-To stop this schema change:
-```
-schemabot stop apply-a1b2c3d4e5f6 -e staging
-```
 
 _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 

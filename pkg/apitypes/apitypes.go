@@ -1986,6 +1986,12 @@ type ProgressOperationResponse struct {
 	RolloutStep int    `json:"rollout_step,omitempty"`
 	StartedAt   string `json:"started_at,omitempty"`
 	CompletedAt string `json:"completed_at,omitempty"`
+	// Metadata is the progress display metadata this operation's driver last
+	// recorded, such as its statement position and the server's report of the
+	// work in flight. The response's top-level metadata speaks for one
+	// operation only, so a table in a rollout reads its work from here, on the
+	// operation that runs it (TableProgressResponse.OperationKey).
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // ProgressOperationRef names one operation of an apply by its deployment and
@@ -2007,7 +2013,12 @@ type TableProgressResponse struct {
 	// deployment can address several targets, each running its own copy of the
 	// change, so the deployment alone does not say which member's progress this
 	// row reports.
-	Target          string `json:"target,omitempty"`
+	Target string `json:"target,omitempty"`
+	// OperationKey names, with Deployment, the operation that runs this table,
+	// since one target can run several operations. Empty when the table
+	// belongs to no listed operation, and on an operation with the legacy
+	// single-operation key.
+	OperationKey    string `json:"operation_key,omitempty"`
 	Keyspace        string `json:"keyspace,omitempty"`
 	ChangeType      string `json:"change_type,omitempty"` // create, alter, drop
 	Status          string `json:"status"`

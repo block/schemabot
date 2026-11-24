@@ -343,9 +343,6 @@ func writeApplyStep(sb *strings.Builder, data ApplyStatusCommentData) {
 		fmt.Fprintf(sb, " · `%s`", statement)
 	}
 	sb.WriteString("\n")
-	if line := ui.FormatBuildWork(data.BuildWork); line != "" {
-		fmt.Fprintf(sb, "%s\n", line)
-	}
 }
 
 // writeApplyStatusHeader writes the headline for an in-place apply status
@@ -596,18 +593,32 @@ func writeDeployRequestLink(sb *strings.Builder, data ApplyStatusCommentData) {
 	fmt.Fprintf(sb, "\nDeploy request: %s\n", data.DeployRequestURL)
 }
 
+// stopOrCancelCommand names the command that ends this apply's in-flight
+// work, or presentation.StopCommandNone where its engine can end none of it.
 func stopOrCancelCommand(data ApplyStatusCommentData) string {
-	if strings.EqualFold(data.Engine, storage.EnginePlanetScale) {
-		return "cancel"
-	}
-	return "stop"
+	return presentation.StopCommand(data.Engine, data.BuildWork, data.StepsTotal)
 }
 
-func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentData, stopPrefix, cancelPrefix string) {
+// retryInterruptedNote says what happens to an apply a data plane is retrying.
+const retryInterruptedNote = "An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted."
+
+// writeStopOrCancelFooterAction writes the command that ends the apply's
+// in-flight work under the label for that command. Where the engine can end
+// none of the work in flight, it offers no command, since the engine would
+// refuse it; a non-empty note still tells the reader what is happening.
+func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentData, stopPrefix, cancelPrefix, note string) {
 	command := stopOrCancelCommand(data)
-	prefix := stopPrefix
-	if command == "cancel" {
+	var prefix string
+	switch command {
+	case presentation.StopCommandStop:
+		prefix = stopPrefix
+	case presentation.StopCommandCancel:
 		prefix = cancelPrefix
+	default:
+		if note != "" && !data.InRolloutSection {
+			fmt.Fprintf(sb, "\n---\n\n%s\n", note)
+		}
+		return
 	}
 	writeMemberFooterAction(sb, data, prefix, AppendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment), data.Tenant))
 }
@@ -934,7 +945,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData,
 				renderResumingTable(sb, dialect, table, budget)
 				continue
 			}
-			renderTableProgress(sb, dialect, table, data.State, data.Attempt, data.ErrorMessage, budget)
+			renderTableProgress(sb, dialect, table, data.State, data.Attempt, data.ErrorMessage, data.BuildWork, budget)
 		}
 	}
 }
@@ -1089,7 +1100,7 @@ func sortRowsByTable(rows []TableProgressData, statePriority func(tableStatus st
 // instead of ANSI. applyError is the apply-level error message the comment
 // renders as its own block, so a failed table's identical error is not
 // repeated below the row.
-func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table TableProgressData, applyState string, applyAttempt int, applyError string, budget *ddlBlockBudget) {
+func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table TableProgressData, applyState string, applyAttempt int, applyError string, work apitypes.BuildWork, budget *ddlBlockBudget) {
 	// Normalize to canonical Task state for consistent matching.
 	status := state.NormalizeTaskStatus(table.Status)
 
@@ -1237,7 +1248,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 
 	default:
 		// Running / in-progress
-		renderRunningTable(sb, dialect, table, budget)
+		renderRunningTable(sb, dialect, table, work, budget)
 	}
 
 	renderShardSummary(sb, table, presentation.RunningCopying, budget)
@@ -1292,10 +1303,15 @@ func writeMemberList(sb *strings.Builder, noun presentation.Noun, members []Shar
 	}
 }
 
-// renderRunningTable renders a table that is actively copying rows.
-func renderRunningTable(sb *strings.Builder, dialect schema.Dialect, table TableProgressData, budget *ddlBlockBudget) {
+// renderRunningTable renders a table that is actively copying rows, or, with
+// no row count, building an index or applying a change that copies no rows.
+// The build work is the apply's: a concurrent index build has no rows to
+// count, so its bar is the engine's whole-build percent, and the current
+// phase's counters take the detail line a row copy gives its rows.
+func renderRunningTable(sb *strings.Builder, dialect schema.Dialect, table TableProgressData, work apitypes.BuildWork, budget *ddlBlockBudget) {
 	defer writeThrottleTooltip(sb, table)
-	if table.RowsTotal > 0 {
+	switch {
+	case table.RowsTotal > 0:
 		if ui.EstimateExceeded(table.RowsCopied, table.RowsTotal) {
 			fmt.Fprintf(sb, "**%s**: %s Finalizing copy%s\n", inlineCode(table.TableName), ui.ProgressBarActivity(), ui.ThrottledSuffix(table.Throttled))
 			writeDDLLine(sb, dialect, table.DDL, budget)
@@ -1319,7 +1335,13 @@ func renderRunningTable(sb *strings.Builder, dialect schema.Dialect, table Table
 			ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal), ui.ThrottledSuffix(table.Throttled))
 		writeDDLLine(sb, dialect, table.DDL, budget)
 		writeRowsAndETA(sb, table)
-	} else {
+	case work.IsConcurrentIndexBuild():
+		fmt.Fprintf(sb, "**%s**: %s%s\n", inlineCode(table.TableName), ui.IndexBuildProgress(table.PercentComplete), ui.ThrottledSuffix(table.Throttled))
+		writeDDLLine(sb, dialect, table.DDL, budget)
+		if line := ui.FormatBuildWork(work); line != "" {
+			fmt.Fprintf(sb, "- %s\n", line)
+		}
+	default:
 		// No row data yet (initializing or instant DDL)
 		fmt.Fprintf(sb, "**%s**: Running...%s\n", inlineCode(table.TableName), ui.ThrottledSuffix(table.Throttled))
 		writeDDLLine(sb, dialect, table.DDL, budget)
@@ -1527,21 +1549,19 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 			// on its own; give the operator the same retry guidance a locally
 			// parked apply gets.
 			writeStopOrCancelFooterAction(sb, data,
-				"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:",
-				"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To cancel it:")
+				retryInterruptedNote+" To stop retrying:", retryInterruptedNote+" To cancel it:", retryInterruptedNote)
 			return
 		}
-		writeStopOrCancelFooterAction(sb, data, "To stop this schema change:", "To cancel this schema change:")
+		writeStopOrCancelFooterAction(sb, data, "To stop this schema change:", "To cancel this schema change:", "")
 	case state.Apply.PreparingBranch,
 		state.Apply.ApplyingBranchChanges,
 		state.Apply.ValidatingBranch,
 		state.Apply.CreatingDeployRequest,
 		state.Apply.ValidatingDeployRequest:
-		writeStopOrCancelFooterAction(sb, data, "To stop this schema change:", "To cancel this schema change:")
+		writeStopOrCancelFooterAction(sb, data, "To stop this schema change:", "To cancel this schema change:", "")
 	case state.Apply.FailedRetryable:
 		writeStopOrCancelFooterAction(sb, data,
-			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:",
-			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To cancel it:")
+			retryInterruptedNote+" To stop retrying:", retryInterruptedNote+" To cancel it:", retryInterruptedNote)
 	case state.Apply.Stopped:
 		writeStoppedByFreeze(sb, data.StoppedByFreeze)
 		writeMemberFooterAction(sb, data, "Paused — to resume from where it stopped:", AppendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
