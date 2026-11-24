@@ -43,7 +43,8 @@ func (c Config) Validate() error {
 }
 
 // Publisher returns nil only after the transport accepts the payload. Receivers
-// deduplicate by the payload's stable apply identifier; acceptance is not delivery.
+// deduplicate by event_id and correlate outcomes by the stable apply identifier;
+// acceptance is not delivery.
 type Publisher interface {
 	Publish(context.Context, json.RawMessage) error
 }

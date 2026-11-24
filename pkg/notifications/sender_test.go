@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -93,7 +94,7 @@ func newMemoryOutbox(t *testing.T, count int) *memoryOutbox {
 	outbox := &memoryOutbox{published: make(map[int64]bool), status: make(map[int64]string)}
 	for i := 1; i <= count; i++ {
 		outbox.status[int64(i)] = storage.OutboxStatusPending
-		payload, err := json.Marshal(storage.ApplyCompletedEvent{ID: fmt.Sprintf("apply_%d", i), Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "production", CompletedAt: time.Now().UTC()})
+		payload, err := json.Marshal(storage.ApplyFinishedEvent{EventID: fmt.Sprintf("event_%d", i), Type: "apply.finished", App: "checkout", Outcome: state.Apply.Completed, ID: fmt.Sprintf("apply_%d", i), Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "production", CompletedAt: time.Now().UTC()})
 		require.NoError(t, err)
 		outbox.events = append(outbox.events, &storage.OutboxEvent{ID: int64(i), Payload: payload, CreatedAt: time.Now().Add(-time.Minute)})
 	}
@@ -116,9 +117,10 @@ func TestSenderAcceptanceAndReplay(t *testing.T) {
 	require.NoError(t, NewSender(store, publisher, logger).sendBatch(t.Context()))
 	require.Len(t, accepted, 2)
 	assert.JSONEq(t, accepted[0], accepted[1])
-	var message storage.ApplyCompletedEvent
+	var message storage.ApplyFinishedEvent
 	require.NoError(t, json.Unmarshal([]byte(accepted[1]), &message))
 	assert.Equal(t, "apply_1", message.ID)
+	assert.Equal(t, "event_1", message.EventID)
 	assert.True(t, store.published[1])
 }
 
@@ -127,7 +129,7 @@ func TestSenderFailureDoesNotHideLaterBatches(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	var attempts []string
 	publisher := publisherFunc(func(_ context.Context, payload json.RawMessage) error {
-		var message storage.ApplyCompletedEvent
+		var message storage.ApplyFinishedEvent
 		require.NoError(t, json.Unmarshal(payload, &message))
 		attempts = append(attempts, message.ID)
 		if message.ID != fmt.Sprintf("apply_%d", batchSize+1) {
@@ -157,7 +159,7 @@ func TestSenderSustainedArrivalsRevisitEarlierRows(t *testing.T) {
 	var accepted []string
 	recovered := false
 	publisher := publisherFunc(func(_ context.Context, payload json.RawMessage) error {
-		var message storage.ApplyCompletedEvent
+		var message storage.ApplyFinishedEvent
 		require.NoError(t, json.Unmarshal(payload, &message))
 		if message.ID == "apply_2" && !recovered {
 			return errors.New("SQS rejected notification")
@@ -255,7 +257,7 @@ func TestSenderPanicQuarantine(t *testing.T) {
 			var output bytes.Buffer
 			var attempts []string
 			publisher := publisherFunc(func(_ context.Context, payload json.RawMessage) error {
-				var message storage.ApplyCompletedEvent
+				var message storage.ApplyFinishedEvent
 				require.NoError(t, json.Unmarshal(payload, &message))
 				attempts = append(attempts, message.ID)
 				if message.ID == "apply_1" && !markPanic {
@@ -308,7 +310,7 @@ func TestSenderQuarantineFailureRemainsVisible(t *testing.T) {
 	store.quarantineErr = errors.New("diagnostic storage unavailable")
 	var output bytes.Buffer
 	publisher := publisherFunc(func(_ context.Context, payload json.RawMessage) error {
-		var message storage.ApplyCompletedEvent
+		var message storage.ApplyFinishedEvent
 		require.NoError(t, json.Unmarshal(payload, &message))
 		if message.ID == "apply_1" {
 			panic("publisher fault")
@@ -379,7 +381,7 @@ func TestSenderPrefetchedDisposition(t *testing.T) {
 			store := newMemoryOutbox(t, 2)
 			var accepted []string
 			publisher := publisherFunc(func(_ context.Context, payload json.RawMessage) error {
-				var message storage.ApplyCompletedEvent
+				var message storage.ApplyFinishedEvent
 				require.NoError(t, json.Unmarshal(payload, &message))
 				accepted = append(accepted, message.ID)
 				if message.ID == "apply_1" {

@@ -16,7 +16,7 @@ const (
 	OutboxStatusSkipped     = "skipped"
 )
 
-// RecordingErrorPolicy controls whether notification recording can block completion.
+// RecordingErrorPolicy controls whether notification recording can block an outcome transition.
 type RecordingErrorPolicy string
 
 const (
@@ -42,18 +42,26 @@ func (p RecordingErrorPolicy) Validate() error {
 	}
 }
 
-// ApplyCompletedEvent identifies a completed apply. Receivers deduplicate on ID.
-type ApplyCompletedEvent struct {
-	ID           string    `json:"id"`
-	Database     string    `json:"database"`
-	DatabaseType string    `json:"database_type"`
-	Environment  string    `json:"environment"`
-	Repository   string    `json:"repository,omitempty"`
-	PullRequest  int       `json:"pull_request,omitempty"`
-	CompletedAt  time.Time `json:"completed_at"`
+// ApplyFinishedEvent records one committed apply outcome. EventID deduplicates
+// delivery; ID correlates outcomes for the same apply, including corrections.
+type ApplyFinishedEvent struct {
+	EventID string `json:"event_id"`
+	Type    string `json:"type"`
+	App     string `json:"app"`
+	Outcome string `json:"outcome"`
+	// OccurredAtNanos is the intent's capture time in Unix nanoseconds, before
+	// its state transaction commits. It is not the commit or delivery time.
+	OccurredAtNanos int64     `json:"occurred_at_nanos"`
+	ID              string    `json:"id"`
+	Database        string    `json:"database"`
+	DatabaseType    string    `json:"database_type"`
+	Environment     string    `json:"environment"`
+	Repository      string    `json:"repository,omitempty"`
+	PullRequest     int       `json:"pull_request,omitempty"`
+	CompletedAt     time.Time `json:"completed_at"`
 }
 
-// OutboxEvent is a notification committed alongside its apply's completion.
+// OutboxEvent is a notification committed alongside its apply's outcome.
 type OutboxEvent struct {
 	ID        int64
 	ApplyID   int64
@@ -62,7 +70,7 @@ type OutboxEvent struct {
 	CreatedAt time.Time
 }
 
-// OutboxStore holds pending completion notifications. Concurrent senders may
+// OutboxStore holds pending outcome notifications. Concurrent senders may
 // deliver the same event; acceptance is recorded only after transport acceptance.
 type OutboxStore interface {
 	MaxID(ctx context.Context) (int64, error)

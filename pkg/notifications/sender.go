@@ -124,7 +124,7 @@ func (s *Sender) publish(ctx context.Context, event *storage.OutboxEvent) error 
 // A diagnostic decode failure must not prevent transport from accepting it.
 func (s *Sender) eventLogAttrs(event *storage.OutboxEvent) []any {
 	attrs := []any{"outbox_id", event.ID}
-	var completion storage.ApplyCompletedEvent
+	var completion storage.ApplyFinishedEvent
 	if err := json.Unmarshal(event.Payload, &completion); err != nil {
 		return append(attrs, "identity_decode_error", err)
 	}

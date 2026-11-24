@@ -4,9 +4,13 @@ package storage
 // the storage layer itself enforces — things a claim query or a store decides,
 // not anything the caller could apply on its own.
 type Options struct {
-	// ChangeEventsOnRecordingError defaults to block. Continue permits a completed
-	// apply to commit without notification intent when recording fails.
+	// ChangeEventsOnRecordingError defaults to block. Continue permits an outcome
+	// transition to commit without notification intent when recording fails.
 	ChangeEventsOnRecordingError RecordingErrorPolicy
+
+	// ChangeEventApp resolves a logical database's application label at intent
+	// creation. An empty result falls back to the database name.
+	ChangeEventApp func(database string) string
 
 	// MaxDriversPerApply caps how many operation leases one apply may hold at
 	// once. Zero or negative selects DefaultMaxDriversPerApply; there is no
@@ -25,6 +29,11 @@ func WithMaxDriversPerApply(n int) Option {
 	return func(o *Options) {
 		o.MaxDriversPerApply = n
 	}
+}
+
+// WithChangeEventApp supplies the application label resolver for durable events.
+func WithChangeEventApp(resolve func(database string) string) Option {
+	return func(o *Options) { o.ChangeEventApp = resolve }
 }
 
 // WithChangeEventsOnRecordingError selects the notification recording policy.

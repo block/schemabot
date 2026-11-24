@@ -122,13 +122,13 @@ func TestLocalClient_DriveAdoptsEngineTerminalTruthBeforeConsumingCancel(t *test
 		"the apply must adopt the engine's completed outcome, not cancelled")
 	assert.NotNil(t, settled.CompletedAt, "a completed apply must carry its completion time")
 
-	var completions []storage.ApplyCompletedEvent
+	var completions []storage.ApplyFinishedEvent
 	for afterID := int64(0); ; {
 		pendingEvents, err := stor.OutboxEvents().ListUnpublished(ctx, afterID, 100)
 		require.NoError(t, err)
 		for _, event := range pendingEvents {
 			if event.ApplyID == apply.ID {
-				var completion storage.ApplyCompletedEvent
+				var completion storage.ApplyFinishedEvent
 				require.NoError(t, json.Unmarshal(event.Payload, &completion))
 				completions = append(completions, completion)
 			}

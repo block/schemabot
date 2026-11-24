@@ -15,25 +15,38 @@ import (
 	"github.com/google/uuid"
 )
 
-const applyCompletedEventType = "apply_completed"
+const applyFinishedEventType = "apply.finished"
 
-// enqueueApplyCompleted reads the winning stored outcome, never a caller's stale
-// apply snapshot. Its insert shares the transaction that records completion.
-func (s *applyStore) enqueueApplyCompleted(ctx context.Context, tx *rebindTx, applyID int64) (*completionRecordingFailure, error) {
-	var event storage.ApplyCompletedEvent
+func notifiesApplyOutcome(outcome string) bool {
+	return state.IsState(outcome, state.SettledApplyStates...)
+}
+
+// enqueueApplyFinished reads the winning stored outcome, never a caller's stale
+// apply snapshot. Its insert shares the transaction that records that outcome.
+func (s *applyStore) enqueueApplyFinished(ctx context.Context, tx *rebindTx, applyID int64) (*outcomeRecordingFailure, error) {
+	var event storage.ApplyFinishedEvent
 	err := tx.QueryRowContext(ctx, `
 		SELECT apply_identifier, database_name, database_type, environment,
-		       repository, pull_request, COALESCE(completed_at, updated_at)
-		FROM applies WHERE id = ? AND state = ?
-	`, applyID, state.Apply.Completed).Scan(&event.ID, &event.Database, &event.DatabaseType,
-		&event.Environment, &event.Repository, &event.PullRequest, &event.CompletedAt)
+		       repository, pull_request, COALESCE(completed_at, updated_at), state
+		FROM applies WHERE id = ? AND state IN (?, ?, ?, ?)
+	`, applyID, state.Apply.Completed, state.Apply.Failed, state.Apply.Cancelled, state.Apply.Reverted).Scan(&event.ID, &event.Database, &event.DatabaseType,
+		&event.Environment, &event.Repository, &event.PullRequest, &event.CompletedAt, &event.Outcome)
 	if err != nil {
-		return nil, fmt.Errorf("read completed apply %d for notification: %w", applyID, err)
+		return nil, fmt.Errorf("read finished apply %d for notification: %w", applyID, err)
 	}
 	event.CompletedAt = event.CompletedAt.UTC()
+	event.Type = applyFinishedEventType
+	event.EventID = uuid.NewString()
+	event.OccurredAtNanos = time.Now().UnixNano()
+	if s.changeEventApp != nil {
+		event.App = s.changeEventApp(event.Database)
+	}
+	if event.App == "" {
+		event.App = event.Database
+	}
 	payload, err := json.Marshal(event)
 	if err != nil {
-		return nil, fmt.Errorf("encode completion notification for apply %s: %w", event.ID, err)
+		return nil, fmt.Errorf("encode apply outcome notification for apply %s: %w", event.ID, err)
 	}
 	continueOnError := s.recordingErrorPolicy == storage.RecordingErrorContinue
 	if continueOnError {
@@ -45,9 +58,9 @@ func (s *applyStore) enqueueApplyCompleted(ctx context.Context, tx *rebindTx, ap
 	}
 	_, recordingErr := tx.ExecContext(ctx, `
   INSERT INTO outbox_events (apply_id, event_type, payload, status) VALUES (?, ?, ?, ?)
- `, applyID, applyCompletedEventType, string(payload), storage.OutboxStatusPending)
+ `, applyID, applyFinishedEventType, string(payload), storage.OutboxStatusPending)
 	if recordingErr != nil {
-		recordingErr = fmt.Errorf("enqueue completion notification for apply %s: %w", event.ID, recordingErr)
+		recordingErr = fmt.Errorf("enqueue apply outcome notification for apply %s: %w", event.ID, recordingErr)
 		if !continueOnError {
 			return nil, recordingErr
 		}
@@ -61,26 +74,26 @@ func (s *applyStore) enqueueApplyCompleted(ctx context.Context, tx *rebindTx, ap
 		}
 	}
 	if recordingErr != nil {
-		return &completionRecordingFailure{event: event, err: recordingErr}, nil
+		return &outcomeRecordingFailure{event: event, err: recordingErr}, nil
 	}
 	return nil, nil
 }
 
-// completionRecordingFailure is reported only after the outer transaction commits.
-// A failed commit must not be counted as a completed apply without intent.
-type completionRecordingFailure struct {
-	event storage.ApplyCompletedEvent
+// outcomeRecordingFailure is reported only after the outer transaction commits.
+// A failed commit must not be counted as a committed outcome without intent.
+type outcomeRecordingFailure struct {
+	event storage.ApplyFinishedEvent
 	err   error
 }
 
-func (f *completionRecordingFailure) report(ctx context.Context) {
+func (f *outcomeRecordingFailure) report(ctx context.Context) {
 	if f == nil {
 		return
 	}
 	apply := storage.Apply{ApplyIdentifier: f.event.ID, Database: f.event.Database,
 		DatabaseType: f.event.DatabaseType, Environment: f.event.Environment,
-		Repository: f.event.Repository, PullRequest: f.event.PullRequest, State: state.Apply.Completed}
-	slog.ErrorContext(ctx, "Apply completed without notification intent; recording failed and will not be retried",
+		Repository: f.event.Repository, PullRequest: f.event.PullRequest, State: f.event.Outcome}
+	slog.ErrorContext(ctx, "Apply outcome committed without notification intent; recording failed and will not be retried",
 		append(apply.LogAttrs(), "recording_error_policy", storage.RecordingErrorContinue, "error", f.err)...)
 	metrics.RecordOutboxRecordingFailure(ctx, f.event.Environment)
 }

@@ -50,6 +50,7 @@ const (
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
 	recordingErrorPolicy storage.RecordingErrorPolicy
+	changeEventApp       func(string) string
 	db                   *rebindDB
 	dialect              Dialect
 	identity             identityInserter
@@ -1658,16 +1659,16 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 		}
 	}
 
-	// Only a stored transition creates notification intent. A completed apply
-	// refreshed after an upgrade must not become a historical notification.
-	completionTransition := false
-	if state.IsState(apply.State, state.Apply.Completed) {
+	// Only a change of stored outcome creates notification intent. Same-state
+	// refreshes and initially finished applies do not create historical events.
+	outcomeTransition := false
+	if notifiesApplyOutcome(apply.State) {
 		var previousState string
 		err := writeTx.tx.QueryRowContext(ctx, `SELECT state FROM applies WHERE id = ? FOR UPDATE`, apply.ID).Scan(&previousState)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("read previous state of completing apply %d: %w", apply.ID, err)
 		}
-		completionTransition = err == nil && !state.IsState(previousState, state.Apply.Completed)
+		outcomeTransition = err == nil && !state.IsState(previousState, apply.State)
 	}
 
 	optionsUpdate := ""
@@ -1732,9 +1733,9 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 			}
 		}
 	}
-	var recordingFailure *completionRecordingFailure
-	if completionTransition {
-		recordingFailure, err = s.enqueueApplyCompleted(ctx, writeTx.tx, apply.ID)
+	var recordingFailure *outcomeRecordingFailure
+	if outcomeTransition {
+		recordingFailure, err = s.enqueueApplyFinished(ctx, writeTx.tx, apply.ID)
 		if err != nil {
 			return err
 		}
@@ -1870,7 +1871,7 @@ func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expe
 	args := []any{newState, storedMessage(ctx, "applies.error_message", errorMessage, nil), startedAt, completedAt, applyID, expectedState}
 	args = append(args, guard.predicateArgs...)
 
-	if state.IsState(newState, state.Apply.Completed) && !state.IsState(expectedState, state.Apply.Completed) {
+	if notifiesApplyOutcome(newState) && !state.IsState(expectedState, newState) {
 		return s.completeDerivedState(ctx, applyID, expectedState, guard, args)
 	}
 	result, err := s.db.ExecContext(ctx, guard.query, args...)
@@ -1942,7 +1943,7 @@ func (s *applyStore) completeDerivedState(ctx context.Context, applyID int64, ex
 		}
 		return false, nil
 	}
-	recordingFailure, err := s.enqueueApplyCompleted(ctx, tx, applyID)
+	recordingFailure, err := s.enqueueApplyFinished(ctx, tx, applyID)
 	if err != nil {
 		return false, err
 	}
@@ -3562,8 +3563,19 @@ func (s *applyStore) expireRetryable(ctx context.Context, endedOperationStopType
 	if err != nil {
 		return nil, fmt.Errorf("expire retryable applies: %w", err)
 	}
+	var recordingFailures []*outcomeRecordingFailure
+	for _, apply := range applies {
+		failure, err := s.enqueueApplyFinished(ctx, tx, apply.ID)
+		if err != nil {
+			return nil, err
+		}
+		recordingFailures = append(recordingFailures, failure)
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit expire retryable applies: %w", err)
+	}
+	for _, failure := range recordingFailures {
+		failure.report(ctx)
 	}
 	now := time.Now()
 	for _, apply := range applies {

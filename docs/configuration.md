@@ -12,7 +12,7 @@
 - [Hybrid Mode](#hybrid-mode)
 - [Drivers](#drivers)
 - [Metrics](#metrics)
-- [Apply Completion Notifications](#apply-completion-notifications)
+- [Apply Outcome Notifications](#apply-outcome-notifications)
 - [Rate Limits](#rate-limits)
 - [Pending Drops](#pending-drops)
 - [Direct Execution](#direct-execution)
@@ -1020,21 +1020,24 @@ The cap applies only to *starting* new operations — a first start, a resume af
 
 A multi-shard apply started with a manual `--defer-cutover` keeps its drivers while it waits: unlike the automatic barrier park, a manually deferred operation holds its claim and keeps heartbeating, so it stays counted. Its cutover is accepted only once every operation waits, which takes a cap no smaller than the apply's width, so a deferred apply that would hold more operations at once than `max_drivers_per_apply` is [refused at the start](#deferred-cutover-capacity). Run it without `--defer-cutover`, or raise `max_drivers_per_apply` to at least its width.
 
-## Apply Completion Notifications
+## Apply Outcome Notifications
 
-By default, every winning transition to `completed` records an outbox row in the
-same storage transaction, on MySQL and PostgreSQL. Failed and stopped applies do
-not emit notifications, and historical completed applies are not backfilled.
+By default, every winning transition to `completed`, `failed`, `cancelled`, or
+`reverted` records an outbox row in the same storage transaction, on MySQL and
+PostgreSQL. `cancelled` means the change was cancelled; `reverted` means the engine
+reverted it. Stopped and retryable failures do not emit outcome notifications.
+Creation in an initial outcome state and same-state refreshes do not emit events,
+and historical outcomes are not backfilled.
 
 The per-install server setting `change_events_on_recording_error` accepts `block`
-(the default, including when omitted) or `continue`. `block` rolls back completion
+(the default, including when omitted) or `continue`. `block` rolls back the outcome
 if intent recording fails. `continue` recovers the failed intent insert with a
-savepoint and commits completion without a notification. State, lease, CAS, savepoint
+savepoint and commits the outcome without a notification. State, lease, CAS, savepoint
 recovery, and commit errors still fail normally; this setting only tolerates an
 intent insert failure. Invalid values fail server configuration validation.
 
 **Opting into `continue` weakens ST-12's default atomic notification guarantee.**
-After a completion commits without intent, SchemaBot emits an error log with the
+After an outcome commits without intent, SchemaBot emits an error log with the
 apply identity and increments `schemabot.outbox.recording_failures_total` for its
 environment. Investigate the paired log and repair storage recording; the missing
 notification is not automatically retried or backfilled. A failed outer commit
@@ -1066,6 +1069,11 @@ Each SQS message body is JSON:
 
 ```json
 {
+  "event_id": "103dfb3a-5cb6-4b2c-b36a-6bc0d75ce5c7",
+  "type": "apply.finished",
+  "app": "checkout",
+  "outcome": "completed",
+  "occurred_at_nanos": 1795132800000000000,
   "id": "apply_example",
   "database": "orders",
   "database_type": "mysql",
@@ -1076,9 +1084,21 @@ Each SQS message body is JSON:
 }
 ```
 
-`id` is the stable apply identifier. `repository` and `pull_request` are omitted
-when absent. Receivers must deduplicate by `id`: multiple senders and a restart
-after SQS acceptance but before the published mark can produce duplicates.
+`id` is the stable apply correlation identifier. Deduplicate delivery by `event_id`,
+not by `id`: corrected outcomes and reruns can produce distinct events for one
+apply. Multiple senders and a restart after SQS acceptance but before the published
+mark can deliver the same event more than once. `app` is captured from the database
+registration, falling back to the logical database name when empty. `repository`
+and `pull_request` are omitted when absent.
+
+`occurred_at_nanos` is the intent capture time in Unix nanoseconds, inside the
+winning state transaction before commit. It is not the commit or delivery time.
+`completed_at` is the stored outcome timestamp (or the stored update timestamp
+when absent), with the database's timestamp precision, not nanosecond precision.
+A receiver can derive a JSON message with `app`, `environment`,
+`timestamp` from `occurred_at_nanos`, and a description using `type`, such as
+`apply.finished apply=apply_example outcome=completed`. Aggregate events do not
+contain operation identity, deployment, or attempt facts.
 Acceptance by SQS does not mean that a receiver processed the message.
 
 The sender processes at most 100 rows per batch, continues past failed rows, and

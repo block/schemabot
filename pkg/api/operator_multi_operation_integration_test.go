@@ -82,7 +82,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, pendingEvents, 1, "the winning operation-lease projection must enqueue completion")
 		assert.Equal(t, seed.applyID, pendingEvents[0].ApplyID)
-		var completion storage.ApplyCompletedEvent
+		var completion storage.ApplyFinishedEvent
 		require.NoError(t, json.Unmarshal(pendingEvents[0].Payload, &completion))
 		assert.Equal(t, "matrix-rolling-halt-ok", completion.ID)
 

@@ -99,7 +99,7 @@ func testCompletionOutboxRollback(t *testing.T, newStore func(*testing.T) *Stora
 			}
 			original := store.db.binder
 			store.db.binder = rejectOutboxInsertBinder{original}
-			require.ErrorContains(t, complete(), "enqueue completion notification")
+			require.ErrorContains(t, complete(), "enqueue apply outcome notification")
 			store.db.binder = original
 			stored, err := store.Applies().Get(ctx, id)
 			require.NoError(t, err)
@@ -203,7 +203,7 @@ func assertRestartedSenderDelivers(t *testing.T, store *Storage, applyIdentifier
 	})
 	select {
 	case payload := <-accepted:
-		var message storage.ApplyCompletedEvent
+		var message storage.ApplyFinishedEvent
 		require.NoError(t, json.Unmarshal(payload, &message))
 		assert.Equal(t, applyIdentifier, message.ID)
 	case <-ctx.Done():
@@ -329,7 +329,7 @@ func testNotificationStatuses(t *testing.T, store *Storage) {
 		} else if status != storage.OutboxStatusPending {
 			created = created.Add(-24 * time.Hour)
 		}
-		_, err := store.db.ExecContext(ctx, `INSERT INTO outbox_events (apply_id, event_type, payload, status, created_at, quarantine_token) VALUES (?, ?, ?, ?, ?, ?)`, 1, applyCompletedEventType, `{"id":"apply_status"}`, status, created, "retained-incident")
+		_, err := store.db.ExecContext(ctx, `INSERT INTO outbox_events (apply_id, event_type, payload, status, created_at, quarantine_token) VALUES (?, ?, ?, ?, ?, ?)`, 1, applyFinishedEventType, `{"id":"apply_status"}`, status, created, "retained-incident")
 		require.NoError(t, err)
 		id, err := store.OutboxEvents().MaxID(ctx)
 		require.NoError(t, err)
