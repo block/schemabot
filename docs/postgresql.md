@@ -4,7 +4,8 @@
 
 ## Table of Contents
 
-- [Alpha status](#alpha-status)
+- [Beta status](#beta-status)
+- [Schema pull](#schema-pull)
 - [Where it runs](#where-it-runs)
 - [What pg-sprite does](#what-pg-sprite-does)
 - [How a change runs](#how-a-change-runs)
@@ -15,7 +16,7 @@
 - [Blocked plans](#blocked-plans)
 - [Apply-time refusals](#apply-time-refusals)
 - [Unsupported workflow features](#unsupported-workflow-features)
-- [Schema pull](#schema-pull)
+- [Schema pull](#schema-pull-1)
 - [Row-level security](#row-level-security)
 - [Configuration and credentials](#configuration-and-credentials)
 - [Table ownership](#table-ownership)
@@ -35,53 +36,82 @@ review the exact SQL before anything runs. Planning and
 execution are done by [pg-sprite](https://github.com/block/pg-sprite), an
 open-source schema change engine for PostgreSQL.
 
-PostgreSQL support is in **alpha**. It handles a narrow set of changes today,
-and the list of what it cannot do yet is long; [Alpha status](#alpha-status)
-spells it out. Inside that set it is as careful as on any other database: a
-change it cannot run without a long lock is blocked in the plan, with the
-reason, before anything touches the database, and nothing falls back to a
-riskier way of running it.
+PostgreSQL support is in **beta**. It runs a documented set of changes and
+refuses the rest with the reason, as [Beta status](#beta-status) lists. A
+change it cannot run without a long lock is blocked in the plan, before
+anything touches the database.
 
-## Alpha status
+## Beta status
+
+PostgreSQL support is in **beta**. SchemaBot runs the changes listed under
+"What works today" and refuses everything else with the reason, in most cases
+when you plan it. It never falls back to a riskier way of running a change.
+[What GA, beta, and alpha mean](engines.md#what-ga-beta-and-alpha-mean)
+explains the levels. Changes run through
+[pg-sprite](https://github.com/block/pg-sprite#readme), which is itself an
+early release.
 
 **What works today:**
 
-- Planning on every pull request and in the CLI, with the plan's exact SQL, and
-  a Check Run that can block the merge until the change is applied.
-- `ALTER TABLE` changes that only touch the catalog, such as adding a nullable
-  column, on tables up to 1 GiB.
-- Adding an index to an existing table, built with `CREATE INDEX CONCURRENTLY`.
-  A running build can be cancelled.
+- Plans on every pull request and in the CLI, showing the exact SQL. The
+  Check Run passes once the live schema matches the pull request; make it a
+  [required check](check-runs.md#branch-protection-setup) so the pull request
+  cannot merge before then.
+- `ALTER TABLE` changes that don't rewrite the table, such as adding a
+  nullable column or a check constraint, on tables up to the size limit (1 GiB by
+  default).
+- Adding an index to an existing table with `CREATE INDEX CONCURRENTLY`. You
+  can cancel a build that is running.
 - Creating a table together with its indexes.
 - Adding labels to an existing enum type (see [Enum types](#enum-types)).
 - Row-level security policies on an existing table.
 - `schemabot init` and `schemabot pull` for an existing database, and
   PostgreSQL as the database that stores SchemaBot's own state.
 
-**Not implemented yet:**
+**Not GA yet.** SchemaBot blocks or refuses these; it never runs them:
 
-- **Changes that rewrite a table**, such as changing a column's type. These
-  need an online copy of the table, which SchemaBot does not run on PostgreSQL
-  yet, so the plan is blocked.
-- **`ALTER TABLE` on a table larger than 1 GiB.** Blocked, for the same reason.
-- **Foreign keys.** Adding or dropping one is blocked, and `pull` refuses a
-  table that has one.
-- **Dropping a table.** SchemaBot never runs `DROP TABLE` on PostgreSQL, and
-  there is no pending-drops quarantine.
-- **Creating an enum type**, or removing or reordering its labels. Only label
-  additions run.
-- **Controls on a running change.** `stop`, `start`, `cutover`, deferred
-  cutover, `revert`, and `skip-revert` are not available. `cancel` works only
-  on an index build.
+- **Rewriting a table**, such as changing a column's type or adding a `USING`
+  expression. This needs pg-sprite's copy-and-swap, which is still in
+  preview, so the plan is blocked whatever the table's size.
+- **`ALTER TABLE` on a table larger than the size limit.** Blocked for the
+  same reason.
+- **Foreign keys.** Adding or dropping one is blocked;
+  [Blocked plans](#blocked-plans) explains how to run one yourself.
+- **Dropping a table.** SchemaBot never drops a PostgreSQL table, and there
+  is no pending-drops quarantine to hold one.
+- **Creating an enum type**, or removing or reordering its labels.
+- **Controls on a running change.** You can cancel an index build, but
+  `stop`, `start`, `cutover`, deferred cutover, `revert`, and `skip-revert`
+  are not available. See
+  [Unsupported workflow features](#unsupported-workflow-features).
+- **An index on a partitioned table's parent.** The plan is blocked, because
+  the index has to be built one partition at a time and SchemaBot does not
+  run that build yet. Some other changes to a partitioned parent are refused
+  when the apply runs; see [Partitioned tables](#partitioned-tables).
+- **Row-level security beyond existing tables.** Declaring it on a new table,
+  or changing policies and structure in the same plan, is blocked. A plan for
+  a namespace with managed row-level security cannot be rolled back. See
+  [Row-level security](#row-level-security).
 - **Pulling every table shape.** `pull` refuses inherited and unlogged
-  tables, triggers, comments, explicit collations, and non-default table
-  options. A partitioned table is pulled as its parent alone.
+  tables, tables with a foreign key, triggers, comments, explicit collations,
+  and non-default table options, rather than writing a partial schema. A
+  partitioned table is pulled as its parent alone. See
+  [Schema pull](#schema-pull).
 - **Detailed catalog output** from the schema intelligence API.
 
-The [reference](#supported-changes) below has the rules behind each item.
-[What GA and alpha mean](engines.md#what-ga-and-alpha-mean) defines the bar
-PostgreSQL support has to reach to leave alpha.
+**A passing plan is not a promise that the apply will succeed.** Some checks
+can only run against the live table, when the apply starts:
 
+- A statement the planner expected to be quick that turns out to rewrite the
+  table is cancelled by its time budget, and nothing is changed.
+- A table that grew past the size limit after the plan is refused.
+- A plan with several statements is not atomic. They run in order, so if one
+  fails, the ones before it stay applied. Keep a change to one statement when
+  a half-applied plan would be unsafe to leave in place.
+
+[Apply-time refusals](#apply-time-refusals) lists every check that runs then.
+
+## Schema pull
 ## Where it runs
 
 SchemaBot works with PostgreSQL 14 and later, self-hosted or managed,

@@ -7,7 +7,7 @@
 - [Capability matrix](#capability-matrix)
 - [What the terms mean](#what-the-terms-mean)
 - [Why the differences exist](#why-the-differences-exist)
-- [What GA and alpha mean](#what-ga-and-alpha-mean)
+- [What GA, beta, and alpha mean](#what-ga-beta-and-alpha-mean)
 - [Load management](#load-management)
 - [Dropped tables](#dropped-tables)
 - [Reading further](#reading-further)
@@ -52,7 +52,7 @@ stay put, where this page moves as engines gain features.
 | | Spirit (MySQL) | PlanetScale (Vitess) | pg-sprite (PostgreSQL) |
 |---|---|---|---|
 | **Cheap native path tried first** | yes, instant DDL | yes, instant DDL | yes, attempted under budgets that cancel a rewrite |
-| **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | planned; meanwhile a rewrite is refused above a size limit and cancelled by its budget below it |
+| **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | planned; meanwhile a predicted rewrite is blocked at plan, and a mispredicted one is cancelled by its budget |
 | **Escape hatch for refused statements** | direct execution: on by default, size-bounded | none, excluded by design | none, native execution is already the only path |
 | **`stop`** | yes | no | planned |
 | **`start`** | yes | deferred deploys only | planned |
@@ -259,9 +259,11 @@ described above, and it is not on the PostgreSQL roadmap today.
 
 Until the copy lands, a PostgreSQL change is kept safe by bounding work rather than pacing it. Only
 a small set of statement shapes is allowed at all, which is why a `DROP TABLE` never reaches the
-database. Above the configured table size limit, anything that might rewrite is refused before it
-runs. Below it, the bounded attempt described above is what stands in for a copy: the change is
-tried once, and a rewrite is cancelled by its own budget rather than allowed to hold a lock. Some
+database. A statement the planner predicts will rewrite the table is blocked at plan time, whatever
+the table's size, and any other `ALTER TABLE` is refused above the configured table size limit.
+Below it, the bounded attempt described above is what stands in for a copy: the change is tried
+once, and if the prediction was wrong and it does rewrite, its own budget cancels it rather than
+letting it hold a lock. Some
 statements skip the gamble because PostgreSQL has a genuinely online form of them, and the planner
 substitutes it: an index build becomes `CREATE INDEX CONCURRENTLY`, and a constraint is added `NOT
 VALID` and then validated. The constraint steps still sit under the size limit, which is checked
@@ -271,18 +273,27 @@ is bounded by its own duration budget instead. [postgresql.md](postgresql.md) ha
 the full boundary and is worth reading before you point SchemaBot at a PostgreSQL database; it
 tracks the engine more closely than this page does.
 
-## What GA and alpha mean
+## What GA, beta, and alpha mean
 
-The engine badges on the [README](../README.md) are claims about capability, and this is where
-they are defined. An engine is **GA** when it can do the two things below. **Alpha** means
-it cannot yet, and that what is missing is written on this page rather than left for you to
-discover against a database.
+Every engine in the [README](../README.md) carries a badge: GA, beta, or alpha. The badge tells
+you how much of your schema that engine can change today. It is not a safety rating. At every
+level, an engine refuses a change it cannot run safely and tells you why, rather than running it
+anyway.
 
-Maturity is a capability question, not a safety one. An engine below GA is narrower rather than
-looser: fewer classes of change can be executed and fewer operations are available against one
-that is running, but at the edge of that envelope it behaves the same as any other engine. That
-part is [invariants.md](invariants.md)'s, and most of what is in there is not about engines at
-all.
+- **GA** engines can change any table, however large, and keep you in control while a change
+  runs. The two requirements below spell out what that takes.
+- **Beta** engines handle a clear, documented set of changes. Anything outside that set is refused
+  with the reason, and most of it is blocked when you plan it, so you find out on the pull
+  request rather than in production. The engine's guide lists what is not GA yet, including the
+  checks that can only run once the change does.
+- **Alpha** engines are experimental and still being built. Expect significant changes between
+  releases, both in what they can do and in how they work. Their guide may not list every gap
+  yet, so read it before you rely on one.
+
+Below GA, an engine is narrower, not looser. It runs fewer kinds of change and offers fewer
+controls once a change is running, but whatever it does run follows the same safety rules as every
+other engine. Those rules live in [invariants.md](invariants.md), and most of them have nothing to
+do with engines.
 
 **Online DDL.** An engine that can only run what the database does natively cannot change a large
 table at all, so the harder half of a real schema gets blocked instead of applied. Falling back to
