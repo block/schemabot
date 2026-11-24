@@ -239,6 +239,7 @@ func TestEngine_Plan_DropTablesRefusesARecentlyWrittenTable(t *testing.T) {
 		DropTables:  []string{"_executions_new"},
 	})
 	require.Error(t, err, "Plan() must refuse to drop a table that is still being written")
+	assert.True(t, engine.IsPlanRefused(err), "the refusal is the config's to fix, not an engine failure")
 	assert.Nil(t, result)
 	assert.Contains(t, err.Error(), "drop_tables entries were written in the last 1d")
 	assert.Contains(t, err.Error(), `"_executions_new" (`)
@@ -273,6 +274,7 @@ func TestEngine_Plan_DropTablesRefusesATableWithNoWriteTimeOnARecentlyStartedSer
 		DropTables:  []string{"_jobs_old"},
 	})
 	require.Error(t, err, "Plan() must refuse to drop a table whose recent writes the server cannot account for")
+	assert.True(t, engine.IsPlanRefused(err), "the refusal is the config's to fix, not an engine failure")
 	assert.Nil(t, result)
 	assert.Contains(t, err.Error(), `SchemaBot cannot tell whether drop_tables entries "_jobs_old" were written in the last 1d: the server has no write time for them and started `)
 	assert.Contains(t, err.Error(), "Plan again in ")
@@ -342,6 +344,7 @@ func TestEngine_Plan_DropTablesRefusesContradictoryConfig(t *testing.T) {
 		DropTables:  []string{"executions"},
 	})
 	require.Error(t, err, "Plan() must refuse an entry a schema file declares")
+	assert.True(t, engine.IsPlanRefused(err))
 	assert.Contains(t, err.Error(), `drop_tables entry "executions" (the file spells it "Executions") is also declared by a schema file`)
 	assert.True(t, engine.IsPlanRefused(err), "the schema files are refused as written, not the engine failing")
 
