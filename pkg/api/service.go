@@ -156,6 +156,11 @@ type Service struct {
 	// ternFailures remembers, per cache key, the last failed local client
 	// resolution until its expiry, guarded by ternMu.
 	ternFailures map[string]ternResolveFailure
+	// engineGeneration counts RegisterEngine calls, guarded by ternMu. A
+	// resolution records its failure only while the generation it started
+	// under is current, so a failure from an attempt that ran before a new
+	// factory was registered is not remembered past that registration.
+	engineGeneration uint64
 	// ternFlight shares one client resolution among concurrent first callers of
 	// the same cache key.
 	ternFlight singleflight.Group
@@ -549,8 +554,11 @@ func (s *Service) RegisterEngine(databaseType string, factory tern.EngineFactory
 	}
 	s.engineFactories[databaseType] = factory
 	// A remembered failure may be a missing engine for this type; the next
-	// caller resolves again with the factory in place.
+	// caller resolves again with the factory in place. Bumping the generation
+	// keeps a resolution still running from the old registry from recording
+	// its failure after this.
 	clear(s.ternFailures)
+	s.engineGeneration++
 	return nil
 }
 
@@ -716,9 +724,14 @@ func (s *Service) createLocalTernClient(key, deployment, environment, dbType str
 	if build == nil {
 		build = s.newLocalTernClient
 	}
+	s.ternMu.Lock()
+	generation := s.engineGeneration
+	s.ternMu.Unlock()
 	client, err := build(key, deployment, dbType, envConfig)
 	if err != nil {
-		s.recordTernFailure(key, deployment, environment, dbType, err)
+		if registered := s.recordTernFailure(key, deployment, environment, dbType, generation, err); registered != nil {
+			return registered, nil
+		}
 		return nil, err
 	}
 	installed, created, err := s.installTernClient(key, client)
@@ -733,28 +746,42 @@ func (s *Service) createLocalTernClient(key, deployment, environment, dbType str
 
 // recordTernFailure logs a failed local client resolution and remembers it so
 // callers within ternClientFailureTTL get the error without another lookup.
-// A cancelled resolution says nothing about the deployment, so it is logged
-// but not remembered.
-func (s *Service) recordTernFailure(key, deployment, environment, dbType string, err error) {
-	if errors.Is(err, context.Canceled) {
-		s.logger.Warn("tern client resolution was cancelled; the next request resolves it again",
-			"key", key, "deployment", deployment, "environment", environment, "database_type", dbType, "error", err)
-		return
-	}
-	s.logger.Error("tern client resolution failed; requests for this deployment get this failure until the retry time",
-		"key", key, "deployment", deployment, "environment", environment, "database_type", dbType,
-		"cached_for", ternClientFailureTTL.String(), "error", err)
+// generation is the engine registry generation the resolution started under.
+//
+// A client registered for the key while the resolution ran is returned, and
+// the caller serves it instead of the failure, as a successful build would
+// defer to it. A cancelled resolution says nothing about the deployment, and a
+// failure from a registry that RegisterEngine has since replaced may be one
+// the new factory fixes, so both are logged but not remembered.
+func (s *Service) recordTernFailure(key, deployment, environment, dbType string, generation uint64, err error) tern.Client {
+	attrs := []any{"key", key, "deployment", deployment, "environment", environment, "database_type", dbType, "error", err}
 
 	s.ternMu.Lock()
-	defer s.ternMu.Unlock()
-	if _, ok := s.ternClients[key]; ok {
-		return
+	if registered, ok := s.ternClients[key]; ok {
+		s.ternMu.Unlock()
+		s.logger.Warn("tern client resolution failed, but a client was registered for this deployment while it ran; serving the registered client", attrs...)
+		return registered
+	}
+	if errors.Is(err, context.Canceled) {
+		s.ternMu.Unlock()
+		s.logger.Warn("tern client resolution was cancelled; the next request resolves it again", attrs...)
+		return nil
+	}
+	if generation != s.engineGeneration {
+		s.ternMu.Unlock()
+		s.logger.Warn("tern client resolution failed while an engine was registered; the failure is not remembered and the next request resolves again", attrs...)
+		return nil
 	}
 	if s.ternFailures == nil {
 		s.ternFailures = make(map[string]ternResolveFailure)
 	}
 	now := s.clock.Now()
 	s.ternFailures[key] = ternResolveFailure{err: err, failedAt: now, expiresAt: now.Add(ternClientFailureTTL)}
+	s.ternMu.Unlock()
+
+	s.logger.Error("tern client resolution failed; requests for this deployment get this failure until the retry time",
+		append(attrs, "cached_for", ternClientFailureTTL.String())...)
+	return nil
 }
 
 // installTernClient stores a newly built client under ternMu. A client already

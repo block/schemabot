@@ -290,6 +290,64 @@ func TestService_TernClientClosesClientThatLosesInstallRace(t *testing.T) {
 	assert.Equal(t, int32(0), registered.closes.Load())
 }
 
+// When a client is registered while a resolution is still running and that
+// resolution then fails, every caller waiting on it gets the registered client,
+// not the failure, and nothing is remembered: registration wins over a failed
+// build the same way it wins over a successful one.
+func TestService_TernClientFailedResolutionServesClientRegisteredMeanwhile(t *testing.T) {
+	resolver := newTernResolver("orders")
+	svc := newTernClientTestService(t, resolver, "orders")
+	resolver.fail(errors.New("secret store timed out"))
+
+	pending := ternClientAsync(svc, "orders")
+	assert.Equal(t, "orders", receiveStartedResolution(t, resolver))
+
+	registered := &closeCountingTernClient{}
+	svc.RegisterTernClient("orders", "staging", registered)
+	close(resolver.gates["orders"])
+
+	result := receiveTernClientResult(t, pending)
+	require.NoError(t, result.err)
+	assert.Same(t, tern.Client(registered), result.client)
+
+	svc.ternMu.Lock()
+	_, remembered := svc.ternFailures["orders/staging"]
+	svc.ternMu.Unlock()
+	assert.False(t, remembered, "a failure answered by the registered client is not remembered")
+}
+
+// An engine registered while a resolution is still running clears the
+// remembered failures, and the older resolution's failure, arriving after the
+// registration, is not remembered in their place: the next call tries again
+// with the new factory instead of getting a cached failure for the rest of the
+// window.
+func TestService_TernClientFailureFromBeforeRegisterEngineIsNotCached(t *testing.T) {
+	resolver := newTernResolver("orders")
+	svc := newTernClientTestService(t, resolver, "orders")
+	fake := clock.NewFake(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
+	require.NoError(t, svc.SetClock(fake))
+	missingEngine := errors.New("no engine registered for this database type")
+	resolver.fail(missingEngine)
+
+	pending := ternClientAsync(svc, "orders")
+	assert.Equal(t, "orders", receiveStartedResolution(t, resolver))
+
+	factory := func(tern.LocalConfig, *slog.Logger) (engine.Engine, error) {
+		return &fakeRegisteredEngine{}, nil
+	}
+	require.NoError(t, svc.RegisterEngine(storage.DatabaseTypeMySQL, factory))
+	close(resolver.gates["orders"])
+
+	result := receiveTernClientResult(t, pending)
+	require.ErrorIs(t, result.err, missingEngine, "the attempt that failed still reports its own failure")
+
+	resolver.succeed()
+	client, err := svc.TernClient("orders", "staging")
+	require.NoError(t, err, "the failure from before the registration must not be served from the cache")
+	assert.NotNil(t, client)
+	assert.Equal(t, int32(2), resolver.calls.Load(), "the next call resolves again")
+}
+
 // A resolution that finishes after the service is closed closes its client and
 // reports the closed service instead of installing a client nothing will close.
 func TestService_TernClientResolutionAfterCloseClosesClient(t *testing.T) {
