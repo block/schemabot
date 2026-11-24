@@ -20,6 +20,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -64,6 +65,7 @@ func redactionPlanRequest() PlanRequest {
 	return PlanRequest{
 		Database:    "payments",
 		Environment: "staging",
+		Repository:  "octo/payments",
 		Type:        storage.DatabaseTypeMySQL,
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
 			"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
@@ -110,6 +112,7 @@ func TestHandlePlanAnswersFixedMessageWhenPlanningFails(t *testing.T) {
 			line := requireLogLine(t, decodeLogLines(t, logs.Bytes()), "plan failed")
 			assert.Equal(t, "payments", line["database"])
 			assert.Equal(t, "staging", line["environment"])
+			assert.Equal(t, "octo/payments", line["repository"])
 			assert.Contains(t, line["error"], "user:pass")
 		})
 	}
@@ -170,6 +173,7 @@ func TestHandlePlanAnswersFixedMessageWhenRolloutMembersCannotBePlanned(t *testi
 	logs := captureServiceLogs(svc)
 	request := planDiffReq(t)
 	request.RendersRollout = true
+	request.Repository = "octo/testapp"
 
 	rec := postJSON(t, svc.handlePlan, "/api/plan", request)
 
@@ -180,6 +184,7 @@ func TestHandlePlanAnswersFixedMessageWhenRolloutMembersCannotBePlanned(t *testi
 	line := requireLogLine(t, decodeLogLines(t, logs.Bytes()), "plan failed: the rollout's member plans could not be completed")
 	assert.Equal(t, "testapp", line["database"])
 	assert.Equal(t, "production", line["environment"])
+	assert.Equal(t, "octo/testapp", line["repository"])
 	assert.Equal(t, reviewed.PlanId, line["plan_id"])
 	assert.Contains(t, line["error"], "user:pass")
 }
@@ -270,8 +275,8 @@ func TestHandlePullSchemaAnswersFixedMessageWhenPullFails(t *testing.T) {
 	assert.Contains(t, line["error"], "user:pass")
 }
 
-// A pull request naming a namespace SchemaBot cannot pull keeps SchemaBot's
-// own text, which says what to change.
+// A pull request naming a namespace SchemaBot cannot pull is the caller's to
+// fix, so it answers 400 with SchemaBot's own text, which says what to change.
 func TestHandlePullSchemaKeepsTextWrittenForTheReader(t *testing.T) {
 	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce"}, &mockTernClient{})
 
@@ -281,10 +286,50 @@ func TestHandlePullSchemaKeepsTextWrittenForTheReader(t *testing.T) {
 		Namespaces:  []string{"a/b"},
 	})
 
-	require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
 	var resp apitypes.ErrorResponse
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	assert.Equal(t, `pull schema failed: pull namespace "a/b" must be a single path component`, resp.Error)
+	assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
+}
+
+// A pull whose remote deployment cannot be reached answers 503 with a fixed
+// message and keeps engine_unavailable, so the CLI still knows to retry. The
+// connection error, which names the address it dialed, stays in the server log.
+func TestHandlePullSchemaAnswersFixedMessageWhenDeploymentIsUnavailable(t *testing.T) {
+	client := &mockTernClient{isRemote: true, pullSchemaErr: status.Error(codes.Unavailable,
+		`connection error: desc = "transport: Error while dialing: dial tcp 10.0.0.5:9090: connect: connection refused"`)}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce"}, client)
+	logs := captureServiceLogs(svc)
+
+	rec := postJSON(t, svc.handlePullSchema, "/api/pull", apitypes.PullSchemaRequest{Database: "orders", Environment: "production"})
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+	resp := decodeErrorResponse(t, rec)
+	assert.Equal(t, `pull schema failed for database "orders" in environment "production": SchemaBot could not reach the deployment that serves it. `+
+		`Retry in a moment. If it keeps failing, a SchemaBot operator can find the cause in the server log.`, resp.Error)
+	assert.Equal(t, apitypes.ErrCodeEngineUnavailable, resp.ErrorCode)
+
+	line := requireLogLine(t, decodeLogLines(t, logs.Bytes()), "pull schema failed because remote deployment is unavailable")
+	assert.Equal(t, "orders", line["database"])
+	assert.Contains(t, line["error"], "10.0.0.5:9090")
+}
+
+// An apply whose plan was made for a different rollout member than the one it
+// would run on keeps the text that says to re-plan, through the handler's
+// message builder and under an outer wrap.
+func TestApplyFailureKeepsReplanTextWhenPlanMemberDiffers(t *testing.T) {
+	svc := withheldDropService(&capturingPlanStore{}, &mockTernClient{})
+	plan := &storage.Plan{Database: "payments", PlanIdentifier: "plan-1", Deployment: "east", Target: "payments-east"}
+	targets := []routing.ExecutionTarget{{Deployment: "west", Target: "payments-west"}}
+
+	_, err := svc.resolveApplyMembers(t.Context(), plan, "staging", targets)
+	require.Error(t, err)
+
+	got := applyFailureMessage("plan-1", fmt.Errorf("create apply via 10.0.0.5:3306: %w", err))
+	assert.Contains(t, got, "re-plan the environment so the apply runs the plan its target was planned for")
+	assert.NotContains(t, got, "10.0.0.5")
+	assert.NotContains(t, got, "SchemaBot hit an")
 }
 
 // An apply that fails inside SchemaBot answers 500 with a fixed message that
@@ -316,15 +361,15 @@ func TestFailureMessagesKeepOnlyTextWrittenForTheReader(t *testing.T) {
 	raw := fmt.Errorf("store plan: %w", errors.New(sensitivePlanFailure))
 
 	assert.Equal(t, "apply failed: re-plan the environment, then apply again", applyFailureMessage("plan-1", authored))
-	assert.Equal(t, "pull schema failed: re-plan the environment, then apply again", pullFailureMessage("orders", "production", authored))
 	assert.Equal(t, "plan failed: re-plan the environment, then apply again", planFailureMessage("payments", "staging", authored))
 	assert.Equal(t, "plan failed: re-plan the environment, then apply again", planRolloutFailureMessage("payments", "staging", authored))
 
 	for name, message := range map[string]string{
-		"apply":        applyFailureMessage("plan-1", raw),
-		"pull":         pullFailureMessage("orders", "production", raw),
-		"plan":         planFailureMessage("payments", "staging", raw),
-		"plan rollout": planRolloutFailureMessage("payments", "staging", raw),
+		"apply":            applyFailureMessage("plan-1", raw),
+		"pull":             pullFailureMessage("orders", "production"),
+		"pull unavailable": pullUnavailableMessage("orders", "production"),
+		"plan":             planFailureMessage("payments", "staging", raw),
+		"plan rollout":     planRolloutFailureMessage("payments", "staging", raw),
 	} {
 		assert.NotContains(t, message, "10.0.0.5", name)
 		assert.NotContains(t, message, "user:pass", name)

@@ -282,11 +282,16 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 				"deployment", unavailableErr.Deployment,
 				"target", unavailableErr.Target,
 				"error", err)
-			s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable, "pull schema failed: "+err.Error())
+			s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable, pullUnavailableMessage(req.Database, req.Environment))
+			return
+		}
+		if text, ok := authoredMessage(err); ok {
+			s.logger.Warn("pull schema rejected", "database", req.Database, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "pull schema failed: "+text)
 			return
 		}
 		s.logger.Error("pull schema failed", "database", req.Database, "environment", req.Environment, "error", err)
-		s.writeError(w, http.StatusInternalServerError, pullFailureMessage(req.Database, req.Environment, err))
+		s.writeError(w, http.StatusInternalServerError, pullFailureMessage(req.Database, req.Environment))
 		return
 	}
 
@@ -758,7 +763,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 	// error says which step failed.
 	rollout, err := s.planRollout(r.Context(), req, primaryPlan, resp)
 	if err != nil {
-		s.logger.Error("plan failed: the rollout's member plans could not be completed", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
+		s.logger.Error("plan failed: the rollout's member plans could not be completed", "database", req.Database, "environment", req.Environment, "repository", req.Repository, "plan_id", resp.PlanID, "error", err)
 		s.writeError(w, http.StatusInternalServerError, planRolloutFailureMessage(req.Database, req.Environment, err))
 		return
 	}
@@ -1822,7 +1827,10 @@ func (e *operatorMessageError) Error() string { return e.message }
 
 // operatorMessagef builds an operatorMessageError. Use it only for a message
 // that wraps no cause and names the next step; any error that wraps a cause
-// belongs in the server log instead.
+// belongs in the server log instead. Naming a configured deployment, target,
+// or rollout member is fine: the plan response and the apply refusals show
+// those names already. What stays out is anything a cause carries, such as an
+// address, a DSN, or a driver's text.
 func operatorMessagef(format string, args ...any) error {
 	return &operatorMessageError{message: fmt.Sprintf(format, args...)}
 }
@@ -1877,11 +1885,16 @@ const (
 // pullFailureMessage is the 500 body of a failed pull. The cause can be a
 // storage, driver, or engine error carrying addresses or credentials, so it
 // stays in the server log. A pull changes nothing, so it can be repeated.
-func pullFailureMessage(database, environment string, err error) string {
-	if text, ok := authoredMessage(err); ok {
-		return "pull schema failed: " + text
-	}
+func pullFailureMessage(database, environment string) string {
 	return fmt.Sprintf("pull schema failed for database %q in environment %q: SchemaBot hit an internal error while reading the live schema. "+
+		"Retry in a moment. %s", database, environment, retryFailureTail)
+}
+
+// pullUnavailableMessage is the 503 body of a pull whose remote deployment
+// could not be reached. The connection error names the address it dialed, so
+// it stays in the server log with the deployment and target.
+func pullUnavailableMessage(database, environment string) string {
+	return fmt.Sprintf("pull schema failed for database %q in environment %q: SchemaBot could not reach the deployment that serves it. "+
 		"Retry in a moment. %s", database, environment, retryFailureTail)
 }
 
