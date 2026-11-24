@@ -713,7 +713,7 @@ deployment can address several targets, each running its own copy of the change,
 so several rows for the same table share a deployment and differ in their
 target. The pair is read from the stored task's operation row, so a
 single-target apply reports its one member the same way, and a row the server
-cannot match to a stored task carries neither field. Such a row also carries
+cannot match to a stored task carries neither field. A matched row also carries
 `operation_key`, naming the operation that runs it, since one target can run
 several operations when a rollout goes table by table.
 A sharded apply lists one operation per shard and table it changes, plus each
