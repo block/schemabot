@@ -12,10 +12,12 @@ const (
 	testWeek = 7 * testDay
 )
 
-// The two duration formatters agree up to a day and then diverge: the elapsed
-// style keeps two units, the exact style keeps every non-zero unit. Pinning
-// both over the same inputs shows where they differ, so a change to one can
-// never shift the other unnoticed.
+// The two duration formatters agree from one second up to a day. Below a
+// second, and for zero and negative durations, they differ ("< 1s" against
+// "0s" or "-5s"). From a day up the elapsed style keeps two units while the
+// exact style keeps every non-zero unit down to minutes. Pinning both over the
+// same inputs shows where they differ, so a change to one can never shift the
+// other unnoticed.
 func TestFormatDurationStyles(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -54,9 +56,10 @@ func TestFormatDurationStyles(t *testing.T) {
 	}
 }
 
-// The two seconds-based formatters agree up to a day and then diverge: the ETA
-// style reports days, the remaining-time style stops at hours. Pinning both over
-// the same inputs shows where they differ.
+// The two seconds-based formatters agree from one second up to a day. Zero
+// differs ("0s" against "< 1s"), and from a day up the ETA style reports days
+// while the remaining-time style stops at hours. Pinning both over the same
+// inputs shows where they differ.
 func TestFormatSecondsStyles(t *testing.T) {
 	tests := []struct {
 		name      string

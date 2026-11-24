@@ -351,7 +351,9 @@ func FormatTimeAgo(t time.Time) string {
 // Examples: 500ms → "< 1s", 45s → "45s", 90s → "1m 30s", 2h → "2h"
 //
 // FormatExactDuration is the other duration formatter. It keeps every non-zero
-// unit, so it shows the minutes of a duration that runs a day or longer.
+// unit down to minutes once a duration reaches an hour (it drops seconds there
+// too, so 1h1m1s reads "1h 1m"), which means it still shows the minutes of a
+// duration that runs a day or longer.
 func FormatHumanDuration(d time.Duration) string {
 	if d < time.Second {
 		return "< 1s"
@@ -413,10 +415,11 @@ func FormatDurationSeconds(seconds int64) string {
 }
 
 // FormatExactDuration formats a duration with seconds under an hour and minutes
-// at every larger scale, and leaves out any unit that is zero. It truncates to whole seconds first, so a
-// duration under a second reads "0s". From a week up it leads with weeks. A
-// negative duration reads as negative seconds ("-90s"); callers pass a
-// duration that has already been checked to be positive.
+// at every larger scale, and leaves out any unit that is zero. It truncates to
+// whole seconds first, so a duration under a second reads "0s", and from an
+// hour up it drops seconds (1h1m1s reads "1h 1m"). From a week up it leads
+// with weeks. A negative duration reads as negative seconds ("-90s"); callers
+// pass a duration that has already been checked to be positive.
 // Examples: 45s → "45s", 5m → "5m", 25h → "1d 1h", 25h1m → "1d 1h 1m", 8d3h4m → "1w 1d 3h 4m"
 //
 // FormatHumanDuration is the other duration formatter. It stops at the two
