@@ -616,7 +616,9 @@ it does not create a PR review trail.
 ### Freeze an environment
 
 An environment freeze holds new schema changes in its scope until it ends or
-someone lifts it. Setting or lifting one is a write, and
+someone lifts it. The [freeze guide](freeze.md) explains how freezes work, the
+pull request and API forms, and what an agent may do. Setting or lifting one is
+a write, and
 [`freeze.groups`](configuration.md#freeze-groups-forward-auth) members may do
 so without any other write access.
 

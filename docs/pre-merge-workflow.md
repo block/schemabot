@@ -215,7 +215,7 @@ records the desired state the databases already run.
 - **Environment frozen?** The apply is refused and nothing changes. The
   refusal names each freeze and when it ends. Run the same command again once
   the freeze is lifted, or ask for an override if the change can't wait. See
-  [freeze an environment](cli.md#freeze-an-environment)
+  [freeze an environment](freeze.md)
 
 ![A freeze refuses an apply on the PR and nothing changes; after the freeze is lifted, the same command applies the change and the PR merges](../assets/pr-freeze-demo.gif)
 
@@ -437,7 +437,7 @@ These gates apply according to your installation’s configuration:
 | Schema freshness | `apply` is refused when the PR head moved since the plan, when the confirmed plan no longer matches the head, or when the base branch's schema directory changed after the PR diverged | [configuration.md](configuration.md#base-branch-schema-freshness) |
 | Database lock | One PR (or CLI operator) holds a database at a time, from `apply` until merge, close, or `unlock`; a competing apply is refused with the holder named | [check-runs.md](check-runs.md#unlock) |
 | Promotion order | Production applies only after the prior environment's check is success | [check-runs.md](check-runs.md#environment-ordering) |
-| Environment freeze | While a freeze is in effect, `apply`, `start` and `cutover` in its scope are refused unless a second person approves an override | [cli.md](cli.md#freeze-an-environment) |
+| Environment freeze | While a freeze is in effect, `apply`, `start` and `cutover` in its scope are refused unless a second person approves an override | [freeze.md](freeze.md) |
 | PR checks gate | When enabled, requires the configured CI checks to pass before applying | [configuration.md](configuration.md#pr-checks-gate) |
 | Review gate | When enabled, requires an approving review from a configured reviewer before applying; the author’s own approval never counts | [configuration.md](configuration.md#review-gate) |
 | Merge gate | The required aggregate check passes when its scope has no unapplied managed schema changes | [check-runs.md](check-runs.md) |
