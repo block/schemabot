@@ -2,12 +2,14 @@ package apitypes
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 )
 
 const (
 	buildOperationMetadataKey   = "executor_operation"
 	buildServerPhaseMetadataKey = "server_phase"
+	buildPercentMetadataKey     = "percent"
 )
 
 // BuildWork describes server-reported work for the operation currently being
@@ -26,6 +28,12 @@ type BuildWork struct {
 	TuplesTotal  int64
 	LockersDone  int64
 	LockersTotal int64
+	// Percent is the engine's whole-build percent with its decimals, which a
+	// large build needs because its whole percent can stand still for
+	// minutes. HasPercent is false when the engine publishes none, and the
+	// renderer then shows the table's whole percent.
+	Percent    float64
+	HasPercent bool
 }
 
 // IsConcurrentIndexBuild reports whether the work belongs to a concurrent
@@ -74,6 +82,16 @@ func ParseBuildWork(metadata map[string]string) (BuildWork, error) {
 			return BuildWork{}, fmt.Errorf("progress metadata %s %d is negative", field.key, value)
 		}
 		*field.value = value
+	}
+	if raw, present := metadata[buildPercentMetadataKey]; present {
+		percent, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return BuildWork{}, fmt.Errorf("progress metadata %s %q is not a number: %w", buildPercentMetadataKey, raw, err)
+		}
+		if math.IsNaN(percent) || percent < 0 || percent > 100 {
+			return BuildWork{}, fmt.Errorf("progress metadata %s %q is not between 0 and 100", buildPercentMetadataKey, raw)
+		}
+		work.Percent, work.HasPercent = percent, true
 	}
 	return work, nil
 }

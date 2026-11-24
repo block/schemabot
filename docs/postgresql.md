@@ -1228,7 +1228,8 @@ while PostgreSQL publishes a progress row for a concurrent index build. The
 metadata also carries `step`, `steps_total`, and the sanitized `statement`
 for the statement in flight; `executor_operation`, pg-sprite's class for the
 step (`admitting`, `optimistic`, `brief`, `validate-constraint`,
-`concurrent-index-build`); and `attempt`. Whenever a progress row is
+`concurrent-index-build`); `attempt`; and, while a concurrent index build
+runs, `percent`, the whole-build percent with two decimals. Whenever a progress row is
 published, all six counters — `blocks_done`, `blocks_total`, `tuples_done`,
 `tuples_total`, `lockers_done`, `lockers_total` — are present, zeros
 included: a zero is a reading, and an absent key means PostgreSQL has not
@@ -1238,11 +1239,15 @@ scan's block counters remain visible while live tuples are sorted, so the
 counters are read together with `server_phase`, never on their own.
 
 Table progress during a concurrent index build is a whole-build estimate, not
-a phase ratio. pg-sprite derives it from the server phase and its counters,
-and SchemaBot reports it as a whole number rounded down, so it stays below 100
-until the apply completes. It never moves backwards within a build; a poll
-for which pg-sprite reports no percent — between phases, in a phase it does
-not know, or while the view cannot be read — keeps the last one.
+a phase ratio. pg-sprite derives it from the server phase and its counters.
+SchemaBot stores it on the table as a whole number rounded down, so it stays
+below 100 until the apply completes, and the PR comment and the CLI show it
+with two decimals from the `percent` metadata, so a large build visibly moves
+between polls. It never moves backwards within a build, decimals included; a
+poll for which pg-sprite reports no percent — between phases, in a phase it
+does not know, or while the view cannot be read — keeps the last one. A build
+running across several targets shows the mean of each target's whole percent,
+without decimals.
 
 ## SchemaBot storage
 

@@ -88,6 +88,10 @@ type trackedApply struct {
 	// concurrent index build is the one PostgreSQL change an operator can
 	// cancel, so the shape decides the answer before any server is asked.
 	concurrentIndex bool
+	// percentStep is the executor step the result's precise percent was
+	// read from. A percent measures one step's completion, so the
+	// never-regress floor holds only while later polls report that step.
+	percentStep string
 	// cancelApply ends the drive's own context. It is the cancel of last
 	// resort: the build backend is signalled through the tracker first, and
 	// the context is cancelled only when that signal cannot reach a running

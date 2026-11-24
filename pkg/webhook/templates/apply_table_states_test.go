@@ -21,7 +21,7 @@ func TestRenderTableProgress_EveryStateHasItsOwnRow(t *testing.T) {
 	table := TableProgressData{TableName: "users"}
 
 	var running strings.Builder
-	renderRunningTable(&running, schema.DialectMySQL, table, apitypes.BuildWork{}, nil)
+	renderInFlightTable(&running, schema.DialectMySQL, table, apitypes.BuildWork{}, nil)
 
 	v := reflect.ValueOf(state.Task)
 	for i := range v.NumField() {
