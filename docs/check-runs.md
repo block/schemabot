@@ -609,9 +609,13 @@ Release lock only
 Check still blocks if unapplied schema changes remain
 ```
 
-`schemabot unlock` releases locks. It does not make the required aggregate check
-pass; if the PR still contains unapplied schema changes, the aggregate remains
-blocked until a new plan shows no changes or the changes are applied.
+`schemabot unlock` releases locks, except a lock that an apply which has not
+settled still records, including a stopped apply. That lock stays held, and the
+command answers with the apply and what to do: wait for or cancel an active
+apply, resume or cancel a stopped one. Unlock does not make the required
+aggregate check pass; if the PR still contains unapplied schema changes, the
+aggregate remains blocked until a new plan shows no changes or the changes are
+applied.
 
 ```text
 PR closed
@@ -1120,7 +1124,10 @@ records the time to the microsecond.
 
 A `closed` webhook releases locks held by that PR and deletes SchemaBot's stored
 check records for the PR. It does not cancel in-flight applies. Those applies
-continue to their terminal state in Tern.
+continue to their terminal state in Tern. A lock that an apply which has not
+settled still records, including a stopped apply, is kept along with the PR's
+stored check records, so the apply stays protected until an operator resumes
+or cancels it and unlocks.
 
 GitHub check runs already published to commits remain in GitHub history, but
 SchemaBot removes its internal PR safety state because the PR is no longer
@@ -1138,10 +1145,13 @@ GitHub:
 
 A merged PR cannot reopen, so a merge skips the read.
 
-The retry is limited to five attempts, one minute apart. A GitHub outage that
-lasts longer, a suspended or removed App installation, or a deleted repository
-uses up those attempts. The lock then stays held and blocks other PRs on that
-database until an operator runs `schemabot unlock`.
+The retry is limited to five attempts. The wait between them doubles: one,
+two, four, then eight minutes, at least fifteen minutes in all. Each wait
+also gets a random extra of up to a quarter of its length, so deliveries
+that failed together do not all retry at the same moment. A GitHub outage
+that lasts longer, a suspended or removed App installation, or a deleted
+repository uses up those attempts. The lock then stays held and blocks other
+PRs on that database until an operator runs `schemabot unlock`.
 
 The read is made once, before cleanup starts. A PR that reopens while cleanup
 is already running is not seen by that cleanup, which finishes as if the PR
@@ -1395,9 +1405,11 @@ rollback watcher cannot overwrite a newer plan or newer apply result.
 
 ### Unlock
 
-`schemabot unlock` releases the PR's lock. It does not mark the aggregate check
-as passing. If the PR still contains unapplied schema changes, the aggregate
-continues to block until a new plan shows no changes or the changes are applied.
+`schemabot unlock` releases the PR's lock, unless an apply which has not
+settled still records it; see [Unlock And Close](#unlock-and-close). It does
+not mark the aggregate check as passing. If the PR still contains unapplied
+schema changes, the aggregate continues to block until a new plan shows no
+changes or the changes are applied.
 
 ### Schema changes but no configured environments are allowed
 

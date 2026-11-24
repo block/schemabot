@@ -291,7 +291,7 @@ func newStoppedApplyCheckFixture(t *testing.T, repo string, pr int, applySHA, he
 	f.db = db
 	f.store = st
 	f.service = svc
-	f.handler = NewHandler(svc, factory, nil, logger)
+	f.handler = NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 	f.apply = apply
 	return f
 }

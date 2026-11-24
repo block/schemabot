@@ -113,6 +113,7 @@ type nativeApply struct {
 	sql                        string
 	steps                      int
 	concurrentIndex            bool
+	enumValueAdd               bool
 	concurrentIndexMaxDuration time.Duration
 	cancelRequested            func() bool
 }
@@ -222,6 +223,17 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if err != nil {
 		slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned DDL is not one statement or a valid greenfield create set", tc.Table)
+	}
+	// A label addition to an enum type is the one shape that names a type
+	// rather than a table, so it is admitted on its own terms before the
+	// table privilege tiers, which have no rung for it.
+	enumStatement, enumValueAdd, err := isEnumValueAdd(statements)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
+	}
+	if enumValueAdd {
+		return validateEnumValueAdd(req, tc, enumStatement)
 	}
 	if _, err := preflight.RequiredTier(statements); err != nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: SchemaBot's PostgreSQL support does not execute this statement shape yet", tc.Table)
@@ -673,8 +685,9 @@ func (r *refusal) compose(err error) {
 }
 
 const (
-	replanRemedy    = "re-plan against the current schema"
-	clauseSeparator = "; "
+	replanRemedy             = "re-plan against the current schema"
+	invariantViolationRemedy = "inspect the target and server logs before re-running"
+	clauseSeparator          = "; "
 )
 
 // sequenceStepClause names the failed step of a multi-statement create set
@@ -715,6 +728,11 @@ func committedCreatePrefixDetail(err error, table string) (string, bool) {
 // and remedies leave unsanitized and classifyRefusal sanitizes the composed
 // detail at its return.
 func refusalForCause(err error, table string) *refusal {
+	// An enum step's own outcomes are decided first, so a missing grant on
+	// the type is named as the type's, not a table's.
+	if r := enumTypeRefusal(err, table); r != nil {
+		return r
+	}
 	var privilegeErr *preflight.PrivilegeError
 	if errors.As(err, &privilegeErr) {
 		object := "on table " + quotedTable(table)
@@ -958,6 +976,15 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "planned-object-drift",
 			cause:  fmt.Sprintf("the enum type the planned statement for %s names is a different type than the one checked", quotedTable(table)),
 			remedy: replanRemedy}, true
+	case executor.CodeEnumLabelExists, executor.CodeEnumNeighborMissing:
+		// The enum type gained the label the ADD VALUE adds, or lost the
+		// label it is placed next to, after planning, and nothing was added.
+		// enumTypeRefusal decides on the typed error first and names the
+		// labels; this arm keeps the switch total and gives the bare code the
+		// same verdict.
+		return &refusal{reason: "planned-object-drift",
+			cause:  fmt.Sprintf("the enum type the planned statement for %s names changed its labels after planning", quotedTable(table)),
+			remedy: replanRemedy}, true
 	case executor.CodeDataFault:
 		// The server rejected the table's rows as the statement would shape
 		// them (a value the new type will not hold, a constraint the rows
@@ -978,7 +1005,7 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		// apply fails closed until an operator has inspected the target.
 		return &refusal{reason: "engine-invariant-violation",
 			cause:  fmt.Sprintf("the engine's safety invariants did not hold while changing table %s", quotedTable(table)),
-			remedy: "inspect the target and server logs before re-running"}, true
+			remedy: invariantViolationRemedy}, true
 	case executor.CodeInvalidIndexOtherTable, executor.CodeInvalidIndexNotDroppable:
 		// The permanent members of the invalid-index family: the requested
 		// name is held by an entry this change can never clear — an invalid
@@ -1332,6 +1359,9 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 			return fmt.Errorf("apply row security for %q.%q: %w", change.namespace, change.table, err)
 		}
 		return nil
+	}
+	if change.enumValueAdd {
+		return executeEnumValueAdd(ctx, pool, change)
 	}
 	statements, err := postgresCreateSetStatements(change.sql)
 	if err != nil {

@@ -54,7 +54,7 @@ func (s *prClosedLockStore) GetByPR(_ context.Context, _ string, _ int) ([]*stor
 	return s.locks, nil
 }
 
-func (s *prClosedLockStore) ReleaseByID(_ context.Context, id int64, database, _, _, pendingPlanID string) error {
+func (s *prClosedLockStore) ReleaseByIDIfUnused(_ context.Context, id int64, database, _, _, pendingPlanID string) error {
 	s.releasedRows = append(s.releasedRows, pinnedRelease{id: id, pendingPlanID: pendingPlanID})
 	if err := s.releaseErr[database]; err != nil {
 		return err
@@ -106,7 +106,7 @@ func prClosedTestHandler(t *testing.T, st storage.Storage) *Handler {
 func prClosedTestHandlerWithGitHub(t *testing.T, st storage.Storage, factory *fakeClientFactory) *Handler {
 	t.Helper()
 	service := api.New(st, &api.ServerConfig{}, nil, testLogger())
-	return NewHandler(service, factory, nil, testLogger())
+	return NewHandler(service, factory, nil, testLogger(), WithInsecureSkipSignatureVerification())
 }
 
 // prClosedGitHub serves octocat/hello-world#1 with the given live state, or
@@ -424,6 +424,50 @@ func TestPRClosedKeepsALockHeldAgainAfterTheListing(t *testing.T) {
 
 			assert.Equal(t, []string{"billing"}, lockStore.released, "the lock held again stays held; the other is released")
 			assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must survive while a lock is held again after the listing")
+		})
+	}
+}
+
+// TestPRClosedKeepsALockAnUnsettledApplyRecords covers a close delivery whose
+// applies read finds nothing in flight on orders, and whose release of the
+// orders lock then finds an apply recording that lock row: one that became
+// durable after the read, or a stopped apply the read treats as finished.
+// The lock still protects that apply, so it stays held and the PR's stored
+// check state stays, exactly as for an apply the read found in flight. The
+// delivery completes: a retry would only find the same apply again. The PR's
+// other lock is still released.
+func TestPRClosedKeepsALockAnUnsettledApplyRecords(t *testing.T) {
+	tests := []struct {
+		name       string
+		applyState string
+		readSees   []*storage.Apply
+	}{
+		{name: "apply started after the applies read", applyState: state.Apply.Running},
+		{
+			name:       "stopped apply",
+			applyState: state.Apply.Stopped,
+			readSees:   []*storage.Apply{prClosedApply("orders", state.Apply.Stopped)},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			lockStore := &prClosedLockStore{
+				locks: []*storage.Lock{prClosedLock("orders"), prClosedLock("billing")},
+				releaseErr: map[string]error{"orders": &storage.LockInUseError{
+					LockID: 7,
+					Apply:  prClosedApply("orders", tc.applyState),
+				}},
+			}
+			checkStore := &prClosedCheckStore{}
+			st := &prClosedTestStorage{locks: lockStore, applies: &prClosedApplyStore{applies: tc.readSees}, checks: checkStore}
+
+			h := prClosedTestHandler(t, st)
+			ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true)
+			require.NoError(t, err, "a lock kept for an apply is the in-flight outcome, not a failure to retry")
+			assert.True(t, ran)
+
+			assert.Equal(t, []string{"billing"}, lockStore.released, "the lock the apply records stays held; the other is released")
+			assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must survive while an apply recording the PR's lock has not settled")
 		})
 	}
 }

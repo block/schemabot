@@ -1599,6 +1599,12 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "apply rejected: "+err.Error())
 			return
 		}
+		if released, ok := errors.AsType[*applyLockReleasedError](err); ok {
+			s.logger.Warn("apply rejected: the database lock it would record was released or acquired again while it was being queued; no apply was created",
+				"plan_id", req.PlanID, "database", released.Database, "environment", req.Environment, "error", released.Err)
+			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeLockChanged, "apply rejected: "+err.Error())
+			return
+		}
 		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
 			s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeSourcePolicyDenied, "apply failed: "+err.Error())
 			return
@@ -1682,6 +1688,11 @@ const applyMetricStatusRejected = "rejected"
 
 func applyMetricStatusForError(err error) string {
 	if errors.Is(err, storage.ErrActiveApplyExists) {
+		return "conflict"
+	}
+	// A lock released while the apply was being queued is a race with the
+	// operator who released it, not a server failure.
+	if _, ok := errors.AsType[*applyLockReleasedError](err); ok {
 		return "conflict"
 	}
 	if isPlanAdmissionRefusal(err) {
@@ -1858,6 +1869,38 @@ func isApplyCreationStorageRefusal(err error) bool {
 	}
 	return errors.Is(err, storage.ErrLockIntentChanged)
 }
+
+// isRecordedLockGone reports whether storing an apply failed because the lock
+// row it would record was released, or released and acquired again, after
+// apply creation read it. Storage locks that row in the transaction that
+// creates the apply, so a release that checks for applies before it deletes
+// the row cannot interleave with the create; the create refuses instead.
+func isRecordedLockGone(err error) bool {
+	if errors.Is(err, storage.ErrLockNotFound) {
+		return true
+	}
+	return errors.Is(err, storage.ErrLockReplaced)
+}
+
+// applyLockReleasedError refuses an apply whose database lock was released,
+// or released and acquired again, while the apply was being queued. No apply
+// was created.
+type applyLockReleasedError struct {
+	Database string
+	Err      error
+}
+
+// Error names which of the two happened, since they need different next steps:
+// a released lock has to be taken again, and a lock taken again may now be
+// someone else's.
+func (e *applyLockReleasedError) Error() string {
+	if errors.Is(e.Err, storage.ErrLockReplaced) {
+		return fmt.Sprintf("the lock on database %q was released and taken again while this apply was being queued, so nothing was queued; check who holds it with `schemabot locks`, then apply again", e.Database)
+	}
+	return fmt.Sprintf("the lock on database %q was released while this apply was being queued, so nothing was queued; take the lock again, then apply again", e.Database)
+}
+
+func (e *applyLockReleasedError) Unwrap() error { return e.Err }
 
 // PlanNotFoundError identifies an apply that names a plan SchemaBot has no
 // record of. It matches storage.ErrPlanNotFound, and carries the plan
@@ -2444,6 +2487,9 @@ func (s *Service) createStoredApply(
 	// apply exists, and handleApply's callers treat a 4xx as proof it does not.
 	storedApplyID, err := s.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)
 	if err != nil {
+		if isRecordedLockGone(err) {
+			return nil, 0, &applyLockReleasedError{Database: plan.Database, Err: err}
+		}
 		if isApplyCreationStorageRefusal(err) {
 			return nil, 0, fmt.Errorf("store apply and tasks: %w", err)
 		}
@@ -3611,12 +3657,12 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	}
 	schemaFiles, err := rollbackSchemaFiles(plan)
 	if err != nil {
-		return nil, terminalControlf("rollback source plan is invalid: %w", err)
+		return nil, authoredTerminalControlf("rollback source plan is invalid: %w", err)
 	}
 
 	deployment, err := storedDeploymentForApply(apply)
 	if err != nil {
-		return nil, terminalControlf("rollback source apply is invalid: %w", err)
+		return nil, authoredTerminalControlf("rollback source apply is invalid: %w", err)
 	}
 	if plan.Target == "" {
 		return nil, terminalControlf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
@@ -3624,12 +3670,18 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	if err := s.refuseMultiTargetRollback(ctx, apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
 		return nil, err
 	}
-	// Client resolution is a config lookup: a deployment that cannot resolve a
-	// Tern client resolves the same way on every attempt, so the failure is
-	// terminal until an operator fixes the routing configuration.
+	// A deployment missing from the server configuration, or configured in a way
+	// that can never produce a client, fails the same way on every attempt, so
+	// that answer is terminal. A secrets lookup for the DSN or token that failed
+	// can clear on a later attempt, so it stays retryable. The raw cause can carry DSN or host
+	// fragments and goes only to the server log; the returned error carries a
+	// message SchemaBot wrote, because the webhook posts it to the PR.
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
-		return nil, terminalControlf("database %q (%s): %w", apply.Database, apply.Environment, err)
+		s.logger.Error("failed to create Tern client",
+			append(apply.LogAttrs(),
+				"operation", "rollback_plan", "error", err)...)
+		return nil, controlTernClientFailure(apply, deployment, err)
 	}
 
 	prNumber := int32(apply.PullRequest)
@@ -3683,11 +3735,19 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 				Err:        err,
 			}
 		}
-		return nil, terminalControlf("rollback plan for database %q (%s): %w%s",
-			apply.Database, apply.Environment, err, recordedIgnoreTablesNote(req.IgnoreTables))
+		failure := &terminalControlError{err: fmt.Errorf("rollback plan for database %q (%s): %w%s",
+			apply.Database, apply.Environment, err, recordedIgnoreTablesNote(req.IgnoreTables))}
+		// A refusal is the engine's answer for whoever edits the schema
+		// files, so the requester sees it. Any other Plan failure can carry
+		// driver or transport text and stays in the server log.
+		if isPlanRefusal(err) {
+			failure.shown = fmt.Sprintf("rollback plan for database %q (%s): %s%s",
+				apply.Database, apply.Environment, planRefusalReason(err), recordedIgnoreTablesNote(req.IgnoreTables))
+		}
+		return nil, failure
 	}
 	if err := s.refuseDropsOfWithheldTables(req, resp, deployment); err != nil {
-		return nil, terminalControlf("rollback plan for database %q (%s): %w", apply.Database, apply.Environment, err)
+		return nil, authoredTerminalControlf("rollback plan for database %q (%s): %w", apply.Database, apply.Environment, err)
 	}
 	s.normalizeExecutionVerdicts(resp, apply.Database, deployment)
 	route := storedPlanRoute{
@@ -3925,4 +3985,17 @@ func PlanFailureLog(logger *slog.Logger, err error) func(msg string, args ...any
 		return logger.Warn
 	}
 	return logger.Error
+}
+
+// planRefusalReason is a refusal's own text, without the gRPC status prefix a
+// remote data plane's answer carries. It reads the status itself, since
+// grpcstatus.FromError puts the whole wrapped text back into the message.
+func planRefusalReason(err error) string {
+	var remote interface{ GRPCStatus() *grpcstatus.Status }
+	if errors.As(err, &remote) {
+		if st := remote.GRPCStatus(); st != nil {
+			return st.Message()
+		}
+	}
+	return err.Error()
 }

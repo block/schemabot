@@ -66,7 +66,7 @@ func TestRefreshChecksForTerminalApply_CompletedRollbackIsActionRequired(t *test
 	ghClient.BaseURL, err = url.Parse("http://127.0.0.1:0/")
 	require.NoError(t, err)
 	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghClient, logger)}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-rollback-terminal",

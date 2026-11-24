@@ -277,7 +277,7 @@ func TestResumeClaimedApply_DriveLogsCarryApplyIdentity(t *testing.T) {
 
 	// The call site passes only the message — every identity attr must come
 	// from the bound logger.
-	noStore := requireLogLine(t, lines, "operator: no apply log store configured; the apply's own log will not state that a driver claimed it to resume it")
+	noStore := requireLogLine(t, lines, "operator: no apply log store configured; the apply's own log will not state that a driver claimed it")
 	assertDriveIdentity(noStore)
 
 	resumedLine := requireLogLine(t, lines, "operator: resumed apply")

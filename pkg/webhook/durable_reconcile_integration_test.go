@@ -50,7 +50,7 @@ func setupSynthesizedDispatchTest(t *testing.T, dbName, headSHA string) (*Handle
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
 	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger,
-		WithDurableWebhookDispatch(), WithWebhookReconciler(), WithWebhookReconcileSynthesis())
+		WithDurableWebhookDispatch(), WithWebhookReconciler(), WithWebhookReconcileSynthesis(), WithInsecureSkipSignatureVerification())
 
 	inserted, resynthesized, err := h.synthesizeMissingHeadDelivery(t.Context(), "OctoCat/Hello-World", 1, headSHA, 12345)
 	require.NoError(t, err)
