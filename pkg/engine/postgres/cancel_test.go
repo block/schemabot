@@ -65,7 +65,7 @@ func runningDrive(t *testing.T, tracker buildTracker, concurrentIndex bool) (*En
 	eng := &Engine{progress: map[string]*trackedApply{
 		cancelTestKey: {
 			result: &engine.ProgressResult{State: engine.StateRunning}, tracker: tracker,
-			logger: slog.New(slog.DiscardHandler), concurrentIndex: concurrentIndex,
+			logger: slog.New(slog.DiscardHandler), cancellableBuild: concurrentIndex,
 			cancelApply: func() {
 				cancel()
 				select {
@@ -187,6 +187,43 @@ func TestCancelFallsBackToTheApplyContextWhenTheBuildCannotBeSignalled(t *testin
 			assert.True(t, requestedCancel(t, eng), "the flag stays set: a signal that failed late may still have landed")
 		})
 	}
+}
+
+// A partitioned build's signal reaches only the partition build in flight,
+// which may finish before the signal lands and leave the next partition to
+// start. The cancel also ends the drive's context, so the build stops at the
+// partition it is on and settles cancelled. A build that had finished every
+// partition by then is reported as completed.
+func TestCancelOfAPartitionedBuildEndsTheDrive(t *testing.T) {
+	partitionedDrive := func(t *testing.T, tracker buildTracker) (*Engine, *fakeDrive) {
+		eng, drive := runningDrive(t, tracker, true)
+		eng.progress[cancelTestKey].partitionedBuild = true
+		return eng, drive
+	}
+
+	t.Run("the next partition does not start", func(t *testing.T) {
+		tracker := &fakeBuildTracker{}
+		eng, drive := partitionedDrive(t, tracker)
+		drive.settleWhenCancelled(engine.StateCancelled)
+
+		result, err := eng.Cancel(t.Context(), cancelRequest())
+		require.NoError(t, err)
+		assert.True(t, result.Accepted)
+		assert.True(t, tracker.cancelled.Load(), "the partition in flight is signalled first")
+		assert.True(t, drive.wasCancelled(), "the drive is ended so no later partition starts")
+		assert.True(t, requestedCancel(t, eng))
+	})
+
+	t.Run("a build that finished every partition stays completed", func(t *testing.T) {
+		tracker := &fakeBuildTracker{}
+		eng, drive := partitionedDrive(t, tracker)
+		drive.settleWhenCancelled(engine.StateCompleted)
+
+		_, err := eng.Cancel(t.Context(), cancelRequest())
+		require.Error(t, err)
+		assert.True(t, engine.IsAlreadyCompleted(err), "the build had already finished: %v", err)
+		assert.True(t, drive.wasCancelled())
+	})
 }
 
 // A cancel whose signal arrives after the build has finished is answered by
@@ -528,7 +565,7 @@ func TestOutsideCancelWhileOperatorCancelWaits(t *testing.T) {
 				}
 				require.NoError(t, got.err)
 				assert.True(t, got.result.Accepted)
-				assert.Equal(t, "Concurrent index build cancelled", got.result.Message)
+				assert.Equal(t, "Index build cancelled", got.result.Message)
 				assert.True(t, requestedCancel(t, eng))
 			})
 		})
@@ -670,7 +707,7 @@ func TestCancelThatSendsNothingDoesNotWithdrawAnOverlappingCancel(t *testing.T) 
 			}
 			require.NoError(t, got.err)
 			assert.True(t, got.result.Accepted)
-			assert.Equal(t, "Concurrent index build cancelled", got.result.Message)
+			assert.Equal(t, "Index build cancelled", got.result.Message)
 			assert.Equal(t, engine.StateCancelled, drive.publishedState())
 			assert.True(t, requestedCancel(t, eng))
 		})

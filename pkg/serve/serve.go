@@ -460,9 +460,13 @@ func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os
 	// RPC or claimed an apply, a webhook delivery or a lease. Until a server
 	// serves a listener, nothing else closes it, so a failed bind closes the
 	// ones already bound.
+	listen := srv.listen
+	if listen == nil {
+		listen = listenForServe
+	}
 	var bound []net.Listener
 	bind := func(name, port string) (net.Listener, error) {
-		listener, err := listenForServe(runCtx, name, port)
+		listener, err := listen(runCtx, name, port)
 		if err != nil {
 			for _, earlier := range bound {
 				err = errors.Join(err, earlier.Close())
@@ -583,6 +587,11 @@ type Server struct {
 	telemetry  *api.Telemetry
 	authz      auth.Authorizer
 	engines    map[string]tern.EngineFactory
+	// listen binds the port a named server will serve on. It is nil outside
+	// tests, which means listenForServe. A test sets it to hand over listeners
+	// it already holds, because a port it chose and released can be taken by
+	// another process before the server binds it.
+	listen func(ctx context.Context, name, port string) (net.Listener, error)
 	// probeCancel and probeDone are set by Start when a startup target probe is
 	// launched; Close cancels the probe and waits on probeDone so an in-flight
 	// probe never outlives the resolver and clients svc.Close tears down.

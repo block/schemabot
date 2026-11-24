@@ -1911,6 +1911,12 @@ the re-plan speaks for a shard-tagged task at all. `remainingPlannedChanges` on 
 path of the PlanetScale engine (`pkg/engine/planetscale/apply.go`) runs only reviewed DDL for the
 tables the branch still lacks, refuses a branch that differs outside the reviewed DDL, and
 validates the branch against the declared schema before creating or adopting the deploy request.
+On PostgreSQL, a statement that drops a column, a constraint, or a NOT NULL runs only with the
+planner's record of that object, which the plan stores with the change and every apply path passes
+back, matching a task to its change by the statement's canonical form (`planChangeMetadata` in
+`pkg/tern/plan_change_metadata.go`); the apply refuses a drop with no record
+and drops nothing when the object no longer matches it under the table's lock
+(`reviewedDropForApply` and `executeReviewedDrop` in `pkg/engine/postgres/apply.go`).
 The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
 and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
@@ -1980,7 +1986,7 @@ The byte bound has no exact corroboration and approves on its estimate. The verd
 belongs to the target that will run the statement: a deployment that applies a plan it did not
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
 planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the
-privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS admission refusals
+privilege, size, and partitioned index shape gates in `pkg/engine/postgres/postgres.go`, plus RLS admission refusals
 in `pkg/engine/postgres/row_security.go` and enum type refusals, the type privilege gate, and
 blocked label additions in `pkg/engine/postgres/enum_type.go` that abort plan creation or mark the
 plan blocked, and the apply-time gates in `pkg/engine/postgres/row_security_apply.go` and

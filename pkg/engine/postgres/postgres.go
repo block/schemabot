@@ -84,10 +84,16 @@ type trackedApply struct {
 	result  *engine.ProgressResult
 	tracker buildTracker
 	logger  *slog.Logger
-	// concurrentIndex records the shape the apply was admitted as: a
-	// concurrent index build is the one PostgreSQL change an operator can
-	// cancel, so the shape decides the answer before any server is asked.
-	concurrentIndex bool
+	// cancellableBuild records the shape the apply was admitted as: an
+	// index build, concurrent or partition by partition, is the one
+	// PostgreSQL change an operator can cancel, so the shape decides the
+	// answer before any server is asked.
+	cancellableBuild bool
+	// partitionedBuild records that the build runs one concurrent build per
+	// partition. A cancel signal reaches only the partition build in flight,
+	// which can finish before the signal lands, so Cancel also ends the
+	// drive's context to keep the next partition from starting.
+	partitionedBuild bool
 	// percentStep is the executor step the result's precise percent was
 	// read from. A percent measures one step's completion, so the
 	// never-regress floor holds only while later polls report that step.
@@ -580,6 +586,14 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 				stepMode = engine.ExecutionModeBlocked
 				stepReason = fmt.Sprintf("statement for table %q is a shape SchemaBot's PostgreSQL support does not execute yet; rewriting the change cannot make it eligible", table)
 			}
+			metadata, unrecordedDrop, err := stepDropMetadata(statement, sql)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("record the reviewed drop for table %q: %w", report.Table, err)
+			}
+			if unrecordedDrop && stepMode == "" {
+				stepMode = engine.ExecutionModeBlocked
+				stepReason = fmt.Sprintf("statement for table %q drops an object the planner did not record, so the apply cannot check that it is still the object this plan reviewed; make the change outside SchemaBot", table)
+			}
 			// Verdict reasons quote the table name, a planner-sourced
 			// identifier, so the reserved cause separator is neutralized
 			// before the reason becomes one cause of the verdict.
@@ -591,6 +605,7 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 				UnsafeReason:  destructiveReason(statement.Destructive, table),
 				ExecutionMode: stepMode,
 				ModeReason:    engine.SanitizeBlockedCause(stepReason),
+				Metadata:      metadata,
 			})
 			tiers = append(tiers, stepTier)
 		}
@@ -902,7 +917,7 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 	reason := engine.SanitizeBlockedCause(singleLine(fmt.Sprintf("statement for table %q: %s", report.Table, r.detail)))
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
-		if err := blockRewriteSteps(changes, reason); err != nil {
+		if err := blockRewriteSteps(changes, reason, partitionedIndexBuildSteps(report)); err != nil {
 			if fullyBlocked {
 				slog.Warn("PostgreSQL table size check could not classify a blocked step; existing blocked plan verdicts remain unchanged",
 					"database", database,
@@ -933,18 +948,21 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 }
 
 // blockRewriteSteps marks every step whose native cost scales with the existing
-// table blocked with the reason. A concurrent index build keeps its verdict: it
-// is bounded by its duration envelope rather than the table size ceiling. An
-// earlier blocked verdict retains its reason and gains the independent size
-// cause so the operator can resolve both without another planning round trip.
+// table blocked with the reason. Two index builds keep their verdict, because
+// each is bounded by the concurrent index duration envelope rather than the
+// table size ceiling: a concurrent index build, and a step the planner routed
+// to the partitioned index build, named by partitionedBuilds, which builds one
+// partition at a time under that envelope per partition. An earlier blocked
+// verdict retains its reason and gains the independent size cause so the
+// operator can resolve both without another planning round trip.
 // parser.Classify in tableChanges parsed every rendered statement, including
 // blocked steps, with the same single-statement requirements used here. A
 // statement that now fails to classify is therefore an invariant violation.
 // Every step is classified before any verdict is written, so a caller that
 // keeps the plan on that error keeps it exactly as it was rather than with
 // the size cause on some steps and not others.
-func blockRewriteSteps(changes []engine.TableChange, reason string) error {
-	concurrentIndexes := make([]bool, len(changes))
+func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedBuilds map[string]bool) error {
+	durationBounded := make([]bool, len(changes))
 	for i := range changes {
 		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
 			continue
@@ -953,13 +971,13 @@ func blockRewriteSteps(changes []engine.TableChange, reason string) error {
 		if err != nil {
 			return fmt.Errorf("classify planned statement for table %q: %w", changes[i].Table, err)
 		}
-		concurrentIndexes[i] = concurrentIndex
+		durationBounded[i] = concurrentIndex || partitionedBuilds[changes[i].DDL]
 	}
 	for i := range changes {
 		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
 			continue
 		}
-		if concurrentIndexes[i] {
+		if durationBounded[i] {
 			continue
 		}
 		if changes[i].ExecutionMode == engine.ExecutionModeBlocked {
@@ -973,6 +991,21 @@ func blockRewriteSteps(changes []engine.TableChange, reason string) error {
 		changes[i].ModeReason = reason
 	}
 	return nil
+}
+
+// partitionedIndexBuildSteps returns the planned steps the planner routed to
+// the partitioned index build, keyed by the DDL tableChanges renders for them.
+func partitionedIndexBuildSteps(report pgplan.Report) map[string]bool {
+	steps := make(map[string]bool)
+	for _, statement := range report.Statements {
+		if statement.Execution != planner.ExecutionPartitionedIndexBuild {
+			continue
+		}
+		for _, sql := range statement.ExecSQL {
+			steps[sql] = true
+		}
+	}
+	return steps
 }
 
 // concurrentIndexStatement reports whether sql is a single CREATE INDEX
@@ -1385,6 +1418,11 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 	if verdict, ok := executionContractVerdict(statement.Execution, table); !ok {
 		return verdict
 	}
+	if statement.Execution == planner.ExecutionPartitionedIndexBuild {
+		if verdict, ok := partitionedIndexShapeVerdict(statement.ExecSQL, table); !ok {
+			return verdict
+		}
+	}
 	if statement.Disposition == router.DispositionExecute && statement.Route == planner.RouteNative &&
 		statement.Backend == router.BackendNative && len(statement.ExecSQL) > 0 {
 		return stepVerdict{}
@@ -1460,26 +1498,16 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 
 // executionContractVerdict checks the execution contract the planner attached
 // to a statement's steps, which says how they must run. SchemaBot runs a
-// statement's steps one at a time, each in its own transaction, so that
-// contract, or no steps at all, leaves the verdict to the disposition and
-// reports ok. Any other contract is a blocked verdict, since running its
-// steps one at a time is not what the contract asks for:
-//
-//   - A partitioned index build's one step is a CREATE INDEX on a partitioned
-//     table that must not run as written, because the plain statement builds
-//     every partition's index under a lock that blocks writes to the whole
-//     table. SchemaBot does not drive the partition-by-partition build yet.
-//   - A contract this build does not know is reported as vocabulary that
-//     moved, so the caller logs it.
+// statement's steps one at a time, each in its own transaction, and it runs a
+// partitioned index build's one step through pg-sprite's partition-by-partition
+// build, so either contract, or no steps at all, leaves the verdict to the
+// disposition and reports ok. A contract this build does not know is a blocked
+// verdict reported as vocabulary that moved, so the caller logs it: running
+// its steps one at a time may not be what the contract asks for.
 func executionContractVerdict(execution planner.Execution, table string) (stepVerdict, bool) {
 	switch execution {
-	case "", planner.ExecutionAutocommit:
+	case "", planner.ExecutionAutocommit, planner.ExecutionPartitionedIndexBuild:
 		return stepVerdict{}, true
-	case planner.ExecutionPartitionedIndexBuild:
-		return stepVerdict{
-			mode:   engine.ExecutionModeBlocked,
-			reason: fmt.Sprintf("statement for table %q builds an index on a partitioned table, which has to be built one partition at a time, and SchemaBot does not run that build yet; build it outside SchemaBot one partition at a time, then re-plan", table),
-		}, false
 	default:
 		return stepVerdict{
 			mode:         engine.ExecutionModeBlocked,
@@ -1487,6 +1515,32 @@ func executionContractVerdict(execution planner.Execution, table string) (stepVe
 			unrecognized: &unrecognizedPlannerVocabulary{kind: "execution", value: string(execution)},
 		}, false
 	}
+}
+
+// partitionedIndexShapeVerdict runs the partitioned index build's own shape
+// admission over the planned step, so a statement the build would refuse
+// before touching the target, such as one naming a TABLESPACE, is blocked on
+// the plan instead of failing at apply. The build takes exactly one statement;
+// any other step count means the plan contract moved under this build.
+func partitionedIndexShapeVerdict(execSQL []string, table string) (stepVerdict, bool) {
+	if len(execSQL) != 1 {
+		return stepVerdict{
+			mode:         engine.ExecutionModeBlocked,
+			reason:       fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table),
+			unrecognized: &unrecognizedPlannerVocabulary{kind: "partitioned_index_build_steps", value: strconv.Itoa(len(execSQL))},
+		}, false
+	}
+	err := executor.AdmitPartitionedIndexShape(execSQL[0])
+	if err == nil {
+		return stepVerdict{}, true
+	}
+	if r := classifyRefusal(err, table); r != nil {
+		return stepVerdict{mode: engine.ExecutionModeBlocked, reason: fmt.Sprintf("statement for table %q: %s", table, r.detail)}, false
+	}
+	return stepVerdict{
+		mode:   engine.ExecutionModeBlocked,
+		reason: fmt.Sprintf("statement for table %q builds an index on a partitioned table in a shape SchemaBot's PostgreSQL support does not run", table),
+	}, false
 }
 
 // createShapeRefusalReason renders the create path's typed refusal cause in
@@ -1751,10 +1805,10 @@ func applyGoroutineExited(tracked *trackedApply) bool {
 // shutdown open.
 func (e *Engine) HaltForShutdown(ctx context.Context) error {
 	e.mu.Lock()
-	halted := e.cancelConcurrentBuildsLocked(func(*trackedApply) bool { return true })
+	halted := e.cancelIndexBuildsLocked(func(*trackedApply) bool { return true })
 	e.mu.Unlock()
 	if halted > 0 {
-		slog.Info("PostgreSQL engine halting concurrent index builds for shutdown", "builds", halted)
+		slog.Info("PostgreSQL engine halting index builds for shutdown", "builds", halted)
 	}
 
 	// Wait off the calling goroutine so work that will not come down bounds
@@ -1779,7 +1833,7 @@ func (e *Engine) HaltForShutdown(ctx context.Context) error {
 func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
 	e.mu.Lock()
 	owned := func(tracked *trackedApply) bool { return tracked.owner == owner }
-	halted := e.cancelConcurrentBuildsLocked(owned)
+	halted := e.cancelIndexBuildsLocked(owned)
 	var pending []chan struct{}
 	for _, tracked := range e.progress {
 		if owned(tracked) {
@@ -1788,7 +1842,7 @@ func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
 	}
 	e.mu.Unlock()
 	if halted > 0 {
-		slog.Info("PostgreSQL engine halting the concurrent index builds a drive started as it returns", "builds", halted)
+		slog.Info("PostgreSQL engine halting the index builds a drive started as it returns", "builds", halted)
 	}
 
 	for _, done := range pending {
@@ -1801,12 +1855,12 @@ func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
 	return nil
 }
 
-// cancelConcurrentBuildsLocked ends the running concurrent index builds that
+// cancelIndexBuildsLocked ends the running index builds that
 // selected picks and returns how many it ended. The caller holds e.mu.
-func (e *Engine) cancelConcurrentBuildsLocked(selected func(*trackedApply) bool) int {
+func (e *Engine) cancelIndexBuildsLocked(selected func(*trackedApply) bool) int {
 	halted := 0
 	for _, tracked := range e.progress {
-		if selected(tracked) && tracked.concurrentIndex && !tracked.result.State.IsTerminal() && tracked.cancelApply != nil {
+		if selected(tracked) && tracked.cancellableBuild && !tracked.result.State.IsTerminal() && tracked.cancelApply != nil {
 			tracked.cancelApply()
 			halted++
 		}

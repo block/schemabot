@@ -219,15 +219,11 @@ func TestExecutionVerdictEmptyCreateShapeCause(t *testing.T) {
 	}, "users", nil))
 }
 
-// An index build on a partitioned table has to run one partition at a time;
-// run as the plain statement it would lock the whole partition tree against
-// writes. SchemaBot does not drive that build, so a plan carrying it blocks
-// the statement in SchemaBot's words instead of running the native step.
-func TestExecutionVerdictBlocksPartitionedIndexBuild(t *testing.T) {
-	assert.Equal(t, stepVerdict{
-		mode:   engine.ExecutionModeBlocked,
-		reason: `statement for table "events" builds an index on a partitioned table, which has to be built one partition at a time, and SchemaBot does not run that build yet; build it outside SchemaBot one partition at a time, then re-plan`,
-	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
+// TestExecutionVerdictRunsPartitionedIndexBuild pins that the planner's
+// partitioned index build is an executable step: SchemaBot runs it through
+// pg-sprite's partition-by-partition build rather than as the statement.
+func TestExecutionVerdictRunsPartitionedIndexBuild(t *testing.T) {
+	assert.Equal(t, stepVerdict{}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
 		Disposition: router.DispositionExecute,
 		Route:       planner.RouteNative,
 		Backend:     router.BackendNative,
@@ -236,18 +232,40 @@ func TestExecutionVerdictBlocksPartitionedIndexBuild(t *testing.T) {
 	}, "events", nil))
 }
 
-// Every execution contract the planner can attach either runs as SchemaBot's
-// per-step native path or is blocked in SchemaBot's words; only a contract
-// outside the planner's closed set is reported as vocabulary that moved.
+// TestExecutionVerdictBlocksPartitionedIndexShapeTheBuildRefuses pins that a
+// partitioned index build the executor would refuse at admission is blocked
+// on the plan, in the same words the apply would fail with, so the refusal
+// gates the apply instead of surfacing after it starts.
+func TestExecutionVerdictBlocksPartitionedIndexShapeTheBuildRefuses(t *testing.T) {
+	statement := pgplan.Statement{
+		Disposition: router.DispositionExecute,
+		Route:       planner.RouteNative,
+		Backend:     router.BackendNative,
+		Execution:   planner.ExecutionPartitionedIndexBuild,
+		ExecSQL:     []string{"CREATE INDEX events_created_at_idx ON public.events (created_at) TABLESPACE fast"},
+	}
+	assert.Equal(t, stepVerdict{
+		mode:   engine.ExecutionModeBlocked,
+		reason: `statement for table "events": the index on "events" names a TABLESPACE, which the partitions' indexes would not use; remove the TABLESPACE clause from the schema file, then re-plan against the current schema`,
+	}, executionVerdict(pgplan.FormatVersion, statement, "events", nil))
+
+	statement.ExecSQL = []string{"CREATE INDEX a_idx ON public.events (a)", "CREATE INDEX b_idx ON public.events (b)"}
+	assert.Equal(t, stepVerdict{
+		mode:         engine.ExecutionModeBlocked,
+		reason:       `statement for table "events" has an unrecognized planner verdict`,
+		unrecognized: &unrecognizedPlannerVocabulary{kind: "partitioned_index_build_steps", value: "2"},
+	}, executionVerdict(pgplan.FormatVersion, statement, "events", nil))
+}
+
+// Every execution contract the planner can attach runs; only a contract
+// outside the planner's closed set is blocked, and reported as vocabulary
+// that moved.
 func TestExecutionContractVerdictCoversEveryExecution(t *testing.T) {
 	for _, execution := range planner.Executions() {
 		t.Run(string(execution), func(t *testing.T) {
 			verdict, runs := executionContractVerdict(execution, "users")
-			assert.Nil(t, verdict.unrecognized, "a contract the planner names must have a sentence of its own")
-			if !runs {
-				assert.Equal(t, engine.ExecutionModeBlocked, verdict.mode)
-				assert.NotEmpty(t, verdict.reason)
-			}
+			assert.True(t, runs, "a contract the planner names must run")
+			assert.Equal(t, stepVerdict{}, verdict)
 		})
 	}
 
@@ -1116,11 +1134,12 @@ func TestConcurrentIndexStatement(t *testing.T) {
 	assert.Contains(t, err.Error(), "parse PostgreSQL statement")
 }
 
-// TestBlockRewriteStepsKeepsEarlierVerdictsAndConcurrentBuilds proves the size
+// TestBlockRewriteStepsKeepsEarlierVerdictsAndIndexBuilds proves the size
 // verdict lands only on the steps it is about: a step an earlier gate already
 // blocked keeps that gate's reason before the appended size cause, and a
-// concurrent index build stays executable under its own bound.
-func TestBlockRewriteStepsKeepsEarlierVerdictsAndConcurrentBuilds(t *testing.T) {
+// concurrent index build and a partitioned index build stay executable under
+// their own bound.
+func TestBlockRewriteStepsKeepsEarlierVerdictsAndIndexBuilds(t *testing.T) {
 	changes := []engine.TableChange{
 		{
 			Table:         "users",
@@ -1130,17 +1149,24 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndConcurrentBuilds(t *testing.T) 
 		},
 		{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text"},
 		{Table: "users", DDL: "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"},
+		{Table: "users", DDL: "CREATE INDEX users_name_idx ON public.users (name)"},
+		{Table: "users", DDL: "CREATE INDEX users_age_idx ON public.users (age)"},
 	}
+	partitionedBuilds := map[string]bool{"CREATE INDEX users_name_idx ON public.users (name)": true}
 
-	require.NoError(t, blockRewriteSteps(changes, "size verdict"))
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds))
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
 	assert.Equal(t, []string{"privilege verdict", "size verdict"}, engine.BlockedCauses(changes[0].ModeReason))
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
 	assert.Empty(t, changes[2].ExecutionMode)
 	assert.Empty(t, changes[2].ModeReason)
+	assert.Empty(t, changes[3].ExecutionMode, "a partitioned index build is bounded per partition, not by the table size")
+	assert.Empty(t, changes[3].ModeReason)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[4].ExecutionMode, "a plain index build the planner did not route to the partitioned build stays under the ceiling")
+	assert.Equal(t, "size verdict", changes[4].ModeReason)
 
-	require.NoError(t, blockRewriteSteps(changes, "size verdict"))
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds))
 	assert.Equal(t, []string{"privilege verdict", "size verdict"}, engine.BlockedCauses(changes[0].ModeReason))
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
 }
@@ -1152,7 +1178,7 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndConcurrentBuilds(t *testing.T) 
 func TestBlockRewriteStepsFailsClosedOnUnparseableStep(t *testing.T) {
 	changes := []engine.TableChange{{Table: "users", DDL: "ALTER TABLE public.users ADD"}}
 
-	err := blockRewriteSteps(changes, "size verdict")
+	err := blockRewriteSteps(changes, "size verdict", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `classify planned statement for table "users"`)
 	assert.Empty(t, changes[0].ExecutionMode)

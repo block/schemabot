@@ -218,6 +218,9 @@ func TestPlans(t *testing.T, h Harness) {
 			Operation:    "alter",
 			IsUnsafe:     true,
 			UnsafeReason: "DROP COLUMN removes data",
+			// The engine's plan-time record must survive storage, since the
+			// apply reads it back from the stored plan.
+			Metadata: map[string]string{"reviewed_drop": `{"kind":"column","name":"email"}`},
 		}
 		planID, err := store.Plans().Create(ctx, &storage.Plan{
 			PlanIdentifier: "plan_shards",

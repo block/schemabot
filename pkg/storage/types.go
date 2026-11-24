@@ -923,6 +923,12 @@ type TableChange struct {
 	// moves, with how each move changes the way values compare. Empty when
 	// the change re-collates no column, or the engine does not report it.
 	CollationChanges []CollationChange `json:"collation_changes,omitempty"`
+
+	// Metadata is what the engine recorded about this change at plan time
+	// and needs back at apply time (engine.TableChange.Metadata). It is
+	// stored with the reviewed plan so the apply runs against what was
+	// reviewed rather than against a fresh read of the target.
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // CollationChange is one existing column a planned change moves onto another

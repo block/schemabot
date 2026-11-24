@@ -5,7 +5,6 @@
 ## Table of Contents
 
 - [Beta status](#beta-status)
-- [Schema pull](#schema-pull)
 - [Where it runs](#where-it-runs)
 - [What pg-sprite does](#what-pg-sprite-does)
 - [How a change runs](#how-a-change-runs)
@@ -16,7 +15,7 @@
 - [Blocked plans](#blocked-plans)
 - [Apply-time refusals](#apply-time-refusals)
 - [Unsupported workflow features](#unsupported-workflow-features)
-- [Schema pull](#schema-pull-1)
+- [Schema pull](#schema-pull)
 - [Row-level security](#row-level-security)
 - [Configuration and credentials](#configuration-and-credentials)
 - [Table ownership](#table-ownership)
@@ -62,6 +61,9 @@ early release.
   default).
 - Adding an index to an existing table with `CREATE INDEX CONCURRENTLY`. You
   can cancel a build that is running.
+- Adding an index to a partitioned table. SchemaBot builds it one partition
+  at a time, and applying the plan again after a cancel or failure resumes
+  from the partitions already built.
 - Creating a table together with its indexes.
 - Adding labels to an existing enum type (see [Enum types](#enum-types)).
 - Row-level security policies on an existing table.
@@ -84,10 +86,9 @@ early release.
   `stop`, `start`, `cutover`, deferred cutover, `revert`, and `skip-revert`
   are not available. See
   [Unsupported workflow features](#unsupported-workflow-features).
-- **An index on a partitioned table's parent.** The plan is blocked, because
-  the index has to be built one partition at a time and SchemaBot does not
-  run that build yet. Some other changes to a partitioned parent are refused
-  when the apply runs; see [Partitioned tables](#partitioned-tables).
+- **Some changes to a partitioned table's parent**, such as a `NOT VALID`
+  foreign key before PostgreSQL 18, are refused when the apply runs. See
+  [Partitioned tables](#partitioned-tables).
 - **Row-level security beyond existing tables.** Declaring it on a new table,
   or changing policies and structure in the same plan, is blocked. A plan for
   a namespace with managed row-level security cannot be rolled back. See
@@ -111,7 +112,6 @@ can only run against the live table, when the apply starts:
 
 [Apply-time refusals](#apply-time-refusals) lists every check that runs then.
 
-## Schema pull
 ## Where it runs
 
 SchemaBot works with PostgreSQL 14 and later, self-hosted or managed,
@@ -363,14 +363,15 @@ conditions:
   [Index builds](#index-builds)). Statement kinds outside that set fail
   closed.
 - For a change to an existing table, the target is an ordinary or partitioned
-  table. Native `ALTER TABLE` and blocking `CREATE INDEX` statements also
-  require its measured on-disk size to be no more than
+  table. Native `ALTER TABLE` statements also require its measured on-disk
+  size to be no more than
   the configured native-apply ceiling (1 GiB by default; see
   `postgres.native_safe_table_size_limit_bytes` in
   [configuration](configuration.md)). For a partitioned parent, the
   measurement includes its complete partition tree. The ceiling bounds
   work that scales with existing data, so it does not apply to a `CREATE
-  TABLE` or `CREATE INDEX CONCURRENTLY`.
+  TABLE`, a `CREATE INDEX CONCURRENTLY`, or an index built on a partitioned
+  table, which the duration bound covers instead.
 - The target role passes the privilege preflight for the planned statement.
   A greenfield create is checked against the schema — the role needs `CREATE`
   on the target schema — because no table exists to state facts about.
@@ -384,6 +385,9 @@ conditions:
   The catalog reads pg-sprite runs in the build's own session ahead of the
   build share its `statement_timeout`, so the bound ends one of those too and
   the failure names the option all the same.
+- An index built on a partitioned table uses the same bound twice: each
+  partition's build gets the full bound, and so does the build as a whole.
+  See [Partitioned index builds](#partitioned-index-builds).
 
 The common supported case is a metadata-only `ALTER TABLE`, such as adding a
 nullable column:
@@ -456,15 +460,52 @@ recovery that cannot prove the entry unchanged through to its removal fails
 retryable the same way; one that finds the connection pool a session short is
 refused permanently, since a retry sees the same pool. A concurrent build against a partitioned
 parent is refused permanently, because PostgreSQL cannot build parent-level
-indexes concurrently.
+indexes concurrently. An index on a partitioned parent is written without
+`CONCURRENTLY` and built one partition at a time instead; see
+[Partitioned index builds](#partitioned-index-builds).
 
 Indexes declared together with a new table take a different path: they run as
 plain, non-concurrent steps inside the greenfield create set, because the table
 has no readers yet (see [Greenfield tables](#greenfield-tables)).
 
+### Partitioned index builds
+
+PostgreSQL cannot build an index on a partitioned table's parent
+concurrently, and a plain `CREATE INDEX` on the parent blocks writes to every
+partition until it finishes. So when a schema file adds an index to a
+partitioned table, the plan shows the parent's statement, such as
+`CREATE INDEX events_kind_idx ON ONLY public.events USING btree (kind)`, and
+the apply runs it through pg-sprite's partitioned index build:
+
+1. Create the index on the parent only. It starts invalid.
+2. For each partition, build its index concurrently and attach it to the
+   parent's index.
+3. Confirm the parent's index is valid, which PostgreSQL allows only once
+   every partition has an attached index.
+
+The build holds the parent's advisory lock throughout and needs a target
+connection pool of at least two connections. Each partition's build is bounded
+by `postgres.concurrent_index_max_duration`, and the build as a whole runs
+under a deadline of the same bound. The table size ceiling does not apply.
+
+The build resumes. A partition whose index is already built and attached is
+kept, so applying the same plan again after a failure, a cancel, or a
+shutdown builds only the partitions that are left. A build that runs past its
+deadline after it finished at least one partition fails retryable for this
+reason. A build that runs past its deadline before it finished any partition
+fails without a retry, since applying again would spend the same deadline on
+the same partition: raise `postgres.concurrent_index_max_duration` and apply
+again. Both details name the option.
+
+The plan refuses shapes the build cannot run, such as a `TABLESPACE` clause,
+`IF NOT EXISTS`, or an unnamed index. If the table is no longer partitioned
+when the apply runs, the apply is refused before it touches the table, and
+the detail asks you to plan again.
+
 ### Control operations
 
-Cancel is supported for an existing table's concurrent index build. Plain DDL
+Cancel is supported for an existing table's concurrent index build and for a
+partitioned index build. Plain DDL
 is never cancellable: each statement commits or fails on its own, so a cancel
 of one is declined as a typed unsupported operation and the durable request
 resolves terminally.
@@ -502,11 +543,19 @@ carrying the failure detail. A cancel whose build has not settled within the
 engine's wait is reported as still running, and the next attempt waits for it
 again.
 
-On shutdown the engine halts its running concurrent index builds the same way
+A cancelled partitioned index build settles as `cancelled` without removing
+anything. The cancel signals the partition build in flight and also ends the
+apply's context, so no later partition starts even when the signalled one
+finishes first. The partitions already built keep their index, and applying
+the plan again resumes the build from them.
+
+On shutdown the engine halts its running concurrent and partitioned index
+builds the same way
 — by cancelling their contexts — so the process does not exit with a build
 running on the target under a lease nobody renews. A halt is not an operator
 cancel: the apply records the build's failure, stays active, and the next
-driver to claim it recovers the leftover index before its own build. Plain DDL
+driver to claim it recovers the leftover index before its own build, or
+resumes a partitioned build from the partitions already built. Plain DDL
 is left to finish; a halt whose budget expires while such a statement is still
 running reports that the target may still be held.
 
@@ -567,9 +616,10 @@ reconcile that live prefix when the refusal has none.
 ### Partitioned tables
 
 The target preflight accepts ordinary tables, leaf partitions, and partitioned
-parents. pg-sprite also defines specific refusals for parent-level index
-builds, index adoption, and `NOT VALID` foreign keys on PostgreSQL versions
-before 18. The SchemaBot PostgreSQL apply path's table-change ladder invokes
+parents. An index on a partitioned parent runs as a
+[partitioned index build](#partitioned-index-builds). pg-sprite also defines
+specific refusals for concurrent parent-level index builds, index adoption,
+and `NOT VALID` foreign keys on PostgreSQL versions before 18. The SchemaBot PostgreSQL apply path's table-change ladder invokes
 that partition-specific admission check immediately before execution; a
 `CREATE TABLE` returns from the optimistic path before the ladder and does not
 reach it. Unsupported changes to a
@@ -651,6 +701,26 @@ Check Run concludes unsuccessfully, and an apply attempt is rejected before
 any apply or task is queued. Rewrite the declarative change into an eligible
 form or use a separately reviewed operational process; flags do not override
 an engine-blocked verdict.
+
+A statement that drops a column, a constraint, or a column's `NOT NULL` runs
+only against the object the plan reviewed. The plan records the object's
+definition as it read it, and the apply checks the live object against that
+record under the table's lock, in the transaction that drops it. When the
+object changed after the plan, for example a column dropped and added again
+under the same name, the apply refuses and drops nothing; re-plan against the
+current schema and review the new plan. A plan that cannot record the object
+it drops is blocked. A deployment that builds its plan from another
+deployment's dispatch keeps the record the plan was reviewed with, and refuses
+the change before any of its tasks run when its own objects do not match that
+record. A column at a different position, or with different dependents, than
+on the primary deployment does not match, so that drop cannot run on that
+deployment from the primary deployment's plan.
+
+A plan approved before this check shipped has no record, so its drops are
+refused. That includes an apply still running at the upgrade: a sequential
+apply whose earlier tasks already ran stops at its first drop. Re-plan any
+approved plan that drops a column, a constraint, or a `NOT NULL` after the
+upgrade, and apply the new plan.
 
 The engine does not execute `DROP TABLE` or other statement kinds outside its
 admitted set. That includes tables that exist on the target but that no schema
@@ -797,7 +867,7 @@ change or that depend on the target:
   failure includes the provisioning `GRANT` derived by pg-sprite.
 - Exhausting the 30-second statement budget is a permanent native-safety
   refusal. Exhausting the lock budget is retryable after contention clears.
-- Every apply other than a concurrent index build runs under a fixed
+- Every apply other than a concurrent or partitioned index build runs under a fixed
   five-minute client-side ceiling. It is not configurable: it exists to
   guarantee a terminal progress state when a dial hangs or a connection is
   black-holed, not to bound legitimate work, which the statement and lock
@@ -833,9 +903,9 @@ change or that depend on the target:
   the same naming, as is a build that ran past the bound and provably left
   nothing, whose refusal names `postgres.concurrent_index_max_duration` as
   the option to raise. A
-  parent-level index build on a partitioned table never reaches the apply: the
-  plan blocks it, because the index has to be built one partition at a time
-  and SchemaBot does not run that build yet. A target connection pool too
+  parent-level index on a partitioned table runs as a
+  [partitioned index build](#partitioned-index-builds) instead. A target
+  connection pool too
   small to hold the build's sessions at once is refused permanently — the
   recovery holds one more session than the build, so a pool sized to the
   build alone refuses the recovery — since the pool is sized by the target
@@ -857,7 +927,7 @@ PostgreSQL targets do not support:
 - pending drops;
 - deferred cutover (`--defer-cutover`);
 - stop, start, cutover, revert, or skip-revert controls;
-- cancel of anything other than a concurrent index build (see
+- cancel of anything other than an index build (see
   [Control operations](#control-operations)).
 
 Each PostgreSQL DDL statement on this path runs as its own transaction that
@@ -1343,14 +1413,14 @@ solely from a state this engine never reports.
 | `engine.Engine.Apply` | Implemented | Starts bounded native DDL or a greenfield create sequence in this process; a concurrent index build runs outside a transaction as PostgreSQL requires. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
 | `engine.Engine.Progress` | Implemented | Reads the apply record held by this engine instance and augments a running concurrent index build from PostgreSQL's progress view. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
 | `engine.Engine.Stop` | Typed decline at drive time | A concurrent index build has no resumable midpoint, while other statements commit or fail on their own; the durable request resolves terminally and never settles the apply as stopped or cancelled. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go), [`pkg/tern/local_control.go`](../pkg/tern/local_control.go) |
-| `engine.Engine.Cancel` | Implemented for concurrent index builds; typed decline for plain DDL | PostgreSQL can cancel the build backend or its apply context, but plain DDL has no separately managed work to cancel safely. | [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
+| `engine.Engine.Cancel` | Implemented for concurrent and partitioned index builds; typed decline for plain DDL | PostgreSQL can cancel the build backend or its apply context, but plain DDL has no separately managed work to cancel safely. | [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
 | `engine.Engine.Start` | Typed decline at drive time | Stop cannot create a stopped engine phase, so there is nothing to resume. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go), [`pkg/tern/local_control.go`](../pkg/tern/local_control.go) |
 | `engine.Engine.Cutover` | Typed decline at drive time | DDL changes the target directly; there is no deferred table swap to trigger. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go), [`pkg/tern/local_control.go`](../pkg/tern/local_control.go) |
 | `engine.Engine.Revert` | Refused at intake; typed decline never reached | Each successful statement commits directly and creates no revert window, so the API refuses the request before any engine is consulted and the driver never enters the state from which it would call the engine. | [`pkg/api/control_handlers.go`](../pkg/api/control_handlers.go), [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
 | `engine.Engine.SkipRevert` | Refused at intake; typed decline never reached | With no revert window, every committed statement is already permanent; refused at the same intake gate as revert. | [`pkg/api/control_handlers.go`](../pkg/api/control_handlers.go), [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
 | `engine.Drainer.DrainContext` | Implemented | Recovery must wait for in-process apply goroutines before re-planning, then discard their instance-local progress. The wait ends with the drive's context, leaving the work tracked, so a drive whose claim is gone does not sit behind it. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
-| `engine.ShutdownHalter.HaltForShutdown` | Implemented | Shutdown cancels in-process concurrent index builds so they do not keep target resources after this instance stops renewing its lease; bounded plain DDL is allowed to finish. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
-| `engine.OwnedWorkHalter.HaltWorkOwnedBy` | Implemented | A drive handing its apply back cancels the concurrent index builds it started, and only those, and waits for its plain DDL to finish; another drive's applies on the same engine are left running. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.ShutdownHalter.HaltForShutdown` | Implemented | Shutdown cancels in-process concurrent and partitioned index builds so they do not keep target resources after this instance stops renewing its lease; bounded plain DDL is allowed to finish. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.OwnedWorkHalter.HaltWorkOwnedBy` | Implemented | A drive handing its apply back cancels the concurrent and partitioned index builds it started, and only those, and waits for its plain DDL to finish; another drive's applies on the same engine are left running. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
 | `engine.DeferredCutoverSignalChecker.DeferredCutoverSignalExists` | Not applicable; not implemented | Direct DDL has no deferred cutover gate or durable table-swap signal. | [`pkg/engine/engine.go`](../pkg/engine/engine.go), [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
 | `engine.ExternallyAuthoritativeProgress.ProgressIsExternallyAuthoritative` | Not applicable; not implemented | Progress is held in the engine instance's in-memory apply map, not in an external service that every instance can query authoritatively. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
 | `engine.SynchronousWorkRegistration.RegistersWorkSynchronously` | Implemented; returns `true` | `Apply` claims the tracked progress entry before returning and has no remote provisioning phase. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
