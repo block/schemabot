@@ -66,17 +66,51 @@ func TestDurableWebhookDriverRetriesQuotaReserveRefusalAtResetWithoutChargingAtt
 	}
 }
 
-// A delivery that fails for any other reason keeps the one-minute retry and
+// A delivery that fails for any other reason keeps the backoff retry, which
+// waits the base delay plus up to a quarter more after its first claim, and
 // spends the attempt its claim consumed.
 func TestDurableWebhookDriverChargesOtherRetryableFailures(t *testing.T) {
 	before := time.Now()
 	store := driveQuotaReserveDelivery(t, durablePullRequestEvent(t), errors.New("GitHub returned 502"))
+	after := time.Now()
 
 	require.Empty(t, store.failedUncharged, "only a quota reserve refusal is retried without charging an attempt")
 	require.Len(t, store.failed, 1)
 	failure := <-store.failed
 	require.NotNil(t, failure.retryAfter)
-	assert.WithinDuration(t, before.Add(durableWebhookRetryDelay), *failure.retryAfter, 5*time.Second)
+	delay := durableWebhookRetryDelay(1)
+	assert.False(t, failure.retryAfter.Before(before.Add(delay)), "retry must wait at least %s", delay)
+	assert.False(t, failure.retryAfter.After(after.Add(delay+delay/4)), "retry must not wait longer than %s", delay+delay/4)
+}
+
+// A charged quota reserve refusal on a later claim is retried at the reset,
+// not at the backoff time for that attempt, whether the reset comes before or
+// after it: any retry before the reset would be refused the same way.
+func TestDurableWebhookDriverRetriesChargedQuotaReserveRefusalAtResetOnLaterAttempts(t *testing.T) {
+	tests := []struct {
+		name       string
+		attempt    int
+		resetAfter time.Duration
+	}{
+		{name: "reset after the backoff time", attempt: 3, resetAfter: 25 * time.Minute},
+		{name: "reset before the backoff time", attempt: 4, resetAfter: 90 * time.Second},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			event := durablePullRequestEvent(t)
+			event.ReceivedAt = time.Now().Add(-quotaReserveUnchargedWindow - time.Minute)
+			event.Attempts = tc.attempt - 1 // FindNext claim increments to attempt
+			resetAt := time.Now().Add(tc.resetAfter).Truncate(time.Second)
+
+			store := driveQuotaReserveDelivery(t, event, quotaReserveRefusalError(resetAt))
+
+			require.Empty(t, store.failedUncharged)
+			require.Len(t, store.failed, 1)
+			failure := <-store.failed
+			require.NotNil(t, failure.retryAfter)
+			assert.True(t, resetAt.Equal(*failure.retryAfter), "retry at the quota reset %s, got %s", resetAt, failure.retryAfter)
+		})
+	}
 }
 
 // A delivery the reserve keeps refusing stops being free once it is older

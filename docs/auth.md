@@ -191,9 +191,15 @@ a separate route that accepts GitHub deliveries and lets SchemaBot verify
 their signatures. This does not require making the API public.
 
 Always configure the webhook secret for a shared installation. Without it,
-the single-App configuration skips signature verification. A signed delivery
-proves where the event came from; it does not grant the comment author
-permission to apply a change.
+the single-App configuration currently skips signature verification and
+accepts unsigned deliveries, and the webhook handler logs a warning that names
+the missing secret. A future release will refuse unsigned deliveries when no
+secret is set. A program that embeds the `pkg/webhook` handler and wants to
+accept unsigned deliveries on purpose, such as a test or a local harness, passes
+`webhook.WithInsecureSkipSignatureVerification()` when it builds the handler,
+which silences the warning. The `schemabot serve` command already refuses to
+start without a webhook secret. A signed delivery proves where the event came
+from; it does not grant the comment author permission to apply a change.
 
 Set command permissions and check the connection below. You can configure
 CLI and API access separately if you need those interfaces too.
@@ -979,7 +985,35 @@ without passing through the mesh.
 Leave loopback addresses out of the trusted proxy networks unless you intend
 this access. Writes accepted from loopback are logged at warning level and
 counted with reason `loopback_source`. Logging makes that access visible; it
-does not prevent it.
+does not prevent it. SchemaBot also records the caller of a loopback request
+as unverified, so it never attributes a freeze or an override approval to
+an identity the local caller typed.
+
+A mesh sidecar can deliver proxied requests from a loopback address too. An
+Istio sidecar whose ingress delivers to `127.0.0.1:<port>` sends them from
+`127.0.0.1`, the same address as a port-forward, so SchemaBot cannot tell the
+two apart. Configure the sidecar to deliver to the pod IP (`0.0.0.0:<port>`)
+instead. Istio then sends proxied requests from `127.0.0.6`, and a
+port-forward still arrives from `127.0.0.1`. List the sidecar's address so
+SchemaBot verifies proxied requests from it:
+
+```yaml
+trusted_proxy_spiffe: [spiffe://example.org/ns/ingress/sa/proxy]
+trusted_mesh_loopback_sources: [127.0.0.6]
+```
+
+A request from a listed address must still pass the SPIFFE check. The
+setting requires `trusted_proxy_spiffe` and refuses `127.0.0.1` and `::1`.
+If you also set `trusted_proxy_cidrs`, add each listed address to it (for
+example `127.0.0.6/32`): the CIDR check runs first, and SchemaBot refuses to
+start with a listed address outside those networks.
+
+Listing an address trusts every process in the pod's network namespace like
+the proxy. Any of them can connect from `127.0.0.6` and send an XFCC header
+that names the proxy, as it already can from the pod IP under SPIFFE-only
+trust. List an address only when nothing else in the pod sends requests to
+SchemaBot, and every peer the sidecar admits is a proxy that sets the
+identity headers and XFCC itself.
 
 #### Service mesh setup
 

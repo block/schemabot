@@ -148,9 +148,11 @@ func TestEngine_Plan_IgnoreTablesRefusesDeclaredTable(t *testing.T) {
 		IgnoreTables: []string{flywayTable},
 	})
 	require.Error(t, err, "Plan() must refuse a table that is both withheld and declared")
+	assert.True(t, engine.IsPlanRefused(err))
 	assert.Contains(t, err.Error(), flywayTable)
 	assert.Contains(t, err.Error(), "ignore_tables")
 	assert.Contains(t, err.Error(), "Remove the entry or the schema file")
+	assert.True(t, engine.IsPlanRefused(err), "the schema files are refused as written, not the engine failing")
 }
 
 // Whether a declaration and a differently-cased entry name one table is the
@@ -307,6 +309,7 @@ func TestEngine_Plan_IgnoreTablesPatternRefusesDeclaredTable(t *testing.T) {
 		IgnoreTables: []string{`/^relay_\d+_feed$/`},
 	})
 	require.Error(t, err, "Plan() must refuse a pattern that matches a declared table")
+	assert.True(t, engine.IsPlanRefused(err))
 	assert.Contains(t, err.Error(), `ignore_tables entry "/^relay_\d+_feed$/" matches "Relay_1_Feed"`)
 	assert.Contains(t, err.Error(), "Narrow the pattern")
 
@@ -428,6 +431,7 @@ func TestEngine_Plan_RefusesADeclaredTableTheNamingConventionSkips(t *testing.T)
 		Credentials: &engine.Credentials{DSN: dsn},
 	})
 	require.Error(t, err, "Plan() must refuse to plan a CREATE for a live table it skips")
+	assert.True(t, engine.IsPlanRefused(err))
 	assert.Nil(t, result)
 	assert.Contains(t, err.Error(), `declares table "_legacy", which the MySQL planner never manages because its name starts with "_"`)
 }

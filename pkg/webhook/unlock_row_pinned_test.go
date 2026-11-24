@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -269,6 +270,38 @@ func TestUnlockKeepsLockAnUnsettledApplyRecords(t *testing.T) {
 				"Resume it with `schemabot start apply-orders-1 -e staging` or cancel it with `schemabot cancel apply-orders-1 -e staging`, then unlock again.",
 			},
 		},
+		{
+			name:       "apply in its revert window",
+			applyState: state.Apply.RevertWindow,
+			wantBody: []string{
+				"Apply `apply-orders-1` has passed its cutover and is in its revert window, so it still holds this lock.",
+				"Revert it with `schemabot revert apply-orders-1 -e staging` or keep the change with `schemabot skip-revert apply-orders-1 -e staging`, then unlock again.",
+			},
+		},
+		{
+			name:       "revert in progress",
+			applyState: state.Apply.Reverting,
+			wantBody: []string{
+				"Apply `apply-orders-1` is finishing its revert window (state: `reverting`) and still holds this lock.",
+				"Wait for it, then unlock again.",
+			},
+		},
+		{
+			name:       "skip-revert in progress",
+			applyState: state.Apply.SkippingRevert,
+			wantBody: []string{
+				"(state: `skipping_revert`)",
+				"Wait for it, then unlock again.",
+			},
+		},
+		{
+			name:       "ended apply with an operation still running",
+			applyState: state.Apply.Failed,
+			wantBody: []string{
+				"Apply `apply-orders-1` has ended (state: `failed`), but one of its operations is still running and holds this lock.",
+				"Wait for that operation to finish, then unlock again.",
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -347,6 +380,55 @@ func TestUnlockKeptLockAndAlreadyReleasedLockAnswersOnlyWithTheRefusal(t *testin
 	assert.Contains(t, body, "Cannot Unlock")
 	assert.Contains(t, body, "apply-orders-1")
 	assert.Empty(t, comments, "the kept lock must not be followed by 'every lock was already released'")
+}
+
+// An unlock matches two locks: one a stopped apply records, so it is kept, and
+// one whose release fails. The pass retries, and the retry finds the kept lock
+// again. The refusal is posted once, by the pass that does not retry, rather
+// than once per pass.
+func TestUnlockAnswersAKeptLockOnceWhenAnotherReleaseIsRetried(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := recordComments(t, mux)
+	billing := withLockID(prOwnedOrdersLock(), 42)
+	billing.DatabaseName = "billing"
+	lockStore := &unlockTestLockStore{
+		locks: []*storage.Lock{withLockID(prOwnedOrdersLock(), 41), billing},
+		releaseErrs: map[string]error{
+			"orders": &storage.LockInUseError{LockID: 41, Apply: &storage.Apply{
+				ApplyIdentifier: "apply-orders-1",
+				Database:        "orders",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+				Repository:      "octocat/hello-world",
+				PullRequest:     1,
+				State:           state.Apply.Stopped,
+			}},
+			"billing": errors.New("storage write failed"),
+		},
+	}
+	st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+	h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+	command := CommandResult{Action: action.Unlock}
+
+	retry, err := h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser", command)
+
+	require.Error(t, err)
+	assert.True(t, retry, "a failed release retries the delivery")
+	assert.Empty(t, comments, "the pass that retries posts no answer for the kept lock")
+
+	delete(lockStore.releaseErrs, "billing")
+	retry, err = h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser", command)
+
+	require.NoError(t, err)
+	assert.False(t, retry)
+	assert.Equal(t, []string{"billing"}, lockStore.released)
+	success := requireComment(t, comments, "unlock success for billing")
+	assert.Contains(t, success, "Lock Released")
+	assert.Contains(t, success, "`billing`")
+	refusal := requireComment(t, comments, "cannot-unlock answer")
+	assert.Contains(t, refusal, "Cannot Unlock")
+	assert.Contains(t, refusal, "apply-orders-1")
+	assert.Empty(t, comments, "the kept lock is answered once across both passes")
 }
 
 func withLockID(lock *storage.Lock, id int64) *storage.Lock {

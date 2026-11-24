@@ -37,7 +37,7 @@ func TestHaltForShutdownCancelsTheCopyAndWaitsForItToExit(t *testing.T) {
 
 	var lockReleased sync.WaitGroup
 	lockReleased.Add(1)
-	rm.goRun(func() {
+	startTestRun(eng, rm, func() {
 		<-runCtx.Done()
 		lockReleased.Done()
 	})
@@ -62,7 +62,7 @@ func TestHaltForShutdownFailsWhenTheCopyWillNotComeDown(t *testing.T) {
 		tables:   []string{"line_items"},
 		state:    engine.StateRunning,
 	}
-	rm.goRun(func() { <-stuck })
+	startTestRun(eng, rm, func() { <-stuck })
 	eng.runningSchemaChange = rm
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
@@ -87,8 +87,8 @@ func TestHaltForShutdownAfterTheChangeEndedIsANoOp(t *testing.T) {
 		state:      engine.StateCompleted,
 		cancelFunc: func() { cancelled = true },
 	}
-	rm.goRun(func() {})
-	rm.wg.Wait()
+	startTestRun(eng, rm, func() {})
+	waitForTestRun(t, eng, rm)
 	eng.runningSchemaChange = rm
 
 	require.NoError(t, eng.HaltForShutdown(t.Context()))
@@ -111,7 +111,7 @@ func TestHaltForShutdownWaitsOutATeardownWithoutCancellingIt(t *testing.T) {
 		cancelFunc: func() { cancelled = true },
 	}
 	teardown := make(chan struct{})
-	rm.goRun(func() { <-teardown })
+	startTestRun(eng, rm, func() { <-teardown })
 	eng.runningSchemaChange = rm
 
 	halted := make(chan error, 1)
@@ -180,16 +180,16 @@ func TestHaltWorkOwnedByLeavesAnotherDrivesRunRunning(t *testing.T) {
 		owner:      "drive-b",
 		cancelFunc: func() { cancelled = true; cancelRun() },
 	}
-	rm.goRun(func() { <-runCtx.Done() })
+	startTestRun(eng, rm, func() { <-runCtx.Done() })
 	eng.runningSchemaChange = rm
 
 	require.NoError(t, eng.HaltWorkOwnedBy(t.Context(), "drive-a"))
 	assert.False(t, cancelled, "the run belongs to drive-b, so drive-a's halt leaves it running")
-	assert.Equal(t, int32(1), rm.active.Load())
+	assert.True(t, testRunAlive(eng, rm), "the run is still alive")
 
 	require.NoError(t, eng.HaltWorkOwnedBy(t.Context(), "drive-b"))
 	assert.True(t, cancelled, "drive-b's halt reaches the run drive-b started")
-	assert.Zero(t, rm.active.Load())
+	assert.False(t, testRunAlive(eng, rm), "the halted run has returned")
 }
 
 // The run records the owner of the context it was started under, so the halt
@@ -232,7 +232,7 @@ func TestDrainContextEndsWithTheCallersContext(t *testing.T) {
 		tables:   []string{"line_items"},
 		state:    engine.StateRunning,
 	}
-	rm.goRun(func() { <-exit })
+	startTestRun(eng, rm, func() { <-exit })
 	eng.runningSchemaChange = rm
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
@@ -258,7 +258,7 @@ func TestDrainContextNamesARunThatIsStillPublishingItsTables(t *testing.T) {
 		database: "orders",
 		state:    engine.StateRunning,
 	}
-	rm.goRun(func() {
+	startTestRun(eng, rm, func() {
 		for {
 			select {
 			case <-exit:
@@ -295,7 +295,7 @@ func TestApplyStopsWaitingForThePreviousRunWithTheCallersContext(t *testing.T) {
 		tables:   []string{"users"},
 		state:    engine.StateRunning,
 	}
-	rm.goRun(func() { <-exit })
+	startTestRun(eng, rm, func() { <-exit })
 	eng.runningSchemaChange = rm
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)

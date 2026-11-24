@@ -117,6 +117,7 @@ func TestEnginePlanForeignKeyToMissingTable(t *testing.T) {
 	_, err = New().Plan(t.Context(), req)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, schemadiff.ErrReferencedTableNotFound)
+	assert.True(t, engine.IsPlanRefused(err))
 	assert.Contains(t, err.Error(), `plan PostgreSQL schema in "public"/"orders.sql"`)
 	assert.Contains(t, err.Error(), "public.customers")
 	assert.Contains(t, err.Error(), "a foreign key can reference only a table that already exists on the target, so leave the foreign key out of the schema file, apply the referenced table first, then run the ADD CONSTRAINT outside SchemaBot and add the foreign key back to the file")

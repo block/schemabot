@@ -53,8 +53,8 @@ func TestFromArgs(t *testing.T) {
 // TestCommand covers how hints render the recorded route. Like the name, the
 // route is process-global, so both are reset around the test. A run with no
 // routing flags renders the bare command; a wrapper that records a routing
-// flag of its own gets it on every hint; and recording an empty route clears
-// it.
+// flag of its own gets it on every hint unless the hint already passes that
+// flag; and recording an empty route clears it.
 func TestCommand(t *testing.T) {
 	name.Store(nil)
 	route.Store(nil)
@@ -71,6 +71,21 @@ func TestCommand(t *testing.T) {
 		Command("progress", "apply-1", "-e", "production"))
 	assert.Equal(t, `acme schemabot start -e <environment> apply-1 --profile prod --context west\ cluster`,
 		Command("start", "-e", "<environment>", "apply-1"), "caller args, including a placeholder, render as given")
+
+	SetRoute(Flag{"--profile", "prod"}, Flag{"-e", "development"})
+	assert.Equal(t, "acme schemabot start apply-1 -e development --profile prod",
+		Command("start", "apply-1", "-e", "development"), "a routing flag the caller already passes is not repeated")
+	assert.Equal(t, "acme schemabot start apply-1 -e=staging --profile prod",
+		Command("start", "apply-1", "-e=staging"), "the caller's joined value stands alone")
+	assert.Equal(t, "acme schemabot start apply-1 --profile prod -e development",
+		Command("start", "apply-1"), "a routing flag the caller does not pass is still appended")
+
+	SetRoute(Flag{"--environment", "development"})
+	assert.Equal(t, "acme schemabot start apply-1 -e staging",
+		Command("start", "apply-1", "-e", "staging"), "a recorded long spelling is not repeated after the short one")
+	SetRoute(Flag{"-e", "development"})
+	assert.Equal(t, "acme schemabot start apply-1 --environment=staging",
+		Command("start", "apply-1", "--environment=staging"), "a recorded short spelling is not repeated after the long one")
 
 	SetRoute(Flag{"--profile", "bad\nname"}, Flag{"--context", "west"})
 	assert.Equal(t, "acme schemabot progress apply-1 --context west", Command("progress", "apply-1"),

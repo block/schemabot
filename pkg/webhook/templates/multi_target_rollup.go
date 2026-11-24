@@ -315,7 +315,9 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	// started.
 	var cancelled, neverStarted int
 	var running int
-	for _, c := range cells {
+	statuses := make([]string, len(cells))
+	for i, c := range cells {
+		statuses[i] = c.Status
 		switch state.NormalizeTaskStatus(c.Status) {
 		case state.Task.Completed, state.Task.RevertWindow:
 			// A target in its revert window has completed the change.
@@ -342,7 +344,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	pending := queued
 	pendingWord := presentation.PendingWord(settled)
 	coverage := presentation.TargetCoverage(done, running, pending, failed, retrying, presentation.RunningCopying, pendingWord)
-	status := rollupTaskStatus(cells)
+	status := presentation.RollupTaskStatus(statuses)
 	if keepsTargetProgressBar(cells, status, done, pending, settled) {
 		percent := presentation.PercentAcrossTargets(parts, 0)
 		// With the rows to copy known, the bar leads from the copy's start,
@@ -357,7 +359,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 			if line := rows.RowsLine(len(cells), targetsTableBytes(cells)); line != "" {
 				sb.WriteString("- " + line + "\n")
 			}
-			writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
+			writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, presentation.RunningCopying, budget)
 			return
 		}
 	}
@@ -401,7 +403,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		}
 	}
 	if lists {
-		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
+		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, presentation.RunningCopying, budget)
 	}
 }
 
@@ -564,29 +566,6 @@ func targetsTableBytes(cells []TableProgressData) *int64 {
 		total += *c.EstimatedBytes
 	}
 	return &total
-}
-
-// rollupTaskStatus is a table's status across targets: a failure or halt
-// first, then any target still moving, then queued, then complete.
-func rollupTaskStatus(cells []TableProgressData) string {
-	statuses := make([]string, len(cells))
-	for i, c := range cells {
-		statuses[i] = state.NormalizeTaskStatus(c.Status)
-	}
-	for _, halting := range []string{state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled} {
-		if slices.Contains(statuses, halting) {
-			return halting
-		}
-	}
-	for _, s := range statuses {
-		if s != state.Task.Pending && s != state.Task.Completed {
-			return s
-		}
-	}
-	if slices.Contains(statuses, state.Task.Pending) {
-		return state.Task.Pending
-	}
-	return state.Task.Completed
 }
 
 // writeFailedTargets names each failed or retrying target and its error, the

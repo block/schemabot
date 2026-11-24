@@ -476,13 +476,13 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		h.logger.Info("apply: the target the apply was narrowed to has no changes; posting its plan without updating stored check state",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"plan_id", planResp.PlanID, "narrowed_to", planResp.NarrowedTo)
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+		commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 		commentData.ScopedDatabase = result.Database
 		commentData.Target = result.Target
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		return false, nil
 	default:
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+		commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 		commentData.ScopedDatabase = result.Database
 		commentData.DeploymentDrift = rolloutPreview
 		if headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout); checkErr != nil {
@@ -513,7 +513,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// toward --allow-unsafe for a guaranteed failure. No lock is held yet, so
 	// the rejection needs no release.
 	if planResp.HasBlockedChanges() {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+		commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 		commentData.ScopedDatabase = result.Database
 		commentData.Target = narrowedTarget(planResp, result.Target)
 		h.logger.Info("apply rejected: plan contains engine-blocked changes",
@@ -643,7 +643,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// apply proceeds automatically and the unsafe opt-in already solicited
 	// consent for every attributed table, where the re-plan choice the
 	// disclosure coaches is no longer open.
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 	commentData.ScopedDatabase = result.Database
 	commentData.Target = narrowedTarget(planResp, result.Target)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, rolloutPreview, repo, pr, environment)
@@ -765,20 +765,26 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// lands. A failed post releases the lock and stays retryable, as a pending
 	// confirmation whose comment never appeared does; the stored check keeps
 	// blocking merge on the pending changes meanwhile.
+	// The comment's ID and data ride into executeApply so a change gate that
+	// refuses the apply can edit the footer this comment posts, which promises
+	// an apply that then never starts.
+	var autoComment *autoApplyComment
 	if runsMemberWork {
-		if postErr := h.postCommentReportingError(repo, pr, installationID, templates.RenderPlanComment(commentData)); postErr != nil {
+		commentID, postErr := h.postCommentReportingID(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		if postErr != nil {
 			h.logger.Error("failed to post the comment disclosing the other targets' plans, so nothing was dispatched; releasing the lock",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "plan_id", planResp.PlanID, "error", postErr)
 			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "automatic apply disclosure post failure")
 			return true, fmt.Errorf("apply command disclosure of the other targets' plans %s#%d: %w", repo, pr, postErr)
 		}
-	} else {
-		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		autoComment = &autoApplyComment{ID: commentID, Data: commentData}
+	} else if commentID := h.postCommentBestEffortID(repo, pr, installationID, templates.RenderPlanComment(commentData)); commentID != 0 {
+		autoComment = &autoApplyComment{ID: commentID, Data: commentData}
 	}
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
-	h.executeApply(ctx, client, repo, pr, schemaResult, sharedSchemaPeers, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopies)
+	h.executeApply(ctx, client, repo, pr, schemaResult, sharedSchemaPeers, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopies, autoComment)
 	return false, nil
 }
 
@@ -1152,7 +1158,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 
 	disclosedCopies := disclosureDescribesThisApply(existingLock, storedPlan, environment)
 
-	h.executeApply(ctx, client, repo, pr, schemaResult, sharedSchemaPeers, environment, installationID, requestedBy, result, nil, storedPlan, existingLock.PendingPlanID, disclosedCopies)
+	h.executeApply(ctx, client, repo, pr, schemaResult, sharedSchemaPeers, environment, installationID, requestedBy, result, nil, storedPlan, existingLock.PendingPlanID, disclosedCopies, nil)
 	return false, nil
 }
 
@@ -1503,6 +1509,9 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	// retryable, and a re-drive only sees the locks that are still held.
 	var releaseErrs []error
 	var released, alreadyGone, reacquired, inUse int
+	// A kept lock's answer waits until the pass is known not to retry: a
+	// retried delivery sees the kept lock again and would answer it again.
+	var inUseAnswers []string
 	for _, lock := range locks {
 		err := h.service.Storage().Locks().ReleaseByIDIfUnused(ctx, lock.ID, lock.DatabaseName, lock.DatabaseType, lock.Owner, lock.PendingPlanID)
 		var inUseErr *storage.LockInUseError
@@ -1514,7 +1523,7 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 			h.logger.Warn("unlock refused: an apply recording the lock has not settled; the lock stays held",
 				append(inUseErr.Apply.LogAttrs(),
 					"command_repo", repo, "command_pr", pr, "lock_owner", lock.Owner, "force", result.Force, "error", err)...)
-			h.postComment(repo, pr, installationID, templates.RenderCannotUnlock(
+			inUseAnswers = append(inUseAnswers, templates.RenderCannotUnlock(
 				lock.DatabaseName, inUseErr.Apply.Environment, inUseErr.Apply.ApplyIdentifier, inUseErr.Apply.State))
 			continue
 		}
@@ -1556,7 +1565,14 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 			lock.DatabaseName, "", requestedBy))
 	}
 	if len(releaseErrs) > 0 {
+		if len(inUseAnswers) > 0 {
+			h.logger.Info("unlock is retrying a failed release; the answer for each kept lock waits for the retry",
+				"repo", repo, "pr", pr, "in_use", inUse)
+		}
 		return true, fmt.Errorf("unlock command release locks %s#%d: %w", repo, pr, errors.Join(releaseErrs...))
+	}
+	for _, answer := range inUseAnswers {
+		h.postComment(repo, pr, installationID, answer)
 	}
 	if released == 0 && reacquired > 0 {
 		h.logger.Info("unlock released nothing because at least one current lock was acquired again after the command",

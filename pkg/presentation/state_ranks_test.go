@@ -158,6 +158,28 @@ func TestTableRolloutRankRanksEveryPairOfTaskStates(t *testing.T) {
 	}
 }
 
+// A table run on several targets reads as a failure or halt first, then as
+// the first moving state a target reports, then queued, then complete. The
+// proto-prefixed spelling of a state rolls up as the canonical state.
+func TestRollupTaskStatusPrecedenceCoversEveryTaskState(t *testing.T) {
+	task := state.Task
+	tiers := []statetest.RollupTier{
+		{States: []string{task.Failed, task.FailedRetryable, task.Stopped, task.Cancelled}},
+		{States: []string{
+			task.Running, task.CatchingUp, task.Checksumming, task.PostChecksum,
+			task.WaitingForDeploy, task.WaitingForCutover, task.Recovering,
+			task.CuttingOver, task.RevertWindow, task.Reverting, task.Reverted,
+		}, FirstReported: true},
+		{States: []string{task.Pending}},
+		{States: []string{task.Completed}},
+	}
+	statetest.AssertRollup(t, statetest.Every(t, state.Task), tiers, func(first, second string) string {
+		return RollupTaskStatus([]string{first, second})
+	})
+	assert.Equal(t, task.Completed, RollupTaskStatus(nil), "a table no target reports reads as complete")
+	assert.Equal(t, task.Failed, RollupTaskStatus([]string{"STATE_RUNNING", "STATE_FAILED"}))
+}
+
 // A task ranking gives a state the same rank however it is spelled: the
 // proto-prefixed form ranks as the canonical state, and an operation state
 // that is not a task state ranks as running, the state it stands in for.

@@ -244,7 +244,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	svc := api.New(st, serverConfig, map[string]tern.Client{}, logger)
 	t.Cleanup(func() { _ = svc.Close() })
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// Step 1: Post initial progress comment
 	h.postAndTrackComment(ctx, "org/repo", 42, 12345, apply, state.Comment.Progress, "Initial progress")
@@ -1276,7 +1276,7 @@ func setupApplyCommentFixture(t *testing.T, p applyCommentFixtureParams) *applyC
 		capture: capture,
 		factory: factory,
 		logger:  logger,
-		handler: NewHandler(svc, factory, nil, logger),
+		handler: NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification()),
 	}
 }
 
@@ -3253,7 +3253,7 @@ func TestE2EReconcileMissingSummaryCommentsPostsSummary(t *testing.T) {
 	svc := api.New(st, &api.ServerConfig{}, map[string]tern.Client{}, logger)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 	// Run startup reconciliation directly; the fake GitHub server captures the
 	// summary comment that would be posted during server startup.
 	h.ReconcileMissingSummaryComments(ctx)
@@ -3406,7 +3406,7 @@ func TestE2EReconcileMissingSummaryCommentsRepairsStoppedApply(t *testing.T) {
 	svc := api.New(st, &api.ServerConfig{}, map[string]tern.Client{}, logger)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 	h.ReconcileMissingSummaryComments(ctx)
 
 	var created commentCreate
@@ -3452,7 +3452,7 @@ func TestE2EReconcileMissingSummaryCommentsRespectsFreshClaim(t *testing.T) {
 	svc := api.New(st, &api.ServerConfig{}, map[string]tern.Client{}, logger)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 	h.ReconcileMissingSummaryComments(ctx)
 
 	select {
@@ -3586,7 +3586,7 @@ func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 	svc := api.New(st, serverConfig, map[string]tern.Client{}, logger)
 	t.Cleanup(func() { _ = svc.Close() })
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// Resume: post new progress comment (upsert should replace old ID)
 	h.postAndTrackComment(ctx, "org/repo-resume", 43, 12345, apply, state.Comment.Progress, "Resumed progress")
@@ -3784,7 +3784,7 @@ func TestE2EEditTrackedCommentNotFound(t *testing.T) {
 	svc := api.New(st, serverConfig, map[string]tern.Client{}, logger)
 	t.Cleanup(func() { _ = svc.Close() })
 
-	_ = NewHandler(svc, factory, nil, logger)
+	_ = NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// Try to edit a comment for a non-existent apply via observer — should be a no-op
 	obs := NewCommentObserver(CommentObserverConfig{
@@ -3852,7 +3852,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		installClient, capture := setupFakeGitHubForComments(t)
 		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 		svc := api.New(st, &api.ServerConfig{}, nil, logger)
-		h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger)
+		h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger, WithInsecureSkipSignatureVerification())
 		return h, capture
 	}
 

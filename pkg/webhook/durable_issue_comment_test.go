@@ -48,7 +48,7 @@ func newDurableIssueCommentEnqueueHandler(t *testing.T, events storage.WebhookEv
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{}, nil, logger)
-	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch())
+	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 }
 
 // TestIssueCommentGateBlockParity pins the shared gate ladder reason by

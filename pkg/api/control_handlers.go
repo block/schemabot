@@ -37,6 +37,10 @@ type controlOperationHTTPError struct {
 
 type terminalControlError struct {
 	err error
+	// shown is the text a 5xx answer carries: text SchemaBot wrote for the
+	// requester. Empty when the error carries a cause SchemaBot did not
+	// write, which goes to the server log instead.
+	shown string
 }
 
 func (e *terminalControlError) Error() string {
@@ -76,9 +80,23 @@ func controlConflictCodef(code, format string, args ...any) error {
 
 // terminalControlf marks a control failure that retrying the same request
 // cannot repair: an internal data invariant violation or a deterministic
-// downstream rejection.
+// downstream rejection. Its text is shown to the requester only when no
+// argument is an error: an error can carry storage, driver, or engine text
+// whichever verb formats it.
 func terminalControlf(format string, args ...any) error {
-	return &terminalControlError{err: fmt.Errorf(format, args...)}
+	err := fmt.Errorf(format, args...)
+	shown := err.Error()
+	if slices.ContainsFunc(args, func(arg any) bool { _, isErr := arg.(error); return isErr }) {
+		shown = ""
+	}
+	return &terminalControlError{err: err, shown: shown}
+}
+
+// authoredTerminalControlf is terminalControlf for a message SchemaBot wrote
+// in full, including the errors it wraps, so the whole text is shown.
+func authoredTerminalControlf(format string, args ...any) error {
+	err := fmt.Errorf(format, args...)
+	return &terminalControlError{err: err, shown: err.Error()}
 }
 
 // controlOperationErrorCode is the error code a rejection carries, empty for
@@ -375,7 +393,67 @@ func (s *Service) logFreezeOverrideForApply(ctx context.Context, apply *storage.
 		request.Identifier, request.RequestedBy, request.ApprovedBy, strings.Join(request.Blockers, ", ")))
 }
 
+// controlInternalFailureMessage is what a control request answers when it fails
+// inside SchemaBot after the request was accepted for processing. The cause
+// can carry DSN or host fragments, storage or driver text, or an engine RPC
+// error, so it goes to the server log and never to the requester. The request
+// may already have been recorded, so the message tells the requester to check
+// the schema change before sending it again. Planning a rollback records no
+// request, so for it the message says no rollback was started.
+func controlInternalFailureMessage(opName string, apply *storage.Apply) string {
+	subject := opName + " failed"
+	if apply != nil {
+		subject += " for apply " + apply.ApplyIdentifier
+	}
+	effect := "The request may already be recorded, so check the schema change's status before sending it again."
+	if opName == "rollback plan" {
+		effect = "No rollback was started."
+	}
+	return subject + ": SchemaBot hit an internal error. " + effect +
+		" A SchemaBot operator can find the cause in the server log."
+}
+
+// controlNotAttemptedMessage is what a control request answers when SchemaBot
+// fails to load the apply or its routing before it attempts the operation. The
+// cause goes to the server log. Nothing was recorded, so the requester can send
+// the request again.
+func controlNotAttemptedMessage(operation, applyIdentifier string) string {
+	return fmt.Sprintf("The %s was not attempted for apply %q because of an internal SchemaBot error, so nothing was changed. "+
+		"Retry in a moment. If it keeps failing, a SchemaBot operator can find the cause in the server log.",
+		strings.ReplaceAll(operation, "_", "-"), applyIdentifier)
+}
+
+// controlMissingDeploymentMessage is what a control request answers when the
+// stored apply has no deployment to route it to. Nothing was changed, and
+// sending it again meets the same record, so it does not suggest a retry.
+func controlMissingDeploymentMessage(operation, applyIdentifier string) string {
+	return fmt.Sprintf("The %s was not attempted for apply %q because SchemaBot has no deployment recorded for it, so nothing was changed. "+
+		"Sending it again will fail the same way. A SchemaBot operator can find the apply in the server log.",
+		strings.ReplaceAll(operation, "_", "-"), applyIdentifier)
+}
+
+// authoredControlFailureMessage returns the text a 5xx control error shows the
+// requester, which SchemaBot wrote and which carries the next step. A typed
+// HTTP failure, such as the engine-unavailable 503, shows the message it was
+// built with, and a terminal control error shows its shown text. It reads the
+// text from the typed error itself, so anything an outer wrap added stays out
+// of it.
+func authoredControlFailureMessage(err error) (string, bool) {
+	if httpErr, ok := errors.AsType[*controlOperationHTTPError](err); ok {
+		return httpErr.err.Error(), true
+	}
+	terminalErr, ok := errors.AsType[*terminalControlError](err)
+	if !ok || terminalErr.shown == "" {
+		return "", false
+	}
+	return terminalErr.shown, true
+}
+
 // writeControlError logs and writes an HTTP error for a control operation.
+// A 5xx answer carries a fixed message, because the error behind it is not
+// SchemaBot's to show a requester, unless SchemaBot wrote the message itself;
+// a 5xx answer also keeps its error code, so a client can tell a retryable
+// engine-unavailable 503 apart. A rejection carries its own text.
 func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply *storage.Apply, err error) {
 	if s.writeChangeGateError(w, opName, err) {
 		return
@@ -389,7 +467,12 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply 
 		s.logger.Error(opName+" failed", attrs...)
 		// The code is what tells a client that an engine-unavailable 503 is
 		// worth retrying.
-		s.writeErrorCode(w, status, controlOperationErrorCode(err), opName+" failed: "+err.Error())
+		code := controlOperationErrorCode(err)
+		if authored, ok := authoredControlFailureMessage(err); ok {
+			s.writeErrorCode(w, status, code, opName+" failed: "+authored)
+			return
+		}
+		s.writeErrorCode(w, status, code, controlInternalFailureMessage(opName, apply))
 	} else {
 		s.logger.Warn(opName+" rejected", attrs...)
 		s.writeErrorCode(w, status, controlOperationErrorCode(err), opName+" rejected: "+err.Error())
@@ -431,9 +514,7 @@ func (s *Service) rejectControlIfStopPending(ctx context.Context, opName string,
 func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, operation string, dest any,
 	applyID, environment *string) (tern.Client, *storage.Apply, string, bool) {
 
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(dest); err != nil {
+	if err := decodeStrictJSONBody(r, dest); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return nil, nil, "", false
 	}
@@ -449,20 +530,20 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, o
 
 	applyIdentifier := *applyID
 	if s.storage == nil {
-		s.logger.Error("storage not available for control request", "path", r.URL.Path, "apply_id", applyIdentifier, "environment", *environment)
-		s.writeError(w, http.StatusInternalServerError, "storage is not available")
+		s.logger.Error("storage not available for control request", "path", r.URL.Path, "operation", operation, "apply_id", applyIdentifier, "environment", *environment)
+		s.writeError(w, http.StatusInternalServerError, controlNotAttemptedMessage(operation, applyIdentifier))
 		return nil, nil, "", false
 	}
 	applyStore := s.storage.Applies()
 	if applyStore == nil {
-		s.logger.Error("apply store not available for control request", "path", r.URL.Path, "apply_id", applyIdentifier, "environment", *environment)
-		s.writeError(w, http.StatusInternalServerError, "apply store is not available")
+		s.logger.Error("apply store not available for control request", "path", r.URL.Path, "operation", operation, "apply_id", applyIdentifier, "environment", *environment)
+		s.writeError(w, http.StatusInternalServerError, controlNotAttemptedMessage(operation, applyIdentifier))
 		return nil, nil, "", false
 	}
 	apply, err := applyStore.GetByApplyIdentifier(r.Context(), applyIdentifier)
 	if err != nil {
-		s.logger.Error("failed to load apply for control request", "path", r.URL.Path, "apply_id", applyIdentifier, "environment", *environment, "error", err)
-		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to look up apply %q: %v", applyIdentifier, err))
+		s.logger.Error("failed to load apply for control request", "path", r.URL.Path, "operation", operation, "apply_id", applyIdentifier, "environment", *environment, "error", err)
+		s.writeError(w, http.StatusInternalServerError, controlNotAttemptedMessage(operation, applyIdentifier))
 		return nil, nil, "", false
 	}
 	if apply == nil {
@@ -482,8 +563,8 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, o
 	if err != nil {
 		s.logger.Error("control request apply is missing stored deployment metadata",
 			append(apply.LogAttrs(),
-				"error", err)...)
-		s.writeError(w, http.StatusInternalServerError, err.Error())
+				"operation", operation, "path", r.URL.Path, "error", err)...)
+		s.writeError(w, http.StatusInternalServerError, controlMissingDeploymentMessage(operation, applyIdentifier))
 		return nil, nil, "", false
 	}
 
@@ -3059,9 +3140,7 @@ type RollbackPlanRequest struct {
 // a plan to revert to the schema state before that apply.
 func (s *Service) handleRollbackPlan(w http.ResponseWriter, r *http.Request) {
 	var req RollbackPlanRequest
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}

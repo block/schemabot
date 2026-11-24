@@ -117,7 +117,7 @@ func prClosedTestHandler(t *testing.T, st storage.Storage) *Handler {
 func prClosedTestHandlerWithGitHub(t *testing.T, st storage.Storage, factory *fakeClientFactory) *Handler {
 	t.Helper()
 	service := api.New(st, &api.ServerConfig{}, nil, testLogger())
-	return NewHandler(service, factory, nil, testLogger())
+	return NewHandler(service, factory, nil, testLogger(), WithInsecureSkipSignatureVerification())
 }
 
 // prClosedGitHub serves octocat/hello-world#1 with the given live state, or
