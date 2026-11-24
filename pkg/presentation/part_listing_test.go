@@ -448,10 +448,23 @@ func TestIndexBuildPercentAcrossTargets(t *testing.T) {
 		{name: "a failed target counts as nothing", parts: []Part{running(80), {Status: state.Task.Failed, PercentComplete: 90}}, want: 40},
 		{name: "a percent past complete is clamped", parts: []Part{running(140)}, want: 99},
 		{name: "every target done", parts: []Part{{Status: state.Task.Completed}, {Status: state.Task.RevertWindow}}, want: 100},
+		{name: "progress on a few of many targets reads as begun", parts: manyTargets(300, Part{Status: state.Task.Completed}, Part{Status: state.Task.Completed}, running(10)), want: 1},
+		{name: "many targets, none started", parts: manyTargets(300), want: 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, IndexBuildPercentAcrossTargets(tt.parts))
 		})
 	}
+}
+
+// manyTargets is a rollout of n targets: the given ones first, then queued
+// targets for the rest.
+func manyTargets(n int, first ...Part) []Part {
+	parts := make([]Part, n)
+	for i := range parts {
+		parts[i] = Part{Status: state.Task.Pending}
+	}
+	copy(parts, first)
+	return parts
 }

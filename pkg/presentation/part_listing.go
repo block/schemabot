@@ -801,7 +801,10 @@ func AcrossTargetsPercent(pct int, exact bool, copied, total int64) string {
 // reports its own whole-build percent instead, so the table's percent is their
 // mean: a completed target counts in full, a running target by its percent,
 // and every other target as nothing yet. Like PercentAcrossTargets, it stops
-// short of complete until every target has completed.
+// short of complete until every target has completed. Once any target has
+// made progress it reads at least 1%, the way a row copy that has moved rows
+// does (ui.RowCopyDisplayPercent): across many targets the mean can round
+// down to 0, which would read as a build that has not started.
 func IndexBuildPercentAcrossTargets(parts []Part) int {
 	if len(parts) == 0 {
 		return 0
@@ -817,6 +820,9 @@ func IndexBuildPercentAcrossTargets(parts []Part) int {
 		}
 	}
 	percent := sum / len(parts)
+	if percent == 0 && sum > 0 {
+		percent = 1
+	}
 	if done < len(parts) {
 		percent = min(percent, 99)
 	}
