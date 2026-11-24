@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/auth"
 )
 
 func TestAuthConfigValidate(t *testing.T) {
@@ -150,5 +151,45 @@ func TestAuthConfigValidate(t *testing.T) {
 		}}).Validate()
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "SPIFFE-anchored proxy trust")
+	})
+
+	t.Run("forward_auth accepts mesh loopback sources with SPIFFE trust", func(t *testing.T) {
+		require.NoError(t, (&api.AuthConfig{Type: "forward_auth", ForwardAuth: api.ForwardAuthSettings{
+			TrustedProxySPIFFE:         []string{"spiffe://example.org/ns/ingress/sa/proxy"},
+			TrustedMeshLoopbackSources: []string{"127.0.0.6"},
+		}}).Validate())
+	})
+
+	t.Run("forward_auth rejects mesh loopback sources without SPIFFE trust", func(t *testing.T) {
+		err := (&api.AuthConfig{Type: "forward_auth", ForwardAuth: api.ForwardAuthSettings{
+			TrustedProxyCIDRs:          []string{"127.0.0.0/8"},
+			TrustedMeshLoopbackSources: []string{"127.0.0.6"},
+		}}).Validate()
+		require.ErrorIs(t, err, auth.ErrMeshSourcesNeedSPIFFE)
+	})
+
+	t.Run("forward_auth requires a mesh loopback source inside the trusted networks", func(t *testing.T) {
+		settings := api.ForwardAuthSettings{
+			TrustedProxySPIFFE:         []string{"spiffe://example.org/ns/ingress/sa/proxy"},
+			TrustedProxyCIDRs:          []string{"127.0.0.1/32"},
+			TrustedMeshLoopbackSources: []string{"127.0.0.6"},
+		}
+		err := (&api.AuthConfig{Type: "forward_auth", ForwardAuth: settings}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "outside every trusted_proxy_cidrs network")
+
+		settings.TrustedProxyCIDRs = append(settings.TrustedProxyCIDRs, "127.0.0.6/32")
+		require.NoError(t, (&api.AuthConfig{Type: "forward_auth", ForwardAuth: settings}).Validate())
+	})
+
+	t.Run("forward_auth rejects the port-forward source as a mesh source", func(t *testing.T) {
+		for _, source := range []string{"127.0.0.1", "::1"} {
+			err := (&api.AuthConfig{Type: "forward_auth", ForwardAuth: api.ForwardAuthSettings{
+				TrustedProxySPIFFE:         []string{"spiffe://example.org/ns/ingress/sa/proxy"},
+				TrustedMeshLoopbackSources: []string{source},
+			}}).Validate()
+			require.Error(t, err, source)
+			assert.Contains(t, err.Error(), "port-forward", source)
+		}
 	})
 }

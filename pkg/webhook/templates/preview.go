@@ -2331,6 +2331,50 @@ func PreviewCommentApplyPlanDowngraded() string {
 	})
 }
 
+// PreviewCommentApplyPlanChangeGateRefused renders the locked apply-plan of an
+// automatic apply after a change gate refused it, as the comment reads once its
+// footer is edited. The refusal itself posts as the comment below.
+func PreviewCommentApplyPlanChangeGateRefused() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:            "testapp",
+		SchemaName:          "testapp",
+		Environment:         "staging",
+		HeadSHA:             previewHeadSHA,
+		Repository:          previewRepository,
+		RequestedBy:         previewRequestedBy,
+		IsMySQL:             true,
+		DatabaseType:        "mysql",
+		Changes:             samplePlanChanges(),
+		IsLocked:            true,
+		LockOwner:           "acme/myapp#42",
+		LockAcquired:        "2026-03-14 10:30:00 UTC",
+		RefusedByChangeGate: true,
+		LockReleased:        true,
+		RefusalPosted:       true,
+	})
+}
+
+// PreviewCommentApplyPlanRefusalUnposted renders the same edited
+// comment when the refusal comment did not post and the lock was not released:
+// no lock claim, and a footer that carries the reason to look and the next step.
+func PreviewCommentApplyPlanRefusalUnposted() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:            "testapp",
+		SchemaName:          "testapp",
+		Environment:         "staging",
+		HeadSHA:             previewHeadSHA,
+		Repository:          previewRepository,
+		RequestedBy:         previewRequestedBy,
+		IsMySQL:             true,
+		DatabaseType:        "mysql",
+		Changes:             samplePlanChanges(),
+		IsLocked:            true,
+		LockOwner:           "acme/myapp#42",
+		LockAcquired:        "2026-03-14 10:30:00 UTC",
+		RefusedByChangeGate: true,
+	})
+}
+
 // =============================================================================
 // Vitess Plan Comment Previews
 // =============================================================================
