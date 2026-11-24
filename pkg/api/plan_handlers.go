@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -181,9 +180,7 @@ func (e *RemoteDeploymentUnavailableError) Unwrap() error {
 // handlePullSchema handles POST /api/pull requests.
 func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 	var req apitypes.PullSchemaRequest
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
@@ -627,9 +624,7 @@ type ApplyRequest struct {
 // handlePlan handles POST /api/plan requests.
 func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 	var req PlanRequest
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
@@ -1532,9 +1527,7 @@ func storedNarrowingConflicts(stored, planned string) bool {
 // which the CLI reads as an unknown outcome and keeps its lock for.
 func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 	var req ApplyRequest
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
