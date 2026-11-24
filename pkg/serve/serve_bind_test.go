@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -73,15 +74,92 @@ func newBindTestServer(t *testing.T, logger *slog.Logger, metricsPort int, metri
 	}, &serverClosed
 }
 
-// requirePortFree fails the test unless port can be bound again, which shows
-// that the run that held it has released it.
-func requirePortFree(t *testing.T, port int, name string) {
+// heldPorts are loopback ports a test configures on a Server. Each one stays
+// bound from the moment the test chooses it until the server takes it over, so
+// no other process can claim the port in between. A port the test released and
+// the server bound again by number could be taken by a test running in another
+// package, and the run would then fail on a listener the test never meant to
+// occupy.
+type heldPorts struct {
+	mu        sync.Mutex
+	listeners map[string]*heldListener
+}
+
+// heldListener records whether the server took the listener and whether it was
+// closed afterwards.
+type heldListener struct {
+	net.Listener
+	mu     sync.Mutex
+	taken  bool
+	closed bool
+}
+
+func (l *heldListener) Close() error {
+	l.mu.Lock()
+	l.closed = true
+	l.mu.Unlock()
+	if err := l.Listener.Close(); err != nil {
+		return fmt.Errorf("close held listener on %s: %w", l.Addr(), err)
+	}
+	return nil
+}
+
+// holdPorts binds n loopback ports and holds them for the test. Listeners the
+// server never takes are closed when the test ends; the ones it takes are its
+// own to close.
+func holdPorts(t *testing.T, n int) (*heldPorts, []int) {
 	t.Helper()
 
+	held := &heldPorts{listeners: make(map[string]*heldListener, n)}
+	ports := make([]int, 0, n)
 	var config net.ListenConfig
-	rebound, err := config.Listen(t.Context(), "tcp", ":"+strconv.Itoa(port))
-	require.NoError(t, err, "the %s port is free again once the run has failed", name)
-	require.NoError(t, rebound.Close())
+	for range n {
+		listener, err := config.Listen(t.Context(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		addr, ok := listener.Addr().(*net.TCPAddr)
+		require.True(t, ok, "a TCP listener reports a TCP address")
+		held.listeners[strconv.Itoa(addr.Port)] = &heldListener{Listener: listener}
+		ports = append(ports, addr.Port)
+	}
+	t.Cleanup(func() {
+		held.mu.Lock()
+		defer held.mu.Unlock()
+		for _, listener := range held.listeners {
+			if !listener.taken {
+				assert.NoError(t, listener.Close())
+			}
+		}
+	})
+	return held, ports
+}
+
+// listen is a Server.listen that hands over the held listener for a held port
+// and binds any other port for real, so a port another listener occupies still
+// fails the way it does in production.
+func (h *heldPorts) listen(ctx context.Context, name, port string) (net.Listener, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if listener, ok := h.listeners[port]; ok && !listener.taken {
+		listener.taken = true
+		return listener, nil
+	}
+	return listenForServe(ctx, name, port)
+}
+
+// requireReleased fails the test if the server took the listener for port and
+// did not close it, which would leave the failed run holding a socket.
+func (h *heldPorts) requireReleased(t *testing.T, port int, name string) {
+	t.Helper()
+
+	h.mu.Lock()
+	listener, ok := h.listeners[strconv.Itoa(port)]
+	h.mu.Unlock()
+	require.True(t, ok, "the %s port is one the test holds", name)
+	listener.mu.Lock()
+	defer listener.mu.Unlock()
+	if listener.taken {
+		assert.True(t, listener.closed, "the run closes the %s listener it bound once it has failed", name)
+	}
 }
 
 // A second `schemabot serve` starts while another process already holds its
@@ -110,12 +188,14 @@ func TestServeFailsOnTakenPortBeforeStartingBackgroundWork(t *testing.T) {
 			var mu sync.Mutex
 			logger := slog.New(slog.NewTextHandler(&lockedWriter{mu: &mu, w: &logs}, nil))
 
-			ports := map[string]int{"grpc": freeTCPPort(t), "http": freeTCPPort(t), "metrics": freeTCPPort(t)}
+			held, free := holdPorts(t, 3)
+			ports := map[string]int{"grpc": free[0], "http": free[1], "metrics": free[2]}
 			taken := occupiedPort(t)
 			ports[tt.taken] = taken
 
 			var dispatchStarted bool
 			srv, serverClosed := newBindTestServer(t, logger, ports["metrics"], http.NotFoundHandler(), func() { dispatchStarted = true })
+			srv.listen = held.listen
 
 			runCtx, signalled, stopWatching := watchForShutdownSignal(t.Context())
 			defer stopWatching()
@@ -139,7 +219,7 @@ func TestServeFailsOnTakenPortBeforeStartingBackgroundWork(t *testing.T) {
 
 			for name, port := range ports {
 				if name != tt.taken {
-					requirePortFree(t, port, name)
+					held.requireReleased(t, port, name)
 				}
 			}
 
@@ -159,7 +239,8 @@ func TestServeFailsOnTakenPortBeforeStartingBackgroundWork(t *testing.T) {
 // port, and not the other way round.
 func TestServeServesEachHandlerOnItsOwnBoundPort(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
-	httpPort, metricsPort := freeTCPPort(t), freeTCPPort(t)
+	held, ports := holdPorts(t, 2)
+	httpPort, metricsPort := ports[0], ports[1]
 	started := make(chan struct{}, 1)
 	metrics := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if _, err := io.WriteString(w, "metrics-body"); err != nil {
@@ -167,6 +248,7 @@ func TestServeServesEachHandlerOnItsOwnBoundPort(t *testing.T) {
 		}
 	})
 	srv, serverClosed := newBindTestServer(t, logger, metricsPort, metrics, func() { started <- struct{}{} })
+	srv.listen = held.listen
 
 	runCtx, signalled, stopWatching := watchForShutdownSignal(t.Context())
 	defer stopWatching()
