@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
@@ -372,7 +373,9 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	coverage := presentation.TargetCoverage(done, running, pending, failed, retrying, presentation.RunningCopying, pendingWord)
 	status := presentation.RollupTaskStatus(statuses)
 	if indexBuild && running > 0 {
-		fmt.Fprintf(sb, "**%s**: %s%s\n", name, ui.IndexBuildProgress(presentation.IndexBuildPercentAcrossTargets(parts)), ui.ThrottledSuffix(anyTargetThrottled(cells)))
+		// The percent across targets is a whole-number mean of each target's
+		// whole percent, so it has no decimals to show.
+		fmt.Fprintf(sb, "**%s**: %s%s\n", name, ui.IndexBuildProgress(presentation.IndexBuildPercentAcrossTargets(parts), apitypes.BuildWork{}), ui.ThrottledSuffix(anyTargetThrottled(cells)))
 		writeDDL()
 		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, presentation.RunningApplying, budget)
 		return
