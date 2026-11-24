@@ -1043,21 +1043,23 @@ database name when no application is registered.
 
 - The executing worker reports `operation.started` when a fresh attempt reaches
   the engine. It reports `operation.finished` when a drive that called the engine
-  commits the attempt outcome. A drive that only reconciles a stored outcome
-  after a takeover may omit the operation finish. An automatic retry opens a
-  new attempt.
-- The control plane reports `apply.finished` when the apply records a final
-  outcome. The description includes the apply ID and deployment outcomes.
-  This covers applies initiated from a pull request or the CLI.
+  commits the attempt outcome. After a takeover, the finish can be omitted if
+  the drive cannot establish a new outcome for the attempt. An automatic retry opens a
+  new attempt even when its outcome is again `failed_retryable`.
+- The control plane reports `apply.finished` when a state transition records
+  the settled rollout outcome. If the rollout settles while the apply already
+  has that outcome, the event is omitted. The description includes the apply
+  ID and deployment outcomes for pull request and CLI applies.
 
 Each server configures its own destinations. For a remote apply, configure the
 worker to report operation events and the control plane to report the aggregate
 outcome. Worker events use the executing deployment's apply and operation IDs.
 The worker receives the managed app label in the existing dispatch options.
 
-Delivery is best effort. Each destination has a bounded queue and a short HTTP
-timeout. Full queues drop events, delivery failures are logged, and there are no
-delivery retries. Shutting down the server can discard events still in memory.
+Delivery is best effort. The server offers events in memory without writing
+event records. Each destination has a bounded queue and a short HTTP timeout.
+Full queues drop events, delivery failures are logged, and there are no delivery
+retries. Shutting down the server can discard events still in memory.
 
 ## Rate Limits
 

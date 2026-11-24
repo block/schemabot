@@ -28,7 +28,11 @@ const changeEventTestDeadline = 5 * time.Second
 func TestChangeEventLifecycle(t *testing.T) {
 	t.Run("MySQL", func(t *testing.T) {
 		clearTables(t)
-		testChangeEventLifecycle(t, testDB, NewMySQL)
+		db, err := sql.Open("block-mysql", testDSNChangedRows)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, db.Close()) })
+		db.SetMaxOpenConns(1)
+		testChangeEventLifecycle(t, db, NewMySQL)
 	})
 	t.Run("PostgreSQL", func(t *testing.T) {
 		_, db := testutil.StartPostgres(t, "change_events")
@@ -135,7 +139,7 @@ func testChangeEventLifecycle(t *testing.T, db *sql.DB, newStore func(*sql.DB, .
 	}
 	audit, err = store.ApplyLogs().GetByApply(ctx, apply.ID)
 	require.NoError(t, err)
-	require.Len(t, audit, 2, "only the observed operation finish and the aggregate finish are recorded")
+	require.Empty(t, audit, "change events use no audit records")
 
 	cancelLock := createTestLock(t, store, "events_cancel_db", "mysql")
 	cancelled := createTestApply(t, store, cancelLock, "apply_cancelled", 2)
@@ -151,7 +155,7 @@ func testChangeEventLifecycle(t *testing.T, db *sql.DB, newStore func(*sql.DB, .
 	}
 	audit, err = store.ApplyLogs().GetByApply(ctx, cancelled.ID)
 	require.NoError(t, err)
-	require.Len(t, audit, 1)
+	require.Empty(t, audit)
 
 	remoteLock := createTestLock(t, store, "events_remote_db", "mysql")
 	remote := &storage.Apply{
@@ -193,6 +197,117 @@ func testChangeEventLifecycle(t *testing.T, db *sql.DB, newStore func(*sql.DB, .
 	}
 	audit, err = store.ApplyLogs().GetByApply(ctx, remote.ID)
 	require.NoError(t, err)
-	require.Len(t, audit, 1, "the worker records its operation finish only")
-	require.Equal(t, changeevents.OperationFinished, audit[0].EventType)
+	require.Empty(t, audit)
+
+	testRetryAndRolloutFinishEvents(t, store, delivered)
+}
+
+// A parent-lease retry can record the same failed_retryable state even after
+// the next attempt has reached the engine. A rollout can likewise settle while
+// its parent already says failed, but only a winning state swap can report it.
+func testRetryAndRolloutFinishEvents(t *testing.T, store *Storage, delivered <-chan string) {
+	t.Helper()
+	ctx := t.Context()
+	now := time.Now()
+	retryLock := createTestLock(t, store, "events_retry_db", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, retryLock, "apply_retry", 4, state.Apply.FailedRetryable, "staging")
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "local", State: state.ApplyOperation.FailedRetryable, StartedAt: &now,
+		ErrorMessage: "retryable engine error",
+	})
+	require.NoError(t, err)
+	_, err = store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: "retry_task", ApplyID: apply.ID, ApplyOperationID: &opID, PlanID: apply.PlanID,
+		Database: apply.Database, DatabaseType: apply.DatabaseType, Environment: apply.Environment, Engine: apply.Engine,
+		State: state.Task.FailedRetryable, CreatedAt: now, UpdatedAt: now,
+	})
+	require.NoError(t, err)
+	claim, err := store.ApplyOperations().FindNextApplyOperation(ctx, "retry-same-state")
+	require.NoError(t, err)
+	require.NotNil(t, claim)
+	require.Equal(t, opID, claim.ID)
+	require.Equal(t, 1, claim.Attempt)
+	require.True(t, claim.StartsAttempt)
+	require.Equal(t, state.ApplyOperation.FailedRetryable, claim.State)
+	parent, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "retry-same-state")
+	require.NoError(t, err)
+	require.NotNil(t, parent)
+	drive := storage.WithOperationChangeAttempt(storage.WithOperationLease(ctx, claim.Lease()), claim)
+	store.ObserveOperationDispatch(drive, apply)
+	if _, mysql := store.applyOperations.dialect.(MySQLDialect); mysql {
+		// Match the stored heartbeat so the first outcome write changes zero
+		// rows under MySQL's changed-rows behavior.
+		_, err := store.db.ExecContext(ctx, "SET timestamp = 1700000000")
+		require.NoError(t, err)
+		_, err = store.db.ExecContext(ctx, "UPDATE apply_operations SET updated_at = NOW() WHERE id = ?", opID)
+		require.NoError(t, err)
+	}
+	require.NoError(t, store.ApplyOperations().MarkFailedRetryable(drive, opID, "retryable engine error"))
+	if _, mysql := store.applyOperations.dialect.(MySQLDialect); mysql {
+		_, err := store.db.ExecContext(ctx, "SET timestamp = DEFAULT")
+		require.NoError(t, err)
+	}
+	require.NoError(t, store.ApplyOperations().MarkFailedRetryable(drive, opID, "repeat after outcome"))
+
+	_, err = store.db.ExecContext(ctx, `UPDATE apply_operations SET updated_at = ? WHERE id = ?`,
+		now.Add(-2*storage.ApplyLeaseStaleAfter), opID)
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `UPDATE applies SET updated_at = ? WHERE id = ?`,
+		now.Add(-2*storage.ApplyLeaseStaleAfter), apply.ID)
+	require.NoError(t, err)
+	recovered, err := store.ApplyOperations().FindNextApplyOperation(ctx, "recover-same-state")
+	require.NoError(t, err)
+	require.NotNil(t, recovered)
+	require.Equal(t, opID, recovered.ID)
+	require.Equal(t, claim.Attempt, recovered.Attempt)
+	require.False(t, recovered.StartsAttempt)
+	recovery := storage.WithOperationChangeAttempt(storage.WithOperationLease(ctx, recovered.Lease()), recovered)
+	store.ObserveOperationDispatch(recovery, apply)
+	require.NoError(t, store.ApplyOperations().MarkFailedRetryable(recovery, opID, "retryable engine error"))
+
+	for i, reopen := range []bool{false, true} {
+		identifier := "apply_rollout_" + strconv.Itoa(i)
+		lock := createTestLock(t, store, identifier, "mysql")
+		rollout := createTestApplyWithStateAndEnv(t, store, lock, identifier, int64(5+i), state.Apply.Running, "staging")
+		for _, op := range []*storage.ApplyOperation{
+			{ApplyID: rollout.ID, Deployment: "failed", State: state.ApplyOperation.Failed},
+			{ApplyID: rollout.ID, Deployment: "started", State: state.ApplyOperation.Running, StartedAt: &now},
+			{ApplyID: rollout.ID, Deployment: "queued", State: state.ApplyOperation.Pending},
+		} {
+			_, err = store.ApplyOperations().Insert(ctx, op)
+			require.NoError(t, err)
+		}
+		ops, err := store.ApplyOperations().ListByApply(ctx, rollout.ID)
+		require.NoError(t, err)
+		rollout.State = state.Apply.Failed
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+		from := state.Apply.Failed
+		if reopen {
+			swapped, err := store.Applies().UpdateDerivedState(ctx, rollout.ID, from, state.Apply.RunningDegraded, "", nil, nil)
+			require.NoError(t, err)
+			require.True(t, swapped)
+			from = state.Apply.RunningDegraded
+		}
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ops[1].ID))
+		swapped, err := store.Applies().UpdateDerivedState(ctx, rollout.ID, from, state.Apply.Failed, "", nil, &now)
+		require.NoError(t, err)
+		require.True(t, swapped)
+	}
+
+	identity := " apply=apply_retry operation=" + strconv.FormatInt(opID, 10) + " deployment=local attempt=2"
+	deadline := time.NewTimer(changeEventTestDeadline)
+	defer deadline.Stop()
+	for _, want := range []string{
+		"operation.started" + identity,
+		"operation.finished" + identity + " outcome=failed_retryable",
+		"apply.finished apply=apply_rollout_1 outcome=failed deployments=failed(failed:1),queued(pending:1),started(completed:1)",
+	} {
+		select {
+		case received := <-delivered:
+			description := strconv.Quote(want + " https://github.com/org/repo/pull/123")
+			require.JSONEq(t, `{"app":"registered-app","description":`+description+`}`, received)
+		case <-deadline.C:
+			t.Fatalf("did not receive %s", want)
+		}
+	}
 }

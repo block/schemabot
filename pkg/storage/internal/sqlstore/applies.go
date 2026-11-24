@@ -15,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/block/schemabot/pkg/changeevents"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -1574,6 +1573,7 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 // updateOnce runs one attempt of Update in its own transaction.
 func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease storage.ApplyLease, hasLease bool) error {
 	var err error
+	finishEligible := s.events.directApplyFinishEligible(ctx, apply)
 	lockTarget := isActiveApplyState(apply.State)
 	database, dbType, environment, deployment := apply.Database, apply.DatabaseType, apply.Environment, apply.Deployment
 	if lockTarget && (!hasApplyTarget(database, dbType, environment) || deployment == "") {
@@ -1652,8 +1652,7 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 	// write still uses the original statement to preserve its other updates.
 	var result sql.Result
 	var terminalTransition bool
-	if s.events != nil && s.events.sender.Enabled(changeevents.ApplyFinished, apply.Environment) &&
-		state.IsState(apply.State, state.SettledApplyStates...) {
+	if finishEligible {
 		result, err = writeTx.tx.ExecContext(ctx, statement+" AND state <> ?", append(args, apply.State)...)
 		if err != nil {
 			return fmt.Errorf("update apply %d: %w", apply.ID, err)
@@ -1695,7 +1694,7 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 		return fmt.Errorf("commit update apply %d: %w", apply.ID, err)
 	}
 	if terminalTransition {
-		s.events.finishApply(ctx, apply.ID, apply.State)
+		s.events.finishApply(ctx, apply.ID, apply.State, true)
 	}
 	return nil
 }
@@ -1834,7 +1833,7 @@ func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expe
 	}
 	if rows > 0 {
 		if !state.IsState(expectedState, newState) {
-			s.events.finishApply(ctx, applyID, newState)
+			s.events.finishApply(ctx, applyID, newState, false)
 		}
 		return true, nil
 	}
@@ -3267,7 +3266,7 @@ func (s *applyStore) ExpireRetryable(ctx context.Context, endedOperationStopType
 		})
 	if err == nil {
 		for _, result := range expired {
-			s.events.finishApply(ctx, result.Apply.ID, result.Apply.State)
+			s.events.finishApply(ctx, result.Apply.ID, result.Apply.State, false)
 		}
 	}
 	return expired, err

@@ -321,6 +321,7 @@ func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Ap
 	if err != nil {
 		return nil, fmt.Errorf("build deferred deploy request for task %s: %w", applyTasks[0].TaskIdentifier, err)
 	}
+	c.observeOperationDispatch(ctx)
 	result, err := eng.Start(withDriveWorkOwner(ctx), controlReq)
 	if err != nil {
 		return nil, fmt.Errorf("start deferred deploy: %w", err)

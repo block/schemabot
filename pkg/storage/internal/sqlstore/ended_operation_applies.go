@@ -214,7 +214,7 @@ func (s *applyStore) SettleAppliesStoppedForEndedOperation(ctx context.Context, 
 		})
 	if err == nil {
 		for _, result := range settled {
-			s.events.finishApply(ctx, result.Apply.ID, result.Apply.State)
+			s.events.finishApply(ctx, result.Apply.ID, result.Apply.State, false)
 		}
 	}
 	return settled, err

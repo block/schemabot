@@ -189,11 +189,11 @@ func setupStorageSchema(t *testing.T, dsn string) {
 
 // createStorage creates a storage instance from DSN for testing.
 // Requires setupStorageSchema to have been called first.
-func createStorage(t *testing.T, dsn string) storage.Storage {
+func createStorage(t *testing.T, dsn string, opts ...storage.Option) storage.Storage {
 	t.Helper()
 	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database for storage")
-	return mysqlstore.New(db)
+	return mysqlstore.New(db, opts...)
 }
 
 // buildSchemaWithAllTables builds schema files including ALL existing tables in the database.

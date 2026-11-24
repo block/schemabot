@@ -3,6 +3,8 @@ package storage
 import (
 	"context"
 	"sync/atomic"
+
+	"github.com/block/schemabot/pkg/state"
 )
 
 // OperationChangeRecorder is implemented by stores configured to observe
@@ -19,7 +21,9 @@ type OperationChangeAttempt struct {
 	Deployment  string
 	Number      int
 	Starts      bool
+	Retry       bool
 	dispatched  atomic.Bool
+	finished    atomic.Bool
 }
 
 // ObserveDispatch records the first local engine handoff for this drive.
@@ -32,10 +36,16 @@ func (a *OperationChangeAttempt) ObservedDispatch() bool {
 	return a.dispatched.Load()
 }
 
+// ObserveFinish lets a drive offer at most one outcome for the attempt.
+func (a *OperationChangeAttempt) ObserveFinish() bool {
+	return a.finished.CompareAndSwap(false, true)
+}
+
 // WithOperationChangeAttempt carries claim-time identity through the drive.
 func WithOperationChangeAttempt(ctx context.Context, op *ApplyOperation) context.Context {
 	return context.WithValue(ctx, operationChangeAttemptKey{}, &OperationChangeAttempt{
 		OperationID: op.ID, Deployment: op.Deployment, Number: op.Attempt + 1, Starts: op.StartsAttempt,
+		Retry: op.StartsAttempt && state.IsState(op.State, state.ApplyOperation.FailedRetryable),
 	})
 }
 

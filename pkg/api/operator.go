@@ -2757,6 +2757,24 @@ func (s *Service) recheckOperationLease(ctx context.Context, driverID int, op *s
 // driver's own claim — keeps the row unclaimable for a full staleness window,
 // which is the stall the release exists to avoid.
 func (s *Service) releaseOperationClaimBeforeDrive(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease) {
+	if op.StartsAttempt && state.IsState(op.State, state.ApplyOperation.Pending, state.ApplyOperation.Stopped) {
+		// A claim that never dispatched should remain eligible for its first
+		// start on the next drive. The compare-and-set restores the claim's
+		// prior state only while this driver still owns the unchanged row.
+		returned, err := s.storage.ApplyOperations().ReturnUnstartedClaim(ctx, opLease, op.State)
+		if err != nil {
+			s.logClaimFailure(ctx, "operator: failed to return the claim of an operation that did not start", "unstarted_claim_return_error",
+				append(op.LogAttrs(), "driver", driverID, "error", err)...)
+			return
+		}
+		if returned {
+			return
+		}
+	}
+	s.releaseOperationClaim(ctx, driverID, op, opLease)
+}
+
+func (s *Service) releaseOperationClaim(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease) {
 	released, err := s.storage.ApplyOperations().ReleaseClaim(ctx, opLease)
 	if err != nil {
 		s.logClaimFailure(ctx, "operator: failed to release the operation lease this driver will not drive under; the operation is retried once its lease goes stale", "operation_lease_release_error",
@@ -2792,7 +2810,7 @@ func (s *Service) handBackDeferredCutoverDrive(ctx context.Context, driverID int
 	if holdsParent {
 		s.releaseParentApplyClaim(releaseCtx, driverID, apply, op)
 	}
-	s.releaseOperationClaimBeforeDrive(releaseCtx, driverID, op, opLease)
+	s.releaseOperationClaim(releaseCtx, driverID, op, opLease)
 }
 
 // releaseFinishedOperationClaim clears the operation lease a drive leaves
@@ -2918,29 +2936,7 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, 
 		return
 	}
 	metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
-	released, err := s.storage.ApplyOperations().ReleaseClaim(ctx, opLease)
-	if err != nil {
-		s.logClaimFailure(ctx, "operator: parent apply not claimable and operation lease release failed; operation will be retried once its lease goes stale", "operation_lease_release_error",
-			append(parent.LogAttrs(),
-				"driver", driverID,
-				"apply_operation_id", op.ID,
-				"operation_deployment", op.Deployment,
-				"error", err)...)
-		return
-	}
-	if !released {
-		s.logger.Warn("operator: parent apply not claimable and operation lease already rotated; the new lease owner drives the operation",
-			append(parent.LogAttrs(),
-				"driver", driverID,
-				"apply_operation_id", op.ID,
-				"operation_deployment", op.Deployment)...)
-		return
-	}
-	s.logger.Warn("operator: parent apply not claimable for operation; operation lease released for retry on the next poll",
-		append(parent.LogAttrs(),
-			"driver", driverID,
-			"apply_operation_id", op.ID,
-			"operation_deployment", op.Deployment)...)
+	s.releaseOperationClaimBeforeDrive(ctx, driverID, op, opLease)
 }
 
 func (s *Service) reconcileClaimedOperationFromTerminalParent(ctx context.Context, driverID int, op *storage.ApplyOperation, parent *storage.Apply) {
