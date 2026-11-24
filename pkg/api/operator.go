@@ -1336,7 +1336,8 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	stopHeartbeat := s.startApplyOperationHeartbeat(runCtx, driverID, op, apply, cancelRun)
 	defer stopHeartbeat()
 
-	resumed, resumeErr := s.resumeClaimedApply(runCtx, driverID, apply, op.ID, op.Deployment)
+	resumed, resumeErr := s.resumeClaimedApplyWithOptions(runCtx, driverID, apply, op.ID, op.Deployment,
+		resumeClaimedApplyOptions{operationKey: op.OperationKey})
 	stopHeartbeat()
 	if errors.Is(resumeErr, tern.ErrDeferredCutoverDriveHandedBack) {
 		s.handBackDeferredCutoverDrive(ctx, driverID, apply, op, opLease, true)
@@ -1751,7 +1752,7 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	// Suppress the per-driver terminal observer: the aggregate terminal summary
 	// is published once by the projection CAS winner, not per deployment.
 	resumed, resumeErr := s.resumeClaimedApplyWithOptions(runCtx, driverID, apply, op.ID, op.Deployment,
-		resumeClaimedApplyOptions{suppressRecoveredObserver: true, cutover: cutover, projectionOwnsGauge: preDrive.OwnsActiveAppliesGauge})
+		resumeClaimedApplyOptions{suppressRecoveredObserver: true, cutover: cutover, projectionOwnsGauge: preDrive.OwnsActiveAppliesGauge, operationKey: op.OperationKey})
 	stopHeartbeat()
 	if errors.Is(resumeErr, tern.ErrDeferredCutoverDriveHandedBack) {
 		s.handBackDeferredCutoverDrive(ctx, driverID, apply, op, opLease, false)
@@ -3067,6 +3068,10 @@ type resumeClaimedApplyOptions struct {
 	// projection: the claim of a paused rollout's operation does not count it
 	// again, since the projection does when the parent leaves its pause.
 	projectionOwnsGauge bool
+	// operationKey names the claimed operation in the apply's log, so the
+	// claims of operations that share one deployment, such as the shards of a
+	// sharded target, can be told apart.
+	operationKey string
 }
 
 func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID int, apply *storage.Apply, applyOperationID int64, operationDeployment string, opts resumeClaimedApplyOptions) (bool, error) {
@@ -3109,7 +3114,7 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 	// why new state transitions appear after a failure or a driver crash —
 	// without this entry, an operator reading apply_logs sees a gap between
 	// the last failure and the resumed work.
-	s.logApplyResumeClaim(ctx, logger, driverID, apply)
+	s.logApplyClaim(ctx, logger, driverID, apply, applyOperationID, deployment, opts.operationKey)
 
 	previousState := apply.State
 
@@ -3345,21 +3350,37 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 	return true, nil
 }
 
-// logApplyResumeClaim appends a durable apply log entry recording that an
-// operator driver claimed the apply to resume it. Best-effort: a failed
-// append must not block the resume, so the error is logged on the caller's
+// logApplyClaim appends a durable apply log entry recording that an operator
+// driver claimed the apply, or one deployment's operation of it, and is now
+// driving it. A claim happens on every drive, not only after a failure, so the
+// message says what was claimed rather than calling it a resume, and names the
+// deployment so the claims of a multi-deployment apply can be told apart. A
+// claim changes no state, so the entry carries none. Best-effort: a failed
+// append must not block the drive, so the error is logged on the caller's
 // drive-scoped logger and the claim proceeds.
-func (s *Service) logApplyResumeClaim(ctx context.Context, logger *slog.Logger, driverID int, apply *storage.Apply) {
+func (s *Service) logApplyClaim(ctx context.Context, logger *slog.Logger, driverID int, apply *storage.Apply, applyOperationID int64, deployment, operationKey string) {
 	s.appendApplyLog(ctx, logger, &storage.ApplyLog{
 		ApplyID:   apply.ID,
 		Level:     storage.LogLevelInfo,
 		EventType: storage.LogEventInfo,
 		Source:    storage.LogSourceSchemaBot,
-		Message:   fmt.Sprintf("Operator claimed apply to resume it (driver %d, state %s)", driverID, apply.State),
-		OldState:  apply.State,
-		NewState:  apply.State,
+		Message:   applyClaimMessage(driverID, apply.State, applyOperationID, deployment, operationKey),
 		CreatedAt: s.clock.Now(),
-	}, "that a driver claimed it to resume it")
+	}, "that a driver claimed it")
+}
+
+// applyClaimMessage is the apply log line for a driver's claim. It names the
+// operation as well as its deployment when the operation has a key, because
+// the operations of a sharded target share one deployment and differ only by
+// key.
+func applyClaimMessage(driverID int, applyState string, applyOperationID int64, deployment, operationKey string) string {
+	if applyOperationID == 0 {
+		return fmt.Sprintf("Driver %d claimed the apply (apply state %s)", driverID, applyState)
+	}
+	if operationKey == "" {
+		return fmt.Sprintf("Driver %d claimed deployment %s (apply state %s)", driverID, deployment, applyState)
+	}
+	return fmt.Sprintf("Driver %d claimed operation %s on deployment %s (apply state %s)", driverID, operationKey, deployment, applyState)
 }
 
 // failClaimedApplyAfterDrivePanic contains an engine-drive panic to the

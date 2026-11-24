@@ -15,6 +15,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/caller"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
@@ -209,6 +210,9 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 				ETASeconds:      sh.EtaSeconds,
 				PercentComplete: pct,
 				CutoverAttempts: sh.CutoverAttempts,
+				// The data plane reports one statement per table, which
+				// every shard it lists runs.
+				CopiesNoRows: !presentation.ChangeCopiesRows(tpr.ChangeType, tpr.IsInstant),
 			})
 		}
 		httpResp.Tables = append(httpResp.Tables, tpr)

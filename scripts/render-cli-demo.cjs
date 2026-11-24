@@ -52,10 +52,13 @@ async function main() {
         '-append', '-colors', '256', '-unique-colors', palette,
       ]);
       const output = path.join(root, 'assets', demo.name + '.gif');
+      // Chrome can antialias an edge, such as a rounded corner, slightly
+      // differently from one screenshot to the next. The fuzz keeps that
+      // invisible difference from turning an unchanged frame into a full one.
       execFileSync('magick', [
         '-loop', '0',
         ...frames.flatMap(f => ['-delay', String(Math.round(f.delay)), f.file]),
-        '+dither', '-remap', palette, '-layers', 'OptimizePlus', output,
+        '+dither', '-remap', palette, '-fuzz', '2%', '-layers', 'OptimizePlus', output,
       ]);
       console.log(demo.name, Math.round(duration) + 's', fs.statSync(output).size + ' bytes', 'frames:', tmp);
       await page.close();

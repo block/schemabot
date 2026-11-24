@@ -357,7 +357,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 			if line := rows.RowsLine(len(cells), targetsTableBytes(cells)); line != "" {
 				sb.WriteString("- " + line + "\n")
 			}
-			writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
+			writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, presentation.RunningCopying, budget)
 			return
 		}
 	}
@@ -401,7 +401,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		}
 	}
 	if lists {
-		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
+		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, presentation.RunningCopying, budget)
 	}
 }
 

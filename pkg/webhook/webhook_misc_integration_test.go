@@ -120,7 +120,7 @@ func TestE2EWebhookMetrics(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// Send an issue_comment webhook (plan command).
 	commentReq := buildWebhookRequest(t, webhookPayloadOpts{
@@ -196,7 +196,7 @@ func TestE2EWebhookPlanCommandCountsThePlanOnce(t *testing.T) {
 	setupFakeGitHubForPlan(t, mux, schemaFiles, fmt.Sprintf("database: %s\ntype: mysql\n", dbName), dbName)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClient(client, logger)}, nil, logger)
+	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClient(client, logger)}, nil, logger, WithInsecureSkipSignatureVerification())
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot plan -e staging", isPR: true}, nil))

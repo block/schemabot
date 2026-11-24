@@ -67,7 +67,7 @@ The inventory uses the real databases command against a loopback fixture. The st
 
 The fleet pull view enables the production interactive color setting and shows the entire result in one frame. Each fleet command finishes typing, then pauses briefly before output appears.
 
-All animations render at 12 frames per second. The cutover copy advances in five-point steps, with brief holds for interactive controls.
+All animations render at 12 frames per second. Chrome can antialias an edge, such as the terminal's rounded corner, slightly differently from one screenshot to the next, so the encoder compares frames with a 2% color fuzz; without it, that invisible difference turns unchanged frames into full ones and multiplies the GIF's size. The cutover copy advances in five-point steps, with brief holds for interactive controls.
 
 The rollback illustration restores a removed index, which can require a row copy; the index drop in the text-only declined example can finish through native MySQL DDL. The rollback scenario runs `RollbackCmd` with both no and yes against a loopback fixture. It checks the source apply, target environment, request order, lock target, reviewed plan ID, and that the safe rollback carries no unsafe consent. Declining must issue no lock or apply request. The accepted command runs with `Watch: true`, opens its watcher automatically, and polls the new apply ID through 25%, 100%, and completion. Production watcher views provide the selected animation frames. No database is contacted. The preview and submitted output are separate selected terminal views, with input echo added for the animation.
 

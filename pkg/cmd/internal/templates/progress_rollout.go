@@ -517,7 +517,7 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 		return "", false
 	}
 	var b strings.Builder
-	writeTableLine(&b, t, "%s %s%s", ui.ProgressBarRowCopy(pct), presentation.AcrossTargetsPercent(pct, rows.Exact(targets), rows.Copied, rows.Total), throttledSuffix(t))
+	writeTableLine(&b, t, "%s %s%s", ui.ProgressBarRowCopy(pct), presentation.AcrossTargetsPercent(pct, rows.Exact(targets), rows.Copied, rows.Total), ui.ThrottledSuffix(t.Throttled))
 	if t.DDL != "" {
 		b.WriteString(formatTableDDL(t))
 	}

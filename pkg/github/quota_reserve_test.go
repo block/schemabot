@@ -428,7 +428,7 @@ func TestQuotaReserveIgnoresUnusableQuotaReports(t *testing.T) {
 		{name: "garbled remaining count", remaining: "fifty", reset: inWindow},
 		{name: "garbled reset time", remaining: "50", reset: "soon"},
 		{name: "reset ten years out", remaining: "50", reset: strconv.FormatInt(now.Add(10*365*24*time.Hour).Unix(), 10)},
-		{name: "reset just past the horizon", remaining: "50", reset: strconv.FormatInt(now.Add(quotaResetHorizon+time.Second).Unix(), 10)},
+		{name: "reset just past the horizon", remaining: "50", reset: strconv.FormatInt(now.Add(QuotaResetHorizon+time.Second).Unix(), 10)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rt, ok := newQuotaReserveTransport(http.DefaultTransport, 100, 42, nil).(*quotaReserveTransport)
@@ -450,7 +450,7 @@ func TestQuotaReserveIgnoresUnusableQuotaReports(t *testing.T) {
 		rt, ok := newQuotaReserveTransport(http.DefaultTransport, 100, 42, nil).(*quotaReserveTransport)
 		require.True(t, ok)
 		rt.now = func() time.Time { return now }
-		quotaReserveObserve(t, rt, "50", strconv.FormatInt(now.Add(quotaResetHorizon).Unix(), 10))
+		quotaReserveObserve(t, rt, "50", strconv.FormatInt(now.Add(QuotaResetHorizon).Unix(), 10))
 		refusal, _ := rt.admit(metrics.GitHubOperationFetchFileContent, true)
 		assert.NotNil(t, refusal)
 	})

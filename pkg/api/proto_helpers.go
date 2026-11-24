@@ -264,6 +264,7 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 
 	httpResp.ExistingCopies = existingCopiesFromProto(resp.ExistingCopies)
 	httpResp.ExemptTables = exemptTablesFromProto(resp.ExemptTables)
+	httpResp.UnmatchedDropTables = resp.GetUnmatchedDropTables()
 
 	return httpResp
 }

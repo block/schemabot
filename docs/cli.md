@@ -1001,9 +1001,9 @@ before running it. Recreating a dropped column cannot recover its old data.
 
 ```console
 $ schemabot logs apply-example-73
-11:47:07 [INF] Apply queued: apply-example-73
-11:47:07 [INF] [orders] Starting spirit migration
-11:47:07 [INF] [orders] acquired advisory lock
+2026-03-15 11:47:07 UTC [INF] Apply queued: apply-example-73
+2026-03-15 11:47:07 UTC [INF] [orders] Starting spirit migration
+2026-03-15 11:47:07 UTC [INF] [orders] acquired advisory lock
 ...
 ```
 
@@ -1036,9 +1036,9 @@ a whole, such as state changes.
 
 ```console
 $ schemabot logs apply-example-73 --target shop-002
-11:47:07 [INF] Apply queued: apply-example-73
-11:48:12 [INF] [orders] acquired advisory lock
-11:52:40 [INF] [orders] Table complete
+2026-03-15 11:47:07 UTC [INF] Apply queued: apply-example-73
+2026-03-15 11:48:12 UTC [INF] [orders] acquired advisory lock
+2026-03-15 11:52:40 UTC [INF] [orders] Table complete
 ...
 ```
 

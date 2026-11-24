@@ -696,9 +696,23 @@ func (c *GRPCClient) logTaskStateTransition(ctx context.Context, applyID int64, 
 		message, oldState, task.State)
 }
 
+// remoteTaskStateChangeMessage names the table and, on a sharded target, the
+// shard whose task changed state, so a slow or failed shard can be found from
+// the apply's log. The old and new states are carried on the log entry itself
+// and rendered beside the message, so the message does not repeat them.
+func remoteTaskStateChangeMessage(task *storage.Task) string {
+	if task.Shard == "" {
+		return fmt.Sprintf("Remote task %s changed state", task.TableName)
+	}
+	return fmt.Sprintf("Remote task %s on shard %s changed state", task.TableName, task.Shard)
+}
+
+// logApplyWarning records a warning that changes no state, so the entry
+// carries no state pair: the log readers render one beside the message
+// whenever both states are set.
 func (c *GRPCClient) logApplyWarning(ctx context.Context, apply *storage.Apply, message string) {
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError,
-		message, apply.State, apply.State)
+		message, "", "")
 }
 
 func remoteApplyStateDescription(remoteState ternv1.State) string {
@@ -2362,6 +2376,18 @@ func (c *GRPCClient) logProgressReadFromWholeApply(ctx context.Context, apply *s
 			"remote_operation_id", scope.operation.ExternalOperationID,
 			"operation_key", scope.operation.OperationKey,
 			"operation_deployment", scope.operation.Deployment)...)
+	// The apply log names each task's shard on its state changes. When the
+	// answer covers the whole remote apply, a task's state can come from a
+	// sibling operation's matching task, so the apply log says so beside them.
+	c.logApplyWarning(ctx, apply, wholeApplyProgressMessage(scope.operation.OperationKey, reason))
+}
+
+// wholeApplyProgressMessage tells the apply log's reader that an operation's
+// task state changes are read from the whole remote apply, not from the
+// operation alone, and why.
+func wholeApplyProgressMessage(operationKey, reason string) string {
+	return fmt.Sprintf("Progress for %s is read from the whole remote apply, so its task state changes can show a sibling's progress: %s",
+		operationKey, reason)
 }
 
 // remoteProgress polls the remote apply for this drive, scoped to its remote
@@ -3763,7 +3789,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 			if remoteStartRequested {
 				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply start requested by operator", oldState)
 			} else if oldState != apply.State {
-				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply state refreshed before operator start: %s -> %s", oldState, apply.State), oldState)
+				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply state refreshed before operator start", oldState)
 			}
 		}
 	}
@@ -5204,7 +5230,7 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 			return fmt.Errorf("sync task %s from gRPC progress for %s: %w", storedTask.TaskIdentifier, storedApply.ApplyIdentifier, err)
 		}
 		if oldTaskState != storedTask.State {
-			c.logTaskStateTransition(ctx, storedApply.ID, storedTask, fmt.Sprintf("Remote task %s changed state: %s -> %s", storedTask.TableName, oldTaskState, storedTask.State), oldTaskState)
+			c.logTaskStateTransition(ctx, storedApply.ID, storedTask, remoteTaskStateChangeMessage(storedTask), oldTaskState)
 		}
 
 		// Mirror the per-shard progress the data plane reported into control-plane
@@ -5842,7 +5868,7 @@ func (c *GRPCClient) pollRemoteUntilDone(ctx context.Context, apply *storage.App
 				return fmt.Errorf("sync apply %s from gRPC progress: %w", apply.ApplyIdentifier, err)
 			}
 			if persisted && oldApplyState != apply.State {
-				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply changed state: %s -> %s", oldApplyState, apply.State), oldApplyState)
+				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply changed state", oldApplyState)
 			}
 
 			// Park-and-release at the cutover barrier, mirroring the LocalClient

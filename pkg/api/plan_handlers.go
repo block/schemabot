@@ -3610,12 +3610,12 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	}
 	schemaFiles, err := rollbackSchemaFiles(plan)
 	if err != nil {
-		return nil, terminalControlf("rollback source plan is invalid: %w", err)
+		return nil, authoredTerminalControlf("rollback source plan is invalid: %w", err)
 	}
 
 	deployment, err := storedDeploymentForApply(apply)
 	if err != nil {
-		return nil, terminalControlf("rollback source apply is invalid: %w", err)
+		return nil, authoredTerminalControlf("rollback source apply is invalid: %w", err)
 	}
 	if plan.Target == "" {
 		return nil, terminalControlf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
@@ -3623,12 +3623,18 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	if err := s.refuseMultiTargetRollback(ctx, apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
 		return nil, err
 	}
-	// Client resolution is a config lookup: a deployment that cannot resolve a
-	// Tern client resolves the same way on every attempt, so the failure is
-	// terminal until an operator fixes the routing configuration.
+	// A deployment missing from the server configuration, or configured in a way
+	// that can never produce a client, fails the same way on every attempt, so
+	// that answer is terminal. A secrets lookup for the DSN or token that failed
+	// can clear on a later attempt, so it stays retryable. The raw cause can carry DSN or host
+	// fragments and goes only to the server log; the returned error carries a
+	// message SchemaBot wrote, because the webhook posts it to the PR.
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
-		return nil, terminalControlf("database %q (%s): %w", apply.Database, apply.Environment, err)
+		s.logger.Error("failed to create Tern client",
+			append(apply.LogAttrs(),
+				"operation", "rollback_plan", "error", err)...)
+		return nil, controlTernClientFailure(apply, deployment, err)
 	}
 
 	prNumber := int32(apply.PullRequest)
@@ -3682,11 +3688,19 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 				Err:        err,
 			}
 		}
-		return nil, terminalControlf("rollback plan for database %q (%s): %w%s",
-			apply.Database, apply.Environment, err, recordedIgnoreTablesNote(req.IgnoreTables))
+		failure := &terminalControlError{err: fmt.Errorf("rollback plan for database %q (%s): %w%s",
+			apply.Database, apply.Environment, err, recordedIgnoreTablesNote(req.IgnoreTables))}
+		// A refusal is the engine's answer for whoever edits the schema
+		// files, so the requester sees it. Any other Plan failure can carry
+		// driver or transport text and stays in the server log.
+		if isPlanRefusal(err) {
+			failure.shown = fmt.Sprintf("rollback plan for database %q (%s): %s%s",
+				apply.Database, apply.Environment, planRefusalReason(err), recordedIgnoreTablesNote(req.IgnoreTables))
+		}
+		return nil, failure
 	}
 	if err := s.refuseDropsOfWithheldTables(req, resp, deployment); err != nil {
-		return nil, terminalControlf("rollback plan for database %q (%s): %w", apply.Database, apply.Environment, err)
+		return nil, authoredTerminalControlf("rollback plan for database %q (%s): %w", apply.Database, apply.Environment, err)
 	}
 	s.normalizeExecutionVerdicts(resp, apply.Database, deployment)
 	route := storedPlanRoute{
@@ -3913,4 +3927,17 @@ func isPlanRefusal(err error) bool {
 		return true
 	}
 	return grpcstatus.Code(err) == grpccodes.FailedPrecondition
+}
+
+// planRefusalReason is a refusal's own text, without the gRPC status prefix a
+// remote data plane's answer carries. It reads the status itself, since
+// grpcstatus.FromError puts the whole wrapped text back into the message.
+func planRefusalReason(err error) string {
+	var remote interface{ GRPCStatus() *grpcstatus.Status }
+	if errors.As(err, &remote) {
+		if st := remote.GRPCStatus(); st != nil {
+			return st.Message()
+		}
+	}
+	return err.Error()
 }

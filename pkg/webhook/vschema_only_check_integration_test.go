@@ -74,7 +74,7 @@ func TestUpsertPlanCheckRecord_VSchemaOnlyPlanRequiresApply(t *testing.T) {
 	require.NoError(t, err)
 	installClient := ghclient.NewInstallationClient(ghc, logger)
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	schema := &ghclient.SchemaRequestResult{
 		Repository:  repo,

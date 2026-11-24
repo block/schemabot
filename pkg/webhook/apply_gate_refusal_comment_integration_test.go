@@ -1,0 +1,254 @@
+//go:build integration
+
+package webhook
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"testing"
+	"time"
+
+	gh "github.com/google/go-github/v86/github"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/storage"
+)
+
+// gateRefusalEdit is one edit the fake GitHub accepted for a PR comment.
+type gateRefusalEdit struct {
+	ID   string
+	Body string
+}
+
+// recordCommentEdits serves comment edits on the fake GitHub, answering with
+// status, and returns what it receives. It also has the fake answer each posted
+// comment with an ID of its own, so an edit's ID names the comment it targets.
+func recordCommentEdits(mux *http.ServeMux, result *planFlowResult, status int) <-chan gateRefusalEdit {
+	result.DistinctCommentIDs.Store(true)
+	edits := make(chan gateRefusalEdit, 10)
+	mux.HandleFunc("PATCH /repos/octocat/hello-world/issues/comments/{id}", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		edits <- gateRefusalEdit{ID: r.PathValue("id"), Body: body.Body}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = fmt.Fprint(w, `{"id":99}`)
+	})
+	return edits
+}
+
+func freezeDatabase(t *testing.T, svc *api.Service, dbName, environment, reason string) {
+	t.Helper()
+	freezeID := engine.NewFreezeID()
+	_, err := svc.Storage().Freezes().Create(t.Context(), &storage.EnvironmentFreeze{
+		Identifier:  freezeID,
+		Environment: environment,
+		Databases:   []string{dbName},
+		Kind:        storage.FreezeKindOnDemand,
+		Running:     storage.FreezeRunningContinue,
+		StartsAt:    time.Now().Add(-time.Hour),
+		Reason:      reason,
+		CreatedBy:   "alice",
+		Source:      storage.FreezeSourceManual,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = svc.Storage().Freezes().Lift(context.WithoutCancel(t.Context()), freezeID, "alice", "test done")
+	})
+}
+
+// An automatic apply posts its "Applying automatically" comment before the
+// change gates run, so a freeze that refuses the apply afterwards leaves that
+// comment promising a run that never happens. The refusal comment still posts,
+// the lock is released, and the earlier comment is edited to say it did not run.
+func TestE2EAutomaticApplyRefusedByAFreezeEditsItsComment(t *testing.T) {
+	dbName := "webhook_apply_frozen_edit"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	freezeDatabase(t, svc, dbName, driftEnv, "incident 45")
+
+	var edits <-chan gateRefusalEdit
+	apply := runRolloutWebhookWithFiles(t, svc, dbName,
+		buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e " + driftEnv, isPR: true}, nil),
+		map[string]string{"users.sql": usersWithEmailSchema},
+		func(mux *http.ServeMux, result *planFlowResult) {
+			edits = recordCommentEdits(mux, result, http.StatusOK)
+		})
+
+	announced := awaitCommentContaining(t, apply, "**Applying automatically**")
+	assert.Contains(t, announced, "🔒 **Lock acquired by**")
+	awaitCommentContaining(t, apply, "## ❄️ Apply Blocked by a Freeze\n")
+
+	edit := awaitCapture(t, edits, "the announcing comment to be edited", func(gateRefusalEdit) bool { return true })
+	announcementID := apply.PostedCommentID(t, "**Applying automatically**")
+	refusalID := apply.PostedCommentID(t, "## ❄️ Apply Blocked by a Freeze\n")
+	require.NotEqual(t, announcementID, refusalID, "the fake answers each comment with its own ID")
+	assert.Equal(t, strconv.FormatInt(announcementID, 10), edit.ID, "the edit targets the comment the apply posted, not the refusal")
+	assert.Contains(t, edit.Body, "**Not applied** — see the comment below for why.\n")
+	assert.Contains(t, edit.Body, "🔓 **Lock released**")
+	assert.NotContains(t, edit.Body, "Applying automatically")
+	assert.NotContains(t, edit.Body, "Lock acquired")
+	assert.Contains(t, edit.Body, "ALTER TABLE", "the edited comment still shows the plan it was posted with")
+
+	requireNoApplies(t, svc, dbName)
+	requireNoApplyLock(t, svc, dbName)
+}
+
+// The edited footer points at the refusal comment, so when that comment did not
+// post, the footer says why nothing ran and what to comment to see the reason,
+// rather than pointing at a comment that does not exist.
+func TestE2EAutomaticApplyRefusedByAFreezeNamesTheNextStepWhenTheRefusalDoesNotPost(t *testing.T) {
+	dbName := "webhook_apply_frozen_unposted"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	freezeDatabase(t, svc, dbName, driftEnv, "incident 48")
+
+	var edits <-chan gateRefusalEdit
+	apply := runRolloutWebhookWithFiles(t, svc, dbName,
+		buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e " + driftEnv, isPR: true}, nil),
+		map[string]string{"users.sql": usersWithEmailSchema},
+		func(mux *http.ServeMux, result *planFlowResult) {
+			edits = recordCommentEdits(mux, result, http.StatusOK)
+			refusalHeading := "## ❄️ Apply Blocked by a Freeze"
+			result.FailCommentPostContaining.Store(&refusalHeading)
+		})
+
+	awaitCommentContaining(t, apply, "**Applying automatically**")
+	awaitCommentContaining(t, apply, "## ❄️ Apply Blocked by a Freeze\n")
+
+	edit := awaitCapture(t, edits, "the announcing comment to be edited", func(gateRefusalEdit) bool { return true })
+	assert.Equal(t, strconv.FormatInt(apply.PostedCommentID(t, "**Applying automatically**"), 10), edit.ID)
+	assert.Contains(t, edit.Body, "**Not applied** — a change gate refused this apply, and SchemaBot could not post why.\n")
+	assert.Contains(t, edit.Body, "If the gate now allows it, **the apply starts**.", "the retry is labeled as one that can start the apply")
+	assert.Contains(t, edit.Body, "To retry, comment:\n```\nschemabot apply -e "+driftEnv+"\n```\n")
+	assert.NotContains(t, edit.Body, "see the comment below", "no refusal comment exists to point at")
+	assert.Contains(t, edit.Body, "🔓 **Lock released**", "the lock was released, so the claim stays")
+	assert.NotContains(t, edit.Body, "Applying automatically")
+
+	requireNoApplies(t, svc, dbName)
+	requireNoApplyLock(t, svc, dbName)
+}
+
+// refuseLockRelease fails every conditional lock release, the way a storage
+// outage after the gate refused the apply leaves the pinned lock held.
+type refuseLockRelease struct {
+	storage.Storage
+}
+
+func (s refuseLockRelease) Locks() storage.LockStore { return refusedReleaseLocks{s.Storage.Locks()} }
+
+type refusedReleaseLocks struct{ storage.LockStore }
+
+func (refusedReleaseLocks) ReleaseIfPendingPlanID(context.Context, string, string, string, string) (bool, error) {
+	return false, errors.New("storage unavailable")
+}
+
+// The lock line is a claim, so the edited comment makes it only when the
+// refusal released the lock. When the release fails the lock stays held, and
+// the comment says neither that it was released nor that it is still acquired,
+// while the refusal footer is unchanged.
+func TestE2EAutomaticApplyRefusedByAFreezeMakesNoLockClaimWhenTheReleaseFails(t *testing.T) {
+	dbName := "webhook_apply_frozen_lock_held"
+	svc := setupE2ERolloutServiceWithStorage(t, dbName, []deploymentSpec{
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent, func(st storage.Storage) storage.Storage { return refuseLockRelease{st} })
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	freezeDatabase(t, svc, dbName, driftEnv, "incident 49")
+
+	var edits <-chan gateRefusalEdit
+	apply := runRolloutWebhookWithFiles(t, svc, dbName,
+		buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e " + driftEnv, isPR: true}, nil),
+		map[string]string{"users.sql": usersWithEmailSchema},
+		func(mux *http.ServeMux, result *planFlowResult) {
+			edits = recordCommentEdits(mux, result, http.StatusOK)
+		})
+
+	awaitCommentContaining(t, apply, "## ❄️ Apply Blocked by a Freeze\n")
+	edit := awaitCapture(t, edits, "the announcing comment to be edited", func(gateRefusalEdit) bool { return true })
+	assert.Contains(t, edit.Body, "**Not applied** — see the comment below for why.\n")
+	assert.NotContains(t, edit.Body, "Lock released", "the lock is still held")
+	assert.NotContains(t, edit.Body, "Lock acquired")
+
+	requireNoApplies(t, svc, dbName)
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	assert.NotNil(t, lock, "the failed release left the lock held")
+}
+
+// The edit is cosmetic: GitHub refusing it changes nothing the operator acts
+// on. The refusal comment is posted and the lock is released regardless.
+func TestE2EAutomaticApplyRefusedByAFreezeSurvivesAFailedEdit(t *testing.T) {
+	dbName := "webhook_apply_frozen_edit_fails"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	freezeDatabase(t, svc, dbName, driftEnv, "incident 46")
+
+	var edits <-chan gateRefusalEdit
+	apply := runRolloutWebhookWithFiles(t, svc, dbName,
+		buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e " + driftEnv, isPR: true}, nil),
+		map[string]string{"users.sql": usersWithEmailSchema},
+		func(mux *http.ServeMux, result *planFlowResult) {
+			edits = recordCommentEdits(mux, result, http.StatusNotFound)
+		})
+
+	awaitCommentContaining(t, apply, "## ❄️ Apply Blocked by a Freeze\n")
+	awaitCapture(t, edits, "the edit attempt", func(gateRefusalEdit) bool { return true })
+
+	requireNoApplies(t, svc, dbName)
+	requireNoApplyLock(t, svc, dbName)
+}
+
+// apply-confirm acts on a comment that asked for the confirmation, not one that
+// announced an automatic apply, so a freeze refusing it posts the refusal and
+// edits nothing.
+func TestE2EApplyConfirmRefusedByAFreezeEditsNoComment(t *testing.T) {
+	dbName := "webhook_confirm_frozen_no_edit"
+	svc := setupE2EService(t, dbName)
+	seedCheck(t, svc, dbName, "staging", "action_required")
+	seedPendingConfirmation(t, svc, dbName, "plan-pending-"+dbName, "staging")
+	freezeDatabase(t, svc, dbName, "staging", "incident 47")
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	baseURL, err := url.Parse(server.URL + "/")
+	require.NoError(t, err)
+	client := gh.NewClient(nil)
+	client.BaseURL = baseURL
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{"users.sql": confirmEnvironmentUsersSQL},
+		fmt.Sprintf("database: %s\ntype: mysql\n", dbName), dbName)
+	edits := recordCommentEdits(mux, result, http.StatusOK)
+	h := newE2EHandler(t, svc, client)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply-confirm -e staging", isPR: true}, nil))
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	awaitCommentContaining(t, result, "Apply-confirm Blocked by a Freeze")
+	// Any edit happens in the handler's own work, so once that work is done
+	// there is nothing left that could still make one.
+	drainCtx, cancel := context.WithTimeout(t.Context(), webhookIntegrationPollDeadline)
+	defer cancel()
+	h.DrainInProcessWebhookWork(drainCtx)
+	require.NoError(t, drainCtx.Err(), "the command's work must finish before the test checks for edits")
+	assert.Empty(t, edits, "a refused apply-confirm edits no comment")
+
+	requireNoApplies(t, svc, dbName)
+	requireNoApplyLock(t, svc, dbName)
+}

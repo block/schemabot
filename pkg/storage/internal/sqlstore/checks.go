@@ -1020,10 +1020,10 @@ func (s *checkStore) GetByDatabase(ctx context.Context, repo, environment, dbTyp
 func (s *checkStore) Delete(ctx context.Context, id int64) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM checks WHERE id = ?`, id)
 	if err != nil {
-		return err
+		return fmt.Errorf("delete check %d: %w", id, err)
 	}
 
-	return checkRowsAffected(result, storage.ErrCheckNotFound)
+	return checkRowsAffected(result, storage.ErrCheckNotFound, fmt.Sprintf("deleting check %d", id))
 }
 
 // DeleteStalePlanOnly removes a plan-only row no plan can store again. The
