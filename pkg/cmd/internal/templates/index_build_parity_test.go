@@ -34,16 +34,17 @@ func postgresProgress(ddl string, percent int32, metadata map[string]string) *ap
 
 // An operator following a PostgreSQL index build from the terminal and from
 // the PR sees one bar with one percent: both surfaces draw the engine's
-// whole-build percent from the same table row. The current phase's counters
+// whole-build percent, with the two decimals the engine publishes, from the
+// same progress response. The current phase's counters
 // sit where a row copy puts its rows, on a detail line under the table's
 // statement, and carry no percent of their own, so neither surface shows a
 // second percent.
 func TestIndexBuildProgressReadsTheSameOnEverySurface(t *testing.T) {
 	resp := postgresProgress("CREATE INDEX CONCURRENTLY idx_users_email ON users (email)", 25, map[string]string{
 		"executor_operation": "concurrent-index-build", "server_phase": "building index: scanning table",
-		"blocks_done": "30000", "blocks_total": "48000",
+		"blocks_done": "30000", "blocks_total": "48000", "percent": "25.37",
 	})
-	want := ui.IndexBuildProgress(25)
+	want := ui.ProgressBarRowCopy(25) + " 25.37%"
 	const counters = "Building index: 30,000 of 48,000 blocks"
 
 	cli := renderRollout(t, ParseProgressResponse(resp))
@@ -114,7 +115,7 @@ func TestRolledUpIndexBuildReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			want := ui.IndexBuildProgress(tc.percent) + tc.suffix
+			want := ui.IndexBuildProgress(tc.percent, apitypes.BuildWork{}) + tc.suffix
 			cli := renderRollout(t, ParseProgressResponse(indexBuildRolloutResponse(tc.targets)))
 			pr := indexBuildRolloutComment(tc.targets)
 			assert.Contains(t, cli, "orders: "+want+"\n", "CLI")

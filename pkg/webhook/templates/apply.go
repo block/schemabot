@@ -1336,7 +1336,7 @@ func renderRunningTable(sb *strings.Builder, dialect schema.Dialect, table Table
 		writeDDLLine(sb, dialect, table.DDL, budget)
 		writeRowsAndETA(sb, table)
 	case work.IsConcurrentIndexBuild():
-		fmt.Fprintf(sb, "**%s**: %s%s\n", inlineCode(table.TableName), ui.IndexBuildProgress(table.PercentComplete), ui.ThrottledSuffix(table.Throttled))
+		fmt.Fprintf(sb, "**%s**: %s%s\n", inlineCode(table.TableName), ui.IndexBuildProgress(table.PercentComplete, work), ui.ThrottledSuffix(table.Throttled))
 		writeDDLLine(sb, dialect, table.DDL, budget)
 		if line := ui.FormatBuildWork(work); line != "" {
 			fmt.Fprintf(sb, "- %s\n", line)

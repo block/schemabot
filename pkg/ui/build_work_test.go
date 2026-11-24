@@ -204,8 +204,20 @@ func TestFormatBuildWork(t *testing.T) {
 
 // A running index build draws the engine's whole-build percent on a bar, and
 // a build with no progress yet reads as starting rather than stuck at 0%.
+// When the engine publishes the percent with its decimals, the line shows two
+// of them, so a large build moves between polls while its whole percent stands
+// still; the bar fills to the whole percent below it.
 func TestIndexBuildProgress(t *testing.T) {
-	assert.Equal(t, "⏳ Starting index build...", IndexBuildProgress(0))
-	assert.Equal(t, ProgressBarRowCopy(25)+" 25%", IndexBuildProgress(25))
-	assert.Equal(t, ProgressBarRowCopy(100)+" 100%", IndexBuildProgress(140))
+	none := apitypes.BuildWork{}
+	assert.Equal(t, "⏳ Starting index build...", IndexBuildProgress(0, none))
+	assert.Equal(t, ProgressBarRowCopy(25)+" 25%", IndexBuildProgress(25, none))
+	assert.Equal(t, ProgressBarRowCopy(100)+" 100%", IndexBuildProgress(140, none))
+
+	precise := func(percent float64) apitypes.BuildWork {
+		return apitypes.BuildWork{Operation: "concurrent-index-build", Percent: percent, HasPercent: true}
+	}
+	assert.Equal(t, ProgressBarRowCopy(35)+" 35.45%", IndexBuildProgress(35, precise(35.45)))
+	assert.Equal(t, ProgressBarRowCopy(13)+" 13.80%", IndexBuildProgress(13, precise(13.8)), "a tenth still reads with two places")
+	assert.Equal(t, ProgressBarRowCopy(0)+" 0.05%", IndexBuildProgress(0, precise(0.05)), "a build under one percent reads as moving, not starting")
+	assert.Equal(t, "⏳ Starting index build...", IndexBuildProgress(0, precise(0)))
 }

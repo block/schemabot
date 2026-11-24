@@ -2014,13 +2014,49 @@ func (e *Engine) retainRunningPercent(key string, source, result *engine.Progres
 	if tracked == nil || tracked.result != source || len(source.Tables) == 0 {
 		return
 	}
-	if result.Progress < source.Progress {
+	if runningPercentBehind(result, source) {
 		result.Progress = source.Progress
 		result.Tables[0].Progress = source.Tables[0].Progress
+		if precise, ok := source.Metadata[runningPercentMetadataKey]; ok {
+			result.Metadata[runningPercentMetadataKey] = precise
+		}
 		return
 	}
 	source.Progress = result.Progress
 	source.Tables[0].Progress = result.Tables[0].Progress
+	if precise, ok := result.Metadata[runningPercentMetadataKey]; ok {
+		if source.Metadata == nil {
+			source.Metadata = make(map[string]string)
+		}
+		source.Metadata[runningPercentMetadataKey] = precise
+	}
+}
+
+// runningPercentBehind reports whether a poll's percent trails the running
+// record's. The precise percent decides when both carry one, because two
+// readings in the same whole percent differ only in their decimals.
+func runningPercentBehind(result, source *engine.ProgressResult) bool {
+	if result.Progress < source.Progress {
+		return true
+	}
+	resultPrecise, resultOK := preciseRunningPercent(result.Metadata)
+	sourcePrecise, sourceOK := preciseRunningPercent(source.Metadata)
+	return resultOK && sourceOK && resultPrecise < sourcePrecise
+}
+
+// preciseRunningPercent reads back the precise percent setRunningPercent
+// recorded. The engine writes the value itself, so one that does not parse
+// is treated as absent rather than compared.
+func preciseRunningPercent(metadata map[string]string) (float64, bool) {
+	raw, ok := metadata[runningPercentMetadataKey]
+	if !ok {
+		return 0, false
+	}
+	percent, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, false
+	}
+	return percent, true
 }
 
 // executorProgressMetadata folds the tracker's current position and operation
@@ -2099,16 +2135,25 @@ func executorProgressMetadata(ctx context.Context, tracker buildTracker, result 
 	if percent := snapshot.Detail.Percent; percent != nil && snapshot.Detail.Operation == progress.OperationConcurrentIndex && !result.State.IsTerminal() {
 		setRunningPercent(result, *percent)
 	}
+	if result.State.IsTerminal() {
+		delete(metadata, runningPercentMetadataKey)
+	}
 	if err != nil {
 		return fmt.Errorf("read pg-sprite executor progress: %w", err)
 	}
 	return nil
 }
 
+// runningPercentMetadataKey is the metadata key that carries pg-sprite's
+// percent for a running index build with its decimals, so a large build
+// visibly moves between polls while its whole percent stands still. It is
+// present only while the build runs.
+const runningPercentMetadataKey = "percent"
+
 // setRunningPercent writes pg-sprite's percent for the running step onto both
-// the apply and its single table, so the two never disagree. pg-sprite reports
-// tenths below 100; the whole percent is rounded down, so a running step never
-// reads as finished.
+// the apply and its single table, so the two never disagree, and records it
+// with two decimals in the metadata. pg-sprite reports a percent below 100; the
+// whole percent is rounded down, so a running step never reads as finished.
 func setRunningPercent(result *engine.ProgressResult, percent float64) {
 	if len(result.Tables) == 0 {
 		return
@@ -2116,6 +2161,10 @@ func setRunningPercent(result *engine.ProgressResult, percent float64) {
 	whole := int(math.Floor(percent))
 	result.Progress = whole
 	result.Tables[0].Progress = whole
+	if result.Metadata == nil {
+		result.Metadata = make(map[string]string)
+	}
+	result.Metadata[runningPercentMetadataKey] = strconv.FormatFloat(percent, 'f', 2, 64)
 }
 
 // progressIdentity extracts the apply identity that keys engine progress.

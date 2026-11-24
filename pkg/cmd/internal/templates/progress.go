@@ -826,7 +826,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			fmt.Fprintf(&b, indentDetail+"Status: %s\n", t.Status)
 		}
 	case t.BuildWork.IsConcurrentIndexBuild():
-		writeTableLine(&b, t, "%s%s", ui.IndexBuildProgress(t.PercentComplete), ui.ThrottledSuffix(t.Throttled))
+		writeTableLine(&b, t, "%s%s", ui.IndexBuildProgress(t.PercentComplete, t.BuildWork), ui.ThrottledSuffix(t.Throttled))
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
 		}

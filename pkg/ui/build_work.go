@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -85,14 +86,26 @@ func formatTuples(label string, work apitypes.BuildWork) string {
 
 // IndexBuildProgress renders the progress of a running concurrent index build:
 // a bar and the engine's whole-build percent, which counts every phase of the
-// build rather than only the current one. Before the build reports any
-// progress it shows a starting indicator instead, because a 0% bar reads as
-// stuck, the same way a row copy that has not started does. The PR comment and
-// the CLI both render the build through this, so they show the same number.
-func IndexBuildProgress(percent int) string {
+// build rather than only the current one. When the engine publishes that
+// percent with its decimals it is shown to two places (e.g. "35.45%"), so a
+// large build visibly moves between polls; otherwise the table's whole
+// percent is shown. Before the build reports any progress it shows a starting
+// indicator instead, because a 0% bar reads as stuck, the same way a row copy
+// that has not started does. The PR comment and the CLI both render the build
+// through this, so they show the same number.
+func IndexBuildProgress(percent int, work apitypes.BuildWork) string {
+	if work.HasPercent {
+		precise := math.Min(math.Max(work.Percent, 0), 100)
+		if precise == 0 {
+			return indexBuildStarting
+		}
+		return fmt.Sprintf("%s %.2f%%", ProgressBarRowCopy(int(math.Floor(precise))), precise)
+	}
 	pct := ClampPercent(percent)
 	if pct == 0 {
-		return "⏳ Starting index build..."
+		return indexBuildStarting
 	}
 	return fmt.Sprintf("%s %d%%", ProgressBarRowCopy(pct), pct)
 }
+
+const indexBuildStarting = "⏳ Starting index build..."
