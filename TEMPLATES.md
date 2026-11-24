@@ -9825,6 +9825,10 @@ Use 'schemabot status <apply_id>' to view details
 Empty database:
 
 No applies recorded for database 'new-db'
+
+Empty database, filtered to one environment:
+
+No applies recorded for database 'new-db' in staging
 ```
 </details>
 
