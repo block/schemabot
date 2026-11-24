@@ -61,7 +61,16 @@ type ApplyFinishedEvent struct {
 	CompletedAt     time.Time `json:"completed_at"`
 }
 
-// OutboxEvent is a notification committed alongside its apply's outcome.
+// OperationFinishedEvent records the first committed outcome of one operation
+// attempt. Attempt is one-based and belongs to this operation, not its parent.
+type OperationFinishedEvent struct {
+	ApplyFinishedEvent
+	OperationID int64  `json:"operation_id"`
+	Deployment  string `json:"deployment"`
+	Attempt     int    `json:"attempt"`
+}
+
+// OutboxEvent is a notification committed alongside an apply or operation outcome.
 type OutboxEvent struct {
 	ID        int64
 	ApplyID   int64

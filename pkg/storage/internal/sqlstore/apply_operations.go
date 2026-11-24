@@ -39,7 +39,9 @@ type applyOperationStore struct {
 	// once; see freshLeaseCountSQL. Always positive — NewWithDependencies
 	// substitutes storage.DefaultMaxDriversPerApply for an unset value, so the
 	// claim path has no uncapped mode.
-	maxDriversPerApply int
+	maxDriversPerApply   int
+	recordingErrorPolicy storage.RecordingErrorPolicy
+	changeEventApp       func(string) string
 }
 
 // Insert stores a new apply_operations row and returns its ID.
@@ -284,6 +286,12 @@ func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, err
 	args = append(args, setArgs...)
 	args = append(args, id)
 	args = append(args, guardArgs...)
+	if len(setArgs) > 0 && len(assignments) > 0 && assignments[0].Column == "state" {
+		outcome, _ := setArgs[0].(string)
+		if guard.kind == operationGuardOperation && notifiesOperationOutcome(outcome) {
+			return s.writeFinishedOperation(ctx, id, guard, guard.updateStatement(s.dialect, assignments), args)
+		}
+	}
 	result, err := s.db.ExecContext(ctx, guard.updateStatement(s.dialect, assignments), args...)
 	if err != nil {
 		return fmt.Errorf("%s (id=%d): %w", errContext, id, err)

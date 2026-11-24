@@ -1022,19 +1022,30 @@ A multi-shard apply started with a manual `--defer-cutover` keeps its drivers wh
 
 ## Apply Outcome Notifications
 
-By default, every winning transition to `completed`, `failed`, `cancelled`, or
+By default, every winning apply transition to `completed`, `failed`, `cancelled`, or
 `reverted` records an outbox row in the same storage transaction, on MySQL and
 PostgreSQL. `cancelled` means the change was cancelled; `reverted` means the engine
-reverted it. Stopped and retryable failures do not emit outcome notifications.
+reverted it. Stopped and retryable failures do not emit aggregate outcome notifications.
 Creation in an initial outcome state and same-state refreshes do not emit events,
 and historical outcomes are not backfilled.
+
+An operation driver also records `operation.finished` with its first committed
+`completed`, `failed`, `cancelled`, `reverted`, or `failed_retryable` outcome per
+operation attempt. The write must hold that operation's current lease. It captures
+the operation ID, deployment and one-based operation-local attempt from the locked
+row; the parent apply's retry count is not used. A deliberate redispatch advances
+the attempt; recovering a crashed driver retains it. Repeated writes for an already
+recorded attempt do not add events or restrict the operation's existing state
+transitions. No `operation.started` event is recorded. Unscoped and parent-lease
+writes do not produce operation events.
 
 The per-install server setting `change_events_on_recording_error` accepts `block`
 (the default, including when omitted) or `continue`. `block` rolls back the outcome
 if intent recording fails. `continue` recovers the failed intent insert with a
 savepoint and commits the outcome without a notification. State, lease, CAS, savepoint
 recovery, and commit errors still fail normally; this setting only tolerates an
-intent insert failure. Invalid values fail server configuration validation.
+intent insert failure. This policy applies to aggregate and operation outcomes.
+Invalid values fail server configuration validation.
 
 **Opting into `continue` weakens ST-12's default atomic notification guarantee.**
 After an outcome commits without intent, SchemaBot emits an error log with the
@@ -1099,6 +1110,35 @@ A receiver can derive a JSON message with `app`, `environment`,
 `timestamp` from `occurred_at_nanos`, and a description using `type`, such as
 `apply.finished apply=apply_example outcome=completed`. Aggregate events do not
 contain operation identity, deployment, or attempt facts.
+
+An `operation.finished` payload has the same common fields, plus `operation_id`,
+`deployment`, and `attempt`. Its `outcome` and `completed_at` describe the operation,
+not the parent. For `failed_retryable`, `completed_at` uses the operation's update
+time when no completion time is stored. A durable per-operation attempt marker
+prevents replayed writes from duplicating intent, including after a `continue`
+recording failure; missing notifications are not backfilled on replay. Startup
+adds the nullable marker column to existing storage on both dialects.
+
+For example, operation `17` of `apply_example` completes in deployment `region-a`
+on its first attempt. A receiver can derive this envelope from that operation's
+record (the aggregate record alone cannot provide these operation facts):
+
+```json
+{
+  "app": "checkout",
+  "environment": "production",
+  "timestamp": 1795132800000000000,
+  "description": "operation.finished apply=apply_example operation=17 deployment=region-a attempt=1 outcome=completed"
+}
+```
+
+The corresponding configurable template is applied by the receiver, not by the
+SQS sender. Set `Description` from the operation fields as shown above:
+
+```gotemplate
+{"app":{{json .App}},"environment":{{json .Environment}},"timestamp":{{.OccurredAtNanos}},"description":{{json .Description}}}
+```
+
 Acceptance by SQS does not mean that a receiver processed the message.
 
 The sender processes at most 100 rows per batch, continues past failed rows, and
