@@ -3738,3 +3738,38 @@ func TestSetRunningPercentRoundsDown(t *testing.T) {
 		})
 	}
 }
+
+// TestOnlyAConcurrentIndexBuildSetsTheApplyPercent proves the apply and its
+// table take pg-sprite's percent only from a concurrent index build. pg-sprite
+// also measures other steps, such as a copy, by their own completion, and
+// reporting one step's completion as the apply's would misstate how far the
+// apply has come.
+func TestOnlyAConcurrentIndexBuildSetsTheApplyPercent(t *testing.T) {
+	cases := []struct {
+		operation progress.Operation
+		want      int
+	}{
+		{operation: progress.OperationConcurrentIndex, want: 42},
+		{operation: progress.OperationCopy, want: 7},
+		{operation: progress.OperationChecksum, want: 7},
+		{operation: progress.OperationValidate, want: 7},
+		{operation: progress.OperationOptimistic, want: 7},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.operation), func(t *testing.T) {
+			percent := 42.0
+			tracker := &fakeBuildTracker{snapshot: progress.Snapshot{
+				Step:       1,
+				TotalSteps: 1,
+				Detail:     progress.Detail{Operation: tc.operation, Percent: &percent},
+			}}
+			result := &engine.ProgressResult{State: engine.StateRunning, Progress: 7, Tables: []engine.TableProgress{{Progress: 7}}}
+
+			require.NoError(t, executorProgressMetadata(t.Context(), tracker, result))
+
+			assert.Equal(t, tc.want, result.Progress)
+			assert.Equal(t, tc.want, result.Tables[0].Progress)
+			assert.Equal(t, string(tc.operation), result.Metadata["executor_operation"])
+		})
+	}
+}
