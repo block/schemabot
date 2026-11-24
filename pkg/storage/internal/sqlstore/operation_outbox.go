@@ -54,7 +54,7 @@ func (s *applyOperationStore) writeFinishedOperation(ctx context.Context, id int
 		}
 		// Under continue this also marks a deliberately lost intent. Replaying the
 		// state write must not silently backfill a notification after that decision.
-		if _, err := tx.ExecContext(ctx, `UPDATE apply_operations SET finished_event_attempt = ? WHERE id = ? AND lease_token = ?`, attempt, id, guard.opLease.Token); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE apply_operations SET finished_event_attempt = ?, updated_at = updated_at WHERE id = ? AND lease_token = ?`, attempt, id, guard.opLease.Token); err != nil {
 			return fmt.Errorf("record operation outcome attempt (id=%d): %w", id, err)
 		}
 	}
