@@ -411,7 +411,7 @@ func TestConfirmationRequiresTheReviewedPrimaryMember(t *testing.T) {
 			} else {
 				assert.Empty(t, reason)
 			}
-			difference, err := h.confirmationCoversPrimaryTarget(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production", tc.rolloutAtConfirm)
+			difference, _, err := h.confirmationCoversPrimaryTarget(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production", tc.rolloutAtConfirm)
 			require.NoError(t, err)
 			assert.Equal(t, wantDifference, difference)
 			if tc.changed {
@@ -698,14 +698,18 @@ func TestSingleTargetConfirmationRefusesAStatementWhoseObjectsChanged(t *testing
 				service: api.New(&rollbackConfirmTestStorage{plans: store}, &api.ServerConfig{}, nil, testLogger()),
 				logger:  slog.New(slog.NewTextHandler(&logs, nil)),
 			}
-			difference, err := h.confirmationCoversPrimaryTarget(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production", false)
+			difference, tables, err := h.confirmationCoversPrimaryTarget(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production", false)
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, difference)
+			if tc.want != workObjects {
+				assert.Empty(t, tables)
+			}
 			if tc.want == workObjects {
+				assert.Equal(t, []string{"users"}, tables)
 				assert.Contains(t, logs.String(), "a reviewed statement now acts on objects the confirmed plan did not record")
 				assert.Contains(t, logs.String(), "pending_plan_id=plan_reviewed plan_id=plan_current tables=[users]")
-				assert.Equal(t, "This confirmation no longer covers what the apply would run: the re-plan of target `eu` differs from the confirmed plan in the objects its statements act on, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
-					unconfirmedWorkMessage(memberWork{members: 1}, primaryTargetDifferenceReason("eu", difference)))
+				assert.Equal(t, "This confirmation no longer covers what the apply would run: the re-plan of target `eu` differs from the confirmed plan in the objects its statements act on (`users`), so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
+					unconfirmedWorkMessage(memberWork{members: 1}, objectsDifferenceReason("eu", tables)))
 			}
 		})
 	}

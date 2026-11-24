@@ -362,7 +362,7 @@ func (h *Handler) executeApply(
 		// the confirmed comment showed. A rollout that has since shrunk to the
 		// primary target is still checked against its confirmed round.
 		if storedPlan == nil {
-			difference, coverErr := h.confirmationCoversPrimaryTarget(ctx, expectedPendingPlanID, planResp.PlanID, environment, rollout.work.members > 1)
+			difference, changedTables, coverErr := h.confirmationCoversPrimaryTarget(ctx, expectedPendingPlanID, planResp.PlanID, environment, rollout.work.members > 1)
 			if coverErr != nil {
 				h.logger.Error("apply-confirm rejected: could not load the confirmed plan, its round, or the re-plan to compare the primary target's work; the pending confirmation is preserved",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
@@ -372,7 +372,11 @@ func (h *Handler) executeApply(
 				return
 			}
 			if difference != workUnchanged {
-				reason := primaryTargetDifferenceReason(h.primaryTargetName(rollout.work, planResp, schemaResult.Database, environment), difference)
+				primary := h.primaryTargetName(rollout.work, planResp, schemaResult.Database, environment)
+				reason := primaryTargetDifferenceReason(primary, difference)
+				if difference == workObjects {
+					reason = objectsDifferenceReason(primary, changedTables)
+				}
 				h.logger.Info("apply-confirm refused: the primary target would run work the confirmed plan did not show",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
@@ -405,17 +409,22 @@ func (h *Handler) executeApply(
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
 			planDriftCause(planResp, storedPlan), rolloutPreview, runsMemberWork); err != nil {
-			h.logger.Error("failed to post the DDL-drift downgrade comment",
+			h.logger.Error("failed to post the DDL-drift downgrade comment, so the pending confirmation was not moved",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "error", err)
+			return
 		}
+		h.moveConfirmationToShownReplan(ctx, repo, pr, installationID, database, dbType, environment, actionName, requestedBy,
+			expectedPendingPlanID, planResp.PlanID, rolloutDisclosedCopies(planResp, rollout, runsMemberWork), repinRefusal,
+			"DDL drift", "The schema changes differ from the posted plan")
 		return
 	}
 	// The statements match, but the engine records what each one acts on at
 	// plan time, and an object replaced since the stored plan was posted
 	// leaves the statement unchanged. The posted comment covered the objects
 	// the stored plan recorded, so a re-plan that reaches others is shown again
-	// and confirmed by hand.
+	// and confirmed by hand. An automatic apply that cannot make the comparison
+	// releases the lock it took, as its other failures past the hand-off do.
 	if storedPlan != nil {
 		const unverifiedReplan = "SchemaBot could not verify the plan this apply would run, so nothing was applied. Retry the command, and see server logs if it persists."
 		current, err := h.service.Storage().Plans().Get(ctx, planResp.PlanID)
@@ -423,6 +432,7 @@ func (h *Handler) executeApply(
 			h.logger.Error("automatic apply stopped: could not load the re-plan to compare the objects its statements act on with the posted plan",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"plan_id", planResp.PlanID, "posted_plan_id", storedPlan.PlanIdentifier, "error", err)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "re-plan unreadable for the objects comparison")
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, unverifiedReplan)
 			return
 		}
@@ -430,6 +440,7 @@ func (h *Handler) executeApply(
 			h.logger.Error("automatic apply stopped: the re-plan was not stored, so the objects its statements act on cannot be compared with the posted plan",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"plan_id", planResp.PlanID, "posted_plan_id", storedPlan.PlanIdentifier)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "re-plan missing for the objects comparison")
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, unverifiedReplan)
 			return
 		}
@@ -444,21 +455,9 @@ func (h *Handler) executeApply(
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
 				return
 			}
-			// The confirmation is held to the objects its plan recorded, so it
-			// must point at the re-plan the comment just showed. Left on the
-			// posted plan, every apply-confirm would meet the old record and
-			// stop again.
-			disclosed := rolloutDisclosedCopies(planResp, rollout, runsMemberWork)
-			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosed); err != nil {
-				if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
-					return
-				}
-				h.logger.Error("failed to re-pin pending confirmation onto the plan that shows the changed objects",
-					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-					"environment", environment, "plan_id", planResp.PlanID, "error", err)
-				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-					"The objects some schema changes act on changed after the plan was posted. SchemaBot stopped the apply but could not record the confirmation; re-run `schemabot apply -e "+environment+"` to review the new plan.")
-			}
+			h.moveConfirmationToShownReplan(ctx, repo, pr, installationID, database, dbType, environment, actionName, requestedBy,
+				expectedPendingPlanID, planResp.PlanID, rolloutDisclosedCopies(planResp, rollout, runsMemberWork), repinRefusal,
+				"changed objects", "The objects some schema changes act on changed after the plan was posted")
 			return
 		}
 	}
@@ -490,19 +489,9 @@ func (h *Handler) executeApply(
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
 				return
 			}
-			// The comment just posted renders this re-plan, so it discloses
-			// whatever unfinished copy the re-plan would discard.
-			disclosed := rolloutDisclosedCopies(planResp, rollout, runsMemberWork)
-			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosed); err != nil {
-				if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
-					return
-				}
-				h.logger.Error("failed to re-pin pending confirmation onto the plan that discloses the newly-direct changes",
-					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-					"environment", environment, "plan_id", planResp.PlanID, "error", err)
-				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-					"Some changes now run as direct execution. SchemaBot stopped the apply but could not record the confirmation; re-run `schemabot apply -e "+environment+"` to see how they will run.")
-			}
+			h.moveConfirmationToShownReplan(ctx, repo, pr, installationID, database, dbType, environment, actionName, requestedBy,
+				expectedPendingPlanID, planResp.PlanID, rolloutDisclosedCopies(planResp, rollout, runsMemberWork), repinRefusal,
+				"newly-direct changes", "Some changes now run as direct execution")
 			return
 		}
 	}
@@ -1186,6 +1175,33 @@ func (h *Handler) postAutoConfirmDowngrade(
 	return h.postCommentReportingError(repo, pr, installationID, templates.RenderPlanComment(commentData))
 }
 
+// moveConfirmationToShownReplan moves the pending confirmation onto the
+// re-plan that a stop for confirmation just posted. The next apply-confirm is
+// checked against the plan its comment showed, so a confirmation left on the
+// earlier plan would meet that plan's statements and records and stop again.
+// The comment renders the re-plan, so it discloses whatever unfinished copy the
+// re-plan would discard, and disclosed moves with the pin. A re-pin the lock
+// refused reports the lock change; any other failure is logged and tells the
+// operator to run apply again. stop names the cause for the log, and stopped
+// leads the operator's message.
+func (h *Handler) moveConfirmationToShownReplan(ctx context.Context, repo string, pr int, installationID int64,
+	database, dbType, environment, actionName, requestedBy, expectedPendingPlanID, planID string,
+	disclosed []storage.DisclosedCopy, repinRefusal templates.ApplyLockIntentChangedData, stop, stopped string,
+) {
+	err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planID, disclosed)
+	if err == nil {
+		return
+	}
+	if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
+		return
+	}
+	h.logger.Error("failed to re-pin the pending confirmation onto the re-plan the stop comment shows",
+		"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+		"environment", environment, "plan_id", planID, "stop", stop, "error", err)
+	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+		stopped+". SchemaBot stopped the apply but could not record the confirmation; re-run `schemabot apply -e "+environment+"` to review the new plan.")
+}
+
 // repinPendingConfirmation moves this PR's apply lock onto the plan whose
 // comment is being posted now, together with what that comment discloses about
 // an unfinished copy on the target. Both move in one storage write, so the
@@ -1370,7 +1386,7 @@ func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *
 func objectsChangedCause(tables []string) *templates.PausedApplyCauseData {
 	entries := make([]string, 0, len(tables))
 	for _, table := range tables {
-		entries = append(entries, fmt.Sprintf("`%s` changed after the plan was posted", table))
+		entries = append(entries, fmt.Sprintf("`%s`", table))
 	}
 	if len(entries) > planDriftEntryCap {
 		remaining := len(entries) - planDriftEntryCap

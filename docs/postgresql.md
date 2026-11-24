@@ -561,9 +561,10 @@ deployment from the primary deployment's plan.
 
 The same record holds a confirmation to the objects it was given for. The
 apply plans again when it is confirmed, and a re-plan that runs the same drop
-against a replaced object does not run: the confirmation is refused, and an
-automatic apply stops and asks for confirmation on a new comment. Run apply
-again to review the plan against the current schema.
+against a replaced object does not run. A refused confirmation applies
+nothing; run apply again to review the plan against the current schema. An
+automatic apply stops instead and posts a new comment that shows the re-plan
+and names the tables whose objects changed; confirm that comment to apply it.
 
 A plan approved before this check shipped has no record, so its drops are
 refused. That includes an apply still running at the upgrade: a sequential

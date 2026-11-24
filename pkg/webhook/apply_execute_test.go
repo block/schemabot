@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/api"
@@ -888,5 +889,23 @@ func TestDispatchErrorMessageNamesTheRefusingDeployment(t *testing.T) {
 func TestObjectsChangedCause(t *testing.T) {
 	cause := objectsChangedCause([]string{"orders", "users"})
 	assert.Equal(t, "The objects these schema changes act on changed after the plan was posted", cause.Heading)
-	assert.Equal(t, []string{"`orders` changed after the plan was posted", "`users` changed after the plan was posted"}, cause.Entries)
+	assert.Equal(t, []string{"`orders`", "`users`"}, cause.Entries, "the heading says what changed, so each entry is the table alone")
+}
+
+// The confirm refusal names the tables whose statements now act on objects
+// the confirmed plan did not record, capped like the paused comment's list.
+func TestObjectsDifferenceReason(t *testing.T) {
+	assert.Equal(t, "the re-plan of target `eu` differs from the confirmed plan in the objects its statements act on (`orders`, `users`)",
+		objectsDifferenceReason("eu", []string{"orders", "users"}))
+	assert.Equal(t, "the re-plan of target `eu` differs from the confirmed plan in the objects its statements act on",
+		objectsDifferenceReason("eu", nil))
+
+	tables := make([]string, planDriftEntryCap+2)
+	for i := range tables {
+		tables[i] = fmt.Sprintf("t%02d", i)
+	}
+	reason := objectsDifferenceReason("eu", tables)
+	assert.Contains(t, reason, "`t00`")
+	assert.NotContains(t, reason, fmt.Sprintf("`t%02d`", planDriftEntryCap))
+	assert.True(t, strings.HasSuffix(reason, ", 2 more)"), reason)
 }

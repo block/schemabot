@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -546,6 +547,25 @@ func primaryTargetDifferenceReason(primary string, difference workDifference) st
 	return fmt.Sprintf("the re-plan of target `%s` differs from the confirmed plan in %s", primary, difference)
 }
 
+// objectsDifferenceReason is primaryTargetDifferenceReason for a re-plan whose
+// statements now act on objects the confirmed plan did not record, naming the
+// tables those statements change.
+func objectsDifferenceReason(primary string, tables []string) string {
+	reason := primaryTargetDifferenceReason(primary, workObjects)
+	if len(tables) == 0 {
+		return reason
+	}
+	named := make([]string, 0, len(tables))
+	for _, table := range tables {
+		named = append(named, "`"+table+"`")
+	}
+	if len(named) > planDriftEntryCap {
+		remaining := len(named) - planDriftEntryCap
+		named = append(named[:planDriftEntryCap:planDriftEntryCap], fmt.Sprintf("%d more", remaining))
+	}
+	return fmt.Sprintf("%s (%s)", reason, strings.Join(named, ", "))
+}
+
 func primaryTargetChanged(pinned, current *storage.Plan) bool {
 	return (routing.ExecutionTarget{Deployment: pinned.Deployment, Target: pinned.Target}).MemberID() !=
 		(routing.ExecutionTarget{Deployment: current.Deployment, Target: current.Target}).MemberID()
@@ -673,46 +693,51 @@ func roundMemberName(target *storage.Plan, round map[string]*storage.Plan) strin
 // the reviewed member and each statement the confirmed plan also ran still acts
 // on the objects that plan recorded. A pinned or confirm-time
 // plan that no longer loads is an error: what the comment showed, or what the
-// apply would run, cannot be told.
-func (h *Handler) confirmationCoversPrimaryTarget(ctx context.Context, pinnedPlanID, currentPlanID, environment string, rolloutAtConfirm bool) (workDifference, error) {
+// apply would run, cannot be told. When the objects differ, tables names the
+// tables whose statements now act on objects the confirmed plan did not
+// record, so the refusal can name them.
+func (h *Handler) confirmationCoversPrimaryTarget(ctx context.Context, pinnedPlanID, currentPlanID, environment string, rolloutAtConfirm bool) (difference workDifference, tables []string, err error) {
 	plans := h.service.Storage().Plans()
 	pinned, err := plans.Get(ctx, pinnedPlanID)
 	if err != nil {
-		return workUnchanged, fmt.Errorf("load confirmed plan %s: %w", pinnedPlanID, err)
+		return workUnchanged, nil, fmt.Errorf("load confirmed plan %s: %w", pinnedPlanID, err)
 	}
 	if pinned == nil {
-		return workUnchanged, fmt.Errorf("confirmed plan %s no longer exists", pinnedPlanID)
+		return workUnchanged, nil, fmt.Errorf("confirmed plan %s no longer exists", pinnedPlanID)
 	}
 	current, err := plans.Get(ctx, currentPlanID)
 	if err != nil {
-		return workUnchanged, fmt.Errorf("load confirm-time plan %s: %w", currentPlanID, err)
+		return workUnchanged, nil, fmt.Errorf("load confirm-time plan %s: %w", currentPlanID, err)
 	}
 	if current == nil {
-		return workUnchanged, fmt.Errorf("confirm-time plan %s was not stored", currentPlanID)
+		return workUnchanged, nil, fmt.Errorf("confirm-time plan %s was not stored", currentPlanID)
 	}
 	if primaryTargetChanged(pinned, current) {
 		h.logConfirmedPrimaryTargetChanged(pinned, current, environment)
-		return workTarget, nil
+		return workTarget, nil, nil
 	}
 	if !rolloutAtConfirm {
 		confirmedRound, err := h.service.MemberPlansForReviewRound(ctx, pinned, environment)
 		if err != nil {
-			return workUnchanged, fmt.Errorf("load member plans of the confirmed round %s: %w", pinnedPlanID, err)
+			return workUnchanged, nil, fmt.Errorf("load member plans of the confirmed round %s: %w", pinnedPlanID, err)
 		}
 		if len(confirmedRound) == 0 {
 			if tables := objectsChangedSinceReview(pinned, current); len(tables) > 0 {
 				h.logger.Info("apply-confirm refused: a reviewed statement now acts on objects the confirmed plan did not record",
 					"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "plan_id", currentPlanID, "tables", tables)
-				return workObjects, nil
+				return workObjects, tables, nil
 			}
 			h.logger.Debug("apply-confirm: the confirmed plan was reviewed for a single target, so its re-plan runs under the single-target gates",
 				"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "plan_id", currentPlanID)
-			return workUnchanged, nil
+			return workUnchanged, nil, nil
 		}
 		h.logger.Info("apply-confirm: the confirmed round planned other targets that the rollout no longer has; comparing the primary target's re-plan with the confirmed plan",
 			"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "plan_id", currentPlanID, "confirmed_member_plans", len(confirmedRound))
 	}
-	return memberWorkDifference(pinned, current), nil
+	if difference := memberWorkDifference(pinned, current); difference != workObjects {
+		return difference, nil, nil
+	}
+	return workObjects, objectsChangedSinceReview(pinned, current), nil
 }
 
 // workDifference names the part of a target's work in which two plans for it
