@@ -127,7 +127,7 @@ func TestLocalClient_DriveAdoptsEngineTerminalTruthBeforeConsumingCancel(t *test
 		pendingEvents, err := stor.OutboxEvents().ListUnpublished(ctx, afterID, 100)
 		require.NoError(t, err)
 		for _, event := range pendingEvents {
-			if event.ApplyID == apply.ID && event.EventType == "apply.finished" {
+			if event.ApplyID == apply.ID {
 				var completion storage.ApplyFinishedEvent
 				require.NoError(t, json.Unmarshal(event.Payload, &completion))
 				completions = append(completions, completion)

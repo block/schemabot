@@ -97,7 +97,7 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier, dialect: deps.Dialect, locker: deps.Locker},
 		applyComments:   &applyCommentStore{db: rdb, dialect: deps.Dialect},
 		planComments:    &planCommentStore{db: rdb, identity: deps.Identity, dialect: deps.Dialect},
-		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier, maxDriversPerApply: maxDriversPerApply, recordingErrorPolicy: deps.Options.ChangeEventsOnRecordingError.OrDefault(), changeEventApp: deps.Options.ChangeEventApp},
+		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier, maxDriversPerApply: maxDriversPerApply},
 		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		settings:        &settingsStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		freezes:         &freezeStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},

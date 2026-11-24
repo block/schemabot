@@ -74,26 +74,16 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		driveNextOperation(t, ctx, svc, 2)
 		pendingEvents, err := stor.OutboxEvents().ListUnpublished(ctx, 0, 100)
 		require.NoError(t, err)
-		require.Len(t, pendingEvents, 2, "each finished operation records its own outcome before the parent settles")
-		for _, event := range pendingEvents {
-			assert.Equal(t, "operation.finished", event.EventType)
-		}
+		require.Empty(t, pendingEvents, "an unfinished projection must not enqueue completion")
 
 		// The final operation projects the parent under its operation lease.
 		driveNextOperation(t, ctx, svc, 3)
 		pendingEvents, err = stor.OutboxEvents().ListUnpublished(ctx, 0, 100)
 		require.NoError(t, err)
-		require.Len(t, pendingEvents, 4, "three operation outcomes and one aggregate outcome are recorded")
-		var aggregate []*storage.OutboxEvent
-		for _, event := range pendingEvents {
-			if event.EventType == "apply.finished" {
-				aggregate = append(aggregate, event)
-			}
-		}
-		require.Len(t, aggregate, 1, "only the winning parent projection records the aggregate outcome")
-		assert.Equal(t, seed.applyID, aggregate[0].ApplyID)
+		require.Len(t, pendingEvents, 1, "the winning operation-lease projection must enqueue completion")
+		assert.Equal(t, seed.applyID, pendingEvents[0].ApplyID)
 		var completion storage.ApplyFinishedEvent
-		require.NoError(t, json.Unmarshal(aggregate[0].Payload, &completion))
+		require.NoError(t, json.Unmarshal(pendingEvents[0].Payload, &completion))
 		assert.Equal(t, "matrix-rolling-halt-ok", completion.ID)
 
 		assert.Equal(t, []string{"region-a", "region-b", "region-c"}, rec.resumeOrder(),

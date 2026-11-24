@@ -58,7 +58,6 @@ type options struct {
 	commit     string
 	date       string
 	engines    map[string]tern.EngineFactory
-	publishers map[string]notifications.PublisherFactory
 	authorizer auth.Authorizer
 	// localHosted marks a server hosted by RunLocal. It is not a config field
 	// because it is not the operator's to set: it says which entry point built
@@ -99,18 +98,6 @@ func WithEngine(databaseType string, factory tern.EngineFactory) Option {
 			o.engines = make(map[string]tern.EngineFactory)
 		}
 		o.engines[databaseType] = factory
-	}
-}
-
-// WithPublisher registers a publisher factory for a transport type. The last
-// registration wins, including overrides of the built-in SQS factory. Build
-// rejects an empty type or nil factory before constructing the server.
-func WithPublisher(publisherType string, factory notifications.PublisherFactory) Option {
-	return func(o *options) {
-		if o.publishers == nil {
-			o.publishers = make(map[string]notifications.PublisherFactory)
-		}
-		o.publishers[publisherType] = factory
 	}
 }
 
@@ -672,10 +659,6 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	for _, opt := range opts {
 		opt(&o)
 	}
-	publisherRegistry, err := notifications.NewRegistry(o.publishers)
-	if err != nil {
-		return nil, fmt.Errorf("configure publisher factories: %w", err)
-	}
 	logger := o.logger
 	version := o.version
 	if version == "" {
@@ -792,23 +775,13 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		}
 	}()
 
-	if err := cfg.ApplyNotifications.Validate(); err != nil {
-		return nil, fmt.Errorf("configure apply completion publisher: %w", err)
-	}
-	var destinations []notifications.Destination
-	if cfg.ApplyNotifications.Publisher != "" {
-		destinations = append(destinations, notifications.Destination{
-			Type:     cfg.ApplyNotifications.Publisher,
-			Settings: map[string]any{"queue_url": cfg.ApplyNotifications.QueueURL, "region": cfg.ApplyNotifications.Region},
-		})
-	}
-	routes, err := publisherRegistry.Resolve(ctx, destinations)
+	publisher, err := notifications.NewPublisher(ctx, cfg.ApplyNotifications)
 	if err != nil {
 		return nil, fmt.Errorf("configure apply completion publisher: %w", err)
 	}
 	var notificationSender *notifications.Sender
-	if len(routes) != 0 {
-		notificationSender = notifications.NewSender(store.OutboxEvents(), routes[0].Publisher, logger)
+	if publisher != nil {
+		notificationSender = notifications.NewSender(store.OutboxEvents(), publisher, logger)
 	}
 
 	// Register embedder-supplied engines before any client is built or the

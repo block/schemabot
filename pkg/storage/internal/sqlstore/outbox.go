@@ -48,12 +48,7 @@ func (s *applyStore) enqueueApplyFinished(ctx context.Context, tx *rebindTx, app
 	if err != nil {
 		return nil, fmt.Errorf("encode apply outcome notification for apply %s: %w", event.ID, err)
 	}
-	return recordOutcomeIntent(ctx, tx, applyID, event, payload, s.recordingErrorPolicy)
-}
-
-// recordOutcomeIntent applies the installation policy only to the outbox insert.
-func recordOutcomeIntent(ctx context.Context, tx *rebindTx, applyID int64, event storage.ApplyFinishedEvent, payload []byte, policy storage.RecordingErrorPolicy) (*outcomeRecordingFailure, error) {
-	continueOnError := policy == storage.RecordingErrorContinue
+	continueOnError := s.recordingErrorPolicy == storage.RecordingErrorContinue
 	if continueOnError {
 		// PostgreSQL aborts the transaction after a statement error. Recover only
 		// the intent insert; state writes and their lease/CAS fences precede it.
@@ -63,13 +58,9 @@ func recordOutcomeIntent(ctx context.Context, tx *rebindTx, applyID int64, event
 	}
 	_, recordingErr := tx.ExecContext(ctx, `
   INSERT INTO outbox_events (apply_id, event_type, payload, status) VALUES (?, ?, ?, ?)
- `, applyID, event.Type, string(payload), storage.OutboxStatusPending)
+ `, applyID, applyFinishedEventType, string(payload), storage.OutboxStatusPending)
 	if recordingErr != nil {
-		if event.Type == operationFinishedEventType {
-			recordingErr = fmt.Errorf("enqueue operation outcome notification for apply %s: %w", event.ID, recordingErr)
-		} else {
-			recordingErr = fmt.Errorf("enqueue apply outcome notification for apply %s: %w", event.ID, recordingErr)
-		}
+		recordingErr = fmt.Errorf("enqueue apply outcome notification for apply %s: %w", event.ID, recordingErr)
 		if !continueOnError {
 			return nil, recordingErr
 		}
@@ -91,9 +82,8 @@ func recordOutcomeIntent(ctx context.Context, tx *rebindTx, applyID int64, event
 // outcomeRecordingFailure is reported only after the outer transaction commits.
 // A failed commit must not be counted as a committed outcome without intent.
 type outcomeRecordingFailure struct {
-	event     storage.ApplyFinishedEvent
-	operation *storage.ApplyOperation
-	err       error
+	event storage.ApplyFinishedEvent
+	err   error
 }
 
 func (f *outcomeRecordingFailure) report(ctx context.Context) {
@@ -103,12 +93,6 @@ func (f *outcomeRecordingFailure) report(ctx context.Context) {
 	apply := storage.Apply{ApplyIdentifier: f.event.ID, Database: f.event.Database,
 		DatabaseType: f.event.DatabaseType, Environment: f.event.Environment,
 		Repository: f.event.Repository, PullRequest: f.event.PullRequest, State: f.event.Outcome}
-	if f.operation != nil {
-		slog.ErrorContext(ctx, "Operation outcome committed without notification intent; recording failed and will not be retried",
-			append(append(apply.IdentityLogAttrs(), f.operation.LogAttrs()...), "event_type", f.event.Type, "attempt", f.operation.Attempt+1, "recording_error_policy", storage.RecordingErrorContinue, "error", f.err)...)
-		metrics.RecordOutboxRecordingFailure(ctx, f.event.Environment)
-		return
-	}
 	slog.ErrorContext(ctx, "Apply outcome committed without notification intent; recording failed and will not be retried",
 		append(apply.LogAttrs(), "recording_error_policy", storage.RecordingErrorContinue, "error", f.err)...)
 	metrics.RecordOutboxRecordingFailure(ctx, f.event.Environment)
