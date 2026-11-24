@@ -28,9 +28,10 @@ type webhookPayload struct {
 		} `json:"pull_request"`
 	} `json:"issue"`
 	Comment *struct {
-		ID   int64  `json:"id"`
-		Body string `json:"body"`
-		User *struct {
+		ID        int64     `json:"id"`
+		Body      string    `json:"body"`
+		CreatedAt time.Time `json:"created_at"`
+		User      *struct {
 			Login string `json:"login"`
 			Type  string `json:"type"`
 		} `json:"user"`
@@ -180,6 +181,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	parser := NewCommandParser()
 	result := parser.ParseCommand(payload.Comment.Body)
 	result.CommentID = payload.Comment.ID
+	result.RequestedAt = payload.Comment.CreatedAt
 	result.DeliveryID = deliveryID
 
 	if !result.IsMention {
@@ -1147,6 +1149,7 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 	parser := NewCommandParser()
 	result := parser.ParseCommand(payload.Comment.Body)
 	result.CommentID = payload.Comment.ID
+	result.RequestedAt = payload.Comment.CreatedAt
 	result.DeliveryID = event.DeliveryID
 	result.SuppressRetryComments = true
 	// The two drop paths below can swallow a command the user already saw

@@ -421,11 +421,7 @@ func writeApplyMetadata(sb *strings.Builder, data ApplyStatusCommentData, render
 	if data.InRolloutSection {
 		return
 	}
-	attributionAt := renderedAt
-	if data.RequestedBy == "" {
-		attributionAt = startedAtDisplay(data.StartedAt, renderedAt)
-	}
-	writeAppliedByOrTimestampAt(sb, data.RequestedBy, attributionAt)
+	writeAppliedByOrTimestampAt(sb, data.RequestedBy, startedAtDisplay(data.StartedAt, renderedAt))
 }
 
 // appendPlanMetadata adds the plan the member is running to a metadata line,

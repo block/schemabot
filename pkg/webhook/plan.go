@@ -1676,6 +1676,15 @@ func planTableSizes(schema *ghclient.SchemaRequestResult, sc *apitypes.SchemaCha
 	return sizes
 }
 
+// commandPlanCommentData builds the plan comment a command posts, stamped with
+// the time the command was posted. Its "Requested by" line then reads when the
+// operator asked, however long planning took, rather than when it rendered.
+func (h *Handler) commandPlanCommentData(schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, requestedBy string, result CommandResult) templates.PlanCommentData {
+	data := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+	data.RequestedAt = result.RequestedAt
+	return data
+}
+
 // buildPlanCommentData converts plan results into template data.
 func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy, agentHint, cliName string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
