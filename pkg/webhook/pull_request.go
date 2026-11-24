@@ -457,10 +457,13 @@ type autoPlanDispatch struct {
 func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string, opts autoPlanOptions) (autoPlanDispatch, error) {
 	repo = storage.CanonicalKey(repo)
 	// Every discovery failure below posts through this one call, so whether
-	// the check says SchemaBot retries at the quota reset is read from the
-	// durable delivery's mark in one place.
+	// the check says SchemaBot retries at the quota reset is decided in one
+	// place. A schema exception delivery's retry stops before it clears the
+	// aggregate block when the PR is within the database limit, so its retry
+	// does not lift the block and the check asks for a re-run instead.
+	retriedAtReset := durableRetryAtQuotaReset(ctx) && !opts.schemaExceptionEvent
 	postDiscoveryFailure := func(err error) {
-		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err, durableRetryAtQuotaReset(ctx))
+		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err, retriedAtReset)
 	}
 	// Snapshot the base ref before anything is read, so the publish-time check
 	// below covers the whole of discovery. A base that moves mid-discovery

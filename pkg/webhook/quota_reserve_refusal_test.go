@@ -90,16 +90,19 @@ func TestQuotaResetTimeNamesAMinuteThatIsNeverEarly(t *testing.T) {
 
 // An auto-plan whose discovery the quota reserve refuses fails the aggregate
 // closed, and the check says who acts at the reset: SchemaBot when the
-// auto-plan runs inside a durable delivery retried then, and the author
-// otherwise.
+// auto-plan runs inside a durable delivery whose retry lifts the block, and
+// the author otherwise. A schema exception delivery's retry stops early for a
+// PR within the database limit, so it asks for a re-run.
 func TestAutoPlanDiscoveryRefusedByQuotaReserveSaysWhoRetries(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		durable bool
-		want    string
+		name      string
+		durable   bool
+		exception bool
+		want      string
 	}{
 		{name: "durable delivery retried at the reset", durable: true, want: "It will retry when the quota resets at "},
 		{name: "request path", durable: false, want: "Re-run this check after the quota resets at "},
+		{name: "durable schema exception delivery", durable: true, exception: true, want: "Re-run this check after the quota resets at "},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := &foldCheckStore{}
@@ -124,7 +127,7 @@ func TestAutoPlanDiscoveryRefusedByQuotaReserveSaysWhoRetries(t *testing.T) {
 			if tc.durable {
 				ctx = withDurableRetryAtQuotaReset(ctx)
 			}
-			_, err := h.dispatchAutoPlanForPR(ctx, installClient, "octocat/hello-world", 1, "abc123", 12345, "pull_request", "opened", "", "delivery-1", autoPlanOptions{})
+			_, err := h.dispatchAutoPlanForPR(ctx, installClient, "octocat/hello-world", 1, "abc123", 12345, "pull_request", "opened", "", "delivery-1", autoPlanOptions{schemaExceptionEvent: tc.exception})
 
 			require.ErrorIs(t, err, ghclient.ErrGitHubQuotaReserved)
 			require.NotEmpty(t, store.upserted)
