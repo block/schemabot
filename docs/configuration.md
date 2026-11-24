@@ -1022,25 +1022,27 @@ A multi-shard apply started with a manual `--defer-cutover` keeps its drivers wh
 
 ## Apply completion notifications
 
-A winning transition to `completed` records notification intent in the same storage
+A winning transition to `completed` attempts notification intent in the same storage
 transaction on MySQL and PostgreSQL. Initial completed creation and same-state
 refreshes do not emit events; historical completions are not backfilled.
 
-`change_events_on_recording_error` selects `block` (the default) or `continue`.
-`block` rolls back completion if intent recording fails. **`continue` weakens
-ST-12's default atomic guarantee:** an intent insert failure permits completion
-without a notification. State, lease, CAS, savepoint and commit errors still fail.
+**Notification recording is best-effort: an intent insert failure permits
+completion without a notification.** State, ownership, lease, CAS, payload-read,
+savepoint and commit errors still fail. The insert runs behind a savepoint so
+PostgreSQL can recover its aborted statement without losing the completion;
+MySQL uses the same boundary. There is no recording-policy setting.
+
 After a committed loss, an error log identifies the apply and
 `schemabot.outbox.recording_failures_total` increments for its environment. Repair
-storage recording; missing notifications are not retried or backfilled. These
-post-commit signals are best-effort and can be lost on a process crash; a failed
-commit emits neither. The policy also applies when delivery is disabled.
+storage recording; missing notifications are permanently lost, not retried or
+backfilled. These post-commit signals are best-effort and can be lost on a process
+crash; a failed commit emits neither. This behavior also applies when delivery is
+disabled. Configurable hard-fail recording and additional outcomes are deferred.
 
 Delivery is disabled by default, but recording continues. Enabling delivery sends
 accumulated pending rows. Configure the server that owns apply storage:
 
 ```yaml
-change_events_on_recording_error: block
 apply_notifications:
   publisher: sqs
   queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/apply-completed

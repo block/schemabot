@@ -6870,38 +6870,3 @@ func TestReposServedByGitHubApp(t *testing.T) {
 	assert.False(t, restricted)
 	assert.Nil(t, repos)
 }
-
-// The server accepts a recording policy without enabling delivery and rejects
-// invalid values at configuration load rather than after an apply completes.
-func TestLoadServerConfig_RecordingErrorPolicy(t *testing.T) {
-	for _, value := range []string{"", "block", "continue", "ignore"} {
-		t.Run(value, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "config.yaml")
-			content := `
-databases:
-  orders:
-    type: mysql
-    environments:
-      staging:
-        target: orders-staging
-        deployment: default
-tern_deployments:
-  default:
-    staging: "tern-staging:9090"
-`
-			if value != "" {
-				content += "change_events_on_recording_error: " + value + "\n"
-			}
-			require.NoError(t, os.WriteFile(path, []byte(content), 0600))
-			cfg, err := LoadServerConfigFromFile(path)
-			if value == "ignore" {
-				require.ErrorContains(t, err, "change_events_on_recording_error must be block or continue")
-				return
-			}
-			require.NoError(t, err)
-			expected := storage.RecordingErrorPolicy(value).OrDefault()
-			assert.Equal(t, expected, storage.BuildOptions(storage.WithChangeEventsOnRecordingError(cfg.ChangeEventsOnRecordingError)).ChangeEventsOnRecordingError)
-			assert.Empty(t, cfg.ApplyNotifications.Publisher)
-		})
-	}
-}

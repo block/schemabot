@@ -3,9 +3,12 @@
 package sqlstore
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -20,6 +23,10 @@ import (
 	"github.com/block/schemabot/pkg/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 // Committed intent survives storage reconstruction, and concurrent state or
@@ -257,4 +264,287 @@ func testNotificationStatuses(t *testing.T, store *Storage) {
 		require.NoError(t, store.db.QueryRowContext(ctx, `SELECT published_at FROM outbox_events WHERE id = ?`, id).Scan(&second))
 		assert.Equal(t, first, second)
 	}
+}
+
+// Event metadata captures the configured application label and completion time.
+func TestMySQLApplyEventMetadata(t *testing.T) {
+	testApplyEventMetadata(t, func(t *testing.T, opts ...storage.Option) *Storage {
+		t.Helper()
+		clearTables(t)
+		return NewMySQL(testDB, opts...)
+	})
+}
+
+// PostgreSQL records the same immutable completion payload.
+func TestPostgresApplyEventMetadata(t *testing.T) {
+	_, db := testutil.StartPostgres(t, "apply_outcome_outbox")
+	applyPostgresTestSchema(t, db)
+	testApplyEventMetadata(t, func(t *testing.T, opts ...storage.Option) *Storage {
+		t.Helper()
+		clearPostgresTables(t, db)
+		return NewPostgres(db, opts...)
+	})
+}
+
+func testApplyEventMetadata(t *testing.T, newStore func(*testing.T, ...storage.Option) *Storage) {
+	t.Helper()
+	store := newStore(t, storage.WithChangeEventApp(func(database string) string {
+		assert.Equal(t, "outcome_db", database)
+		return "checkout"
+	}))
+	lock := createTestLock(t, store, "outcome_db", storage.DatabaseTypeMySQL)
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_example", 1, state.Apply.Running, "production")
+	before := time.Now()
+	swapped, err := store.Applies().UpdateDerivedState(t.Context(), apply.ID, state.Apply.Running, state.Apply.Completed, "", nil, nil)
+	require.NoError(t, err)
+	require.True(t, swapped)
+	events, err := store.OutboxEvents().ListUnpublished(t.Context(), 0, 10)
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	var event storage.ApplyFinishedEvent
+	require.NoError(t, json.Unmarshal(events[0].Payload, &event))
+	assert.Equal(t, "checkout", event.App)
+	assert.Equal(t, state.Apply.Completed, event.Outcome)
+	assert.GreaterOrEqual(t, event.OccurredAtNanos, before.UnixNano())
+	assert.LessOrEqual(t, event.OccurredAtNanos, time.Now().UnixNano())
+}
+
+// Both completion writers recover a failed intent insert without hiding errors
+// in state, ownership or transaction handling.
+func TestMySQLCompletionRecording(t *testing.T) {
+	testCompletionRecording(t, func(t *testing.T) *Storage {
+		t.Helper()
+		clearTables(t)
+		return NewMySQL(testDB)
+	}, failingCompletionCommitPool(t, testDB.Driver(), testDSN))
+}
+
+// PostgreSQL statement errors abort a transaction until rollback to a savepoint.
+// Recording must recover that transaction, not just ignore the insert error.
+func TestPostgresCompletionRecording(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "outbox_recording")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	testCompletionRecording(t, func(t *testing.T) *Storage {
+		t.Helper()
+		clearPostgresTables(t, db)
+		return NewPostgres(db)
+	}, failingCompletionCommitPool(t, db.Driver(), dsn))
+}
+
+// Roll back through the real driver at the commit boundary, then return an
+// error. The writer must not report a lost notification for an uncommitted apply.
+type completionCommitConnector struct {
+	driver driver.Driver
+	dsn    string
+}
+
+func (c completionCommitConnector) Driver() driver.Driver { return c.driver }
+
+func (c completionCommitConnector) Connect(context.Context) (driver.Conn, error) {
+	conn, err := c.driver.Open(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+	return completionCommitConn{Conn: conn}, nil
+}
+
+type completionCommitConn struct{ driver.Conn }
+
+func (c completionCommitConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	tx, err := c.Conn.(driver.ConnBeginTx).BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return completionCommitTx{Tx: tx}, nil
+}
+
+type completionCommitTx struct{ driver.Tx }
+
+func (tx completionCommitTx) Commit() error {
+	if err := tx.Rollback(); err != nil {
+		return err
+	}
+	return errors.New("injected completion commit failure")
+}
+
+func failingCompletionCommitPool(t *testing.T, d driver.Driver, dsn string) *sql.DB {
+	t.Helper()
+	db := sql.OpenDB(completionCommitConnector{driver: d, dsn: dsn})
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	return db
+}
+
+type recordingFaultBinder struct {
+	binder
+	fault string
+}
+
+func (b recordingFaultBinder) Rebind(query string) string {
+	switch {
+	case strings.Contains(query, "INSERT INTO outbox_events"):
+		query = strings.Replace(query, "INSERT INTO outbox_events", "INSERT INTO nonexistent_notification_table", 1)
+	case b.fault == "state" && strings.Contains(query, "UPDATE applies"):
+		query = strings.Replace(query, "UPDATE applies", "UPDATE nonexistent_apply_table", 1)
+	case b.fault == "read" && strings.Contains(query, "FROM applies WHERE id = ? AND state = ?"):
+		query = strings.Replace(query, "FROM applies", "FROM nonexistent_apply_table", 1)
+	case b.fault == "savepoint" && query == "SAVEPOINT completion_notification":
+		query = "SAVEPOINT"
+	case b.fault == "recover" && query == "ROLLBACK TO SAVEPOINT completion_notification":
+		query = "ROLLBACK TO SAVEPOINT nonexistent_notification_savepoint"
+	case b.fault == "release" && query == "RELEASE SAVEPOINT completion_notification":
+		query = "RELEASE SAVEPOINT nonexistent_notification_savepoint"
+	}
+	return b.binder.Rebind(query)
+}
+
+func testCompletionRecording(t *testing.T, newStore func(*testing.T) *Storage, commitPool *sql.DB) {
+	t.Helper()
+	outcome := state.Apply.Completed
+	for _, derived := range []bool{false, true} {
+		writer := "Direct"
+		if derived {
+			writer = "Derived"
+		}
+		t.Run(writer, func(t *testing.T) {
+			for _, tc := range []struct {
+				name      string
+				fault     string
+				completes bool
+				wantError string
+			}{
+				{name: "InsertError", fault: "insert", completes: true},
+				{name: "Success", completes: true},
+				{name: "CommitError", fault: "commit", wantError: "injected completion commit failure"},
+				{name: "StateError", fault: "state", wantError: "nonexistent_apply_table"},
+				{name: "StateReadError", fault: "read", wantError: "read finished apply"},
+				{name: "SavepointError", fault: "savepoint", wantError: "save notification recording"},
+				{name: "RecoveryError", fault: "recover", wantError: "recover notification recording"},
+				{name: "ReleaseError", fault: "release", wantError: "release notification recording"},
+				{name: "LeaseLost", fault: "lease"},
+				{name: "CASMiss", fault: "cas"},
+			} {
+				if tc.fault == "cas" && !derived {
+					continue
+				}
+				t.Run(tc.name, func(t *testing.T) {
+					ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+					defer cancel()
+					store := newStore(t)
+					lock := storagetest.CreateLock(t, store, "outbox_recording", storage.DatabaseTypeMySQL)
+					apply := storagetest.CreateApplyWithStateAndEnv(t, store, lock, "apply_recording", 0, state.Apply.Running, "staging")
+					reader, output := captureRecordingFailureSignals(t)
+					originalPool := store.db.pool
+					if tc.fault == "commit" {
+						store.db.pool = commitPool
+					}
+					original := store.db.binder
+					if tc.fault != "" {
+						store.db.binder = recordingFaultBinder{binder: original, fault: tc.fault}
+					}
+					if tc.fault == "lease" {
+						ctx = storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "stale-driver", Token: "stale-token"})
+					}
+					now := time.Now().UTC().Truncate(time.Second)
+					var err error
+					if derived {
+						expectedState := state.Apply.Running
+						if tc.fault == "cas" {
+							expectedState = state.Apply.Pending
+						}
+						var swapped bool
+						swapped, err = store.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, outcome, "", nil, &now)
+						assert.Equal(t, tc.completes, swapped)
+					} else {
+						apply.State = outcome
+						apply.CompletedAt = &now
+						err = store.Applies().Update(ctx, apply)
+					}
+					store.db.binder = original
+					store.db.pool = originalPool
+					switch {
+					case tc.fault == "lease":
+						require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+					case tc.wantError != "":
+						require.ErrorContains(t, err, tc.wantError)
+					default:
+						require.NoError(t, err)
+					}
+					stored, err := store.Applies().Get(ctx, apply.ID)
+					require.NoError(t, err)
+					expected := state.Apply.Running
+					if tc.completes {
+						expected = outcome
+					}
+					assert.Equal(t, expected, stored.State)
+					if tc.completes {
+						require.NotNil(t, stored.CompletedAt)
+						assert.WithinDuration(t, now, *stored.CompletedAt, time.Second)
+					}
+					events, err := store.OutboxEvents().ListUnpublished(ctx, 0, 10)
+					require.NoError(t, err)
+					if tc.fault == "" {
+						require.Len(t, events, 1)
+					} else {
+						assert.Empty(t, events)
+					}
+					assertRecordingFailureSignals(t, reader, output, tc.completes && tc.fault == "insert")
+				})
+			}
+		})
+	}
+}
+
+func captureRecordingFailureSignals(t *testing.T) (*metric.ManualReader, *bytes.Buffer) {
+	t.Helper()
+	reader := metric.NewManualReader()
+	provider := metric.NewMeterProvider(metric.WithReader(reader))
+	previousProvider := otel.GetMeterProvider()
+	otel.SetMeterProvider(provider)
+	previousLogger := slog.Default()
+	output := &bytes.Buffer{}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(output, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(previousLogger)
+		otel.SetMeterProvider(previousProvider)
+		require.NoError(t, provider.Shutdown(context.WithoutCancel(t.Context())))
+	})
+	return reader, output
+}
+
+func assertRecordingFailureSignals(t *testing.T, reader *metric.ManualReader, output *bytes.Buffer, wantLoss bool) {
+	t.Helper()
+	var data metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &data))
+	var count int64
+	for _, scope := range data.ScopeMetrics {
+		for _, instrument := range scope.Metrics {
+			if instrument.Name != "schemabot.outbox.recording_failures_total" {
+				continue
+			}
+			sum, ok := instrument.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+			require.Len(t, sum.DataPoints, 1)
+			assert.Equal(t, attribute.NewSet(attribute.String("environment", "staging")), sum.DataPoints[0].Attributes)
+			count += sum.DataPoints[0].Value
+		}
+	}
+	if !wantLoss {
+		assert.Zero(t, count)
+		assert.NotContains(t, output.String(), "Apply outcome committed without notification intent")
+		return
+	}
+	assert.EqualValues(t, 1, count)
+	var log map[string]any
+	require.NoError(t, json.Unmarshal(bytes.TrimSpace(output.Bytes()), &log))
+	assert.Equal(t, "ERROR", log["level"])
+	assert.Equal(t, "Apply outcome committed without notification intent; recording failed and will not be retried", log["msg"])
+	assert.Equal(t, "apply_recording", log["apply_id"])
+	assert.Equal(t, "outbox_recording", log["database"])
+	assert.Equal(t, "staging", log["environment"])
+	assert.Contains(t, log["error"], "nonexistent_notification_table")
+	assert.NotContains(t, output.String(), "payload")
 }

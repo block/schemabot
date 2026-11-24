@@ -4,10 +4,6 @@ package storage
 // the storage layer itself enforces — things a claim query or a store decides,
 // not anything the caller could apply on its own.
 type Options struct {
-	// ChangeEventsOnRecordingError defaults to block. Continue permits an outcome
-	// transition to commit without notification intent when recording fails.
-	ChangeEventsOnRecordingError RecordingErrorPolicy
-
 	// ChangeEventApp resolves a logical database's application label at intent
 	// creation. An empty result falls back to the database name.
 	ChangeEventApp func(database string) string
@@ -36,11 +32,6 @@ func WithChangeEventApp(resolve func(database string) string) Option {
 	return func(o *Options) { o.ChangeEventApp = resolve }
 }
 
-// WithChangeEventsOnRecordingError selects the notification recording policy.
-func WithChangeEventsOnRecordingError(policy RecordingErrorPolicy) Option {
-	return func(o *Options) { o.ChangeEventsOnRecordingError = policy }
-}
-
 // BuildOptions applies opts over the defaults and returns the resolved settings.
 func BuildOptions(opts ...Option) Options {
 	var resolved Options
@@ -50,7 +41,6 @@ func BuildOptions(opts ...Option) Options {
 	if resolved.MaxDriversPerApply <= 0 {
 		resolved.MaxDriversPerApply = DefaultMaxDriversPerApply
 	}
-	resolved.ChangeEventsOnRecordingError = resolved.ChangeEventsOnRecordingError.OrDefault()
 	return resolved
 }
 

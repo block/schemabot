@@ -757,7 +757,6 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	// Create service with dependencies
 	store, err := newStore(dialect, db,
 		storage.WithMaxDriversPerApply(cfg.MaxDriversPerApply),
-		storage.WithChangeEventsOnRecordingError(cfg.ChangeEventsOnRecordingError),
 		storage.WithChangeEventApp(func(database string) string {
 			if registration := cfg.Database(database); registration != nil {
 				return registration.App

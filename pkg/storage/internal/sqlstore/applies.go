@@ -49,12 +49,11 @@ const (
 
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
-	recordingErrorPolicy storage.RecordingErrorPolicy
-	changeEventApp       func(string) string
-	db                   *rebindDB
-	dialect              Dialect
-	identity             identityInserter
-	classifier           ErrorClassifier
+	changeEventApp func(string) string
+	db             *rebindDB
+	dialect        Dialect
+	identity       identityInserter
+	classifier     ErrorClassifier
 	// locker serializes concurrent applies against the same target with a
 	// session-scoped advisory lock held on the pinned apply connection. It must
 	// match the storage database's family.

@@ -60,10 +60,6 @@ type ServerConfig struct {
 	// ApplyNotifications selects delivery of durable completion notifications.
 	ApplyNotifications notifications.Config `yaml:"apply_notifications"`
 
-	// ChangeEventsOnRecordingError controls whether recording failure blocks completion.
-	// The default is block; continue allows completion without notification intent.
-	ChangeEventsOnRecordingError storage.RecordingErrorPolicy `yaml:"change_events_on_recording_error"`
-
 	// Auth configures API authentication. When Type is empty or "none" (the
 	// default), authentication is disabled and all requests are allowed,
 	// unchanged from deployments without this config.
@@ -2436,9 +2432,6 @@ func (c *ServerConfig) validateTargetTableOwners() error {
 
 // Validate checks the configuration for required fields and consistency.
 func (c *ServerConfig) Validate() error {
-	if err := c.ChangeEventsOnRecordingError.Validate(); err != nil {
-		return err
-	}
 	if err := c.ApplyNotifications.Validate(); err != nil {
 		return err
 	}

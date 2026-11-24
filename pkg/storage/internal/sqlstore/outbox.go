@@ -44,30 +44,22 @@ func (s *applyStore) enqueueApplyFinished(ctx context.Context, tx *rebindTx, app
 	if err != nil {
 		return nil, fmt.Errorf("encode apply outcome notification for apply %s: %w", event.ID, err)
 	}
-	continueOnError := s.recordingErrorPolicy == storage.RecordingErrorContinue
-	if continueOnError {
-		// PostgreSQL aborts the transaction after a statement error. Recover only
-		// the intent insert; state writes and their lease/CAS fences precede it.
-		if _, err := tx.ExecContext(ctx, "SAVEPOINT completion_notification"); err != nil {
-			return nil, fmt.Errorf("save notification recording for apply %s: %w", event.ID, err)
-		}
+	// PostgreSQL aborts the transaction after a statement error. Recover only
+	// the intent insert; state writes and their lease/CAS fences precede it.
+	if _, err := tx.ExecContext(ctx, "SAVEPOINT completion_notification"); err != nil {
+		return nil, fmt.Errorf("save notification recording for apply %s: %w", event.ID, err)
 	}
 	_, recordingErr := tx.ExecContext(ctx, `
   INSERT INTO outbox_events (apply_id, event_type, payload, status) VALUES (?, ?, ?, ?)
  `, applyID, applyFinishedEventType, string(payload), storage.OutboxStatusPending)
 	if recordingErr != nil {
 		recordingErr = fmt.Errorf("enqueue apply outcome notification for apply %s: %w", event.ID, recordingErr)
-		if !continueOnError {
-			return nil, recordingErr
-		}
 		if _, err := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT completion_notification"); err != nil {
 			return nil, fmt.Errorf("recover notification recording for apply %s (%w): %w", event.ID, recordingErr, err)
 		}
 	}
-	if continueOnError {
-		if _, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT completion_notification"); err != nil {
-			return nil, fmt.Errorf("release notification recording for apply %s: %w", event.ID, err)
-		}
+	if _, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT completion_notification"); err != nil {
+		return nil, fmt.Errorf("release notification recording for apply %s: %w", event.ID, err)
 	}
 	if recordingErr != nil {
 		return &outcomeRecordingFailure{event: event, err: recordingErr}, nil
@@ -90,7 +82,7 @@ func (f *outcomeRecordingFailure) report(ctx context.Context) {
 		DatabaseType: f.event.DatabaseType, Environment: f.event.Environment,
 		Repository: f.event.Repository, PullRequest: f.event.PullRequest, State: f.event.Outcome}
 	slog.ErrorContext(ctx, "Apply outcome committed without notification intent; recording failed and will not be retried",
-		append(apply.LogAttrs(), "recording_error_policy", storage.RecordingErrorContinue, "error", f.err)...)
+		append(apply.LogAttrs(), "error", f.err)...)
 	metrics.RecordOutboxRecordingFailure(ctx, f.event.Environment)
 }
 

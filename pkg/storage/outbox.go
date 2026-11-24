@@ -3,43 +3,16 @@ package storage
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"time"
 )
 
-// Outbox status is the delivery disposition; acceptance timestamps and incident
-// tokens are retained details, not state predicates.
+// Outbox status is the delivery disposition; acceptance timestamps are retained
+// details, not state predicates.
 const (
 	OutboxStatusPending     = "pending"
 	OutboxStatusPublished   = "published"
 	OutboxStatusQuarantined = "quarantined"
 )
-
-// RecordingErrorPolicy controls whether notification recording can block an outcome transition.
-type RecordingErrorPolicy string
-
-const (
-	RecordingErrorBlock    RecordingErrorPolicy = "block"
-	RecordingErrorContinue RecordingErrorPolicy = "continue"
-)
-
-// OrDefault resolves an omitted recording policy to block.
-func (p RecordingErrorPolicy) OrDefault() RecordingErrorPolicy {
-	if p == "" {
-		return RecordingErrorBlock
-	}
-	return p
-}
-
-// Validate rejects unsupported recording policies.
-func (p RecordingErrorPolicy) Validate() error {
-	switch p.OrDefault() {
-	case RecordingErrorBlock, RecordingErrorContinue:
-		return nil
-	default:
-		return fmt.Errorf("change_events_on_recording_error must be block or continue")
-	}
-}
 
 // ApplyFinishedEvent records a committed successful completion. EventID
 // deduplicates delivery; ID identifies the apply.
@@ -77,9 +50,9 @@ type OutboxStore interface {
 	ListUnpublished(ctx context.Context, afterID int64, limit int) ([]*OutboxEvent, error)
 	// Quarantine atomically holds pending intent and records an apply log.
 	Quarantine(ctx context.Context, id int64) error
-	// MarkPublished retains acceptance even if a prefetched send races a hold or skip.
-	// Only pending disposition becomes published; quarantined and skipped stay held.
+	// MarkPublished retains acceptance even if a prefetched send races a quarantine.
+	// Only pending disposition becomes published; quarantined intent stays held.
 	MarkPublished(ctx context.Context, id int64) error
-	// OldestUnpublishedAt includes pending and quarantined intent, not skipped rows.
+	// OldestUnpublishedAt includes both pending and quarantined intent.
 	OldestUnpublishedAt(ctx context.Context) (*time.Time, error)
 }
