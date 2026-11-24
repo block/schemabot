@@ -1598,6 +1598,12 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "apply rejected: "+err.Error())
 			return
 		}
+		if released, ok := errors.AsType[*applyLockReleasedError](err); ok {
+			s.logger.Warn("apply rejected: the database lock it would record was released or acquired again while it was being queued; no apply was created",
+				"plan_id", req.PlanID, "database", released.Database, "environment", req.Environment, "error", released.Err)
+			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeLockChanged, "apply rejected: "+err.Error())
+			return
+		}
 		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
 			s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeSourcePolicyDenied, "apply failed: "+err.Error())
 			return
@@ -1681,6 +1687,11 @@ const applyMetricStatusRejected = "rejected"
 
 func applyMetricStatusForError(err error) string {
 	if errors.Is(err, storage.ErrActiveApplyExists) {
+		return "conflict"
+	}
+	// A lock released while the apply was being queued is a race with the
+	// operator who released it, not a server failure.
+	if _, ok := errors.AsType[*applyLockReleasedError](err); ok {
 		return "conflict"
 	}
 	if isPlanAdmissionRefusal(err) {
@@ -1857,6 +1868,38 @@ func isApplyCreationStorageRefusal(err error) bool {
 	}
 	return errors.Is(err, storage.ErrLockIntentChanged)
 }
+
+// isRecordedLockGone reports whether storing an apply failed because the lock
+// row it would record was released, or released and acquired again, after
+// apply creation read it. Storage locks that row in the transaction that
+// creates the apply, so a release that checks for applies before it deletes
+// the row cannot interleave with the create; the create refuses instead.
+func isRecordedLockGone(err error) bool {
+	if errors.Is(err, storage.ErrLockNotFound) {
+		return true
+	}
+	return errors.Is(err, storage.ErrLockReplaced)
+}
+
+// applyLockReleasedError refuses an apply whose database lock was released,
+// or released and acquired again, while the apply was being queued. No apply
+// was created.
+type applyLockReleasedError struct {
+	Database string
+	Err      error
+}
+
+// Error names which of the two happened, since they need different next steps:
+// a released lock has to be taken again, and a lock taken again may now be
+// someone else's.
+func (e *applyLockReleasedError) Error() string {
+	if errors.Is(e.Err, storage.ErrLockReplaced) {
+		return fmt.Sprintf("the lock on database %q was released and taken again while this apply was being queued, so nothing was queued; check who holds it with `schemabot locks`, then apply again", e.Database)
+	}
+	return fmt.Sprintf("the lock on database %q was released while this apply was being queued, so nothing was queued; take the lock again, then apply again", e.Database)
+}
+
+func (e *applyLockReleasedError) Unwrap() error { return e.Err }
 
 // PlanNotFoundError identifies an apply that names a plan SchemaBot has no
 // record of. It matches storage.ErrPlanNotFound, and carries the plan
@@ -2443,6 +2486,9 @@ func (s *Service) createStoredApply(
 	// apply exists, and handleApply's callers treat a 4xx as proof it does not.
 	storedApplyID, err := s.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)
 	if err != nil {
+		if isRecordedLockGone(err) {
+			return nil, 0, &applyLockReleasedError{Database: plan.Database, Err: err}
+		}
 		if isApplyCreationStorageRefusal(err) {
 			return nil, 0, fmt.Errorf("store apply and tasks: %w", err)
 		}
