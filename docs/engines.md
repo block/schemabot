@@ -276,10 +276,10 @@ tracks the engine more closely than this page does.
 The engine badges on the [README](../README.md) are claims about capability, and this is where
 they are defined. An engine is **GA** when it can do the two things below.
 
-An engine is **beta** when it cannot do both yet, but every change it accepts runs on a path that
-is generally available in the engine underneath it. A change outside that set is blocked in the
-plan, with the reason, before anything touches the database. What is not GA yet is listed in the
-engine's guide rather than left for you to discover against a database.
+An engine is **beta** when it cannot do both yet, but runs a defined set of changes and blocks
+every change outside that set in the plan, with the reason, before anything touches the database.
+What is not GA yet is listed in the engine's guide rather than left for you to discover against a
+database.
 
 Maturity is a capability question, not a safety one. An engine below GA is narrower rather than
 looser: fewer classes of change can be executed and fewer operations are available against one

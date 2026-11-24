@@ -36,13 +36,14 @@ own state. See [SchemaBot storage](#schemabot-storage) for that distinction.
 
 ## Beta status
 
-PostgreSQL support is in **beta**. Every change SchemaBot runs on PostgreSQL
-goes through a path pg-sprite marks generally available. A change outside the
-list below is blocked in the plan, with the reason, before anything touches the
-database. Nothing falls back to a riskier way of running it.
+PostgreSQL support is in **beta**. SchemaBot runs the changes listed below
+and blocks every other change in the plan, with the reason, before anything
+touches the database. Nothing falls back to a riskier way of running it.
 [What GA and beta mean](engines.md#what-ga-and-beta-mean) defines the bar.
+pg-sprite, the engine underneath, is itself an early release; its
+[README](https://github.com/block/pg-sprite#readme) states its own readiness.
 
-**Generally available:**
+**Supported:**
 
 - Planning on every pull request and in the CLI, with the plan's exact SQL, and
   a Check Run that blocks the merge until the change is applied.
@@ -60,7 +61,7 @@ database. Nothing falls back to a riskier way of running it.
 
 - **Changes that rewrite a table**, such as a general column type change or a
   `USING` expression. These need pg-sprite's copy-and-swap, which is in
-  preview, so SchemaBot blocks the plan instead of running it.
+  preview, so SchemaBot blocks the plan at any table size.
 - **`ALTER TABLE` on a table above the native-apply ceiling.** Blocked, for
   the same reason.
 - **Foreign keys.** Adding or dropping one is blocked; see
