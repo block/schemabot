@@ -235,9 +235,18 @@ func TestHandleApply_DirectApplyRefusedWhenLockReleasedBeforeCreate(t *testing.T
 	for _, tc := range []struct {
 		name      string
 		reacquire bool
+		wantError string
 	}{
-		{name: "released", reacquire: false},
-		{name: "released and acquired again", reacquire: true},
+		{
+			name:      "released",
+			reacquire: false,
+			wantError: `apply rejected: the lock on database "testapp" was released while this apply was being queued, so nothing was queued; take the lock again, then apply again`,
+		},
+		{
+			name:      "released and acquired again",
+			reacquire: true,
+			wantError: "apply rejected: the lock on database \"testapp\" was released and taken again while this apply was being queued, so nothing was queued; check who holds it with `schemabot locks`, then apply again",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
@@ -249,7 +258,8 @@ func TestHandleApply_DirectApplyRefusedWhenLockReleasedBeforeCreate(t *testing.T
 			require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
 			var resp apitypes.ErrorResponse
 			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
-			assert.Equal(t, `apply rejected: the lock on database "testapp" was released or acquired again while this apply was being queued, so nothing was queued; check the lock and apply again`, resp.Error)
+			assert.Equal(t, tc.wantError, resp.Error)
+			assert.Equal(t, apitypes.ErrCodeLockChanged, resp.ErrorCode)
 
 			var applies int
 			require.NoError(t, f.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM applies`).Scan(&applies))

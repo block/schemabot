@@ -1601,7 +1601,7 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		if released, ok := errors.AsType[*applyLockReleasedError](err); ok {
 			s.logger.Warn("apply rejected: the database lock it would record was released or acquired again while it was being queued; no apply was created",
 				"plan_id", req.PlanID, "database", released.Database, "environment", req.Environment, "error", released.Err)
-			s.writeError(w, http.StatusConflict, "apply rejected: "+err.Error())
+			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeLockChanged, "apply rejected: "+err.Error())
 			return
 		}
 		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
@@ -1889,8 +1889,14 @@ type applyLockReleasedError struct {
 	Err      error
 }
 
+// Error names which of the two happened, since they need different next steps:
+// a released lock has to be taken again, and a lock taken again may now be
+// someone else's.
 func (e *applyLockReleasedError) Error() string {
-	return fmt.Sprintf("the lock on database %q was released or acquired again while this apply was being queued, so nothing was queued; check the lock and apply again", e.Database)
+	if errors.Is(e.Err, storage.ErrLockReplaced) {
+		return fmt.Sprintf("the lock on database %q was released and taken again while this apply was being queued, so nothing was queued; check who holds it with `schemabot locks`, then apply again", e.Database)
+	}
+	return fmt.Sprintf("the lock on database %q was released while this apply was being queued, so nothing was queued; take the lock again, then apply again", e.Database)
 }
 
 func (e *applyLockReleasedError) Unwrap() error { return e.Err }
