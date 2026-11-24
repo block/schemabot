@@ -17,19 +17,15 @@ import (
 
 const applyFinishedEventType = "apply.finished"
 
-func notifiesApplyOutcome(outcome string) bool {
-	return state.IsState(outcome, state.SettledApplyStates...)
-}
-
-// enqueueApplyFinished reads the winning stored outcome, never a caller's stale
-// apply snapshot. Its insert shares the transaction that records that outcome.
+// enqueueApplyFinished reads the winning stored completion, never a caller's stale
+// apply snapshot. Its insert shares the transaction that records completion.
 func (s *applyStore) enqueueApplyFinished(ctx context.Context, tx *rebindTx, applyID int64) (*outcomeRecordingFailure, error) {
 	var event storage.ApplyFinishedEvent
 	err := tx.QueryRowContext(ctx, `
 		SELECT apply_identifier, database_name, database_type, environment,
 		       repository, pull_request, COALESCE(completed_at, updated_at), state
-		FROM applies WHERE id = ? AND state IN (?, ?, ?, ?)
-	`, applyID, state.Apply.Completed, state.Apply.Failed, state.Apply.Cancelled, state.Apply.Reverted).Scan(&event.ID, &event.Database, &event.DatabaseType,
+		FROM applies WHERE id = ? AND state = ?
+	`, applyID, state.Apply.Completed).Scan(&event.ID, &event.Database, &event.DatabaseType,
 		&event.Environment, &event.Repository, &event.PullRequest, &event.CompletedAt, &event.Outcome)
 	if err != nil {
 		return nil, fmt.Errorf("read finished apply %d for notification: %w", applyID, err)
@@ -138,8 +134,8 @@ func (s *outboxStore) ListUnpublished(ctx context.Context, afterID int64, limit 
 }
 
 func (s *outboxStore) MarkPublished(ctx context.Context, id int64) error {
-	// A prefetched send may finish after quarantine or a future permanent skip.
-	// Record that acceptance without clearing the hold or its retained audit.
+	// A prefetched send may finish after quarantine. Record acceptance without
+	// clearing the hold or its retained audit.
 	if _, err := s.db.ExecContext(ctx, `
 		UPDATE outbox_events
 		SET status = CASE WHEN status = ? THEN ? ELSE status END,
@@ -162,9 +158,7 @@ func (s *outboxStore) OldestUnpublishedAt(ctx context.Context) (*time.Time, erro
 	return &oldest.Time, nil
 }
 
-// Quarantine leaves transport acceptance and the completed apply unchanged.
-// Its token identifies this incident even if the same row is released and
-// quarantined again within the storage clock's timestamp precision.
+// Quarantine leaves transport acceptance and the apply outcome unchanged.
 func (s *outboxStore) Quarantine(ctx context.Context, id int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -180,14 +174,12 @@ func (s *outboxStore) Quarantine(ctx context.Context, id int64) error {
 		slog.DebugContext(ctx, "completion notification is not pending; no quarantine recorded", "outbox_id", id, "status", status)
 		return nil
 	}
-	token := uuid.NewString()
-	if _, err := tx.ExecContext(ctx, `UPDATE outbox_events SET status = ?, quarantine_token = ? WHERE id = ?`, storage.OutboxStatusQuarantined, token, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE outbox_events SET status = ? WHERE id = ?`, storage.OutboxStatusQuarantined, id); err != nil {
 		return fmt.Errorf("quarantine notification %d: %w", id, err)
 	}
 	metadata, err := json.Marshal(struct {
-		OutboxID        int64  `json:"outbox_id"`
-		QuarantineToken string `json:"quarantine_token"`
-	}{id, token})
+		OutboxID int64 `json:"outbox_id"`
+	}{id})
 	if err != nil {
 		return fmt.Errorf("encode quarantine diagnostic for notification %d: %w", id, err)
 	}
@@ -195,7 +187,7 @@ func (s *outboxStore) Quarantine(ctx context.Context, id int64) error {
   INSERT INTO apply_logs (apply_id, level, event_type, source, message, metadata)
   VALUES (?, ?, ?, ?, ?, ?)
  `, applyID, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
-		"Completion notification quarantined after a panic. It remains held until an authorized release operation is available.", string(metadata)); err != nil {
+		"Completion notification quarantined after a panic. Delivery is held; no release operation is available.", string(metadata)); err != nil {
 		return fmt.Errorf("record quarantine diagnostic for notification %d: %w", id, err)
 	}
 	if err := tx.Commit(); err != nil {

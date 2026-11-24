@@ -6,7 +6,6 @@ CREATE TABLE `outbox_events` (
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `status` varchar(20) NOT NULL DEFAULT 'pending',
   `published_at` datetime DEFAULT NULL,
-  `quarantine_token` varchar(36) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_status` (`status`,`created_at`,`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

@@ -332,22 +332,13 @@ func (s *applyStore) settleAppliesStoppedForEndedOperation(ctx context.Context, 
 	if err != nil {
 		return nil, err
 	}
-	var recordingFailures []*outcomeRecordingFailure
 	for _, apply := range settled {
 		if err := settleStoppedForEndedOperation(ctx, tx, apply); err != nil {
 			return nil, err
 		}
-		failure, err := s.enqueueApplyFinished(ctx, tx, apply.Apply.ID)
-		if err != nil {
-			return nil, err
-		}
-		recordingFailures = append(recordingFailures, failure)
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit settle of applies stopped for an ended operation: %w", err)
-	}
-	for _, failure := range recordingFailures {
-		failure.report(ctx)
 	}
 	now := time.Now()
 	for _, apply := range settled {

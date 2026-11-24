@@ -13,7 +13,6 @@ const (
 	OutboxStatusPending     = "pending"
 	OutboxStatusPublished   = "published"
 	OutboxStatusQuarantined = "quarantined"
-	OutboxStatusSkipped     = "skipped"
 )
 
 // RecordingErrorPolicy controls whether notification recording can block an outcome transition.
@@ -42,8 +41,8 @@ func (p RecordingErrorPolicy) Validate() error {
 	}
 }
 
-// ApplyFinishedEvent records one committed apply outcome. EventID deduplicates
-// delivery; ID correlates outcomes for the same apply, including corrections.
+// ApplyFinishedEvent records a committed successful completion. EventID
+// deduplicates delivery; ID identifies the apply.
 type ApplyFinishedEvent struct {
 	EventID string `json:"event_id"`
 	Type    string `json:"type"`

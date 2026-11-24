@@ -327,82 +327,54 @@ func TestSenderQuarantineFailureRemainsVisible(t *testing.T) {
 }
 
 func TestSenderFailureIdentityLogs(t *testing.T) {
-	for _, malformed := range []bool{false, true} {
-		for _, markFailure := range []bool{false, true} {
-			t.Run(fmt.Sprintf("Malformed=%v/MarkFailure=%v", malformed, markFailure), func(t *testing.T) {
-				store := newMemoryOutbox(t, 1)
-				if malformed {
-					store.events[0].Payload = json.RawMessage(`{"secret":"do-not-log",`)
-				}
-				if markFailure {
-					store.markErr = errors.New("mark unavailable")
-				}
-				var output bytes.Buffer
-				publisher := publisherFunc(func(context.Context, json.RawMessage) error {
-					if markFailure {
-						return nil
-					}
-					return errors.New("transport unavailable")
-				})
-				sender := NewSender(store, publisher, slog.New(slog.NewJSONHandler(&output, nil)))
-				require.Error(t, sender.sendBatch(t.Context()))
-				log := output.String()
-				assert.Contains(t, log, `"outbox_id":1`)
-				assert.NotContains(t, log, "do-not-log")
-				if malformed {
-					assert.Contains(t, log, "identity_decode_error")
-				} else {
-					assert.Contains(t, log, `"apply_id":"apply_1"`)
-					assert.Contains(t, log, `"database":"orders"`)
-					assert.Contains(t, log, `"database_type":"mysql"`)
-					assert.Contains(t, log, `"environment":"production"`)
-				}
-			})
-		}
-	}
-	// A malformed diagnostic payload is still handed to the transport unchanged.
 	store := newMemoryOutbox(t, 1)
-	store.events[0].Payload = json.RawMessage(`invalid-json`)
+	var output bytes.Buffer
+	sender := NewSender(store, publisherFunc(func(context.Context, json.RawMessage) error {
+		return errors.New("transport unavailable")
+	}), slog.New(slog.NewJSONHandler(&output, nil)))
+	require.Error(t, sender.sendBatch(t.Context()))
+	assert.Contains(t, output.String(), `"apply_id":"apply_1"`)
+	assert.Contains(t, output.String(), `"database":"orders"`)
+	assert.NotContains(t, output.String(), `"payload"`)
+
+	// Diagnostic decoding cannot prevent delivery or disclose the payload.
+	store.events[0].Payload = json.RawMessage(`{"secret":"do-not-log",`)
+	output.Reset()
+	require.Error(t, sender.sendBatch(t.Context()))
+	assert.Contains(t, output.String(), "identity_decode_error")
+	assert.NotContains(t, output.String(), "do-not-log")
 	var sent json.RawMessage
-	sender := NewSender(store, publisherFunc(func(_ context.Context, payload json.RawMessage) error {
+	sender.publisher = publisherFunc(func(_ context.Context, payload json.RawMessage) error {
 		sent = payload
 		return nil
-	}), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	})
 	require.NoError(t, sender.sendBatch(t.Context()))
 	assert.Equal(t, store.events[0].Payload, sent)
 	assert.True(t, store.published[1])
 }
 
-// A disposition changed after prefetch suppresses future batches, not the send
-// already selected. Acceptance remains visible without clearing a hold or skip.
+// Quarantine after prefetch excludes later selections, not a send in flight.
+// Transport acceptance remains visible without clearing the hold.
 func TestSenderPrefetchedDisposition(t *testing.T) {
-	for _, disposition := range []string{storage.OutboxStatusQuarantined, storage.OutboxStatusSkipped} {
-		t.Run(disposition, func(t *testing.T) {
-			store := newMemoryOutbox(t, 2)
-			var accepted []string
-			publisher := publisherFunc(func(_ context.Context, payload json.RawMessage) error {
-				var message storage.ApplyFinishedEvent
-				require.NoError(t, json.Unmarshal(payload, &message))
-				accepted = append(accepted, message.ID)
-				if message.ID == "apply_1" {
-					store.status[1] = disposition
-				}
-				return nil
-			})
-			sender := NewSender(store, publisher, slog.New(slog.DiscardHandler))
-			require.NoError(t, sender.sendBatch(t.Context()))
-			require.NoError(t, sender.sendBatch(t.Context()))
-			assert.Equal(t, []string{"apply_1", "apply_2"}, accepted)
-			assert.Equal(t, disposition, store.status[1])
-			assert.True(t, store.published[1], "actual acceptance is retained")
-			oldest, err := store.OldestUnpublishedAt(t.Context())
-			require.NoError(t, err)
-			if disposition == storage.OutboxStatusSkipped {
-				assert.Nil(t, oldest)
-			} else {
-				require.NotNil(t, oldest)
-				assert.Equal(t, store.events[0].CreatedAt, *oldest)
-			}
-		})
-	}
+	store := newMemoryOutbox(t, 2)
+	var accepted []string
+	publisher := publisherFunc(func(_ context.Context, payload json.RawMessage) error {
+		var message storage.ApplyFinishedEvent
+		require.NoError(t, json.Unmarshal(payload, &message))
+		accepted = append(accepted, message.ID)
+		if message.ID == "apply_1" {
+			store.status[1] = storage.OutboxStatusQuarantined
+		}
+		return nil
+	})
+	sender := NewSender(store, publisher, slog.New(slog.DiscardHandler))
+	require.NoError(t, sender.sendBatch(t.Context()))
+	require.NoError(t, sender.sendBatch(t.Context()))
+	assert.Equal(t, []string{"apply_1", "apply_2"}, accepted)
+	assert.Equal(t, storage.OutboxStatusQuarantined, store.status[1])
+	assert.True(t, store.published[1], "actual acceptance is retained")
+	oldest, err := store.OldestUnpublishedAt(t.Context())
+	require.NoError(t, err)
+	require.NotNil(t, oldest)
+	assert.Equal(t, store.events[0].CreatedAt, *oldest)
 }

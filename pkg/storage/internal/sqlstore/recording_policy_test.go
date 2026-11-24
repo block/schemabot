@@ -62,7 +62,7 @@ func (b recordingPolicyFaultBinder) Rebind(query string) string {
 		query = strings.Replace(query, "INSERT INTO outbox_events", "INSERT INTO nonexistent_notification_table", 1)
 	case b.fault == "state" && strings.Contains(query, "UPDATE applies"):
 		query = strings.Replace(query, "UPDATE applies", "UPDATE nonexistent_apply_table", 1)
-	case b.fault == "read" && strings.Contains(query, "FROM applies WHERE id = ? AND state IN (?, ?, ?, ?)"):
+	case b.fault == "read" && strings.Contains(query, "FROM applies WHERE id = ? AND state = ?"):
 		query = strings.Replace(query, "FROM applies", "FROM nonexistent_apply_table", 1)
 	case b.fault == "savepoint" && query == "SAVEPOINT completion_notification":
 		query = "SAVEPOINT"
@@ -76,106 +76,103 @@ func (b recordingPolicyFaultBinder) Rebind(query string) string {
 
 func testCompletionRecordingPolicy(t *testing.T, newStore func(*testing.T, ...storage.Option) *Storage) {
 	t.Helper()
-	for _, outcome := range state.SettledApplyStates {
-		t.Run(outcome, func(t *testing.T) {
-			for _, derived := range []bool{false, true} {
-				writer := "Direct"
-				if derived {
-					writer = "Derived"
+	outcome := state.Apply.Completed
+	for _, derived := range []bool{false, true} {
+		writer := "Direct"
+		if derived {
+			writer = "Derived"
+		}
+		t.Run(writer, func(t *testing.T) {
+			for _, tc := range []struct {
+				name      string
+				policy    storage.RecordingErrorPolicy
+				fault     string
+				completes bool
+				wantError string
+			}{
+				{name: "Omitted", fault: "insert", wantError: "enqueue apply outcome notification"},
+				{name: "Block", policy: storage.RecordingErrorBlock, fault: "insert", wantError: "enqueue apply outcome notification"},
+				{name: "Continue", policy: storage.RecordingErrorContinue, fault: "insert", completes: true},
+				{name: "ContinueSuccess", policy: storage.RecordingErrorContinue, completes: true},
+				{name: "StateError", policy: storage.RecordingErrorContinue, fault: "state", wantError: "nonexistent_apply_table"},
+				{name: "StateReadError", policy: storage.RecordingErrorContinue, fault: "read", wantError: "read finished apply"},
+				{name: "SavepointError", policy: storage.RecordingErrorContinue, fault: "savepoint", wantError: "save notification recording"},
+				{name: "RecoveryError", policy: storage.RecordingErrorContinue, fault: "recover", wantError: "recover notification recording"},
+				{name: "ReleaseError", policy: storage.RecordingErrorContinue, fault: "release", wantError: "release notification recording"},
+				{name: "LeaseLost", policy: storage.RecordingErrorContinue, fault: "lease"},
+				{name: "CASMiss", policy: storage.RecordingErrorContinue, fault: "cas"},
+			} {
+				if tc.fault == "cas" && !derived {
+					continue
 				}
-				t.Run(writer, func(t *testing.T) {
-					for _, tc := range []struct {
-						name      string
-						policy    storage.RecordingErrorPolicy
-						fault     string
-						completes bool
-						wantError string
-					}{
-						{name: "Omitted", fault: "insert", wantError: "enqueue apply outcome notification"},
-						{name: "Block", policy: storage.RecordingErrorBlock, fault: "insert", wantError: "enqueue apply outcome notification"},
-						{name: "Continue", policy: storage.RecordingErrorContinue, fault: "insert", completes: true},
-						{name: "ContinueSuccess", policy: storage.RecordingErrorContinue, completes: true},
-						{name: "StateError", policy: storage.RecordingErrorContinue, fault: "state", wantError: "nonexistent_apply_table"},
-						{name: "StateReadError", policy: storage.RecordingErrorContinue, fault: "read", wantError: "read finished apply"},
-						{name: "SavepointError", policy: storage.RecordingErrorContinue, fault: "savepoint", wantError: "save notification recording"},
-						{name: "RecoveryError", policy: storage.RecordingErrorContinue, fault: "recover", wantError: "recover notification recording"},
-						{name: "ReleaseError", policy: storage.RecordingErrorContinue, fault: "release", wantError: "release notification recording"},
-						{name: "LeaseLost", policy: storage.RecordingErrorContinue, fault: "lease"},
-						{name: "CASMiss", policy: storage.RecordingErrorContinue, fault: "cas"},
-					} {
-						if tc.fault == "cas" && !derived {
-							continue
-						}
-						t.Run(tc.name, func(t *testing.T) {
-							ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-							defer cancel()
-							var opts []storage.Option
-							if tc.policy != "" {
-								opts = append(opts, storage.WithChangeEventsOnRecordingError(tc.policy))
-							}
-							store := newStore(t, opts...)
-							lock := storagetest.CreateLock(t, store, "outbox_policy", storage.DatabaseTypeMySQL)
-							apply := storagetest.CreateApplyWithStateAndEnv(t, store, lock, "apply_recording_policy", 0, state.Apply.Running, "staging")
-							reader, output := captureRecordingFailureSignals(t)
-							original := store.db.binder
-							if tc.fault != "" {
-								store.db.binder = recordingPolicyFaultBinder{binder: original, fault: tc.fault}
-							}
-							if tc.fault == "lease" {
-								ctx = storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "stale-driver", Token: "stale-token"})
-							}
-							now := time.Now().UTC().Truncate(time.Second)
-							var err error
-							if derived {
-								expectedState := state.Apply.Running
-								if tc.fault == "cas" {
-									expectedState = state.Apply.Pending
-								}
-								var swapped bool
-								swapped, err = store.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, outcome, "", nil, &now)
-								assert.Equal(t, tc.completes, swapped)
-							} else {
-								apply.State = outcome
-								apply.CompletedAt = &now
-								err = store.Applies().Update(ctx, apply)
-							}
-							store.db.binder = original
-							switch {
-							case tc.fault == "lease":
-								require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
-							case tc.wantError != "":
-								require.ErrorContains(t, err, tc.wantError)
-								if tc.fault == "insert" {
-									if _, postgres := original.(PostgresDialect); postgres {
-										var sqlErr *pgconn.PgError
-										require.ErrorAs(t, err, &sqlErr)
-										assert.Equal(t, "42P01", sqlErr.Code, "a server-side undefined-table error, not a client argument failure")
-									}
-								}
-							default:
-								require.NoError(t, err)
-							}
-							stored, err := store.Applies().Get(ctx, apply.ID)
-							require.NoError(t, err)
-							expected := state.Apply.Running
-							if tc.completes {
-								expected = outcome
-							}
-							assert.Equal(t, expected, stored.State)
-							if tc.completes {
-								require.NotNil(t, stored.CompletedAt)
-								assert.WithinDuration(t, now, *stored.CompletedAt, time.Second)
-							}
-							events, err := store.OutboxEvents().ListUnpublished(ctx, 0, 10)
-							require.NoError(t, err)
-							if tc.fault == "" {
-								require.Len(t, events, 1)
-							} else {
-								assert.Empty(t, events)
-							}
-							assertRecordingFailureSignals(t, reader, output, tc.completes && tc.fault == "insert")
-						})
+				t.Run(tc.name, func(t *testing.T) {
+					ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+					defer cancel()
+					var opts []storage.Option
+					if tc.policy != "" {
+						opts = append(opts, storage.WithChangeEventsOnRecordingError(tc.policy))
 					}
+					store := newStore(t, opts...)
+					lock := storagetest.CreateLock(t, store, "outbox_policy", storage.DatabaseTypeMySQL)
+					apply := storagetest.CreateApplyWithStateAndEnv(t, store, lock, "apply_recording_policy", 0, state.Apply.Running, "staging")
+					reader, output := captureRecordingFailureSignals(t)
+					original := store.db.binder
+					if tc.fault != "" {
+						store.db.binder = recordingPolicyFaultBinder{binder: original, fault: tc.fault}
+					}
+					if tc.fault == "lease" {
+						ctx = storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "stale-driver", Token: "stale-token"})
+					}
+					now := time.Now().UTC().Truncate(time.Second)
+					var err error
+					if derived {
+						expectedState := state.Apply.Running
+						if tc.fault == "cas" {
+							expectedState = state.Apply.Pending
+						}
+						var swapped bool
+						swapped, err = store.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, outcome, "", nil, &now)
+						assert.Equal(t, tc.completes, swapped)
+					} else {
+						apply.State = outcome
+						apply.CompletedAt = &now
+						err = store.Applies().Update(ctx, apply)
+					}
+					store.db.binder = original
+					switch {
+					case tc.fault == "lease":
+						require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+					case tc.wantError != "":
+						require.ErrorContains(t, err, tc.wantError)
+						if tc.fault == "insert" {
+							if _, postgres := original.(PostgresDialect); postgres {
+								var sqlErr *pgconn.PgError
+								require.ErrorAs(t, err, &sqlErr)
+								assert.Equal(t, "42P01", sqlErr.Code, "a server-side undefined-table error, not a client argument failure")
+							}
+						}
+					default:
+						require.NoError(t, err)
+					}
+					stored, err := store.Applies().Get(ctx, apply.ID)
+					require.NoError(t, err)
+					expected := state.Apply.Running
+					if tc.completes {
+						expected = outcome
+					}
+					assert.Equal(t, expected, stored.State)
+					if tc.completes {
+						require.NotNil(t, stored.CompletedAt)
+						assert.WithinDuration(t, now, *stored.CompletedAt, time.Second)
+					}
+					events, err := store.OutboxEvents().ListUnpublished(ctx, 0, 10)
+					require.NoError(t, err)
+					if tc.fault == "" {
+						require.Len(t, events, 1)
+					} else {
+						assert.Empty(t, events)
+					}
+					assertRecordingFailureSignals(t, reader, output, tc.completes && tc.fault == "insert")
 				})
 			}
 		})

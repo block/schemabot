@@ -1659,16 +1659,16 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 		}
 	}
 
-	// Only a change of stored outcome creates notification intent. Same-state
-	// refreshes and initially finished applies do not create historical events.
-	outcomeTransition := false
-	if notifiesApplyOutcome(apply.State) {
+	// Only a stored completion transition creates notification intent. Same-state
+	// refreshes and initially completed applies do not create historical events.
+	completionTransition := false
+	if state.IsState(apply.State, state.Apply.Completed) {
 		var previousState string
 		err := writeTx.tx.QueryRowContext(ctx, `SELECT state FROM applies WHERE id = ? FOR UPDATE`, apply.ID).Scan(&previousState)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("read previous state of completing apply %d: %w", apply.ID, err)
 		}
-		outcomeTransition = err == nil && !state.IsState(previousState, apply.State)
+		completionTransition = err == nil && !state.IsState(previousState, state.Apply.Completed)
 	}
 
 	optionsUpdate := ""
@@ -1734,7 +1734,7 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 		}
 	}
 	var recordingFailure *outcomeRecordingFailure
-	if outcomeTransition {
+	if completionTransition {
 		recordingFailure, err = s.enqueueApplyFinished(ctx, writeTx.tx, apply.ID)
 		if err != nil {
 			return err
@@ -1871,7 +1871,7 @@ func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expe
 	args := []any{newState, storedMessage(ctx, "applies.error_message", errorMessage, nil), startedAt, completedAt, applyID, expectedState}
 	args = append(args, guard.predicateArgs...)
 
-	if notifiesApplyOutcome(newState) && !state.IsState(expectedState, newState) {
+	if state.IsState(newState, state.Apply.Completed) && !state.IsState(expectedState, state.Apply.Completed) {
 		return s.completeDerivedState(ctx, applyID, expectedState, guard, args)
 	}
 	result, err := s.db.ExecContext(ctx, guard.query, args...)
@@ -3563,19 +3563,8 @@ func (s *applyStore) expireRetryable(ctx context.Context, endedOperationStopType
 	if err != nil {
 		return nil, fmt.Errorf("expire retryable applies: %w", err)
 	}
-	var recordingFailures []*outcomeRecordingFailure
-	for _, apply := range applies {
-		failure, err := s.enqueueApplyFinished(ctx, tx, apply.ID)
-		if err != nil {
-			return nil, err
-		}
-		recordingFailures = append(recordingFailures, failure)
-	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit expire retryable applies: %w", err)
-	}
-	for _, failure := range recordingFailures {
-		failure.report(ctx)
 	}
 	now := time.Now()
 	for _, apply := range applies {

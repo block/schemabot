@@ -1020,52 +1020,38 @@ The cap applies only to *starting* new operations — a first start, a resume af
 
 A multi-shard apply started with a manual `--defer-cutover` keeps its drivers while it waits: unlike the automatic barrier park, a manually deferred operation holds its claim and keeps heartbeating, so it stays counted. Its cutover is accepted only once every operation waits, which takes a cap no smaller than the apply's width, so a deferred apply that would hold more operations at once than `max_drivers_per_apply` is [refused at the start](#deferred-cutover-capacity). Run it without `--defer-cutover`, or raise `max_drivers_per_apply` to at least its width.
 
-## Apply Outcome Notifications
+## Apply completion notifications
 
-By default, every winning transition to `completed`, `failed`, `cancelled`, or
-`reverted` records an outbox row in the same storage transaction, on MySQL and
-PostgreSQL. `cancelled` means the change was cancelled; `reverted` means the engine
-reverted it. Stopped and retryable failures do not emit outcome notifications.
-Creation in an initial outcome state and same-state refreshes do not emit events,
-and historical outcomes are not backfilled.
+A winning transition to `completed` records notification intent in the same storage
+transaction on MySQL and PostgreSQL. Initial completed creation and same-state
+refreshes do not emit events; historical completions are not backfilled.
 
-The per-install server setting `change_events_on_recording_error` accepts `block`
-(the default, including when omitted) or `continue`. `block` rolls back the outcome
-if intent recording fails. `continue` recovers the failed intent insert with a
-savepoint and commits the outcome without a notification. State, lease, CAS, savepoint
-recovery, and commit errors still fail normally; this setting only tolerates an
-intent insert failure. Invalid values fail server configuration validation.
+`change_events_on_recording_error` selects `block` (the default) or `continue`.
+`block` rolls back completion if intent recording fails. **`continue` weakens
+ST-12's default atomic guarantee:** an intent insert failure permits completion
+without a notification. State, lease, CAS, savepoint and commit errors still fail.
+After a committed loss, an error log identifies the apply and
+`schemabot.outbox.recording_failures_total` increments for its environment. Repair
+storage recording; missing notifications are not retried or backfilled. These
+post-commit signals are best-effort and can be lost on a process crash; a failed
+commit emits neither. The policy also applies when delivery is disabled.
 
-**Opting into `continue` weakens ST-12's default atomic notification guarantee.**
-After an outcome commits without intent, SchemaBot emits an error log with the
-apply identity and increments `schemabot.outbox.recording_failures_total` for its
-environment. Investigate the paired log and repair storage recording; the missing
-notification is not automatically retried or backfilled. A failed outer commit
-emits neither committed-loss signal. Logs and metrics are best-effort: a process
-crash immediately after commit can lose those signals. Delivery failures remain
-retryable independently of this setting, which also applies when delivery is disabled.
+Delivery is disabled by default, but recording continues. Enabling delivery sends
+accumulated pending rows. Configure the server that owns apply storage:
 
 ```yaml
-change_events_on_recording_error: continue # Optional; default: block
-```
-
-Delivery is disabled by default. To send pending notifications to a standard SQS
-queue, configure the server that owns the apply storage:
-
-```yaml
+change_events_on_recording_error: block
 apply_notifications:
   publisher: sqs
   queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/apply-completed
   region: us-east-1
 ```
 
-The publisher uses the AWS SDK's normal credential chain and needs
-`sqs:SendMessage` on that queue. `region` may be omitted when the normal AWS
-configuration supplies it. FIFO queues are not supported. An empty `publisher`
-disables delivery without discarding stored intent; enabling it later sends the
-pending rows accumulated while it was disabled.
+SQS requires a standard queue (not FIFO), the AWS SDK credential chain and
+`sqs:SendMessage` permission. Omit `region` if AWS configuration supplies it;
+an empty `publisher` disables delivery without discarding intent.
 
-Each SQS message body is JSON:
+Each message body is JSON:
 
 ```json
 {
@@ -1084,71 +1070,34 @@ Each SQS message body is JSON:
 }
 ```
 
-`id` is the stable apply correlation identifier. Deduplicate delivery by `event_id`,
-not by `id`: corrected outcomes and reruns can produce distinct events for one
-apply. Multiple senders and a restart after SQS acceptance but before the published
-mark can deliver the same event more than once. `app` is captured from the database
-registration, falling back to the logical database name when empty. `repository`
-and `pull_request` are omitted when absent.
+Deduplicate by `event_id`; `id` identifies the apply. Multiple senders or a restart
+after SQS acceptance but before its storage mark can duplicate delivery. Acceptance
+does not mean a receiver processed the message. `app` captures `DatabaseConfig.App`,
+falling back to the logical database name. `repository` and `pull_request` are
+omitted when absent. `occurred_at_nanos` captures intent creation inside the state
+transaction, not commit or delivery time; `completed_at` uses the stored completion
+(or update) timestamp and its database precision.
 
-`occurred_at_nanos` is the intent capture time in Unix nanoseconds, inside the
-winning state transaction before commit. It is not the commit or delivery time.
-`completed_at` is the stored outcome timestamp (or the stored update timestamp
-when absent), with the database's timestamp precision, not nanosecond precision.
-A receiver can derive a JSON message with `app`, `environment`,
-`timestamp` from `occurred_at_nanos`, and a description using `type`, such as
-`apply.finished apply=apply_example outcome=completed`. Aggregate events do not
-contain operation identity, deployment, or attempt facts.
-Acceptance by SQS does not mean that a receiver processed the message.
+The sender scans bounded batches, continues past failed rows and revisits earlier
+pending IDs even under sustained arrivals. Ordinary transport errors retry without
+an attempt limit. Failed batches back off up to 30 seconds; that is not an end-to-end
+delivery bound. Shutdown cancels delivery and waits at most five seconds.
 
-The sender processes at most 100 rows per batch, continues past failed rows, and
-backs off between failed batches from two seconds up to 30 seconds. It scans
-later IDs even if an earlier batch cannot be published. Each scan captures the
-highest stored ID and returns to retry earlier pending rows after reaching it,
-even while new full batches keep arriving. The backoff sleep is capped at 30 seconds and
-resets to one second after any successful batch. It is not an end-to-end delivery bound:
-each row can take ten seconds to send and another ten seconds to record acceptance,
-in addition to storage reads and the wait for earlier batches. Shutdown cancels the
-sender and waits at most five seconds. No sender election, consumer, retention
-cleanup, or backfill runs. Published rows are retained indefinitely as an audit trail;
-the outbox table grows by design.
+`status` alone selects delivery: only `pending` rows are selected. A per-row panic
+atomically records `quarantined` and an apply-log diagnostic without changing the
+payload or apply. Diagnostic failure rolls back quarantine; panic details remain
+in server logs. `published_at` records acceptance, not disposition: a prefetched
+send may finish after quarantine without clearing the hold. Conversely, a stale
+panic cannot quarantine a published row. Stop and drain all senders to rule out
+in-flight sends. Quarantined rows remain held; no release operation is available.
+Do not edit SchemaBot storage by hand.
 
-Each retained row has one authoritative `status`: `pending`, `published`,
-`quarantined`, or `skipped`. Only pending rows enter new delivery batches.
-`published_at` records actual transport acceptance and `quarantine_token` identifies
-an incident; neither detail selects a row for delivery. Rows in every state are
-retained indefinitely.
-
-A panic while processing a pending notification atomically changes its status to
-`quarantined`, records a fresh incident token and writes an apply-log diagnostic.
-The payload and completed apply are unchanged. Ordinary transport errors leave
-intent pending and retry without an attempt limit. A failed quarantine transaction
-leaves it pending and logs a containment failure. Panic values and stacks stay in
-server logs. The recovered-panic counter uses the `completion_sender` operation.
-
-Quarantine and permanent skip exclude future selections, not copies already
-prefetched or sends already in flight. A later successful send records
-`published_at` but changes status to `published` only while it is still `pending`;
-`quarantined` and `skipped` remain held with their audit details intact. If acceptance
-is recorded first, a later panic cannot quarantine that published row. A panic
-while recording acceptance can leave the row quarantined even though SQS accepted
-it; a future authorized release could resend it. Receivers must deduplicate.
-Stopping and draining all senders is necessary to rule out in-flight sends.
-
-**There is no release or skip operation in this version.** Quarantined rows stay
-held until an authorized SchemaBot release operation exists, even after repairing
-the publisher. The `skipped` state is reserved for an explicit permanent-skip
-operation; disabling delivery never skips intent. Operators must not edit
-SchemaBot's storage by hand. Release and skip API/CLI operations, with normal
-authorization and atomic apply-log auditing, are follow-up work.
-
-While delivery is enabled, `schemabot.outbox.oldest_unpublished_age` records the
-true oldest-created age across `pending` and `quarantined` rows, or zero when
-neither exists. `published` and `skipped` do not contribute, including a skipped row
-with no acceptance timestamp. A quarantined row still contributes if an in-flight
-send later records acceptance: its disposition is still held. A growing value calls
-for checking sender logs, quarantined notifications, queue permissions and SQS
-reachability. A failed storage read does not record a misleading zero.
+All rows, including `published`, are retained indefinitely; the table grows by
+design. There is no cleanup or consumer. While delivery is enabled,
+`schemabot.outbox.oldest_unpublished_age` measures the oldest `pending` or
+`quarantined` row, including a held row with recorded acceptance. A growing age
+calls for checking sender logs, quarantines, queue permissions and reachability.
+An empty backlog records zero; a failed read does not.
 
 ## Rate Limits
 

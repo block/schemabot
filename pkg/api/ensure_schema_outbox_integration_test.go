@@ -39,11 +39,10 @@ func TestEnsureSchema_OutboxStatus(t *testing.T) {
 
 			// Every authoritative disposition survives repeated convergence,
 			// including held intent that records a late transport acceptance.
-			_, err := db.ExecContext(ctx, `INSERT INTO outbox_events (apply_id, event_type, payload, status, published_at, quarantine_token) VALUES
-				(1, 'apply_completed', '{"id":"pending"}', 'pending', NULL, NULL),
-				(2, 'apply_completed', '{"id":"published"}', 'published', '2026-01-01 00:00:00', NULL),
-				(3, 'apply_completed', '{"id":"quarantined"}', 'quarantined', '2026-01-01 00:00:00', 'incident'),
-				(4, 'apply_completed', '{"id":"skipped"}', 'skipped', NULL, NULL)`)
+			_, err := db.ExecContext(ctx, `INSERT INTO outbox_events (apply_id, event_type, payload, status, published_at) VALUES
+				(1, 'apply.finished', '{"id":"pending"}', 'pending', NULL),
+				(2, 'apply.finished', '{"id":"published"}', 'published', '2026-01-01 00:00:00'),
+				(3, 'apply.finished', '{"id":"quarantined"}', 'quarantined', '2026-01-01 00:00:00')`)
 			require.NoError(t, err)
 			require.NoError(t, converge())
 			require.NoError(t, converge())
@@ -57,7 +56,7 @@ func TestEnsureSchema_OutboxStatus(t *testing.T) {
 			}
 			require.NoError(t, rows.Err())
 			require.NoError(t, rows.Close())
-			assert.Equal(t, []string{storage.OutboxStatusPending, storage.OutboxStatusPublished, storage.OutboxStatusQuarantined, storage.OutboxStatusSkipped}, statuses)
+			assert.Equal(t, []string{storage.OutboxStatusPending, storage.OutboxStatusPublished, storage.OutboxStatusQuarantined}, statuses)
 		})
 	}
 }

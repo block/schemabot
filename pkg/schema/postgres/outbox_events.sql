@@ -6,7 +6,6 @@ CREATE TABLE outbox_events (
   created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   status varchar(20) NOT NULL DEFAULT 'pending',
   published_at timestamp DEFAULT NULL,
-  quarantine_token varchar(36) DEFAULT NULL,
   PRIMARY KEY (id)
 );
 CREATE INDEX idx_outbox_events_status ON outbox_events (status, created_at, id);
