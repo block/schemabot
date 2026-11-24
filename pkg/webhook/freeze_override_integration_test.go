@@ -83,6 +83,7 @@ func TestE2EApplyOverrideFromAPullRequestNeedsAnotherGitHubApprover(t *testing.T
 	})
 	freezeID := freezeForOverride(t, svc.Storage(), driftEnv, dbName)
 	svc.Config().Freeze.GitHubTeams = []string{approveTeam}
+	svc.Config().Freeze.OverridePolicy = api.FreezeOverridePolicyApproval
 
 	refused := runRolloutWebhook(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv+` --override "fix the index"`))
 	comment := awaitCommentContaining(t, refused, "| `"+freezeID+"` | until lifted |")
@@ -123,6 +124,40 @@ func TestE2EApplyOverrideFromAPullRequestNeedsAnotherGitHubApprover(t *testing.T
 	assert.Equal(t, request.Identifier, created.GetOptions().FreezeOverride)
 }
 
+// Under the default reason override policy, a commenter's own reason admits
+// the apply from the pull request at once. The override is stored in the
+// GitHub identity domain, approved by its requester, with the reason, and
+// the apply records it. No approver team is needed.
+func TestE2EApplyOverrideFromAPullRequestOnReason(t *testing.T) {
+	dbName := "webhook_override_reason"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	freezeID := freezeForOverride(t, svc.Storage(), driftEnv, dbName)
+	require.True(t, svc.Config().Freeze.OverrideOnReason(), "reason is the default")
+
+	refused := runRolloutWebhook(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv))
+	comment := awaitCommentContaining(t, refused, "| `"+freezeID+"` | until lifted |")
+	assert.Contains(t, comment, "- **Go ahead with a reason** if this change can't wait.")
+	assert.NotContains(t, comment, "approver")
+	requireNoApplies(t, svc, dbName)
+
+	admitted := runRolloutWebhook(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv+` --override "fix the index"`))
+	created := awaitRolloutApply(t, svc, dbName, admitted)
+	request, err := svc.Storage().FreezeOverrides().Get(t.Context(), created.GetOptions().FreezeOverride)
+	require.NoError(t, err)
+	assert.True(t, request.OnReason())
+	assert.Equal(t, "github:carol", request.RequestedBy)
+	assert.Equal(t, "github:carol", request.ApprovedBy)
+	assert.Equal(t, "github:testuser", request.PRAuthor)
+	assert.Equal(t, 1, request.PullRequest)
+	assert.Equal(t, []string{"freeze " + freezeID}, request.Blockers)
+	assert.Equal(t, "fix the index", request.Reason)
+}
+
 // approveTeam is the one freeze approver team the approval tests configure.
 const approveTeam = "acme/freeze-approvers"
 
@@ -161,6 +196,7 @@ func TestE2EFreezeApproveFromTheSamePullRequest(t *testing.T) {
 		{name: "us", liveSchema: usersBaseSchema},
 	}, api.PlanIndependent)
 	svc.Config().Freeze.GitHubTeams = []string{approveTeam}
+	svc.Config().Freeze.OverridePolicy = api.FreezeOverridePolicyApproval
 	schemabotDB := openDriftDB(t, e2eSchemabotDSN)
 	t.Cleanup(func() {
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
@@ -235,6 +271,7 @@ func TestE2EFreezeApproveNeedsConfiguredTeamsAndAPullRequestRequest(t *testing.T
 	assert.Contains(t, comment, "not configured")
 
 	svc.Config().Freeze.GitHubTeams = []string{approveTeam}
+	svc.Config().Freeze.OverridePolicy = api.FreezeOverridePolicyApproval
 	viaAPI, err := svc.Storage().FreezeOverrides().Create(t.Context(), &storage.FreezeOverrideRequest{
 		Identifier: engine.NewFreezeOverrideID(), Environment: driftEnv, Action: storage.FreezeOverrideActionApply,
 		TargetID: dbName + "/x@0123456789abcdef", Database: dbName, Blockers: []string{"freeze freeze-x"}, Reason: "fix",
@@ -333,6 +370,7 @@ func newControlOverrideFixture(t *testing.T, applyIdentifier, database string, c
 	service := apiServiceForStopCommandTest(t, store, database)
 	service.RegisterTernClient(database, "staging", &stopCommandTernClient{remote: cutover})
 	service.Config().Freeze.GitHubTeams = []string{approveTeam}
+	service.Config().Freeze.OverridePolicy = api.FreezeOverridePolicyApproval
 	h := &Handler{
 		service:   service,
 		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),

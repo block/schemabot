@@ -381,8 +381,8 @@ func (s *Service) logControlOperationForApply(ctx context.Context, apply *storag
 	}
 }
 
-// logFreezeOverrideForApply writes the apply log entry for a start or cutover
-// that an approved override request let past a freeze. It does nothing when no
+// logFreezeOverrideForApply writes the apply log entry for an apply, start or
+// cutover that an approved override request let past a freeze. It does nothing when no
 // override admitted the change.
 func (s *Service) logFreezeOverrideForApply(ctx context.Context, apply *storage.Apply, caller, eventType string, request *storage.FreezeOverrideRequest) {
 	if request == nil {

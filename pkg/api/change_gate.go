@@ -279,7 +279,7 @@ func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, call
 			"reason", approved.Reason, "blockers", approved.Blockers)...)
 		return admitCtx, approved, nil
 	}
-	onReason := in.Override != "" && s.config != nil && s.config.Freeze.OverrideOnReason()
+	onReason := in.Override != "" && (s.config == nil || s.config.Freeze.OverrideOnReason())
 	if onReason {
 		admitted, err := s.overrideOnReason(ctx, in, blockers)
 		if err != nil {
@@ -347,7 +347,15 @@ func (s *Service) approvedOverride(ctx context.Context, in changeGateInput, bloc
 		return nil, fmt.Errorf("list approved overrides for %s %s in %s: %w", in.Action, in.TargetID, in.Environment, err)
 	}
 	ids := changeGateBlockerIDs(blockers)
+	// An override admitted on its own reason counts only while the policy
+	// allows that. A server switched back to approval honors only overrides a
+	// second person approved, so one recorded before the switch admits no new
+	// command. Work it already admitted keeps it (approvedOverridesForApply).
+	onReason := s.config == nil || s.config.Freeze.OverrideOnReason()
 	for _, request := range approved {
+		if request.OnReason() && !onReason {
+			continue
+		}
 		if request.Covers(ids) && storage.CanonicalKey(request.RequestedBy) == storage.CanonicalKey(caller) && sameOverrideOrigin(ctx, request) {
 			return request, nil
 		}

@@ -28,29 +28,30 @@ type FreezeConfig struct {
 	GitHubTeams []string `yaml:"github_teams,omitempty"`
 
 	// OverridePolicy decides what an `--override "<reason>"` does when a
-	// freeze refuses a change. FreezeOverridePolicyApproval, the default,
-	// records a request that someone other than the requester and the pull
-	// request's author must approve. FreezeOverridePolicyReason lets the
-	// change through on the requester's own reason, like an audited deploy
-	// override: the request is stored approved by its requester, and the
-	// reason stays on it for audit. Under either policy the reason is
-	// required, an override covers only the change it was given for, and it
-	// lasts at most storage.FreezeOverrideMaxLifetime.
+	// freeze refuses a change. FreezeOverridePolicyReason, the default, lets
+	// the change through on the requester's own reason, like an audited
+	// deploy override: the request is stored approved by its requester, and
+	// the reason stays on it for audit. FreezeOverridePolicyApproval records
+	// a request that someone other than the requester and the pull request's
+	// author must approve. Under either policy the reason is required, an
+	// override covers only the change it was given for, and it lasts at most
+	// storage.FreezeOverrideMaxLifetime.
 	OverridePolicy string `yaml:"override_policy,omitempty"`
 }
 
 // FreezeOverridePolicyApproval requires a second person to approve an
-// override. An empty policy means this one.
+// override.
 const FreezeOverridePolicyApproval = "approval"
 
 // FreezeOverridePolicyReason lets the requester's own reason admit an
-// override, with no second approver.
+// override, with no second approver. An empty policy means this one.
 const FreezeOverridePolicyReason = "reason"
 
 // OverrideOnReason reports whether an override reason admits a change on its
-// own, with no second approver.
+// own, with no second approver: true unless the policy is
+// FreezeOverridePolicyApproval.
 func (c FreezeConfig) OverrideOnReason() bool {
-	return strings.TrimSpace(c.OverridePolicy) == FreezeOverridePolicyReason
+	return strings.TrimSpace(c.OverridePolicy) != FreezeOverridePolicyApproval
 }
 
 // DirectWriteReasonNotFreezeAdmin denies a freeze write to a caller in

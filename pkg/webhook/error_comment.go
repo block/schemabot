@@ -63,7 +63,7 @@ func (h *Handler) postChangeGateRefusal(
 ) bool {
 	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
 		var approvers []string
-		onReason := false
+		onReason := true // the default policy
 		if config, ok := h.serverConfig(); ok {
 			approvers = config.Freeze.GitHubTeams
 			onReason = config.Freeze.OverrideOnReason()

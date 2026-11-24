@@ -183,7 +183,7 @@ func RenderStartWithdrawn(data StartWithdrawnData) string {
 	if data.StoppedByFreeze != "" {
 		body += fmt.Sprintf("**Stopped by**: freeze %s\n", inlineCode(data.StoppedByFreeze))
 		body += "\nA freeze that stops schema changes in this environment took effect before the start requested earlier did, so the start was withdrawn. " +
-			"The schema change stays stopped. Start it again after the freeze ends or is lifted, or add `--override` and your reason to the start command to ask a freeze approver to let it through.\n"
+			"The schema change stays stopped. Start it again after the freeze ends or is lifted, or add `--override` and your reason to the start command if it can't wait.\n"
 		return body
 	}
 	body += "\nA stop arrived before the start requested earlier took effect, so the start was withdrawn. The schema change stays stopped; start it again to resume.\n"

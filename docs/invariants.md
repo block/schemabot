@@ -2268,14 +2268,14 @@ database clock, so every pod agrees at the edges of a freeze. A pull request rol
 cutover, nor is a stop, a cancel or a revert. When SchemaBot cannot read the freezes, or the override
 requests below, it refuses the change with a retryable error, never letting it through unchecked.
 A freeze refuses a change unless an approved override request covers every blocker on it. The
-requester, who must be verified, runs the apply, start or cutover with an override reason, and
-SchemaBot records a request and refuses, naming it. Asking again before approval names the same request
+requester, who must be verified, runs the apply, start or cutover with an override reason. Under
+the default `freeze.override_policy`, `reason`, that reason admits the change at once: SchemaBot
+stores the request approved by its requester (`overrideOnReason`), and the rules below on what an
+approval covers still hold. Under `approval`, the rest of this paragraph applies: SchemaBot records
+a request and refuses, naming it. Asking again before approval names the same request
 (`requestOverride`), which keeps its first reason; the refusal says so when the new reason differs. A verified member of `freeze.groups` who is not the requester approves it;
 write groups do not grant approval, and with no freeze group configured nobody approves, so nobody
-overrides alone, admins included. That two-person rule is the default `freeze.override_policy`,
-`approval`. A server that sets `reason` opts out of it on purpose: the requester's reason admits
-the change at once, stored as a request approved by its requester (`overrideOnReason`), and every
-other rule here still holds. Storage also refuses the pull request's author once a request
+overrides alone, admins included. Storage also refuses the pull request's author once a request
 records one. A request from a pull request records its commenter and author as `github:<login>`,
 which storage cannot match to a forward-auth subject, so an approval must come from the same
 identity domain: `handleFreezeOverrideApprove` refuses a request where `FromPullRequest` holds, and
