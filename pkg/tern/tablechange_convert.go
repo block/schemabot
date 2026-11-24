@@ -3,7 +3,7 @@ package tern
 // Per-boundary TableChange conversion helpers. A table change crosses three
 // boundaries — engine → storage, engine → proto, and proto → storage — and
 // every hop must carry the full advisory annotation set (unsafe and
-// execution-mode fields). Each helper owns one hop's field mapping so a new
+// execution-mode fields) and the engine's own plan-time Metadata. Each helper owns one hop's field mapping so a new
 // annotation field is added here once per boundary instead of at every
 // conversion site, and a helper that stops compiling is the signal that a
 // boundary was missed.
@@ -18,6 +18,8 @@ package tern
 // boundary that owns a rule keeps it.
 
 import (
+	"maps"
+
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/proto/ternconv"
@@ -43,6 +45,7 @@ func storageTableChangeFromEngine(tc engine.TableChange, namespace string) stora
 		LargestShardRows: tc.LargestShardRows,
 		EstimatedBytes:   tc.EstimatedBytes,
 		CollationChanges: storageCollationChangesFromEngine(tc.CollationChanges),
+		Metadata:         maps.Clone(tc.Metadata),
 	}
 }
 
@@ -63,6 +66,7 @@ func protoTableChangeFromEngine(tc engine.TableChange, namespace string) *ternv1
 		LargestShardRows: tc.LargestShardRows,
 		EstimatedBytes:   tc.EstimatedBytes,
 		CollationChanges: protoCollationChangesFromEngine(tc.CollationChanges),
+		Metadata:         maps.Clone(tc.Metadata),
 	}
 }
 
@@ -86,6 +90,7 @@ func StorageTableChangeFromProto(ch *ternv1.TableChange, namespace, table, ddlTe
 		LargestShardRows: ch.LargestShardRows,
 		EstimatedBytes:   ch.EstimatedBytes,
 		CollationChanges: storageCollationChangesFromProto(ch.CollationChanges),
+		Metadata:         maps.Clone(ch.GetMetadata()),
 	}
 }
 

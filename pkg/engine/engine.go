@@ -798,6 +798,12 @@ type TableChange struct {
 	// compare equal. Empty when the change re-collates no column, and for an
 	// engine that does not report it.
 	CollationChanges []CollationChange
+	// Metadata carries what the engine recorded about this change at plan
+	// time and needs back at apply time, keyed by names the engine owns. The
+	// plan stores it with the change, and every path that hands the change to
+	// the engine for apply passes it back unchanged. Empty when the engine
+	// recorded nothing.
+	Metadata map[string]string
 }
 
 // CollationChange is one existing column a planned change moves onto another

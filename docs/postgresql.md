@@ -594,6 +594,26 @@ any apply or task is queued. Rewrite the declarative change into an eligible
 form or use a separately reviewed operational process; flags do not override
 an engine-blocked verdict.
 
+A statement that drops a column, a constraint, or a column's `NOT NULL` runs
+only against the object the plan reviewed. The plan records the object's
+definition as it read it, and the apply checks the live object against that
+record under the table's lock, in the transaction that drops it. When the
+object changed after the plan, for example a column dropped and added again
+under the same name, the apply refuses and drops nothing; re-plan against the
+current schema and review the new plan. A plan that cannot record the object
+it drops is blocked. A deployment that builds its plan from another
+deployment's dispatch keeps the record the plan was reviewed with, and refuses
+the change before any of its tasks run when its own objects do not match that
+record. A column at a different position, or with different dependents, than
+on the primary deployment does not match, so that drop cannot run on that
+deployment from the primary deployment's plan.
+
+A plan approved before this check shipped has no record, so its drops are
+refused. That includes an apply still running at the upgrade: a sequential
+apply whose earlier tasks already ran stops at its first drop. Re-plan any
+approved plan that drops a column, a constraint, or a `NOT NULL` after the
+upgrade, and apply the new plan.
+
 The engine does not execute `DROP TABLE` or other statement kinds outside its
 admitted set. That includes tables that exist on the target but that no schema
 file in the namespace declares. The common case is onboarding an existing

@@ -586,6 +586,14 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 				stepMode = engine.ExecutionModeBlocked
 				stepReason = fmt.Sprintf("statement for table %q is a shape SchemaBot's PostgreSQL support does not execute yet; rewriting the change cannot make it eligible", table)
 			}
+			metadata, unrecordedDrop, err := stepDropMetadata(statement, sql)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("record the reviewed drop for table %q: %w", report.Table, err)
+			}
+			if unrecordedDrop && stepMode == "" {
+				stepMode = engine.ExecutionModeBlocked
+				stepReason = fmt.Sprintf("statement for table %q drops an object the planner did not record, so the apply cannot check that it is still the object this plan reviewed; make the change outside SchemaBot", table)
+			}
 			// Verdict reasons quote the table name, a planner-sourced
 			// identifier, so the reserved cause separator is neutralized
 			// before the reason becomes one cause of the verdict.
@@ -597,6 +605,7 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 				UnsafeReason:  destructiveReason(statement.Destructive, table),
 				ExecutionMode: stepMode,
 				ModeReason:    engine.SanitizeBlockedCause(stepReason),
+				Metadata:      metadata,
 			})
 			tiers = append(tiers, stepTier)
 		}
