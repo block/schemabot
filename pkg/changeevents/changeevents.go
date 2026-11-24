@@ -2,18 +2,13 @@
 package changeevents
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
-	"net/url"
 	"slices"
 	"strings"
 	"sync/atomic"
-	"text/template"
 	"time"
 )
 
@@ -44,9 +39,23 @@ type Event struct {
 	Description     string
 }
 
+// Publisher sends one encoded JSON payload. Publish respects ctx and returns
+// nil once the transport accepts the payload.
+type Publisher interface {
+	Publish(context.Context, json.RawMessage) error
+}
+
+// PublisherDestination selects events for one publisher. Encode runs on the
+// destination's worker and must return a complete JSON value.
+type PublisherDestination struct {
+	Environments []string
+	Events       []string
+	Encode       func(Event) (json.RawMessage, error)
+	Publisher    Publisher
+}
+
 type delivery struct {
-	destination Destination
-	template    *template.Template
+	destination PublisherDestination
 	queue       chan Event
 	drops       atomic.Uint64
 }
@@ -58,17 +67,29 @@ type Sender struct {
 	ctx        context.Context
 }
 
-// New validates the destinations and starts one sender per destination.
+// New starts delivery to the configured HTTP destinations.
 func New(destinations []Destination, logger *slog.Logger) (*Sender, error) {
-	if len(destinations) == 0 {
+	return NewWithPublishers(destinations, nil, logger)
+}
+
+// NewWithPublishers starts one bounded worker per HTTP or injected destination.
+// With no destinations it returns a disabled (nil) sender.
+func NewWithPublishers(httpDestinations []Destination, publishers []PublisherDestination, logger *slog.Logger) (*Sender, error) {
+	if len(httpDestinations) == 0 && len(publishers) == 0 {
 		return nil, nil
 	}
+	destinations := make([]PublisherDestination, 0, len(httpDestinations)+len(publishers))
+	for i, config := range httpDestinations {
+		dest, err := newHTTPDestination(config)
+		if err != nil {
+			return nil, fmt.Errorf("change_events[%d]: %w", i, err)
+		}
+		destinations = append(destinations, dest)
+	}
+	destinations = append(destinations, publishers...)
+
 	sender := &Sender{}
 	for i, dest := range destinations {
-		parsed, err := url.Parse(dest.URL)
-		if err != nil || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-			return nil, fmt.Errorf("change_events[%d]: expected an HTTP(S) URL without credentials or a fragment", i)
-		}
 		if len(dest.Environments) == 0 || slices.ContainsFunc(dest.Environments, func(env string) bool { return strings.TrimSpace(env) == "" }) {
 			return nil, fmt.Errorf("change_events[%d]: environments must name at least one environment", i)
 		}
@@ -82,31 +103,18 @@ func New(destinations []Destination, logger *slog.Logger) (*Sender, error) {
 				return nil, fmt.Errorf("change_events[%d]: unknown event %q", i, kind)
 			}
 		}
-		if strings.TrimSpace(dest.Body) == "" {
-			return nil, fmt.Errorf("change_events[%d]: body template is empty", i)
-		}
-		tmpl, err := template.New("event").Option("missingkey=error").Funcs(template.FuncMap{
-			"json": func(value any) (string, error) {
-				encoded, err := json.Marshal(value)
-				return string(encoded), err
-			},
-		}).Parse(dest.Body)
-		if err != nil {
-			return nil, fmt.Errorf("change_events[%d]: parse body template: %w", i, err)
+		if dest.Encode == nil || dest.Publisher == nil {
+			return nil, fmt.Errorf("change_events[%d]: encoder and publisher are required", i)
 		}
 		dest.Environments = slices.Clone(dest.Environments)
 		dest.Events = slices.Clone(dest.Events)
 		sender.deliveries = append(sender.deliveries, &delivery{
-			destination: dest, template: tmpl, queue: make(chan Event, queueCapacity),
+			destination: dest, queue: make(chan Event, queueCapacity),
 		})
 	}
 	sender.ctx, sender.cancel = context.WithCancel(context.Background())
-	client := &http.Client{
-		Timeout:       sendTimeout,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
 	for i, dest := range sender.deliveries {
-		go dest.run(sender.ctx, client, logger.With("change_event_destination", i))
+		go dest.run(sender.ctx, logger.With("change_event_destination", i))
 	}
 	return sender, nil
 }
@@ -153,7 +161,7 @@ func (s *Sender) Close() {
 	}
 }
 
-func (d *delivery) run(ctx context.Context, client *http.Client, logger *slog.Logger) {
+func (d *delivery) run(ctx context.Context, logger *slog.Logger) {
 	reportDrops := func() {
 		if count := d.drops.Swap(0); count > 0 {
 			logger.Warn("change event queue full", "dropped", count)
@@ -165,7 +173,7 @@ func (d *delivery) run(ctx context.Context, client *http.Client, logger *slog.Lo
 	for ctx.Err() == nil {
 		select {
 		case event := <-d.queue:
-			if err := d.send(ctx, client, event); err != nil && ctx.Err() == nil {
+			if err := d.send(ctx, event); err != nil && ctx.Err() == nil {
 				logger.Warn("change event delivery failed", "event", event.Type, "environment", event.Environment, "error", err)
 			}
 		case <-ticker.C:
@@ -176,31 +184,15 @@ func (d *delivery) run(ctx context.Context, client *http.Client, logger *slog.Lo
 	}
 }
 
-func (d *delivery) send(ctx context.Context, client *http.Client, event Event) error {
-	var body bytes.Buffer
-	if err := d.template.Execute(&body, event); err != nil {
+func (d *delivery) send(ctx context.Context, event Event) error {
+	payload, err := d.destination.Encode(event)
+	if err != nil {
 		return fmt.Errorf("render body: %w", err)
 	}
-	if !json.Valid(body.Bytes()) {
+	if !json.Valid(payload) {
 		return fmt.Errorf("rendered body is invalid JSON")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.destination.URL, &body)
-	if err != nil {
-		return fmt.Errorf("create change event request")
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		// A url.Error includes the configured URL, which can contain a token.
-		requestErr := &url.Error{}
-		if errors.As(err, &requestErr) {
-			err = requestErr.Err
-		}
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP status %d", resp.StatusCode)
-	}
-	return nil
+	sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
+	defer cancel()
+	return d.destination.Publisher.Publish(sendCtx, payload)
 }
