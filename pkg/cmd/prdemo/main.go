@@ -13,6 +13,7 @@ import (
 
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -25,6 +26,8 @@ const (
 	headSHA     = "abcdef1234567890abcdef1234567890abcdef12"
 	lockOwner   = "example/shop#42"
 	addIndex    = "ALTER TABLE `orders` ADD INDEX `idx_status`(`status`)"
+	// The freeze recording adds a column, which MySQL applies instantly.
+	addColumn = "ALTER TABLE `orders` ADD COLUMN `gift_note` varchar(255)"
 )
 
 var (
@@ -37,8 +40,10 @@ var (
 
 func member(target string) string { return deployment + "/" + target }
 
-func changes() []templates.KeyspaceChangeData {
-	return []templates.KeyspaceChangeData{{Keyspace: database, Statements: []string{addIndex + ";"}}}
+func changes() []templates.KeyspaceChangeData { return changesOf(addIndex) }
+
+func changesOf(ddl string) []templates.KeyspaceChangeData {
+	return []templates.KeyspaceChangeData{{Keyspace: database, Statements: []string{ddl + ";"}}}
 }
 
 func bytesOf(target string) *int64 {
@@ -257,7 +262,7 @@ func main() {
 		narrowed.Progress = append(narrowed.Progress, narrowedComment(narrowedTo, percent, 0, false))
 	}
 
-	out := map[string]any{"multiTarget": fanOut, "target": narrowed, "stop": stopDemo()}
+	out := map[string]any{"multiTarget": fanOut, "target": narrowed, "stop": stopDemo(), "freeze": freezeDemo()}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", " ")
 	if err := enc.Encode(out); err != nil {
@@ -313,4 +318,94 @@ func stopDemo() stopScenario {
 		demo.Resumed = append(demo.Resumed, rolloutComment(percents, 0, false))
 	}
 	return demo
+}
+
+// freezeScenario is an apply that asks for a freeze override. The freeze
+// refuses it, so the apply comment says it did not run and the refusal below
+// names the override request. A second person, a freeze approver, approves
+// it, and the author's next apply runs as usual.
+type freezeScenario struct {
+	Command  string `json:"command"`
+	Plan     string `json:"plan"`
+	Apply    string `json:"apply"`
+	Refused  string `json:"refused"`
+	Refusal  string `json:"refusal"`
+	Approver string `json:"approver"`
+	Approve  string `json:"approve"`
+	Approved string `json:"approved"`
+	Rerun    string `json:"rerun"`
+	Complete string `json:"complete"`
+	Summary  string `json:"summary"`
+}
+
+// freezePlanComment is the plan comment of the one-target database the freeze
+// recording uses. refused marks an apply comment a change gate refused.
+func freezePlanComment(locked, refused bool) string {
+	data := templates.PlanCommentData{
+		Database: database, SchemaName: database, Environment: environment, HeadSHA: headSHA,
+		Repository: repository, RequestedBy: requestedBy, IsMySQL: true, DatabaseType: "mysql", Changes: changesOf(addColumn),
+	}
+	if locked {
+		data.IsLocked = true
+		data.LockOwner = lockOwner
+		data.LockAcquired = startedAt.Format("2006-01-02 15:04:05 UTC")
+	}
+	if refused {
+		data.RefusedByChangeGate, data.LockReleased, data.RefusalPosted = true, true, true
+	}
+	return templates.RenderPlanComment(data)
+}
+
+func freezeDemo() freezeScenario {
+	const (
+		overrideID = "ovr-123"
+		reason     = "Hotfix: checkout needs the gift_note column"
+		approver   = "monalisa"
+	)
+	demo := freezeScenario{
+		Command: `schemabot apply -e production --override "` + reason + `"`,
+		Plan:    freezePlanComment(false, false),
+		Apply:   freezePlanComment(true, false),
+		Refused: freezePlanComment(true, true),
+		Refusal: templates.RenderChangeGateRefusal(templates.ChangeGateRefusalData{
+			CommandName: action.Apply, TakesOverride: true, Environment: environment, RequestedBy: requestedBy,
+			Timestamp: startedAt.Format("2006-01-02 15:04:05"),
+			Freezes:   []templates.RefusingFreeze{{ID: "freeze-abc", Reason: "Holiday code freeze"}},
+			Override: &templates.RefusalOverrideRequest{
+				ID: overrideID, Requester: requestedBy, Author: requestedBy, Reason: reason,
+			},
+			Approvers: []string{"example/db-approvers"},
+		}),
+		Approver: approver,
+		Approve:  "schemabot freeze approve " + overrideID,
+		Approved: templates.RenderFreezeOverrideApproved(templates.FreezeOverrideApprovedData{
+			ID: overrideID, Approver: approver, Action: action.Apply, Database: database, Environment: environment,
+			RequestedBy: requestedBy, Reason: reason, ExpiresAt: startedAt.Add(24 * time.Hour),
+		}),
+		Rerun:    "schemabot apply -e production",
+		Complete: instantComment(false),
+		Summary:  instantComment(true),
+	}
+	return demo
+}
+
+// instantComment renders the freeze recording's apply once it has completed:
+// the column add is instant, so there is no row copy to follow.
+func instantComment(summary bool) string {
+	data := templates.ApplyStatusCommentData{
+		Database:    database,
+		Environment: environment,
+		State:       state.Apply.Completed,
+		Engine:      "Spirit",
+		ApplyID:     "apply-example-94",
+		StartedAt:   startedAt.Format(time.RFC3339),
+		CompletedAt: startedAt.Add(2 * time.Second).Format(time.RFC3339),
+		Tables: []templates.TableProgressData{{
+			TableName: "orders", DDL: addColumn, Status: state.Task.Completed, PercentComplete: 100, IsInstant: true, Started: true,
+		}},
+	}
+	if summary {
+		return templates.RenderApplySummaryComment(data)
+	}
+	return templates.RenderApplyStatusComment(data)
 }

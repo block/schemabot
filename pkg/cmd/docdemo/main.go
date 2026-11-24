@@ -311,6 +311,40 @@ func vitessDemo() Demo {
 	return Demo{Name: "cli-vitess", Title: "One deploy request. Progress across every shard.", Height: 740, Frames: frames}
 }
 
+// freezeDemo shows the core freeze workflow: a freeze refuses an apply, and
+// once it is lifted the same apply runs.
+func freezeDemo() Demo {
+	confirm := capture(func() {
+		t.WritePlanHeader(t.PlanHeaderData{Database: "shop", SchemaName: "schema", IsMySQL: true, IsApply: true})
+		changes := []t.DDLChange{{TableName: "orders", ChangeType: "alter", DDL: ddl}}
+		t.WriteEnvironmentHeader("production")
+		t.WriteNamespaceChanges([]t.NamespaceChange{{Namespace: "shop", Changes: changes}}, true, "shop", schema.DialectMySQL)
+		t.WritePlanSummary(changes)
+	}) + applyPrompt()
+	freeze := apitypes.Freeze{
+		ID: "freeze-abc", Environment: "production", Kind: "on_demand", Running: "continue",
+		StartsAt: time.Date(2026, 1, 15, 14, 30, 0, 0, time.UTC), Reason: "Holiday code freeze",
+		CreatedBy: "alice", Source: "manual", InEffect: true,
+	}
+	created := capture(func() { t.WriteFreezeCreated(freeze) })
+	refused := capture(func() {
+		t.WriteChangeGateRefused(t.ChangeGateRefusedData{Environment: "production", Operation: "apply",
+			Blockers: []apitypes.ChangeGateBlocker{{Gate: "freeze", ID: freeze.ID, Reason: freeze.Reason}}})
+	})
+	if !strings.Contains(refused, "production is frozen. This change did not start.") {
+		panic("freeze refusal changed: " + refused)
+	}
+	lifted := capture(func() { t.WriteFreezeLifted(freeze) })
+	frames := []Frame{
+		{3, `schemabot freeze -e production --reason "Holiday code freeze"`, "Start a holiday code freeze", created},
+		{2, "schemabot apply -s ./schema -e production", "A schema change is ready to ship", confirm + "▌"},
+		{0.8, "", "", confirm + "yes"},
+		{4, "", "The freeze refuses it; nothing starts", confirm + "yes\n" + refused},
+		{4, `schemabot unfreeze freeze-abc --reason "Holidays are over"`, "The holidays are over: lift the freeze", lifted},
+	}
+	return Demo{Name: "cli-freeze", Title: "Freeze production for a code freeze or an incident", Height: 740, Bar: "shop · production", Frames: frames}
+}
+
 // Read the confirmation text from the actual apply command so this fixture
 // fails when the command stops using that prompt rather than silently drifting.
 func applyPrompt() string {
@@ -1016,7 +1050,7 @@ func main() {
 	}
 	stopFrames = append(stopFrames, Frame{3, "", "The watcher confirms completion", live(100, state.Apply.Completed, false, "")})
 	demos = append(demos, Demo{Name: "cli-stop", Title: "Stop and resume a change.", Frames: stopFrames})
-	demos = append(demos, vitessDemo(), rollbackDemo(), rolloutDemo(), targetDemo(), rolloutStopDemo())
+	demos = append(demos, vitessDemo(), rollbackDemo(), rolloutDemo(), targetDemo(), rolloutStopDemo(), freezeDemo())
 	fleetLines := busyFleet(now)
 	pull := capture(func() {
 		// The capture pipe is not a TTY; this frame represents an interactive terminal.
