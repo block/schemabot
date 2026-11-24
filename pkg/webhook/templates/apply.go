@@ -48,6 +48,9 @@ type TableProgressData struct {
 	Throttled      bool
 	ThrottleReason string
 	IsInstant      bool
+	// ChangeType is the statement's operation: create, alter, or drop. A
+	// change that reports no progress reads by what it does.
+	ChangeType string
 	// Started reports that the engine began the table's change: its task
 	// left the queue, whether or not it reported rows before it settled.
 	Started bool
@@ -1115,44 +1118,6 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		fmt.Fprintf(sb, "**%s**: %s \u2705 Complete\n", inlineCode(table.TableName), bar)
 		writeDDLLine(sb, dialect, table.DDL, budget)
 
-	case state.Task.CatchingUp:
-		// Row copy is complete; the engine is draining the changes that
-		// accumulated on the source while the copy ran. On a busy table this
-		// catch-up can run for hours, so name the phase instead of rendering a
-		// serene completed copy.
-		fmt.Fprintf(sb, "**%s**: %s ⏩ Catching up on accumulated changes...\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(100))
-		writeDDLLine(sb, dialect, table.DDL, budget)
-		if table.RowsCopied > 0 {
-			fmt.Fprintf(sb, "- Rows copied: %s\n", ui.FormatNumber(table.RowsCopied))
-		}
-
-	case state.Task.Checksumming:
-		// Row copy is complete; the engine is verifying the copied data against
-		// the source before cutover. On a large table this can run for hours, so
-		// show how far the verification has progressed once Spirit reports a total.
-		if table.ChecksumRowsTotal > 0 {
-			pct := ui.ChecksumDisplayPercent(table.ChecksumRowsChecked, table.ChecksumRowsTotal)
-			fmt.Fprintf(sb, "**%s**: %s \U0001f50d Checksumming to verify data (%s)%s\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(pct),
-				ui.FormatRowCopyPercent(pct, table.ChecksumRowsChecked, table.ChecksumRowsTotal), ui.ThrottledSuffix(table.Throttled))
-			writeDDLLine(sb, dialect, table.DDL, budget)
-			fmt.Fprintf(sb, "- Rows verified: %s / %s\n",
-				ui.FormatNumber(ui.ClampRows(table.ChecksumRowsChecked, table.ChecksumRowsTotal)), ui.FormatNumber(table.ChecksumRowsTotal))
-		} else {
-			fmt.Fprintf(sb, "**%s**: %s \U0001f50d Checksumming to verify data...%s\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(100), ui.ThrottledSuffix(table.Throttled))
-			writeDDLLine(sb, dialect, table.DDL, budget)
-		}
-		writeThrottleTooltip(sb, table)
-
-	case state.Task.PostChecksum:
-		// The verification passed and the engine is draining the changes that
-		// accumulated on the source while it ran. Named separately from the
-		// pre-checksum catch-up so the row doesn't rewind to an earlier phase.
-		fmt.Fprintf(sb, "**%s**: %s ⏩ Data verified, applying final changes...\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(100))
-		writeDDLLine(sb, dialect, table.DDL, budget)
-		if table.RowsCopied > 0 {
-			fmt.Fprintf(sb, "- Rows copied: %s\n", ui.FormatNumber(table.RowsCopied))
-		}
-
 	case state.Task.WaitingForCutover:
 		fmt.Fprintf(sb, "**%s**: %s Waiting for cutover\n", inlineCode(table.TableName), ui.ProgressBarWaitingCutover())
 		writeDDLLine(sb, dialect, table.DDL, budget)
@@ -1247,8 +1212,9 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		renderStoppedTable(sb, dialect, table, budget)
 
 	default:
-		// Running / in-progress
-		renderRunningTable(sb, dialect, table, work, budget)
+		// Copying, building, verifying, or catching up: the reading every
+		// surface shares.
+		renderInFlightTable(sb, dialect, table, work, budget)
 	}
 
 	renderShardSummary(sb, table, presentation.RunningCopying, budget)
@@ -1303,70 +1269,54 @@ func writeMemberList(sb *strings.Builder, noun presentation.Noun, members []Shar
 	}
 }
 
-// renderRunningTable renders a table that is actively copying rows, or, with
-// no row count, building an index or applying a change that copies no rows.
-// The build work is the apply's: a concurrent index build has no rows to
-// count, so its bar is the engine's whole-build percent, and the current
-// phase's counters take the detail line a row copy gives its rows.
-func renderRunningTable(sb *strings.Builder, dialect schema.Dialect, table TableProgressData, work apitypes.BuildWork, budget *ddlBlockBudget) {
-	defer writeThrottleTooltip(sb, table)
-	switch {
-	case table.RowsTotal > 0:
-		if ui.EstimateExceeded(table.RowsCopied, table.RowsTotal) {
-			fmt.Fprintf(sb, "**%s**: %s Finalizing copy%s\n", inlineCode(table.TableName), ui.ProgressBarActivity(), ui.ThrottledSuffix(table.Throttled))
-			writeDDLLine(sb, dialect, table.DDL, budget)
-			fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(table.RowsCopied))
-			fmt.Fprintf(sb, "- "+glyph.Info+" _%s_\n", ui.EstimateExceededTooltip)
-			return
-		}
+// renderInFlightTable writes a table the engine is working on as every surface
+// reads it (presentation.ReadInFlightTable): the bar and label beside the
+// table name, its statement, then the detail lines. The build work is the
+// apply's, which is what a concurrent index build draws its bar and counters
+// from.
+func renderInFlightTable(sb *strings.Builder, dialect schema.Dialect, table TableProgressData, work apitypes.BuildWork, budget *ddlBlockBudget) {
+	r := presentation.ReadInFlightTable(tableFacts(table, work))
+	fmt.Fprintf(sb, "**%s**: %s\n", inlineCode(table.TableName), r.Headline())
+	writeDDLLine(sb, dialect, table.DDL, budget)
+	writeTableDetails(sb, r.Details)
+}
 
-		pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied)
-		if pct == 0 {
-			// Row total is known but the copy hasn't reported progress yet
-			// (VReplication / Spirit ramp-up). A 0% bar reads as stuck, so show
-			// a starting indicator and the row total instead.
-			fmt.Fprintf(sb, "**%s**: ⏳ Starting copy...%s\n", inlineCode(table.TableName), ui.ThrottledSuffix(table.Throttled))
-			writeDDLLine(sb, dialect, table.DDL, budget)
-			writeRowsAndETA(sb, table)
-			return
-		}
-		bar := ui.ProgressBarRowCopy(pct)
-		fmt.Fprintf(sb, "**%s**: %s %s%s\n", inlineCode(table.TableName), bar,
-			ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal), ui.ThrottledSuffix(table.Throttled))
-		writeDDLLine(sb, dialect, table.DDL, budget)
-		writeRowsAndETA(sb, table)
-	case work.IsConcurrentIndexBuild():
-		fmt.Fprintf(sb, "**%s**: %s%s\n", inlineCode(table.TableName), ui.IndexBuildProgress(table.PercentComplete), ui.ThrottledSuffix(table.Throttled))
-		writeDDLLine(sb, dialect, table.DDL, budget)
-		if line := ui.FormatBuildWork(work); line != "" {
-			fmt.Fprintf(sb, "- %s\n", line)
-		}
-	default:
-		// No row data yet (initializing or instant DDL)
-		fmt.Fprintf(sb, "**%s**: Running...%s\n", inlineCode(table.TableName), ui.ThrottledSuffix(table.Throttled))
-		writeDDLLine(sb, dialect, table.DDL, budget)
+// tableFacts is what the PR comment knows about a table's change, in the form
+// every surface reads it from.
+func tableFacts(table TableProgressData, work apitypes.BuildWork) presentation.TableFacts {
+	return presentation.TableFacts{
+		Status:              table.Status,
+		ChangeType:          table.ChangeType,
+		IsInstant:           table.IsInstant,
+		PercentComplete:     table.PercentComplete,
+		RowsCopied:          table.RowsCopied,
+		RowsTotal:           table.RowsTotal,
+		ETASeconds:          table.ETASeconds,
+		EstimatedBytes:      table.EstimatedBytes,
+		ChecksumRowsChecked: table.ChecksumRowsChecked,
+		ChecksumRowsTotal:   table.ChecksumRowsTotal,
+		Throttled:           table.Throttled,
+		ThrottleReason:      table.ThrottleReason,
+		BuildWork:           work,
 	}
 }
 
-// writeThrottleTooltip explains the header's "(throttled)" annotation with the
-// engine's reason, using the same tooltip idiom as the estimate-exceeded note.
-// The reason is sanitized at the engine boundary before it is stored, and is
-// escaped here like any other engine prose, so a delimiter in it cannot end
-// the italic span and a mention in it notifies nobody. When the engine reports
-// throttled without a reason, the header annotation stands alone.
-func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
-	if !table.Throttled || table.ThrottleReason == "" {
-		return
+// writeTableDetails writes a table's detail lines as list items. A note is
+// set apart in italics after the info glyph, with its docs link inside the
+// span. Engine prose in a note is escaped like any other, so a delimiter in it
+// cannot end the italic span and a mention in it notifies nobody.
+func writeTableDetails(sb *strings.Builder, details []presentation.TableDetail) {
+	for _, d := range details {
+		if !d.Note {
+			fmt.Fprintf(sb, "- %s\n", d.Text)
+			continue
+		}
+		text := escapeProse(d.Text)
+		if d.DocsURL != "" {
+			text += fmt.Sprintf(" ([docs](%s))", d.DocsURL)
+		}
+		fmt.Fprintf(sb, "- "+glyph.Info+" _%s_\n", text)
 	}
-	// The raw reason names the engine signal; the tip says what the pause
-	// protects, and links the reference doc for remediation prose. A reason
-	// whose signal has no tip renders alone so a new engine signal degrades
-	// to raw text rather than a wrong explanation.
-	if tip := ui.ThrottleTip(table.ThrottleReason); tip != "" {
-		fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s · %s ([docs](%s))_\n", escapeProse(table.ThrottleReason), tip, ui.MySQLThrottleDocURL)
-		return
-	}
-	fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s_\n", escapeProse(table.ThrottleReason))
 }
 
 // tableBegan reports whether the engine began a table's change before it
@@ -1496,25 +1446,12 @@ func writePlannedRows(sb *strings.Builder, estimatedRows, estimatedBytes *int64,
 	}
 }
 
-// writeRowsAndETA writes the rows copied / total line with optional ETA.
+// writeRowsAndETA writes a copy's rows line (presentation.RowsLine).
 func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 	if table.RowsTotal <= 0 {
 		return
 	}
-	copied := ui.ClampRows(table.RowsCopied, table.RowsTotal)
-	size := ui.FormatTableSizeClause(table.EstimatedBytes)
-	if table.ETASeconds > 0 {
-		fmt.Fprintf(sb, "- Rows: %s / %s%s \u00b7 ETA: %s\n",
-			ui.FormatNumber(copied),
-			ui.FormatNumber(table.RowsTotal),
-			size,
-			ui.FormatETA(table.ETASeconds))
-	} else {
-		fmt.Fprintf(sb, "- Rows: %s / %s%s\n",
-			ui.FormatNumber(copied),
-			ui.FormatNumber(table.RowsTotal),
-			size)
-	}
+	fmt.Fprintf(sb, "- %s\n", presentation.RowsLine(tableFacts(table, apitypes.BuildWork{})))
 }
 
 // writeApplyFooter writes a state-specific footer with the next operator action.
@@ -2139,6 +2076,14 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 			PercentComplete: int(t.PercentComplete),
 			ETASeconds:      t.ETASeconds,
 			IsInstant:       t.IsInstant,
+			ChangeType:      t.ChangeType,
+			EstimatedBytes:  t.EstimatedBytes,
+			EstimatedRows:   t.EstimatedRows,
+
+			ChecksumRowsChecked: t.ChecksumRowsChecked,
+			ChecksumRowsTotal:   t.ChecksumRowsTotal,
+			Throttled:           t.Throttled,
+			ThrottleReason:      t.ThrottleReason,
 		})
 	}
 

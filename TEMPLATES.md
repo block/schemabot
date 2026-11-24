@@ -9010,7 +9010,7 @@ To resume from where it stopped:
 
   ── myapp_sharded ──
 
-     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Running...
+     ~ users: Running...
        ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
 
@@ -9384,7 +9384,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 
   ── myapp_unsharded ──
 
-     ~ orders_seq: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Running...
+     ~ orders_seq: Running...
        CREATE TABLE `orders_seq` (
            `id` int unsigned NOT NULL DEFAULT '0',
            `next_id` bigint unsigned,

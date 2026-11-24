@@ -761,6 +761,10 @@ const (
 	EnginePostgres    = "postgres"
 )
 
+// Engines lists every engine constant above, for checks that must hold on
+// every engine. TestEnginesListsEveryEngineConstant keeps it complete.
+var Engines = []string{EngineSpirit, EnginePlanetScale, EngineStrata, EnginePostgres}
+
 // ApplyOperationKind constants classify operation rows by scheduling role.
 const (
 	ApplyOperationKindWork           = "work"
