@@ -2350,14 +2350,6 @@ func planGroupList(noun presentation.Noun, members []string, total int) string {
 	return noun.Plural + " " + strings.Join(quoted, ", ")
 }
 
-// shardCoveragePhrase states how much of a keyspace a shard group covers:
-// "all 32 shards" when it covers every planned shard, "12 of 32 shards" for
-// a subset, or a bare count when the keyspace total is unknown — a subset
-// must never read like whole-keyspace coverage.
-func shardCoveragePhrase(count, totalShards int) string {
-	return presentation.CoveragePhrase(shardNoun, count, totalShards)
-}
-
 // writeShardGroupHeading writes a shard group's bold heading above its DDL
 // block. Few shards read inline by name; a wide group leads with how much of
 // the keyspace it covers — "all 32 shards" when it covers every planned
