@@ -89,6 +89,18 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 	writeFailedTargets(sb, data.Model, g)
 }
 
+// anyTargetThrottled reports whether the engine's throttler is holding back
+// any target's run of the table, so the rolled-up headline says so, as the
+// CLI's does.
+func anyTargetThrottled(cells []TableProgressData) bool {
+	for _, c := range cells {
+		if c.Throttled {
+			return true
+		}
+	}
+	return false
+}
+
 // lineRunsIndexBuild reports whether a target running the line's table is in
 // a concurrent index build, read from that target's own operation, since an
 // operation's build work says nothing about its siblings.
@@ -360,7 +372,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	coverage := presentation.TargetCoverage(done, running, pending, failed, retrying, presentation.RunningCopying, pendingWord)
 	status := presentation.RollupTaskStatus(statuses)
 	if indexBuild && running > 0 {
-		fmt.Fprintf(sb, "**%s**: %s\n", name, ui.IndexBuildProgress(presentation.IndexBuildPercentAcrossTargets(parts)))
+		fmt.Fprintf(sb, "**%s**: %s%s\n", name, ui.IndexBuildProgress(presentation.IndexBuildPercentAcrossTargets(parts)), ui.ThrottledSuffix(anyTargetThrottled(cells)))
 		writeDDL()
 		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, presentation.RunningApplying, budget)
 		return
@@ -373,8 +385,8 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 			// The list under the rows says where each target stands, so the
 			// headline carries only the table's progress across all of them,
 			// the way a sharded table's does.
-			fmt.Fprintf(sb, "**%s**: %s %s\n", name, ui.ProgressBarRowCopy(pct),
-				presentation.AcrossTargetsPercent(pct, rows.Exact(len(cells)), rows.Copied, rows.Total))
+			fmt.Fprintf(sb, "**%s**: %s %s%s\n", name, ui.ProgressBarRowCopy(pct),
+				presentation.AcrossTargetsPercent(pct, rows.Exact(len(cells)), rows.Copied, rows.Total), ui.ThrottledSuffix(anyTargetThrottled(cells)))
 			writeDDL()
 			if line := rows.RowsLine(len(cells), targetsTableBytes(cells)); line != "" {
 				sb.WriteString("- " + line + "\n")

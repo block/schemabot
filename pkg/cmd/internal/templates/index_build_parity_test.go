@@ -82,12 +82,16 @@ type indexBuildTarget struct {
 	// building marks a target whose operation runs the index build, as its
 	// recorded build work says.
 	building bool
+	// throttled marks a target whose engine's throttler is holding the
+	// build back.
+	throttled bool
 }
 
 // An operator following a concurrent index build rolled out across targets
 // sees one bar with one percent on both surfaces: the mean of each target's
 // whole-build percent, with finished targets counted whole and queued ones as
-// not started. The apply carries no build work of its own here, so the CLI
+// not started. A throttled target marks the line throttled on both. The apply
+// carries no build work of its own here, so the CLI
 // draws the bar only by reading each table's build work from the operation
 // that runs it (UX-5).
 func TestRolledUpIndexBuildReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
@@ -100,14 +104,17 @@ func TestRolledUpIndexBuildReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
 		name    string
 		targets []indexBuildTarget
 		percent int
+		suffix  string
 	}{
 		{name: "two targets building", targets: []indexBuildTarget{running(20), running(30)}, percent: 25},
 		{name: "one target done beside one building", targets: []indexBuildTarget{completed, running(50)}, percent: 75},
 		{name: "one target queued", targets: []indexBuildTarget{running(60), queued, completed}, percent: 53},
+		{name: "one target throttled", targets: []indexBuildTarget{running(20), {opState: state.ApplyOperation.Running, status: state.Task.Running, percent: 30, building: true, throttled: true}},
+			percent: 25, suffix: ui.ThrottledSuffix(true)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			want := ui.IndexBuildProgress(tc.percent)
+			want := ui.IndexBuildProgress(tc.percent) + tc.suffix
 			cli := renderRollout(t, ParseProgressResponse(indexBuildRolloutResponse(tc.targets)))
 			pr := indexBuildRolloutComment(tc.targets)
 			assert.Contains(t, cli, "orders: "+want+"\n", "CLI")
@@ -136,7 +143,7 @@ func indexBuildRolloutResponse(targets []indexBuildTarget) *apitypes.ProgressRes
 		resp.Tables = append(resp.Tables, &apitypes.TableProgressResponse{
 			Deployment: "prod", Target: name, OperationKey: name, Keyspace: "orders",
 			TableName: "orders", DDL: createOrdersIndex, ChangeType: "create", Status: target.status,
-			PercentComplete: int32(target.percent),
+			PercentComplete: int32(target.percent), Throttled: target.throttled,
 		})
 	}
 	return resp
@@ -153,6 +160,7 @@ func indexBuildRolloutComment(targets []indexBuildTarget) string {
 			Engine: storage.EnginePostgres,
 			Tables: []webhooktemplates.TableProgressData{{
 				TableName: "orders", DDL: createOrdersIndex, Status: target.status, PercentComplete: target.percent,
+				Throttled: target.throttled,
 			}},
 		}
 		if target.building {
