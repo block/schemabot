@@ -2201,9 +2201,9 @@ func pollRunningIndexBuild(t *testing.T, eng *Engine) *engine.ProgressResult {
 
 // TestProgressReportsExecutorDetailAndBuildPercent proves a poll during a
 // concurrent index build carries the executor's operation class and attempt,
-// the server's phase and every counter of its progress row, and a percent
-// that places the phase's block position on the whole build's scale, on the
-// apply and its table alike.
+// the server's phase and every counter of its progress row, and pg-sprite's
+// whole-build percent rounded down to a whole number, on the apply and its
+// table alike.
 func TestProgressReportsExecutorDetailAndBuildPercent(t *testing.T) {
 	eng := New()
 	row := heapScanRow
@@ -2220,15 +2220,15 @@ func TestProgressReportsExecutorDetailAndBuildPercent(t *testing.T) {
 	assert.Equal(t, "2", got.Metadata["lockers_done"])
 	assert.Equal(t, "4", got.Metadata["lockers_total"])
 	assert.NotContains(t, got.Metadata, "current_locker_pid")
-	assert.Equal(t, 25, got.Tables[0].Progress, "25 of 40 heap blocks inside the 0–40 band of the first heap scan")
+	assert.Equal(t, 21, got.Tables[0].Progress, "pg-sprite places 25 of 40 heap blocks at 21.9% of the build, rounded down")
 	assert.Equal(t, got.Tables[0].Progress, got.Progress, "the apply and its table report the same percent")
 }
 
 // TestProgressReportsHonestZerosWhileWaitingForWriters proves a phase that
 // publishes no block work still reports every counter: a build parked behind
 // writers reports zero lockers cleared and zero blocks, not missing keys, and
-// its percent is the phase's position on the whole build, not a division of
-// the zero block total.
+// its percent is pg-sprite's position for the phase on the whole build, not
+// a division of the zero block total.
 func TestProgressReportsHonestZerosWhileWaitingForWriters(t *testing.T) {
 	eng := New()
 	row := indexProgressRow{phase: "waiting for writers before validation", lockersTotal: 3}
@@ -2241,8 +2241,8 @@ func TestProgressReportsHonestZerosWhileWaitingForWriters(t *testing.T) {
 	assert.Equal(t, "0", got.Metadata["blocks_total"])
 	assert.Equal(t, "0", got.Metadata["tuples_done"])
 	assert.Equal(t, "0", got.Metadata["tuples_total"])
-	assert.Equal(t, 60, got.Tables[0].Progress, "the first heap scan is behind it, validation ahead of it")
-	assert.Equal(t, 60, got.Progress)
+	assert.Equal(t, 50, got.Tables[0].Progress, "the build is behind it, validation ahead of it")
+	assert.Equal(t, 50, got.Progress)
 }
 
 // TestProgressKeepsLastKnownPercentWithoutABuildRow proves the derived
@@ -2256,12 +2256,12 @@ func TestProgressKeepsLastKnownPercentWithoutABuildRow(t *testing.T) {
 	row := heapScanRow
 	session := &publishedIndexProgressSession{row: &row}
 	claimRunningIndexBuild(t, eng, session)
-	require.Equal(t, 25, pollRunningIndexBuild(t, eng).Tables[0].Progress)
+	require.Equal(t, 21, pollRunningIndexBuild(t, eng).Tables[0].Progress)
 
 	session.row = nil
 	got := pollRunningIndexBuild(t, eng)
-	assert.Equal(t, 25, got.Tables[0].Progress, "no row keeps the last-known percent")
-	assert.Equal(t, 25, got.Progress)
+	assert.Equal(t, 21, got.Tables[0].Progress, "no row keeps the last-known percent")
+	assert.Equal(t, 21, got.Progress)
 	assert.NotContains(t, got.Metadata, "blocks_done", "no row publishes no counters")
 
 	validation := indexProgressRow{phase: "index validation: scanning table", blocksDone: 40, blocksTotal: 40}
@@ -2312,8 +2312,8 @@ func TestProgressStraddlingATerminalPublishDoesNotFloorToTheRetiredRecord(t *tes
 	}
 	got := pollRunningIndexBuild(t, eng)
 	assert.Equal(t, engine.StateRunning, got.State)
-	assert.Equal(t, 25, got.Progress)
-	assert.Equal(t, 25, got.Tables[0].Progress)
+	assert.Equal(t, 21, got.Progress)
+	assert.Equal(t, 21, got.Tables[0].Progress)
 
 	got = pollRunningIndexBuild(t, eng)
 	assert.Equal(t, engine.StateCompleted, got.State)
@@ -2337,8 +2337,8 @@ func TestProgressStraddlingAReclaimDoesNotFloorToTheRetiredRecord(t *testing.T) 
 	}
 	got := pollRunningIndexBuild(t, eng)
 	assert.Equal(t, engine.StateRunning, got.State)
-	assert.Equal(t, 25, got.Progress)
-	assert.Equal(t, 25, got.Tables[0].Progress)
+	assert.Equal(t, 21, got.Progress)
+	assert.Equal(t, 21, got.Tables[0].Progress)
 
 	session.row = nil
 	got = pollRunningIndexBuild(t, eng)
@@ -2355,12 +2355,12 @@ func TestProgressKeepsPercentWhenTheBuildRowReadFails(t *testing.T) {
 	row := heapScanRow
 	session := &publishedIndexProgressSession{row: &row}
 	tracker := claimRunningIndexBuild(t, eng, session)
-	require.Equal(t, 25, pollRunningIndexBuild(t, eng).Tables[0].Progress)
+	require.Equal(t, 21, pollRunningIndexBuild(t, eng).Tables[0].Progress)
 
 	tracker.SetConcurrentBuild(&indexProgressSession{err: errors.New("connection reset by peer")}, 42)
 	got := pollRunningIndexBuild(t, eng)
 	assert.Equal(t, engine.StateRunning, got.State)
-	assert.Equal(t, 25, got.Tables[0].Progress)
+	assert.Equal(t, 21, got.Tables[0].Progress)
 	assert.Equal(t, "2", got.Metadata["step"])
 }
 
@@ -3713,4 +3713,28 @@ func TestChangedRowSecurityReviewRequiresNewPlan(t *testing.T) {
 	require.NotNil(t, r)
 	assert.Equal(t, "row-security-plan-changed", r.reason)
 	assert.Equal(t, "re-plan and review the new SQL before applying", r.remedy)
+}
+
+// TestSetRunningPercentRoundsDown proves the apply and its table carry
+// pg-sprite's percent as a whole number rounded down, so a step pg-sprite
+// places just below the end never reads as finished.
+func TestSetRunningPercentRoundsDown(t *testing.T) {
+	cases := []struct {
+		name    string
+		percent float64
+		want    int
+	}{
+		{name: "a fraction rounds down", percent: 21.9, want: 21},
+		{name: "the highest running percent stays below 100", percent: 99.9, want: 99},
+		{name: "a whole percent is kept", percent: 50, want: 50},
+		{name: "zero is a reading", percent: 0, want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := &engine.ProgressResult{Progress: 7, Tables: []engine.TableProgress{{Progress: 7}}}
+			setRunningPercent(result, tc.percent)
+			assert.Equal(t, tc.want, result.Progress)
+			assert.Equal(t, tc.want, result.Tables[0].Progress)
+		})
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -1955,9 +1956,9 @@ func (e *Engine) retainRunningPercent(key string, source, result *engine.Progres
 // progressResult's pre-execution position. The counters are the exception:
 // once the server publishes a row every counter is written, zeros included,
 // because a zero is a reading (no lockers cleared yet) and an absent key
-// means the server has not published one. A running result's percent is
-// derived from the server phase and counters through concurrentIndexPercent;
-// without a row, or in a phase the band table does not know, the percent the
+// means the server has not published one. A running result's percent is the
+// one pg-sprite derives for the step in flight; while pg-sprite reports none —
+// no row, a phase it does not know, or a read that failed — the percent the
 // result already carries stands. The statement passes through
 // sanitizeStatementText and the server phase through sanitizeReasonText
 // because the metadata is destined for operator-facing single-line rendering
@@ -2011,13 +2012,12 @@ func executorProgressMetadata(ctx context.Context, tracker buildTracker, result 
 		metadata["tuples_total"] = strconv.FormatUint(work.TuplesTotal, 10)
 		metadata["lockers_done"] = strconv.FormatUint(work.LockersDone, 10)
 		metadata["lockers_total"] = strconv.FormatUint(work.LockersTotal, 10)
-		// A build row describes work in flight, so it only refines a running
-		// result's percent. A terminal result's percent is decided by its
-		// state; a stale build snapshot must not pull a completed apply
-		// below 100.
-		if !result.State.IsTerminal() {
-			setRunningPercent(result, snapshot.Detail.ServerPhase, *work)
-		}
+	}
+	// pg-sprite's percent describes work in flight, so it only refines a
+	// running result's percent. A terminal result's percent is decided by its
+	// state; a stale build snapshot must not pull a completed apply below 100.
+	if percent := snapshot.Detail.Percent; percent != nil && !result.State.IsTerminal() {
+		setRunningPercent(result, *percent)
 	}
 	if err != nil {
 		return fmt.Errorf("read pg-sprite executor progress: %w", err)
@@ -2025,16 +2025,17 @@ func executorProgressMetadata(ctx context.Context, tracker buildTracker, result 
 	return nil
 }
 
-// setRunningPercent writes the whole-build percent derived from a build row
-// onto both the apply and its single table, so the two never disagree. A
-// phase the band table does not know leaves both as they were.
-func setRunningPercent(result *engine.ProgressResult, serverPhase string, work progress.Work) {
-	percent, ok := concurrentIndexPercent(serverPhase, work)
-	if !ok || len(result.Tables) == 0 {
+// setRunningPercent writes pg-sprite's percent for the running step onto both
+// the apply and its single table, so the two never disagree. pg-sprite reports
+// tenths below 100; the whole percent is rounded down, so a running step never
+// reads as finished.
+func setRunningPercent(result *engine.ProgressResult, percent float64) {
+	if len(result.Tables) == 0 {
 		return
 	}
-	result.Progress = percent
-	result.Tables[0].Progress = percent
+	whole := int(math.Floor(percent))
+	result.Progress = whole
+	result.Tables[0].Progress = whole
 }
 
 // progressIdentity extracts the apply identity that keys engine progress.
