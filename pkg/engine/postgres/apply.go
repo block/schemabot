@@ -1921,8 +1921,8 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 // The percent never regresses within a record. A record hosts one build —
 // a concurrent index apply is a single statement, and the executor's
 // bounded retries apply to transactional statements, not to a build — and
-// the band scale only advances as the build moves through its phases, so a
-// poll whose row derives a lower percent than the record carries read the
+// pg-sprite's percent only advances as the build moves through its phases,
+// so a poll whose row derives a lower percent than the record carries read the
 // server before a poller that has already carried a later row forward. The
 // tracker serializes the reads but not the write-backs, so the earlier
 // reading lands here second; it adopts the record's percent rather than
@@ -2016,7 +2016,10 @@ func executorProgressMetadata(ctx context.Context, tracker buildTracker, result 
 	// pg-sprite's percent describes work in flight, so it only refines a
 	// running result's percent. A terminal result's percent is decided by its
 	// state; a stale build snapshot must not pull a completed apply below 100.
-	if percent := snapshot.Detail.Percent; percent != nil && !result.State.IsTerminal() {
+	// Only a concurrent index build's percent becomes the apply's: pg-sprite
+	// also measures some other steps, such as a copy, by their own completion,
+	// and one step's completion is not the apply's.
+	if percent := snapshot.Detail.Percent; percent != nil && snapshot.Detail.Operation == progress.OperationConcurrentIndex && !result.State.IsTerminal() {
 		setRunningPercent(result, *percent)
 	}
 	if err != nil {
