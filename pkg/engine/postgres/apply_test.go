@@ -2301,9 +2301,9 @@ func TestProgressReportsExecutorDetailAndBuildPercent(t *testing.T) {
 	assert.Equal(t, "2", got.Metadata["lockers_done"])
 	assert.Equal(t, "4", got.Metadata["lockers_total"])
 	assert.NotContains(t, got.Metadata, "current_locker_pid")
-	assert.Equal(t, 21, got.Tables[0].Progress, "pg-sprite places 25 of 40 heap blocks at 21.9% of the build, rounded down")
+	assert.Equal(t, 21, got.Tables[0].Progress, "pg-sprite places 25 of 40 heap blocks at 21.88% of the build, rounded down")
 	assert.Equal(t, got.Tables[0].Progress, got.Progress, "the apply and its table report the same percent")
-	assert.Equal(t, "21.90", got.Metadata["percent"], "the metadata keeps pg-sprite's percent with its decimals")
+	assert.Equal(t, "21.88", got.Metadata["percent"], "the metadata keeps pg-sprite's percent with its decimals")
 }
 
 // TestProgressReportsHonestZerosWhileWaitingForWriters proves a phase that
@@ -2344,7 +2344,7 @@ func TestProgressKeepsLastKnownPercentWithoutABuildRow(t *testing.T) {
 	got := pollRunningIndexBuild(t, eng)
 	assert.Equal(t, 21, got.Tables[0].Progress, "no row keeps the last-known percent")
 	assert.Equal(t, 21, got.Progress)
-	assert.Equal(t, "21.90", got.Metadata["percent"], "no row keeps the last-known precise percent")
+	assert.Equal(t, "21.88", got.Metadata["percent"], "no row keeps the last-known precise percent")
 	assert.NotContains(t, got.Metadata, "blocks_done", "no row publishes no counters")
 
 	validation := indexProgressRow{phase: "index validation: scanning table", blocksDone: 40, blocksTotal: 40}
@@ -2383,24 +2383,24 @@ func TestProgressNeverRegressesWithinABuild(t *testing.T) {
 // TestProgressDecimalsNeverRegressWithinAWholePercent proves the decimals
 // follow the same rule as the whole percent: 24 and 25 of 40 heap blocks both
 // round down to 21%, so only the precise percent shows that the 24-block row
-// is the stale one, and the poll answers with the record's 21.90 rather than
+// is the stale one, and the poll answers with the record's 21.88 rather than
 // stepping back to 21.00.
 func TestProgressDecimalsNeverRegressWithinAWholePercent(t *testing.T) {
 	eng := New()
 	row := heapScanRow
 	session := &publishedIndexProgressSession{row: &row}
 	claimRunningIndexBuild(t, eng, session)
-	require.Equal(t, "21.90", pollRunningIndexBuild(t, eng).Metadata["percent"])
+	require.Equal(t, "21.88", pollRunningIndexBuild(t, eng).Metadata["percent"])
 
 	stale := heapScanRow
 	stale.blocksDone = 24
 	session.row = &stale
 	got := pollRunningIndexBuild(t, eng)
-	assert.Equal(t, "21.90", got.Metadata["percent"], "a stale row in the same whole percent does not pull the decimals back")
+	assert.Equal(t, "21.88", got.Metadata["percent"], "a stale row in the same whole percent does not pull the decimals back")
 	assert.Equal(t, 21, got.Progress)
 
 	session.row = nil
-	assert.Equal(t, "21.90", pollRunningIndexBuild(t, eng).Metadata["percent"], "the record kept the later reading")
+	assert.Equal(t, "21.88", pollRunningIndexBuild(t, eng).Metadata["percent"], "the record kept the later reading")
 }
 
 // Two polls clone the record while it still reads 0%. The first stores a
