@@ -36,45 +36,48 @@ own state. See [SchemaBot storage](#schemabot-storage) for that distinction.
 
 ## Beta status
 
-PostgreSQL support is in **beta**. SchemaBot runs the changes listed below
-and blocks every other change in the plan, with the reason, before anything
-touches the database. Nothing falls back to a riskier way of running it.
-[What GA, beta, and alpha mean](engines.md#what-ga-beta-and-alpha-mean) defines the bar.
-pg-sprite, the engine underneath, is itself an early release; its
-[README](https://github.com/block/pg-sprite#readme) states its own readiness.
+PostgreSQL support is in **beta**. SchemaBot runs the changes listed under
+"What works today" and blocks everything else when you plan it, with the
+reason, before anything touches your database. It never falls back to a
+riskier way of running a change.
+[What GA, beta, and alpha mean](engines.md#what-ga-beta-and-alpha-mean)
+explains the levels. Changes run through
+[pg-sprite](https://github.com/block/pg-sprite#readme), which is itself an
+early release.
 
-**Supported:**
+**What works today:**
 
-- Planning on every pull request and in the CLI, with the plan's exact SQL, and
-  a Check Run that blocks the merge until the change is applied.
-- `ALTER TABLE` changes that pg-sprite runs natively, such as adding a nullable
-  column, on tables up to the native-apply ceiling (1 GiB by default).
-- Adding an index to an existing table with `CREATE INDEX CONCURRENTLY`. A
-  running build can be cancelled.
+- Plans on every pull request and in the CLI, showing the exact SQL, with a
+  Check Run that blocks the merge until the change is applied.
+- `ALTER TABLE` changes that don't rewrite the table, such as adding a
+  nullable column or a constraint, on tables up to the size limit (1 GiB by
+  default).
+- Adding an index to an existing table with `CREATE INDEX CONCURRENTLY`. You
+  can cancel a build that is running.
 - Creating a table together with its indexes.
 - Adding labels to an existing enum type (see [Enum types](#enum-types)).
 - Row-level security policies on an existing table.
 - `schemabot init` and `schemabot pull` for an existing database, and
   PostgreSQL as the database that stores SchemaBot's own state.
 
-**Not GA yet** (blocked in the plan or refused, never run):
+**Not GA yet.** SchemaBot blocks or refuses these; it never runs them:
 
-- **Changes that rewrite a table**, such as a general column type change or a
-  `USING` expression. These need pg-sprite's copy-and-swap, which is in
-  preview, so SchemaBot blocks the plan at any table size.
-- **`ALTER TABLE` on a table above the native-apply ceiling.** Blocked, for
-  the same reason.
-- **Foreign keys.** Adding or dropping one is blocked; see
-  [Blocked plans](#blocked-plans).
-- **Dropping a table.** SchemaBot never runs `DROP TABLE` on PostgreSQL, and
-  there is no pending-drops quarantine.
+- **Rewriting a table**, such as changing a column's type or adding a `USING`
+  expression. This needs pg-sprite's copy-and-swap, which is still in
+  preview, so the plan is blocked whatever the table's size.
+- **`ALTER TABLE` on a table larger than the size limit.** Blocked for the
+  same reason.
+- **Foreign keys.** Adding or dropping one is blocked;
+  [Blocked plans](#blocked-plans) explains how to run one yourself.
+- **Dropping a table.** SchemaBot never drops a PostgreSQL table, and there
+  is no pending-drops quarantine to hold one.
 - **Creating an enum type**, or removing or reordering its labels.
-- **Controls on a running change.** `stop`, `start`, `cutover`, deferred
-  cutover, `revert`, and `skip-revert` are not available, and `cancel` works
-  only on an index build. See
+- **Controls on a running change.** You can cancel an index build, but
+  `stop`, `start`, `cutover`, deferred cutover, `revert`, and `skip-revert`
+  are not available. See
   [Unsupported workflow features](#unsupported-workflow-features).
-- **Pulling every table shape.** `pull` refuses the shapes listed under
-  [Schema pull](#schema-pull) rather than writing a partial schema.
+- **Pulling every table shape.** `pull` refuses some tables, listed under
+  [Schema pull](#schema-pull), rather than writing a partial schema.
 
 ## Schema pull
 

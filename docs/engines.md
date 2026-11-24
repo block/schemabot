@@ -273,23 +273,23 @@ tracks the engine more closely than this page does.
 
 ## What GA, beta, and alpha mean
 
-The engine badges on the [README](../README.md) are claims about capability, and this is where
-they are defined. An engine is **GA** when it can do the two things below.
+Every engine in the [README](../README.md) carries a badge: GA, beta, or alpha. The badge tells
+you how much of your schema that engine can change today. It is not a safety rating. At every
+level, an engine refuses a change it cannot run safely and tells you why before anything touches
+your database.
 
-An engine is **beta** when it is not GA yet but runs a set of changes its guide lists, and blocks
-every other change in the plan, with the reason, before anything touches the database.
-What is not GA yet is listed in the engine's guide rather than left for you to discover against a
-database.
+- **GA** engines can change any table, however large, and keep you in control while a change
+  runs. The two requirements below spell out what that takes.
+- **Beta** engines handle a clear, documented set of changes. Anything outside that set is blocked
+  when you plan it, with the reason, so you find out on the pull request rather than in
+  production. The engine's guide lists everything that is not GA yet.
+- **Alpha** engines are still being built. What they can do grows with each release, and their
+  guide may not list every gap yet, so read it before you rely on one.
 
-An engine is **alpha** while it is still being built. It runs a narrow set of changes that grows
-from release to release, and its guide may not list every gap yet, so check the guide before you
-rely on it. Outside that set it blocks the plan like any other engine.
-
-Maturity is a capability question, not a safety one. An engine below GA is narrower rather than
-looser: fewer classes of change can be executed and fewer operations are available against one
-that is running, but at the edge of that envelope it behaves the same as any other engine. That
-part is [invariants.md](invariants.md)'s, and most of what is in there is not about engines at
-all.
+Below GA, an engine is narrower, not looser. It runs fewer kinds of change and offers fewer
+controls once a change is running, but whatever it does run follows the same safety rules as every
+other engine. Those rules live in [invariants.md](invariants.md), and most of them have nothing to
+do with engines.
 
 **Online DDL.** An engine that can only run what the database does natively cannot change a large
 table at all, so the harder half of a real schema gets blocked instead of applied. Falling back to
