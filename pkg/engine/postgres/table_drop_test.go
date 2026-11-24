@@ -10,13 +10,19 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 )
 
-// referencing returns a model of table with one foreign key named constraint.
-func referencing(table, constraint string, referencedBy ...string) schemadiff.Model {
+// referencing returns a model of table with one foreign key named constraint,
+// referenced by the given foreign keys of other tables.
+func referencing(table, constraint string, referencedBy ...schemadiff.IncomingForeignKey) schemadiff.Model {
 	return schemadiff.Model{
-		Table:        table,
-		Constraints:  []schemadiff.Constraint{{Name: constraint, Def: "FOREIGN KEY (ref_id) REFERENCES other(id)"}},
-		ReferencedBy: referencedBy,
+		Table:               table,
+		Constraints:         []schemadiff.Constraint{{Name: constraint, Def: "FOREIGN KEY (ref_id) REFERENCES other(id)"}},
+		IncomingForeignKeys: referencedBy,
 	}
+}
+
+// fk names a foreign key of a table in the public schema.
+func fk(table, constraint string) schemadiff.IncomingForeignKey {
+	return schemadiff.IncomingForeignKey{Schema: "public", Table: table, Constraint: constraint}
 }
 
 // A chain of foreign keys among dropped tables orders the drops so each
@@ -24,27 +30,34 @@ func referencing(table, constraint string, referencedBy ...string) schemadiff.Mo
 // leaves out the references that are gone by the time the drop runs.
 func TestPlanTableDropsOrdersReferencingTablesFirst(t *testing.T) {
 	plan := planTableDrops("public", map[string]schemadiff.Model{
-		"a_regions":    {Table: "a_regions", ReferencedBy: []string{"warehouses.warehouses_region_fkey"}},
-		"warehouses":   referencing("warehouses", "warehouses_region_fkey", "z_shipments.z_shipments_warehouse_fkey"),
+		"a_regions": {
+			Table:               "a_regions",
+			ReferencedBy:        []string{"warehouses.warehouses_region_fkey"},
+			IncomingForeignKeys: []schemadiff.IncomingForeignKey{fk("warehouses", "warehouses_region_fkey")},
+		},
+		"warehouses":   referencing("warehouses", "warehouses_region_fkey", fk("z_shipments", "z_shipments_warehouse_fkey")),
 		"z_shipments":  referencing("z_shipments", "z_shipments_warehouse_fkey"),
 		"m_standalone": {Table: "m_standalone"},
-	})
+	}, nil)
 	assert.Equal(t, []string{"m_standalone", "z_shipments", "warehouses", "a_regions"}, plan.order)
 	assert.Empty(t, plan.blocked)
 	assert.Equal(t, "table a_regions\n", plan.definitions["a_regions"])
 	assert.NotContains(t, plan.definitions["warehouses"], "referenced by")
 }
 
-// Introspection leaves a table's foreign key to itself out of the tables
-// that reference it, so a reference that resolves to the table itself
-// belongs to a same-named table in another schema, which stays. The table
-// is blocked rather than dropped into the server's refusal.
-func TestPlanTableDropsBlocksAReferenceThatResolvesToItself(t *testing.T) {
+// A table and a constraint can share their names with a table and a
+// constraint in another schema. A foreign key of billing.orders, which
+// stays, keeps accounts, even though public.orders, which the plan drops,
+// has a foreign key of the same name.
+func TestPlanTableDropsKeepsATableReferencedFromAnotherSchema(t *testing.T) {
 	plan := planTableDrops("public", map[string]schemadiff.Model{
-		"categories": referencing("categories", "categories_parent_fkey", "categories.categories_parent_fkey"),
-	})
-	assert.Empty(t, plan.order)
-	assert.Contains(t, plan.blocked["categories"], "its foreign keys form a cycle")
+		"accounts": {Table: "accounts", IncomingForeignKeys: []schemadiff.IncomingForeignKey{
+			{Schema: "billing", Table: "orders", Constraint: "orders_user_fkey"},
+		}},
+		"orders": referencing("orders", "orders_user_fkey"),
+	}, nil)
+	assert.Equal(t, []string{"orders"}, plan.order)
+	assert.Contains(t, plan.blocked["accounts"][0], `foreign key constraint(s) "billing.orders.orders_user_fkey" of tables that stay reference it`)
 }
 
 // A table that a kept table references is blocked, and blocking it keeps
@@ -52,24 +65,28 @@ func TestPlanTableDropsBlocksAReferenceThatResolvesToItself(t *testing.T) {
 // stays, so tags stays, and so does colors, which tags references.
 func TestPlanTableDropsBlocksTablesThatStayReferenced(t *testing.T) {
 	plan := planTableDrops("public", map[string]schemadiff.Model{
-		"colors": {Table: "colors", ReferencedBy: []string{"tags.tags_color_fkey"}},
-		"tags":   referencing("tags", "tags_color_fkey", "posts.posts_tag_fkey"),
-	})
+		"colors": {Table: "colors", IncomingForeignKeys: []schemadiff.IncomingForeignKey{fk("tags", "tags_color_fkey")}},
+		"tags":   referencing("tags", "tags_color_fkey", fk("posts", "posts_tag_fkey")),
+	}, nil)
 	assert.Empty(t, plan.order)
-	assert.Contains(t, plan.blocked["tags"], `foreign key constraint(s) "posts.posts_tag_fkey" of tables that stay reference it`)
-	assert.Contains(t, plan.blocked["colors"], `"tags.tags_color_fkey"`)
+	assert.Contains(t, plan.blocked["tags"][0], `foreign key constraint(s) "posts.posts_tag_fkey" of tables that stay reference it`)
+	assert.Contains(t, plan.blocked["colors"][0], `"tags.tags_color_fkey"`)
 }
 
-// Introspection names a referencing table without its schema, so the same
-// name twice means two tables in different schemas. Only one of them can be
-// the dropped table, so the table they reference stays.
-func TestPlanTableDropsBlocksAReferenceItCannotAttribute(t *testing.T) {
+// A table the target refuses to drop, such as one a view reads, is
+// blocked with the target's reasons, and the tables it references stay
+// with it.
+func TestPlanTableDropsBlocksATableTheTargetRefuses(t *testing.T) {
 	plan := planTableDrops("public", map[string]schemadiff.Model{
-		"users":  {Table: "users", ReferencedBy: []string{"orders.orders_user_fkey", "orders.orders_user_fkey"}},
+		"users":  {Table: "users", IncomingForeignKeys: []schemadiff.IncomingForeignKey{fk("orders", "orders_user_fkey")}},
 		"orders": referencing("orders", "orders_user_fkey"),
-	})
-	assert.Equal(t, []string{"orders"}, plan.order)
-	assert.Contains(t, plan.blocked["users"], `"orders.orders_user_fkey"`)
+	}, map[string][]string{"orders": {"view public.open_orders depends on it", "the engine role cannot drop it"}})
+	assert.Empty(t, plan.order)
+	assert.Equal(t, []string{
+		`table "orders" exists on the target but no schema file in namespace "public" declares it; view public.open_orders depends on it`,
+		"the engine role cannot drop it",
+	}, plan.blocked["orders"])
+	assert.Contains(t, plan.blocked["users"][0], `"orders.orders_user_fkey"`)
 }
 
 // Partitioned tables, partitions, and inheritance parents and children are
@@ -79,15 +96,15 @@ func TestPlanTableDropsBlocksHierarchiesAndCycles(t *testing.T) {
 		"events":  {Table: "events", PartitionKey: "RANGE (day)"},
 		"base":    {Table: "base", InheritanceChildren: []string{"public.derived"}},
 		"derived": {Table: "derived", InheritsParents: []string{"public.base"}},
-		"ping":    referencing("ping", "ping_pong_fkey", "pong.pong_ping_fkey"),
-		"pong":    referencing("pong", "pong_ping_fkey", "ping.ping_pong_fkey"),
-	})
+		"ping":    referencing("ping", "ping_pong_fkey", fk("pong", "pong_ping_fkey")),
+		"pong":    referencing("pong", "pong_ping_fkey", fk("ping", "ping_pong_fkey")),
+	}, nil)
 	assert.Empty(t, plan.order)
 	for _, table := range []string{"events", "base", "derived"} {
-		assert.Contains(t, plan.blocked[table], "does not drop a partitioned table or a table in an inheritance hierarchy", table)
+		assert.Contains(t, plan.blocked[table][0], "does not drop a partitioned table or a table in an inheritance hierarchy", table)
 	}
 	for _, table := range []string{"ping", "pong"} {
-		assert.Contains(t, plan.blocked[table], "its foreign keys form a cycle", table)
+		assert.Contains(t, plan.blocked[table][0], "its foreign keys form a cycle", table)
 	}
 }
 

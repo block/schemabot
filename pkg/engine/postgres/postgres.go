@@ -1052,6 +1052,7 @@ func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, nam
 		return nil, nil, nil, fmt.Errorf("list declarable tables in namespace %q: %w", namespace, err)
 	}
 	models := map[string]schemadiff.Model{}
+	refused := map[string][]string{}
 	var exempt []string
 	var withheld []string
 	for _, name := range names {
@@ -1089,8 +1090,11 @@ func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, nam
 			return nil, nil, nil, fmt.Errorf("read undeclared table %q: %w", name, err)
 		}
 		models[name] = m
+		if refused[name], err = tableDropRefusals(ctx, pool, namespace, name); err != nil {
+			return nil, nil, nil, err
+		}
 	}
-	plan := planTableDrops(namespace, models)
+	plan := planTableDrops(namespace, models, refused)
 	drops := make([]engine.TableChange, 0, len(models))
 	for _, name := range plan.order {
 		change, err := undeclaredTableDrop(namespace, name, parser)
@@ -1105,13 +1109,17 @@ func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, nam
 			"database", database,
 			"namespace", namespace,
 			"table", name,
-			"reason", plan.blocked[name])
+			"reasons", plan.blocked[name])
 		change, err := undeclaredTableDrop(namespace, name, parser)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		change.ExecutionMode = engine.ExecutionModeBlocked
-		change.ModeReason = sanitizeReasonText(plan.blocked[name])
+		causes := make([]string, len(plan.blocked[name]))
+		for i, cause := range plan.blocked[name] {
+			causes[i] = sanitizeReasonText(cause)
+		}
+		change.ModeReason = engine.JoinBlockedCauses(causes)
 		drops = append(drops, change)
 	}
 	return drops, exempt, withheld, nil

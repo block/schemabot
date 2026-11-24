@@ -733,13 +733,16 @@ plan Check Run fails:
 |---|---|
 | Partitioned, a partition's parent, or in an inheritance hierarchy | The drop reaches tables or rows the plan does not show |
 | Referenced by a foreign key of a table that stays | PostgreSQL refuses the drop without `CASCADE` |
+| Read by a view, a function, a policy, or another object that stays | PostgreSQL refuses the drop without `CASCADE` |
+| Owned by a role the engine role cannot act as | Only a table's owner can drop it. The reason gives the grant to run |
 | In a cycle of foreign keys with other dropped tables | No drop order works |
 
-Declare the table, remove the foreign keys first, or drop the table through a
-separately reviewed process.
+Declare the table, remove the foreign keys or objects first, or drop the table
+through a separately reviewed process.
 
-**Apply refusals.** A view or other object that depends on the table makes
-the apply fail and drop nothing. Drop or change that object, then apply again.
+**Apply refusals.** The apply checks the role's access again, and the server
+refuses a drop that an object created after the plan depends on. Either way
+the apply fails and drops nothing. Fix the cause, then apply again.
 
 **Tables the plan does not count:**
 
