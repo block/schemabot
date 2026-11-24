@@ -96,13 +96,69 @@ func TestGitHubQuotaSnapshotRegistryFreshness(t *testing.T) {
 	lines = snapshotLines(scrape(), "schemabot_github_rate_limit_remaining")
 	require.Len(t, lines, 1)
 	assert.True(t, strings.HasSuffix(lines[0], " 15000"))
-	// Reset expiry removes a snapshot even when it is younger than 120 seconds.
+	// A reset does not remove a snapshot; only its age does.
 	now = sample.ResetAt.Add(-time.Second)
 	sample.ObservedAt = now
 	RecordGitHubRateLimit(t.Context(), sample)
 	now = sample.ResetAt
+	assert.Len(t, snapshotLines(scrape(), "schemabot_github_rate_limit_remaining"), 1)
+	now = sample.ObservedAt.Add(GitHubRateLimitSnapshotMaxAge + time.Nanosecond)
 	assert.Empty(t, snapshotLines(scrape(), "schemabot_github_rate_limit_remaining"))
 	assert.Len(t, snapshotLines(scrape(), "schemabot_github_rate_limit_observation_age_seconds"), 1)
+}
+
+// An installation's hourly window resets between two quota probe reads. The
+// installation was read seconds before the reset and is read again a probe
+// interval later, so its budget is never unknown: across the reset it keeps
+// exporting the allowance read before it until the next read replaces it with
+// the new window.
+// An installation that is not read again still turns unobserved once that
+// reading ages out, so a stalled probe or a failing read keeps a quota gate
+// closed.
+func TestGitHubQuotaResetBetweenProbeReadsKeepsInstallationObserved(t *testing.T) {
+	recorder, scrape := newQuotaRegistry(t)
+	reset := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)
+	now := reset.Add(-5 * time.Second)
+	recorder.now = func() time.Time { return now }
+	unobserved := func() string {
+		lines := snapshotLines(scrape(), "schemabot_github_rate_limit_unobserved_installations")
+		require.Len(t, lines, 1)
+		return lines[0]
+	}
+	remaining := func() []string {
+		return snapshotLines(scrape(), "schemabot_github_rate_limit_remaining")
+	}
+
+	beforeReset := quotaSample(now, 9000)
+	require.Equal(t, reset, beforeReset.ResetAt)
+	RecordGitHubRateLimit(t.Context(), beforeReset)
+	SetGitHubQuotaProbeTargets(1, "example-app", []int64{42}, 0)
+	assert.True(t, strings.HasSuffix(unobserved(), " 0"), unobserved())
+
+	// Between the reset and the next probe read, which comes once per probe
+	// interval: half the export age.
+	now = reset.Add(GitHubRateLimitSnapshotMaxAge/2 - 5*time.Second)
+	assert.True(t, strings.HasSuffix(unobserved(), " 0"), "the window reset, but the installation was read moments ago: %s", unobserved())
+	lines := remaining()
+	require.Len(t, lines, 1)
+	assert.True(t, strings.HasSuffix(lines[0], " 9000"), "the allowance read before the reset: %s", lines[0])
+
+	// The next probe read reports the new window.
+	afterReset := quotaSample(now, 14999)
+	require.Equal(t, reset.Add(time.Hour), afterReset.ResetAt)
+	RecordGitHubRateLimit(t.Context(), afterReset)
+	SetGitHubQuotaProbeTargets(1, "example-app", []int64{42}, 0)
+	lines = remaining()
+	require.Len(t, lines, 1)
+	assert.True(t, strings.HasSuffix(lines[0], " 14999"), lines[0])
+	assert.True(t, strings.HasSuffix(unobserved(), " 0"), unobserved())
+
+	// Without another read the installation turns unobserved once that
+	// reading ages out, even though its probe keeps reporting it as a target.
+	now = afterReset.ObservedAt.Add(GitHubRateLimitSnapshotMaxAge + time.Nanosecond)
+	SetGitHubQuotaProbeTargets(1, "example-app", []int64{42}, 0)
+	assert.True(t, strings.HasSuffix(unobserved(), " 1"), "an installation that is not read again is unknown: %s", unobserved())
+	assert.Empty(t, remaining())
 }
 
 func TestGitHubQuotaSnapshotOrderingAndIdentity(t *testing.T) {

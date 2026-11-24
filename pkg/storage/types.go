@@ -378,9 +378,10 @@ type Check struct {
 	// AggregateRender is what an aggregate row's Check Run text was rendered
 	// from, so the text can be rendered again with newer rollout counts
 	// without re-reading the PR. The encoding belongs to the caller. Upsert
-	// writes it, so an Upsert that leaves it empty clears it; other reads do
-	// not load it, and GetAggregateRender returns it. Empty on per-database
-	// rows.
+	// writes it, so an Upsert that leaves it empty clears it. GetAggregateRender
+	// returns it, and ListRemovableOnPRClose loads it so close cleanup can tell
+	// a render-only rewrite from an untouched row; other reads do not load it.
+	// Empty on per-database rows.
 	AggregateRender []byte `json:"-"`
 
 	// CreatedAt is when the check was created.

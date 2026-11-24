@@ -1,7 +1,8 @@
 //go:build integration
 
 // Lock release integration tests for an apply that records the lock and
-// becomes durable after the release path last read the applies.
+// becomes durable after the release path last read the applies, and for check
+// state written again after close cleanup listed it and released the lock.
 
 package webhook
 
@@ -266,4 +267,99 @@ func TestE2EUnlockKeepsLockAnUnsettledApplyRecords(t *testing.T) {
 			assert.Equal(t, held.ID, lock.ID)
 		})
 	}
+}
+
+// afterLockRelease runs after each lock release that succeeds, standing in
+// for work another pod does once close cleanup has released a lock and before
+// it deletes the PR's stored check state.
+type afterLockRelease struct {
+	storage.LockStore
+	after func(ctx context.Context, database, dbType string)
+}
+
+func (s *afterLockRelease) ReleaseByIDIfUnused(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error {
+	if err := s.LockStore.ReleaseByIDIfUnused(ctx, id, database, dbType, owner, pendingPlanID); err != nil {
+		return err
+	}
+	if s.after != nil {
+		s.after(ctx, database, dbType)
+	}
+	return nil
+}
+
+type afterLockReleaseStorage struct {
+	storage.Storage
+	locks *afterLockRelease
+}
+
+func (s *afterLockReleaseStorage) Locks() storage.LockStore { return s.locks }
+
+// A PR closes without merging, and close cleanup reads it as closed. The PR
+// then reopens without a push, and once cleanup has released its lock, an
+// `apply` takes the lock again and stores its plan's check state on the same
+// head, rewriting the row cleanup listed. Cleanup deletes only what it listed
+// and has not changed since: the reopened PR's check state and its new lock
+// survive, the row of another database nobody touched is deleted, and the pass
+// returns an error so the durable retry starts with a fresh live read.
+func TestE2EPRCloseCleanupKeepsCheckStateWrittenAfterTheListing(t *testing.T) {
+	dbName := "webhook_close_rewrite_race"
+	otherDB := "webhook_close_rewrite_untouched"
+	ctx := t.Context()
+	wrapper := &afterLockRelease{}
+	svc := setupE2EServiceOpts(t, dbName, e2eServiceOpts{
+		skipOperator: true,
+		wrapStorage: func(st storage.Storage) storage.Storage {
+			wrapper.LockStore = st.Locks()
+			return &afterLockReleaseStorage{Storage: st, locks: wrapper}
+		},
+	})
+	require.NoError(t, svc.Storage().Locks().Acquire(ctx, lockRaceTestLock(dbName)))
+	planCheck := func(database string, checkRunID int64) *storage.Check {
+		return &storage.Check{
+			Repository:   "octocat/hello-world",
+			PullRequest:  1,
+			HeadSHA:      "abc123",
+			Environment:  "staging",
+			DatabaseType: storage.DatabaseTypeMySQL,
+			DatabaseName: database,
+			CheckRunID:   checkRunID,
+			HasChanges:   true,
+			Status:       checkStatusCompleted,
+			Conclusion:   checkConclusionActionRequired,
+		}
+	}
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, planCheck(dbName, 42)))
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, planCheck(otherDB, 43)))
+
+	wrapper.after = func(ctx context.Context, database, dbType string) {
+		reacquired := lockRaceTestLock(database)
+		reacquired.DatabaseType = dbType
+		reacquired.PendingPlanID = "plan-after-reopen"
+		require.NoError(t, svc.Storage().Locks().Acquire(ctx, reacquired))
+		require.NoError(t, svc.Storage().Checks().Upsert(ctx, planCheck(database, 77)))
+	}
+
+	factory, _ := prClosedGitHub(t, "closed", 0)
+	h := NewHandler(svc, factory, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+	drainWebhookWorkOnCleanup(t, h)
+
+	ran, err := h.runPRCloseCleanup(ctx, "octocat/hello-world", 1, 12345, false)
+	require.Error(t, err, "check state written again after the listing must fail the pass so a retry re-reads the live PR")
+	assert.ErrorContains(t, err, "1 stored check rows for closed PR octocat/hello-world#1 were written again after close cleanup listed them and are kept")
+	assert.False(t, ran)
+
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", storage.DatabaseTypeMySQL, dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check, "the reopened PR's plan check state must survive the close cleanup that listed the row before it was rewritten")
+	assert.Equal(t, int64(77), check.CheckRunID)
+	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
+
+	lock, err := svc.Storage().Locks().Get(ctx, dbName, storage.DatabaseTypeMySQL)
+	require.NoError(t, err)
+	require.NotNil(t, lock, "the reopened PR's lock stays held")
+	assert.Equal(t, "plan-after-reopen", lock.PendingPlanID)
+
+	untouched, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", storage.DatabaseTypeMySQL, otherDB)
+	require.NoError(t, err)
+	assert.Nil(t, untouched, "a listed row nobody wrote since the listing is deleted")
 }
