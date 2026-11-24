@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
@@ -18,7 +19,7 @@ const applyCompletedEventType = "apply_completed"
 
 // enqueueApplyCompleted reads the winning stored outcome, never a caller's stale
 // apply snapshot. Its insert shares the transaction that records completion.
-func enqueueApplyCompleted(ctx context.Context, tx *rebindTx, applyID int64) error {
+func (s *applyStore) enqueueApplyCompleted(ctx context.Context, tx *rebindTx, applyID int64) (*completionRecordingFailure, error) {
 	var event storage.ApplyCompletedEvent
 	err := tx.QueryRowContext(ctx, `
 		SELECT apply_identifier, database_name, database_type, environment,
@@ -27,19 +28,61 @@ func enqueueApplyCompleted(ctx context.Context, tx *rebindTx, applyID int64) err
 	`, applyID, state.Apply.Completed).Scan(&event.ID, &event.Database, &event.DatabaseType,
 		&event.Environment, &event.Repository, &event.PullRequest, &event.CompletedAt)
 	if err != nil {
-		return fmt.Errorf("read completed apply %d for notification: %w", applyID, err)
+		return nil, fmt.Errorf("read completed apply %d for notification: %w", applyID, err)
 	}
 	event.CompletedAt = event.CompletedAt.UTC()
 	payload, err := json.Marshal(event)
 	if err != nil {
-		return fmt.Errorf("encode completion notification for apply %s: %w", event.ID, err)
+		return nil, fmt.Errorf("encode completion notification for apply %s: %w", event.ID, err)
 	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO outbox_events (apply_id, event_type, payload, status) VALUES (?, ?, ?, ?)
-	`, applyID, applyCompletedEventType, string(payload), storage.OutboxStatusPending); err != nil {
-		return fmt.Errorf("enqueue completion notification for apply %s: %w", event.ID, err)
+	continueOnError := s.recordingErrorPolicy == storage.RecordingErrorContinue
+	if continueOnError {
+		// PostgreSQL aborts the transaction after a statement error. Recover only
+		// the intent insert; state writes and their lease/CAS fences precede it.
+		if _, err := tx.ExecContext(ctx, "SAVEPOINT completion_notification"); err != nil {
+			return nil, fmt.Errorf("save notification recording for apply %s: %w", event.ID, err)
+		}
 	}
-	return nil
+	_, recordingErr := tx.ExecContext(ctx, `
+  INSERT INTO outbox_events (apply_id, event_type, payload, status) VALUES (?, ?, ?, ?)
+ `, applyID, applyCompletedEventType, string(payload), storage.OutboxStatusPending)
+	if recordingErr != nil {
+		recordingErr = fmt.Errorf("enqueue completion notification for apply %s: %w", event.ID, recordingErr)
+		if !continueOnError {
+			return nil, recordingErr
+		}
+		if _, err := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT completion_notification"); err != nil {
+			return nil, fmt.Errorf("recover notification recording for apply %s (%w): %w", event.ID, recordingErr, err)
+		}
+	}
+	if continueOnError {
+		if _, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT completion_notification"); err != nil {
+			return nil, fmt.Errorf("release notification recording for apply %s: %w", event.ID, err)
+		}
+	}
+	if recordingErr != nil {
+		return &completionRecordingFailure{event: event, err: recordingErr}, nil
+	}
+	return nil, nil
+}
+
+// completionRecordingFailure is reported only after the outer transaction commits.
+// A failed commit must not be counted as a completed apply without intent.
+type completionRecordingFailure struct {
+	event storage.ApplyCompletedEvent
+	err   error
+}
+
+func (f *completionRecordingFailure) report(ctx context.Context) {
+	if f == nil {
+		return
+	}
+	apply := storage.Apply{ApplyIdentifier: f.event.ID, Database: f.event.Database,
+		DatabaseType: f.event.DatabaseType, Environment: f.event.Environment,
+		Repository: f.event.Repository, PullRequest: f.event.PullRequest, State: state.Apply.Completed}
+	slog.ErrorContext(ctx, "Apply completed without notification intent; recording failed and will not be retried",
+		append(apply.LogAttrs(), "recording_error_policy", storage.RecordingErrorContinue, "error", f.err)...)
+	metrics.RecordOutboxRecordingFailure(ctx, f.event.Environment)
 }
 
 type outboxStore struct {

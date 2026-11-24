@@ -1022,9 +1022,29 @@ A multi-shard apply started with a manual `--defer-cutover` keeps its drivers wh
 
 ## Apply Completion Notifications
 
-Every winning transition to `completed` records an outbox row in the same storage
-transaction, on MySQL and PostgreSQL. Failed and stopped applies do not emit
-notifications, and historical completed applies are not backfilled.
+By default, every winning transition to `completed` records an outbox row in the
+same storage transaction, on MySQL and PostgreSQL. Failed and stopped applies do
+not emit notifications, and historical completed applies are not backfilled.
+
+The per-install server setting `change_events_on_recording_error` accepts `block`
+(the default, including when omitted) or `continue`. `block` rolls back completion
+if intent recording fails. `continue` recovers the failed intent insert with a
+savepoint and commits completion without a notification. State, lease, CAS, savepoint
+recovery, and commit errors still fail normally; this setting only tolerates an
+intent insert failure. Invalid values fail server configuration validation.
+
+**Opting into `continue` weakens ST-12's default atomic notification guarantee.**
+After a completion commits without intent, SchemaBot emits an error log with the
+apply identity and increments `schemabot.outbox.recording_failures_total` for its
+environment. Investigate the paired log and repair storage recording; the missing
+notification is not automatically retried or backfilled. A failed outer commit
+emits neither committed-loss signal. Logs and metrics are best-effort: a process
+crash immediately after commit can lose those signals. Delivery failures remain
+retryable independently of this setting, which also applies when delivery is disabled.
+
+```yaml
+change_events_on_recording_error: continue # Optional; default: block
+```
 
 Delivery is disabled by default. To send pending notifications to a standard SQS
 queue, configure the server that owns the apply storage:

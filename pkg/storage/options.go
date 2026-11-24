@@ -4,6 +4,10 @@ package storage
 // the storage layer itself enforces — things a claim query or a store decides,
 // not anything the caller could apply on its own.
 type Options struct {
+	// ChangeEventsOnRecordingError defaults to block. Continue permits a completed
+	// apply to commit without notification intent when recording fails.
+	ChangeEventsOnRecordingError RecordingErrorPolicy
+
 	// MaxDriversPerApply caps how many operation leases one apply may hold at
 	// once. Zero or negative selects DefaultMaxDriversPerApply; there is no
 	// uncapped mode, because an uncapped claim path is what lets one wide
@@ -23,6 +27,11 @@ func WithMaxDriversPerApply(n int) Option {
 	}
 }
 
+// WithChangeEventsOnRecordingError selects the notification recording policy.
+func WithChangeEventsOnRecordingError(policy RecordingErrorPolicy) Option {
+	return func(o *Options) { o.ChangeEventsOnRecordingError = policy }
+}
+
 // BuildOptions applies opts over the defaults and returns the resolved settings.
 func BuildOptions(opts ...Option) Options {
 	var resolved Options
@@ -32,6 +41,7 @@ func BuildOptions(opts ...Option) Options {
 	if resolved.MaxDriversPerApply <= 0 {
 		resolved.MaxDriversPerApply = DefaultMaxDriversPerApply
 	}
+	resolved.ChangeEventsOnRecordingError = resolved.ChangeEventsOnRecordingError.OrDefault()
 	return resolved
 }
 

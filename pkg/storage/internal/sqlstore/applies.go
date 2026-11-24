@@ -49,10 +49,11 @@ const (
 
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
-	db         *rebindDB
-	dialect    Dialect
-	identity   identityInserter
-	classifier ErrorClassifier
+	recordingErrorPolicy storage.RecordingErrorPolicy
+	db                   *rebindDB
+	dialect              Dialect
+	identity             identityInserter
+	classifier           ErrorClassifier
 	// locker serializes concurrent applies against the same target with a
 	// session-scoped advisory lock held on the pinned apply connection. It must
 	// match the storage database's family.
@@ -1731,14 +1732,17 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 			}
 		}
 	}
+	var recordingFailure *completionRecordingFailure
 	if completionTransition {
-		if err := enqueueApplyCompleted(ctx, writeTx.tx, apply.ID); err != nil {
+		recordingFailure, err = s.enqueueApplyCompleted(ctx, writeTx.tx, apply.ID)
+		if err != nil {
 			return err
 		}
 	}
 	if err := writeTx.commit(); err != nil {
 		return fmt.Errorf("commit update apply %d: %w", apply.ID, err)
 	}
+	recordingFailure.report(ctx)
 	return nil
 }
 
@@ -1938,12 +1942,14 @@ func (s *applyStore) completeDerivedState(ctx context.Context, applyID int64, ex
 		}
 		return false, nil
 	}
-	if err := enqueueApplyCompleted(ctx, tx, applyID); err != nil {
+	recordingFailure, err := s.enqueueApplyCompleted(ctx, tx, applyID)
+	if err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit completing derived apply %d: %w", applyID, err)
 	}
+	recordingFailure.report(ctx)
 	return true, nil
 }
 

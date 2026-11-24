@@ -26,7 +26,7 @@ type rejectOutboxInsertBinder struct{ binder }
 
 func (b rejectOutboxInsertBinder) Rebind(query string) string {
 	if strings.Contains(query, "INSERT INTO outbox_events") {
-		return "INSERT INTO nonexistent_notification_table (payload) VALUES ('rejected')"
+		return b.binder.Rebind(strings.Replace(query, "INSERT INTO outbox_events", "INSERT INTO nonexistent_notification_table", 1))
 	}
 	return b.binder.Rebind(query)
 }

@@ -1103,12 +1103,15 @@ dialects by the storage parity suite (`pkg/storage/storagetest/ended_operation_a
 drive tail leaves SchemaBot's stop pending for the settle (`completeLandedStopForHeldOpenApply`,
 `pkg/api/operator.go`).
 
-### ST-12: Completion and notification intent commit together
+### ST-12: Completion obeys the notification recording policy
 
-A winning update from a persisted non-completed apply state to `completed` commits
-its notification intent in the same transaction. If recording intent fails, completion
-rolls back. Creation in an initial completed state and same-state refreshes are not
-transitions. *Enforced:* `updateOnce`, `completeDerivedState`, and
+By default, a winning update from a persisted non-completed apply state to `completed`
+commits its notification intent in the same transaction, or rolls back completion if
+recording fails. An installation may explicitly allow completion without intent;
+recording failure then leaves completion committed and is logged and counted after commit.
+Neither policy suppresses state, ownership, or transaction errors. Creation in an initial
+completed state and same-state refreshes are not transitions.
+*Enforced:* `updateOnce`, `completeDerivedState`, and
 `enqueueApplyCompleted` (`pkg/storage/internal/sqlstore/applies.go`,
 `pkg/storage/internal/sqlstore/outbox.go`).
 

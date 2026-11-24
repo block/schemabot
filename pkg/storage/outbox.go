@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -14,6 +15,32 @@ const (
 	OutboxStatusQuarantined = "quarantined"
 	OutboxStatusSkipped     = "skipped"
 )
+
+// RecordingErrorPolicy controls whether notification recording can block completion.
+type RecordingErrorPolicy string
+
+const (
+	RecordingErrorBlock    RecordingErrorPolicy = "block"
+	RecordingErrorContinue RecordingErrorPolicy = "continue"
+)
+
+// OrDefault resolves an omitted recording policy to block.
+func (p RecordingErrorPolicy) OrDefault() RecordingErrorPolicy {
+	if p == "" {
+		return RecordingErrorBlock
+	}
+	return p
+}
+
+// Validate rejects unsupported recording policies.
+func (p RecordingErrorPolicy) Validate() error {
+	switch p.OrDefault() {
+	case RecordingErrorBlock, RecordingErrorContinue:
+		return nil
+	default:
+		return fmt.Errorf("change_events_on_recording_error must be block or continue")
+	}
+}
 
 // ApplyCompletedEvent identifies a completed apply. Receivers deduplicate on ID.
 type ApplyCompletedEvent struct {

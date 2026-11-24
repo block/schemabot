@@ -29,3 +29,15 @@ func TestBuildOptions_MaxDriversPerApply(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildOptions_RecordingErrorPolicy(t *testing.T) {
+	for _, policy := range []RecordingErrorPolicy{"", RecordingErrorBlock, RecordingErrorContinue} {
+		t.Run(string(policy), func(t *testing.T) {
+			expected := policy.OrDefault()
+			assert.NoError(t, policy.Validate())
+			assert.Equal(t, expected, BuildOptions(WithChangeEventsOnRecordingError(policy)).ChangeEventsOnRecordingError)
+		})
+	}
+	assert.Equal(t, RecordingErrorBlock, BuildOptions().ChangeEventsOnRecordingError)
+	assert.ErrorContains(t, RecordingErrorPolicy("ignore").Validate(), "must be block or continue")
+}

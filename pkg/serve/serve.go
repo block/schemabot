@@ -755,7 +755,10 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 
 	// Create service with dependencies
-	store, err := newStore(dialect, db, storage.WithMaxDriversPerApply(cfg.MaxDriversPerApply))
+	store, err := newStore(dialect, db,
+		storage.WithMaxDriversPerApply(cfg.MaxDriversPerApply),
+		storage.WithChangeEventsOnRecordingError(cfg.ChangeEventsOnRecordingError),
+	)
 	if err != nil {
 		return nil, err
 	}
