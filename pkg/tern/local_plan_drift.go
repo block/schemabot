@@ -49,9 +49,10 @@ type driftChangeMultiset map[driftChangeKey]int
 // replannedChange is one change as this deployment's own re-plan produced it:
 // the statement its engine emitted against this target, the execution-mode
 // verdict on how that statement would run here, whether its engine judged
-// the statement unsafe, and the engine's plan-time record of this target's
-// objects the statement depends on. metadataConflict marks a key the re-plan
-// produced more than once with records that disagree.
+// the statement unsafe, and the engine's record of this target's objects the
+// statement acts on as the re-plan read them, which must equal the record the
+// change was reviewed with. metadataConflict marks a key the re-plan produced
+// more than once with records that disagree.
 type replannedChange struct {
 	ddl              string
 	mode             string
@@ -69,20 +70,21 @@ func replannedChangeOf(tc storage.TableChange) replannedChange {
 	return replannedChange{ddl: tc.DDL, mode: tc.ExecutionMode, reason: tc.ModeReason, unsafe: tc.IsUnsafe, unsafeReason: tc.UnsafeReason, metadata: tc.Metadata}
 }
 
-// stampOnto writes the re-planned facts onto a change. The statement,
-// execution-mode verdict, and engine metadata are this target's and replace
-// what the change carried. The metadata in particular describes this target's
-// live objects: a dropped column's record names its position and dependents
-// here, which can differ from the primary's, and the engine checks the drop
-// against it exactly. The unsafe flag is only ever tightened: a re-plan that
-// judges the statement unsafe marks the change unsafe, so the unsafe-change
-// admission gate requires the opt-in for it, and a re-plan that judges it
-// safe leaves a change already marked unsafe as it is.
+// stampOnto writes the re-planned facts onto a change. The statement and
+// execution-mode verdict are this target's and replace what the change
+// carried. The engine metadata is not replaced: it is the record the plan was
+// reviewed with of the objects the change acts on, and a re-plan reads the
+// objects as they are now, which can be ones that took a reviewed object's
+// name after review. stampReplannedTables refuses a change whose re-plan reads
+// a different record before stampOnto runs. The unsafe flag is only ever
+// tightened: a re-plan that judges the statement unsafe marks the change
+// unsafe, so the unsafe-change admission gate requires the opt-in for it, and
+// a re-plan that judges it safe leaves a change already marked unsafe as it
+// is.
 func (r replannedChange) stampOnto(tc *storage.TableChange) {
 	tc.DDL = r.ddl
 	tc.ExecutionMode = r.mode
 	tc.ModeReason = r.reason
-	tc.Metadata = maps.Clone(r.metadata)
 	if !r.unsafe {
 		return
 	}
@@ -639,7 +641,10 @@ func (c *LocalClient) stampReplannedTables(parser ddl.StatementParser, tables []
 			return fmt.Errorf("table %q: no re-planned change for one the drift comparison matched", tc.Table)
 		}
 		if change.metadataConflict {
-			return fmt.Errorf("table %q: this deployment's re-plan holds more than one copy of a change with different engine metadata, so it cannot say which record the change runs against", tc.Table)
+			return engine.NewPermanentError("table %q: this deployment's re-plan holds more than one copy of a change with different engine records, so it cannot say which objects the change acts on; %s", tc.Table, driftRecoveryHint)
+		}
+		if !maps.Equal(tc.Metadata, change.metadata) {
+			return engine.NewPermanentError("table %q: the objects this change acts on are not the ones the plan reviewed on this deployment (the engine's record of them differs), so it was refused rather than run against unreviewed objects; %s. If the new plan is refused here too, this deployment's objects differ from the primary deployment's and the change cannot run here", tc.Table, driftRecoveryHint)
 		}
 		change.stampOnto(tc)
 	}

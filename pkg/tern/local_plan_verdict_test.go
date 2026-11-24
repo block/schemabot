@@ -669,7 +669,7 @@ func TestStampReplannedTablesRefusesConflictingEngineMetadata(t *testing.T) {
 	tables := []storage.TableChange{{Table: "users", Operation: "alter", DDL: statement}}
 	err = client.stampReplannedTables(parser, tables, replanned)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "more than one copy of a change with different engine metadata")
+	assert.Contains(t, err.Error(), "more than one copy of a change with different engine records")
 }
 
 // A blocked verdict on one shard's copy of a table already seen on another

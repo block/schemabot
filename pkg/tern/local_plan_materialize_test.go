@@ -383,51 +383,68 @@ func TestMaterializedPostgresPlanNamesThisDeploymentsSchema(t *testing.T) {
 	assert.Equal(t, local, flat[0].DDL)
 }
 
-// A dropped column's plan-time record describes the column as the planner read
-// it on one target: its position and its dependents. The same column can sit at
-// a different position on another deployment, so a deployment that builds its
-// plan from a dispatch stores its own re-plan's record, not the primary's, and
-// the engine checks the drop against the column this target actually has.
-func TestMaterializedPlanCarriesThisDeploymentsReviewedDrop(t *testing.T) {
+// A plan drops users.legacy. Before this deployment's first dispatch, someone
+// drops legacy here and adds a new legacy column, so the re-plan still emits the
+// same DROP COLUMN but records the new column. The stored change keeps the
+// record the plan was reviewed with, and a re-plan that reads a different one is
+// refused before any task runs, so the engine never checks the drop against
+// the replacement. The same refusal covers a column that sits at a different
+// position here than on the primary deployment.
+func TestMaterializedPlanRefusesADropWhoseObjectDiffersFromTheReviewedRecord(t *testing.T) {
 	const dispatched = `ALTER TABLE "svc-database-qa".users DROP COLUMN legacy`
 	const local = `ALTER TABLE "svc-database-us-qa".users DROP COLUMN legacy`
-	primaryRecord := map[string]string{"postgres_reviewed_drop": `{"kind":"column","name":"legacy","definition":"3 legacy text"}`}
-	localRecord := map[string]string{"postgres_reviewed_drop": `{"kind":"column","name":"legacy","definition":"5 legacy text"}`}
-	fake := &namespaceCaptureEngine{planResult: &engine.PlanResult{Changes: []engine.SchemaChange{{
-		Namespace: "svc-database-us-qa",
-		TableChanges: []engine.TableChange{{
-			Table:         "users",
-			Operation:     ddl.StatementAlterTable,
-			DDL:           local,
-			ExecutionMode: engine.ExecutionModeDirect,
-			Metadata:      localRecord,
-		}},
-	}}}}
-	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 34}
-	c := postgresOverrideClient(fake)
-	c.config.SchemaOverrides = map[string]string{"svc": "svc-database-us-qa"}
-	c.storage = &fakePlanStorage{plans: store}
+	reviewed := map[string]string{"postgres_reviewed_drop": `{"kind":"column","name":"legacy","definition":"attnum 3: text"}`}
+	client := func(record map[string]string) (*LocalClient, *fakePlanStore) {
+		fake := &namespaceCaptureEngine{planResult: &engine.PlanResult{Changes: []engine.SchemaChange{{
+			Namespace: "svc-database-us-qa",
+			TableChanges: []engine.TableChange{{
+				Table:         "users",
+				Operation:     ddl.StatementAlterTable,
+				DDL:           local,
+				ExecutionMode: engine.ExecutionModeDirect,
+				Metadata:      record,
+			}},
+		}}}}
+		store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 34}
+		c := postgresOverrideClient(fake)
+		c.config.SchemaOverrides = map[string]string{"svc": "svc-database-us-qa"}
+		c.storage = &fakePlanStorage{plans: store}
+		return c, store
+	}
+	dispatch := func() *ternv1.ApplyRequest {
+		return &ternv1.ApplyRequest{
+			PlanId:      "plan_pg_reviewed_drop",
+			Environment: "qa",
+			DdlChanges: []*ternv1.TableChange{
+				{TableName: "users", Ddl: dispatched, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "svc", Metadata: reviewed},
+			},
+			SchemaFiles: map[string]*ternv1.SchemaFiles{
+				"svc": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint);"}},
+			},
+		}
+	}
 
-	got, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
-		PlanId:      "plan_pg_reviewed_drop",
-		Environment: "qa",
-		DdlChanges: []*ternv1.TableChange{
-			{TableName: "users", Ddl: dispatched, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "svc", Metadata: primaryRecord},
-		},
-		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			"svc": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint);"}},
-		},
+	t.Run("the reviewed column is still there", func(t *testing.T) {
+		c, store := client(map[string]string{"postgres_reviewed_drop": `{"kind":"column","name":"legacy","definition":"attnum 3: text"}`})
+		got, _, err := c.planForApplyRequest(t.Context(), dispatch())
+		require.NoError(t, err)
+		require.NotNil(t, store.created)
+		flat := got.FlatDDLChanges()
+		require.Len(t, flat, 1)
+		assert.Equal(t, reviewed, flat[0].Metadata, "the stored change keeps the reviewed record")
+		assert.Equal(t, local, flat[0].DDL, "and runs this deployment's rendering of the statement")
 	})
 
-	require.NoError(t, err)
-	require.NotNil(t, store.created)
-	ns := store.created.Namespaces["svc"]
-	require.NotNil(t, ns)
-	require.Len(t, ns.Tables, 1)
-	assert.Equal(t, localRecord, ns.Tables[0].Metadata, "the stored record is this deployment's, not the primary's")
-	flat := got.FlatDDLChanges()
-	require.Len(t, flat, 1)
-	assert.Equal(t, localRecord, flat[0].Metadata)
+	t.Run("a replacement column took its name", func(t *testing.T) {
+		c, store := client(map[string]string{"postgres_reviewed_drop": `{"kind":"column","name":"legacy","definition":"attnum 7: jsonb"}`})
+		_, _, err := c.planForApplyRequest(t.Context(), dispatch())
+		require.Error(t, err)
+		var permanent *engine.PermanentError
+		require.ErrorAs(t, err, &permanent, "a redispatch reads the same objects, so the refusal is permanent")
+		assert.Contains(t, err.Error(), `table "users": the objects this change acts on are not the ones the plan reviewed on this deployment`)
+		assert.Contains(t, err.Error(), driftRecoveryHint)
+		assert.Nil(t, store.created, "no plan is stored, so no task runs")
+	})
 }
 
 // A dispatched change that already arrives blocked is never run here, so it

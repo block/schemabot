@@ -482,9 +482,11 @@ object changed after the plan, for example a column dropped and added again
 under the same name, the apply refuses and drops nothing; re-plan against the
 current schema and review the new plan. A plan that cannot record the object
 it drops is blocked. A deployment that builds its plan from another
-deployment's dispatch records the object as its own re-plan read it, since the
-same column can sit at a different position or have different dependents
-there.
+deployment's dispatch keeps the record the plan was reviewed with, and refuses
+the change before any of its tasks run when its own objects do not match that
+record. A column at a different position, or with different dependents, than
+on the primary deployment does not match, so that drop cannot run on that
+deployment from the primary deployment's plan.
 
 A plan approved before this check shipped has no record, so its drops are
 refused. That includes an apply still running at the upgrade: a sequential
