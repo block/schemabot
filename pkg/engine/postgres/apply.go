@@ -561,6 +561,23 @@ func invalidIndexWordingFor(invalidErr *executor.InvalidIndexError) invalidIndex
 			lead:        "an operator must resolve it on the target",
 			remedyRest:  ", since it is a partitioned table's index, an index partition, or a constraint's index, or rename the index in the schema file and re-plan",
 		}
+	case executor.CodeDataFault:
+		// The build failed on the table's rows: duplicate values under a
+		// unique index, or a value an index expression cannot take. A rerun
+		// meets the same rows, so the rows come first. The rerun's recovery
+		// then removes the invalid index only once pg-sprite proves no build
+		// holds it, so the operator is never sent to drop it by name. The
+		// server's error is not rendered: it quotes the offending values.
+		causeAfter := ", and the failed build left it invalid on the target"
+		if !errors.Is(invalidErr.Cleanup, executor.ErrBuildLeftInvalidIndex) {
+			causeAfter = ", and an invalid index this build could not prove its own holds the name"
+		}
+		return invalidIndexWording{
+			causeBefore: "the table's rows cannot be indexed by index ",
+			causeAfter:  causeAfter,
+			lead:        "correct the rows",
+			remedyRest:  ", then re-run; the rerun removes the invalid index once it proves no build holds it",
+		}
 	default:
 		// CodeInvalidIndexUnproven and any future verdict fail safe with
 		// investigation steps: the index under the name may be healthy.
@@ -906,7 +923,8 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 	case executor.CodeEmptySequence, executor.CodeUnsupportedSequenceStep,
 		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
 		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable,
-		executor.CodeUnsupportedAcceptedBlocking:
+		executor.CodeUnsupportedAcceptedBlocking, executor.CodeNotCreateIndex,
+		executor.CodeNotPartitionedTable:
 		// Shape refusals: the executor refused the statement's form at
 		// admission, so retrying the identical plan refails the same way.
 		return &refusal{reason: "unsupported-statement-shape",
@@ -959,14 +977,72 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "replica-identity-drop",
 			cause:  fmt.Sprintf("the planned drop on %s would remove what its replica identity index is built on", quotedTable(table)),
 			remedy: "point REPLICA IDENTITY elsewhere, then " + replanRemedy}, true
+	case executor.CodePartitionedIndexNameTaken:
+		// The build left the relation holding the name alone, so only an
+		// operator freeing the name, or the schema file choosing another,
+		// changes the outcome.
+		return &refusal{reason: "partitioned-index-name-taken",
+			cause:  fmt.Sprintf("a name the index build on partitioned table %s needs is held by another relation", quotedTable(table)),
+			remedy: "rename the index in the schema file and re-plan, or drop or rename the relation that holds the name"}, true
+	case executor.CodeForeignTablePartition:
+		return &refusal{reason: "foreign-table-partition",
+			cause:  fmt.Sprintf("a partition of %s is a foreign table, which cannot have an index; nothing was created", quotedTable(table)),
+			remedy: "detach the foreign table partition, or leave the index out of the schema file, then " + replanRemedy}, true
+	case executor.CodeUniqueIndexPartitionKey:
+		return &refusal{reason: "unique-index-partition-key",
+			cause:  fmt.Sprintf("the unique index on %s does not include every partition key column", quotedTable(table)),
+			remedy: "add the partition key columns to the index in the schema file, then " + replanRemedy}, true
+	case executor.CodeTableLockUnconfirmed:
+		// The connected role cannot see when other sessions started, which
+		// the build needs to prove the table lock it waits behind is its
+		// own. The grant is target configuration, so the same environmental
+		// class as a missing privilege.
+		return &refusal{reason: "insufficient-privileges",
+			cause:         fmt.Sprintf("the connected role cannot see other sessions' start times, which the index build on %s needs", quotedTable(table)),
+			remedy:        "grant the role pg_read_all_stats, then re-run",
+			provisionable: true}, true
+	case executor.CodePartitionDetachPending:
+		return &refusal{reason: "partition-detach-pending",
+			cause:  fmt.Sprintf("a partition of %s has an unfinished concurrent detach", quotedTable(table)),
+			remedy: "finish the detach with ALTER TABLE ... DETACH PARTITION ... FINALIZE, then re-run"}, true
+	case executor.CodePartitionedIndexTablespace:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("the index on %s names a TABLESPACE, which the partitions' indexes would not use", quotedTable(table)),
+			remedy: "remove the TABLESPACE clause from the schema file, then " + replanRemedy}, true
+	case executor.CodeDropOutcomeUnknown:
+		// The drop ran, and the check of which index it removed failed.
+		// SchemaBot's retry re-runs the drop, which would act on whatever
+		// now holds the name, so the apply fails closed until an operator
+		// has read the catalog.
+		return &refusal{reason: "drop-outcome-unknown",
+			cause:  fmt.Sprintf("an index drop on %s ran, and which index it removed could not be confirmed", quotedTable(table)),
+			remedy: "inspect the table's indexes before re-running"}, true
+	case executor.CodeDroppedIndexReplaced:
+		// Unlike the drift codes, something was dropped: another session
+		// gave the name to a different index between the check and the drop.
+		return &refusal{reason: "dropped-index-replaced",
+			cause:  fmt.Sprintf("the index drop on %s removed an index created after review under the reviewed index's name", quotedTable(table)),
+			remedy: "inspect the table's indexes and recreate the dropped one if it should stay, then " + replanRemedy}, true
+	case executor.CodeDroppedObjectHasDescendants:
+		return &refusal{reason: "dropped-object-has-descendants",
+			cause:  fmt.Sprintf("the planned drop on %s would also reach unreviewed partitions or child tables", quotedTable(table)),
+			remedy: "make the drop outside SchemaBot on the whole table tree, then " + replanRemedy}, true
 	case executor.CodeAdoptedIndexDrift, executor.CodeValidatedConstraintDrift,
-		executor.CodeRenamedIndexDrift:
+		executor.CodeRenamedIndexDrift, executor.CodeDroppedIndexDrift:
 		// The index or constraint the planned statement names changed after
 		// planning — dropped, replaced, left invalid, or now backing a
 		// constraint — read again under the table's lock; nothing was
 		// applied. The plan is stale, so only a re-plan changes the outcome.
 		return &refusal{reason: "planned-object-drift",
 			cause:  fmt.Sprintf("the index or constraint the planned statement for %s names changed after planning", quotedTable(table)),
+			remedy: replanRemedy}, true
+	case executor.CodeDroppedObjectDrift:
+		// The column, constraint, or NOT NULL the planned drop removes no
+		// longer has the definition the plan recorded, read again under the
+		// table's lock; nothing was dropped. The plan is stale, so only a
+		// re-plan changes the outcome.
+		return &refusal{reason: "planned-object-drift",
+			cause:  fmt.Sprintf("the object the planned drop on %s removes changed after planning", quotedTable(table)),
 			remedy: replanRemedy}, true
 	case executor.CodeEnumTypeDrift:
 		// The type name an ADD VALUE spells resolved to a different type
@@ -1028,10 +1104,11 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeCancelledExternally, executor.CodeInvalidIndexOwnLeftover,
 		executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuildInFlight,
 		executor.CodeInvalidIndexBuilderUnobservable, executor.CodeInvalidIndexUnproven,
-		executor.CodeExecutionFailed:
+		executor.CodePartitionedIndexUnsettled, executor.CodeExecutionFailed:
 		// Operational outcomes: a bounded lock race, the caller's own
 		// context ending or an external stop, an invalid-index state a retry
-		// recovers or an operator clears or waits out, or a failure outside
+		// recovers or an operator clears or waits out, a partitioned index
+		// build that a rerun resumes, or a failure outside
 		// the typed set. A retry can succeed once conditions change, so
 		// none is a permanent refusal.
 		return nil, true
