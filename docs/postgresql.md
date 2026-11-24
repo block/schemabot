@@ -46,8 +46,10 @@ early release.
 
 **What works today:**
 
-- Plans on every pull request and in the CLI, showing the exact SQL, with a
-  Check Run that blocks the merge until the change is applied.
+- Plans on every pull request and in the CLI, showing the exact SQL. The
+  Check Run passes once the live schema matches the pull request; make it a
+  [required check](check-runs.md#branch-protection-setup) so the pull request
+  cannot merge before then.
 - `ALTER TABLE` changes that don't rewrite the table, such as adding a
   nullable column or a check constraint, on tables up to the size limit (1 GiB by
   default).
