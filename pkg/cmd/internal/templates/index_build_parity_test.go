@@ -18,8 +18,9 @@ import (
 )
 
 // postgresProgress is a PostgreSQL apply running one statement, as the
-// progress API reports it. metadata is the engine's build work, if any.
-func postgresProgress(ddl string, percent int32, metadata map[string]string) *apitypes.ProgressResponse {
+// progress API reports it. changeType is the statement's operation, and
+// metadata is the engine's build work, if any.
+func postgresProgress(ddl, changeType string, percent int32, metadata map[string]string) *apitypes.ProgressResponse {
 	md := map[string]string{"step": "1", "steps_total": "1", "statement": ddl}
 	maps.Copy(md, metadata)
 	return &apitypes.ProgressResponse{
@@ -27,7 +28,7 @@ func postgresProgress(ddl string, percent int32, metadata map[string]string) *ap
 		State: state.Apply.Running, Engine: storage.EnginePostgres, DatabaseType: storage.DatabaseTypePostgres,
 		Metadata: md,
 		Tables: []*apitypes.TableProgressResponse{{
-			TableName: "users", DDL: ddl, ChangeType: "create", Status: state.Task.Running, PercentComplete: percent,
+			TableName: "users", DDL: ddl, ChangeType: changeType, Status: state.Task.Running, PercentComplete: percent,
 		}},
 	}
 }
@@ -40,7 +41,7 @@ func postgresProgress(ddl string, percent int32, metadata map[string]string) *ap
 // statement, and carry no percent of their own, so neither surface shows a
 // second percent.
 func TestIndexBuildProgressReadsTheSameOnEverySurface(t *testing.T) {
-	resp := postgresProgress("CREATE INDEX CONCURRENTLY idx_users_email ON users (email)", 25, map[string]string{
+	resp := postgresProgress("CREATE INDEX CONCURRENTLY idx_users_email ON users (email)", "alter", 25, map[string]string{
 		"executor_operation": "concurrent-index-build", "server_phase": "building index: scanning table",
 		"blocks_done": "30000", "blocks_total": "48000", "percent": "25.37",
 	})
@@ -62,14 +63,14 @@ func TestIndexBuildProgressReadsTheSameOnEverySurface(t *testing.T) {
 }
 
 // A PostgreSQL statement that is not an index build has no percent to show,
-// so neither surface draws a bar for it.
+// so neither surface draws a bar for it, and both name it the same way.
 func TestPostgresPlainDDLDrawsNoBar(t *testing.T) {
-	resp := postgresProgress("ALTER TABLE users ADD COLUMN nickname text", 0, nil)
+	resp := postgresProgress("ALTER TABLE users ADD COLUMN nickname text", "alter", 0, nil)
 
 	data := ParseProgressResponse(resp)
 	require.Len(t, data.Tables, 1)
 	assert.False(t, data.Tables[0].BuildWork.IsConcurrentIndexBuild())
-	assert.NotContains(t, FormatTableProgress(data.Tables[0]), "index build")
+	assert.Contains(t, FormatTableProgress(data.Tables[0]), "users: Running...\n")
 
 	pr := webhooktemplates.RenderApplyStatusComment(webhooktemplates.ApplyStatusFromProgress(resp, "octocat"))
 	assert.Contains(t, pr, "**`users`**: Running...\n")

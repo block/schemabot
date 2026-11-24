@@ -9,7 +9,7 @@
 <p align="center">
   <img alt="MySQL: GA" src="https://img.shields.io/badge/MySQL-GA-brightgreen" />
   <img alt="Vitess: GA" src="https://img.shields.io/badge/Vitess-GA-brightgreen" />
-  <img alt="PostgreSQL: early alpha" src="https://img.shields.io/badge/PostgreSQL-early_alpha-orange" />
+  <img alt="PostgreSQL: beta" src="https://img.shields.io/badge/PostgreSQL-beta-yellow" />
 </p>
 
 <p align="center">
@@ -91,7 +91,7 @@ To run the PR workflow for your team, deploy the server from [Releases](#release
 |---|---|---|
 | MySQL | Generally available | [Spirit](https://github.com/block/spirit), with instant DDL where supported and online copying when needed |
 | Vitess on PlanetScale | Generally available | [Deploy requests](https://planetscale.com/docs/vitess/schema-changes/deploy-requests), with per-shard progress |
-| PostgreSQL | Early alpha | [pg-sprite](https://github.com/block/pg-sprite); see the [support envelope](./docs/postgresql.md) |
+| PostgreSQL | Beta | [pg-sprite](https://github.com/block/pg-sprite); see [what is not GA yet](./docs/postgresql.md#beta-status) |
 
 Follow progress, choose cutover timing, and pause, resume, cancel, or roll back where the engine supports it. Execution methods, throttling, and recovery differ by engine; the [capability matrix](./docs/engines.md) explains the choices.
 

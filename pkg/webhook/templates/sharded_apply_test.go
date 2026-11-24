@@ -601,7 +601,7 @@ func TestRenderShardedApplyComment_TableCopyProgressBar(t *testing.T) {
 		}},
 	})
 
-	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(62)+" 62%")
+	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(62)+" 62.38%")
 	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s")
 	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s\n- Shards: 2 (2 copying)\n  - ◉ `-40`: 71%\n  - ◉ `80-`: 54%\n",
 		"the shard list sits below the rows line, the shards in their own order")
@@ -632,7 +632,7 @@ func TestRenderShardedApplyComment_TableCopyPartialCoverageDisclosed(t *testing.
 		}},
 	})
 
-	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(62)+" 62% (1 of 2 shards)")
+	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(62)+" 62.38% (1 of 2 shards)")
 	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 across 1 of 2 shards · ETA: ≥ 3m 15s")
 	assert.Contains(t, out, "- Shards: 2 (1 copying, 1 queued)\n  - ◉ `-40`: 62%\n  - ○ `80-`: queued\n", "the shard list sits below the rows line")
 }
@@ -672,7 +672,7 @@ func TestRenderShardedApplyComment_TableCopyShowsPlannedSize(t *testing.T) {
 	assert.Contains(t, partial, "- Rows: 914,707 / 1,466,232 across 1 of 2 shards · ~23.4 GB across all 2 shards · ETA: ≥ 3m 15s\n")
 
 	stillAttaching := render(1, 4, ShardProgressData{Shard: "40-80", Status: state.Task.Pending})
-	assert.Contains(t, stillAttaching, "**`mutes`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% (1 of 4 shards)\n")
+	assert.Contains(t, stillAttaching, "**`mutes`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.38% (1 of 4 shards)\n")
 	assert.Contains(t, stillAttaching, "- Rows: 914,707 / 1,466,232 across 1 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ 3m 15s\n",
 		"the rows and the size name the plan's shards, not the operations attached so far")
 
@@ -732,9 +732,10 @@ func TestRenderShardedApplyComment_TableCopyStarting(t *testing.T) {
 }
 
 // A huge table early in its copy has real rows copied but a fraction that
-// rounds down to zero percent; the line shows a 1% floor so live progress is
-// never misread as a copy that has not begun.
-func TestRenderShardedApplyComment_TableCopySubPercentFloorsAtOne(t *testing.T) {
+// rounds down to zero percent; the bar keeps a one-cell floor and the label
+// shows the fraction, so live progress is never misread as a copy that has
+// not begun.
+func TestRenderShardedApplyComment_TableCopySubPercentShowsFraction(t *testing.T) {
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
 		ApplyID: "apply-x",
@@ -747,7 +748,7 @@ func TestRenderShardedApplyComment_TableCopySubPercentFloorsAtOne(t *testing.T) 
 		}},
 	})
 
-	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(1)+" 1%")
+	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(1)+" 0.29%")
 	assert.Contains(t, out, "- Rows: 4,200 / 1,466,232")
 	assert.NotContains(t, out, "Starting copy", "rows are already flowing")
 }
@@ -1175,7 +1176,7 @@ func TestRenderShardedApplyComment_CopyingTableReadsLikeVitess(t *testing.T) {
 	rows := strings.Index(out, "- Rows: 500 / 1,000")
 	shards := strings.Index(out, "- Shards:")
 	require.NotEqual(t, -1, bar, "the aggregated progress bar renders:\n%s", out)
-	assert.Contains(t, out, "50%", "the bar aggregates both shards' rows")
+	assert.Contains(t, out, "50.00%", "the bar aggregates both shards' rows")
 	assert.Less(t, bar, ddl, "the DDL follows the progress bar")
 	assert.Less(t, ddl, rows, "the rows line follows the DDL")
 	assert.Less(t, rows, shards, "the per-shard breakdown comes last")
