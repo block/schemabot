@@ -448,24 +448,36 @@ func (e *Engine) Drain() {
 	if rm == nil {
 		return
 	}
-	exit.waitWithoutBound()
-	e.releaseDrained(rm, raceWindow)
+	for {
+		exit.waitWithoutBound()
+		next, resumed := e.releaseDrained(rm, exit, raceWindow)
+		if !resumed {
+			return
+		}
+		exit = next
+	}
 }
 
 // DrainContext is Drain bounded by ctx. When ctx ends before the schema change
 // exits, it returns an error and leaves the change tracked, so the engine
-// still reports it as holding the target.
+// still reports it as holding the target. A run that Start resumes while the
+// drain waits is waited for within the same ctx.
 func (e *Engine) DrainContext(ctx context.Context) error {
 	rm, exit, raceWindow := e.trackedForDrain()
 	if rm == nil {
 		return nil
 	}
-	if err := exit.wait(ctx); err != nil {
-		database, tables := e.runTarget(rm)
-		return fmt.Errorf("drain schema change on database %s tables %v: still running after %w", database, tables, err)
+	for {
+		if err := exit.wait(ctx); err != nil {
+			database, tables := e.runTarget(rm)
+			return fmt.Errorf("drain schema change on database %s tables %v: still running after %w", database, tables, err)
+		}
+		next, resumed := e.releaseDrained(rm, exit, raceWindow)
+		if !resumed {
+			return nil
+		}
+		exit = next
 	}
-	e.releaseDrained(rm, raceWindow)
-	return nil
 }
 
 // runTarget reads the database and tables of a run that may still be running.
@@ -488,9 +500,12 @@ func (e *Engine) trackedForDrain() (*runningSchemaChange, runExit, func()) {
 	return rm, rm.run.exit(), e.drainRaceWindow
 }
 
-// releaseDrained stops tracking rm once its run has exited, keeping its
-// outcome for a later progress poll.
-func (e *Engine) releaseDrained(rm *runningSchemaChange, raceWindow func()) {
+// releaseDrained stops tracking rm once the run the drain waited for, exited,
+// has returned, keeping its outcome for a later progress poll. When Start has
+// resumed rm in a new run since the drain took exited, rm stays tracked and
+// releaseDrained returns the new run's handle with resumed set, so the drain
+// waits for that run before it releases anything.
+func (e *Engine) releaseDrained(rm *runningSchemaChange, exited runExit, raceWindow func()) (next runExit, resumed bool) {
 	if raceWindow != nil {
 		raceWindow()
 	}
@@ -503,13 +518,25 @@ func (e *Engine) releaseDrained(rm *runningSchemaChange, raceWindow func()) {
 		e.mu.Unlock()
 		e.schemaChangeLogger(rm).Debug("drained schema change is no longer tracked; leaving the engine's current state in place",
 			"database", rm.database, "tables", rm.tables)
-		return
+		return runExit{}, false
+	}
+	if current := rm.run.exit(); current != exited {
+		// Start resumed the change after the waited-for run returned. The
+		// resumed run is still working on the target, so releasing rm now
+		// would hide it from an ownership halt (OW-3) and let the caller
+		// proceed as if the target had drained.
+		database, tables := rm.database, rm.tables
+		e.mu.Unlock()
+		e.schemaChangeLogger(rm).Debug("drained schema change was resumed while the drain waited; waiting for the resumed run",
+			"database", database, "tables", tables)
+		return current, true
 	}
 	if retainsDrainedOutcome(rm.state) {
 		e.drainedOutcome = newDrainedOutcome(rm)
 	}
 	e.runningSchemaChange = nil
 	e.mu.Unlock()
+	return runExit{}, false
 }
 
 // installRunningSchemaChange publishes rm as the engine's tracked schema
@@ -1226,7 +1253,11 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	// match.
 	defaultMessage := fmt.Sprintf("Schema change %s", rm.state)
 	switch {
-	case stopAwaitsRunner(rm):
+	case state == engine.StateRunning && rm.state == engine.StateStopped:
+		// progressState reports a stopped change as running only while its
+		// stop awaits the runner. Reading that from state, instead of checking
+		// the runner again, keeps the state and the message on one
+		// observation of a runner that can return at any moment.
 		message = stoppingMessage
 	case state != rm.state && message == defaultMessage:
 		message = fmt.Sprintf("Schema change %s", state)

@@ -174,3 +174,48 @@ func TestConcurrentStartsOnAStoppedChangeResumeItOnce(t *testing.T) {
 		waitForTestRun(t, eng, rm)
 	}
 }
+
+// A drain waits for the change's run to return and then releases the change.
+// A start can resume the change in a new run in between. The drain then waits
+// for the resumed run within its own deadline, and keeps tracking the change
+// while that run works on the target, so an ownership halt still reaches it
+// and the caller does not proceed as if the target had drained. Once the
+// resumed run returns, the drain releases the change.
+func TestDrainWaitsForARunResumedBetweenItsWaitAndItsRelease(t *testing.T) {
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	rm := registerRunningSchemaChange(eng)
+	startTestRun(eng, rm, func() {})
+	waitForTestRun(t, eng, rm)
+
+	release := make(chan struct{})
+	var releaseRun sync.Once
+	t.Cleanup(func() { releaseRun.Do(func() { close(release) }) })
+	var resumeOnce sync.Once
+	eng.mu.Lock()
+	eng.drainRaceWindow = func() {
+		resumeOnce.Do(func() { startTestRun(eng, rm, func() { <-release }) })
+	}
+	eng.mu.Unlock()
+
+	shortCtx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	err := eng.DrainContext(shortCtx)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "the drain waits for the resumed run")
+	assert.Contains(t, err.Error(), "still running")
+
+	eng.mu.Lock()
+	tracked := eng.runningSchemaChange
+	eng.mu.Unlock()
+	assert.Same(t, rm, tracked, "the change stays tracked while the resumed run is working")
+	assert.True(t, testRunAlive(eng, rm))
+
+	releaseRun.Do(func() { close(release) })
+	ctx, cancelDrain := context.WithTimeout(t.Context(), runTrackerTestDeadline)
+	defer cancelDrain()
+	require.NoError(t, eng.DrainContext(ctx))
+
+	eng.mu.Lock()
+	tracked = eng.runningSchemaChange
+	eng.mu.Unlock()
+	assert.Nil(t, tracked, "the change is released once the resumed run has returned")
+}
