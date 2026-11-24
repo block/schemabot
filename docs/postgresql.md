@@ -611,6 +611,13 @@ record. A column at a different position, or with different dependents, than
 on the primary deployment does not match, so that drop cannot run on that
 deployment from the primary deployment's plan.
 
+The same record holds a confirmation to the objects it was given for. The
+apply plans again when it is confirmed, and a re-plan that runs the same drop
+against a replaced object does not run. A refused confirmation applies
+nothing; run apply again to review the plan against the current schema. An
+automatic apply stops instead and posts a new comment that shows the re-plan
+and names the tables whose objects changed; confirm that comment to apply it.
+
 A plan approved before this check shipped has no record, so its drops are
 refused. That includes an apply still running at the upgrade: a sequential
 apply whose earlier tasks already ran stops at its first drop. Re-plan any
