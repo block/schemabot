@@ -11,7 +11,7 @@ const ENGINES={
  // diffColors are the opening diff's deleted and added line backgrounds.
  mysql:{gif:'assets/pr-workflow-demo.gif',done:'100.00%',diffColors:['FFEBE9','FFCECB','DAFBE1','ACEEBB']},
  // The PostgreSQL diff only adds lines.
- postgres:{gif:'assets/pr-postgres-workflow-demo.gif',done:'95%',diffColors:['DAFBE1','ACEEBB']},
+ postgres:{gif:'assets/pr-postgres-workflow-demo.gif',done:'95.00%',diffColors:['DAFBE1','ACEEBB']},
 };
 if(!ENGINES[engine])throw new Error(`Unknown engine ${engine}; expected one of ${Object.keys(ENGINES).join(', ')}`);
 (async()=>{

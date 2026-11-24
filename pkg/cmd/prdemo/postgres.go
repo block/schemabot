@@ -9,6 +9,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"time"
@@ -99,13 +100,26 @@ func running(step int) string {
 	data.Statement = runningStmt
 	phase, inPhase := buildPhaseAt(step)
 	data.BuildWork = apitypes.BuildWork{Operation: "concurrent-index-build", ServerPhase: phase.name}
+	var done, total int64
 	if phase.tuples {
-		data.BuildWork.TuplesDone, data.BuildWork.TuplesTotal = int64(inPhase*tuplesTotal), tuplesTotal
+		done, total = int64(inPhase*tuplesTotal), tuplesTotal
+		data.BuildWork.TuplesDone, data.BuildWork.TuplesTotal = done, total
 	} else {
-		data.BuildWork.BlocksDone, data.BuildWork.BlocksTotal = int64(inPhase*blocksTotal), blocksTotal
+		done, total = int64(inPhase*blocksTotal), blocksTotal
+		data.BuildWork.BlocksDone, data.BuildWork.BlocksTotal = done, total
 	}
-	data.Tables[0].PercentComplete = phase.start + int(inPhase*float64(phase.end-phase.start))
+	percent := buildPercent(phase, done, total)
+	data.BuildWork.Percent, data.BuildWork.HasPercent = percent, true
+	data.Tables[0].PercentComplete = int(percent)
 	return templates.RenderApplyStatusComment(data)
+}
+
+// buildPercent is the whole-build percent the engine reports for a phase's
+// counter pair: the phase's span start plus its counted share of the span,
+// rounded down to hundredths so a running build never reads as finished.
+func buildPercent(phase buildPhase, done, total int64) float64 {
+	span := float64(phase.end - phase.start)
+	return math.Floor((float64(phase.start)+float64(done)/float64(total)*span)*100) / 100
 }
 
 // buildPhaseAt is the counted build phase step percent of the way through the
