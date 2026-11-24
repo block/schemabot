@@ -29,12 +29,8 @@ func (c Config) Validate() error {
 			return fmt.Errorf("apply_notifications.publisher is required when transport settings are present")
 		}
 	case "sqs":
-		u, err := url.Parse(c.QueueURL)
-		if err != nil || u.Host == "" || u.Scheme != "https" || u.Path == "" {
-			return fmt.Errorf("apply_notifications.queue_url must be an HTTPS SQS queue URL")
-		}
-		if strings.HasSuffix(u.Path, ".fifo") {
-			return fmt.Errorf("apply_notifications requires a standard SQS queue, not FIFO")
+		if err := validateSQSQueue(c.QueueURL); err != nil {
+			return fmt.Errorf("apply_notifications: %w", err)
 		}
 	default:
 		return fmt.Errorf("apply_notifications.publisher must be empty or sqs")
@@ -58,15 +54,45 @@ func NewPublisher(ctx context.Context, c Config) (Publisher, error) {
 	if c.Publisher == "" {
 		return nil, nil
 	}
+	resolved, err := resolveSQSPublisher(ctx, c.QueueURL, c.Region)
+	if err != nil {
+		return nil, err
+	}
+	return resolved.Publisher, nil
+}
+
+func validateSQSQueue(queueURL string) error {
+	u, err := url.Parse(queueURL)
+	if err != nil || u.Host == "" || u.Scheme != "https" || u.Path == "" {
+		return fmt.Errorf("queue_url must be an HTTPS SQS queue URL")
+	}
+	if strings.HasSuffix(u.Path, ".fifo") {
+		return fmt.Errorf("publisher requires a standard SQS queue, not FIFO")
+	}
+	return nil
+}
+
+func resolveSQSPublisher(ctx context.Context, queueURL, region string) (ResolvedPublisher, error) {
 	var opts []func(*config.LoadOptions) error
-	if c.Region != "" {
-		opts = append(opts, config.WithRegion(c.Region))
+	if region != "" {
+		opts = append(opts, config.WithRegion(region))
 	}
 	cfg, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("load AWS configuration for completion notifications: %w", err)
+		return ResolvedPublisher{}, fmt.Errorf("load AWS configuration for completion notifications: %w", err)
 	}
-	return &sqsPublisher{client: sqs.NewFromConfig(cfg), queueURL: c.QueueURL}, nil
+	if cfg.Region == "" {
+		return ResolvedPublisher{}, fmt.Errorf("resolve SQS publisher: AWS region is required")
+	}
+	// Use the same resolved AWS configuration for identity and client creation.
+	identity, err := json.Marshal([]string{queueURL, cfg.Region})
+	if err != nil {
+		return ResolvedPublisher{}, fmt.Errorf("encode SQS destination identity: %w", err)
+	}
+	return ResolvedPublisher{
+		Identity:  string(identity),
+		Publisher: &sqsPublisher{client: sqs.NewFromConfig(cfg), queueURL: queueURL},
+	}, nil
 }
 
 type sqsClient interface {
