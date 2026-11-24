@@ -1766,11 +1766,14 @@ engine reports its progress as the same table facts, and that reading is derived
 facts and rendered by the CLI and the PR comment alike. So an operator watching two engines' schema
 changes sees the same phase named the same way, with the same figures in the same place. Only
 markup and the bar's drawing may differ between surfaces. *Enforced:* the shared reading
-(`ReadInFlightTable` in `pkg/presentation/table_reading.go`), and a test that renders every phase
-for every engine in `storage.Engines` through both surfaces and fails when they read differently
-(`TestInFlightTableReadsTheSameOnEverySurface` in `pkg/cmd/internal/templates`), with
-`TestEnginesListsEveryEngineConstant` in `pkg/storage` keeping that list complete, and its sharded
-counterpart for a table copying across shards (`TestShardedInFlightTableReadsTheSameOnEverySurface`).
+(`ReadInFlightTable` in `pkg/presentation/table_reading.go`), and a test that renders one progress
+response for every phase through both surfaces, under every engine in `storage.Engines`, and fails
+when they read differently (`TestInFlightTableReadsTheSameOnEverySurface` in
+`pkg/cmd/internal/templates`), with `TestEnginesListsEveryEngineConstant` in `pkg/storage` keeping
+that list complete. Its sharded counterpart (`TestShardedInFlightTableReadsTheSameOnEverySurface`)
+covers a table copying across shards in the CLI, the sharded apply comment, and the apply status
+comment. These tests prove the surfaces read the same facts alike; which facts an engine reports is
+pinned by that engine's own progress tests.
 
 ## Recovery (RC)
 

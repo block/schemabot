@@ -608,7 +608,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			pct := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBarRowCopy(pct)
 			writeTableLine(&b, t, "%s Row copy in progress (%s%s)", bar,
-				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), shardCoverageSuffix(t))
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), presentation.ShardCoverageSuffix(tableFacts(t)))
 			if t.DDL != "" {
 				b.WriteString(formatTableDDL(t))
 			}
@@ -706,7 +706,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBar(cancelledPercent, ui.ColorOrange)
 			writeTableLine(&b, t, "%s 🚫 Cancelled at %s%s", bar,
-				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), shardCoverageSuffix(t))
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), presentation.ShardCoverageSuffix(tableFacts(t)))
 		} else {
 			writeTableLine(&b, t, "🚫 Cancelled (not started)")
 		}
@@ -726,7 +726,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			writeTableLine(&b, t, "%s ⏹️ Stopped (was waiting for cutover)", bar)
 		case t.PercentComplete > 0 || t.RowsCopied > 0:
 			writeTableLine(&b, t, "%s ⏹️ Stopped at %s%s", bar,
-				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), shardCoverageSuffix(t))
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), presentation.ShardCoverageSuffix(tableFacts(t)))
 		default:
 			writeTableLine(&b, t, "⏹️ Stopped (not started)")
 		}
@@ -734,8 +734,10 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			b.WriteString(formatTableDDL(t))
 		}
 		if t.RowsTotal > 0 && (t.PercentComplete > 0 || t.RowsCopied > 0) {
-			coverage, size, _ := rowsCoverageAndSize(t)
-			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s%s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), coverage, size)
+			// A stopped copy is not advancing, so its rows line carries no ETA.
+			f := tableFacts(t)
+			f.ETASeconds = 0
+			b.WriteString(indentDetail + presentation.RowsLine(f) + "\n")
 		}
 		b.WriteString("\n")
 		b.WriteString(formatTableParts(t))
@@ -817,10 +819,10 @@ func tableFacts(t TableProgress) presentation.TableFacts {
 		BuildWork:           t.BuildWork,
 		PlannedShards:       t.PlannedShards,
 	}
-	if reporting, ok := partialShardCoverage(t); ok {
-		f.ShardsReporting, f.ShardsTotal = reporting, shardTotal(t)
+	if t.AcrossTargets {
+		return f
 	}
-	return f
+	return f.WithShardCoverage(len(t.Shards), shardsReporting(t))
 }
 
 // writeTableDetail writes one detail line under a table's statement. A note
@@ -863,35 +865,16 @@ func writePlannedRows(b *strings.Builder, t TableProgress) {
 	}
 }
 
-// rowsCoverageAndSize returns the clauses a table's rows line carries after
-// its row counts: the shards the counts cover when only some have reported,
-// and the table's planned size, which then names the shards it covers. partial
-// reports whether the counts cover only some shards.
-func rowsCoverageAndSize(t TableProgress) (coverage, size string, partial bool) {
-	reporting, ok := partialShardCoverage(t)
-	if !ok {
-		return "", ui.FormatTableSizeClause(t.EstimatedBytes), false
-	}
-	return fmt.Sprintf(" across %d of %d shards", reporting, shardTotal(t)),
-		ui.FormatShardedTableSizeClause(t.EstimatedBytes, t.PlannedShards), true
-}
-
-// partialShardCoverage returns how many of a sharded table's shards have
-// reported a row total, and whether that is only some of them: while later
-// shards have not started, the table's row figures cover the started ones
-// alone, so the bar and the rows line say so rather than passing those
-// shards' fraction off as the table's, as the PR comment does.
-func partialShardCoverage(t TableProgress) (int, bool) {
-	if t.AcrossTargets || len(t.Shards) < 2 {
-		return 0, false
-	}
+// shardsReporting is how many of a sharded table's shards have reported a
+// row total.
+func shardsReporting(t TableProgress) int {
 	reporting := 0
 	for _, sh := range t.Shards {
 		if sh.RowsTotal > 0 {
 			reporting++
 		}
 	}
-	return reporting, reporting > 0 && reporting < shardTotal(t)
+	return reporting
 }
 
 // shardTotal is how many shards a sharded table's copy spans: the plan's
@@ -899,15 +882,6 @@ func partialShardCoverage(t TableProgress) (int, bool) {
 // it recorded none, as the PR comment counts them.
 func shardTotal(t TableProgress) int {
 	return max(len(t.Shards), t.PlannedShards)
-}
-
-// shardCoverageSuffix annotates a sharded table's copy percentage with the
-// shards it covers when only some have reported (partialShardCoverage).
-func shardCoverageSuffix(t TableProgress) string {
-	if reporting, ok := partialShardCoverage(t); ok {
-		return fmt.Sprintf(" (%d of %d shards)", reporting, shardTotal(t))
-	}
-	return ""
 }
 
 // writeTableProgress writes progress for a single table to stdout.

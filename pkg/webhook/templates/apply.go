@@ -65,6 +65,9 @@ type TableProgressData struct {
 	// while the table is in flight (see renderShardSummary); detailed per-shard
 	// row counts/ETAs stay in the CLI, not the PR comment.
 	Shards []ShardProgressData
+	// PlannedShards is how many shards the plan sized the table across. Zero
+	// when the plan recorded no count; the listed shards then stand for it.
+	PlannedShards int
 }
 
 // TaskStatusReadyForCutover reports whether a table's task status marks it as
@@ -1282,8 +1285,15 @@ func renderInFlightTable(sb *strings.Builder, dialect schema.Dialect, table Tabl
 }
 
 // tableFacts is what the PR comment knows about a table's change, in the form
-// every surface reads it from.
+// every surface reads it from. A sharded table whose row figures cover only
+// the shards that have reported says how many.
 func tableFacts(table TableProgressData, work apitypes.BuildWork) presentation.TableFacts {
+	reporting := 0
+	for _, sh := range table.Shards {
+		if sh.RowsTotal > 0 {
+			reporting++
+		}
+	}
 	return presentation.TableFacts{
 		Status:              table.Status,
 		ChangeType:          table.ChangeType,
@@ -1298,7 +1308,8 @@ func tableFacts(table TableProgressData, work apitypes.BuildWork) presentation.T
 		Throttled:           table.Throttled,
 		ThrottleReason:      table.ThrottleReason,
 		BuildWork:           work,
-	}
+		PlannedShards:       table.PlannedShards,
+	}.WithShardCoverage(len(table.Shards), reporting)
 }
 
 // writeTableDetails writes a table's detail lines as list items. A note is
@@ -2084,8 +2095,31 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
 			Throttled:           t.Throttled,
 			ThrottleReason:      t.ThrottleReason,
+			Shards:              shardProgressFromResponse(t.Shards),
+			PlannedShards:       int(t.PlannedShards),
 		})
 	}
 
 	return data
+}
+
+// shardProgressFromResponse is a table's per-shard progress as the progress
+// API reports it.
+func shardProgressFromResponse(shards []*apitypes.ShardProgressResponse) []ShardProgressData {
+	if len(shards) == 0 {
+		return nil
+	}
+	out := make([]ShardProgressData, 0, len(shards))
+	for _, sh := range shards {
+		out = append(out, ShardProgressData{
+			Shard:               sh.Shard,
+			Status:              state.NormalizeTaskStatus(sh.Status),
+			PercentComplete:     int(sh.PercentComplete),
+			RowsCopied:          sh.RowsCopied,
+			RowsTotal:           sh.RowsTotal,
+			ChecksumRowsChecked: sh.ChecksumRowsChecked,
+			ChecksumRowsTotal:   sh.ChecksumRowsTotal,
+		})
+	}
+	return out
 }

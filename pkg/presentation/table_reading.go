@@ -46,6 +46,23 @@ func (f TableFacts) partialShards() bool {
 	return f.ShardsReporting > 0 && f.ShardsReporting < f.ShardsTotal
 }
 
+// WithShardCoverage returns the facts with the shards their row figures cover,
+// for a table that lists its shards: listed is how many it lists and reporting
+// how many of those have reported a row total. The table spans the plan's
+// shard count, or the listed shards when more are listed or the plan recorded
+// none. While later shards have not reported, the figures cover the reporting
+// ones alone, so the reading says so rather than passing their fraction off
+// as the table's. A table with one shard or none listed is left as it is.
+func (f TableFacts) WithShardCoverage(listed, reporting int) TableFacts {
+	if listed < 2 {
+		return f
+	}
+	if total := max(listed, f.PlannedShards); reporting > 0 && reporting < total {
+		f.ShardsReporting, f.ShardsTotal = reporting, total
+	}
+	return f
+}
+
 // TableReading is how one table's change reads on every surface: a bar and a
 // label beside the table name, then detail lines under its statement. The
 // surfaces differ only in markup.

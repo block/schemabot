@@ -139,11 +139,28 @@ func TestShardedInFlightTableReadsTheSameOnEverySurface(t *testing.T) {
 				}}}},
 			})
 
+			// The same table in a single-deployment apply, as the progress
+			// API reports it, reaches the apply status comment.
+			apiShards := make([]*apitypes.ShardProgressResponse, tc.shards)
+			for i, sh := range cliShards {
+				apiShards[i] = &apitypes.ShardProgressResponse{Shard: sh.Shard, Status: sh.Status, RowsCopied: sh.RowsCopied, RowsTotal: sh.RowsTotal}
+			}
+			status := webhooktemplates.RenderApplyStatusComment(webhooktemplates.ApplyStatusFromProgress(&apitypes.ProgressResponse{
+				ApplyID: "apply-5e6f7a8b", Database: "shop", Environment: "staging", State: state.Apply.Running,
+				Tables: []*apitypes.TableProgressResponse{{
+					TableName: "orders", DDL: "ALTER TABLE orders ADD COLUMN note text", Status: state.Task.Running, ChangeType: "alter",
+					RowsCopied: tc.rowsCopied, RowsTotal: total, ETASeconds: 195, PlannedShards: int32(tc.shards), Shards: apiShards,
+				}},
+			}, "octocat"))
+
 			cliHeadline, cliDetails := cliInFlightReading(t, cli)
 			prHeadline, prDetails := shardedPRInFlightReading(t, pr)
+			statusHeadline, statusDetails := shardedPRInFlightReading(t, status)
 			assert.Equal(t, tc.headline, withoutBar(cliHeadline), "CLI headline")
-			assert.Equal(t, withoutBar(cliHeadline), withoutBar(prHeadline), "the PR comment's headline reads as the CLI's")
-			assert.Equal(t, withoutShardList(cliDetails), withoutShardList(prDetails), "the PR comment's detail lines read as the CLI's")
+			assert.Equal(t, withoutBar(cliHeadline), withoutBar(prHeadline), "the sharded PR comment's headline reads as the CLI's")
+			assert.Equal(t, withoutBar(cliHeadline), withoutBar(statusHeadline), "the apply status comment's headline reads as the CLI's")
+			assert.Equal(t, withoutShardList(cliDetails), withoutShardList(prDetails), "the sharded PR comment's detail lines read as the CLI's")
+			assert.Equal(t, withoutShardList(cliDetails), withoutShardList(statusDetails), "the apply status comment's detail lines read as the CLI's")
 			require.NotEmpty(t, withoutShardList(prDetails), "the table has a rows line")
 		})
 	}
