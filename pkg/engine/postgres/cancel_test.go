@@ -65,7 +65,7 @@ func runningDrive(t *testing.T, tracker buildTracker, concurrentIndex bool) (*En
 	eng := &Engine{progress: map[string]*trackedApply{
 		cancelTestKey: {
 			result: &engine.ProgressResult{State: engine.StateRunning}, tracker: tracker,
-			logger: slog.New(slog.DiscardHandler), concurrentIndex: concurrentIndex,
+			logger: slog.New(slog.DiscardHandler), cancellableBuild: concurrentIndex,
 			cancelApply: func() {
 				cancel()
 				select {

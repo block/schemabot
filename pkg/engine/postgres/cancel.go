@@ -64,9 +64,9 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 		e.mu.Unlock()
 		return e.settledCancel(key, tracked)
 	}
-	if !tracked.concurrentIndex {
+	if !tracked.cancellableBuild {
 		e.mu.Unlock()
-		return nil, engine.NewUnsupportedOperationError("cancel is supported for PostgreSQL concurrent index builds only: this schema change runs as plain DDL that commits or fails on its own")
+		return nil, engine.NewUnsupportedOperationError("cancel is supported for PostgreSQL index builds only: this schema change runs as plain DDL that commits or fails on its own")
 	}
 	tracker, logger, cancelApply, done := tracked.tracker, tracked.logger, tracked.cancelApply, tracked.done
 	if err := ctx.Err(); err != nil {

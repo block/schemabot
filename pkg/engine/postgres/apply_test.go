@@ -408,6 +408,7 @@ func TestApplyTablePreflightLimitFollowsStatementCost(t *testing.T) {
 	const configuredLimit = int64(1234)
 
 	assert.Equal(t, preflight.NoSizeLimit, applyTablePreflightLimit(nativeApply{concurrentIndex: true}, configuredLimit))
+	assert.Equal(t, preflight.NoSizeLimit, applyTablePreflightLimit(nativeApply{partitionedIndex: true}, configuredLimit))
 	assert.Equal(t, configuredLimit, applyTablePreflightLimit(nativeApply{}, configuredLimit))
 }
 
@@ -3701,17 +3702,20 @@ func TestValidateOptimisticApplyAcceptsCreateSet(t *testing.T) {
 	assert.False(t, change.concurrentIndex)
 }
 
-// TestValidateOptimisticApplyClassifiesConcurrentIndex pins both halves of
-// the predicate that routes a statement to the concurrent-build executor:
-// only a lone CREATE INDEX that names CONCURRENTLY qualifies. A plain CREATE
-// INDEX is the same statement kind and must stay on the transactional path;
+// TestValidateOptimisticApplyClassifiesIndexBuilds pins the predicate that
+// routes a lone statement to an index build executor: a CREATE INDEX that
+// names CONCURRENTLY goes to the concurrent build, and a plain CREATE INDEX,
+// which reaches the apply alone only as the planner's partitioned index build,
+// goes to the partitioned build and never runs as written. Both are duration
+// bounded and cancellable; any other statement is neither.
 // TestValidateOptimisticApplyAcceptsCreateSet pins that a create set, which
 // is never one statement, does not qualify either.
-func TestValidateOptimisticApplyClassifiesConcurrentIndex(t *testing.T) {
+func TestValidateOptimisticApplyClassifiesIndexBuilds(t *testing.T) {
 	tests := []struct {
-		name       string
-		ddl        string
-		concurrent bool
+		name        string
+		ddl         string
+		concurrent  bool
+		partitioned bool
 	}{
 		{
 			name:       "concurrent index",
@@ -3719,9 +3723,13 @@ func TestValidateOptimisticApplyClassifiesConcurrentIndex(t *testing.T) {
 			concurrent: true,
 		},
 		{
-			name:       "plain index stays transactional",
-			ddl:        "CREATE INDEX widgets_name_idx ON public.widgets (name)",
-			concurrent: false,
+			name:        "plain index is the partitioned build",
+			ddl:         "CREATE INDEX widgets_name_idx ON public.widgets (name)",
+			partitioned: true,
+		},
+		{
+			name: "column addition is no index build",
+			ddl:  "ALTER TABLE public.widgets ADD COLUMN name text",
 		},
 	}
 	for _, tc := range tests {
@@ -3738,6 +3746,8 @@ func TestValidateOptimisticApplyClassifiesConcurrentIndex(t *testing.T) {
 			change, err := validateOptimisticApply(req)
 			require.NoError(t, err)
 			assert.Equal(t, tc.concurrent, change.concurrentIndex)
+			assert.Equal(t, tc.partitioned, change.partitionedIndex)
+			assert.Equal(t, tc.concurrent || tc.partitioned, change.durationBoundedIndexBuild())
 		})
 	}
 }
