@@ -283,8 +283,9 @@ your database.
 - **Beta** engines handle a clear, documented set of changes. Anything outside that set is blocked
   when you plan it, with the reason, so you find out on the pull request rather than in
   production. The engine's guide lists everything that is not GA yet.
-- **Alpha** engines are still being built. What they can do grows with each release, and their
-  guide may not list every gap yet, so read it before you rely on one.
+- **Alpha** engines are experimental and still being built. Expect significant changes between
+  releases, both in what they can do and in how they work. Their guide may not list every gap
+  yet, so read it before you rely on one.
 
 Below GA, an engine is narrower, not looser. It runs fewer kinds of change and offers fewer
 controls once a change is running, but whatever it does run follows the same safety rules as every
