@@ -670,7 +670,8 @@ func roundMemberName(target *storage.Plan, round map[string]*storage.Plan) strin
 // even when the topology has since shrunk to the primary target alone. A
 // confirmation that neither marks as a rollout's was given for a single target,
 // whose re-plan runs under the single-target gates only while it still addresses
-// the reviewed member. A pinned or confirm-time
+// the reviewed member and each statement the confirmed plan also ran still acts
+// on the objects that plan recorded. A pinned or confirm-time
 // plan that no longer loads is an error: what the comment showed, or what the
 // apply would run, cannot be told.
 func (h *Handler) confirmationCoversPrimaryTarget(ctx context.Context, pinnedPlanID, currentPlanID, environment string, rolloutAtConfirm bool) (workDifference, error) {
@@ -699,6 +700,11 @@ func (h *Handler) confirmationCoversPrimaryTarget(ctx context.Context, pinnedPla
 			return workUnchanged, fmt.Errorf("load member plans of the confirmed round %s: %w", pinnedPlanID, err)
 		}
 		if len(confirmedRound) == 0 {
+			if tables := objectsChangedSinceReview(pinned, current); len(tables) > 0 {
+				h.logger.Info("apply-confirm refused: a reviewed statement now acts on objects the confirmed plan did not record",
+					"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "plan_id", currentPlanID, "tables", tables)
+				return workObjects, nil
+			}
 			h.logger.Debug("apply-confirm: the confirmed plan was reviewed for a single target, so its re-plan runs under the single-target gates",
 				"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "plan_id", currentPlanID)
 			return workUnchanged, nil
@@ -718,6 +724,7 @@ const (
 	workUnchanged     workDifference = ""
 	workTarget        workDifference = "which primary target it addresses"
 	workStatements    workDifference = "its statements"
+	workObjects       workDifference = "the objects its statements act on"
 	workExecutionMode workDifference = "how its statements run"
 	workUnsafe        workDifference = "which of its statements are unsafe"
 	workFinalizer     workDifference = "which namespaces it finalizes"
@@ -728,7 +735,8 @@ const (
 // for one target differ, or workUnchanged when they run the same work. It
 // compares everything an apply created from the plan executes and the comment
 // shows: the table changes and each shard's own changes, byte for byte, then
-// how each of those statements runs, then each statement's unsafe verdict and
+// the engine's record of the objects each statement acts on, then how each of
+// those statements runs, then each statement's unsafe verdict and
 // reason, which the target's schema decides and can change without changing
 // the statement, then which namespaces end with a
 // finalizer, and the VSchema each of those writes with the record of what that
@@ -737,6 +745,9 @@ const (
 func memberWorkDifference(a, b *storage.Plan) workDifference {
 	if !slices.EqualFunc(a.FlatDDLChanges(), b.FlatDDLChanges(), sameStatement) || !sameShardChanges(a.Shards, b.Shards, sameStatement) {
 		return workStatements
+	}
+	if !slices.EqualFunc(a.FlatDDLChanges(), b.FlatDDLChanges(), sameObjects) || !sameShardChanges(a.Shards, b.Shards, sameObjects) {
+		return workObjects
 	}
 	if !slices.EqualFunc(a.FlatDDLChanges(), b.FlatDDLChanges(), sameTableChange) || !sameShardChanges(a.Shards, b.Shards, sameTableChange) {
 		return workExecutionMode
@@ -774,6 +785,55 @@ func sameVSchemaChange(a, b *storage.NamespacePlanData) bool {
 // the same table, however each is executed.
 func sameStatement(a, b storage.TableChange) bool {
 	return a.Namespace == b.Namespace && a.Table == b.Table && a.Operation == b.Operation && a.DDL == b.DDL
+}
+
+// sameObjects reports whether two table changes run the same statement against
+// the same objects, as the engine recorded them at plan time. An engine records
+// only the identity of what a statement acts on, never anything that changes
+// between two plans of the same objects, so a different record means the
+// statement now reaches an object the operator did not review.
+func sameObjects(a, b storage.TableChange) bool {
+	return sameStatement(a, b) && maps.Equal(a.Metadata, b.Metadata)
+}
+
+// objectsChangedSinceReview returns, sorted, the tables on which current runs a
+// statement that reviewed also ran but with an engine record of its objects
+// that reviewed never carried for it. A statement reviewed did not run is not
+// compared: it has no record to hold it to, and the gates for new work decide
+// it.
+func objectsChangedSinceReview(reviewed, current *storage.Plan) []string {
+	type statementKey struct{ namespace, shard, table, operation, ddl string }
+	keyOf := func(shard string, c storage.TableChange) statementKey {
+		return statementKey{c.Namespace, shard, c.Table, c.Operation, c.DDL}
+	}
+	recorded := make(map[statementKey][]map[string]string)
+	for _, c := range reviewed.FlatDDLChanges() {
+		recorded[keyOf("", c)] = append(recorded[keyOf("", c)], c.Metadata)
+	}
+	for _, shard := range reviewed.Shards {
+		for _, c := range shard.Changes {
+			recorded[keyOf(shard.Shard, c)] = append(recorded[keyOf(shard.Shard, c)], c.Metadata)
+		}
+	}
+	changed := make(map[string]bool)
+	check := func(shard string, c storage.TableChange) {
+		records, ok := recorded[keyOf(shard, c)]
+		if !ok {
+			return
+		}
+		if !slices.ContainsFunc(records, func(r map[string]string) bool { return maps.Equal(r, c.Metadata) }) {
+			changed[c.Table] = true
+		}
+	}
+	for _, c := range current.FlatDDLChanges() {
+		check("", c)
+	}
+	for _, shard := range current.Shards {
+		for _, c := range shard.Changes {
+			check(shard.Shard, c)
+		}
+	}
+	return slices.Sorted(maps.Keys(changed))
 }
 
 // sameTableChange reports whether two table changes run the same statement the

@@ -1917,6 +1917,11 @@ back, matching a task to its change by the statement's canonical form (`planChan
 `pkg/tern/plan_change_metadata.go`); the apply refuses a drop with no record
 and drops nothing when the object no longer matches it under the table's lock
 (`reviewedDropForApply` and `executeReviewedDrop` in `pkg/engine/postgres/apply.go`).
+The re-plan an apply runs after a confirmation, or after an automatic apply posts its plan, holds
+each statement the confirmed plan ran to the engine's record of the objects it acts on: a record
+that differs refuses the confirmation, or stops the automatic apply for manual confirmation
+(`memberWorkDifference` and `objectsChangedSinceReview` in `pkg/webhook/apply_member_work.go`,
+called from `executeApply` in `pkg/webhook/apply_execute.go`).
 The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
 and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the

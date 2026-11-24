@@ -882,3 +882,11 @@ func TestDispatchErrorMessageNamesTheRefusingDeployment(t *testing.T) {
 		"This rollback can't defer its cutover: it would keep 40 drivers waiting for the cutover on the `east` deployment, and its servers have 32 drivers that can wait. To defer it, give that deployment's servers 8 more by raising `drivers` or running more servers. Otherwise run `schemabot rollback-confirm -e production` without `--defer-cutover`.",
 		deferredCutoverCapacityMessage(tooWide, action.RollbackConfirm, "production", ""))
 }
+
+// An automatic apply whose re-plan reaches objects the posted plan did not
+// record stops for manual confirmation, and the comment names each table.
+func TestObjectsChangedCause(t *testing.T) {
+	cause := objectsChangedCause([]string{"orders", "users"})
+	assert.Equal(t, "The objects these schema changes act on changed after the plan was posted", cause.Heading)
+	assert.Equal(t, []string{"`orders` changed after the plan was posted", "`users` changed after the plan was posted"}, cause.Entries)
+}

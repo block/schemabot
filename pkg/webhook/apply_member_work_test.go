@@ -90,6 +90,11 @@ func TestMemberWorkDifference(t *testing.T) {
 	assert.Equal(t, workStatements, memberWorkDifference(plan(nil), plan(func(c *storage.TableChange) {
 		c.Table = "refunds"
 	})), "a different table")
+	assert.Equal(t, workObjects, memberWorkDifference(plan(func(c *storage.TableChange) {
+		c.Metadata = map[string]string{"reviewed_object": "column region, position 4"}
+	}), plan(func(c *storage.TableChange) {
+		c.Metadata = map[string]string{"reviewed_object": "column region, position 9"}
+	})), "the same statement, now acting on an object the confirmed plan did not record")
 	assert.Equal(t, workExecutionMode, memberWorkDifference(plan(nil), plan(func(c *storage.TableChange) {
 		c.ExecutionMode = "direct"
 	})), "the same statement, now run as direct execution")
@@ -653,4 +658,90 @@ func TestUnverifiedMemberWorkMessage(t *testing.T) {
 // name as a function.
 func staticName(name string) func() string {
 	return func() string { return name }
+}
+
+// A plan drops users.legacy, recorded at plan time as the column at position
+// 3. Before the operator confirms, someone drops legacy and adds a new legacy
+// column at position 7, so the re-plan runs the same DROP COLUMN with a
+// different record. The single-target confirmation does not cover it, while a
+// re-plan with the same record, or one that only adds a statement the
+// confirmed plan did not run, still runs under the single-target gates.
+func TestSingleTargetConfirmationRefusesAStatementWhoseObjectsChanged(t *testing.T) {
+	const dropLegacy = `ALTER TABLE "public"."users" DROP COLUMN "legacy"`
+	const addNote = `ALTER TABLE "public"."users" ADD COLUMN "note" text`
+	drop := func(record string) storage.TableChange {
+		return storage.TableChange{Namespace: "public", Table: "users", Operation: "alter", DDL: dropLegacy,
+			Metadata: map[string]string{"reviewed_object": record}}
+	}
+	planOf := func(id int64, identifier string, changes ...storage.TableChange) *storage.Plan {
+		return &storage.Plan{ID: id, PlanIdentifier: identifier, Database: "app", Deployment: "eu", Target: "app",
+			Namespaces: map[string]*storage.NamespacePlanData{"public": {Tables: changes}}}
+	}
+	for _, tc := range []struct {
+		name    string
+		current []storage.TableChange
+		want    workDifference
+	}{
+		{name: "the reviewed column was replaced", current: []storage.TableChange{drop("attnum 7")}, want: workObjects},
+		{name: "the reviewed column is still there", current: []storage.TableChange{drop("attnum 3")}, want: workUnchanged},
+		{name: "a statement the confirmed plan did not run", current: []storage.TableChange{drop("attnum 3"),
+			{Namespace: "public", Table: "users", Operation: "alter", DDL: addNote}}, want: workUnchanged},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pinned := planOf(1, "plan_reviewed", drop("attnum 3"))
+			current := planOf(2, "plan_current", tc.current...)
+			store := &primaryConfirmationPlanStore{rollbackConfirmTestPlanStore: rollbackConfirmTestPlanStore{
+				plans: map[string]*storage.Plan{pinned.PlanIdentifier: pinned, current.PlanIdentifier: current},
+			}}
+			var logs bytes.Buffer
+			h := &Handler{
+				service: api.New(&rollbackConfirmTestStorage{plans: store}, &api.ServerConfig{}, nil, testLogger()),
+				logger:  slog.New(slog.NewTextHandler(&logs, nil)),
+			}
+			difference, err := h.confirmationCoversPrimaryTarget(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production", false)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, difference)
+			if tc.want == workObjects {
+				assert.Contains(t, logs.String(), "a reviewed statement now acts on objects the confirmed plan did not record")
+				assert.Contains(t, logs.String(), "pending_plan_id=plan_reviewed plan_id=plan_current tables=[users]")
+				assert.Equal(t, "This confirmation no longer covers what the apply would run: the re-plan of target `eu` differs from the confirmed plan in the objects its statements act on, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
+					unconfirmedWorkMessage(memberWork{members: 1}, primaryTargetDifferenceReason("eu", difference)))
+			}
+		})
+	}
+}
+
+// Each table whose reviewed statement now carries a record the reviewed plan
+// never held for it is named once, shard by shard, and a statement that
+// appears twice is matched against either of its reviewed records.
+func TestObjectsChangedSinceReview(t *testing.T) {
+	change := func(table, record string) storage.TableChange {
+		return storage.TableChange{Namespace: "public", Table: table, Operation: "alter",
+			DDL: "ALTER TABLE " + table + " DROP COLUMN legacy", Metadata: map[string]string{"reviewed_object": record}}
+	}
+	reviewed := &storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{"public": {Tables: []storage.TableChange{
+			change("users", "a"), change("users", "b"), change("orders", "a"),
+		}}},
+		Shards: []storage.ShardPlan{{Namespace: "public", Shard: "-80", Changes: []storage.TableChange{change("events", "a")}}},
+	}
+	same := &storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{"public": {Tables: []storage.TableChange{
+			change("users", "b"), change("users", "a"), change("orders", "a"),
+		}}},
+		Shards: []storage.ShardPlan{{Namespace: "public", Shard: "-80", Changes: []storage.TableChange{change("events", "a")}}},
+	}
+	assert.Empty(t, objectsChangedSinceReview(reviewed, same))
+
+	changed := &storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{"public": {Tables: []storage.TableChange{
+			change("users", "c"), change("orders", "a"),
+		}}},
+		Shards: []storage.ShardPlan{
+			{Namespace: "public", Shard: "-80", Changes: []storage.TableChange{change("events", "b")}},
+			{Namespace: "public", Shard: "80-", Changes: []storage.TableChange{change("events", "z")}},
+		},
+	}
+	assert.Equal(t, []string{"events", "users"}, objectsChangedSinceReview(reviewed, changed),
+		"shard 80- ran no reviewed statement, so only shard -80's record is compared")
 }

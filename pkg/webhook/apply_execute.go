@@ -411,6 +411,41 @@ func (h *Handler) executeApply(
 		}
 		return
 	}
+	// The statements match, but the engine records what each one acts on at
+	// plan time, and an object replaced since the stored plan was posted
+	// leaves the statement unchanged. The posted comment covered the objects
+	// the stored plan recorded, so a re-plan that reaches others is shown again
+	// and confirmed by hand.
+	if storedPlan != nil {
+		const unverifiedReplan = "SchemaBot could not verify the plan this apply would run, so nothing was applied. Retry the command, and see server logs if it persists."
+		current, err := h.service.Storage().Plans().Get(ctx, planResp.PlanID)
+		if err != nil {
+			h.logger.Error("automatic apply stopped: could not load the re-plan to compare the objects its statements act on with the posted plan",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "posted_plan_id", storedPlan.PlanIdentifier, "error", err)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, unverifiedReplan)
+			return
+		}
+		if current == nil {
+			h.logger.Error("automatic apply stopped: the re-plan was not stored, so the objects its statements act on cannot be compared with the posted plan",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "posted_plan_id", storedPlan.PlanIdentifier)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, unverifiedReplan)
+			return
+		}
+		if tables := objectsChangedSinceReview(storedPlan, current); len(tables) > 0 {
+			h.logger.Info("automatic apply downgraded: a statement now acts on objects the posted plan did not record",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "posted_plan_id", storedPlan.PlanIdentifier, "tables", tables)
+			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+				objectsChangedCause(tables), rolloutPreview, runsMemberWork); err != nil {
+				h.logger.Error("failed to post the comment showing the changed objects",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+					"environment", environment, "plan_id", planResp.PlanID, "error", err)
+			}
+			return
+		}
+	}
 
 	// Engine refusals are judged against the live table, so the re-plan can
 	// route a statement to direct execution that the plan behind the comment the
@@ -1309,6 +1344,25 @@ func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *
 
 	return &templates.PausedApplyCauseData{
 		Heading: "Schema changes differ from the plan this apply was started from",
+		Entries: entries,
+	}
+}
+
+// objectsChangedCause names the tables whose statements now act on objects the
+// posted plan did not record, such as a column dropped and added again under
+// the same name.
+func objectsChangedCause(tables []string) *templates.PausedApplyCauseData {
+	entries := make([]string, 0, len(tables))
+	for _, table := range tables {
+		entries = append(entries, fmt.Sprintf("`%s` changed after the plan was posted", table))
+	}
+	if len(entries) > planDriftEntryCap {
+		remaining := len(entries) - planDriftEntryCap
+		entries = append(entries[:planDriftEntryCap:planDriftEntryCap],
+			fmt.Sprintf("and %d more %s", remaining, ui.PluralizeLabel("table", "tables", remaining)))
+	}
+	return &templates.PausedApplyCauseData{
+		Heading: "The objects these schema changes act on changed after the plan was posted",
 		Entries: entries,
 	}
 }
