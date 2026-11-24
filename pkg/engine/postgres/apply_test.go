@@ -3747,7 +3747,7 @@ func TestValidateOptimisticApplyRefusesNonNativeShape(t *testing.T) {
 		Changes: []engine.SchemaChange{{
 			Namespace: "public",
 			TableChanges: []engine.TableChange{{
-				Table: "users", DDL: "DROP TABLE public.users",
+				Table: "users", DDL: "TRUNCATE public.users",
 			}},
 		}},
 		Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},

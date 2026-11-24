@@ -187,7 +187,7 @@ dedicated owner role, read [Table ownership](#table-ownership) before the first
 | A new label on an existing enum type | Runs as `ALTER TYPE ... ADD VALUE`, one label per step, before the table changes. Creating a type or removing a label fails the plan. See [Enum types](#enum-types) |
 | Row-level security policies on an existing table | Run in one transaction, after you explicitly approve them, because they change who can read rows. See [Row-level security](#row-level-security) |
 | Adding or dropping a foreign key | Shown in the plan, but blocked. See [Blocked plans](#blocked-plans) |
-| A table with no schema file, or a deleted file | Blocked as a `DROP TABLE`, except archive tables and `ignore_tables` entries. SchemaBot never drops a PostgreSQL table |
+| A table with no schema file, or a deleted file | Runs as `DROP TABLE` after you approve it with `--allow-unsafe`, as on MySQL. Archive tables and `ignore_tables` entries are left alone. See [Tables with no schema file](#tables-with-no-schema-file) |
 
 Once a statement starts, it runs until it commits or its timeout ends it; it
 cannot be paused. An index build is the one change you can cancel while it
@@ -699,28 +699,47 @@ running during the upgrade. Plan again and apply the new plan.
 
 A namespace is owned whole: its schema files declare which tables exist, not
 only each table's shape. So the plan shows a live table with no file as a
-`DROP TABLE`. SchemaBot never runs that drop, so the plan is blocked. Hiding
-it would let a database that does not match its files pass the check.
+`DROP TABLE`. Hiding it would let a database that does not match its files
+pass the check.
 
 This happens when:
 
-- You onboard an existing database, and some tables have no file yet.
 - A pull request deletes a table's file. Deleting every file in one namespace
-  keeps the namespace in the plan, with each of its tables as a blocked drop.
-  Deleting every schema file fails the plan instead.
+  drops every table in it. Deleting every schema file fails the plan instead.
+- You onboard an existing database, and some tables have no file yet.
 - Another tool creates a table in the namespace.
 
-The whole database waits on a blocked drop. Every namespace is planned on
-every pull request, so changes in other namespaces wait too. When onboarding,
-declare the existing tables first.
+**The drop is destructive.** It runs only after you approve it with
+`--allow-unsafe`, as a MySQL table drop does. The drop is plain `DROP TABLE`,
+without `CASCADE`, and it cannot be undone.
 
-**To clear it**, do one of these:
+**Only the reviewed table is dropped.** The plan records the table's
+definition. The apply locks the table, compares it with that record, and drops
+nothing if they differ. A table that is already gone is skipped with a
+warning.
 
-- Declare the table in a schema file. A file that matches the live table
-  removes the drop from the plan. `schemabot pull` and `schemabot onboard`
-  write these files for you.
-- Add the table to `ignore_tables`, or its namespace to `ignore_namespaces`.
-- Drop the table through a separately reviewed process.
+**Order.** When one dropped table has a foreign key to another, the
+referencing table is dropped first.
+
+**To keep a table**, declare it in a schema file, or add it to
+`ignore_tables` (or its namespace to `ignore_namespaces`). `schemabot pull` and
+`schemabot onboard` write the files for you. When onboarding, declare the
+existing tables first.
+
+**Drops the plan blocks.** These stay in the plan as blocked drops, and the
+plan Check Run fails:
+
+| The table | Why |
+|---|---|
+| Partitioned, a partition's parent, or in an inheritance hierarchy | The drop reaches tables or rows the plan does not show |
+| Referenced by a foreign key of a table that stays | PostgreSQL refuses the drop without `CASCADE` |
+| In a cycle of foreign keys with other dropped tables | No drop order works |
+
+Declare the table, remove the foreign keys first, or drop the table through a
+separately reviewed process.
+
+**Apply refusals.** A view or other object that depends on the table makes
+the apply fail and drop nothing. Drop or change that object, then apply again.
 
 **Tables the plan does not count:**
 
@@ -747,7 +766,7 @@ A hand-written file can use `CREATE UNLOGGED TABLE`, `PARTITION BY`, and an
 unlogged table needs its own file.
 
 The plan and `pull` list a namespace's tables with the same pg-sprite query,
-so a pulled baseline never leaves out a table that the next plan blocks on.
+so a pulled baseline never leaves out a table that the next plan drops.
 SchemaBot's catalog reads name every catalog object with `pg_catalog.`, so a
 `search_path` that puts a user schema first cannot change their answer.
 
