@@ -701,9 +701,9 @@ rollout's table line counts each target that has not reported by its estimate,
 so the total spans every target and reads as approximate (`Rows: 500 / ~4k`).
 A sharded table rolled up across its shards carries `estimated_bytes` but not
 `estimated_rows`.
-A PostgreSQL concurrent index build reports a whole-build percentage estimated
-from the server's build phase and its counters; it stays below 100 until the
-apply completes and holds its last value between phases (see
+A PostgreSQL concurrent index build reports the whole-build percentage
+pg-sprite estimates from the server's build phase and its counters; it stays
+below 100 until the apply completes and holds its last value between phases (see
 [postgresql.md](postgresql.md)).
 Sharded engines can add per-shard progress, and multi-deployment applies list
 operations with their deployment, target, state, and cutover policy. A rollout's

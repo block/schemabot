@@ -212,16 +212,15 @@ published, all six counters — `blocks_done`, `blocks_total`, `tuples_done`,
 included: a zero is a reading, and an absent key means PostgreSQL has not
 published a row. PostgreSQL scopes block and tuple counters to phases, but a
 completed phase's values can persist into the next phase. The completed heap
-scan's block counters remain visible while live tuples are sorted, so that
-sorting phase's zero-width band absorbs the carry-over and reports its start.
+scan's block counters remain visible while live tuples are sorted, so the
+counters are read together with `server_phase`, never on their own.
 
 Table progress during a concurrent index build is a whole-build estimate, not
-a phase ratio. Each server phase owns a fixed band of the 0–100 scale in
-PostgreSQL's documented phase order, a phase with block or tuple counters
-interpolates within its band, and a waiting or sorting phase reports the
-band's start. The estimate stays below 100 until the apply completes and never
-moves backwards within a build; a poll that finds no progress row — between
-phases, or while the view cannot be read — keeps the last derived percent.
+a phase ratio. pg-sprite derives it from the server phase and its counters,
+and SchemaBot reports it as a whole number rounded down, so it stays below 100
+until the apply completes. It never moves backwards within a build; a poll
+for which pg-sprite reports no percent — between phases, in a phase it does
+not know, or while the view cannot be read — keeps the last one.
 
 A multi-statement plan — several tables changed, or one declarative edit that
 the planner expands into several steps — is not applied atomically. The
