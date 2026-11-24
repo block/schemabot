@@ -185,8 +185,10 @@ Now run the original command again, with or without `--override`, and the
 change runs. In the watch view, press **Enter** again for a held `cutover` or
 a waiting deploy.
 
-`--override` works the same on `start` and `cutover`. It needs a verified
-caller: a request through a port-forward or another unverified lane is
+`--override` works the same on `start` and `cutover`. A CLI or API
+`rollback` has none: the freeze holds it until the freeze ends or is lifted,
+and a rollback from the pull request is never held. `--override` needs a
+verified caller: a request through a port-forward or another unverified lane is
 refused, because nobody could tell who asked.
 
 ### From a pull request
@@ -202,19 +204,20 @@ schemabot apply -e production --override "Hotfix: checkout needs the gift_note c
 The same flag works on `apply-confirm`, `start` and `cutover`. SchemaBot
 records the request for you and the PR author, and its comment names the
 request and the teams that may approve it. An approver comments on the same
-pull request:
+pull request with the approve command from that comment. On a repository that
+several SchemaBot deployments serve, that command already includes the right
+`-t <tenant>`; copy it as is:
 
 ```text
 schemabot freeze approve ovr-8c41d2e9a7f03b56
 ```
 
 SchemaBot replies with who approved which change. Then comment the original
-command again. On a repository that several SchemaBot deployments serve, the
-refusal's command already includes the right `-t <tenant>`; copy it as is.
+command again.
 
 ### What an approval covers
 
-- **One change:** the action (`apply`, `start` or `cutover`) and the target it was asked for. A different plan for the same database needs its own request.
+- **One change:** the action (`apply`, `start` or `cutover`) and what it acts on. For an apply, that is the schema each member is asked to reach, not the plan, because running the command again plans afresh. A different schema for the same database needs its own request.
 - **One person:** the requester. Anyone else whose change the freeze holds asks for their own.
 - **Only the freezes that refused it.** If another freeze starts before you run the command again, the approval no longer covers every freeze in the way, and the change is refused again.
 - **At most 24 hours.** Within that window the requester may use it more than once, for example to start the same apply again after a stop. An expired request can't be approved; ask again.
@@ -401,8 +404,9 @@ The change is still refused, and the refusal now carries the recorded
 ```
 
 `target_id` names exactly what the approval covers: for an apply, the database
-and a digest of the plan each member runs; for a start or cutover, the apply.
-Treat it as opaque.
+and a digest of the schema each member is asked to reach (its schema files and
+the tables it ignores or drops); for a start or cutover, the apply. Treat it
+as opaque.
 
 A freeze approver other than the requester approves it, with no body:
 
@@ -438,7 +442,7 @@ Every error has the standard body, `{"error": "...", "error_code": "..."}`.
 | Status | When |
 |---|---|
 | `400` (`invalid_request`) | A missing `environment` or `reason`, an unknown field, a bad time, a planned freeze with no end, an end in the past, or an override reason over 500 characters. |
-| `403` | Asking for or approving an override as an unverified caller, or approving your own request. |
+| `403` | Setting or lifting a freeze without freeze write access; approving an override without being a freeze approver (`write_groups` alone is not enough); asking for or approving an override as an unverified caller; or approving your own request. |
 | `404` (`not_found`) | No freeze or override request with that ID. |
 | `409` | `change_gate_refused`, or a lift of a freeze already lifted or ended, or an approval of a request already approved, expired, or asked for on a pull request. |
 | `500`, `503` | `change_gate_unavailable` or `storage_error`: SchemaBot could not read or write its freeze storage. Nothing changed. Retry with backoff. |
@@ -449,7 +453,7 @@ Every error has the standard body, `{"error": "...", "error_code": "..."}`.
 |---|---|
 | Scope | An environment, such as `production`. Databases and deployments narrow it. Without them it covers the whole environment. |
 | Kind | `on_demand` starts now, or at `--start`, and holds until someone lifts it, or until `--end` if you give one. `planned` starts at `--start` and needs `--end`. |
-| Held | A new `apply`, a `start` of a stopped or waiting apply, and a `cutover`. |
+| Held | A new `apply`, a `start` of a stopped or waiting apply, a `cutover`, and a CLI or API `rollback`. A CLI or API rollback has no override: lift the freeze, or roll back from the pull request instead. |
 | Not held | `stop`, `cancel`, `revert`, and a pull request rollback. Those make a change smaller or safer, so a freeze never blocks them. |
 | Running work | Applies that started before the freeze keep running, unless the freeze [stops them](#stop-work-that-is-already-running). |
 | Several freezes | A change is held while any freeze covers it. Each freeze holds until it ends or is lifted. |
@@ -532,7 +536,7 @@ Recognize a refusal by its signal, not its wording:
 
 - **CLI:** exit code 1 with the `❄️ <environment> is frozen` line, and nothing started.
 - **API:** `409` with `error_code: "change_gate_refused"`. Read `blockers` for the freezes.
-- **Pull request:** a comment headed `Blocked by a Freeze`, and the plan comment says it was not applied.
+- **Pull request:** a comment whose heading starts with `❄️` and contains `Blocked by`: `Blocked by a Freeze` for one freeze, `Blocked by Freezes` for several. The plan comment also says the change was not applied.
 
 When a freeze refuses a change, the agent:
 

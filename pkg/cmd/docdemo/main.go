@@ -324,7 +324,7 @@ func freezeDemo() Demo {
 	freeze := apitypes.Freeze{
 		ID: "freeze-abc", Environment: "production", Kind: "on_demand", Running: "continue",
 		StartsAt: time.Date(2026, 1, 15, 14, 30, 0, 0, time.UTC), Reason: "Holiday code freeze",
-		CreatedBy: "alice", Source: "cli", InEffect: true,
+		CreatedBy: "alice", Source: "manual", InEffect: true,
 	}
 	created := capture(func() { t.WriteFreezeCreated(freeze) })
 	refused := capture(func() {
