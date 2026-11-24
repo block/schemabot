@@ -37,7 +37,7 @@ func newE2EHandlerWithConfigDirHints(t *testing.T, svc *api.Service, client *gh.
 	installClient := ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")
 	installClient.SetConfigDirHints(svc.Config())
 	factory := &fakeClientFactory{client: installClient}
-	return NewHandler(svc, factory, nil, logger)
+	return NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 }
 
 // setupFakeGitHubForPlanOnTruncatedRepo simulates the GitHub API of a

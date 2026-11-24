@@ -48,7 +48,7 @@ func TestDurablePushWebhookQueuesAndAcks(t *testing.T) {
 		Repos: map[string]api.RepoConfig{"octocat/hello-world": {}},
 	}, nil, logger)
 	clientFactory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
-	h := NewHandler(service, clientFactory, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, clientFactory, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	req := buildPushWebhookRequest(t, "refs/heads/main", "pushsha123", false)
 	req.Header.Set(headerDeliveryID, "delivery-push-1")
@@ -81,7 +81,7 @@ func TestDurablePushWebhookCanonicalizesRepository(t *testing.T) {
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{"mixedcase/sample-repo": {}},
 	}, nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	req := buildPushWebhookRequest(t, "refs/heads/main", "MixedCaseSHA", false)
 	body, err := io.ReadAll(req.Body)
@@ -108,7 +108,7 @@ func TestDurablePushWebhookIgnoresFeatureBranch(t *testing.T) {
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{"octocat/hello-world": {}},
 	}, nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	req := buildPushWebhookRequest(t, "refs/heads/feature-branch", "pushsha123", false)
 	req.Header.Set(headerDeliveryID, "delivery-push-1")

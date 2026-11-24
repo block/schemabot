@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -716,26 +717,51 @@ func unscopedCommandFansOut(result CommandResult) bool {
 // failure would leave the record claiming they were shown something they never
 // saw.
 func (h *Handler) postCommentReportingError(repo string, pr int, installationID int64, body string) error {
+	_, err := h.postCommentReportingID(repo, pr, installationID, body)
+	return err
+}
+
+// postCommentReportingID is postCommentReportingError for a caller that may
+// edit the comment later, so it also returns the posted comment's ID.
+func (h *Handler) postCommentReportingID(repo string, pr int, installationID int64, body string) (int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
-		return fmt.Errorf("create GitHub client to comment on %s#%d: %w", repo, pr, err)
+		return 0, fmt.Errorf("create GitHub client to comment on %s#%d: %w", repo, pr, err)
 	}
 
-	if _, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, "", body)); err != nil {
-		return fmt.Errorf("post comment on %s#%d: %w", repo, pr, err)
+	commentID, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, "", body))
+	if err != nil {
+		return 0, fmt.Errorf("post comment on %s#%d: %w", repo, pr, err)
 	}
-	return nil
+	return commentID, nil
 }
 
-// postComment posts a comment on a PR, best effort.
+// postComment posts a comment on a PR, best effort. On a listen-only
+// repository the GitHub client refuses the write by design, so that refusal
+// is logged at Info rather than as a failure; the GitHub request metric also
+// counts it as suppressed.
 func (h *Handler) postComment(repo string, pr int, installationID int64, body string) {
-	if err := h.postCommentReportingError(repo, pr, installationID, body); err != nil {
+	h.postCommentBestEffortID(repo, pr, installationID, body)
+}
+
+// postCommentBestEffortID is postComment for a caller that may edit the comment
+// later. It returns the posted comment's ID, or zero when the post did not
+// land, which the caller treats as nothing to edit.
+func (h *Handler) postCommentBestEffortID(repo string, pr int, installationID int64, body string) int64 {
+	commentID, err := h.postCommentReportingID(repo, pr, installationID, body)
+	switch {
+	case err == nil:
+	case errors.Is(err, ghclient.ErrListenOnlyRepository):
+		h.logger.Info("comment not posted: repository is listen-only",
+			"repo", repo, "pr", pr, "installation_id", installationID)
+	default:
 		h.logger.Error("failed to post comment",
 			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)
 	}
+	return commentID
 }
 
 // postAndTrackComment creates a PR comment and stores its ID in apply_comments.

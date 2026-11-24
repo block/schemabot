@@ -719,7 +719,10 @@ keyspace's finalizer, and the response sets `sharded: true`. Its `tables` are
 then rolled up across the shards: one entry per keyspace table, with `status`
 the shard state that needs attention first, `rows_copied` and `rows_total`
 summed over the shards that have reported a total, and `shards` listing each
-shard's own state and rows. `estimated_bytes` is the table's planned size
+shard's own state and rows. A shard sets `copies_no_rows: true` when every
+change it runs on the table copies no rows (a `CREATE TABLE`, a `DROP TABLE`,
+or an instant `ALTER`), so a running shard reads as applying rather than as a
+table copy. `estimated_bytes` is the table's planned size
 across all its shards, and `planned_shards` the number of shards the plan
 recorded it spanning. A shard whose wave has not started reports its
 operation's state and no rows. A table on its keyspace's only shard keeps its
@@ -772,9 +775,12 @@ a data plane that fails the read or does not answer. Retry after a short wait.
 If it keeps failing, the cause is in the server logs and can be a configuration
 error that only an operator can fix. A server with no configuration for the
 apply's deployment answers `404` with `error_code` `deployment_not_found`, which
-retrying does not fix.
+retrying does not fix. When the server cannot read the apply or its tasks from
+its own storage, or the apply has no deployment recorded, the route answers
+`500` with `error_code` `storage_error` and a fixed message that names the apply
+and leaves the cause in the server logs; clients retry it as a transient failure.
 `schemabot status <apply_id>` prints "No schema change found" only for the
-unknown `apply_id`. It reports the other two answers as errors and exits
+unknown `apply_id`. It reports every other error answer as an error and exits
 non-zero.
 
 <details>
@@ -1828,6 +1834,15 @@ and the server logs a warning naming the entry. The plan request carries the
 entries as `drop_tables`, and they are persisted with the plan, so a resume or
 drift check of that plan proposes the same drops.
 
+A `drop_tables` entry that names no live table on the target plans nothing.
+The planner reports it in `unmatched_drop_tables`, in the order the config
+lists the entries, and the PR comment and CLI print one line per entry for the
+first 20 and count the rest in one more line. On a plan with a `rollout`, the
+field describes the primary target only, and neither the PR comment nor the
+CLI prints it. Like
+`exempt_tables`, the field is carried on the response to the plan request only
+and is omitted when every entry matched.
+
 Response excerpt from the plan request (illustrative values):
 
 ```json
@@ -1846,8 +1861,18 @@ Response excerpt from the plan request (illustrative values):
       "tables": ["events_archive_2025_01", "orders_archive_2024"],
       "reason": "archive naming"
     }
-  ]
+  ],
+  "unmatched_drop_tables": ["_orders_olds"]
 }
+```
+
+`schemabot plan` prints the same plan's disclosure lines as:
+
+```text
+ℹ️  Ignored tables in namespace app (leading underscore): _orders_old
+ℹ️  Ignored tables in namespace app (archive naming): events_archive_2025_01, orders_archive_2024
+
+⚠️  drop_tables entry "_orders_olds" names no table on the target, so this plan drops nothing for it. Fix the name, or remove the entry if the table is already gone.
 ```
 
 The list defaults to 20 plans per page and caps a page at 200, newest first.

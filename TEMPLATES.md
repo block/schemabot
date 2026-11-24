@@ -648,6 +648,25 @@ DROP TABLE `_events_old`;
 </details>
 
 <details>
+<summary><a name="mysql-plan-drop-tables-entry-names-no-table"></a><strong>MySQL Plan (Drop Tables Entry Names No Table)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+✅ **No schema changes detected**
+
+ℹ️ Ignored tables in namespace `testapp` (leading underscore): `_events_old`
+
+⚠️ `drop_tables` entry `_events_olds` names no table on the target, so this plan drops nothing for it. Fix the name, or remove the entry if the table is already gone.
+
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-many-lint-warnings"></a><strong>MySQL Plan (Many Lint Warnings)</strong></summary>
 
 
@@ -910,7 +929,7 @@ schemabot plan -e staging
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
-ALTER TABLE users ALTER COLUMN email TYPE bigint;
+ALTER TABLE users ADD COLUMN order_ref text UNIQUE;
 ```
 
 ```sql
@@ -918,7 +937,7 @@ ALTER TABLE orders ADD COLUMN notes text;
 ```
 
 ⛔ **Cannot apply**: 1 change the engine refuses to execute
-- `users`: statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned
+- `users`: statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change
   - statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit
 
 An apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
@@ -1347,7 +1366,7 @@ schemabot apply -e staging
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
-ALTER TABLE users ALTER COLUMN email TYPE bigint;
+ALTER TABLE users ADD COLUMN order_ref text UNIQUE;
 ```
 
 ```sql
@@ -1359,7 +1378,7 @@ ALTER TABLE orders ADD COLUMN notes text;
 ---
 
 **⛔ Apply rejected**: 1 planned change the engine refuses to execute
-- `users`: statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned
+- `users`: statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change
   - statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit
 
 Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
@@ -4628,6 +4647,111 @@ schemabot apply-confirm -e staging
 🔓 To discard this plan and unlock, comment:
 ```
 schemabot unlock
+```
+
+</details>
+
+<details>
+<summary><a name="schema-change-apply-refused-by-a-change-gate"></a><strong>Schema Change Apply (Refused By A Change Gate)</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔓 **Lock released**
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+**Not applied** — see the comment below for why.
+
+</details>
+
+<details>
+<summary><a name="schema-change-apply-refused-by-a-change-gate-refusal-not-posted"></a><strong>Schema Change Apply (Refused By A Change Gate, Refusal Not Posted)</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+**Not applied** — a change gate refused this apply, and SchemaBot could not post why.
+
+Commenting the apply again retries it. If the gate still refuses it, SchemaBot posts why. If the gate now allows it, **the apply starts**.
+
+To retry, comment:
+```
+schemabot apply -e staging
 ```
 
 </details>
@@ -11264,7 +11388,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-**Status**: In Progress — 1 of 4 changes applied
+**Status**: In Progress — 1 of 4 changes applied (done on 1 of 6 shards)
 
 **Shards**: 1 completed, 1 running table copy, 4 waiting for cdb_resolute_lookup/-
 

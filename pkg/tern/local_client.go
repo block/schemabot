@@ -1624,6 +1624,9 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 			PlanId:       result.PlanID,
 			Engine:       c.protoEngine(),
 			ExemptTables: protoExemptTables(result.ExemptTables),
+			// An entry that names no table drops nothing, so a clean plan
+			// is also where it has to be reported.
+			UnmatchedDropTables: result.UnmatchedDropTables,
 		}, nil
 	}
 
@@ -1666,13 +1669,14 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 
 	changes, violations, protoShards := c.planResultToProtoChanges(result)
 	return &ternv1.PlanResponse{
-		PlanId:         result.PlanID,
-		Engine:         c.protoEngine(),
-		Changes:        changes,
-		LintViolations: violations,
-		Shards:         protoShards,
-		ExistingCopies: c.protoExistingCopies(result, c.runningCopiesForPlan(ctx, result, req.Environment, localPlanTarget(req, c.config.Database))),
-		ExemptTables:   protoExemptTables(result.ExemptTables),
+		PlanId:              result.PlanID,
+		Engine:              c.protoEngine(),
+		Changes:             changes,
+		LintViolations:      violations,
+		Shards:              protoShards,
+		ExistingCopies:      c.protoExistingCopies(result, c.runningCopiesForPlan(ctx, result, req.Environment, localPlanTarget(req, c.config.Database))),
+		ExemptTables:        protoExemptTables(result.ExemptTables),
+		UnmatchedDropTables: result.UnmatchedDropTables,
 	}, nil
 }
 
@@ -2040,17 +2044,17 @@ func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanReques
 		// shape, so refuse rather than emit a plan that proposes dropping the
 		// namespace the config says to leave alone.
 		if len(req.GetIgnoredNamespaces()) > 0 {
-			return nil, fmt.Errorf(
+			return nil, &engine.PlanRefusedError{Err: fmt.Errorf(
 				"ignore_namespaces is not supported for MySQL targets whose DSN names a database: the whole database is diffed as one unit, so ignored namespaces %v would have their live tables planned as DROP TABLE; use a namespace-free target DSN or remove ignore_namespaces",
-				req.GetIgnoredNamespaces())
+				req.GetIgnoredNamespaces())}
 		}
 		// A namespace the target's entry does not select is withheld the same
 		// way, so its live tables, still on this database until moved, would be
 		// planned as drops too.
 		if len(req.GetUnselectedNamespaces()) > 0 {
-			return nil, fmt.Errorf(
+			return nil, &engine.PlanRefusedError{Err: fmt.Errorf(
 				"a targets entry that selects namespaces is not supported for MySQL targets whose DSN names a database: the whole database is diffed as one unit, so unselected namespaces %v would have their live tables planned as DROP TABLE; use a namespace-free target DSN or remove the entry's namespaces list",
-				req.GetUnselectedNamespaces())
+				req.GetUnselectedNamespaces())}
 		}
 		return c.planNamespaceWithEngine(ctx, eng, req, database, schemaFiles, c.credentials())
 	}
@@ -2106,7 +2110,7 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 
 	// Copies are checked only when every namespace's plan checked its own.
 	result := &engine.PlanResult{PlanID: engine.NewPlanID(), NoChanges: true, ExistingCopiesChecked: true}
-	for _, namespace := range namespaces {
+	for i, namespace := range namespaces {
 		creds, err := c.credentialsForMySQLNamespace(namespace)
 		if err != nil {
 			return nil, err
@@ -2120,6 +2124,16 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 		result.ExistingCopies = append(result.ExistingCopies, nsResult.ExistingCopies...)
 		result.ExistingCopiesChecked = result.ExistingCopiesChecked && nsResult.ExistingCopiesChecked
 		result.ExemptTables = append(result.ExemptTables, nsResult.ExemptTables...)
+		// Every namespace is planned with the whole drop_tables list, so an
+		// entry is unmatched only when no namespace's database has the table:
+		// one that names a table in any of them plans a drop there.
+		if i == 0 {
+			result.UnmatchedDropTables = slices.Clone(nsResult.UnmatchedDropTables)
+		} else {
+			result.UnmatchedDropTables = slices.DeleteFunc(result.UnmatchedDropTables, func(entry string) bool {
+				return !slices.Contains(nsResult.UnmatchedDropTables, entry)
+			})
+		}
 		if !nsResult.NoChanges || len(nsResult.Changes) > 0 {
 			result.NoChanges = false
 		}
@@ -3254,7 +3268,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	// This runs before the blocked and unsafe-change gates so they judge the
 	// verdicts this shard's re-plan set.
 	if scope.shard != "" {
-		if err := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope, append(apply.LogAttrs(), "operation_key", operationKey)); err != nil {
+		if err := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope); err != nil {
 			return c.replayConcurrentAttachOrFail(ctx, req, apply, operationKey,
 				fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err))
 		}
@@ -3388,7 +3402,7 @@ func (c *LocalClient) replayConcurrentAttachOrFail(ctx context.Context, req *ter
 		return nil, errors.Join(verifyErr, fmt.Errorf("re-read operation %s after its drift check failed: %w", operationKey, err))
 	}
 	if winner == nil {
-		c.logger.Warn("Apply: refusing shard dispatch whose drift check failed; dispatch is rejected",
+		c.logger.Warn("Apply: refusing shard dispatch that failed its check against the live schema; dispatch is rejected",
 			append(apply.LogAttrs(),
 				"operation_key", operationKey,
 				"idempotency_key", req.IdempotencyKey,
@@ -3570,7 +3584,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			"environment", req.Environment,
 			"idempotency_key", req.IdempotencyKey,
 		}
-		if verifyErr := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope, dispatchAttrs); verifyErr != nil {
+		if verifyErr := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope); verifyErr != nil {
 			// A same-key dispatch that created the apply while this one was
 			// between its key lookup and its re-plan may already have run the
 			// change, and then the re-plan no longer lists it and reads as
@@ -3590,7 +3604,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 					append(existing.LogAttrs(), "idempotency_key", req.IdempotencyKey, "shard", scope.shard)...)
 				return c.dispatchIntoExistingApply(ctx, req, existing, plan, scope, "create_race")
 			}
-			c.logger.Warn("Apply: refusing shard dispatch whose drift check failed; dispatch is rejected",
+			c.logger.Warn("Apply: refusing shard dispatch that failed its check against the live schema; dispatch is rejected",
 				append(dispatchAttrs, "plan_id", req.PlanId, "shard", scope.shard, "error", verifyErr)...)
 			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, verifyErr)
 		}

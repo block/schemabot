@@ -96,7 +96,7 @@ func TestRefreshChecksForTerminalApplyPublishesOnPRHead(t *testing.T) {
 	ghc.BaseURL, err = url.Parse(server.URL + "/")
 	require.NoError(t, err)
 	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghc, logger)}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-terminal-head-publish",

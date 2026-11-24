@@ -48,3 +48,16 @@ func throttleSignalTip(part string) string {
 	}
 	return ""
 }
+
+// ThrottledSuffix annotates a paced-phase header when the engine's throttler
+// is holding the phase back, so a slow bar reads as deliberate backpressure —
+// slowed, not stopped — right where the eye checks progress, and never to be
+// confused with an operator stop. The drive clears the stored flag when the
+// throttle lifts, so the annotation disappears on the next refresh. The CLI
+// and the PR comment append it to the same headers.
+func ThrottledSuffix(throttled bool) string {
+	if !throttled {
+		return ""
+	}
+	return " (throttled)"
+}

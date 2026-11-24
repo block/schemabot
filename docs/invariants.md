@@ -300,7 +300,8 @@ operator's typo rather than a peer on a different release, and ignoring it would
 *Enforced:* the additive-only proto and storage-schema rules, checked before a tag
 ([release.md](release.md)); strict decoding on the HTTP API handlers
 (`pkg/api/control_handlers.go`, `pkg/api/freeze_handlers.go`, `pkg/api/lock_handlers.go`,
-`pkg/api/plan_handlers.go`, `pkg/api/settings_handlers.go`, `pkg/api/storage_schema_handlers.go`) and on config load
+`pkg/api/plan_handlers.go`, `pkg/api/settings_handlers.go`, `pkg/api/storage_schema_handlers.go`,
+`pkg/api/webhook_ops_handlers.go`) and on config load
 (`pkg/api/config.go`).
 
 ### AV-7: An acknowledged delivery is a promise
@@ -493,7 +494,9 @@ waiting out a boot budget measured in minutes for a database the instance will n
 way down, every wait on background work carries a bound of its own, so shutdown ends when those
 bounds are spent rather than when the slowest goroutine decides to return. An instance that cannot
 finish starting exits non-zero rather than lingering, so the platform restarts it instead of
-routing to it.
+routing to it. An instance that cannot take every port it serves on exits before it serves
+anything, claims work, registers its drivers or runs a repair pass, so its exit leaves nothing
+for a peer to take back.
 
 Stopping at a bound is safe because the instance is on its way out and nothing abandoned at one is
 lost: the work left behind stops when the process does, so the target it still holds is released by
@@ -510,7 +513,8 @@ a routine restart becomes an interrupted schema change with no bound on how long
 locked. *Enforced:* the bounded waits on the close path (`pkg/drain`, used by `pkg/api/operator.go`,
 `pkg/api/shutdown.go`, `pkg/webhook/durable_dispatch.go`, and `pkg/serve/serve.go`) and the
 signal-scoped startup context (`pkg/serve/serve.go`, `pkg/cmd/commands/serve.go`), which reaches an
-in-flight storage convergence as the deliberate stop AV-13 permits.
+in-flight storage convergence as the deliberate stop AV-13 permits; binding every listener before
+any serves or `Server.Start` runs (`serveUntilShutdown` in `pkg/serve/serve.go`).
 
 ### AV-15: A pull request's GitHub cost grows with its schema inputs, not with the rest of the PR
 
@@ -750,10 +754,11 @@ that would clear the block without the divergence behind it being addressed.
 
 *Enforced:* stale-check reconciliation (`pkg/webhook/check_records.go`), aggregate re-evaluation
 (`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), the re-plan a settled
-apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`), and
+apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`),
 the plan that settles the rows a database left on earlier commits under an old type, and removes
 those it left in an environment it no longer has, which no later plan would store again (`settleLeftBehindChecks` in
-`pkg/webhook/pull_request.go`).
+`pkg/webhook/pull_request.go`), and the durable delivery retry that re-runs a plan refused by the
+GitHub quota reserve once the quota resets (`pkg/webhook/durable_dispatch.go`).
 A concurrent stale publication can leave an obsolete blocker without arming these retries;
 that case requires another fold ([publication concurrency](check-runs.md#publication-concurrency)).
 
@@ -1934,9 +1939,11 @@ those changes: when that comment cannot be posted, `rollback` withdraws its pin 
 `LockStore.ClearPendingPlanID`). On the data plane, apply admission requires the opt-in for the
 applying deployment's own re-planned unsafe verdicts, stamped onto the materialized plan and the
 dispatch scope, a shard dispatch attaching or creating from a stored plan row re-planned against
-its own shard and stamped with that shard's verdict, and a shard dispatch this deployment could
-not re-plan (it carries no schema files) treated as unsafe
-(`verifyShardDispatchAgainstLiveSchema` and `restoreDispatchedUnsafeVerdicts` in
+its own shard and stamped with that shard's verdict, and a shard dispatch this deployment cannot
+re-plan (it carries no schema files) refused before any of its work is admitted, whether it
+attaches, creates from a stored plan row or materializes the plan
+(`refuseShardDispatchWithoutSchemaFiles`, `verifyShardDispatchAgainstLiveSchema` and
+`restoreDispatchedUnsafeVerdicts` in
 `pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeDDLChangesWithoutOptIn` in
 `pkg/tern/local_client.go`), and the applying deployment's own re-planned VSchema deletions and
 mutations added to the ones the dispatch carried (`stampReplannedVSchema` in
@@ -1955,9 +1962,10 @@ belongs to the target that will run the statement: a deployment that applies a p
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
 planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the
 privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS admission refusals
-in `pkg/engine/postgres/row_security.go` and enum type refusals and blocked label additions
-in `pkg/engine/postgres/enum_type.go` that abort plan creation or mark the plan blocked, and the apply-time gate in
-`pkg/engine/postgres/row_security_apply.go`); the whole-plan
+in `pkg/engine/postgres/row_security.go` and enum type refusals, the type privilege gate, and
+blocked label additions in `pkg/engine/postgres/enum_type.go` that abort plan creation or mark the
+plan blocked, and the apply-time gates in `pkg/engine/postgres/row_security_apply.go` and
+`pkg/engine/postgres/enum_type_apply.go`); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
 path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), and for a shard dispatch attaching
 to an existing apply or creating one from a stored plan row its re-planned scope
@@ -2105,7 +2113,8 @@ allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), 
 resolver identity assertions (`pkg/inventory/overrides.go`), discovery scoped to the
 configured inventory environment (`pkg/etre/resolver.go`), rollout member selection
 (`pkg/api/rollout_member_selector.go`, `applyTargets` in `pkg/api/plan_handlers.go`), the PostgreSQL
-apply's check that planned DDL names the schema it targets (`pkg/engine/postgres/apply.go`), and
+apply's check that planned DDL names the schema it targets (`pkg/engine/postgres/apply.go`, and
+`validateEnumValueAdd` in `pkg/engine/postgres/enum_type_apply.go` for an enum label addition), and
 source policy (`pkg/webhook/schema_source_policy.go`).
 
 ### AZ-2: Authorization fails closed at every tier
@@ -2122,7 +2131,10 @@ classification (`pkg/auth/tiers.go`), with structural sweep tests over the route
 
 ### AZ-3: Identity comes from a verified lane
 
-Forwarded identity headers are trusted only from explicitly listed proxies, a gateway-verified
+Forwarded identity headers are trusted only from explicitly listed proxies. A user identity
+forwarded from a loopback source other than a listed mesh sidecar address, such as a
+port-forward, is admitted but never verified; listing a mesh sidecar address trusts every process
+in the pod's network namespace like the proxy. A gateway-verified
 service caller never reaches the write tier by self-asserting user headers, and every write and
 control action is attributed to the verified caller rather than to any client-supplied caller
 string. A client-supplied string never proves ownership either: a scoped operator releases a lock

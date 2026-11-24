@@ -76,6 +76,18 @@ type ForwardAuthConfig struct {
 	// ReadServiceSPIFFE lists caller SPIFFE IDs granted read-tier access
 	// through a trusted gateway. Service callers never get the write tier.
 	ReadServiceSPIFFE []string
+
+	// TrustedMeshLoopbackSources lists loopback addresses that a service-mesh
+	// sidecar uses as the source of the requests it delivers, such as Istio's
+	// 127.0.0.6 when the sidecar delivers to the pod IP. A request from
+	// one of them that passed the SPIFFE check is treated as proxied, so its
+	// identity is verified. A request from any other loopback address, such as
+	// a kubectl port-forward from 127.0.0.1, stays on the break-glass lane (see
+	// reasonLoopbackSource). Each entry must be a single loopback IP other than
+	// 127.0.0.1 and ::1, and the list requires TrustedProxySPIFFE. Empty, the
+	// default, treats every loopback source as break-glass. (Istio's IPv6
+	// source, ::6, is not a loopback address, so it never needs listing.)
+	TrustedMeshLoopbackSources []string
 }
 
 // ForwardAuthAuthorizer authenticates requests from an authenticating reverse
@@ -124,6 +136,7 @@ type ForwardAuthAuthorizer struct {
 	gatewaySPIFFE     []string
 	callerHeader      string
 	readServiceSPIFFE []string
+	meshSources       []net.IP
 	logger            *slog.Logger
 }
 
@@ -222,6 +235,16 @@ func NewForwardAuthAuthorizer(cfg ForwardAuthConfig, logger *slog.Logger) (*Forw
 	if len(gateways) > 0 && len(spiffe) == 0 {
 		return nil, fmt.Errorf("forward_auth trusted_gateway_spiffe requires SPIFFE-anchored proxy trust (trusted_proxy_spiffe): with CIDR-only trust the service-caller lane is unreachable")
 	}
+	meshSources, err := ParseTrustedMeshLoopbackSources(cfg.TrustedMeshLoopbackSources)
+	if err != nil {
+		return nil, err
+	}
+	if len(meshSources) > 0 && len(spiffe) == 0 {
+		return nil, ErrMeshSourcesNeedSPIFFE
+	}
+	if err := CheckMeshSourcesInTrustedNetworks(meshSources, nets); err != nil {
+		return nil, err
+	}
 	if len(gateways) > 0 {
 		logger.Warn("forward-auth honoring gateway-forwarded caller identity: every listed gateway must strip inbound copies of the caller header before setting it from the verified client certificate",
 			"caller_header", callerHeader, "gateways", len(gateways), "read_service_callers", len(readServices))
@@ -239,6 +262,7 @@ func NewForwardAuthAuthorizer(cfg ForwardAuthConfig, logger *slog.Logger) (*Forw
 		gatewaySPIFFE:     gateways,
 		callerHeader:      callerHeader,
 		readServiceSPIFFE: readServices,
+		meshSources:       meshSources,
 		logger:            logger,
 	}, nil
 }
@@ -327,7 +351,7 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 		}
 
 		reason := ""
-		if requestFromLoopback(r) {
+		if a.breakGlassSource(r) {
 			reason = reasonLoopbackSource
 			if tier == TierWrite {
 				// The subject is caller-supplied header input on this path —
@@ -355,19 +379,78 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 // a kubectl port-forward — so its identity headers were supplied by the local
 // caller, not verified by the proxy. The reason lets operators alert on
 // break-glass usage that would otherwise be indistinguishable from proxied
-// traffic.
+// traffic. A configured mesh source (TrustedMeshLoopbackSources) is the
+// exception: the sidecar delivers proxied traffic from it. Listing one trusts
+// every process in the pod's network namespace like the proxy, since any of
+// them can connect from that address. Such a request still needs the proxy's
+// SPIFFE ID in XFCC.
 const reasonLoopbackSource = "loopback_source"
 
-// requestFromLoopback reports whether the request's source address is a
-// loopback IP (see reasonLoopbackSource for why that matters to the trust
-// decision's audit trail).
-func requestFromLoopback(r *http.Request) bool {
+// breakGlassSource reports whether the request came from a loopback address
+// other than a configured mesh source (see reasonLoopbackSource for why that
+// matters to the trust decision). Callers ask only after the request passed
+// the trust check, so a mesh source counts as proxied only for a request whose
+// XFCC carried a trusted SPIFFE ID: the constructor requires SPIFFE trust
+// whenever mesh sources are set.
+func (a *ForwardAuthAuthorizer) breakGlassSource(r *http.Request) bool {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
 	ip := net.ParseIP(strings.TrimSpace(host))
-	return ip != nil && ip.IsLoopback()
+	if ip == nil || !ip.IsLoopback() {
+		return false
+	}
+	return !slices.ContainsFunc(a.meshSources, ip.Equal)
+}
+
+// ErrMeshSourcesNeedSPIFFE refuses mesh sources without SPIFFE trust. A mesh
+// source address does not identify the sender: any process in the pod's
+// network namespace can connect from it. The XFCC SPIFFE check is the only
+// check of who sent the request.
+var ErrMeshSourcesNeedSPIFFE = fmt.Errorf("forward_auth trusted_mesh_loopback_sources requires trusted_proxy_spiffe: any process in the pod can connect from a mesh source address, so only the XFCC SPIFFE check shows who sent the request")
+
+// CheckMeshSourcesInTrustedNetworks refuses a mesh source that the CIDR check
+// would never admit. With trusted_proxy_cidrs set, that check runs before
+// anything else, so a request from a mesh source outside every listed network
+// is refused with a 401 even when its XFCC names the proxy. No networks means
+// SPIFFE-only trust, where every source passes the CIDR step.
+func CheckMeshSourcesInTrustedNetworks(sources []net.IP, nets []*net.IPNet) error {
+	if len(nets) == 0 {
+		return nil
+	}
+	for _, ip := range sources {
+		if !slices.ContainsFunc(nets, func(n *net.IPNet) bool { return n.Contains(ip) }) {
+			return fmt.Errorf("forward_auth trusted_mesh_loopback_sources entry %q is outside every trusted_proxy_cidrs network: the CIDR check runs first, so requests from it would be refused; add %s/32 to trusted_proxy_cidrs", ip.String(), ip.String())
+		}
+	}
+	return nil
+}
+
+// ParseTrustedMeshLoopbackSources parses trusted_mesh_loopback_sources. Each
+// entry must be one loopback IP. 127.0.0.1 and ::1 are refused because a
+// kubectl port-forward arrives from them, so trusting them would verify
+// identity headers the person running the port-forward typed.
+func ParseTrustedMeshLoopbackSources(entries []string) ([]net.IP, error) {
+	var sources []net.IP
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		ip := net.ParseIP(entry)
+		if ip == nil {
+			return nil, fmt.Errorf("forward_auth trusted_mesh_loopback_sources entry %q is not an IP address (list single addresses, not networks)", entry)
+		}
+		if !ip.IsLoopback() {
+			return nil, fmt.Errorf("forward_auth trusted_mesh_loopback_sources entry %q is not a loopback address; a proxy on the network is trusted with trusted_proxy_cidrs", entry)
+		}
+		if ip.Equal(net.IPv4(127, 0, 0, 1)) || ip.Equal(net.IPv6loopback) {
+			return nil, fmt.Errorf("forward_auth trusted_mesh_loopback_sources entry %q is where a kubectl port-forward arrives from; trusting it would verify identity headers the port-forward's caller supplies", entry)
+		}
+		sources = append(sources, ip)
+	}
+	return sources, nil
 }
 
 // authorizeGatewayCaller handles the service-caller lane: a caller-forwarding
@@ -431,7 +514,7 @@ func (a *ForwardAuthAuthorizer) authorizeGatewayCaller(w http.ResponseWriter, r 
 	}
 
 	reason := ""
-	if requestFromLoopback(r) {
+	if a.breakGlassSource(r) {
 		reason = reasonLoopbackSource
 	}
 	authDecision(r, tier, "allow", reason)

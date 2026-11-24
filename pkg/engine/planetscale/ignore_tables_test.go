@@ -132,6 +132,7 @@ func TestWithholdIgnoredTablesRefusesDeclaredTable(t *testing.T) {
 	assert.Contains(t, err.Error(), "flyway_schema_history")
 	assert.Contains(t, err.Error(), `namespace "commerce"`)
 	assert.Contains(t, err.Error(), "Remove the entry or the schema file")
+	assert.True(t, engine.IsPlanRefused(err), "the schema files are refused as written, not the engine failing")
 
 	assert.Equal(t, []string{"flyway_schema_history"}, tableSchemaNames(currentSchema["commerce"]),
 		"a refused plan leaves the live schema as it found it")

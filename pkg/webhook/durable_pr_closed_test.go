@@ -65,7 +65,7 @@ func TestDurablePRClosedWebhookQueuesAndAcks(t *testing.T) {
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{"octocat/hello-world": {}},
 	}, nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "closed", merged: true}, nil)
 	req.Header.Set(headerDeliveryID, "delivery-closed-1")
@@ -98,7 +98,7 @@ func TestDurablePRClosedDriverRunsCleanup(t *testing.T) {
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(st, &api.ServerConfig{}, nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
@@ -130,7 +130,7 @@ func TestDurablePRClosedDriverCleansMergedCloseWithoutInstallation(t *testing.T)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(st, &api.ServerConfig{}, nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
@@ -159,7 +159,7 @@ func TestDurablePRClosedDriverRetriesOnApplyLookupFailure(t *testing.T) {
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(st, &api.ServerConfig{}, nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
@@ -193,7 +193,7 @@ func TestDurablePRClosedDriverSkipsCleanupForReopenedPR(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	service := api.New(st, &api.ServerConfig{}, nil, logger)
-	h := NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
@@ -228,7 +228,7 @@ func TestDurablePRClosedDriverRetriesWhenLivePRReadFails(t *testing.T) {
 	factory, _ := prClosedGitHub(t, "closed", http.StatusForbidden)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(st, &api.ServerConfig{}, nil, logger)
-	h := NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
