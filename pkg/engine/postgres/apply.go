@@ -562,23 +562,21 @@ func invalidIndexWordingFor(invalidErr *executor.InvalidIndexError) invalidIndex
 			remedyRest:  ", since it is a partitioned table's index, an index partition, or a constraint's index, or rename the index in the schema file and re-plan",
 		}
 	case executor.CodeDataFault:
-		// The build failed on the table's rows, such as duplicate values
-		// under a unique index. A rerun meets the same rows, so the rows
-		// come first. The server's error is not rendered: it quotes the
-		// offending values.
-		if errors.Is(invalidErr.Cleanup, executor.ErrBuildLeftInvalidIndex) {
-			return invalidIndexWording{
-				causeBefore: "the table's rows violate index ",
-				causeAfter:  ", and the failed build left it invalid on the target",
-				lead:        "correct the rows",
-				remedyRest:  ", then drop the invalid index with DROP INDEX CONCURRENTLY and re-run",
-			}
+		// The build failed on the table's rows: duplicate values under a
+		// unique index, or a value an index expression cannot take. A rerun
+		// meets the same rows, so the rows come first. The rerun's recovery
+		// then removes the invalid index only once pg-sprite proves no build
+		// holds it, so the operator is never sent to drop it by name. The
+		// server's error is not rendered: it quotes the offending values.
+		causeAfter := ", and the failed build left it invalid on the target"
+		if !errors.Is(invalidErr.Cleanup, executor.ErrBuildLeftInvalidIndex) {
+			causeAfter = ", and an invalid index this build could not prove its own holds the name"
 		}
 		return invalidIndexWording{
-			causeBefore: "the table's rows violate index ",
-			causeAfter:  ", and an invalid index this build could not prove its own holds the name",
+			causeBefore: "the table's rows cannot be indexed by index ",
+			causeAfter:  causeAfter,
 			lead:        "correct the rows",
-			remedyRest:  ", then inspect pg_index.indisvalid on the target before removing the invalid index and re-running",
+			remedyRest:  ", then re-run; the rerun removes the invalid index once it proves no build holds it",
 		}
 	default:
 		// CodeInvalidIndexUnproven and any future verdict fail safe with
@@ -1030,14 +1028,21 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 			cause:  fmt.Sprintf("the planned drop on %s would also reach unreviewed partitions or child tables", quotedTable(table)),
 			remedy: "make the drop outside SchemaBot on the whole table tree, then " + replanRemedy}, true
 	case executor.CodeAdoptedIndexDrift, executor.CodeValidatedConstraintDrift,
-		executor.CodeRenamedIndexDrift, executor.CodeDroppedIndexDrift,
-		executor.CodeDroppedObjectDrift:
+		executor.CodeRenamedIndexDrift, executor.CodeDroppedIndexDrift:
 		// The index or constraint the planned statement names changed after
 		// planning — dropped, replaced, left invalid, or now backing a
 		// constraint — read again under the table's lock; nothing was
 		// applied. The plan is stale, so only a re-plan changes the outcome.
 		return &refusal{reason: "planned-object-drift",
 			cause:  fmt.Sprintf("the index or constraint the planned statement for %s names changed after planning", quotedTable(table)),
+			remedy: replanRemedy}, true
+	case executor.CodeDroppedObjectDrift:
+		// The column, constraint, or NOT NULL the planned drop removes no
+		// longer has the definition the plan recorded, read again under the
+		// table's lock; nothing was dropped. The plan is stale, so only a
+		// re-plan changes the outcome.
+		return &refusal{reason: "planned-object-drift",
+			cause:  fmt.Sprintf("the object the planned drop on %s removes changed after planning", quotedTable(table)),
 			remedy: replanRemedy}, true
 	case executor.CodeEnumTypeDrift:
 		// The type name an ADD VALUE spells resolved to a different type

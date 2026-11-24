@@ -1474,7 +1474,7 @@ func executionContractVerdict(execution planner.Execution, table string) (stepVe
 	case planner.ExecutionPartitionedIndexBuild:
 		return stepVerdict{
 			mode:   engine.ExecutionModeBlocked,
-			reason: fmt.Sprintf("statement for table %q builds an index on a partitioned table, which has to be built one partition at a time; SchemaBot's PostgreSQL support does not run that build yet", table),
+			reason: fmt.Sprintf("statement for table %q builds an index on a partitioned table, which has to be built one partition at a time, and SchemaBot does not run that build yet; build it outside SchemaBot one partition at a time, then re-plan", table),
 		}, false
 	default:
 		return stepVerdict{
@@ -1567,11 +1567,14 @@ func rewriteRequiredReason(guidance suggest.Guidance, table string) (string, boo
 		// for the day the planner attaches it here.
 		reason = "drops a column and adds it back, which discards every value the column holds; change the column's type in place with ALTER COLUMN ... TYPE ... USING ..., which converts its values"
 	case suggest.GuidanceAddIntegerPrimaryKey:
-		// Carried by the refusal of a table rebuild on a table with no
-		// primary key. Adding the key would not make the change run here,
-		// since SchemaBot does not run table rebuilds on PostgreSQL yet, so
-		// the sentence names both gaps and sends the change outside
-		// SchemaBot rather than to a re-plan that would refuse it again.
+		// The planner does not attach this code to a statement; pg-sprite's
+		// own run path carries it on its refusal of a table rebuild on a
+		// table with no primary key. The case keeps the mapping complete for
+		// the day the planner attaches it here. Adding the key would not make
+		// the change run here, since SchemaBot does not run table rebuilds
+		// on PostgreSQL yet, so the sentence names both gaps and sends the
+		// change outside SchemaBot rather than to a re-plan that would refuse
+		// it again.
 		reason = rebuildWithoutIntegerKeyReason
 	default:
 		return "", false

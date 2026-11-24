@@ -1104,7 +1104,7 @@ func TestCatalogAndRowRefusalsNameTheirRemedies(t *testing.T) {
 			cause:  `the index or constraint the planned statement for "users" names changed after planning`,
 			remedy: "re-plan against the current schema"},
 		{code: executor.CodeDroppedObjectDrift, reason: "planned-object-drift",
-			cause:  `the index or constraint the planned statement for "users" names changed after planning`,
+			cause:  `the object the planned drop on "users" removes changed after planning`,
 			remedy: "re-plan against the current schema"},
 		{code: executor.CodeDroppedObjectHasDescendants, reason: "dropped-object-has-descendants",
 			cause:  `the planned drop on "users" would also reach unreviewed partitions or child tables`,

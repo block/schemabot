@@ -43,10 +43,11 @@ whose schema the reserved list does not name is pulled as if it were an
 application schema, so select the schema explicitly with `--namespace` when the
 database hosts extensions. Only ordinary and partitioned tables are exported;
 views, materialized views, and foreign tables are not, and partition children
-are not exported separately from their parent.
+are not exported separately from their parent. A partitioned parent is
+exported with its `PARTITION BY` clause and without its partitions.
 
 The pull is refused in full if any selected table cannot round-trip through the
-declarative format. This includes partitioned parents, foreign-key relationships,
+declarative format. This includes foreign-key relationships,
 unlogged tables, explicit collations, and sequence defaults that cannot be
 represented safely, as well as tables carrying objects the format does not
 model at all: triggers, table and column comments, non-default
@@ -244,6 +245,10 @@ server's own timer is what ends an over-long build — and reports completion
 only once the catalog shows the index valid. A build that fails part-way
 leaves an invalid index; the stored failure names it and is retryable, and
 when the bound is what ended the build it names the option to raise. A build
+that fails on the table's rows, such as duplicate values under a unique
+index, is refused instead, because a retry meets the same rows: correct the
+rows, then re-run, and the rerun removes the invalid index once it proves no
+build holds it. A build
 that runs past the bound and provably leaves nothing behind is refused
 permanently, naming the option, because an identical retry would spend the
 same bound again.
@@ -499,7 +504,7 @@ operational process. `schemabot pull` and `schemabot onboard` write the files
 for the tables the plan holds accountable, so onboarding an existing database
 is a pull, not hand-writing every file; the pull refuses a namespace as a
 whole when any of its tables carries objects the format cannot represent
-(triggers, table or column comments, relation options, inheritance, partitioning,
+(triggers, table or column comments, relation options, inheritance,
 or foreign keys on either side), and those tables need a hand-written file or
 a reviewed drop before the rest can be pulled. `CREATE UNLOGGED TABLE`,
 `PARTITION BY` and a child of `INHERITS` flattened to its own columns are all
@@ -632,7 +637,8 @@ change or that depend on the target:
   index built inside one caller-owned envelope under the engine's own
   deadline of the same bound. A build
   that leaves an invalid index behind — including one the bound's timer
-  cancelled — or finds one another backend is visibly still building fails as a
+  cancelled, but not one that failed on the table's rows, which is refused as
+  above — or finds one another backend is visibly still building fails as a
   retryable operational failure naming the index and the next step; the
   invalid index, not the cause that produced it, is the outcome the retry
   acts on, and the next drive recovers the leftover as abandoned. When the
@@ -649,11 +655,13 @@ change or that depend on the target:
   the same naming, as is a build that ran past the bound and provably left
   nothing, whose refusal names `postgres.concurrent_index_max_duration` as
   the option to raise. A
-  parent-level index build on a partitioned table is refused permanently, and
-  so is a target connection pool too small to hold the build's sessions at
-  once — the recovery holds one more session than the build, so a pool sized
-  to the build alone refuses the recovery — since the pool is sized by the
-  target DSN and a retry sees the same pool.
+  parent-level index build on a partitioned table never reaches the apply: the
+  plan blocks it, because the index has to be built one partition at a time
+  and SchemaBot does not run that build yet. A target connection pool too
+  small to hold the build's sessions at once is refused permanently — the
+  recovery holds one more session than the build, so a pool sized to the
+  build alone refuses the recovery — since the pool is sized by the target
+  DSN and a retry sees the same pool.
 - Other operational failures are recorded as retryable when no create-set
   prefix committed and expose a sanitized message; connection and server
   details remain in server logs. A create-set failure after the table commits

@@ -226,7 +226,7 @@ func TestExecutionVerdictEmptyCreateShapeCause(t *testing.T) {
 func TestExecutionVerdictBlocksPartitionedIndexBuild(t *testing.T) {
 	assert.Equal(t, stepVerdict{
 		mode:   engine.ExecutionModeBlocked,
-		reason: `statement for table "events" builds an index on a partitioned table, which has to be built one partition at a time; SchemaBot's PostgreSQL support does not run that build yet`,
+		reason: `statement for table "events" builds an index on a partitioned table, which has to be built one partition at a time, and SchemaBot does not run that build yet; build it outside SchemaBot one partition at a time, then re-plan`,
 	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
 		Disposition: router.DispositionExecute,
 		Route:       planner.RouteNative,

@@ -2296,8 +2296,8 @@ func TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion(t *testing.T) 
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "a build the table's rows violate fails the same way on every rerun")
 	assert.Equal(t, `recovering abandoned invalid index "public"."orders_ref_key" failed: `+
-		`the table's rows violate index "public"."orders_ref_key", and the failed build left it invalid on the target; `+
-		`correct the rows, then drop the invalid index with DROP INDEX CONCURRENTLY and re-run`, progress.ErrorMessage)
+		`the table's rows cannot be indexed by index "public"."orders_ref_key", and the failed build left it invalid on the target; `+
+		`correct the rows, then re-run; the rerun removes the invalid index once it proves no build holds it`, progress.ErrorMessage)
 	assert.NotContains(t, progress.ErrorMessage, "ref-collision", "the server's unique-violation text never reaches the operator surface")
 
 	var valid bool
