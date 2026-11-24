@@ -1346,12 +1346,6 @@ type ApplyStore interface {
 	// came from, so callers deciding whether a record is safe to retire must
 	// treat it as owning.
 	ExistsForDatabaseHead(ctx context.Context, repo string, pr int, database, databaseType, headSHA string) (bool, error)
-
-	// Delete removes an apply by ID.
-	Delete(ctx context.Context, id int64) error
-
-	// DeleteByPR removes all applies for a PR (cleanup on PR close/merge).
-	DeleteByPR(ctx context.Context, repo string, pr int) error
 }
 
 // ApplyOperationWithTasks groups one apply_operations row with the task rows it owns.

@@ -111,9 +111,11 @@ func (s *controlRequestStore) listStrandedPending(ctx context.Context, limit int
 	for _, req := range stranded {
 		parent, ok := parents[req.ApplyID]
 		if !ok {
-			// The apply was deleted between the two reads (PR cleanup races the
-			// reaper). Its requests go with it, so there is nothing left to answer.
-			slog.WarnContext(ctx, "apply disappeared while listing a stranded control request; the request is being deleted with it",
+			// The apply is gone. SchemaBot never deletes an apply and the storage
+			// schema has no foreign keys, so this request was left behind by a
+			// delete from outside SchemaBot. There is no apply to answer for, so
+			// the request stays as it is.
+			slog.WarnContext(ctx, "apply is missing for a stranded control request; the request is left unchanged",
 				"operation", req.Operation, "requested_by", req.RequestedBy)
 			continue
 		}
