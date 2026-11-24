@@ -316,15 +316,20 @@ func stopDemo() stopScenario {
 	return demo
 }
 
-// freezeScenario is an apply a freeze refuses, run again once the freeze is
-// lifted. The refused apply edits its apply comment to say it did not run and
-// posts the refusal below it; the second apply runs as usual.
+// freezeScenario is an apply that asks for a freeze override. The freeze
+// refuses it, so the apply comment says it did not run and the refusal below
+// names the override request. A second person, a freeze approver, approves
+// it, and the author's next apply runs as usual.
 type freezeScenario struct {
 	Command  string   `json:"command"`
 	Plan     string   `json:"plan"`
 	Apply    string   `json:"apply"`
 	Refused  string   `json:"refused"`
 	Refusal  string   `json:"refusal"`
+	Approver string   `json:"approver"`
+	Approve  string   `json:"approve"`
+	Approved string   `json:"approved"`
+	Rerun    string   `json:"rerun"`
 	Progress []string `json:"progress"`
 	Complete string   `json:"complete"`
 	Summary  string   `json:"summary"`
@@ -370,8 +375,13 @@ func singleComment(percent int, elapsed time.Duration, summary bool) string {
 }
 
 func freezeDemo() freezeScenario {
+	const (
+		overrideID = "ovr-123"
+		reason     = "SEV-1234 fix: this index ends the slow orders query"
+		approver   = "monalisa"
+	)
 	demo := freezeScenario{
-		Command: "schemabot apply -e production",
+		Command: `schemabot apply -e production --override "` + reason + `"`,
 		Plan:    singlePlanComment(false, false),
 		Apply:   singlePlanComment(true, false),
 		Refused: singlePlanComment(true, true),
@@ -379,8 +389,18 @@ func freezeDemo() freezeScenario {
 			CommandName: action.Apply, TakesOverride: true, Environment: environment, RequestedBy: requestedBy,
 			Timestamp: startedAt.Format("2006-01-02 15:04:05"),
 			Freezes:   []templates.RefusingFreeze{{ID: "freeze-abc", Reason: "SEV-1234 payments latency"}},
+			Override: &templates.RefusalOverrideRequest{
+				ID: overrideID, Requester: requestedBy, Author: requestedBy, Reason: reason,
+			},
 			Approvers: []string{"example/db-approvers"},
 		}),
+		Approver: approver,
+		Approve:  "schemabot freeze approve " + overrideID,
+		Approved: templates.RenderFreezeOverrideApproved(templates.FreezeOverrideApprovedData{
+			ID: overrideID, Approver: approver, Action: action.Apply, Database: database, Environment: environment,
+			RequestedBy: requestedBy, Reason: reason, ExpiresAt: startedAt.Add(24 * time.Hour),
+		}),
+		Rerun:    "schemabot apply -e production",
 		Complete: singleComment(100, 6*time.Minute, false),
 		Summary:  singleComment(100, 6*time.Minute, true),
 	}

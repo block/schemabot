@@ -214,11 +214,13 @@ records the desired state the databases already run.
   get past a finding that belongs to it
 - **Environment frozen?** The apply is refused and starts no new work. Applies
   that started before the freeze can keep running unless it stops them. The
-  refusal lists the freezes that hold it, up to ten, and counts the rest. Run the same command again once
-  the freeze is lifted, or ask for an override if the change can't wait. See
-  [freeze an environment](freeze.md)
+  refusal lists the freezes that hold it, up to ten, and counts the rest.
+  Run the same command again once the freeze is lifted. If the change can't
+  wait, run it with `--override "<reason>"`: a freeze approver other than you
+  and the PR author approves it on the PR, and your next apply runs. See
+  [freeze an environment](freeze.md#ask-for-an-override)
 
-![A freeze refuses an apply on the PR and nothing changes; after the freeze is lifted, the same command applies the change and the PR merges](../assets/pr-freeze-demo.gif)
+![The PR author asks for an override, the freeze refuses the apply and records the request, a second person approves it, and the next apply runs and the PR merges](../assets/pr-freeze-demo.gif)
 
 See [schema freshness](configuration.md#base-branch-schema-freshness) for how
 the gate scopes these checks to the relevant schema directory.

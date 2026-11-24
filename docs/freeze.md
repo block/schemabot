@@ -22,7 +22,7 @@ launch. While it holds, SchemaBot refuses every new `apply`, `start` and
 freeze [stops them](#what-stop-does-to-running-work). A change that can't wait goes through only
 when a second person approves an override for it.
 
-![Freeze production, an apply that starts nothing while the freeze holds, then lift the freeze and run the same apply to completion](../assets/cli-freeze.gif)
+![Freeze production, an apply the freeze refuses with nothing started, then lift the freeze](../assets/cli-freeze.gif)
 
 This guide is for the people who set freezes, the people whose changes a
 freeze holds, and the agents that work for either. It covers the CLI, the pull
@@ -111,9 +111,7 @@ To ask for an override, run the same command with --override "<reason>".
 ```
 
 On a pull request, SchemaBot posts the refusal as a comment, and the plan
-comment says the change was not applied:
-
-![A freeze refuses an apply on the PR and nothing changes; after the freeze is lifted, the same command applies the change and the PR merges](../assets/pr-freeze-demo.gif)
+comment says the change was not applied.
 
 You have two choices:
 
@@ -154,6 +152,8 @@ approval admits that change and it runs. In the watch view, press **Enter**
 again for a held `cutover` or a waiting deploy.
 
 ### From a pull request
+
+![The PR author asks for an override, the freeze refuses the apply and records the request, a second person approves it, and the next apply runs and the PR merges](../assets/pr-freeze-demo.gif)
 
 Comment the command with the flag:
 

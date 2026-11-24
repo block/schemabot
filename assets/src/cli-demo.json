@@ -923,7 +923,7 @@
     "height": 740,
     "bar": "shop · production",
     "name": "cli-freeze",
-    "title": "Freeze production. Lift it to ship.",
+    "title": "Freeze production during an incident",
     "frames": [
       {
         "seconds": 3,
@@ -947,49 +947,13 @@
         "seconds": 4,
         "command": "",
         "caption": "The freeze refuses it; nothing starts",
-        "output": "╭─────────────────────────────────────────────╮\n│  MySQL Schema Change Apply                  │\n│                                             │\n│  Database: shop                             │\n│  Schema name: schema                        │\n╰─────────────────────────────────────────────╯\n\n\u001b[1mProduction\u001b[0m\n     ~ orders\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n📋 Plan: 1 table to alter\n\n\nDo you want to apply these changes? Only 'yes' will be accepted: yes\n❄️ production is frozen. This change did not start.\n   freeze-abc  SEV-1234 payments latency  (until lifted)\nTo ask for an override, run the same command with --override \"\u003creason\u003e\".\n"
-      },
-      {
-        "seconds": 3,
-        "command": "schemabot unfreeze freeze-abc --reason \"SEV resolved\"",
-        "caption": "The incident is over: lift the freeze",
-        "output": "✓ freeze-abc lifted.\n"
-      },
-      {
-        "seconds": 2,
-        "command": "schemabot apply -s ./schema -e production",
-        "caption": "Run the same apply again",
-        "output": "╭─────────────────────────────────────────────╮\n│  MySQL Schema Change Apply                  │\n│                                             │\n│  Database: shop                             │\n│  Schema name: schema                        │\n╰─────────────────────────────────────────────╯\n\n\u001b[1mProduction\u001b[0m\n     ~ orders\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n📋 Plan: 1 table to alter\n\n\nDo you want to apply these changes? Only 'yes' will be accepted: ▌"
-      },
-      {
-        "seconds": 0.8,
-        "command": "",
-        "caption": "",
-        "output": "╭─────────────────────────────────────────────╮\n│  MySQL Schema Change Apply                  │\n│                                             │\n│  Database: shop                             │\n│  Schema name: schema                        │\n╰─────────────────────────────────────────────╯\n\n\u001b[1mProduction\u001b[0m\n     ~ orders\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n📋 Plan: 1 table to alter\n\n\nDo you want to apply these changes? Only 'yes' will be accepted: yes"
-      },
-      {
-        "seconds": 1.5,
-        "command": "",
-        "caption": "With no freeze in effect, the apply starts",
-        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 10.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 1,000,000 / 10,000,000 · ETA: 18m 0s\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
-      },
-      {
-        "seconds": 1,
-        "command": "",
-        "caption": "",
-        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 40.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 4,000,000 / 10,000,000 · ETA: 12m 0s\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
-      },
-      {
-        "seconds": 1,
-        "command": "",
-        "caption": "",
-        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 7,000,000 / 10,000,000 · ETA: 6m 0s\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+        "output": "╭─────────────────────────────────────────────╮\n│  MySQL Schema Change Apply                  │\n│                                             │\n│  Database: shop                             │\n│  Schema name: schema                        │\n╰─────────────────────────────────────────────╯\n\n\u001b[1mProduction\u001b[0m\n     ~ orders\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n📋 Plan: 1 table to alter\n\n\nDo you want to apply these changes? Only 'yes' will be accepted: yes\n❄️ production is frozen. This change did not start.\n   freeze-abc  SEV-1234 payments latency  (until lifted)\nTo ask for an override, run the same command with --override \"<reason>\".\n"
       },
       {
         "seconds": 4,
-        "command": "",
-        "caption": "The change is complete",
-        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-73\n"
+        "command": "schemabot unfreeze freeze-abc --reason \"SEV resolved\"",
+        "caption": "The incident is over: lift the freeze",
+        "output": "✓ freeze-abc lifted.\n"
       }
     ]
   },

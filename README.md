@@ -42,7 +42,7 @@ SchemaBot is declarative and GitOps-driven: SQL files in your repository provide
 
 **Freeze an environment.** During an incident, hold new schema changes until you lift the freeze.
 
-<img src="./assets/cli-freeze.gif" width="800" alt="Freeze production, see an apply refused, lift the freeze, and run the apply">
+<img src="./assets/cli-freeze.gif" width="800" alt="Freeze production, see an apply refused, and lift the freeze">
 
 [Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md) · [Freeze an environment](./docs/freeze.md)
 

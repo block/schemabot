@@ -74,13 +74,8 @@ const ddl = "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"
 // fixture. Init's first fetch seeds the model; subsequent requests have the apply
 // ID supplied by that response. No private model fields or UI strings are copied.
 func live(p int, phase string, throttled bool, key string) string {
-	return liveIn("staging", p, phase, throttled, key)
-}
-
-// liveIn is live for an apply in the given environment.
-func liveIn(environment string, p int, phase string, throttled bool, key string) string {
 	response := apitypes.ProgressResponse{
-		ApplyID: "apply-example-73", Database: "shop", DatabaseType: "mysql", Environment: environment, Engine: "Spirit", State: phase,
+		ApplyID: "apply-example-73", Database: "shop", DatabaseType: "mysql", Environment: "staging", Engine: "Spirit", State: phase,
 		Tables: []*apitypes.TableProgressResponse{{TableName: "orders", Keyspace: "shop", ChangeType: "alter", DDL: ddl,
 			Status: phase, RowsCopied: int64(p) * 100000, RowsTotal: 10000000, PercentComplete: int32(p), ETASeconds: int64(100-p) * 12,
 			Throttled: throttled, ThrottleReason: "commit-latency 120ms >= 100ms"}},
@@ -99,7 +94,7 @@ func liveIn(environment string, p int, phase string, throttled bool, key string)
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				panic(err)
 			}
-			if request.ApplyID != "apply-example-73" || request.Environment != environment {
+			if request.ApplyID != "apply-example-73" || request.Environment != "staging" {
 				panic("wrong cutover target")
 			}
 			if r.URL.Path == "/api/cutover" {
@@ -115,7 +110,7 @@ func liveIn(environment string, p int, phase string, throttled bool, key string)
 		panic("unexpected fixture request: " + r.Method + " " + r.URL.Path)
 	}))
 	defer server.Close()
-	model := commands.NewWatchModel(server.URL, "shop", environment, true)
+	model := commands.NewWatchModel(server.URL, "shop", "staging", true)
 	batch := model.Init()().(tea.BatchMsg)
 	updated, _ := model.Update(batch[0]())
 	if key == "enter" {
@@ -340,21 +335,14 @@ func freezeDemo() Demo {
 		panic("freeze refusal changed: " + refused)
 	}
 	lifted := capture(func() { t.WriteFreezeLifted(freeze) })
-	apply := "schemabot apply -s ./schema -e production"
 	frames := []Frame{
 		{3, `schemabot freeze -e production --reason "SEV-1234 payments latency"`, "An incident starts: freeze production", created},
-		{2, apply, "A schema change is ready to ship", confirm + "▌"},
+		{2, "schemabot apply -s ./schema -e production", "A schema change is ready to ship", confirm + "▌"},
 		{0.8, "", "", confirm + "yes"},
 		{4, "", "The freeze refuses it; nothing starts", confirm + "yes\n" + refused},
-		{3, `schemabot unfreeze freeze-abc --reason "SEV resolved"`, "The incident is over: lift the freeze", lifted},
-		{2, apply, "Run the same apply again", confirm + "▌"},
-		{0.8, "", "", confirm + "yes"},
-		{1.5, "", "With no freeze in effect, the apply starts", liveIn("production", 10, state.Apply.Running, false, "")},
-		{1, "", "", liveIn("production", 40, state.Apply.Running, false, "")},
-		{1, "", "", liveIn("production", 70, state.Apply.Running, false, "")},
-		{4, "", "The change is complete", liveIn("production", 100, state.Apply.Completed, false, "")},
+		{4, `schemabot unfreeze freeze-abc --reason "SEV resolved"`, "The incident is over: lift the freeze", lifted},
 	}
-	return Demo{Name: "cli-freeze", Title: "Freeze production. Lift it to ship.", Height: 740, Bar: "shop · production", Frames: frames}
+	return Demo{Name: "cli-freeze", Title: "Freeze production during an incident", Height: 740, Bar: "shop · production", Frames: frames}
 }
 
 // Read the confirmation text from the actual apply command so this fixture
