@@ -130,7 +130,7 @@ extra:
       choices.
     postgresql.md: >-
       What SchemaBot supports on PostgreSQL today through pg-sprite, while
-      support is in alpha, and which tables and changes it refuses.
+      support is in beta, and which tables and changes it refuses.
     vitess.md: >-
       Run Vitess schema changes on PlanetScale through branches and deploy
       requests, with per-shard progress and the token permissions SchemaBot
