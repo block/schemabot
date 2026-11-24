@@ -1986,7 +1986,7 @@ The byte bound has no exact corroboration and approves on its estimate. The verd
 belongs to the target that will run the statement: a deployment that applies a plan it did not
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
 planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the
-privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS admission refusals
+privilege, size, and partitioned index shape gates in `pkg/engine/postgres/postgres.go`, plus RLS admission refusals
 in `pkg/engine/postgres/row_security.go` and enum type refusals, the type privilege gate, and
 blocked label additions in `pkg/engine/postgres/enum_type.go` that abort plan creation or mark the
 plan blocked, and the apply-time gates in `pkg/engine/postgres/row_security_apply.go` and

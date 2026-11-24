@@ -1969,7 +1969,7 @@ func TestEngineCancelConcurrentIndexBuildWithoutABackendSignal(t *testing.T) {
 	result, err := eng.Cancel(t.Context(), cancelRequestFor("orders"))
 	require.NoError(t, err)
 	assert.True(t, result.Accepted)
-	assert.Equal(t, "Concurrent index build cancelled", result.Message)
+	assert.Equal(t, "Index build cancelled", result.Message)
 
 	got := awaitPostgresProgress(t, eng, "orders")
 	assert.Equal(t, engine.StateCancelled, got.State, "progress: %+v", got)

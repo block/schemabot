@@ -408,6 +408,7 @@ func TestApplyTablePreflightLimitFollowsStatementCost(t *testing.T) {
 	const configuredLimit = int64(1234)
 
 	assert.Equal(t, preflight.NoSizeLimit, applyTablePreflightLimit(nativeApply{concurrentIndex: true}, configuredLimit))
+	assert.Equal(t, preflight.NoSizeLimit, applyTablePreflightLimit(nativeApply{partitionedIndex: true}, configuredLimit))
 	assert.Equal(t, configuredLimit, applyTablePreflightLimit(nativeApply{}, configuredLimit))
 }
 
@@ -1601,7 +1602,7 @@ func TestProgressReportsExecutorStepPosition(t *testing.T) {
 	eng := New()
 	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 3}
 	tracker := newTestTracker(t)
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default(), false, nil, "")
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default(), buildShape{}, nil, "")
 	req := &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}}
 
 	before, err := eng.Progress(t.Context(), req)
@@ -1637,7 +1638,7 @@ func TestProgressMetadataIsStableWhilePositionIsUnchanged(t *testing.T) {
 	tracker := newTestTracker(t)
 	tracker.Start(3, progress.OperationAdmitting)
 	tracker.StartStep(2, progress.OperationBrief, "CREATE INDEX widgets_name_idx ON public.widgets (name)")
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now().Add(-time.Minute), change, ""), tracker, slog.Default(), false, nil, "")
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now().Add(-time.Minute), change, ""), tracker, slog.Default(), buildShape{}, nil, "")
 	req := &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}}
 
 	first, err := eng.Progress(t.Context(), req)
@@ -1684,7 +1685,7 @@ func TestPublishProgressKeepsTerminalPositionAsPublished(t *testing.T) {
 	eng := New()
 	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 2}
 	tracker := newTestTracker(t)
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default(), false, nil, "")
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default(), buildShape{}, nil, "")
 	tracker.Start(2, progress.OperationAdmitting)
 	tracker.StartStep(2, progress.OperationBrief, "CREATE INDEX widgets_name_idx ON public.widgets (name)")
 	tracker.Finish(errors.New("boom"))
@@ -2123,7 +2124,7 @@ func TestProgressReadsTheTrackerOutsideTheEngineLock(t *testing.T) {
 	session := &blockingProgressSession{started: make(chan struct{}), release: make(chan struct{})}
 	tracker.SetConcurrentBuild(session, 42)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, logger, false, nil, "")
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, logger, buildShape{}, nil, "")
 
 	polled := make(chan error, 1)
 	go func() {
@@ -2139,7 +2140,7 @@ func TestProgressReadsTheTrackerOutsideTheEngineLock(t *testing.T) {
 	claimed := make(chan struct{})
 	go func() {
 		defer close(claimed)
-		eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), newTestTracker(t), logger, false, nil, "")
+		eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), newTestTracker(t), logger, buildShape{}, nil, "")
 		eng.publishProgress("task-b", progressResult(engine.StateCompleted, "completed", time.Now(), change, ""), logger)
 	}()
 	select {
@@ -2165,7 +2166,7 @@ func TestProgressNeverReadsTheTrackerForATerminalApply(t *testing.T) {
 	eng := New()
 	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 2}
 	tracker, session := activeBuildTracker(t, errors.New("progress view unavailable"))
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default(), false, nil, "")
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default(), buildShape{}, nil, "")
 	terminal := progressResult(engine.StateFailed, "failed", time.Now(), change, "detail")
 	terminal.Metadata["step"] = "2"
 	eng.publishProgress("task-a", terminal, slog.Default())
@@ -2269,7 +2270,7 @@ func claimRunningIndexBuild(t *testing.T, eng *Engine, session *publishedIndexPr
 	tracker.StartStep(2, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)")
 	tracker.SetAttempt(3)
 	tracker.SetConcurrentBuild(session, 42)
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default(), false, nil, "")
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default(), buildShape{}, nil, "")
 	return tracker
 }
 
@@ -2431,6 +2432,37 @@ func TestPrecisePercentBelongsToTheIndexBuildInFlight(t *testing.T) {
 	assert.Equal(t, "3.50", pollRunningIndexBuild(t, eng).Metadata["percent"], "the record keeps the second build's reading")
 }
 
+// A partitioned index build on events builds events_2025's index in step 2
+// of 3, attaches it, and builds events_2026's index in step 3. Each
+// partition's build is its own step, so events_2026 reports its own reading
+// from its first poll instead of being held at events_2025's 21.88.
+func TestPartitionedBuildReportsEachPartitionsOwnPercent(t *testing.T) {
+	eng := New()
+	first := heapScanRow
+	change := nativeApply{namespace: "public", table: "events", sql: "CREATE INDEX events_kind_idx ON public.events (kind)", steps: 1, partitionedIndex: true}
+	tracker := newTestTracker(t)
+	tracker.Start(3, progress.OperationBrief)
+	tracker.StartStep(2, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY events_2025_kind_idx ON public.events_2025 (kind)")
+	tracker.SetConcurrentBuild(&publishedIndexProgressSession{row: &first}, 42)
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default(), change.buildShape(), nil, "")
+	got := pollRunningIndexBuild(t, eng)
+	require.Equal(t, "2", got.Metadata["step"])
+	require.Equal(t, "21.88", got.Metadata["percent"])
+
+	tracker.StartStep(2, progress.OperationBrief, "ALTER INDEX public.events_kind_idx ATTACH PARTITION public.events_2025_kind_idx")
+	assert.NotContains(t, pollRunningIndexBuild(t, eng).Metadata, "percent", "the attach is not an index build")
+
+	second := heapScanRow
+	second.blocksDone = 4
+	tracker.StartStep(3, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY events_2026_kind_idx ON public.events_2026 (kind)")
+	tracker.SetConcurrentBuild(&publishedIndexProgressSession{row: &second}, 43)
+	got = pollRunningIndexBuild(t, eng)
+	assert.Equal(t, "3", got.Metadata["step"])
+	assert.Equal(t, "3", got.Metadata["steps_total"])
+	assert.Equal(t, "3.50", got.Metadata["percent"], "events_2026 reports its own reading")
+	assert.Equal(t, 3, got.Progress)
+}
+
 // Two polls clone the record while it still reads 0%. The first stores a
 // reading of 0.10%; the second finds no progress row and derives nothing. The
 // second poll adopts the stored 0.10% instead of showing the build as just
@@ -2489,7 +2521,7 @@ func TestProgressStraddlingAReclaimDoesNotFloorToTheRetiredRecord(t *testing.T) 
 	session.row = &heapScan
 	session.onRead = func() {
 		session.onRead = nil
-		eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default(), false, nil, "")
+		eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default(), buildShape{}, nil, "")
 	}
 	got := pollRunningIndexBuild(t, eng)
 	assert.Equal(t, engine.StateRunning, got.State)
@@ -2621,7 +2653,7 @@ func TestProgressAnswersLastKnownPositionWhenTrackerReadFails(t *testing.T) {
 	tracker, _ := activeBuildTracker(t, errors.New("connection reset by peer"))
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, logger, false, nil, "")
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, logger, buildShape{}, nil, "")
 
 	got, err := eng.Progress(t.Context(), &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}})
 
@@ -3573,7 +3605,7 @@ func TestRecoveryFailureDetailNamesTheAbandonedIndex(t *testing.T) {
 func TestProgressIsKeyedToTheRequestingApply(t *testing.T) {
 	eng := New()
 	change := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
-	eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), change, ""), newTestTracker(t), slog.Default(), false, nil, "")
+	eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), change, ""), newTestTracker(t), slog.Default(), buildShape{}, nil, "")
 
 	tracked, err := eng.Progress(t.Context(), &engine.ProgressRequest{
 		ResumeState: &engine.ResumeState{MigrationContext: "task-a"},
@@ -3605,8 +3637,8 @@ func TestConcurrentAppliesEachAnswerForTheirOwnWork(t *testing.T) {
 	eng := New()
 	changeA := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
 	changeB := nativeApply{namespace: "public", table: "t_b", sql: "ALTER TABLE public.t_b ADD COLUMN b text"}
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), changeA, ""), newTestTracker(t), slog.Default(), false, nil, "")
-	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), false, nil, "")
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), changeA, ""), newTestTracker(t), slog.Default(), buildShape{}, nil, "")
+	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), buildShape{}, nil, "")
 
 	first, err := eng.Progress(t.Context(), &engine.ProgressRequest{
 		ResumeState: &engine.ResumeState{MigrationContext: "task-a"},
@@ -3634,10 +3666,10 @@ func TestClaimProgressRetiresSettledApplies(t *testing.T) {
 	settled := nativeApply{namespace: "public", table: "t_settled", sql: "ALTER TABLE public.t_settled ADD COLUMN a text"}
 	running := nativeApply{namespace: "public", table: "t_running", sql: "ALTER TABLE public.t_running ADD COLUMN b text"}
 	fresh := nativeApply{namespace: "public", table: "t_fresh", sql: "ALTER TABLE public.t_fresh ADD COLUMN c text"}
-	eng.claimProgress("task-settled", progressResult(engine.StateCompleted, "completed", time.Now(), settled, ""), newTestTracker(t), slog.Default(), false, nil, "")
-	eng.claimProgress("task-running", progressResult(engine.StateRunning, "preflight", time.Now(), running, ""), newTestTracker(t), slog.Default(), false, nil, "")
+	eng.claimProgress("task-settled", progressResult(engine.StateCompleted, "completed", time.Now(), settled, ""), newTestTracker(t), slog.Default(), buildShape{}, nil, "")
+	eng.claimProgress("task-running", progressResult(engine.StateRunning, "preflight", time.Now(), running, ""), newTestTracker(t), slog.Default(), buildShape{}, nil, "")
 
-	eng.claimProgress("task-fresh", progressResult(engine.StateRunning, "preflight", time.Now(), fresh, ""), newTestTracker(t), slog.Default(), false, nil, "")
+	eng.claimProgress("task-fresh", progressResult(engine.StateRunning, "preflight", time.Now(), fresh, ""), newTestTracker(t), slog.Default(), buildShape{}, nil, "")
 
 	retired, err := eng.Progress(t.Context(), &engine.ProgressRequest{
 		ResumeState: &engine.ResumeState{MigrationContext: "task-settled"},
@@ -3663,7 +3695,7 @@ func TestUntrackedApplyProgressIsDiscarded(t *testing.T) {
 	eng := New()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	changeB := nativeApply{namespace: "public", table: "t_b", sql: "ALTER TABLE public.t_b ADD COLUMN b text"}
-	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), false, nil, "")
+	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), buildShape{}, nil, "")
 
 	changeA := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
 	eng.publishProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), changeA, ""), logger)
@@ -3691,8 +3723,8 @@ func TestDrainStopsTrackingEverySchemaChange(t *testing.T) {
 	eng := New()
 	changeA := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
 	changeB := nativeApply{namespace: "public", table: "t_b", sql: "ALTER TABLE public.t_b ADD COLUMN b text"}
-	close(eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), changeA, ""), newTestTracker(t), slog.Default(), false, nil, ""))
-	close(eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), false, nil, ""))
+	close(eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), changeA, ""), newTestTracker(t), slog.Default(), buildShape{}, nil, ""))
+	close(eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), buildShape{}, nil, ""))
 
 	eng.Drain()
 
@@ -3777,17 +3809,20 @@ func TestValidateOptimisticApplyAcceptsCreateSet(t *testing.T) {
 	assert.False(t, change.concurrentIndex)
 }
 
-// TestValidateOptimisticApplyClassifiesConcurrentIndex pins both halves of
-// the predicate that routes a statement to the concurrent-build executor:
-// only a lone CREATE INDEX that names CONCURRENTLY qualifies. A plain CREATE
-// INDEX is the same statement kind and must stay on the transactional path;
+// TestValidateOptimisticApplyClassifiesIndexBuilds pins the predicate that
+// routes a lone statement to an index build executor: a CREATE INDEX that
+// names CONCURRENTLY goes to the concurrent build, and a plain CREATE INDEX,
+// which reaches the apply alone only as the planner's partitioned index build,
+// goes to the partitioned build and never runs as written. Both are duration
+// bounded and cancellable; any other statement is neither.
 // TestValidateOptimisticApplyAcceptsCreateSet pins that a create set, which
 // is never one statement, does not qualify either.
-func TestValidateOptimisticApplyClassifiesConcurrentIndex(t *testing.T) {
+func TestValidateOptimisticApplyClassifiesIndexBuilds(t *testing.T) {
 	tests := []struct {
-		name       string
-		ddl        string
-		concurrent bool
+		name        string
+		ddl         string
+		concurrent  bool
+		partitioned bool
 	}{
 		{
 			name:       "concurrent index",
@@ -3795,9 +3830,13 @@ func TestValidateOptimisticApplyClassifiesConcurrentIndex(t *testing.T) {
 			concurrent: true,
 		},
 		{
-			name:       "plain index stays transactional",
-			ddl:        "CREATE INDEX widgets_name_idx ON public.widgets (name)",
-			concurrent: false,
+			name:        "plain index is the partitioned build",
+			ddl:         "CREATE INDEX widgets_name_idx ON public.widgets (name)",
+			partitioned: true,
+		},
+		{
+			name: "column addition is no index build",
+			ddl:  "ALTER TABLE public.widgets ADD COLUMN name text",
 		},
 	}
 	for _, tc := range tests {
@@ -3814,6 +3853,8 @@ func TestValidateOptimisticApplyClassifiesConcurrentIndex(t *testing.T) {
 			change, err := validateOptimisticApply(req)
 			require.NoError(t, err)
 			assert.Equal(t, tc.concurrent, change.concurrentIndex)
+			assert.Equal(t, tc.partitioned, change.partitionedIndex)
+			assert.Equal(t, tc.concurrent || tc.partitioned, change.durationBoundedIndexBuild())
 		})
 	}
 }

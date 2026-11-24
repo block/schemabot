@@ -115,12 +115,38 @@ type nativeApply struct {
 	sql              string
 	steps            int
 	concurrentIndex  bool
+	partitionedIndex bool
 	enumValueAdd     bool
 	// dropped is the plan's record of the live object the statement drops,
 	// which the apply checks under the table's lock before dropping it.
 	dropped                    *schemadiff.DroppedObject
 	concurrentIndexMaxDuration time.Duration
 	cancelRequested            func() bool
+}
+
+// durationBoundedIndexBuild reports whether the change is an index build run
+// under the concurrent index duration envelope instead of the table size
+// ceiling and the optimistic apply ceiling: a concurrent index build, or a
+// partitioned index build, whose every partition is one concurrent build. It
+// is also what makes an apply cancellable, since only these builds run long
+// enough for an operator to need to end them.
+func (c nativeApply) durationBoundedIndexBuild() bool {
+	return c.concurrentIndex || c.partitionedIndex
+}
+
+// buildShape is how an operator cancel reaches the change's work.
+type buildShape struct {
+	// cancellable is set for an index build, concurrent or partition by
+	// partition, the one PostgreSQL change an operator can cancel.
+	cancellable bool
+	// partitioned is set for a partitioned index build, which runs one
+	// concurrent build per partition, so a signal to the build in flight
+	// does not reach the partitions after it.
+	partitioned bool
+}
+
+func (c nativeApply) buildShape() buildShape {
+	return buildShape{cancellable: c.durationBoundedIndexBuild(), partitioned: c.partitionedIndex}
 }
 
 // targetConn carries one background apply's connection inputs: the raw DSN
@@ -176,7 +202,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// engine itself can end the drive — a cancel of last resort, and the
 	// halt on shutdown.
 	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
-	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.concurrentIndex, cancelApply, engine.WorkOwnerFromContext(ctx))
+	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.buildShape(), cancelApply, engine.WorkOwnerFromContext(ctx))
 	conn := targetConn{dsn: req.Credentials.DSN, caCertPath: caPath}
 	e.wg.Go(func() {
 		defer close(done)
@@ -246,22 +272,23 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if err := plannedSchemaMatchesTarget(statements, req.Changes[0].Namespace); err != nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: %w", tc.Table, err)
 	}
-	concurrentIndex := false
-	var dropped *schemadiff.DroppedObject
+	change := nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements)}
 	if len(statements) == 1 {
 		// The tier derivation above parsed this statement already, so a
 		// parse failure here is an invariant guard; the message stays curated
 		// like the refusals above because it reaches the operator surface.
-		concurrentIndex, err = concurrentIndexStatement(statements[0])
+		build, err := classifyIndexBuild(statements[0])
 		if err != nil {
 			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
 		}
-		dropped, err = reviewedDropForApply(req.Database, tc, statements[0])
+		change.concurrentIndex = build == indexBuildConcurrent
+		change.partitionedIndex = build == indexBuildPartitioned
+		change.dropped, err = reviewedDropForApply(req.Database, tc, statements[0])
 		if err != nil {
 			return nativeApply{}, err
 		}
 	}
-	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements), concurrentIndex: concurrentIndex, dropped: dropped}, nil
+	return change, nil
 }
 
 // reviewedDropForApply returns the plan's record of the object a statement
@@ -288,6 +315,41 @@ func reviewedDropForApply(database string, tc engine.TableChange, statement stri
 		return nil, fmt.Errorf("apply PostgreSQL table %q: the plan does not record the object this statement drops, so the apply cannot check it is still the object that was reviewed; re-plan and apply again", tc.Table)
 	}
 	return dropped, nil
+}
+
+// indexBuild is the executor a lone planned statement is admitted to.
+type indexBuild int
+
+const (
+	// indexBuildNone is every statement that is not a CREATE INDEX.
+	indexBuildNone indexBuild = iota
+	// indexBuildConcurrent is a CREATE INDEX CONCURRENTLY, which the
+	// planner writes for an index on an existing table.
+	indexBuildConcurrent
+	// indexBuildPartitioned is a CREATE INDEX without CONCURRENTLY. Alone,
+	// on an existing table, that statement reaches the apply only as the
+	// planner's partitioned index build: an index on a plain table is
+	// rewritten to the concurrent form or blocked at plan time, and an index
+	// declared with a new table arrives inside its create set. The apply
+	// still proves the live table is partitioned before building, so the
+	// statement never runs as written.
+	indexBuildPartitioned
+)
+
+// classifyIndexBuild says which index build executor, if any, runs sql.
+func classifyIndexBuild(sql string) (indexBuild, error) {
+	statement, err := pgstatement.ParseOne(sql)
+	if err != nil {
+		return indexBuildNone, fmt.Errorf("parse PostgreSQL statement: %w", err)
+	}
+	switch {
+	case statement.Kind() != pgstatement.KindCreateIndex:
+		return indexBuildNone, nil
+	case statement.Concurrent():
+		return indexBuildConcurrent, nil
+	default:
+		return indexBuildPartitioned, nil
+	}
 }
 
 // plannedSchemaMatchesTarget refuses an apply whose planned DDL names a
@@ -338,7 +400,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	// survive the request) and ends only when the engine cancels the drive,
 	// so boundedness comes from the ceiling instead.
 	ceiling := e.optimisticApplyCeiling
-	if change.concurrentIndex {
+	if change.durationBoundedIndexBuild() {
 		ceiling = e.concurrentIndexMaxDuration + concurrentIndexHeadroom
 		change.concurrentIndexMaxDuration = e.concurrentIndexMaxDuration
 		change.cancelRequested = cancelRequested
@@ -378,6 +440,15 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		// that it acted on the apply: a backend cancelled from outside
 		// SchemaBot is a failure the next drive retries, never a cancel
 		// nobody asked for.
+		if change.partitionedIndex {
+			// The partitioned build keeps every partition it finished and
+			// the parent's invalid index, and the next apply of the same plan
+			// resumes from them, recovering the cancelled partition's
+			// leftover first. Nothing is dropped, so there is no cleanup
+			// to report.
+			publish(progressResult(engine.StateCancelled, "cancelled", started, change, partitionedIndexCancelledDetail))
+			return
+		}
 		detail := cancelledIndexCleanupDetail(err)
 		if detail == "" && errors.As(err, &invalidErr) {
 			detail = invalidIndexDetail(invalidErr)
@@ -463,6 +534,14 @@ type applyFailure struct {
 func classifyApplyFailure(err error, table string) applyFailure {
 	if detail, committed := committedCreatePrefixDetail(err, table); committed {
 		return applyFailure{detail: detail, committedPrefix: true}
+	}
+	var partitionedBoundErr *partitionedIndexBoundError
+	if errors.As(err, &partitionedBoundErr) {
+		// A partitioned build keeps the partitions it finished, so a run
+		// that finished at least one (a run that finished none is refused
+		// above) spends its retry on the partitions left rather than
+		// starting over.
+		return applyFailure{detail: partitionedBoundErr.Error() + "; the retry resumes from the partitions already built", retryable: true}
 	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) {
@@ -831,6 +910,15 @@ func refusalForCause(err error, table string) *refusal {
 		return &refusal{reason: "concurrent-index-bound-exceeded", cause: boundErr.Error(),
 			remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
 	}
+	// A partitioned build that ran past its bound without finishing a
+	// partition made no progress a retry could keep, so retrying unchanged
+	// spends the same bound on the same partition again. It is refused like
+	// the concurrent build's overrun and names the same option.
+	var partitionedBoundErr *partitionedIndexBoundError
+	if errors.As(err, &partitionedBoundErr) && partitionedBoundErr.partitionsBuilt == 0 {
+		return &refusal{reason: "partitioned-index-bound-exceeded", cause: partitionedBoundErr.Error(),
+			remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
+	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
 		return &refusal{reason: "not-native-safe-budget-exceeded", cause: budgetErr.Error()}
@@ -959,8 +1047,7 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 	case executor.CodeEmptySequence, executor.CodeUnsupportedSequenceStep,
 		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
 		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable,
-		executor.CodeUnsupportedAcceptedBlocking, executor.CodeNotCreateIndex,
-		executor.CodeNotPartitionedTable:
+		executor.CodeUnsupportedAcceptedBlocking, executor.CodeNotCreateIndex:
 		// Shape refusals: the executor refused the statement's form at
 		// admission, so retrying the identical plan refails the same way.
 		return &refusal{reason: "unsupported-statement-shape",
@@ -1013,6 +1100,14 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "replica-identity-drop",
 			cause:  fmt.Sprintf("the planned drop on %s would remove what its replica identity index is built on", quotedTable(table)),
 			remedy: "point REPLICA IDENTITY elsewhere, then " + replanRemedy}, true
+	case executor.CodeNotPartitionedTable:
+		// The plan routed the index to the partitioned build, and the table
+		// is no longer partitioned. The build refuses before it touches the
+		// target, so the statement never runs as a blocking CREATE INDEX; a
+		// new plan routes the index to the concurrent build instead.
+		return &refusal{reason: "not-partitioned-table",
+			cause:  fmt.Sprintf("%s is no longer partitioned, so the index planned for its partitions was not built", quotedTable(table)),
+			remedy: replanRemedy}, true
 	case executor.CodePartitionedIndexNameTaken:
 		// The build left the relation holding the name alone, so only an
 		// operator freeing the name, or the schema file choosing another,
@@ -1500,13 +1595,19 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	if _, err := preflight.CheckPrivileges(ctx, pool, change.namespace, change.table, preflight.Requirement{Tier: tier}); err != nil {
 		return fmt.Errorf("check privileges for PostgreSQL table %q: %w", change.table, err)
 	}
-	// Concurrent index builds are bounded by their caller-owned duration
+	// Concurrent and partitioned index builds are bounded by the duration
 	// envelope rather than the rewrite ceiling. NoSizeLimit still proves the
 	// target exists and is an ordinary or partitioned table.
 	preflightLimit := applyTablePreflightLimit(change, tableSizeLimit)
 	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, preflightLimit)
 	if err != nil {
 		return fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
+	}
+	if change.partitionedIndex {
+		// The build refuses a table that is no longer partitioned before it
+		// uses a session, so a plan made against a partitioned parent never
+		// runs here as a blocking CREATE INDEX on a plain table.
+		return buildPartitionedIndex(ctx, poolCfg, pool, table, change, tracker, logger)
 	}
 	if table.Partitioned() {
 		// The partition admission policy runs here, in the session window
@@ -1538,9 +1639,10 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	// sequence and its router promotes that into ExecSQL, so such an index
 	// takes the concurrent branch above. A blocking CREATE INDEX does not
 	// reach this call: a plain index on an existing table is rewritten at
-	// plan time or, when the rewrite could not be constructed, blocked; a
-	// partitioned parent's build is refused by CheckPartitionSupport above;
-	// and an index declared with a new table diverts to executeCreate,
+	// plan time or, when the rewrite could not be constructed, blocked; an
+	// index on a partitioned parent branches off above to the partitioned
+	// build, which builds each partition's index concurrently; and an index
+	// declared with a new table diverts to executeCreate,
 	// where greenfieldCreateSet keeps the blocking form on purpose — a
 	// table born in the run has no readers, and CONCURRENTLY cannot run
 	// inside its create sequence.
@@ -1582,7 +1684,7 @@ func executeReviewedDrop(ctx context.Context, pool *pgxpool.Pool, table prefligh
 }
 
 func applyTablePreflightLimit(change nativeApply, tableSizeLimit int64) int64 {
-	if change.concurrentIndex {
+	if change.durationBoundedIndexBuild() {
 		return preflight.NoSizeLimit
 	}
 	return tableSizeLimit
@@ -1647,6 +1749,95 @@ var concurrentIndex = concurrentIndexExecutor{
 	build:   executor.BuildIndexConcurrentlyWithProgress,
 	rebuild: executor.RebuildAbandonedIndex,
 	drop:    executor.DropAbandonedIndex,
+}
+
+// partitionedIndexBuild is the executor entry point a partitioned index build
+// reaches. It is a test seam, so a test can observe the budget, the deadline
+// and the table the drive hands the build against an executor it scripts; the
+// package default is the executor's own function. Like concurrentIndex, it is
+// package state shared by every drive in the process, so swapping it is not
+// safe from a test that runs in parallel with another.
+var partitionedIndexBuild = executor.BuildPartitionedIndexWithProgress
+
+// partitionedIndexCancelledDetail is the operator-facing outcome of a
+// partitioned index build an operator cancelled.
+const partitionedIndexCancelledDetail = "Partitioned index build cancelled; the partitions already built keep their index, and applying the plan again resumes the build"
+
+// buildPartitionedIndex adds an index to a partitioned table through
+// pg-sprite's partitioned index build: it creates the parent's index with ON
+// ONLY, builds each partition's index concurrently and attaches it, and
+// returns once the parent's index is verified valid. The statement never runs
+// as written, which would block writes to the whole table while every
+// partition's index is built. The executor refuses a table that is not
+// partitioned before it touches the target, so a table that stopped being
+// partitioned after planning is a typed refusal rather than a blocking build.
+//
+// Each partition's build gets the concurrent index bound as its budget, and
+// the whole build gets the same bound as its deadline, so one apply is bounded
+// the way a concurrent build on a plain table is. A build that runs past the
+// deadline keeps every partition it finished, and the retry resumes from
+// them. An operator cancel signals the partition build in flight through the
+// tracker; the drive classifies the outcome.
+func buildPartitionedIndex(ctx context.Context, cfg dbconn.Config, pool *pgxpool.Pool, table preflight.PreflightedTable, change nativeApply, tracker *progress.Tracker, logger *slog.Logger) error {
+	if change.concurrentIndexMaxDuration <= 0 {
+		// The same guard as buildIndexConcurrently: the drive stamps the
+		// bound on every change, so only a nativeApply built without the
+		// drive reaches this branch.
+		return fmt.Errorf("build PostgreSQL index on partitioned table %q: build bound is unset", change.table)
+	}
+	buildCtx, cancel := context.WithTimeout(ctx, change.concurrentIndexMaxDuration)
+	defer cancel()
+	start := time.Now()
+	report, err := partitionedIndexBuild(buildCtx, cfg, pool, table, change.sql,
+		executor.ConcurrentBudget{Overall: change.concurrentIndexMaxDuration}, tracker)
+	if err == nil {
+		logger.Info("PostgreSQL partitioned index build finished",
+			"namespace", change.namespace, "table", change.table, "index", report.Index,
+			"partitions", report.Partitions, "partitions_built", len(report.Worked),
+			"parent_created", report.ParentCreated, "duration", report.Duration)
+		return nil
+	}
+	if partitionedBuildRanPastBound(ctx, buildCtx) {
+		// The deadline is the outcome, whatever the executor was doing when
+		// it fired, so the bound error does not carry the executor's error
+		// for the classifiers to read; the log does.
+		built := len(report.Worked)
+		if built == 0 {
+			logger.Warn("PostgreSQL partitioned index build ran past its bound before it finished any partition; the apply is refused until the bound is raised",
+				"namespace", change.namespace, "table", change.table, "bound", change.concurrentIndexMaxDuration, "error", err)
+		} else {
+			logger.Warn("PostgreSQL partitioned index build ran past its bound; the retry resumes from the partitions already built",
+				"namespace", change.namespace, "table", change.table, "bound", change.concurrentIndexMaxDuration,
+				"partitions_built", built, "error", err)
+		}
+		return fmt.Errorf("build PostgreSQL index on partitioned table %q: %w", change.table,
+			&partitionedIndexBoundError{bound: change.concurrentIndexMaxDuration, partitionsBuilt: built})
+	}
+	return fmt.Errorf("build PostgreSQL index on partitioned table %q: %w", change.table,
+		nameConcurrentIndexBound(err, change.concurrentIndexMaxDuration, time.Since(start)))
+}
+
+// partitionedBuildRanPastBound reports whether the build's own deadline ended
+// it, as opposed to the drive's context: an operator cancel or an engine halt
+// ends the drive's context, and is classified as what it is.
+func partitionedBuildRanPastBound(driveCtx, buildCtx context.Context) bool {
+	return driveCtx.Err() == nil && errors.Is(buildCtx.Err(), context.DeadlineExceeded)
+}
+
+// partitionedIndexBoundError reports that a partitioned index build ran past
+// the concurrent index bound before every partition had its index.
+// partitionsBuilt is how many partitions this run gave an index, which
+// decides whether a retry can make progress.
+type partitionedIndexBoundError struct {
+	bound           time.Duration
+	partitionsBuilt int
+}
+
+func (e *partitionedIndexBoundError) Error() string {
+	if e.partitionsBuilt == 0 {
+		return fmt.Sprintf("the partitioned index build ran past %s (%s) before it finished any partition", concurrentIndexBoundOption, e.bound)
+	}
+	return fmt.Sprintf("the partitioned index build ran past %s (%s) before every partition had its index", concurrentIndexBoundOption, e.bound)
 }
 
 // buildIndexConcurrently runs a CREATE INDEX CONCURRENTLY through pg-sprite's
@@ -2335,7 +2526,7 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 //
 // The returned channel is the drive's to close once its terminal result is
 // published; Cancel waits on it for the outcome.
-func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger, concurrentIndex bool, cancelApply context.CancelFunc, owner string) chan struct{} {
+func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger, shape buildShape, cancelApply context.CancelFunc, owner string) chan struct{} {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.progress == nil {
@@ -2349,7 +2540,7 @@ func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracke
 	done := make(chan struct{})
 	e.progress[key] = &trackedApply{
 		result: result, tracker: tracker, logger: logger,
-		concurrentIndex: concurrentIndex, cancelApply: cancelApply, done: done,
+		cancellableBuild: shape.cancellable, partitionedBuild: shape.partitioned, cancelApply: cancelApply, done: done,
 		owner: owner,
 	}
 	return done
