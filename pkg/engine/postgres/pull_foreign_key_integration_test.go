@@ -159,3 +159,21 @@ func TestEnginePullSchemaPlansValidationOfANotValidForeignKey(t *testing.T) {
 	assert.Equal(t, engine.ExecutionModeBlocked, validate.ExecutionMode,
 		"SchemaBot does not run foreign key changes on PostgreSQL yet, so the validation is shown for review")
 }
+
+// A schema file cannot declare row-level security and a foreign key together
+// yet, so a table with both is refused, and with it the pull, rather than
+// written without one of them.
+func TestEnginePullSchemaRefusesRowSecurityWithAForeignKey(t *testing.T) {
+	eng, _ := pullForeignKeyTarget(t, "pull_row_security_fk_test", `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint REFERENCES public.users (id));
+		ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;
+		CREATE POLICY orders_all ON public.orders USING (true)`)
+
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "public" table "orders": render`)
+	assert.Contains(t, err.Error(), "foreign keys are not supported in desired row security")
+}

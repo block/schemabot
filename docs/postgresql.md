@@ -842,6 +842,7 @@ out. To keep it, declare it in the file. To remove it, run the
 | Crosses namespaces | A file cannot reference a table in another namespace |
 | Sits on a partition | A partition has no file of its own |
 | References its own table through a standalone unique index | The file would declare the key before the index exists. Make the index a `UNIQUE` constraint to pull it |
+| Sits on a table with row-level security | A file cannot declare row-level security and a foreign key together yet |
 
 Remove the foreign key, or drop the table through a reviewed process, then
 pull again.
