@@ -510,6 +510,7 @@ func collectPlanWork(result *apitypes.PlanResponse) planWork {
 			w.vschemaChanges = append(w.vschemaChanges, templates.VSchemaChange{
 				Keyspace: sc.Namespace,
 				Diff:     sc.Metadata[apitypes.VSchemaDiffMetadataKey],
+				Summary:  apitypes.VSchemaSummaryLines(sc.Metadata[apitypes.VSchemaSummaryMetadataKey]),
 			})
 		} else if sc.NeedsFinalizer() {
 			w.finalizeOnly[renderedNamespace(sc.Namespace, result.Database)] = true
@@ -646,10 +647,10 @@ func writePlanGuidance(result *apitypes.PlanResponse, isApply bool) {
 // namespace, then its direct-execution and unsafe-change disclosures. It
 // writes no summary, so a rollout can close every group's detail with one.
 func writeChangeDetail(result *apitypes.PlanResponse, w planWork, isApply bool) {
-	// Build VSchema diff map by keyspace for merging into namespace changes
-	vsDiffByKS := make(map[string]string)
+	// Index VSchema changes by keyspace for merging into namespace changes
+	vsByKS := make(map[string]templates.VSchemaChange)
 	for _, vc := range w.vschemaChanges {
-		vsDiffByKS[vc.Keyspace] = vc.Diff
+		vsByKS[vc.Keyspace] = vc
 	}
 
 	// Render DDL + VSchema changes grouped by namespace/keyspace
@@ -662,9 +663,10 @@ func writeChangeDetail(result *apitypes.PlanResponse, w planWork, isApply bool) 
 				Changes:   w.namespaceMap[ns],
 				Finalize:  w.finalize[ns],
 			}
-			if diff, ok := vsDiffByKS[ns]; ok {
+			if vc, ok := vsByKS[ns]; ok {
 				nc.VSchemaChanged = true
-				nc.VSchemaDiff = diff
+				nc.VSchemaDiff = vc.Diff
+				nc.VSchemaSummary = vc.Summary
 			}
 			nsChanges = append(nsChanges, nc)
 		}

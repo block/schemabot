@@ -55,6 +55,7 @@ func previewVSchemaPlanOutput() {
    }
  }
 `,
+			Summary: []string{"changes table `users`: no routing becomes vindex `hash` on `id`", "adds table `user_preferences`: vindex `hash` on `user_id`"},
 		},
 	}
 
@@ -64,6 +65,7 @@ func previewVSchemaPlanOutput() {
 			Changes:        changes,
 			VSchemaChanged: true,
 			VSchemaDiff:    vschemaChanges[0].Diff,
+			VSchemaSummary: vschemaChanges[0].Summary,
 		},
 	}
 	WriteNamespaceChanges(namespaces, false, "testapp-vitess", schema.DialectMySQL)
@@ -102,6 +104,7 @@ func previewVSchemaOnlyOutput() {
    },
    "tables": {
 `,
+			Summary: []string{"adds vindex `lookup_email`: type `consistent_lookup`, backed by `users_email_idx`"},
 		},
 	}
 
@@ -110,6 +113,7 @@ func previewVSchemaOnlyOutput() {
 			Namespace:      "testapp_sharded",
 			VSchemaChanged: true,
 			VSchemaDiff:    vschemaChanges[0].Diff,
+			VSchemaSummary: vschemaChanges[0].Summary,
 		},
 	}
 	WriteNamespaceChanges(namespaces, false, "testapp-vitess", schema.DialectMySQL)
@@ -151,6 +155,7 @@ func previewMultiKeyspacePlanOutput() {
 +    }
    },
 `,
+			Summary: []string{"adds vindex `lookup_email`: type `consistent_lookup`, backed by `users_email_idx`"},
 		},
 		{
 			Keyspace: "testapp",
@@ -166,13 +171,13 @@ func previewMultiKeyspacePlanOutput() {
 +  }
  }
 `,
+			Summary: []string{"adds table `orders_seq`: sequence table", "adds table `users_email_idx`", "adds table `users_seq`: sequence table"},
 		},
 	}
 
-	// Build VSchema diff map by keyspace
-	vsDiffByKS := make(map[string]string)
+	vsByKS := make(map[string]VSchemaChange)
 	for _, vc := range vschemaChanges {
-		vsDiffByKS[vc.Keyspace] = vc.Diff
+		vsByKS[vc.Keyspace] = vc
 	}
 
 	namespaces := []NamespaceChange{
@@ -180,13 +185,15 @@ func previewMultiKeyspacePlanOutput() {
 			Namespace:      "testapp_sharded",
 			Changes:        changes[:2],
 			VSchemaChanged: true,
-			VSchemaDiff:    vsDiffByKS["testapp_sharded"],
+			VSchemaDiff:    vsByKS["testapp_sharded"].Diff,
+			VSchemaSummary: vsByKS["testapp_sharded"].Summary,
 		},
 		{
 			Namespace:      "testapp",
 			Changes:        changes[2:],
 			VSchemaChanged: true,
-			VSchemaDiff:    vsDiffByKS["testapp"],
+			VSchemaDiff:    vsByKS["testapp"].Diff,
+			VSchemaSummary: vsByKS["testapp"].Summary,
 		},
 	}
 	WriteNamespaceChanges(namespaces, false, "testapp-vitess", schema.DialectMySQL)

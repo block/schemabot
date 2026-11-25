@@ -281,8 +281,9 @@ type psMetadataForStorage struct {
 // vschemaKeyspaceDiff mirrors the PlanetScale engine's per-keyspace VSchema diff
 // shape so the stored-state projection can decode it.
 type vschemaKeyspaceDiff struct {
-	Namespace string `json:"namespace"`
-	Diff      string `json:"diff"`
+	Namespace string   `json:"namespace"`
+	Diff      string   `json:"diff"`
+	Summary   []string `json:"summary,omitempty"`
 }
 
 func decodePSMetadataForStorage(s string) (*psMetadataForStorage, error) {
@@ -368,6 +369,7 @@ func PSDisplayMetadata(resumeStateMetadata string) (map[string]string, error) {
 				Namespace: d.Namespace,
 				Status:    meta.VSchemaStatus,
 				Diff:      d.Diff,
+				Summary:   d.Summary,
 			})
 		}
 		encoded, err := apitypes.EncodeVSchemaChanges(changes)
@@ -416,7 +418,7 @@ func PSDisplayMetadataStorageBlob(md map[string]string) (string, error) {
 		if m.VSchemaStatus == "" {
 			m.VSchemaStatus = ch.Status
 		}
-		m.VSchemaDiffs = append(m.VSchemaDiffs, vschemaKeyspaceDiff{Namespace: ch.Namespace, Diff: ch.Diff})
+		m.VSchemaDiffs = append(m.VSchemaDiffs, vschemaKeyspaceDiff{Namespace: ch.Namespace, Diff: ch.Diff, Summary: ch.Summary})
 	}
 	if m.DeployRequestURL == "" && m.BranchName == "" && !m.IsInstant && !m.DeferredDeploy && len(m.VSchemaDiffs) == 0 && m.RevertExpiresAt == nil {
 		return "", nil

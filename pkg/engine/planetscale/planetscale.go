@@ -474,8 +474,9 @@ func formatDeployRequestError(dr *ps.DeployRequest) string {
 
 // vschemaKeyspaceDiff is one keyspace's VSchema diff captured at deploy creation.
 type vschemaKeyspaceDiff struct {
-	Namespace string `json:"namespace"`
-	Diff      string `json:"diff"`
+	Namespace string   `json:"namespace"`
+	Diff      string   `json:"diff"`
+	Summary   []string `json:"summary,omitempty"`
 }
 
 // psMetadata holds PlanetScale-specific state stored as JSON in ResumeState.Metadata.

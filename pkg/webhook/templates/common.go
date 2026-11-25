@@ -9,6 +9,7 @@ import (
 	"unicode"
 
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -223,6 +224,31 @@ func vschemaDiffBudget(diffCount int) int {
 		return maxCommentVSchemaDiffLen
 	}
 	return maxCommentVSchemaDiffLen / diffCount
+}
+
+// writeVSchemaChangeBody renders what one keyspace's VSchema change does: its
+// description, one line per table, vindex, or keyspace setting, with the raw
+// diff collapsed beneath it as the full record. A line diff alone cannot say
+// which table an added or removed entry belongs to, which the description
+// does. A change recorded without a description shows its diff open, since
+// the diff is then the only account of the change.
+func writeVSchemaChangeBody(sb *strings.Builder, summary []string, diff string, budget int) {
+	if len(summary) == 0 {
+		if diff != "" {
+			writeVSchemaDiffFence(sb, diff, budget)
+		}
+		return
+	}
+	for _, line := range presentation.VSchemaSummaryLines(summary) {
+		fmt.Fprintf(sb, "- %s\n", line)
+	}
+	sb.WriteString("\n")
+	if diff == "" {
+		return
+	}
+	sb.WriteString("<details><summary>VSchema diff</summary>\n\n")
+	writeVSchemaDiffFence(sb, diff, budget)
+	sb.WriteString("</details>\n\n")
 }
 
 // writeVSchemaDiffFence renders a VSchema diff inside a diff fence sized so

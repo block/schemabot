@@ -875,6 +875,7 @@ func vschemaChangesForDisplay(meta *psMetadata) []apitypes.VSchemaChange {
 			Namespace: d.Namespace,
 			Status:    meta.VSchemaStatus,
 			Diff:      d.Diff,
+			Summary:   d.Summary,
 		})
 	}
 	return changes

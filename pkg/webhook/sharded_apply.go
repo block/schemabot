@@ -96,6 +96,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 					Namespace: finalizerNS,
 					Status:    status,
 					Diff:      view.vschemaDiff(finalizerNS),
+					Summary:   view.vschemaSummary(finalizerNS),
 				})
 			}
 			if finalizerError == "" && isOperationFailureState(op.State) && op.ErrorMessage != "" {
@@ -174,13 +175,15 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 }
 
 // shardedPlanView is what a sharded apply's comment reads from the stored
-// plan: each namespace's rendered VSchema diff, the namespaces finalized
+// plan: each namespace's rendered VSchema diff and its per-element summary,
+// the namespaces finalized
 // without a VSchema change to show, and each table's planned size. A nil
 // view, when the stored plan could not be read, renders every finalizer as a
 // VSchema change without a diff and every table without a size.
 type shardedPlanView struct {
-	vschemaDiffs map[string]string
-	finalizeOnly map[string]bool
+	vschemaDiffs     map[string]string
+	vschemaSummaries map[string][]string
+	finalizeOnly     map[string]bool
 	// tableSizes is each table's planned on-disk size, summed across its
 	// shards, with the number of shards the sum covers. The shard tasks carry
 	// no size of their own, since the plan's figure is the whole table's, so
@@ -270,6 +273,15 @@ func (p *shardedPlanView) vschemaDiff(namespace string) string {
 	return p.vschemaDiffs[namespace]
 }
 
+// vschemaSummary returns the per-element description of the namespace's
+// VSchema change, or nil when the stored plan carries none.
+func (p *shardedPlanView) vschemaSummary(namespace string) []string {
+	if p == nil {
+		return nil
+	}
+	return p.vschemaSummaries[namespace]
+}
+
 // finalizesOnly reports whether the stored plan finalizes the namespace
 // without a VSchema change to show.
 func (p *shardedPlanView) finalizesOnly(namespace string) bool {
@@ -305,12 +317,13 @@ func resolveShardedPlanView(ctx context.Context, stor storage.Storage, apply *st
 	}
 
 	view := &shardedPlanView{
-		vschemaDiffs:   map[string]string{},
-		finalizeOnly:   map[string]bool{},
-		tableSizes:     map[shardedTableKey]plannedTableSize{},
-		plannedChanges: map[shardedTableKey]presentation.TableChange{},
-		shardCounts:    map[shardedTableKey]int{},
-		shardCopyRows:  map[shardedShardTableKey]int64{},
+		vschemaDiffs:     map[string]string{},
+		vschemaSummaries: map[string][]string{},
+		finalizeOnly:     map[string]bool{},
+		tableSizes:       map[shardedTableKey]plannedTableSize{},
+		plannedChanges:   map[shardedTableKey]presentation.TableChange{},
+		shardCounts:      map[shardedTableKey]int{},
+		shardCopyRows:    map[shardedShardTableKey]int64{},
 	}
 	for namespace, nsData := range plan.Namespaces {
 		if nsData == nil {
@@ -334,6 +347,9 @@ func resolveShardedPlanView(ctx context.Context, stor storage.Storage, apply *st
 		}
 		if d := nsData.Metadata[storage.PlanMetadataVSchemaDiff]; d != "" {
 			view.vschemaDiffs[namespace] = d
+		}
+		if lines := apitypes.VSchemaSummaryLines(nsData.Metadata[storage.PlanMetadataVSchemaSummary]); len(lines) > 0 {
+			view.vschemaSummaries[namespace] = lines
 		}
 		if nsData.FinalizesWithoutVSchemaChange() {
 			view.finalizeOnly[namespace] = true

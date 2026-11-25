@@ -651,6 +651,9 @@ type KeyspaceChangeData struct {
 	Statements     []string
 	VSchemaChanged bool
 	VSchemaDiff    string
+	// VSchemaSummary describes the VSchema change one line per table,
+	// vindex, or keyspace setting; empty when the engine recorded none.
+	VSchemaSummary []string
 
 	// Finalize marks a keyspace the engine asked to finalize after its DDL.
 	// A keyspace with DDL or a VSchema change to show finalizes as part of that
@@ -2006,8 +2009,8 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 
 		if hasVSchemaChanges {
 			writeNamespaceLabel(sb, data, "VSchema", "")
-			if ks.VSchemaDiff != "" {
-				writeVSchemaDiffFence(sb, ks.VSchemaDiff, diffBudget)
+			if ks.VSchemaDiff != "" || len(ks.VSchemaSummary) > 0 {
+				writeVSchemaChangeBody(sb, ks.VSchemaSummary, ks.VSchemaDiff, diffBudget)
 			} else {
 				sb.WriteString("_(diff not available)_\n\n")
 			}

@@ -358,11 +358,11 @@ func FormatNamespacedTablesWithActivity(tables []TableProgress, activityBar, act
 func FormatVSchemaStatus(changes []apitypes.VSchemaChange) string {
 	var b strings.Builder
 	for _, c := range changes {
-		if c.Diff == "" {
+		if c.Diff == "" && len(c.Summary) == 0 {
 			continue
 		}
 		fmt.Fprintf(&b, "    ~ VSchema (%s): %s\n", c.Namespace, ui.VSchemaStatusLabel(c.Status))
-		b.WriteString(FormatVSchemaDiff(c.Diff, indentContent))
+		b.WriteString(FormatVSchemaChangeBody(c.Summary, c.Diff, indentContent))
 	}
 	if b.Len() == 0 {
 		return ""
@@ -370,6 +370,30 @@ func FormatVSchemaStatus(changes []apitypes.VSchemaChange) string {
 	b.WriteString("\n")
 	return b.String()
 }
+
+// FormatVSchemaChangeBody renders what one keyspace's VSchema change does: its
+// description, one line per table, vindex, or keyspace setting, capped the
+// same way as the PR comment's, then the raw diff as the full record. A
+// terminal has no collapsed block, so the diff follows the description
+// directly. The description's code spans are markdown, so their backticks are
+// dropped here.
+func FormatVSchemaChangeBody(summary []string, diff, indent string) string {
+	var b strings.Builder
+	for _, line := range presentation.VSchemaSummaryLines(summary) {
+		fmt.Fprintf(&b, "%s- %s\n", indent, plainCodeSpans.Replace(line))
+	}
+	if diff != "" {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(FormatVSchemaDiff(diff, indent))
+	}
+	return b.String()
+}
+
+// plainCodeSpans strips the markdown code-span fences a VSchema description
+// carries, the double fence first so a name holding a backtick keeps it.
+var plainCodeSpans = strings.NewReplacer("`` ", "", " ``", "", "`", "")
 
 // FormatVSchemaDiff returns a VSchema diff with colorized +/- lines as a string,
 // stripping ---/+++/@@ headers. Shared between plan and progress views.

@@ -20,6 +20,7 @@ import (
 	"github.com/block/spirit/pkg/utils"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/lint"
@@ -87,7 +88,11 @@ func vschemaDiffsFromChanges(changes []engine.SchemaChange) []vschemaKeyspaceDif
 	var diffs []vschemaKeyspaceDiff
 	for _, sc := range changes {
 		if d := sc.Metadata["vschema"]; d != "" {
-			diffs = append(diffs, vschemaKeyspaceDiff{Namespace: sc.Namespace, Diff: d})
+			diffs = append(diffs, vschemaKeyspaceDiff{
+				Namespace: sc.Namespace,
+				Diff:      d,
+				Summary:   apitypes.VSchemaSummaryLines(sc.Metadata[apitypes.VSchemaSummaryMetadataKey]),
+			})
 		}
 	}
 	return diffs
