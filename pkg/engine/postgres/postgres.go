@@ -398,7 +398,6 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		if err != nil {
 			return nil, fmt.Errorf("compare live tables against schema files in namespace %q: %w", namespace, err)
 		}
-		sizeDroppedTables(ctx, pool, req.Database, namespace, drops)
 		schemaChange.TableChanges = append(schemaChange.TableChanges, drops...)
 		if len(exempt) > 0 {
 			slices.Sort(exempt)
@@ -422,6 +421,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			result.Changes = append(result.Changes, schemaChange)
 		}
 	}
+	sizeDroppedTables(ctx, pool, req.Database, result.Changes)
 	result.NoChanges = len(result.Changes) == 0
 	result.PlanID = engine.NewPlanID()
 	return result, nil

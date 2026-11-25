@@ -63,25 +63,37 @@ func attachTableSize(changes []engine.TableChange, table string, est tableSizeEs
 	}
 }
 
-// sizeDroppedTables gives each undeclared table the plan drops its size. No
-// size ceiling applies to a drop, so the preflight runs with no limit, only to
-// measure the table. Sizes are display-only: the reads share one
-// engine.TableSizeProbeTimeout budget, and a failed read logs and leaves that
-// drop without a size rather than failing the plan.
-func sizeDroppedTables(ctx context.Context, pool *pgxpool.Pool, database, namespace string, drops []engine.TableChange) {
-	if len(drops) == 0 {
-		return
-	}
+// sizeDroppedTables gives each table the plan drops its size. A PostgreSQL
+// plan drops only the live tables no schema file declares. No size ceiling
+// applies to a drop, so the preflight runs with no limit, only to measure the
+// table. Sizes are display-only: every read in the plan shares one
+// engine.TableSizeProbeTimeout budget, the reads stop once it runs out, and a
+// failed read leaves that drop without a size rather than failing the plan.
+func sizeDroppedTables(ctx context.Context, pool *pgxpool.Pool, database string, changes []engine.SchemaChange) {
 	probeCtx, cancel := context.WithTimeout(ctx, engine.TableSizeProbeTimeout)
 	defer cancel()
-	for i := range drops {
-		proof, err := preflight.CheckTable(probeCtx, pool, namespace, drops[i].Table, math.MaxInt64)
-		if err != nil {
-			slog.Warn("PostgreSQL table size unavailable for a table the plan drops; the plan will show its size as unavailable",
-				"database", database, "namespace", namespace, "table", drops[i].Table, "error", err)
-			continue
+	for i := range changes {
+		namespace := changes[i].Namespace
+		for j := range changes[i].TableChanges {
+			drop := &changes[i].TableChanges[j]
+			if drop.Operation != ddl.StatementDropTable {
+				continue
+			}
+			if err := probeCtx.Err(); err != nil {
+				slog.Warn("PostgreSQL table size budget ran out; the plan will show the remaining dropped tables' sizes as unavailable",
+					"database", database, "namespace", namespace, "first_unsized_table", drop.Table, "error", err)
+				return
+			}
+			proof, err := preflight.CheckTable(probeCtx, pool, namespace, drop.Table, math.MaxInt64)
+			if err != nil {
+				slog.Warn("PostgreSQL table size unavailable for a table the plan drops; the plan will show its size as unavailable",
+					"database", database, "namespace", namespace, "table", drop.Table, "error", err)
+				continue
+			}
+			est := sizeFromPreflight(database, namespace, proof)
+			drop.EstimatedRows = copyEstimate(est.rows)
+			drop.EstimatedBytes = copyEstimate(est.bytes)
 		}
-		attachTableSize(drops[i:i+1], drops[i].Table, sizeFromPreflight(database, namespace, proof))
 	}
 }
 

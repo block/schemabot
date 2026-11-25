@@ -56,3 +56,23 @@ func TestBlockOversizedTableKeepsMeasuredBytes(t *testing.T) {
 	assert.Equal(t, new(int64(2048)), changes[0].EstimatedBytes)
 	assert.Nil(t, changes[0].EstimatedRows)
 }
+
+// Every drop in the plan shares one size budget: once it has run out, no
+// further reads are issued, so planning many namespaces cannot stretch the
+// display-only work past engine.TableSizeProbeTimeout. A nil pool would panic
+// on a read, so the plan finishing proves none was issued.
+func TestSizeDroppedTablesStopsWhenTheBudgetRunsOut(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	changes := []engine.SchemaChange{
+		{Namespace: "public", TableChanges: []engine.TableChange{{Table: "legacy", Operation: ddl.StatementDropTable}}},
+		{Namespace: "billing", TableChanges: []engine.TableChange{{Table: "old_invoices", Operation: ddl.StatementDropTable}}},
+	}
+
+	sizeDroppedTables(ctx, nil, "app", changes)
+
+	for _, sc := range changes {
+		assert.Nil(t, sc.TableChanges[0].EstimatedBytes, "%s.%s", sc.Namespace, sc.TableChanges[0].Table)
+		assert.Nil(t, sc.TableChanges[0].EstimatedRows, "%s.%s", sc.Namespace, sc.TableChanges[0].Table)
+	}
+}
