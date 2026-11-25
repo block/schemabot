@@ -135,10 +135,6 @@ type PlanCommentData struct {
 	// planned, nil when none does, when they could not be read, or when the
 	// comment offers no apply.
 	Freezes *PlanFreezeNotice
-	// Override is the reason the refused command gave with --override. A
-	// refusal's retry command carries it while a freeze still holds the
-	// change, so the author does not type it again.
-	Override string
 
 	// ScopedDatabase is the database this comment's copy-paste commands name,
 	// so the follow-up an operator is being asked for is one they can paste in

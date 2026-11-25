@@ -181,7 +181,7 @@ func TestE2EApplyOverrideOfAnUnsafeChange(t *testing.T) {
 	withoutConsent := runRolloutWebhookWithFiles(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv+` --override "fix the index"`), dropEmail)
 	refusal := awaitCommentContaining(t, withoutConsent, "Apply rejected")
 	assert.Contains(t, refusal, "| `"+freezeID+"` | until lifted |", "the refusal names the freeze the retry meets next")
-	assert.Contains(t, refusal, "schemabot apply -e "+driftEnv+` --allow-unsafe --override "fix the index"`, "the retry keeps the reason")
+	assert.Contains(t, refusal, "schemabot apply -e "+driftEnv+` --allow-unsafe --override "<why it can't wait>"`, "the retry carries the override")
 	requireNoApplies(t, svc, dbName)
 
 	admitted := runRolloutWebhookWithFiles(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv+` --allow-unsafe --override "fix the index"`), dropEmail)

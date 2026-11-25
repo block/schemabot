@@ -141,7 +141,7 @@ command already carries `--override "<why it can't wait>"`. A freeze that is
 scheduled but has not started is named with when it starts, so you can apply
 before it does. The notice only informs: the apply checks the freezes again,
 and that check decides. If an apply is refused for an unsafe change first, the
-retry command it offers keeps your `--override`.
+retry command it offers carries `--override` too.
 
 You have two choices:
 

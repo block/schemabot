@@ -96,39 +96,6 @@ func appendFreezeOverride(command string, notice *PlanFreezeNotice) string {
 	return command + " " + overridePlaceholder
 }
 
-// appendRetryOverride adds --override to the command a refusal asks the
-// author to run again, when a freeze in effect would refuse it. It carries
-// the reason the refused command gave, so the author does not type it again,
-// or the placeholder when the command gave none or its reason cannot be
-// quoted back.
-func appendRetryOverride(command string, notice *PlanFreezeNotice, reason string) string {
-	if notice == nil || len(notice.InEffect) == 0 || !notice.offersOverride() {
-		return command
-	}
-	if quoted, ok := quoteOverrideReason(reason); ok {
-		return command + " --override " + quoted
-	}
-	return command + " " + overridePlaceholder
-}
-
-// quoteOverrideReason quotes reason so the command parser reads it back as one
-// value. The parser has no escapes: a reason is wrapped in the quote it does
-// not contain, and one with both, a line break, or a code fence, which would
-// end the block the command renders in, is not quoted back at all.
-func quoteOverrideReason(reason string) (string, bool) {
-	if strings.TrimSpace(reason) == "" || strings.ContainsAny(reason, "\r\n") || strings.Contains(reason, "```") {
-		return "", false
-	}
-	switch {
-	case !strings.Contains(reason, `"`):
-		return `"` + reason + `"`, true
-	case !strings.Contains(reason, "'"):
-		return "'" + reason + "'", true
-	default:
-		return "", false
-	}
-}
-
 // writeScheduledFreezes writes the scheduled freezes as a table, at most
 // maxListedFreezes of them, and counts the rest.
 func writeScheduledFreezes(sb *strings.Builder, freezes []ScheduledFreeze) {

@@ -284,9 +284,10 @@ func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, reje
 	if includeFlag {
 		command += " --allow-unsafe"
 	}
-	// A freeze refuses the retry too unless it carries the override, so it
-	// keeps the one the command gave.
-	command = appendRetryOverride(command, data.Freezes, data.Override)
+	// A freeze refuses the retry too unless it carries an override. The
+	// author types the reason again, as they type --allow-unsafe again: a
+	// consent is given against the comment they read, never pasted back.
+	command = appendFreezeOverride(command, data.Freezes)
 	lead := fmt.Sprintf("**%s To proceed with these destructive changes**", glyph.Escalation)
 	writeConsentCommand(sb, lead, consent.dropSteps, consent.instruction(includeFlag), command)
 }

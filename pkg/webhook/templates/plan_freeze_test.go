@@ -174,36 +174,27 @@ func TestRenderMultiEnvPlanCommentOverridesOnlyTheFrozenEnvironment(t *testing.T
 }
 
 // An apply refused for its unsafe change meets the freeze next, so the
-// refusal names the freeze and its retry keeps the reason the author gave.
-func TestRenderUnsafeChangesBlockedKeepsTheOverride(t *testing.T) {
+// refusal names the freeze and its retry carries --override. The author types
+// the reason again, as they type --allow-unsafe again.
+func TestRenderUnsafeChangesBlockedOffersTheOverride(t *testing.T) {
 	plan := frozenPlan("production", &PlanFreezeNotice{
 		InEffect: []RefusingFreeze{{ID: "freeze-3f9a1c2e7b4d8a06", Reason: "Holiday code freeze"}}, OverrideOnReason: true,
 	})
 	plan.HasUnsafeChanges = true
 	plan.UnsafeChanges = []UnsafeChangeData{{Table: "users", Reason: "drops column email"}}
 
-	for name, tc := range map[string]struct{ reason, command string }{
-		"reason given":        {"fix the index", `schemabot apply -e production --allow-unsafe --override "fix the index"`},
-		"reason with a quote": {`the "orders" fix`, `schemabot apply -e production --allow-unsafe --override 'the "orders" fix'`},
-		"reason unquotable":   {`it's the "orders" fix`, `schemabot apply -e production --allow-unsafe --override "<why it can't wait>"`},
-		"no reason given":     {"", `schemabot apply -e production --allow-unsafe --override "<why it can't wait>"`},
-	} {
-		t.Run(name, func(t *testing.T) {
-			plan.Override = tc.reason
-			out := RenderUnsafeChangesBlocked(plan)
-			assert.Contains(t, out, "`production` is frozen")
-			assert.Contains(t, out, "```\n"+tc.command+"\n```")
-		})
-	}
+	out := RenderUnsafeChangesBlocked(plan)
+
+	assert.Contains(t, out, "`production` is frozen")
+	assert.Contains(t, out, "```\nschemabot apply -e production --allow-unsafe --override \"<why it can't wait>\"\n```")
 }
 
-// Without a freeze in effect, the retry carries no override, even one the
-// refused command gave: nothing is left for it to let through.
-func TestRenderUnsafeChangesBlockedWithoutAFreezeDropsTheOverride(t *testing.T) {
+// Without a freeze in effect, the retry carries no override: nothing is left
+// for it to let through.
+func TestRenderUnsafeChangesBlockedWithoutAFreezeOffersNoOverride(t *testing.T) {
 	plan := frozenPlan("production", nil)
 	plan.HasUnsafeChanges = true
 	plan.UnsafeChanges = []UnsafeChangeData{{Table: "users", Reason: "drops column email"}}
-	plan.Override = "fix the index"
 
 	assert.NotContains(t, RenderUnsafeChangesBlocked(plan), "--override")
 }
