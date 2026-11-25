@@ -529,5 +529,38 @@ func TestExecutePullSchema_ATableAnyTargetSkippedIsSkippedForTheEnvironment(t *t
 	}, ns.SkippedTables)
 	assert.Equal(t, int32(1), resp.TableCount)
 	require.Len(t, resp.Targets, 2)
+	assert.Equal(t, int32(1), resp.Targets[0].TableCount, "the primary's count leaves out the table the environment skipped")
+	assert.Equal(t, int32(1), resp.Targets[1].TableCount)
 	assert.Empty(t, resp.Targets[1].DivergedTables, "a skipped table is not compared")
+}
+
+// A table can be skipped in a namespace that only a later target holds. The
+// namespace's baseline target returns nothing for it, yet the skipped table
+// still reaches the caller under that namespace, so it lands in ignore_tables
+// rather than going unreported.
+func TestExecutePullSchema_SkippedTableInANamespaceTheBaselineLacks(t *testing.T) {
+	shard := pulledTables(map[string]string{})
+	shard.Namespaces = map[string]*ternv1.PulledNamespace{"testapp_0": {
+		Tables: map[string]string{},
+		SkippedTables: []*ternv1.SkippedTable{
+			{Table: "events", Reason: "schema files cannot describe its trigger"},
+		},
+	}}
+	client := newPerTargetPullClient(map[string]*ternv1.PullSchemaResponse{
+		"testapp-001": pulledTables(map[string]string{"users": pullUsersDDL}),
+		"testapp-002": shard,
+	}, nil)
+	svc := pullTargetService(t, multiTargetPullEnv(), map[string]tern.Client{"eu/production": client})
+
+	req := pullRequest()
+	req.SkipUnrepresentableTables = true
+	resp, err := svc.ExecutePullSchema(t.Context(), req)
+	require.NoError(t, err)
+
+	require.Contains(t, resp.Namespaces, "testapp_0")
+	assert.Empty(t, resp.Namespaces["testapp_0"].Tables)
+	assert.Equal(t, []apitypes.SkippedTable{
+		{Table: "events", Reason: "schema files cannot describe its trigger"},
+	}, resp.Namespaces["testapp_0"].SkippedTables)
+	assertTableCountMatchesNamespaces(t, resp)
 }
