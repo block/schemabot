@@ -48,6 +48,10 @@ func inFlightCases() []inFlightCase {
 		{name: "throttled row copy", table: running(apitypes.TableProgressResponse{ChangeType: "alter", RowsCopied: 3_500_000, RowsTotal: 7_200_000, PercentComplete: 48, Throttled: true, ThrottleReason: "threads-running 41 over 32"}),
 			headline: "48.61% (throttled)"},
 		{name: "copy past its estimate", table: running(apitypes.TableProgressResponse{ChangeType: "alter", RowsCopied: 7_500_000, RowsTotal: 7_200_000, PercentComplete: 100}), headline: "Finalizing copy"},
+		{name: "copy finished short of its estimate", table: running(apitypes.TableProgressResponse{ChangeType: "alter", RowsCopied: 1, RowsTotal: 200_000, PercentComplete: 100}),
+			headline: "100.00%", details: []string{"Rows copied: 1"}},
+		{name: "copy finished with no rows copied", table: running(apitypes.TableProgressResponse{ChangeType: "alter", RowsTotal: 200_000, PercentComplete: 100}),
+			headline: "100.00%"},
 		{name: "index build", table: running(apitypes.TableProgressResponse{ChangeType: "alter", PercentComplete: 25}),
 			metadata: map[string]string{"executor_operation": "concurrent-index-build", "server_phase": "building index: scanning table", "blocks_done": "30000", "blocks_total": "48000"},
 			headline: "25%"},
@@ -102,6 +106,101 @@ func TestInFlightTableReadsTheSameOnEverySurface(t *testing.T) {
 				assert.Equal(t, !tc.noBar, hasBar(prHeadline), "PR comment bar")
 			})
 		}
+	}
+}
+
+// One table's copy finishes short of its estimate while another table is
+// still copying, so the finished table's task stays running. The finished copy
+// may have inserted no rows at all, when the source emptied after its estimate
+// or the binlog applier moved every row first. Both surfaces read it as fully
+// copied, with the rows it copied, and never as a percent of the estimate
+// beside a full bar or as a copy that is starting. The copying table keeps its
+// own percent (UX-8).
+func TestFinishedCopyReadsAsCopiedBesideATableStillCopying(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		rowsCopied int64
+		rowsLine   string
+	}{
+		{name: "some rows copied", rowsCopied: 1, rowsLine: "Rows copied: 1"},
+		{name: "no rows copied", rowsCopied: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &apitypes.ProgressResponse{
+				ApplyID: "apply-5e6f7a8b", Database: "shop", Environment: "staging",
+				State: state.Apply.Running, Engine: storage.EngineSpirit,
+				Tables: []*apitypes.TableProgressResponse{
+					{TableName: "events", DDL: "ALTER TABLE events ADD UNIQUE KEY uk_email (email)", ChangeType: "alter",
+						Status: state.Task.Running, RowsCopied: tc.rowsCopied, RowsTotal: 200_000, PercentComplete: 100},
+					{TableName: "orders", DDL: "ALTER TABLE orders ADD INDEX idx_created (created_at)", ChangeType: "alter",
+						Status: state.Task.Running, RowsCopied: 3_500_000, RowsTotal: 7_200_000, PercentComplete: 48},
+				},
+			}
+			data := ParseProgressResponse(resp)
+			require.Len(t, data.Tables, 2)
+			cli := ansiEscape.ReplaceAllString(FormatTableProgress(data.Tables[0])+FormatTableProgress(data.Tables[1]), "")
+			pr := webhooktemplates.RenderApplyStatusComment(webhooktemplates.ApplyStatusFromProgress(resp, "octocat"))
+
+			for surface, out := range map[string]string{"CLI": cli, "PR comment": pr} {
+				assert.Contains(t, out, "100.00%", "%s: the finished table reads as fully copied", surface)
+				if tc.rowsLine != "" {
+					assert.Contains(t, out, tc.rowsLine, "%s: the finished table shows the rows it copied", surface)
+				}
+				assert.NotContains(t, out, "Starting copy", "%s: the finished table reads as a copy that is starting", surface)
+				assert.NotContains(t, out, "0.01%", "%s: the finished table reads as a percent of its estimate", surface)
+				assert.NotContains(t, out, "/ 200,000", "%s: the finished table's rows line contradicts its bar", surface)
+				assert.Contains(t, out, "48.61%", "%s: the copying table keeps its own percent", surface)
+				assert.Contains(t, out, "Rows: 3,500,000 / 7,200,000", "%s: the copying table keeps its rows line", surface)
+			}
+			// The finished table counts its whole estimate in the summary:
+			// 200,000 + 3,500,000 of 7,400,000.
+			assert.Contains(t, pr, "2 running (50.00%)", "the summary counts the finished table in full")
+		})
+	}
+}
+
+// The users table's copy finished short of its estimate, inserting
+// 3,261,100,506 of an estimated 3,291,032,158 rows. The apply then halts: it
+// is stopped at the cutover gate, cancelled, or fails at cutover. Both
+// surfaces read the halted table as fully copied, with the rows it copied, and
+// never as a percent of the estimate or with a rows line against it (UX-8).
+func TestHaltedFinishedCopyReadsAsCopied(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		applyState string
+		taskState  string
+		cliWord    string
+		prWord     string
+	}{
+		{name: "stopped at the cutover gate", applyState: state.Apply.Stopped, taskState: state.Task.Stopped},
+		{name: "cancelled", applyState: state.Apply.Cancelled, taskState: state.Task.Cancelled, cliWord: "Cancelled at 100.00%", prWord: "Cancelled at 100.00%"},
+		{name: "failed at cutover", applyState: state.Apply.Failed, taskState: state.Task.Failed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &apitypes.ProgressResponse{
+				ApplyID: "apply-9c0d1e2f", Database: "shop", Environment: "staging",
+				State: tc.applyState, Engine: storage.EngineSpirit,
+				Tables: []*apitypes.TableProgressResponse{
+					{TableName: "users", DDL: "ALTER TABLE users ADD UNIQUE KEY uk_handle (handle)", ChangeType: "alter",
+						Status: tc.taskState, RowsCopied: 3_261_100_506, RowsTotal: 3_291_032_158, PercentComplete: 100},
+				},
+			}
+			data := ParseProgressResponse(resp)
+			require.Len(t, data.Tables, 1)
+			cli := ansiEscape.ReplaceAllString(FormatTableProgress(data.Tables[0]), "")
+			pr := webhooktemplates.RenderApplyStatusComment(webhooktemplates.ApplyStatusFromProgress(resp, "octocat"))
+
+			for surface, out := range map[string]string{"CLI": cli, "PR comment": pr} {
+				assert.NotContains(t, out, "99.09%", "%s: the finished table reads as a percent of its estimate", surface)
+				assert.NotContains(t, out, "/ 3,291,032,158", "%s: the finished table's rows line contradicts its full bar", surface)
+			}
+			if tc.cliWord != "" {
+				assert.Contains(t, cli, tc.cliWord)
+			}
+			if tc.prWord != "" {
+				assert.Contains(t, pr, tc.prWord)
+			}
+		})
 	}
 }
 

@@ -1055,12 +1055,65 @@ worker to report operation events and the control plane to report the aggregate
 outcome. Worker events use the executing deployment's apply and operation IDs.
 The worker receives the managed app label in the existing dispatch options.
 
-Delivery is best effort. The server offers events in memory without writing
-event records. Each destination has a bounded queue and a short HTTP timeout.
-Full queues drop events, delivery failures are logged, and there are no delivery
-retries. When a reaper settles an apply, the delivery workers load event details
-in the background so the reaper can update GitHub without waiting. Shutting down
-the server can discard events still in memory.
+### Amazon SQS destinations
+
+Use `sqs_change_events` to publish structured JSON to an existing standard SQS
+queue. Each queue selects its own events and environments. It works on its own
+or alongside the HTTP destinations above.
+
+```yaml
+sqs_change_events:
+  - queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/schema-events
+    region: us-east-1
+    environments: [production]
+    events: [apply.finished]
+```
+
+Grant the server role `sqs:SendMessage` on that queue. The publisher uses the AWS
+SDK credential chain. Set `region` to the queue's region or supply it through
+the AWS SDK configuration. Omitting `sqs_change_events` disables SQS delivery.
+
+An `apply.finished` message for a successful apply looks like this:
+
+```json
+{
+  "event_id": "103dfb3a-5cb6-4b2c-b36a-6bc0d75ce5c7",
+  "type": "apply.finished",
+  "id": "apply_example",
+  "app": "checkout",
+  "database": "orders",
+  "database_type": "mysql",
+  "environment": "production",
+  "repository": "example/schemas",
+  "pull_request": 42,
+  "outcome": "completed",
+  "completed_at": "2026-11-20T00:00:00Z",
+  "occurred_at_nanos": 1795132800000000000
+}
+```
+
+Use `event_id` to deduplicate deliveries. With a local worker, operation events
+and the control plane’s `apply.finished` event share the same apply `id`. With a
+remote worker, operation events carry the worker’s apply ID and `apply.finished`
+carries the control plane’s apply ID. Joining on `id` only correlates events
+within the same apply record.
+
+Apply
+outcomes include `completed`, `failed`, `cancelled`, and `reverted`. Consumers
+that react only to successful schema changes should select `outcome == "completed"`.
+`occurred_at_nanos` is when the hook observed the event. `completed_at` is the
+stored apply completion time, falling back to the stored update time. Operation
+events include `operation_id`, `deployment`, and `attempt`. Only finish events
+carry an outcome, and only aggregate finish events carry `completed_at`.
+Repository and pull request fields are omitted when absent.
+
+Delivery is best effort for both transports. Each destination uses a bounded
+in-memory queue and a three-second send deadline. A full queue, a failed send,
+or shutdown can lose events. The SQS publisher makes one send attempt. Once
+SQS accepts a message, the queue's retention and delivery policies apply.
+Delivery failures are logged. SchemaBot writes no outbox rows. When a reaper
+settles an apply, delivery workers load the event details in the background
+so the reaper can update GitHub without waiting.
 
 ## Rate Limits
 

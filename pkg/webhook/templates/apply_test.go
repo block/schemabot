@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
@@ -2175,6 +2176,29 @@ func TestPreviewCommentSummaryFailed(t *testing.T) {
 	assert.Contains(t, result, "**`users`** — Failed at 30.00%")
 	assert.Contains(t, result, "**`orders`** — Completed", "on a failed apply, the reader must be able to tell which tables made it")
 	assert.Contains(t, result, "**`products`** — Cancelled")
+}
+
+// A table whose copy finished short of its estimate, then halted, reads in
+// the terminal summary as halted at 100.00%, not at a percent of the estimate.
+func TestSummaryEntryReadsAFinishedCopyAsDone(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		want   string
+	}{
+		{status: state.Task.Failed, want: "**`users`** — Failed at 100.00%"},
+		{status: state.Task.Stopped, want: "**`users`** — Stopped at 100.00%"},
+		{status: state.Task.Cancelled, want: "**`users`** — Cancelled at 100.00%"},
+	} {
+		t.Run(tc.status, func(t *testing.T) {
+			var sb strings.Builder
+			writeSummaryTableEntry(&sb, schema.DialectMySQL, TableProgressData{
+				TableName: "users", Status: tc.status,
+				RowsCopied: 3_261_100_506, RowsTotal: 3_291_032_158, PercentComplete: 100,
+			}, true, nil)
+			assert.Contains(t, sb.String(), tc.want)
+			assert.NotContains(t, sb.String(), "99.09%")
+		})
+	}
 }
 
 func TestPreviewCommentSummaryStopped(t *testing.T) {

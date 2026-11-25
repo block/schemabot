@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/changeevents"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/google/uuid"
 )
 
 const changeEventStorageTimeout = 250 * time.Millisecond
@@ -64,12 +65,12 @@ func (r *changeEventRecorder) finishOperation(ctx context.Context, applyID int64
 }
 
 func (r *changeEventRecorder) operationEvent(apply *storage.Apply, attempt *storage.OperationChangeAttempt, kind, outcome string) changeevents.Event {
-	event := changeevents.Event{
-		Type: kind, App: r.application(apply.GetOptions().ChangeEventApp, apply.Database), Environment: apply.Environment,
-		OccurredAtNanos: time.Now().UnixNano(),
-		Description: fmt.Sprintf("%s apply=%s operation=%d deployment=%s attempt=%d", kind,
-			apply.ApplyIdentifier, attempt.OperationID, attempt.Deployment, attempt.Number),
-	}
+	event := r.newEvent(apply, kind, outcome, apply.GetOptions().ChangeEventApp, time.Now().UnixNano())
+	event.Details.OperationID = attempt.OperationID
+	event.Details.Deployment = attempt.Deployment
+	event.Details.Attempt = attempt.Number
+	event.Description = fmt.Sprintf("%s apply=%s operation=%d deployment=%s attempt=%d", kind,
+		apply.ApplyIdentifier, attempt.OperationID, attempt.Deployment, attempt.Number)
 	if outcome != "" {
 		event.Description += " outcome=" + outcome
 	}
@@ -151,12 +152,26 @@ func (r *changeEventRecorder) loadApplyFinish(ctx context.Context, applyID int64
 		}
 	}
 	summary := changeEventDeploymentSummary(ops, outcome)
+	event := r.newEvent(apply, changeevents.ApplyFinished, outcome, "", occurredAt)
+	completedAt := apply.UpdatedAt
+	if apply.CompletedAt != nil {
+		completedAt = *apply.CompletedAt
+	}
+	event.Details.CompletedAt = completedAt.UTC()
+	event.Description = fmt.Sprintf("%s apply=%s outcome=%s%s%s", changeevents.ApplyFinished, apply.ApplyIdentifier,
+		outcome, summary, changeEventCaller(apply.Caller, apply.Repository, apply.PullRequest))
+	return event, true
+}
+
+func (r *changeEventRecorder) newEvent(apply *storage.Apply, kind, outcome, app string, occurredAt int64) changeevents.Event {
 	return changeevents.Event{
-		Type: changeevents.ApplyFinished, App: r.application("", apply.Database), Environment: apply.Environment,
+		Type: kind, App: r.application(app, apply.Database), Environment: apply.Environment,
 		OccurredAtNanos: occurredAt,
-		Description: fmt.Sprintf("%s apply=%s outcome=%s%s%s", changeevents.ApplyFinished, apply.ApplyIdentifier,
-			outcome, summary, changeEventCaller(apply.Caller, apply.Repository, apply.PullRequest)),
-	}, true
+		Details: changeevents.EventDetails{
+			EventID: uuid.NewString(), ApplyID: apply.ApplyIdentifier, Outcome: outcome,
+			Database: apply.Database, DatabaseType: apply.DatabaseType, Repository: apply.Repository, PullRequest: apply.PullRequest,
+		},
+	}
 }
 
 func (r *changeEventRecorder) application(app, database string) string {
