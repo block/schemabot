@@ -52,8 +52,10 @@ type shardWorkGroup struct {
 // display status from the operation state, and its diff from the stored plan
 // (the view, see resolveShardedPlanView) — rendered in the comment's
 // VSchema section. A keyspace the stored plan finalizes without a VSchema
-// change renders in the Finalize section instead, so the comment does not
-// claim a VSchema change the plan never carried. A
+// change has nothing of its own for the operator to review, so its finalizer
+// is not listed, the same as in the plan: the finalize is an engine step, not
+// a change the operator made. Its outcome still reaches the comment through
+// the apply's state and failure callout. A
 // failed finalizer's error also stands in for the apply-level failure cause
 // when the apply row carries none, since a finalizer failure is
 // operation-scoped and leaves no failed shard row to name it.
@@ -77,7 +79,6 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 	type keyspaceShard struct{ namespace, shard string }
 	groupIndex := make(map[keyspaceShard]int)
 	var vschemaChanges []apitypes.VSchemaChange
-	var finalizes []templates.ShardedFinalize
 	finalizerError := ""
 	for _, op := range ops {
 		ns, shard, table, ok := state.ShardWorkKey(op.OperationKey)
@@ -89,9 +90,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 				continue
 			}
 			status := presentation.FinalizerVSchemaStatus(apply.State, op.State)
-			if view.finalizesOnly(finalizerNS) {
-				finalizes = append(finalizes, templates.ShardedFinalize{Keyspace: finalizerNS, Status: status})
-			} else {
+			if !view.finalizesOnly(finalizerNS) {
 				vschemaChanges = append(vschemaChanges, apitypes.VSchemaChange{
 					Namespace: finalizerNS,
 					Status:    status,
@@ -157,7 +156,6 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		ErrorMessage:   errorMessage,
 		Keyspaces:      keyspaces,
 		VSchemaChanges: vschemaChanges,
-		Finalizes:      finalizes,
 		Tenant:         tenant,
 		Rollback:       apply.IsRollback(),
 	}

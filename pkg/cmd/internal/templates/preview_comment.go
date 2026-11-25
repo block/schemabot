@@ -510,7 +510,6 @@ func previewCommentShardedAllOutput() {
 		{"APPLY WITH DIVERGENT SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyDivergent()) }},
 		{"APPLY ACROSS MULTIPLE KEYSPACES", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyMultiKeyspace()) }},
 		{"SUMMARY: ALL SHARDS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCompleted()) }},
-		{"SUMMARY: KEYSPACE FINALIZED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFinalized()) }},
 		{"SUMMARY: HALT ON FAILURE (ONE SHARD FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFailed()) }},
 		{"SUMMARY: DEFERRED CUTOVER STOPPED AFTER A SHARD FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryStoppedAtCutover()) }},
 		{"SUMMARY: DEFERRED CUTOVER STOPPED AFTER A TABLE FAILED ON A KEYSPACE'S ONLY SHARD", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryStoppedAtCutoverOnOnlyShard()) }},
