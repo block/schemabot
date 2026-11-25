@@ -49,6 +49,7 @@ const (
 
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
+	events     *changeEventRecorder
 	db         *rebindDB
 	dialect    Dialect
 	identity   identityInserter
@@ -1626,6 +1627,7 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 // updateOnce runs one attempt of Update in its own transaction.
 func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease storage.ApplyLease, hasLease bool) error {
 	var err error
+	finishSelected := s.events.selectsApplyFinish(apply)
 	lockTarget := isActiveApplyState(apply.State)
 	database, dbType, environment, deployment := apply.Database, apply.DatabaseType, apply.Environment, apply.Deployment
 	if lockTarget && (!hasApplyTarget(database, dbType, environment) || deployment == "") {
@@ -1693,14 +1695,33 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 	// attempt + 1: a driver's in-memory copy goes stale the moment the stored
 	// budget is adjusted out-of-band mid-drive, and persisting it absolutely
 	// would silently reset that adjustment and re-open expired recovery.
-	result, err := writeTx.tx.ExecContext(ctx, fmt.Sprintf(`
+	statement := fmt.Sprintf(`
 		UPDATE applies
 		SET state = ?, error_message = ?,
 		    external_id = ?%s, started_at = ?, completed_at = ?, updated_at = NOW()
 		WHERE id = ?%s%s
-	`, optionsUpdate, leasePredicate, finishedPredicate), args...)
-	if err != nil {
-		return fmt.Errorf("update apply %d: %w", apply.ID, err)
+	`, optionsUpdate, leasePredicate, finishedPredicate)
+
+	// The first write matches a real terminal transition. An idempotent
+	// write still uses the original statement to preserve its other updates.
+	var result sql.Result
+	var terminalTransition bool
+	if finishSelected {
+		result, err = writeTx.tx.ExecContext(ctx, statement+" AND state <> ?", append(args, apply.State)...)
+		if err != nil {
+			return fmt.Errorf("update apply %d: %w", apply.ID, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("read apply update rows affected for apply %d: %w", apply.ID, err)
+		}
+		terminalTransition = rows > 0
+	}
+	if !terminalTransition {
+		result, err = writeTx.tx.ExecContext(ctx, statement, args...)
+		if err != nil {
+			return fmt.Errorf("update apply %d: %w", apply.ID, err)
+		}
 	}
 	if hasLease || finishedGuarded {
 		rows, err := result.RowsAffected()
@@ -1725,6 +1746,9 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 	}
 	if err := writeTx.commit(); err != nil {
 		return fmt.Errorf("commit update apply %d: %w", apply.ID, err)
+	}
+	if terminalTransition {
+		s.events.finishApply(ctx, apply.ID, apply.State, true)
 	}
 	return nil
 }
@@ -1862,6 +1886,9 @@ func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expe
 		return false, fmt.Errorf("read derived apply state rows affected for apply %d: %w", applyID, err)
 	}
 	if rows > 0 {
+		if !state.IsState(expectedState, newState) {
+			s.events.finishApply(ctx, applyID, newState, false)
+		}
 		return true, nil
 	}
 
@@ -3287,10 +3314,16 @@ func (s *applyStore) WithBranchReconcileElection(ctx context.Context, fn func(co
 // ExpireRetryable elects one instance per pass and expires under the lock. See
 // storage.ApplyStore for the contract.
 func (s *applyStore) ExpireRetryable(ctx context.Context, endedOperationStopTypes []string, limit int) ([]*storage.RetryableApplyExpiration, error) {
-	return reapUnderElection(ctx, s.db, s.locker, retryableExpirySweep,
+	expired, err := reapUnderElection(ctx, s.db, s.locker, retryableExpirySweep,
 		func(ctx context.Context) ([]*storage.RetryableApplyExpiration, error) {
 			return s.expireRetryable(ctx, endedOperationStopTypes, limit)
 		})
+	if err == nil {
+		for _, result := range expired {
+			s.events.offerReapedApplyFinish(result.Apply)
+		}
+	}
+	return expired, err
 }
 
 // expireRetryable transitions failed_retryable applies that exhausted their

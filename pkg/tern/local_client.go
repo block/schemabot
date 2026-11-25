@@ -634,6 +634,7 @@ func (c *LocalClient) applyWithEngine(ctx context.Context, eng engine.Engine, re
 	ctx = withDriveWorkOwner(ctx)
 	req = applyRequestWithStatedDirectExecution(req)
 	if !c.remapsPostgresNamespaces() {
+		c.observeOperationDispatch(ctx)
 		return eng.Apply(ctx, req)
 	}
 	// Remapping rewrites the caller's request, so it is done on a copy: the
@@ -656,6 +657,7 @@ func (c *LocalClient) applyWithEngine(ctx context.Context, eng engine.Engine, re
 		return nil, fmt.Errorf("prepare PostgreSQL apply schema files: %w", err)
 	}
 	requestCopy.SchemaFiles = physicalFiles
+	c.observeOperationDispatch(ctx)
 	return eng.Apply(ctx, &requestCopy)
 }
 
@@ -3736,6 +3738,10 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		ExpectedOperationKeys: normalizedManifest(req.GenerationOperationKeys),
 		CreatedAt:             now,
 		UpdatedAt:             now,
+	}
+	if app := req.GetOptions()[changeEventAppOption]; app != "" {
+		applyOpts.ChangeEventApp = app
+		apply.SetOptions(applyOpts)
 	}
 
 	// The stopped applies whose resting copies this dispatch meets are stamped

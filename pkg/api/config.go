@@ -21,6 +21,7 @@ import (
 
 	gomysql "github.com/block/mysql"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/changeevents"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
@@ -45,6 +46,9 @@ var configIdentifierPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 // ServerConfig holds the server-side SchemaBot configuration.
 // This is loaded from a YAML file specified by SCHEMABOT_CONFIG_FILE.
 type ServerConfig struct {
+	// ChangeEvents asynchronously reports selected operation and apply lifecycle events.
+	ChangeEvents []changeevents.Destination `yaml:"change_events,omitempty"`
+
 	liveDatabases *liveDatabaseRegistry
 
 	// ExperimentalStrataEnabled permits experimental Strata registrations and
@@ -3329,6 +3333,14 @@ func (c *ServerConfig) Database(name string) *DatabaseConfig {
 		return &db
 	}
 	return nil
+}
+
+// DatabaseApp returns the registered application for a logical database.
+func (c *ServerConfig) DatabaseApp(database string) string {
+	if db, ok := c.DatabaseConfigs()[database]; ok {
+		return db.App
+	}
+	return ""
 }
 
 // DatabaseEnvironment returns the environment configuration for a database.

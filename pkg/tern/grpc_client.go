@@ -149,6 +149,7 @@ type GRPCClient struct {
 	client            ternv1.TernClient
 	guardedPlanConn   *grpc.ClientConn
 	guardedPlanClient ternv1.TernClient
+	changeEventApp    func(database string) string
 	address           string          // dial address for logging/debugging
 	storage           storage.Storage // SchemaBot's storage for apply/task management
 	logger            *slog.Logger    // base logger; drives bind apply identity via applyLogger
@@ -195,6 +196,9 @@ var _ Client = (*GRPCClient)(nil)
 
 // Config holds configuration for the gRPC client.
 type Config struct {
+	// ChangeEventApp resolves the registered app to forward to a remote worker.
+	ChangeEventApp func(database string) string
+
 	// Address is the gRPC server address (e.g., "localhost:9090").
 	Address string
 
@@ -392,6 +396,7 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 		client:            ternv1.NewTernClient(conn),
 		guardedPlanConn:   guardedPlanConn,
 		guardedPlanClient: ternv1.NewTernClient(guardedPlanConn),
+		changeEventApp:    config.ChangeEventApp,
 		address:           config.Address,
 		storage:           config.Storage,
 		logger:            config.Logger,
@@ -3240,6 +3245,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 	if scope.remoteApplyID(apply) == "" {
 		driveOptions := effectiveCopyDriveOptions(apply, scope.multiOperation, scope.operation)
 		options := driveOptions.Map()
+		c.setChangeEventApp(options, apply.Database)
 		target := options["target"]
 		if target == "" {
 			target = apply.Database
@@ -4220,6 +4226,7 @@ func (c *GRPCClient) dispatchRemoteApply(ctx context.Context, apply *storage.App
 	// operation through its swap in turn.
 	driveOptions := effectiveCopyDriveOptions(apply, scope.multiOperation, scope.operation)
 	options := driveOptions.Map()
+	c.setChangeEventApp(options, apply.Database)
 	target := options["target"]
 	if target == "" {
 		target = apply.Database
