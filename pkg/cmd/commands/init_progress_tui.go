@@ -13,6 +13,9 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 type initStageMsg string
@@ -162,7 +165,23 @@ func initCompletion(result *initResult, environment, defaultProfile, invocation 
 		noun = "table"
 	}
 	heading := lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#1A7F37", Dark: "#3FB950"}).Render("✓ Your schema is ready")
-	return fmt.Sprintf("\n  %s\n\n  %d %s · Baseline plan: no changes.\n\n%s\n  Make your first edit, then review the plan:\n\n    %s\n\n", heading, result.Tables, noun, initSchemaTree(result.SchemaDir), next)
+	return fmt.Sprintf("\n  %s\n\n  %d %s · Baseline plan: no changes.\n\n%s\n%s  Make your first edit, then review the plan:\n\n    %s\n\n", heading, result.Tables, noun, initSchemaTree(result.SchemaDir), initSkippedSummary(result.SkippedTables), next)
+}
+
+// initSkippedSummary names the tables the import left out, one per line, so
+// the operator learns at setup that SchemaBot will not manage them.
+func initSkippedSummary(skipped []initSkippedTable) string {
+	if len(skipped) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "  %s  Not managed: %d %s no schema file, so schemabot.yaml lists %s in ignore_tables:\n",
+		glyph.Attention, len(skipped), ui.PluralizeLabel("table has", "tables have", len(skipped)), ui.PluralizeLabel("it", "them", len(skipped)))
+	for _, table := range skipped {
+		fmt.Fprintf(&b, "    %s.%s: %s\n", table.Namespace, table.Table, table.Reason)
+	}
+	b.WriteString("\n")
+	return b.String()
 }
 
 // Preview a bounded number of SQL files, without following directory symlinks.

@@ -39,6 +39,9 @@ func (cmd *PullCmd) Run(g *Globals) error {
 			Namespaces:    cmd.Namespaces,
 			CatalogDetail: cmd.CatalogDetail,
 			Lint:          cmd.Lint,
+			// Pull writes no files, so it shows every table it can and
+			// names the rest rather than refusing the whole namespace.
+			SkipUnrepresentableTables: true,
 		})
 		return pullErr
 	})
@@ -83,7 +86,9 @@ const maxTablesInFilterError = 20
 func filterPullSchemaTables(resp *apitypes.PullSchemaResponse, filter string) error {
 	needle := strings.ToLower(filter)
 	matched := make(map[string]map[string]string, len(resp.Namespaces))
+	matchedSkipped := make(map[string][]apitypes.SkippedTable, len(resp.Namespaces))
 	var kept int32
+	var keptSkipped int
 	for name, ns := range resp.Namespaces {
 		keptTables := make(map[string]string)
 		for table, ddl := range ns.Tables {
@@ -93,17 +98,24 @@ func filterPullSchemaTables(resp *apitypes.PullSchemaResponse, filter string) er
 		}
 		matched[name] = keptTables
 		kept += int32(len(keptTables))
+		for _, skipped := range ns.SkippedTables {
+			if strings.Contains(strings.ToLower(skipped.Table), needle) {
+				matchedSkipped[name] = append(matchedSkipped[name], skipped)
+			}
+		}
+		keptSkipped += len(matchedSkipped[name])
 	}
-	if kept == 0 {
+	if kept == 0 && keptSkipped == 0 {
 		return errNoTableMatches(resp, filter)
 	}
 	for name, ns := range resp.Namespaces {
 		keptTables := matched[name]
-		if len(keptTables) == 0 {
+		if len(keptTables) == 0 && len(matchedSkipped[name]) == 0 {
 			delete(resp.Namespaces, name)
 			continue
 		}
 		ns.Tables = keptTables
+		ns.SkippedTables = matchedSkipped[name]
 		ns.Artifacts = nil
 		if ns.NamespaceCatalog != nil {
 			ns.NamespaceCatalog.TableCount = int32(len(keptTables))

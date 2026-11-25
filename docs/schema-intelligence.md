@@ -367,6 +367,22 @@ On a database with several targets, a table any target skips is skipped for
 all of them, because every target is planned from the same files. It is left
 out of the schema and of the `targets` comparison.
 
+`schemabot pull` always sets the flag, since it writes no files, and lists the
+skipped tables under their namespace:
+
+```sh
+schemabot pull -d shop -e production
+```
+
+```sql
+-- Namespace `public` — 1 table
+-- Skipped 1 table:
+--   accounts: schema files cannot describe its trigger
+```
+
+`schemabot onboard` and `schemabot init` set it too, and write each skipped
+table into `schemabot.yaml`'s `ignore_tables`.
+
 ### Databases that span several targets
 
 A database whose environment lists `targets` addresses several targets at once,

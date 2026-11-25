@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -39,6 +40,7 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 		fmt.Println(annotation(fmt.Sprintf("-- Namespace %s — %d %s",
 			emphasis("`"+name+"`"), len(ns.Tables), ui.Pluralize("table", len(ns.Tables)))))
 		writePulledLint(ns.Lint)
+		writePulledSkippedTables(ns.SkippedTables)
 
 		for _, table := range sortedKeys(ns.Tables) {
 			fmt.Println()
@@ -275,6 +277,33 @@ func writePulledLint(violations []*apitypes.LintViolationResponse) {
 			line += v.Table + ": "
 		}
 		writeCommented("--   ", line+v.Message)
+	}
+}
+
+// writePulledSkippedTables lists the tables the pull left out because schema
+// files cannot describe them, as "--" comments so the output stays valid SQL.
+func writePulledSkippedTables(skipped []apitypes.SkippedTable) {
+	if len(skipped) == 0 {
+		return
+	}
+	fmt.Println(annotation(fmt.Sprintf("-- Skipped %d %s:", len(skipped), ui.Pluralize("table", len(skipped)))))
+	for _, table := range skipped {
+		writeCommented("--   ", table.Table+": "+table.Reason)
+	}
+}
+
+// WriteOnboardSkippedTables tells the operator which tables onboarding left
+// out of the schema files and listed in ignore_tables instead, so SchemaBot
+// will neither change nor drop them.
+func WriteOnboardSkippedTables(namespace string, skipped []apitypes.SkippedTable) {
+	if len(skipped) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Printf("%s  Not managed in namespace %s: %d %s no schema file, so schemabot.yaml lists %s in ignore_tables:\n",
+		glyph.Attention, namespace, len(skipped), ui.PluralizeLabel("table has", "tables have", len(skipped)), ui.PluralizeLabel("it", "them", len(skipped)))
+	for _, table := range skipped {
+		fmt.Printf("  %s: %s\n", table.Table, table.Reason)
 	}
 }
 

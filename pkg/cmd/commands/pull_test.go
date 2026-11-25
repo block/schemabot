@@ -251,3 +251,34 @@ func TestFilterPullSchemaTablesErrorsWhenNothingMatches(t *testing.T) {
 	assert.Contains(t, err.Error(), `no table matching "odres" in database orders environment production`)
 	assert.Contains(t, err.Error(), "available tables: users")
 }
+
+// A table the pull skipped is still a table the operator can ask about: the
+// filter keeps a matching skipped table, and keeps a namespace whose only
+// match is a skipped table, so the output says why it has no definition.
+func TestFilterPullSchemaTablesKeepsMatchingSkippedTables(t *testing.T) {
+	resp := &apitypes.PullSchemaResponse{
+		Database: "app", Type: "postgres", Environment: "development", TableCount: 2,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"public": {
+				Tables: map[string]string{"audit_events": "CREATE TABLE audit_events (id bigint);", "orders": "CREATE TABLE orders (id bigint);"},
+				SkippedTables: []apitypes.SkippedTable{
+					{Table: "audit_log", Reason: "unlogged tables cannot be rendered as a desired schema"},
+					{Table: "sessions", Reason: "schema files cannot describe its trigger"},
+				},
+			},
+			"billing": {
+				Tables:        map[string]string{"invoices": "CREATE TABLE invoices (id bigint);"},
+				SkippedTables: []apitypes.SkippedTable{{Table: "audit_ledger", Reason: "table inheritance cannot be rendered as a desired schema"}},
+			},
+		},
+	}
+
+	require.NoError(t, filterPullSchemaTables(resp, "audit"))
+
+	require.Contains(t, resp.Namespaces, "public")
+	assert.Equal(t, map[string]string{"audit_events": "CREATE TABLE audit_events (id bigint);"}, resp.Namespaces["public"].Tables)
+	assert.Equal(t, []apitypes.SkippedTable{{Table: "audit_log", Reason: "unlogged tables cannot be rendered as a desired schema"}}, resp.Namespaces["public"].SkippedTables)
+	require.Contains(t, resp.Namespaces, "billing", "a namespace whose only match is a skipped table stays")
+	assert.Empty(t, resp.Namespaces["billing"].Tables)
+	assert.Equal(t, []apitypes.SkippedTable{{Table: "audit_ledger", Reason: "table inheritance cannot be rendered as a desired schema"}}, resp.Namespaces["billing"].SkippedTables)
+}

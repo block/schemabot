@@ -974,9 +974,8 @@ you select JSON output. Each PostgreSQL schema is a SchemaBot namespace.
   with its `PARTITION BY` clause, without its partitions.
 - Not views, materialized views, or foreign tables.
 
-**What it refuses.** If any selected table cannot round-trip through the
-schema file format, the whole pull is refused and nothing is written. That
-covers tables with:
+**Tables it cannot describe.** Some tables cannot round-trip through the
+schema file format. These include tables with:
 
 - A foreign key into another namespace or on a partition, on either side.
   See [Foreign keys](#foreign-keys)
@@ -984,6 +983,16 @@ covers tables with:
 - Explicit collations
 - Sequence defaults it cannot represent safely
 - Triggers, table or column comments, or non-default table options
+
+| Command | What happens to such a table |
+|---|---|
+| `pull` | Left out of the SQL and listed in a `-- Skipped` comment with the reason |
+| `onboard`, `init` | No file is written. `schemabot.yaml` lists it in `ignore_tables`, so SchemaBot never changes or drops it, and the command names it with the reason |
+| `POST /api/pull` | The whole pull is refused, unless the request sets `skip_unrepresentable_tables`. See [Skip tables schema files cannot describe](schema-intelligence.md#skip-tables-schema-files-cannot-describe) |
+
+An `ignore_tables` entry is a bare table name, so it also withholds a table of
+the same name in every other namespace. A skipped table whose name reads as an
+`ignore_tables` pattern refuses onboarding; rename it first.
 
 The schema intelligence API's detailed catalog output is not available for
 PostgreSQL. A request for it is rejected rather than answered with the basic
