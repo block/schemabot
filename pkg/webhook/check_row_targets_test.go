@@ -158,7 +158,7 @@ func TestAggregateTitleNamesRolloutTargets(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			conclusion, _ := computeAggregate(tc.checks, nil)
-			title, _ := aggregateSummary(tc.checks, conclusion, nil, nil)
+			title, _ := aggregateSummary(tc.checks, conclusion, nil, nil, "")
 			assert.Equal(t, tc.want, title)
 		})
 	}

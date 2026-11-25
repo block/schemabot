@@ -1618,7 +1618,7 @@ func TestE2EAggregateReportsFailedApplyFromEarlierCommit(t *testing.T) {
 		assert.Equal(t, "Apply failed", cr.Output.Title)
 		assert.Contains(t, cr.Output.Summary, "| `"+dbName+"` | mysql |")
 		assert.Contains(t, cr.Output.Summary, "| Failed |")
-		assert.Contains(t, cr.Output.Summary, "**To clear this:** comment `schemabot plan -e staging` on the pull request.")
+		assert.Contains(t, cr.Output.Summary, "**To clear this:** comment `schemabot plan -e staging -d "+dbName+"` on the pull request.")
 	case <-time.After(webhookIntegrationCheckRunDeadline):
 		require.FailNow(t, "timed out waiting for the failed aggregate check run on the new commit")
 	}

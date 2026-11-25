@@ -758,8 +758,8 @@ The pull request is named however you already have it: by URL, by
 
 Each row carries a stable `reason` code, and the two that decide what to do
 next are `awaiting_replan_after_apply`, which SchemaBot converges on its own,
-and `reconciliation_owed`, which needs a person to plan the environment. The command separates them
-under "Waiting on SchemaBot" and "Waiting on an operator" so the distinction
+and `reconciliation_owed`, which needs a person to act. The command separates
+them under "Waiting on SchemaBot" and "Waiting on an operator" so the distinction
 does not have to be inferred from a status and a conclusion. The full set of
 codes is defined in `pkg/checkstate`, and `--json` emits them alongside the
 `blocking` and `self_converging` flags for a script or an agent to branch on.
@@ -800,9 +800,13 @@ computed or compared shows no count rather than one read from an unusable plan.
 
 It reads state and never writes: recreating a missing Check Run is
 `checks backfill` below. A `reconciliation_owed` row clears when a person
-plans the environment once the apply has settled. The plan diffs the pull
-request against the target as it is now, so it clears the block only when
-the target already matches, and otherwise shows what is left to apply.
+plans its database once the apply has settled, and the row's `do:` line names
+that plan. The plan diffs the pull request against the target as it is now,
+so it clears the block only when the target already matches, and otherwise
+shows what is left to apply. A row blocked by
+`schema_removed_after_apply_started` is the exception: the pull request no
+longer changes that database, so a plan of it is refused (MG-6). Add the
+schema change back and plan it, or roll the apply back.
 
 ### Backfilling missing Check Runs
 

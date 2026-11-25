@@ -158,7 +158,7 @@ func TestParticipantCheckOutcomesUnresolvedAfterBudgetExhausted(t *testing.T) {
 	assert.Equal(t, checkConclusionActionRequired, conclusion)
 	assert.Equal(t, checkStatusCompleted, status)
 
-	title, _ := aggregateSummary(checks, conclusion, nil, nil)
+	title, _ := aggregateSummary(checks, conclusion, nil, nil, "")
 	assert.Equal(t, "1 participant deployment has not reported", title,
 		"an unresolved participant must read as a reporting gap, not a pending apply")
 }
@@ -176,7 +176,7 @@ func TestAggregateSummaryWaitingForParticipants(t *testing.T) {
 	require.Empty(t, conclusion)
 	require.Equal(t, checkStatusInProgress, status)
 
-	title, summary := aggregateSummary(checks, conclusion, nil, nil)
+	title, summary := aggregateSummary(checks, conclusion, nil, nil, "")
 	assert.Equal(t, "Waiting for 1 participant deployment to report", title)
 	assert.Contains(t, summary, "Waiting to report")
 	assert.Contains(t, summary, "`tenant-a`")

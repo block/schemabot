@@ -405,3 +405,45 @@ func TestDiagnoseRowInEnvironmentNotConfigured(t *testing.T) {
 		})
 	}
 }
+
+// A reconciliation names the plan of the row's own database, so the command an
+// operator pastes from `checks show` addresses the database that is blocked.
+func TestDiagnoseNamesTheBlockedDatabasesPlan(t *testing.T) {
+	t.Parallel()
+
+	got := Diagnose(&storage.Check{
+		HeadSHA: headSHA, Environment: "staging", DatabaseType: "mysql", DatabaseName: "inventory",
+		ApplyID: 42, Status: StatusCompleted, Conclusion: ConclusionFailure, BlockingReason: BlockRollbackCompleted,
+	}, headSHA, nil, "")
+	assert.Equal(t, ReasonReconciliationOwed, got.Reason)
+	assert.Contains(t, got.Remedy, "comment `schemabot plan -e staging -d inventory` on the pull request")
+
+	terminal := Diagnose(&storage.Check{
+		HeadSHA: headSHA, Environment: "production", DatabaseType: "mysql", DatabaseName: "orders",
+		ApplyID: 42, Status: StatusCompleted, Conclusion: ConclusionFailure,
+	}, headSHA, nil, "")
+	assert.Equal(t, ReasonReconciliationOwed, terminal.Reason)
+	assert.Contains(t, terminal.Remedy, "comment `schemabot plan -e production -d orders` on the pull request")
+}
+
+// A pull request that stopped changing a database an apply had started on
+// cannot plan that database (MG-6), so the remedy names the two ways out:
+// put the change back and plan it, or roll the apply back.
+func TestDiagnoseSchemaRemovedNamesTheChangeOrARollback(t *testing.T) {
+	t.Parallel()
+
+	check := &storage.Check{
+		HeadSHA: headSHA, Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders",
+		ApplyID: 42, Status: StatusCompleted, Conclusion: ConclusionFailure, BlockingReason: BlockSchemaRemovedAfterApplyStarted,
+	}
+	got := Diagnose(check, headSHA, &storage.Apply{ApplyIdentifier: "apply-example-12", State: "failed"}, "")
+	assert.Equal(t, ReasonReconciliationOwed, got.Reason)
+	assert.True(t, got.Blocking)
+	assert.False(t, got.SelfConverging)
+	assert.Equal(t, "The pull request no longer changes this database, so a plan of it is refused. "+
+		"Once the apply has settled, either add the schema change back to the pull request and comment `schemabot plan -e staging -d orders`, "+
+		"or comment `schemabot rollback apply-example-12 -e staging` to undo it.", got.Remedy)
+
+	unread := Diagnose(check, headSHA, nil, "")
+	assert.Contains(t, unread.Remedy, "`schemabot rollback <apply-id> -e staging`", "an apply that could not be read leaves its identifier as a placeholder")
+}

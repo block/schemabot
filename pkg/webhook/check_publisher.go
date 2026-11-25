@@ -857,6 +857,7 @@ func (h *Handler) foldAggregateCheckRun(
 		Progress:           h.rolloutProgressForPR(ctx, repo, pr, ownContributions),
 		PrerequisiteNotice: prerequisiteSummary(contributions, h.aggregateCheckNameForRepo(repo), repo, headSHA),
 		Inputs:             renderInputsOf(dbChecks),
+		Tenant:             h.deploymentTenant(),
 	}
 	if staleCount > 0 {
 		h.logger.Info("aggregate fold holds rows recorded for another commit as blocking until results land for the current commit",

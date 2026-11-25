@@ -1122,7 +1122,7 @@ Waiting on an operator:
   staging/inventory: A terminal outcome left this check blocking, and the target may not match the pull request.
     apply: apply-example-68 (rolled_back)
     blocking reason: rollback_completed
-    do: Once the apply has settled, comment `schemabot plan -e <environment>` on the pull request. If the target matches the pull request, the plan clears this block. If not, the plan shows what is left to apply.
+    do: Once the apply has settled, comment `schemabot plan -e staging -d inventory` on the pull request. If the target matches the pull request, the plan clears this block. If not, the plan shows what is left to apply.
   staging/shipments: The apply holding this check is stopped, so the gate stays closed.
     apply: apply-example-81 (stopped)
     do: Start the apply or cancel it. It does not settle on its own, and no plan replaces a stopped apply's result.

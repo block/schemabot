@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"slices"
@@ -11,6 +12,7 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // aggregateCheckNameForEnv returns the environment-scoped aggregate check name.
@@ -296,24 +298,56 @@ func settledApplyFailure(c *storage.Check) bool {
 // it diffs the pull request against the target as it is now, so it passes
 // only when the target already matches and otherwise lists what is left to
 // apply. The apply's failure therefore never clears without a fresh look at
-// the target.
-func failedApplyRemedy(checks []*storage.Check) string {
-	var environments []string
+// the target. Each failed database gets its own plan, carrying the
+// deployment's tenant so the pasted command reaches this deployment.
+//
+// A database the pull request no longer changes cannot be planned while the
+// apply owns its row (MG-6), so its line says to add the change back first or
+// roll the apply back instead.
+func failedApplyRemedy(checks []*storage.Check, tenant string) string {
+	type target struct{ environment, database string }
+	var plannable, removed []target
 	for _, c := range checks {
-		if settledApplyFailure(c) && !slices.Contains(environments, c.Environment) {
-			environments = append(environments, c.Environment)
+		if !settledApplyFailure(c) {
+			continue
+		}
+		t := target{c.Environment, c.DatabaseName}
+		if c.BlockingReason == storage.SchemaRemovedAfterApplyStartedBlockingReason {
+			if !slices.Contains(removed, t) {
+				removed = append(removed, t)
+			}
+			continue
+		}
+		if !slices.Contains(plannable, t) {
+			plannable = append(plannable, t)
 		}
 	}
-	if len(environments) == 0 {
+	if len(plannable) == 0 && len(removed) == 0 {
 		return ""
 	}
-	slices.Sort(environments)
-	commands := make([]string, len(environments))
-	for i, environment := range environments {
-		commands[i] = "`schemabot plan -e " + environment + "`"
+	byName := func(a, b target) int {
+		return cmp.Or(cmp.Compare(a.environment, b.environment), cmp.Compare(a.database, b.database))
 	}
-	return "\n**To clear this:** comment " + strings.Join(commands, " and ") +
-		" on the pull request. If the target matches the pull request, the plan clears the failure. If not, the plan shows what is left to apply.\n"
+	slices.SortFunc(plannable, byName)
+	slices.SortFunc(removed, byName)
+	plan := func(t target) string {
+		return "`" + templates.AppendTenantFlag("schemabot plan -e "+t.environment+" -d "+t.database, tenant) + "`"
+	}
+	var b strings.Builder
+	if len(plannable) > 0 {
+		commands := make([]string, len(plannable))
+		for i, t := range plannable {
+			commands[i] = plan(t)
+		}
+		b.WriteString("\n**To clear this:** comment " + strings.Join(commands, " and ") +
+			" on the pull request. If the target matches the pull request, the plan clears the failure. If not, the plan shows what is left to apply.\n")
+	}
+	for _, t := range removed {
+		rollback := "`" + templates.AppendTenantFlag("schemabot rollback <apply-id> -e "+t.environment, tenant) + "`"
+		b.WriteString("\n**To clear `" + t.database + "` in " + t.environment + ":** the pull request no longer changes it, so a plan of it is refused. " +
+			"Add the schema change back and comment " + plan(t) + ", or comment " + rollback + " to undo the apply.\n")
+	}
+	return b.String()
 }
 
 // anyInProgressOnCommit reports whether any check recorded for headSHA is
@@ -375,7 +409,9 @@ func computeAggregate(checks []*storage.Check, stopped stoppedApplyIDs) (conclus
 }
 
 // aggregateSummary builds a human-readable title and markdown summary for the aggregate check.
-func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppedApplyIDs, progress rolloutProgress) (title, summary string) {
+// tenant is the deployment's own tenant, which the commands the summary names
+// carry; pass "" for an untenanted deployment.
+func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppedApplyIDs, progress rolloutProgress, tenant string) (title, summary string) {
 	switch conclusion {
 	case checkConclusionSuccess:
 		if allChecksAreUpToDate(checks) {
@@ -386,7 +422,7 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		summary = buildAggregateTable(checks, stopped, progress)
 	case checkConclusionFailure:
 		title = "Apply failed"
-		summary = buildAggregateTable(checks, stopped, progress) + failedApplyRemedy(checks)
+		summary = buildAggregateTable(checks, stopped, progress) + failedApplyRemedy(checks, tenant)
 	case checkConclusionActionRequired:
 		pending := 0
 		unresolved := 0
