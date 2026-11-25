@@ -504,6 +504,11 @@ func partProgress(p Part) string {
 	if p.RowsTotal <= 0 {
 		return pct
 	}
+	if ui.CopyFinishedShortOfEstimate(p.PercentComplete, p.RowsCopied, p.RowsTotal) {
+		// The part's copy is done short of its estimate, so its rows read as
+		// the rows it copied rather than a fraction of the estimate.
+		return fmt.Sprintf("%s · %s %s copied", pct, ui.FormatNumber(p.RowsCopied), ui.Pluralize("row", int(min(p.RowsCopied, 2))))
+	}
 	return fmt.Sprintf("%s · %s / %s rows", pct, ui.FormatNumber(ui.ClampRows(p.RowsCopied, p.RowsTotal)), ui.FormatNumber(p.RowsTotal))
 }
 
@@ -721,7 +726,7 @@ func SumTargetRows(parts []Part) TargetRows {
 			switch {
 			case p.RowsTotal > 0:
 				r.Counted++
-				r.Copied += ui.ClampRows(p.RowsCopied, p.RowsTotal)
+				r.Copied += ui.CopyCoveredRows(p.PercentComplete, p.RowsCopied, p.RowsTotal)
 				r.Total += p.RowsTotal
 			case p.PlannedRows != nil:
 				r.Counted++
@@ -905,7 +910,7 @@ func PercentAcrossTargets(parts []Part, silent int) int {
 				}
 				continue
 			}
-			rows := ui.ClampRows(p.RowsCopied, p.RowsTotal)
+			rows := ui.CopyCoveredRows(p.PercentComplete, p.RowsCopied, p.RowsTotal)
 			share += float64(rows) / float64(p.RowsTotal)
 			copied += rows
 			total += p.RowsTotal

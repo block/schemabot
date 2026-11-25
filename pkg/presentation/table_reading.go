@@ -173,7 +173,7 @@ func readRunning(f TableFacts) TableReading {
 			{Text: fmt.Sprintf("Rows copied: %s so far", ui.FormatNumber(f.RowsCopied))},
 			{Text: ui.EstimateExceededTooltip, Note: true},
 		}}
-	case copyFinishedShortOfEstimate(f):
+	case ui.CopyFinishedShortOfEstimate(f.PercentComplete, f.RowsCopied, f.RowsTotal):
 		// The engine reports the copy done, but it inserted fewer rows than
 		// the estimated total, as when the estimate ran high or the copy
 		// skipped rows. It can insert none at all, when the source emptied
@@ -218,15 +218,6 @@ func readRunning(f TableFacts) TableReading {
 	}
 }
 
-// copyFinishedShortOfEstimate reports whether the engine says a table's copy
-// is done while the rows it copied fall short of the estimated total. An
-// engine's percent reaches 100 short of the total only when the engine itself
-// declares the copy finished, since a percent read from the rows stays below
-// 100 until the rows reach the total.
-func copyFinishedShortOfEstimate(f TableFacts) bool {
-	return f.PercentComplete >= 100 && f.RowsCopied >= 0 && f.RowsCopied < f.RowsTotal
-}
-
 // applyingLabel names a change that reports no progress by what it does.
 func applyingLabel(f TableFacts) string {
 	op := ddl.OpToStatementType(f.ChangeType)
@@ -242,10 +233,21 @@ func applyingLabel(f TableFacts) string {
 
 // rowsCopiedDetail reports the rows a finished copy moved, once it moved any.
 func rowsCopiedDetail(f TableFacts) []TableDetail {
-	if f.RowsCopied <= 0 {
-		return nil
+	if line := FinishedCopyRowsText(f.RowsCopied); line != "" {
+		return []TableDetail{{Text: line}}
 	}
-	return []TableDetail{{Text: "Rows copied: " + ui.FormatNumber(f.RowsCopied)}}
+	return nil
+}
+
+// FinishedCopyRowsText is the rows line of a copy the engine reports finished
+// short of its estimate: the rows it copied, since a line against the
+// estimate would contradict the full bar beside it. It is empty when the copy
+// inserted none.
+func FinishedCopyRowsText(rowsCopied int64) string {
+	if rowsCopied <= 0 {
+		return ""
+	}
+	return "Rows copied: " + ui.FormatNumber(rowsCopied)
 }
 
 // RowsLine is a copy's rows line: rows copied of the total, the shards the

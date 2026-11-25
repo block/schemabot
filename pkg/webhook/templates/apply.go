@@ -732,7 +732,7 @@ func runningPercentText(running []TableProgressData) string {
 		if t.RowsTotal <= 0 {
 			return ""
 		}
-		copied += ui.ClampRows(t.RowsCopied, t.RowsTotal)
+		copied += ui.CopyCoveredRows(t.PercentComplete, t.RowsCopied, t.RowsTotal)
 		total += t.RowsTotal
 	}
 	if copied == 0 {
@@ -1430,8 +1430,13 @@ func renderStoppedTable(sb *strings.Builder, dialect schema.Dialect, table Table
 
 	writeDDLLine(sb, dialect, table.DDL, budget)
 
-	// Show rows (no ETA) for stopped tables with progress
-	if table.RowsTotal > 0 && (table.PercentComplete > 0 || table.RowsCopied > 0) {
+	// Show rows (no ETA) for stopped tables with progress. A copy finished
+	// short of its estimate shows the rows it copied, as a running one does.
+	if ui.CopyFinishedShortOfEstimate(table.PercentComplete, table.RowsCopied, table.RowsTotal) {
+		if line := presentation.FinishedCopyRowsText(table.RowsCopied); line != "" {
+			fmt.Fprintf(sb, "- %s\n", line)
+		}
+	} else if table.RowsTotal > 0 && (table.PercentComplete > 0 || table.RowsCopied > 0) {
 		fmt.Fprintf(sb, "- Rows: %s / %s%s\n",
 			ui.FormatNumber(ui.ClampRows(table.RowsCopied, table.RowsTotal)),
 			ui.FormatNumber(table.RowsTotal),

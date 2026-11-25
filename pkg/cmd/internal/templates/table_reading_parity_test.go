@@ -152,6 +152,54 @@ func TestFinishedCopyReadsAsCopiedBesideATableStillCopying(t *testing.T) {
 				assert.Contains(t, out, "48.61%", "%s: the copying table keeps its own percent", surface)
 				assert.Contains(t, out, "Rows: 3,500,000 / 7,200,000", "%s: the copying table keeps its rows line", surface)
 			}
+			// The finished table counts its whole estimate in the summary:
+			// 200,000 + 3,500,000 of 7,400,000.
+			assert.Contains(t, pr, "2 running (50.00%)", "the summary counts the finished table in full")
+		})
+	}
+}
+
+// The users table's copy finished short of its estimate, inserting
+// 3,261,100,506 of an estimated 3,291,032,158 rows. The apply then halts: it
+// is stopped at the cutover gate, cancelled, or fails at cutover. Both
+// surfaces read the halted table as fully copied, with the rows it copied, and
+// never as a percent of the estimate or with a rows line against it (UX-8).
+func TestHaltedFinishedCopyReadsAsCopied(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		applyState string
+		taskState  string
+		cliWord    string
+		prWord     string
+	}{
+		{name: "stopped at the cutover gate", applyState: state.Apply.Stopped, taskState: state.Task.Stopped},
+		{name: "cancelled", applyState: state.Apply.Cancelled, taskState: state.Task.Cancelled, cliWord: "Cancelled at 100.00%", prWord: "Cancelled at 100.00%"},
+		{name: "failed at cutover", applyState: state.Apply.Failed, taskState: state.Task.Failed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &apitypes.ProgressResponse{
+				ApplyID: "apply-9c0d1e2f", Database: "shop", Environment: "staging",
+				State: tc.applyState, Engine: storage.EngineSpirit,
+				Tables: []*apitypes.TableProgressResponse{
+					{TableName: "users", DDL: "ALTER TABLE users ADD UNIQUE KEY uk_handle (handle)", ChangeType: "alter",
+						Status: tc.taskState, RowsCopied: 3_261_100_506, RowsTotal: 3_291_032_158, PercentComplete: 100},
+				},
+			}
+			data := ParseProgressResponse(resp)
+			require.Len(t, data.Tables, 1)
+			cli := ansiEscape.ReplaceAllString(FormatTableProgress(data.Tables[0]), "")
+			pr := webhooktemplates.RenderApplyStatusComment(webhooktemplates.ApplyStatusFromProgress(resp, "octocat"))
+
+			for surface, out := range map[string]string{"CLI": cli, "PR comment": pr} {
+				assert.NotContains(t, out, "99.09%", "%s: the finished table reads as a percent of its estimate", surface)
+				assert.NotContains(t, out, "/ 3,291,032,158", "%s: the finished table's rows line contradicts its full bar", surface)
+			}
+			if tc.cliWord != "" {
+				assert.Contains(t, cli, tc.cliWord)
+			}
+			if tc.prWord != "" {
+				assert.Contains(t, pr, tc.prWord)
+			}
 		})
 	}
 }
