@@ -131,7 +131,8 @@ func TestEnginePullSchemaSkipsTablesItCannotDescribe(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "pull_skip_test")
 	_, err := db.ExecContext(t.Context(), `
 		CREATE SCHEMA app;
-		CREATE UNLOGGED TABLE app.audit_log (id bigint PRIMARY KEY);
+		CREATE TABLE app.customers (id bigint PRIMARY KEY);
+		CREATE UNLOGGED TABLE app.audit_log (id bigint PRIMARY KEY, customer_id bigint REFERENCES app.customers (id));
 		CREATE TABLE app.accounts (id bigint PRIMARY KEY);
 		CREATE TABLE app.orders (id bigint PRIMARY KEY, account_id bigint NOT NULL REFERENCES app.accounts (id));
 		CREATE FUNCTION app.touch_account() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
@@ -145,8 +146,8 @@ func TestEnginePullSchemaSkipsTablesItCannotDescribe(t *testing.T) {
 
 	pulled := response.Namespaces["app"]
 	require.NotNil(t, pulled)
-	assert.Equal(t, int32(1), response.TableCount)
-	assert.Equal(t, []string{"orders"}, slices.Sorted(maps.Keys(pulled.Tables)))
+	assert.Equal(t, int32(2), response.TableCount)
+	assert.Equal(t, []string{"customers", "orders"}, slices.Sorted(maps.Keys(pulled.Tables)))
 	require.Len(t, pulled.SkippedTables, 2)
 	assert.Equal(t, "accounts", pulled.SkippedTables[0].GetTable())
 	assert.Equal(t, "schema files cannot describe its trigger, comment", pulled.SkippedTables[0].GetReason())
@@ -155,7 +156,8 @@ func TestEnginePullSchemaSkipsTablesItCannotDescribe(t *testing.T) {
 
 	// The pulled files plus an ignore_tables entry per skipped table describe
 	// the target exactly: no change, and above all no DROP TABLE, even for the
-	// key on orders that references a skipped table.
+	// key on orders that references a skipped table, or the key on the skipped
+	// audit_log that references customers.
 	files := make(map[string]string, len(pulled.Tables))
 	for table, sql := range pulled.Tables {
 		files[table+".sql"] = sql
