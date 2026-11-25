@@ -1302,6 +1302,7 @@ func tableFacts(table TableProgressData, work apitypes.BuildWork) presentation.T
 		RowsCopied:          table.RowsCopied,
 		RowsTotal:           table.RowsTotal,
 		ETASeconds:          table.ETASeconds,
+		EstimatedRows:       table.EstimatedRows,
 		EstimatedBytes:      table.EstimatedBytes,
 		ChecksumRowsChecked: table.ChecksumRowsChecked,
 		ChecksumRowsTotal:   table.ChecksumRowsTotal,

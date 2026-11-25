@@ -811,6 +811,7 @@ func tableFacts(t TableProgress) presentation.TableFacts {
 		RowsTotal:           t.RowsTotal,
 		RowsTotalPlanned:    t.RowsTotalPlanned,
 		ETASeconds:          t.ETASeconds,
+		EstimatedRows:       t.EstimatedRows,
 		EstimatedBytes:      t.EstimatedBytes,
 		ChecksumRowsChecked: t.ChecksumRowsChecked,
 		ChecksumRowsTotal:   t.ChecksumRowsTotal,
