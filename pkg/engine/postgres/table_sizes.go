@@ -22,30 +22,33 @@ type tableSizeEstimate struct {
 // sizeFromPreflight reads the display estimate from the size the native-safe
 // ceiling already measured, so the plan shows the same figure the gate judged.
 // TotalBytes is pg_total_relation_size summed over the partition tree (heap,
-// indexes, and TOAST). RelTuples is the catalog's row estimate, which is
-// negative until the table is first analyzed; that is an unknown count, not
-// an empty table.
+// indexes, and TOAST).
 func sizeFromPreflight(database, namespace string, proof preflight.PreflightedTable) tableSizeEstimate {
-	bytes := proof.TotalBytes()
-	est := tableSizeEstimate{bytes: &bytes}
-	if proof.RelTuples() < 0 {
-		// Routine for a table autovacuum has not reached yet, so Info, not Warn.
-		slog.Info("PostgreSQL table has never been analyzed; the plan will omit its row count",
-			"database", database, "namespace", namespace, "table", proof.Table())
-		return est
-	}
-	rows := int64(math.Round(proof.RelTuples()))
-	est.rows = &rows
-	return est
+	return sizeEstimate(database, namespace, proof.Table(), proof.TotalBytes(), proof.RelTuples())
 }
 
 // sizeFromSizeRefusal reads the display estimate from a size ceiling refusal,
-// which carries the measured bytes but no row estimate.
+// which carries the same measured bytes and row estimate as a table that
+// passed, so a table over the ceiling keeps its rows line.
 func sizeFromSizeRefusal(database, namespace, table string, refusal *preflight.SizeError) tableSizeEstimate {
-	slog.Info("PostgreSQL size ceiling refusal carries no row estimate; the plan will omit the table's row count",
-		"database", database, "namespace", namespace, "table", table)
-	bytes := refusal.TotalBytes
-	return tableSizeEstimate{bytes: &bytes}
+	return sizeEstimate(database, namespace, table, refusal.TotalBytes, refusal.RelTuples)
+}
+
+// sizeEstimate builds the display estimate from the measured bytes and the
+// catalog's row estimate. RelTuples is negative until the table is first
+// analyzed; that is an unknown count, not an empty table, so the rows are
+// left out rather than reported as zero.
+func sizeEstimate(database, namespace, table string, totalBytes int64, relTuples float64) tableSizeEstimate {
+	est := tableSizeEstimate{bytes: &totalBytes}
+	if relTuples < 0 {
+		// Routine for a table autovacuum has not reached yet, so Info, not Warn.
+		slog.Info("PostgreSQL table has never been analyzed; the plan will omit its row count",
+			"database", database, "namespace", namespace, "table", table)
+		return est
+	}
+	rows := int64(math.Round(relTuples))
+	est.rows = &rows
+	return est
 }
 
 // attachTableSize gives every change to the table its estimate, as Spirit does

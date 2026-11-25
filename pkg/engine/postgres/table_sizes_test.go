@@ -39,22 +39,34 @@ func TestAttachTableSize(t *testing.T) {
 }
 
 // A table over the native-safe ceiling is blocked, and its plan still shows
-// the size the ceiling measured. The refusal carries no row estimate, so the
-// row count is omitted rather than reported as zero.
-func TestBlockOversizedTableKeepsMeasuredBytes(t *testing.T) {
-	report := pgplan.Report{Schema: "public", Table: "users", Statements: []pgplan.Statement{{SQL: "ALTER TABLE public.users ALTER COLUMN id TYPE bigint"}}}
-	changes := []engine.TableChange{{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE public.users ALTER COLUMN id TYPE bigint"}}
-	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
-		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}
+// the size and row estimate the ceiling read. A table that has never been
+// analyzed has no row estimate, so its row count is omitted rather than
+// reported as zero.
+func TestBlockOversizedTableKeepsMeasuredSize(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		relTuples float64
+		wantRows  *int64
+	}{
+		{name: "analyzed", relTuples: 48_200_000.4, wantRows: new(int64(48_200_000))},
+		{name: "never analyzed", relTuples: -1, wantRows: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			report := pgplan.Report{Schema: "public", Table: "users", Statements: []pgplan.Statement{{SQL: "ALTER TABLE public.users ALTER COLUMN id TYPE bigint"}}}
+			changes := []engine.TableChange{{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE public.users ALTER COLUMN id TYPE bigint"}}
+			checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+				return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024, RelTuples: tc.relTuples}
+			}
+
+			changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+			require.NoError(t, err)
+
+			require.Len(t, changes, 1)
+			assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+			assert.Equal(t, new(int64(2048)), changes[0].EstimatedBytes)
+			assert.Equal(t, tc.wantRows, changes[0].EstimatedRows)
+		})
 	}
-
-	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
-	require.NoError(t, err)
-
-	require.Len(t, changes, 1)
-	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
-	assert.Equal(t, new(int64(2048)), changes[0].EstimatedBytes)
-	assert.Nil(t, changes[0].EstimatedRows)
 }
 
 // Every drop in the plan shares one size budget: once it has run out, no
