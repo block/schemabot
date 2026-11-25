@@ -108,7 +108,11 @@ Use `--namespace` (API: `namespaces`) to select namespaces; omit it to discover
 the non-reserved namespaces.
 Supply concrete live namespace names when selecting them. `{env}` and `$ENV`
 are schema-directory placeholders, so both are rejected in `--namespace` and
-`POST /api/pull` `namespaces` arguments.
+`POST /api/pull` `namespaces` arguments. A namespace argument that is not one
+concrete, unreserved name, or that repeats, answers `400` with `error_code`
+`invalid_request` and says what to change. When the deployment that serves the
+database cannot be reached, pull answers `503` with `error_code`
+`engine_unavailable`; retry after a short wait.
 
 ```sh
 schemabot pull -d shop -e production

@@ -82,6 +82,10 @@ func (c planErrorClient) Plan(context.Context, *ternv1.PlanRequest) (*ternv1.Pla
 	return nil, c.err
 }
 
+func (c planErrorClient) PlanDiff(context.Context, *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	return nil, c.err
+}
+
 type noopControlClient struct {
 	Client
 }
@@ -222,23 +226,28 @@ func TestServerPullSchemaMapsKnownErrorsToStatusCode(t *testing.T) {
 }
 
 // A plan the engine refuses is the schema files' to fix, so the server answers
-// FailedPrecondition, which callers do not alert on. Any other plan failure is
-// the server's and stays Internal.
+// FailedPrecondition, which callers do not alert on, with the refusal's own
+// text: a wrap added on the way out, which can name an address, stays in this
+// server's log. Any other plan failure is the server's and stays Internal.
 func TestServerPlanMapsRefusalToFailedPrecondition(t *testing.T) {
+	const refusal = "keyspace orders has no schema file for 1 sequence table(s)"
 	testCases := []struct {
-		name string
-		err  error
-		want codes.Code
+		name        string
+		err         error
+		wantCode    codes.Code
+		wantMessage string
 	}{
 		{
-			name: "engine refused the plan",
-			err:  fmt.Errorf("plan keyspace orders: %w", &engine.PlanRefusedError{Err: errors.New("keyspace orders has no schema file for 1 sequence table(s)")}),
-			want: codes.FailedPrecondition,
+			name:        "engine refused the plan under a wrap that names an address",
+			err:         fmt.Errorf("plan keyspace orders via 10.0.0.5:3306: %w", &engine.PlanRefusedError{Err: errors.New(refusal)}),
+			wantCode:    codes.FailedPrecondition,
+			wantMessage: refusal,
 		},
 		{
-			name: "engine failed",
-			err:  errors.New("connect to topology: connection refused"),
-			want: codes.Internal,
+			name:        "engine failed",
+			err:         errors.New("connect to topology: connection refused"),
+			wantCode:    codes.Internal,
+			wantMessage: "connect to topology: connection refused",
 		},
 	}
 
@@ -248,8 +257,13 @@ func TestServerPlanMapsRefusalToFailedPrecondition(t *testing.T) {
 
 			_, err := server.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders"})
 			require.Error(t, err)
-			assert.Equal(t, tc.want, status.Code(err))
-			assert.Equal(t, tc.err.Error(), status.Convert(err).Message())
+			assert.Equal(t, tc.wantCode, status.Code(err))
+			assert.Equal(t, tc.wantMessage, status.Convert(err).Message())
+
+			_, err = server.PlanDiff(t.Context(), &ternv1.PlanRequest{Database: "orders"})
+			require.Error(t, err)
+			assert.Equal(t, tc.wantCode, status.Code(err), "a rollout member is planned with PlanDiff")
+			assert.Equal(t, tc.wantMessage, status.Convert(err).Message())
 		})
 	}
 }

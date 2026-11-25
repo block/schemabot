@@ -449,8 +449,9 @@ func TestApplyHandler_StorageFailureStaysServerError(t *testing.T) {
 		assert.Equal(t, `apply rejected: database "testdb": deferred cutover is not supported for database_type: postgres`, resp.Error)
 	})
 
-	// An engine routing failure is not a storage failure and keeps its message.
-	t.Run("an engine routing failure keeps its message", func(t *testing.T) {
+	// An engine routing failure is not a storage failure, and its cause names
+	// deployments, so the answer is the fixed message.
+	t.Run("an engine routing failure answers the fixed message", func(t *testing.T) {
 		plan := executeApplyTestPlan()
 		plan.Deployment = "unrouted"
 		svc, _ := newQueueApplyTestService(plan, &mockTernClient{}, &capturingApplyStore{})
@@ -459,7 +460,8 @@ func TestApplyHandler_StorageFailureStaysServerError(t *testing.T) {
 
 		assert.Equal(t, http.StatusInternalServerError, status)
 		assert.NotEqual(t, apitypes.ErrCodeStorageError, resp.ErrorCode)
-		assert.Equal(t, `apply failed: database "testdb" (staging): unknown deployment "unrouted": tern deployment not configured`, resp.Error)
+		assert.Equal(t, wantApplyFailedMessage, resp.Error)
+		assert.NotContains(t, resp.Error, "unrouted", "the deployment named in the cause stays in the server log")
 	})
 }
 
