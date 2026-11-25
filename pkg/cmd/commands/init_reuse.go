@@ -5,8 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -88,4 +90,28 @@ func validateInitSchemaReuse(root, database, engine string) (bool, error) {
 		return false, err
 	}
 	return true, checkInitSchemaIdentity(cfg, root, database, engine)
+}
+
+// requireReusedConfigWithholdsSkipped refuses a reused config whose
+// ignore_tables does not withhold every table the pull skipped. It checks each
+// table with the same matcher the plan uses, so an entry the config already
+// has, plain or pattern, counts exactly as it will when the plan runs.
+func requireReusedConfigWithholdsSkipped(exclusions client.PlanExclusions, skipped []skippedTableGroup) error {
+	ignored, err := engine.NewIgnoredTables(exclusions.Tables)
+	if err != nil {
+		return fmt.Errorf("read the existing schemabot.yaml's ignore_tables: %w", err)
+	}
+	var managed []string
+	for _, group := range skipped {
+		for _, table := range group.Tables {
+			if ignored.Withholds(table.Table) {
+				continue
+			}
+			managed = append(managed, fmt.Sprintf("%s.%s (%s)", group.Namespace, table.Table, table.Reason))
+		}
+	}
+	if len(managed) == 0 {
+		return nil
+	}
+	return fmt.Errorf("your existing schemabot.yaml manages tables that schema files cannot describe, and your files were not changed. Add each table to ignore_tables, then run setup again:\n  %s", strings.Join(managed, "\n  "))
 }

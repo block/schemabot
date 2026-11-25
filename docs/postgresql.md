@@ -868,9 +868,9 @@ Which tables depends on the case:
 | The foreign key | Tables skipped | Why |
 |---|---|---|
 | Crosses namespaces | Both | A file cannot reference a table in another namespace |
-| Sits on a partition | Both | A partition has no file of its own. Declare the key on the partitioned parent |
+| Sits on a partition | The referenced table, with a reason that names the partition's key | A partition has no file of its own. Declare the key on the partitioned parent |
 | Sits on a table with no file of its own, such as one an extension owns | The referenced table | The key would be lost from the baseline |
-| References its own table through a standalone unique index | The referencing table | The file would declare the key before the index exists. Make the index a `UNIQUE` constraint to pull it |
+| References its own table through a standalone unique index | The referencing table | The file would declare the key before the index exists. Make the index an immediate `UNIQUE` constraint to pull it. A deferrable one does not count |
 | Sits on a table with row-level security | The referencing table | A file cannot declare row-level security and a foreign key together yet |
 
 Remove the foreign key, or drop the table through a reviewed process, then
@@ -1308,6 +1308,10 @@ leaves. See [Index builds](#index-builds).
 - A namespace cannot be rolled back when one of its managed tables has a
   foreign key to or from another namespace, or is referenced by a table the
   plan does not manage.
+- A namespace cannot be rolled back when one of its managed tables holds a
+  foreign key added `NOT VALID`. A schema file declares every key as
+  validated, so rolling back would run a `VALIDATE` the forward apply never
+  ran.
 - Rollback never removes an enum label, since PostgreSQL cannot drop one. The
   plan's table changes are reversed, and the label stays.
 - [RV-7](invariants.md#rv-7-rollback-needs-the-originals) requires complete
