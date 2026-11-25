@@ -2891,6 +2891,14 @@ type claimLadderOperationStore struct {
 	claimFilters []storage.OperationClaimFilter
 	claimErr     error
 	claimPanic   string
+	// contendedClaims is how many claims in a row report that the operation
+	// they would take was locked by another transaction before claims go on
+	// as usual.
+	contendedClaims int
+	// onContendedClaim, when set, runs as a contended claim returns, with the
+	// number of claims made so far, so a test can close the claim gate or
+	// cancel the driver while the claim is in hand.
+	onContendedClaim func(claims int)
 }
 
 func (s *claimLadderOperationStore) FindNextApplyOperationCutover(context.Context, string) (*storage.ApplyOperation, error) {
@@ -2908,6 +2916,13 @@ func (s *claimLadderOperationStore) FindNextApplyOperation(ctx context.Context, 
 	}
 	if s.claimErr != nil {
 		return nil, s.claimErr
+	}
+	if s.contendedClaims > 0 {
+		s.contendedClaims--
+		if s.onContendedClaim != nil {
+			s.onContendedClaim(s.claims)
+		}
+		return nil, fmt.Errorf("apply_operation 1 of apply 1 is claimable but the claim took none: %w", storage.ErrOperationClaimContended)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2998,8 +3013,8 @@ func TestDriveTick_ContainsOperationClaimPanic(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, testServerConfig(), nil, logger)
 
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate(), passPolled) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate(), passPolled) })
 	assert.Equal(t, 2, ops.claims, "the driver must keep polling after each contained panic")
 }
 
@@ -3025,7 +3040,7 @@ func TestDriveTick_ReservedDriverSkipsDeferredCutoverWork(t *testing.T) {
 			svc := New(&mockStorageWithApplyStores{applies: &operationClaimApplyStore{}, operations: ops}, testServerConfig(), nil, logger)
 			svc.operatorDrivers.Store(int64(tc.drivers))
 
-			svc.driveTick(t.Context(), tc.driverID, openClaimGate())
+			svc.driveTick(t.Context(), tc.driverID, openClaimGate(), passPolled)
 
 			require.Len(t, ops.claimFilters, 1, "the tick reaches the operation claim once")
 			assert.Equal(t, tc.skips, ops.claimFilters[0].SkipDeferredCutoverWork)
@@ -3090,8 +3105,8 @@ func TestDriveTick_ContainsStopReconciliationProbePanic(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, testServerConfig(), nil, logger)
 
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate(), passPolled) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate(), passPolled) })
 	assert.Equal(t, 2, applies.stopProbes, "the driver must keep probing after each contained panic")
 	assert.Zero(t, ops.claims, "the panic consumed the tick before the operation claim")
 }
@@ -3133,7 +3148,7 @@ func TestDriveTick_ContainsDrivePanicUnderOperationClaimAndKeepsClaiming(t *test
 		"east/staging": client,
 	}, logger)
 
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate(), passPolled) })
 	assert.Equal(t, 1, ops.claims)
 	assert.True(t, state.IsState(op.State, state.ApplyOperation.Failed),
 		"the poisoned operation row must be failed so it is not re-claimed")
@@ -3141,7 +3156,7 @@ func TestDriveTick_ContainsDrivePanicUnderOperationClaimAndKeepsClaiming(t *test
 	assert.True(t, state.IsState(applies.apply.State, state.Apply.Failed),
 		"the parent apply must be failed under the dual-lease containment")
 
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate(), passPolled) })
 	assert.Equal(t, 2, ops.claims,
 		"the driver must keep claiming after containing the panic, and the failed operation must not be claimable")
 }

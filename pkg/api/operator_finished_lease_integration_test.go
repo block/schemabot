@@ -53,7 +53,7 @@ func TestOperator_FinishedDriveHandsItsOperationLeaseBack(t *testing.T) {
 			svc := newMatrixService(t, stor, matrixClients(stor, &driveRecorder{}, map[string]matrixOutcome{
 				"region-a": {taskState: ended.taskState, errMsg: "drive ended"},
 			}))
-			svc.recoverApplyOperation(ctx, 1, "handback-driver")
+			svc.recoverApplyOperation(ctx, 1, "handback-driver", passPolled)
 
 			op, err := stor.ApplyOperations().Get(ctx, seed.opID("region-a"))
 			require.NoError(t, err)
@@ -96,7 +96,7 @@ func TestOperator_ClaimDrainKeepsTheOperationLeaseForShutdown(t *testing.T) {
 		"region-a": {taskState: state.Task.Completed},
 	}))
 	svc.beginClaimDrain()
-	svc.recoverApplyOperation(ctx, 1, "draining-driver")
+	svc.recoverApplyOperation(ctx, 1, "draining-driver", passPolled)
 
 	op, err := stor.ApplyOperations().Get(ctx, seed.opID("region-a"))
 	require.NoError(t, err)
