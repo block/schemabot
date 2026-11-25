@@ -516,17 +516,43 @@ func TestFormatApplyStatusComment_MultiKeyspaceRendersKeyspaceSections(t *testin
 	assert.Contains(t, out, "### VSchema", "the finalizer renders in the VSchema section, not as a shard")
 }
 
-// When the apply spans keyspaces, a shard's ordering label names its blocker
-// with the keyspace-qualified shard — every unsharded keyspace's shard is "-",
-// so a bare name would be ambiguous — while the status row itself keeps the
-// plain shard name under its keyspace heading.
+// eightShards are the shards of a keyspace split eight ways.
+var eightShards = []string{"-20", "20-40", "40-60", "60-80", "80-a0", "a0-c0", "c0-e0", "e0-"}
+
+// The shards of one target copy in parallel, and only the apply's driver cap
+// holds the rest back, so the PR comment counts the shards still to start as
+// queued, as the CLI does, rather than as waiting for the first shard.
+func TestBuildShardedApplyData_CountsShardsTheDriverCapHoldsBackAsQueued(t *testing.T) {
+	ops := make([]*storage.ApplyOperation, 0, len(eightShards))
+	for i, shard := range eightShards {
+		opState := state.ApplyOperation.Pending
+		if i < 2 {
+			opState = state.ApplyOperation.Running
+		}
+		ops = append(ops, &storage.ApplyOperation{
+			ID: int64(i + 1), ApplyID: 1, Deployment: "default", OperationKey: "commerce/" + shard + "/orders",
+			State: opState, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt,
+		})
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "commerce", Environment: "staging", State: state.Apply.Running}
+
+	out := templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, false, nil, nil, ""))
+
+	assert.Contains(t, out, "**Shards**: 2 running table copy, 6 queued")
+	assert.NotContains(t, out, "waiting for")
+}
+
+// When the apply spans keyspaces and rollout members, a shard's ordering label
+// names its blocker with the keyspace-qualified shard — every unsharded
+// keyspace's shard is "-", so a bare name would be ambiguous — while the
+// status row itself keeps the plain shard name under its keyspace heading.
 func TestBuildShardedApplyData_MultiKeyspaceQualifiesOrderingLabels(t *testing.T) {
-	mk := func(id int64, key, opState, errMsg string) *storage.ApplyOperation {
-		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	mk := func(id int64, deployment, key, opState, errMsg string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: deployment, OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	}
 	ops := []*storage.ApplyOperation{
-		mk(1, "contacts/-/entries", state.ApplyOperation.Failed, "boom"),
-		mk(2, "contacts_lookup/-/entries_lookup", state.ApplyOperation.Pending, ""),
+		mk(1, "us", "contacts/-/entries", state.ApplyOperation.Failed, "boom"),
+		mk(2, "eu", "contacts_lookup/-/entries_lookup", state.ApplyOperation.Pending, ""),
 	}
 	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_contacts", Environment: "staging", State: state.Apply.Failed}
 

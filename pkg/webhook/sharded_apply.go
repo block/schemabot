@@ -415,6 +415,7 @@ func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, release
 		for _, op := range g.ops {
 			sw.Operations = append(sw.Operations, presentation.Operation{
 				Deployment:        op.Deployment,
+				Target:            op.Target,
 				OperationKey:      op.OperationKey,
 				EndedBy:           endedBy[op.ID],
 				State:             op.State,
