@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -798,24 +799,35 @@ func TestWebhookYesFlagRejectedOnNonApply(t *testing.T) {
 	}
 }
 
+// A control command that names no apply gets the usage reply before SchemaBot
+// looks for any apply, so it never acts on one it inferred (CO-11).
+// The command list comes from the storage registry, so a new control operation
+// is held to the rule without anyone extending this test. Rollback is checked
+// beside them: it acts on the apply it reverses, and has its own usage reply.
 func TestWebhookControlCommandMissingApplyID(t *testing.T) {
-	tests := []struct {
-		name    string
-		comment string
-		action  string
-	}{
-		{name: "stop", comment: "schemabot stop -e staging", action: "stop"},
-		{name: "cancel", comment: "schemabot cancel -e staging", action: "cancel"},
-		{name: "start", comment: "schemabot start -e staging", action: "start"},
-		{name: "cutover", comment: "schemabot cutover -e staging", action: "cutover"},
+	type missingIDCase struct {
+		action string
+		usage  string
 	}
+	var tests []missingIDCase
+	for _, op := range storage.ControlOperations() {
+		tests = append(tests, missingIDCase{
+			action: op.Command(),
+			usage:  "schemabot " + op.Command() + " <apply-id> -e <environment>",
+		})
+	}
+	tests = append(tests, missingIDCase{action: action.Rollback, usage: "schemabot rollback <apply-id>"})
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		t.Run(tt.action, func(t *testing.T) {
+			spec, ok := specByName[tt.action]
+			require.True(t, ok, "control operation %q has no PR comment command", tt.action)
+			require.True(t, spec.HasApplyID, "PR comment command %q must take the apply ID it acts on", tt.action)
+
 			h, comments, _ := newTestHandler(t)
 
 			req := buildWebhookRequest(t, webhookPayloadOpts{
-				comment: tt.comment,
+				comment: "schemabot " + tt.action + " -e staging",
 				isPR:    true,
 			}, nil)
 
@@ -823,12 +835,11 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 			h.ServeHTTP(rr, req)
 
 			require.Equal(t, http.StatusOK, rr.Code)
-			assert.Contains(t, rr.Body.String(), tt.action+" started")
 
 			select {
 			case body := <-comments:
 				assert.Contains(t, body, "Missing Apply ID")
-				assert.Contains(t, body, "schemabot "+tt.action+" <apply-id> -e <environment>")
+				assert.Contains(t, body, tt.usage)
 			case <-time.After(2 * time.Second):
 				require.FailNow(t, "timed out waiting for missing apply ID comment")
 			}

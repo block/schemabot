@@ -2225,17 +2225,26 @@ const (
 	ControlOperationRelease ControlOperation = "release"
 )
 
+// controlOperations are the operations this release implements. It is the
+// registry the operator surfaces are checked against: every operation here is
+// a command on the PR comment, the CLI, and the HTTP API, and every one of
+// them is refused without the apply ID it acts on (CO-11).
+var controlOperations = []ControlOperation{
+	ControlOperationStart, ControlOperationStop, ControlOperationCancel,
+	ControlOperationCutover, ControlOperationRevert, ControlOperationSkipRevert,
+	ControlOperationRelease,
+}
+
+// ControlOperations returns every operation this release implements.
+func ControlOperations() []ControlOperation {
+	return slices.Clone(controlOperations)
+}
+
 // Valid reports whether the operation is one SchemaBot recognizes. Control
 // operations cross the control-plane / data-plane boundary as strings, so a
 // value read off the wire is checked here before it reaches storage.
 func (o ControlOperation) Valid() bool {
-	switch o {
-	case ControlOperationStart, ControlOperationStop, ControlOperationCancel,
-		ControlOperationCutover, ControlOperationRevert, ControlOperationSkipRevert,
-		ControlOperationRelease:
-		return true
-	}
-	return false
+	return slices.Contains(controlOperations, o)
 }
 
 // Command returns the operation spelled as the command an operator types
