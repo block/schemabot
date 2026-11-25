@@ -235,6 +235,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	commentData.DeploymentDrift = driftPreview
 	h.annotateMemberApplyRefusal(ctx, &commentData, planResp, environment, drift, repo, pr)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, driftPreview, repo, pr, environment)
+	h.annotatePlanFreezes(ctx, &commentData, planResp, schemaResult.Database, environment, false, repo, pr)
 	if commentData.OffersApply() {
 		commentData.ApplyAuthorization = h.applyAuthorizationForPlanComment(ctx, client, repo, pr, schemaResult.Database, requestedBy)
 	}
@@ -295,6 +296,7 @@ func (h *Handler) postNarrowedPlan(ctx context.Context, client *ghclient.Install
 	commentData.ScopedDatabase = databaseName
 	commentData.Target = target
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, nil, repo, pr, environment)
+	h.annotatePlanFreezes(ctx, &commentData, planResp, schemaResult.Database, environment, true, repo, pr)
 	if commentData.OffersApply() {
 		commentData.ApplyAuthorization = h.applyAuthorizationForPlanComment(ctx, client, repo, pr, schemaResult.Database, requestedBy)
 	}
@@ -931,6 +933,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		commentData.DeploymentDrift = driftPreview
 		h.annotateMemberApplyRefusal(ctx, &commentData, planResp, env, drift, repo, pr)
+		h.annotatePlanFreezes(ctx, &commentData, planResp, schemaResult.Database, env, false, repo, pr)
 		multiEnvData.Plans[env] = &commentData
 	}
 	for env, base := range h.planBaseSchemas(ctx, client, repo, pr, plannedSchemas) {

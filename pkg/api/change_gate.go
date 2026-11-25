@@ -85,12 +85,7 @@ func (g freezeGate) Blockers(ctx context.Context, in changeGateInput) ([]apitype
 	}
 	var blockers []apitypes.ChangeGateBlocker
 	for _, freeze := range freezes {
-		// One frozen deployment refuses the whole change: a change that ran
-		// on the others would leave the database half changed.
-		covers := slices.ContainsFunc(in.Deployments, func(deployment string) bool {
-			return freeze.Covers(deployment, in.Database)
-		})
-		if !covers {
+		if !freezeCoversChange(freeze, in.Deployments, in.Database) {
 			continue
 		}
 		blockers = append(blockers, apitypes.ChangeGateBlocker{
@@ -101,6 +96,15 @@ func (g freezeGate) Blockers(ctx context.Context, in changeGateInput) ([]apitype
 		})
 	}
 	return blockers, nil
+}
+
+// freezeCoversChange reports whether freeze covers a change to database that
+// runs on deployments. One frozen deployment covers the whole change: a change
+// that ran on the others would leave the database half changed.
+func freezeCoversChange(freeze *storage.EnvironmentFreeze, deployments []string, database string) bool {
+	return slices.ContainsFunc(deployments, func(deployment string) bool {
+		return freeze.Covers(deployment, database)
+	})
 }
 
 // changeGates lists the gates every apply, start and cutover must pass. A
