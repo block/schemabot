@@ -246,6 +246,18 @@ type APIError struct {
 	ErrorCode string // Error code from API response (e.g., "not_found", "storage_error")
 	Message   string
 
+	// Blockers, OverrideRequest and OverrideOnReason are set on a
+	// change_gate_refused answer: what refused the change, the override
+	// request SchemaBot recorded for the caller, if any, and whether a repeat
+	// with an override reason runs with no approver.
+	Blockers         []apitypes.ChangeGateBlocker
+	OverrideRequest  *apitypes.FreezeOverrideRequest
+	OverrideOnReason bool
+
+	// LockHolder is set on a lock_in_use answer: the apply that kept the
+	// lock.
+	LockHolder *apitypes.LockHolder
+
 	// RetryAfterSeconds is the delay the server asked the client to wait, set
 	// only on responses that advertise one. Read it through RetryAfter rather
 	// than on its own, so a retry is never scheduled without it.
@@ -356,10 +368,16 @@ type ResponseReadError struct {
 
 func (e *ResponseReadError) Error() string {
 	msg := "read response: " + e.Err.Error()
-	if warning := effectOf(e.Method, e.Path).warning(); warning != "" {
+	if warning := e.effect().warning(); warning != "" {
 		msg += "\n" + warning
 	}
 	return msg
+}
+
+// effect returns what the request may have left behind on the server, which
+// received it before the answer failed.
+func (e *ResponseReadError) effect() requestEffect {
+	return effectOf(e.Method, e.Path)
 }
 
 func (e *ResponseReadError) Unwrap() error {
@@ -437,8 +455,9 @@ func doPostIntoWithClient(ctx context.Context, client *http.Client, endpoint, pa
 
 	// Control endpoints answer 202 Accepted when the request is durably
 	// recorded and the apply owner completes it asynchronously; the body
-	// carries the same JSON shape as a 200 and is equally a success.
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+	// carries the same JSON shape as a 200 and is equally a success. Creating a
+	// freeze answers 201 Created with the new freeze in the body.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusCreated {
 		return parseAPIError(resp, respBody)
 	}
 
@@ -518,6 +537,10 @@ func parseAPIError(resp *http.Response, body []byte) *APIError {
 	if json.Unmarshal(body, &errResp) == nil {
 		apiErr.ErrorCode = errResp.ErrorCode
 		apiErr.RetryAfterSeconds = errResp.RetryAfterSeconds
+		apiErr.Blockers = errResp.Blockers
+		apiErr.OverrideRequest = errResp.OverrideRequest
+		apiErr.OverrideOnReason = errResp.OverrideOnReason
+		apiErr.LockHolder = errResp.LockHolder
 	}
 	return apiErr
 }
@@ -608,13 +631,36 @@ func (e *ConnectionError) message() string {
 	} else {
 		msg = fmt.Sprintf("connection failed: %s: %s", e.Endpoint, cause)
 	}
-	if failedBeforeSending(e.Err) {
-		return msg
-	}
-	if warning := effectOf(failedRequest(e.Err)).warning(); warning != "" {
+	if warning := e.effect().warning(); warning != "" {
 		msg += "\n" + warning
 	}
 	return msg
+}
+
+// effect returns what the failed request may have left behind on the server.
+// A request that never reached the server changed nothing: its connection was
+// refused, its host did not resolve, or it failed before any of it was sent.
+func (e *ConnectionError) effect() requestEffect {
+	if isConnectionRefused(e.Err) || isHostNotFound(e.Err) || failedBeforeSending(e.Err) {
+		return requestEffect{}
+	}
+	return effectOf(failedRequest(e.Err))
+}
+
+// ServerMayHaveActed reports whether err is the failure of a request that
+// changes something and that the server may have received: the connection
+// failed after some of the request could have been sent, or the answer was cut
+// off. These are the failures whose message says the server may already have
+// acted. It is false when the server answered, when the request never reached
+// it, and when the request only reads.
+func ServerMayHaveActed(err error) bool {
+	if connErr, ok := errors.AsType[*ConnectionError](err); ok {
+		return connErr.effect().changes
+	}
+	if readErr, ok := errors.AsType[*ResponseReadError](err); ok {
+		return readErr.effect().changes
+	}
+	return false
 }
 
 // requestEffect says what a failed request may have left behind on the
@@ -663,9 +709,15 @@ var requestEffects = map[string]requestEffect{
 	"/api/locks":         shownBy("locks"),
 	"/api/locks/acquire": shownBy("locks"),
 
+	// Freeze routes carry an ID, so effectOf looks them up by these prefixes.
+	// Setting or lifting a freeze shows in the freeze list, and an override
+	// approval in the override request itself.
+	"/api/freezes":            shownBy("freeze list"),
+	"/api/freezes/":           shownBy("freeze list"),
+	"/api/freezes/overrides/": shownBy("freeze override <ovr-id>"),
+
 	// Changes that no single command shows.
 	"/api/checks/synthesize":    changesWithoutCommand,
-	"/api/webhooks/redrive":     changesWithoutCommand,
 	"/api/storage/schema/apply": changesWithoutCommand,
 }
 
@@ -681,6 +733,12 @@ func effectOf(method, path string) requestEffect {
 	// The endpoint may carry a path of its own ahead of the API path.
 	if i := strings.LastIndex(path, "/api/"); i >= 0 {
 		path = path[i:]
+	}
+	switch {
+	case strings.HasPrefix(path, "/api/freezes/overrides/"):
+		path = "/api/freezes/overrides/"
+	case strings.HasPrefix(path, "/api/freezes/"):
+		path = "/api/freezes/"
 	}
 	if effect, ok := requestEffects[path]; ok {
 		return effect
@@ -728,8 +786,8 @@ func failedRequest(err error) (method, path string) {
 // failedBeforeSending reports whether the request failed before any of it was
 // sent, so the server cannot have acted on it: while opening the connection to
 // the server or to a proxy, or during the TLS handshake. The HTTP client
-// replaces the handshake error with its own text when a plain HTTP server
-// answers, so that case is matched by text.
+// replaces the handshake error with http.ErrSchemeMismatch when a plain HTTP
+// server answers.
 func failedBeforeSending(err error) bool {
 	var opErr *net.OpError
 	if errors.As(err, &opErr) && (opErr.Op == "dial" || opErr.Op == "proxyconnect") {
@@ -743,7 +801,7 @@ func failedBeforeSending(err error) bool {
 	if errors.As(err, &recordErr) {
 		return true
 	}
-	return strings.Contains(err.Error(), "server gave HTTP response to HTTPS client")
+	return errors.Is(err, http.ErrSchemeMismatch)
 }
 
 // isConnectionRefused reports whether the server's host refused the

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -111,6 +112,9 @@ const (
 	// paused state; the merge gate stays fail-closed on the failed deployment.
 	OnFailurePause = "pause"
 )
+
+// RollbackPendingPlanPrefix tags a lock pin created for rollback confirmation.
+const RollbackPendingPlanPrefix = "rollback:"
 
 // Lock represents a database-level deployment lock.
 // Locks prevent concurrent schema changes to the same database across
@@ -374,9 +378,10 @@ type Check struct {
 	// AggregateRender is what an aggregate row's Check Run text was rendered
 	// from, so the text can be rendered again with newer rollout counts
 	// without re-reading the PR. The encoding belongs to the caller. Upsert
-	// writes it, so an Upsert that leaves it empty clears it; other reads do
-	// not load it, and GetAggregateRender returns it. Empty on per-database
-	// rows.
+	// writes it, so an Upsert that leaves it empty clears it. GetAggregateRender
+	// returns it, and ListRemovableOnPRClose loads it so close cleanup can tell
+	// a render-only rewrite from an untouched row; other reads do not load it.
+	// Empty on per-database rows.
 	AggregateRender []byte `json:"-"`
 
 	// CreatedAt is when the check was created.
@@ -392,6 +397,300 @@ const (
 	CheckStatusSuccess = "success"
 	CheckStatusFailure = "failure"
 )
+
+// Freeze kinds say how a freeze was set.
+const (
+	// FreezeKindOnDemand is a freeze that starts when it is set, for any
+	// reason, such as an incident. It may have no end time, in which case it
+	// lasts until someone lifts it.
+	FreezeKindOnDemand = "on_demand"
+
+	// FreezeKindPlanned is a freeze with a known window, such as a code
+	// freeze on a calendar. It ends on its own at its end time.
+	FreezeKindPlanned = "planned"
+)
+
+// Freeze running policies say what happens to applies admitted before a
+// freeze started. A freeze always refuses new applies; the policy decides
+// whether admitted ones finish or stop.
+const (
+	// FreezeRunningContinue lets admitted applies run to the end, every
+	// operation and the cutover included. It suits a calendar freeze.
+	FreezeRunningContinue = "continue"
+
+	// FreezeRunningStop stops admitted applies, and keeps an admitted apply
+	// from starting an operation it has not started. It suits an incident.
+	FreezeRunningStop = "stop"
+)
+
+// FreezeSourceManual is the source of a freeze set by a person or a direct
+// API caller. Other sources are synced from an external system, and each
+// source owns its own freezes.
+const FreezeSourceManual = "manual"
+
+// EnvironmentFreeze is one freeze of an environment, or of part of it.
+// While a freeze is in effect, SchemaBot refuses new changes in its scope
+// unless a second person approved an override. The row stays after the freeze ends or is
+// lifted, as the audit trail.
+type EnvironmentFreeze struct {
+	ID         int64  // internal; Identifier is the handle users and logs see
+	Identifier string // "freeze-..."
+
+	// Environment is the frozen environment. Deployments and Databases
+	// narrow the freeze; an empty list covers everything at that level.
+	Environment string
+	Deployments []string
+	Databases   []string
+
+	Kind    string // FreezeKindOnDemand or FreezeKindPlanned
+	Running string // FreezeRunningContinue or FreezeRunningStop
+
+	// StartsAt is when the freeze takes effect. EndsAt is when it ends on
+	// its own; nil means it lasts until someone lifts it.
+	StartsAt time.Time
+	EndsAt   *time.Time
+
+	Reason    string
+	CreatedBy string // the verified caller who set the freeze
+
+	// Source is FreezeSourceManual or the external system the freeze was
+	// synced from; ExternalID identifies it there and is empty for manual.
+	Source     string
+	ExternalID string
+
+	// LiftedBy, LiftReason and LiftedAt are set when the freeze is lifted
+	// early; LiftReason is optional.
+	LiftedBy   string
+	LiftReason string
+	LiftedAt   *time.Time
+
+	CreatedAt time.Time
+}
+
+// InEffectAt reports whether the freeze blocks changes at t: it has started,
+// it has not reached its end time, and nobody has lifted it.
+func (f *EnvironmentFreeze) InEffectAt(t time.Time) bool {
+	if f == nil || f.LiftedAt != nil {
+		return false
+	}
+	if t.Before(f.StartsAt) {
+		return false
+	}
+	return f.EndsAt == nil || t.Before(*f.EndsAt)
+}
+
+// Covers reports whether a change to database in deployment falls inside the
+// freeze's scope. Deployment and database are compared in canonical form.
+func (f *EnvironmentFreeze) Covers(deployment, database string) bool {
+	if f == nil {
+		return false
+	}
+	return scopeIncludes(f.Deployments, deployment) && scopeIncludes(f.Databases, database)
+}
+
+// scopeIncludes reports whether value is in scope, where an empty scope
+// includes everything.
+func scopeIncludes(scope []string, value string) bool {
+	if len(scope) == 0 {
+		return true
+	}
+	value = CanonicalKey(value)
+	for _, entry := range scope {
+		if CanonicalKey(entry) == value {
+			return true
+		}
+	}
+	return false
+}
+
+// hasBlankEntry reports whether scope names an empty entry. An empty scope
+// list covers everything, so a blank entry must be refused rather than
+// dropped: dropping it would widen the freeze to the whole level.
+func hasBlankEntry(scope []string) bool {
+	for _, entry := range scope {
+		if strings.TrimSpace(entry) == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// Validate reports the first problem that makes the freeze unfit to store.
+func (f *EnvironmentFreeze) Validate() error {
+	switch {
+	case f == nil:
+		return errors.New("freeze is required")
+	case strings.TrimSpace(f.Identifier) == "":
+		return errors.New("freeze identifier is required")
+	case strings.TrimSpace(f.Environment) == "":
+		return errors.New("freeze environment is required")
+	case f.Kind != FreezeKindOnDemand && f.Kind != FreezeKindPlanned:
+		return fmt.Errorf("freeze kind %q is not %q or %q", f.Kind, FreezeKindOnDemand, FreezeKindPlanned)
+	case f.Running != FreezeRunningContinue && f.Running != FreezeRunningStop:
+		return fmt.Errorf("freeze running policy %q is not %q or %q", f.Running, FreezeRunningContinue, FreezeRunningStop)
+	case f.StartsAt.IsZero():
+		return errors.New("freeze start time is required")
+	case f.EndsAt != nil && !f.EndsAt.After(f.StartsAt):
+		return errors.New("freeze end time must be after its start time")
+	case f.Kind == FreezeKindPlanned && f.EndsAt == nil:
+		return errors.New("a planned freeze needs an end time")
+	case hasBlankEntry(f.Deployments):
+		return errors.New("freeze deployments must not contain an empty name")
+	case hasBlankEntry(f.Databases):
+		return errors.New("freeze databases must not contain an empty name")
+	case strings.TrimSpace(f.Reason) == "":
+		return errors.New("freeze reason is required")
+	case strings.TrimSpace(f.CreatedBy) == "":
+		return errors.New("freeze creator is required")
+	case strings.TrimSpace(f.Source) == "":
+		return errors.New("freeze source is required")
+	case f.Source == FreezeSourceManual && f.ExternalID != "":
+		return errors.New("a manual freeze has no external id")
+	case f.Source != FreezeSourceManual && f.ExternalID == "":
+		return fmt.Errorf("a freeze from source %q needs an external id", f.Source)
+	}
+	return nil
+}
+
+// Freeze override actions: the change an override request lets through.
+const (
+	// FreezeOverrideActionApply creates an apply from a plan.
+	FreezeOverrideActionApply = "apply"
+	// FreezeOverrideActionCutover records a deferred cutover for an apply.
+	FreezeOverrideActionCutover = "cutover"
+	// FreezeOverrideActionStart records a start for a stopped or waiting
+	// apply.
+	FreezeOverrideActionStart = "start"
+)
+
+// FreezeOverrideReasonMax caps an override reason so it fits on a pull
+// request.
+const FreezeOverrideReasonMax = 500
+
+// FreezeOverrideMaxLifetime caps how long after its creation, by the
+// database clock, an override request may expire. The request is the only
+// record that an override exists, so storage refuses one meant to outlive
+// any incident, whatever its caller.
+const FreezeOverrideMaxLifetime = 24 * time.Hour
+
+// FreezeOverrideRequest asks to let one change through the freezes that hold
+// it. Under the approval override policy nobody overrides alone: a second
+// person approves the request. Under the reason policy, the default, the
+// request is stored approved by its requester, on their reason, and admits
+// only the command that gave it. Either way the change goes
+// ahead only while every blocker it meets is one the request names.
+type FreezeOverrideRequest struct {
+	ID          int64
+	Identifier  string
+	Environment string
+	// Action is the change the request lets through; TargetID is the schema
+	// an apply asks for, or the apply a cutover or start would act on.
+	Action   string
+	TargetID string
+	Database string
+	// Repository and PullRequest name the pull request the change came
+	// from, when it came from one. A request from a pull request must name
+	// its repository and author; a request with no pull request has neither.
+	Repository  string
+	PullRequest int
+	// PRAuthor is that pull request's author, who may not approve.
+	PRAuthor string
+	// Blockers are the blockers the request covers, each "gate id".
+	Blockers    []string
+	Reason      string
+	RequestedBy string
+	ApprovedBy  string
+	ApprovedAt  *time.Time
+	// ExpiresAt is when the request stops counting, approved or not.
+	ExpiresAt time.Time
+	CreatedAt time.Time
+}
+
+// Validate reports the first problem that makes the request unfit to store.
+func (r *FreezeOverrideRequest) Validate() error {
+	switch {
+	case r == nil:
+		return errors.New("freeze override request is required")
+	case strings.TrimSpace(r.Identifier) == "":
+		return errors.New("freeze override request identifier is required")
+	case strings.TrimSpace(r.Environment) == "":
+		return errors.New("freeze override request environment is required")
+	case r.Action != FreezeOverrideActionApply && r.Action != FreezeOverrideActionCutover && r.Action != FreezeOverrideActionStart:
+		return fmt.Errorf("freeze override action %q is not %q, %q or %q", r.Action,
+			FreezeOverrideActionApply, FreezeOverrideActionCutover, FreezeOverrideActionStart)
+	case strings.TrimSpace(r.TargetID) == "":
+		return errors.New("freeze override request target is required")
+	case strings.TrimSpace(r.Database) == "":
+		return errors.New("freeze override request database is required")
+	case r.PullRequest < 0:
+		return fmt.Errorf("freeze override pull request %d is not a PR number", r.PullRequest)
+	case r.PullRequest > 0 && strings.TrimSpace(r.Repository) == "":
+		return errors.New("freeze override request from a pull request needs its repository")
+	case r.PullRequest > 0 && strings.TrimSpace(r.PRAuthor) == "":
+		// Without the author, Approve could not refuse them.
+		return errors.New("freeze override request from a pull request needs its author")
+	case len(r.Blockers) == 0:
+		return errors.New("a freeze override request covers at least one blocker")
+	case hasBlankEntry(r.Blockers):
+		return errors.New("freeze override blockers must not contain an empty entry")
+	case strings.TrimSpace(r.Reason) == "":
+		return errors.New("freeze override reason is required")
+	case len([]rune(strings.TrimSpace(r.Reason))) > FreezeOverrideReasonMax:
+		return fmt.Errorf("freeze override reason is longer than %d characters", FreezeOverrideReasonMax)
+	case strings.TrimSpace(r.RequestedBy) == "":
+		return errors.New("freeze override requester is required")
+	case r.ExpiresAt.IsZero():
+		return errors.New("freeze override request expiry is required")
+	}
+	return nil
+}
+
+// Covers reports whether the request names every one of blockers. An empty
+// blockers is covered: a change with no blockers is not held.
+func (r *FreezeOverrideRequest) Covers(blockers []string) bool {
+	for _, blocker := range blockers {
+		if !slices.Contains(r.Blockers, blocker) {
+			return false
+		}
+	}
+	return true
+}
+
+// GitHubIdentityPrefix marks an identity from a pull request command. SchemaBot
+// cannot map a GitHub login to a forward-auth subject, so the two never compare
+// equal by name; the prefix keeps each in its own domain.
+const GitHubIdentityPrefix = "github:"
+
+// GitHubIdentity returns the identity of a GitHub login in the pull request
+// domain.
+func GitHubIdentity(login string) string { return GitHubIdentityPrefix + login }
+
+// IsGitHubIdentity reports whether who is in the pull request domain. The
+// prefix matches in any case, as people do (IsPersonOf), so "GitHub:dave" is
+// in the domain too.
+func IsGitHubIdentity(who string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(who)), GitHubIdentityPrefix)
+}
+
+// FromPullRequest reports whether the request was asked for on a pull request,
+// so only a pull request approves it. Either marker puts it there.
+func (r *FreezeOverrideRequest) FromPullRequest() bool {
+	return r.PullRequest > 0 || IsGitHubIdentity(r.RequestedBy)
+}
+
+// IsPersonOf reports whether who is the request's requester or its pull
+// request's author, compared case-insensitively.
+func (r *FreezeOverrideRequest) IsPersonOf(who string) bool {
+	who = CanonicalKey(strings.TrimSpace(who))
+	return who == CanonicalKey(r.RequestedBy) || (r.PRAuthor != "" && who == CanonicalKey(r.PRAuthor))
+}
+
+// OnReason reports whether the request was admitted on its requester's own
+// reason, under the reason override policy, rather than approved by someone
+// else. Approve refuses the requester, so only CreateOnReason stores one.
+func (r *FreezeOverrideRequest) OnReason() bool {
+	return r.ApprovedAt != nil && CanonicalKey(r.ApprovedBy) == CanonicalKey(r.RequestedBy)
+}
 
 // Setting represents an admin-level SchemaBot setting.
 // Examples: feature flags, default options, maintenance mode.
@@ -417,6 +716,19 @@ type Setting struct {
 // reconciler owns and derives those rows; they are component state that
 // shares the settings table, not configuration an operator chooses.
 const WebhookReconcileScanCursorSettingKeyPrefix = "webhook_reconcile_scan_cursor:"
+
+// MaxSettingKeyBytes is the longest settings key storage keeps whole. It is
+// the width of the setting_key column (varchar(255)) in pkg/schema/mysql and
+// pkg/schema/postgres. A key that passes IsPrintableASCIISettingKey takes one
+// byte per character, so the byte count and the column's character count agree.
+const MaxSettingKeyBytes = 255
+
+// MaxSettingValueBytes is the largest settings value storage keeps whole. It
+// is the size of a MySQL TEXT column, which holds 65,535 bytes and is what
+// setting_value is in pkg/schema/mysql. The PostgreSQL column is unbounded
+// text, but the limit is the same on every dialect so a value accepted on one
+// is accepted on the other.
+const MaxSettingValueBytes = 65535
 
 // IsComponentStateSettingKey reports whether key names a row a component
 // keeps for its own state rather than an operator setting. The settings
@@ -471,6 +783,10 @@ const (
 	EngineStrata      = "strata"
 	EnginePostgres    = "postgres"
 )
+
+// Engines lists every engine constant above, for checks that must hold on
+// every engine. TestEnginesListsEveryEngineConstant keeps it complete.
+var Engines = []string{EngineSpirit, EnginePlanetScale, EngineStrata, EnginePostgres}
 
 // ApplyOperationKind constants classify operation rows by scheduling role.
 const (
@@ -629,6 +945,12 @@ type TableChange struct {
 	// moves, with how each move changes the way values compare. Empty when
 	// the change re-collates no column, or the engine does not report it.
 	CollationChanges []CollationChange `json:"collation_changes,omitempty"`
+
+	// Metadata is what the engine recorded about this change at plan time
+	// and needs back at apply time (engine.TableChange.Metadata). It is
+	// stored with the reviewed plan so the apply runs against what was
+	// reviewed rather than against a fresh read of the target.
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // CollationChange is one existing column a planned change moves onto another
@@ -761,6 +1083,16 @@ type NamespacePlanData struct {
 	// Plan.IgnoreTables reads their union. A re-plan that rebuilds only some
 	// of the plan's namespaces therefore still withholds all of them.
 	IgnoreTables []string `json:"ignore_tables,omitempty"`
+
+	// DropTables is the drop_tables config the plan was reviewed under: every
+	// entry the planner was asked to drop, not the subset that named a live
+	// table here. A re-plan of a stored plan must be asked to drop the same
+	// entries, or it no longer proposes the reviewed DROP TABLE statements and
+	// disagrees with the plan it is checking. Like IgnoreTables, it is the
+	// plan's record rather than the live config, the whole list is kept for
+	// the members this plan travels to, and every stored namespace carries
+	// the same list; Plan.DropTables reads their union.
+	DropTables []string `json:"drop_tables,omitempty"`
 
 	// Finalize records that the engine asked for this namespace's group
 	// finalizer to run once every shard's DDL has landed, independent of a
@@ -1042,6 +1374,44 @@ func (p *Plan) IgnoreTables() []string {
 			continue
 		}
 		tables = append(tables, nsData.IgnoreTables...)
+	}
+	sort.Strings(tables)
+	return slices.Compact(tables)
+}
+
+// RecordDropTables stores the drop_tables config the plan was reviewed under
+// on every namespace it carries, so a re-plan of this plan — a rollback, a
+// resume, a member's drift check — is asked to drop the same tables and
+// proposes the same DROP TABLE statements the plan was reviewed with.
+// DropTables reads it back.
+func (p *Plan) RecordDropTables(tables []string) {
+	if p == nil || len(tables) == 0 {
+		return
+	}
+	normalized := slices.Clone(tables)
+	sort.Strings(normalized)
+	normalized = slices.Compact(normalized)
+	for _, nsData := range p.Namespaces {
+		if nsData == nil {
+			continue
+		}
+		nsData.DropTables = slices.Clone(normalized)
+	}
+}
+
+// DropTables returns, in sorted order, the drop_tables entries the plan was
+// reviewed under, across all namespaces. A re-plan of a stored plan passes
+// these back so it proposes the same drops the plan was reviewed with.
+func (p *Plan) DropTables() []string {
+	if p == nil {
+		return nil
+	}
+	var tables []string
+	for _, nsData := range p.Namespaces {
+		if nsData == nil {
+			continue
+		}
+		tables = append(tables, nsData.DropTables...)
 	}
 	sort.Strings(tables)
 	return slices.Compact(tables)
@@ -1731,6 +2101,18 @@ type ApplyOptions struct {
 	// and must not merge as-is), not success.
 	Rollback bool `json:"rollback,omitempty"`
 
+	// PinnedRollback marks a rollback the PR rollback command pinned, which
+	// storage verified against the lock when it created the apply. The
+	// change gates never hold one, at creation or at a later start or
+	// cutover. It is recorded at creation and never read from caller
+	// options: the rollback option above is the caller's to set.
+	PinnedRollback bool `json:"pinned_rollback,omitempty"`
+
+	// FreezeOverride is the identifier of the approved freeze override request
+	// that let this apply past a freeze at creation. It is recorded at
+	// creation and never read from caller options.
+	FreezeOverride string `json:"freeze_override,omitempty"`
+
 	// NarrowedTo is the MemberID (deployment/target) of the one rollout member
 	// a narrowed apply ran on. Empty for an apply of the whole rollout. It is
 	// recorded at creation and never read from caller options, so a rollback
@@ -2152,12 +2534,41 @@ const ForwardingControlRequestCaller = "tern-grpc"
 // SchemaBot.
 const EndedOperationStopCaller = "schemabot"
 
+// freezeStopCallerPrefix starts the requester recorded for the stop a freeze
+// with running policy FreezeRunningStop issues on an admitted apply. The rest
+// is the freeze's identifier.
+const freezeStopCallerPrefix = "freeze:"
+
+// FreezeStopCaller is the requester recorded for the stop that the freeze
+// with this identifier issues. No operator issued it, so it names the freeze,
+// and status can say which freeze stopped the apply.
+func FreezeStopCaller(freezeID string) string {
+	return freezeStopCallerPrefix + freezeID
+}
+
+// IsFreezeStopCaller reports whether requestedBy is in the form SchemaBot
+// reserves for the stop a freeze issues.
+func IsFreezeStopCaller(requestedBy string) bool {
+	return strings.HasPrefix(requestedBy, freezeStopCallerPrefix)
+}
+
+// FreezeFromStopCaller returns the identifier of the freeze that issued a
+// stop, when requestedBy is a FreezeStopCaller.
+func FreezeFromStopCaller(requestedBy string) (string, bool) {
+	freezeID, ok := strings.CutPrefix(requestedBy, freezeStopCallerPrefix)
+	if !ok || freezeID == "" {
+		return "", false
+	}
+	return freezeID, true
+}
+
 // ControlRequestNamesAnOperator reports whether a requester identifies the
 // operator who issued the command. Only such a value is worth showing in the
 // PR notice, whose whole purpose is telling an operator which of their commands
 // did not take effect.
 func ControlRequestNamesAnOperator(requestedBy string) bool {
-	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller && requestedBy != EndedOperationStopCaller
+	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller && requestedBy != EndedOperationStopCaller &&
+		!IsFreezeStopCaller(requestedBy)
 }
 
 // IsMirroredRemoteRejection reports whether this row exists only to carry
@@ -2989,6 +3400,12 @@ var AutoPlanPullRequestActions = []string{"opened", "synchronize", "reopened"}
 // but a closed delivery itself is never superseded, because its cleanup must
 // always run.
 const PullRequestClosedAction = "closed"
+
+// PullRequestSynchronizeAction is the pull_request action GitHub delivers when
+// new commits are pushed to a PR's head branch, force-pushes included. Pushes
+// arrive in bursts, so it is the one auto-plan action a webhook handler may
+// hold back for a quiet period before a driver can claim it.
+const PullRequestSynchronizeAction = "synchronize"
 
 // WebhookEventStatesAll lists every canonical webhook inbox state, ordered from
 // earliest to terminal. Use it to enumerate states for metrics and stats so a

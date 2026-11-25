@@ -100,7 +100,7 @@ func TestUpdateCheckRecordForApplyResult_CancelledForwardApplyReleasesOwnership(
 	svc := setupE2EService(t, database)
 	apply := createCancelledCheckApply(t, svc, database, false)
 	storeCancelledOwnedCheck(t, svc, apply, checkStatusInProgress, "")
-	h := NewHandler(svc, nil, nil, testLogger())
+	h := NewHandler(svc, nil, nil, testLogger(), WithInsecureSkipSignatureVerification())
 
 	updated, err := h.updateCheckRecordForApplyResult(t.Context(), cancelledCheckRepo, cancelledCheckPR, apply)
 	require.NoError(t, err)
@@ -125,7 +125,7 @@ func TestUpdateCheckRecordForApplyResult_CancelledForwardApplyWithCompletedTaskR
 	createCancelledCheckTask(t, svc, apply, "task-cancelled-completed", state.Task.Completed)
 	createCancelledCheckTask(t, svc, apply, "task-cancelled-sibling", state.Task.Cancelled)
 	storeCancelledOwnedCheck(t, svc, apply, checkStatusInProgress, "")
-	h := NewHandler(svc, nil, nil, testLogger())
+	h := NewHandler(svc, nil, nil, testLogger(), WithInsecureSkipSignatureVerification())
 
 	updated, err := h.updateCheckRecordForApplyResult(t.Context(), cancelledCheckRepo, cancelledCheckPR, apply)
 	require.NoError(t, err)
@@ -160,7 +160,7 @@ func TestReconcileStaleChecks_CancelledOwnedFailureReleasesOnce(t *testing.T) {
 	client.BaseURL = baseURL
 	setupFakeGitHubForPlan(t, mux, nil, "", database)
 	installClient := ghclient.NewInstallationClient(client, testLogger())
-	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, testLogger())
+	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, testLogger(), WithInsecureSkipSignatureVerification())
 
 	require.NoError(t, h.reconcileStaleChecks(t.Context(), installClient, cancelledCheckRepo, cancelledCheckPR))
 	check := loadCancelledCheck(t, svc, database)
@@ -184,7 +184,7 @@ func TestUpdateCheckRecordForApplyResult_CancelledRollbackRetainsOwnership(t *te
 	svc := setupE2EService(t, database)
 	apply := createCancelledCheckApply(t, svc, database, true)
 	storeCancelledOwnedCheck(t, svc, apply, checkStatusInProgress, "")
-	h := NewHandler(svc, nil, nil, testLogger())
+	h := NewHandler(svc, nil, nil, testLogger(), WithInsecureSkipSignatureVerification())
 
 	updated, err := h.updateCheckRecordForApplyResult(t.Context(), cancelledCheckRepo, cancelledCheckPR, apply)
 	require.NoError(t, err)
@@ -231,7 +231,7 @@ func TestE2EPlanCancelledApplyWithEarlierFailedApplyCompletedTaskStaysBlocked(t 
 	client.BaseURL = baseURL
 	result := setupFakeGitHubForPlan(t, mux, map[string]string{}, "", database)
 	installClient := ghclient.NewInstallationClient(client, testLogger())
-	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, testLogger())
+	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, testLogger(), WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot plan -e staging", isPR: true}, nil)
 	rr := httptest.NewRecorder()
@@ -243,7 +243,7 @@ func TestE2EPlanCancelledApplyWithEarlierFailedApplyCompletedTaskStaysBlocked(t 
 		assert.Contains(t, body, "Schema Change Reconciliation Required")
 		assert.NotContains(t, body, "refreshed as passing")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for reconciliation comment")
+		require.FailNow(t, "timed out waiting for reconciliation comment")
 	}
 
 	check := loadCancelledCheck(t, svc, database)
@@ -330,7 +330,7 @@ func TestUpdateCheckRecordForApplyResult_CancelledForwardApplyRepairsCheckOwnedB
 	apply := createCancelledCheckApply(t, svc, database, false)
 	require.Greater(t, apply.ID, earlierID)
 	storeCancelledOwnedCheck(t, svc, earlier, checkStatusCompleted, checkConclusionFailure)
-	h := NewHandler(svc, nil, nil, testLogger())
+	h := NewHandler(svc, nil, nil, testLogger(), WithInsecureSkipSignatureVerification())
 
 	updated, err := h.updateCheckRecordForApplyResult(t.Context(), cancelledCheckRepo, cancelledCheckPR, apply)
 	require.NoError(t, err)
@@ -362,7 +362,7 @@ func TestE2EPlanCancelledApplyWithNoManagedFilesConvergesPassing(t *testing.T) {
 	client.BaseURL = baseURL
 	result := setupFakeGitHubForPlan(t, mux, map[string]string{}, "", database)
 	installClient := ghclient.NewInstallationClient(client, testLogger())
-	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, testLogger())
+	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, testLogger(), WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot plan -e staging", isPR: true}, nil)
 	rr := httptest.NewRecorder()
@@ -375,7 +375,7 @@ func TestE2EPlanCancelledApplyWithNoManagedFilesConvergesPassing(t *testing.T) {
 		assert.Contains(t, body, "No Schema Files Changed")
 		assert.Contains(t, body, "refreshed as passing")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for passing convergence comment")
+		require.FailNow(t, "timed out waiting for passing convergence comment")
 	}
 
 	check := loadCancelledCheck(t, svc, database)

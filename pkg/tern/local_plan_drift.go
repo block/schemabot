@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -47,29 +48,39 @@ type driftChangeMultiset map[driftChangeKey]int
 
 // replannedChange is one change as this deployment's own re-plan produced it:
 // the statement its engine emitted against this target, the execution-mode
-// verdict on how that statement would run here, and whether its engine judged
-// the statement unsafe.
+// verdict on how that statement would run here, whether its engine judged
+// the statement unsafe, and the engine's record of this target's objects the
+// statement acts on as the re-plan read them, which must equal the record the
+// change was reviewed with. metadataConflict marks a key the re-plan produced
+// more than once with records that disagree.
 type replannedChange struct {
-	ddl          string
-	mode         string
-	reason       string
-	unsafe       bool
-	unsafeReason string
+	ddl              string
+	mode             string
+	reason           string
+	unsafe           bool
+	unsafeReason     string
+	metadata         map[string]string
+	metadataConflict bool
 }
 
 // replannedChangeOf reads the re-planned facts back off a plan row's change,
 // so a change carried from the plan row is stamped exactly as the plan row
 // was.
 func replannedChangeOf(tc storage.TableChange) replannedChange {
-	return replannedChange{ddl: tc.DDL, mode: tc.ExecutionMode, reason: tc.ModeReason, unsafe: tc.IsUnsafe, unsafeReason: tc.UnsafeReason}
+	return replannedChange{ddl: tc.DDL, mode: tc.ExecutionMode, reason: tc.ModeReason, unsafe: tc.IsUnsafe, unsafeReason: tc.UnsafeReason, metadata: tc.Metadata}
 }
 
 // stampOnto writes the re-planned facts onto a change. The statement and
 // execution-mode verdict are this target's and replace what the change
-// carried. The unsafe flag is only ever tightened: a re-plan that judges the
-// statement unsafe marks the change unsafe, so the unsafe-change admission
-// gate requires the opt-in for it, and a re-plan that judges it safe leaves a
-// change already marked unsafe as it is.
+// carried. The engine metadata is not replaced: it is the record the plan was
+// reviewed with of the objects the change acts on, and a re-plan reads the
+// objects as they are now, which can be ones that took a reviewed object's
+// name after review. stampReplannedTables refuses a change whose re-plan reads
+// a different record before stampOnto runs. The unsafe flag is only ever
+// tightened: a re-plan that judges the statement unsafe marks the change
+// unsafe, so the unsafe-change admission gate requires the opt-in for it, and
+// a re-plan that judges it safe leaves a change already marked unsafe as it
+// is.
 func (r replannedChange) stampOnto(tc *storage.TableChange) {
 	tc.DDL = r.ddl
 	tc.ExecutionMode = r.mode
@@ -114,13 +125,16 @@ type replannedChanges struct {
 // prevent, and an unsafe flag wins for the same reason: the kept copy takes
 // the unsafe flag and reason of the other copy when only that one is unsafe.
 // Otherwise the first seen stands — the copies canonicalize equal by
-// construction of the key, so either statement is this target's own.
+// construction of the key, so either statement is this target's own. Copies
+// whose engine metadata disagree mark the key conflicting, since either record
+// could be the one the change runs against.
 func (r replannedChanges) record(key driftChangeKey, change replannedChange) {
 	existing, seen := r.byChange[key]
 	if !seen {
 		r.byChange[key] = change
 		return
 	}
+	conflict := existing.metadataConflict || change.metadataConflict || !maps.Equal(existing.metadata, change.metadata)
 	kept, other := existing, change
 	if change.mode == engine.ExecutionModeBlocked && existing.mode != engine.ExecutionModeBlocked {
 		kept, other = change, existing
@@ -128,6 +142,7 @@ func (r replannedChanges) record(key driftChangeKey, change replannedChange) {
 	if other.unsafe && !kept.unsafe {
 		kept.unsafe, kept.unsafeReason = true, other.unsafeReason
 	}
+	kept.metadataConflict = conflict
 	r.byChange[key] = kept
 }
 
@@ -136,6 +151,28 @@ func (r replannedChanges) record(key driftChangeKey, change replannedChange) {
 // must be regenerated against the current schema and re-reviewed before
 // re-applying. Without this an operator only learns what drifted, not what to do.
 const driftRecoveryHint = "to recover, re-plan against the current live schema to refresh the reviewed plan, then re-apply"
+
+// missingSchemaFilesRecoveryHint gives the next step for a shard dispatch that
+// arrived without the reviewed schema files. Every current control plane
+// sends them, so the dispatch came from one older than this data plane.
+const missingSchemaFilesRecoveryHint = "to recover, upgrade the SchemaBot server that dispatched it so it sends the reviewed schema files with each shard, then plan and apply again"
+
+// refuseShardDispatchWithoutSchemaFiles refuses a shard dispatch that carries
+// no schema files, on every path that admits one: attaching to an existing
+// apply, creating an apply from a stored plan row, and materializing the plan
+// from the dispatch. Without the reviewed schema there is nothing to re-plan
+// the shard against, so the change would run unjudged against the shard's
+// live schema. The gate counts namespaces, not files: a namespace declared
+// empty (every table dropped) is still a reviewed schema to re-plan against.
+// The refusal is permanent, since a redispatch of the same request carries
+// the same nothing; the caller logs it with the dispatch's identifiers.
+func (c *LocalClient) refuseShardDispatchWithoutSchemaFiles(req *ternv1.ApplyRequest, shard string) error {
+	if len(req.SchemaFiles) > 0 {
+		return nil
+	}
+	return engine.NewPermanentError("shard dispatch for plan %s (database %q, target %q, shard %q) carries no schema files to re-plan against, so it was refused rather than run on this shard unchecked against its live schema; %s",
+		req.PlanId, c.config.Database, req.Target, shard, missingSchemaFilesRecoveryHint)
+}
 
 // verifyMaterializedPlanMatchesLiveSchema fails closed unless the reviewed DDL a
 // dispatch carries exactly matches what this deployment would independently plan
@@ -181,6 +218,9 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 			return replannedChanges{}, fmt.Errorf("drift guard: %w", err)
 		}
 		targetShard = shard
+		if err := c.refuseShardDispatchWithoutSchemaFiles(req, targetShard); err != nil {
+			return replannedChanges{}, err
+		}
 	}
 
 	result, err := c.replanForDispatch(ctx, req, schemaFiles)
@@ -247,6 +287,12 @@ func (c *LocalClient) replanForDispatch(ctx context.Context, req *ternv1.ApplyRe
 		// where it was planned, so an entry naming a table only this
 		// deployment holds withholds it here too.
 		IgnoreTables: req.GetIgnoreTables(),
+		// Likewise the re-plan must be asked to drop what the reviewed plan
+		// was asked to drop. A table no schema file declares that the engine
+		// skips by its name is dropped only when drop_tables names it, so a
+		// re-plan without the list leaves out the reviewed DROP TABLE and
+		// this guard reads the difference as drift.
+		DropTables: req.GetDropTables(),
 		// The guard compares the reviewed DDL against this re-plan, so the
 		// re-plan has to be judged under the dispatch's own policy. Under a
 		// different one a statement the reviewed plan routed directly comes
@@ -279,16 +325,15 @@ func (c *LocalClient) replanForDispatch(ctx context.Context, req *ternv1.ApplyRe
 // are no evidence about this one.
 //
 // A dispatch that carries no schema files has no reviewed schema to re-plan
-// against, and runs against the plan row as it is: a change no re-plan has
-// judged keeps the mark that makes admission require the unsafe opt-in for it.
-// logAttrs identify the apply and operation for that warning.
-func (c *LocalClient) verifyShardDispatchAgainstLiveSchema(ctx context.Context, req *ternv1.ApplyRequest, scope *dispatchScope, logAttrs []any) error {
-	if len(req.SchemaFiles) == 0 {
-		c.logger.Warn("shard dispatch carries no schema files to re-plan against; admitting it against the plan row, which will require the unsafe opt-in for every change it could not confirm",
-			append(logAttrs,
-				"plan_id", req.PlanId,
-				"shard", scope.shard)...)
-		return nil
+// against, so the check cannot be made and the dispatch is refused: admitting
+// it would run a change on this shard that nothing judged against the shard's
+// live schema, which is what the check exists to prevent. The control plane
+// stamps the reviewed schema files on every shard dispatch, so a dispatch
+// without them comes from a dispatcher this deployment does not agree with,
+// and a redispatch of the same request cannot clear the refusal.
+func (c *LocalClient) verifyShardDispatchAgainstLiveSchema(ctx context.Context, req *ternv1.ApplyRequest, scope *dispatchScope) error {
+	if err := c.refuseShardDispatchWithoutSchemaFiles(req, scope.shard); err != nil {
+		return err
 	}
 	schemaFiles, err := c.normalizeSchemaFiles(protoToSchemaFiles(req.SchemaFiles))
 	if err != nil {
@@ -397,7 +442,7 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 			}
 			key := driftChangeKey{ns, shard, tc.Table, ddl.StatementTypeToOp(tc.Operation), canon}
 			ms[key]++
-			replanned.record(key, replannedChange{ddl: tc.DDL, mode: tc.ExecutionMode, reason: tc.ModeReason, unsafe: tc.IsUnsafe, unsafeReason: tc.UnsafeReason})
+			replanned.record(key, replannedChange{ddl: tc.DDL, mode: tc.ExecutionMode, reason: tc.ModeReason, unsafe: tc.IsUnsafe, unsafeReason: tc.UnsafeReason, metadata: tc.Metadata})
 		}
 	}
 	return ms, replanned, nil
@@ -594,6 +639,12 @@ func (c *LocalClient) stampReplannedTables(parser ddl.StatementParser, tables []
 		change, ok := replanned.byChange[driftChangeKey{c.planNamespace(tc.Namespace), replanned.targetShard, tc.Table, tc.Operation, canon}]
 		if !ok {
 			return fmt.Errorf("table %q: no re-planned change for one the drift comparison matched", tc.Table)
+		}
+		if change.metadataConflict {
+			return engine.NewPermanentError("table %q: this deployment's re-plan holds more than one copy of a change with different engine records, so it cannot say which objects the change acts on; %s", tc.Table, driftRecoveryHint)
+		}
+		if !maps.Equal(tc.Metadata, change.metadata) {
+			return engine.NewPermanentError("table %q: the objects this change acts on are not the ones the plan reviewed on this deployment (the engine's record of them differs), so it was refused rather than run against unreviewed objects; %s. If the new plan is refused here too, this deployment's objects differ from the primary deployment's and the change cannot run here", tc.Table, driftRecoveryHint)
 		}
 		change.stampOnto(tc)
 	}

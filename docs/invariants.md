@@ -299,8 +299,9 @@ fields they do not recognize, because there an unknown field is a caller's mista
 operator's typo rather than a peer on a different release, and ignoring it would swallow intent.
 *Enforced:* the additive-only proto and storage-schema rules, checked before a tag
 ([release.md](release.md)); strict decoding on the HTTP API handlers
-(`pkg/api/control_handlers.go`, `pkg/api/lock_handlers.go`, `pkg/api/plan_handlers.go`,
-`pkg/api/settings_handlers.go`, `pkg/api/storage_schema_handlers.go`) and on config load
+(`pkg/api/control_handlers.go`, `pkg/api/freeze_handlers.go`, `pkg/api/lock_handlers.go`,
+`pkg/api/plan_handlers.go`, `pkg/api/settings_handlers.go`, `pkg/api/storage_schema_handlers.go`,
+`pkg/api/webhook_ops_handlers.go`) and on config load
 (`pkg/api/config.go`).
 
 ### AV-7: An acknowledged delivery is a promise
@@ -493,7 +494,9 @@ waiting out a boot budget measured in minutes for a database the instance will n
 way down, every wait on background work carries a bound of its own, so shutdown ends when those
 bounds are spent rather than when the slowest goroutine decides to return. An instance that cannot
 finish starting exits non-zero rather than lingering, so the platform restarts it instead of
-routing to it.
+routing to it. An instance that cannot take every port it serves on exits before it serves
+anything, claims work, registers its drivers or runs a repair pass, so its exit leaves nothing
+for a peer to take back.
 
 Stopping at a bound is safe because the instance is on its way out and nothing abandoned at one is
 lost: the work left behind stops when the process does, so the target it still holds is released by
@@ -510,7 +513,8 @@ a routine restart becomes an interrupted schema change with no bound on how long
 locked. *Enforced:* the bounded waits on the close path (`pkg/drain`, used by `pkg/api/operator.go`,
 `pkg/api/shutdown.go`, `pkg/webhook/durable_dispatch.go`, and `pkg/serve/serve.go`) and the
 signal-scoped startup context (`pkg/serve/serve.go`, `pkg/cmd/commands/serve.go`), which reaches an
-in-flight storage convergence as the deliberate stop AV-13 permits.
+in-flight storage convergence as the deliberate stop AV-13 permits; binding every listener before
+any serves or `Server.Start` runs (`serveUntilShutdown` in `pkg/serve/serve.go`).
 
 ### AV-15: A pull request's GitHub cost grows with its schema inputs, not with the rest of the PR
 
@@ -614,7 +618,10 @@ still gets one: an explicit passing "no schema files changed". GitHub treats a m
 check as not passing, so having nothing to say has to be said rather than left empty. The same
 logic applies in reverse. When SchemaBot expects a check, environment, or config and cannot find
 it, that reads as blocking, never as not-applicable. A gate must not be removable by the very
-change it guards. *Enforced:* aggregate creation on head-commit events
+change it guards. An environment the server config no longer lists for a database is no longer
+expected, so a plan of that database removes the plan-only rows left in it; a row a started apply
+owns keeps blocking (MG-6), and an environment listed again reads as missing, never as passing.
+*Enforced:* aggregate creation on head-commit events
 (`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); verified per-environment
 scope and pending contributions for missing local results (`pkg/webhook/aggregate_scope.go`,
 `pkg/webhook/check_publisher.go`); config discovery, the command
@@ -697,11 +704,12 @@ A later commit that removes the schema change must not make the aggregate pass b
 the check stays blocked (`schema_removed_after_apply_started`) until the apply settles and an
 operator reconciles the target. Closing and reopening the PR does not wash this state away.
 *Enforced:* stale-check cleanup and the plan that settles the rows a database left under an old
-type, both of which block a row a started apply owns instead of clearing it (`cleanupStaleChecks`
-and `settleChecksReplacedByNewType` in `pkg/webhook/pull_request.go`, the latter called from
-`handlePlanCommand` and `handleMultiEnvPlan` in `pkg/webhook/plan.go`, and `checkHasStartedApply` in
-`pkg/webhook/check_aggregate.go`), and the storage write that marks a stale plan successful only
-while no apply owns the row (`MarkStalePlanSuccessful` in `pkg/storage/internal/sqlstore/checks.go`);
+type or in an environment it no longer has, both of which block a row a started apply owns instead
+of clearing it (`cleanupStaleChecks` and `settleLeftBehindChecks` in `pkg/webhook/pull_request.go`,
+the latter called from `handlePlanCommand` and `handleMultiEnvPlan` in `pkg/webhook/plan.go`, and
+`checkHasStartedApply` in `pkg/webhook/check_aggregate.go`), and the storage writes that mark a stale plan successful,
+or remove one in an environment the database no longer has, only while no apply owns the row
+(`MarkStalePlanSuccessful` and `DeleteStalePlanOnly` in `pkg/storage/internal/sqlstore/checks.go`);
 the block decided against the row as stored under its row lock (`BlockStaleStartedApply`), and the
 apply completion that keeps that block rather than writing it away (`CompleteForApply`, both in
 `pkg/storage/internal/sqlstore/checks.go`);
@@ -745,8 +753,12 @@ too, by the operator reconciling the target — what it must not do is converge 
 that would clear the block without the divergence behind it being addressed.
 
 *Enforced:* stale-check reconciliation (`pkg/webhook/check_records.go`), aggregate re-evaluation
-(`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), and the re-plan a settled
-apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`).
+(`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), the re-plan a settled
+apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`),
+the plan that settles the rows a database left on earlier commits under an old type, and removes
+those it left in an environment it no longer has, which no later plan would store again (`settleLeftBehindChecks` in
+`pkg/webhook/pull_request.go`), and the durable delivery retry that re-runs a plan refused by the
+GitHub quota reserve once the quota resets (`pkg/webhook/durable_dispatch.go`).
 A concurrent stale publication can leave an obsolete blocker without arming these retries;
 that case requires another fold ([publication concurrency](check-runs.md#publication-concurrency)).
 
@@ -812,6 +824,26 @@ shared command and recovery policy (`pkg/webhook/pr_target.go`); auto-plan and
 aggregate publishers (`pkg/webhook/pull_request.go`, `pkg/webhook/check_publisher.go`);
 fresh-snapshot and uncached apply-acceptance gates (`pkg/webhook/apply_handlers.go`,
 `pkg/webhook/apply_execute.go`).
+
+### MG-14: Databases that share a schema pass only while each withholds the other's tables
+
+When two databases managed from one repository have namespaces that the same rollout member stores
+in one schema, as that member's data plane reports it, a plan or apply of either passes only while
+each withholds from its plans every table the other declares in that schema, and no table is
+declared by both there. Both databases' schema files are read at the pull request's head, so the
+rule holds before an apply has created a new table, and a pull request that adds a table to one
+database and withholds it from the other in the same change passes. A database whose files cannot
+be read, or whose namespaces the member's data plane cannot place, fails the environment rather
+than passing it. *Breaks if violated:* a pull request that adds a table to one database merges green, and once
+it is applied the other database's next plan proposes dropping it. *Enforced:*
+`CheckSharedSchemaIgnoreLists` in `pkg/api/shared_schema.go`, which places each namespace through
+`Service.ResolveNamespaces` (`pkg/api/shared_schema_resolve.go`) and the data plane's
+`ResolveNamespaces` (`pkg/tern/local_client.go`), run before the plan by
+`verifySharedSchemaIgnoreLists` (`pkg/webhook/shared_schema.go`) from the single- and
+multi-environment plans in `pkg/webhook/plan.go`, and before an apply or apply-confirm by
+`enforceSharedSchemaIgnoreLists` in `pkg/webhook/apply_handlers.go`, whose comparison holds only
+while `assertBaseSchemaStillCurrent` (`pkg/webhook/schema_freshness.go`) finds no base branch
+change to the other database's inputs.
 
 ## Apply state machine (ST)
 
@@ -1393,7 +1425,9 @@ refusal (`resolveOrRetryRevertPhaseRequest` and `resolveOrRetryAutoSkipRevert`,
 terminal resolution of a typed unsupported-operation
 decline (`failPendingRequestForUnsupportedOperation`, `pkg/tern/local_control.go`), reached from
 the stop and cancel paths in that file and from the revert and skip-revert paths in
-`pkg/tern/local_apply_grouped.go`, the claim arms that hand a pending cancel to a rollout's
+`pkg/tern/local_apply_grouped.go`, the engine contract suite, which holds every engine to that
+typed decline for a start, cutover, revert, or skip-revert it does not support
+(`pkg/engine/enginetest`), the claim arms that hand a pending cancel to a rollout's
 stopped and cutover-parked operations and a pending stop to its cutover-parked ones, and that keep
 its pending operations from starting while either pends (`FindNextApplyOperation`,
 `pkg/storage/internal/sqlstore/apply_operations.go`), the settling of its never-started
@@ -1722,6 +1756,25 @@ one rollout has got. *Enforced:* the shared derivation (`SumTargetRows`, `Percen
 renders the same rollouts through both surfaces and fails when they read differently
 (`TestRolledUpTableReadsTheSameInTheCLIAndThePRComment` in `pkg/cmd/internal/templates`).
 
+### UX-8: A table in flight reads the same on every surface, whichever engine runs it
+
+While an engine works on a table's change, the table has one reading: the label beside its name,
+and the detail lines under its statement. This holds while the engine copies rows, builds an
+index, verifies a copy, catches up on changes, or applies a change that reports no progress, and
+whether the table runs on one target or copies across shards. Each
+engine reports its progress as the same table facts, and that reading is derived once from those
+facts and rendered by the CLI and the PR comment alike. So an operator watching two engines' schema
+changes sees the same phase named the same way, with the same figures in the same place. Only
+markup and the bar's drawing may differ between surfaces. *Enforced:* the shared reading
+(`ReadInFlightTable` in `pkg/presentation/table_reading.go`), and a test that renders one progress
+response for every phase through both surfaces, under every engine in `storage.Engines`, and fails
+when they read differently (`TestInFlightTableReadsTheSameOnEverySurface` in
+`pkg/cmd/internal/templates`), with `TestEnginesListsEveryEngineConstant` in `pkg/storage` keeping
+that list complete. Its sharded counterpart (`TestShardedInFlightTableReadsTheSameOnEverySurface`)
+covers a table copying across shards in the CLI, the sharded apply comment, and the apply status
+comment. These tests prove the surfaces read the same facts alike; which facts an engine reports is
+pinned by that engine's own progress tests.
+
 ## Recovery (RC)
 
 ### RC-1: Nothing is orphaned
@@ -1858,6 +1911,18 @@ the re-plan speaks for a shard-tagged task at all. `remainingPlannedChanges` on 
 path of the PlanetScale engine (`pkg/engine/planetscale/apply.go`) runs only reviewed DDL for the
 tables the branch still lacks, refuses a branch that differs outside the reviewed DDL, and
 validates the branch against the declared schema before creating or adopting the deploy request.
+On PostgreSQL, a statement that drops a table, a column, a constraint, or a NOT NULL runs only with the
+planner's record of that object, which the plan stores with the change and every apply path passes
+back, matching a task to its change by the statement's canonical form (`planChangeMetadata` in
+`pkg/tern/plan_change_metadata.go`); the apply refuses a drop with no record
+and drops nothing when the object no longer matches it under the table's lock
+(`reviewedDropForApply` and `executeReviewedDrop` in `pkg/engine/postgres/apply.go`;
+`tableDropForApply` and `executeTableDrop` in `pkg/engine/postgres/table_drop.go`).
+The re-plan an apply runs after a confirmation, or after an automatic apply posts its plan, holds
+each statement the confirmed plan ran to the engine's record of the objects it acts on: a record
+that differs refuses the confirmation, or stops the automatic apply for manual confirmation
+(`memberWorkDifference` and `objectsChangedSinceReview` in `pkg/webhook/apply_member_work.go`,
+called from `executeApply` in `pkg/webhook/apply_execute.go`).
 The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
 and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
@@ -1883,7 +1948,7 @@ Unsafe changes (error-severity lint findings such as table and column drops) blo
 unfinished row copy, require the operator to confirm the specific consequences disclosed to
 them. The re-plan that runs just before execution re-checks that verdict, so a plan that changed
 after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the pull request apply flow, for both `apply` and `apply-confirm`
-(`pkg/api/plan_handlers.go`, `pkg/webhook/apply_gating.go`, `pkg/webhook/apply_execute.go`), including the re-check that the work of every rollout member, the
+(`pkg/api/plan_handlers.go`, `pkg/webhook/apply_gating.go`, `pkg/webhook/apply_execute.go`), including the refusal, at plan and again at apply creation, of a `drop_tables` entry that names a working table of an apply on the same database and environment that has not settled, a stopped one included, since a drop discloses no copy it discards (`refuseDropsOfUnsettledApplyWorkTables` in `pkg/api/drop_tables_work_tables.go`), the re-check that the work of every rollout member, the
 primary target's included, is what the confirmation, or the comment an automatic apply posted,
 was given against and carries no consequence it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversPrimaryTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
 `pkg/webhook/apply_member_work.go`), with an automatic apply running other members' work only once that comment has landed (`applyCommandCore` in `pkg/webhook/apply_handlers.go`), where every member's discarded copies take the same two-step confirm as the primary plan's, consent being recorded copy by copy with the target each is on and a copy the confirmation did not name stopping the apply again (`rolloutDiscardedCopies`, `rolloutDisclosedCopies` and `undisclosedDiscards` in `pkg/webhook/apply_member_work.go`, recorded on the lock as `DisclosedCopies`, disclosed under each target's plan by `writeTargetDiscardedCopies` in `pkg/webhook/templates/plan.go`) and a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopiesUnreported` and `MemberDiscardedCopies` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
@@ -1905,9 +1970,11 @@ those changes: when that comment cannot be posted, `rollback` withdraws its pin 
 `LockStore.ClearPendingPlanID`). On the data plane, apply admission requires the opt-in for the
 applying deployment's own re-planned unsafe verdicts, stamped onto the materialized plan and the
 dispatch scope, a shard dispatch attaching or creating from a stored plan row re-planned against
-its own shard and stamped with that shard's verdict, and a shard dispatch this deployment could
-not re-plan (it carries no schema files) treated as unsafe
-(`verifyShardDispatchAgainstLiveSchema` and `restoreDispatchedUnsafeVerdicts` in
+its own shard and stamped with that shard's verdict, and a shard dispatch this deployment cannot
+re-plan (it carries no schema files) refused before any of its work is admitted, whether it
+attaches, creates from a stored plan row or materializes the plan
+(`refuseShardDispatchWithoutSchemaFiles`, `verifyShardDispatchAgainstLiveSchema` and
+`restoreDispatchedUnsafeVerdicts` in
 `pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeDDLChangesWithoutOptIn` in
 `pkg/tern/local_client.go`), and the applying deployment's own re-planned VSchema deletions and
 mutations added to the ones the dispatch carried (`stampReplannedVSchema` in
@@ -1925,9 +1992,12 @@ The byte bound has no exact corroboration and approves on its estimate. The verd
 belongs to the target that will run the statement: a deployment that applies a plan it did not
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
 planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the
-privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS admission refusals
-in `pkg/engine/postgres/row_security.go` that abort plan creation and the apply-time gate in
-`pkg/engine/postgres/row_security_apply.go`); the whole-plan
+privilege, size, and partitioned index shape gates in `pkg/engine/postgres/postgres.go` and the
+table drop gates in `pkg/engine/postgres/table_drop.go`, plus RLS admission refusals
+in `pkg/engine/postgres/row_security.go` and enum type refusals, the type privilege gate, and
+blocked label additions in `pkg/engine/postgres/enum_type.go` that abort plan creation or mark the
+plan blocked, and the apply-time gates in `pkg/engine/postgres/row_security_apply.go` and
+`pkg/engine/postgres/enum_type_apply.go`); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
 path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), and for a shard dispatch attaching
 to an existing apply or creating one from a stored plan row its re-planned scope
@@ -2075,21 +2145,28 @@ allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), 
 resolver identity assertions (`pkg/inventory/overrides.go`), discovery scoped to the
 configured inventory environment (`pkg/etre/resolver.go`), rollout member selection
 (`pkg/api/rollout_member_selector.go`, `applyTargets` in `pkg/api/plan_handlers.go`), the PostgreSQL
-apply's check that planned DDL names the schema it targets (`pkg/engine/postgres/apply.go`), and
+apply's check that planned DDL names the schema it targets (`pkg/engine/postgres/apply.go`, and
+`validateEnumValueAdd` in `pkg/engine/postgres/enum_type_apply.go` for an enum label addition), and
 source policy (`pkg/webhook/schema_source_policy.go`).
 
 ### AZ-2: Authorization fails closed at every tier
 
 An API route not classified as a read is treated as a write. Planning counts as a write, since it
 stages a change. A target that cannot be resolved never authorizes. A configured grant that could
-never match any request is a startup error rather than silent dead config. And a new mutating
+never match any request is a startup error rather than silent dead config. An operator whose grant
+is limited to some environments is denied, and nothing is written, for work outside them, including
+when the request names a granted environment for work stored in another. And a new mutating
 endpoint cannot ship without a test proving it denies unauthorized callers. *Enforced:* the tier
-classification (`pkg/auth/tiers.go`), with a structural sweep test over the route table
-(`pkg/api/service.go`).
+classification (`pkg/auth/tiers.go`), with structural sweep tests over the route table
+(`pkg/api/service.go`): `pkg/api/route_authorization_sweep_test.go` for the database scope and
+`pkg/api/route_environment_scope_sweep_test.go` for the environment scope.
 
 ### AZ-3: Identity comes from a verified lane
 
-Forwarded identity headers are trusted only from explicitly listed proxies, a gateway-verified
+Forwarded identity headers are trusted only from explicitly listed proxies. A user identity
+forwarded from a loopback source other than a listed mesh sidecar address, such as a
+port-forward, is admitted but never verified; listing a mesh sidecar address trusts every process
+in the pod's network namespace like the proxy. A gateway-verified
 service caller never reaches the write tier by self-asserting user headers, and every write and
 control action is attributed to the verified caller rather than to any client-supplied caller
 string. A client-supplied string never proves ownership either: a scoped operator releases a lock
@@ -2098,14 +2175,16 @@ scoped operator never takes a lock without one, and a lock with no recorded acqu
 only under a deployment-wide grant. *Enforced:* the
 trust-anchor config, which refuses to start without one, and identity-precedence rules in the auth
 layer (`pkg/auth`); the scoped lock release and re-acquire in `pkg/api/lock_handlers.go`, the release
-pinned to the lock row it checked and the re-acquire told which row its acquire created (`ReleaseByID`
-and `Acquire` in `pkg/storage/internal/sqlstore/locks.go`).
+pinned to the lock row it checked, or to the row the caller named when it sends one, and the
+re-acquire told which row its acquire created (`ReleaseByID`, `ReleaseByIDIfUnused` and `Acquire` in
+`pkg/storage/internal/sqlstore/locks.go`).
 
 ### AZ-4: Applying takes an authorized actor
 
 A PR apply requires an actor authorized for the target (configured operators, admin teams, repo
-admins, or CODEOWNERS, per config), evaluated per database. The change's author cannot satisfy
-their own review requirement. An approval that the reviewer withdrew or that the repository
+admins, CODEOWNERS, or Apps the database lists as command Apps, per config), evaluated per
+database. The change's author cannot satisfy their own review requirement, and a command App's
+approval never satisfies it. An approval that the reviewer withdrew or that the repository
 dismissed does not count. By default an authorized approval counts on whichever commit of the
 change it was given. Where the review policy requires re-approval, an approval counts only for the
 schema change it reviewed: it was given on the commit being applied, or on an earlier commit at which the change's own
@@ -2181,6 +2260,113 @@ its state so the retry uses the same execution authority.
 `pkg/cmd/commands/init_publish_linux.go`, `pkg/cmd/commands/init_publish_other.go`,
 `pkg/cmd/commands/init_sample.go`, and `pkg/localdemo/database.go`.
 
+### AZ-10: A freeze holds every new change it covers
+
+While a freeze covering a change is in effect, SchemaBot refuses to create its apply, to record a
+start for an apply that is stopped or waiting to start, and to record a cutover for a deferred
+apply. A change that started before the freeze keeps running, unless the freeze stops it (AZ-11).
+If any deployment the change runs on is covered, the whole change is refused; for an existing
+apply that includes every deployment its stored operations run on. "In effect" is decided by the
+database clock, so every pod agrees at the edges of a freeze. A pull request rollback is never held, at creation or at a later start or
+cutover, nor is a stop, a cancel or a revert. When SchemaBot cannot read the freezes, or the override
+requests below, it refuses the change with a retryable error, never letting it through unchecked.
+A freeze refuses a change unless an override covers every blocker on it. Only a verified
+requester asks for one, by giving an override reason with the apply, start or cutover. An override
+covers one environment, one action and one target: for an apply, the database and, for each rollout
+member, the schema and the table lists its plan was reviewed under, not the plan, because a repeated
+command plans afresh; for a start or a cutover, the apply. A change to what any member would run, a
+rollout that gains a member, or a blocker the override does not name needs a new override.
+An override admitted on its requester's reason admits only the command that gave the reason and the
+work that command starts. A later command, a retry of the same change included, gives its own reason.
+Any other override admits a change only once a second person approves it, and only for its
+requester, for at most 24 hours. Nobody approves their own request or one on a pull request they
+wrote, and an approval comes from the identity domain the request was asked in: a forward-auth
+subject approves a request from the CLI, and a GitHub team member approves a request from the pull
+request it names, which no other pull request shares. With no approver configured, nobody overrides
+alone, admins included. Which of the two kinds a server records is its override policy
+([freeze.md](freeze.md#choose-the-override-policy)).
+A PR rollback is known by a `pinned_rollback` option the server records when it creates the apply.
+A rollback created by an earlier version has none, so a freeze holds its later start or cutover;
+lifting the freeze lets it through.
+A freeze created while a change is being admitted is not missed. Creating a freeze bumps its
+environment's freeze epoch in the same transaction. The gate reads the epoch before it lists the
+freezes, and the transaction that writes the apply, start or cutover locks the epoch row and
+refuses the change with a retryable error if the epoch moved or could not be read. The lock makes
+a freeze being created wait for that write, so the freeze is acknowledged only after any change it
+did not see. One edge stays open: a planned freeze whose start time passes between the check and
+the write does not move the epoch, so a change admitted in that moment runs. The window is one
+request long.
+*Breaks if violated:* a schema change starts, or its cutover runs, during an incident or a code freeze.
+*Enforced:* the change gates and their evaluator (`checkChangeGates`, `pkg/api/change_gate.go`),
+run before apply creation in `queueValidatedApply` (`pkg/api/plan_handlers.go`), before a start is
+recorded in `executeStartForApply` and before a cutover is recorded in `executeCutoverForApply`
+(`pkg/api/control_handlers.go`), with the freeze query `ListInEffect`
+(`pkg/storage/internal/sqlstore/freezes.go`). The epoch check is `checkFreezeEpochGuard`
+(`pkg/storage/internal/sqlstore/freezes.go`), called in apply creation
+(`pkg/storage/internal/sqlstore/applies.go`) and in `requestPending` for a start or cutover
+(`pkg/storage/internal/sqlstore/control_requests.go`). A call-graph test
+(`pkg/api/change_gate_completeness_test.go`) fails on any path that creates an apply or records a
+start or cutover without passing a function that runs the gates. The override check is
+`approvedOverride` (`pkg/api/change_gate.go`), which reads `ListApproved`, skips every override
+admitted on a reason, and admits only a request whose `Covers` names every blocker and whose origin
+matches (`sameOverrideOrigin`). The target is `applyOverrideTarget`. An override admitted on a reason
+is stored by `overrideOnReason` through `CreateOnReason`, and the work it starts keeps it at claim
+through `approvedOverridesForApply`; the policy is `FreezeConfig.OverrideOnReason`. Under approval,
+`requestOverride` records the request, and the approver rules are `AuthorizeFreezeApprove`
+(`pkg/api/freeze_authorization.go`), `handleFreezeOverrideApprove`, `ApprovePullRequestOverride`
+and `Approve` (`pkg/storage/internal/sqlstore/freeze_overrides.go`).
+
+### AZ-11: A stop freeze stops the admitted changes it covers
+
+Setting a freeze with running `stop` that is in effect at once records a stop on every apply it
+covers that is pending, paused, or doing work a stop can end, by the same rule as AZ-10: one covered
+deployment holds the whole change. A rollout paused after a failure is stopped because its other
+members can still be writing. The stop is the ordinary durable stop, recorded with the freeze
+as its requester (`freeze:<id>`), so its driver delivers it as it would an operator's, and the apply
+resumes with a start, which the freeze's gate holds (AZ-10). A stopped apply with a start queued
+before the freeze is swept too: the stop withdraws the start, or stays pending for the drive that
+already claimed it (CO-4). A stopped apply with no start queued has nothing to stop and is in
+neither list. No client may send a stop under that
+requester, so a stop that reads as a freeze's is one a freeze issued. The freeze is stored before the
+sweep, so it refuses new changes whatever the sweep reports. An apply the sweep cannot stop, such as
+a PlanetScale apply, which has no stop, or one whose operations it cannot read, is listed in the
+response with why, never skipped silently; when it cannot list the applies at all, it says it
+stopped none. An apply waiting for its cutover is left alone, because the freeze refuses the cutover,
+and so is a pull request rollback, which no freeze holds. A planned `stop` freeze stops nothing when
+it is set; an apply already running when it starts is stopped only at the checkpoint below.
+A driver checks again at claim, before it starts an operation that has not started or resumes a
+stopped one for a queued start. While a `stop` freeze covering the apply is in effect, it returns the
+claim with the operation as it was, unstarted, and records the freeze's stop, which stop
+reconciliation delivers without starting anything; for a queued start, the stop withdraws it (CO-4).
+This holds work a planned `stop` freeze meets once it starts, and stops a running rollout when it
+claims its next deployment. A claim that recovers or redispatches work instead records the freeze's
+stop and drives on, so the drive delivers it; that covers unstarted work whose claim could not be
+returned, which reads as running until its lease goes stale. When the engine refuses that stop, the
+work keeps running, except a PlanetScale deploy queued before the freeze, which is not driven, so it
+waits until the freeze ends. An apply that runs to the end without such a claim keeps running. A pending
+cancel is never held: the claim that carries it is driven whatever the freezes (AZ-10, CO-2). An
+approved override that admitted the apply at its creation, or the one that admitted its queued start,
+which the start request names, lets it start when it names the freeze; another approval for the same
+apply does not. When the freezes or the override requests cannot be read, or the stop cannot be
+recorded, the operation is not driven, so it never starts unchecked: a start claim goes back unstarted
+and the pod skips it in its claims for a short while, so other work is claimed meanwhile, and a
+recovery keeps its lease until it goes stale and is checked again.
+Status names the freeze that stopped an apply, read from the stop's requester, so a stopped apply
+never reads as an operator's stop or as one a start will resume while the freeze holds it.
+*Breaks if violated:* a schema change judged unsafe keeps writing through the incident that froze
+it, or an operator reads a freeze as having stopped changes that still run.
+*Enforced:* `stopAppliesForFreeze` (`pkg/api/freeze_stop_sweep.go`), which lists applies with
+`GetUnsettled` so stopped ones are included, called by `handleFreezeCreate`
+(`pkg/api/freeze_handlers.go`) after the freeze is stored, records each stop through `stopApply`
+(`pkg/api/control_handlers.go`) with `storage.FreezeStopCaller`. `executeStopForApply` refuses a
+caller where `storage.IsFreezeStopCaller` holds. The claim checkpoint is `holdClaimForStopFreeze`
+(`pkg/api/freeze_claim_checkpoint.go`), called by `recoverApplyOperation` (`pkg/api/operator.go`)
+before the drive, which hands the claim back with `ReturnUnstartedClaim`
+(`pkg/storage/internal/sqlstore/apply_operations.go`) and skips it with `storage.SkipOperations`.
+The start request records the override that admitted it in `startControlRequestMetadata`
+(`pkg/api/control_handlers.go`). `StoppedByFreeze` (`pkg/api/freeze_stopped_by.go`) names the freeze
+for the progress response and the pull request comments.
+
 ## Structural enforcement
 
 The strongest invariants are enforced by structure, so regressions fail CI instead of review:
@@ -2190,6 +2376,8 @@ The strongest invariants are enforced by structure, so regressions fail CI inste
   recovery arm (ST-8).
 - **Route-table sweep.** Every mutating endpoint requires a denial fixture proving its
   handler-level authorization check (AZ-2).
+- **Change gate coverage.** A call-graph test fails on any path that creates an apply or records a
+  start or cutover without running the change gates (AZ-10).
 - **Engine conformance.** Engines run a shared conformance kit, and an engine that cannot
   exhibit a case documents an explicit skip rather than a silent opt-out (CO-3, CO-8).
 - **Claim parity.** The states the claim query accepts are pinned by tests, so a state added to

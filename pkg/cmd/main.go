@@ -50,6 +50,8 @@ type CLI struct {
 	Databases  commands.DatabasesCmd  `cmd:"" help:"List configured databases"`
 	Unlock     commands.UnlockCmd     `cmd:"" help:"Release a database lock"`
 	Locks      commands.LocksCmd      `cmd:"" help:"List all active database locks"`
+	Freeze     commands.FreezeCmd     `cmd:"" help:"Freeze an environment, or list, show and approve overrides of freezes"`
+	Unfreeze   commands.UnfreezeCmd   `cmd:"" help:"Lift an environment freeze"`
 	Logs       commands.LogsCmd       `cmd:"" help:"View apply logs"`
 	Status     commands.StatusCmd     `cmd:"" help:"Show schema change status"`
 	Plans      commands.PlansCmd      `cmd:"" name:"list-plans" help:"List recently generated schema change plans"`
@@ -58,7 +60,6 @@ type CLI struct {
 	Configure  commands.ConfigureCmd  `cmd:"" help:"Configure CLI settings (endpoint, profiles)"`
 	Login      commands.LoginCmd      `cmd:"" help:"Log in via OIDC and cache a token for the active profile"`
 	Settings   commands.SettingsCmd   `cmd:"" help:"View or update schema change settings"`
-	Webhooks   commands.WebhooksCmd   `cmd:"" help:"Manage GitHub App webhook deliveries"`
 	Checks     commands.ChecksCmd     `cmd:"" help:"Manage SchemaBot Check Runs on PRs"`
 	Storage    commands.StorageCmd    `cmd:"" help:"Inspect and maintain SchemaBot's own storage database"`
 	Local      commands.LocalCmd      `cmd:"" hidden:"" help:"Internal local runtime host"`
@@ -204,7 +205,7 @@ func usesLocalRuntime(command string, cli *CLI) bool {
 		return false
 	}
 	switch parts[0] {
-	case "plan", "onboard", "pull", "apply", "progress", "cutover", "stop", "cancel", "start", "release", "revert", "skip-revert", "rollback", "databases", "unlock", "locks", "logs", "status", "list-plans":
+	case "plan", "onboard", "pull", "apply", "progress", "cutover", "stop", "cancel", "start", "release", "revert", "skip-revert", "rollback", "databases", "unlock", "locks", "freeze", "unfreeze", "logs", "status", "list-plans":
 		return true
 	case "storage":
 		// A storage subcommand reaches its database either through the API or

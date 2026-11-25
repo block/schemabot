@@ -44,6 +44,10 @@ type SchemaRequestResult struct {
 	// the plan request and the response reports which of them withheld
 	// anything.
 	IgnoreTables []string
+	// DropTables is the config's drop_tables as written. Like IgnoreTables it
+	// names live tables only the data plane can see, so the entries travel
+	// with the plan request and the plan shows the drops they produced.
+	DropTables []string
 }
 
 // EnvironmentValidator verifies that a discovered database can be used with
@@ -165,6 +169,7 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 		HeadSHA:           prInfo.HeadSHA,
 		IgnoredNamespaces: ignoredNamespaces,
 		IgnoreTables:      config.IgnoreTables,
+		DropTables:        config.DropTables,
 	}, nil
 }
 

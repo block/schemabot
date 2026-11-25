@@ -14,7 +14,6 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
@@ -36,6 +35,7 @@ type ApplyCmd struct {
 	SkipRevert   bool          `help:"Skip revert window after completion (Vitess only)" name:"skip-revert"`
 	Branch       string        `help:"Reuse existing PlanetScale branch (syncs with main, skips branch creation)" name:"branch"`
 	AllowUnsafe  bool          `help:"Allow destructive changes (DROP TABLE, DROP COLUMN, etc.)" name:"allow-unsafe"`
+	Override     string        `help:"Why this change can't wait. It lets the change through a freeze, or asks a freeze approver to, as the server's override policy says" name:"override"`
 	Force        bool          `help:"Force acquire lock (breaks existing lock from another owner)"`
 	Yield        bool          `help:"Release the lock once the apply has finished (kept while it is still running or stopped)"`
 	NoLock       bool          `help:"Don't hold a database lock during the operation" name:"no-lock"`
@@ -145,6 +145,7 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 		// body, which discloses them on both of its own branches.
 		if cmd.Output != OutputFormatJSON {
 			templates.WriteExemptTables(planResult.ExemptTables)
+			templates.WriteUnmatchedDropTables(shownUnmatchedDropTables(planResult))
 		}
 		return nil
 	}
@@ -273,6 +274,11 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 	// finding it already held under this owner, so only a lock this command
 	// took is released when its apply is never submitted.
 	var lockCreated bool
+	// lockID is the lock row the acquire reported, which every release this
+	// command sends names, so it never removes a lock it did not take or one
+	// an apply still runs under. It is zero from a server that does not
+	// report it.
+	var lockID int64
 	if !cmd.NoLock {
 		// If --force, break any existing lock first
 		if cmd.Force {
@@ -297,8 +303,8 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 
 		// Acquire the lock
 		err = withLoading("Acquiring database lock...", cmd.Output != OutputFormatJSON, func() error {
-			var lockErr error
-			_, lockCreated, lockErr = client.AcquireLock(ep, cfg.Database, cfg.Type, owner, cmd.Repository, cmd.PullRequest)
+			acquired, created, lockErr := client.AcquireLock(ep, cfg.Database, cfg.Type, owner, cmd.Repository, cmd.PullRequest)
+			lockCreated, lockID = created, acquiredLockID(acquired)
 			return lockErr
 		})
 		if errors.Is(err, client.ErrLockHeld) {
@@ -338,19 +344,19 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 	// what each runs. Members the server listed as refused were turned away
 	// before the prompt; a member whose own plan apply creation refuses
 	// without having listed it is refused by POST /api/apply instead.
-	applyID, err := applyAndWatch(ctx, ep, planResult, true, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
+	applyID, err := applyAndWatch(ctx, ep, planResult, true, cfg.Database, cmd.Environment, owner, cmd.Override, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
 	if err != nil {
 		if lockCreated && neverSubmitted(err) {
-			return releaseUnsubmittedLock(ep, cfg.Database, cfg.Type, owner, err)
+			return releaseUnsubmittedLock(ep, cfg.Database, cfg.Type, owner, lockID, err)
 		}
 		if cmd.Yield && !cmd.NoLock && applyID != "" {
-			return errors.Join(err, yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID))
+			return errors.Join(err, yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID, lockID))
 		}
 		return err
 	}
 
 	if cmd.Yield && !cmd.NoLock {
-		return yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID)
+		return yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID, lockID)
 	}
 
 	return nil
@@ -394,7 +400,14 @@ func childWorkSettled(progress *apitypes.ProgressResponse) bool {
 // command got here: an unwatched apply, a stopped one, and a watch the operator
 // left all return without the apply having finished. Anything that is not a
 // settled state keeps the lock and says how to release it later.
-func yieldLock(ep, database, dbType, owner, environment, applyID string) error {
+//
+// The release names the lock row the acquire reported (lockID), and the
+// server releases it only while no apply that can still change runs under it.
+// This command's own apply has settled by then, so the condition keeps the
+// lock only for an apply another command of the same owner started under the
+// same row, and a row taken again since is left alone. A server that reported
+// no row ID leaves no safe release, so the lock is kept.
+func yieldLock(ep, database, dbType, owner, environment, applyID string, lockID int64) error {
 	if applyID == "" {
 		templates.WriteLockKept(database, dbType, "the server returned no apply ID to check")
 		return fmt.Errorf("release lock for %s: the server returned no apply ID", database)
@@ -408,12 +421,45 @@ func yieldLock(ep, database, dbType, owner, environment, applyID string) error {
 		templates.WriteLockKept(database, dbType, lockKeptReason(applyID, environment, progress))
 		return nil
 	}
-	if err := client.ReleaseLock(ep, database, dbType, owner); err != nil {
+	if lockID == 0 {
+		templates.WriteLockKeptWithoutID(database, dbType)
+		return nil
+	}
+	err = client.ReleaseLockIfUnused(ep, database, dbType, owner, lockID)
+	if inUse, ok := errors.AsType[*client.LockInUseError](err); ok {
+		templates.WriteLockInUse(database, dbType, inUse.Holder.ApplyID, inUse.Holder.State, inUse.Holder.Environment)
+		return nil
+	}
+	if errors.Is(err, client.ErrLockReplaced) {
+		templates.WriteLockReplaced(database, dbType)
+		return nil
+	}
+	// Someone else released the lock, or it is held under another owner now:
+	// either way this command has nothing to release, and the apply it ran
+	// settled, so this is not a failure.
+	if errors.Is(err, client.ErrLockNotFound) {
+		templates.WriteUnsubmittedLockAlreadyReleased(database, dbType)
+		return nil
+	}
+	if errors.Is(err, client.ErrLockNotOwned) {
+		templates.WriteLockHeldByAnotherOwner(database, dbType)
+		return nil
+	}
+	if err != nil {
 		templates.WriteLockKept(database, dbType, fmt.Sprintf("the server did not release it (%v)", err))
 		return fmt.Errorf("release lock for %s: %w", database, err)
 	}
 	templates.WriteLockReleased(database, dbType)
 	return nil
+}
+
+// acquiredLockID returns the lock row ID a lock acquire reported, or zero
+// when it reported no lock or a server too old to report the ID answered.
+func acquiredLockID(lock *client.LockInfo) int64 {
+	if lock == nil {
+		return 0
+	}
+	return lock.ID
 }
 
 // lockKeptReason says why --yield kept the lock for an apply that
@@ -515,7 +561,7 @@ func watchAfterCutover(poller *progressPoller) error {
 		}
 
 		// Get tables for display
-		tables := ddl.FilterInternalTablesTyped(result.Tables)
+		tables := result.Tables
 		if len(tables) > 0 && !headerPrinted {
 			// Calculate max table name length for alignment
 			for _, tbl := range tables {
@@ -622,11 +668,11 @@ func (cmd *ApplyCmd) refuseActiveSchemaChange(database string, check func() (*cl
 // names each unsafe change and the command that permits them.
 func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, schemaDir, target string, output OutputFormat) error {
 	unsafeChanges := planResult.RolloutUnsafeChanges()
-	retry := fmt.Sprintf("apply -s %s -e %s", initShellArg(schemaDir), initShellArg(environment))
+	retry := []string{"apply", "-s", initShellArg(schemaDir), "-e", initShellArg(environment)}
 	if target != "" {
-		retry += " --target " + initShellArg(target)
+		retry = append(retry, "--target", initShellArg(target))
 	}
-	retry += " --allow-unsafe"
+	retry = append(retry, "--allow-unsafe")
 	if output == OutputFormatJSON {
 		return errors.New(templates.UnsafeChangesBlockedSummary(unsafeChanges, retry))
 	}
@@ -681,19 +727,19 @@ func rolloutRefusalSummary(refused []*apitypes.PlanMemberRefusalResponse, enviro
 			entries = append(entries, fmt.Sprintf("%s (%s; no apply runs it, so change the schema files)", r.Member, r.Detail))
 			continue
 		}
-		entries = append(entries, fmt.Sprintf("%s (%s; run it with: %s)", r.Member, r.Detail, cliname.Command(narrowedApplyRerun(r, environment, schemaDir))))
+		entries = append(entries, fmt.Sprintf("%s (%s; run it with: %s)", r.Member, r.Detail, cliname.Command(narrowedApplyRerun(r, environment, schemaDir)...)))
 	}
 	return strings.Join(entries, "; ")
 }
 
-// narrowedApplyRerun is the apply narrowed to one refused member, without the
-// binary name. It names the member by the selector the server accepts, which
+// narrowedApplyRerun is the words of the apply narrowed to one refused member,
+// without the binary name, one shell-escaped word per element. It names the member by the selector the server accepts, which
 // for a deployment with one target is its target rather than the deployment
 // name it is shown under.
-func narrowedApplyRerun(r *apitypes.PlanMemberRefusalResponse, environment, schemaDir string) string {
-	rerun := fmt.Sprintf("apply -s %s -e %s --target %s", initShellArg(schemaDir), initShellArg(environment), initShellArg(r.Target))
+func narrowedApplyRerun(r *apitypes.PlanMemberRefusalResponse, environment, schemaDir string) []string {
+	rerun := []string{"apply", "-s", initShellArg(schemaDir), "-e", initShellArg(environment), "--target", initShellArg(r.Target)}
 	if r.AllowUnsafe {
-		rerun += " --allow-unsafe"
+		rerun = append(rerun, "--allow-unsafe")
 	}
 	return rerun
 }
@@ -703,7 +749,7 @@ func narrowedApplyRerun(r *apitypes.PlanMemberRefusalResponse, environment, sche
 // lists, naming the narrowed apply that runs each one.
 func blockRolloutApplyRefused(planResult *apitypes.PlanResponse, rollout *apitypes.PlanRolloutResponse, database, environment, schemaDir string) error {
 	OutputPlanResult(planResult, database, environment, schemaDir, true)
-	var reruns []string
+	var reruns [][]string
 	for _, r := range rollout.Refused {
 		if r.Reason == apitypes.PlanMemberBlocked {
 			continue
@@ -969,7 +1015,7 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 			return noActiveChangeError(poller.applyID, poller.environment)
 		}
 
-		tables := ddl.FilterInternalTablesTyped(result.Tables)
+		tables := result.Tables
 
 		// Emit per-table events
 		for _, tbl := range tables {

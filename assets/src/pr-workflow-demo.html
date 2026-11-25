@@ -3,12 +3,16 @@
 <div class="page" id="page"><div id="scroll-content"><div class="prhead"><h1>Add an index to users <span>#42</span></h1><div class="meta"><span class="state" id="state">Open</span><span id="prmeta"><b>octocat</b> wants to merge 1 commit into <code>main</code> from <code>add-user-index</code></span></div><div class="tabs"><span class="selected"><svg class="ui-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M2 2h10v8H7l-3 3v-3H2z"/><path d="M13 5h2v8h-2v2l-2-2H8"/></svg>Conversation <i class="counter">5</i></span><span><svg class="ui-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><circle cx="8" cy="8" r="3"/><path d="M1 8h4m6 0h4"/></svg>Commits <i class="counter">1</i></span><span><svg class="ui-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M7 13H2V1h9v5M5 4h3M5 7h2m2 4 2 2 4-4"/></svg>Checks <i class="counter">2</i></span><span><svg class="ui-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M3 1h7l3 3v11H3zM10 1v4h3M5 9h6M8 6v6"/></svg>Files changed <i class="counter">1</i></span></div></div>
 <div id="diff-view" class="hidden">
 <div class="diff-toolbar"><button class="quiet">▣</button><button class="quiet">▣ All commits ⌄</button><span class="toolbar-spacer"></span><span class="tiny">◯ 0 / 1 viewed</span><span class="toolbar-divider"></span><button class="btn">Submit review ⌄</button><button class="quiet">⚙</button><span class="tiny">ⓘ　♧ 0</span></div>
-<div class="diff-layout"><aside class="file-tree"><div class="file-filter">⌕ <span>Filter files…</span></div><div class="tree-folder">⌄ <span class="folder-icon"></span>schema</div><div class="tree-file">▧ <span>users.sql</span></div></aside>
-<div class="diff-main"><div class="diff-file"><div class="diff-title"><span>⌄</span><span>schema/users.sql</span><span class="file-actions"><b class="ok">+2</b> <b class="deleted-text">−1</b> <span class="diffstat">▪▪<span class="deleted-text">▪</span>▫▫</span><button class="quiet">☐ Viewed</button><span>···</span></span></div><table class="diff-code"><colgroup><col class="number-col"><col class="sign-col"><col><col class="number-col"><col class="sign-col"><col></colgroup><tbody id="diff-rows"></tbody></table></div></div></div></div>
+<div class="diff-layout"><aside class="file-tree"><div class="file-filter">⌕ <span>Filter files…</span></div><div class="tree-folder" id="tree-folder">⌄ <span class="folder-icon"></span>schema</div><div class="tree-file">▧ <span>users.sql</span></div></aside>
+<div class="diff-main"><div class="diff-file"><div class="diff-title"><span>⌄</span><span id="diff-path">schema/users.sql</span><span class="file-actions"><span id="diff-stat"><b class="ok">+2</b> <b class="deleted-text">−1</b> <span class="diffstat">▪▪<span class="deleted-text">▪</span>▫▫</span></span><button class="quiet">☐ Viewed</button><span>···</span></span></div><table class="diff-code"><colgroup><col class="number-col"><col class="sign-col"><col><col class="number-col"><col class="sign-col"><col></colgroup><tbody id="diff-rows"></tbody></table></div></div></div></div>
 <div class="content" id="conversation"><div class="tl" id="timeline"></div><div id="checks" class="checks hidden"></div></div></div>
 </div>
 <div class="footer">Illustrative workflow using rendered comment templates · elapsed time compressed</div>
-<script src="pr-workflow-comments.js"></script><script>
+<script>
+// ?engine=postgres records the PostgreSQL workflow; the default is MySQL.
+const ENGINE=new URLSearchParams(location.search).get('engine')==='postgres'?'postgres':'mysql';
+document.write(`<script src="${ENGINE==='postgres'?'pr-postgres-comments.js':'pr-workflow-comments.js'}"><\/script>`);
+</script><script>
 const command='schemabot apply -e staging',clamp=x=>Math.max(0,Math.min(1,x)),ease=x=>{x=clamp(x);return x*x*(3-2*x)};
 function card(id,body,bot=true){return `<div class="c" id="${id}">${bot?'<img class="av" src="../schemabot-avatar-200.png">':'<img class="av h" src="../octocat-avatar-200.png">'}<div class="hd"><b>${bot?'schemabot':'octocat'}</b> commented <span>now</span><span class="lbl ${bot?'bot':''}">${bot?'bot':'Author'}</span><span class="more">···</span></div><div class="bd" id="${id}-body">${body}</div></div>`}
 document.getElementById('timeline').innerHTML=card('plan',COMMENTS.plan)+card('command','',false)+card('apply',COMMENTS.apply)+card('progress',COMMENTS.running)+card('summary',COMMENTS.summary);
@@ -16,11 +20,20 @@ document.getElementById('timeline').innerHTML=card('plan',COMMENTS.plan)+card('c
 // cannot make the browser clamp scrollTop and jump back up the thread.
 const diffLines=COMMENTS.diffLines;
 function diffSide(number,html,kind='context',sign=' '){return `<td class="ln ${kind}">${number}</td><td class="mark ${kind}">${sign}</td><td class="code ${kind}">${html}</td>`;}
-document.getElementById('diff-rows').innerHTML='<tr class="hunk"><td colspan="6">　↥　　@@ −1,6 +1,7 @@ CREATE TABLE `users` (</td></tr>'+
- diffLines.slice(0,4).map((line,i)=>'<tr>'+diffSide(i+1,line)+diffSide(i+1,line)+'</tr>').join('')+
+const contextRows=(n)=>diffLines.slice(0,n).map((line,i)=>'<tr>'+diffSide(i+1,line)+diffSide(i+1,line)+'</tr>').join('');
+if(ENGINE==='postgres'){
+ // The index is a new statement below the table in schema/public/users.sql.
+ document.getElementById('tree-folder').innerHTML='⌄ <span class="folder-icon"></span>schema / public';
+ document.getElementById('diff-path').textContent='schema/public/users.sql';
+ document.getElementById('diff-stat').innerHTML='<b class="ok">+2</b> <b class="deleted-text">−0</b> <span class="diffstat">▪▪▫▫▫</span>';
+ document.getElementById('diff-rows').innerHTML='<tr class="hunk"><td colspan="6">　↥　　@@ −1,6 +1,8 @@ CREATE TABLE "users" (</td></tr>'+contextRows(6)+
+  [6,7].map(i=>'<tr>'+diffSide('','','empty')+diffSide(i+1,diffLines[i],'added','+')+'</tr>').join('');
+} else {
+ document.getElementById('diff-rows').innerHTML='<tr class="hunk"><td colspan="6">　↥　　@@ −1,6 +1,7 @@ CREATE TABLE `users` (</td></tr>'+contextRows(4)+
  '<tr>'+diffSide(5,diffLines[4].replace(/,$/,''),'deleted','−')+diffSide(5,diffLines[4],'added','+')+'</tr>'+
  '<tr>'+diffSide('','','empty')+diffSide(6,diffLines[5],'added','+')+'</tr>'+
  '<tr>'+diffSide(6,diffLines[6])+diffSide(7,diffLines[6])+'</tr>';
+}
 let previousScroll=0;
 function setHTML(el,html){if(el.dataset.renderedHtml!==html){el.innerHTML=html;el.dataset.renderedHtml=html;}}
 window.renderFrame=function(t,frameSeconds=1/12){
@@ -37,7 +50,8 @@ window.renderFrame=function(t,frameSeconds=1/12){
  let p=Math.round(clamp((t-10)/10)*100); // Whole polling updates, followed by a visible 100% frame.
  p=t>=20?100:Math.floor(p/4)*4;
  const bars='🟦'.repeat(Math.round(p/5))+'⬜'.repeat(20-Math.round(p/5));
- setHTML(document.getElementById('progress-body'),t>=21.5?COMMENTS.complete:COMMENTS.running.replace('DEMOVALUEBARTOKEN',bars).replace('DEMOVALUEPERCENTTOKEN',p.toFixed(2)).replace('DEMOVALUEROWSTOKEN',Math.round(7200000*p/100).toLocaleString('en-US')).replace('DEMOVALUEETATOKEN',p===100?'0s':`${Math.floor((100-p)*3.3/60)}m ${Math.round((100-p)*3.3%60)}s`));
+ // PostgreSQL progress comments are rendered per polling update; MySQL fills one template.
+ setHTML(document.getElementById('progress-body'),t>=21.5?COMMENTS.complete:ENGINE==='postgres'?COMMENTS.running[p]:COMMENTS.running.replace('DEMOVALUEBARTOKEN',bars).replace('DEMOVALUEPERCENTTOKEN',p.toFixed(2)).replace('DEMOVALUEROWSTOKEN',Math.round(7200000*p/100).toLocaleString('en-US')).replace('DEMOVALUEETATOKEN',p===100?'0s':`${Math.floor((100-p)*3.3/60)}m ${Math.round((100-p)*3.3%60)}s`));
  const checks=document.getElementById('checks');checks.classList.remove('hidden');
  const applied=t>=21.5,active=t>=8&&!applied;
  const checkHeading=applied?'All checks have passed':active?'Some checks haven’t completed yet':'Some checks were not successful';

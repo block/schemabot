@@ -40,6 +40,20 @@ func parseDSN(dsn string) (host, username, password, database string, err error)
 	return cfg.Addr, cfg.User, cfg.Passwd, cfg.DBName, nil
 }
 
+// withoutTables returns the live tables other than the named ones.
+func withoutTables(current []table.TableSchema, names []string) []table.TableSchema {
+	if len(names) == 0 {
+		return current
+	}
+	kept := make([]table.TableSchema, 0, len(current))
+	for _, ts := range current {
+		if !slices.Contains(names, ts.Name) {
+			kept = append(kept, ts)
+		}
+	}
+	return kept
+}
+
 // groupChangesByNamespace builds the plan's per-namespace SchemaChanges.
 // Spirit operates on a single database, but table changes are grouped by the
 // namespace they belong to (from SchemaFiles keys) for consistency with
@@ -114,13 +128,13 @@ func namespaceForTable(table string, declaredIn map[string]string, sf schema.Sch
 		// SchemaBot's own callers reject a request with no schema files before
 		// it plans, so only a direct Tern Plan call with an empty map lands
 		// here. Every live table would be a drop, so refuse with the way out.
-		return "", fmt.Errorf("DROP TABLE %q cannot be placed: the request carries no schema files for database %q. Restore this database's schema files, or remove the database from the SchemaBot config", table, database)
+		return "", &engine.PlanRefusedError{Err: fmt.Errorf("DROP TABLE %q cannot be placed: the request carries no schema files for database %q. Restore this database's schema files, or remove the database from the SchemaBot config", table, database)}
 	case 1:
 		for nsName := range sf {
 			return nsName, nil
 		}
 	}
-	return "", fmt.Errorf("DROP TABLE %q cannot be placed: namespaces %v all diff against database %q. Keep this database's schema files in one namespace directory, or ask a SchemaBot operator to use a target with no database in its DSN", table, namespaceNames(sf), database)
+	return "", &engine.PlanRefusedError{Err: fmt.Errorf("DROP TABLE %q cannot be placed: namespaces %v all diff against database %q. Keep this database's schema files in one namespace directory, or ask a SchemaBot operator to use a target with no database in its DSN", table, namespaceNames(sf), database)}
 }
 
 // namespaceNames returns the sorted namespace keys for inclusion in error

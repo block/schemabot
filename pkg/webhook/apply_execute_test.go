@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/api"
@@ -33,6 +34,16 @@ func TestApplyExecutionErrorMessage(t *testing.T) {
 		msg := applyExecutionErrorMessage(action.Apply, "staging", "", err)
 		assert.Equal(t, err.Error()+".", msg)
 		assert.NotContains(t, msg, "again without")
+	})
+
+	// An apply refused because its plan drops a working table of an apply
+	// stopped since the plan was made names the entry, that apply, and what
+	// to do with it, rather than the generic line.
+	t.Run("drop of an unsettled apply's working table names the apply", func(t *testing.T) {
+		err := fmt.Errorf("create apply: %w", &api.DropTablesInUseError{Entry: "_users_new", ApplyID: "apply-7f3a", ApplyState: "stopped", Table: "users"})
+		assert.Equal(t,
+			`drop_tables entry "_users_new" is a working table of apply apply-7f3a, which is stopped and changes table "users". Dropping it would discard that apply's copy. Start or cancel it, then plan again.`,
+			applyExecutionErrorMessage(action.Apply, "staging", "", err))
 	})
 
 	t.Run("lock intent change remains actionable", func(t *testing.T) {
@@ -550,7 +561,7 @@ func TestPlanDriftCause(t *testing.T) {
 		},
 	}
 
-	cause := planDriftCause(planResp, storedPlan)
+	cause := planDriftCause(planResp, storedPlan, nil)
 
 	assert.Equal(t, "Schema changes differ from the plan this apply was started from", cause.Heading)
 	assert.Equal(t, []string{
@@ -590,6 +601,48 @@ func TestTargetPlanDriftEntries(t *testing.T) {
 	assert.Empty(t, targetPlanDriftEntries(nil, &storage.Plan{}, "us"), "a target with nothing to do then or now has no entry")
 }
 
+// A target whose statements drifted can also carry an unchanged statement whose
+// object was replaced. Its entries name that table next to the drifted
+// statements, so the statement drift never hides the replaced object.
+func TestTargetPlanDriftEntriesNameChangedObjectsBesideStatementDrift(t *testing.T) {
+	dropLegacy := storage.TableChange{Table: "users", Operation: "alter", DDL: "ALTER TABLE `users` DROP COLUMN `legacy`"}
+	plan := func(record string, extra ...storage.TableChange) *storage.Plan {
+		drop := dropLegacy
+		drop.Metadata = map[string]string{"recorded_object": record}
+		return &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"mydb": {Tables: append([]storage.TableChange{drop}, extra...)},
+		}}
+	}
+	addNote := storage.TableChange{Table: "orders", Operation: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `note` text"}
+
+	assert.Equal(t, []string{
+		"Target `us`: `orders` (alter) is no longer planned",
+		"Target `us`: `users`: a statement now acts on an object that changed after the plan was posted",
+	}, targetPlanDriftEntries(plan("legacy text", addNote), plan("legacy jsonb"), "us"))
+	assert.Equal(t, []string{"Target `us`: `orders` (alter) is no longer planned"},
+		targetPlanDriftEntries(plan("legacy text", addNote), plan("legacy text"), "us"),
+		"an unchanged object adds no entry")
+}
+
+// A single target's statement drift names the tables whose objects changed
+// under an unchanged statement after the drifted statements.
+func TestPlanDriftCauseNamesChangedObjects(t *testing.T) {
+	cause := planDriftCause(
+		&apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{{Namespace: "mydb", TableChanges: []*apitypes.TableChangeResponse{
+			{TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` DROP COLUMN `legacy`"},
+		}}}},
+		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"mydb": {Tables: []storage.TableChange{
+			{Table: "users", Operation: "alter", DDL: "ALTER TABLE `users` DROP COLUMN `legacy`"},
+			{Table: "orders", Operation: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `note` text"},
+		}}}},
+		[]string{"users"},
+	)
+	assert.Equal(t, []string{
+		"`orders` (alter) is no longer planned",
+		"`users`: a statement now acts on an object that changed after the plan was posted",
+	}, cause.Entries)
+}
+
 // A re-plan that differs in dozens of changes has already made its point, and
 // listing every one buries the statements the operator came to read.
 func TestPlanDriftCauseCapsTheEntryList(t *testing.T) {
@@ -605,6 +658,7 @@ func TestPlanDriftCauseCapsTheEntryList(t *testing.T) {
 	cause := planDriftCause(
 		&apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{{Namespace: "mydb", TableChanges: tableChanges}}},
 		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"mydb": {}}},
+		nil,
 	)
 
 	assert.Len(t, cause.Entries, planDriftEntryCap+1)
@@ -628,6 +682,7 @@ func TestPlanDriftCauseReportsAnAmendedStatementOnce(t *testing.T) {
 				{Table: "orders", Operation: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `notes` varchar(255)"},
 			}},
 		}},
+		nil,
 	)
 
 	assert.Equal(t, []string{
@@ -650,6 +705,7 @@ func TestPlanDriftCauseNamesTheNamespaceOnlyWhenItDisambiguates(t *testing.T) {
 				{Table: "orders", Operation: "create", DDL: "CREATE TABLE `orders` (`id` bigint)"},
 			}},
 		}},
+		nil,
 	)
 	assert.Equal(t, []string{
 		"`orders` in `shard_a` (create) is new",
@@ -663,6 +719,7 @@ func TestPlanDriftCauseNamesTheNamespaceOnlyWhenItDisambiguates(t *testing.T) {
 			}},
 		}},
 		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"mydb": {}}},
+		nil,
 	)
 	assert.Equal(t, []string{
 		"`orders` (create) is new",
@@ -871,4 +928,30 @@ func TestDispatchErrorMessageNamesTheRefusingDeployment(t *testing.T) {
 	assert.Equal(t,
 		"This rollback can't defer its cutover: it would keep 40 drivers waiting for the cutover on the `east` deployment, and its servers have 32 drivers that can wait. To defer it, give that deployment's servers 8 more by raising `drivers` or running more servers. Otherwise run `schemabot rollback-confirm -e production` without `--defer-cutover`.",
 		deferredCutoverCapacityMessage(tooWide, action.RollbackConfirm, "production", ""))
+}
+
+// An automatic apply whose re-plan reaches objects the posted plan did not
+// record stops for manual confirmation, and the comment names each table.
+func TestObjectsChangedCause(t *testing.T) {
+	cause := objectsChangedCause([]string{"orders", "users"})
+	assert.Equal(t, "The objects these schema changes act on changed after the plan was posted", cause.Heading)
+	assert.Equal(t, []string{"`orders`", "`users`"}, cause.Entries, "the heading says what changed, so each entry is the table alone")
+}
+
+// The confirm refusal names the tables whose statements now act on objects
+// the confirmed plan did not record, capped like the paused comment's list.
+func TestObjectsDifferenceReason(t *testing.T) {
+	assert.Equal(t, "the re-plan of target `eu` differs from the confirmed plan in the objects its statements act on (`orders`, `users`)",
+		objectsDifferenceReason("eu", []string{"orders", "users"}))
+	assert.Equal(t, "the re-plan of target `eu` differs from the confirmed plan in the objects its statements act on",
+		objectsDifferenceReason("eu", nil))
+
+	tables := make([]string, planDriftEntryCap+2)
+	for i := range tables {
+		tables[i] = fmt.Sprintf("t%02d", i)
+	}
+	reason := objectsDifferenceReason("eu", tables)
+	assert.Contains(t, reason, "`t00`")
+	assert.NotContains(t, reason, fmt.Sprintf("`t%02d`", planDriftEntryCap))
+	assert.True(t, strings.HasSuffix(reason, ", 2 more)"), reason)
 }

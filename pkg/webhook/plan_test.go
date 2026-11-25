@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -151,6 +152,38 @@ func TestBuildPlanCommentData_CarriesExemptTables(t *testing.T) {
 		{Namespace: "app", Tables: []string{"orders_archive_2024", "events_archive_2025_01"}, Reason: "archive naming"},
 		{Namespace: "audit", Tables: []string{"logs_archive_2023"}, Reason: "archive naming"},
 	}, data.ExemptTables)
+}
+
+// A repository names a leftover table from an earlier online schema change in
+// drop_tables, so the plan drops `_jobs_old`. The PR comment shows the
+// statement and lists the drop among the unsafe changes, the same as the CLI
+// plan (TestWritePlanBody_ShowsDropOfUnderscoreTable).
+func TestBuildPlanCommentData_ShowsDropOfUnderscoreTable(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "jobs", Type: "mysql"}
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "jobs",
+			TableChanges: []*apitypes.TableChangeResponse{{
+				TableName:    "_jobs_old",
+				DDL:          "DROP TABLE `_jobs_old`;",
+				ChangeType:   "drop",
+				IsUnsafe:     true,
+				UnsafeReason: "DROP TABLE removes all data",
+			}},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+	require.Len(t, data.Changes, 1)
+	assert.Equal(t, []string{"DROP TABLE `_jobs_old`;"}, data.Changes[0].Statements)
+	require.Len(t, data.UnsafeChanges, 1)
+	assert.Equal(t, "_jobs_old", data.UnsafeChanges[0].Table)
+
+	comment := templates.RenderPlanComment(data)
+	assert.Contains(t, comment, "DROP TABLE `_jobs_old`;")
+	assert.Contains(t, comment, "**1** table to drop")
+	assert.Contains(t, comment, "`_jobs_old`")
+	assert.Contains(t, comment, "DROP TABLE removes all data")
 }
 
 // An unsafe change on a single shard (per-shard plan) is surfaced with its shard,
@@ -1062,6 +1095,22 @@ func TestUserFacingErrorPreservesNonGRPCErrors(t *testing.T) {
 	assert.Equal(t, "invalid DDL", got)
 }
 
+// A plan refused because SchemaBot could not read whether an apply still
+// needs a drop_tables entry shows a fixed line on the PR. The storage error
+// behind it, with its hosts and driver text, stays in the server log.
+func TestUserFacingErrorHidesTheCauseOfAFailedDropTablesCheck(t *testing.T) {
+	err := fmt.Errorf("plan orders/staging: %w", &api.DropTablesCheckError{
+		Database:    "orders",
+		Environment: "staging",
+		Err:         errors.New("dial tcp 10.1.2.3:3306: connect: connection refused"),
+	})
+
+	got := userFacingError(err)
+
+	assert.Equal(t, dropTablesCheckFailedMessage, got)
+	assert.NotContains(t, got, "10.1.2.3")
+}
+
 func TestUserFacingErrorExplainsConfigOutsideAllowedDirs(t *testing.T) {
 	err := &schemaConfigOutsideAllowedDirsError{
 		Database:     "orders",
@@ -1108,8 +1157,7 @@ func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {
 	assert.Contains(t, rendered, "**⛔ Apply rejected**: 1 unsafe change detected")
 	assert.Contains(t, rendered, "`users`")
 	assert.Contains(t, rendered, "DROP TABLE removes all data")
-	assert.Contains(t, rendered, "**🚨 To proceed with these destructive changes**:\n1. Deploy application code that no longer reads from or writes to the dropped table.\n2. Add `--allow-unsafe` to confirm 1 unsafe change on `users`:\n   ```\n   schemabot apply -e staging\n   ```\n")
-	assert.NotContains(t, rendered, "--allow-unsafe\n```", "consenting to destroy data takes typing the flag, so the pasteable command leaves it out")
+	assert.Contains(t, rendered, "**🚨 To proceed with these destructive changes**:\n1. Deploy application code that no longer reads from or writes to the dropped table.\n2. Post this command to confirm 1 unsafe change on `users`:\n   ```\n   schemabot apply -e staging --allow-unsafe\n   ```\n")
 }
 
 // A table can carry several lint violations in one engine-joined reason
@@ -1240,7 +1288,7 @@ func TestRenderUnsafeChangesBlocked_CustomDatabaseTypeHeader(t *testing.T) {
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "## Schema Change Plan")
-	assertPasteableCommand(t, rendered, "schemabot apply -e staging")
+	assertPasteableCommand(t, rendered, "schemabot apply -e staging --allow-unsafe")
 }
 
 func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) {
@@ -1262,7 +1310,7 @@ func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) 
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "**Tenant**: `alpha`")
-	assertPasteableCommand(t, rendered, "schemabot apply -e staging --tenant alpha")
+	assertPasteableCommand(t, rendered, "schemabot apply -e staging --tenant alpha --allow-unsafe")
 }
 
 // A plan comment's copy-paste commands name a database only where a bare
@@ -1494,4 +1542,25 @@ func TestSourcePolicyRefusalHoldingEachFailure(t *testing.T) {
 func assertPasteableCommand(t *testing.T, comment, cmd string) {
 	t.Helper()
 	assert.Regexp(t, "(?m)^ *```\n *"+regexp.QuoteMeta(cmd)+"\n *```$", comment)
+}
+
+// Every plan comment an apply command posts (the locked comment, the
+// confirmation downgrade, the no-change and blocked-change replies) shows the
+// time the command was posted, not the time the comment rendered, so a slow
+// re-plan does not move the "Requested by" line.
+func TestCommandPlanCommentData_StampsRequestTime(t *testing.T) {
+	h := &Handler{}
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "mysql"}
+	planResp := &apitypes.PlanResponse{PlanID: "plan_abc123"}
+	requestedAt := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
+	result := CommandResult{Tenant: "default", RequestedAt: requestedAt}
+
+	data := h.commandPlanCommentData(schema, planResp, "staging", "jdoe", result)
+
+	assert.Equal(t, requestedAt, data.RequestedAt)
+	assert.Equal(t, "default", data.Tenant)
+	assert.Equal(t, "jdoe", data.RequestedBy)
+	assert.Equal(t, "plan_abc123", data.PlanID)
+	assert.Contains(t, templates.RenderPlanComment(data), "at 2026-02-03 04:05:06 UTC")
+	assert.Contains(t, templates.RenderBlockedChangesApplyRejected(data), "at 2026-02-03 04:05:06 UTC")
 }

@@ -179,10 +179,11 @@ func TestEnginePullSchemaExcludesPartitionChildren(t *testing.T) {
 	eng := NewForTarget(0, 0, "pull_partition_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
 
-	require.Error(t, err)
-	assert.Nil(t, response)
-	assert.Contains(t, err.Error(), `schema "app" table "events"`)
-	assert.NotContains(t, err.Error(), "events_2026")
+	require.NoError(t, err)
+	tables := response.Namespaces["app"].GetTables()
+	assert.Equal(t, []string{"events"}, sortedKeys(tables), "only the partitioned parent is exported")
+	assert.Contains(t, tables["events"], "PARTITION BY RANGE (created_at)")
+	assert.NotContains(t, tables["events"], "events_2026")
 }
 
 // Views are outside the table baseline, so ordinary and materialized views do
@@ -403,7 +404,7 @@ func TestEnginePlanRollbackBaselineMembershipRoundTrip(t *testing.T) {
 			assert.True(t, drop.IsUnsafe, "rollback keeps destructive-change disclosure")
 			assert.NotEmpty(t, drop.UnsafeReason)
 			require.Empty(t, drop.ExecutionMode)
-			rolledBack, err := eng.Apply(ctx, applyRequest(dsn, drop.Table, drop.DDL))
+			rolledBack, err := eng.Apply(ctx, plannedApplyRequest(dsn, drop))
 			require.NoError(t, err)
 			require.True(t, rolledBack.Accepted)
 			require.Equal(t, engine.StateCompleted, awaitPostgresProgress(t, eng, tt.table).State)
@@ -948,7 +949,7 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 	require.Len(t, result.Changes[0].TableChanges, 1)
 	change := result.Changes[0].TableChanges[0]
 	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
-	assert.Contains(t, change.ModeReason, "in-place ALTER TABLE",
+	assert.Contains(t, change.ModeReason, "in-place changes that need ownership",
 		"the reason must name the tier whose access is missing")
 	assert.Contains(t, change.ModeReason, "provision with: GRANT",
 		"the reason must carry the exact provisioning statement")
@@ -956,7 +957,7 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 		"the reason must carry the exact failed catalog check")
 	causes := engine.BlockedCauses(change.ModeReason)
 	require.Len(t, causes, 2, "the privilege gap and the size ceiling are independent causes")
-	assert.Contains(t, causes[0], "in-place ALTER TABLE", "the privilege cause comes first")
+	assert.Contains(t, causes[0], "in-place changes that need ownership", "the privilege cause comes first")
 	assert.True(t, strings.HasPrefix(causes[1], `statement for table "users": table size`),
 		"the size cause follows the privilege cause: %q", causes[1])
 }
@@ -1154,22 +1155,26 @@ func TestEnginePlanCreateTableIgnoresSizeCeiling(t *testing.T) {
 	assert.Empty(t, change.ModeReason)
 }
 
-// TestEnginePlanUndeclaredTableIsBlockedDrop proves a live table that no
+// TestEnginePlanUndeclaredTableIsUnsafeDrop proves a live table that no
 // schema file declares never vanishes from the plan: the declarative diff
-// surfaces it as a DROP TABLE that is both destructive and blocked, so the
-// reviewer sees the divergence and the apply path can never run the drop. The
-// verdict prescribes only remedies the operator can follow — a table that owns
-// a foreign key into another namespace cannot be declared, and any other table
-// with a foreign key on either side cannot be declared by a pulled file, so
-// each reason names the constraint and the side it lives on instead of a file
-// that cannot be written. A declared table that already matches its file contributes nothing,
-// even when foreign keys elsewhere reference it. Tables whose definition lives
-// elsewhere are not reported on their own: a partition belongs to its parent
-// and an extension-owned table to its extension. Archive tables are exempt by
-// naming convention, as they are on MySQL, while an underscore prefix means
-// nothing on PostgreSQL. An inheritance child and an unlogged table are
-// ordinary tables that must carry their own file.
-func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
+// surfaces it as a DROP TABLE behind the unsafe acknowledgment, as a MySQL
+// table drop is, with the table's definition recorded so the apply drops only
+// the table the reviewer saw. Drops run in foreign key order: warehouses
+// references regions, so warehouses is dropped first, and regions' recorded
+// definition leaves that reference out because it is gone by then. A table's
+// foreign key to itself orders nothing.
+//
+// A drop the plan cannot make safely is blocked, after the executable ones: a
+// partitioned table and an inheritance child, whose drops reach rows the plan
+// does not show; a table that a table which stays references, since the drop
+// never cascades; and two tables whose foreign keys form a cycle, which no
+// drop order satisfies. A declared table that already matches its file
+// contributes nothing, even when foreign keys elsewhere reference it. Tables
+// whose definition lives elsewhere are not reported on their own: a partition
+// belongs to its parent and an extension-owned table to its extension.
+// Archive tables are exempt by naming convention, as they are on MySQL, while
+// an underscore prefix means nothing on PostgreSQL.
+func TestEnginePlanUndeclaredTableIsUnsafeDrop(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_undeclared_test")
 	_, err := db.ExecContext(t.Context(), `
 		CREATE TABLE public.users (id bigint PRIMARY KEY, email text NOT NULL);
@@ -1177,13 +1182,18 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint REFERENCES public.users (id));
 		CREATE TABLE public.regions (id bigint PRIMARY KEY);
 		CREATE TABLE public.warehouses (id bigint PRIMARY KEY, region_id bigint REFERENCES public.regions (id));
+		CREATE TABLE public.categories (id bigint PRIMARY KEY, parent_id bigint REFERENCES public.categories (id));
 		CREATE SCHEMA billing;
 		CREATE TABLE billing.accounts (id bigint PRIMARY KEY);
 		CREATE TABLE public.invoices (id bigint PRIMARY KEY, account_id bigint REFERENCES billing.accounts (id));
-		CREATE TABLE public.events (id bigint, day date) PARTITION BY RANGE (day);
+		CREATE TABLE public.tags (id bigint PRIMARY KEY);
+		CREATE TABLE public.events (id bigint, day date, tag_id bigint REFERENCES public.tags (id)) PARTITION BY RANGE (day);
 		CREATE TABLE public.events_2026 PARTITION OF public.events
 			FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
 		CREATE TABLE public.users_history () INHERITS (public.users);
+		CREATE TABLE public.ping (id bigint PRIMARY KEY, pong_id bigint);
+		CREATE TABLE public.pong (id bigint PRIMARY KEY, ping_id bigint REFERENCES public.ping (id));
+		ALTER TABLE public.ping ADD CONSTRAINT ping_pong_id_fkey FOREIGN KEY (pong_id) REFERENCES public.pong (id);
 		CREATE UNLOGGED TABLE public.scratch (id bigint PRIMARY KEY);
 		CREATE TABLE public._settings (id bigint PRIMARY KEY);
 		CREATE TABLE public.audit_log_archive_2019 (id bigint PRIMARY KEY);
@@ -1213,36 +1223,49 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 	assert.Equal(t, "public", result.ExemptTables[0].Namespace)
 	assert.Equal(t, []string{"audit_log_archive_2019"}, result.ExemptTables[0].Tables)
 	assert.Equal(t, "archive naming", result.ExemptTables[0].Reason)
-	assert.NotContains(t, result.ExemptTables[0].Tables, "legacy_users")
-	require.Len(t, result.Changes[0].TableChanges, 9,
-		"every undeclared table with a definition of its own is reported; the declared table, its partition, the extension-owned table and the archive table are not")
 
-	const declarable = "declare the table in a schema file to keep it under management, or drop it through a separately reviewed process"
-	const ownsForeignKey = `it carries foreign key constraint(s) "orders_user_id_fkey", so the schema pull cannot write a file for it — declare the table by hand in a schema file, foreign keys included, to keep it under management, or drop it through a separately reviewed process`
-	const ownsCrossNamespaceForeignKey = `the table cannot be declared while it carries foreign key constraint(s) "invoices_account_id_fkey", which reference another namespace and schema files do not support — drop the table, or remove those foreign keys before declaring it, through a separately reviewed process`
-	const referencedByForeignKey = `foreign key constraint(s) "warehouses_region_id_fkey" on other tables reference it, so the schema pull cannot write a file for it — declare the table by hand in a schema file to keep it under management, or drop it together with the referencing constraints through a separately reviewed process`
-	for i, want := range []struct{ table, ddl, remedy string }{
-		{"_settings", "DROP TABLE public._settings", declarable},
-		{"events", "DROP TABLE public.events", declarable},
-		{"invoices", "DROP TABLE public.invoices", ownsCrossNamespaceForeignKey},
-		{"legacy_users", "DROP TABLE public.legacy_users", declarable},
-		{"orders", "DROP TABLE public.orders", ownsForeignKey},
-		{"regions", "DROP TABLE public.regions", referencedByForeignKey},
-		{"scratch", "DROP TABLE public.scratch", declarable},
-		{"users_history", "DROP TABLE public.users_history", declarable},
-		{"warehouses", "DROP TABLE public.warehouses", `it carries foreign key constraint(s) "warehouses_region_id_fkey", so the schema pull cannot write a file for it`},
-	} {
-		change := result.Changes[0].TableChanges[i]
+	const hierarchy = "SchemaBot does not drop a partitioned table or a table in an inheritance hierarchy"
+	const cycle = "its foreign keys form a cycle with other tables the plan drops"
+	wants := []struct{ table, blockedBecause string }{
+		{"_settings", ""},
+		{"categories", ""},
+		{"invoices", ""},
+		{"legacy_users", ""},
+		{"orders", ""},
+		{"scratch", ""},
+		{"warehouses", ""},
+		{"regions", ""},
+		{"events", hierarchy},
+		{"ping", cycle},
+		{"pong", cycle},
+		{"tags", `foreign key constraint(s) "events.events_tag_id_fkey" of tables that stay reference it`},
+		{"users_history", hierarchy},
+	}
+	changes := result.Changes[0].TableChanges
+	require.Len(t, changes, len(wants),
+		"every undeclared table with a definition of its own is reported; the declared table, its partition, the extension-owned table and the archive table are not")
+	for i, want := range wants {
+		change := changes[i]
 		assert.Equal(t, want.table, change.Table)
 		assert.Equal(t, ddl.StatementDropTable, change.Operation)
-		assert.Equal(t, want.ddl, change.DDL)
+		assert.Equal(t, "DROP TABLE public."+want.table, change.DDL)
 		assert.True(t, change.IsUnsafe, "a drop removes live data and must carry the unsafe flag")
 		assert.Equal(t, `DROP TABLE removes all data from table "`+want.table+`"`, change.UnsafeReason)
-		assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode,
-			"the native-safe path never executes a drop, so the verdict must say so at plan time")
+		if want.blockedBecause == "" {
+			assert.Empty(t, change.ExecutionMode, "%s: %s", want.table, change.ModeReason)
+			assert.Contains(t, change.Metadata[reviewedTableDropMetadataKey], "table "+want.table+"\n",
+				"the plan records the definition of the table it drops")
+			continue
+		}
+		assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode, want.table)
 		assert.Contains(t, change.ModeReason, `table "`+want.table+`" exists on the target but no schema file in namespace "public" declares it`)
-		assert.Contains(t, change.ModeReason, want.remedy)
+		assert.Contains(t, change.ModeReason, want.blockedBecause)
+		assert.Empty(t, change.Metadata[reviewedTableDropMetadataKey], "a blocked drop records nothing to execute")
 	}
+	assert.NotContains(t, changes[7].Metadata[reviewedTableDropMetadataKey], "referenced by",
+		"regions is dropped after warehouses, so no foreign key references it by then")
+	assert.Contains(t, changes[1].Metadata[reviewedTableDropMetadataKey], "constraint categories_parent_id_fkey: FOREIGN KEY (parent_id) REFERENCES categories(id)",
+		"a table's foreign key to itself goes with the table")
 	for _, table := range []string{"legacy_users", "orders", "regions", "warehouses", "invoices", "scratch", "users_history", "_settings", "audit_log_archive_2019", "ext_owned_config"} {
 		assert.True(t, testutil.PostgresTableExists(t, db, "public", table), "planning must never touch the target")
 	}
@@ -1271,7 +1294,8 @@ func TestEnginePlanEmptyNamespaceSurfacesAllLiveTables(t *testing.T) {
 	assert.Equal(t, "users", change.Table)
 	assert.Equal(t, "DROP TABLE public.users", change.DDL)
 	assert.Equal(t, ddl.StatementDropTable, change.Operation)
-	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+	assert.True(t, change.IsUnsafe)
+	assert.Empty(t, change.ExecutionMode, change.ModeReason)
 }
 
 // TestEnginePlanUndeclaredTableInMissingSchema proves a namespace whose
@@ -1328,8 +1352,9 @@ func TestEnginePlanUndeclaredTablesAcrossNamespaces(t *testing.T) {
 	for _, change := range result.Changes {
 		for _, tc := range change.TableChanges {
 			assert.Equal(t, ddl.StatementDropTable, tc.Operation)
-			assert.Equal(t, engine.ExecutionModeBlocked, tc.ExecutionMode)
-			assert.Contains(t, tc.ModeReason, `no schema file in namespace "`+change.Namespace+`" declares it`)
+			assert.Equal(t, "DROP TABLE "+change.Namespace+"."+tc.Table, tc.DDL)
+			assert.True(t, tc.IsUnsafe)
+			assert.Empty(t, tc.ExecutionMode, tc.ModeReason)
 			dropsByNamespace[change.Namespace] = append(dropsByNamespace[change.Namespace], tc.Table)
 		}
 	}
@@ -1340,7 +1365,7 @@ func TestEnginePlanUndeclaredTablesAcrossNamespaces(t *testing.T) {
 }
 
 // TestLiveTablesUnderShadowingSearchPath proves the catalog reads that find
-// undeclared live tables and the schema pull fail closed when the target's
+// undeclared live tables and their foreign keys and the schema pull fail closed when the target's
 // search_path lists a user schema ahead of pg_catalog. Decoy relations named
 // after every catalog table the queries touch, decoy "=", "<>", ">" and ">="
 // operators over every operand type the queries compare, and decoy array_agg
@@ -1403,18 +1428,24 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 	require.NoError(t, pool.QueryRow(t.Context(), "SHOW search_path").Scan(&searchPath))
 	require.Equal(t, "hostile, pg_catalog, public", searchPath, "the pool must see the hostile search_path for the test to prove anything")
 
-	tables, err := liveTables(t.Context(), pool, "public")
+	pulled, err := schemadiff.ListManagedTables(t.Context(), pool, "public")
 	require.NoError(t, err)
-	assert.Equal(t, []liveTable{
+	assert.Equal(t, []string{"events", "invoices", "orders", "users"}, pulled,
+		"every live table must be enumerated, and only the partition and the extension-owned table left out, despite the shadowing search_path")
+
+	keys, err := foreignKeysFor(t.Context(), pool, "public", pulled)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []tableForeignKeys{
 		{name: "events", foreignKeys: []string{}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{}},
 		{name: "invoices", foreignKeys: []string{"invoices_account_id_fkey"}, crossNamespaceForeignKeys: []string{"invoices_account_id_fkey"}, referencedBy: []string{}},
 		{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{}},
 		{name: "users", foreignKeys: []string{}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{"orders_user_id_fkey"}},
-	}, tables, "every live table and its foreign keys must be enumerated, and only the partition and the extension-owned table left out, despite the shadowing search_path")
+	}, keys, "every table's foreign keys must be read from the real catalog")
 
-	pulled, err := schemadiff.ListManagedTables(t.Context(), pool, "public")
+	users, err := schemadiff.Introspect(t.Context(), pool, "public", "users")
 	require.NoError(t, err)
-	assert.Equal(t, []string{"events", "invoices", "orders", "users"}, pulled, "the pull must render the same set the plan holds files accountable for")
+	assert.Equal(t, []string{"orders.orders_user_id_fkey"}, users.ReferencedBy,
+		"the definition a table drop records must name the foreign keys that reference the table")
 
 	namespaces, err := pullNamespaces(t.Context(), pool, "")
 	require.NoError(t, err)
@@ -1793,7 +1824,7 @@ func TestEngineSharedAcrossAppliesKeepsProgressPerApply(t *testing.T) {
 func TestEngineApplyRefusesNonNativeShape(t *testing.T) {
 	dsn, _ := testutil.StartPostgres(t, "shape_test")
 	eng := New()
-	_, err := eng.Apply(t.Context(), applyRequest(dsn, "users", "DROP TABLE public.users"))
+	_, err := eng.Apply(t.Context(), applyRequest(dsn, "users", "TRUNCATE public.users"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not execute this statement shape yet")
 }
@@ -1968,7 +1999,7 @@ func TestEngineCancelConcurrentIndexBuildWithoutABackendSignal(t *testing.T) {
 	result, err := eng.Cancel(t.Context(), cancelRequestFor("orders"))
 	require.NoError(t, err)
 	assert.True(t, result.Accepted)
-	assert.Equal(t, "Concurrent index build cancelled", result.Message)
+	assert.Equal(t, "Index build cancelled", result.Message)
 
 	got := awaitPostgresProgress(t, eng, "orders")
 	assert.Equal(t, engine.StateCancelled, got.State, "progress: %+v", got)
@@ -2270,9 +2301,10 @@ func TestEngineHaltForShutdownEndsAParkedConcurrentBuild(t *testing.T) {
 // recovery that clears the abandoned entry but whose build then fails
 // reports the failure, never a completion: the abandoned invalid index is
 // removed, the unique build fails on duplicate rows and leaves its own
-// invalid index under the name, and the apply fails retryable naming that
-// index — while the catalog still shows it invalid, the state a completion
-// would have misreported as the index the schema declares.
+// invalid index under the name, and the apply is refused naming that index —
+// while the catalog still shows it invalid, the state a completion would have
+// misreported as the index the schema declares. The refusal is permanent: a
+// rerun meets the same duplicate rows, so the operator corrects them first.
 func TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "recovery_failure_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
@@ -2291,10 +2323,11 @@ func TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion(t *testing.T) 
 	require.NoError(t, err)
 	progress := awaitPostgresProgress(t, eng, "orders")
 	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
-	assert.Equal(t, "failed", progress.Metadata["phase"])
-	assert.True(t, progress.Retryable, "a build that fails after the recovery is operational; the drive must offer the retry")
-	assert.Contains(t, progress.ErrorMessage, "orders_ref_key")
-	assert.Contains(t, progress.ErrorMessage, "invalid index")
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "a build the table's rows violate fails the same way on every rerun")
+	assert.Equal(t, `recovering abandoned invalid index "public"."orders_ref_key" failed: `+
+		`the table's rows cannot be indexed by index "public"."orders_ref_key", and the failed build left it invalid on the target; `+
+		`correct the rows, then re-run; the rerun removes the invalid index once it proves no build holds it`, progress.ErrorMessage)
 	assert.NotContains(t, progress.ErrorMessage, "ref-collision", "the server's unique-violation text never reaches the operator surface")
 
 	var valid bool
@@ -2416,6 +2449,14 @@ func applyRequest(dsn, table, statement string) *engine.ApplyRequest {
 		Credentials: &engine.Credentials{DSN: dsn},
 		ResumeState: &engine.ResumeState{MigrationContext: applyTaskID(table)},
 	}
+}
+
+// plannedApplyRequest is applyRequest for a change a plan returned, carrying
+// the metadata the engine recorded with it as the drive layer does.
+func plannedApplyRequest(dsn string, change engine.TableChange) *engine.ApplyRequest {
+	req := applyRequest(dsn, change.Table, change.DDL)
+	req.Changes[0].TableChanges[0].Metadata = change.Metadata
+	return req
 }
 
 func applyTaskID(table string) string {

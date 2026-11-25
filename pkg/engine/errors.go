@@ -228,6 +228,28 @@ func IsUnsupportedOperation(err error) bool {
 	return ok
 }
 
+// PlanRefusedError wraps an error to indicate the engine declined to plan
+// because the declared schema cannot be applied safely as written, such as a
+// change that would drop a table the database still depends on. It is not a
+// failure of the engine or its backend: planning the same schema files against
+// the same target is refused again. The remedy is the operator's, and the
+// wrapped message says what it is: usually a change to those files, and for
+// some refusals a change on the target, such as waiting until a table due to
+// be dropped has gone long enough without a write.
+type PlanRefusedError struct {
+	Err error
+}
+
+func (e *PlanRefusedError) Error() string { return e.Err.Error() }
+func (e *PlanRefusedError) Unwrap() error { return e.Err }
+
+// IsPlanRefused reports whether err indicates the engine declined to plan the
+// declared schema as written.
+func IsPlanRefused(err error) bool {
+	var refused *PlanRefusedError
+	return errors.As(err, &refused)
+}
+
 // IsRetryable returns true if the error should be retried by the operator.
 // All errors are retryable by default, and engines explicitly wrap only
 // permanent errors with PermanentError.

@@ -145,7 +145,7 @@ func newMultiEnvPlanHarnessWithRepo(t *testing.T, productionTargets []api.Target
 	return &namespacePlacementHarness{
 		dbName:  dbName,
 		store:   st,
-		handler: NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger),
+		handler: NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger, WithInsecureSkipSignatureVerification()),
 		github:  result,
 		client:  installClient,
 		mux:     mux,
@@ -163,7 +163,7 @@ func (p *namespacePlacementHarness) comment(t *testing.T, command string) string
 		// The comment renders a refusal HTML-escaped.
 		return html.UnescapeString(body)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatalf("timed out waiting for the reply to %q", command)
+		require.FailNow(t, fmt.Sprintf("timed out waiting for the reply to %q", command))
 		return ""
 	}
 }

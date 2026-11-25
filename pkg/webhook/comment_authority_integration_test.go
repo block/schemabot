@@ -171,9 +171,9 @@ func requireNoGitHubCalls(t *testing.T, capture *commentCapture) {
 	t.Helper()
 	select {
 	case edit := <-capture.edits:
-		t.Fatalf("expected no GitHub comment edit, got edit of comment %d", edit.CommentID)
+		require.FailNow(t, fmt.Sprintf("expected no GitHub comment edit, got edit of comment %d", edit.CommentID))
 	case created := <-capture.creates:
-		t.Fatalf("expected no GitHub comment create, got comment %d", created.ID)
+		require.FailNow(t, fmt.Sprintf("expected no GitHub comment create, got comment %d", created.ID))
 	default:
 	}
 }
@@ -207,7 +207,7 @@ func TestObserverEditsProgressCommentForOperationScopedApply(t *testing.T) {
 		assert.Contains(t, edited.Body, fx.apply.ApplyIdentifier, "progress edit must render the live apply")
 		assert.Contains(t, edited.Body, "running table copy", "progress edit must render the in-flight operations")
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for the progress comment edit")
+		require.FailNow(t, "timed out waiting for the progress comment edit")
 	}
 
 	// The edit was performed under the durable authority recorded on the
@@ -250,7 +250,7 @@ func TestObserverEditsProgressCommentForWholeTargetRollout(t *testing.T) {
 		assert.Contains(t, edited.Body, fx.apply.ApplyIdentifier, "progress edit must render the live apply")
 		assert.Contains(t, edited.Body, "running table copy", "progress edit must render the in-flight operations")
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for the progress comment edit")
+		require.FailNow(t, "timed out waiting for the progress comment edit")
 	}
 
 	owner := progressObserverOwner(t, fx.db, fx.apply.ID)
@@ -289,7 +289,7 @@ func TestConcurrentObserversShareOneProgressCommentAuthority(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, fx.progressCommentID, edited.CommentID)
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for the winner's progress comment edit")
+		require.FailNow(t, "timed out waiting for the winner's progress comment edit")
 	}
 
 	loserLogger := &capturingLogger{}
@@ -359,7 +359,7 @@ func TestLeaseHeldApplyKeepsLeaseAuthoritative(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, fx.progressCommentID, edited.CommentID)
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for the lease holder's progress comment edit")
+		require.FailNow(t, "timed out waiting for the lease holder's progress comment edit")
 	}
 
 	owner := progressObserverOwner(t, fx.db, fx.apply.ID)

@@ -37,7 +37,7 @@ func newE2EHandlerWithConfigDirHints(t *testing.T, svc *api.Service, client *gh.
 	installClient := ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")
 	installClient.SetConfigDirHints(svc.Config())
 	factory := &fakeClientFactory{client: installClient}
-	return NewHandler(svc, factory, nil, logger)
+	return NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 }
 
 // setupFakeGitHubForPlanOnTruncatedRepo simulates the GitHub API of a
@@ -256,7 +256,7 @@ func TestE2EPlanCommandOnNoSchemaChangesPRRecreatesPassingCheck(t *testing.T) {
 		assert.NotContains(t, body, "truncated repository tree")
 		assert.NotContains(t, body, "Plan Failed")
 	case <-time.After(30 * time.Second):
-		t.Fatal(`timed out waiting for the "No Schema Files Changed" comment`)
+		require.FailNow(t, `timed out waiting for the "No Schema Files Changed" comment`)
 	}
 
 	select {
@@ -265,7 +265,7 @@ func TestE2EPlanCommandOnNoSchemaChangesPRRecreatesPassingCheck(t *testing.T) {
 		assert.Equal(t, "completed", cr.Status)
 		assert.Equal(t, "success", cr.Conclusion)
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for passing check run")
+		require.FailNow(t, "timed out waiting for passing check run")
 	}
 }
 
@@ -303,12 +303,12 @@ func TestE2EPlanCommandOnClosedPRRefusesToRecreateChecks(t *testing.T) {
 		assert.Contains(t, body, "is closed")
 		assert.Contains(t, body, "open PRs")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for closed-PR error comment")
+		require.FailNow(t, "timed out waiting for closed-PR error comment")
 	}
 
 	select {
 	case cr := <-result.checkRuns:
-		t.Fatalf("no Check Run should be created for a closed PR, got %q (%s/%s)", cr.Name, cr.Status, cr.Conclusion)
+		require.FailNow(t, fmt.Sprintf("no Check Run should be created for a closed PR, got %q (%s/%s)", cr.Name, cr.Status, cr.Conclusion))
 	default:
 	}
 }
@@ -361,7 +361,7 @@ func TestE2EPlanCommandOnTruncatedRepoDiscoversConfigViaConfiguredDirs(t *testin
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, "users")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for plan comment")
+		require.FailNow(t, "timed out waiting for plan comment")
 	}
 }
 
@@ -401,6 +401,6 @@ func TestE2EPlanCommandOnTruncatedRepoWithoutConfiguredDirsFailsClosed(t *testin
 		assert.Contains(t, body, "`allowed_dirs`")
 		assert.NotContains(t, body, "Database Not Found")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for failure comment")
+		require.FailNow(t, "timed out waiting for failure comment")
 	}
 }

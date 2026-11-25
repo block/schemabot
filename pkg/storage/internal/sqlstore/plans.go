@@ -250,9 +250,9 @@ func (s *planStore) List(ctx context.Context, opts storage.ListPlansOptions) ([]
 func (s *planStore) Delete(ctx context.Context, id int64) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM plans WHERE id = ?`, id)
 	if err != nil {
-		return err
+		return fmt.Errorf("delete plan %d: %w", id, err)
 	}
-	return checkRowsAffected(result, storage.ErrPlanNotFound)
+	return checkRowsAffected(result, storage.ErrPlanNotFound, fmt.Sprintf("deleting plan %d", id))
 }
 
 // DeleteByPR removes all plans for a PR.
@@ -388,6 +388,7 @@ func namespacesWithShardPlans(plan *storage.Plan) map[string]*storage.NamespaceP
 			Artifacts:             nsData.Artifacts,
 			Metadata:              nsData.Metadata,
 			IgnoreTables:          nsData.IgnoreTables,
+			DropTables:            nsData.DropTables,
 			Finalize:              nsData.Finalize,
 		}
 	}

@@ -2,6 +2,7 @@ package commands
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
@@ -12,7 +13,8 @@ import (
 // StartCmd resumes a stopped schema change.
 type StartCmd struct {
 	ControlFlags
-	Watch bool `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
+	Watch    bool   `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
+	Override string `help:"Why this change can't wait. It lets the change through a freeze, or asks a freeze approver to, as the server's override policy says" name:"override"`
 }
 
 // Run executes the start command.
@@ -57,9 +59,10 @@ func (cmd *StartCmd) Run(g *Globals) error {
 	var startResult *apitypes.StartResponse
 	err = withLoading("Starting schema change...", true, func() error {
 		var startErr error
-		startResult, startErr = client.CallStartAPI(ep, cmd.Environment, cmd.ApplyID)
+		startResult, startErr = client.CallStartAPIWithOverride(ep, cmd.Environment, cmd.ApplyID, cmd.Override)
 		return startErr
 	})
+	err = reportChangeGate(err, cmd.Environment, "start", strings.TrimSpace(cmd.Override) != "", false)
 	if err != nil {
 		return err
 	}

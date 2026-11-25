@@ -121,6 +121,12 @@ type Storage interface {
 	// Settings returns the settings store.
 	Settings() SettingsStore
 
+	// Freezes returns the environment freeze store.
+	Freezes() FreezeStore
+
+	// FreezeOverrides returns the store of freeze override requests.
+	FreezeOverrides() FreezeOverrideStore
+
 	// WebhookEvents returns the durable webhook event inbox store.
 	WebhookEvents() WebhookEventStore
 
@@ -171,6 +177,24 @@ type LockStore interface {
 	// another owner, and ErrLockIntentChanged when the row now carries another
 	// pending plan.
 	ReleaseByID(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error
+
+	// ReleaseByIDIfUnused releases the lock like ReleaseByID, and also only
+	// while no apply whose outcome can still change records the row as its
+	// lock. A stopped apply keeps the lock, since it can be resumed under it,
+	// and so does a terminal apply with an operation still in progress. Only
+	// applies that record this row count: an apply still running under an
+	// older row of the same database, left behind by a force release, does
+	// not keep the current owner's lock, so a caller that also refuses while
+	// any apply runs on the database checks that itself.
+	// The row is held for the decision, so an apply created under the row in
+	// a transaction that locks it either commits before the check and keeps
+	// the lock, or fails without creating the apply. A create that waited for
+	// the release can fail with a deadlock or serialization error rather than
+	// ErrLockIntentChanged. It returns nil
+	// when it released the lock; a *LockInUseError, matching ErrLockInUse and
+	// naming the apply, when it kept the lock for that apply; and the errors
+	// ReleaseByID returns when the row no longer holds the lock as given.
+	ReleaseByIDIfUnused(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error
 
 	// ReleaseIfPendingPlanID releases a lock only while both its owner and
 	// pending plan still match. A mismatch is a no-op so a superseding apply or
@@ -249,12 +273,15 @@ type CheckStore interface {
 	// from in_progress to a successful no-op plan result. Returns true when recovery occurred.
 	RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, check *Check) (bool, error)
 
-	// MarkStalePlanSuccessful marks plan-only stored check state successful when
-	// the database it covers is no longer in the PR. It fails closed: the update
-	// is skipped when the row is in_progress or owns an apply ID, so a started
-	// apply that began after stale cleanup read the row keeps blocking the PR.
-	// Returns true when the row was marked successful.
-	MarkStalePlanSuccessful(ctx context.Context, check *Check) (bool, error)
+	// MarkStalePlanSuccessful marks plan-only stored check state successful on
+	// check.HeadSHA when nothing will replace the row. It fails closed: the
+	// update is skipped when the row is in_progress or owns an apply ID, so a
+	// started apply that began after stale cleanup read the row keeps blocking
+	// the PR. readHeadSHA is the head the caller read the row at; a row a newer
+	// write moved to any head other than readHeadSHA or check.HeadSHA belongs to
+	// that write and is left alone. Returns true when the row is plan-only
+	// successful on check.HeadSHA after the call.
+	MarkStalePlanSuccessful(ctx context.Context, check *Check, readHeadSHA string) (bool, error)
 
 	// BlockStaleStartedApply records that the schema change a started apply
 	// owns is gone from the PR: it moves the row onto headSHA with check's
@@ -335,16 +362,23 @@ type CheckStore interface {
 	// Delete removes stored check state by ID.
 	Delete(ctx context.Context, id int64) error
 
-	// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a
-	// closed PR, retaining apply-owned rows the close must not unblock. Once
+	// DeleteStalePlanOnly removes check's plan-only row when no plan can store
+	// it again. It fails closed: a row that is in_progress or owns an apply ID
+	// is kept, and so is a row a newer write moved off readHeadSHA, the head the
+	// caller read it at. Returns true when no row is stored for check's key
+	// after the call.
+	DeleteStalePlanOnly(ctx context.Context, check *Check, readHeadSHA string) (bool, error)
+
+	// ListRemovableOnPRClose returns the stored check state a close of the PR
+	// removes, retaining apply-owned rows the close must not unblock. Once
 	// an apply has started, its stored check state stays authoritative across
 	// a close and reopen until an operator reconciles the target environment.
-	// Plan-only rows (no apply_id) are always deleted. Apply-owned rows are
+	// Plan-only rows (no apply_id) are always listed. Apply-owned rows are
 	// handled by close kind:
 	//
 	//   - merged close: rows that are in_progress or whose conclusion is
 	//     anything but success are retained; rows that concluded successfully
-	//     are deleted, because the merged PR carries the applied schema and
+	//     are listed, because the merged PR carries the applied schema and
 	//     nothing remains for the row to block.
 	//   - unmerged close: every apply-owned row is retained, including rows
 	//     whose conclusion is success. A stored success only proves the
@@ -354,7 +388,118 @@ type CheckStore interface {
 	//     Reopen-time stale cleanup converges the retained row: it converts
 	//     it to action_required when the schema change is gone from the PR,
 	//     or a fresh plan result replaces it when the change is still present.
-	DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int, merged bool) error
+	ListRemovableOnPRClose(ctx context.Context, repo string, pr int, merged bool) ([]*Check, error)
+
+	// DeleteListedIfUnchanged deletes each row ListRemovableOnPRClose listed
+	// only while every column it was listed with, updated_at included, is
+	// unchanged, and returns the rows it kept because they were written since
+	// the listing. A row is compared and deleted under its row lock, so a
+	// write after the comparison cannot be deleted. A listed row already gone
+	// is neither deleted nor kept, and a row inserted since the listing is
+	// never touched.
+	DeleteListedIfUnchanged(ctx context.Context, listed []*Check) (kept []*Check, err error)
+}
+
+// FreezeStore records environment freezes. While a freeze is in effect,
+// SchemaBot refuses new changes in its scope unless they carry an override.
+// Freezes may overlap, and each is lifted by its own identifier. A row stays
+// after its freeze ends or is lifted, as the audit trail.
+//
+// Environments, deployments and databases are identity strings: the store
+// passes them through CanonicalKey.
+type FreezeStore interface {
+	// Create records a freeze and returns it as stored. It returns
+	// ErrFreezeExists when the identifier, or the source and external id, is
+	// already taken.
+	Create(ctx context.Context, freeze *EnvironmentFreeze) (*EnvironmentFreeze, error)
+
+	// Get returns the freeze with this identifier, or ErrFreezeNotFound.
+	Get(ctx context.Context, identifier string) (*EnvironmentFreeze, error)
+
+	// Lift ends a freeze early and returns it as lifted. The update is
+	// conditional, so two concurrent lifts end it once. It returns
+	// ErrFreezeNotFound when there is no such freeze, ErrFreezeAlreadyLifted
+	// when someone lifted it first, and ErrFreezeEnded when it already
+	// reached its end time. The lift time is the database's clock.
+	Lift(ctx context.Context, identifier, liftedBy, reason string) (*EnvironmentFreeze, error)
+
+	// ListInEffect returns the freezes in effect now, oldest start first.
+	// An empty environment returns every environment's freezes. "Now" is the
+	// database's clock, so every pod agrees at the edges of a freeze.
+	ListInEffect(ctx context.Context, environment string) ([]*EnvironmentFreeze, error)
+
+	// List reads one consistent view of the freezes: the ones in effect or
+	// scheduled at the database's clock, and up to recent freezes of any
+	// state. An empty environment returns every environment's freezes.
+	List(ctx context.Context, environment string, recent int) (*FreezeListing, error)
+
+	// Now returns the database's clock, the one ListInEffect compares
+	// against. A caller that labels a freeze as in effect or scheduled uses
+	// it, so the label agrees with the query.
+	Now(ctx context.Context) (time.Time, error)
+
+	// Epoch returns the environment's freeze epoch, which Create bumps in
+	// the transaction that inserts a freeze. The change gate reads it
+	// before ListInEffect and passes it to the admission write in a
+	// FreezeEpochGuard. Epoch records the environment with epoch 0 if it has
+	// no row yet, so the admission write always has a row to lock.
+	Epoch(ctx context.Context, environment string) (int64, error)
+}
+
+// FreezeOverrideStore records requests to let one change through the freezes
+// that hold it, and their approvals. Requests are never deleted, so they are
+// the audit record of every override.
+type FreezeOverrideStore interface {
+	// Create records a request and returns it as stored.
+	Create(ctx context.Context, request *FreezeOverrideRequest) (*FreezeOverrideRequest, error)
+
+	// CreateOnReason records a request that its requester's reason admits,
+	// for a server whose override policy needs no second approver. It is
+	// stored approved by its requester at creation, by the database clock,
+	// so every later check finds it as an approved override. Its other
+	// rules are Create's.
+	CreateOnReason(ctx context.Context, request *FreezeOverrideRequest) (*FreezeOverrideRequest, error)
+
+	// Get returns the request with this identifier, or
+	// ErrFreezeOverrideNotFound.
+	Get(ctx context.Context, identifier string) (*FreezeOverrideRequest, error)
+
+	// Approve records approver's approval and returns the approved request.
+	// It refuses the requester and the pull request's author
+	// (ErrFreezeOverrideSelfApproval), a request already approved
+	// (ErrFreezeOverrideAlreadyApproved), and one past its expiry by the
+	// database clock (ErrFreezeOverrideExpired). Of two racing approvals,
+	// exactly one succeeds.
+	Approve(ctx context.Context, identifier, approver string) (*FreezeOverrideRequest, error)
+
+	// ListApproved returns the approved requests for one change that have
+	// not expired by the database clock, most recently approved first.
+	ListApproved(ctx context.Context, target FreezeOverrideTarget) ([]*FreezeOverrideRequest, error)
+
+	// ListPending returns the requests for one change that are not yet
+	// approved and have not expired by the database clock, newest first.
+	ListPending(ctx context.Context, target FreezeOverrideTarget) ([]*FreezeOverrideRequest, error)
+}
+
+// FreezeOverrideTarget names the change an override request is for.
+type FreezeOverrideTarget struct {
+	Environment string
+	Action      string
+	// TargetID is the plan an apply would run, or the apply a cutover or
+	// start would act on.
+	TargetID string
+}
+
+// FreezeListing is what FreezeStore.List read. Both lists come from one
+// snapshot of the store, and Now is the database clock they were filtered
+// by, so a caller that labels them by Now never contradicts itself.
+type FreezeListing struct {
+	Now time.Time
+	// Current holds the freezes in effect or scheduled at Now, oldest start
+	// first.
+	Current []*EnvironmentFreeze
+	// Recent holds the most recent freezes of any state, newest start first.
+	Recent []*EnvironmentFreeze
 }
 
 // SettingsStore manages admin-level SchemaBot settings (global config).
@@ -565,6 +710,17 @@ type WebhookEventStore interface {
 	// recoverable: the reconciler may synthesize a recovery delivery for its
 	// head, and GitHub Redeliver reopens it.
 	MarkFailed(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error
+
+	// MarkFailedUncharged marks a claimed event retryable after retryAfter,
+	// like MarkFailed with a retry time, and refunds the attempt its claim
+	// consumed. Drivers use it when the delivery could not run yet for a
+	// reason that has a known end, such as a GitHub quota that resets at a
+	// known time, so waiting for that end does not spend the retry budget.
+	// The caller bounds how often a delivery is rescheduled this way. Unlike
+	// Release it keeps started_at, since processing did begin. Repeating the
+	// call with the same lease token refunds nothing more and returns nil.
+	// Returns ErrWebhookEventLeaseLost when the lease token is stale.
+	MarkFailedUncharged(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter time.Time) error
 
 	// MarkFailedPermanent dead-letters a claimed event: the driver proved the
 	// delivery can never succeed for its head, so no retry, reconciler
@@ -1206,12 +1362,6 @@ type ApplyStore interface {
 	// came from, so callers deciding whether a record is safe to retire must
 	// treat it as owning.
 	ExistsForDatabaseHead(ctx context.Context, repo string, pr int, database, databaseType, headSHA string) (bool, error)
-
-	// Delete removes an apply by ID.
-	Delete(ctx context.Context, id int64) error
-
-	// DeleteByPR removes all applies for a PR (cleanup on PR close/merge).
-	DeleteByPR(ctx context.Context, repo string, pr int) error
 }
 
 // ApplyOperationWithTasks groups one apply_operations row with the task rows it owns.
@@ -1933,6 +2083,16 @@ type ApplyOperationStore interface {
 	// longer matches (another writer rotated or cleared it), in which case the
 	// row has moved on and needs nothing from the caller.
 	ReleaseClaim(ctx context.Context, lease OperationLease) (bool, error)
+
+	// ReturnUnstartedClaim hands back an operation a driver claimed to start
+	// but will not start, as it was before the claim: an operation claimed out
+	// of pending goes back to pending with no started_at, and one claimed out
+	// of stopped goes back to stopped. claimedFrom is that earlier state,
+	// pending or stopped. Unlike ReleaseClaim, the row does not re-enter as
+	// active work a later claim would drive without starting it again. The
+	// write is guarded on the lease token and on the state the claim moved
+	// the row to; it reports false when either no longer matches.
+	ReturnUnstartedClaim(ctx context.Context, lease OperationLease, claimedFrom string) (bool, error)
 
 	// ReleaseFinishedClaim hands back the lease on an operation whose drive has
 	// ended. A drive that finishes leaves its lease in place, so the row it

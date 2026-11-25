@@ -8,6 +8,7 @@ import (
 )
 
 type databaseSnapshot struct {
+	revision  uint64
 	declared  map[string]DatabaseConfig
 	effective map[string]DatabaseConfig
 }
@@ -22,6 +23,14 @@ func (c *ServerConfig) DatabaseConfigs() map[string]DatabaseConfig {
 		return c.liveDatabases.current.Load().effective
 	}
 	return c.Databases
+}
+
+// DatabaseRegistrationRevision changes each time local registration publishes a new snapshot.
+func (c *ServerConfig) DatabaseRegistrationRevision() uint64 {
+	if c.liveDatabases != nil {
+		return c.liveDatabases.current.Load().revision
+	}
+	return 0
 }
 
 // withDatabaseSnapshot pins database lookups for one operation, including helper calls.
@@ -103,7 +112,7 @@ func (c *ServerConfig) PrepareLocalRegistration(next *ServerConfig, resolved map
 	validated := *next
 	validated.Databases = effective
 	publish := func() {
-		c.liveDatabases.current.Store(&databaseSnapshot{declared: next.Databases, effective: effective})
+		c.liveDatabases.current.Store(&databaseSnapshot{revision: current.revision + 1, declared: next.Databases, effective: effective})
 	}
 	return &validated, publish, nil
 }

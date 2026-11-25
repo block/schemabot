@@ -1,10 +1,12 @@
 package templates
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
 )
@@ -159,7 +161,7 @@ func entryLine(t *testing.T, out, prefix string) string {
 			return line
 		}
 	}
-	t.Fatalf("no copy entry starting with %q in:\n%s", prefix, out)
+	require.FailNow(t, fmt.Sprintf("no copy entry starting with %q in:\n%s", prefix, out))
 	return ""
 }
 

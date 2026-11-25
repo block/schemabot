@@ -82,14 +82,6 @@ func ListDatabases(endpoint string, opts ListDatabasesOptions) (*apitypes.Databa
 	return &result, nil
 }
 
-func RedriveWebhooks(ctx context.Context, endpoint string, req apitypes.WebhookRedriveRequest) (*apitypes.WebhookRedriveResponse, error) {
-	var result apitypes.WebhookRedriveResponse
-	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/webhooks/redrive", req, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
-}
-
 func ChecksScan(ctx context.Context, endpoint string, req apitypes.ChecksScanRequest) (*apitypes.ChecksScanResponse, error) {
 	var result apitypes.ChecksScanResponse
 	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/checks/scan", req, &result); err != nil {
@@ -222,6 +214,19 @@ func CallPullSchemaAPIWithContext(ctx context.Context, endpoint, database, dbTyp
 type PlanExclusions struct {
 	Namespaces []string
 	Tables     []string
+	// DropTables is not an exclusion: it is the config's drop_tables, the
+	// live tables the plan should drop although no schema file declares them.
+	// It travels here because it comes from the same file and rides on the
+	// same request.
+	DropTables []string
+}
+
+// WithoutDropTables returns the exclusions alone, for a plan that verifies
+// schema files mirror the target and must not propose the drops the config
+// asks for.
+func (e PlanExclusions) WithoutDropTables() PlanExclusions {
+	e.DropTables = nil
+	return e
 }
 
 // CallPlanAPI calls the plan API by reading .sql files from schemaDir.
@@ -279,7 +284,7 @@ func callPlanAPI(ctx context.Context, endpoint, database, dbType, environment, s
 		}
 		return nil, nil, fmt.Errorf("no .sql files found in %s", schemaRoot)
 	}
-	resp, err := postPlanRequestWithContext(ctx, endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, exclusions.Tables, groupedExecution, target, rendersRollout)
+	resp, err := postPlanRequestWithContext(ctx, endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, exclusions.Tables, exclusions.DropTables, groupedExecution, target, rendersRollout)
 	if err != nil {
 		return nil, ignored, err
 	}
@@ -290,7 +295,7 @@ func callPlanAPI(ctx context.Context, endpoint, database, dbType, environment, s
 // schema files. It does not say it renders the rollout, so the server refuses
 // it a rollout-wide plan of an environment with more than one member.
 func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int) (*apitypes.PlanResponse, error) {
-	return postPlanRequestWithContext(context.Background(), endpoint, database, dbType, environment, schemaFiles, repo, pr, nil, nil, false, "", false)
+	return postPlanRequestWithContext(context.Background(), endpoint, database, dbType, environment, schemaFiles, repo, pr, nil, nil, nil, false, "", false)
 }
 
 // postPlanRequestWithContext posts a plan request. ignoredNamespaces names the
@@ -299,7 +304,7 @@ func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schema
 // rendersRollout is the caller's own statement, never a default: a caller
 // that does not read the rollout block would present the primary's plan as
 // every member's.
-func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces, ignoreTables []string, groupedExecution bool, target string, rendersRollout bool) (*apitypes.PlanResponse, error) {
+func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces, ignoreTables, dropTables []string, groupedExecution bool, target string, rendersRollout bool) (*apitypes.PlanResponse, error) {
 	req := apitypes.PlanRequest{
 		Database:          database,
 		Type:              dbType,
@@ -308,6 +313,7 @@ func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType,
 		Repository:        repo,
 		IgnoredNamespaces: ignoredNamespaces,
 		IgnoreTables:      ignoreTables,
+		DropTables:        dropTables,
 		GroupedExecution:  groupedExecution,
 		Target:            target,
 		RendersRollout:    rendersRollout,
@@ -352,6 +358,13 @@ func CallApplyAPI(endpoint, planID, environment, caller string, options map[stri
 // runs, a client capability rather than consent; see
 // apitypes.ApplyRequest.RendersRollout.
 func CallApplyAPIForTarget(endpoint, planID, environment, caller, target string, rendersRollout bool, options map[string]string) (*apitypes.ApplyResponse, error) {
+	return CallApplyAPIWithOverride(endpoint, planID, environment, caller, target, rendersRollout, "", options)
+}
+
+// CallApplyAPIWithOverride is CallApplyAPIForTarget that also asks a freeze
+// approver to let the apply through when a freeze refuses it. An empty override
+// asks for nothing.
+func CallApplyAPIWithOverride(endpoint, planID, environment, caller, target string, rendersRollout bool, override string, options map[string]string) (*apitypes.ApplyResponse, error) {
 	req := apitypes.ApplyRequest{
 		PlanID:         planID,
 		Environment:    environment,
@@ -359,6 +372,7 @@ func CallApplyAPIForTarget(endpoint, planID, environment, caller, target string,
 		Options:        options,
 		Target:         target,
 		RendersRollout: rendersRollout,
+		Override:       strings.TrimSpace(override),
 	}
 	var result apitypes.ApplyResponse
 	if err := doPostInto(endpoint, "/api/apply", req, &result); err != nil {
@@ -370,8 +384,8 @@ func CallApplyAPIForTarget(endpoint, planID, environment, caller, target string,
 // callControlAPI posts an apply-scoped control request to path and decodes the
 // typed response. Control operations share the same ControlRequest body and
 // differ only by endpoint path and response type.
-func callControlAPI[Resp any](endpoint, path, environment, applyID string) (*Resp, error) {
-	req := apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
+func callControlAPI[Resp any](endpoint, path, environment, applyID, override string) (*Resp, error) {
+	req := apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner(), Override: strings.TrimSpace(override)}
 	var result Resp
 	if err := doPostInto(endpoint, path, req, &result); err != nil {
 		return nil, err
@@ -381,7 +395,13 @@ func callControlAPI[Resp any](endpoint, path, environment, applyID string) (*Res
 
 // CallCutoverAPI calls the cutover API and returns the typed result.
 func CallCutoverAPI(endpoint, environment, applyID string) (*apitypes.ControlResponse, error) {
-	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/cutover", environment, applyID)
+	return CallCutoverAPIWithOverride(endpoint, environment, applyID, "")
+}
+
+// CallCutoverAPIWithOverride is CallCutoverAPI that also gives an override reason
+// to let the cutover through when a freeze refuses it.
+func CallCutoverAPIWithOverride(endpoint, environment, applyID, override string) (*apitypes.ControlResponse, error) {
+	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/cutover", environment, applyID, override)
 }
 
 // GetProgress fetches progress for a schema change by apply ID.
@@ -398,11 +418,20 @@ func GetProgressCtx(ctx context.Context, endpoint, applyID string) (*apitypes.Pr
 	return &result, nil
 }
 
-// GetDatabaseHistory fetches the apply history for a database.
-func GetDatabaseHistory(endpoint, database, environment string) (*apitypes.DatabaseHistoryResponse, error) {
+// GetDatabaseHistory fetches one page of a database's apply history, newest
+// first. after names the last apply of the previous page; empty fetches the
+// first page.
+func GetDatabaseHistory(endpoint, database, environment, after string) (*apitypes.DatabaseHistoryResponse, error) {
 	path := fmt.Sprintf("/api/history/%s", database)
+	values := url.Values{}
 	if environment != "" {
-		path += "?environment=" + environment
+		values.Set("environment", environment)
+	}
+	if after != "" {
+		values.Set("starting_after", after)
+	}
+	if encoded := values.Encode(); encoded != "" {
+		path += "?" + encoded
 	}
 	var result apitypes.DatabaseHistoryResponse
 	if err := doGetInto(endpoint, path, &result); err != nil {
@@ -637,32 +666,38 @@ func isSchemaFile(name string) bool {
 
 // CallStopAPI calls the stop API and returns the typed result.
 func CallStopAPI(endpoint, environment, applyID string) (*apitypes.StopResponse, error) {
-	return callControlAPI[apitypes.StopResponse](endpoint, "/api/stop", environment, applyID)
+	return callControlAPI[apitypes.StopResponse](endpoint, "/api/stop", environment, applyID, "")
 }
 
 // CallCancelAPI calls the cancel API and returns the typed result.
 func CallCancelAPI(endpoint, environment, applyID string) (*apitypes.CancelResponse, error) {
-	return callControlAPI[apitypes.CancelResponse](endpoint, "/api/cancel", environment, applyID)
+	return callControlAPI[apitypes.CancelResponse](endpoint, "/api/cancel", environment, applyID, "")
 }
 
 // CallStartAPI calls the start API and returns the typed result.
 func CallStartAPI(endpoint, environment, applyID string) (*apitypes.StartResponse, error) {
-	return callControlAPI[apitypes.StartResponse](endpoint, "/api/start", environment, applyID)
+	return CallStartAPIWithOverride(endpoint, environment, applyID, "")
+}
+
+// CallStartAPIWithOverride is CallStartAPI that also gives an override reason to
+// let the start through when a freeze refuses it.
+func CallStartAPIWithOverride(endpoint, environment, applyID, override string) (*apitypes.StartResponse, error) {
+	return callControlAPI[apitypes.StartResponse](endpoint, "/api/start", environment, applyID, override)
 }
 
 // CallReleaseAPI calls the release API and returns the typed result.
 func CallReleaseAPI(endpoint, environment, applyID string) (*apitypes.ReleaseResponse, error) {
-	return callControlAPI[apitypes.ReleaseResponse](endpoint, "/api/release", environment, applyID)
+	return callControlAPI[apitypes.ReleaseResponse](endpoint, "/api/release", environment, applyID, "")
 }
 
 // CallRevertAPI calls the revert API and returns the typed result.
 func CallRevertAPI(endpoint, environment, applyID string) (*apitypes.ControlResponse, error) {
-	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/revert", environment, applyID)
+	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/revert", environment, applyID, "")
 }
 
 // CallSkipRevertAPI calls the skip-revert API and returns the typed result.
 func CallSkipRevertAPI(endpoint, environment, applyID string) (*apitypes.ControlResponse, error) {
-	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/skip-revert", environment, applyID)
+	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/skip-revert", environment, applyID, "")
 }
 
 // ExitWithJSON outputs a JSON error response and exits with code 1.
@@ -683,6 +718,9 @@ func ExitWithJSON(code, message string) error {
 
 // LockInfo represents lock information returned from the API.
 type LockInfo struct {
+	// ID identifies the lock row. It is zero from a server that does not
+	// report it.
+	ID           int64     `json:"id"`
 	Database     string    `json:"database"`
 	DatabaseType string    `json:"database_type"`
 	Owner        string    `json:"owner"`
@@ -819,6 +857,55 @@ func ReleaseLock(endpoint, database, dbType, owner string) error {
 	return err
 }
 
+// ReleaseLockIfUnused releases the lock row id, the row a lock acquire
+// reported, under owner, only while no apply that can still change runs under
+// it. It returns ErrLockNotFound when no lock is held, ErrLockReplaced when a
+// different lock now holds the database, ErrLockNotOwned when the row is held
+// under another owner, and a *LockInUseError naming the apply that kept the
+// lock. Every refusal leaves the lock held now as it is.
+func ReleaseLockIfUnused(endpoint, database, dbType, owner string, id int64) error {
+	err := doSendBody(endpoint, http.MethodDelete, "/api/locks", map[string]any{
+		"database":      database,
+		"database_type": dbType,
+		"owner":         owner,
+		"id":            id,
+	})
+	apiErr, ok := errors.AsType[*APIError](err)
+	if !ok {
+		return err
+	}
+	switch {
+	case apiErr.Status == http.StatusForbidden && apiErr.ErrorCode == apitypes.ErrCodeLockNotOwned:
+		return ErrLockNotOwned
+	case apiErr.Status == http.StatusNotFound:
+		return ErrLockNotFound
+	case apiErr.Status == http.StatusConflict && apiErr.ErrorCode == apitypes.ErrCodeLockReplaced:
+		return ErrLockReplaced
+	case apiErr.Status == http.StatusConflict && apiErr.ErrorCode == apitypes.ErrCodeLockInUse:
+		inUse := &LockInUseError{}
+		if apiErr.LockHolder != nil {
+			inUse.Holder = *apiErr.LockHolder
+		}
+		return inUse
+	default:
+		return err
+	}
+}
+
+// LockInUseError is a release that kept the lock because an apply that can
+// still change runs under it. Holder names that apply; it is empty when the
+// server did not name it.
+type LockInUseError struct {
+	Holder apitypes.LockHolder
+}
+
+func (e *LockInUseError) Error() string {
+	if e.Holder.ApplyID == "" {
+		return "lock is in use by an apply"
+	}
+	return fmt.Sprintf("lock is in use by apply %s (%s)", e.Holder.ApplyID, e.Holder.State)
+}
+
 // ForceReleaseLock releases a lock regardless of owner (admin override).
 func ForceReleaseLock(endpoint, database, dbType string) error {
 	err := doSendBody(endpoint, http.MethodDelete, "/api/locks", map[string]any{
@@ -864,6 +951,7 @@ var (
 	ErrLockHeld     = fmt.Errorf("lock is already held by another owner")
 	ErrLockNotOwned = fmt.Errorf("lock is not owned by you")
 	ErrLockNotFound = fmt.Errorf("lock not found")
+	ErrLockReplaced = fmt.Errorf("lock was released and taken again since")
 )
 
 // StatusOptions controls the status list request.
@@ -1020,6 +1108,11 @@ func (scope LogScope) setQuery(values url.Values) {
 // scope narrows the read to one target or shard. The response carries the
 // newest limit entries plus whether older ones exist beyond the window.
 func GetLogs(endpoint, database, environment, applyID string, scope LogScope, limit int) (*apitypes.LogsResponse, error) {
+	return GetLogsCtx(context.Background(), endpoint, database, environment, applyID, scope, limit)
+}
+
+// GetLogsCtx is like GetLogs but accepts a context for timeout/cancellation control.
+func GetLogsCtx(ctx context.Context, endpoint, database, environment, applyID string, scope LogScope, limit int) (*apitypes.LogsResponse, error) {
 	if database == "" && applyID == "" {
 		return nil, fmt.Errorf("database or apply_id is required")
 	}
@@ -1045,7 +1138,7 @@ func GetLogs(endpoint, database, environment, applyID string, scope LogScope, li
 	}
 
 	var result apitypes.LogsResponse
-	if err := doGetInto(endpoint, path, &result); err != nil {
+	if err := doGetIntoCtx(ctx, endpoint, path, &result); err != nil {
 		return nil, err
 	}
 	if err := scope.requireEchoed(result.Target, result.Shard); err != nil {
@@ -1079,6 +1172,11 @@ func requireEchoedScope(kind, flag, requested, echoed string) error {
 // one source per remote read. scope keeps only the sources of one target or
 // shard, and each source's entries for it.
 func GetDeploymentLogs(endpoint, applyID, deployment string, scope LogScope, limit int) (*apitypes.DeploymentLogsResponse, error) {
+	return GetDeploymentLogsCtx(context.Background(), endpoint, applyID, deployment, scope, limit)
+}
+
+// GetDeploymentLogsCtx is like GetDeploymentLogs but accepts a context for timeout/cancellation control.
+func GetDeploymentLogsCtx(ctx context.Context, endpoint, applyID, deployment string, scope LogScope, limit int) (*apitypes.DeploymentLogsResponse, error) {
 	values := url.Values{}
 	values.Set("apply_id", applyID)
 	values.Set("deployment", deployment)
@@ -1087,7 +1185,7 @@ func GetDeploymentLogs(endpoint, applyID, deployment string, scope LogScope, lim
 		values.Set("limit", strconv.Itoa(limit))
 	}
 	var result apitypes.DeploymentLogsResponse
-	if err := doGetInto(endpoint, "/api/logs?"+values.Encode(), &result); err != nil {
+	if err := doGetIntoCtx(ctx, endpoint, "/api/logs?"+values.Encode(), &result); err != nil {
 		return nil, err
 	}
 	if err := scope.requireEchoed(result.Target, result.Shard); err != nil {

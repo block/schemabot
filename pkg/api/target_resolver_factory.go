@@ -324,21 +324,25 @@ func buildCredentialResolver(ctx context.Context, cfg EtreCredentialsConfig, dec
 		if err := awscreds.ValidateRegions(cfg.Region, cfg.ReachableRegions); err != nil {
 			return nil, fmt.Errorf("target_resolver.etre.credentials: %w", err)
 		}
+		if err := awscreds.ValidateSecretsManagerEndpoints(cfg.Region, cfg.ReachableRegions, cfg.SecretsManagerEndpoints); err != nil {
+			return nil, fmt.Errorf("target_resolver.etre.credentials.secrets_manager_endpoints: %w", err)
+		}
 		awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("load AWS config for target_resolver.etre.credentials: %w", err)
 		}
 		resolver, err := awscreds.New(awscreds.Config{
-			AWSConfig:        awsCfg,
-			Region:           cfg.Region,
-			RegionAttribute:  cfg.RegionAttribute,
-			ReachableRegions: cfg.ReachableRegions,
-			RoleARN:          cfg.RoleARN,
-			ExternalID:       cfg.ExternalID,
-			SecretName:       cfg.SecretName,
-			AccountAttribute: cfg.AccountAttribute,
-			Username:         cfg.Username,
-			Decode:           decode,
+			AWSConfig:               awsCfg,
+			Region:                  cfg.Region,
+			RegionAttribute:         cfg.RegionAttribute,
+			ReachableRegions:        cfg.ReachableRegions,
+			SecretsManagerEndpoints: cfg.SecretsManagerEndpoints,
+			RoleARN:                 cfg.RoleARN,
+			ExternalID:              cfg.ExternalID,
+			SecretName:              cfg.SecretName,
+			AccountAttribute:        cfg.AccountAttribute,
+			Username:                cfg.Username,
+			Decode:                  decode,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("build target_resolver.etre.credentials awssm resolver: %w", err)

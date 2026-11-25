@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -153,7 +154,7 @@ func TestCheckPriorEnvViaLocalReturnsStorageError(t *testing.T) {
 		assert.NotContains(t, body, "storage read failed",
 			"raw error text must never render in PR markdown")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for fail-closed comment")
+		require.FailNow(t, "timed out waiting for fail-closed comment")
 	}
 }
 
@@ -199,7 +200,7 @@ func TestCheckPriorEnvViaLocalDurableAttemptSuppressesErrorComment(t *testing.T)
 
 	select {
 	case body := <-comments:
-		t.Fatalf("no comment should be posted when retry comments are suppressed, got: %s", body)
+		require.FailNow(t, fmt.Sprintf("no comment should be posted when retry comments are suppressed, got: %s", body))
 	case <-time.After(200 * time.Millisecond):
 	}
 }
@@ -251,7 +252,7 @@ func TestCheckPriorEnvViaLocalMissingCheckBlocksWithActionableGuidance(t *testin
 		assert.Contains(t, body, "schemabot plan -e staging")
 		assert.NotContains(t, body, "Retry the apply command")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for missing-check comment")
+		require.FailNow(t, "timed out waiting for missing-check comment")
 	}
 }
 
@@ -303,7 +304,7 @@ func TestCheckPriorEnvViaLocalRetriesBeforeFailClosed(t *testing.T) {
 
 	select {
 	case body := <-comments:
-		t.Fatalf("unexpected comment posted: %s", body)
+		require.FailNow(t, fmt.Sprintf("unexpected comment posted: %s", body))
 	default:
 	}
 }
@@ -386,7 +387,7 @@ func TestCheckPriorEnvViaLocalRequiresCheckOnPRHead(t *testing.T) {
 			assert.Contains(t, body, "schemabot plan -e staging")
 			assert.NotContains(t, body, "could not find a completed")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for earlier-commit block comment")
+			require.FailNow(t, "timed out waiting for earlier-commit block comment")
 		}
 	})
 
@@ -417,7 +418,7 @@ func TestCheckPriorEnvViaLocalRequiresCheckOnPRHead(t *testing.T) {
 				assert.NotContains(t, body, tc.outcome,
 					"the outcome recorded for another commit is not the reason to give")
 			case <-time.After(2 * time.Second):
-				t.Fatal("timed out waiting for earlier-commit block comment")
+				require.FailNow(t, "timed out waiting for earlier-commit block comment")
 			}
 		})
 	}
@@ -439,7 +440,7 @@ func TestCheckPriorEnvViaLocalRequiresCheckOnPRHead(t *testing.T) {
 			assert.NotContains(t, body, "recorded on commit")
 			assert.NotContains(t, body, "schemabot plan -e staging")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for in-progress block comment")
+			require.FailNow(t, "timed out waiting for in-progress block comment")
 		}
 	})
 
@@ -458,7 +459,7 @@ func TestCheckPriorEnvViaLocalRequiresCheckOnPRHead(t *testing.T) {
 			assert.Contains(t, body, "Staging failed. Fix the issue and re-apply staging before applying to production.")
 			assert.NotContains(t, body, "recorded on commit")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for failed-prior-environment block comment")
+			require.FailNow(t, "timed out waiting for failed-prior-environment block comment")
 		}
 	})
 
@@ -472,7 +473,7 @@ func TestCheckPriorEnvViaLocalRequiresCheckOnPRHead(t *testing.T) {
 
 		select {
 		case body := <-comments:
-			t.Fatalf("unexpected comment posted: %s", body)
+			require.FailNow(t, fmt.Sprintf("unexpected comment posted: %s", body))
 		default:
 		}
 	})
@@ -487,7 +488,7 @@ func TestCheckPriorEnvViaLocalRequiresCheckOnPRHead(t *testing.T) {
 
 		select {
 		case body := <-comments:
-			t.Fatalf("unexpected comment posted: %s", body)
+			require.FailNow(t, fmt.Sprintf("unexpected comment posted: %s", body))
 		default:
 		}
 	})
@@ -505,7 +506,7 @@ func TestCheckPriorEnvViaLocalRequiresCheckOnPRHead(t *testing.T) {
 		case body := <-comments:
 			assert.Contains(t, body, "Could not verify staging status: failed to resolve the PR head commit.")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for fail-closed comment")
+			require.FailNow(t, "timed out waiting for fail-closed comment")
 		}
 	})
 
@@ -522,7 +523,7 @@ func TestCheckPriorEnvViaLocalRequiresCheckOnPRHead(t *testing.T) {
 
 		select {
 		case body := <-comments:
-			t.Fatalf("no comment should be posted when retry comments are suppressed, got: %s", body)
+			require.FailNow(t, fmt.Sprintf("no comment should be posted when retry comments are suppressed, got: %s", body))
 		case <-time.After(200 * time.Millisecond):
 		}
 	})
@@ -596,13 +597,13 @@ func TestCheckPriorEnvironmentsWithProductionOnlyServerConfigChecksStaging(t *te
 	select {
 	case <-checkRunRequests:
 	case <-time.After(2 * time.Second):
-		t.Fatal("expected staging GitHub check lookup")
+		require.FailNow(t, "expected staging GitHub check lookup")
 	}
 	select {
 	case body := <-comments:
 		assert.Contains(t, body, "staging")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for staging block comment")
+		require.FailNow(t, "timed out waiting for staging block comment")
 	}
 
 	schemaResult := &ghclient.SchemaRequestResult{Database: "orders", Type: "mysql"}
@@ -617,13 +618,13 @@ func TestCheckPriorEnvironmentsWithProductionOnlyServerConfigChecksStaging(t *te
 	select {
 	case <-checkRunRequests:
 	case <-time.After(2 * time.Second):
-		t.Fatal("expected staging GitHub check lookup")
+		require.FailNow(t, "expected staging GitHub check lookup")
 	}
 	select {
 	case body := <-comments:
 		assert.Contains(t, body, "staging")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for staging block comment")
+		require.FailNow(t, "timed out waiting for staging block comment")
 	}
 }
 
@@ -719,7 +720,7 @@ func TestCheckPriorEnvironmentsWithDatabaseOverrideGatesOnOverrideOrder(t *testi
 		case name := <-checkRunLookups:
 			assert.Equal(t, checkName, name, "gate must look up the override's prior environment check")
 		case <-time.After(2 * time.Second):
-			t.Fatalf("expected GitHub check lookup for %s", checkName)
+			require.FailNow(t, fmt.Sprintf("expected GitHub check lookup for %s", checkName))
 		}
 	}
 	select {
@@ -728,7 +729,7 @@ func TestCheckPriorEnvironmentsWithDatabaseOverrideGatesOnOverrideOrder(t *testi
 		assert.Contains(t, body, "Apply sandbox first")
 		assert.NotContains(t, body, "staging")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for sandbox block comment")
+		require.FailNow(t, "timed out waiting for sandbox block comment")
 	}
 
 	// An apply targeting an environment absent from the override fails closed
@@ -743,11 +744,11 @@ func TestCheckPriorEnvironmentsWithDatabaseOverrideGatesOnOverrideOrder(t *testi
 		assert.Contains(t, body, "`staging` is not in the configured promotion order")
 		assert.Contains(t, body, "Configured promotion order: `qa` → `sandbox` → `production`")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for unlisted-environment block comment")
+		require.FailNow(t, "timed out waiting for unlisted-environment block comment")
 	}
 	select {
 	case name := <-checkRunLookups:
-		t.Fatalf("unlisted-environment guard must fail closed before any GitHub check lookup, got lookup for %s", name)
+		require.FailNow(t, fmt.Sprintf("unlisted-environment guard must fail closed before any GitHub check lookup, got lookup for %s", name))
 	default:
 	}
 }
@@ -841,7 +842,7 @@ func TestCheckPriorEnvironmentsCrossDeploymentAppTrust(t *testing.T) {
 		assert.False(t, blocked, "a passing staging aggregate check from the trusted staging deployment App must allow production apply")
 		select {
 		case body := <-comments:
-			t.Fatalf("unexpected comment posted: %s", body)
+			require.FailNow(t, fmt.Sprintf("unexpected comment posted: %s", body))
 		default:
 		}
 	})
@@ -863,7 +864,7 @@ func TestCheckPriorEnvironmentsCrossDeploymentAppTrust(t *testing.T) {
 			assert.Contains(t, body, "trusted-check-app-slugs")
 			assert.NotContains(t, body, "could not find a completed `staging` check")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for staging block comment")
+			require.FailNow(t, "timed out waiting for staging block comment")
 		}
 	})
 }
@@ -942,7 +943,7 @@ func TestCheckPriorEnvironmentsScopedTargetMissingFromOrderFailsClosed(t *testin
 		assert.Contains(t, body, "environment_order")
 		assert.Contains(t, body, "`staging` → `production`")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for unlisted-environment config error comment")
+		require.FailNow(t, "timed out waiting for unlisted-environment config error comment")
 	}
 
 	dp := requirePromotionConfigErrorBlockDataPoint(t, reader)
@@ -973,7 +974,7 @@ func requirePromotionConfigErrorBlockDataPoint(t *testing.T, reader *sdkmetric.M
 		}
 	}
 
-	t.Fatal("schemabot.promotion.config_error_blocks_total metric not found")
+	require.FailNow(t, "schemabot.promotion.config_error_blocks_total metric not found")
 	return metricdata.DataPoint[int64]{}
 }
 
@@ -1054,7 +1055,7 @@ func TestCheckPriorEnvironmentsScopedTargetInOrderAllowsApply(t *testing.T) {
 
 	select {
 	case body := <-comments:
-		t.Fatalf("unexpected comment posted: %s", body)
+		require.FailNow(t, fmt.Sprintf("unexpected comment posted: %s", body))
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -1141,7 +1142,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 
 		select {
 		case body := <-comments:
-			t.Fatalf("unexpected comment posted: %s", body)
+			require.FailNow(t, fmt.Sprintf("unexpected comment posted: %s", body))
 		default:
 		}
 	})
@@ -1157,7 +1158,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 
 		select {
 		case body := <-comments:
-			t.Fatalf("unexpected comment posted: %s", body)
+			require.FailNow(t, fmt.Sprintf("unexpected comment posted: %s", body))
 		default:
 		}
 	})
@@ -1182,7 +1183,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 
 		select {
 		case body := <-comments:
-			t.Fatalf("unexpected comment posted: %s", body)
+			require.FailNow(t, fmt.Sprintf("unexpected comment posted: %s", body))
 		default:
 		}
 	})
@@ -1250,7 +1251,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 				assert.Contains(t, body, tc.want)
 				assert.NotContains(t, body, tc.notWant)
 			default:
-				t.Fatal("expected a comment explaining the blocked apply")
+				require.FailNow(t, "expected a comment explaining the blocked apply")
 			}
 		})
 	}
@@ -1269,7 +1270,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			assert.Contains(t, body, "schemabot plan -e staging")
 			assert.NotContains(t, body, "Retry the apply command")
 		default:
-			t.Fatal("expected a comment explaining the missing prior environment check")
+			require.FailNow(t, "expected a comment explaining the missing prior environment check")
 		}
 	})
 
@@ -1307,7 +1308,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			assert.Contains(t, body, "will not resolve this")
 			assert.NotContains(t, body, "could not find a completed `staging` check")
 		default:
-			t.Fatal("expected a comment explaining the untrusted prior environment check")
+			require.FailNow(t, "expected a comment explaining the untrusted prior environment check")
 		}
 	})
 
@@ -1362,7 +1363,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			assert.Contains(t, body, "Apply Blocked")
 			assert.Contains(t, body, "staging")
 		default:
-			t.Fatal("expected a comment explaining the verification failure")
+			require.FailNow(t, "expected a comment explaining the verification failure")
 		}
 	})
 
@@ -1422,7 +1423,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 
 		select {
 		case body := <-comments:
-			t.Fatalf("unexpected comment posted: %s", body)
+			require.FailNow(t, fmt.Sprintf("unexpected comment posted: %s", body))
 		default:
 		}
 	})
@@ -1474,7 +1475,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			assert.Contains(t, body, "Apply Blocked")
 			assert.Contains(t, body, "staging")
 		default:
-			t.Fatal("expected a comment explaining the API failure")
+			require.FailNow(t, "expected a comment explaining the API failure")
 		}
 	})
 }

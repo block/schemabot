@@ -29,6 +29,12 @@ type LockReleaseRequest struct {
 	DatabaseType string `json:"database_type"`
 	Owner        string `json:"owner,omitempty"`
 	Force        bool   `json:"force,omitempty"`
+	// ID pins the release to the lock row a lock acquire reported. With it the
+	// release deletes only that row, and only while no apply that can still
+	// change records the row as its lock; a lock released and taken again
+	// since, even under the same owner, is left held. Without it the release
+	// is by owner. A supplied ID below 1 is refused rather than read as absent.
+	ID *int64 `json:"id,omitempty"`
 }
 
 // LockResponse is the response for lock operations.
@@ -42,6 +48,9 @@ type LockResponse struct {
 
 // LockInfo represents lock information in API responses.
 type LockInfo struct {
+	// ID identifies the lock row. A release that sends it removes only this
+	// row, never a lock taken again under the same owner since.
+	ID           int64  `json:"id,omitempty"`
 	Database     string `json:"database"`
 	DatabaseType string `json:"database_type"`
 	Owner        string `json:"owner"`
@@ -275,6 +284,14 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "database and database_type are required")
 		return
 	}
+	if req.ID != nil && *req.ID < 1 {
+		s.writeError(w, http.StatusBadRequest, "id must be the positive lock ID a lock acquire reported")
+		return
+	}
+	if req.Force && req.ID != nil {
+		s.writeError(w, http.StatusBadRequest, "id cannot be combined with force: a forced release removes whichever lock is held")
+		return
+	}
 
 	// Force release bypasses the lock ownership check, so it is an
 	// administrative override rather than an operator control on the caller's
@@ -332,6 +349,10 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 		s.releaseScopedLock(w, r, req)
 		return
 	}
+	if req.ID != nil {
+		s.releaseLockRowIfUnused(w, r, req)
+		return
+	}
 
 	err := s.storage.Locks().Release(ctx, req.Database, req.DatabaseType, req.Owner)
 	if errors.Is(err, storage.ErrLockNotFound) {
@@ -385,7 +406,9 @@ func holdsLockByOwnerAlone(reason string) bool {
 // row, and then deletes only that row (ReleaseByID). The acquirer never
 // changes under a row ID, so the decision cannot go stale between the read and
 // the delete; a lock released and acquired again in between is reported, and
-// the new lock is left held.
+// the new lock is left held. A release that names a lock row (req.ID) is
+// refused unless that row is the lock read, and is then carried out by
+// releaseLockRowIfUnused, so it also keeps a lock an apply still runs under.
 func (s *Service) releaseScopedLock(w http.ResponseWriter, r *http.Request, req LockReleaseRequest) {
 	ctx := r.Context()
 	user := auth.UserFromContext(ctx)
@@ -415,6 +438,10 @@ func (s *Service) releaseScopedLock(w http.ResponseWriter, r *http.Request, req 
 		"repository", lock.Repository, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
 		"owner", lock.Owner, "subject", subject,
 	}
+	if req.ID != nil && lock.ID != *req.ID {
+		s.writeLockReplaced(w, r, req, lockReplacedReasonRetaken, append(logAttrs, "lock_id", *req.ID, "held_lock_id", lock.ID))
+		return
+	}
 	if lock.Owner != req.Owner {
 		metrics.RecordLockOperation(ctx, "release", req.Database, "not_owned")
 		s.logger.Warn("scoped lock release refused: the lock is held under another owner",
@@ -433,6 +460,10 @@ func (s *Service) releaseScopedLock(w http.ResponseWriter, r *http.Request, req 
 		}
 		s.logger.Warn("scoped lock release refused: the lock does not belong to any of the caller's operator groups; the lock stays held", attrs...)
 		s.writeError(w, http.StatusForbidden, s.scopedLockDenialMessage("lock_release", "releasing", lock, refusal))
+		return
+	}
+	if req.ID != nil {
+		s.releaseLockRowIfUnused(w, r, req)
 		return
 	}
 
@@ -466,6 +497,102 @@ func (s *Service) releaseScopedLock(w http.ResponseWriter, r *http.Request, req 
 	metrics.RecordLockOperation(ctx, "release", req.Database, "success")
 	s.logger.Info("scoped lock release released the lock", logAttrs...)
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "released"})
+}
+
+// releaseLockRowIfUnused releases the lock row req.ID names, under req.Owner,
+// only while no apply that can still change records that row as its lock. An
+// owner string is shared by every command one account runs on one host, so a
+// command that took a row cannot tell from the owner alone whether another of
+// its commands reused that row for an apply, or whether the row was released
+// and taken again under the same owner since; the row ID and the apply check
+// tell both. The lock API's acquire records no pending plan, so a row that
+// carries one was acquired again for a plan since and is reported replaced.
+// Every refusal leaves whatever lock is held as it is.
+func (s *Service) releaseLockRowIfUnused(w http.ResponseWriter, r *http.Request, req LockReleaseRequest) {
+	ctx := r.Context()
+	logAttrs := []any{
+		"database", req.Database, "database_type", req.DatabaseType, "owner", req.Owner, "lock_id", *req.ID,
+	}
+	err := s.storage.Locks().ReleaseByIDIfUnused(ctx, *req.ID, req.Database, req.DatabaseType, req.Owner, "")
+	if errors.Is(err, storage.ErrLockInUse) {
+		s.writeLockInUse(w, r, req, err, logAttrs)
+		return
+	}
+	if errors.Is(err, storage.ErrLockReplaced) {
+		s.writeLockReplaced(w, r, req, lockReplacedReasonRetaken, append(logAttrs, "error", err))
+		return
+	}
+	if errors.Is(err, storage.ErrLockIntentChanged) {
+		s.writeLockReplaced(w, r, req, lockReplacedReasonPlanPinned, append(logAttrs, "error", err))
+		return
+	}
+	if errors.Is(err, storage.ErrLockNotFound) {
+		metrics.RecordLockOperation(ctx, "release", req.Database, "not_found")
+		s.logger.Info("lock release pinned to a lock row found no lock held; nothing was released", logAttrs...)
+		s.writeError(w, http.StatusNotFound, "lock not found")
+		return
+	}
+	if errors.Is(err, storage.ErrLockNotOwned) {
+		metrics.RecordLockOperation(ctx, "release", req.Database, "not_owned")
+		s.logger.Warn("lock release pinned to a lock row refused: the row is held under another owner; the lock stays held", logAttrs...)
+		s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeLockNotOwned, "lock is not owned by you")
+		return
+	}
+	if err != nil {
+		metrics.RecordLockOperation(ctx, "release", req.Database, "error")
+		s.logger.Error("lock release pinned to a lock row failed; the lock may still be held", append(logAttrs, "error", err)...)
+		s.writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	metrics.RecordLockOperation(ctx, "release", req.Database, "success")
+	s.logger.Info("lock release pinned to a lock row released the lock", logAttrs...)
+	s.writeJSON(w, http.StatusOK, map[string]string{"status": "released"})
+}
+
+// writeLockInUse answers a release pinned to a lock row that kept the lock
+// because an apply that can still change records the row as its lock. err
+// matches storage.ErrLockInUse; the apply it names is returned so the caller
+// can tell the operator which apply holds the lock.
+func (s *Service) writeLockInUse(w http.ResponseWriter, r *http.Request, req LockReleaseRequest, err error, logAttrs []any) {
+	ctx := r.Context()
+	metrics.RecordLockOperation(ctx, "release", req.Database, "in_use")
+	inUse, ok := errors.AsType[*storage.LockInUseError](err)
+	if !ok {
+		s.logger.Warn("lock release pinned to a lock row kept the lock: an apply records the row as its lock, and storage did not name it",
+			append(logAttrs, "error", err)...)
+		s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeLockInUse,
+			fmt.Sprintf("lock on database %q was kept: an apply that can still change runs under it; nothing was released", req.Database))
+		return
+	}
+	apply := inUse.Apply
+	s.logger.Info("lock release pinned to a lock row kept the lock: an apply that can still change records the row as its lock",
+		append(apply.LogAttrs(), "owner", req.Owner, "lock_id", *req.ID)...)
+	s.writeJSON(w, http.StatusConflict, apitypes.ErrorResponse{
+		Error: fmt.Sprintf("lock on database %q was kept: apply %s (%s) runs under it; nothing was released",
+			req.Database, apply.ApplyIdentifier, apply.State),
+		ErrorCode:  apitypes.ErrCodeLockInUse,
+		LockHolder: &apitypes.LockHolder{ApplyID: apply.ApplyIdentifier, State: apply.State, Environment: apply.Environment},
+	})
+}
+
+// Reasons a release pinned to a lock row finds the lock is no longer the one
+// it named.
+const (
+	lockReplacedReasonRetaken    = "it was released and taken again since"
+	lockReplacedReasonPlanPinned = "a plan was pinned to it since"
+)
+
+// writeLockReplaced answers a release pinned to a lock row that found the
+// lock is no longer the one the caller named: the row was released and the
+// lock taken again since, possibly under the same owner, or a plan was pinned
+// to the row. reason says which, so nothing was released.
+func (s *Service) writeLockReplaced(w http.ResponseWriter, r *http.Request, req LockReleaseRequest, reason string, logAttrs []any) {
+	ctx := r.Context()
+	metrics.RecordLockOperation(ctx, "release", req.Database, "conflict")
+	s.logger.Warn("lock release pinned to a lock row refused: the lock is no longer the one it named; the lock held now stays held",
+		append(logAttrs, "reason", reason)...)
+	s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeLockReplaced,
+		fmt.Sprintf("lock on database %q is no longer the lock this release named: %s; nothing was released", req.Database, reason))
 }
 
 // scopedLockRefusal reports why a scoped operator holding callerGroups (their
@@ -617,6 +744,7 @@ func (c *ServerConfig) lockAcquirer(ctx context.Context, database string) (*stor
 // lockToInfo converts a storage.Lock to an API LockInfo.
 func lockToInfo(lock *storage.Lock) *LockInfo {
 	info := &LockInfo{
+		ID:           lock.ID,
 		Database:     lock.DatabaseName,
 		DatabaseType: lock.DatabaseType,
 		Owner:        lock.Owner,

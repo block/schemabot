@@ -218,6 +218,9 @@ func TestPlans(t *testing.T, h Harness) {
 			Operation:    "alter",
 			IsUnsafe:     true,
 			UnsafeReason: "DROP COLUMN removes data",
+			// The engine's plan-time record must survive storage, since the
+			// apply reads it back from the stored plan.
+			Metadata: map[string]string{"reviewed_drop": `{"kind":"column","name":"email"}`},
 		}
 		planID, err := store.Plans().Create(ctx, &storage.Plan{
 			PlanIdentifier: "plan_shards",
@@ -363,6 +366,45 @@ func TestPlans(t *testing.T, h Harness) {
 		require.Contains(t, got.Namespaces, "commerce")
 		assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, got.Namespaces["commerce"].IgnoreTables)
 		assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, got.IgnoreTables(),
+			"the re-plan reads the union across namespaces")
+	})
+
+	t.Run("RoundTripsDropTables", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// A table the plan's drop_tables config named is dropped although no
+		// schema file declares it, so a re-plan that did not know about the
+		// list would not propose the reviewed DROP TABLE. The record must
+		// survive the round-trip for a rollback, a resume, or a member's drift
+		// check to be asked to drop the same tables.
+		plan := &storage.Plan{
+			PlanIdentifier: "plan_drop_tables",
+			Database:       "commerce",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Repository:     "org/repo",
+			PullRequest:    123,
+			Environment:    "staging",
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce": {
+					Tables: []storage.TableChange{{Namespace: "commerce", Table: "_users_old", Operation: "drop"}},
+				},
+				"billing": {
+					Tables: []storage.TableChange{{Namespace: "billing", Table: "invoices", Operation: "alter"}},
+				},
+			},
+			CreatedAt: time.Now().UTC().Truncate(time.Second),
+		}
+		plan.RecordDropTables([]string{"_users_old", "_invoices_old"})
+		_, err := store.Plans().Create(ctx, plan)
+		require.NoError(t, err)
+
+		got, err := store.Plans().Get(ctx, "plan_drop_tables")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		require.Contains(t, got.Namespaces, "billing")
+		assert.Equal(t, []string{"_invoices_old", "_users_old"}, got.Namespaces["billing"].DropTables)
+		assert.Equal(t, []string{"_invoices_old", "_users_old"}, got.DropTables(),
 			"the re-plan reads the union across namespaces")
 	})
 

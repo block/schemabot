@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -110,7 +111,7 @@ func runListenOnlyAutoPlan(t *testing.T, allowedEnvironments, environmentDirecto
 		AllowedEnvironments: allowedEnvironments,
 		Repos:               map[string]api.RepoConfig{"octocat/hello-world": {ListenOnly: true}},
 	}, nil, logger)
-	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")}, nil, logger)
+	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")}, nil, logger, WithInsecureSkipSignatureVerification())
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "synchronize", beforeSHA: "oldsha", headSHA: "abc123"}, nil))
@@ -164,7 +165,7 @@ func findLogEntry(t *testing.T, logs *bytes.Buffer, msg string) map[string]any {
 			return entry
 		}
 	}
-	t.Fatalf("no log entry %q in:\n%s", msg, logs.String())
+	require.FailNow(t, fmt.Sprintf("no log entry %q in:\n%s", msg, logs.String()))
 	return nil
 }
 

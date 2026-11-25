@@ -3,17 +3,18 @@ package commands
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
 )
 
 // CutoverCmd triggers cutover for a deferred schema change.
 type CutoverCmd struct {
 	ControlFlags
-	Watch bool `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
+	Watch    bool   `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
+	Override string `help:"Why this change can't wait. It lets the change through a freeze, or asks a freeze approver to, as the server's override policy says" name:"override"`
 }
 
 // Run executes the cutover command.
@@ -37,7 +38,7 @@ func (cmd *CutoverCmd) Run(ctx context.Context, g *Globals) error {
 		populateControlDisplayFields(&cmd.Database, result)
 		if state.IsState(result.State, state.Apply.Completed) {
 			fmt.Println("✓ Schema change already complete")
-			tables := ddl.FilterInternalTablesTyped(result.Tables)
+			tables := result.Tables
 			if len(tables) > 0 {
 				fmt.Println("Tables:")
 				for _, tbl := range tables {
@@ -54,9 +55,10 @@ func (cmd *CutoverCmd) Run(ctx context.Context, g *Globals) error {
 	var cutoverResult *apitypes.ControlResponse
 	err = withLoading("Requesting cutover...", true, func() error {
 		var cutoverErr error
-		cutoverResult, cutoverErr = client.CallCutoverAPI(ep, cmd.Environment, cmd.ApplyID)
+		cutoverResult, cutoverErr = client.CallCutoverAPIWithOverride(ep, cmd.Environment, cmd.ApplyID, cmd.Override)
 		return cutoverErr
 	})
+	err = reportChangeGate(err, cmd.Environment, "cutover", strings.TrimSpace(cmd.Override) != "", false)
 	if err != nil {
 		return err
 	}

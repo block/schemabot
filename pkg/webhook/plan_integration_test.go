@@ -59,7 +59,7 @@ func TestE2EPlanWithChanges(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -80,7 +80,7 @@ func TestE2EPlanWithChanges(t *testing.T) {
 		assert.Contains(t, body, dbName)
 		assert.Contains(t, body, "staging")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for plan comment")
+		require.FailNow(t, "timed out waiting for plan comment")
 	}
 
 	// Verify check run was created (per-database + aggregate)
@@ -90,7 +90,7 @@ func TestE2EPlanWithChanges(t *testing.T) {
 		assert.Equal(t, "completed", cr.Status)
 		assert.Equal(t, "action_required", cr.Conclusion)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for check run")
+		require.FailNow(t, "timed out waiting for check run")
 	}
 
 	// Verify plan was persisted to SchemaBot storage
@@ -188,7 +188,7 @@ func TestE2EPlanUnscopedRejectsMultipleManagedDatabases(t *testing.T) {
 		assert.Contains(t, body, dbName)
 		assert.Contains(t, body, "webhook_plan_multidb_other")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for multiple databases rejection comment")
+		require.FailNow(t, "timed out waiting for multiple databases rejection comment")
 	}
 
 	plans, err := svc.Storage().Plans().GetByPR(t.Context(), "octocat/hello-world", 1)
@@ -249,7 +249,7 @@ func TestE2EPlanUnscopedPlansOwnedDatabaseWhenPRTouchesUnownedConfig(t *testing.
 		assert.Contains(t, body, dbName)
 		assert.NotContains(t, body, "webhook_plan_fanout_unowned")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for plan comment for the owned database")
+		require.FailNow(t, "timed out waiting for plan comment for the owned database")
 	}
 }
 
@@ -303,7 +303,7 @@ func TestE2EPlanUnscopedPlansRegisteredDatabaseWhenPRTouchesUnregisteredConfig(t
 		assert.NotContains(t, body, "Multiple Databases Detected")
 		assert.NotContains(t, body, "webhook_plan_registry_unregistered")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for plan comment for the registered database")
+		require.FailNow(t, "timed out waiting for plan comment for the registered database")
 	}
 }
 
@@ -342,7 +342,7 @@ func assertRenameVacatingSchemaIsPlanned(t *testing.T, result *planFlowResult, d
 		assert.Contains(t, body, "orders")
 		assert.NotContains(t, body, "No Schema Files Changed")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the plan comment on a rename that vacates a schema path")
+		require.FailNow(t, "timed out waiting for the plan comment on a rename that vacates a schema path")
 	}
 
 	select {
@@ -352,7 +352,7 @@ func assertRenameVacatingSchemaIsPlanned(t *testing.T, result *planFlowResult, d
 		assert.Equal(t, checkStatusCompleted, cr.Status)
 		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for the aggregate Check Run on a rename that vacates a schema path")
+		require.FailNow(t, "timed out waiting for the aggregate Check Run on a rename that vacates a schema path")
 	}
 }
 
@@ -480,7 +480,7 @@ func TestE2EPlanSourcePolicyBlocksUnauthorizedRepo(t *testing.T) {
 		assert.Contains(t, body, "source policy")
 		assert.Contains(t, body, "repo &#34;octocat/hello-world&#34; is not authorized")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for source policy failure comment")
+		require.FailNow(t, "timed out waiting for source policy failure comment")
 	}
 
 	plans, err := svc.Storage().Plans().GetByPR(t.Context(), "octocat/hello-world", 1)
@@ -497,7 +497,7 @@ func TestE2EPlanSourcePolicyBlocksUnauthorizedRepo(t *testing.T) {
 	select {
 	case aggregateCheck = <-result.checkRuns:
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for source policy aggregate check run")
+		require.FailNow(t, "timed out waiting for source policy aggregate check run")
 	}
 	assert.Equal(t, aggregateCheckName, aggregateCheck.Name)
 	assert.Equal(t, checkStatusCompleted, aggregateCheck.Status)
@@ -544,7 +544,7 @@ func TestE2EPlanNoChanges(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -562,7 +562,7 @@ func TestE2EPlanNoChanges(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "No schema changes detected")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for plan comment")
+		require.FailNow(t, "timed out waiting for plan comment")
 	}
 
 	// Verify check run — should be success
@@ -571,7 +571,7 @@ func TestE2EPlanNoChanges(t *testing.T) {
 		assert.Equal(t, "completed", cr.Status)
 		assert.Equal(t, "success", cr.Conclusion)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for check run")
+		require.FailNow(t, "timed out waiting for check run")
 	}
 
 	// Verify plan was persisted to SchemaBot storage
@@ -622,7 +622,7 @@ func TestE2EPlanConfigNotFound(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -640,7 +640,7 @@ func TestE2EPlanConfigNotFound(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "No SchemaBot Configuration Found")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for error comment")
+		require.FailNow(t, "timed out waiting for error comment")
 	}
 }
 
@@ -712,7 +712,7 @@ func TestE2EPlanCommentShowsTableSizes(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -736,7 +736,7 @@ func TestE2EPlanCommentShowsTableSizes(t *testing.T) {
 		summaryAt := strings.Index(body, "📋 **Plan**:")
 		assert.Less(t, sizesAt, summaryAt, "sizes render above the plan summary")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for plan comment")
+		require.FailNow(t, "timed out waiting for plan comment")
 	}
 }
 
@@ -797,7 +797,7 @@ func TestE2EPlanCommentShowsCollationChanges(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -820,7 +820,7 @@ func TestE2EPlanCommentShowsCollationChanges(t *testing.T) {
 			"  - Values that differ only by accents or other characters can start comparing equal.\n"+
 			"  - `note` is in unique index `uk_note`: the apply fails if two existing rows collide in that index under the new collation.\n", body)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for plan comment")
+		require.FailNow(t, "timed out waiting for plan comment")
 	}
 }
 
@@ -860,7 +860,7 @@ func TestE2EPlanCleansStalePlanOnlyChecksBeforeConvergingAggregates(t *testing.T
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -878,7 +878,7 @@ func TestE2EPlanCleansStalePlanOnlyChecksBeforeConvergingAggregates(t *testing.T
 		assert.Contains(t, body, "refreshed as passing")
 		assert.Contains(t, body, "abc123")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for check refresh comment")
+		require.FailNow(t, "timed out waiting for check refresh comment")
 	}
 
 	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
@@ -938,7 +938,7 @@ func TestE2EPlanScopedToOneEnvironmentBlocksOnOtherEnvironmentApply(t *testing.T
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -955,7 +955,7 @@ func TestE2EPlanScopedToOneEnvironmentBlocksOnOtherEnvironmentApply(t *testing.T
 		assert.Contains(t, body, "production")
 		assert.NotContains(t, body, "refreshed as passing")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for reconciliation comment")
+		require.FailNow(t, "timed out waiting for reconciliation comment")
 	}
 }
 
@@ -981,7 +981,7 @@ func TestE2EMultiEnvPlan(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// "schemabot plan" without -e → multi-env plan
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -1013,7 +1013,7 @@ func TestE2EMultiEnvPlan(t *testing.T) {
 		assert.Contains(t, body, "schemabot apply -e staging")
 		assert.Contains(t, body, "schemabot apply -e production")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for multi-env plan comment")
+		require.FailNow(t, "timed out waiting for multi-env plan comment")
 	}
 
 	// Should get the aggregate check run
@@ -1023,7 +1023,7 @@ func TestE2EMultiEnvPlan(t *testing.T) {
 		assert.Equal(t, "completed", cr.Status)
 		assert.Equal(t, "action_required", cr.Conclusion)
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for aggregate check run")
+		require.FailNow(t, "timed out waiting for aggregate check run")
 	}
 }
 
@@ -1058,7 +1058,7 @@ func TestE2EMultiEnvPlanDifferentChanges(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan",
@@ -1086,7 +1086,7 @@ func TestE2EMultiEnvPlanDifferentChanges(t *testing.T) {
 		// Footer should only suggest production
 		assert.Contains(t, body, "schemabot apply -e production")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for multi-env plan comment")
+		require.FailNow(t, "timed out waiting for multi-env plan comment")
 	}
 }
 
@@ -1176,7 +1176,7 @@ func TestE2EPlanUsesServerSideTarget(t *testing.T) {
 
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -1196,7 +1196,7 @@ func TestE2EPlanUsesServerSideTarget(t *testing.T) {
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for plan comment")
+		require.FailNow(t, "timed out waiting for plan comment")
 	}
 }
 
@@ -1237,7 +1237,7 @@ func TestE2EPlanExcludesIgnoredNamespaces(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -1260,7 +1260,7 @@ func TestE2EPlanExcludesIgnoredNamespaces(t *testing.T) {
 		assert.NotContains(t, body, "widgets")
 		assert.Contains(t, body, "ℹ️ Namespaces excluded from this plan by `ignore_namespaces`: `local_fixtures`")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for plan comment")
+		require.FailNow(t, "timed out waiting for plan comment")
 	}
 
 	// The stored plan record carries no trace of the ignored namespace.
@@ -1311,7 +1311,7 @@ func TestE2EPlanIgnoringEveryNamespaceFails(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -1329,6 +1329,6 @@ func TestE2EPlanIgnoringEveryNamespaceFails(t *testing.T) {
 		assert.Contains(t, body, "after excluding ignored namespaces")
 		assert.NotContains(t, body, "No schema changes detected")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for error comment")
+		require.FailNow(t, "timed out waiting for error comment")
 	}
 }

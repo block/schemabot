@@ -103,7 +103,7 @@ func TestE2ERollbackPlanViaWebhook(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// Get the apply identifier for the rollback command
 	storedApply, err := svc.Storage().Applies().Get(ctx, applyID)
@@ -143,7 +143,7 @@ func TestE2ERollbackPlanViaWebhook(t *testing.T) {
 		assert.Contains(t, body, "schemabot rollback-confirm -e staging")
 		assert.Contains(t, body, "schemabot unlock")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for rollback plan comment")
+		require.FailNow(t, "timed out waiting for rollback plan comment")
 	}
 
 	// Step 6: Verify lock was acquired
@@ -162,7 +162,7 @@ func TestE2ERollbackPlanViaWebhook(t *testing.T) {
 
 	select {
 	case cr := <-result.checkRuns:
-		t.Fatalf("rollback planning should not update check runs before confirmation, got: %+v", cr)
+		require.FailNow(t, fmt.Sprintf("rollback planning should not update check runs before confirmation, got: %+v", cr))
 	case <-time.After(500 * time.Millisecond):
 	}
 }
@@ -189,7 +189,7 @@ func TestE2ERollbackApplyNotFound(t *testing.T) {
 		assert.Contains(t, body, "Apply Not Found")
 		assert.Contains(t, body, "apply_deadbeef0000")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for comment")
+		require.FailNow(t, "timed out waiting for comment")
 	}
 }
 
@@ -214,7 +214,7 @@ func TestE2ERollbackConfirmNoLock(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	_, err := svc.Storage().Applies().Create(t.Context(), &storage.Apply{
 		ApplyIdentifier: "apply_aabbccdd0012",
@@ -243,7 +243,7 @@ func TestE2ERollbackConfirmNoLock(t *testing.T) {
 		assert.Contains(t, body, "No Lock Found")
 		assert.Contains(t, body, "schemabot rollback <apply-id> -e staging")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for no-lock comment")
+		require.FailNow(t, "timed out waiting for no-lock comment")
 	}
 }
 
@@ -347,7 +347,7 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 		assert.Contains(t, body, "`idx_name`")
 		assert.Contains(t, body, "To confirm this rollback:\n1. Make the dropped index invisible, then verify application queries no longer rely on it for safe performance.\n2. Add `--allow-unsafe` to confirm 1 unsafe change on `users`")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for rollback plan comment")
+		require.FailNow(t, "timed out waiting for rollback plan comment")
 	}
 	pinnedLock, err := svc.Storage().Locks().Get(ctx, dbName, "mysql")
 	require.NoError(t, err)
@@ -406,7 +406,7 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 				assert.NotContains(t, body, "Schema Change Applied")
 			}
 		case <-deadline:
-			t.Fatal("timed out waiting for the rollback summary comment — " +
+			require.FailNow(t, "timed out waiting for the rollback summary comment — "+
 				"watchApplyProgress may have lost repo/PR/installationID context")
 		}
 	}
@@ -444,52 +444,7 @@ func requireSingleRollbackApply(t *testing.T, svc *api.Service, dbName string) *
 func TestE2ERollbackConfirmSafeRollbackRunsWithoutAllowUnsafe(t *testing.T) {
 	dbName := "webhook_rbconfirm_safe"
 	svc := setupE2EService(t, dbName)
-	ctx := t.Context()
-
-	// The PR first adds the index, then drops it again; the drop is the apply
-	// rolled back.
-	seedCompletedIndexApply(t, svc, dbName)
-	prNumber := int32(1)
-	planResp, err := svc.ExecutePlan(ctx, api.PlanRequest{
-		Database:    dbName,
-		Environment: "staging",
-		Type:        "mysql",
-		Repository:  "octocat/hello-world",
-		PullRequest: &prNumber,
-		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			dbName: {Files: map[string]string{"users.sql": rollbackTestSchemaWithoutIndex}},
-		},
-	})
-	require.NoError(t, err)
-	_, dropApplyID, err := svc.ExecuteApply(ctx, api.ApplyRequest{
-		PlanID:      planResp.PlanID,
-		Environment: "staging",
-		Options:     map[string]string{"allow_unsafe": "true"},
-	})
-	require.NoError(t, err)
-	require.Eventually(t, func() bool {
-		a, err := svc.Storage().Applies().Get(ctx, dropApplyID)
-		return err == nil && a != nil && state.IsState(a.State, state.Apply.Completed)
-	}, webhookIntegrationPollDeadline, 500*time.Millisecond, "the index drop apply should complete")
-	dropApply, err := svc.Storage().Applies().Get(ctx, dropApplyID)
-	require.NoError(t, err)
-
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-	client := gh.NewClient(nil)
-	client.BaseURL, _ = url.Parse(server.URL + "/")
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
-	result := setupFakeGitHubForPlan(t, mux, map[string]string{
-		"users.sql": rollbackTestSchemaWithoutIndex,
-	}, schemabotConfig, dbName)
-	h := newE2EHandler(t, svc, client)
-	sendComment := func(comment string) {
-		t.Helper()
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil))
-		require.Equal(t, http.StatusOK, rr.Code)
-	}
+	dropApply, result, sendComment := setupSafeRollback(t, svc, dbName)
 
 	sendComment(fmt.Sprintf("schemabot rollback %s -e staging", dropApply.ApplyIdentifier))
 	plan := awaitCommentContaining(t, result, "Rollback Plan")
@@ -693,7 +648,7 @@ func setupRollbackConfirmRace(t *testing.T, dbName string) *rollbackConfirmRaceF
 	case body := <-f.result.comments:
 		require.Contains(t, body, "Rollback Plan")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for rollback plan comment")
+		require.FailNow(t, "timed out waiting for rollback plan comment")
 	}
 
 	f.confirmedLock, err = f.lockStore.Get(ctx, dbName, "mysql")
@@ -771,7 +726,7 @@ func TestE2ERollbackConfirmRejectedWhenLockIntentChangesBeforeExecute(t *testing
 				assert.Contains(t, body, msgRollbackLockIntentChanged)
 				assert.NotContains(t, body, storage.ErrLockIntentChanged.Error(), "the raw storage error must not reach the PR comment")
 			case <-time.After(webhookIntegrationPollDeadline):
-				t.Fatal("timed out waiting for the rollback-confirm rejection comment")
+				require.FailNow(t, "timed out waiting for the rollback-confirm rejection comment")
 			}
 
 			allApplies, err := f.svc.Storage().Applies().GetByDatabase(ctx, tt.dbName, "mysql", "staging")
@@ -1211,8 +1166,8 @@ func (s *recordingCheckStore) RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Con
 	return updated, err
 }
 
-func (s *recordingCheckStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check) (bool, error) {
-	updated, err := s.CheckStore.MarkStalePlanSuccessful(ctx, check)
+func (s *recordingCheckStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check, readHeadSHA string) (bool, error) {
+	updated, err := s.CheckStore.MarkStalePlanSuccessful(ctx, check, readHeadSHA)
 	if err == nil && updated {
 		s.record("mark_stale_plan_successful", check.DatabaseName, check.Status, check.Conclusion)
 	}
@@ -1346,7 +1301,7 @@ func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 	select {
 	case <-result.comments:
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for rollback plan comment")
+		require.FailNow(t, "timed out waiting for rollback plan comment")
 	}
 
 	// Run rollback-confirm, recording every stored check state write for this
@@ -1421,7 +1376,7 @@ func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 				return
 			}
 		case <-deadline:
-			t.Fatal("timed out waiting for rollback aggregate to become action_required")
+			require.FailNow(t, "timed out waiting for rollback aggregate to become action_required")
 		}
 	}
 }
@@ -1490,7 +1445,7 @@ func TestE2ERollbackIgnoredByNonOwningInstance(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	commands := []string{
 		"schemabot rollback apply-aabbccdd0011 -e staging",
@@ -1512,10 +1467,66 @@ func TestE2ERollbackIgnoredByNonOwningInstance(t *testing.T) {
 	// the staging commands). Wait long enough for any async handler to fire.
 	select {
 	case body := <-comments:
-		t.Fatalf("production instance should not post a comment for staging rollback command, got: %s", body)
+		require.FailNow(t, fmt.Sprintf("production instance should not post a comment for staging rollback command, got: %s", body))
 	case reaction := <-reactions:
-		t.Fatalf("production instance should not react to staging rollback command, got: %s", reaction)
+		require.FailNow(t, fmt.Sprintf("production instance should not react to staging rollback command, got: %s", reaction))
 	case <-time.After(2 * time.Second):
 		// Expected: no comment or reaction posted.
 	}
+}
+
+// setupSafeRollback completes an apply that adds an index on users and then
+// one that drops it, the apply a rollback adds the index back for: a rollback
+// with no unsafe changes. It returns the drop apply, the fake GitHub's
+// recorded comments, and a function that sends a PR comment to the handler.
+func setupSafeRollback(t *testing.T, svc *api.Service, dbName string) (*storage.Apply, *planFlowResult, func(string)) {
+	t.Helper()
+	ctx := t.Context()
+
+	// The PR first adds the index, then drops it again; the drop is the apply
+	// rolled back.
+	seedCompletedIndexApply(t, svc, dbName)
+	prNumber := int32(1)
+	planResp, err := svc.ExecutePlan(ctx, api.PlanRequest{
+		Database:    dbName,
+		Environment: "staging",
+		Type:        "mysql",
+		Repository:  "octocat/hello-world",
+		PullRequest: &prNumber,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			dbName: {Files: map[string]string{"users.sql": rollbackTestSchemaWithoutIndex}},
+		},
+	})
+	require.NoError(t, err)
+	_, dropApplyID, err := svc.ExecuteApply(ctx, api.ApplyRequest{
+		PlanID:      planResp.PlanID,
+		Environment: "staging",
+		Options:     map[string]string{"allow_unsafe": "true"},
+	})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		a, err := svc.Storage().Applies().Get(ctx, dropApplyID)
+		return err == nil && a != nil && state.IsState(a.State, state.Apply.Completed)
+	}, webhookIntegrationPollDeadline, 500*time.Millisecond, "the index drop apply should complete")
+	dropApply, err := svc.Storage().Applies().Get(ctx, dropApplyID)
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": rollbackTestSchemaWithoutIndex,
+	}, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+	sendComment := func(comment string) {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil))
+		require.Equal(t, http.StatusOK, rr.Code)
+	}
+
+	return dropApply, result, sendComment
 }

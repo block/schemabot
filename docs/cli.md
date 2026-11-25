@@ -324,6 +324,9 @@ for the environment too. Without one, `onboard` refuses a namespace named for
 the environment, because writing it would create the environment's root and
 hide the other namespaces. It also refuses namespaces whose directories are
 symlinks to one directory unless the pull returns the same schema for each.
+It also refuses when an existing `drop_tables` entry names a table the target
+still has, because writing that table's file would make every later plan
+refuse the repository. Apply the drop first, or remove the entry.
 
 The command's PR hint is for GitHub automation. You can also use the generated
 files directly with the CLI, as shown below.
@@ -366,7 +369,7 @@ database: shop
 type: mysql
 ```
 
-Preserve any existing `ignore_namespaces` and `ignore_tables` settings. For
+Preserve any existing `ignore_namespaces`, `ignore_tables` and `drop_tables` settings. For
 each managed table, copy its decoded SQL string to
 `schema/<namespace>/<table>.sql`, adding line breaks outside quoted content
 without changing options, comments, or statements. The example becomes
@@ -599,7 +602,17 @@ work before releasing it. `apply` and `rollback` release a lock they took
 themselves when the schema change was never submitted: the server refused it,
 or you pressed Ctrl-C before it was sent. A server error or a lost connection
 leaves it unknown whether the apply started, so the lock stays held. A lock
-you already held before the command started also stays held. Locks span the
+you already held before the command started also stays held. The release, and
+the one `apply --yield` sends once its apply settles, names the lock the
+command took, so a lock another of your commands started an apply under stays
+held for that apply, and a lock released and taken again since stays with
+whoever holds it now; the command says which happened. Only a started apply
+counts: another of your commands that has found the lock but not yet started
+its apply does not keep it, so wait for that command before you release. A
+server too old to
+name the lock gets no release at all: the command keeps the lock and tells you
+to check `schemabot locks` and run `schemabot unlock` if nothing of yours runs
+under it. Locks span the
 database's environments; forcing one away from its owner is an administrative
 action, not a routine retry.
 See [locks](schema-intelligence.md#check-locks) for the inspection request and
@@ -609,6 +622,87 @@ who may act.
 For changes that need PR approval and merge checks, use the
 [PR workflow](pre-merge-workflow.md). Direct CLI access is a separate path;
 it does not create a PR review trail.
+
+### Freeze an environment
+
+An environment freeze holds new schema changes in its scope until it ends or
+someone lifts it. The [freeze guide](freeze.md) explains how freezes work, the
+pull request and API forms, and what an agent may do. Setting or lifting one is
+a write, and
+[`freeze.groups`](configuration.md#freeze-groups-forward-auth) members may do
+so without any other write access.
+
+![Freeze production, an apply the freeze refuses with nothing started, then lift the freeze](../assets/cli-freeze.gif)
+
+```console
+$ schemabot freeze -e production --reason "Holiday code freeze"
+$ schemabot freeze -e production --reason "holiday freeze" --planned \
+    --start 2026-12-20T00:00:00Z --end 2027-01-03T00:00:00Z
+$ schemabot freeze list -e production
+$ schemabot freeze show freeze-abc123
+$ schemabot unfreeze freeze-abc123 --reason "Holidays are over"
+```
+
+`--deployment` and `--database` narrow a freeze and repeat; without them it
+covers the whole environment. `--running` says what happens to applies
+already pending or running in scope: `continue` (the default) lets them finish,
+and `stop` stops each one when the freeze is set, including a rollout paused
+after a failure, and withdraws a start queued on a stopped apply. The confirmation lists the applies it asked to stop; a stop
+takes effect as its driver delivers it, so confirm each one with
+`schemabot status <apply-id>`. The CLI waits up to 15 minutes for the
+confirmation, since each stop can wait on its engine. It also lists any apply it could not stop, which
+keeps running, with the reason and what to do: a PlanetScale apply has no stop,
+and cancel ends it permanently. While a `stop` freeze is in effect, SchemaBot
+also stops an apply instead of starting work on it that has not started, so a
+planned `stop` freeze holds what has not started once it begins. A PlanetScale
+deploy queued before the freeze waits until it ends. A planned `stop` freeze
+stops an apply already running when it starts only at the apply's next
+checkpoint: when a rollout starts its next deployment, or when SchemaBot
+recovers a drive that crashed or failed. An apply that reaches neither keeps
+running. `schemabot status <apply-id>`, the watch view and the pull request
+comment say which freeze stopped an apply, and once that freeze has ended, that
+a plain start resumes it. A stopped apply resumes with
+`schemabot start` once the freeze ends, or with an approved
+override. Times are RFC3339 and print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
+and the recent ones.
+
+On a server whose `freeze.override_policy` is `approval`, a second person
+approves a request to let one change through a freeze. Read it with
+`freeze override <ovr-id>` and approve it with `freeze approve <ovr-id>`.
+Only a verified member of `freeze.groups` other than the requester may approve.
+A request asked for on a pull request is approved there instead, by a
+`freeze.github_teams` member commenting `schemabot freeze approve <ovr-id>`.
+Each command prints the server's reason when it refuses.
+
+A freeze refuses every `apply`, `start` and `cutover` it covers unless an
+override for you covers that change. Without one, the command exits 1 with
+nothing started:
+
+```console
+$ schemabot apply -s schema -e production
+❄️ production is frozen. This change did not start.
+   freeze-abc  Holiday code freeze  (until lifted)
+If this change can't wait, run the same command with --override "<reason>".
+```
+
+`--override "<reason>"` on `apply`, `start` and `cutover` overrides the freeze
+for that one change. It needs a verified caller, and the reason is at most 500
+characters. Under the default `freeze.override_policy`, `reason`, the command
+runs at once and SchemaBot records the reason. The reason covers that command
+only: run it again during the freeze and give `--override` again. On a server
+set to `approval`,
+it asks a freeze approver instead, and the refusal names the request:
+
+```console
+$ schemabot apply -s schema -e production --override "Hotfix: checkout needs the gift_note column"
+❄️ production is frozen. This change did not start.
+   freeze-abc  Holiday code freeze  (until lifted)
+Override requested: ovr-123. A freeze approver other than you must run 'schemabot freeze approve ovr-123', then run this command again.
+```
+
+Once an approver approves it, run the same command again: the approval admits
+it, and it runs instead of exiting 1. When SchemaBot could not check the
+freezes, nothing started and the command says to try again.
 
 ## Follow and control a change
 
@@ -689,6 +783,28 @@ $ schemabot cutover apply-example-73 -e staging
 
 Keep watching until the state is `Completed`; acceptance alone does not mean
 the swap has finished.
+
+When a [freeze](#freeze-an-environment) covers the change, **Enter** in the watch is
+refused like the command, and the change does not start. The watch's keys
+send no override reason, so the refusal names the exact command that asks for
+one and stays on screen while the watch keeps following the apply:
+
+```console
+Press Enter to proceed with cutover (or ESC to detach)
+
+❄️ production is frozen. This cutover did not start.
+   freeze-abc  Holiday code freeze  (until lifted)
+If this change can't wait, override the freeze with a reason:
+  schemabot cutover apply-example-73 -e production --override "<reason>"
+Run that in another terminal: it starts the change at once, and this watch follows it.
+```
+
+Run that command from another terminal. Under the default override policy it
+starts the change at once, and the watch follows it. On a server set to
+`approval` it records a request instead, and the last line says so: once an
+approver approves it, press **Enter** in the watch again, and the approval
+admits it with no reason attached. **Enter** on a waiting deploy works the same
+way and names `schemabot start`.
 
 ![CLI progress shows copying, deferred cutover, and completion](../assets/cli-cutover.gif)
 
@@ -905,9 +1021,9 @@ before running it. Recreating a dropped column cannot recover its old data.
 
 ```console
 $ schemabot logs apply-example-73
-11:47:07 [INF] Apply queued: apply-example-73
-11:47:07 [INF] [orders] Starting spirit migration
-11:47:07 [INF] [orders] acquired advisory lock
+2026-03-15 11:47:07 UTC [INF] Apply queued: apply-example-73
+2026-03-15 11:47:07 UTC [INF] [orders] Starting spirit migration
+2026-03-15 11:47:07 UTC [INF] [orders] acquired advisory lock
 ...
 ```
 
@@ -922,7 +1038,8 @@ cannot reach is retried with backoff, the same way the watchers retry, and
 following stops with a non-zero exit once polls have kept failing for a few
 minutes in a row. Run the same `logs` command again to keep following: it
 prints the newest entries again and does not resume from the last line shown.
-Ctrl-C ends following normally.
+Ctrl-C ends following normally. Without `-f`, Ctrl-C abandons the read and
+exits 130, as other commands do when interrupted before their output.
 
 With `--deployment`, a source whose logs could not be read is reported as a
 warning while the other sources keep printing. That warning does not end
@@ -939,9 +1056,9 @@ a whole, such as state changes.
 
 ```console
 $ schemabot logs apply-example-73 --target shop-002
-11:47:07 [INF] Apply queued: apply-example-73
-11:48:12 [INF] [orders] acquired advisory lock
-11:52:40 [INF] [orders] Table complete
+2026-03-15 11:47:07 UTC [INF] Apply queued: apply-example-73
+2026-03-15 11:48:12 UTC [INF] [orders] acquired advisory lock
+2026-03-15 11:52:40 UTC [INF] [orders] Table complete
 ...
 ```
 
@@ -1092,6 +1209,14 @@ when findings remain; do not treat every nonzero exit as a transport error.
 This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
 
+`checks backfill` replaces the removed `webhooks redrive` command and its
+`POST /api/webhooks/redrive` endpoint. To recover missing Check Runs, run
+`checks backfill`, then run the `--plan --pr` command it prints for deferred
+schema PRs. To inspect or redeliver one specific failed delivery, use
+**Recent Deliveries** on the GitHub App's **Advanced** settings page. Scripts
+that sent delivery IDs to the removed endpoint should move to that page or to
+GitHub's App delivery API.
+
 A missing check on a PR that changes no managed schema costs a few GitHub
 requests to recreate. A PR that does change managed schema needs a plan, and
 a plan reads every changed database's schema once per environment, so one
@@ -1131,6 +1256,35 @@ below `--rate-limit-floor` (20% by default), it stops the batch and returns
 the PRs it did not start. The command waits for the budget to reset and sends
 them again, so live webhook traffic keeps its headroom.
 
+A blocked merge queue holds every PR queued behind it, so a sweep of a
+repository also reads its merge queue. A merge group missing its SchemaBot
+check gets the same passing check the `merge_group` webhook posts, before
+any PR's check is recreated. The server lists the queue again first and
+posts only on groups it still holds. It posts only the checks in the run's
+`-e` and `--check-name` that the group is missing, and leaves the group's
+existing checks as they are:
+
+```console
+$ schemabot checks backfill acme/store -e production
+Scanned 1 open PRs and 3 queued merge groups in acme/store for SchemaBot (production).
+2 merge groups are missing SchemaBot Check Runs, blocking the PRs queued behind them:
+MERGE GROUP                             BASE  MISSING CHECKS          OUTCOME
+https://github.com/acme/store/pull/431  main  SchemaBot (production)  posted passing merge queue check
+https://github.com/acme/store/pull/436  main  SchemaBot (production)  skipped: no longer in the merge queue
+
+PR                                      MISSING CHECKS          OUTCOME
+https://github.com/acme/store/pull/418  SchemaBot (production)  created 1 Check Run
+```
+
+A scan of named PRs (`--pr`) leaves the merge queue out. If the server
+cannot read a repository's merge queue, because it is older or because the
+read failed, the backfill still recreates the PRs' checks. The report names
+the repositories whose queue went unchecked, and the run exits nonzero,
+since an unchecked queue may still be blocked. A request to post merge queue
+checks that fails does not stop the sweep either: the PRs' checks are still
+recreated, the groups in that request are reported as failed, and the run
+exits nonzero.
+
 `--skip-repo` leaves repositories out of an `--all-repos` sweep, for example
 one you have already backfilled by hand. Separate names with commas or repeat
 the flag. A name the server does not declare stops the sweep, so a typo
@@ -1143,8 +1297,8 @@ Skipped repositories named by --skip-repo: acme/monorepo.
 No missing SchemaBot Check Runs found.
 ```
 
-A Ctrl-C or SIGTERM stops `checks backfill` and `webhooks redrive` where they
-are. Each says on stderr that it was canceled and exits 130, the status a
+A Ctrl-C or SIGTERM stops `checks backfill` where it is. It says on stderr
+that it was canceled and exits 130, the status a
 shell reports for an interrupted process, so a script can tell an interrupted
 run from one that failed or left findings.
 
@@ -1163,8 +1317,6 @@ What an interrupted run reports depends on where it stopped:
   may have acted on the request in flight. A PR in a later batch reads
   `not attempted: interrupted before this PR was sent`, because it never
   reached the server.
-- `webhooks redrive` prints the redelivery counts from the chunks that
-  completed, and prints none under `--dry-run`.
 
 ```console
 $ schemabot checks backfill acme/store -e production
@@ -1201,10 +1353,8 @@ sent for it. The same interrupted run, cut down to two of its PRs:
 }
 ```
 
-Treat the redrive counts as a lower bound: the server may have finished part
-of the chunk that was in flight. Checks already recreated and deliveries
-already redelivered are not undone. Run `checks backfill` again to finish the
-sweep; it only acts on PRs whose Check Runs are still missing.
+Checks already recreated are not undone. Run `checks backfill` again to finish
+the sweep; it only acts on PRs whose Check Runs are still missing.
 
 If `checks backfill` cannot write its interrupted report to stdout, for
 example because the disk behind a redirect is full, it says so on stderr,

@@ -8,6 +8,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -19,6 +20,15 @@ import (
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
+
+// autoApplyComment is the "Schema Change Apply" comment an automatic apply
+// posted before dispatch, with the data it was rendered from. A change gate
+// that refuses the apply after the comment is up re-renders it from Data, so
+// the comment stops announcing an apply that will not run.
+type autoApplyComment struct {
+	ID   int64
+	Data templates.PlanCommentData
+}
 
 // executeApply re-plans for drift detection and executes the apply. This is the shared
 // execution core used by both handleApplyConfirmCommand and handleApplyCommand.
@@ -39,15 +49,40 @@ import (
 // the consent this re-plan is checked against: the plan decided whether to
 // stop, and the same decision is made again here, copy by copy, against the
 // targets as they are now.
+//
+// autoComment is the comment the automatic path posted announcing the apply,
+// nil on apply-confirm, whose comment never promised one, and when that post
+// did not land.
 func (h *Handler) executeApply(
 	ctx context.Context, client *ghclient.InstallationClient,
-	repo string, pr int, schemaResult *ghclient.SchemaRequestResult,
+	repo string, pr int, schemaResult *ghclient.SchemaRequestResult, sharedSchemaPeers []sharedSchemaPeerInputs,
 	environment string, installationID int64, requestedBy string,
 	result CommandResult, storedPlan, disclosedPlan *storage.Plan, expectedPendingPlanID string,
-	disclosedCopies []storage.DisclosedCopy,
+	disclosedCopies []storage.DisclosedCopy, autoComment *autoApplyComment,
 ) {
 	database := schemaResult.Database
 	dbType := schemaResult.Type
+	actionName := action.ApplyConfirm
+	if storedPlan != nil {
+		actionName = action.Apply
+	}
+
+	// A refused automatic apply has no pending confirmation to resume.
+	// Admission runs before acceptance, so only this attempt's pin can be released.
+	handleAdmissionError := func(err error) bool {
+		if _, refused := errors.AsType[*api.PRSchemaAdmissionError](err); !refused {
+			return false
+		}
+		if storedPlan != nil {
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			h.releaseApplyLockIfIntentUnchanged(releaseCtx, repo, pr, database, dbType, environment, expectedPendingPlanID, "PR schema admission refused")
+		}
+		if !isPRSchemaRefusal(err) {
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, "Could not verify the PR database limit. Retry the command.")
+		}
+		return true
+	}
 
 	// apply-confirm names no target: it confirms the plan its apply posted, so
 	// a plan narrowed to one rollout member narrows the re-plan and the apply
@@ -71,6 +106,7 @@ func (h *Handler) executeApply(
 		SchemaPath:        schemaResult.SchemaPath,
 		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
 		IgnoreTables:      schemaResult.IgnoreTables,
+		DropTables:        schemaResult.DropTables,
 		SourceTrusted:     true,
 		// This re-plan is what the copy-discard gate below reads, so it has to
 		// predict the apply that is about to run, not the default shape. The
@@ -80,9 +116,13 @@ func (h *Handler) executeApply(
 	}
 
 	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
+	if handleAdmissionError(err) {
+		return
+	}
+
 	if err != nil {
 		h.logger.Error("plan execution failed on confirm", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, userFacingError(err))
 		return
 	}
 
@@ -92,10 +132,6 @@ func (h *Handler) executeApply(
 	// be rejected before any plan-derived response — the "no changes" release,
 	// the drift downgrade, and especially the unsafe-change prompt would all
 	// misread DDL that is only an artifact of the stale branch.
-	actionName := action.ApplyConfirm
-	if storedPlan != nil {
-		actionName = action.Apply
-	}
 	// What a refusal tells the operator when the lock changed under the apply:
 	// re-run the apply they sent, narrowed as its confirmed plan was, with the
 	// options they typed.
@@ -125,7 +161,7 @@ func (h *Handler) executeApply(
 	// release the observed lock intent; the gate has already logged and
 	// posted the distinction, and the user's recovery is re-issuing the
 	// command.
-	rejected, freshnessErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName)
+	rejected, freshnessErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, sharedSchemaPeers, freshPRInfo, environment, requestedBy, actionName)
 	if freshnessErr != nil {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final base-schema freshness verification failure")
 		return
@@ -191,6 +227,10 @@ func (h *Handler) executeApply(
 	// posted with every target's plan just before this re-plan. Work that comment
 	// did not show stops for a fresh confirmation or is refused.
 	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
+	if handleAdmissionError(rollout.admissionErr) {
+		return
+	}
+
 	primaryTargetConverged := !planResp.HasChanges()
 	refuseRollout := func(reason string) {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, reason)
@@ -322,7 +362,7 @@ func (h *Handler) executeApply(
 		// the confirmed comment showed. A rollout that has since shrunk to the
 		// primary target is still checked against its confirmed round.
 		if storedPlan == nil {
-			difference, coverErr := h.confirmationCoversPrimaryTarget(ctx, expectedPendingPlanID, planResp.PlanID, environment, rollout.work.members > 1)
+			difference, changedTables, coverErr := h.confirmationCoversPrimaryTarget(ctx, expectedPendingPlanID, planResp.PlanID, environment, rollout.work.members > 1)
 			if coverErr != nil {
 				h.logger.Error("apply-confirm rejected: could not load the confirmed plan, its round, or the re-plan to compare the primary target's work; the pending confirmation is preserved",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
@@ -332,7 +372,11 @@ func (h *Handler) executeApply(
 				return
 			}
 			if difference != workUnchanged {
-				reason := primaryTargetDifferenceReason(h.primaryTargetName(rollout.work, planResp, schemaResult.Database, environment), difference)
+				primary := h.primaryTargetName(rollout.work, planResp, schemaResult.Database, environment)
+				reason := primaryTargetDifferenceReason(primary, difference)
+				if difference == workObjects {
+					reason = objectsDifferenceReason(primary, changedTables)
+				}
 				h.logger.Info("apply-confirm refused: the primary target would run work the confirmed plan did not show",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
@@ -358,18 +402,67 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// Automatic apply DDL drift check: if the re-plan DDL differs from the stored auto-plan,
-	// downgrade to manual confirmation so the user reviews the new plan.
-	if storedPlan != nil && !ddlMatchesStoredPlan(planResp, storedPlan) {
-		h.logger.Info("automatic apply downgraded: DDL drift detected",
-			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			planDriftCause(planResp, storedPlan), rolloutPreview, runsMemberWork); err != nil {
-			h.logger.Error("failed to post the DDL-drift downgrade comment",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-				"environment", environment, "error", err)
+	// An automatic apply is held to the plan its comment posted: the
+	// statements, and the objects the engine recorded each one acting on at
+	// plan time. An object replaced since the plan was posted leaves its
+	// statement unchanged, so the re-plan is compared on both, and a re-plan
+	// that differs in either is shown again and confirmed by hand. The comment
+	// names every difference, so a statement drift elsewhere in the plan never
+	// hides an unchanged statement whose object was replaced. An automatic
+	// apply that cannot make the comparison releases the lock it took, as its
+	// other failures past the hand-off do.
+	if storedPlan != nil {
+		const unverifiedReplan = "SchemaBot could not verify the plan this apply would run, so nothing was applied. Retry the command, and see server logs if it persists."
+		current, err := h.service.Storage().Plans().Get(ctx, planResp.PlanID)
+		if err != nil {
+			h.logger.Error("automatic apply stopped: could not load the re-plan to compare the objects its statements act on with the posted plan",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "posted_plan_id", storedPlan.PlanIdentifier, "error", err)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "re-plan unreadable for the objects comparison")
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, unverifiedReplan)
+			return
 		}
-		return
+		if current == nil {
+			h.logger.Error("automatic apply stopped: the re-plan was not stored, so the objects its statements act on cannot be compared with the posted plan",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "posted_plan_id", storedPlan.PlanIdentifier)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "re-plan missing for the objects comparison")
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, unverifiedReplan)
+			return
+		}
+		changedTables := objectsChangedSinceReview(storedPlan, current)
+		if !ddlMatchesStoredPlan(planResp, storedPlan) {
+			h.logger.Info("automatic apply downgraded: DDL drift detected",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "posted_plan_id", storedPlan.PlanIdentifier, "tables_with_changed_objects", changedTables)
+			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+				planDriftCause(planResp, storedPlan, changedTables), rolloutPreview, runsMemberWork); err != nil {
+				h.logger.Error("failed to post the DDL-drift downgrade comment, so the pending confirmation was not moved",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+					"environment", environment, "error", err)
+				return
+			}
+			h.moveConfirmationToShownReplan(ctx, repo, pr, installationID, database, dbType, environment, actionName, requestedBy,
+				expectedPendingPlanID, planResp.PlanID, rolloutDisclosedCopies(planResp, rollout, runsMemberWork), repinRefusal,
+				"DDL drift", "The schema changes differ from the posted plan")
+			return
+		}
+		if len(changedTables) > 0 {
+			h.logger.Info("automatic apply downgraded: a statement now acts on objects the posted plan did not record",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "posted_plan_id", storedPlan.PlanIdentifier, "tables", changedTables)
+			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+				objectsChangedCause(changedTables), rolloutPreview, runsMemberWork); err != nil {
+				h.logger.Error("failed to post the comment showing the changed objects, so the pending confirmation was not moved",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+					"environment", environment, "plan_id", planResp.PlanID, "error", err)
+				return
+			}
+			h.moveConfirmationToShownReplan(ctx, repo, pr, installationID, database, dbType, environment, actionName, requestedBy,
+				expectedPendingPlanID, planResp.PlanID, rolloutDisclosedCopies(planResp, rollout, runsMemberWork), repinRefusal,
+				"changed objects", "The objects some schema changes act on changed after the plan was posted")
+			return
+		}
 	}
 
 	// Engine refusals are judged against the live table, so the re-plan can
@@ -399,19 +492,9 @@ func (h *Handler) executeApply(
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
 				return
 			}
-			// The comment just posted renders this re-plan, so it discloses
-			// whatever unfinished copy the re-plan would discard.
-			disclosed := rolloutDisclosedCopies(planResp, rollout, runsMemberWork)
-			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosed); err != nil {
-				if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
-					return
-				}
-				h.logger.Error("failed to re-pin pending confirmation onto the plan that discloses the newly-direct changes",
-					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-					"environment", environment, "plan_id", planResp.PlanID, "error", err)
-				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-					"Some changes now run as direct execution. SchemaBot stopped the apply but could not record the confirmation; re-run `schemabot apply -e "+environment+"` to see how they will run.")
-			}
+			h.moveConfirmationToShownReplan(ctx, repo, pr, installationID, database, dbType, environment, actionName, requestedBy,
+				expectedPendingPlanID, planResp.PlanID, rolloutDisclosedCopies(planResp, rollout, runsMemberWork), repinRefusal,
+				"newly-direct changes", "Some changes now run as direct execution")
 			return
 		}
 	}
@@ -566,10 +649,40 @@ func (h *Handler) executeApply(
 		ConfirmedMemberWork:   confirmedMemberWork,
 		Target:                result.Target,
 	}
+	// The commenter is who the gate admits on an approved override, so it
+	// rides on every apply, not only one asking for an override. The author
+	// is from the fresh read above: a request needs one, and the gate records
+	// none without it. A fan-out runs this once per deployment, so each
+	// records its own request.
+	ctx = api.WithPullRequestOverrideRequester(ctx, api.PullRequestRequester{
+		Login: requestedBy, Repository: repo, PullRequest: pr, Author: freshPRInfo.User,
+	})
+	if result.OverrideGiven {
+		applyReq.Override = result.Override
+	}
 
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
 		h.service.ClearPendingObserver(pendingObserver)
+		if handleAdmissionError(err) {
+			return
+		}
+		if isChangeGateError(err) {
+			// The gate refused before the apply was created, so the pending
+			// lock this attempt pinned, by an apply or an apply-confirm,
+			// would otherwise stay held. The release is conditional on that
+			// pin, so a lock repinned meanwhile stays.
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			lockReleased := h.releaseApplyLockIfIntentUnchanged(releaseCtx, repo, pr, database, dbType, environment, expectedPendingPlanID, "change gate refused")
+			cancel()
+			h.logger.Info("apply refused by a change gate", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
+			refusalPosted := h.postChangeGateRefusal(repo, pr, installationID, actionName, environment, requestedBy, err)
+			// The refusal is posted first: it is what the operator acts on, and
+			// the edited footer points at it, so the edit never waits on it. A
+			// refusal that did not land leaves the edit to carry the next step.
+			h.markAutoApplyCommentRefused(ctx, client, repo, pr, database, dbType, environment, autoComment, lockReleased, refusalPosted)
+			return
+		}
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
 		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(actionName, environment, h.deploymentTenant(), err))
 		return
@@ -734,6 +847,9 @@ func targetPlanDriftEntries(was, is *storage.Plan, name string) []string {
 		tablePrefix, subject = fmt.Sprintf("Target `%s`: ", name), fmt.Sprintf("Target `%s`", name)
 	}
 	if entries := planDriftEntries(planDriftStatements(isIDs), planDriftStatements(wasIDs), tablePrefix); len(entries) > 0 {
+		if was != nil && is != nil {
+			entries = append(entries, changedObjectEntries(objectsChangedSinceReview(was, is), tablePrefix)...)
+		}
 		return entries
 	}
 	switch {
@@ -785,7 +901,7 @@ func (h *Handler) rejectBlockedChanges(
 	planResp *apitypes.PlanResponse, environment, requestedBy, actionName string, result CommandResult, expectedPendingPlanID string,
 ) {
 	database, dbType := schemaResult.Database, schemaResult.Type
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 	commentData.ScopedDatabase = result.Database
 	commentData.Target = narrowedTarget(planResp, result.Target)
 	h.logger.Info("apply rejected: re-plan contains engine-blocked changes",
@@ -823,6 +939,16 @@ func applyExecutionErrorMessage(command, environment, tenant string, err error) 
 	})
 }
 
+// isChangeGateError reports whether a change gate refused the change or could
+// not check it. Either way the change was refused before it was created.
+func isChangeGateError(err error) bool {
+	if _, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
+		return true
+	}
+	_, ok := errors.AsType[*api.ChangeGateUnavailableError](err)
+	return ok
+}
+
 // dispatchMessages carries the command-specific words dispatchErrorMessage
 // renders around the shared classification of a failed dispatch.
 type dispatchMessages struct {
@@ -858,7 +984,9 @@ type dispatchMessages struct {
 // that creates a new one. A rollout member's refused
 // plan is named by target and table from fields SchemaBot controls. Everything
 // else is an internal error whose text stays in server logs behind the fixed
-// line.
+// line. A change gate's error never reaches here: both callers post it with
+// postChangeGateRefusal first, and a refusal's raw text would carry the
+// freezes' reasons, mentions and all.
 func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 	if errors.Is(err, storage.ErrLockIntentChanged) {
 		return msgs.lockIntentChanged
@@ -889,6 +1017,11 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 			parts = append(parts, msgs.afterRefusal)
 		}
 		return strings.Join(parts, " ")
+	}
+	if inUse, ok := errors.AsType[*api.DropTablesInUseError](err); ok {
+		// Built from the config entry, the apply's identifier and state, and
+		// the table its plan changes, never from storage error text.
+		return inUse.Error()
 	}
 	if missing, ok := errors.AsType[*api.PlanNotFoundError](err); ok {
 		return templates.PlanNotFoundDetail(missing.PlanID, msgs.replan)
@@ -1028,7 +1161,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy string,
 	cause *templates.PausedApplyCauseData, rolloutPreview *templates.DeploymentDriftData, runsMemberWork bool,
 ) error {
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 	commentData.ScopedDatabase = result.Database
 	commentData.Target = narrowedTarget(planResp, result.Target)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, rolloutPreview, repo, pr, environment)
@@ -1046,6 +1179,33 @@ func (h *Handler) postAutoConfirmDowngrade(
 	// the comment renders their plans.
 	commentData.DeploymentDrift = rolloutPreview
 	return h.postCommentReportingError(repo, pr, installationID, templates.RenderPlanComment(commentData))
+}
+
+// moveConfirmationToShownReplan moves the pending confirmation onto the
+// re-plan that a stop for confirmation just posted. The next apply-confirm is
+// checked against the plan its comment showed, so a confirmation left on the
+// earlier plan would meet that plan's statements and records and stop again.
+// The comment renders the re-plan, so it discloses whatever unfinished copy the
+// re-plan would discard, and disclosed moves with the pin. A re-pin the lock
+// refused reports the lock change; any other failure is logged and tells the
+// operator to run apply again. stop names the cause for the log, and stopped
+// leads the operator's message.
+func (h *Handler) moveConfirmationToShownReplan(ctx context.Context, repo string, pr int, installationID int64,
+	database, dbType, environment, actionName, requestedBy, expectedPendingPlanID, planID string,
+	disclosed []storage.DisclosedCopy, repinRefusal templates.ApplyLockIntentChangedData, stop, stopped string,
+) {
+	err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planID, disclosed)
+	if err == nil {
+		return
+	}
+	if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
+		return
+	}
+	h.logger.Error("failed to re-pin the pending confirmation onto the re-plan the stop comment shows",
+		"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+		"environment", environment, "plan_id", planID, "stop", stop, "error", err)
+	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+		stopped+". SchemaBot stopped the apply but could not record the confirmation; re-run `schemabot apply -e "+environment+"` to review the new plan.")
 }
 
 // repinPendingConfirmation moves this PR's apply lock onto the plan whose
@@ -1137,14 +1297,17 @@ func (h *Handler) reportRepinRefused(err error, repo string, pr int, installatio
 // whose pending plan has since changed — e.g. a rollback plan re-pinned it while
 // the gate ran — belongs to that newer intent and is preserved. The reason names
 // the gate that triggered the release so logs distinguish the call sites.
-func (h *Handler) releaseApplyLockIfIntentUnchanged(ctx context.Context, repo string, pr int, database, dbType, environment, expectedPendingPlanID, reason string) {
+// It reports whether this call released the lock, for a caller that tells the
+// operator the lock is gone: a failed release and a preserved lock both leave
+// it held, and most callers have nothing to say about either.
+func (h *Handler) releaseApplyLockIfIntentUnchanged(ctx context.Context, repo string, pr int, database, dbType, environment, expectedPendingPlanID, reason string) bool {
 	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
 	released, relErr := h.service.Storage().Locks().ReleaseIfPendingPlanID(ctx, database, dbType, lockOwner, expectedPendingPlanID)
 	if relErr != nil {
 		h.logger.Error("failed to release apply lock after pre-execution rejection",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 			"environment", environment, "reason", reason, "error", relErr)
-		return
+		return false
 	}
 	if !released {
 		h.logger.Info("preserved apply lock after pre-execution rejection because its pending intent changed",
@@ -1152,6 +1315,7 @@ func (h *Handler) releaseApplyLockIfIntentUnchanged(ctx context.Context, repo st
 			"environment", environment, "reason", reason,
 			"expected_pending_plan_id", expectedPendingPlanID)
 	}
+	return released
 }
 
 // planChangeIdentity is the drift-comparison key for a single table change. A
@@ -1204,11 +1368,11 @@ func planDriftStatements(identities map[planChangeIdentity]int) map[planDriftCha
 // and a removed one — the pair would name the same table and operation twice,
 // once as present and once as absent, and the field that tells them apart is
 // the one deliberately left out.
-func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *templates.PausedApplyCauseData {
+func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan, changedTables []string) *templates.PausedApplyCauseData {
 	now := planDriftStatements(responsePlanIdentities(planResp))
 	started := planDriftStatements(storedPlanIdentities(storedPlan))
 
-	entries := planDriftEntries(now, started, "")
+	entries := append(planDriftEntries(now, started, ""), changedObjectEntries(changedTables, "")...)
 
 	if len(entries) > planDriftEntryCap {
 		remaining := len(entries) - planDriftEntryCap
@@ -1218,6 +1382,37 @@ func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *
 
 	return &templates.PausedApplyCauseData{
 		Heading: "Schema changes differ from the plan this apply was started from",
+		Entries: entries,
+	}
+}
+
+// changedObjectEntries names, among the entries of a statement drift, each
+// table with an unchanged statement that now acts on an object the posted plan
+// did not record. The statement reads the same in both plans, so without its
+// own entry the replaced object would go unmentioned.
+func changedObjectEntries(tables []string, prefix string) []string {
+	entries := make([]string, 0, len(tables))
+	for _, table := range tables {
+		entries = append(entries, fmt.Sprintf("%s`%s`: a statement now acts on an object that changed after the plan was posted", prefix, table))
+	}
+	return entries
+}
+
+// objectsChangedCause names the tables whose statements now act on objects the
+// posted plan did not record, such as a column dropped and added again under
+// the same name.
+func objectsChangedCause(tables []string) *templates.PausedApplyCauseData {
+	entries := make([]string, 0, len(tables))
+	for _, table := range tables {
+		entries = append(entries, fmt.Sprintf("`%s`", table))
+	}
+	if len(entries) > planDriftEntryCap {
+		remaining := len(entries) - planDriftEntryCap
+		entries = append(entries[:planDriftEntryCap:planDriftEntryCap],
+			fmt.Sprintf("and %d more %s", remaining, ui.PluralizeLabel("table", "tables", remaining)))
+	}
+	return &templates.PausedApplyCauseData{
+		Heading: "The objects these schema changes act on changed after the plan was posted",
 		Entries: entries,
 	}
 }
@@ -1484,4 +1679,35 @@ func normalizePlanNamespace(namespace string) string {
 		return "default"
 	}
 	return namespace
+}
+
+// markAutoApplyCommentRefused edits the comment an automatic apply posted
+// before a change gate refused it, so its footer says the apply did not run
+// instead of "Applying automatically". It is best effort: a failed edit leaves
+// the refusal comment, which is posted either way, as the correct record. A
+// nil comment, the apply-confirm path, has nothing to edit. The edit claims only
+// what happened: the lock released only when this refusal released it, and the
+// refusal comment below only when it posted.
+func (h *Handler) markAutoApplyCommentRefused(
+	ctx context.Context, client *ghclient.InstallationClient,
+	repo string, pr int, database, dbType, environment string, comment *autoApplyComment,
+	lockReleased, refusalPosted bool,
+) {
+	if comment == nil {
+		return
+	}
+	data := comment.Data
+	data.RefusedByChangeGate = true
+	data.LockReleased = lockReleased
+	data.RefusalPosted = refusalPosted
+
+	editCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	// The post wrapped the body with an empty environment, so the edit does too.
+	body := h.renderPRComment(repo, pr, "", templates.RenderPlanComment(data))
+	if err := client.EditIssueComment(editCtx, repo, comment.ID, body); err != nil {
+		h.logger.Error("failed to edit the automatic apply comment after a change gate refused the apply; it still says the apply is running",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "comment_id", comment.ID, "error", err)
+	}
 }

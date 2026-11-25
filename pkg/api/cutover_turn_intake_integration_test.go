@@ -41,7 +41,7 @@ func TestCutoverIntakeFollowsDeploymentOrder(t *testing.T) {
 	requestCutover := func(t *testing.T, applyID int64) error {
 		t.Helper()
 		apply := getApply(t, ctx, stor, applyID)
-		_, _, err := svc.executeCutoverForApply(ctx, nil, apply, apply.ApplyIdentifier, "cli:alice")
+		_, _, err := svc.executeCutoverForApply(ctx, nil, apply, apply.ApplyIdentifier, "cli:alice", "")
 		return err
 	}
 	requirePending := func(t *testing.T, applyID int64, pending bool) {
@@ -194,7 +194,7 @@ func TestCutoverIntakeFollowsDeploymentOrder(t *testing.T) {
 		command := func(t *testing.T) int {
 			t.Helper()
 			apply := getApply(t, ctx, stor, seed.applyID)
-			resp, status, err := svc.executeCutoverForApply(ctx, nil, apply, apply.ApplyIdentifier, "cli:alice")
+			resp, status, err := svc.executeCutoverForApply(ctx, nil, apply, apply.ApplyIdentifier, "cli:alice", "")
 			require.NoError(t, err)
 			require.NotNil(t, resp)
 			assert.True(t, resp.Accepted)

@@ -48,6 +48,12 @@ type OperationClaimFilter struct {
 	// drive hands such an apply back once the request is delivered
 	// (tern.ErrDeferredCutoverDriveHandedBack).
 	SkipDeferredCutoverWork bool
+	// SkipOperationIDs leaves these operations out of every claim that starts
+	// or resumes work. A driver lists the operations it recently held back
+	// unstarted, so the claim order, oldest first, reaches other work instead
+	// of handing it the same held operation on every pass. Claims that
+	// recover a crashed drive or deliver a stop or cancel still match.
+	SkipOperationIDs []int64
 }
 
 // OperationClaimOption adjusts an OperationClaimFilter.
@@ -57,6 +63,13 @@ type OperationClaimOption func(*OperationClaimFilter)
 func SkipDeferredCutoverWork() OperationClaimOption {
 	return func(f *OperationClaimFilter) {
 		f.SkipDeferredCutoverWork = true
+	}
+}
+
+// SkipOperations adds ids to OperationClaimFilter.SkipOperationIDs.
+func SkipOperations(ids ...int64) OperationClaimOption {
+	return func(f *OperationClaimFilter) {
+		f.SkipOperationIDs = append(f.SkipOperationIDs, ids...)
 	}
 }
 

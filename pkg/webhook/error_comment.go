@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/templates"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -31,14 +32,51 @@ func (h *Handler) postCommandError(
 	repo string, pr int, installationID int64,
 	commandName, environment, requestedBy, errorDetail string,
 ) {
-	h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
+	h.postCommandErrorLanded(repo, pr, installationID, commandName, environment, requestedBy, errorDetail)
+}
+
+// postCommandErrorLanded is postCommandError reporting whether the comment
+// landed, for a caller whose own message points at it.
+func (h *Handler) postCommandErrorLanded(
+	repo string, pr int, installationID int64,
+	commandName, environment, requestedBy, errorDetail string,
+) bool {
+	return h.postCommentBestEffortID(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 		RequestedBy:  requestedBy,
 		Timestamp:    templates.NowFunc().UTC().Format("2006-01-02 15:04:05"),
 		Environment:  environment,
 		Environments: h.deploymentEnvironmentScope(environment),
 		CommandName:  commandName,
 		ErrorDetail:  userFacingErrorDetail(errorDetail),
-	}))
+	})) != 0
+}
+
+// postChangeGateRefusal posts a change gate's answer to a PR command, for an
+// err that isChangeGateError accepts. A freeze refusal gets its own comment,
+// which SchemaBot writes itself: what is frozen, until when and why, and what
+// the commenter can do next. A gate that could not decide posts its fixed
+// message as a command error. It reports whether that comment landed, for a
+// caller whose own message points at it.
+func (h *Handler) postChangeGateRefusal(
+	repo string, pr int, installationID int64,
+	commandName, environment, requestedBy string, err error,
+) bool {
+	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
+		var approvers []string
+		onReason := true // the default policy
+		if config, ok := h.serverConfig(); ok {
+			approvers = config.Freeze.GitHubTeams
+			onReason = config.Freeze.OverrideOnReason()
+		}
+		data := changeGateRefusalData(refused, commandName, h.deploymentTenant(), requestedBy, approvers)
+		data.OverrideOnReason = onReason
+		return h.postCommentBestEffortID(repo, pr, installationID, templates.RenderChangeGateRefusal(data)) != 0
+	}
+	message := "SchemaBot could not check for freezes, so this did not start. Try again."
+	if unavailable, ok := errors.AsType[*api.ChangeGateUnavailableError](err); ok {
+		message = unavailable.UserMessage()
+	}
+	return h.postCommandErrorLanded(repo, pr, installationID, commandName, environment, requestedBy, message)
 }
 
 // deploymentEnvironmentScope returns the environments this deployment
@@ -58,9 +96,23 @@ func (h *Handler) deploymentEnvironmentScope(environment string) []string {
 	return config.AllowedEnvironments
 }
 
+// dropTablesCheckFailedMessage is the PR comment line for a plan refused
+// because SchemaBot could not read whether an apply still needs a table the
+// config lists under drop_tables.
+const dropTablesCheckFailedMessage = "SchemaBot could not check whether an apply that may still resume needs a table listed under `drop_tables`, so the plan was refused. Run the command again; if it fails again, the SchemaBot server logs have the cause."
+
 func userFacingError(err error) string {
 	if message, ok := userFacingConfigNotAuthorizedError(err); ok {
 		return message
+	}
+	// The cause is a storage failure the server logs with its identifiers.
+	if _, ok := errors.AsType[*api.DropTablesCheckError](err); ok {
+		return dropTablesCheckFailedMessage
+	}
+	// The cause is the data plane's error, which the caller logs with its
+	// identifiers.
+	if resolveErr, ok := errors.AsType[*api.NamespaceResolutionError](err); ok {
+		return namespaceResolutionFailedMessage(resolveErr)
 	}
 	var remoteErr *api.RemoteDeploymentUnavailableError
 	if errors.As(err, &remoteErr) {
@@ -70,6 +122,26 @@ func userFacingError(err error) string {
 		return userFacingRemoteUnavailableError("", "", err.Error())
 	}
 	return err.Error()
+}
+
+// namespaceResolutionFailedMessage is the PR comment line for a shared schema
+// check that could not learn which schemas a database's namespaces address on
+// a target. A data plane too old to answer needs an upgrade, and saying so is
+// the whole remedy. A data plane whose engine cannot resolve namespaces will
+// refuse every retry, so the line says so instead of suggesting one. Any other
+// failure is named only by its identifiers.
+func namespaceResolutionFailedMessage(err *api.NamespaceResolutionError) string {
+	where := "target `" + err.Target + "` of deployment `" + err.Deployment + "`"
+	if err.DataPlaneTooOld() {
+		return "SchemaBot could not check which schemas `" + err.Database + "` shares with other databases on " + where +
+			", because that deployment's data plane cannot report which schema each namespace addresses. Upgrade that data plane, then run the command again."
+	}
+	if errors.Is(err, tern.ErrResolveNamespacesUnsupported) {
+		return "SchemaBot could not check which schemas `" + err.Database + "` shares with other databases on " + where +
+			", because that deployment's data plane cannot resolve namespaces for this database's engine. Running the command again will not help; the SchemaBot server logs have the cause."
+	}
+	return "SchemaBot could not check which schemas `" + err.Database + "` shares with other databases on " + where +
+		", so the command was refused. Run the command again; if it fails again, the SchemaBot server logs have the cause."
 }
 
 func userFacingConfigNotAuthorizedError(err error) (string, bool) {

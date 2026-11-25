@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"log/slog"
 	"testing"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -18,6 +20,34 @@ func adoptCopy(namespace string, tables ...string) *engine.ExistingCopy {
 		Tables:      tables,
 		Age:         4 * time.Second,
 	}
+}
+
+// A plan marks a copy running from the database's non-terminal tasks alone. A
+// task copying `line_items` on the planned target marks it, and a row that only
+// reads as terminal once normalized marks nothing.
+func TestRunningCopyTablesReadsOnlyTheNonTerminalTasks(t *testing.T) {
+	operationID := int64(5)
+	copying := &storage.Task{
+		ID: 1, TaskIdentifier: "task-copying", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL,
+		Environment: "staging", TableName: "line_items", State: state.Task.Running, ApplyOperationID: &operationID,
+	}
+	aliased := &storage.Task{
+		ID: 2, TaskIdentifier: "task-aliased", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL,
+		Environment: "staging", TableName: "shipments", State: "STATE_COMPLETED", ApplyOperationID: &operationID,
+	}
+	client := &LocalClient{
+		config: LocalConfig{Database: "orders", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			tasks:           rawNonTerminalStore{rows: []*storage.Task{aliased, copying}},
+			applyOperations: &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{{ID: operationID, Target: "orders-target"}}},
+		},
+		logger: slog.Default(),
+	}
+
+	running, err := client.runningCopyTables(t.Context(), "orders", "staging", "orders-target")
+
+	require.NoError(t, err)
+	assert.Equal(t, map[runningCopyKey]bool{{"orders", "line_items"}: true}, running)
 }
 
 // A copy the deployment is still making is disclosed as running, so the surface

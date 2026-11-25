@@ -2,10 +2,13 @@
 package sqlstore
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/state"
@@ -19,6 +22,11 @@ const checkColumns = `id, repository, pull_request, head_sha,
 	check_run_id, apply_id, has_changes, status, conclusion,
 	blocking_reason, error_message, change_summary, rollout_targets, rollout_targets_with_work,
 	created_at, updated_at`
+
+// removableCheckColumns is checkColumns with the aggregate render, for the
+// close cleanup listing and its delete. The render is compared with the rest,
+// so a rewrite that changes only an aggregate's render is kept.
+const removableCheckColumns = checkColumns + `, aggregate_render`
 
 const (
 	checkStatusInProgress         = "in_progress"
@@ -385,11 +393,16 @@ func successfulNoOpPlanResult(check *storage.Check) bool {
 // this call (whether this call wrote it or it already was), and false only when a
 // started apply still owns it.
 //
+// The update also pins the head the caller read the row at. A row a newer
+// write moved to a head that is neither readHeadSHA nor check.HeadSHA, such as
+// a newer commit's plan settling it first, belongs to that write and is left
+// alone, so a slower settle for an older commit cannot pull it back.
+//
 // This deliberately clears a review-time deployment drift block too: once a later
 // commit removes the database from the PR and no apply has started, the reviewed
 // plan is no longer part of the merge gate, so the plan-only drift block should
 // stop blocking. A started apply still owns the row and is left untouched.
-func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check) (bool, error) {
+func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check, readHeadSHA string) (bool, error) {
 	canonicalizeCheck(check)
 	targets, withWork := rolloutTargetsKeptWithSummary(check)
 	var checkRunID any
@@ -412,9 +425,10 @@ func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
 		  AND status != ? AND apply_id IS NULL
+		  AND head_sha IN (?, ?)
 	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary, targets, withWork,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
-		checkStatusInProgress)
+		checkStatusInProgress, readHeadSHA, check.HeadSHA)
 	if err != nil {
 		return false, fmt.Errorf("mark stale plan check successful for %s#%d %s/%s/%s: %w",
 			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, err)
@@ -429,10 +443,10 @@ func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage
 	}
 
 	// Under changed-rows semantics, RowsAffected is 0 both when the guard
-	// excluded the row (an apply claimed it) and when the row already held the
-	// exact plan-only success values this call would have written. Re-read the
-	// row to tell these apart so an already-successful row is treated as success
-	// rather than left blocking.
+	// excluded the row (an apply claimed it, or a newer write moved it) and when
+	// the row already held the exact plan-only success values this call would
+	// have written. Re-read the row to tell these apart so an already-successful
+	// row is treated as success rather than left blocking.
 	current, err := s.Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
 	if err != nil {
 		return false, fmt.Errorf("re-read stale plan check after no-op update for %s#%d %s/%s/%s: %w",
@@ -442,7 +456,7 @@ func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage
 		return false, fmt.Errorf("stale plan check vanished after no-op update for %s#%d %s/%s/%s",
 			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
 	}
-	return isPlanOnlySuccessful(current), nil
+	return isPlanOnlySuccessful(current) && current.HeadSHA == check.HeadSHA, nil
 }
 
 // BlockStaleStartedApply records that the schema change a started apply owns
@@ -1014,19 +1028,43 @@ func (s *checkStore) GetByDatabase(ctx context.Context, repo, environment, dbTyp
 func (s *checkStore) Delete(ctx context.Context, id int64) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM checks WHERE id = ?`, id)
 	if err != nil {
-		return err
+		return fmt.Errorf("delete check %d: %w", id, err)
 	}
 
-	return checkRowsAffected(result, storage.ErrCheckNotFound)
+	return checkRowsAffected(result, storage.ErrCheckNotFound, fmt.Sprintf("deleting check %d", id))
 }
 
-// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a
-// closed PR, retaining apply-owned rows the close must not unblock. Once an
-// apply has started, its stored check state is authoritative until an
-// operator reconciles the target environment — closing and reopening the PR
-// must not convert it into a passing aggregate.
+// DeleteStalePlanOnly removes a plan-only row no plan can store again. The
+// delete is one guarded statement, so an apply that claimed the row, or a
+// newer write that moved it off the head the caller read it at, after the
+// caller read it keeps the row. A row already gone counts as removed.
+func (s *checkStore) DeleteStalePlanOnly(ctx context.Context, check *storage.Check, readHeadSHA string) (bool, error) {
+	canonicalizeCheck(check)
+	target := fmt.Sprintf("%s#%d %s/%s/%s",
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	if _, err := s.db.ExecContext(ctx, `
+		DELETE FROM checks
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		  AND status != ? AND apply_id IS NULL AND head_sha = ?
+	`, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		checkStatusInProgress, readHeadSHA); err != nil {
+		return false, fmt.Errorf("delete stale plan-only check %s read at %s: %w", target, readHeadSHA, err)
+	}
+	current, err := s.Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	if err != nil {
+		return false, fmt.Errorf("re-read stale plan-only check %s after delete: %w", target, err)
+	}
+	return current == nil, nil
+}
+
+// ListRemovableOnPRClose returns the stored check state a close of the PR
+// removes, for DeleteListedIfUnchanged to delete, retaining apply-owned rows
+// the close must not unblock. Once an apply has started, its stored check
+// state is authoritative until an operator reconciles the target environment —
+// closing and reopening the PR must not convert it into a passing aggregate.
 //
-// Plan-only rows (apply_id unset) are always deleted: no apply ever reached
+// Plan-only rows (apply_id unset) are always listed: no apply ever reached
 // the live database for them, so a reopened PR starts clean.
 //
 // On a merged close, an apply-owned row is retained when it is either:
@@ -1039,7 +1077,7 @@ func (s *checkStore) Delete(ctx context.Context, id int64) error {
 //     operator attention is still required, e.g. the schema change was
 //     removed from the PR after the apply started or a rollback completed.
 //
-// Apply-owned rows whose conclusion is success are deleted on a merged
+// Apply-owned rows whose conclusion is success are listed on a merged
 // close: the apply finished cleanly and the merged PR carries the applied
 // schema, so nothing remains for the row to block.
 //
@@ -1051,29 +1089,130 @@ func (s *checkStore) Delete(ctx context.Context, id int64) error {
 // Reopen-time stale cleanup converges the retained row: it converts it to
 // action_required when the schema change is gone from the PR, or a fresh
 // plan result replaces it when the change is still present.
-func (s *checkStore) DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int, merged bool) error {
+func (s *checkStore) ListRemovableOnPRClose(ctx context.Context, repo string, pr int, merged bool) ([]*storage.Check, error) {
 	repo = storage.CanonicalKey(repo)
 	if merged {
-		_, err := s.db.ExecContext(ctx, `
-			DELETE FROM checks
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT `+removableCheckColumns+`
+			FROM checks
 			WHERE repository = ? AND pull_request = ?
 			  AND (apply_id IS NULL OR (status != ? AND conclusion = ?))
+			ORDER BY id
 		`, repo, pr, checkStatusInProgress, checkConclusionSuccess)
 		if err != nil {
-			return fmt.Errorf("delete checks for merged closed PR %s#%d: %w", repo, pr, err)
+			return nil, fmt.Errorf("list removable checks for merged closed PR %s#%d: %w", repo, pr, err)
 		}
-		return nil
+		defer utils.CloseAndLog(rows)
+		return scanRemovableChecks(rows)
 	}
 
-	_, err := s.db.ExecContext(ctx, `
-		DELETE FROM checks
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+removableCheckColumns+`
+		FROM checks
 		WHERE repository = ? AND pull_request = ?
 		  AND apply_id IS NULL
+		ORDER BY id
 	`, repo, pr)
 	if err != nil {
-		return fmt.Errorf("delete plan-only checks for unmerged closed PR %s#%d: %w", repo, pr, err)
+		return nil, fmt.Errorf("list plan-only checks for unmerged closed PR %s#%d: %w", repo, pr, err)
 	}
-	return nil
+	defer utils.CloseAndLog(rows)
+	return scanRemovableChecks(rows)
+}
+
+// DeleteListedIfUnchanged deletes each listed row only while it is still the
+// row ListRemovableOnPRClose returned, and returns the rows it kept because
+// they were written since. Each row is read by ID under FOR UPDATE and compared
+// with the listing in the same transaction as its delete, so a write that
+// reaches the row after the comparison waits on the row lock and then finds it
+// deleted, rather than being deleted itself.
+//
+// The comparison covers every column the listing read, updated_at included,
+// rather than updated_at alone: updated_at is whole-second on MySQL, so a
+// rewrite in the same second as the listed write keeps its timestamp and would
+// look unchanged. A rewrite is kept when it changed any column, or when it
+// landed in a later second; only a rewrite in the same second that stores
+// exactly the listed values is deleted, and that row says nothing the listed
+// row did not.
+//
+// A listed row already gone is what the caller wanted and is neither deleted
+// nor kept. A row inserted since the listing has an ID the listing does not
+// name, so it is never touched.
+func (s *checkStore) DeleteListedIfUnchanged(ctx context.Context, listed []*storage.Check) ([]*storage.Check, error) {
+	if len(listed) == 0 {
+		return nil, nil
+	}
+	ordered := slices.Clone(listed)
+	// A fixed lock order keeps two deletes over overlapping rows from
+	// deadlocking each other.
+	slices.SortFunc(ordered, func(a, b *storage.Check) int { return cmp.Compare(a.ID, b.ID) })
+
+	var kept []*storage.Check
+	err := withLockRetry(ctx, s.classifier, "delete listed check state for closed PR", func() error {
+		kept = nil
+		tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+		if err != nil {
+			return fmt.Errorf("begin listed check state delete: %w", err)
+		}
+		defer rollbackTx(ctx, tx, "delete listed check state")
+
+		for _, row := range ordered {
+			target := fmt.Sprintf("%s#%d %s/%s/%s (check %d)",
+				row.Repository, row.PullRequest, row.Environment, row.DatabaseType, row.DatabaseName, row.ID)
+			current, err := scanRemovableCheck(tx.QueryRowContext(ctx, `
+				SELECT `+removableCheckColumns+`
+				FROM checks
+				WHERE id = ?
+				FOR UPDATE
+			`, row.ID))
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("read listed check state %s: %w", target, err)
+			}
+			if !checkRowUnchanged(row, current) {
+				kept = append(kept, current)
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM checks WHERE id = ?`, row.ID); err != nil {
+				return fmt.Errorf("delete listed check state %s: %w", target, err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit listed check state delete: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return kept, nil
+}
+
+// checkRowUnchanged reports whether current still holds every value listed
+// was read with.
+func checkRowUnchanged(listed, current *storage.Check) bool {
+	return listed.ID == current.ID &&
+		listed.Repository == current.Repository &&
+		listed.PullRequest == current.PullRequest &&
+		listed.HeadSHA == current.HeadSHA &&
+		listed.Environment == current.Environment &&
+		listed.DatabaseType == current.DatabaseType &&
+		listed.DatabaseName == current.DatabaseName &&
+		listed.CheckRunID == current.CheckRunID &&
+		listed.ApplyID == current.ApplyID &&
+		listed.HasChanges == current.HasChanges &&
+		listed.Status == current.Status &&
+		listed.Conclusion == current.Conclusion &&
+		listed.BlockingReason == current.BlockingReason &&
+		listed.ErrorMessage == current.ErrorMessage &&
+		listed.ChangeSummary == current.ChangeSummary &&
+		listed.RolloutTargets == current.RolloutTargets &&
+		listed.RolloutTargetsWithWork == current.RolloutTargetsWithWork &&
+		bytes.Equal(listed.AggregateRender, current.AggregateRender) &&
+		listed.CreatedAt.Equal(current.CreatedAt) &&
+		listed.UpdatedAt.Equal(current.UpdatedAt)
 }
 
 // scanCheck scans a single check row, returning nil if not found.
@@ -1098,19 +1237,47 @@ func scanChecks(rows *sql.Rows) ([]*storage.Check, error) {
 	return checks, rows.Err()
 }
 
-// scanCheckInto scans check data from any scanner (Row or Rows).
-func scanCheckInto(s scanner) (*storage.Check, error) {
+// scanRemovableChecks scans rows selected with removableCheckColumns.
+func scanRemovableChecks(rows *sql.Rows) ([]*storage.Check, error) {
+	var checks []*storage.Check
+	for rows.Next() {
+		check, err := scanRemovableCheck(rows)
+		if err != nil {
+			return nil, err
+		}
+		checks = append(checks, check)
+	}
+	return checks, rows.Err()
+}
+
+// scanRemovableCheck scans a row selected with removableCheckColumns.
+func scanRemovableCheck(s scanner) (*storage.Check, error) {
+	var render sql.NullString
+	check, err := scanCheckInto(s, &render)
+	if err != nil {
+		return nil, err
+	}
+	if render.Valid && render.String != "" {
+		check.AggregateRender = []byte(render.String)
+	}
+	return check, nil
+}
+
+// scanCheckInto scans check data from any scanner (Row or Rows). extra
+// receives any columns selected after checkColumns.
+func scanCheckInto(s scanner, extra ...any) (*storage.Check, error) {
 	var check storage.Check
 	var checkRunID, applyID sql.NullInt64
 	var conclusion, blockingReason, errorMessage, changeSummary sql.NullString
 
-	err := s.Scan(
+	dest := []any{
 		&check.ID, &check.Repository, &check.PullRequest, &check.HeadSHA,
 		&check.Environment, &check.DatabaseType, &check.DatabaseName,
 		&checkRunID, &applyID, &check.HasChanges, &check.Status, &conclusion,
 		&blockingReason, &errorMessage, &changeSummary, &check.RolloutTargets, &check.RolloutTargetsWithWork,
 		&check.CreatedAt, &check.UpdatedAt,
-	)
+	}
+	err := s.Scan(append(dest, extra...)...)
 	if err != nil {
 		return nil, err
 	}

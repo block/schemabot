@@ -8,8 +8,8 @@
 // beside them (🛑), naming the member each one collapses into, so a sixth
 // level cannot enter through a glyph the vocabulary never defined.
 //
-// The vocabulary's non-severity members, the documentation pointer 📖 and the
-// tip 💡, are flagged the same way: they share the package so every surface
+// The vocabulary's non-severity members, the documentation pointer 📖, the
+// tip 💡 and the freeze ❄️, are flagged the same way: they share the package so every surface
 // renders the same glyph, and a literal spelled at a rendering site would let
 // them drift.
 //
@@ -71,6 +71,7 @@ var vocabularyGlyphs = []struct {
 }{
 	{"📖", "glyph.Docs", "documentation"},
 	{"💡", "glyph.Tip", "tip"},
+	{"❄", "glyph.Frozen", "freeze"},
 }
 
 // Analyzer flags string literals containing a severity glyph in non-test
@@ -79,7 +80,7 @@ var vocabularyGlyphs = []struct {
 // drifts.
 var Analyzer = &analysis.Analyzer{
 	Name:     "severityglyphs",
-	Doc:      "flags severity glyph literals (🚨 ⛔ ❌ ⚠️ ℹ️), glyphs that read as severity without being vocabulary members (🛑), and the documentation (📖) and tip (💡) glyphs, in non-test files; use the named pkg/glyph constants (callers exclude pkg/glyph itself from the package set)",
+	Doc:      "flags severity glyph literals (🚨 ⛔ ❌ ⚠️ ℹ️), glyphs that read as severity without being vocabulary members (🛑), and the documentation (📖), tip (💡) and freeze (❄️) glyphs, in non-test files; use the named pkg/glyph constants (callers exclude pkg/glyph itself from the package set)",
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
 	Run:      run,
 }

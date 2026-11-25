@@ -187,6 +187,7 @@ type: mysql
 | `type` | Yes | `"mysql"`, `"vitess"`, `"strata"` (experimental; requires server opt-in — see [Strata](strata-engine.md)), or `"postgres"` |
 | `ignore_namespaces` | No | Namespace subdirectories to exclude from plans, applies, and checks (see [Ignoring Namespaces](namespaces.md#ignoring-namespaces)) |
 | `ignore_tables` | No | Live table names to withhold from the planner, so an undeclared table is neither created nor dropped. An entry wrapped in slashes, such as `/^relay_[0-9]+_feed$/`, is a regular expression matched against the whole name (see [Ignoring Tables](namespaces.md#ignoring-tables)) |
+| `drop_tables` | No | MySQL only. Exact names of live tables no schema file declares that the plan should drop, such as an online schema change's leftover `_` table, which the planner otherwise skips. Each drop is an unsafe change, and the plan lists any entry that names no table (see [Dropping Tables](namespaces.md#dropping-tables)) |
 
 Environment availability and promotion order are configured on the SchemaBot server.
 

@@ -36,6 +36,7 @@ import (
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/pendingdrops"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/targetauth"
 )
 
@@ -116,6 +117,11 @@ type Engine struct {
 	// sends, given the probe's context, so tests can make the server slow to
 	// answer and prove every statement runs under the probe's budget.
 	sizeProbeSQL func(ctx context.Context, stmt string) string
+
+	// dropTablesQuietPeriod is how long a drop_tables entry must have gone
+	// without a write before a plan proposes dropping it. New sets it to
+	// defaultDropTablesQuietPeriod; it is a field so tests can shorten it.
+	dropTablesQuietPeriod time.Duration
 }
 
 // runningSchemaChange tracks the state of an in-progress schema change.
@@ -181,21 +187,86 @@ type runningSchemaChange struct {
 	username   string
 	password   string
 
-	// For waiting on schema change to finish. active counts the run goroutines
-	// still executing, so a halt can tell work that is still running from work
-	// that has already ended.
-	wg     sync.WaitGroup
-	active atomic.Int32
+	// run follows the goroutine executing the schema change, so a halt, drain,
+	// stop, or start can tell work that is still running from work that has
+	// already ended, and wait for it to return. Guarded by Engine.mu.
+	run runTracker
 }
 
-// goRun runs the schema change's background work, tracked by both wg and
-// active.
-func (rm *runningSchemaChange) goRun(run func()) {
-	rm.active.Add(1)
-	rm.wg.Go(func() {
-		defer rm.active.Add(-1)
+// runTracker follows the current run of a schema change: the goroutine Apply
+// starts, or the one Start resumes it in. Each run gets its own done channel,
+// made and published in the same Engine.mu critical section that decides the
+// run may start, and closed by the run goroutine as the last thing it does.
+// A waiter takes the channel under Engine.mu and selects on it and its own
+// context, so a waiter that gives up leaves nothing behind that a later run
+// could collide with. Its zero value tracks no run. Guarded by Engine.mu.
+type runTracker struct {
+	// done is closed when the current run returns. It is nil until the first
+	// run starts.
+	done chan struct{}
+}
+
+// start claims a new run and launches it. The caller must hold Engine.mu, in
+// the same critical section in which it checked that no earlier run is alive.
+func (t *runTracker) start(run func()) {
+	done := make(chan struct{})
+	t.done = done
+	go func() {
+		defer close(done)
 		run()
-	})
+	}()
+}
+
+// alive reports whether the current run has not returned yet. The caller must
+// hold Engine.mu.
+func (t *runTracker) alive() bool {
+	return !t.exit().returned()
+}
+
+// exit returns the handle a waiter uses to wait for the current run to return.
+// The caller must hold Engine.mu; the handle itself is used without it.
+func (t *runTracker) exit() runExit {
+	return runExit{done: t.done}
+}
+
+// runExit is a waiter's handle on one run's return. A handle on no run reads
+// as already returned.
+type runExit struct {
+	done <-chan struct{}
+}
+
+// returned reports whether the run has returned.
+func (x runExit) returned() bool {
+	if x.done == nil {
+		return true
+	}
+	select {
+	case <-x.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// wait waits for the run to return, or for ctx to end. A run that has already
+// returned wins over a context that has already ended.
+func (x runExit) wait(ctx context.Context) error {
+	if x.returned() {
+		return nil
+	}
+	select {
+	case <-x.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// waitWithoutBound waits for the run to return, however long it takes.
+func (x runExit) waitWithoutBound() {
+	if x.done != nil {
+		<-x.done
+	}
 }
 
 // Compile-time check that Engine implements the interface.
@@ -253,6 +324,8 @@ func New(cfg Config) *Engine {
 		lockWaitTimeout:     lockWaitTimeout,
 		disablePendingDrops: cfg.DisablePendingDrops,
 		checkpointMaxAge:    checkpointMaxAge,
+
+		dropTablesQuietPeriod: defaultDropTablesQuietPeriod,
 	}
 	eng.debugLogs.Store(cfg.DebugLogs)
 
@@ -371,28 +444,40 @@ func (e *Engine) RegistersWorkSynchronously() bool {
 // Drain waits without a bound, for a caller that owns the engine outright. A
 // drive waits through DrainContext instead, so it never outlives its claim.
 func (e *Engine) Drain() {
-	rm, raceWindow := e.trackedForDrain()
+	rm, exit, raceWindow := e.trackedForDrain()
 	if rm == nil {
 		return
 	}
-	rm.wg.Wait()
-	e.releaseDrained(rm, raceWindow)
+	for {
+		exit.waitWithoutBound()
+		next, resumed := e.releaseDrained(rm, exit, raceWindow)
+		if !resumed {
+			return
+		}
+		exit = next
+	}
 }
 
 // DrainContext is Drain bounded by ctx. When ctx ends before the schema change
 // exits, it returns an error and leaves the change tracked, so the engine
-// still reports it as holding the target.
+// still reports it as holding the target. A run that Start resumes while the
+// drain waits is waited for within the same ctx.
 func (e *Engine) DrainContext(ctx context.Context) error {
-	rm, raceWindow := e.trackedForDrain()
+	rm, exit, raceWindow := e.trackedForDrain()
 	if rm == nil {
 		return nil
 	}
-	if err := waitForRunExit(ctx, rm); err != nil {
-		database, tables := e.runTarget(rm)
-		return fmt.Errorf("drain schema change on database %s tables %v: still running after %w", database, tables, err)
+	for {
+		if err := exit.wait(ctx); err != nil {
+			database, tables := e.runTarget(rm)
+			return fmt.Errorf("drain schema change on database %s tables %v: still running after %w", database, tables, err)
+		}
+		next, resumed := e.releaseDrained(rm, exit, raceWindow)
+		if !resumed {
+			return nil
+		}
+		exit = next
 	}
-	e.releaseDrained(rm, raceWindow)
-	return nil
 }
 
 // runTarget reads the database and tables of a run that may still be running.
@@ -403,16 +488,24 @@ func (e *Engine) runTarget(rm *runningSchemaChange) (string, []string) {
 	return rm.database, rm.tables
 }
 
-// trackedForDrain returns the schema change a drain waits for, if any.
-func (e *Engine) trackedForDrain() (*runningSchemaChange, func()) {
+// trackedForDrain returns the schema change a drain waits for, if any, and the
+// handle on its current run's return.
+func (e *Engine) trackedForDrain() (*runningSchemaChange, runExit, func()) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.runningSchemaChange, e.drainRaceWindow
+	rm := e.runningSchemaChange
+	if rm == nil {
+		return nil, runExit{}, e.drainRaceWindow
+	}
+	return rm, rm.run.exit(), e.drainRaceWindow
 }
 
-// releaseDrained stops tracking rm once its run has exited, keeping its
-// outcome for a later progress poll.
-func (e *Engine) releaseDrained(rm *runningSchemaChange, raceWindow func()) {
+// releaseDrained stops tracking rm once the run the drain waited for, exited,
+// has returned, keeping its outcome for a later progress poll. When Start has
+// resumed rm in a new run since the drain took exited, rm stays tracked and
+// releaseDrained returns the new run's handle with resumed set, so the drain
+// waits for that run before it releases anything.
+func (e *Engine) releaseDrained(rm *runningSchemaChange, exited runExit, raceWindow func()) (next runExit, resumed bool) {
 	if raceWindow != nil {
 		raceWindow()
 	}
@@ -425,13 +518,25 @@ func (e *Engine) releaseDrained(rm *runningSchemaChange, raceWindow func()) {
 		e.mu.Unlock()
 		e.schemaChangeLogger(rm).Debug("drained schema change is no longer tracked; leaving the engine's current state in place",
 			"database", rm.database, "tables", rm.tables)
-		return
+		return runExit{}, false
+	}
+	if current := rm.run.exit(); current != exited {
+		// Start resumed the change after the waited-for run returned. The
+		// resumed run is still working on the target, so releasing rm now
+		// would hide it from an ownership halt (OW-3) and let the caller
+		// proceed as if the target had drained.
+		database, tables := rm.database, rm.tables
+		e.mu.Unlock()
+		e.schemaChangeLogger(rm).Debug("drained schema change was resumed while the drain waited; waiting for the resumed run",
+			"database", database, "tables", tables)
+		return current, true
 	}
 	if retainsDrainedOutcome(rm.state) {
 		e.drainedOutcome = newDrainedOutcome(rm)
 	}
 	e.runningSchemaChange = nil
 	e.mu.Unlock()
+	return runExit{}, false
 }
 
 // installRunningSchemaChange publishes rm as the engine's tracked schema
@@ -444,6 +549,17 @@ func (e *Engine) installRunningSchemaChange(rm *runningSchemaChange) {
 	e.runningSchemaChange = rm
 	e.drainedOutcome = nil
 	e.mu.Unlock()
+}
+
+// installAndRun publishes rm like installRunningSchemaChange and starts its
+// run in the same critical section, so no halt, drain, or progress poll can
+// find the change published without the run that executes it.
+func (e *Engine) installAndRun(rm *runningSchemaChange, run func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.runningSchemaChange = rm
+	e.drainedOutcome = nil
+	rm.run.start(run)
 }
 
 // drainedOutcome is the retained result of a schema change that reached a
@@ -572,7 +688,8 @@ func (e *Engine) halt(ctx context.Context, selected func(*runningSchemaChange) b
 		e.mu.Unlock()
 		return nil
 	}
-	if rm.active.Load() == 0 {
+	exit := rm.run.exit()
+	if exit.returned() {
 		database, tables, state := rm.database, rm.tables, rm.state
 		e.mu.Unlock()
 		e.schemaChangeLogger(rm).Debug("schema change has already ended; nothing to halt",
@@ -592,7 +709,7 @@ func (e *Engine) halt(ctx context.Context, selected func(*runningSchemaChange) b
 	// it would write progress for work that is over, and cancelling would cut
 	// short a teardown that releases the table on its own. Wait for it instead.
 	if outcome.IsTerminal() {
-		return waitForSchemaChangeExit(ctx, rm, database, tables)
+		return waitForSchemaChangeExit(ctx, exit, database, tables)
 	}
 
 	// Checkpoint before cancelling. Spirit checkpoints on its own interval, so
@@ -609,7 +726,7 @@ func (e *Engine) halt(ctx context.Context, selected func(*runningSchemaChange) b
 		cancelRun()
 	}
 
-	if err := waitForSchemaChangeExit(ctx, rm, database, tables); err != nil {
+	if err := waitForSchemaChangeExit(ctx, exit, database, tables); err != nil {
 		return err
 	}
 	logger.Info("schema change halted; the target's lock is released and the apply stays active for another driver",
@@ -617,33 +734,14 @@ func (e *Engine) halt(ctx context.Context, selected func(*runningSchemaChange) b
 	return nil
 }
 
-// waitForSchemaChangeExit waits for the change's run goroutines to return. It
-// waits off the calling goroutine so a runner that will not come down bounds
-// the caller at ctx rather than blocking it forever; the wait goroutine ends
-// with the runner it is waiting on.
-func waitForSchemaChangeExit(ctx context.Context, rm *runningSchemaChange, database string, tables []string) error {
-	if err := waitForRunExit(ctx, rm); err != nil {
+// waitForSchemaChangeExit waits for the change's run to return, bounded by ctx,
+// so a runner that will not come down bounds the caller at ctx rather than
+// blocking it forever.
+func waitForSchemaChangeExit(ctx context.Context, exit runExit, database string, tables []string) error {
+	if err := exit.wait(ctx); err != nil {
 		return fmt.Errorf("halt schema change on database %s tables %v: still running after %w; the target may still be locked", database, tables, err)
 	}
 	return nil
-}
-
-// waitForRunExit waits off the calling goroutine for the change's run
-// goroutines to return, or for ctx to end. The wait goroutine ends with the
-// runner it is waiting on.
-func waitForRunExit(ctx context.Context, rm *runningSchemaChange) error {
-	done := make(chan struct{})
-	go func() {
-		rm.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 // Plan computes the schema changes needed by diffing current schema against desired.
@@ -668,16 +766,23 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	if err != nil {
 		return nil, fmt.Errorf("plan database %s: %w", database, err)
 	}
-	current, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored)
+	drops, err := engine.NewDroppedTables(req.DropTables)
+	if err != nil {
+		return nil, fmt.Errorf("plan database %s: %w", database, err)
+	}
+	if err := drops.RefuseIgnored(ignored); err != nil {
+		return nil, &engine.PlanRefusedError{Err: fmt.Errorf("plan database %s: %w", database, err)}
+	}
+	current, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored, drops)
 	if err != nil {
 		return nil, fmt.Errorf("fetch current schema: %w", err)
 	}
-	currentSchema, withheld, lowerCaseTableNames := current.tables, current.withheld, current.lowerCaseTableNames
+	currentSchema, lowerCaseTableNames := current.tables, current.lowerCaseTableNames
 	e.logger.Debug("fetched current schema", "database", database, "tables", len(currentSchema))
 	for i, ts := range currentSchema {
 		e.logger.Debug("current schema table", "index", i, "stmt", ts.Schema[:min(200, len(ts.Schema))])
 	}
-	exemptTables := exemptWithheldTables(ignored, req, database, withheld)
+	exemptTables := exemptLiveTables(ignored, req, database, current)
 
 	// Build list of desired table schemas from all namespaces. Every namespace
 	// is diffed as one set against the database, so a table two schema files
@@ -711,7 +816,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 					return nil, fmt.Errorf("SQL usage error in %s/%s: %w", namespace, filename, err)
 				}
 				if err := declared.Declare(namespace+"/"+filename, ct.TableName); err != nil {
-					return nil, err
+					return nil, &engine.PlanRefusedError{Err: err}
 				}
 				// The diff names a live table the way it exists, so every
 				// lookup below keys the declaration by that spelling.
@@ -726,9 +831,10 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	// A table the config withholds that a schema file also declares is a
 	// contradiction the diff below would resolve as a CREATE TABLE for a table
 	// that already exists. Refuse in namespace order so the error names the
-	// same namespace on every run.
+	// same namespace on every run. Each is a refusal of the schema files as
+	// written, which the person who edits them fixes.
 	for _, namespace := range slices.Sorted(maps.Keys(declaredByNamespace)) {
-		if err := ignored.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
+		if err := refuseDeclaredTables(namespace, declaredByNamespace[namespace], ignored, drops, current); err != nil {
 			return nil, err
 		}
 	}
@@ -772,7 +878,22 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			NoChanges:             true,
 			ExistingCopiesChecked: true,
 			ExemptTables:          exemptTables,
+			UnmatchedDropTables:   current.unmatched,
 		}, nil
+	}
+
+	// A drop_tables entry is dropped only once the target shows it has gone
+	// the quiet period without a write. The check comes after the config's own
+	// contradictions are refused above, so an entry that should not be listed
+	// at all is reported as that, whatever the target says about its writes.
+	if !drops.Empty() {
+		db, err := target.get(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("plan database %s: check when drop_tables entries were last written: %w", database, err)
+		}
+		if err := e.requireQuietDropTables(ctx, db, database, drops); err != nil {
+			return nil, fmt.Errorf("plan database %s: %w", database, err)
+		}
 	}
 
 	// The engine's refusal checks compare a redeclared column against its
@@ -872,7 +993,13 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		lintViolations = append(lintViolations, lint.PlannedChangeViolations(pc)...)
 	}
 
-	schemaChanges, err := groupChangesByNamespace(changes, currentSchema, namespaceByTable, req.SchemaFiles, database)
+	// A drop_tables entry the naming conventions skip is in currentSchema only
+	// so it can be dropped. A rollback restores the recorded definitions, so
+	// recording one would have the rollback recreate an empty leftover that its
+	// own resume, planning without the list, then refuses as a declared table
+	// it never manages. A listed table with an ordinary name is one the plan
+	// would drop anyway, and its definition is recorded as any other's.
+	schemaChanges, err := groupChangesByNamespace(changes, withoutTables(currentSchema, current.reclaimed), namespaceByTable, req.SchemaFiles, database)
 	if err != nil {
 		return nil, err
 	}
@@ -888,26 +1015,74 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		ExistingCopies:        existingCopies,
 		ExistingCopiesChecked: copiesChecked,
 		ExemptTables:          exemptTables,
+		UnmatchedDropTables:   current.unmatched,
 	}, nil
 }
 
-// exemptWithheldTables builds the plan's ignore_tables disclosure. A withheld
-// table has no declaring file, so the file-based attribution the table changes
-// use cannot place it in a namespace: with one namespace in the request it
-// belongs to that namespace, and with several the unit being diffed is the
+// exemptLiveTables builds the plan's disclosure of the live tables the diff
+// never saw: the ones ignore_tables withheld, then the ones the underscore and
+// archive naming conventions excluded, one group per reason. None of these
+// tables has a declaring file, so the file-based attribution the table changes
+// use cannot place them in a namespace: with one namespace in the request they
+// belong to that namespace, and with several the unit being diffed is the
 // database itself, which is what the disclosure then names.
-func exemptWithheldTables(ignored engine.IgnoredTables, req *engine.PlanRequest, database string, withheld []string) []*engine.ExemptTables {
+func exemptLiveTables(ignored engine.IgnoredTables, req *engine.PlanRequest, database string, live *liveSchema) []*engine.ExemptTables {
 	namespace := database
 	if len(req.SchemaFiles) == 1 {
 		for ns := range req.SchemaFiles {
 			namespace = ns
 		}
 	}
-	exemption := ignored.Exemption(namespace, withheld)
-	if exemption == nil {
-		return nil
+	var groups []*engine.ExemptTables
+	if exemption := ignored.Exemption(namespace, live.withheld); exemption != nil {
+		groups = append(groups, exemption)
 	}
-	return []*engine.ExemptTables{exemption}
+	if len(live.underscore) > 0 {
+		groups = append(groups, &engine.ExemptTables{Namespace: namespace, Tables: live.underscore, Reason: engine.ExemptReasonLeadingUnderscore})
+	}
+	if len(live.archive) > 0 {
+		groups = append(groups, &engine.ExemptTables{Namespace: namespace, Tables: live.archive, Reason: engine.ExemptReasonArchiveNaming})
+	}
+	return groups
+}
+
+// refuseDeclaredTables refuses the tables a namespace's schema files declare
+// that the config or the naming conventions withhold from the diff. Each is a
+// plan refusal: the schema files or the config must change before the same
+// request can plan.
+func refuseDeclaredTables(namespace string, declared []string, ignored engine.IgnoredTables, drops engine.DroppedTables, live *liveSchema) error {
+	if err := ignored.RefuseDeclared(namespace, declared); err != nil {
+		return &engine.PlanRefusedError{Err: err}
+	}
+	if err := drops.RefuseDeclared(namespace, declared); err != nil {
+		return &engine.PlanRefusedError{Err: err}
+	}
+	return refuseDeclaredSkippedTables(namespace, declared, live)
+}
+
+// refuseDeclaredSkippedTables refuses a schema file that declares a live table
+// a naming convention keeps out of the diff. The diff never sees the live
+// table, so it would propose CREATE TABLE for a table that already exists, and
+// the apply would fail part way. Names compare ignoring case, the way
+// IgnoredTables.RefuseDeclared compares them, because whether two spellings
+// are one table is the target's answer.
+func refuseDeclaredSkippedTables(namespace string, declared []string, live *liveSchema) error {
+	skipped := make(map[string]string, len(live.underscore)+len(live.archive))
+	for _, name := range live.underscore {
+		skipped[schema.CaseFoldKey(name)] = "its name starts with \"_\""
+	}
+	for _, name := range live.archive {
+		skipped[schema.CaseFoldKey(name)] = "its name follows the archive convention <name>_archive_YYYY"
+	}
+	for _, table := range declared {
+		why, ok := skipped[schema.CaseFoldKey(table)]
+		if !ok {
+			continue
+		}
+		return &engine.PlanRefusedError{Err: fmt.Errorf("a schema file in namespace %q declares table %q, which the MySQL planner never manages because %s. Rename the table, or remove its schema file",
+			namespace, table, why)}
+	}
+	return nil
 }
 
 // Apply starts executing a schema change plan using Spirit.
@@ -1000,9 +1175,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		owner:           engine.WorkOwnerFromContext(ctx),
 		applyIdentifier: req.ApplyIdentifier,
 	}
-	e.installRunningSchemaChange(rm)
-
-	rm.goRun(func() {
+	e.installAndRun(rm, func() {
 		defer cancel()
 		if !e.stoppedStatementsEnded(bgCtx, host, username, password, database) {
 			return
@@ -1086,9 +1259,18 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 
 	state := progressState(rm, spiritState)
 
-	// If state was overridden and message is still the default fallback, update message to match
+	// A stop still waiting for its runner says so. Otherwise, if state was
+	// overridden and message is still the default fallback, update message to
+	// match.
 	defaultMessage := fmt.Sprintf("Schema change %s", rm.state)
-	if state != rm.state && message == defaultMessage {
+	switch {
+	case state == engine.StateRunning && rm.state == engine.StateStopped:
+		// progressState reports a stopped change as running only while its
+		// stop awaits the runner. Reading that from state, instead of checking
+		// the runner again, keeps the state and the message on one
+		// observation of a runner that can return at any moment.
+		message = stoppingMessage
+	case state != rm.state && message == defaultMessage:
 		message = fmt.Sprintf("Schema change %s", state)
 	}
 
@@ -1229,6 +1411,21 @@ func tableInPacedPhase(copyComplete bool, spiritState status.State) bool {
 	return !copyComplete || spiritState == status.Checksum
 }
 
+// stopAwaitsRunner reports whether the change is marked stopped while the
+// runner the stop interrupted has not returned, as after a stop whose wait
+// ended at its caller's context. The runner can still finish the change on its
+// way out, so stopped is not yet settled and Start refuses to resume it. A
+// progress poll reports such a change as running, the state an engine reports
+// for work still in motion, so no caller reads the stop as settled while the
+// runner can still change the target. The caller must hold e.mu.
+func stopAwaitsRunner(rm *runningSchemaChange) bool {
+	return rm.state == engine.StateStopped && rm.run.alive()
+}
+
+// stoppingMessage is the progress message for a change whose stop is still
+// waiting for the runner it interrupted.
+const stoppingMessage = "Stopping: waiting for the interrupted runner to return"
+
 // spiritPostCopyPhase reports whether the runner is in one of the active
 // phases between finishing the row copy and finishing the cutover: applying
 // the accumulated changeset, restoring deferred indexes, analyzing, verifying
@@ -1249,9 +1446,14 @@ func spiritPostCopyPhase(s status.State) bool {
 // progressState resolves the state reported for a progress poll. The tracked
 // state is authoritative for terminal outcomes: they are recorded before the
 // runner is closed, so a runner observed mid-teardown never changes the
-// recorded outcome. Spirit's status only refines a non-terminal state, e.g.
-// surfacing the sentinel wait for a deferred cutover.
+// recorded outcome. The one exception is a stop still waiting for the runner
+// it interrupted (stopAwaitsRunner), which reports running until that runner
+// returns. Spirit's status only refines a non-terminal state, e.g. surfacing
+// the sentinel wait for a deferred cutover. The caller must hold e.mu.
 func progressState(rm *runningSchemaChange, spiritState status.State) engine.State {
+	if stopAwaitsRunner(rm) {
+		return engine.StateRunning
+	}
 	state := rm.state
 	if !state.IsTerminal() && spiritState == status.WaitingOnSentinelTable && rm.deferCutover {
 		state = engine.StateWaitingForCutover
@@ -1280,9 +1482,10 @@ func progressState(rm *runningSchemaChange, spiritState status.State) engine.Sta
 // config does not name would have to come from the loader, which already holds
 // the full list from SHOW TABLES before it reads a definition.
 //
-// The leading-underscore exclusion stays with the loader unconditionally: it
-// discards the names it drops, so an entry naming one cannot be disclosed as
-// withheld from here whatever the ordering.
+// The leading-underscore exclusion stays with the loader unconditionally, so a
+// table it excludes is disclosed under the naming convention, never as
+// withheld by an ignore_tables entry that also names it. The loader reports
+// every table either exclusion dropped, which is what the plan discloses.
 func liveSchemaFilterOptions(ignored engine.IgnoredTables) []table.FilterOption {
 	opts := []table.FilterOption{table.WithoutUnderscoreTables, table.WithStrippedAutoIncrement}
 	if !ignored.MayWithhold(table.IsArchiveTable) {
@@ -1323,6 +1526,20 @@ type liveSchema struct {
 	// disclosure a withheld table would be indistinguishable from an
 	// unchanged one.
 	withheld []string
+	// underscore and archive are the live tables the naming conventions kept
+	// out of the diff, sorted, for the plan to disclose the same way: a table
+	// starting with "_" and a table named <name>_archive_YYYY[_MM[_DD]]. An
+	// archive table ignore_tables also names is reported in withheld instead;
+	// a "_" table is always reported here, because the loader drops it before
+	// the config is matched.
+	underscore []string
+	archive    []string
+	// reclaimed is the drop_tables entries in tables only because the list
+	// named them: the naming conventions would otherwise have kept them out.
+	reclaimed []string
+	// unmatched is the drop_tables entries that name no live table, in the
+	// order the config lists them, for the plan to report: they drop nothing.
+	unmatched []string
 	// lowerCaseTableNames is the target's @@lower_case_table_names, which
 	// decides whether the diff compares table names case-insensitively.
 	lowerCaseTableNames int
@@ -1333,7 +1550,10 @@ type liveSchema struct {
 // and archive tables that are maintained outside declarative schema files.
 //
 // ignored withholds the tables the repository's ignore_tables config names.
-func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, ignored engine.IgnoredTables) (*liveSchema, error) {
+// drops names tables the repository's drop_tables config asks to drop: one the
+// naming conventions would exclude is read back into the live schema, so the
+// diff proposes DROP TABLE for it like any other undeclared table.
+func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, ignored engine.IgnoredTables, drops engine.DroppedTables) (*liveSchema, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open target database: %w", err)
@@ -1351,9 +1571,44 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		return nil, fmt.Errorf("read lower_case_table_names: %w", err)
 	}
 
-	tables, err := table.LoadSchemaFromDB(ctx, db, liveSchemaFilterOptions(ignored)...)
+	tables, excluded, err := table.LoadSchemaAndExcludedTablesFromDB(ctx, db, liveSchemaFilterOptions(ignored)...)
 	if err != nil {
 		return nil, fmt.Errorf("load schema: %w", err)
+	}
+	var underscore, archive, reclaimed []string
+	for _, ex := range excluded {
+		if drops.Names(ex.Name) {
+			reclaimed = append(reclaimed, ex.Name)
+			continue
+		}
+		switch ex.Filter {
+		case table.WithoutUnderscoreTables:
+			underscore = append(underscore, ex.Name)
+		case table.WithoutArchiveTables:
+			archive = append(archive, ex.Name)
+		default:
+			return nil, fmt.Errorf("load schema: the loader excluded table %q under filter option %d, which the plan cannot disclose", ex.Name, ex.Filter)
+		}
+	}
+	for _, name := range reclaimed {
+		ts, err := loadTableSchema(ctx, db, name)
+		if err != nil {
+			return nil, fmt.Errorf("load schema of drop_tables entry %q: %w", name, err)
+		}
+		tables = append(tables, ts)
+	}
+	var unmatched []string
+	if !drops.Empty() {
+		// Every listed table that exists is in tables by now: the loader
+		// returned it, or it was read back in above.
+		liveNames := make([]string, 0, len(tables))
+		for _, ts := range tables {
+			liveNames = append(liveNames, ts.Name)
+		}
+		if unmatched = drops.Unmatched(liveNames); len(unmatched) > 0 {
+			e.logger.Info("drop_tables entries name no table on the target, so the plan drops nothing for them",
+				"database", database, "entries", unmatched)
+		}
 	}
 
 	// The archive-naming exclusion is applied here when the loader was not
@@ -1371,11 +1626,23 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 			continue
 		}
 		if table.IsArchiveTable(ts.Name) {
-			continue
+			if !drops.Names(ts.Name) {
+				archive = append(archive, ts.Name)
+				continue
+			}
+			if !slices.Contains(reclaimed, ts.Name) {
+				reclaimed = append(reclaimed, ts.Name)
+			}
 		}
 		kept = append(kept, ts)
 	}
+	if len(reclaimed) > 0 {
+		e.logger.Info("drop_tables entries read into the live schema so the plan drops them",
+			"database", database, "tables", reclaimed)
+	}
 	slices.Sort(withheld)
+	slices.Sort(underscore)
+	slices.Sort(archive)
 	if len(withheld) > 0 {
 		// The plan discloses this too; the log is where an operator tracing
 		// "why does the plan not mention table X" finds the answer without a
@@ -1383,7 +1650,15 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		e.logger.Info("live tables withheld from the plan by ignore_tables",
 			"database", database, "tables", withheld)
 	}
-	return &liveSchema{tables: kept, withheld: withheld, lowerCaseTableNames: lowerCaseTableNames}, nil
+	return &liveSchema{
+		tables:              kept,
+		withheld:            withheld,
+		underscore:          underscore,
+		archive:             archive,
+		reclaimed:           reclaimed,
+		unmatched:           unmatched,
+		lowerCaseTableNames: lowerCaseTableNames,
+	}, nil
 }
 
 // tableSizeEstimate is one table's approximate plan-time size read from

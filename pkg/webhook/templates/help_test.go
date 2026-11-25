@@ -18,3 +18,17 @@ func TestRenderHelpCommentListsControlCommands(t *testing.T) {
 	assert.Contains(t, rendered, "`schemabot cutover <apply-id> -e <env>`")
 	assert.Contains(t, rendered, "Complete a deferred cutover")
 }
+
+// The override flag is listed with the commands that take it.
+func TestRenderHelpCommentListsOverrideFlag(t *testing.T) {
+	rendered := RenderHelpComment()
+	assert.Contains(t, rendered, "`--override \"<reason>\"`")
+	assert.Contains(t, rendered, "(apply, apply-confirm, start and cutover)")
+}
+
+// The freeze approval is listed, and takes the override request's ID.
+func TestRenderHelpCommentListsFreezeApprove(t *testing.T) {
+	rendered := RenderHelpComment()
+	assert.Contains(t, rendered, "`schemabot freeze approve <ovr-id>`")
+	assert.Contains(t, rendered, "Approve a freeze override request asked for on this PR")
+}

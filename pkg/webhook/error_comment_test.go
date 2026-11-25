@@ -2,6 +2,8 @@ package webhook
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -9,7 +11,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -57,7 +61,7 @@ func TestPostCommandError_RendersTimestamp(t *testing.T) {
 		assert.Contains(t, body, "`staging`")
 		assert.Contains(t, body, "> boom")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for posted comment")
+		require.FailNow(t, "timed out waiting for posted comment")
 	}
 }
 
@@ -89,8 +93,35 @@ func TestPostCommandErrorExplainsRemoteUnavailable(t *testing.T) {
 	case body := <-bodies:
 		assert.Contains(t, body, "SchemaBot could not reach the remote schema change service")
 		assert.Contains(t, body, "No healthy upstream is available")
-		assert.Contains(t, body, "Raw error: rpc error: code = Unavailable desc = no healthy upstream")
+		assert.Contains(t, body, "Raw error: no healthy upstream")
+		assert.NotContains(t, body, "rpc error: code =")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for posted comment")
+		require.FailNow(t, "timed out waiting for posted comment")
 	}
+}
+
+// A shared schema check that cannot learn which schemas a database's
+// namespaces address fails the command with a fixed line naming the database,
+// target, and deployment. The data plane's own error stays in the server logs,
+// a data plane too old to answer is told to upgrade, and a data plane whose
+// engine cannot resolve namespaces is told a retry will not help.
+func TestUserFacingErrorHidesNamespaceResolutionCause(t *testing.T) {
+	resolution := func(cause error) error {
+		return fmt.Errorf("compare ignore_tables of %q with the databases sharing its targets in staging: %w", "shop",
+			&api.NamespaceResolutionError{Database: "shop", Environment: "staging", Deployment: "east", Target: "shop-001", Namespaces: []string{"shop"}, Cause: cause})
+	}
+
+	t.Run("a data plane that predates the RPC", func(t *testing.T) {
+		message := userFacingError(resolution(fmt.Errorf("resolve namespaces: %w", tern.ErrResolveNamespacesUnimplemented)))
+		assert.Equal(t, "SchemaBot could not check which schemas `shop` shares with other databases on target `shop-001` of deployment `east`, because that deployment's data plane cannot report which schema each namespace addresses. Upgrade that data plane, then run the command again.", message)
+	})
+	t.Run("an engine that cannot resolve namespaces", func(t *testing.T) {
+		message := userFacingError(resolution(fmt.Errorf("resolve namespaces: %w", tern.ErrResolveNamespacesUnsupported)))
+		assert.Equal(t, "SchemaBot could not check which schemas `shop` shares with other databases on target `shop-001` of deployment `east`, because that deployment's data plane cannot resolve namespaces for this database's engine. Running the command again will not help; the SchemaBot server logs have the cause.", message)
+	})
+	t.Run("any other failure", func(t *testing.T) {
+		message := userFacingError(resolution(errors.New("dial tcp db-internal.example:3306: connection refused")))
+		assert.Equal(t, "SchemaBot could not check which schemas `shop` shares with other databases on target `shop-001` of deployment `east`, so the command was refused. Run the command again; if it fails again, the SchemaBot server logs have the cause.", message)
+		assert.NotContains(t, message, "db-internal")
+	})
 }

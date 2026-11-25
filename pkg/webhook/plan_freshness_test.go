@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -36,7 +37,7 @@ func TestAssertPlanStillCurrent_MatchProceeds(t *testing.T) {
 
 	select {
 	case body := <-comments:
-		t.Fatalf("no comment should be posted on a match; got: %s", body)
+		require.FailNow(t, fmt.Sprintf("no comment should be posted on a match; got: %s", body))
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -67,7 +68,7 @@ func TestAssertPlanStillCurrent_EmptyHeadSHASkips(t *testing.T) {
 
 	select {
 	case body := <-comments:
-		t.Fatalf("no comment should be posted for legacy plan rows; got: %s", body)
+		require.FailNow(t, fmt.Sprintf("no comment should be posted for legacy plan rows; got: %s", body))
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -109,6 +110,6 @@ func TestAssertPlanStillCurrent_MismatchRejectsAndPostsComment(t *testing.T) {
 			"retry hint must direct the user to re-run apply (a fresh plan is needed)")
 		assert.Contains(t, body, "alice", "must attribute the requester")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for rejection comment")
+		require.FailNow(t, "timed out waiting for rejection comment")
 	}
 }

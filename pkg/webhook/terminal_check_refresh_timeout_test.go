@@ -178,7 +178,7 @@ func newTerminalRefreshTimeoutFixture(t *testing.T, repo, database string, wrap 
 	ghc.BaseURL, err = url.Parse(server.URL + "/")
 	require.NoError(t, err)
 	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghc, logger)}
-	f.handler = NewHandler(svc, factory, nil, logger)
+	f.handler = NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 	f.handler.terminalCheckRefreshTimeoutOverride = terminalRefreshTestDeadline
 
 	f.apply = &storage.Apply{
@@ -225,7 +225,7 @@ func (f *terminalRefreshTimeoutFixture) refresh(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("terminal refresh did not give up on a call that never answers")
+		require.FailNow(t, "terminal refresh did not give up on a call that never answers")
 	}
 }
 

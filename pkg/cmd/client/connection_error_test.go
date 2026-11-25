@@ -2,6 +2,7 @@ package client
 
 import (
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -294,8 +295,10 @@ func TestEveryNonGetRequestPathIsClassified(t *testing.T) {
 		"/api/settings":             {changes: true, check: "settings"},
 		"/api/locks":                {changes: true, check: "locks"},
 		"/api/locks/acquire":        {changes: true, check: "locks"},
+		"/api/freezes":              {changes: true, check: "freeze list"},
+		"/api/freezes/":             {changes: true, check: "freeze list"},
+		"/api/freezes/overrides/":   {changes: true, check: "freeze override <ovr-id>"},
 		"/api/checks/synthesize":    {changes: true},
-		"/api/webhooks/redrive":     {changes: true},
 		"/api/storage/schema/apply": {changes: true},
 	}
 
@@ -418,7 +421,70 @@ func TestWarningDependsOnTheRequestAndWhenItFailed(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.wantMessage, FormatConnectionError(endpoint, tc.err).Error())
+			err := FormatConnectionError(endpoint, tc.err)
+			assert.Equal(t, tc.wantMessage, err.Error())
+			assert.Equal(t, strings.Contains(tc.wantMessage, mayHaveActed), ServerMayHaveActed(err),
+				"ServerMayHaveActed agrees with the warning in the message")
+		})
+	}
+}
+
+// ServerMayHaveActed answers for real failures the way their messages do: yes
+// when a request that changes something got no complete answer, and no when
+// the server answered, the request never reached it, or it only reads.
+func TestServerMayHaveActedMatchesWhatTheFailureMessageSays(t *testing.T) {
+	release := map[string]string{"database": "orders", "database_type": "mysql", "owner": "cli:alice@laptop"}
+	refusing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"storage unavailable"}`, http.StatusInternalServerError)
+	}))
+	t.Cleanup(refusing.Close)
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "a lock release the server read and never answered",
+			err:  doSendBody(droppingServer(t).URL, http.MethodDelete, "/api/locks", release),
+			want: true,
+		},
+		{
+			name: "a lock release whose answer was cut off",
+			err:  doSendBody(truncatedOK(t).URL, http.MethodDelete, "/api/locks", release),
+			want: true,
+		},
+		{
+			name: "a lock release wrapped by its caller",
+			err:  fmt.Errorf("release lock for orders: %w", doSendBody(droppingServer(t).URL, http.MethodDelete, "/api/locks", release)),
+			want: true,
+		},
+		{
+			name: "a lock release the server answered with an error",
+			err:  doSendBody(refusing.URL, http.MethodDelete, "/api/locks", release),
+			want: false,
+		},
+		{
+			name: "a lock release whose connection was refused",
+			err:  doSendBody(closedPortEndpoint(t), http.MethodDelete, "/api/locks", release),
+			want: false,
+		},
+		{
+			name: "a read the server never answered",
+			err:  doGetInto(droppingServer(t).URL, "/api/locks", &map[string]any{}),
+			want: false,
+		},
+		{
+			name: "an error that is not a failed request",
+			err:  ErrLockNotFound,
+			want: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Error(t, tc.err)
+			assert.Equal(t, tc.want, ServerMayHaveActed(tc.err), tc.err.Error())
+			assert.Equal(t, tc.want, strings.Contains(tc.err.Error(), mayHaveActed), tc.err.Error())
 		})
 	}
 }
@@ -454,6 +520,38 @@ func TestPlainHTTPServerBehindAnHTTPSEndpointCarriesNoWarning(t *testing.T) {
 
 	msg := requireConnectionError(t, err).Error()
 	assert.Equal(t, "connection failed: "+endpoint+": http: server gave HTTP response to HTTPS client", msg)
+}
+
+// A plain HTTP server answering an https request is recognized by the error
+// value the HTTP client returns, however deep it sits in the chain: the apply
+// was never sent, so the message carries no warning. An error that only
+// carries the same words says nothing about this request's own handshake, so
+// it gets the warning like any other failure the client cannot place.
+func TestPlainHTTPServerIsRecognizedByErrorValueNotByItsWords(t *testing.T) {
+	const endpoint = "https://schemabot.test"
+	const words = "http: server gave HTTP response to HTTPS client"
+	tests := []struct {
+		name        string
+		cause       error
+		wantMessage string
+	}{
+		{
+			name:        "the client's own error value, wrapped again on the way up",
+			cause:       fmt.Errorf("round trip: %w", http.ErrSchemeMismatch),
+			wantMessage: "connection failed: " + endpoint + ": round trip: " + words,
+		},
+		{
+			name:        "another error with the same words",
+			cause:       errors.New(words),
+			wantMessage: "connection failed: " + endpoint + ": " + words + "\n" + mayHaveActed + " " + statusHint,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := &url.Error{Op: "Post", URL: endpoint + "/api/apply", Err: tc.cause}
+			assert.Equal(t, tc.wantMessage, FormatConnectionError(endpoint, err).Error())
+		})
+	}
 }
 
 // An https endpoint that reaches something that speaks neither TLS nor HTTP,
@@ -563,4 +661,14 @@ func TestRefusedCauseWithoutAnErrnoKeepsTheShortMessage(t *testing.T) {
 	err := FormatConnectionError("http://schemabot.test", errors.New("connection refused"))
 
 	assert.Equal(t, "cannot connect to http://schemabot.test (is the server running?)", err.Error())
+}
+
+// A freeze request carries an ID in its path, and is still classified by its
+// route: setting or lifting a freeze points at the freeze list, and an
+// override approval at the override request.
+func TestEffectOfClassifiesFreezeRoutesWithIDs(t *testing.T) {
+	assert.Equal(t, shownBy("freeze list"), effectOf(http.MethodPost, "/api/freezes"))
+	assert.Equal(t, shownBy("freeze list"), effectOf(http.MethodPost, "/api/freezes/freeze-abc/lift"))
+	assert.Equal(t, shownBy("freeze override <ovr-id>"), effectOf(http.MethodPost, "/schemabot/api/freezes/overrides/ovr-1/approve"))
+	assert.Equal(t, readsOnly, effectOf(http.MethodGet, "/api/freezes/freeze-abc"))
 }

@@ -74,6 +74,8 @@ var parityFamilies = []parityFamily{
 	{storageMethod: "Plans", test: TestPlans},
 	{storageMethod: "PlanComments", test: TestPlanComments},
 	{storageMethod: "Settings", test: TestSettings},
+	{storageMethod: "Freezes", test: TestFreezes},
+	{storageMethod: "FreezeOverrides", test: TestFreezeOverrides},
 	{storageMethod: "ApplyLogs", test: TestApplyLogs},
 	{storageMethod: "Locks", test: TestLocks},
 	{storageMethod: "Applies", test: TestApplies},

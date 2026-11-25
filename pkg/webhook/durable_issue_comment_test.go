@@ -48,7 +48,7 @@ func newDurableIssueCommentEnqueueHandler(t *testing.T, events storage.WebhookEv
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{}, nil, logger)
-	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch())
+	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 }
 
 // TestIssueCommentGateBlockParity pins the shared gate ladder reason by
@@ -100,6 +100,9 @@ func TestIssueCommentGateBlockParity(t *testing.T) {
 		{name: "rollback misplaced defer-cutover", comment: "schemabot rollback apply_123 -e production --defer-cutover -t alpha", want: issueCommentGateDeferCutover},
 		{name: "unsupported database", comment: "schemabot stop -e production -d accounts -t alpha", want: issueCommentGateDatabase},
 		{name: "unsupported target", comment: "schemabot apply-confirm -e production --target payments-002 -t alpha", want: issueCommentGateTarget},
+		{name: "unsupported override", comment: `schemabot rollback apply_123 -e production --override "fix" -t alpha`, want: issueCommentGateOverride},
+		{name: "override passes on apply", comment: `schemabot apply -e production --override "fix" -t alpha`, want: issueCommentGatePass},
+		{name: "blank override reason", comment: `schemabot apply -e production --override "" -t alpha`, want: issueCommentGateOverrideReason},
 		{name: "narrowed plan missing environment", comment: "schemabot plan --target payments-002 -t alpha", want: issueCommentGateMissingEnvironment},
 	}
 	for _, tt := range tests {
@@ -261,7 +264,7 @@ func TestDurableIssueCommentDriverRetriesBootstrapFailure(t *testing.T) {
 		require.True(t, failure.retryAfter.After(before), "retry must be scheduled in the future")
 		require.Contains(t, failure.errMsg, "installation token unavailable")
 	default:
-		t.Fatal("expected bootstrap failure to be marked failed")
+		require.FailNow(t, "expected bootstrap failure to be marked failed")
 	}
 	require.Empty(t, store.completed)
 }
@@ -280,7 +283,7 @@ func TestDurableIssueCommentDriverFailsMalformedRowTerminally(t *testing.T) {
 	case failure := <-store.failedPermanent:
 		require.Contains(t, failure.errMsg, "decode durable issue_comment delivery")
 	default:
-		t.Fatal("expected malformed issue_comment delivery to be dead-lettered")
+		require.FailNow(t, "expected malformed issue_comment delivery to be dead-lettered")
 	}
 	require.Empty(t, store.failed, "a malformed row is deterministic and must not burn retry budget")
 	require.Empty(t, store.completed)
@@ -301,7 +304,7 @@ func TestDurableIssueCommentDriverFailsUnparseableTenantTerminally(t *testing.T)
 	case failure := <-store.failedPermanent:
 		require.Contains(t, failure.errMsg, "unparseable tenant ID")
 	default:
-		t.Fatal("expected unparseable-tenant delivery to be dead-lettered")
+		require.FailNow(t, "expected unparseable-tenant delivery to be dead-lettered")
 	}
 	require.Empty(t, store.failed, "an unparseable tenant is deterministic and must not burn retry budget")
 	require.Empty(t, store.completed)
@@ -355,12 +358,12 @@ func TestDurableIssueCommentDriverCompletesNonDispatchableRows(t *testing.T) {
 			select {
 			case <-store.completed:
 			default:
-				t.Fatal("expected non-dispatchable issue_comment delivery to be marked completed")
+				require.FailNow(t, "expected non-dispatchable issue_comment delivery to be marked completed")
 			}
 			require.Empty(t, store.failed)
 			select {
 			case <-factory.forInstallationStarted:
-				t.Fatal("a non-dispatchable delivery must not create a GitHub client")
+				require.FailNow(t, "a non-dispatchable delivery must not create a GitHub client")
 			default:
 			}
 		})
@@ -407,12 +410,12 @@ func TestDurableIssueCommentDriverCompletesUnroutedCommands(t *testing.T) {
 			select {
 			case <-store.completed:
 			default:
-				t.Fatal("expected unrouted issue_comment delivery to be marked completed")
+				require.FailNow(t, "expected unrouted issue_comment delivery to be marked completed")
 			}
 			require.Empty(t, store.failed)
 			select {
 			case <-factory.forInstallationStarted:
-				t.Fatal("an unrouted delivery must not create a GitHub client")
+				require.FailNow(t, "an unrouted delivery must not create a GitHub client")
 			default:
 			}
 		})
@@ -441,7 +444,7 @@ func TestDurableIssueCommentDriverDispatchesParticipantFanOut(t *testing.T) {
 	select {
 	case <-factory.forInstallationStarted:
 	default:
-		t.Fatal("expected participant fan-out apply to reach the command core")
+		require.FailNow(t, "expected participant fan-out apply to reach the command core")
 	}
 	require.Empty(t, store.completed, "fan-out apply must dispatch, not complete as a no-op")
 }
@@ -461,12 +464,12 @@ func TestDurableIssueCommentDriverCompletesUnregisteredRepo(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected unregistered-repo issue_comment delivery to be marked completed")
+		require.FailNow(t, "expected unregistered-repo issue_comment delivery to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	select {
 	case <-factory.forInstallationStarted:
-		t.Fatal("unregistered repo must not create a GitHub client")
+		require.FailNow(t, "unregistered repo must not create a GitHub client")
 	default:
 	}
 	requireUnregisteredRepositoryCounted(t, reader, "issue_comment", "created")
@@ -486,12 +489,12 @@ func TestDurableIssueCommentDriverCompletesListenOnlyRepo(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected listen-only issue_comment delivery to be marked completed")
+		require.FailNow(t, "expected listen-only issue_comment delivery to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	select {
 	case <-factory.forInstallationStarted:
-		t.Fatal("listen-only repo must not create a GitHub client")
+		require.FailNow(t, "listen-only repo must not create a GitHub client")
 	default:
 	}
 }
@@ -562,7 +565,7 @@ func TestDurableIssueCommentDriverAnswersApplyThroughCore(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected the driven apply command to complete its delivery")
+		require.FailNow(t, "expected the driven apply command to complete its delivery")
 	}
 	require.Empty(t, store.failed)
 	body := requireComment(t, comments, "environment-not-configured apply answer")
@@ -582,7 +585,7 @@ func TestDurableIssueCommentDriverAnswersUnlockThroughCore(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected the driven unlock command to complete its delivery")
+		require.FailNow(t, "expected the driven unlock command to complete its delivery")
 	}
 	require.Empty(t, store.failed)
 	body := requireComment(t, comments, "no-locks unlock answer")
@@ -611,7 +614,7 @@ func TestDurableIssueCommentDriverRetriesUnlockLockLookupFailure(t *testing.T) {
 		require.True(t, failure.retryAfter.After(before), "retry must be scheduled in the future")
 		require.Contains(t, failure.errMsg, "lock lookup failed")
 	default:
-		t.Fatal("expected unlock lock-lookup failure to be marked failed")
+		require.FailNow(t, "expected unlock lock-lookup failure to be marked failed")
 	}
 	require.Empty(t, store.completed)
 	require.Empty(t, comments, "an intermediate durable attempt must not post a retry comment")
@@ -657,7 +660,7 @@ func (s *cancelOnLookupLockStore) GetByPR(_ context.Context, _ string, _ int) ([
 	return s.locks, nil
 }
 
-func (s *cancelOnLookupLockStore) ReleaseByID(ctx context.Context, _ int64, _, _, _, _ string) error {
+func (s *cancelOnLookupLockStore) ReleaseByIDIfUnused(ctx context.Context, _ int64, _, _, _, _ string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -686,7 +689,7 @@ func TestDurableIssueCommentDriverCancelledUnlockStopsLockReleases(t *testing.T)
 	case released := <-store.released:
 		require.Equal(t, "token-1", released.leaseToken)
 	default:
-		t.Fatal("expected the cancelled run to release its claim for re-drive")
+		require.FailNow(t, "expected the cancelled run to release its claim for re-drive")
 	}
 	require.Empty(t, store.completed, "a cancelled run must not complete the delivery")
 }
@@ -707,7 +710,7 @@ func TestDurableIssueCommentDriverCancelledRunReleasesClaim(t *testing.T) {
 	case released := <-store.released:
 		require.Equal(t, "token-1", released.leaseToken)
 	default:
-		t.Fatal("expected the cancelled run to release its claim for re-drive")
+		require.FailNow(t, "expected the cancelled run to release its claim for re-drive")
 	}
 	require.Empty(t, store.completed, "a cancelled run must not complete the delivery")
 }

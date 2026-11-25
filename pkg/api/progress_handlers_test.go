@@ -10,30 +10,26 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/presentation"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
-	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
 // Live-remote progress renders the same operation string for a table change
 // that the storage-served path persists as the task's DDL action, so a client
-// polling an apply sees a stable change type across the two sources. Only
-// CHANGE_TYPE_OTHER differs by design: live progress has no DDL parser to
-// recover an operation from, so it renders the change type as empty.
+// polling an apply sees a stable change type across the two sources, for
+// every value of the proto enum. Only CHANGE_TYPE_OTHER differs by design:
+// live progress has no DDL parser to recover an operation from, so it
+// renders the change type as empty.
 func TestChangeTypeToStringMatchesStorageOperation(t *testing.T) {
-	for _, ct := range []ternv1.ChangeType{
-		ternv1.ChangeType_CHANGE_TYPE_CREATE,
-		ternv1.ChangeType_CHANGE_TYPE_ALTER,
-		ternv1.ChangeType_CHANGE_TYPE_DROP,
-		ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX,
-		ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX,
-		ternv1.ChangeType_CHANGE_TYPE_RENAME,
-		ternv1.ChangeType_CHANGE_TYPE_TRUNCATE,
-		ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW,
-		ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
-	} {
-		assert.Equal(t, protoChangeTypeToOperation(ct), changeTypeToString(ct), "change type %v", ct)
+	for value, name := range ternv1.ChangeType_name {
+		ct := ternv1.ChangeType(value)
+		if ct == ternv1.ChangeType_CHANGE_TYPE_OTHER {
+			continue
+		}
+		assert.Equal(t, protoChangeTypeToOperation(ct), changeTypeToString(ct), "change type %s", name)
+		assert.NotEmpty(t, changeTypeToString(ct), "change type %s", name)
 	}
 	assert.Empty(t, changeTypeToString(ternv1.ChangeType_CHANGE_TYPE_OTHER))
 }
@@ -287,22 +283,31 @@ func TestProgressOperationsCarryRolloutStep(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(string(encoded), `"rollout_step"`), "a row of a member's whole change omits the step: %s", encoded)
 }
 
-// The operation-id map that attributes tasks to rollout members carries the
-// whole routing pair. One deployment can address several targets, each copying
-// the same tables against its own schema, so a task attributed to the deployment
-// alone would not say which member's progress it reports.
-func TestProgressOperationsMapCarriesTheRoutingPair(t *testing.T) {
+// Each table names the operation that runs it, and each operation carries its
+// own progress metadata. One target can run several operations, and the
+// response's top-level metadata speaks for one operation only, so a rollout's
+// table reads the work in flight from its own operation rather than from
+// whichever operation the top level happened to describe.
+func TestProgressAttributesEachTableToItsOperation(t *testing.T) {
 	ops := []*storage.ApplyOperation{
-		{ID: 1, Deployment: "primary", Target: "testapp-001", State: state.Apply.Running},
-		{ID: 2, Deployment: "primary", Target: "testapp-002", State: state.Apply.Pending},
+		{ID: 1, Deployment: "primary", Target: "testapp-001", OperationKey: "step-1", State: state.Apply.Completed},
+		{ID: 2, Deployment: "primary", Target: "testapp-001", OperationKey: "step-2", State: state.Apply.Running,
+			ProgressMetadata: `{"executor_operation":"concurrent-index-build","server_phase":"building index: scanning table"}`},
 		{ID: 3, Deployment: "eu-west", Target: "orders-eu", State: state.Apply.Pending},
 	}
 
-	_, memberByOperationID := progressOperationsFromRows(ops)
-	require.Len(t, memberByOperationID, 3)
-	assert.Equal(t, routing.ExecutionTarget{Deployment: "primary", Target: "testapp-001"}, memberByOperationID[1])
-	assert.Equal(t, routing.ExecutionTarget{Deployment: "primary", Target: "testapp-002"}, memberByOperationID[2])
-	assert.Equal(t, routing.ExecutionTarget{Deployment: "eu-west", Target: "orders-eu"}, memberByOperationID[3])
+	responses, operationByID := progressOperationsFromRows(ops)
+	require.Len(t, responses, 3)
+	assert.Nil(t, responses[0].Metadata, "an operation that recorded no progress metadata carries none")
+	assert.Equal(t, map[string]string{
+		"executor_operation": "concurrent-index-build",
+		"server_phase":       "building index: scanning table",
+	}, responses[1].Metadata)
+
+	opID := int64(2)
+	var tpr apitypes.TableProgressResponse
+	attributeStoredTask(&tpr, &storage.Task{TaskIdentifier: "task-users", ApplyOperationID: &opID}, operationByID)
+	assert.Equal(t, apitypes.TableProgressResponse{TaskID: "task-users", Deployment: "primary", Target: "testapp-001", OperationKey: "step-2"}, tpr)
 }
 
 // A table's target survives the API's JSON encoding, so the CLI can scope each
@@ -336,5 +341,26 @@ func TestEngineNameNamesEveryEngine(t *testing.T) {
 	for value := range ternv1.Engine_name {
 		engine := ternv1.Engine(value)
 		assert.Equal(t, want[engine], engineName(engine), "engine %s", engine)
+	}
+}
+
+// The PR comment names an apply's engine as storage records it and the CLI as
+// the progress API reports it. Both names must choose the same stop or cancel
+// command, or one surface offers a command the engine refuses while the other
+// offers the one it accepts.
+func TestProgressEngineNamesChooseTheStorageEnginesStopCommand(t *testing.T) {
+	build := apitypes.BuildWork{Operation: "concurrent-index-build"}
+	for engine, stored := range map[ternv1.Engine]string{
+		ternv1.Engine_ENGINE_SPIRIT:      storage.EngineSpirit,
+		ternv1.Engine_ENGINE_PLANETSCALE: storage.EnginePlanetScale,
+		ternv1.Engine_ENGINE_STRATA:      storage.EngineStrata,
+		ternv1.Engine_ENGINE_POSTGRES:    storage.EnginePostgres,
+	} {
+		t.Run(stored, func(t *testing.T) {
+			for _, work := range []apitypes.BuildWork{{}, build} {
+				assert.Equal(t, presentation.StopCommand(stored, work, 1), presentation.StopCommand(engineName(engine), work, 1),
+					"%s reported as %q", stored, engineName(engine))
+			}
+		})
 	}
 }

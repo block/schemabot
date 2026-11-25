@@ -69,6 +69,12 @@ request bodies that try to send database or deployment fields.
 | DELETE | `/api/locks` | Release lock |
 | GET | `/api/locks` | List all locks |
 | GET/POST | `/api/settings` | Read/write settings |
+| POST | `/api/freezes` | Set an environment freeze |
+| GET | `/api/freezes` | List freezes in effect, scheduled, and recent |
+| GET | `/api/freezes/{id}` | Get one freeze |
+| POST | `/api/freezes/{id}/lift` | Lift a freeze early |
+| GET | `/api/freezes/overrides/{id}` | Get one freeze override request |
+| POST | `/api/freezes/overrides/{id}/approve` | Approve a freeze override request (verified `freeze.groups` member other than the requester) |
 
 ### Health
 
@@ -114,5 +120,6 @@ See the top-level [README](../../README.md) for configuration examples.
 | `lock_handlers.go` | Lock acquire/release/list handlers |
 | `log_handlers.go` | Apply log handlers |
 | `settings_handlers.go` | Settings read/write handlers |
+| `freeze_handlers.go` | Environment freeze set/list/get/lift handlers |
 | `proto_helpers.go` | Proto ↔ HTTP type conversion helpers |
 | `ensure_schema.go` | `EnsureSchema()` — applies embedded SQL schema to storage DB using Spirit |

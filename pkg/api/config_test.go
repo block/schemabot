@@ -4927,6 +4927,34 @@ func TestServerConfig_AppsValidation(t *testing.T) {
 			wantErrSub: "github.trusted-check-app-slugs contains an empty value",
 		},
 		{
+			name: "single-app github: with a quota reserve is accepted",
+			github: GitHubConfig{
+				AppID: "42", PrivateKey: "env:PK", WebhookSecret: "env:WS",
+				QuotaReserve: 1500,
+			},
+			repos: map[string]RepoConfig{"org/repo": {}},
+		},
+		{
+			name: "single-app github: with a negative quota reserve is rejected",
+			github: GitHubConfig{
+				AppID: "42", PrivateKey: "env:PK", WebhookSecret: "env:WS",
+				QuotaReserve: -1,
+			},
+			repos:      map[string]RepoConfig{"org/repo": {}},
+			wantErrSub: "github quota-reserve must not be negative, got -1",
+		},
+		{
+			name: "app with a negative quota reserve is rejected",
+			apps: map[string]GitHubAppConfig{
+				"app-a": {
+					AppID: "12345", PrivateKey: "env:PK", WebhookSecret: "env:WS",
+					QuotaReserve: -5,
+				},
+			},
+			repos:      map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+			wantErrSub: `app "app-a" quota-reserve must not be negative, got -5`,
+		},
+		{
 			name: "app with duplicate trusted check app slugs is rejected",
 			apps: map[string]GitHubAppConfig{
 				"app-a": {
@@ -4956,6 +4984,13 @@ func TestServerConfig_AppsValidation(t *testing.T) {
 		{
 			name:       "github: and apps: together is rejected",
 			github:     GitHubConfig{AppID: "42", PrivateKey: "env:PK", WebhookSecret: "env:WS"},
+			apps:       map[string]GitHubAppConfig{"app-a": validApp},
+			repos:      map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+			wantErrSub: "github: and apps: are mutually exclusive",
+		},
+		{
+			name:       "github: with only a quota reserve and apps: together is rejected",
+			github:     GitHubConfig{QuotaReserve: 1500},
 			apps:       map[string]GitHubAppConfig{"app-a": validApp},
 			repos:      map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
 			wantErrSub: "github: and apps: are mutually exclusive",
@@ -6803,4 +6838,35 @@ func TestValidateListenOnlyRepo(t *testing.T) {
 			assert.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
+}
+
+// The quota probe reads only the installations serving the repositories an App
+// is configured for. With Apps configured, an App serves the repos whose
+// github_app names it, and an App no repository points at serves none. A
+// single-App config that lists repositories serves exactly those; one that
+// lists none may serve any repository, so the probe reads every installation.
+func TestReposServedByGitHubApp(t *testing.T) {
+	multi := &ServerConfig{
+		Apps: map[string]GitHubAppConfig{"primary": {}, "secondary": {}, "unused": {}},
+		Repos: map[string]RepoConfig{
+			"octo/b": {GitHubApp: "primary"},
+			"octo/a": {GitHubApp: "primary"},
+			"else/c": {GitHubApp: "secondary"},
+		},
+	}
+	repos, restricted := multi.ReposServedByGitHubApp("primary")
+	assert.True(t, restricted)
+	assert.Equal(t, []string{"octo/a", "octo/b"}, repos)
+	repos, restricted = multi.ReposServedByGitHubApp("unused")
+	assert.True(t, restricted)
+	assert.Empty(t, repos)
+
+	single := &ServerConfig{Repos: map[string]RepoConfig{"octo/b": {}, "octo/a": {}}}
+	repos, restricted = single.ReposServedByGitHubApp("default")
+	assert.True(t, restricted)
+	assert.Equal(t, []string{"octo/a", "octo/b"}, repos)
+
+	repos, restricted = (&ServerConfig{}).ReposServedByGitHubApp("default")
+	assert.False(t, restricted)
+	assert.Nil(t, repos)
 }

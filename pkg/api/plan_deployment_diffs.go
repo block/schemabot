@@ -178,8 +178,11 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			results[i].DirectExecution = directExecution
 
 			resp, err := s.planDeploymentDiff(gctx, req, target, schemaFiles, directExecution)
+			if _, refused := errors.AsType[*PRSchemaAdmissionError](err); refused {
+				return err
+			}
 			if err != nil {
-				s.logger.Warn("plan deployment diff failed; deployment will block the review rollup",
+				PlanFailureLog(s.logger, err)("plan deployment diff failed; deployment will block the review rollup",
 					"database", req.Database,
 					"environment", req.Environment,
 					"deployment", target.Deployment,
@@ -293,6 +296,10 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 		// target, so a member asked without the list would diff tables the
 		// primary withheld and report them as drift the primary does not have.
 		IgnoreTables: req.IgnoreTables,
+		// The drop list travels for the same reason: a member asked without it
+		// would not plan the drops the primary planned and would report the
+		// difference as drift the primary does not have.
+		DropTables: req.DropTables,
 		// Always stated, never left absent: absence tells the data plane the
 		// caller predates the grouping choice, and this caller has made one.
 		GroupedExecution: new(req.GroupedExecution),
@@ -308,6 +315,10 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 		ternReq.HeadSha = *req.HeadSHA
 	}
 
+	ctx, err = s.withPRSchemaPlanAdmission(ctx, client, req.Repository, int(ternReq.PullRequest), ternReq.HeadSha)
+	if err != nil {
+		return nil, err
+	}
 	resp, err := client.PlanDiff(ctx, ternReq)
 	if err != nil {
 		return nil, fmt.Errorf("plan diff on deployment %q target %q: %w", target.Deployment, target.Target, err)

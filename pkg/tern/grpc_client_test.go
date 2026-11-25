@@ -1530,8 +1530,10 @@ func TestGRPCClient_ResumeApplyRedispatchesAdoptedStatementRendering(t *testing.
 // with the dispatch for that re-plan to reach the same verdict: a table the
 // repository withheld is live on the member and declared by no schema file, so
 // a member that re-plans without the list proposes dropping it and then fails
-// its own drift check against a plan it can never match.
-func TestGRPCClient_ResumeApplyDispatchCarriesIgnoreTables(t *testing.T) {
+// its own drift check against a plan it can never match. The reviewed
+// `drop_tables` travels for the mirror reason: a member that re-plans without
+// it leaves out the reviewed DROP TABLE and fails the same check.
+func TestGRPCClient_ResumeApplyDispatchCarriesIgnoreAndDropTables(t *testing.T) {
 	server := &capturingTernServer{
 		remoteApplyID: "remote-dispatched-ignore",
 		progressTables: []*ternv1.TableProgress{{
@@ -1573,6 +1575,7 @@ func TestGRPCClient_ResumeApplyDispatchCarriesIgnoreTables(t *testing.T) {
 		Namespaces: map[string]*storage.NamespacePlanData{"default": {}},
 	}
 	plan.RecordIgnoreTables([]string{"flyway_schema_history", "legacy_audit"})
+	plan.RecordDropTables([]string{"_users_old", "_users_new"})
 	client.storage = &mockStorage{
 		applies: &mockApplyStore{apply: apply},
 		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
@@ -1590,6 +1593,8 @@ func TestGRPCClient_ResumeApplyDispatchCarriesIgnoreTables(t *testing.T) {
 		"the schema files the member re-plans are what the exclusions qualify")
 	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit"}, req.IgnoreTables,
 		"the dispatch carries the reviewed entries: without them the member re-plans the withheld tables as drops")
+	assert.Equal(t, []string{"_users_new", "_users_old"}, req.DropTables,
+		"the dispatch carries the reviewed drop list: without it the member's re-plan leaves out the reviewed drops")
 }
 
 // The VSchema-only dispatch is the other hop that hands a plan to a member, and
@@ -5002,7 +5007,8 @@ func TestGRPCClient_ResumeApplyLogsRemoteLifecycle(t *testing.T) {
 		messages = append(messages, log.Message)
 	}
 	assert.Contains(t, messages, "Apply dispatched to remote Tern: target=testdb-target deployment=us-west remote_apply_id=remote-lifecycle-123")
-	assert.Contains(t, messages, "Remote task users changed state: pending -> completed")
+	assert.True(t, hasStateTransitionLog(logs.logs, "Remote task users changed state", state.Task.Pending, state.Task.Completed),
+		"expected the remote task transition in logs: %v", messages)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Remote apply reached terminal state: completed"),
 		"expected final remote apply state in logs: %v", messages)
 	assert.Equal(t, state.Task.Completed, task.State)
@@ -5713,7 +5719,7 @@ func TestGRPCClient_SyncStoredTasksFromRemoteTasksUsesRemoteTaskState(t *testing
 			assert.Equal(t, tc.wantStoredTaskState, storedTask.State)
 			assert.Equal(t, tc.wantProgress, storedTask.ProgressPercent)
 			assert.Equal(t, tc.wantCompletedAt, storedTask.CompletedAt != nil)
-			assert.True(t, hasLogMessageContaining(logs.logs, "Remote task users changed state: running -> "+tc.wantStoredTaskState))
+			assert.True(t, hasStateTransitionLog(logs.logs, "Remote task users changed state", state.Task.Running, tc.wantStoredTaskState))
 		})
 	}
 }
@@ -6069,9 +6075,9 @@ func TestGRPCClient_RemoteRetryablePauseKeepsDrivePollingToCompletion(t *testing
 		assert.False(t, state.IsState(update.State, state.Apply.Failed, state.Apply.FailedRetryable),
 			"a retryable pause must never persist a failed or failed_retryable apply row while the drive polls, got %s", update.State)
 	}
-	assert.True(t, hasLogMessageContaining(logs.logs, "Remote task users changed state: pending -> failed_retryable"),
+	assert.True(t, hasStateTransitionLog(logs.logs, "Remote task users changed state", state.Task.Pending, state.Task.FailedRetryable),
 		"the task row must mirror the data-plane pause")
-	assert.True(t, hasLogMessageContaining(logs.logs, "Remote task users changed state: failed_retryable -> running"),
+	assert.True(t, hasStateTransitionLog(logs.logs, "Remote task users changed state", state.Task.FailedRetryable, state.Task.Running),
 		"the task row must follow the data plane's next recovery attempt")
 }
 
@@ -6151,9 +6157,9 @@ func TestGRPCClient_FailedRetryableWireStateKeepsDrivePollingToCompletion(t *tes
 		assert.False(t, state.IsState(update.State, state.Apply.Failed, state.Apply.FailedRetryable),
 			"a retryable pause must never persist a failed or failed_retryable apply row while the drive polls, got %s", update.State)
 	}
-	assert.True(t, hasLogMessageContaining(logs.logs, "Remote task users changed state: pending -> failed_retryable"),
+	assert.True(t, hasStateTransitionLog(logs.logs, "Remote task users changed state", state.Task.Pending, state.Task.FailedRetryable),
 		"the task row must mirror the data-plane pause")
-	assert.True(t, hasLogMessageContaining(logs.logs, "Remote task users changed state: failed_retryable -> running"),
+	assert.True(t, hasStateTransitionLog(logs.logs, "Remote task users changed state", state.Task.FailedRetryable, state.Task.Running),
 		"the task row must follow the data plane's next recovery attempt")
 }
 
@@ -7624,6 +7630,17 @@ func TestTerminalTaskStateForApply(t *testing.T) {
 func hasLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 	for _, log := range logs {
 		if strings.Contains(log.Message, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasStateTransitionLog reports whether logs hold an entry with exactly this
+// message whose old and new states are the given ones.
+func hasStateTransitionLog(logs []*storage.ApplyLog, message, oldState, newState string) bool {
+	for _, log := range logs {
+		if log.Message == message && log.OldState == oldState && log.NewState == newState {
 			return true
 		}
 	}
@@ -10764,15 +10781,16 @@ func TestGRPCMethodDeadlineCoversEveryTernRPC(t *testing.T) {
 		ternv1.Tern_StorageSchemaPlan_FullMethodName:       true,
 	}
 	control := map[string]bool{
-		ternv1.Tern_Progress_FullMethodName:       true,
-		ternv1.Tern_BatchProgress_FullMethodName:  true,
-		ternv1.Tern_Logs_FullMethodName:           true,
-		ternv1.Tern_Cutover_FullMethodName:        true,
-		ternv1.Tern_Health_FullMethodName:         true,
-		ternv1.Tern_Stop_FullMethodName:           true,
-		ternv1.Tern_Cancel_FullMethodName:         true,
-		ternv1.Tern_Start_FullMethodName:          true,
-		ternv1.Tern_DriverCapacity_FullMethodName: true,
+		ternv1.Tern_Progress_FullMethodName:          true,
+		ternv1.Tern_BatchProgress_FullMethodName:     true,
+		ternv1.Tern_Logs_FullMethodName:              true,
+		ternv1.Tern_Cutover_FullMethodName:           true,
+		ternv1.Tern_Health_FullMethodName:            true,
+		ternv1.Tern_Stop_FullMethodName:              true,
+		ternv1.Tern_Cancel_FullMethodName:            true,
+		ternv1.Tern_Start_FullMethodName:             true,
+		ternv1.Tern_DriverCapacity_FullMethodName:    true,
+		ternv1.Tern_ResolveNamespaces_FullMethodName: true,
 	}
 
 	require.Empty(t, ternv1.Tern_ServiceDesc.Streams, "streaming RPCs bypass the unary deadline interceptor")
@@ -11049,4 +11067,14 @@ func TestObserverPollTreatsAReattachedObserverAsTheSameRegistration(t *testing.T
 		5*time.Second, 10*time.Millisecond, "the observer is cleared after its terminal update")
 	waitForTicks(t, applies, 0)
 	assert.Equal(t, int32(1), stopped.terminal.Load())
+}
+
+// A remote task's state change names the shard on a sharded target, so an
+// operator reading the apply's log can find a slow or failed shard, and never
+// repeats the states the log entry already carries.
+func TestRemoteTaskStateChangeMessageNamesTheShard(t *testing.T) {
+	assert.Equal(t, "Remote task users changed state",
+		remoteTaskStateChangeMessage(&storage.Task{TableName: "users"}))
+	assert.Equal(t, "Remote task users on shard 80-c0 changed state",
+		remoteTaskStateChangeMessage(&storage.Task{TableName: "users", Shard: "80-c0"}))
 }

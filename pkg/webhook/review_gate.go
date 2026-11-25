@@ -59,6 +59,10 @@ type ReviewGateResult struct {
 	// approval to count, since the schema change may have changed since, so
 	// the comment also asks them to approve the latest commit.
 	UnauthorizedEarlierApprovers []string
+	// CommandAppApprovers approved the PR but are command Apps, whose approval
+	// never counts and which no team or reviewer setting can make eligible, so
+	// the comment says that instead of the unauthorized-reviewer guidance.
+	CommandAppApprovers []string
 	// BaseRef and DefaultBranch are the PR's base branch and the repository's
 	// default branch. An approval is carried across base branch changes only
 	// when they are the same, so the review-required comment says so when they
@@ -118,6 +122,7 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 			UncomparedApprovers:          gateResult.UncomparedApprovers,
 			UnauthorizedApprovers:        gateResult.UnauthorizedApprovers,
 			UnauthorizedEarlierApprovers: gateResult.UnauthorizedEarlierApprovers,
+			CommandAppApprovers:          gateResult.CommandAppApprovers,
 			BaseRef:                      gateResult.BaseRef,
 			DefaultBranch:                gateResult.DefaultBranch,
 		}
@@ -159,8 +164,9 @@ func reviewGateErrorDetail(err error) string {
 // approval counts only for the schema change it reviewed: it must have been
 // given on HeadSHA, or on an earlier commit at which the PR's change to the
 // database's schema inputs is the same as at HeadSHA (see approvalCoversHead).
-// When GitHub is unavailable while proving that, the approval state is
-// undetermined and the gate returns an evaluation error rather than a block.
+// When GitHub is unavailable while proving that, or the quota reserve refuses
+// a read it needs, the approval state is undetermined and the gate returns an
+// evaluation error rather than a block.
 // An approval on an earlier commit that cannot be compared with HeadSHA at all
 // does not count; it is recorded in UncomparedApprovers so the comment can say
 // why it was not counted.
@@ -238,10 +244,16 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		compareStatements: h.statementComparerFor(repo, pr, database, environment, schema.Type),
 		verdicts:          make(map[string]approvalVerdict),
 	}
-	var changedApprovers, changedPaths, changedBasePaths, uncomparedApprovers, unauthorizedApprovers, unauthorizedEarlierApprovers []string
+	var changedApprovers, changedPaths, changedBasePaths, uncomparedApprovers, unauthorizedApprovers, unauthorizedEarlierApprovers, commandAppApprovers []string
 	var staleApprovals []staleApproval
 	for _, approval := range validApprovals {
 		reviewer := approval.User
+		if policy.IsCommandApp != nil && policy.IsCommandApp(reviewer) {
+			h.logger.Info("review gate: approval does not count because the reviewer is a command App",
+				"repo", repo, "pr", pr, "database", database, "reviewer", reviewer, "head_sha", headSHA)
+			commandAppApprovers = append(commandAppApprovers, reviewer)
+			continue
+		}
 		matched, principal, err := policy.Matches(ctx, client, reviewer)
 		if err != nil {
 			return nil, err
@@ -313,7 +325,8 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		"valid_approvers", validApprovers,
 		"changed_approvers", changedApprovers,
 		"uncompared_approvers", uncomparedApprovers,
-		"unauthorized_approvers", unauthorizedApprovers, "head_sha", headSHA,
+		"unauthorized_approvers", unauthorizedApprovers,
+		"command_app_approvers", commandAppApprovers, "head_sha", headSHA,
 		"operator_reviewers", policy.OperatorReviewers,
 		"other_reviewers", policy.OtherReviewers)
 	return &ReviewGateResult{
@@ -328,6 +341,7 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		UncomparedApprovers:          uncomparedApprovers,
 		UnauthorizedApprovers:        unauthorizedApprovers,
 		UnauthorizedEarlierApprovers: unauthorizedEarlierApprovers,
+		CommandAppApprovers:          commandAppApprovers,
 		BaseRef:                      prInfo.BaseRef,
 		DefaultBranch:                prInfo.DefaultBranch,
 	}, nil
@@ -419,8 +433,9 @@ func (h *Handler) statementComparerFor(repo string, pr int, database, environmen
 // schemaChangeUnchangedSince). Anything that prevents that comparison (no
 // recorded commit, an unknown commit, a tree GitHub cannot list completely)
 // is returned as an errApprovalNotComparable error. A comparison GitHub could
-// not answer — it was unavailable, or the evaluation was cancelled — is
-// returned as an error too, and never cached as a verdict.
+// not answer — it was unavailable, the quota reserve refused a read, or the
+// evaluation was cancelled — is returned as an error too, and never cached as
+// a verdict.
 func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (approvalVerdict, error) {
 	approvedSHA := approval.CommitID
 	if approvedSHA == "" {
@@ -452,12 +467,19 @@ func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.Insta
 // are not this PR's change, and they reached the base branch through their
 // own PR and its own review. A change the PR itself makes differently at the
 // head does. A comparison that cannot be completed is recorded as
-// errApprovalNotComparable, and a GitHub outage is returned as a retryable
-// error.
+// errApprovalNotComparable, and a GitHub outage or a read the quota reserve
+// refused is returned as a retryable error.
 func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (approvalVerdict, error) {
 	comparison, err := client.PRSchemaChangeUnchangedSince(ctx, c.repo, c.baseRef, c.defaultBranch, approval.CommitID, c.headSHA, c.inputPaths, c.compareStatements)
 	if err != nil {
 		if ghclient.IsUnavailableError(err) {
+			return approvalVerdict{}, fmt.Errorf("compare schema change for %s#%d database %q at approved commit %s and head %s: %w",
+				c.repo, c.pr, c.database, approval.CommitID, c.headSHA, err)
+		}
+		// A read the quota reserve refused was never sent, so GitHub gave no
+		// answer about the approval, and asking again after the reset can
+		// prove it still covers the head.
+		if errors.Is(err, ghclient.ErrGitHubQuotaReserved) {
 			return approvalVerdict{}, fmt.Errorf("compare schema change for %s#%d database %q at approved commit %s and head %s: %w",
 				c.repo, c.pr, c.database, approval.CommitID, c.headSHA, err)
 		}
@@ -656,6 +678,11 @@ type reviewGatePolicy struct {
 	OperatorTeams      []string
 	OperatorUsers      []string
 	CodeownerReviewers map[string]struct{}
+	// IsCommandApp reports whether a reviewer is an App that any database
+	// lists in command_apps. Such an App may run commands, but its approval
+	// never counts, for any database, even if its login is also configured as
+	// a reviewer; it is also left out of the reviewer lists.
+	IsCommandApp func(reviewer string) bool
 	// IncludeCodeowners records that CODEOWNERS was consulted, so an empty
 	// reviewer set can name CODEOWNERS as the source that contributed none.
 	IncludeCodeowners bool
@@ -670,6 +697,9 @@ type reviewGatePolicy struct {
 }
 
 func (p reviewGatePolicy) Matches(ctx context.Context, client *ghclient.InstallationClient, reviewer string) (bool, string, error) {
+	if p.IsCommandApp != nil && p.IsCommandApp(reviewer) {
+		return false, "", nil
+	}
 	if len(p.AdminTeams) > 0 {
 		matched, principal, err := actorInAnyTeam(ctx, client, p.AdminTeams, reviewer)
 		if err != nil {
@@ -725,10 +755,16 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 		RepoAdminTeams:     repoAdminTeams,
 		RepoAdminUsers:     repoAdminUsers,
 		CodeownerReviewers: make(map[string]struct{}),
+		IsCommandApp:       config.IsConfiguredCommandApp,
 	}
+	// A command App's approval never counts, so it is never listed as a
+	// reviewer to ask.
 	appendOperatorReviewers := func(values ...[]string) {
 		for _, group := range values {
 			for _, value := range group {
+				if config.IsConfiguredCommandApp(value) {
+					continue
+				}
 				policy.OperatorReviewers = appendUniqueString(policy.OperatorReviewers, value)
 			}
 		}
@@ -739,6 +775,9 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 		for _, group := range values {
 			for _, value := range group {
 				if containsFold(policy.OperatorReviewers, value) {
+					continue
+				}
+				if config.IsConfiguredCommandApp(value) {
 					continue
 				}
 				policy.OtherReviewers = appendUniqueString(policy.OtherReviewers, value)

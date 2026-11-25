@@ -15,12 +15,19 @@ func engineWithSettledApply(t *testing.T, state engine.State, phase, detail stri
 	t.Helper()
 	eng := New()
 	change := nativeApply{namespace: "public", table: "users", sql: concurrentIndexDDL, steps: 1, concurrentIndex: true}
-	eng.claimProgress(cancelTestKey, progressResult(state, phase, time.Now(), change, detail), newTestTracker(t), slog.New(slog.DiscardHandler), true, nil, "")
+	eng.claimProgress(cancelTestKey, progressResult(state, phase, time.Now(), change, detail), newTestTracker(t), slog.New(slog.DiscardHandler), buildShape{cancellable: true}, nil, "")
 	return eng
 }
 
 func postgresProgressRequest() *engine.ProgressRequest {
 	return &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: cancelTestKey}}
+}
+
+// declinedControlFixture addresses a control operation PostgreSQL declines for
+// every schema change. The engine declines before it reads the request, so a
+// fresh engine stands for every state the change could be in.
+func declinedControlFixture(*testing.T) enginetest.ControlFixture {
+	return enginetest.ControlFixture{Engine: New(), Req: cancelRequest()}
 }
 
 // The PostgreSQL engine's contract-suite run. The engine tracks its applies in
@@ -29,7 +36,9 @@ func postgresProgressRequest() *engine.ProgressRequest {
 // completed result before the cancel arrived. Stop is declined for every
 // PostgreSQL change — a concurrent index build has no resumable midpoint and
 // plain DDL commits or fails on its own — so the stop cases have no
-// completed-versus-nonexistent distinction to pin.
+// completed-versus-nonexistent distinction to pin. Start, cutover, revert, and
+// skip-revert are declined for every change too: there is no stopped phase to
+// resume, no table swap, and no revert window.
 func TestEngineConformance(t *testing.T) {
 	enginetest.Run(t, enginetest.Harness{
 		CancelAlreadyCompleted: func(t *testing.T) enginetest.ControlFixture {
@@ -66,6 +75,10 @@ func TestEngineConformance(t *testing.T) {
 				},
 			}
 		},
+		StartUnsupported:      declinedControlFixture,
+		CutoverUnsupported:    declinedControlFixture,
+		RevertUnsupported:     declinedControlFixture,
+		SkipRevertUnsupported: declinedControlFixture,
 		Skips: map[enginetest.Case]string{
 			enginetest.CaseStopAlreadyCompleted:    "PostgreSQL declines stop for every schema change with a typed UnsupportedOperationError: a concurrent index build has no resumable midpoint and plain DDL commits or fails on its own, so a stop is never answered from the change's state.",
 			enginetest.CaseStopNonexistent:         "PostgreSQL declines stop for every schema change with a typed UnsupportedOperationError before looking the change up, so a stop of a nonexistent change is not distinguishable from any other stop.",

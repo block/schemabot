@@ -96,7 +96,7 @@ func TestRefreshChecksForTerminalApplyPublishesOnPRHead(t *testing.T) {
 	ghc.BaseURL, err = url.Parse(server.URL + "/")
 	require.NoError(t, err)
 	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghc, logger)}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-terminal-head-publish",
@@ -137,7 +137,7 @@ func TestRefreshChecksForTerminalApplyPublishesOnPRHead(t *testing.T) {
 		assert.Equal(t, headSHA, got.HeadSHA,
 			"the aggregate must be published on the commit the PR is gated on, not the apply's")
 	default:
-		t.Fatal("terminal refresh published no aggregate Check Run")
+		require.FailNow(t, "terminal refresh published no aggregate Check Run")
 	}
 
 	assert.Equal(t, int64(2), prFetches.Load(),

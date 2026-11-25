@@ -83,6 +83,9 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	r := *req
 	r.Database = e.resolveDatabase(req.Credentials, req.Database)
 	req = &r
+	if err := engine.RefuseDropTables("PlanetScale", req.DropTables); err != nil {
+		return nil, &engine.PlanRefusedError{Err: fmt.Errorf("plan database %s: %w", req.Database, err)}
+	}
 
 	e.logger.Info("computing plan",
 		"database", req.Database,
@@ -287,7 +290,7 @@ func (e *Engine) withholdIgnoredTables(ignored engine.IgnoredTables, req *engine
 			names[i] = ts.Name
 		}
 		if err := ignored.RefuseDeclared(ks, names); err != nil {
-			return nil, err
+			return nil, &engine.PlanRefusedError{Err: err}
 		}
 
 		live, ok := currentSchema[ks]
@@ -343,7 +346,7 @@ func parseDesiredSchemas(keyspace string, ns *schema.Namespace) ([]table.TableSc
 				return nil, fmt.Errorf("SQL usage error in keyspace %s/%s: %w", keyspace, filename, err)
 			}
 			if err := declared.Declare(keyspace+"/"+filename, ct.TableName); err != nil {
-				return nil, err
+				return nil, &engine.PlanRefusedError{Err: err}
 			}
 			schemas = append(schemas, table.TableSchema{
 				Name:   ct.TableName,

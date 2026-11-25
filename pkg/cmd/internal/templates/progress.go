@@ -3,7 +3,6 @@ package templates
 import (
 	"fmt"
 	"log/slog"
-	"math"
 	"sort"
 	"strings"
 	"time"
@@ -146,7 +145,7 @@ func WriteProgress(data ProgressData) {
 			if expires, err := time.Parse(time.RFC3339, expiresStr); err == nil {
 				remaining := time.Until(expires)
 				if remaining > 0 {
-					rows = append(rows, BoxRow{"Revert expires in", FormatDurationSeconds(int64(remaining.Seconds()))})
+					rows = append(rows, BoxRow{"Revert expires in", ui.FormatDurationSeconds(int64(remaining.Seconds()))})
 				}
 			}
 		}
@@ -159,6 +158,7 @@ func WriteProgress(data ProgressData) {
 	if data.State == state.Apply.Failed && data.ErrorMessage != "" {
 		fmt.Printf("\n  %s%s%s\n", ANSIRed, data.ErrorMessage, ANSIReset)
 	}
+	writeStoppedByFreeze(data)
 	if data.Sharded {
 		if note := ShardedStoppedAtCutoverNote(data.State, data.Operations, data.Tables, data.Released); note != "" {
 			fmt.Printf("\n  ⏹️ %s\n", note)
@@ -250,9 +250,6 @@ func writeProgressStep(data ProgressData) {
 		fmt.Printf(" · %s", statement)
 	}
 	fmt.Println()
-	if line := ui.FormatBuildWork(data.BuildWork); line != "" {
-		fmt.Println(line)
-	}
 }
 
 // FormatNamespacedTables returns tables grouped by keyspace as a string, collapsing
@@ -474,15 +471,10 @@ func FormatTableProgressWithActivityBar(t TableProgress, activityBar string) str
 }
 
 // runningWord names t's parts while they work on its change: copying, unless
-// the change copies no rows, which a CREATE TABLE, a DROP TABLE and an instant
-// ALTER do not. The table's own line says "Applying..." for those, and its
-// parts read the same way.
+// the change copies no rows (presentation.ChangeCopiesRows). The table's own
+// line says "Applying..." for those, and its parts read the same way.
 func runningWord(t TableProgress) string {
-	switch ddl.OpToStatementType(t.ChangeType) {
-	case ddl.StatementCreateTable, ddl.StatementDropTable:
-		return presentation.RunningApplying
-	}
-	return presentation.RunningWord(!isInstantAlter(t))
+	return presentation.RunningWord(presentation.ChangeCopiesRows(t.ChangeType, t.IsInstant))
 }
 
 // isInstantAlter reports whether the table should be described as applying
@@ -541,6 +533,9 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	if coverage, ok := awaitsResume(t); ok {
 		return formatResumingTable(t, coverage)
 	}
+	if t.AcrossTargets && t.BuildWork.IsConcurrentIndexBuild() {
+		return formatIndexBuildAcrossTargets(t)
+	}
 	if keepsAcrossTargetsBar(t) {
 		if out, ok := formatAcrossTargetsProgress(t); ok {
 			return out
@@ -586,56 +581,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString("\n")
 		b.WriteString(formatTableParts(t))
 		return b.String()
-	case state.Task.CatchingUp:
-		// Row copy is done; the engine is applying the changes that accumulated
-		// from live traffic during the copy. On a busy source this catch-up can
-		// run for a long time, so name the phase instead of showing a serene
-		// full bar that looks finished.
-		writeTableLine(&b, t, "%s ⏩ Catching up on accumulated changes...", ui.ProgressBarRowCopy(100))
-		if t.DDL != "" {
-			b.WriteString(formatTableDDL(t))
-		}
-		if t.RowsCopied > 0 {
-			fmt.Fprintf(&b, indentDetail+"Rows copied: %s\n", ui.FormatNumber(t.RowsCopied))
-		}
-		b.WriteString("\n")
-		b.WriteString(formatTableParts(t))
-		return b.String()
-	case state.Task.Checksumming:
-		// Row copy is done; the engine is verifying the copied data against the
-		// source. On a large table this can run for hours, so show how far the
-		// verification has progressed once Spirit has reported a total.
-		if t.ChecksumRowsTotal > 0 {
-			checksumPct := int(math.Round(float64(t.ChecksumRowsChecked) * 100 / float64(t.ChecksumRowsTotal)))
-			pct := ui.RowCopyDisplayPercent(checksumPct, t.ChecksumRowsChecked)
-			writeTableLine(&b, t, "%s 🔍 Checksumming to verify data (%s%s)%s", ui.ProgressBarRowCopy(pct),
-				ui.FormatRowCopyPercent(checksumPct, t.ChecksumRowsChecked, t.ChecksumRowsTotal), shardCoverageSuffix(t), throttledSuffix(t))
-			if t.DDL != "" {
-				b.WriteString(formatTableDDL(t))
-			}
-			fmt.Fprintf(&b, indentDetail+"Rows verified: %s / %s\n",
-				ui.FormatNumber(ui.ClampRows(t.ChecksumRowsChecked, t.ChecksumRowsTotal)), ui.FormatNumber(t.ChecksumRowsTotal))
-		} else {
-			writeTableLine(&b, t, "%s 🔍 Checksumming to verify data...%s", ui.ProgressBarRowCopy(100), throttledSuffix(t))
-			if t.DDL != "" {
-				b.WriteString(formatTableDDL(t))
-			}
-		}
-		writeThrottleTooltip(&b, t)
-		b.WriteString("\n")
-		b.WriteString(formatTableParts(t))
-		return b.String()
-	case state.Task.PostChecksum:
-		// The verification passed and the engine is applying the changes that
-		// accumulated while it ran. Named separately from the pre-checksum
-		// catch-up so the display doesn't rewind to an earlier phase.
-		writeTableLine(&b, t, "%s ⏩ Data verified, applying final changes...", ui.ProgressBarRowCopy(100))
-		if t.DDL != "" {
-			b.WriteString(formatTableDDL(t))
-		}
-		if t.RowsCopied > 0 {
-			fmt.Fprintf(&b, indentDetail+"Rows copied: %s\n", ui.FormatNumber(t.RowsCopied))
-		}
+	case state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum:
+		writeInFlightTable(&b, t, activityBar, activityLabel)
 		b.WriteString("\n")
 		b.WriteString(formatTableParts(t))
 		return b.String()
@@ -657,11 +604,11 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.Recovering:
-		if recoveringIsCopyingRows(t) {
+		if ui.RecoveringCopyingRows(t.RowsTotal, t.PercentComplete) {
 			pct := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBarRowCopy(pct)
 			writeTableLine(&b, t, "%s Row copy in progress (%s%s)", bar,
-				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), shardCoverageSuffix(t))
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), presentation.ShardCoverageSuffix(tableFacts(t)))
 			if t.DDL != "" {
 				b.WriteString(formatTableDDL(t))
 			}
@@ -759,7 +706,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBar(cancelledPercent, ui.ColorOrange)
 			writeTableLine(&b, t, "%s 🚫 Cancelled at %s%s", bar,
-				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), shardCoverageSuffix(t))
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), presentation.ShardCoverageSuffix(tableFacts(t)))
 		} else {
 			writeTableLine(&b, t, "🚫 Cancelled (not started)")
 		}
@@ -779,7 +726,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			writeTableLine(&b, t, "%s ⏹️ Stopped (was waiting for cutover)", bar)
 		case t.PercentComplete > 0 || t.RowsCopied > 0:
 			writeTableLine(&b, t, "%s ⏹️ Stopped at %s%s", bar,
-				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), shardCoverageSuffix(t))
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), presentation.ShardCoverageSuffix(tableFacts(t)))
 		default:
 			writeTableLine(&b, t, "⏹️ Stopped (not started)")
 		}
@@ -787,86 +734,23 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			b.WriteString(formatTableDDL(t))
 		}
 		if t.RowsTotal > 0 && (t.PercentComplete > 0 || t.RowsCopied > 0) {
-			coverage, size, _ := rowsCoverageAndSize(t)
-			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s%s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), coverage, size)
+			// A stopped copy is not advancing, so its rows line carries no ETA.
+			f := tableFacts(t)
+			f.ETASeconds = 0
+			b.WriteString(indentDetail + presentation.RowsLine(f) + "\n")
 		}
 		b.WriteString("\n")
 		b.WriteString(formatTableParts(t))
 		return b.String()
 	}
 
-	// In-progress state — rendered from the structured copy fields, which are
-	// the same source the PR comment renders from.
-	switch {
-	case t.RowsTotal > 0 && t.RowsCopied == 0:
-		// Row total is known but the copy hasn't reported progress yet
-		// (Vitess VReplication / Spirit ramp-up — can take a while on a large
-		// table). Show a starting indicator and the row total instead of a 0%
-		// bar that reads as stuck.
-		writeTableLine(&b, t, "⏳ Starting copy...%s", throttledSuffix(t))
-		if t.DDL != "" {
-			b.WriteString(formatTableDDL(t))
-		}
-		writeStructuredRowsAndETA(&b, t)
-	case t.RowsTotal > 0 && ui.EstimateExceeded(t.RowsCopied, t.RowsTotal):
-		// The copy has passed the engine's estimate, so a percentage would
-		// read as done while rows are still moving. The block ends the way
-		// every in-progress block does, below: the throttle note, the blank
-		// line that separates it from the next table, and the shard rows.
-		writeEstimateExceededTable(&b, t, activityBar, activityLabel)
-	case t.RowsTotal > 0:
-		// Row copy in progress — show progress bar with structured fields
-		displayPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
-		bar := ui.ProgressBarRowCopy(displayPercent)
-		writeTableLine(&b, t, "%s %s%s%s", bar,
-			ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), shardCoverageSuffix(t), throttledSuffix(t))
-
-		if t.DDL != "" {
-			b.WriteString(formatTableDDL(t))
-		}
-
-		writeStructuredRowsAndETA(&b, t)
-
-		statusLower := strings.ToLower(t.Status)
-		if statusLower != "" && statusLower != "running" && statusLower != "row_copy" {
-			fmt.Fprintf(&b, indentDetail+"Status: %s\n", t.Status)
-		}
-	default:
-		// No row copy data — CREATE/DROP, instant DDL, or VSchema-only.
-		// Show a full blue bar with a state label.
-		bar := ui.ProgressBarRowCopy(100)
-		op := ddl.OpToStatementType(t.ChangeType)
-		switch {
-		case isInstantAlter(t):
-			writeTableLine(&b, t, "%s Applying instantly...%s", bar, throttledSuffix(t))
-		case op == ddl.StatementCreateTable || op == ddl.StatementDropTable:
-			writeTableLine(&b, t, "%s Applying...%s", bar, throttledSuffix(t))
-		default:
-			writeTableLine(&b, t, "%s Running...%s", bar, throttledSuffix(t))
-		}
-		if t.DDL != "" {
-			b.WriteString(formatTableDDL(t))
-		}
-	}
-
-	writeThrottleTooltip(&b, t)
+	// Copying, building, or applying: the reading every surface shares.
+	writeInFlightTable(&b, t, activityBar, activityLabel)
 	if len(t.Shards) == 0 {
 		b.WriteString("\n")
 	}
 	b.WriteString(formatTableParts(t))
 	return b.String()
-}
-
-// throttledSuffix annotates a paced-phase header when the engine's throttler
-// is holding the phase back, so a slow bar reads as deliberate backpressure —
-// slowed, not stopped — right where the eye checks progress, and never to be
-// confused with an operator stop. The drive clears the stored flag when the
-// throttle lifts, so the annotation disappears on the next refresh.
-func throttledSuffix(t TableProgress) string {
-	if !t.Throttled {
-		return ""
-	}
-	return " (throttled)"
 }
 
 // FormatThrottleReference renders one shared reference for a progress view.
@@ -893,94 +777,104 @@ func DocsLine(url string) string {
 	return glyph.Docs + " Docs: " + ANSIBlue + ui.Link(ui.DocRef(url), url) + ANSIReset
 }
 
+// writeInFlightTable writes a table the engine is working on as every surface
+// reads it (presentation.ReadInFlightTable): the bar and label beside the
+// table name, its statement, then the detail lines. A copy that has passed its
+// row estimate takes the caller's activity bar and label, which the watch view
+// animates, followed by the shards the copy covers.
+func writeInFlightTable(b *strings.Builder, t TableProgress, activityBar, activityLabel string) {
+	f := tableFacts(t)
+	r := presentation.ReadInFlightTable(f)
+	headline := r.Headline()
+	if r.Activity {
+		headline = activityBar + " " + activityLabel + presentation.ShardCoverageSuffix(f) + ui.ThrottledSuffix(r.Throttled)
+	}
+	writeTableLine(b, t, "%s", headline)
+	if t.DDL != "" {
+		b.WriteString(formatTableDDL(t))
+	}
+	for _, d := range r.Details {
+		writeTableDetail(b, d)
+	}
+}
+
+// tableFacts is what the CLI knows about a table's change, in the form every
+// surface reads it from. A sharded table whose row figures cover only the
+// shards that have reported says how many.
+func tableFacts(t TableProgress) presentation.TableFacts {
+	f := presentation.TableFacts{
+		Status:              t.Status,
+		ChangeType:          t.ChangeType,
+		IsInstant:           t.IsInstant,
+		PercentComplete:     t.PercentComplete,
+		RowsCopied:          t.RowsCopied,
+		RowsTotal:           t.RowsTotal,
+		RowsTotalPlanned:    t.RowsTotalPlanned,
+		ETASeconds:          t.ETASeconds,
+		EstimatedBytes:      t.EstimatedBytes,
+		ChecksumRowsChecked: t.ChecksumRowsChecked,
+		ChecksumRowsTotal:   t.ChecksumRowsTotal,
+		Throttled:           t.Throttled,
+		ThrottleReason:      t.ThrottleReason,
+		BuildWork:           t.BuildWork,
+		PlannedShards:       t.PlannedShards,
+	}
+	if t.AcrossTargets {
+		return f
+	}
+	return f.WithShardCoverage(len(t.Shards), shardsReporting(t))
+}
+
+// writeTableDetail writes one detail line under a table's statement. A note
+// is dimmed after the info glyph; its docs page is named once for the whole
+// view (FormatThrottleReference) rather than on every line.
+func writeTableDetail(b *strings.Builder, d presentation.TableDetail) {
+	if d.Note {
+		b.WriteString(indentDetail + ANSIDim + d.NoteText() + ANSIReset + "\n")
+		return
+	}
+	b.WriteString(indentDetail + d.Text + "\n")
+}
+
 // writeThrottleTooltip explains the header's "(throttled)" annotation with the
-// engine's reason, using the same dimmed tooltip idiom as the estimate-exceeded
-// note. When the engine reports throttled without a reason, the header
-// annotation stands alone.
+// engine's reason (presentation.ThrottleNote).
 func writeThrottleTooltip(b *strings.Builder, t TableProgress) {
-	if !t.Throttled || t.ThrottleReason == "" {
-		return
+	if note, ok := presentation.ThrottleNote(tableFacts(t)); ok {
+		writeTableDetail(b, note)
 	}
-	// The raw reason names the engine signal; the tip says what the pause
-	// protects. A reason whose signal has no tip renders alone so a new
-	// engine signal degrades to raw text rather than a wrong explanation.
-	if tip := ui.ThrottleTip(t.ThrottleReason); tip != "" {
-		fmt.Fprintf(b, indentDetail+"%s"+glyph.Info+" Throttled: %s · %s%s\n", ANSIDim, t.ThrottleReason, tip, ANSIReset)
-		return
-	}
-	fmt.Fprintf(b, indentDetail+"%s"+glyph.Info+" Throttled: %s%s\n", ANSIDim, t.ThrottleReason, ANSIReset)
 }
 
-func recoveringIsCopyingRows(t TableProgress) bool {
-	return t.RowsTotal > 0 && t.PercentComplete < 100
-}
-
+// writeStructuredRowsAndETA writes a copy's rows line (presentation.RowsLine).
 func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
-	coverage, size, partial := rowsCoverageAndSize(t)
-	eta := ui.FormatETA(t.ETASeconds)
-	if partial || t.RowsTotalPlanned {
-		// The unreported shards or targets can only add time, so the ETA is
-		// a floor.
-		eta = "≥ " + eta
-	}
-	total := ui.FormatNumber(t.RowsTotal)
-	if t.RowsTotalPlanned {
-		total = ui.FormatApproxRows(t.RowsTotal)
-	}
-	if t.ETASeconds > 0 {
-		fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s%s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), total, coverage, size, eta)
-		return
-	}
-	fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), total, coverage, size)
+	b.WriteString(indentDetail + presentation.RowsLine(tableFacts(t)) + "\n")
 }
 
-// writePlannedRows writes the rows line of a queued table: the plan's row
-// estimate and size, both approximate, so the work ahead is visible before
-// the copy starts. A table rolled up across targets names them, since its
-// estimate is their sum. It writes nothing when the plan had no row estimate,
-// which a table rolled up across targets lacks while some of its targets have
-// reported nothing at all: their estimates are not known, so a sum of the rest
-// would understate the table (tableAcrossTargets).
+// writePlannedRows writes the rows line of a queued table
+// (presentation.PlannedRowsText). A table rolled up across targets names them,
+// since its estimate is their sum. It writes nothing when the plan had no row
+// estimate, which a table rolled up across targets lacks while some of its
+// targets have reported nothing at all: their estimates are not known, so a
+// sum of the rest would understate the table (tableAcrossTargets).
 func writePlannedRows(b *strings.Builder, t TableProgress) {
-	if t.EstimatedRows == nil {
-		return
-	}
 	span := ""
 	if t.AcrossTargets {
 		span = presentation.PlannedRowsSpan(len(t.Shards))
 	}
-	fmt.Fprintf(b, indentDetail+"Rows: %s%s%s\n", ui.FormatApproxRows(*t.EstimatedRows), span, ui.FormatTableSizeClause(t.EstimatedBytes))
+	if text := presentation.PlannedRowsText(t.EstimatedRows, t.EstimatedBytes, span); text != "" {
+		b.WriteString(indentDetail + text + "\n")
+	}
 }
 
-// rowsCoverageAndSize returns the clauses a table's rows line carries after
-// its row counts: the shards the counts cover when only some have reported,
-// and the table's planned size, which then names the shards it covers. partial
-// reports whether the counts cover only some shards.
-func rowsCoverageAndSize(t TableProgress) (coverage, size string, partial bool) {
-	reporting, ok := partialShardCoverage(t)
-	if !ok {
-		return "", ui.FormatTableSizeClause(t.EstimatedBytes), false
-	}
-	return fmt.Sprintf(" across %d of %d shards", reporting, shardTotal(t)),
-		ui.FormatShardedTableSizeClause(t.EstimatedBytes, t.PlannedShards), true
-}
-
-// partialShardCoverage returns how many of a sharded table's shards have
-// reported a row total, and whether that is only some of them: while later
-// shards have not started, the table's row figures cover the started ones
-// alone, so the bar and the rows line say so rather than passing those
-// shards' fraction off as the table's, as the PR comment does.
-func partialShardCoverage(t TableProgress) (int, bool) {
-	if t.AcrossTargets || len(t.Shards) < 2 {
-		return 0, false
-	}
+// shardsReporting is how many of a sharded table's shards have reported a
+// row total.
+func shardsReporting(t TableProgress) int {
 	reporting := 0
 	for _, sh := range t.Shards {
 		if sh.RowsTotal > 0 {
 			reporting++
 		}
 	}
-	return reporting, reporting > 0 && reporting < shardTotal(t)
+	return reporting
 }
 
 // shardTotal is how many shards a sharded table's copy spans: the plan's
@@ -988,27 +882,6 @@ func partialShardCoverage(t TableProgress) (int, bool) {
 // it recorded none, as the PR comment counts them.
 func shardTotal(t TableProgress) int {
 	return max(len(t.Shards), t.PlannedShards)
-}
-
-// shardCoverageSuffix annotates a sharded table's copy percentage with the
-// shards it covers when only some have reported (partialShardCoverage).
-func shardCoverageSuffix(t TableProgress) string {
-	if reporting, ok := partialShardCoverage(t); ok {
-		return fmt.Sprintf(" (%d of %d shards)", reporting, shardTotal(t))
-	}
-	return ""
-}
-
-// writeEstimateExceededTable writes the header and detail lines of a table
-// whose copy has passed the engine's row estimate: the rows copied so far and
-// a note that the copy is still running, in place of a percentage.
-func writeEstimateExceededTable(b *strings.Builder, t TableProgress, activityBar, activityLabel string) {
-	fmt.Fprintf(b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s%s\n", t.TableName, activityBar, activityLabel, throttledSuffix(t))
-	if t.DDL != "" {
-		b.WriteString(formatTableDDL(t))
-	}
-	fmt.Fprintf(b, indentDetail+"Rows copied: %s so far\n", ui.FormatNumber(t.RowsCopied))
-	fmt.Fprintf(b, indentDetail+"%s"+glyph.Info+" %s%s\n", ANSIDim, ui.EstimateExceededTooltip, ANSIReset)
 }
 
 // writeTableProgress writes progress for a single table to stdout.
@@ -1611,7 +1484,10 @@ type ApplyHistoryData struct {
 // DatabaseHistoryData contains data for rendering database history.
 type DatabaseHistoryData struct {
 	Database string
-	Applies  []ApplyHistoryData
+	// Environment is the environment the history was filtered to; empty when
+	// it covers every environment.
+	Environment string
+	Applies     []ApplyHistoryData
 }
 
 // databaseHistoryColumns returns the columns the history table renders, in order.
@@ -1629,7 +1505,7 @@ func databaseHistoryColumns() []statusColumn[ApplyHistoryData] {
 // WriteDatabaseHistory writes the database history output.
 func WriteDatabaseHistory(data DatabaseHistoryData) {
 	if len(data.Applies) == 0 {
-		fmt.Printf("%sNo schema changes found for database '%s'%s\n", ANSIDim, data.Database, ANSIReset)
+		fmt.Printf("%s%s%s\n", ANSIDim, emptyHistoryLine(data.Database, data.Environment), ANSIReset)
 		return
 	}
 
@@ -1640,6 +1516,17 @@ func WriteDatabaseHistory(data DatabaseHistoryData) {
 
 	fmt.Println()
 	fmt.Printf("%sUse '%s' to view details%s\n", ANSIDim, cliname.Command("status", "<apply_id>"), ANSIReset)
+}
+
+// emptyHistoryLine says that no apply has been recorded for the database, in
+// the environment when the history was filtered to one. It speaks of applies,
+// not schema changes, so it does not read as a claim that the database has no
+// schema or is unknown.
+func emptyHistoryLine(database, environment string) string {
+	if environment == "" {
+		return fmt.Sprintf("No applies recorded for database '%s'", database)
+	}
+	return fmt.Sprintf("No applies recorded for database '%s' in %s", database, environment)
 }
 
 // stateColorFunc returns an ANSI color function for the given state.

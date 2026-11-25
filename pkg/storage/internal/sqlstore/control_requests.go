@@ -111,10 +111,12 @@ func (s *controlRequestStore) listStrandedPending(ctx context.Context, limit int
 	for _, req := range stranded {
 		parent, ok := parents[req.ApplyID]
 		if !ok {
-			// The apply was deleted between the two reads (PR cleanup races the
-			// reaper). Its requests go with it, so there is nothing left to answer.
-			slog.WarnContext(ctx, "apply disappeared while listing a stranded control request; the request is being deleted with it",
-				"operation", req.Operation, "requested_by", req.RequestedBy)
+			// The scan selects only requests whose settled apply exists, so the
+			// apply was removed between the scan and the parent read. SchemaBot
+			// never deletes an apply, so this was a delete from outside SchemaBot.
+			// There is no apply to answer for, so the request stays as it is.
+			slog.WarnContext(ctx, "apply disappeared between the stranded control request scan and the parent read; the request is left unchanged",
+				"control_request_id", req.ID, "operation", req.Operation, "requested_by", req.RequestedBy)
 			continue
 		}
 		listed = append(listed, &storage.StrandedControlRequest{Request: req, Apply: parent})
@@ -264,6 +266,14 @@ func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.A
 		slog.DebugContext(ctx, "control request already settled for this command; leaving it settled",
 			"apply_id", req.ApplyID, "operation", req.Operation, "command_id", commandID, "status", existing.Status)
 		return existing, false, nil
+	}
+	// A start or cutover this call records is admitted here, so it is
+	// checked against the freeze epoch the change gate read. A request
+	// already pending or settled was admitted before and returned above.
+	if req.Operation == storage.ControlOperationStart || req.Operation == storage.ControlOperationCutover {
+		if err := checkFreezeEpochGuard(ctx, tx); err != nil {
+			return nil, false, fmt.Errorf("record %s control request for apply %d: %w", req.Operation, req.ApplyID, err)
+		}
 	}
 	if err := markResumed(ctx, tx, req); err != nil {
 		return nil, false, err

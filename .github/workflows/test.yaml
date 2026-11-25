@@ -51,6 +51,10 @@ jobs:
               - '!**/*.md'
               - '!docs/.toc-manifest'
               - '!{docs,assets}/**/*.{svg,png,jpg,jpeg,gif,webp,ico}'
+            # The agent skill is Markdown, but the Unit Tests job parses its
+            # commands and pins its command policy, so a skill edit runs CI.
+            skill:
+              - 'skills/**'
       - name: "Resolve code-change and coverage flags"
         id: out
         shell: bash
@@ -58,6 +62,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           FILTER_OUTCOME: ${{ steps.filter.outcome }}
           FILTER_CODE: ${{ steps.filter.outputs.code }}
+          FILTER_SKILL: ${{ steps.filter.outputs.skill }}
           PR_SMOKE_ENABLED: ${{ vars.PR_SMOKE_E2E_ENABLED }}
         run: |
           set -euo pipefail
@@ -66,6 +71,8 @@ jobs:
             code=true
           elif [ "$FILTER_OUTCOME" != "success" ]; then
             echo "::warning::paths-filter failed; running CI instead of skipping"
+            code=true
+          elif [ "$FILTER_SKILL" = "true" ]; then
             code=true
           else
             code="$FILTER_CODE"
@@ -214,6 +221,13 @@ jobs:
           # per-package once its wall clock has settled well below the other
           # shards' for a stretch of main runs.
           - shard: pkg/api
+          # The engine packages and their subpackages. PostgreSQL (with the
+          # Supabase image only it needs), Spirit and PlanetScale are the
+          # heaviest binaries after the shards above, so they get their own
+          # runner and the remaining long tail keeps headroom under the job
+          # budget even when a runner is slow to restore the cache and pull
+          # images.
+          - shard: pkg/engine
           # Every other integration-tagged package: tests that live beside the
           # code they cover, spread across ./pkg, ./cmd and ./e2e. A newly
           # added package is picked up here without touching this file.
@@ -244,9 +258,9 @@ jobs:
             postgres:16 \
             postgres:17 \
             ministackorg/ministack:1.5.10 \
-            testcontainers/ryuk:0.13.0
+            testcontainers/ryuk:0.14.0
       - name: "Pre-pull Supabase PostgreSQL"
-        if: matrix.shard == 'per-package'
+        if: matrix.shard == 'pkg/engine'
         run: scripts/ci/prepull-images.sh supabase/postgres:17.6.1.136@sha256:f371b5f3f2ac0a05703f33d6e6134515fb2498cab708fb948a0aeb7481467c00
       - name: "Test"
         # Cap package-level parallelism: the integration suite runs many heavy
@@ -278,11 +292,13 @@ jobs:
           # cross-package suite takes that shard. A future nested package named
           # `integration` belongs beside the code it covers, in per-package.
           # pkg/tern, pkg/webhook and pkg/api are `$`-anchored so their
-          # subpackages stay in per-package.
+          # subpackages stay in per-package; pkg/engine takes its subpackages
+          # with it.
           declare -A selectors=(
             ["./integration"]='^github\.com/block/schemabot/integration(/|$)'
             ["tern-webhook"]='^github\.com/block/schemabot/pkg/(tern|webhook)$'
             ["pkg/api"]='^github\.com/block/schemabot/pkg/api$'
+            ["pkg/engine"]='^github\.com/block/schemabot/pkg/engine(/|$)'
           )
           if [ "$SHARD" = "per-package" ]; then
             match="-vE"
@@ -438,7 +454,7 @@ jobs:
         run: |
           scripts/ci/prepull-images.sh \
             mysql:8.0 \
-            testcontainers/ryuk:0.13.0 \
+            testcontainers/ryuk:0.14.0 \
             --dockerfile deploy/local/Dockerfile.localscale
       - name: "Build LocalScale image"
         run: |

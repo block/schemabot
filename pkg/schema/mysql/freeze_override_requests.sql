@@ -1,0 +1,21 @@
+CREATE TABLE `freeze_override_requests` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `override_identifier` varchar(255) NOT NULL,
+  `environment` varchar(255) NOT NULL,
+  `action` varchar(32) NOT NULL,
+  `target_id` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+  `database_name` varchar(255) NOT NULL,
+  `repository` varchar(255) NOT NULL,
+  `pull_request` int NOT NULL,
+  `pr_author` varchar(255) DEFAULT NULL,
+  `blockers` json NOT NULL,
+  `reason` text NOT NULL,
+  `requested_by` varchar(255) NOT NULL,
+  `approved_by` varchar(255) DEFAULT NULL,
+  `approved_at` datetime(6) DEFAULT NULL,
+  `expires_at` datetime(6) NOT NULL,
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_override_identifier` (`override_identifier`),
+  KEY `idx_environment_action_target` (`environment`,`action`,`target_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

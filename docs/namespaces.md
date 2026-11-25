@@ -10,6 +10,7 @@
 - [Per-Environment Schema Roots](#per-environment-schema-roots)
 - [Ignoring Namespaces](#ignoring-namespaces)
 - [Ignoring Tables](#ignoring-tables)
+- [Dropping Tables](#dropping-tables)
 - [Per-Target Schema Overrides](#per-target-schema-overrides)
 - [Summary](#summary)
 - [How Namespaces Flow Through the System](#how-namespaces-flow-through-the-system)
@@ -148,10 +149,11 @@ unsafe change and requires the same
 Deleting every schema file in a namespace, or moving them all out of it, does
 not remove the namespace from the plan while another namespace still declares
 files under the schema root. Every table the emptied namespace still holds is
-planned as a `DROP TABLE` change: on MySQL and Vitess an unsafe change that
-needs the explicit drop approval before it can run, on PostgreSQL a blocked
-change that fails the check until the tables are declared again or dropped
-through a reviewed schema change. Only the files the pull request itself
+planned as a `DROP TABLE` change: an unsafe change that needs the explicit
+drop approval before it can run. On PostgreSQL some of these drops are blocked
+instead, such as a table that a view reads; see
+[Tables with no schema file](./postgresql.md#tables-with-no-schema-file). Only
+the files the pull request itself
 removes count — a deletion it inherited from history its base branch has not
 caught up with is not one it proposes.
 
@@ -460,6 +462,33 @@ Upgrade SchemaBot servers and data planes before adding a pattern. An older buil
 
 Declaring a table in a schema file *and* ignoring it is a contradiction SchemaBot refuses, at onboard time before anything is written and at plan time thereafter. That includes a pattern that matches a declared table. The refusal ignores case, since some databases fold table names to lower case. Two spellings count as the same table when one lower-cases or Unicode-folds to the other, for plain entries and patterns alike, so a few non-ASCII spellings that were distinct before patterns, such as the long s `ſ` and `s`, now collide. The error names the entries to remove, and for a pattern, the declared tables it matches, so you can narrow it.
 
+### Databases that share a schema
+
+Two databases can split one schema between them. One example is an app whose unsharded tables live in shard 0's schema, next to that shard's copy of the sharded tables. One database holds the unsharded tables, and the other holds the sharded tables in every shard's schema. On the cluster where they meet, each database's plan sees the other's tables as undeclared, so each `schemabot.yaml` lists the other's tables under `ignore_tables`:
+
+```yaml
+# shop/schemabot.yaml           # shop_sharded/schemabot.yaml
+database: shop                  database: shop_sharded
+type: mysql                     type: mysql
+ignore_tables:                  ignore_tables:
+  - orders                        - sequences
+  - order_items
+```
+
+A pull request that adds a table to one database has to add it to the other's `ignore_tables` too. Otherwise its own plan passes, and the missing entry only shows up later, as a `DROP TABLE` in the other database's plan. So SchemaBot checks every plan and apply from a pull request for this.
+
+Two databases share a schema when, in the same environment, both have a target on the same cluster behind the same deployment, and a namespace of each is stored in one schema there. SchemaBot asks that deployment's data plane which schema each namespace addresses on the target, because only the data plane knows the target's connection. A MySQL target whose DSN names a database stores every namespace in that database. A target with a `schema_overrides` entry stores the namespace under the override's name. Otherwise each namespace is its own schema, so `shop` and `shop_sharded` on the same cluster share nothing. For each table that one database declares in a shared schema, the other must withhold it, by name or by pattern. If it does not, the environment's check fails. The error names the table, the database whose `ignore_tables` is missing it, and the file to add it to. The other database's files are read from the pull request's head, so a pull request that adds the table and the entry together passes.
+
+- A table that both databases declare in one schema also fails the check, whatever the lists say. Each table belongs to one of them. This holds when the two declare it under different namespaces that the target stores in one schema. A pair that declares the same table name under two namespaces the target stores as two schemas passes, because those are two separate tables.
+- A database cannot withhold a table it declares itself. `ignore_tables` applies to every namespace of a database, so when the other database declares a table in a shared schema and this one declares a table of the same name in another of its namespaces, no entry can keep it out. The check fails and names both namespaces. Rename one of the two tables, or store the two namespaces in different schemas.
+- Every data plane that serves one of the targets must be able to report which schema each namespace addresses. A data plane from a release that cannot fails the environment, and the comment names the deployment to upgrade. Any other failure to get the answer fails the environment too, and the server logs have the cause.
+- Entries match case exactly. A target that folds table names stores `Refunds` as `refunds`, so a table declared with capital letters needs an entry for its lower-case spelling as well, or a pattern that matches both. The error names every spelling still missing.
+- The other database's files must come from a directory its own `allowed_dirs` allow, the same source policy its own plans pass. If they do not, or if SchemaBot cannot read them, the environment fails. It does not pass a pair it could not compare. A `schemabot.yaml` found elsewhere in the repository is refused the same way.
+- A database whose `schemabot.yaml` is in another repository is managed from there, so it is not compared. SchemaBot skips it when the database accepts no schema changes from this repository, or when a search of the repository read every config it found and none was for that database. A miss that skipped an unreadable config fails the environment.
+- An apply also needs the branch to have every base branch change to the other database's `schemabot.yaml` and schema files. The comparison read them at the pull request's head, so a branch missing a newer change to them is refused as stale, like a branch missing a change to the database's own schema. Merge or rebase the base branch and apply again.
+- A plan narrowed with `--target` runs the check too. The disagreement is in the schema files, so it fails the environment's check whichever target the plan named.
+- The CLI plans one database from a local directory and does not run this check.
+
 ### Exclusions are disclosed
 
 Every plan that withheld tables says so: the PR plan comment renders an
@@ -469,11 +498,115 @@ is distinguishable from a declared one), and the CLI prints the same disclosure
 for `plan` and `apply`. Past five tables the line leads with its count and
 folds the names into a collapsed block, so how many were withheld stays visible
 unexpanded. The reason in parentheses says who withheld the table:
-`ignore_tables` is this config, and the PostgreSQL planner uses the same line
-to disclose the archive-named tables its own naming convention leaves in place.
+`ignore_tables` is this config, and the planners use the same line for the
+tables their own naming conventions leave in place:
+
+| Reason | Engines | Tables |
+|---|---|---|
+| `archive naming` | MySQL, PostgreSQL | `<name>_archive_YYYY`, with an optional month and day |
+| `leading underscore` | MySQL | Names starting with `_`, such as an online schema change's shadow, checkpoint or leftover tables |
+
+The MySQL planner applies the leading-underscore convention before
+`ignore_tables`, so an entry naming a `_` table is reported under
+`leading underscore`, not as withheld by the config. The PlanetScale planner
+leaves `_` tables out without disclosing them, and does not skip archive
+tables. The PR comment and CLI name the first 50 tables of a group and count
+the rest.
+
+A schema file that declares a live table one of these conventions skips is
+refused on MySQL, naming the table: the planner never sees the live table, so
+it would propose creating a table that already exists.
+
 When reviewing a PR that *introduces* an `ignore_tables` entry, the disclosure
 plus the config diff is the review surface: the plan stops seeing that table
 from this PR onward.
+
+## Dropping Tables
+
+The MySQL planner leaves some live tables out of every plan by their names: an
+online schema change's leftover `_` tables and `<name>_archive_YYYY` tables
+(see the table above). Because the plan never sees them, removing a schema file
+cannot drop them. To drop one through SchemaBot, name it under `drop_tables` in
+`schemabot.yaml`:
+
+```yaml
+# schemabot.yaml
+database: commerce
+type: mysql
+drop_tables:
+  - _events_old
+```
+
+The plan proposes `DROP TABLE` for each listed table that is on the target. The
+statement shows in the PR plan comment and in `plan` and `apply` output like any
+other drop, and the drop is listed under unsafe changes, so it needs the same
+consent as any other drop (`--allow-unsafe`). On a deployment with
+[pending drops](pending-drops.md) enabled, the apply moves the table into
+`_pending_drops` rather than dropping it outright, so it can be recovered until
+the retention period ends.
+
+An entry that names no table on the target plans nothing, and the PR plan
+comment and `plan` and `apply` output say so, one line per entry:
+
+> ⚠️ `drop_tables` entry `_events_olds` names no table on the target, so this plan drops nothing for it. Fix the name, or remove the entry if the table is already gone.
+
+That is usually a typo, a name wrapped in backticks, the wrong case, or a table
+already dropped. Without the line, the table you meant would still be listed
+under its naming convention and the plan would look clean.
+
+When a plan covers several environments, an entry is listed only when no
+environment's plan has the table. Once the drop has landed in staging and not
+yet in production, staging's plan is clean and production's still drops the
+table, so the entry is not listed: it is still needed for production. The
+first 20 entries get a line each, and one more line counts the rest.
+
+A plan of an environment that rolls out to several targets lists no such
+entries, and neither does a plan of several environments that includes one.
+The planner reports them for the primary target alone, and another
+target may still have the table and plan its drop.
+
+### Rules
+
+- MySQL only. A plan of a PostgreSQL database, or of one the PlanetScale
+  engine plans, fails when its config lists `drop_tables` and asks you to
+  remove the key.
+- Each entry is one exact, case-sensitive table name. There are no patterns:
+  list each table to drop, so the config diff shows every table the plan will
+  drop. An entry that is blank, padded with whitespace, or contains `/` is an
+  error naming it.
+- Entries are not namespace-qualified, so an entry applies to every namespace
+  the plan covers.
+- A table a schema file declares cannot also be listed, and neither can a table
+  `ignore_tables` withholds. The plan fails and names the entry, so you can
+  remove it from one of the two.
+- A listed table written in the last 24 hours is refused, naming it. A table
+  that still receives rows, such as the shadow table of an online schema change
+  another tool is running, is not a leftover yet. Wait until nothing writes to
+  it. The check reads the write time MySQL keeps in memory, which starts empty
+  when the server restarts, so a table not written since the last restart
+  passes however recently it was written before it. Passing the check does not
+  prove nothing uses the table: confirm that yourself before you list it.
+- A listed table that is a working table of a SchemaBot apply on the same
+  database and environment that is still running or is stopped, such as its
+  copy `_users_new` or its checkpoint `_users_chkpnt`, is refused, naming the
+  apply. A stopped apply resumes from that copy, so start or cancel the apply
+  first. The names are worked out from the tables the apply changes, the way
+  the engine shortens them to fit 64 characters included. A collision refuses
+  the entry for both tables, which errs on the safe side. The check runs when
+  the plan is made and again when the apply is created.
+- An entry that names no live table plans nothing and the plan proceeds. The
+  server logs the entry, so an operator can tell a stale or misspelled entry
+  from a drop that ran.
+- A rollback never drops a listed table. It restores the schema the apply
+  started from, so a listed table still on the target is left in place. A
+  listed table the naming conventions skip stays dropped, since the planner
+  never manages it. A listed table with an ordinary name is recreated, as it
+  would be without the list.
+- A plan records the entries, and an apply, resume or drift check of that plan
+  proposes the same drops.
+
+Remove the entry once the drop has landed. An entry left behind plans nothing,
+but it would drop a table someone later creates under the same name.
 
 ## Per-Target Schema Overrides
 

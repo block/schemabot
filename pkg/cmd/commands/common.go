@@ -23,6 +23,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -126,15 +127,17 @@ type CLIConfig struct {
 	// the exclusion a live table no schema file declares is planned as DROP
 	// TABLE, which blocks the merge.
 	IgnoreTables []string `yaml:"ignore_tables"`
-	SchemaDir    string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
+	// DropTables lists live tables no schema file declares that the plan
+	// should drop, each by its exact name.
+	DropTables []string `yaml:"drop_tables"`
+	SchemaDir  string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
 }
 
-// PlanExclusions returns the config's declared exclusions in the form the plan
-// API takes them. Both lists are exclusions the repository recorded, and they
-// are passed as one value so a caller cannot hand the plan its tables as its
-// namespaces.
+// PlanExclusions returns the config's declared exclusions, and its drop_tables,
+// in the form the plan API takes them. The lists are passed as one value so a
+// caller cannot hand the plan its tables as its namespaces.
 func (c *CLIConfig) PlanExclusions() client.PlanExclusions {
-	return client.PlanExclusions{Namespaces: c.IgnoreNamespaces, Tables: c.IgnoreTables}
+	return client.PlanExclusions{Namespaces: c.IgnoreNamespaces, Tables: c.IgnoreTables, DropTables: c.DropTables}
 }
 
 // LoadCLIConfig loads configuration from schemabot.yaml in the given directory.
@@ -170,6 +173,9 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 		return nil, fmt.Errorf("schemabot.yaml: %w", err)
 	}
 	if err := schema.ValidateIgnoreTables(cfg.IgnoreTables); err != nil {
+		return nil, fmt.Errorf("schemabot.yaml: %w", err)
+	}
+	if _, err := engine.NewDroppedTables(cfg.DropTables); err != nil {
 		return nil, fmt.Errorf("schemabot.yaml: %w", err)
 	}
 	// Schema files are in the same directory as schemabot.yaml
@@ -516,7 +522,7 @@ func writeNarrowedTo(planResult *apitypes.PlanResponse) {
 // rollout-wide apply (apitypes.ApplyRequest.RendersRollout). Each caller
 // decides it for its own output, so a new caller has to decide it rather than
 // inherit it.
-func applyAndWatch(ctx context.Context, ep string, planResult *apitypes.PlanResponse, rendersRollout bool, database, environment, caller, operation string,
+func applyAndWatch(ctx context.Context, ep string, planResult *apitypes.PlanResponse, rendersRollout bool, database, environment, caller, override, operation string,
 	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) (string, error) {
 
 	if planResult.PlanID == "" {
@@ -533,9 +539,10 @@ func applyAndWatch(ctx context.Context, ep string, planResult *apitypes.PlanResp
 		var applyErr error
 		// A narrowed plan is applied to the member it was made for and nowhere
 		// else; the server refuses to run it rollout-wide.
-		applyResult, applyErr = client.CallApplyAPIForTarget(ep, planResult.PlanID, environment, caller, planResult.NarrowedTo, rendersRollout, options)
+		applyResult, applyErr = client.CallApplyAPIWithOverride(ep, planResult.PlanID, environment, caller, planResult.NarrowedTo, rendersRollout, override, options)
 		return applyErr
 	})
+	err = reportChangeGate(err, environment, operation, strings.TrimSpace(override) != "", format == OutputFormatJSON)
 	if submitRefusedByServer(err) {
 		return "", &notSubmittedError{err: err}
 	}
@@ -611,10 +618,14 @@ func neverSubmitted(err error) bool {
 // submitRefusedByServer reports whether err is the apply API refusing the
 // request with a client error. The server answers every refusal of an apply
 // before it creates one, so a 4xx means nothing was queued; a 5xx can come
-// after the apply was stored, so it is not a refusal.
+// after the apply was stored, so it is not a refusal, except the one the
+// server sends when it could not check the change gates and so started nothing.
 func submitRefusedByServer(err error) bool {
 	apiErr, ok := errors.AsType[*client.APIError](err)
-	return ok && apiErr.Status >= 400 && apiErr.Status < 500
+	if !ok {
+		return false
+	}
+	return apiErr.Status >= 400 && apiErr.Status < 500 || apiErr.ErrorCode == apitypes.ErrCodeChangeGateUnavailable
 }
 
 // releaseUnsubmittedLock releases the database lock this command took for a
@@ -627,15 +638,32 @@ func submitRefusedByServer(err error) bool {
 // "Created" means this command's acquire inserted the lock row, not that this
 // command is the row's only user. The owner names the user and the host, so a
 // second command run at the same time under the same account acquires the same
-// row without creating it, and the release is by owner rather than by row. If
-// the server accepted that second command's apply before it refused this one,
-// the release removes the lock that apply runs under.
+// row without creating it, and the same owner can take a new row after this
+// one is force-released. The release therefore names the row the acquire
+// reported (lockID), and the server releases it only while no apply that can
+// still change runs under it: a lock another command's apply runs under, or a
+// newer row, stays held. A server that reported no row ID leaves this command
+// no safe release, so the lock is kept and the operator is shown how to
+// release it.
 //
-// A lock that is already gone, or that another owner now holds, is not a
-// failed release: this command holds nothing either way, so cause is returned
-// alone and no unlock command is offered.
-func releaseUnsubmittedLock(ep, database, dbType, owner string, cause error) error {
-	err := client.ReleaseLock(ep, database, dbType, owner)
+// A lock that is already gone, that another owner now holds, that was taken
+// again since, or that an apply runs under is not a failed release: this
+// command holds nothing it could release, so cause is returned alone and no
+// unlock command is offered.
+//
+// A release the server may have received without answering leaves it unknown
+// whether the lock is still held, so the operator is told that instead of
+// being told the lock was kept.
+func releaseUnsubmittedLock(ep, database, dbType, owner string, lockID int64, cause error) error {
+	if lockID == 0 {
+		templates.WriteLockKeptWithoutID(database, dbType)
+		return cause
+	}
+	err := client.ReleaseLockIfUnused(ep, database, dbType, owner, lockID)
+	if inUse, ok := errors.AsType[*client.LockInUseError](err); ok {
+		templates.WriteLockInUse(database, dbType, inUse.Holder.ApplyID, inUse.Holder.State, inUse.Holder.Environment)
+		return cause
+	}
 	switch {
 	case err == nil:
 		templates.WriteLockReleased(database, dbType)
@@ -643,9 +671,15 @@ func releaseUnsubmittedLock(ep, database, dbType, owner string, cause error) err
 	case errors.Is(err, client.ErrLockNotFound):
 		templates.WriteUnsubmittedLockAlreadyReleased(database, dbType)
 		return cause
+	case errors.Is(err, client.ErrLockReplaced):
+		templates.WriteLockReplaced(database, dbType)
+		return cause
 	case errors.Is(err, client.ErrLockNotOwned):
 		templates.WriteUnsubmittedLockHeldByAnotherOwner(database, dbType)
 		return cause
+	case client.ServerMayHaveActed(err):
+		templates.WriteUnsubmittedLockReleaseUnknown(database, dbType)
+		return errors.Join(cause, fmt.Errorf("release lock for %s: %w", database, err))
 	default:
 		templates.WriteUnsubmittedLockKept(database, dbType, err)
 		return errors.Join(cause, fmt.Errorf("release lock for %s: %w", database, err))

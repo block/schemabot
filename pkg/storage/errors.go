@@ -1,6 +1,9 @@
 package storage
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // Common storage errors.
 var (
@@ -31,11 +34,65 @@ var (
 	// another plan.
 	ErrLockIntentChanged = errors.New("lock intent changed")
 
+	// ErrLockInUse is returned when a release refuses to delete a lock row
+	// because an apply that has not reached a terminal state records that row
+	// as its lock. The lock stays held. A *LockInUseError carries the apply.
+	ErrLockInUse = errors.New("lock is in use by an apply")
+
 	// ErrCheckNotFound is returned when a check does not exist.
 	ErrCheckNotFound = errors.New("check not found")
 
 	// ErrSettingNotFound is returned when a setting does not exist.
 	ErrSettingNotFound = errors.New("setting not found")
+
+	// ErrFreezeNotFound is returned when a freeze does not exist.
+	ErrFreezeNotFound = errors.New("freeze not found")
+
+	// ErrFreezeExists is returned when a freeze's identifier, or its source
+	// and external id, is already taken.
+	ErrFreezeExists = errors.New("freeze already exists")
+
+	// ErrFreezeAlreadyLifted is returned when lifting a freeze someone else
+	// already lifted.
+	ErrFreezeAlreadyLifted = errors.New("freeze already lifted")
+
+	// ErrFreezeOverrideExists is returned when an override request with the
+	// same identifier already exists.
+	ErrFreezeOverrideExists = errors.New("freeze override request already exists")
+
+	// ErrFreezeOverrideNotFound is returned when an override request does
+	// not exist.
+	ErrFreezeOverrideNotFound = errors.New("freeze override request not found")
+
+	// ErrFreezeOverrideAlreadyApproved is returned when approving a request
+	// someone already approved.
+	ErrFreezeOverrideAlreadyApproved = errors.New("freeze override request already approved")
+
+	// ErrFreezeOverrideExpired is returned when approving a request past its
+	// expiry.
+	ErrFreezeOverrideExpired = errors.New("freeze override request expired")
+
+	// ErrFreezeOverrideSelfApproval is returned when the requester or the
+	// pull request's author tries to approve a request.
+	ErrFreezeOverrideSelfApproval = errors.New("freeze override request needs a second person")
+
+	// ErrFreezeOverrideLifetime is returned when creating a request that
+	// expires more than FreezeOverrideMaxLifetime after the database clock.
+	ErrFreezeOverrideLifetime = errors.New("freeze override request expires too late")
+
+	// ErrFreezeEnded is returned when lifting a freeze that already reached
+	// its end time.
+	ErrFreezeEnded = errors.New("freeze already ended")
+
+	// ErrFreezeEpochChanged is returned by an admission write when a freeze
+	// was created in its environment after the change gate checked. The
+	// change was not recorded; checking the freezes again decides it.
+	ErrFreezeEpochChanged = errors.New("a freeze was created after the freeze check")
+
+	// ErrFreezeEpochUnreadable is returned by an admission write when it
+	// could not read the freeze epoch the change gate checked. The change
+	// was not recorded. The error also wraps the cause.
+	ErrFreezeEpochUnreadable = errors.New("the freeze epoch could not be read")
 
 	// ErrApplyNotFound is returned when an apply does not exist.
 	ErrApplyNotFound = errors.New("apply not found")
@@ -161,4 +218,24 @@ func (e *ActiveApplyError) Error() string {
 
 func (e *ActiveApplyError) Unwrap() error {
 	return ErrActiveApplyExists
+}
+
+// LockInUseError reports the apply that kept a lock row from being released.
+// It matches ErrLockInUse, and carries the apply so a caller can log it with
+// Apply.LogAttrs and tell the operator which apply to wait for.
+type LockInUseError struct {
+	// LockID is the lock row the release was pinned to.
+	LockID int64
+	// Apply is the newest apply that records LockID as its lock and has not
+	// reached a terminal state.
+	Apply *Apply
+}
+
+func (e *LockInUseError) Error() string {
+	return fmt.Sprintf("lock row %d is recorded by apply %s in state %s: %s",
+		e.LockID, e.Apply.ApplyIdentifier, e.Apply.State, ErrLockInUse.Error())
+}
+
+func (e *LockInUseError) Unwrap() error {
+	return ErrLockInUse
 }

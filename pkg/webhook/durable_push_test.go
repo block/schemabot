@@ -48,7 +48,7 @@ func TestDurablePushWebhookQueuesAndAcks(t *testing.T) {
 		Repos: map[string]api.RepoConfig{"octocat/hello-world": {}},
 	}, nil, logger)
 	clientFactory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
-	h := NewHandler(service, clientFactory, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, clientFactory, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	req := buildPushWebhookRequest(t, "refs/heads/main", "pushsha123", false)
 	req.Header.Set(headerDeliveryID, "delivery-push-1")
@@ -70,7 +70,7 @@ func TestDurablePushWebhookQueuesAndAcks(t *testing.T) {
 
 	select {
 	case <-clientFactory.forInstallationStarted:
-		t.Fatal("durable request path should not create a GitHub client")
+		require.FailNow(t, "durable request path should not create a GitHub client")
 	default:
 	}
 }
@@ -81,7 +81,7 @@ func TestDurablePushWebhookCanonicalizesRepository(t *testing.T) {
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{"mixedcase/sample-repo": {}},
 	}, nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	req := buildPushWebhookRequest(t, "refs/heads/main", "MixedCaseSHA", false)
 	body, err := io.ReadAll(req.Body)
@@ -108,7 +108,7 @@ func TestDurablePushWebhookIgnoresFeatureBranch(t *testing.T) {
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{"octocat/hello-world": {}},
 	}, nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	req := buildPushWebhookRequest(t, "refs/heads/feature-branch", "pushsha123", false)
 	req.Header.Set(headerDeliveryID, "delivery-push-1")
@@ -151,12 +151,12 @@ func TestDurablePushDriverPostsChecks(t *testing.T) {
 		assert.Equal(t, "pushsha123", c.HeadSHA)
 		assert.Equal(t, "success", c.Conclusion)
 	case <-time.After(durableWebhookTestDeadline):
-		t.Fatal("expected the driver to post a default-branch check")
+		require.FailNow(t, "expected the driver to post a default-branch check")
 	}
 	select {
 	case <-store.completed:
 	case <-time.After(durableWebhookTestDeadline):
-		t.Fatal("expected the delivery to be marked completed")
+		require.FailNow(t, "expected the delivery to be marked completed")
 	}
 	require.Empty(t, store.failed)
 }
@@ -175,12 +175,12 @@ func TestDurablePushDriverCompletesUnregisteredRepo(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected unregistered-repo push delivery to be marked completed")
+		require.FailNow(t, "expected unregistered-repo push delivery to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	select {
 	case <-factory.forInstallationStarted:
-		t.Fatal("unregistered repo must not create a GitHub client")
+		require.FailNow(t, "unregistered repo must not create a GitHub client")
 	default:
 	}
 	requireUnregisteredRepositoryCounted(t, reader, "push", "")
@@ -241,7 +241,7 @@ func TestDurablePushDriverFailsMalformedRowTerminally(t *testing.T) {
 			case failure := <-store.failedPermanent:
 				require.Contains(t, failure.errMsg, "missing repo or head SHA")
 			default:
-				t.Fatal("expected malformed push delivery to be dead-lettered")
+				require.FailNow(t, "expected malformed push delivery to be dead-lettered")
 			}
 			require.Empty(t, store.failed, "a malformed push row is deterministic and must not burn retry budget")
 			require.Empty(t, store.completed)
@@ -266,7 +266,7 @@ func TestDurablePushDriverRetriesClientFailure(t *testing.T) {
 		require.True(t, failure.retryAfter.After(before), "retry must be scheduled in the future")
 		require.Contains(t, failure.errMsg, "installation token unavailable")
 	default:
-		t.Fatal("expected client failure to be marked failed")
+		require.FailNow(t, "expected client failure to be marked failed")
 	}
 	require.Empty(t, store.completed)
 }

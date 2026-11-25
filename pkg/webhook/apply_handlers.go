@@ -90,6 +90,18 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
+	admission, err := h.admitPRSchemaCommand(ctx, client, repo, pr, prPlanDiscoveryKey{})
+	if err != nil {
+		if isPRSchemaRefusal(err) {
+			return false, nil
+		}
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Could not verify the PR database limit. Retry the command.")
+		}
+		return true, fmt.Errorf("verify PR database limit for %s#%d: %w", repo, pr, err)
+	}
+	ctx = withPRSchemaAdmission(ctx, admission)
+
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Apply, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether apply command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 		if !result.SuppressRetryComments {
@@ -139,6 +151,14 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	if blocked, gateErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.Apply, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply command actor authorization gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
+		return false, nil
+	}
+
+	sharedSchemaPeers, blocked, gateErr := h.enforceSharedSchemaIgnoreLists(ctx, client, repo, pr, installationID, environment, requestedBy, action.Apply, schemaResult, result.SuppressRetryComments)
+	if gateErr != nil {
+		return true, fmt.Errorf("apply command shared schema ignore_tables check %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
+		h.logger.Info("apply refused: ignore_tables disagree with a database sharing the same schema", "repo", repo, "pr", pr, "environment", environment, "database", schemaResult.Database, "requested_by", requestedBy)
 		return false, nil
 	}
 
@@ -320,7 +340,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, prInfo.HeadSHA, environment, requestedBy, action.Apply); rejected {
 		return false, nil
 	}
-	if rejected, gateErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, prInfo, environment, requestedBy, action.Apply); gateErr != nil {
+	if rejected, gateErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, sharedSchemaPeers, prInfo, environment, requestedBy, action.Apply); gateErr != nil {
 		return true, fmt.Errorf("apply command base schema freshness gate %s#%d: %w", repo, pr, gateErr)
 	} else if rejected {
 		return false, nil
@@ -339,6 +359,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		SchemaPath:        schemaResult.SchemaPath,
 		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
 		IgnoreTables:      schemaResult.IgnoreTables,
+		DropTables:        schemaResult.DropTables,
 		SourceTrusted:     true,
 		// The copy disclosure in the comment this plan becomes is what the
 		// operator confirms, and the apply re-checks its own re-plan against
@@ -351,6 +372,13 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	}
 
 	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
+	if isPRSchemaRefusal(err) {
+		return false, nil
+	}
+	if _, refused := errors.AsType[*api.PRSchemaAdmissionError](err); refused {
+		return true, err
+	}
+
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "error", err)
 		if isTransientRemotePlanError(err) {
@@ -359,7 +387,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			}
 			return true, fmt.Errorf("apply command plan %s#%d: %w", repo, pr, err)
 		}
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, userFacingError(err))
 		// Failures other than remote-deployment unavailability are treated
 		// as deterministic: the posted error is the command's answer. Some
 		// of them are not truly deterministic (planning runs against a live
@@ -383,6 +411,13 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// as it runs the primary plan: every gate below reads each target's plan,
 	// and the comment the apply posts renders every target's plan.
 	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
+	if rollout.admissionErr != nil {
+		if isPRSchemaRefusal(rollout.admissionErr) {
+			return false, nil
+		}
+		return true, rollout.admissionErr
+	}
+
 	primaryTargetConverged := !planResp.HasChanges()
 	runsMemberWork := rolloutRunsMemberWork(rollout, rolloutPreview)
 	switch {
@@ -441,13 +476,13 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		h.logger.Info("apply: the target the apply was narrowed to has no changes; posting its plan without updating stored check state",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"plan_id", planResp.PlanID, "narrowed_to", planResp.NarrowedTo)
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+		commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 		commentData.ScopedDatabase = result.Database
 		commentData.Target = result.Target
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		return false, nil
 	default:
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+		commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 		commentData.ScopedDatabase = result.Database
 		commentData.DeploymentDrift = rolloutPreview
 		if headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout); checkErr != nil {
@@ -478,7 +513,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// toward --allow-unsafe for a guaranteed failure. No lock is held yet, so
 	// the rejection needs no release.
 	if planResp.HasBlockedChanges() {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+		commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 		commentData.ScopedDatabase = result.Database
 		commentData.Target = narrowedTarget(planResp, result.Target)
 		h.logger.Info("apply rejected: plan contains engine-blocked changes",
@@ -608,7 +643,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// apply proceeds automatically and the unsafe opt-in already solicited
 	// consent for every attributed table, where the re-plan choice the
 	// disclosure coaches is no longer open.
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData := h.commandPlanCommentData(schemaResult, planResp, environment, requestedBy, result)
 	commentData.ScopedDatabase = result.Database
 	commentData.Target = narrowedTarget(planResp, result.Target)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, rolloutPreview, repo, pr, environment)
@@ -730,20 +765,26 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// lands. A failed post releases the lock and stays retryable, as a pending
 	// confirmation whose comment never appeared does; the stored check keeps
 	// blocking merge on the pending changes meanwhile.
+	// The comment's ID and data ride into executeApply so a change gate that
+	// refuses the apply can edit the footer this comment posts, which promises
+	// an apply that then never starts.
+	var autoComment *autoApplyComment
 	if runsMemberWork {
-		if postErr := h.postCommentReportingError(repo, pr, installationID, templates.RenderPlanComment(commentData)); postErr != nil {
+		commentID, postErr := h.postCommentReportingID(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		if postErr != nil {
 			h.logger.Error("failed to post the comment disclosing the other targets' plans, so nothing was dispatched; releasing the lock",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "plan_id", planResp.PlanID, "error", postErr)
 			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "automatic apply disclosure post failure")
 			return true, fmt.Errorf("apply command disclosure of the other targets' plans %s#%d: %w", repo, pr, postErr)
 		}
-	} else {
-		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		autoComment = &autoApplyComment{ID: commentID, Data: commentData}
+	} else if commentID := h.postCommentBestEffortID(repo, pr, installationID, templates.RenderPlanComment(commentData)); commentID != 0 {
+		autoComment = &autoApplyComment{ID: commentID, Data: commentData}
 	}
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopies)
+	h.executeApply(ctx, client, repo, pr, schemaResult, sharedSchemaPeers, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopies, autoComment)
 	return false, nil
 }
 
@@ -855,6 +896,18 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		return false, nil
 	}
 
+	admission, err := h.admitPRSchemaCommand(ctx, client, repo, pr, prPlanDiscoveryKey{})
+	if err != nil {
+		if isPRSchemaRefusal(err) {
+			return false, nil
+		}
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Could not verify the PR database limit. Retry the command.")
+		}
+		return true, fmt.Errorf("verify PR database limit for %s#%d: %w", repo, pr, err)
+	}
+	ctx = withPRSchemaAdmission(ctx, admission)
+
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether apply-confirm command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 		if !result.SuppressRetryComments {
@@ -897,6 +950,14 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	if blocked, gateErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.ApplyConfirm, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply-confirm command actor authorization gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
+		return false, nil
+	}
+
+	sharedSchemaPeers, blocked, gateErr := h.enforceSharedSchemaIgnoreLists(ctx, client, repo, pr, installationID, environment, requestedBy, action.ApplyConfirm, schemaResult, result.SuppressRetryComments)
+	if gateErr != nil {
+		return true, fmt.Errorf("apply-confirm command shared schema ignore_tables check %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
+		h.logger.Info("apply-confirm refused: ignore_tables disagree with a database sharing the same schema", "repo", repo, "pr", pr, "environment", environment, "database", schemaResult.Database, "requested_by", requestedBy)
 		return false, nil
 	}
 
@@ -993,7 +1054,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	// requires the lock, so releasing it would turn a transient GitHub read
 	// failure into a lost confirmation. Only a verified-stale rejection
 	// releases the observed intent.
-	if rejected, gateErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, confirmPRInfo, environment, requestedBy, action.ApplyConfirm); gateErr != nil {
+	if rejected, gateErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, sharedSchemaPeers, confirmPRInfo, environment, requestedBy, action.ApplyConfirm); gateErr != nil {
 		return true, fmt.Errorf("apply-confirm command base schema freshness gate %s#%d: %w", repo, pr, gateErr)
 	} else if rejected {
 		releaseObservedApplyIntent("base-schema freshness rejection")
@@ -1097,7 +1158,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 
 	disclosedCopies := disclosureDescribesThisApply(existingLock, storedPlan, environment)
 
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, storedPlan, existingLock.PendingPlanID, disclosedCopies)
+	h.executeApply(ctx, client, repo, pr, schemaResult, sharedSchemaPeers, environment, installationID, requestedBy, result, nil, storedPlan, existingLock.PendingPlanID, disclosedCopies, nil)
 	return false, nil
 }
 
@@ -1438,17 +1499,34 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	// released and acquired again while they ran (for example another PR's
 	// pending-confirmation apply lock) is a different row and stays held, as
 	// does the same row acquired again for a new plan. The active-apply check
-	// is the one decision the pin does not carry: an apply that becomes durable
-	// after the check leaves the lock row unchanged, so the delete still
-	// matches. That apply's own deployment reservation keeps a second apply
-	// out; the lock row is the operator-visible signal, not the exclusion.
+	// above reads applies before the release, so an apply that records this
+	// lock row and becomes durable after that read would leave the row
+	// unchanged. The release therefore re-checks under the row's lock and
+	// keeps the lock while any apply recording it has not settled, a stopped
+	// apply included, and the command answers with the apply holding it.
 	// A failed release is logged and the loop continues so one failure does
 	// not strand the remaining locks; the collected errors make the delivery
 	// retryable, and a re-drive only sees the locks that are still held.
 	var releaseErrs []error
-	var released, alreadyGone, reacquired int
+	var released, alreadyGone, reacquired, inUse int
+	// A kept lock's answer waits until the pass is known not to retry: a
+	// retried delivery sees the kept lock again and would answer it again.
+	var inUseAnswers []string
 	for _, lock := range locks {
-		err := h.service.Storage().Locks().ReleaseByID(ctx, lock.ID, lock.DatabaseName, lock.DatabaseType, lock.Owner, lock.PendingPlanID)
+		err := h.service.Storage().Locks().ReleaseByIDIfUnused(ctx, lock.ID, lock.DatabaseName, lock.DatabaseType, lock.Owner, lock.PendingPlanID)
+		var inUseErr *storage.LockInUseError
+		if errors.As(err, &inUseErr) {
+			// An apply recording this lock row has not settled, so the lock
+			// still protects it. This is the command's answer for this lock,
+			// not a failure to retry.
+			inUse++
+			h.logger.Warn("unlock refused: an apply recording the lock has not settled; the lock stays held",
+				append(inUseErr.Apply.LogAttrs(),
+					"command_repo", repo, "command_pr", pr, "lock_owner", lock.Owner, "force", result.Force, "error", err)...)
+			inUseAnswers = append(inUseAnswers, templates.RenderCannotUnlock(
+				lock.DatabaseName, inUseErr.Apply.Environment, inUseErr.Apply.ApplyIdentifier, inUseErr.Apply.State))
+			continue
+		}
 		if isLockAcquiredSinceVetting(err) {
 			// The database is locked again since the lookup — the same row with
 			// a new pending plan, or a new row after the vetted one was released
@@ -1487,7 +1565,14 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 			lock.DatabaseName, "", requestedBy))
 	}
 	if len(releaseErrs) > 0 {
+		if len(inUseAnswers) > 0 {
+			h.logger.Info("unlock is retrying a failed release; the answer for each kept lock waits for the retry",
+				"repo", repo, "pr", pr, "in_use", inUse)
+		}
 		return true, fmt.Errorf("unlock command release locks %s#%d: %w", repo, pr, errors.Join(releaseErrs...))
+	}
+	for _, answer := range inUseAnswers {
+		h.postComment(repo, pr, installationID, answer)
 	}
 	if released == 0 && reacquired > 0 {
 		h.logger.Info("unlock released nothing because at least one current lock was acquired again after the command",
@@ -1495,11 +1580,12 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 		h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, unlockStaleCommandMessage)
 		return false, nil
 	}
-	if released == 0 && alreadyGone > 0 {
+	if released == 0 && inUse == 0 && alreadyGone > 0 {
 		// Every matched lock was released by a concurrent operation before this
 		// command could act. The per-lock skips stay silent, so without an
 		// aggregate answer the acked command would end without any comment;
-		// an acknowledged command must always answer.
+		// an acknowledged command must always answer. A lock kept for an apply
+		// already answered with its own comment, and was not released.
 		h.logger.Info("unlock: every matched lock was already released concurrently",
 			"repo", repo, "pr", pr, "already_gone", alreadyGone)
 		h.postComment(repo, pr, installationID, templates.RenderLocksAlreadyReleased())
@@ -1525,11 +1611,11 @@ func isLockAcquiredSinceVetting(err error) bool {
 }
 
 // isVettedLockGone reports whether a row-pinned release found that the lock
-// row unlock vetted no longer holds the lock: no lock is held at all
-// (ErrLockNotFound), or the row is held under another owner (ErrLockNotOwned).
-// Each means the lock the command targeted is gone and nothing this command
-// vetted is left to release; the caller logs the specific error so the cause
-// stays distinguishable.
+// row the caller (unlock, or PR close cleanup) vetted no longer holds the
+// lock: no lock is held at all (ErrLockNotFound), or the row is held under
+// another owner (ErrLockNotOwned). Each means the lock the caller targeted is
+// gone and nothing it vetted is left to release; the caller logs the specific
+// error so the cause stays distinguishable.
 func isVettedLockGone(err error) bool {
 	return errors.Is(err, storage.ErrLockNotFound) ||
 		errors.Is(err, storage.ErrLockNotOwned)

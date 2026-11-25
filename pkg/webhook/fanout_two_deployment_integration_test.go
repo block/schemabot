@@ -60,7 +60,7 @@ func requireNoFanOutComment(t *testing.T, comments chan string) {
 	t.Helper()
 	select {
 	case body := <-comments:
-		t.Fatalf("sibling deployment must stay silent on a fan-out command it does not own, posted: %s", body)
+		require.FailNow(t, fmt.Sprintf("sibling deployment must stay silent on a fan-out command it does not own, posted: %s", body))
 	case <-time.After(500 * time.Millisecond):
 	}
 }
@@ -126,7 +126,7 @@ func TestE2EFanOutRollbackOwnerActsSiblingSilent(t *testing.T) {
 	}, schemabotConfig, dbName)
 
 	installClient := ghclient.NewInstallationClient(client, testLogger())
-	owner := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, testLogger())
+	owner := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, testLogger(), WithInsecureSkipSignatureVerification())
 	sibling, siblingComments := siblingFanOutHandler(t)
 
 	storedApply, err := svc.Storage().Applies().Get(ctx, applyID)
@@ -147,7 +147,7 @@ func TestE2EFanOutRollbackOwnerActsSiblingSilent(t *testing.T) {
 		assert.Contains(t, body, "## Schema Rollback Plan")
 		assert.Contains(t, body, "DROP INDEX", "rollback should drop the index the apply added")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for the owner's rollback plan comment")
+		require.FailNow(t, "timed out waiting for the owner's rollback plan comment")
 	}
 
 	requireNoFanOutComment(t, siblingComments)

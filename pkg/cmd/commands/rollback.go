@@ -94,7 +94,7 @@ func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	// is as destructive as an apply that does.
 	unsafeChanges := planResult.UnsafeChanges()
 	if len(unsafeChanges) > 0 && !cmd.AllowUnsafe {
-		templates.WriteUnsafeChangesBlocked(unsafeChanges, fmt.Sprintf("rollback %s -e %s --allow-unsafe", cmd.ApplyID, cmd.Environment))
+		templates.WriteUnsafeChangesBlocked(unsafeChanges, []string{"rollback", cmd.ApplyID, "-e", cmd.Environment, "--allow-unsafe"})
 		return ErrSilent
 	}
 	if cmd.AllowUnsafe {
@@ -150,9 +150,10 @@ func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	}
 
 	var lockCreated bool
+	var lockID int64
 	err = withLoading("Acquiring database lock...", true, func() error {
-		var lockErr error
-		_, lockCreated, lockErr = client.AcquireLock(ep, database, dbType, owner, "", 0)
+		acquired, created, lockErr := client.AcquireLock(ep, database, dbType, owner, "", 0)
+		lockCreated, lockID = created, acquiredLockID(acquired)
 		return lockErr
 	})
 	if errors.Is(err, client.ErrLockHeld) {
@@ -175,9 +176,9 @@ func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	// a rollout-wide rollback where members are planned on their own, since
 	// none of them has a rollback plan. So showing this plan shows what runs
 	// on every member, though not which members those are.
-	_, err = applyAndWatch(ctx, ep, planResult, true, database, environment, owner, "rollback", cmd.DeferCutover, false, false, cmd.AllowUnsafe, "", cmd.Watch, OutputFormatInteractive, 0)
+	_, err = applyAndWatch(ctx, ep, planResult, true, database, environment, owner, "", "rollback", cmd.DeferCutover, false, false, cmd.AllowUnsafe, "", cmd.Watch, OutputFormatInteractive, 0)
 	if err != nil && lockCreated && neverSubmitted(err) {
-		return releaseUnsubmittedLock(ep, database, dbType, owner, err)
+		return releaseUnsubmittedLock(ep, database, dbType, owner, lockID, err)
 	}
 	return err
 }

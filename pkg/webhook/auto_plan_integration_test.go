@@ -58,7 +58,7 @@ func TestE2EAutoPlan(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// Send a pull_request "opened" webhook instead of an issue_comment
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
@@ -86,7 +86,7 @@ func TestE2EAutoPlan(t *testing.T) {
 		assert.Contains(t, body, "schemabot apply -e staging --tenant alpha")
 		assert.NotContains(t, body, " -d ")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for auto-plan comment")
+		require.FailNow(t, "timed out waiting for auto-plan comment")
 	}
 
 	// Verify check run was created
@@ -96,7 +96,7 @@ func TestE2EAutoPlan(t *testing.T) {
 		assert.Equal(t, "completed", cr.Status)
 		assert.Equal(t, "action_required", cr.Conclusion)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for check run")
+		require.FailNow(t, "timed out waiting for check run")
 	}
 }
 
@@ -140,7 +140,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeSkipsComment(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:    "synchronize",
@@ -161,12 +161,12 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeSkipsComment(t *testing.T) {
 		assert.Equal(t, "completed", cr.Status)
 		assert.Equal(t, "action_required", cr.Conclusion)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for check run")
+		require.FailNow(t, "timed out waiting for check run")
 	}
 
 	select {
 	case body := <-result.comments:
-		t.Fatalf("expected no comment for application-only synchronize, got: %s", body)
+		require.FailNow(t, fmt.Sprintf("expected no comment for application-only synchronize, got: %s", body))
 	case <-time.After(3 * time.Second):
 	}
 }
@@ -214,7 +214,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeRefreshesStalePlan(t *testin
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
-	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger)
+	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:    "synchronize",
@@ -232,7 +232,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeRefreshesStalePlan(t *testin
 		assert.Contains(t, body, "## Schema Change Plan")
 		assert.Contains(t, body, dbName)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for replacement auto-plan comment")
+		require.FailNow(t, "timed out waiting for replacement auto-plan comment")
 	}
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		comments, err := svc.Storage().PlanComments().ListUnretiredForSlot(
@@ -274,7 +274,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeWithoutTrackedPlanPostsComme
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
-	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger)
+	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:    "synchronize",
@@ -292,7 +292,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeWithoutTrackedPlanPostsComme
 		assert.Contains(t, body, "## Schema Change Plan")
 		assert.Contains(t, body, dbName)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for auto-plan comment")
+		require.FailNow(t, "timed out waiting for auto-plan comment")
 	}
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		comments, err := svc.Storage().PlanComments().ListUnretiredForSlot(
@@ -351,7 +351,7 @@ func TestE2EAutoPlanNoticesUnmanagedConfigOnNonAggregateRepo(t *testing.T) {
 		assert.Contains(t, body, fmt.Sprintf("declares database `%s`", dbName))
 		assert.Contains(t, body, "will **not** be planned or applied in any environment")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for unmanaged schema config notice")
+		require.FailNow(t, "timed out waiting for unmanaged schema config notice")
 	}
 
 	// The passing aggregate names the unmanaged schema rather than claiming
@@ -365,7 +365,7 @@ func TestE2EAutoPlanNoticesUnmanagedConfigOnNonAggregateRepo(t *testing.T) {
 		assert.Contains(t, run.Output.Summary, "This PR changes schema only under paths SchemaBot does not manage in any environment")
 		assert.Contains(t, run.Output.Summary, fmt.Sprintf("- `schema` declares database `%s`", dbName))
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the passing aggregate check")
+		require.FailNow(t, "timed out waiting for the passing aggregate check")
 	}
 
 	plans, err := svc.Storage().Plans().GetByPR(t.Context(), "octocat/hello-world", 1)
@@ -430,12 +430,12 @@ func TestE2EAutoPlanNamesUnmanagedSchemaOnEnvironmentScopedPlanComment(t *testin
 		assert.Contains(t, body, "- `schema/ledger_sandbox` declares database `ledger_sandbox`")
 		assert.Less(t, strings.Index(body, "`users`"), strings.Index(body, "does not manage in `staging`"), "the note follows the plan")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the auto-plan comment")
+		require.FailNow(t, "timed out waiting for the auto-plan comment")
 	}
 
 	select {
 	case body := <-result.comments:
-		t.Fatalf("expected the plan comment alone, got another comment: %s", body)
+		require.FailNow(t, fmt.Sprintf("expected the plan comment alone, got another comment: %s", body))
 	case <-time.After(500 * time.Millisecond):
 	}
 }
@@ -489,9 +489,9 @@ func TestE2EAutoPlanStaysSilentOnUnmanagedConfigOnAggregateRepo(t *testing.T) {
 	// belongs to another deployment and the leader owns the aggregate check.
 	select {
 	case body := <-result.comments:
-		t.Fatalf("expected no comment for unmanaged config on aggregate repo, got: %s", body)
+		require.FailNow(t, fmt.Sprintf("expected no comment for unmanaged config on aggregate repo, got: %s", body))
 	case cr := <-result.checkRuns:
-		t.Fatalf("expected no check run for unmanaged config on aggregate participant, got: %s (%s)", cr.Name, cr.Conclusion)
+		require.FailNow(t, fmt.Sprintf("expected no check run for unmanaged config on aggregate participant, got: %s (%s)", cr.Name, cr.Conclusion))
 	case <-time.After(3 * time.Second):
 	}
 }
@@ -541,14 +541,14 @@ func TestE2EAutoPlanSourcePolicyBlocksWithFailingAggregate(t *testing.T) {
 		assert.Contains(t, body, "source policy")
 		assert.Contains(t, body, "repo &#34;octocat/hello-world&#34; is not authorized")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for source policy auto-plan comment")
+		require.FailNow(t, "timed out waiting for source policy auto-plan comment")
 	}
 
 	var aggregateCheck checkRunCapture
 	select {
 	case aggregateCheck = <-result.checkRuns:
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for source policy aggregate check run")
+		require.FailNow(t, "timed out waiting for source policy aggregate check run")
 	}
 	assert.Equal(t, aggregateCheckName, aggregateCheck.Name)
 	assert.Equal(t, "completed", aggregateCheck.Status)
@@ -624,7 +624,7 @@ func TestE2EAutoPlanEmptySchemaRootNamesDatabase(t *testing.T) {
 		assert.Contains(t, body, "**Database**: `"+dbName+"`")
 		assert.Contains(t, body, "**Type**: `MySQL`")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for empty schema root auto-plan failure comment")
+		require.FailNow(t, "timed out waiting for empty schema root auto-plan failure comment")
 	}
 }
 
@@ -668,7 +668,7 @@ func TestE2EReopenedPRAutoPlansCurrentHead(t *testing.T) {
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for reopened auto-plan comment")
+		require.FailNow(t, "timed out waiting for reopened auto-plan comment")
 	}
 
 	select {
@@ -678,7 +678,7 @@ func TestE2EReopenedPRAutoPlansCurrentHead(t *testing.T) {
 		assert.Equal(t, checkStatusCompleted, cr.Status)
 		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for reopened auto-plan check run")
+		require.FailNow(t, "timed out waiting for reopened auto-plan check run")
 	}
 
 	// The stored check state must be tied to the reopened commit SHA, not any
@@ -742,7 +742,7 @@ func TestE2ERetargetedPRAutoPlansAgainstTheNewBase(t *testing.T) {
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for retargeted auto-plan comment")
+		require.FailNow(t, "timed out waiting for retargeted auto-plan comment")
 	}
 
 	select {
@@ -752,7 +752,7 @@ func TestE2ERetargetedPRAutoPlansAgainstTheNewBase(t *testing.T) {
 		assert.Equal(t, checkStatusCompleted, cr.Status)
 		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for retargeted auto-plan check run")
+		require.FailNow(t, "timed out waiting for retargeted auto-plan check run")
 	}
 }
 
@@ -802,12 +802,12 @@ func TestE2EAutoPlanIgnoresSchemaFilesTheDefaultBranchAlreadyHolds(t *testing.T)
 		assert.Equal(t, checkStatusCompleted, cr.Status)
 		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the passing aggregate check run")
+		require.FailNow(t, "timed out waiting for the passing aggregate check run")
 	}
 
 	select {
 	case body := <-result.comments:
-		t.Fatalf("expected no plan comment for a file the default branch already holds, got: %s", body)
+		require.FailNow(t, fmt.Sprintf("expected no plan comment for a file the default branch already holds, got: %s", body))
 	case <-time.After(3 * time.Second):
 	}
 }
@@ -871,7 +871,7 @@ func TestE2EAutoPlanDiscardsAPlanWhoseBaseMovedDuringDiscovery(t *testing.T) {
 
 	select {
 	case body := <-result.comments:
-		t.Fatalf("expected no plan comment for a base the PR no longer has, got: %s", body)
+		require.FailNow(t, fmt.Sprintf("expected no plan comment for a base the PR no longer has, got: %s", body))
 	case <-time.After(3 * time.Second):
 	}
 
@@ -893,7 +893,7 @@ func TestE2EAutoPlanDiscardsAPlanWhoseBaseMovedDuringDiscovery(t *testing.T) {
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the plan comment on the retargeted PR")
+		require.FailNow(t, "timed out waiting for the plan comment on the retargeted PR")
 	}
 }
 
@@ -939,7 +939,7 @@ func TestE2EAutoPlanDiscardsAPlanWhoseHeadMovedDuringDiscovery(t *testing.T) {
 
 	select {
 	case body := <-result.comments:
-		t.Fatalf("expected no plan comment for a head the PR no longer has, got: %s", body)
+		require.FailNow(t, fmt.Sprintf("expected no plan comment for a head the PR no longer has, got: %s", body))
 	case <-time.After(3 * time.Second):
 	}
 
@@ -960,7 +960,7 @@ func TestE2EAutoPlanDiscardsAPlanWhoseHeadMovedDuringDiscovery(t *testing.T) {
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the plan comment on the pushed head")
+		require.FailNow(t, "timed out waiting for the plan comment on the pushed head")
 	}
 }
 
@@ -1021,7 +1021,7 @@ func TestE2EAutoPlanWithLintViolations(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// Send a pull_request "opened" webhook to trigger auto-plan
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
@@ -1044,7 +1044,7 @@ func TestE2EAutoPlanWithLintViolations(t *testing.T) {
 		assert.Contains(t, body, "Lint Warnings", "plan comment should include lint violations section")
 		assert.Contains(t, body, "bad_table", "lint warning should reference the table name")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for auto-plan comment with lint violations")
+		require.FailNow(t, "timed out waiting for auto-plan comment with lint violations")
 	}
 
 	// Verify check run was created
@@ -1053,7 +1053,7 @@ func TestE2EAutoPlanWithLintViolations(t *testing.T) {
 		assert.Contains(t, cr.Name, "SchemaBot")
 		assert.Equal(t, "completed", cr.Status)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for check run")
+		require.FailNow(t, "timed out waiting for check run")
 	}
 }
 
@@ -1108,7 +1108,7 @@ func setupAutoPlanCommentFixture(t *testing.T, dbName string, upToDate bool) *au
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
-	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger)
+	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger, WithInsecureSkipSignatureVerification())
 
 	return &autoPlanCommentFixture{svc: svc, mux: mux, result: result, h: h, deleted: deleted, upToDate: upToDate}
 }
@@ -1153,7 +1153,7 @@ func (f *autoPlanCommentFixture) synchronize(t *testing.T, beforeSHA, headSHA st
 			assert.Equal(t, "action_required", cr.Conclusion)
 		}
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for check run")
+		require.FailNow(t, "timed out waiting for check run")
 	}
 }
 
@@ -1163,9 +1163,9 @@ func (f *autoPlanCommentFixture) requireNoCommentActivity(t *testing.T) {
 	t.Helper()
 	select {
 	case body := <-f.result.comments:
-		t.Fatalf("expected no comment for auto-plan with no changes, but got: %s", body)
+		require.FailNow(t, fmt.Sprintf("expected no comment for auto-plan with no changes, but got: %s", body))
 	case id := <-f.deleted:
-		t.Fatalf("expected no plan comment to be deleted, but comment %s was", id)
+		require.FailNow(t, fmt.Sprintf("expected no plan comment to be deleted, but comment %s was", id))
 	case <-time.After(3 * time.Second):
 	}
 }
@@ -1195,13 +1195,13 @@ func TestE2EAutoPlanNoChangesSupersedesPriorHeadPlan(t *testing.T) {
 		assert.Contains(t, body, "No schema changes detected")
 		assert.Contains(t, body, dbName)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the no-changes plan comment")
+		require.FailNow(t, "timed out waiting for the no-changes plan comment")
 	}
 	select {
 	case id := <-f.deleted:
 		assert.Equal(t, "9001", id)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the prior head's plan comment to be deleted")
+		require.FailNow(t, "timed out waiting for the prior head's plan comment to be deleted")
 	}
 	requireOnlyVisiblePlanComment(t, f, dbName, "abc123", true)
 }
@@ -1281,13 +1281,13 @@ func TestE2EAutoPlanNoChangesSchemaNeutralSyncReplacesOutdatedPlan(t *testing.T)
 		assert.Contains(t, body, "No schema changes detected")
 		assert.NotContains(t, body, "CREATE TABLE")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the no-changes plan comment")
+		require.FailNow(t, "timed out waiting for the no-changes plan comment")
 	}
 	select {
 	case id := <-f.deleted:
 		assert.Equal(t, "9001", id)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the outdated plan comment to be deleted")
+		require.FailNow(t, "timed out waiting for the outdated plan comment to be deleted")
 	}
 	requireOnlyVisiblePlanComment(t, f, dbName, "newsha", true)
 }
@@ -1311,13 +1311,13 @@ func TestE2EAutoPlanSchemaNeutralSyncReplacesOutdatedUpToDatePlan(t *testing.T) 
 		assert.Contains(t, body, "users")
 		assert.NotContains(t, body, "No schema changes detected")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the replacement plan comment")
+		require.FailNow(t, "timed out waiting for the replacement plan comment")
 	}
 	select {
 	case id := <-f.deleted:
 		assert.Equal(t, "9001", id)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the outdated plan comment to be deleted")
+		require.FailNow(t, "timed out waiting for the outdated plan comment to be deleted")
 	}
 	requireOnlyVisiblePlanComment(t, f, dbName, "newsha", false)
 }
@@ -1375,7 +1375,7 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:  "opened",
@@ -1391,7 +1391,7 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 	select {
 	case <-filesFetched:
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for no-schema auto-plan discovery")
+		require.FailNow(t, "timed out waiting for no-schema auto-plan discovery")
 	}
 	select {
 	case cr := <-checkRuns:
@@ -1400,7 +1400,7 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
 		assert.Equal(t, "abc123", cr.HeadSHA)
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for no-schema passing aggregate check run")
+		require.FailNow(t, "timed out waiting for no-schema passing aggregate check run")
 	}
 	var check *storage.Check
 	var checkErr error
@@ -1415,7 +1415,7 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 	assert.Equal(t, checkConclusionSuccess, check.Conclusion)
 	select {
 	case body := <-comments:
-		t.Fatalf("expected no plan comment for no-schema auto-plan, got: %s", body)
+		require.FailNow(t, fmt.Sprintf("expected no plan comment for no-schema auto-plan, got: %s", body))
 	case <-time.After(250 * time.Millisecond):
 	}
 }
@@ -1435,7 +1435,7 @@ func TestE2EAutoPlanBootstrapDoesNotBlockWebhookAck(t *testing.T) {
 		forInstallationErr:     errors.New("github unavailable"),
 	}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:  "opened",
 		headSHA: "abc123",
@@ -1533,7 +1533,7 @@ func TestE2EGitHubUnavailableDuringConfigDiscoveryPublishesFailingAggregates(t *
 			assert.Equal(t, checkConclusionFailure, cr.Conclusion)
 			assert.Equal(t, "abc123", cr.HeadSHA)
 		case <-time.After(webhookIntegrationCheckRunDeadline):
-			t.Fatalf("timed out waiting for failing aggregate check run %d/2, seen: %v", i+1, seen)
+			require.FailNow(t, fmt.Sprintf("timed out waiting for failing aggregate check run %d/2, seen: %v", i+1, seen))
 		}
 	}
 	assert.True(t, seen["SchemaBot (staging)"])
@@ -1641,7 +1641,7 @@ func TestE2EPRFileCapPublishesFailingAggregatesNamingTheCap(t *testing.T) {
 					assert.Contains(t, cr.Output.Summary, "smaller PR",
 						"the check must tell the author how to get a plan")
 				case <-time.After(webhookIntegrationCheckRunDeadline):
-					t.Fatalf("timed out waiting for failing aggregate check run %d/2, seen: %v", i+1, seen)
+					require.FailNow(t, fmt.Sprintf("timed out waiting for failing aggregate check run %d/2, seen: %v", i+1, seen))
 				}
 			}
 			assert.True(t, seen["SchemaBot (staging)"])
@@ -1738,14 +1738,14 @@ func TestE2EGitHubUnavailableDuringAutoPlanDoesNotPublishCheckRun(t *testing.T) 
 	select {
 	case <-prFetchAttempted:
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for auto-plan to verify PR head")
+		require.FailNow(t, "timed out waiting for auto-plan to verify PR head")
 	}
 
 	// Publishing a check run without a verified head SHA could mark the wrong
 	// commit, so no GitHub or stored aggregate check should be created.
 	select {
 	case cr := <-checkRuns:
-		t.Fatalf("GitHub outage should not publish a check run, got: %+v", cr)
+		require.FailNow(t, fmt.Sprintf("GitHub outage should not publish a check run, got: %+v", cr))
 	case <-time.After(250 * time.Millisecond):
 	}
 
@@ -1808,7 +1808,7 @@ func TestE2EAutoPlanFailureCommentAttributesAutomaticTrigger(t *testing.T) {
 		assert.NotContains(t, body, "**Environment**: ``")
 		assert.NotContains(t, body, "Requested by @")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the auto-plan failure comment")
+		require.FailNow(t, "timed out waiting for the auto-plan failure comment")
 	}
 }
 
@@ -2021,7 +2021,7 @@ func TestE2EMultiAppAutoPlan(t *testing.T) {
 		assert.Contains(t, body, "transactions", "should include payments namespace table")
 		assert.Contains(t, body, "audit_log", "should include payments_audit namespace table")
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for plan comment")
+		require.FailNow(t, "timed out waiting for plan comment")
 	}
 
 	// Only the aggregate check run should be created.
@@ -2215,7 +2215,7 @@ func TestE2EAutoPlanManagedDirMissingConfigBlocks(t *testing.T) {
 	select {
 	case aggregateCheck = <-result.checkRuns:
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for managed-dir-missing-config aggregate check run")
+		require.FailNow(t, "timed out waiting for managed-dir-missing-config aggregate check run")
 	}
 	assert.Equal(t, aggregateCheckName, aggregateCheck.Name)
 	assert.Equal(t, "completed", aggregateCheck.Status)
@@ -2300,7 +2300,7 @@ func TestE2EAutoPlanSchemaDirMoveNotBlocked(t *testing.T) {
 		assert.Contains(t, cr.Name, "SchemaBot")
 		assert.Equal(t, "action_required", cr.Conclusion)
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for check run")
+		require.FailNow(t, "timed out waiting for check run")
 	}
 
 	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
@@ -2355,12 +2355,12 @@ func TestE2EAutoPlanFailsClosedWhenTheBaseBranchCannotBeRead(t *testing.T) {
 		assert.Equal(t, configDiscoveryFailedBlock.message, cr.Output.Summary,
 			"the check must report a discovery failure, not a plan result")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the discovery-failure check run")
+		require.FailNow(t, "timed out waiting for the discovery-failure check run")
 	}
 
 	select {
 	case body := <-result.comments:
-		t.Fatalf("expected no plan comment when the base branch could not be read, got: %s", body)
+		require.FailNow(t, fmt.Sprintf("expected no plan comment when the base branch could not be read, got: %s", body))
 	case <-time.After(3 * time.Second):
 	}
 }
@@ -2422,6 +2422,6 @@ func TestE2EAutoPlanScopesItsCommandWhenABareOneReachesMore(t *testing.T) {
 		assert.Contains(t, body, "schemabot apply -e staging -d "+dbName,
 			"a bare command would reach the peer database too, so the comment names its own")
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for auto-plan comment")
+		require.FailNow(t, "timed out waiting for auto-plan comment")
 	}
 }

@@ -15,6 +15,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -69,6 +70,19 @@ type pullSchemaErrorClient struct {
 }
 
 func (c pullSchemaErrorClient) PullSchema(context.Context, *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	return nil, c.err
+}
+
+type planErrorClient struct {
+	Client
+	err error
+}
+
+func (c planErrorClient) Plan(context.Context, *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
+	return nil, c.err
+}
+
+func (c planErrorClient) PlanDiff(context.Context, *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
 	return nil, c.err
 }
 
@@ -209,6 +223,101 @@ func TestServerPullSchemaMapsKnownErrorsToStatusCode(t *testing.T) {
 			assert.Equal(t, tc.want, status.Code(err))
 		})
 	}
+}
+
+// A plan the engine refuses is the schema files' to fix, so the server answers
+// FailedPrecondition, which callers do not alert on, with the refusal's own
+// text: a wrap added on the way out, which can name an address, stays in this
+// server's log. Any other plan failure is the server's and stays Internal.
+func TestServerPlanMapsRefusalToFailedPrecondition(t *testing.T) {
+	const refusal = "keyspace orders has no schema file for 1 sequence table(s)"
+	testCases := []struct {
+		name        string
+		err         error
+		wantCode    codes.Code
+		wantMessage string
+	}{
+		{
+			name:        "engine refused the plan under a wrap that names an address",
+			err:         fmt.Errorf("plan keyspace orders via 10.0.0.5:3306: %w", &engine.PlanRefusedError{Err: errors.New(refusal)}),
+			wantCode:    codes.FailedPrecondition,
+			wantMessage: refusal,
+		},
+		{
+			name:        "engine failed",
+			err:         errors.New("connect to topology: connection refused"),
+			wantCode:    codes.Internal,
+			wantMessage: "connect to topology: connection refused",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := NewServer(planErrorClient{err: tc.err}, slog.Default())
+
+			_, err := server.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders"})
+			require.Error(t, err)
+			assert.Equal(t, tc.wantCode, status.Code(err))
+			assert.Equal(t, tc.wantMessage, status.Convert(err).Message())
+
+			_, err = server.PlanDiff(t.Context(), &ternv1.PlanRequest{Database: "orders"})
+			require.Error(t, err)
+			assert.Equal(t, tc.wantCode, status.Code(err), "a rollout member is planned with PlanDiff")
+			assert.Equal(t, tc.wantMessage, status.Convert(err).Message())
+		})
+	}
+}
+
+// planWithEngineClient plans through the local client's engine path and
+// returns whatever error that path produces, unchanged, so the server maps the
+// error the engine path really returns.
+type planWithEngineClient struct {
+	Client
+	local *LocalClient
+	files schema.SchemaFiles
+}
+
+func (c planWithEngineClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
+	_, err := c.local.planWithEngine(ctx, req, req.GetDatabase(), c.files)
+	return nil, err
+}
+
+func (c planWithEngineClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	_, err := c.local.planWithEngine(ctx, req, req.GetDatabase(), c.files)
+	return nil, err
+}
+
+// A refusal the engine path returns for a declared schema reaches the remote
+// caller as FailedPrecondition with its message intact, through Plan and
+// through the PlanDiff a rollout member is planned with, so the operator who
+// sees it is told what to change and the data plane is not reported as failing.
+func TestServerPlanMapsEnginePathRefusalToFailedPrecondition(t *testing.T) {
+	local, err := NewLocalClient(LocalConfig{
+		Database:  "orders",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: "user:pass@tcp(localhost:3306)/orders",
+	}, nil, slog.Default())
+	require.NoError(t, err)
+	server := NewServer(planWithEngineClient{
+		local: local,
+		files: schema.SchemaFiles{"orders": {Files: map[string]string{"orders.sql": "CREATE TABLE orders (id INT)"}}},
+	}, slog.Default())
+
+	req := &ternv1.PlanRequest{
+		Database:             "orders",
+		UnselectedNamespaces: []string{"ns_1"},
+	}
+	const refusal = "a targets entry that selects namespaces is not supported for MySQL targets whose DSN names a database"
+
+	_, err = server.Plan(t.Context(), req)
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, status.Convert(err).Message(), refusal)
+
+	_, err = server.PlanDiff(t.Context(), req)
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, status.Convert(err).Message(), refusal)
 }
 
 func TestServerApplyScopedRPCsRequireApplyID(t *testing.T) {
@@ -514,7 +623,7 @@ type conflictReadFailureTaskStore struct {
 	storage.TaskStore
 }
 
-func (conflictReadFailureTaskStore) GetByDatabase(context.Context, string) ([]*storage.Task, error) {
+func (conflictReadFailureTaskStore) GetNonTerminalByDatabase(context.Context, string) ([]*storage.Task, error) {
 	return nil, errors.New("tasks storage unavailable")
 }
 

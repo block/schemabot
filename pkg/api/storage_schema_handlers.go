@@ -21,7 +21,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -601,8 +600,8 @@ func storageSchemaApplyWriteBudget(convergence time.Duration) time.Duration {
 // database operator grant authorizes an operator for their own database's
 // schema changes; SchemaBot's storage database is not any team's database, it
 // is the instance's own bookkeeping — the same class of operation as changing
-// deployment settings or redriving webhooks, which are admin-only for the same
-// reason.
+// deployment settings or backfilling Check Runs, which are admin-only for the
+// same reason.
 //
 // This is the second of two gates and it is not the one that usually bites.
 // The first is the tier the auth middleware admits the route at, and both
@@ -633,17 +632,15 @@ func decodeStorageSchemaPlanRequest(r *http.Request) (apitypes.StorageSchemaPlan
 // tolerating an empty one. Every field of both requests is optional — the
 // defaults name this server's own storage, its own embedded schema, and refuse
 // destructive statements — so a caller sending no body at all gets the safe
-// defaults rather than a decode error. Unknown fields are still rejected, so a
-// misspelled "deployment" cannot quietly become a report about, or a
-// convergence of, the wrong storage.
+// defaults rather than a decode error. Unknown fields and data after the JSON
+// value are still rejected, so a misspelled "deployment" cannot quietly become
+// a report about, or a convergence of, the wrong storage.
 func decodeOptionalStorageSchemaBody[T any](r *http.Request) (T, error) {
 	var req T
 	if r.Body == nil {
 		return req, nil
 	}
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		var zero T
 		if errors.Is(err, io.EOF) {
 			return zero, nil

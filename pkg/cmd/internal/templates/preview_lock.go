@@ -40,6 +40,10 @@ func previewLockKeptOutput() {
 func previewUnsubmittedLockNotReleasedOutput() {
 	WriteUnsubmittedLockKept("testapp", "mysql", fmt.Errorf("API error (500): internal error"))
 	fmt.Println()
+	fmt.Println("--- Nothing submitted, release request got no answer ---")
+	fmt.Println()
+	WriteUnsubmittedLockReleaseUnknown("testapp", "mysql")
+	fmt.Println()
 	fmt.Println("--- Nothing submitted, lock already released ---")
 	fmt.Println()
 	WriteUnsubmittedLockAlreadyReleased("testapp", "mysql")
@@ -47,6 +51,22 @@ func previewUnsubmittedLockNotReleasedOutput() {
 	fmt.Println("--- Nothing submitted, lock held by another owner ---")
 	fmt.Println()
 	WriteUnsubmittedLockHeldByAnotherOwner("testapp", "mysql")
+}
+
+func previewLockInUseOutput() {
+	WriteLockInUse("testapp", "mysql", "apply-b2c3d4e5", "running", "staging")
+}
+
+func previewLockReplacedOutput() {
+	WriteLockReplaced("testapp", "mysql")
+	fmt.Println()
+	fmt.Println("--- Apply settled, lock now held by another owner ---")
+	fmt.Println()
+	WriteLockHeldByAnotherOwner("testapp", "mysql")
+}
+
+func previewLockKeptWithoutIDOutput() {
+	WriteLockKeptWithoutID("testapp", "mysql")
 }
 
 func previewLocksListOutput() {

@@ -95,6 +95,15 @@ func TestSilentDiscoveryFailureOnUnscopedFanOut(t *testing.T) {
 	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/plain-repo", "", "", databaseNotFound),
 		"a database discovery miss on a non-aggregate repo still surfaces")
 
+	// A miss that left a config unread is not authoritative even on this
+	// deployment's slice: the unread config might declare the database.
+	inconclusiveMiss := &ghclient.DatabaseNotFoundError{
+		DatabaseName:      "orders",
+		UnreadableConfigs: []string{"apps/orders/schema/schemabot.yaml"},
+	}
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/participant-repo", "", "", inconclusiveMiss),
+		"a participant must surface a miss that left a config unread")
+
 	// A truncated repository tree is uncertainty, not an authoritative miss:
 	// the deployment might own the schema and simply be unable to prove it,
 	// so truncation always surfaces fail-closed instead of deferring.

@@ -264,6 +264,7 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 
 	httpResp.ExistingCopies = existingCopiesFromProto(resp.ExistingCopies)
 	httpResp.ExemptTables = exemptTablesFromProto(resp.ExemptTables)
+	httpResp.UnmatchedDropTables = resp.GetUnmatchedDropTables()
 
 	return httpResp
 }
@@ -300,6 +301,31 @@ func withheldTablesFromProto(groups []*ternv1.ExemptTables) []string {
 	return slices.Compact(tables)
 }
 
+// splitEntriesSkippedByNaming separates, from ignore_tables entries that
+// withheld nothing, the ones naming a live table the planner already skips by
+// a naming convention, such as a "_" table on MySQL. Those entries did reach a
+// table; they are redundant rather than mistaken, and the plan discloses the
+// table under the convention.
+func splitEntriesSkippedByNaming(unmatched []string, groups []*ternv1.ExemptTables) (stillUnmatched, redundant []string) {
+	skipped := make(map[string]bool)
+	for _, group := range groups {
+		if group == nil || group.Reason == engine.ExemptReasonIgnoreTables {
+			continue
+		}
+		for _, table := range group.Tables {
+			skipped[table] = true
+		}
+	}
+	for _, entry := range unmatched {
+		if skipped[entry] {
+			redundant = append(redundant, entry)
+			continue
+		}
+		stillUnmatched = append(stillUnmatched, entry)
+	}
+	return stillUnmatched, redundant
+}
+
 // plannedDropsWithheldBy returns the tables the plan proposes dropping, in its
 // namespace changes or its per-shard changes, that ignored withholds, sorted. A
 // planner that honored the config never sees those tables, so any such drop
@@ -316,6 +342,61 @@ func plannedDropsWithheldBy(changes []*ternv1.SchemaChange, shards []*ternv1.Sha
 	}
 	slices.Sort(dropped)
 	return slices.Compact(dropped)
+}
+
+// dropTablesEntriesStillSkipped returns, in the order the config lists them,
+// the drop_tables entries the plan does not drop although it still discloses
+// them as tables the planner skips by a naming convention. A planner that read
+// drop_tables would have dropped such a table instead of skipping it, so these
+// entries reached a data plane that did not apply the list.
+func dropTablesEntriesStillSkipped(entries []string, changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan, groups []*ternv1.ExemptTables) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	skipped := make(map[string]bool)
+	for _, group := range groups {
+		if group == nil || group.Reason == engine.ExemptReasonIgnoreTables {
+			continue
+		}
+		for _, table := range group.Tables {
+			skipped[table] = true
+		}
+	}
+	dropped := make(map[string]bool)
+	for _, drop := range plannedTableDrops(changes, shards) {
+		dropped[drop.table] = true
+	}
+	var stillSkipped []string
+	for _, entry := range entries {
+		if skipped[entry] && !dropped[entry] && !slices.Contains(stillSkipped, entry) {
+			stillSkipped = append(stillSkipped, entry)
+		}
+	}
+	return stillSkipped
+}
+
+// dropTablesEntriesUnmatched returns, in the order the config lists them, the
+// drop_tables entries the plan neither drops nor still skips by a naming
+// convention: entries naming no live table on the target, ordinarily because
+// the drop already landed or the entry has a typo. stillSkipped is what
+// dropTablesEntriesStillSkipped reported, which is a different answer and is
+// left out here.
+func dropTablesEntriesUnmatched(entries, stillSkipped []string, changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	dropped := make(map[string]bool)
+	for _, drop := range plannedTableDrops(changes, shards) {
+		dropped[drop.table] = true
+	}
+	var unmatched []string
+	for _, entry := range entries {
+		if dropped[entry] || slices.Contains(stillSkipped, entry) || slices.Contains(unmatched, entry) {
+			continue
+		}
+		unmatched = append(unmatched, entry)
+	}
+	return unmatched
 }
 
 // existingCopiesFromProto carries the target's unfinished copies through to the

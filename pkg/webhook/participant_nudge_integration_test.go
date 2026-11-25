@@ -10,6 +10,7 @@
 package webhook
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -127,7 +128,7 @@ func TestE2EParticipantCommentNudgeIgnoresUntrustedBot(t *testing.T) {
 
 	select {
 	case cr := <-checkRuns:
-		t.Fatalf("untrusted bot comment must not trigger a fold, got check run %q", cr.Name)
+		require.FailNow(t, fmt.Sprintf("untrusted bot comment must not trigger a fold, got check run %q", cr.Name))
 	case <-time.After(300 * time.Millisecond):
 	}
 }
@@ -162,7 +163,7 @@ func TestE2EParticipantCommentNudgeLeaderOnly(t *testing.T) {
 
 	select {
 	case cr := <-checkRuns:
-		t.Fatalf("a non-leader must not fold on sibling comments, got check run %q", cr.Name)
+		require.FailNow(t, fmt.Sprintf("a non-leader must not fold on sibling comments, got check run %q", cr.Name))
 	case <-time.After(300 * time.Millisecond):
 	}
 }
@@ -180,7 +181,7 @@ func collectAggregateConclusion(t *testing.T, checkRuns chan checkRunCapture, na
 				return cr
 			}
 		case <-deadline:
-			t.Fatalf("timed out waiting for aggregate %q with conclusion %q", name, wantConclusion)
+			require.FailNow(t, fmt.Sprintf("timed out waiting for aggregate %q with conclusion %q", name, wantConclusion))
 		}
 	}
 }
@@ -308,7 +309,7 @@ func TestE2EParticipantCommentNudgeBlocksOnInProgressParticipant(t *testing.T) {
 				"the aggregate reports the participant's in-flight work")
 			return
 		case <-deadline:
-			t.Fatal("timed out waiting for the folded aggregate")
+			require.FailNow(t, "timed out waiting for the folded aggregate")
 		}
 	}
 }

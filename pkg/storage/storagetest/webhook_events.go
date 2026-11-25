@@ -655,6 +655,65 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		assert.WithinDuration(t, firstStartedAt, *released.StartedAt, time.Second)
 	})
 
+	// MarkFailedUncharged schedules the retry like MarkFailed does but refunds
+	// the claim's attempt, keeps started_at, refunds only once when repeated
+	// with the same lease token, and refuses a stale token.
+	t.Run("MarkFailedUncharged_RefundsAttemptAndSchedulesRetry", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		createEvent(t, store, newEvent("delivery-uncharged"))
+		first := claimExpecting(t, store, "delivery-uncharged")
+		require.NotNil(t, first.StartedAt)
+		firstStartedAt := *first.StartedAt
+		past := time.Now().UTC().Add(-time.Minute)
+		require.NoError(t, store.WebhookEvents().MarkFailed(ctx, first.ID, first.LeaseToken, "transient failure", &past))
+
+		second := claimExpecting(t, store, "delivery-uncharged")
+		require.Equal(t, 2, second.Attempts)
+
+		resetAt := time.Now().UTC().Add(40 * time.Minute)
+		require.ErrorIs(t, store.WebhookEvents().MarkFailedUncharged(ctx, second.ID, "stale-token", "quota reserved", resetAt), storage.ErrWebhookEventLeaseLost)
+		require.NoError(t, store.WebhookEvents().MarkFailedUncharged(ctx, second.ID, second.LeaseToken, "quota reserved", resetAt))
+		require.NoError(t, store.WebhookEvents().MarkFailedUncharged(ctx, second.ID, second.LeaseToken, "quota reserved", resetAt),
+			"repeating the write with the same lease token succeeds")
+
+		deferred, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-uncharged")
+		require.NoError(t, err)
+		require.NotNil(t, deferred)
+		assert.Equal(t, storage.WebhookEventFailedRetryable, deferred.State)
+		assert.Equal(t, 1, deferred.Attempts, "the refused claim's attempt is refunded once, even when the write repeats")
+		assert.Equal(t, "quota reserved", deferred.LastError)
+		require.NotNil(t, deferred.RetryAfter)
+		assert.WithinDuration(t, resetAt, *deferred.RetryAfter, time.Second)
+		require.NotNil(t, deferred.StartedAt, "processing did begin, so started_at is kept")
+		assert.WithinDuration(t, firstStartedAt, *deferred.StartedAt, time.Second)
+		assert.Nil(t, deferred.CompletedAt)
+
+		none, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
+		require.NoError(t, err)
+		assert.Nil(t, none, "the delivery is not claimable before its retry time")
+	})
+
+	// A delivery whose claim reached the attempt cap is still claimable after
+	// MarkFailedUncharged, because the refund brings it back under the cap.
+	t.Run("MarkFailedUncharged_AtCapStaysClaimable", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		driveToCapExhausted(t, store, "delivery-uncharged-cap", time.Minute)
+		atCap, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-uncharged-cap")
+		require.NoError(t, err)
+		require.NotNil(t, atCap)
+		require.Equal(t, storage.MaxWebhookEventAttempts, atCap.Attempts)
+
+		due := time.Now().UTC().Add(-time.Second)
+		require.NoError(t, store.WebhookEvents().MarkFailedUncharged(ctx, atCap.ID, atCap.LeaseToken, "quota reserved", due))
+
+		reclaimed := claimExpecting(t, store, "delivery-uncharged-cap")
+		assert.Equal(t, storage.MaxWebhookEventAttempts, reclaimed.Attempts, "the reclaim spends the refunded attempt again")
+	})
+
 	// A dead-lettered delivery is terminal and sticky: MarkFailedPermanent
 	// records the error that proved the head can never succeed, FindNext never
 	// reclaims the row, and only a redelivery of the same GUID (GitHub
@@ -1349,6 +1408,11 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 	t.Run("MarkFailed_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
 		require.Error(t, store.WebhookEvents().MarkFailed(t.Context(), 1, "token", "boom", nil))
+	})
+
+	t.Run("MarkFailedUncharged_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		require.Error(t, store.WebhookEvents().MarkFailedUncharged(t.Context(), 1, "token", "boom", time.Now()))
 	})
 
 	t.Run("MarkFailedPermanent_DBError", func(t *testing.T) {

@@ -103,6 +103,43 @@ var configDiscoveryFailedBlock = checkBlockReason{
 	message:        "SchemaBot failed this check closed because it could not determine the managed schema configuration for this PR. Review the SchemaBot configuration and retry the check.",
 }
 
+// githubQuotaReservedBlock is used when the installation's GitHub quota is
+// down to the reserve SchemaBot holds back for check runs, so the reads that
+// discover the PR's schema changes were not sent. Nothing is wrong with the
+// PR or its configuration, and the reads go out again once the quota resets,
+// so its message is built per refusal by githubQuotaReservedBlockFor to name
+// the reset time.
+var githubQuotaReservedBlock = checkBlockReason{
+	blockingReason: checkstate.BlockGitHubQuotaReserved,
+}
+
+// githubQuotaReservedBlockFor returns githubQuotaReservedBlock with a message
+// naming when the quota resets and what happens then. retriedAtReset is true
+// only when the durable delivery that posts the block re-runs the discovery
+// itself at the reset; otherwise the author has to re-run the check, since
+// every fold skips a stored aggregate block.
+func githubQuotaReservedBlockFor(resetAt time.Time, retriedAtReset bool) checkBlockReason {
+	block := githubQuotaReservedBlock
+	block.message = "SchemaBot is holding back its remaining GitHub API quota for check runs, so it did not read this PR's schema files. "
+	if retriedAtReset {
+		block.message += "It will retry when the quota resets at " + quotaResetTime(resetAt) + "."
+	} else {
+		block.message += "Re-run this check after the quota resets at " + quotaResetTime(resetAt) + "."
+	}
+	return block
+}
+
+// quotaResetTime renders a quota reset as a UTC time of day, rounded up to the
+// minute so that acting at the named minute is never early. GitHub's quota
+// resets within the hour, so the date adds nothing.
+func quotaResetTime(resetAt time.Time) string {
+	rounded := resetAt.UTC()
+	if truncated := rounded.Truncate(time.Minute); !truncated.Equal(rounded) {
+		rounded = truncated.Add(time.Minute)
+	}
+	return rounded.Format("15:04") + " UTC"
+}
+
 // planPublishVerificationFailedBlock is used when the PR cannot be re-read to
 // confirm a plan is being published for the head commit and base branch it was
 // computed from. Publishing on an unverified PR is what that re-read exists to
@@ -126,6 +163,11 @@ var prFileCapExceededBlock = checkBlockReason{
 	message: "SchemaBot cannot determine whether this PR contains managed schema changes: the PR changes more files than GitHub will report for a single pull request, so the changed-file list SchemaBot reads is incomplete. " +
 		"SchemaBot fails this check closed rather than planning from a partial diff, and retrying the check returns the same incomplete list. " +
 		"Split this PR so GitHub reports the full changed-file list — if it carries schema changes, move them into their own smaller PR and SchemaBot will plan them there.",
+}
+
+var prSchemaCapBlock = checkBlockReason{
+	blockingReason: checkstate.BlockPRSchemaCapExceeded,
+	message:        prSchemaCapTitle,
 }
 
 // managedDirMissingConfigBlock is used when a PR changes schema files under a
@@ -225,8 +267,10 @@ var allCheckBlockReasons = []checkBlockReason{
 	applyCancelledAfterTaskCompletedBlock,
 	githubConfigDiscoveryUnavailableBlock,
 	configDiscoveryFailedBlock,
+	githubQuotaReservedBlock,
 	planPublishVerificationFailedBlock,
 	prFileCapExceededBlock,
+	prSchemaCapBlock,
 	managedDirMissingConfigBlock,
 	reviewTimeDeploymentDriftBlock,
 	namespacePlacementRefusedBlock,

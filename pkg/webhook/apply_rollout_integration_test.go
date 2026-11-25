@@ -77,7 +77,7 @@ func runRolloutWebhookWithFiles(t *testing.T, svc *api.Service, dbName string, r
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClient(client, logger)}, nil, logger)
+	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClient(client, logger)}, nil, logger, WithInsecureSkipSignatureVerification())
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)

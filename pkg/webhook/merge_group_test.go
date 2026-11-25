@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -58,6 +59,16 @@ func buildMergeGroupWebhookRequest(t *testing.T, action, headSHA string, secret 
 
 func mergeGroupTestHandler(t *testing.T, allowedEnvironments []string, repos map[string]api.RepoConfig) (*Handler, chan checkRunCapture) {
 	t.Helper()
+	h, created, _ := mergeGroupTestHandlerWithMux(t, allowedEnvironments, repos)
+	return h, created
+}
+
+// mergeGroupTestHandlerWithMux is mergeGroupTestHandler with the fake GitHub
+// server's mux returned, so a test can serve the merge group's existing Check
+// Runs. The client knows its App slug, as a production client does, so a
+// check-run lookup can verify which App owns a run.
+func mergeGroupTestHandlerWithMux(t *testing.T, allowedEnvironments []string, repos map[string]api.RepoConfig) (*Handler, chan checkRunCapture, *http.ServeMux) {
+	t.Helper()
 	client, mux := setupGitHubServer(t)
 	created := make(chan checkRunCapture, 10)
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
@@ -68,7 +79,7 @@ func mergeGroupTestHandler(t *testing.T, allowedEnvironments []string, repos map
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 555})
 	})
 
-	installClient := ghclient.NewInstallationClient(client, testLogger())
+	installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
 	service := api.New(nil, &api.ServerConfig{
 		AllowedEnvironments: allowedEnvironments,
 		Repos:               repos,
@@ -79,7 +90,7 @@ func mergeGroupTestHandler(t *testing.T, allowedEnvironments []string, repos map
 		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
 		logger:    testLogger(),
 	}
-	return h, created
+	return h, created, mux
 }
 
 // A merge queue evaluates the same required checks against the queue's
@@ -106,7 +117,7 @@ func TestWebhookMergeGroupPostsPassingChecks(t *testing.T) {
 		case c := <-created:
 			got[c.Name] = c
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for merge_group check run")
+			require.FailNow(t, "timed out waiting for merge_group check run")
 		}
 	}
 
@@ -133,7 +144,7 @@ func TestWebhookMergeGroupIgnoresNonChecksRequested(t *testing.T) {
 
 	select {
 	case c := <-created:
-		t.Fatalf("unexpected check run created for destroyed action: %q", c.Name)
+		require.FailNow(t, fmt.Sprintf("unexpected check run created for destroyed action: %q", c.Name))
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -152,7 +163,7 @@ func TestWebhookMergeGroupRejectsUnregisteredRepo(t *testing.T) {
 
 	select {
 	case c := <-created:
-		t.Fatalf("unexpected check run created for unregistered repo: %q", c.Name)
+		require.FailNow(t, fmt.Sprintf("unexpected check run created for unregistered repo: %q", c.Name))
 	case <-time.After(100 * time.Millisecond):
 	}
 	requireUnregisteredRepositoryCounted(t, reader, "merge_group", "checks_requested")
@@ -205,12 +216,12 @@ func TestWebhookMergeGroupUpdatesExistingCheck(t *testing.T) {
 	case id := <-updated:
 		assert.Equal(t, int64(7), id)
 	case <-time.After(2 * time.Second):
-		t.Fatal("expected the existing check run to be updated")
+		require.FailNow(t, "expected the existing check run to be updated")
 	}
 
 	select {
 	case name := <-created:
-		t.Fatalf("expected an update, not a new check run: %q", name)
+		require.FailNow(t, fmt.Sprintf("expected an update, not a new check run: %q", name))
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -231,12 +242,12 @@ func TestWebhookMergeGroupSingleAggregateWhenNoEnvScoping(t *testing.T) {
 		assert.Equal(t, "mergesha123", c.HeadSHA)
 		assert.Equal(t, "success", c.Conclusion)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for merge_group check run")
+		require.FailNow(t, "timed out waiting for merge_group check run")
 	}
 
 	select {
 	case c := <-created:
-		t.Fatalf("expected exactly one aggregate check, got extra: %q", c.Name)
+		require.FailNow(t, fmt.Sprintf("expected exactly one aggregate check, got extra: %q", c.Name))
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -261,7 +272,7 @@ func TestWebhookMergeGroupParticipantStaysSilent(t *testing.T) {
 
 	select {
 	case c := <-created:
-		t.Fatalf("participant posted a merge_group check run: %q", c.Name)
+		require.FailNow(t, fmt.Sprintf("participant posted a merge_group check run: %q", c.Name))
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -290,6 +301,161 @@ func TestWebhookMergeGroupLeaderStillPosts(t *testing.T) {
 		assert.Equal(t, "SchemaBot (production)", c.Name)
 		assert.Equal(t, "success", c.Conclusion)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the leader's merge_group check run")
+		require.FailNow(t, "timed out waiting for the leader's merge_group check run")
+	}
+}
+
+// A checks backfill posts the same passing check on a merge group head that
+// the merge_group webhook would have, so a queue entry whose delivery was lost
+// stops blocking the PRs behind it.
+func TestBackfillMergeQueueCheckPostsPassingChecks(t *testing.T) {
+	h, created, mux := mergeGroupTestHandlerWithMux(t,
+		[]string{"staging", "production"},
+		map[string]api.RepoConfig{"octocat/hello-world": {}},
+	)
+	serveTrustedCheckRuns(t, mux, "octocat/hello-world", "group-412")
+
+	outcome, err := h.BackfillMergeQueueCheck(t.Context(), "octocat/hello-world", 12345, "group-412", api.MergeQueueCheckScope{})
+	require.NoError(t, err)
+	assert.Equal(t, "posted passing merge queue check", outcome)
+
+	got := map[string]checkRunCapture{}
+	for range []int{0, 1} {
+		select {
+		case c := <-created:
+			got[c.Name] = c
+		case <-time.After(2 * time.Second):
+			require.FailNow(t, "timed out waiting for the backfilled merge queue check run")
+		}
+	}
+	for _, name := range []string{"SchemaBot (staging)", "SchemaBot (production)"} {
+		c, ok := got[name]
+		require.True(t, ok, "expected a check run named %q", name)
+		assert.Equal(t, "group-412", c.HeadSHA)
+		assert.Equal(t, "completed", c.Status)
+		assert.Equal(t, "success", c.Conclusion)
+	}
+}
+
+// A backfill skips a merge group for the same reasons the merge_group webhook
+// does: an unregistered repository, or an aggregate participant whose leader
+// posts the required check. Neither posts anything.
+func TestBackfillMergeQueueCheckSkipsWhereTheWebhookWould(t *testing.T) {
+	for name, tc := range map[string]struct {
+		repos map[string]api.RepoConfig
+		want  string
+	}{
+		"unregistered repository": {
+			repos: map[string]api.RepoConfig{"octocat/other-repo": {}},
+			want:  mergeGroupSkipUnregistered,
+		},
+		"aggregate participant": {
+			repos: map[string]api.RepoConfig{"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}}},
+			want:  mergeGroupSkipParticipant,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, created := mergeGroupTestHandler(t, []string{"production"}, tc.repos)
+
+			outcome, err := h.BackfillMergeQueueCheck(t.Context(), "octocat/hello-world", 12345, "group-412", api.MergeQueueCheckScope{})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, outcome)
+
+			select {
+			case c := <-created:
+				require.FailNow(t, fmt.Sprintf("backfill posted a merge queue check run it should have skipped: %q", c.Name))
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
+	}
+}
+
+// A backfill run for one environment posts only that environment's merge queue
+// check. A check already on the merge group is left as it is, even one still
+// in progress, so the backfill never overwrites a check another path owns.
+func TestBackfillMergeQueueCheckPostsOnlyTheMissingChecksInScope(t *testing.T) {
+	h, created, mux := mergeGroupTestHandlerWithMux(t,
+		[]string{"staging", "production"},
+		map[string]api.RepoConfig{"octocat/hello-world": {}},
+	)
+	serveTrustedCheckRuns(t, mux, "octocat/hello-world", "group-412", ghclient.CheckRunResult{
+		ID: 701, Name: "SchemaBot (staging)", Status: "in_progress",
+	})
+	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(http.ResponseWriter, *http.Request) {
+		assert.Fail(t, "backfill updated an existing merge queue check run")
+	})
+
+	outcome, err := h.BackfillMergeQueueCheck(t.Context(), "octocat/hello-world", 12345, "group-412",
+		api.MergeQueueCheckScope{Environment: "production"})
+	require.NoError(t, err)
+	assert.Equal(t, "posted passing merge queue check", outcome)
+	assertCreatedCheckRuns(t, created, "SchemaBot (production)")
+
+	outcome, err = h.BackfillMergeQueueCheck(t.Context(), "octocat/hello-world", 12345, "group-412",
+		api.MergeQueueCheckScope{Environment: "staging"})
+	require.NoError(t, err)
+	assert.Equal(t, mergeQueueChecksAlreadyPresent, outcome)
+	assertCreatedCheckRuns(t, created)
+}
+
+// A check name the server does not post on the merge group fails the head
+// rather than reporting it handled, so the group stays reported as missing the
+// check the operator asked for.
+func TestBackfillMergeQueueCheckRefusesAScopeWithNoCheck(t *testing.T) {
+	h, created, mux := mergeGroupTestHandlerWithMux(t,
+		[]string{"staging", "production"},
+		map[string]api.RepoConfig{"octocat/hello-world": {}},
+	)
+	serveTrustedCheckRuns(t, mux, "octocat/hello-world", "group-412")
+
+	_, err := h.BackfillMergeQueueCheck(t.Context(), "octocat/hello-world", 12345, "group-412",
+		api.MergeQueueCheckScope{CheckName: "SchemaBot (sandbox)"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `posts no merge queue check matching environment "" and check name "SchemaBot (sandbox)"`)
+	assertCreatedCheckRuns(t, created)
+}
+
+// A backfill that cannot read the merge group's existing checks posts nothing,
+// because it cannot tell whether it would add a second check beside one that
+// is already there.
+func TestBackfillMergeQueueCheckPostsNothingWhenTheLookupFails(t *testing.T) {
+	h, created, mux := mergeGroupTestHandlerWithMux(t,
+		[]string{"production"},
+		map[string]api.RepoConfig{"octocat/hello-world": {}},
+	)
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/group-412/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+	})
+
+	_, err := h.BackfillMergeQueueCheck(t.Context(), "octocat/hello-world", 12345, "group-412", api.MergeQueueCheckScope{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `look up merge_group_check check "SchemaBot (production)"`)
+	assertCreatedCheckRuns(t, created)
+}
+
+// assertCreatedCheckRuns asserts the backfill created exactly the named Check
+// Runs, each completed and passing.
+func assertCreatedCheckRuns(t *testing.T, created chan checkRunCapture, names ...string) {
+	t.Helper()
+	got := map[string]checkRunCapture{}
+	for range names {
+		select {
+		case c := <-created:
+			got[c.Name] = c
+		case <-time.After(2 * time.Second):
+			require.FailNow(t, fmt.Sprintf("timed out waiting for check runs %v; got %d", names, len(got)))
+		}
+	}
+	for _, name := range names {
+		c, ok := got[name]
+		if assert.True(t, ok, "expected a check run named %q", name) {
+			assert.Equal(t, "completed", c.Status)
+			assert.Equal(t, "success", c.Conclusion)
+		}
+	}
+	select {
+	case c := <-created:
+		require.FailNow(t, fmt.Sprintf("backfill created an unexpected check run: %q", c.Name))
+	case <-time.After(100 * time.Millisecond):
 	}
 }

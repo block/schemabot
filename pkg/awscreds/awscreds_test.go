@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	smtypes "github.com/aws/aws-sdk-go-v2/service/secretsmanager/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -598,4 +599,136 @@ func TestNewDefaultsAccountAttribute(t *testing.T) {
 	r, err := New(Config{Region: "us-west-2", RoleARN: "arn:aws:iam::{account}:role/role", SecretName: "secret"})
 	require.NoError(t, err)
 	assert.Equal(t, defaultAccountAttribute, r.accountAttr)
+}
+
+// A data plane that reaches Secrets Manager in a region only through a private
+// endpoint sends that region's reads there, signed for the region, while every
+// other region keeps the SDK's default endpoint.
+func TestFetchersUseConfiguredEndpointPerRegion(t *testing.T) {
+	const eastEndpoint = "https://vpce-0example.secretsmanager.us-east-1.vpce.amazonaws.com"
+	cfg := Config{
+		Region:                  "us-west-2",
+		RegionAttribute:         "aws_region",
+		ReachableRegions:        []string{"us-east-1"},
+		SecretsManagerEndpoints: map[string]string{"us-east-1": eastEndpoint},
+		SecretName:              "secret",
+	}
+
+	own, err := New(cfg)
+	require.NoError(t, err)
+	of, ok := own.fetch.(*ownAccountFetcher)
+	require.True(t, ok)
+	east := of.clientForRegion("us-east-1")
+	require.NotNil(t, east.Options().BaseEndpoint)
+	assert.Equal(t, eastEndpoint, *east.Options().BaseEndpoint)
+	assert.Equal(t, "us-east-1", east.Options().Region, "reads are signed for the cluster's region")
+	assert.Nil(t, of.clientForRegion("us-west-2").Options().BaseEndpoint)
+
+	cfg.RoleARN = "arn:aws:iam::{account}:role/role"
+	assumed, err := New(cfg)
+	require.NoError(t, err)
+	af, ok := assumed.fetch.(*assumeRoleFetcher)
+	require.True(t, ok)
+	east = af.clientFor("111111111111", "us-east-1")
+	require.NotNil(t, east.Options().BaseEndpoint)
+	assert.Equal(t, eastEndpoint, *east.Options().BaseEndpoint)
+	assert.Equal(t, "us-east-1", east.Options().Region)
+	assert.Nil(t, af.clientFor("111111111111", "us-west-2").Options().BaseEndpoint)
+}
+
+// The resolver keeps its own copy of the endpoint map, so a caller mutating the
+// map after construction cannot redirect reads past the validation New ran.
+func TestNewCopiesEndpointMap(t *testing.T) {
+	endpoints := map[string]string{"us-west-2": "https://secretsmanager.example.internal"}
+	r, err := New(Config{Region: "us-west-2", SecretsManagerEndpoints: endpoints, SecretName: "secret"})
+	require.NoError(t, err)
+	endpoints["us-west-2"] = "https://elsewhere.example.internal"
+
+	f, ok := r.fetch.(*ownAccountFetcher)
+	require.True(t, ok)
+	got := f.clientForRegion("us-west-2").Options().BaseEndpoint
+	require.NotNil(t, got)
+	assert.Equal(t, "https://secretsmanager.example.internal", *got)
+}
+
+func TestNewValidatesSecretsManagerEndpoints(t *testing.T) {
+	base := Config{Region: "us-west-2", RegionAttribute: "aws_region", ReachableRegions: []string{"us-east-1"}, SecretName: "secret"}
+
+	ok := base
+	ok.SecretsManagerEndpoints = map[string]string{
+		"us-west-2": "https://secretsmanager.us-west-2.example.internal",
+		"us-east-1": "https://secretsmanager.us-east-1.example.internal:8443/",
+	}
+	_, err := New(ok)
+	require.NoError(t, err)
+
+	cases := []struct {
+		name      string
+		endpoints map[string]string
+		want      string
+	}{
+		{"region not read in", map[string]string{"eu-west-1": "https://secretsmanager.example.internal"}, `secrets manager endpoint for region "eu-west-1": the region is neither the home region nor a reachable region`},
+		{"http", map[string]string{"us-east-1": "http://secretsmanager.example.internal"}, `secrets manager endpoint for region "us-east-1": endpoint URL must use https`},
+		{"no scheme", map[string]string{"us-east-1": "secretsmanager.example.internal"}, `secrets manager endpoint for region "us-east-1": endpoint URL must use https`},
+		{"no host", map[string]string{"us-east-1": "https://"}, `secrets manager endpoint for region "us-east-1": endpoint URL names no host`},
+		{"path", map[string]string{"us-east-1": "https://secretsmanager.example.internal/v1"}, `secrets manager endpoint for region "us-east-1": endpoint URL must not have a path`},
+		{"query", map[string]string{"us-east-1": "https://secretsmanager.example.internal?x=1"}, `secrets manager endpoint for region "us-east-1": endpoint URL must not have a query or fragment`},
+		{"credentials", map[string]string{"us-east-1": "https://user:pass@secretsmanager.example.internal"}, `secrets manager endpoint for region "us-east-1": endpoint URL must not carry credentials`},
+		// A value the parser rejects, or reads as something other than a host
+		// URL, can still carry credentials, and the error never repeats it.
+		{"unparseable with credentials", map[string]string{"us-east-1": "https://user:pass@secretsmanager.example.internal:bad"}, `secrets manager endpoint for region "us-east-1": endpoint is not a valid URL`},
+		{"opaque with credentials", map[string]string{"us-east-1": "user:pass@secretsmanager.example.internal"}, `secrets manager endpoint for region "us-east-1": endpoint URL must use https`},
+		// Regions are checked in sorted order, so the first bad entry reported is stable.
+		{"sorted", map[string]string{"us-east-1": "http://a.example.internal", "ap-south-1": "https://b.example.internal"}, `secrets manager endpoint for region "ap-south-1"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			cfg.SecretsManagerEndpoints = tc.endpoints
+			_, err := New(cfg)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+			assert.NotContains(t, err.Error(), "pass", "an endpoint's credentials never reach the error")
+			assert.NotContains(t, err.Error(), "example.internal", "an endpoint's value never reaches the error")
+		})
+	}
+
+	err = ValidateSecretsManagerEndpoints("us-west-2", nil, map[string]string{"us-east-1": "https://secretsmanager.example.internal"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `secrets manager endpoint for region "us-east-1": the region is neither the home region nor a reachable region`)
+	require.NoError(t, ValidateSecretsManagerEndpoints("us-west-2", []string{"us-east-1"}, map[string]string{"us-east-1": "https://secretsmanager.example.internal"}))
+}
+
+// Secrets Manager rejects a custom endpoint in FIPS or dual-stack mode only when
+// a request is made, so New refuses the combination instead of starting a data
+// plane whose every read in an overridden region would fail.
+func TestNewRefusesEndpointsWithFIPSOrDualStack(t *testing.T) {
+	base := Config{
+		Region:                  "us-west-2",
+		SecretsManagerEndpoints: map[string]string{"us-west-2": "https://secretsmanager.example.internal"},
+		SecretName:              "secret",
+	}
+	cases := []struct {
+		name   string
+		source awsconfig.EnvConfig
+		want   string
+	}{
+		{"fips", awsconfig.EnvConfig{UseFIPSEndpoint: aws.FIPSEndpointStateEnabled}, "cannot be combined with FIPS endpoints"},
+		{"dual-stack", awsconfig.EnvConfig{UseDualStackEndpoint: aws.DualStackEndpointStateEnabled}, "cannot be combined with dual-stack endpoints"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			cfg.AWSConfig = aws.Config{ConfigSources: []any{tc.source}}
+			_, err := New(cfg)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+
+			// Without an override the SDK resolves its own FIPS or dual-stack
+			// endpoint, so the same AWS config is accepted.
+			cfg.SecretsManagerEndpoints = nil
+			_, err = New(cfg)
+			require.NoError(t, err)
+		})
+	}
 }

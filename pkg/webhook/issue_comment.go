@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -27,9 +28,10 @@ type webhookPayload struct {
 		} `json:"pull_request"`
 	} `json:"issue"`
 	Comment *struct {
-		ID   int64  `json:"id"`
-		Body string `json:"body"`
-		User *struct {
+		ID        int64     `json:"id"`
+		Body      string    `json:"body"`
+		CreatedAt time.Time `json:"created_at"`
+		User      *struct {
 			Login string `json:"login"`
 			Type  string `json:"type"`
 		} `json:"user"`
@@ -58,6 +60,8 @@ const (
 	issueCommentGateDeferCutover        issueCommentGateBlockReason = "defer-cutover flag unsupported for command"
 	issueCommentGateDatabase            issueCommentGateBlockReason = "database flag unsupported for command"
 	issueCommentGateTarget              issueCommentGateBlockReason = "target flag unsupported for command"
+	issueCommentGateOverride            issueCommentGateBlockReason = "override flag unsupported for command"
+	issueCommentGateOverrideReason      issueCommentGateBlockReason = "override reason invalid"
 )
 
 // issueCommentGateBlock evaluates the routing and usage gates shared by the
@@ -105,6 +109,14 @@ func (h *Handler) issueCommentGateBlock(repo string, result CommandResult, parse
 	if !commandSupportsTargetFlag(result.Action) && parser.HasTargetFlag(commentBody) {
 		return issueCommentGateTarget
 	}
+	if !commandSupportsOverrideFlag(result.Action) && parser.HasOverrideFlag(commentBody) {
+		return issueCommentGateOverride
+	}
+	if result.OverrideGiven {
+		if _, err := api.ValidateOverrideReason(result.Override); err != nil {
+			return issueCommentGateOverrideReason
+		}
+	}
 	return issueCommentGatePass
 }
 
@@ -144,13 +156,15 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		requestedBy = payload.Comment.User.Login
 	}
 
-	// Ignore comments from bots to prevent infinite loops. The one exception is
-	// a trusted sibling SchemaBot deployment's comment on a repo this
-	// deployment leads: it is consumed as an aggregate re-fold nudge — never
-	// parsed as a command — because participants comment at exactly the moments
-	// their Check Runs change, and GitHub delivers check_run events only to the
-	// App that created the check.
-	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" {
+	// Ignore comments from bots to prevent infinite loops. There are two
+	// exceptions. An App listed in command_apps has its comments parsed as
+	// commands, authorized per database like a person's. A trusted sibling
+	// SchemaBot deployment's comment on a repo this deployment leads is
+	// consumed as an aggregate re-fold nudge — never parsed as a command —
+	// because participants comment at exactly the moments their Check Runs
+	// change, and GitHub delivers check_run events only to the App that
+	// created the check.
+	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" && !h.isCommandAppComment(repo, installationID, requestedBy) {
 		if h.participantCommentNudge(ctx, repo, pr, installationID, deliveryID, requestedBy) {
 			h.writeJSON(w, http.StatusOK, map[string]string{
 				"message": "participant comment triggered aggregate re-fold",
@@ -167,6 +181,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	parser := NewCommandParser()
 	result := parser.ParseCommand(payload.Comment.Body)
 	result.CommentID = payload.Comment.ID
+	result.RequestedAt = payload.Comment.CreatedAt
 	result.DeliveryID = deliveryID
 
 	if !result.IsMention {
@@ -308,12 +323,17 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			// aggregate role and -t-scoped plans acknowledge at dispatch, while
 			// an unscoped plan on an aggregate-role repo acknowledges at the
 			// handler's act-point once discovery resolves owned schema.
+			admission, err := h.admitPRSchemaBeforeQueue(ctx, repo, pr, installationID, prPlanDiscoveryKey{})
+			if err != nil {
+				h.answerPRSchemaPlanRefusal(w, repo, pr, installationID, "", requestedBy, err)
+				return
+			}
 			h.logger.Info("plan without -e flag", "repo", repo, "pr", pr)
 			if h.service == nil || h.service.Config().AggregateRoleForRepo(repo) == "" || result.Tenant != "" {
 				h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 			}
 			h.goSafe(repo, pr, installationID, deliveryID, func() {
-				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, 0, true, result.CommentID, nil)
+				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, 0, true, result.CommentID, nil, admission)
 			})
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "multi-env plan started"})
 			return
@@ -480,6 +500,24 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
+	if gateReason == issueCommentGateOverride || gateReason == issueCommentGateOverrideReason {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping override flag reply for unscoped fan-out; the leader posts it once",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
+			return
+		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
+		if gateReason == issueCommentGateOverride {
+			h.postComment(repo, pr, installationID, templates.RenderUnsupportedOverrideFlag(result.Action))
+		} else {
+			_, err := api.ValidateOverrideReason(result.Override)
+			h.postComment(repo, pr, installationID, templates.RenderInvalidOverrideReason(result.Action, err.Error()))
+		}
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
+		return
+	}
+
 	// The branches above match the shared ladder's reasons one-for-one. A
 	// reason none of them recognized means a gate was added to the ladder
 	// without a request-path branch — the ladder said to block, so block:
@@ -577,6 +615,11 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.handleCutoverCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "cutover started"})
+	case action.Freeze:
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
+			h.handleFreezeApproveCommand(repo, pr, installationID, requestedBy, result)
+		})
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "freeze approve started"})
 	case action.SkipRevert:
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleSkipRevertCommand(repo, pr, installationID, requestedBy, result)
@@ -626,7 +669,9 @@ func (h *Handler) fansOutUnscopedCommand(repo string) bool {
 //     lives in exactly one deployment's storage — non-owners silently skip the
 //     lookup miss (see silentOnUnscopedFanOut) and only the owner acts;
 //   - rollback-confirm routes by the pinned pending rollback plan for the
-//     PR/environment, held only by the deployment that posted the plan.
+//     PR/environment, held only by the deployment that posted the plan;
+//   - freeze approve routes by the override request identifier, which lives
+//     in exactly one deployment's storage; the others skip the lookup miss.
 //
 // An action outside the set requires an explicit -t until a single-owner
 // discriminator is established for it.
@@ -635,7 +680,8 @@ func actionFansOutUnscoped(a string) bool {
 	case action.Plan, action.Apply, action.ApplyConfirm, action.Unlock,
 		action.Rollback, action.RollbackConfirm,
 		action.Stop, action.Cancel, action.Start, action.Release,
-		action.Cutover, action.SkipRevert, action.Revert:
+		action.Cutover, action.SkipRevert, action.Revert,
+		action.Freeze:
 		return true
 	default:
 		return false
@@ -673,26 +719,51 @@ func unscopedCommandFansOut(result CommandResult) bool {
 // failure would leave the record claiming they were shown something they never
 // saw.
 func (h *Handler) postCommentReportingError(repo string, pr int, installationID int64, body string) error {
+	_, err := h.postCommentReportingID(repo, pr, installationID, body)
+	return err
+}
+
+// postCommentReportingID is postCommentReportingError for a caller that may
+// edit the comment later, so it also returns the posted comment's ID.
+func (h *Handler) postCommentReportingID(repo string, pr int, installationID int64, body string) (int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
-		return fmt.Errorf("create GitHub client to comment on %s#%d: %w", repo, pr, err)
+		return 0, fmt.Errorf("create GitHub client to comment on %s#%d: %w", repo, pr, err)
 	}
 
-	if _, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, "", body)); err != nil {
-		return fmt.Errorf("post comment on %s#%d: %w", repo, pr, err)
+	commentID, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, "", body))
+	if err != nil {
+		return 0, fmt.Errorf("post comment on %s#%d: %w", repo, pr, err)
 	}
-	return nil
+	return commentID, nil
 }
 
-// postComment posts a comment on a PR, best effort.
+// postComment posts a comment on a PR, best effort. On a listen-only
+// repository the GitHub client refuses the write by design, so that refusal
+// is logged at Info rather than as a failure; the GitHub request metric also
+// counts it as suppressed.
 func (h *Handler) postComment(repo string, pr int, installationID int64, body string) {
-	if err := h.postCommentReportingError(repo, pr, installationID, body); err != nil {
+	h.postCommentBestEffortID(repo, pr, installationID, body)
+}
+
+// postCommentBestEffortID is postComment for a caller that may edit the comment
+// later. It returns the posted comment's ID, or zero when the post did not
+// land, which the caller treats as nothing to edit.
+func (h *Handler) postCommentBestEffortID(repo string, pr int, installationID int64, body string) int64 {
+	commentID, err := h.postCommentReportingID(repo, pr, installationID, body)
+	switch {
+	case err == nil:
+	case errors.Is(err, ghclient.ErrListenOnlyRepository):
+		h.logger.Info("comment not posted: repository is listen-only",
+			"repo", repo, "pr", pr, "installation_id", installationID)
+	default:
 		h.logger.Error("failed to post comment",
 			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)
 	}
+	return commentID
 }
 
 // postAndTrackComment creates a PR comment and stores its ID in apply_comments.
@@ -1032,9 +1103,18 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 	}
 	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" {
-		h.logger.Info("durable issue_comment delivery ignored because the comment author is a bot",
-			"delivery_id", event.DeliveryID, "repo", event.Repository, "pr", event.PullRequest)
-		return false, nil
+		admitted, err := h.durableCommandAppAdmission(event, &payload)
+		if err != nil {
+			h.logger.Warn("durable issue_comment delivery from a command App will be retried because this deployment cannot yet rule out a self-comment",
+				"delivery_id", event.DeliveryID, "repo", event.Repository, "pr", event.PullRequest,
+				"author", payload.Comment.User.Login, "error", err)
+			return true, fmt.Errorf("durable issue_comment delivery %s: %w", event.DeliveryID, err)
+		}
+		if !admitted {
+			h.logger.Info("durable issue_comment delivery ignored because the comment author is a bot",
+				"delivery_id", event.DeliveryID, "repo", event.Repository, "pr", event.PullRequest)
+			return false, nil
+		}
 	}
 
 	installationID, err := durableInstallationID(event)
@@ -1069,6 +1149,7 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 	parser := NewCommandParser()
 	result := parser.ParseCommand(payload.Comment.Body)
 	result.CommentID = payload.Comment.ID
+	result.RequestedAt = payload.Comment.CreatedAt
 	result.DeliveryID = event.DeliveryID
 	result.SuppressRetryComments = true
 	// The two drop paths below can swallow a command the user already saw

@@ -34,6 +34,10 @@ type ShardedApplyData struct {
 	StartedAt   string
 	CompletedAt string
 
+	// StoppedByFreeze names the freeze that stopped the apply, nil when an
+	// operator stopped it or it is not stopped.
+	StoppedByFreeze *apitypes.FreezeStopRef
+
 	// ErrorMessage is the failure cause to surface when the apply failed
 	// without any shard in a failure state: the apply-level error when the
 	// apply row carries one, otherwise a failed finalizer's operation-scoped
@@ -135,6 +139,11 @@ type ShardedTableStatus struct {
 	// shards attached so far. Zero when the plan does not record it.
 	PlannedShards int
 
+	// CopiesNoRows is true when the table's change copies no rows
+	// (presentation.ChangeCopiesRows), so a running table reads as applying
+	// rather than as copying rows.
+	CopiesNoRows bool
+
 	// Shards is the per-shard state (and percent while copying) in resolved
 	// order, rendered as the compact one-line summary while the table is in
 	// flight.
@@ -155,6 +164,11 @@ type ShardStatus struct {
 	// failure it names is EndedBy's.
 	StoppedAtCutover bool
 	EndedBy          string
+	// Landed is true once every table change the shard runs has landed.
+	// State names only the shard's most attention-worthy operation, which
+	// can be a landed one while another table's change on the shard is
+	// still queued.
+	Landed bool
 }
 
 // ShardCell is one (shard, table) operation: the statements that table runs
@@ -343,7 +357,30 @@ func writeShardedStatusLine(sb *strings.Builder, data ShardedApplyData) {
 	if data.Rollback {
 		verb = "rolled back"
 	}
-	fmt.Fprintf(sb, "\n**Status**: %s — %d of %d %s %s\n", word, applied, total, noun, verb)
+	fmt.Fprintf(sb, "\n**Status**: %s — %d of %d %s %s%s\n", word, applied, total, noun, verb, shardsLandedSuffix(data))
+}
+
+// shardsLandedSuffix qualifies the status line while the apply's changes have
+// landed on some shards but not all: a change counts only once it has landed
+// on every shard, so without it an apply most of the way through would read as
+// not started. Rolled back applies and applies with only one shard need none.
+func shardsLandedSuffix(data ShardedApplyData) string {
+	if data.Rollback {
+		return ""
+	}
+	landed, total := 0, 0
+	for _, ks := range data.Keyspaces {
+		for _, sh := range ks.Shards {
+			total++
+			if sh.Landed {
+				landed++
+			}
+		}
+	}
+	if total < 2 || landed == 0 || landed == total {
+		return ""
+	}
+	return fmt.Sprintf(" (done on %d of %d shards)", landed, total)
 }
 
 // shardedChangeFraction counts the apply's changes and how many have landed. A
@@ -600,6 +637,9 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, budget *dd
 		writeShardedTablePhaseProgress(sb, t, writeDDL)
 	default:
 		phrase := shardedTableStatusPhrase(status)
+		if status == state.Task.Running && t.CopiesNoRows {
+			phrase = "🔄 Applying"
+		}
 		if landed := landedShardCount(t.Shards); landed > 0 && landed < len(t.Shards) && !presentation.ListsParts(status) {
 			if status == state.Task.Cancelled {
 				// The pure-cancelled parenthetical ("not started") would be false
@@ -615,7 +655,7 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, budget *dd
 		sb.WriteString(line + "\n")
 		writeDDL()
 	}
-	renderShardSummary(sb, TableProgressData{TableName: t.Table, Status: t.Status, Shards: t.Shards}, budget)
+	renderShardSummary(sb, TableProgressData{TableName: t.Table, Status: t.Status, Shards: t.Shards}, presentation.RunningWord(!t.CopiesNoRows), budget)
 }
 
 // keepsShardedProgressBar reports whether a sharded table past its row copy
@@ -650,45 +690,38 @@ func writeShardedTablePhaseProgress(sb *strings.Builder, t ShardedTableStatus, w
 	writeShardedRowsAndETA(sb, t)
 }
 
-// writeShardedTableCopyProgress renders an actively copying table's live
-// figures, mirroring the single-deployment row-copy idiom: a percent bar from
-// the summed shard rows plus the rows/ETA line. The same honesty guards apply —
-// a copy that has not reported rows yet shows a starting indicator instead of a
-// stuck-looking 0% bar, and a copy past its estimated total shows finalizing
-// instead of a bar pinned at 100%. While some shards have yet to report (later
-// dispatch waves), the figures describe only the reporting shards, so both the
-// headline and the rows line name the coverage and the ETA renders as a floor —
-// nothing claims to describe shards that have not started.
+// writeShardedTableCopyProgress renders an actively copying table the way
+// every surface reads a table in flight (presentation.ReadInFlightTable),
+// from the rows summed across its shards. While some shards have yet to
+// report (later dispatch waves), the figures describe only the reporting
+// shards, so the headline and the rows line name the coverage and the ETA
+// renders as a floor; nothing claims to describe shards that have not started.
 func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus, writeDDL func()) {
-	if ui.EstimateExceeded(t.RowsCopied, t.RowsTotal) {
-		fmt.Fprintf(sb, "**%s**: %s Finalizing copy%s\n", inlineCode(t.Table), ui.ProgressBarActivity(), shardedCopyCoverageSuffix(t))
-		writeDDL()
-		fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(t.RowsCopied))
-		fmt.Fprintf(sb, "- %s _%s_\n", glyph.Info, ui.EstimateExceededTooltip)
-		return
-	}
-	pct := ui.RowCopyDisplayPercent(int(ui.ClampRows(t.RowsCopied, t.RowsTotal)*100/t.RowsTotal), t.RowsCopied)
-	if pct == 0 {
-		fmt.Fprintf(sb, "**%s**: ⏳ Starting copy...\n", inlineCode(t.Table))
-		writeDDL()
-		writeShardedRowsAndETA(sb, t)
-		return
-	}
-	fmt.Fprintf(sb, "**%s**: %s %d%%%s\n", inlineCode(t.Table), ui.ProgressBarRowCopy(pct), pct, shardedCopyCoverageSuffix(t))
+	r := presentation.ReadInFlightTable(shardedTableFacts(t))
+	fmt.Fprintf(sb, "**%s**: %s\n", inlineCode(t.Table), r.Headline())
 	writeDDL()
-	writeShardedRowsAndETA(sb, t)
+	writeTableDetails(sb, r.Details)
 }
 
-// shardedCopyCoverageSuffix qualifies a copying table's headline while later
-// dispatch waves have yet to report: the fraction behind the bar covers only
-// the reporting shards, so the headline says so — "62% (1 of 4 shards)" —
-// instead of passing a wave's fraction off as the whole table's. With every
-// shard reporting the figures are the table's and no qualifier is needed.
-func shardedCopyCoverageSuffix(t ShardedTableStatus) string {
-	if t.ShardsReporting >= t.shardTotal() {
-		return ""
+// shardedTableFacts is what the sharded comment knows about a copying table,
+// in the form every surface reads it from. A table whose row figures cover
+// only the shards that have reported says how many.
+func shardedTableFacts(t ShardedTableStatus) presentation.TableFacts {
+	f := presentation.TableFacts{
+		Status:         state.Task.Running,
+		RowsCopied:     t.RowsCopied,
+		RowsTotal:      t.RowsTotal,
+		ETASeconds:     t.ETASeconds,
+		EstimatedBytes: t.EstimatedBytes,
+		PlannedShards:  t.PlannedShards,
 	}
-	return fmt.Sprintf(" (%s)", shardCoveragePhrase(t.ShardsReporting, t.shardTotal()))
+	if t.RowsTotal > 0 {
+		f.PercentComplete = int(ui.ClampRows(t.RowsCopied, t.RowsTotal) * 100 / t.RowsTotal)
+	}
+	if t.ShardsReporting < t.shardTotal() {
+		f.ShardsReporting, f.ShardsTotal = t.ShardsReporting, t.shardTotal()
+	}
+	return f
 }
 
 // shardTotal is how many shards the table's copy spans: the plan's count, or
@@ -700,26 +733,12 @@ func (t ShardedTableStatus) shardTotal() int {
 	return max(len(t.Shards), t.PlannedShards)
 }
 
-// writeShardedRowsAndETA writes the copying table's rows/ETA line. With every
-// shard reporting it matches the single-deployment line. While later waves
-// have yet to start, the summed totals cover only the reporting shards and the
-// slowest-reporting-shard ETA is a floor, so the line says both: it names the
-// coverage and renders the ETA as "≥" — the remaining shards can only add
-// rows and time.
+// writeShardedRowsAndETA writes the table's rows line (presentation.RowsLine).
+// With every shard reporting it matches the single-deployment line. While
+// later waves have yet to start, it names the coverage and renders the ETA as
+// "≥", since the remaining shards can only add rows and time.
 func writeShardedRowsAndETA(sb *strings.Builder, t ShardedTableStatus) {
-	if t.ShardsReporting >= t.shardTotal() {
-		writeRowsAndETA(sb, TableProgressData{TableName: t.Table, RowsCopied: t.RowsCopied, RowsTotal: t.RowsTotal, ETASeconds: t.ETASeconds, EstimatedBytes: t.EstimatedBytes})
-		return
-	}
-	line := fmt.Sprintf("- Rows: %s / %s across %d of %d shards",
-		ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)),
-		ui.FormatNumber(t.RowsTotal),
-		t.ShardsReporting, t.shardTotal())
-	line += ui.FormatShardedTableSizeClause(t.EstimatedBytes, t.PlannedShards)
-	if t.ETASeconds > 0 {
-		line += fmt.Sprintf(" · ETA: ≥ %s", ui.FormatETA(t.ETASeconds))
-	}
-	sb.WriteString(line + "\n")
+	sb.WriteString("- " + presentation.RowsLine(shardedTableFacts(t)) + "\n")
 }
 
 // shardedTableStatusPhrase maps a table's aggregate task state to its display
@@ -775,11 +794,7 @@ func writeShardedMetadata(sb *strings.Builder, data ShardedApplyData, renderedAt
 		fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID),
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
-	attributionAt := renderedAt
-	if data.RequestedBy == "" {
-		attributionAt = startedAtDisplay(data.StartedAt, renderedAt)
-	}
-	writeAppliedByOrTimestampAt(sb, data.RequestedBy, attributionAt)
+	writeAppliedByOrTimestampAt(sb, data.RequestedBy, startedAtDisplay(data.StartedAt, renderedAt))
 }
 
 // groupShardsBySignature buckets shards whose change set is identical. The
@@ -945,11 +960,12 @@ func shardStatusCell(s ShardStatus) string {
 func writeShardedFooter(sb *strings.Builder, data ShardedApplyData) {
 	switch {
 	case state.IsState(data.State, state.Apply.Failed):
-		writeFooterAction(sb, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+		writeFooterAction(sb, "To retry:", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case state.IsState(data.State, state.Apply.FailedRetryable):
-		writeFooterAction(sb, "An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:", appendTenantFlag(fmt.Sprintf("schemabot stop %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeFooterAction(sb, "An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:", AppendTenantFlag(fmt.Sprintf("schemabot stop %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.IsState(data.State, state.Apply.Stopped):
-		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeStoppedByFreeze(sb, data.StoppedByFreeze)
+		writeFooterAction(sb, "Paused — to resume from where it stopped:", AppendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.IsState(data.State, state.Apply.Cancelled):
 		sb.WriteString("\n---\n\nThis schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.\n")
 	}

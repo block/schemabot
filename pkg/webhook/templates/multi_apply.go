@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
@@ -27,6 +28,10 @@ type MultiDeploymentApplyData struct {
 	// header and used to format the next-action commands. Always set: every
 	// apply is created with a server-generated identifier.
 	ApplyID string
+
+	// StoppedByFreeze names the freeze that stopped the apply, nil when an
+	// operator stopped it or it is not stopped.
+	StoppedByFreeze *apitypes.FreezeStopRef
 
 	// Environment is the rollout environment, shown in the header and used to
 	// format the next-action commands. Always set: a non-empty environment is
@@ -307,11 +312,7 @@ func writeAggregateMetadata(sb *strings.Builder, data MultiDeploymentApplyData, 
 		fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID),
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
-	attributionAt := renderedAt
-	if data.RequestedBy == "" {
-		attributionAt = startedAtDisplay(data.StartedAt, renderedAt)
-	}
-	writeAppliedByOrTimestampAt(sb, data.RequestedBy, attributionAt)
+	writeAppliedByOrTimestampAt(sb, data.RequestedBy, startedAtDisplay(data.StartedAt, renderedAt))
 }
 
 // writeDeploymentCounts writes the per-status histogram so an operator sees
@@ -407,6 +408,7 @@ func rolloutMemberNoun(groups []presentation.Group) presentation.Noun {
 // a failure on an apply that is still active is offered stop first, since a
 // new apply is refused until this one settles.
 func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
+	writeStoppedByFreeze(sb, data.StoppedByFreeze)
 	footer := rolloutFooterData(data)
 	footerStart := sb.Len()
 	actionPending := data.Model.NextAction.Kind != presentation.NextActionNone
@@ -418,7 +420,7 @@ func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
 	paused := state.IsState(data.Model.State, state.Apply.Paused)
 	if paused {
 		writeRolloutFooterAction(sb, footerStart, "Paused after a failure — to let the held deployments proceed:",
-			appendTenantFlag(fmt.Sprintf("schemabot release %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+			AppendTenantFlag(fmt.Sprintf("schemabot release %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	}
 	if !actionPending && !paused {
 		// The single-deployment footer already writes stop under every
@@ -431,8 +433,9 @@ func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
 	if !data.Model.OffersRolloutStop() {
 		return
 	}
-	label, command := rolloutStopAction(footer)
-	writeRolloutFooterAction(sb, footerStart, label, command)
+	if label, command, ok := rolloutStopAction(footer); ok {
+		writeRolloutFooterAction(sb, footerStart, label, command)
+	}
 	if data.Model.RetryWaitsOnActiveApply() {
 		fmt.Fprintf(sb, "\n%s\n", presentation.RetryOnceSettledNote)
 	}
@@ -450,14 +453,20 @@ func writeRolloutFooterAction(sb *strings.Builder, footerStart int, label, comma
 }
 
 // rolloutStopAction is the label and command that stop the whole apply, or
-// cancel it on an engine whose control command is cancel.
-func rolloutStopAction(footer ApplyStatusCommentData) (string, string) {
+// cancel it on an engine whose control command is cancel. ok is false where
+// the engine can end none of the work in flight, so no command is offered.
+func rolloutStopAction(footer ApplyStatusCommentData) (string, string, bool) {
 	command := stopOrCancelCommand(footer)
-	label := "To stop this schema change:"
-	if command == "cancel" {
+	var label string
+	switch command {
+	case presentation.StopCommandStop:
+		label = "To stop this schema change:"
+	case presentation.StopCommandCancel:
 		label = "To cancel this schema change:"
+	default:
+		return "", "", false
 	}
-	return label, appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, footer.ApplyID, footer.Environment), footer.Tenant)
+	return label, AppendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, footer.ApplyID, footer.Environment), footer.Tenant), true
 }
 
 // rolloutFooterData is the apply-wide comment data the rollout footer renders
@@ -501,9 +510,9 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 		}
 		writeFooterAction(sb,
 			fmt.Sprintf("To run the cutover for %s:", inlineCode(na.Name)),
-			appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+			AppendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case presentation.NextActionResume:
-		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeFooterAction(sb, "Paused — to resume from where it stopped:", AppendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case presentation.NextActionReviewFailure:
 		// revert applies only to a deployment still in its post-cutover revert
 		// window, not to a failure; the recovery path for a failed apply is a
@@ -511,7 +520,7 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 		// is terminal a new apply is refused, so writeRolloutFooter offers
 		// stop instead.
 		if data.Model.OffersRetry() {
-			writeFooterAction(sb, presentation.RetryLabel+":", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+			writeFooterAction(sb, presentation.RetryLabel+":", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 		}
 	case presentation.NextActionNone:
 		// No operator action is pending; nothing to render.

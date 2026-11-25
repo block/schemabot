@@ -234,6 +234,58 @@ func TestStatusPageWalkKeepsFilters(t *testing.T) {
 	assertListedOnce(t, want, seen)
 }
 
+// walkHistory requests the first page of a database's history, then each next
+// page after the last apply of the one before, until the history ends. It
+// returns how many times each apply was listed.
+func (s *pagingServer) walkHistory(t *testing.T, database string, query url.Values) (map[string]int, []apitypes.DatabaseHistoryResponse) {
+	t.Helper()
+	seen := map[string]int{}
+	var pages []apitypes.DatabaseHistoryResponse
+	for page := 0; ; page++ {
+		require.Less(t, page, 100, "the walk must end")
+		var resp apitypes.DatabaseHistoryResponse
+		s.get(t, "/api/history/"+database, query, &resp)
+		pages = append(pages, resp)
+		for _, apply := range resp.Applies {
+			seen[apply.ApplyID]++
+		}
+		if !resp.HasMore {
+			return seen, pages
+		}
+		require.NotEmpty(t, resp.Applies, "a truncated page lists applies")
+		query.Set("starting_after", resp.Applies[len(resp.Applies)-1].ApplyID)
+	}
+}
+
+// An operator reads the history of one database a page at a time. Every apply
+// of that database in the requested environment is listed exactly once, newest
+// first, and the applies of other databases and environments never appear.
+func TestHistoryPageWalkListsEveryApplyOfTheDatabaseOnce(t *testing.T) {
+	server := newPagingServer(t)
+	server.seedStatusFleet(t, 300)
+
+	var everything apitypes.StatusResponse
+	server.get(t, "/api/status", url.Values{"environment": {"staging"}, "database": {"fleet_orders"}, "limit": {fmt.Sprint(maxStatusLimit)}}, &everything)
+	require.False(t, everything.HasMore)
+	want := map[string]bool{}
+	for _, apply := range everything.Applies {
+		want[apply.ApplyID] = true
+	}
+	require.Greater(t, len(want), 30)
+
+	seen, pages := server.walkHistory(t, "fleet_orders", url.Values{"environment": {"staging"}, "limit": {"30"}})
+	assert.Greater(t, len(pages), 1)
+	assertListedOnce(t, want, seen)
+	for i, page := range pages {
+		assert.Equal(t, "fleet_orders", page.Database, "page %d", i)
+		assert.Equal(t, 30, page.Limit, "page %d", i)
+		for _, apply := range page.Applies {
+			assert.Equal(t, "staging", apply.Environment, "page %d lists %s", i, apply.ApplyID)
+		}
+	}
+	assert.Equal(t, everything.Applies[0].ApplyID, pages[0].Applies[0].ApplyID, "newest first")
+}
+
 // createPagingPlan stores a plan for the plans page walk, created at the given
 // instant.
 func (s *pagingServer) createPagingPlan(t *testing.T, identifier, database string, createdAt time.Time) {

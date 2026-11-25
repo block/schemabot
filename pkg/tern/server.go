@@ -238,6 +238,21 @@ func pullSchemaErrorCode(err error) codes.Code {
 	return codes.Internal
 }
 
+func (s *Server) ResolveNamespaces(ctx context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error) {
+	resp, err := ResolveNamespacesWith(ctx, s.client, req)
+	if err != nil {
+		// UNIMPLEMENTED is left to mean a data plane that predates the RPC, so
+		// the control plane can tell an upgrade from an engine that has no
+		// answer: this data plane serves the RPC, and its engine declines.
+		code := codes.Internal
+		if errors.Is(err, ErrResolveNamespacesUnsupported) {
+			code = codes.FailedPrecondition
+		}
+		return nil, status.Error(code, err.Error())
+	}
+	return resp, nil
+}
+
 func (s *Server) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
 	resp, err := s.client.CompareSchemaFileChange(ctx, req)
 	if err != nil {
@@ -253,15 +268,31 @@ func (s *Server) CompareSchemaFileChange(ctx context.Context, req *ternv1.Compar
 func (s *Server) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
 	resp, err := s.client.Plan(ctx, req)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, s.planStatusError(ctx, req, err)
 	}
 	return resp, nil
+}
+
+// planStatusError maps a Plan or PlanDiff failure to its gRPC status. A plan
+// the engine refused is the schema files' or the target's to fix, not a fault
+// of this server, so it is FailedPrecondition, which callers do not alert on,
+// and its message is the refusal's own text: the wraps this server added on
+// the way out can name addresses and are logged here instead. Any other
+// failure is Internal and carries the whole error.
+func (s *Server) planStatusError(ctx context.Context, req *ternv1.PlanRequest, err error) error {
+	refusal, ok := errors.AsType[*engine.PlanRefusedError](err)
+	if !ok {
+		return status.Error(codes.Internal, err.Error())
+	}
+	s.logger.WarnContext(ctx, "plan refused; the caller is answered with the refusal's text only",
+		"database", req.GetDatabase(), "environment", req.GetEnvironment(), "error", err)
+	return status.Error(codes.FailedPrecondition, refusal.Error())
 }
 
 func (s *Server) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
 	resp, err := s.client.PlanDiff(ctx, req)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, s.planStatusError(ctx, req, err)
 	}
 	return resp, nil
 }

@@ -335,7 +335,7 @@ func TestUnscopedApplyOnUnregisteredDatabase(t *testing.T) {
 // A -t-scoped command and a non-aggregate repo still surface the error.
 func TestUnscopedMultiEnvPlanOnUnregisteredDatabase(t *testing.T) {
 	barePlan := func(h *Handler, databaseName, tenant string) {
-		h.handleMultiEnvPlan("octocat/hello-world", 1, databaseName, tenant, 12345, "hubot", false, 0, true, 0, nil)
+		h.handleMultiEnvPlan("octocat/hello-world", 1, databaseName, tenant, 12345, "hubot", false, 0, true, 0, nil, prSchemaAdmission{})
 	}
 
 	t.Run("leader answers for a database it has not registered", func(t *testing.T) {
@@ -466,7 +466,7 @@ func newFleetLeader(t *testing.T, cfg *api.ServerConfig) fleetLeader {
 	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	installClient := ghclient.NewInstallationClient(client, logger)
 	installClient.SetConfigDirHints(cfg)
-	h := NewHandler(api.New(&emptyStorage{}, cfg, nil, logger), &fakeClientFactory{client: installClient}, nil, logger)
+	h := NewHandler(api.New(&emptyStorage{}, cfg, nil, logger), &fakeClientFactory{client: installClient}, nil, logger, WithInsecureSkipSignatureVerification())
 	t.Cleanup(func() { h.DrainInProcessWebhookWork(t.Context()) })
 	return fleetLeader{h: h, mux: mux, comments: comments, reactions: reactions, logs: logs}
 }
@@ -698,7 +698,7 @@ func TestNotifyUnmanagedDiscoveredConfigsOnEnvironmentScopedDeployment(t *testin
 // the leader may publish Database Not Found as the fleet-authoritative answer.
 func TestMultiEnvPlanDatabaseNotFoundParticipantDefersToLeader(t *testing.T) {
 	barePlan := func(h *Handler) {
-		h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "hubot", false, 0, true, 0, nil)
+		h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "hubot", false, 0, true, 0, nil, prSchemaAdmission{})
 	}
 
 	t.Run("participant stays silent", func(t *testing.T) {
@@ -1230,7 +1230,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 		case content := <-reactions:
 			assert.Equal(t, "eyes", content)
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for the acknowledgment reaction")
+			require.FailNow(t, "timed out waiting for the acknowledgment reaction")
 		}
 	})
 
@@ -1259,7 +1259,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 		case content := <-reactions:
 			assert.Equal(t, "eyes", content)
 		case <-time.After(2 * time.Second):
-			t.Fatal("the acknowledgment must fire from config discovery, before schema files load")
+			require.FailNow(t, "the acknowledgment must fire from config discovery, before schema files load")
 		}
 	})
 
@@ -1272,11 +1272,11 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 		serveSchemaConfigForDatabase(t, mux, "orders")
 		reactions := registerReactionRecorder(t, mux)
 
-		h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42, nil)
+		h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42, nil, prSchemaAdmission{})
 
 		select {
 		case <-reactions:
-			t.Fatal("a deployment that cannot resolve the database in its registry must not acknowledge")
+			require.FailNow(t, "a deployment that cannot resolve the database in its registry must not acknowledge")
 		case <-time.After(100 * time.Millisecond):
 		}
 	})
@@ -1292,7 +1292,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 		assert.Empty(t, comments, "the silent skip posts nothing")
 		select {
 		case <-reactions:
-			t.Fatal("a silently skipping deployment must not acknowledge the command")
+			require.FailNow(t, "a silently skipping deployment must not acknowledge the command")
 		case <-time.After(100 * time.Millisecond):
 		}
 	})
@@ -1311,7 +1311,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 					CommandResult{Action: action.ApplyConfirm, CommentID: 42})
 			},
 			"multi-env plan": func(h *Handler) {
-				h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42, nil)
+				h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42, nil, prSchemaAdmission{})
 			},
 		} {
 			t.Run(name, func(t *testing.T) {
@@ -1327,7 +1327,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 				case content := <-reactions:
 					assert.Equal(t, "eyes", content)
 				case <-time.After(2 * time.Second):
-					t.Fatal("the leader that answers must acknowledge the command")
+					require.FailNow(t, "the leader that answers must acknowledge the command")
 				}
 			})
 		}

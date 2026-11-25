@@ -51,6 +51,16 @@ func WriteUnsubmittedLockKept(database, dbType string, releaseErr error) {
 	fmt.Printf("   Nothing was submitted, so release it now: %s\n", cliname.Command("unlock", "-d", database, "-t", dbType))
 }
 
+// WriteUnsubmittedLockReleaseUnknown writes the message when the request to
+// release the lock a command took for a schema change it never submitted
+// failed after the server may have received it, so the lock may or may not
+// still be held. Unlock is right either way: it releases a lock that is still
+// held and reports that none is found otherwise.
+func WriteUnsubmittedLockReleaseUnknown(database, dbType string) {
+	fmt.Printf("🔒 Lock for %s (%s) may still be held: the release request failed, so its result is unknown.\n", database, dbType)
+	fmt.Printf("   Nothing was submitted. Release it if it is still held: %s\n", cliname.Command("unlock", "-d", database, "-t", dbType))
+}
+
 // WriteUnsubmittedLockAlreadyReleased writes the message when the lock a
 // command took for a schema change it never submitted was gone by the time the
 // command released it. Nothing is held, so no unlock command is offered.
@@ -66,6 +76,52 @@ func WriteUnsubmittedLockAlreadyReleased(database, dbType string) {
 func WriteUnsubmittedLockHeldByAnotherOwner(database, dbType string) {
 	fmt.Printf("🔒 Lock for %s (%s) is now held by another owner, so it was left in place.\n", database, dbType)
 	fmt.Printf("   Nothing was submitted and this command holds no lock. See who holds it: %s\n", cliname.Command("locks"))
+}
+
+// WriteLockInUse writes the message when a command's release of the lock it
+// took was refused because an apply that can still change runs under that
+// lock: another command of the same owner reused it, or the command's own
+// apply has not settled. The apply's identifier, state, and environment come
+// from the server, so their control runes are removed; the second line names
+// the command that watches the apply. A server that names no apply gets the
+// command that shows who holds the lock instead.
+func WriteLockInUse(database, dbType, applyID, applyState, environment string) {
+	if applyID == "" {
+		fmt.Printf("🔒 Lock kept for %s (%s): an apply still runs under it.\n", database, dbType)
+		fmt.Printf("   See who holds it: %s\n", cliname.Command("locks"))
+		return
+	}
+	applyID = ui.TerminalSafeLine(applyID)
+	fmt.Printf("🔒 Lock kept for %s (%s): apply %s (%s) runs under it.\n", database, dbType, applyID, ui.TerminalSafeLine(applyState))
+	fmt.Printf("   Watch that apply: %s\n", ProgressCommand(applyID, ui.TerminalSafeLine(environment)))
+}
+
+// WriteLockReplaced writes the message when the lock a command took was
+// released and taken again, possibly under the same owner, before the command
+// released it. The lock held now is not the command's, so it is left in place
+// and no unlock command is offered.
+func WriteLockReplaced(database, dbType string) {
+	fmt.Printf("🔒 Lock for %s (%s) was released and taken again since this command took it, so it was left in place.\n", database, dbType)
+	fmt.Printf("   This command released nothing. See who holds it: %s\n", cliname.Command("locks"))
+}
+
+// WriteLockHeldByAnotherOwner writes the message when --yield finds the lock
+// its apply ran under is now held by another owner. That lock is not this
+// command's, so it is left held and no unlock command is offered.
+func WriteLockHeldByAnotherOwner(database, dbType string) {
+	fmt.Printf("🔒 Lock for %s (%s) is now held by another owner, so it was left in place.\n", database, dbType)
+	fmt.Printf("   This command released nothing. See who holds it: %s\n", cliname.Command("locks"))
+}
+
+// WriteLockKeptWithoutID writes the message when a command keeps the lock it
+// would release because the server did not report which lock row it took.
+// Releasing by owner alone could remove a lock another command of the same
+// owner runs an apply under, so the operator is shown how to check and
+// release it themselves.
+func WriteLockKeptWithoutID(database, dbType string) {
+	fmt.Printf("🔒 Lock kept for %s (%s): the server did not say which lock this command took, so releasing it could remove a lock another command uses.\n", database, dbType)
+	fmt.Printf("   See who holds it: %s\n", cliname.Command("locks"))
+	fmt.Printf("   If no apply of yours runs under it, release it: %s\n", cliname.Command("unlock", "-d", database, "-t", dbType))
 }
 
 // WriteLockForceReleased writes the force release message. The previous owner

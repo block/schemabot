@@ -939,7 +939,7 @@ func (s *actorAuthLockStore) ReleaseIfPendingPlanID(_ context.Context, _, _, _, 
 	return true, nil
 }
 
-func (s *actorAuthLockStore) ReleaseByID(_ context.Context, _ int64, database, _, _, _ string) error {
+func (s *actorAuthLockStore) ReleaseByIDIfUnused(_ context.Context, _ int64, database, _, _, _ string) error {
 	if s.releaseErr != nil {
 		return s.releaseErr
 	}
@@ -1022,7 +1022,7 @@ func TestPlanForResolvedDatabaseAllowsDatabaseOperator(t *testing.T) {
 	assert.False(t, blocked)
 	select {
 	case body := <-comments:
-		t.Fatalf("no comment should be posted for an authorized operator, got %q", body)
+		require.FailNow(t, fmt.Sprintf("no comment should be posted for an authorized operator, got %q", body))
 	default:
 	}
 }
@@ -1298,7 +1298,7 @@ func TestHandleMultiEnvPlanBlocksUnauthorizedActorAfterDiscovery(t *testing.T) {
 	})
 	h := actorAuthStorageTestHandler(cfg, &emptyStorage{}, installClient)
 
-	h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "mona", false, 0, true, 0, nil)
+	h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "mona", false, 0, true, 0, nil, prSchemaAdmission{})
 
 	body := requireComment(t, comments, "unauthorized plan comment")
 	assert.Contains(t, body, "SchemaBot Command Not Authorized")

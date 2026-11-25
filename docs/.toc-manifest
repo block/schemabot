@@ -11,6 +11,7 @@ docs/check-runs.md
 docs/configuration.md
 docs/direct-execution.md
 docs/engines.md
+docs/freeze.md
 docs/github-app-setup.md
 docs/grpc-control-edge-cases.md
 docs/invariants.md

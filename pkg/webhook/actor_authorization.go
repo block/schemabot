@@ -224,6 +224,12 @@ func (h *Handler) authorizePRCommandActor(
 		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonMissingServerConfig}, fmt.Errorf("server config is unavailable")
 	}
 	config := h.service.Config()
+	// An App's authority is exactly its command_apps entries. It is decided
+	// before the opt-in check, so turning PR command authorization off never
+	// widens what an App may do, and human principals never apply to an App.
+	if isAppLogin(actor) {
+		return commandAppAuthorization(config, repo, database, actor), nil
+	}
 	// The feature is opt-in; disabled auth preserves existing PR command behavior.
 	if !config.PRCommandAuthorizationEnabled() {
 		return api.ActorAuthorizationResult{Allowed: true, Reason: api.ActorAuthReasonDisabled}, nil
@@ -362,6 +368,28 @@ func (h *Handler) authorizeConfiguredDatabaseActor(
 
 	// No configured user or team authorized this actor.
 	return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonNotAuthorized}, nil
+}
+
+// isAppLogin reports whether a GitHub login belongs to an App. GitHub reserves
+// the "[bot]" suffix for App bot accounts; a person's login cannot contain it.
+func isAppLogin(login string) bool {
+	return strings.HasSuffix(login, "[bot]")
+}
+
+// commandAppAuthorization authorizes an App to run a PR command for database:
+// only when the database lists it in command_apps and accepts repo.
+func commandAppAuthorization(config *api.ServerConfig, repo, database, login string) api.ActorAuthorizationResult {
+	if config.Database(database) == nil {
+		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonMissingDatabaseConfig}
+	}
+	if !config.IsCommandApp(repo, database, login) {
+		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonNotAuthorized}
+	}
+	return api.ActorAuthorizationResult{
+		Allowed:          true,
+		Reason:           api.ActorAuthReasonAllowedCommandApp,
+		MatchedPrincipal: login,
+	}
 }
 
 func actorInAnyTeam(ctx context.Context, client *ghclient.InstallationClient, teams []string, actor string) (bool, string, error) {

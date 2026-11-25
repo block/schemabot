@@ -391,6 +391,201 @@ func TestRunFollowLoopInterruptDuringFailedPollIsNotAFailure(t *testing.T) {
 	assert.Equal(t, 2, polls)
 }
 
+// heldLogServer answers its first answered requests with body and holds every
+// later one open without answering, as a server stuck on a slow read would.
+// Each held request is announced on the returned channel. A held request ends
+// only when the client abandons it or the test finishes.
+func heldLogServer(t *testing.T, answered int, body any) (endpoint string, held <-chan struct{}) {
+	t.Helper()
+	heldCh := make(chan struct{}, 4)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		n := requests
+		mu.Unlock()
+		if n <= answered {
+			w.Header().Set("Content-Type", "application/json")
+			assert.NoError(t, json.NewEncoder(w).Encode(body))
+			return
+		}
+		select {
+		case heldCh <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(server.Close)
+	// Cleanups run last-registered first, so held requests are released before
+	// the server waits for them to return.
+	t.Cleanup(func() { close(release) })
+	return server.URL, heldCh
+}
+
+// waitForHeldRequest waits for the server to hold a request, failing the test
+// if none arrives.
+func waitForHeldRequest(t *testing.T, held <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-held:
+	case <-time.After(followTestDeadline):
+		require.FailNow(t, "no log read reached the server")
+	}
+}
+
+// An operator who presses Ctrl-C while the tail's first read is still waiting
+// on the server ends the tail at once and normally: the read is abandoned
+// rather than awaited, no failure is reported, and the command exits with
+// status 0, as for any other interrupt of a tail.
+func TestFollowLogsInterruptDuringFirstReadEndsAtOnce(t *testing.T) {
+	follows := map[string]func(ctx context.Context, endpoint string) error{
+		"followLogs": func(ctx context.Context, endpoint string) error {
+			return followLogs(ctx, endpoint, "", "", "apply-a", client.LogScope{}, 10)
+		},
+		"followDeploymentLogs": func(ctx context.Context, endpoint string) error {
+			return followDeploymentLogs(ctx, endpoint, "apply-a", "region-a", client.LogScope{}, 10)
+		},
+	}
+	for name, follow := range follows {
+		t.Run(name, func(t *testing.T) {
+			endpoint, held := heldLogServer(t, 0, nil)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			var err error
+			returned := false
+			stderr := captureStderr(t, func() {
+				captureOutput(t, func() {
+					done := make(chan error, 1)
+					go func() { done <- follow(ctx, endpoint) }()
+					waitForHeldRequest(t, held)
+					cancel()
+					select {
+					case err = <-done:
+						returned = true
+					case <-time.After(followTestDeadline):
+					}
+				})
+			})
+
+			require.True(t, returned, "the tail kept waiting on its first read after the interrupt")
+			require.NoError(t, err)
+			assert.Equal(t, 0, ExitCodeFor(err))
+			assert.Empty(t, stderr, "an interrupted read is not reported as a failure")
+		})
+	}
+}
+
+// An operator who presses Ctrl-C while a poll is still waiting on the server
+// ends the tail at once and normally: the poll is abandoned rather than
+// awaited, and its cancelled read is not reported as a failed poll. Both
+// tails run through their production wiring, so each must hand the command
+// context to its later polls, not only to its first read.
+func TestFollowLogsInterruptDuringInFlightPollEndsAtOnce(t *testing.T) {
+	// The tails poll on defaultFollowPacing; shorten its interval so the
+	// held poll arrives at once. This test does not call t.Parallel, so
+	// parallel tests start only after the cleanup restores it.
+	saved := defaultFollowPacing
+	defaultFollowPacing = fastFollowPacing()
+	t.Cleanup(func() { defaultFollowPacing = saved })
+
+	follows := map[string]struct {
+		first  any
+		follow func(ctx context.Context, endpoint string) error
+	}{
+		"followLogs": {
+			first: apitypes.LogsResponse{ApplyID: "apply-a", Logs: []*apitypes.LogEntry{followLogEntry(1)}},
+			follow: func(ctx context.Context, endpoint string) error {
+				return followLogs(ctx, endpoint, "", "", "apply-a", client.LogScope{}, 10)
+			},
+		},
+		"followDeploymentLogs": {
+			first: apitypes.DeploymentLogsResponse{Sources: []*apitypes.DeploymentLogSource{deploymentFollowSource("target-a", "remote-1", 1)}},
+			follow: func(ctx context.Context, endpoint string) error {
+				return followDeploymentLogs(ctx, endpoint, "apply-a", "region-a", client.LogScope{}, 10)
+			},
+		},
+	}
+	for name, tc := range follows {
+		t.Run(name, func(t *testing.T) {
+			endpoint, held := heldLogServer(t, 1, tc.first)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			var err error
+			returned := false
+			var stdout string
+			stderr := captureStderr(t, func() {
+				stdout = captureOutput(t, func() {
+					done := make(chan error, 1)
+					go func() { done <- tc.follow(ctx, endpoint) }()
+					waitForHeldRequest(t, held)
+					cancel()
+					select {
+					case err = <-done:
+						returned = true
+					case <-time.After(followTestDeadline):
+					}
+				})
+			})
+
+			require.True(t, returned, "the tail kept waiting on its poll after the interrupt")
+			require.NoError(t, err)
+			assert.Empty(t, stderr, "an interrupted poll is not reported as a failure")
+			assert.Contains(t, stdout, "entry 1", "the first read was shown before the poll was held")
+		})
+	}
+}
+
+// An operator who presses Ctrl-C while a one-shot logs read is still waiting
+// on the server ends the command at once: the read is abandoned rather than
+// awaited, nothing is reported as a failure, and the command exits with the
+// interrupt status, since it never printed the logs it was asked for.
+func TestShowLogsInterruptDuringReadEndsAtOnce(t *testing.T) {
+	shows := map[string]func(ctx context.Context, endpoint string) error{
+		"showLogs": func(ctx context.Context, endpoint string) error {
+			return showLogs(ctx, endpoint, "", "", "apply-a", client.LogScope{}, 10, false)
+		},
+		"showDeploymentLogs": func(ctx context.Context, endpoint string) error {
+			return showDeploymentLogs(ctx, endpoint, "apply-a", "region-a", client.LogScope{}, 10, false)
+		},
+	}
+	for name, show := range shows {
+		t.Run(name, func(t *testing.T) {
+			endpoint, held := heldLogServer(t, 0, nil)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			var err error
+			returned := false
+			stderr := captureStderr(t, func() {
+				captureOutput(t, func() {
+					done := make(chan error, 1)
+					go func() { done <- show(ctx, endpoint) }()
+					waitForHeldRequest(t, held)
+					cancel()
+					select {
+					case err = <-done:
+						returned = true
+					case <-time.After(followTestDeadline):
+					}
+				})
+			})
+
+			require.True(t, returned, "the read kept waiting on the server after the interrupt")
+			require.ErrorIs(t, err, ErrSilent)
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Equal(t, ExitInterrupted, ExitCodeFor(err))
+			assert.Empty(t, stderr, "an interrupted read is not reported as a failure")
+		})
+	}
+}
+
 func deploymentFollowSource(target, externalID string, ids ...int64) *apitypes.DeploymentLogSource {
 	source := &apitypes.DeploymentLogSource{
 		ExternalID: externalID,
@@ -670,11 +865,11 @@ func TestShowDeploymentLogsDropsTerminalEscapes(t *testing.T) {
 
 	var err error
 	output := captureOutput(t, func() {
-		err = showDeploymentLogs(server.URL, "apply-a", "region-a", client.LogScope{}, 10, false)
+		err = showDeploymentLogs(t.Context(), server.URL, "apply-a", "region-a", client.LogScope{}, 10, false)
 	})
 	require.NoError(t, err)
 
-	timestamp := templates.ANSIDim + createdAt.Local().Format("15:04:05") + templates.ANSIReset
+	timestamp := templates.ANSIDim + createdAt.UTC().Format("2006-01-02 15:04:05 UTC") + templates.ANSIReset
 	cleaned := terminalAttackCleaned
 	assert.Equal(t,
 		templates.ANSIDim+"target-a"+cleaned+" / spirit"+cleaned+" (remote-1"+cleaned+")"+templates.ANSIReset+"\n"+
@@ -723,4 +918,23 @@ func TestFollowFailureWarningDropsTerminalEscapes(t *testing.T) {
 
 	require.NoError(t, err, "one failed poll is retried, not the end of the tail")
 	assert.Equal(t, "Warning: failed to fetch logs (attempt 1/10), retrying in 1ms: storage unavailable"+terminalAttackCleaned+" Warning: the apply was cancelled\n", warning)
+}
+
+// The logs command prints each entry's time in UTC with the zone named, the
+// same way the PR comment's log section does, whatever the local zone of the
+// machine running the CLI.
+func TestPrintLogsShowsUTCTimes(t *testing.T) {
+	pacific := time.FixedZone("PST", -8*60*60)
+	logs := []*client.LogEntry{{
+		CreatedAt: time.Date(2026, 3, 15, 10, 37, 40, 0, pacific),
+		Level:     "info",
+		Message:   "Remote task orders on shard 80-c0 changed state",
+		OldState:  "pending",
+		NewState:  "running",
+	}}
+
+	out := captureOutput(t, func() { printLogs(logs) })
+
+	assert.Contains(t, out, "2026-03-15 18:37:40 UTC")
+	assert.Contains(t, out, "Remote task orders on shard 80-c0 changed state [pending -> running]")
 }

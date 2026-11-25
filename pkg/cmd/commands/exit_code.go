@@ -23,13 +23,17 @@ const (
 	// ExitInterrupted says the operator ended the command before it reached its
 	// usual outcome: a watch was stopped by Ctrl-C, SIGTERM, or the interactive
 	// watcher's detach key while its apply carries on, a schema change was
-	// never submitted, a checks backfill or webhook redrive stopped part-way
-	// through its sweep, a storage apply stopped while it waited on its
-	// convergence, or an init setup was cancelled. It is the status a shell
+	// never submitted, a checks backfill stopped part-way through its sweep,
+	// a storage apply stopped while it waited on its convergence, or an init
+	// setup was cancelled. It is the status a shell
 	// reports for a process the interrupt signal ended, and the one the CLI
 	// exits with on a second signal, so a script sees one status for an
 	// interrupt however the command took it, and never mistakes it for the
 	// apply having failed or for it having completed.
+	//
+	// A log tail (`logs -f`) is the exception. Its only usual outcome is the
+	// operator stopping it, since it never ends on its own except by failing,
+	// so Ctrl-C is its normal end and it exits 0.
 	ExitInterrupted = 130
 )
 

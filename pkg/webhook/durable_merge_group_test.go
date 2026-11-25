@@ -49,7 +49,7 @@ func TestDurableMergeGroupWebhookQueuesAndAcks(t *testing.T) {
 		Repos: map[string]api.RepoConfig{"octocat/hello-world": {}},
 	}, nil, logger)
 	clientFactory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
-	h := NewHandler(service, clientFactory, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, clientFactory, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	req := buildMergeGroupWebhookRequest(t, "checks_requested", "mergesha123", nil)
 	req.Header.Set(headerDeliveryID, "delivery-mg-1")
@@ -72,7 +72,7 @@ func TestDurableMergeGroupWebhookQueuesAndAcks(t *testing.T) {
 
 	select {
 	case <-clientFactory.forInstallationStarted:
-		t.Fatal("durable request path should not create a GitHub client")
+		require.FailNow(t, "durable request path should not create a GitHub client")
 	default:
 	}
 }
@@ -83,7 +83,7 @@ func TestDurableMergeGroupWebhookCanonicalizesRepository(t *testing.T) {
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{"mixedcase/sample-repo": {}},
 	}, nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	req := buildMergeGroupWebhookRequest(t, "checks_requested", "MixedCaseSHA", nil)
 	body, err := io.ReadAll(req.Body)
@@ -110,7 +110,7 @@ func TestDurableMergeGroupWebhookDeduplicatesDelivery(t *testing.T) {
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{"octocat/hello-world": {}},
 	}, nil, logger)
-	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch(), WithInsecureSkipSignatureVerification())
 
 	for range 2 {
 		req := buildMergeGroupWebhookRequest(t, "checks_requested", "mergesha123", nil)
@@ -156,12 +156,12 @@ func TestDurableMergeGroupDriverPostsChecks(t *testing.T) {
 		assert.Equal(t, "mergesha123", c.HeadSHA)
 		assert.Equal(t, "success", c.Conclusion)
 	case <-time.After(durableWebhookTestDeadline):
-		t.Fatal("expected the driver to post a merge_group check")
+		require.FailNow(t, "expected the driver to post a merge_group check")
 	}
 	select {
 	case <-store.completed:
 	case <-time.After(durableWebhookTestDeadline):
-		t.Fatal("expected the delivery to be marked completed")
+		require.FailNow(t, "expected the delivery to be marked completed")
 	}
 	require.Empty(t, store.failed)
 }
@@ -180,12 +180,12 @@ func TestDurableMergeGroupDriverCompletesUnregisteredRepo(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected unregistered-repo merge_group delivery to be marked completed")
+		require.FailNow(t, "expected unregistered-repo merge_group delivery to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	select {
 	case <-factory.forInstallationStarted:
-		t.Fatal("unregistered repo must not create a GitHub client")
+		require.FailNow(t, "unregistered repo must not create a GitHub client")
 	default:
 	}
 	requireUnregisteredRepositoryCounted(t, reader, "merge_group", "checks_requested")
@@ -209,12 +209,12 @@ func TestDurableMergeGroupDriverParticipantStaysSilent(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected participant merge_group delivery to be marked completed")
+		require.FailNow(t, "expected participant merge_group delivery to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	select {
 	case <-factory.forInstallationStarted:
-		t.Fatal("participant must not create a GitHub client for a merge_group check")
+		require.FailNow(t, "participant must not create a GitHub client for a merge_group check")
 	default:
 	}
 }
@@ -236,7 +236,7 @@ func TestDurableMergeGroupDriverRetriesClientFailure(t *testing.T) {
 		require.True(t, failure.retryAfter.After(before), "retry must be scheduled in the future")
 		require.Contains(t, failure.errMsg, "installation token unavailable")
 	default:
-		t.Fatal("expected client failure to be marked failed")
+		require.FailNow(t, "expected client failure to be marked failed")
 	}
 	require.Empty(t, store.completed)
 }

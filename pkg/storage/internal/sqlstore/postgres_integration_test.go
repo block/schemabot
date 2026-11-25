@@ -86,6 +86,20 @@ func TestPostgresStorageParity(t *testing.T) {
 			return NewPostgres(h.db)
 		}, postgresLockWaiter(h.db))
 	})
+	t.Run("FreezeCreateWaitsForAnAdmissionWrite", func(t *testing.T) {
+		testFreezeCreateWaitsForAnAdmissionWrite(t, func(t *testing.T) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			return NewPostgres(h.db)
+		}, postgresLockWaiter(h.db))
+	})
+	t.Run("ReleaseByIDIfUnusedWaitsForApplyCreate", func(t *testing.T) {
+		testReleaseByIDIfUnusedWaitsForApplyCreate(t, func(t *testing.T) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			return NewPostgres(h.db)
+		}, postgresLockWaiter(h.db))
+	})
 	t.Run("StoppedApplyStartRacingItsTakeover", func(t *testing.T) {
 		testStoppedApplyStartRacingItsTakeover(t, func(t *testing.T) *Storage {
 			t.Helper()

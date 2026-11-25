@@ -76,8 +76,9 @@ const (
 
 // Handler processes GitHub webhook events.
 type Handler struct {
-	service   *api.Service
-	ghClients github.ClientSet
+	service         *api.Service
+	ghClients       github.ClientSet
+	prPlanDiscovery prPlanDiscoveryCache
 
 	// shardedPlans is the sharded plan cache every comment render this
 	// handler starts shares; see shardedPlanCache. Nil (a Handler built
@@ -133,6 +134,15 @@ type Handler struct {
 	// (single- and multi-App) unchanged.
 	repoWebhookSecret []byte
 
+	// insecureSkipSignatureVerification is the explicit opt-in to accept
+	// unsigned deliveries in single-App mode when no webhook secret is
+	// configured. Set by WithInsecureSkipSignatureVerification.
+	insecureSkipSignatureVerification bool
+
+	// unsignedDeliveryWarnOnce limits the "signature verification skipped"
+	// warning to one log line per Handler rather than one per delivery.
+	unsignedDeliveryWarnOnce sync.Once
+
 	durableWebhookDispatch      bool
 	durableWebhookDriverCount   int
 	durableWebhookPollInterval  time.Duration
@@ -154,6 +164,10 @@ type Handler struct {
 	// refusing to complete a delivery after lease loss) can be exercised
 	// deterministically. Production code never sets it.
 	durableWebhookProcessOverride func(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error)
+	// durableWebhookRetryJitterOverride is a test seam that replaces
+	// durableWebhookRetryJitter so the random spread on a retry wait is
+	// deterministic. Production code never sets it.
+	durableWebhookRetryJitterOverride func(limit time.Duration) time.Duration
 
 	// inProcessWebhookCount tracks the detached goSafe goroutines that
 	// non-durable event paths (issue_comment, participant_nudge, check_run,
@@ -194,6 +208,11 @@ type Handler struct {
 	checkSuiteRecovery      bool
 	checkSuiteRecoveryGrace time.Duration
 
+	// synchronizeQuietPeriod defers each durable synchronize delivery by this
+	// long after receipt, so a later push in the same burst supersedes it
+	// before it plans. Zero dispatches synchronize deliveries immediately.
+	synchronizeQuietPeriod time.Duration
+
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
 	priorEnvCheckRetryInterval time.Duration
@@ -211,6 +230,18 @@ func WithRepoWebhookSecret(secret []byte) HandlerOption {
 		if len(secret) > 0 {
 			h.repoWebhookSecret = secret
 		}
+	}
+}
+
+// WithInsecureSkipSignatureVerification states that this handler is meant to
+// accept unsigned deliveries when no webhook secret is configured. It is for
+// tests and local harnesses only; a deployment that receives deliveries from
+// GitHub must configure a webhook secret instead. Without a secret and without
+// this option, the handler still accepts unsigned deliveries today and logs a
+// warning, and a future release will refuse them.
+func WithInsecureSkipSignatureVerification() HandlerOption {
+	return func(h *Handler) {
+		h.insecureSkipSignatureVerification = true
 	}
 }
 
@@ -278,6 +309,28 @@ func WithWebhookReconcileScanBounds(maxPages int, lookback time.Duration) Handle
 func WithCheckSuiteRecovery() HandlerOption {
 	return func(h *Handler) {
 		h.checkSuiteRecovery = true
+	}
+}
+
+// DefaultSynchronizeQuietPeriod is the quiet period the server gives a
+// durable synchronize delivery when the operator does not set one. It is long
+// enough to cover the pushes of one stacked-branch rebase or a quick series of
+// fix-up commits, and short enough that a lone push is planned promptly.
+const DefaultSynchronizeQuietPeriod = 15 * time.Second
+
+// WithSynchronizeQuietPeriod defers every durable pull_request synchronize
+// delivery until the quiet period after its receipt has passed. A push that
+// follows within the window is in the inbox by the time the earlier delivery
+// is claimed, so the earlier delivery is superseded at claim time, once the
+// live PR confirms its head is no longer current, and only the newest head of
+// a burst is planned. Opened and reopened deliveries are never deferred. A
+// non-positive period is a no-op, leaving synchronize deliveries immediately
+// claimable. It takes effect only alongside WithDurableWebhookDispatch.
+func WithSynchronizeQuietPeriod(period time.Duration) HandlerOption {
+	return func(h *Handler) {
+		if period > 0 {
+			h.synchronizeQuietPeriod = period
+		}
 	}
 }
 
@@ -383,6 +436,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 
 		// A stop that withdraws a queued start leaves the apply stopped, so no
 		// drive runs to update the PR; tell it the start was withdrawn.
+		service.OnPRSchemaAdmission = h.admitPRSchemaDispatch
 		service.OnQueuedStartWithdrawn = h.reportQueuedStartWithdrawn
 
 		// Register the aggregate terminal-summary callback, invoked by the
@@ -669,6 +723,18 @@ func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Chec
 		return
 	}
 
+	var expected prPlanDiscoveryKey
+	if h.config().PRSchemaCapForRepo(a.Repository).Limit > 0 {
+		expected = h.prPlanDiscoveryKey(a.Repository, a.PullRequest, prInfo)
+	}
+	admission, err := h.admitPRSchemaBeforeQueue(context.Background(), a.Repository, a.PullRequest, a.InstallationID, expected)
+	if err != nil {
+		if !isPRSchemaRefusal(err) {
+			h.logger.Warn("could not verify PR database limit after apply", "repo", a.Repository, "pr", a.PullRequest, "error", err)
+		}
+		return
+	}
+
 	tenant := ""
 	if config := h.service.Config(); config != nil {
 		tenant = config.Tenant
@@ -681,7 +747,7 @@ func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Chec
 		// for an apply, not for a plan. The stored check state it writes is the
 		// whole point. It re-plans the one database the settled apply held the
 		// check for.
-		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, nil)
+		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, nil, admission)
 	})
 }
 
@@ -932,9 +998,10 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
 		display := resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops, nil)
 		view := h.shardedPlans.resolve(ctx, h.service.Storage(), apply, ops)
+		stoppedByFreeze := h.service.StoppedByFreeze(ctx, apply)
 		rejections := loadControlRejections(ctx, h.service.Storage(), h.logger, apply)
 		renderBody := func(apply *storage.Apply) string {
-			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, view, h.deploymentTenant(), h.cliName())
+			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, view, h.deploymentTenant(), h.cliName(), stoppedByFreeze)
 			return body + renderControlRejections(rejections, h.logger, apply, body)
 		}
 		summaryBody := summaryWithFailureLogs(ctx, h.service.Storage(), h.engineLogReader(), h.logger, apply, renderBody)
@@ -1243,8 +1310,18 @@ func (h *Handler) authenticateWebhook(r *http.Request, body []byte) (appName str
 	secret := h.webhookSecretsByApp[defaultAppName]
 	if len(secret) == 0 {
 		// No secret configured — preserve historical behaviour and skip
-		// signature verification entirely. Operators are nudged toward
-		// configuring a secret by serve.go's startup validation.
+		// signature verification entirely. The explicit opt-in skips silently;
+		// without it the handler warns once, since an embedder that built the
+		// handler with an unset secret is accepting forged deliveries.
+		if !h.insecureSkipSignatureVerification {
+			h.unsignedDeliveryWarnOnce.Do(func() {
+				h.logger.Warn("webhook signature verification is skipped because no webhook secret is configured; "+
+					"set the webhook secret or pass WithInsecureSkipSignatureVerification to the webhook handler, "+
+					"as a future release will refuse unsigned deliveries",
+					"delivery_id", r.Header.Get(headerDeliveryID),
+					"event", r.Header.Get("X-GitHub-Event"))
+			})
+		}
 		return defaultAppName, 0, "", true
 	}
 	if !verifyHMAC(signature, body, secret) {

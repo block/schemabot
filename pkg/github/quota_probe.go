@@ -2,8 +2,12 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,26 +50,65 @@ type QuotaProbe struct {
 	listTimeout       time.Duration
 	readTimeout       time.Duration
 	readConcurrency   int
-	listInstallations func(ctx context.Context) ([]int64, error)
+	listInstallations func(ctx context.Context) (quotaTargets, error)
 	readQuota         func(ctx context.Context, installationID int64) error
+	// reportTargets publishes each pass's targets, so an installation the
+	// probe is responsible for counts as unobserved while it has no fresh
+	// budget reading.
+	reportTargets func(quotaTargets)
+	// lastTargets is the last set of targets the probe listed. Only the
+	// probe's own pass touches it, and passes run one at a time.
+	lastTargets quotaTargets
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
 
-// NewQuotaProbe returns a probe over every installation of the App that c
-// authenticates as. Only a server configured with a GitHub App builds one, and
-// each replica runs its own, so the probe's reads grow with the replica count
-// while none of them spends the core budget.
+// quotaTargets is what one probe pass reads: the installations whose budget
+// the probe keeps observed, and how many configured repository owners had no
+// resolvable installation on this pass. An unresolved owner counts as an
+// unobserved installation, since a budget that serves configured repositories
+// is unknown rather than known to be fine.
+type quotaTargets struct {
+	installations []int64
+	unresolved    int
+}
+
+// NewQuotaProbe returns a probe over every active installation of the App that
+// c authenticates as. It is for a server whose config does not enumerate the
+// repositories it serves, so any installation may serve one. Only a server
+// configured with a GitHub App builds one, and each replica runs its own, so
+// the probe's reads grow with the replica count while none of them spends the
+// core budget.
 func (c *Client) NewQuotaProbe() *QuotaProbe {
+	return c.newQuotaProbe(c.listActiveInstallations)
+}
+
+// NewServingQuotaProbe returns a probe over the installations that serve the
+// configured repos, resolved each pass with one installation lookup per
+// repository owner. An installation of the App that serves none of them,
+// such as one on an account the server is not configured for, is not read, so
+// its untouched budget neither stands in for a serving installation running
+// low nor holds back a rollout gate.
+func (c *Client) NewServingQuotaProbe(repos []string) *QuotaProbe {
+	repos = slices.Clone(repos)
+	return c.newQuotaProbe(func(ctx context.Context) (quotaTargets, error) {
+		return c.servingInstallations(ctx, repos), nil
+	})
+}
+
+func (c *Client) newQuotaProbe(listInstallations func(ctx context.Context) (quotaTargets, error)) *QuotaProbe {
 	return &QuotaProbe{
 		logger:            c.logger,
 		interval:          QuotaProbeInterval,
 		listTimeout:       quotaListTimeout,
 		readTimeout:       quotaReadTimeout,
 		readConcurrency:   quotaReadConcurrency,
-		listInstallations: c.listActiveInstallations,
+		listInstallations: listInstallations,
+		reportTargets: func(targets quotaTargets) {
+			metrics.SetGitHubQuotaProbeTargets(c.appID, c.loadAppSlug(), targets.installations, targets.unresolved)
+		},
 		readQuota: func(ctx context.Context, installationID int64) error {
 			ic, err := c.forInstallation(ctx, installationID)
 			if err != nil {
@@ -77,6 +120,16 @@ func (c *Client) NewQuotaProbe() *QuotaProbe {
 			return nil
 		},
 	}
+}
+
+// MarkUnresolved records the App as having one unobserved installation until
+// its first pass resolves real targets, so the App exports a failing
+// unobserved count from the moment it is marked rather than no series at all.
+// Without it, a gate that aggregates across Apps could pass on the Apps that
+// have finished a pass while another's budget is still unknown. A first pass
+// that cannot list installations leaves the mark in place.
+func (p *QuotaProbe) MarkUnresolved() {
+	p.reportTargets(quotaTargets{unresolved: 1})
 }
 
 // Start reads every installation's budget now and then once per interval,
@@ -127,14 +180,24 @@ func (p *QuotaProbe) Stop() {
 // process: errors are logged, every request is bounded by a timeout, and a
 // panic is contained to the list or the one read that raised it (AV-5).
 func (p *QuotaProbe) probeOnce(ctx context.Context) {
-	ids, err := p.listContained(ctx)
+	targets, err := p.listContained(ctx)
 	if err != nil {
-		p.logger.Warn("GitHub quota probe could not list App installations; installation budgets will age out to unknown until a later pass succeeds",
+		p.logger.Warn("GitHub quota probe could not list App installations; counting the App's installation set as unobserved until a later pass lists it",
 			"error", err)
+		p.reportTargets(listFailedTargets(p.lastTargets))
 		return
 	}
+	p.lastTargets = targets
+	// Report the targets as soon as they are listed, so the gauge counts this
+	// pass's installations and unresolved owners while the reads run, and
+	// again once the reads are done: the App slug that labels the targets can
+	// be learned during the first pass's reads, and the targets must carry the
+	// same label as the snapshots those reads record.
+	p.reportTargets(targets)
+	defer p.reportTargets(targets)
+	ids := targets.installations
 	if len(ids) == 0 {
-		p.logger.Debug("GitHub quota probe found no active App installations")
+		p.logger.Debug("GitHub quota probe has no installations to read", "unresolved_owners", targets.unresolved)
 		return
 	}
 	slots := make(chan struct{}, p.readConcurrency)
@@ -154,22 +217,35 @@ func (p *QuotaProbe) probeOnce(ctx context.Context) {
 	}
 }
 
+// listFailedTargets is what a pass reports when it cannot list the App's
+// installations: the last listed installations, still observed while their
+// snapshots stay fresh, plus one unresolved. Webhook traffic keeps refreshing
+// the snapshots of installations already known, so without the unresolved
+// count an installation added since the last successful list would go
+// unseen and a quota gate could pass on a partial set.
+func listFailedTargets(last quotaTargets) quotaTargets {
+	return quotaTargets{
+		installations: last.installations,
+		unresolved:    last.unresolved + 1,
+	}
+}
+
 // listContained lists the App's installations under the list timeout,
 // converting a panic into an error so the pass ends instead of the process.
-func (p *QuotaProbe) listContained(ctx context.Context) ([]int64, error) {
+func (p *QuotaProbe) listContained(ctx context.Context) (quotaTargets, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.listTimeout)
 	defer cancel()
-	var ids []int64
+	var targets quotaTargets
 	recovered, err := panicsafe.Catch(func() error {
 		var listErr error
-		ids, listErr = p.listInstallations(ctx)
+		targets, listErr = p.listInstallations(ctx)
 		return listErr
 	})
 	if recovered != nil {
 		p.recordPanic(ctx, recovered, "list App installations")
-		return nil, recovered
+		return quotaTargets{}, recovered
 	}
-	return ids, err
+	return targets, err
 }
 
 // readInstallation reads one installation's budget under its own timeout. A
@@ -200,12 +276,88 @@ func (p *QuotaProbe) recordPanic(ctx context.Context, recovered *panicsafe.Error
 
 // listActiveInstallations lists the App's installations through the App JWT,
 // skipping suspended ones, which cannot mint the token a budget read needs.
-func (c *Client) listActiveInstallations(ctx context.Context) ([]int64, error) {
+func (c *Client) listActiveInstallations(ctx context.Context) (quotaTargets, error) {
 	appClient, err := c.jwtClient()
 	if err != nil {
-		return nil, fmt.Errorf("list installations: %w", err)
+		return quotaTargets{}, fmt.Errorf("list installations: %w", err)
 	}
-	return activeInstallationIDs(ctx, appClient, c.logger)
+	ids, err := activeInstallationIDs(ctx, appClient, c.logger)
+	if err != nil {
+		return quotaTargets{}, err
+	}
+	return quotaTargets{installations: ids}, nil
+}
+
+// servingInstallations resolves the installations serving repos, one owner at
+// a time, with a fresh lookup on every pass rather than the cached answer, so
+// an App that was uninstalled and reinstalled is followed to its new
+// installation within a pass instead of being probed under its retired id
+// until the server restarts. An owner-wide answer also refreshes the cache
+// webhook dispatch reads. The lookup uses the App JWT, which does not spend an
+// installation's budget, and costs one request per owner per pass, not one per
+// repository: the first repository's answer stands for the whole owner when
+// the installation belongs to the owner's account.
+//
+// A suspended installation is skipped like a repository the App is not
+// installed on, matching the all-installations listing: it cannot mint the
+// token a budget read needs, and it serves no SchemaBot work until the owner
+// unsuspends it, so its budget is not one a gate should wait on.
+//
+// A lookup that fails for any reason other than the App not being installed
+// counts the owner as unresolved and moves on, so GitHub being down fails
+// closed at one lookup per owner. Once the pass's deadline has passed, the
+// owners not yet resolved count as unresolved without a lookup. A repository
+// the App is not installed on has no budget to observe; the owner's other
+// repositories are still tried, as they are after an answer that stands only
+// for the repository asked about, since an installation limited to selected
+// repositories, or on another account, can cover some of them.
+func (c *Client) servingInstallations(ctx context.Context, repos []string) quotaTargets {
+	byOwner := make(map[string][]string)
+	for _, repo := range repos {
+		owner, _ := splitRepo(repo)
+		ownerKey := strings.ToLower(owner)
+		byOwner[ownerKey] = append(byOwner[ownerKey], repo)
+	}
+	owners := slices.Sorted(maps.Keys(byOwner))
+	var targets quotaTargets
+	seen := make(map[int64]bool)
+	for i, ownerKey := range owners {
+		if err := ctx.Err(); err != nil {
+			skipped := len(owners) - i
+			c.logger.Warn("GitHub quota probe ran out of time resolving installations; counting the remaining owners' budgets as unobserved",
+				"unresolved_owners", skipped, "error", err)
+			targets.unresolved += skipped
+			break
+		}
+		for _, repo := range byOwner[ownerKey] {
+			owner, name := splitRepo(repo)
+			lookup, err := c.lookUpRepoInstallation(ctx, repo, owner, name)
+			if errors.Is(err, ErrAppNotInstalled) {
+				c.logger.Warn("GitHub quota probe found a configured repository the App is not installed on; no installation serves it, so it has no budget to observe",
+					"repo", repo, "error", err)
+				continue
+			}
+			if err != nil {
+				c.logger.Warn("GitHub quota probe could not resolve the installation serving a configured repository; counting the owner's budget as unobserved",
+					"repo", repo, "owner", ownerKey, "error", err)
+				targets.unresolved++
+				break
+			}
+			if lookup.suspended {
+				c.logger.Warn("GitHub quota probe found a configured repository served by a suspended installation; it cannot mint the token a budget read needs and serves no requests until it is unsuspended, so it has no budget to observe",
+					"repo", repo, "installation_id", lookup.id)
+			} else if !seen[lookup.id] {
+				seen[lookup.id] = true
+				targets.installations = append(targets.installations, lookup.id)
+			}
+			if lookup.ownerWide {
+				break
+			}
+			c.logger.Debug("GitHub quota probe installation answers only the repository asked about; resolving the owner's other repositories",
+				"repo", repo, "installation_id", lookup.id)
+		}
+	}
+	return targets
 }
 
 func activeInstallationIDs(ctx context.Context, appClient *gh.Client, logger *slog.Logger) ([]int64, error) {

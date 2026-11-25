@@ -1,6 +1,7 @@
 package api
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -47,6 +48,8 @@ func (m *mockStorage) PlanComments() storage.PlanCommentStore       { return nil
 func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore { return nil }
 func (m *mockStorage) Checks() storage.CheckStore                   { return nil }
 func (m *mockStorage) Settings() storage.SettingsStore              { return nil }
+func (m *mockStorage) Freezes() storage.FreezeStore                 { return nil }
+func (m *mockStorage) FreezeOverrides() storage.FreezeOverrideStore { return nil }
 func (m *mockStorage) WebhookEvents() storage.WebhookEventStore     { return m.webhookEvents }
 func (m *mockStorage) DriverPools() storage.DriverPoolStore {
 	return &m.driverPools
@@ -193,6 +196,8 @@ type mockStorageWithApplyStores struct {
 	applyLogs  storage.ApplyLogStore
 	controls   storage.ControlRequestStore
 	operations storage.ApplyOperationStore
+	freezes    storage.FreezeStore
+	overrides  storage.FreezeOverrideStore
 }
 
 func (m *mockStorageWithApplyStores) Plans() storage.PlanStore         { return m.plans }
@@ -344,6 +349,23 @@ type staticApplyStore struct {
 	err     error
 }
 
+// GetInProgress returns the store's applies, as the SQL store returns the
+// applies not yet terminal.
+func (s *staticApplyStore) GetInProgress(context.Context) ([]*storage.Apply, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.apply != nil {
+		return append([]*storage.Apply{s.apply}, s.applies...), nil
+	}
+	return s.applies, nil
+}
+
+// GetUnsettled returns the store's applies, as GetInProgress does.
+func (s *staticApplyStore) GetUnsettled(ctx context.Context) ([]*storage.Apply, error) {
+	return s.GetInProgress(ctx)
+}
+
 func (s *staticApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
 	if s.err != nil {
 		return nil, s.err
@@ -430,6 +452,33 @@ func (s *staticApplyStore) GetByDatabase(_ context.Context, database, dbType, en
 		return nil, nil
 	}
 	return []*storage.Apply{s.apply}, nil
+}
+
+// GetRecent mirrors the SQL store's paging over the fixture rows: the rows
+// matching the database and environment byte-for-byte, below AfterID when it
+// is set, by row id descending, cut to the limit.
+func (s *staticApplyStore) GetRecent(_ context.Context, filter storage.RecentAppliesFilter) ([]*storage.Apply, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	var applies []*storage.Apply
+	for _, apply := range s.applies {
+		if filter.Database != "" && apply.Database != filter.Database {
+			continue
+		}
+		if filter.Environment != "" && apply.Environment != filter.Environment {
+			continue
+		}
+		if filter.AfterID > 0 && apply.ID >= filter.AfterID {
+			continue
+		}
+		applies = append(applies, apply)
+	}
+	slices.SortFunc(applies, func(a, b *storage.Apply) int { return cmp.Compare(b.ID, a.ID) })
+	if filter.Limit > 0 && len(applies) > filter.Limit {
+		applies = applies[:filter.Limit]
+	}
+	return applies, nil
 }
 
 // GetLatestByDatabase returns the first fixture row GetByDatabase matches;
@@ -1118,9 +1167,30 @@ type mockTernClient struct {
 	observerApplyID          int64
 	observer                 tern.ProgressObserver
 	isRemote                 bool
+	// resolveNamespacesMu guards resolveNamespacesReqs: a shared schema check
+	// resolves each peer's namespaces, possibly through one client.
+	resolveNamespacesMu   sync.Mutex
+	resolveNamespacesReqs []*ternv1.ResolveNamespacesRequest
+	// resolveNamespacesHook answers ResolveNamespaces. When nil, each
+	// namespace resolves to itself, the way an unpinned target resolves it.
+	resolveNamespacesHook func(context.Context, *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error)
 }
 
 func (m *mockTernClient) Health(ctx context.Context) error { return m.healthErr }
+func (m *mockTernClient) ResolveNamespaces(ctx context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error) {
+	m.resolveNamespacesMu.Lock()
+	m.resolveNamespacesReqs = append(m.resolveNamespacesReqs, req)
+	hook := m.resolveNamespacesHook
+	m.resolveNamespacesMu.Unlock()
+	if hook != nil {
+		return hook(ctx, req)
+	}
+	schemas := make(map[string]string, len(req.Namespaces))
+	for _, ns := range req.Namespaces {
+		schemas[ns] = ns
+	}
+	return &ternv1.ResolveNamespacesResponse{Schemas: schemas}, nil
+}
 func (m *mockTernClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
 	// A multi-target pull fans its members out concurrently, so several
 	// goroutines record through this one client.
@@ -4847,6 +4917,30 @@ func TestProgressByApplyIDAnswers503WhenEngineProgressFails(t *testing.T) {
 	assert.NotContains(t, w.Body.String(), connectionFragment)
 }
 
+func TestExecuteApplySchemaCapAllowsOnlyPinnedRollback(t *testing.T) {
+	plan := executeApplyTestPlan()
+	plan.Repository, plan.PullRequest = "org/repo", 42
+	applies := &capturingApplyStore{}
+	svc, _ := newQueueApplyTestService(plan, &mockTernClient{}, applies)
+	svc.config.Repos = map[string]RepoConfig{plan.Repository: {PRSchemaCap: &PRSchemaCapConfig{Limit: 5}}}
+	held := errors.New("closed pull request exceeds the schema cap")
+	svc.OnPRSchemaAdmission = func(context.Context, string, int, string) error { return held }
+
+	req := ApplyRequest{PlanID: plan.PlanIdentifier, Environment: plan.Environment, ExpectedLockOwner: "org/repo#42"}
+	for _, pin := range []string{"", plan.PlanIdentifier, storage.RollbackPendingPlanPrefix + "other-plan"} {
+		req.ExpectedPendingPlanID = pin
+		_, _, err := svc.ExecuteApply(t.Context(), req)
+		require.ErrorIs(t, err, held)
+		require.Nil(t, applies.apply)
+	}
+	req.ExpectedPendingPlanID = storage.RollbackPendingPlanPrefix + plan.PlanIdentifier
+	resp, _, err := svc.ExecuteApply(t.Context(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Accepted)
+	require.Equal(t, req.ExpectedPendingPlanID, applies.apply.ExpectedPendingPlanID)
+	require.Equal(t, req.ExpectedLockOwner, applies.apply.ExpectedLockOwner)
+}
+
 func TestExecuteApplyQueuesLocalApplyForOperator(t *testing.T) {
 	applies := &capturingApplyStore{}
 	mock := &mockTernClient{}
@@ -6267,22 +6361,24 @@ func TestHandleStatusFailedFilter(t *testing.T) {
 	assert.Equal(t, "duplicate column name 'status'", resp.Applies[0].ErrorMessage)
 }
 
-func TestParseStatusLimit(t *testing.T) {
+func TestParseApplyListLimit(t *testing.T) {
 	for _, tt := range []struct {
-		name      string
-		target    string
-		want      int
-		wantError bool
+		name         string
+		target       string
+		defaultLimit int
+		want         int
+		wantError    bool
 	}{
-		{name: "default", target: "/api/status", want: defaultStatusLimit},
-		{name: "custom", target: "/api/status?limit=50", want: 50},
-		{name: "clamped", target: "/api/status?limit=5000", want: maxStatusLimit},
-		{name: "zero", target: "/api/status?limit=0", wantError: true},
-		{name: "not a number", target: "/api/status?limit=lots", wantError: true},
+		{name: "status default", target: "/api/status", defaultLimit: defaultStatusLimit, want: defaultStatusLimit},
+		{name: "history default", target: "/api/history/orders", defaultLimit: defaultHistoryLimit, want: maxStatusLimit},
+		{name: "custom", target: "/api/status?limit=50", defaultLimit: defaultStatusLimit, want: 50},
+		{name: "clamped", target: "/api/status?limit=5000", defaultLimit: defaultStatusLimit, want: maxStatusLimit},
+		{name: "zero", target: "/api/status?limit=0", defaultLimit: defaultStatusLimit, wantError: true},
+		{name: "not a number", target: "/api/status?limit=lots", defaultLimit: defaultStatusLimit, wantError: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tt.target, nil)
-			got, err := parseStatusLimit(req)
+			got, err := parseApplyListLimit(req, tt.defaultLimit)
 			if tt.wantError {
 				require.Error(t, err)
 				return
@@ -7036,6 +7132,229 @@ func TestControlHandlersRejectClientDatabase(t *testing.T) {
 			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 			assert.Contains(t, w.Body.String(), "unknown field")
 			assert.Contains(t, w.Body.String(), "database")
+		})
+	}
+}
+
+// A request body holds exactly one JSON value. A body that carries a second
+// object or stray text after it is refused with nothing done: acting on the
+// first value alone would carry out a request other than the one the caller
+// sent. The same body without the trailing data reaches its work, so each probe
+// is shown to see the work it reports as absent.
+func TestRequestHandlersRefuseDataAfterTheJSONValue(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	routes := []struct {
+		name string
+		path string
+		body string
+		// serve builds the service the request is sent to and returns a probe
+		// that reports whether the request reached the work it asks for.
+		serve func(t *testing.T) (*Service, func() bool)
+	}{
+		{
+			name: "pull",
+			path: "/api/pull",
+			body: `{"database":"orders","environment":"production","type":"mysql"}`,
+			serve: func(t *testing.T) (*Service, func() bool) {
+				t.Helper()
+				client := &mockTernClient{pullSchemaResp: &ternv1.PullSchemaResponse{
+					Database: "orders", Type: storage.DatabaseTypeMySQL, Environment: "production",
+				}}
+				cfg := &ServerConfig{
+					Databases: map[string]DatabaseConfig{
+						"orders": {
+							Type:         storage.DatabaseTypeMySQL,
+							Environments: map[string]EnvironmentConfig{"production": {Target: "orders-production", Deployment: DefaultDeployment}},
+						},
+					},
+					TernDeployments: TernConfig{DefaultDeployment: {"production": "localhost:9090"}},
+				}
+				svc := New(&mockStorageWithApplyStores{plans: &staticPlanStore{}, applies: &staticApplyStore{}}, cfg,
+					map[string]tern.Client{DefaultDeployment + "/production": client}, logger)
+				return svc, func() bool { return client.pullSchemaReq != nil }
+			},
+		},
+		{
+			name: "plan",
+			path: "/api/plan",
+			body: `{"database":"payments","environment":"staging","type":"mysql","schema_files":{"payments":{"files":{"users.sql":"CREATE TABLE users (id bigint primary key)"}}}}`,
+			serve: func(t *testing.T) (*Service, func() bool) {
+				t.Helper()
+				client := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-trailing-data"}}
+				plans := &capturingPlanStore{}
+				cfg := &ServerConfig{
+					Databases: map[string]DatabaseConfig{
+						"payments": {
+							Type:         storage.DatabaseTypeMySQL,
+							Environments: map[string]EnvironmentConfig{"staging": {Target: "payments-staging-target", Deployment: DefaultDeployment}},
+						},
+					},
+					TernDeployments: TernConfig{DefaultDeployment: {"staging": "localhost:9090"}},
+				}
+				svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg,
+					map[string]tern.Client{DefaultDeployment + "/staging": client}, logger)
+				return svc, func() bool { return client.planReq != nil || plans.created != nil }
+			},
+		},
+		{
+			name: "apply",
+			path: "/api/apply",
+			body: `{"plan_id":"plan-1","environment":"staging"}`,
+			serve: func(t *testing.T) (*Service, func() bool) {
+				t.Helper()
+				applies := &capturingApplyStore{}
+				svc, _ := newExecuteApplyTestService(&mockTernClient{isRemote: true}, applies)
+				return svc, func() bool {
+					applies.mu.Lock()
+					defer applies.mu.Unlock()
+					return applies.apply != nil
+				}
+			},
+		},
+		{
+			name: "stop",
+			path: "/api/stop",
+			body: `{"apply_id":"apply-123","environment":"staging"}`,
+			serve: func(t *testing.T) (*Service, func() bool) {
+				t.Helper()
+				client := &mockTernClient{stopResp: &ternv1.StopResponse{Accepted: true, StoppedCount: 1}}
+				svc, stores := newControlTestServiceWithStores(client, activeTestApply("apply-123"), nil)
+				return svc, func() bool {
+					stores.controls.mu.Lock()
+					defer stores.controls.mu.Unlock()
+					return len(stores.controls.requests) > 0 || client.stopReq != nil
+				}
+			},
+		},
+		{
+			name: "rollback plan",
+			path: "/api/rollback/plan",
+			body: `{"apply_id":"apply_latest","environment":"staging"}`,
+			serve: func(t *testing.T) (*Service, func() bool) {
+				t.Helper()
+				now := time.Now().UTC()
+				plan := rollbackGuardrailPlan(10, true)
+				plan.Target = "orders"
+				apply := rollbackGuardrailApply("apply_latest", 1, 10, now)
+				apply.Deployment = DefaultDeployment
+				// Tern refuses the rollback plan, so the probe sees the request
+				// reach Tern without the handler going on to store a plan.
+				client := &mockTernClient{planErr: errors.New("tern is unavailable")}
+				svc := New(&mockStorageWithApplyStores{
+					plans:   &staticPlanStore{plansByID: map[int64]*storage.Plan{plan.ID: plan}},
+					applies: &staticApplyStore{applies: []*storage.Apply{apply}},
+					tasks:   &capturingTaskStore{tasks: []*storage.Task{rollbackGuardrailTask(1, 10, now)}},
+				}, testServerConfig(), map[string]tern.Client{DefaultDeployment + "/staging": client}, logger)
+				return svc, func() bool { return client.planReq != nil }
+			},
+		},
+	}
+
+	send := func(t *testing.T, svc *Service, path, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w
+	}
+
+	// More white space than the body limit allows, after a valid value.
+	pastTheLimit := strings.Repeat(" ", maxAPIRequestBodyBytes)
+
+	for _, route := range routes {
+		t.Run(route.name+" without trailing data reaches its work", func(t *testing.T) {
+			svc, reached := route.serve(t)
+			w := send(t, svc, route.path, route.body)
+
+			assert.NotEqual(t, http.StatusBadRequest, w.Code, w.Body.String())
+			assert.True(t, reached(), "the request reaches its work: %s", w.Body.String())
+		})
+
+		// A client that posts a file ending in a newline sends white space
+		// after the value, which is not data.
+		t.Run(route.name+" followed by a newline reaches its work", func(t *testing.T) {
+			svc, reached := route.serve(t)
+			w := send(t, svc, route.path, route.body+"\r\n\n")
+
+			assert.NotEqual(t, http.StatusBadRequest, w.Code, w.Body.String())
+			assert.True(t, reached(), "the request reaches its work: %s", w.Body.String())
+		})
+
+		t.Run(route.name+" followed by white space past the body limit answers 413", func(t *testing.T) {
+			svc, reached := route.serve(t)
+			w := send(t, svc, route.path, route.body+pastTheLimit)
+
+			assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+			assert.False(t, reached(), "nothing is done for a body over the limit")
+		})
+
+		trailing := map[string]string{
+			"a second object": route.body + `{"environment":"production"}`,
+			"stray text":      route.body + ` xx`,
+		}
+		for name, body := range trailing {
+			t.Run(route.name+" followed by "+name+" is refused", func(t *testing.T) {
+				svc, reached := route.serve(t)
+				w := send(t, svc, route.path, body)
+
+				assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+				var resp apitypes.ErrorResponse
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+				assert.Equal(t, "invalid request body: the body must hold one JSON value, but more data follows it", resp.Error)
+				assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
+				assert.False(t, reached(), "nothing is done for a body that was refused")
+			})
+		}
+	}
+}
+
+// Every control operation and both checks routes decode their body strictly,
+// so each is listed here rather than covered through one representative: a
+// route that decodes its own body would otherwise slip past. Trailing data is
+// refused before the route looks anything up, and the same body with a
+// trailing newline gets past the decode to the route's own answer.
+func TestEveryControlAndChecksRouteRefusesDataAfterTheJSONValue(t *testing.T) {
+	routes := map[string]string{
+		"/api/stop":              `{"apply_id":"apply-missing","environment":"staging"}`,
+		"/api/start":             `{"apply_id":"apply-missing","environment":"staging"}`,
+		"/api/cutover":           `{"apply_id":"apply-missing","environment":"staging"}`,
+		"/api/cancel":            `{"apply_id":"apply-missing","environment":"staging"}`,
+		"/api/release":           `{"apply_id":"apply-missing","environment":"staging"}`,
+		"/api/revert":            `{"apply_id":"apply-missing","environment":"staging"}`,
+		"/api/skip-revert":       `{"apply_id":"apply-missing","environment":"staging"}`,
+		"/api/checks/scan":       `{}`,
+		"/api/checks/synthesize": `{}`,
+	}
+	send := func(t *testing.T, path, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		svc, stores := newControlTestServiceWithStores(&mockTernClient{}, nil, nil)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		stores.controls.mu.Lock()
+		defer stores.controls.mu.Unlock()
+		assert.Empty(t, stores.controls.requests, "no control request is recorded")
+		return w
+	}
+
+	for path, body := range routes {
+		t.Run(path, func(t *testing.T) {
+			refused := send(t, path, body+` {"environment":"production"}`)
+			assert.Equal(t, http.StatusBadRequest, refused.Code, refused.Body.String())
+			assert.Contains(t, refused.Body.String(), "more data follows it")
+
+			unknown := send(t, path, `{"surprise":true}`)
+			assert.Equal(t, http.StatusBadRequest, unknown.Code, unknown.Body.String())
+			assert.Contains(t, unknown.Body.String(), `unknown field \"surprise\"`)
+
+			accepted := send(t, path, body+"\n")
+			assert.NotContains(t, accepted.Body.String(), "invalid request body", "a trailing newline gets past the decode")
 		})
 	}
 }

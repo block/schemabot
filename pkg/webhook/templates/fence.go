@@ -557,16 +557,23 @@ func markdownReason(reason string) string {
 // underscore between two letters or digits is left alone, since it cannot
 // start emphasis there and names such as seen_at read as written.
 func escapeProse(text string) string {
+	return codeMentions(text, escapeProseWords)
+}
+
+// codeMentions writes each mention in text as inline code, and every other
+// stretch through words. Mentions that touch share one span so no backtick
+// lands between them.
+func codeMentions(text string, words func(string) string) string {
 	var b strings.Builder
 	last := 0
 	for _, span := range mentionSpans(text) {
-		b.WriteString(escapeProseWords(text[last:span[0]]))
+		b.WriteString(words(text[last:span[0]]))
 		b.WriteByte('`')
 		b.WriteString(text[span[0]:span[1]])
 		b.WriteByte('`')
 		last = span[1]
 	}
-	b.WriteString(escapeProseWords(text[last:]))
+	b.WriteString(words(text[last:]))
 	return b.String()
 }
 

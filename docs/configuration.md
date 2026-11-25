@@ -7,7 +7,7 @@
 - [Local Mode](#local-mode)
 - [gRPC Mode](#grpc-mode)
 - [Multi-Deployment Environments](#multi-deployment-environments)
-- [Multi-Target Environment (preview)](#multi-target-environment-preview)
+- [Multi-Target Environment](#multi-target-environment)
 - [Environment Order](#environment-order)
 - [Hybrid Mode](#hybrid-mode)
 - [Drivers](#drivers)
@@ -32,6 +32,7 @@
 - [Skipping Unrequired Branches](#skipping-unrequired-branches)
 - [Base Branch Schema Freshness](#base-branch-schema-freshness)
 - [Review Gate](#review-gate)
+- [Command Apps](#command-apps)
 - [Authentication](#authentication)
 - [Multi-Environment Deployment](#multi-environment-deployment)
 - [Multi-App Routing](#multi-app-routing)
@@ -259,9 +260,8 @@ blocks the create step at plan time with the grant or correction it needs.
 [Table ownership](postgresql.md#table-ownership) explains what the owner
 controls and shows the full set of grants.
 
-`table_owner` is one role per target, deliberately scalar. A per-namespace
-map mirroring `schema_overrides` is a later extension for a target whose
-schemas have different owners; no such target exists today.
+`table_owner` names one role for the whole target. A target whose schemas
+belong to different owner roles cannot set an owner per schema yet.
 
 The referenced config document is JSON with top-level `host`, `port`, and
 `dbname` fields by default; set `config_paths` to read other keys:
@@ -428,6 +428,7 @@ secret it reads:
 | `secret_name` | the secret, templated over `{target}` and any `{attribute}` | required |
 | `role_arn`, `account_attribute`, `external_id` | the AWS account, by assuming `role_arn` in the account `account_attribute` names | the data plane's own account |
 | `region`, `region_attribute`, `reachable_regions` | the region the secret is read in | required: `region` |
+| `secrets_manager_endpoints` | the Secrets Manager endpoint each region's reads are sent to | each region's public endpoint |
 
 #### Which region a secret is read in
 
@@ -501,6 +502,36 @@ Shapes can mix: a cluster in a region that is not listed still has its secret
 read in `region`, so it needs a replica there while the clusters in listed
 regions do not.
 
+**The data plane reaches Secrets Manager in a region only through a private
+endpoint.** A data plane with no route to the public internet can often still
+call Secrets Manager in another region through an interface VPC endpoint in
+that region, reached over private networking. The SDK sends each read to the
+region's public endpoint unless told otherwise, so name the private one in
+`secrets_manager_endpoints`:
+
+```yaml
+credentials:
+  type: awssm
+  region: us-west-2
+  region_attribute: aws_region
+  reachable_regions: [us-east-1]
+  secrets_manager_endpoints:
+    us-east-1: https://vpce-0example.secretsmanager.us-east-1.vpce.amazonaws.com
+  role_arn: "arn:aws:iam::{account}:role/schemabot-reader"
+  secret_name: "{target}/schemabot"
+```
+
+Each key must be `region` or a region listed in `reachable_regions`, and each
+value an `https` URL that names only a host. The resolver refuses to start
+otherwise, rather than ignore an entry for a region no secret is read in.
+Reads are still signed for the region, so an entry changes where a read is
+sent and never which region's secret it reads. A region without an entry
+uses its public endpoint. Roles are assumed through STS in `region` as before,
+so this setting does not change how STS is reached. Secrets Manager rejects a
+custom endpoint in FIPS or dual-stack mode, so the resolver also refuses to
+start with this setting when the AWS config enables either (for example through
+`AWS_USE_FIPS_ENDPOINT`).
+
 #### What each target account provides
 
 In the account and region a target's secret is read in, the read needs:
@@ -557,7 +588,10 @@ resolver matches and confirm each one carries a region name in
 listing a region there, also confirm that the data plane can
 call Secrets Manager there and that every target in that region has its secret
 there: a listed region the data plane cannot reach turns each of those reads
-into a connection failure.
+into a connection failure. The same holds for an entry in
+`secrets_manager_endpoints`: confirm from the data plane that the endpoint
+resolves and accepts a connection, and that its endpoint policy allows the
+reading identity, before pointing a region's reads at it.
 
 ## gRPC Mode
 
@@ -644,7 +678,7 @@ The schema files are the source of truth. At review time SchemaBot plans every m
 The first member in rollout order is the **primary**. What it does depends on how the environment lists its members:
 
 - **A `deployments` map whose entries each name one `target`.** The deployments are mirrors: they are expected to hold the same schema, so they are expected to plan the same changes. The primary deployment's plan is the reference. SchemaBot stores it, compares every other deployment's plan against it using a diff that is not persisted, and runs it on every deployment at apply time. A deployment whose plan differs from the primary's blocks the merge, because the plan under review was not written for it.
-- **A `targets` list**, at the environment level or inside any `deployments` entry. Each target holds its own schema, so no target is compared against another, the primary included. Each target runs the plan made for it. When targets plan different changes, the differences are shown for review and do not block the merge by themselves: they can be a rollout that landed on some targets and not others, or drift worth a look. [How targets are planned](#how-targets-are-planned) shows an example. An apply that spans several deployments, one of them with a `targets` list, is refused for now; [Multi-Target Environment](#multi-target-environment-preview) shows how to apply one target at a time instead.
+- **A `targets` list**, at the environment level or inside any `deployments` entry. Each target holds its own schema, so no target is compared against another, the primary included. Each target runs the plan made for it. When targets plan different changes, the differences are shown for review and do not block the merge by themselves: they can be a rollout that landed on some targets and not others, or drift worth a look. [How targets are planned](#how-targets-are-planned) shows an example. An apply that spans several deployments, one of them with a `targets` list, is refused for now; [Multi-Target Environment](#multi-target-environment) shows how to apply one target at a time instead.
 
 Every member's plan is reviewed, regardless of which member is primary.
 
@@ -655,9 +689,9 @@ Every member's plan is reviewed, regardless of which member is primary.
 Every deployment name in `deployment_order` must be lowercase; the server
 refuses to start otherwise.
 
-Under `cutover_policy: barrier` or `parallel`, copies start in this order and cutovers follow it: a deployment's cutover runs only once every earlier deployment has completed, revert window included. An earlier deployment that failed stops holding the rollout under `on_failure: continue`, or under `pause` once the rollout is released; under `halt`, and under `pause` until a release, it holds every later cutover. An apply started with `--defer-cutover` follows the same order. Each `schemabot cutover` runs the cutover of the deployment whose turn it is, and only that deployment: a second deployment waits for a second command. A cutover requested while every ready deployment is still waiting on an earlier one is refused, and the refusal names the deployment holding the turn. Within a deployment, copies never wait on each other to start, and each shard's cutover runs as soon as it is parked, at most the server's `max_drivers_per_apply` operations of one apply at once. A `schemabot cutover` addresses the deployment's data-plane apply as a whole, so SchemaBot does not order that deployment's shards and tables among themselves. The targets of a `targets` list do not wait for each other this way; [Multi-Target Environment](#multi-target-environment-preview) describes how their cutovers run. An apply that spans several deployments while one of them has a `targets` list is refused, so one apply never mixes the two.
+Under `cutover_policy: barrier` or `parallel`, copies start in this order and cutovers follow it: a deployment's cutover runs only once every earlier deployment has completed, revert window included. An earlier deployment that failed stops holding the rollout under `on_failure: continue`, or under `pause` once the rollout is released; under `halt`, and under `pause` until a release, it holds every later cutover. An apply started with `--defer-cutover` follows the same order. Each `schemabot cutover` runs the cutover of the deployment whose turn it is, and only that deployment: a second deployment waits for a second command. A cutover requested while every ready deployment is still waiting on an earlier one is refused, and the refusal names the deployment holding the turn. Within a deployment, copies never wait on each other to start, and each shard's cutover runs as soon as it is parked, at most the server's `max_drivers_per_apply` operations of one apply at once. A `schemabot cutover` addresses the deployment's data-plane apply as a whole, so SchemaBot does not order that deployment's shards and tables among themselves. The targets of a `targets` list do not wait for each other this way; [Multi-Target Environment](#multi-target-environment) describes how their cutovers run. An apply that spans several deployments while one of them has a `targets` list is refused, so one apply never mixes the two.
 
-## Multi-Target Environment (preview)
+## Multi-Target Environment
 
 A database that lives on more than one target replaces the scalar `target` with a `targets` list. Each entry is one target the environment addresses, and rollout follows the listed order.
 
@@ -742,7 +776,7 @@ Rules:
 - An environment-level `targets` list is mutually exclusive with an environment-level `deployments` map, the same way an environment-level `target` is. A `targets` list inside a `deployments` entry is how the two combine.
 - The list MUST contain at least one entry, and no entry may be empty.
 - A rollout across the listed targets runs table by table: each table lands on every target before any target starts the next. Tables run in the order the reviewed plan lists them, then any table only another target's plan changes, sorted by name. A target whose plan does not change a table has nothing to run for it, and two statements on one table run together. The exception is a rollout where a target's plan changes a VSchema, which applies with that target's tables, so each target then runs its whole change in one go.
-- `cutover_policy` and `on_failure` order the listed targets' copies within each table the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. Cutover is where targets differ from deployments. The default here is `parallel`: it starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and cuts each target over as soon as its copy is ready: a target never waits for an earlier target's copy or cutover to finish, and an earlier target holds a later target's cutover only while it is failed, retrying a failure, stopped, cancelled, or reverted. The [multi-target apply animation](#multi-target-environment-preview) shows this default with four targets. A deployment with a `targets` list therefore refuses `--defer-cutover`; apply one target at a time with `--target` to hold a target's cutover. Under the default `on_failure: halt` a failed target stops every queued target from starting, and holds the cutover of every later target already copying: each of those finishes its copy and waits at the cutover barrier until an operator stops or cancels it. `max_drivers_per_apply` is therefore what bounds how many targets copy at once, and how many a failure can leave holding a finished copy, so raising it widens both; size it for the targets that share a host's disk and network as well as for throughput. An environment that relies on an unset `cutover_policy` running one target at a time needs `cutover_policy: rolling` to keep doing so: a failed target then stops every later one before it starts copying. Whatever `on_failure` says, a table that failed on any target ends the rollout at that table: `continue` or a released `pause` still runs it on the remaining targets, but no target starts the next table.
+- `cutover_policy` and `on_failure` order the listed targets' copies within each table the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. Cutover is where targets differ from deployments. The default here is `parallel`: it starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and cuts each target over as soon as its copy is ready: a target never waits for an earlier target's copy or cutover to finish, and an earlier target holds a later target's cutover only while it is failed, retrying a failure, stopped, cancelled, or reverted. The [multi-target apply animation](#multi-target-environment) shows this default with four targets. A deployment with a `targets` list therefore refuses `--defer-cutover`; apply one target at a time with `--target` to hold a target's cutover. Under the default `on_failure: halt` a failed target stops every queued target from starting, and holds the cutover of every later target already copying: each of those finishes its copy and waits at the cutover barrier until an operator stops or cancels it. `max_drivers_per_apply` is therefore what bounds how many targets copy at once, and how many a failure can leave holding a finished copy, so raising it widens both; size it for the targets that share a host's disk and network as well as for throughput. An environment that relies on an unset `cutover_policy` running one target at a time needs `cutover_policy: rolling` to keep doing so: a failed target then stops every later one before it starts copying. Whatever `on_failure` says, a table that failed on any target ends the rollout at that table: `continue` or a released `pause` still runs it on the remaining targets, but no target starts the next table.
 - No entry may contain `/`. A deployment addressing several targets names each one in its members' operation keys, and `/` separates a key's components.
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.
@@ -976,7 +1010,7 @@ A single apply that fans out across many deployments or shards claims its operat
 max_drivers_per_apply: 2
 ```
 
-`max_drivers_per_apply` caps how many operations one apply may have in flight at once, across every replica. Size it against `drivers × replicas`: set too high it bounds nothing, set too low a sharded fan-out drives only a few operations at a time. For a [multi-target environment](#multi-target-environment-preview), each target's copy of a table is one operation, so the cap is how many targets copy at once; the animation there shows four targets copying together under a cap of at least four.
+`max_drivers_per_apply` caps how many operations one apply may have in flight at once, across every replica. Size it against `drivers × replicas`: set too high it bounds nothing, set too low a sharded fan-out drives only a few operations at a time. For a [multi-target environment](#multi-target-environment), each target's copy of a table is one operation, so the cap is how many targets copy at once; the animation there shows four targets copying together under a cap of at least four.
 
 The cap applies only to *starting* new operations — a first start, a resume after a stop, and a deferred deploy are all capped. Recovering an operation whose driver crashed, and consuming a stop or cancel request, are never capped: an apply already at its cap must still be able to recover and to be controlled, or the cap becomes the thing that wedges the apply it is bounding.
 
@@ -1122,6 +1156,47 @@ disabled, every caller shares one budget. There is no `per_target` lane. A
 refusal is the same `429` with `error_code: rate_limited` and `Retry-After`, and
 it is returned before any GitHub call is made. Set `enabled: false` to turn
 enforcement off.
+
+### GitHub quota reserve
+
+One GitHub App installation's hourly REST quota is shared by every pull request
+in every repository it serves. Planning a pull request reads its schema files
+and repository trees, and a burst of plans can spend the whole quota. Once it
+is gone, GitHub refuses SchemaBot's Check Run writes too, so required checks
+stop posting on every pull request the installation serves.
+
+`quota-reserve` holds back that many requests per installation for the work
+that gates merges. Once GitHub reports that many or fewer requests remaining,
+SchemaBot stops sending the schema file, blob, and tree reads a plan makes until
+the quota resets. Check Run writes and reads, pull request reads, changed-file
+lists, and comments still go out, and so do the same file and tree reads when
+SchemaBot makes them to decide what a Check Run says, such as which
+environments a pull request's configs cover. A plan that needs a refused read
+fails closed: the pull request's SchemaBot check does not pass until a plan
+succeeds after the reset. When a refused read stops SchemaBot from finding a
+pull request's configs, or from running an `apply` command, SchemaBot retries
+it when the quota resets, and for three hours after the event arrived that wait
+does not use up its retry attempts. After those three hours each refusal uses
+one of the event's five attempts, so an event the quota keeps refusing at every
+hourly reset stops being retried about eight hours after it arrived, and its
+check stays failing until the next push or check re-run. A read refused while one database is being
+planned still fails that plan until the next push or check re-run.
+
+```yaml
+github:
+  quota-reserve: 1500  # default: 0 (disabled)
+```
+
+Under `apps:`, each App takes its own `quota-reserve`, since each App has its
+own installations and quotas. The value must not be negative. SchemaBot tracks
+the remaining quota from GitHub's response headers per installation and per
+server process, less the requests that process has sent and not yet had
+answered, so each replica reaches the reserve on its own reading of the shared
+quota; size the reserve to cover the Check Run traffic of every replica until
+the reset. Each refused read increments
+`schemabot.github.primary_rate_limit_rejections_total` with `origin=reserve`,
+and the first refusal in each reset window logs a warning naming the
+installation, App, remaining quota, reserve, and reset time.
 
 ## Pending Drops
 
@@ -2000,6 +2075,46 @@ unlisted repository:
 
 If `repos` is not configured or empty, all repositories are allowed.
 
+### Pull request database limit
+
+Set `pr_schema_cap` under a repository to pause planning and new applies when
+a pull request changes more than five logical databases managed by this control
+plane. The count covers the full pull request, including when a command names
+one database or target. Environments, keyspaces, and shards of the same
+database count once. Each control plane evaluates its own registrations.
+
+```yaml
+repos:
+  example-org/service:
+    pr_schema_cap:
+      control_plane: payments
+      limit: 5
+      observe: true
+      label: "schemabot: allow-large-plan"
+```
+
+Use `observe: true` to record decisions and projected database planning fan-out
+before enforcement. Omit it to enforce the limit. Omit `limit` for the default of
+five. On shared repositories, give each deployment a distinct `control_plane`
+for the comment and Check Run summary. It defaults to the deployment's
+`tenant`, or the GitHub Check Run name when the deployment has no tenant.
+
+Provision the configured label in the repository before enabling enforcement.
+Applying it acknowledges the current head and base. SchemaBot holds new work
+when the label is removed or the revision changes. On shared repositories,
+designate one deployment to remove stale labels with `manage_label: true` and
+set it to `false` on the others. By default, standalone deployments and aggregate
+leaders remove stale labels. If a stale label remains visible, remove it and
+add it again to acknowledge the new revision.
+
+At or below the limit, admission skips label verification. Above the limit,
+SchemaBot verifies an exception using at most one page of 100 PR timeline
+events. If GitHub reports another page, the PR stays held. Split the changes
+into smaller PRs to proceed.
+
+The exception enables planning and new work on that revision. Existing apply
+approval policies are evaluated independently.
+
 ### Listen-only repositories
 
 A listen-only repository is one SchemaBot reads from but never writes to. Use it to measure what a repository would cost in GitHub requests before you onboard it. For example, a separate SchemaBot deployment with its own GitHub App and no required checks can listen to your largest repository, and catch a release whose reads grow with pull request size before any deployment that gates merges runs it.
@@ -2016,6 +2131,7 @@ For a listen-only repository, SchemaBot:
 - ignores comment commands, so no apply ever starts from the repository. Auto-plan still runs for any database this deployment manages in the repository, but its plan comment and checks are not posted;
 - reads a plan's inputs for a database the pull request changes that this deployment does not register: the schema files at the head for each environment in `allowed_environments`, then one base-branch comparison for all of them. A deployment without `allowed_environments` reads the environments of its `environment_order` (`staging` and `production` by default). Each environment reads its own directory where the repository keeps one, and the config directory otherwise, as a deployment that registers the database does. Nothing is planned, because there is no target to plan against, but the reads are the ones a deployment that registers the database makes, so the measurement covers plans and not only config discovery;
 - runs the default-branch push and merge queue paths up to the Check Run write, so their coverage and Check Run lookups are measured too.
+- reads the pull request head once after config discovery, as the release of a stored aggregate block does, and releases nothing: a listen-only repository has no aggregate check, so it has no block to release.
 
 One path is not measured: the PR aggregate check sync, which reads the PR head and looks up the aggregate Check Run before it writes. A listen-only repository skips it, as any repository with `enable_checks: false` does. Its cost is a few reads per delivery, and it does not grow with the number of files in the pull request.
 
@@ -2202,6 +2318,27 @@ The PR's change is measured against the default branch it was built on: SchemaBo
 
 If the PR's change differs, the Review Required comment names the reviewers whose approvals no longer count and the schema file whose change differs, and the reviewer must approve the current head. If the comparison cannot be completed (GitHub cannot find the approved commit, a directory is too large to list, a symlink points outside the repository, or there are more distinct symlinks than a comparison reads) and no other approval covers the head, that approval does not count and the apply is blocked with a Review Gate Error comment. The comment names the approval that did not count, lists who can approve, and asks for an approval of the latest commit, which needs no comparison. The reason goes to the server logs. Asking GitHub again would return the same answer, so the command is not retried. If GitHub is unavailable while the gate compares the commits, the command fails with a retryable error instead of reporting that a review is required. `apply-confirm` re-checks the gate, so a schema change pushed between `apply` and `apply-confirm` also needs a fresh approval.
 
+## Command Apps
+
+SchemaBot ignores every PR comment written by a GitHub App, so that its own comments and those of sibling SchemaBot deployments never run as commands. A database can list Apps whose comments it does run in `command_apps`, such as the App a deploy pipeline's end-to-end test uses to drive `plan`, `apply`, and the control commands:
+
+```yaml
+databases:
+  orders:
+    type: mysql
+    command_apps: [deploy-gate]      # App slug, not its "deploy-gate[bot]" login
+    environments:
+      staging:
+        dsn: "env:STAGING_ORDERS_DSN"
+```
+
+- A listed App runs commands for this database only, and only from repositories the database accepts (`allowed_repos`).
+- The grant holds whether or not `pr_command_authorization` is enabled, and so does its limit: with authorization off, an App still cannot run `plan` or any other gated command for a database that does not list it. With it enabled, an App is never matched against admin or operator teams and users, so listing its login there grants nothing; `command_apps` is the only way to authorize an App.
+- An App listed by any database never counts as a reviewer, for any database, even when its login is also configured as a reviewer. It is left out of the reviewers a Review Required comment lists, and an approval it gives is called out as one that never counts. Where the review gate is on, an App can apply only a change that a person approved.
+- SchemaBot never runs its own comments: a comment from this deployment's App is ignored even when `command_apps` lists it, and while the deployment does not yet know its own App slug it ignores every App's comment.
+
+SchemaBot refuses to start when a `command_apps` entry is not an App slug (letters, digits, hyphens and underscores, as in the App's URL), carries the `[bot]` suffix, is listed twice, or names an App in `trusted-check-app-slugs`, since those Apps are SchemaBot's own.
+
 ## Authentication
 
 This section is the YAML reference. For setup instructions, working examples, and help with denied requests, start with the [authentication guide](auth.md).
@@ -2261,7 +2398,8 @@ auth:
     trusted_proxy_spiffe:                 # proxy SPIFFE IDs, read from the Envoy XFCC header
       - spiffe://example.org/ns/ingress/sa/proxy
     trusted_proxy_cidrs:                  # and/or source networks allowed to be the proxy
-      - 127.0.0.1/32
+      - 127.0.0.1/32                      # port-forward break-glass
+      - 127.0.0.6/32                      # the mesh source below
     read_groups: [readers]                # groups granted read (empty = any authenticated caller)
     write_groups: [operators]             # groups granted write (empty = no writes)
     # Optional service-caller lane — read-only access for services calling as
@@ -2271,11 +2409,16 @@ auth:
     read_service_spiffe:                  # caller SPIFFE IDs granted read-tier access
       - spiffe://example.org/ns/reporting/sa/reporting
     caller_spiffe_header: X-Forwarded-Caller-Spiffe-Id   # optional (default)
+    # Optional: loopback addresses a mesh sidecar delivers proxied requests
+    # from. Requires trusted_proxy_spiffe; refuses 127.0.0.1 and ::1. With
+    # trusted_proxy_cidrs set, each entry must be inside one of its networks.
+    trusted_mesh_loopback_sources: [127.0.0.6]
 ```
 
 The authorizer proves the request came from the trusted proxy, then reads the forwarded identity:
 
 - **Trust anchor (required, fail-closed).** With neither `trusted_proxy_cidrs` nor `trusted_proxy_spiffe` set, the server refuses to start. There are three modes: **CIDR only** (trust any request whose source IP is in a trusted network), **SPIFFE only** (trust any request whose XFCC carries a trusted SPIFFE ID), or **both** (require the source CIDR *and* a matching XFCC SPIFFE ID — defense in depth). `X-Forwarded-Client-Cert` (XFCC) is a spoofable HTTP header, so SPIFFE-only is safe only when the proxy sanitizes inbound XFCC and the server is not directly reachable (a service mesh) — the server logs a startup warning in that mode.
+- **Loopback sources.** On the identity-header lane, a request from a loopback address is the break-glass lane by default. A kubectl port-forward arrives that way, so its identity headers are typed by the person running it. Such a request is admitted, but its identity is not verified: features that record who acted, such as freeze attribution and override approval, treat it as unverified, and writes log a warning with reason `loopback_source`. `trusted_mesh_loopback_sources` names the loopback addresses a mesh sidecar delivers proxied requests from, such as Istio's `127.0.0.6` when the sidecar delivers to the pod IP. A request from one of them that passed the SPIFFE check is verified like any other proxied request, while a port-forward from `127.0.0.1` stays break-glass. Listing an address trusts every process in the pod's network namespace like the proxy: any of them can connect from `127.0.0.6` and send an XFCC header that names the proxy, just as it already can from the pod IP under SPIFFE-only trust. List one only when nothing else in the pod sends requests to SchemaBot. Each entry must be one loopback IP. `127.0.0.1` and `::1` are refused, including in IPv4-mapped form, and the setting requires `trusted_proxy_spiffe`: the source address does not identify the sender, so the SPIFFE check is the only check of who sent the request. With `trusted_proxy_cidrs` also set, the CIDR check runs first, so each listed address must be inside one of those networks (`127.0.0.6/32`), or the server refuses to start. Istio's IPv6 source, `::6`, is not a loopback address, so it never needs listing. The service-caller gateway lane verifies its caller whatever the source address; there, the setting changes only whether a request from a listed address is counted with reason `loopback_source`.
 - **Tiers.** Reads are open to any authenticated caller unless `read_groups` is set; writes require membership in `write_groups`, or in a database's `operator_groups` (see [Per-database write scoping](#per-database-write-scoping-forward-auth)). Only the canonical header is read, so a smuggled underscore variant (`X_Forwarded_User`) is ignored.
 - **Service callers (read-only).** `trusted_gateway_spiffe` + `read_service_spiffe` open a second lane for services calling as themselves: a caller-forwarding gateway terminates the caller's mTLS, verifies the client certificate, and forwards the caller's SPIFFE ID in `caller_spiffe_header`. The header is honored only when the XFCC-verified peer is a listed gateway, the forwarded caller must appear in `read_service_spiffe`, and service callers never get the write tier (denied with reason `service_caller_write`). The user and groups headers are never read on this lane, and the identity-header proxy always wins — the gateway lane is consulted only when the request did not arrive through the trusted proxy. `trusted_proxy_cidrs`, when set, gate this lane like everything else: a gateway SVID claimed from outside the trusted networks is never honored. **List a gateway only if it strips inbound copies of the caller header before setting it from the verified certificate** — otherwise any caller could forge an identity through it. The lane fails closed: gateways without callers (or callers without a gateway) refuse to start, the lane requires SPIFFE-anchored proxy trust (`trusted_proxy_spiffe`) — under CIDR-only trust an in-CIDR gateway request would be mistaken for the identity-header proxy, leaving the lane unreachable, so that combination refuses to start too — and an empty config disables the lane entirely.
 
@@ -2310,7 +2453,7 @@ Which environments accept scoped writes is a deployment policy, uniform across d
 
 The two value namespaces do not overlap and are verified by different systems, so they are deliberately separate fields: a GitHub team slug has no meaning in the groups header, and a forwarded group name is not a GitHub team. Grant each lane explicitly.
 
-The decision has two halves. The middleware admits any caller in `write_groups` or in any database's `operator_groups` to write-tier endpoints — it runs before the request body is parsed, so it cannot know the target. Each mutating handler then enforces the scope once the target database resolves: `plan` and `apply` from the request/stored plan, control operations (`stop`, `start`, `cutover`, `cancel`, `release`, `revert`, `skip-revert`, `rollback plan`) from the stored apply, and lock acquire/release from the named database (locks are operator controls in the same family as stop/cancel and have no environment dimension, so the grant applies database-wide). Operations with no single target database — settings mutation, checks scan/synthesize/repos, webhook redrive — stay admin-only (`write_groups`). Operator members also get the read tier, deployment-wide.
+The decision has two halves. The middleware admits any caller in `write_groups` or in any database's `operator_groups` to write-tier endpoints — it runs before the request body is parsed, so it cannot know the target. Each mutating handler then enforces the scope once the target database resolves: `plan` and `apply` from the request/stored plan, control operations (`stop`, `start`, `cutover`, `cancel`, `release`, `revert`, `skip-revert`, `rollback plan`) from the stored apply, and lock acquire/release from the named database (locks are operator controls in the same family as stop/cancel and have no environment dimension, so the grant applies database-wide). Operations with no single target database — settings mutation, checks scan/synthesize/repos — stay admin-only (`write_groups`). Operator members also get the read tier, deployment-wide.
 
 Two consequences of the environment-less lock grant are worth stating outright. First, a scoped operator's lock holds applies off **every** environment of their database, including environments outside `operator_environments` — an operator scoped to staging can still freeze production applies of their own database. That direction is fail-safe (a lock only ever prevents changes), so the grant deliberately allows it. Second, the reverse direction is not: force release (`force: true`) bypasses the lock ownership check, so it could undo another holder's safety brake — for example an admin's incident lock. Force release therefore stays admin-only (`write_groups`).
 
@@ -2500,6 +2643,38 @@ tern_deployments:
 ```
 
 Do not require the staging ConfigMap to contain production targets, or the production ConfigMap to contain staging targets. Each instance resolves only the environments it owns.
+
+### Freeze groups (forward-auth)
+
+An environment freeze marks an environment, or some of its deployments and databases, as frozen until it ends or someone lifts it. While a freeze is in effect, SchemaBot refuses every new apply, start and cutover it covers, unless a second person approved an override for that change. Each freeze records a running policy: `continue`, the default, lets applies that started before the freeze finish, and `stop` stops every pending, running or paused apply it covers when the freeze is set, and withdraws a start queued on a stopped one, recording the freeze as the stop's requester. While a `stop` freeze is in effect, SchemaBot stops an apply instead of starting work on it that has not started, and holds a PlanetScale deploy queued before the freeze until the freeze ends. Status and the pull request comment name the freeze that stopped an apply. A planned `stop` freeze stops an apply already running when it starts only at the apply's next checkpoint: when a rollout starts its next deployment, or when SchemaBot recovers a drive that crashed or failed. An apply that reaches neither keeps running. Whether a freeze is in effect is decided by the database clock, so every pod agrees. A freeze is stored by the instance that serves its environment. `write_groups` members may set and lift freezes. To let others, such as incident commanders, do so without any other write, list their forwarded groups in `freeze.groups`:
+
+```yaml
+auth:
+  type: forward_auth
+freeze:
+  groups: [incident-commanders]
+```
+
+The middleware admits `freeze.groups` members to write-tier endpoints, and the freeze handlers (`POST /api/freezes`, `POST /api/freezes/{id}/lift`) allow them. Approving an override (`POST /api/freezes/overrides/{id}/approve`) is for `freeze.groups` members only, not `write_groups`: the caller must be verified and must not be the requester. Every other mutating handler still requires `write_groups` or a database's `operator_groups`, and database operator grants do not cover freezes, which reach past any one database. Members also get the read tier, deployment-wide. `freeze.groups` requires `auth.type: forward_auth`, and its entries must be unique; either mistake is a startup error. Under other auth types, freezes follow the plain admin write gate.
+
+The CLI sets, lists, shows and lifts freezes and approves override requests, and asks for an override with `--override` on `apply`, `start` and `cutover`: see [Freeze an environment](cli.md#freeze-an-environment), and the [freeze guide](freeze.md) for the whole workflow.
+A PR author can ask for an override of a freeze from the pull request: `schemabot apply -e production --override "reason"`, and the same flag on `schemabot apply-confirm`, `schemabot start` and `schemabot cutover`. When a freeze refuses the command, the default policy lets it through on that reason. Under `approval`, SchemaBot records an override request for the commenter and the PR author, and the comment names the request and how it is approved. The request is recorded as `github:<login>`, and an approval has to come from the same identity domain: the API route (`POST /api/freezes/overrides/{id}/approve`) refuses a request asked for on a pull request, and refuses an approver whose forwarded subject starts with `github:`. The identity rule holds both ways: a request asked for through the API or CLI is approved only there, and a request asked for on a pull request only on that pull request.
+
+`freeze.override_policy` decides what an override reason does. `reason`, the default, admits the change on the requester's own reason, with no approver: SchemaBot stores the override already approved by its requester, keeps the reason for audit, and the refusal comment on a pull request says to go ahead with a reason. `approval` records a request that a freeze approver must approve, as described below. Under either policy the reason is required and the caller must be verified. Under `reason` the reason admits only the command that gave it, so a retry gives its own. Under `approval` an approval covers one change for one person for at most 24 hours. Any other value is a startup error. See [choose the override policy](freeze.md#choose-the-override-policy).
+
+```yaml
+freeze:
+  override_policy: approval
+```
+
+Under `approval`, a freeze approver approves from the pull request by commenting `schemabot freeze approve ovr-...` on the pull request where the request was made. Who may is set by `freeze.github_teams`, a list of GitHub teams as `org/team-slug`:
+
+```yaml
+freeze:
+  github_teams: [acme/incident-commanders]
+```
+
+Members of these teams approve as `github:<login>`; apps never do. The list governs only this approval, so unlike `freeze.groups` it needs no `forward_auth`, and its entries must be well formed and unique or startup fails. With no team listed nobody can approve from a pull request, and the reply says so. SchemaBot reads membership through the repository's installation, which needs the GitHub App's **Members: Read** permission (see [GitHub App setup](github-app-setup.md)) and must be able to see each listed team; check that before listing a team. A team it cannot read refuses the approval, never allows it. The comment must be on the pull request the request names: a request from another pull request, or from the API or CLI, is refused with a reply that says where to approve it. Storage refuses the requester and the pull request's author, a request already approved, and one that expired, each with its own reply. The reply names the approver and the change, and says the requester can run the command again. On a repository several deployments serve, a deployment that does not store the request stays silent, so an approval with a wrong or unscoped ID can get no reply; run `schemabot freeze approve <ovr-id> -t <tenant>` for the deployment that recorded the request, which always answers. The refusal that names the request already includes the `--tenant`.
 
 ### Tenant-scoped command routing
 

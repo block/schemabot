@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	gomysql "github.com/block/mysql"
+	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
@@ -99,6 +100,10 @@ type ServerConfig struct {
 	// apply/apply-confirm PR comment commands. When disabled, existing OSS/local
 	// behavior is preserved.
 	PRCommandAuthorization PRCommandAuthorizationConfig `yaml:"pr_command_authorization,omitempty"`
+
+	// Freeze configures environment freezes: who besides the deployment
+	// write groups may set and lift them.
+	Freeze FreezeConfig `yaml:"freeze,omitempty"`
 
 	// ReviewPolicy controls whose PR approvals satisfy the review gate before
 	// apply/apply-confirm proceeds.
@@ -678,6 +683,16 @@ type GitHubConfig struct {
 	// listed in trusted-check-app-slugs, or the gate rejects its Check Run and
 	// blocks every apply.
 	PromotionCheckName string `yaml:"promotion-check-name,omitempty"`
+
+	// QuotaReserve is the number of core REST API requests each App
+	// installation holds back for check runs, pull request reads, comments,
+	// and other merge-gating work. One installation's hourly quota is shared
+	// by every pull request in every repository it serves, so once GitHub
+	// reports this many or fewer requests remaining, SchemaBot stops reading
+	// schema files and trees for plans until the quota resets, and keeps the
+	// rest for Check Runs. Zero (the default) disables the reserve. Must not
+	// be negative.
+	QuotaReserve int64 `yaml:"quota-reserve,omitempty"`
 }
 
 // CheckRunNameBase returns the configured aggregate GitHub Check Run base name.
@@ -1241,13 +1256,21 @@ type EtreCredentialsConfig struct {
 	// RegionAttribute: a target whose cluster is in one of them has its secret
 	// read there, and every other target's secret is read in Region, so it must
 	// be replicated there.
-	Region           string   `yaml:"region,omitempty"`
-	RegionAttribute  string   `yaml:"region_attribute,omitempty"`
-	ReachableRegions []string `yaml:"reachable_regions,omitempty"`
-	RoleARN          string   `yaml:"role_arn,omitempty"`
-	ExternalID       string   `yaml:"external_id,omitempty"`
-	SecretName       string   `yaml:"secret_name,omitempty"`
-	AccountAttribute string   `yaml:"account_attribute,omitempty"`
+	//
+	// SecretsManagerEndpoints maps a region to the Secrets Manager endpoint URL
+	// to call there, for a data plane that reaches Secrets Manager through a
+	// private endpoint (such as an interface VPC endpoint) instead of the public
+	// regional one. Each key must be Region or one of ReachableRegions, and each
+	// value an https URL naming only a host. A region without an entry uses the
+	// default endpoint.
+	Region                  string            `yaml:"region,omitempty"`
+	RegionAttribute         string            `yaml:"region_attribute,omitempty"`
+	ReachableRegions        []string          `yaml:"reachable_regions,omitempty"`
+	SecretsManagerEndpoints map[string]string `yaml:"secrets_manager_endpoints,omitempty"`
+	RoleARN                 string            `yaml:"role_arn,omitempty"`
+	ExternalID              string            `yaml:"external_id,omitempty"`
+	SecretName              string            `yaml:"secret_name,omitempty"`
+	AccountAttribute        string            `yaml:"account_attribute,omitempty"`
 }
 
 // DatabaseConfig holds configuration for a registered database.
@@ -1295,6 +1318,15 @@ type DatabaseConfig struct {
 	// OperatorUsers are GitHub users who may run mutating PR comment commands
 	// for this database when PR command authorization is enabled.
 	OperatorUsers []string `yaml:"operator_users,omitempty"`
+
+	// CommandApps are GitHub App slugs whose comments may run PR commands for
+	// this database, such as a deploy gate's test App. SchemaBot otherwise
+	// ignores every comment from an App. A listed App runs commands only for
+	// this database and only from repositories the database accepts, whether
+	// or not PR command authorization is enabled, and its approval never
+	// counts toward the review gate. A slug may not be one of this
+	// deployment's trusted-check-app-slugs, whose comments are SchemaBot's own.
+	CommandApps []string `yaml:"command_apps,omitempty"`
 
 	// OperatorGroups are forwarded identity groups (see auth.forward_auth)
 	// whose members may run mutating direct API/CLI operations against this
@@ -1879,6 +1911,9 @@ func (c *PlanetScaleConfig) validate() error {
 
 // RepoConfig holds configuration for a specific repository.
 type RepoConfig struct {
+	// PRSchemaCap limits planning fan-out for pull requests in this repository.
+	PRSchemaCap *PRSchemaCapConfig `yaml:"pr_schema_cap,omitempty"`
+
 	// EnableChecks controls whether SchemaBot publishes GitHub Check Runs for
 	// this repository. Stored check state is still maintained for SchemaBot's
 	// own safety gates. Defaults to true when not configured.
@@ -2499,6 +2534,9 @@ func (c *ServerConfig) Validate() error {
 		if err := validateDatabaseActorAuthorization(name, dbConfig); err != nil {
 			return err
 		}
+		if err := c.validateDatabaseCommandApps(name, dbConfig); err != nil {
+			return err
+		}
 		if err := c.validateDatabaseReviewPolicy(name, dbConfig); err != nil {
 			return err
 		}
@@ -2634,10 +2672,16 @@ func (c *ServerConfig) Validate() error {
 	if err := c.validateOperatorScoping(); err != nil {
 		return err
 	}
+	if err := c.validateFreeze(); err != nil {
+		return err
+	}
 
 	for repo, repoConfig := range c.Repos {
 		if repo != storage.CanonicalKey(repo) {
 			return fmt.Errorf("repos repository key %q must be canonical", repo)
+		}
+		if err := c.validatePRSchemaCap(repo, repoConfig); err != nil {
+			return err
 		}
 		if err := validateAggregateConfig(repo, repoConfig.Aggregate); err != nil {
 			return err
@@ -2778,6 +2822,13 @@ type ForwardAuthSettings struct {
 	// through a trusted gateway. Service callers never get the write tier.
 	ReadServiceSPIFFE []string `yaml:"read_service_spiffe,omitempty"`
 
+	// TrustedMeshLoopbackSources lists loopback addresses a service-mesh
+	// sidecar delivers requests from, such as Istio's 127.0.0.6. A
+	// request from one that passed the SPIFFE check has its identity verified;
+	// any other loopback source, such as a kubectl port-forward, stays
+	// break-glass. Requires TrustedProxySPIFFE, and refuses 127.0.0.1 and ::1.
+	TrustedMeshLoopbackSources []string `yaml:"trusted_mesh_loopback_sources,omitempty"`
+
 	// OperatorEnvironments lists the environments in which per-database
 	// operator grants (databases.*.operator_groups) may mutate. The policy is
 	// instance-wide: which environments accept scoped direct writes is a
@@ -2889,7 +2940,19 @@ func (f *ForwardAuthSettings) validate() error {
 	if len(trimmedGateways) > 0 && len(trimmedSPIFFE) == 0 {
 		return fmt.Errorf("forward_auth trusted_gateway_spiffe requires SPIFFE-anchored proxy trust (trusted_proxy_spiffe): with CIDR-only trust the service-caller lane is unreachable")
 	}
-	return nil
+	meshSources, err := auth.ParseTrustedMeshLoopbackSources(f.TrustedMeshLoopbackSources)
+	if err != nil {
+		return err
+	}
+	if len(meshSources) > 0 && len(trimmedSPIFFE) == 0 {
+		return auth.ErrMeshSourcesNeedSPIFFE
+	}
+	nets := make([]*net.IPNet, 0, len(trimmedCIDRs))
+	for _, c := range trimmedCIDRs {
+		_, network, _ := net.ParseCIDR(c) // validated above
+		nets = append(nets, network)
+	}
+	return auth.CheckMeshSourcesInTrustedNetworks(meshSources, nets)
 }
 
 // Comment renderers reserve a fixed amount of headroom under GitHub's comment
@@ -3060,7 +3123,7 @@ func (c *ServerConfig) validateNoLocalRemoteRouteCollision() error {
 //   - If apps: is NOT set, repos must not declare github_app (it would be a
 //     silently ignored field, which we want to fail closed on).
 func (c *ServerConfig) validateGitHubAppsConfig() error {
-	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != "" || c.GitHub.CheckName != "" || len(c.GitHub.TrustedCheckAppSlugs) > 0 || c.GitHub.PromotionCheckName != ""
+	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != "" || c.GitHub.CheckName != "" || len(c.GitHub.TrustedCheckAppSlugs) > 0 || c.GitHub.PromotionCheckName != "" || c.GitHub.QuotaReserve != 0
 	hasApps := c.Apps != nil
 
 	if hasGitHub && hasApps {
@@ -3072,6 +3135,9 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 			return err
 		}
 		if err := c.GitHub.validatePromotionCheckName("github"); err != nil {
+			return err
+		}
+		if err := c.GitHub.validateQuotaReserve("github"); err != nil {
 			return err
 		}
 	}
@@ -3099,6 +3165,9 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 			if err := app.validatePromotionCheckName(fmt.Sprintf("app %q", name)); err != nil {
 				return err
 			}
+			if err := app.validateQuotaReserve(fmt.Sprintf("app %q", name)); err != nil {
+				return err
+			}
 		}
 		for repo, repoConfig := range c.Repos {
 			if repoConfig.GitHubApp == "" {
@@ -3117,6 +3186,15 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 		if repoConfig.GitHubApp != "" {
 			return fmt.Errorf("repository %q sets github_app %q but apps: is not configured", repo, repoConfig.GitHubApp)
 		}
+	}
+	return nil
+}
+
+// validateQuotaReserve rejects a negative quota-reserve, which could only be a
+// typo: a reserve below zero would hold nothing back.
+func (g GitHubConfig) validateQuotaReserve(context string) error {
+	if g.QuotaReserve < 0 {
+		return fmt.Errorf("%s quota-reserve must not be negative, got %d; set 0 to disable the reserve", context, g.QuotaReserve)
 	}
 	return nil
 }
@@ -3705,6 +3783,29 @@ func (c *ServerConfig) ResolveGitHubAppForRepo(repo string) (ResolvedGitHubApp, 
 		return ResolvedGitHubApp{}, fmt.Errorf("default GitHub App: %w", err)
 	}
 	return ResolvedGitHubApp{Name: "default", Config: c.GitHub}, nil
+}
+
+// ReposServedByGitHubApp returns the configured repositories whose webhooks and
+// API calls go through the named App, sorted. restricted is false when the
+// config does not enumerate repositories at all (single-App, empty repos
+// config), meaning the App may serve any repository it is installed on. With
+// Apps configured, the list is the repos whose github_app names the App, so an
+// App no repository points at serves none.
+func (c *ServerConfig) ReposServedByGitHubApp(name string) (repos []string, restricted bool) {
+	if c == nil {
+		return nil, false
+	}
+	if len(c.Apps) == 0 && len(c.Repos) == 0 {
+		return nil, false
+	}
+	for repo, repoConfig := range c.Repos {
+		if len(c.Apps) > 0 && repoConfig.GitHubApp != name {
+			continue
+		}
+		repos = append(repos, repo)
+	}
+	slices.Sort(repos)
+	return repos, true
 }
 
 // ResolveGitHubAppsByID resolves every configured App's app-id and returns

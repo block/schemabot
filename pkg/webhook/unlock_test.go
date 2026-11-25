@@ -54,7 +54,7 @@ func (s *unlockTestLockStore) List(_ context.Context) ([]*storage.Lock, error) {
 	return s.locks, nil
 }
 
-func (s *unlockTestLockStore) ReleaseByID(_ context.Context, _ int64, database, _, _, _ string) error {
+func (s *unlockTestLockStore) ReleaseByIDIfUnused(_ context.Context, _ int64, database, _, _, _ string) error {
 	s.releaseCalls++
 	if err := s.releaseErrs[database]; err != nil {
 		return err

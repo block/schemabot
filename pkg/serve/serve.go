@@ -181,8 +181,13 @@ type webhookRuntime struct {
 	quotaProbes []*ghclient.QuotaProbe
 }
 
-// startQuotaProbes starts every App's quota probe.
+// startQuotaProbes starts every App's quota probe. Every App is marked
+// unresolved before any probe starts, so no App's first pass can export a
+// healthy aggregate while another App has not reported yet.
 func (r webhookRuntime) startQuotaProbes(ctx context.Context) {
+	for _, probe := range r.quotaProbes {
+		probe.MarkUnresolved()
+	}
 	for _, probe := range r.quotaProbes {
 		probe.Start(ctx)
 	}
@@ -408,8 +413,25 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	return serveUntilShutdown(runCtx, srv, signalled, port, grpcPort)
 }
 
+// listenForServe binds the TCP port a named server will serve on, so the caller
+// learns that the port is taken before it starts any background work. The name
+// says which listener failed, since the HTTP and metrics ports are configured
+// separately.
+func listenForServe(ctx context.Context, name, port string) (net.Listener, error) {
+	var lc net.ListenConfig
+	listener, err := lc.Listen(ctx, "tcp", ":"+port)
+	if err != nil {
+		return nil, fmt.Errorf("listen for %s server on port %s: %w", name, port, err)
+	}
+	return listener, nil
+}
+
 // serveUntilShutdown serves a built server on Run's listeners until runCtx ends
 // or a listener fails, then shuts it down.
+//
+// Every listener is bound before any of them serves and before Start launches
+// the background work, so a port that is already in use fails the run while the
+// process has accepted no request and holds no claim.
 //
 // The background work runs under a context of its own rather than runCtx. The
 // operator's drives end on that context, and a drive that ends before Close
@@ -423,23 +445,63 @@ func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os
 	defer cancelBackground()
 	defer utils.CloseAndLog(srv)
 
-	// Optionally start a gRPC server for the Tern proto (used by
+	// Optionally serve the Tern proto over gRPC (used by
 	// docker-compose.grpc.yml). Embedders attach to their own server instead.
+	var grpcServer *grpc.Server
 	if grpcPort != "" {
-		grpcServer := newTernGRPCServer(srv.logger)
+		grpcServer = newTernGRPCServer(srv.logger)
 		if err := srv.RegisterGRPC(runCtx, grpcServer); err != nil {
 			return fmt.Errorf("register grpc tern service: %w", err)
 		}
-		var lc net.ListenConfig
-		listener, err := lc.Listen(runCtx, "tcp", ":"+grpcPort)
+	}
+
+	// Bind every port before anything serves or any background work starts. A
+	// port that is already taken must end the process before it has accepted an
+	// RPC or claimed an apply, a webhook delivery or a lease. Until a server
+	// serves a listener, nothing else closes it, so a failed bind closes the
+	// ones already bound.
+	listen := srv.listen
+	if listen == nil {
+		listen = listenForServe
+	}
+	var bound []net.Listener
+	bind := func(name, port string) (net.Listener, error) {
+		listener, err := listen(runCtx, name, port)
 		if err != nil {
-			return fmt.Errorf("listen on port %s: %w", grpcPort, err)
+			for _, earlier := range bound {
+				err = errors.Join(err, earlier.Close())
+			}
+			return nil, err
 		}
+		bound = append(bound, listener)
+		return listener, nil
+	}
+	var grpcListener net.Listener
+	if grpcServer != nil {
+		listener, err := bind("grpc", grpcPort)
+		if err != nil {
+			return err
+		}
+		grpcListener = listener
+	}
+	httpListener, err := bind("http", port)
+	if err != nil {
+		return err
+	}
+	// Metrics get their own listener so scrapers never traverse the API port
+	// (see ServerConfig.MetricsPort).
+	metricsPort := strconv.Itoa(srv.cfg.MetricsListenPort())
+	metricsListener, err := bind("metrics", metricsPort)
+	if err != nil {
+		return err
+	}
+
+	if grpcServer != nil {
 		go func() {
 			srv.logger.Info("starting gRPC server", "port", grpcPort)
 			// Serve returns ErrServerStopped on GracefulStop during normal
 			// shutdown; that is expected, not an error worth alerting on.
-			if err := grpcServer.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			if err := grpcServer.Serve(grpcListener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 				srv.logger.Error("gRPC server error", "port", grpcPort, "error", err)
 			}
 		}()
@@ -451,20 +513,15 @@ func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os
 	srv.Start(backgroundCtx)
 
 	server := &http.Server{
-		Addr:         ":" + port,
 		Handler:      srv.Handler(),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// Metrics get their own listener so scrapers never traverse the API port
-	// (see ServerConfig.MetricsPort).
-	metricsPort := strconv.Itoa(srv.cfg.MetricsListenPort())
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("GET /metrics", srv.MetricsHandler())
 	metricsServer := &http.Server{
-		Addr:         ":" + metricsPort,
 		Handler:      metricsMux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
@@ -474,13 +531,13 @@ func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os
 	errCh := make(chan error, 2)
 	go func() {
 		srv.logger.Info("starting http server", "port", port)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(httpListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("http server: %w", err)
 		}
 	}()
 	go func() {
 		srv.logger.Info("starting metrics server", "port", metricsPort)
-		if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := metricsServer.Serve(metricsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("metrics server: %w", err)
 		}
 	}()
@@ -530,6 +587,11 @@ type Server struct {
 	telemetry  *api.Telemetry
 	authz      auth.Authorizer
 	engines    map[string]tern.EngineFactory
+	// listen binds the port a named server will serve on. It is nil outside
+	// tests, which means listenForServe. A test sets it to hand over listeners
+	// it already holds, because a port it chose and released can be taken by
+	// another process before the server binds it.
+	listen func(ctx context.Context, name, port string) (net.Listener, error)
 	// probeCancel and probeDone are set by Start when a startup target probe is
 	// launched; Close cancels the probe and waits on probeDone so an in-flight
 	// probe never outlives the resolver and clients svc.Close tears down.
@@ -1143,6 +1205,10 @@ func (s *Server) MetricsHandler() http.Handler {
 // interrupted terminal comments and checks and must not be cut short by a request context)
 // until Close bounds it; it runs before the operator so recovered applies attach
 // observers first.
+//
+// The operator starts claiming work as soon as Start returns, so an embedder
+// binds its own listeners before calling it: a process that then fails to bind
+// would exit holding claims a peer has to wait out.
 func (s *Server) Start(ctx context.Context) {
 	s.reconcile = s.webhook.StartTerminalOutcomeReconciliation(ctx, s.logger)
 	if s.targetResolver != nil {
@@ -1155,6 +1221,7 @@ func (s *Server) Start(ctx context.Context) {
 	s.svc.StartOperator(ctx)
 	s.svc.StartRemoteDeploymentHealthMonitor(ctx)
 	s.svc.StartWebhookInboxMonitor(ctx)
+	s.svc.StartFreezeMonitor(ctx)
 	s.svc.StartOperatorStuckPendingMonitor(ctx)
 	s.svc.StartPendingDropsCleaner(ctx)
 }
@@ -1476,7 +1543,8 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	ghClient := ghclient.NewClient(creds.AppID, []byte(creds.PrivateKey), logger,
 		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs),
 		ghclient.WithConfigDirHints(serverConfig),
-		ghclient.WithListenOnlyRepos(serverConfig))
+		ghclient.WithListenOnlyRepos(serverConfig),
+		ghclient.WithQuotaReserve(serverConfig.GitHub.QuotaReserve))
 	handlerOpts := append([]webhook.HandlerOption{
 		webhook.WithRepoWebhookSecret([]byte(repoWebhookSecret)),
 		webhook.WithDurableWebhookDispatch(),
@@ -1484,10 +1552,12 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	}, webhookReconcileSynthesisOptions(logger)...)
 	handlerOpts = append(handlerOpts, checkSuiteRecoveryOptions(logger)...)
 	handlerOpts = append(handlerOpts, webhookReconcileScanBoundsOptions(logger)...)
+	handlerOpts = append(handlerOpts, synchronizeQuietPeriodOptions(logger)...)
 	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger, handlerOpts...)
 	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub webhook endpoint registered",
 		"app_id", creds.AppID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs,
+		"quota_reserve", serverConfig.GitHub.QuotaReserve,
 		"repo_webhook_dispatch", repoWebhookSecret != "")
 	return webhookRuntime{
 		startDurableWebhookDispatch:    handler.StartDurableWebhookDispatch,
@@ -1495,8 +1565,24 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		drainInProcessWebhookWork:      handler.DrainInProcessWebhookWork,
 		handler:                        handler,
 		reconcileTerminalApplyOutcomes: handler.ReconcileTerminalApplyOutcomes,
-		quotaProbes:                    []*ghclient.QuotaProbe{ghClient.NewQuotaProbe()},
+		quotaProbes:                    []*ghclient.QuotaProbe{newQuotaProbe(serverConfig, ghClient, "default", logger)},
 	}, nil
+}
+
+// newQuotaProbe builds the quota probe for one App. When the config enumerates
+// the repositories the App serves, the probe reads only the installations
+// serving them; otherwise any installation may serve a repository, so it reads
+// them all.
+func newQuotaProbe(serverConfig *api.ServerConfig, client *ghclient.Client, appName string, logger *slog.Logger) *ghclient.QuotaProbe {
+	repos, restricted := serverConfig.ReposServedByGitHubApp(appName)
+	if !restricted {
+		logger.Info("GitHub quota probe reads every installation: the config does not list the repositories this App serves",
+			"app_name", appName)
+		return client.NewQuotaProbe()
+	}
+	logger.Info("GitHub quota probe reads the installations serving configured repositories",
+		"app_name", appName, "repos", len(repos))
+	return client.NewServingQuotaProbe(repos)
 }
 
 // disabledWebhookRuntime serves the webhook path while GitHub is off: every
@@ -1563,14 +1649,16 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 		appClient := ghclient.NewClient(e.id, []byte(privateKey), logger,
 			ghclient.WithTrustedCheckAppSlugs(e.cfg.TrustedCheckAppSlugs),
 			ghclient.WithConfigDirHints(serverConfig),
-			ghclient.WithListenOnlyRepos(serverConfig))
+			ghclient.WithListenOnlyRepos(serverConfig),
+			ghclient.WithQuotaReserve(e.cfg.QuotaReserve))
 		clients[e.name] = appClient
-		quotaProbes = append(quotaProbes, appClient.NewQuotaProbe())
+		quotaProbes = append(quotaProbes, newQuotaProbe(serverConfig, appClient, e.name, logger))
 		secretsByApp[e.name] = []byte(secret)
 		appByID[e.id] = e.name
 
 		logger.Info("registered GitHub App",
-			"app_name", e.name, "app_id", e.id, "trusted_check_app_slugs", e.cfg.TrustedCheckAppSlugs)
+			"app_name", e.name, "app_id", e.id, "trusted_check_app_slugs", e.cfg.TrustedCheckAppSlugs,
+			"quota_reserve", e.cfg.QuotaReserve)
 	}
 
 	handlerOpts := append([]webhook.HandlerOption{
@@ -1579,6 +1667,7 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 	}, webhookReconcileSynthesisOptions(logger)...)
 	handlerOpts = append(handlerOpts, checkSuiteRecoveryOptions(logger)...)
 	handlerOpts = append(handlerOpts, webhookReconcileScanBoundsOptions(logger)...)
+	handlerOpts = append(handlerOpts, synchronizeQuietPeriodOptions(logger)...)
 	handler := webhook.NewHandlerWithDispatch(
 		svc,
 		ghclient.NewClientSet(clients),
@@ -1681,6 +1770,56 @@ func parseWebhookReconcileScanBounds(logger *slog.Logger) (maxPages int, lookbac
 	return maxPages, lookback
 }
 
+// maxSynchronizeQuietPeriod caps WEBHOOK_SYNCHRONIZE_QUIET_PERIOD. Every push
+// waits this long for its plan and its Check Run, so a value such as 15m
+// typed for 15s would hold every PR's required check back for a quarter of
+// an hour.
+const maxSynchronizeQuietPeriod = 2 * time.Minute
+
+// synchronizeQuietPeriodOptions returns the handler option that defers durable
+// synchronize deliveries by WEBHOOK_SYNCHRONIZE_QUIET_PERIOD (a Go duration
+// such as 15s), so a burst of pushes to one PR plans only its newest head.
+// Unset keeps webhook.DefaultSynchronizeQuietPeriod; 0 turns the deferral
+// off and plans every push as soon as it arrives. Like the scan bounds, this
+// is tuning with no safe direction to fail in, so a malformed, negative, or
+// above-ceiling value is logged and ignored and the default stays in force.
+func synchronizeQuietPeriodOptions(logger *slog.Logger) []webhook.HandlerOption {
+	period := parseSynchronizeQuietPeriod(logger)
+	if period == 0 {
+		logger.Info("synchronize quiet period disabled by WEBHOOK_SYNCHRONIZE_QUIET_PERIOD; every push will be planned as soon as it arrives")
+		return nil
+	}
+	logger.Info("synchronize deliveries will wait out a quiet period before planning, so a later push in the same burst supersedes them",
+		"quiet_period", period)
+	return []webhook.HandlerOption{webhook.WithSynchronizeQuietPeriod(period)}
+}
+
+// parseSynchronizeQuietPeriod reads WEBHOOK_SYNCHRONIZE_QUIET_PERIOD,
+// returning the default when it is unset or rejected and zero when the
+// operator turned the quiet period off.
+func parseSynchronizeQuietPeriod(logger *slog.Logger) time.Duration {
+	value := os.Getenv("WEBHOOK_SYNCHRONIZE_QUIET_PERIOD")
+	if value == "" {
+		return webhook.DefaultSynchronizeQuietPeriod
+	}
+	switch parsed, err := time.ParseDuration(value); {
+	case err != nil:
+		logger.Error("invalid WEBHOOK_SYNCHRONIZE_QUIET_PERIOD value; the default synchronize quiet period stays in force",
+			"value", value, "default", webhook.DefaultSynchronizeQuietPeriod, "error", err)
+		return webhook.DefaultSynchronizeQuietPeriod
+	case parsed < 0:
+		logger.Error("WEBHOOK_SYNCHRONIZE_QUIET_PERIOD must not be negative; the default synchronize quiet period stays in force",
+			"value", value, "default", webhook.DefaultSynchronizeQuietPeriod)
+		return webhook.DefaultSynchronizeQuietPeriod
+	case parsed > maxSynchronizeQuietPeriod:
+		logger.Error("WEBHOOK_SYNCHRONIZE_QUIET_PERIOD is above its ceiling; the default synchronize quiet period stays in force",
+			"value", value, "max", maxSynchronizeQuietPeriod, "default", webhook.DefaultSynchronizeQuietPeriod)
+		return webhook.DefaultSynchronizeQuietPeriod
+	default:
+		return parsed
+	}
+}
+
 // checkSuiteRecoveryOptions returns the handler option enabling durable
 // check_suite.requested recovery, unless the operator disabled it with
 // WEBHOOK_CHECK_SUITE_RECOVERY=false. The kill switch makes the webhook
@@ -1708,12 +1847,13 @@ func checkSuiteRecoveryOptions(logger *slog.Logger) []webhook.HandlerOption {
 }
 
 // buildServerAuthorizer constructs the API authorizer exactly as the server
-// wires it: admin teams from PR command authorization, and the operator-group
-// union that widens forward-auth write admission. Hosted server builds and tests of their configured authorization use this
+// wires it: admin teams from PR command authorization, and the scoped groups
+// (database operator groups and freeze groups) that widen forward-auth write
+// admission. Hosted server builds and tests of their configured authorization use this
 // function. The local host injects its private-token authorizer separately and
 // rejects service authentication configuration before Build.
 func buildServerAuthorizer(ctx context.Context, cfg *api.ServerConfig, logger *slog.Logger) (auth.Authorizer, error) {
-	return buildAuthorizer(ctx, cfg.Auth, cfg.PRCommandAuthorization.AdminTeams, cfg.OperatorGroupUnion(), logger)
+	return buildAuthorizer(ctx, cfg.Auth, cfg.PRCommandAuthorization.AdminTeams, cfg.ScopedWriteGroupUnion(), logger)
 }
 
 // buildAuthorizer selects the API authorizer from config. The default
@@ -1754,19 +1894,21 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups, opera
 			"write_groups", len(fa.WriteGroups),
 			"operator_groups", len(operatorGroups),
 			"trusted_gateway_spiffe", len(fa.TrustedGatewaySPIFFE),
-			"read_service_spiffe", len(fa.ReadServiceSPIFFE))
+			"read_service_spiffe", len(fa.ReadServiceSPIFFE),
+			"trusted_mesh_loopback_sources", len(fa.TrustedMeshLoopbackSources))
 		authz, err := auth.NewForwardAuthAuthorizer(auth.ForwardAuthConfig{
-			UserHeader:           fa.UserHeader,
-			GroupsHeader:         fa.GroupsHeader,
-			GroupsDelimiter:      fa.GroupsDelimiter,
-			TrustedProxySPIFFE:   fa.TrustedProxySPIFFE,
-			TrustedProxyCIDRs:    fa.TrustedProxyCIDRs,
-			ReadGroups:           fa.ReadGroups,
-			WriteGroups:          fa.WriteGroups,
-			OperatorGroups:       operatorGroups,
-			TrustedGatewaySPIFFE: fa.TrustedGatewaySPIFFE,
-			CallerSPIFFEHeader:   fa.CallerSPIFFEHeader,
-			ReadServiceSPIFFE:    fa.ReadServiceSPIFFE,
+			UserHeader:                 fa.UserHeader,
+			GroupsHeader:               fa.GroupsHeader,
+			GroupsDelimiter:            fa.GroupsDelimiter,
+			TrustedProxySPIFFE:         fa.TrustedProxySPIFFE,
+			TrustedProxyCIDRs:          fa.TrustedProxyCIDRs,
+			ReadGroups:                 fa.ReadGroups,
+			WriteGroups:                fa.WriteGroups,
+			OperatorGroups:             operatorGroups,
+			TrustedGatewaySPIFFE:       fa.TrustedGatewaySPIFFE,
+			CallerSPIFFEHeader:         fa.CallerSPIFFEHeader,
+			ReadServiceSPIFFE:          fa.ReadServiceSPIFFE,
+			TrustedMeshLoopbackSources: fa.TrustedMeshLoopbackSources,
 		}, logger)
 		if err != nil {
 			return nil, err
@@ -1775,7 +1917,7 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups, opera
 		case len(fa.WriteGroups) == 0 && len(operatorGroups) == 0:
 			logger.Warn("forward-auth enabled with no write groups configured: all write operations will be denied (read still works). Set auth.forward_auth.write_groups to allow writes.")
 		case len(fa.WriteGroups) == 0:
-			logger.Warn("forward-auth enabled with no write groups configured: only per-database operator writes will be allowed; operations with no target database (settings, checks, redrive) will be denied. Set auth.forward_auth.write_groups to allow admin writes.")
+			logger.Warn("forward-auth enabled with no write groups configured: only per-database operator writes will be allowed; operations with no target database (settings, checks) will be denied. Set auth.forward_auth.write_groups to allow admin writes.")
 		}
 		if len(fa.ReadGroups) == 0 {
 			logger.Info("forward-auth enabled with no read groups configured: read operations are open to any authenticated caller from the trusted proxy. Set auth.forward_auth.read_groups to restrict reads.")

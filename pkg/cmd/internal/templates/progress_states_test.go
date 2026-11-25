@@ -492,7 +492,16 @@ func TestWriteDatabaseHistoryEmpty(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteDatabaseHistory(DatabaseHistoryData{Database: "new-db"})
 	})
-	assert.Equal(t, ANSIDim+"No schema changes found for database 'new-db'"+ANSIReset+"\n", output)
+	assert.Equal(t, ANSIDim+"No applies recorded for database 'new-db'"+ANSIReset+"\n", output)
+}
+
+// TestWriteDatabaseHistoryEmptyNamesTheEnvironment pins that a history filtered
+// to one environment says which environment had no applies.
+func TestWriteDatabaseHistoryEmptyNamesTheEnvironment(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteDatabaseHistory(DatabaseHistoryData{Database: "orders", Environment: "staging"})
+	})
+	assert.Equal(t, ANSIDim+"No applies recorded for database 'orders' in staging"+ANSIReset+"\n", output)
 }
 
 // TestWriteStatusListColoredStateCellBytes pins the colored STATE cell's
@@ -537,6 +546,33 @@ func TestWriteDatabaseHistoryAlignsMultiByteCells(t *testing.T) {
 		"an eight-cell CJK name in a ten-cell column gets two cells of padding")
 	assert.Contains(t, output, "  apply_ascii  production  "+ANSIRed+"Failed   "+ANSIReset+"  ",
 		"the ASCII row pads to the same visible width, not to the CJK value's byte length")
+}
+
+// A start that follows the schema change, the default, first reports how many
+// tables it resumed and how many had already finished, each under its own
+// label, and leaves out a count that is zero.
+func TestWriteStartSuccess(t *testing.T) {
+	header := ANSIBold + ANSIGreen + "▶️  Schema change resumed" + ANSIReset + "\n\n" +
+		"Database:    orders\n" +
+		"Environment: staging\n"
+	footer := "\n" + ANSIDim + "Resuming from checkpoint..." + ANSIReset + "\n"
+
+	t.Run("resumed and skipped tables", func(t *testing.T) {
+		output := captureStdout(t, func() {
+			WriteStartSuccess(StartData{Database: "orders", Environment: "staging", ApplyID: "apply-example", StartedCount: 2, SkippedCount: 1})
+		})
+		assert.Equal(t, header+
+			"Resumed:     2 table(s)\n"+
+			"Skipped:     1 table(s) (already complete)\n"+
+			footer, output)
+	})
+
+	t.Run("nothing skipped", func(t *testing.T) {
+		output := captureStdout(t, func() {
+			WriteStartSuccess(StartData{Database: "orders", Environment: "staging", ApplyID: "apply-example", StartedCount: 3})
+		})
+		assert.Equal(t, header+"Resumed:     3 table(s)\n"+footer, output)
+	})
 }
 
 func captureStdout(t *testing.T, fn func()) string {
@@ -653,6 +689,17 @@ func TestFormatTableProgress_TableSizeBesideRows(t *testing.T) {
 	assert.Contains(t, FormatTableProgress(queued), "Rows: ~48.2M · ~23.4 GB\n")
 	queued.EstimatedRows = nil
 	assert.NotContains(t, FormatTableProgress(queued), "Rows:")
+}
+
+// A queued table's planned-rows line sits on its own detail line, indented
+// under the table like every other detail, and is left out when the plan has
+// no row estimate.
+func TestQueuedTableCarriesItsPlannedRowsLine(t *testing.T) {
+	rows, size := int64(1_200_000), int64(3_000_000_000)
+	out := FormatTableProgress(TableProgress{TableName: "orders", ChangeType: "alter", Status: state.Apply.Pending, EstimatedRows: &rows, EstimatedBytes: &size})
+	assert.Contains(t, out, "\n"+indentDetail+"Rows: ~1.2M · ~3.0 GB\n")
+	none := FormatTableProgress(TableProgress{TableName: "orders", ChangeType: "alter", Status: state.Apply.Pending})
+	assert.NotContains(t, none, "Rows:")
 }
 
 // A table applying its accumulated changes names the catch-up phase rather
@@ -772,6 +819,47 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 	assert.NotContains(t, completed, ui.MySQLThrottleDocURL)
 	assert.NotContains(t, notThrottled, ui.MySQLThrottleDocURL)
 	assert.NotContains(t, completed, "Throttled", "a terminal table never renders a stale throttle flag")
+}
+
+// Every phase the engine's throttler paces carries "(throttled)" at the end of
+// its header, so a throttled table never reads as stalled in any of them, and
+// the annotation goes away once the flag clears.
+func TestThrottledHeaderEveryPhase(t *testing.T) {
+	copying := func(mod func(*TableProgress)) TableProgress {
+		tp := TableProgress{TableName: "orders", ChangeType: "alter", Status: state.Apply.Running, Throttled: true}
+		mod(&tp)
+		return tp
+	}
+	cases := map[string]TableProgress{
+		"checksum with a total": copying(func(tp *TableProgress) {
+			tp.Status = state.Apply.Checksumming
+			tp.ChecksumRowsChecked, tp.ChecksumRowsTotal = 500, 1000
+		}),
+		"checksum without a total": copying(func(tp *TableProgress) { tp.Status = state.Apply.Checksumming }),
+		"starting copy":            copying(func(tp *TableProgress) { tp.RowsTotal = 1000 }),
+		"copying":                  copying(func(tp *TableProgress) { tp.RowsTotal, tp.RowsCopied, tp.PercentComplete = 1000, 450, 45 }),
+		"applying instantly":       copying(func(tp *TableProgress) { tp.IsInstant = true }),
+		"applying create":          copying(func(tp *TableProgress) { tp.ChangeType = "create" }),
+		"running without rows":     copying(func(tp *TableProgress) {}),
+		"estimate exceeded":        copying(func(tp *TableProgress) { tp.RowsTotal = 1000; tp.RowsCopied = 1500; tp.PercentComplete = 100 }),
+		"sharded phase": copying(func(tp *TableProgress) {
+			tp.Status = state.Apply.Checksumming
+			tp.RowsTotal, tp.RowsCopied, tp.PercentComplete = 1000, 1000, 100
+			tp.Shards = []ShardProgress{{Shard: "-80", Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, PercentComplete: 100}, {Shard: "80-", Status: state.Task.Running, RowsCopied: 500, RowsTotal: 1000, PercentComplete: 50}}
+		}),
+		"across targets": copying(func(tp *TableProgress) {
+			tp.AcrossTargets = true
+			tp.Shards = []ShardProgress{{Shard: "t1", Status: state.Task.Running, RowsCopied: 500, RowsTotal: 1000, PercentComplete: 50}, {Shard: "t2", Status: state.Task.Pending}}
+		}),
+	}
+	for name, tp := range cases {
+		t.Run(name, func(t *testing.T) {
+			header, _, _ := strings.Cut(strings.TrimLeft(FormatTableProgress(tp), "\n"), "\n")
+			assert.True(t, strings.HasSuffix(header, " (throttled)"), "header %q", header)
+			tp.Throttled = false
+			assert.NotContains(t, FormatTableProgress(tp), "(throttled)")
+		})
+	}
 }
 
 // Interactive throttle hints point at the throttle reference the way a PR

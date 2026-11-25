@@ -32,6 +32,17 @@ func TestPlanResponseFromProtoCarriesExemptTables(t *testing.T) {
 	assert.Equal(t, "archive naming", response.ExemptTables[0].Reason)
 }
 
+// The drop_tables entries a plan reports naming no live table reach the plan
+// response in the order the engine reported them, so both surfaces can say
+// the entry drops nothing.
+func TestPlanResponseFromProtoCarriesUnmatchedDropTables(t *testing.T) {
+	response := planResponseFromProto(&ternv1.PlanResponse{UnmatchedDropTables: []string{"_orders_olds", "`_jobs_old`"}})
+	assert.Equal(t, []string{"_orders_olds", "`_jobs_old`"}, response.UnmatchedDropTables)
+
+	assert.Empty(t, planResponseFromProto(&ternv1.PlanResponse{}).UnmatchedDropTables,
+		"a plan whose entries all matched reports none")
+}
+
 // apitypes carries its own copy of the exemption-reason vocabulary because it
 // is dependency-free by design. This package imports both, so it is where the
 // two are held together: a rename on the engine side that missed the wire side
@@ -72,7 +83,9 @@ func TestPlanResponseWithheldTables(t *testing.T) {
 // withhold them — and the reviewed list is recorded on the stored plan, so a
 // rollback, a resume, or a member's drift check is asked for the same
 // exclusions instead of proposing to drop the tables the plan never captured.
-func TestExecutePlanCarriesIgnoreTablesAndRecordsTheReviewedConfig(t *testing.T) {
+// drop_tables travels and is recorded the same way, so every re-plan of the
+// plan proposes the drops it was reviewed with.
+func TestExecutePlanCarriesIgnoreAndDropTablesAndRecordsTheReviewedConfig(t *testing.T) {
 	plans := &capturingPlanStore{}
 	mockClient := &mockTernClient{planResp: &ternv1.PlanResponse{
 		PlanId: "plan-ignore-tables",
@@ -100,11 +113,14 @@ func TestExecutePlanCarriesIgnoreTablesAndRecordsTheReviewedConfig(t *testing.T)
 		// "never_existed" withholds nothing; the plan proceeds and the caller
 		// is left able to report the unmatched entry.
 		IgnoreTables: []string{"flyway_schema_history", "never_existed"},
+		DropTables:   []string{"_users_old", "_orders_old"},
 	})
 	require.NoError(t, err)
 
 	require.NotNil(t, mockClient.planReq)
 	assert.Equal(t, []string{"flyway_schema_history", "never_existed"}, mockClient.planReq.GetIgnoreTables())
+	assert.Equal(t, []string{"_users_old", "_orders_old"}, mockClient.planReq.GetDropTables(),
+		"the data plane is sent the drop list as the request states it")
 
 	require.NotNil(t, resp)
 	assert.Equal(t, []string{"flyway_schema_history"}, resp.WithheldTables(),
@@ -115,6 +131,8 @@ func TestExecutePlanCarriesIgnoreTablesAndRecordsTheReviewedConfig(t *testing.T)
 		"the stored plan keeps the reviewed config, not the subset that matched here: "+
 			"an entry this target lacks still names a table a member target holds, and a member "+
 			"re-planning under the narrower subset would propose dropping it")
+	assert.Equal(t, []string{"_orders_old", "_users_old"}, plans.created.DropTables(),
+		"the stored plan keeps the reviewed drop list for every re-plan of it")
 }
 
 // An entry that withheld nothing while the plan proposes dropping the very
@@ -191,7 +209,15 @@ func TestExecutePlanKeepsPlanningWhenAnUnmatchedEntryIsNotDropped(t *testing.T) 
 
 // withheldDropService wires a service whose staging plan for payments is
 // answered by client, so a test can hand it the plan a data plane returned.
+// No apply is unsettled on the database.
 func withheldDropService(plans storage.PlanStore, client tern.Client) *Service {
+	return dropTablesService(plans, &unsettledApplyStore{}, nil, client)
+}
+
+// dropTablesService is withheldDropService with the applies that have not
+// settled and their operations, which a plan or apply carrying drop_tables
+// reads to protect their working tables.
+func dropTablesService(plans storage.PlanStore, applies storage.ApplyStore, operations storage.ApplyOperationStore, client tern.Client) *Service {
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
 			"payments": {
@@ -201,9 +227,33 @@ func withheldDropService(plans storage.PlanStore, client tern.Client) *Service {
 		},
 		TernDeployments: TernConfig{DefaultDeployment: {"staging": "localhost:9090"}},
 	}
-	return New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
+	return New(&dropTablesStorage{
+		mockStorageWithPlanLookup: mockStorageWithPlanLookup{plans: plans, operations: operations},
+		applies:                   applies,
+	}, cfg, map[string]tern.Client{
 		DefaultDeployment + "/staging": client,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// dropTablesStorage serves the plans and operations of
+// mockStorageWithPlanLookup and the applies a test sets.
+type dropTablesStorage struct {
+	mockStorageWithPlanLookup
+	applies storage.ApplyStore
+}
+
+func (m *dropTablesStorage) Applies() storage.ApplyStore { return m.applies }
+
+// unsettledApplyStore answers GetUnsettled with the applies a test sets, or
+// with err.
+type unsettledApplyStore struct {
+	storage.ApplyStore
+	unsettled []*storage.Apply
+	err       error
+}
+
+func (s *unsettledApplyStore) GetUnsettled(context.Context) ([]*storage.Apply, error) {
+	return s.unsettled, s.err
 }
 
 // A data plane built before pattern entries reads "/^relay_\d+_feed$/" as the
@@ -447,9 +497,13 @@ func rollbackSourcePlan() *storage.Plan {
 // A rollback re-plans the source plan's captured files against the live target,
 // so it needs the same exclusions — and its own stored plan needs them too: a
 // resume or a further rollback reads them back off that row, and a row that
-// forgot them re-plans the withheld tables as drops.
-func TestExecuteRollbackPlanCarriesAndRecordsTheReviewedIgnoreTables(t *testing.T) {
-	plans := &rollbackSourcePlanStore{source: rollbackSourcePlan()}
+// forgot them re-plans the withheld tables as drops. The source plan's
+// drop_tables is never carried: a rollback restores the earlier schema and
+// does not drop a table the apply left in place.
+func TestExecuteRollbackPlanCarriesIgnoreTablesButNeverDropTables(t *testing.T) {
+	source := rollbackSourcePlan()
+	source.RecordDropTables([]string{"_users_old"})
+	plans := &rollbackSourcePlanStore{source: source}
 	svc, apply := newRollbackExemptService(plans, &ternv1.PlanResponse{
 		PlanId: "plan_rollback",
 		Changes: []*ternv1.SchemaChange{{
@@ -474,10 +528,14 @@ func TestExecuteRollbackPlanCarriesAndRecordsTheReviewedIgnoreTables(t *testing.
 	require.NotNil(t, client.planReq)
 	assert.Equal(t, []string{"flyway_schema_history"}, client.planReq.GetIgnoreTables(),
 		"the rollback re-plan withholds what the source plan was reviewed under")
+	assert.Empty(t, client.planReq.GetDropTables(),
+		"the rollback re-plan is never asked to drop what the source plan listed")
 
 	require.NotNil(t, plans.created)
 	assert.Equal(t, []string{"flyway_schema_history"}, plans.created.IgnoreTables(),
 		"the rollback's own stored plan keeps them for a re-plan of itself")
+	assert.Empty(t, plans.created.DropTables(),
+		"the rollback's own stored plan records no drop list")
 }
 
 // A rollback re-plans schema files the recorded ignore_tables were never
@@ -545,4 +603,147 @@ func TestExecuteRollbackPlanRefusesADropOfAWithheldTable(t *testing.T) {
 	assert.True(t, IsTerminalControlError(err),
 		"the same data plane answers every retry the same way, so the failure must not be re-driven")
 	assert.Nil(t, plans.created, "a rollback plan that would drop a withheld table is not stored")
+}
+
+// An ignore_tables entry naming a "_" table withholds nothing, because the
+// MySQL planner skips the table by its name first. That entry is redundant,
+// not a typo, so it is told apart from an entry that reached no table at all.
+func TestSplitEntriesSkippedByNaming(t *testing.T) {
+	groups := []*ternv1.ExemptTables{
+		{Namespace: "app", Tables: []string{"flyway_schema_history"}, Reason: engine.ExemptReasonIgnoreTables},
+		{Namespace: "app", Tables: []string{"_orders_old"}, Reason: engine.ExemptReasonLeadingUnderscore},
+	}
+	unmatched, redundant := splitEntriesSkippedByNaming([]string{"_orders_old", "flyway_schema_histroy"}, groups)
+	assert.Equal(t, []string{"flyway_schema_histroy"}, unmatched)
+	assert.Equal(t, []string{"_orders_old"}, redundant)
+}
+
+// A data plane that read drop_tables drops a "_" table the list names instead
+// of skipping it by its name. One that still discloses such an entry as skipped,
+// and plans no drop of it, did not apply the list, and only those entries are
+// reported: an entry the plan drops, or one the plan neither drops nor skips
+// because the table is not there, is what a data plane that read the list
+// answers.
+func TestDropTablesEntriesStillSkipped(t *testing.T) {
+	changes := []*ternv1.SchemaChange{{
+		Namespace: "app",
+		TableChanges: []*ternv1.TableChange{{
+			TableName: "_users_old", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP,
+			Ddl: "DROP TABLE `_users_old`",
+		}},
+	}}
+	groups := []*ternv1.ExemptTables{
+		{Namespace: "app", Tables: []string{"_orders_old", "_invoices_old"}, Reason: engine.ExemptReasonLeadingUnderscore},
+		{Namespace: "app", Tables: []string{"_refunds_old"}, Reason: engine.ExemptReasonIgnoreTables},
+	}
+
+	got := dropTablesEntriesStillSkipped(
+		[]string{"_orders_old", "_users_old", "_refunds_old", "never_existed", "_orders_old"},
+		changes, nil, groups)
+
+	assert.Equal(t, []string{"_orders_old"}, got)
+	assert.Nil(t, dropTablesEntriesStillSkipped(nil, changes, nil, groups), "a plan with no drop_tables has nothing to report")
+}
+
+// A drop_tables entry the plan neither drops nor still skips names no live
+// table, such as one whose drop already landed. Only those entries are
+// reported, once each: a dropped entry is planned, and a still-skipped one is
+// the separate answer of a data plane that did not apply the list. A drop
+// planned on one shard counts as planned.
+func TestDropTablesEntriesUnmatched(t *testing.T) {
+	changes := []*ternv1.SchemaChange{{
+		Namespace: "app",
+		TableChanges: []*ternv1.TableChange{{
+			TableName: "_users_old", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP,
+			Ddl: "DROP TABLE `_users_old`",
+		}},
+	}}
+	shards := []*ternv1.ShardPlan{{
+		Namespace: "app", Shard: "-80",
+		Changes: []*ternv1.TableChange{{
+			TableName: "_invoices_old", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP,
+			Ddl: "DROP TABLE `_invoices_old`",
+		}},
+	}}
+
+	got := dropTablesEntriesUnmatched(
+		[]string{"_users_old", "_orders_old", "_payouts_old", "_invoices_old", "_payouts_old"},
+		[]string{"_orders_old"}, changes, shards)
+
+	assert.Equal(t, []string{"_payouts_old"}, got)
+	assert.Nil(t, dropTablesEntriesUnmatched(nil, nil, changes, shards), "a plan with no drop_tables has nothing to report")
+}
+
+// A drop_tables entry that names no live table plans nothing, and the plan
+// still succeeds. The server logs the entry with the identifiers an operator
+// needs to find the config, since that log is the only sign the entry is stale
+// and should be removed.
+func TestPlanHandler_LogsDropTablesEntriesThatNameNoLiveTable(t *testing.T) {
+	mockClient := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-stale-entry"}}
+	svc := withheldDropService(&capturingPlanStore{}, mockClient)
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	pr := int32(42)
+	body, err := json.Marshal(PlanRequest{
+		Database:    "payments",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeMySQL,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+		},
+		Repository:  "acme/payments",
+		PullRequest: &pr,
+		DropTables:  []string{"_payouts_old"},
+	})
+	require.NoError(t, err)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	svc.handlePlan(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var entry map[string]any
+	for line := range bytes.Lines(logs.Bytes()) {
+		var record map[string]any
+		require.NoError(t, json.Unmarshal(line, &record))
+		if record["unmatched_entries"] != nil {
+			entry = record
+		}
+	}
+	require.NotNil(t, entry, "the stale entry is logged: %s", logs.String())
+	assert.Equal(t, "INFO", entry["level"])
+	assert.Equal(t, []any{"_payouts_old"}, entry["unmatched_entries"])
+	assert.Equal(t, "payments", entry["database"])
+	assert.Equal(t, "staging", entry["environment"])
+	assert.Equal(t, DefaultDeployment, entry["deployment"])
+	assert.Equal(t, "acme/payments", entry["repository"])
+	assert.InDelta(t, 42, entry["pull_request"], 0)
+}
+
+// POST /api/plan holds drop_tables to the rule the engine indexes it by, so an
+// entry that is not one exact table name is the request's error, answered
+// before any data plane is asked to plan.
+func TestPlanHandler_InvalidDropTablesEntryIsBadRequest(t *testing.T) {
+	mockClient := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-unused"}}
+	svc := withheldDropService(&capturingPlanStore{}, mockClient)
+	body, err := json.Marshal(PlanRequest{
+		Database:    "payments",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeMySQL,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+		},
+		DropTables: []string{`/^_users_old$/`},
+	})
+	require.NoError(t, err)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	svc.handlePlan(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), `drop_tables entry \"/^_users_old$/\" must be an exact table name`)
+	assert.Nil(t, mockClient.planReq, "no data plane is asked to plan")
 }

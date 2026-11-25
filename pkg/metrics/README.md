@@ -77,11 +77,17 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.webhook.inbox_oldest_claimable_age_seconds` | Gauge | environment | Age of the oldest ready-to-claim durable webhook inbox row |
 | `schemabot.webhook.inbox_stuck_processing` | Gauge | environment | Durable webhook inbox rows stuck in processing past the attempt cap |
 | `schemabot.webhook.inbox_stats_collection_failures` | Counter | environment | Failed durable webhook inbox metric snapshots (liveness signal for the inbox gauges) |
+| `schemabot.environment.frozen` | Gauge | environment, scope | `1` while a freeze of this scope is in effect in the environment, else `0`. `scope` is `environment` for a whole-environment freeze and `partial` for one narrowed to some deployments or databases; both are reported for every environment the instance serves, from one snapshot taken every 30s by the database clock, so a scrape never mixes two snapshots. Exported as `schemabot_environment_frozen`. |
+| `schemabot.environment.freeze_open_seconds` | Gauge | environment | Age in seconds of the oldest open-ended freeze in effect, `0` when none is. Planned freezes have an end time and are not counted. Alert on it to catch a forgotten incident freeze. |
+| `schemabot.environment.frozen_collection_failures` | Counter | environment | Failed freeze snapshots (liveness signal for the frozen gauge) |
+| `schemabot.change_gate.refusals` | Counter | environment, gate, checkpoint | Applies, starts and cutovers refused by a change gate, once per blocking gate (`freeze`) |
+| `schemabot.change_gate.overrides` | Counter | environment, gate, checkpoint | Applies, starts and cutovers an approved override request let through a change gate, once per overridden gate |
+| `schemabot.change_gate.errors` | Counter | environment, checkpoint | Change gate checks that failed, refusing the change with a retryable 503 (`start`, `resume`, `cutover`) |
 | `schemabot.webhook.check_suite_recovery_total` | Counter | environment, repository, outcome | Durable check_suite recovery outcomes (`covered`, `synthesized`, `resynthesized`, `already_queued` per candidate PR; `no_pr_at_ingress`, `no_open_pr`, `truncated` per delivery) |
 | `schemabot.webhook.inbox_dispatch_lag_seconds` | Histogram | environment, event_type, repository | Time from webhook receipt to the delivery's first dispatch claim |
 | `schemabot.webhook.dispatch_duration_seconds` | Histogram | environment, event_type, outcome | Duration of one durable webhook dispatch claim by outcome (deliberately no repository label — see the ledger note below) |
 | `schemabot.github.requests_total` | Counter | environment, operation, category, resource, status, repository, github_app, installation_id | GitHub API request attempts observed by SchemaBot, including attempts that never produced a response |
-| `schemabot.github.primary_rate_limit_rejections_total` | Counter | environment, operation, resource, github_app, installation_id, origin | Primary quota refusals at HTTP or local prevention; investigate shared quota usage and blocked work (see guidance below) |
+| `schemabot.github.primary_rate_limit_rejections_total` | Counter | environment, operation, resource, github_app, installation_id, origin | Primary quota refusals at HTTP, local prevention, or the configured quota reserve; investigate shared quota usage and blocked work (see guidance below) |
 | `schemabot.github.secondary_rate_limit_cooldown_reports_total` | Counter | environment, operation, resource, github_app, installation_id, disposition | Parsed secondary cooldown decisions, including accepted and exceeded allowances |
 | `schemabot.github.wait_duration_seconds` | Histogram (seconds) | environment, operation, resource, github_app, installation_id, layer, reason | Actual elapsed outer read-retry waits, including cancellation/deadline interruptions |
 | `schemabot.github.pr_file_cap_exceeded_total` | Counter | environment, repository, schema_visible | Auto-plan runs failed closed because the PR changes more files than GitHub will report for a single PR. Deterministic per PR, not an outage. Every over-cap PR gets the same cap-specific blocking check; `schema_visible` records whether the reported files include a schema or config path (`true`: the PR plausibly carries a schema change that needs a smaller PR; `false`: the visible files look like a pure refactor) |
@@ -89,6 +95,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.github.rate_limit.limit` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
 | `schemabot.github.rate_limit.remaining` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
 | `schemabot.github.rate_limit.observation_age_seconds` | Observable gauge | environment, operation, resource, github_app, installation_id | Age of the latest trustworthy installation snapshot; rises past the export age only when the quota probe cannot read the budget |
+| `schemabot.github.rate_limit.unobserved_installations` | Observable gauge | environment, operation, resource, github_app | Installations serving configured repositories whose core budget is unknown: no fresh snapshot, or the owner's installation could not be resolved. Every App reports 1 from server start until its probe's first pass resolves its targets; a quota gate requires 0 alongside the `remaining` threshold |
 | `schemabot.github.rate_limit.used` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
 | `schemabot.target.probe.total` | Counter | database_type, environment, outcome | Startup connectivity probes of enumerated targets, by outcome. This counter sits below the volume bar in [Does it belong in a metric?](#does-it-belong-in-a-metric) — one observation per target per process start — and earns its place as a deploy-time alert instead: a fleet-wide rollout produces a burst of observations at once, and any non-`success` outcome in that burst is a rotated credential, dropped grant, or unreachable target found before the first schema change reaches it. Alert on `outcome != success` per environment after each deploy. Target is omitted to bound cardinality; the paired warn log names it |
@@ -153,7 +160,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (PR command actor authorization): `allowed`, `denied`, `error`, `skipped`, `unknown`
 
-**reason** (PR command actor authorization): `disabled`, `allowed_admin_team`, `allowed_admin_user`, `allowed_repo_admin_team`, `allowed_repo_admin_user`, `allowed_operator_team`, `allowed_operator_user`, `missing_actor`, `missing_server_config`, `missing_database_config`, `no_configured_principal`, `not_authorized`, `github_error`, `unknown`
+**reason** (PR command actor authorization): `disabled`, `allowed_admin_team`, `allowed_admin_user`, `allowed_repo_admin_team`, `allowed_repo_admin_user`, `allowed_operator_team`, `allowed_operator_user`, `allowed_command_app`, `missing_actor`, `missing_server_config`, `missing_database_config`, `no_configured_principal`, `not_authorized`, `github_error`, `unknown`
 
 **operation** (check ownership): `apply_finished`, `apply_cancelled_finished`, `rollback_finished`
 
@@ -169,19 +176,19 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **operation** (locks): `acquire`, `release`
 
-**status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `no_acquirer` (a scoped acquire refused because there is no verified acquirer to record; the log line carries the reason), `error`
+**status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `no_acquirer` (a scoped acquire refused because there is no verified acquirer to record; the log line carries the reason), `in_use` (a release that named a lock row kept it because an apply that can still change runs under it; the log line names the apply), `error`
 
 **event_type** (webhooks): `create`, `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `pull_request_review_comment`, `check_run`, `check_suite`, `ping`, `push`
 
 **action** (webhooks): common GitHub actions for the subscribed webhook events, such as `created`, `opened`, `synchronize`, `submitted`, `edited`, `closed`, `requested`, `completed` (omitted for events without actions like `ping` and `push`)
 
-**status** (webhooks): `processed`, `invalid_signature`, `ignored`, `repo_not_configured`, `app_repo_mismatch`, `installation_resolution_failed`, `durable_enqueue_failed`, `durable_command_not_ready`, `durable_command_routing_blocked`, `durable_command_unrouted`, `durable_dispatch_started`, `durable_dispatch_retrying`, `durable_dispatch_failed`, `durable_dispatch_failed_permanent`, `durable_dispatch_completed`, `durable_dispatch_superseded`
+**status** (webhooks): `processed`, `invalid_signature`, `ignored`, `repo_not_configured`, `app_repo_mismatch`, `installation_resolution_failed`, `durable_enqueue_failed`, `durable_command_not_ready`, `durable_command_routing_blocked`, `durable_command_unrouted`, `durable_dispatch_started`, `durable_dispatch_retrying`, `durable_dispatch_quota_reserve_deferred`, `durable_dispatch_failed`, `durable_dispatch_failed_permanent`, `durable_dispatch_completed`, `durable_dispatch_superseded`
 
 **state** (webhook inbox): `pending`, `processing`, `failed_retryable`, `completed`, `failed`, `failed_permanent`, `superseded`, `unknown`
 
-**outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `superseded`, `released`, `lease_lost`, `finish_error`, `unknown`
+**outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `quota_reserve_deferred`, `superseded`, `released`, `lease_lost`, `finish_error`, `unknown`
 
-**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_combined_status`, `get_team`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
+**operation** (GitHub API): `add_comment_reaction`, `compare_commits`, `create_check_run`, `create_installation_access_token`, `create_issue_comment`, `delete_issue_comment`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_branch_rules`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_issue_comment`, `fetch_pull_request`, `fetch_rate_limit`, `fetch_ref`, `fetch_repository`, `fetch_repository_installation`, `get_combined_status`, `get_team`, `get_team_membership`, `graphql_branch_protection`, `graphql_merge_queue_entries`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_app_installations`, `list_check_runs_for_ref`, `list_issue_timeline`, `list_matching_refs`, `list_pr_files`, `list_pull_requests`, `list_pull_requests_for_commit`, `list_reviews`, `list_team_members`, `remove_issue_label`, `request_reviewers`, `unknown`, `update_check_run`
 
 **category** (GitHub API): `auth`, `read`, `write`, `unknown`
 
@@ -320,21 +327,64 @@ should be investigated before relying on branch-protection state.
 reports the latest trustworthy installation budget, without a repository label.
 Group by `github_app`, `installation_id`, and `resource`, taking the minimum
 across replicas. Snapshots require a named App, positive installation ID, valid
-remaining/limit headers, and a future reset time. They disappear from collection
-when older than 120 seconds or when their reset time passes. Repeated scrapes,
+remaining/limit headers, and a reset time after the response was received.
+They disappear from collection when older than 120 seconds, and not before:
+a snapshot whose window resets stays exported until a newer reading replaces
+it or it ages out, so a routine hourly reset never turns an installation that
+is being read into an unknown budget. A snapshot is a reading of bounded age,
+not a lower bound on the budget: requests made since it was read, by this
+replica or any other consumer of the installation, are not in it, across a
+reset or not. A headroom threshold should leave room for what the
+installation can spend within the export age. Repeated scrapes,
 local quota refusals and secondary cooldown waits do not refresh observation age.
-Older reset windows and delayed larger allowances within a window cannot replace
-a depleted snapshot. Within one window, a lower allowance wins even when it is
-recorded out of receipt order; its original receipt time still controls expiry.
-A new window can increase the allowance.
+Within one window the lowest allowance seen is kept, in any receipt order, even
+when GitHub later reports more; a later response with more remaining still
+refreshes the observation time, so an installation that is read keeps its
+snapshot exported. Expiry follows the latest receipt in the window, and a
+response recorded late never moves it later than its own receipt time. When a
+response reports a different reset time, the one received most recently says
+which window is current, and a new window can increase the allowance. That
+holds when the reset time moves earlier too: GitHub can report one reset time
+and then an earlier one for the rest of the window, and the snapshot follows
+the newer readings instead of ageing out on the first. A response received
+before the current snapshot never replaces it with another window. Each reset
+time that has not yet passed keeps its own lowest allowance, so a window that
+becomes current again still exports the depletion already seen in it, whatever
+order the responses are recorded in. The number of reset times kept per
+installation is bounded; past the bound the least recently reported is dropped.
 
 Webhook traffic refreshes a snapshot from the headers of every response, and
 the server's GitHub quota probe refreshes it while there is no traffic: once a
-minute it reads `GET /rate_limit` for each active installation of every
-configured App. GitHub does not count that read against the budget it reports,
-and it is recorded like any other request, as `operation="fetch_rate_limit"`
-after the installation list (`operation="list_app_installations"`). An idle
-server therefore keeps exporting its installations' budgets. The budget read is
+minute it reads `GET /rate_limit` for each installation it is responsible for.
+GitHub does not count that read against the budget it reports, and it is
+recorded like any other request, as `operation="fetch_rate_limit"`. An idle
+server therefore keeps exporting its installations' budgets.
+
+The probe is responsible for the installations that serve the App's configured
+repositories. It resolves them on every pass with one installation lookup per
+repository owner (`GET /repos/{owner}/{repo}/installation` through the App
+JWT, which does not spend an installation's budget), so an App that is
+reinstalled is followed to its new installation within a pass. An installation of the App on an account the server
+serves no repository of is not read, so its untouched budget neither stands in
+for a serving installation running low nor fails a quota gate; it exports a
+snapshot only while it has traffic of its own. A server whose config lists no
+repositories may serve any repository, so its probe reads every active
+installation of the App instead (`operation="list_app_installations"`).
+
+`schemabot.github.rate_limit.unobserved_installations` makes a missing budget
+visible. It counts the probe's installations with no snapshot read within the
+export age (a reset does not count: see above), plus
+each configured owner whose installation the probe could not resolve on its
+last pass, plus one when the last pass could not list the App's installations
+at all, plus one when the probe has not reported its targets within the
+snapshot export age (webhook traffic keeps known installations' snapshots
+fresh, so only the targets' own age shows that the probe has stalled). A 404, meaning the App is not installed on that repository, is not
+counted: no installation serves it. Neither is an installation its owner has
+suspended, which cannot mint the token a budget read needs and serves no work
+until it is unsuspended. Because a missing series cannot lower a
+`min`, a headroom gate checks both: `min` of the snapshot `remaining` at or
+above its threshold, and `max` of `unobserved_installations` at 0. Treat no
+data on either query as a failure. The budget read is
 never refused locally for an exhausted primary budget, so an installation that
 has spent its whole budget still reports 0 rather than aging out to unknown;
 secondary cooldowns still apply to it.
@@ -344,7 +394,7 @@ without App credentials serves a disabled webhook endpoint and starts no probe,
 so a deployment that only runs schema changes and never talks to GitHub sends
 no probe requests and exports no snapshot. Every replica of a server with an App
 runs its own probe, so the reads scale with replicas: 20 replicas make 20
-installation lists per App and 20 budget reads per installation each minute.
+installation lookups per owner and 20 budget reads per installation each minute.
 None of those reads spends the core budget. Each replica exports the same budget
 under its own series, so query the snapshot with an aggregation across replicas
 (`min` for headroom), not a single series.
@@ -380,7 +430,8 @@ when a `not_found` rate looks anomalous.
 Useful dashboard views:
 
 1. Minimum `schemabot.github.rate_limit.remaining{operation="rate_limit_snapshot"}` by `github_app`,
-   `installation_id`, and `resource`.
+   `installation_id`, and `resource`, next to the maximum
+   `schemabot.github.rate_limit.unobserved_installations` by `github_app`.
 2. Request rate from `schemabot.github.requests_total` by `category`,
    `operation`, and `status`.
 3. Write request rate by `github_app` and `installation_id` to spot
@@ -523,7 +574,7 @@ Reason values:
 
 | Reason | Meaning |
 |---|---|
-| `scoped_lane_disabled` | No database has `operator_groups`; the decision is the plain admin gate. |
+| `scoped_lane_disabled` | No database has `operator_groups` and `freeze.groups` is empty; the decision is the plain admin gate. |
 | `target_unresolved` | The stored plan named by the request failed to load or does not exist, so no target database was available to authorize against. |
 | `admin_allow` | Allowed via deployment `write_groups` membership. |
 | `scoped_allow` | Allowed via the target database's `operator_groups` grant. |
@@ -532,10 +583,13 @@ Reason values:
 | `not_database_operator` | Caller's groups do not match the target database's `operator_groups`. |
 | `environment_not_allowed` | Target environment is outside `operator_environments`. |
 | `missing_database_config` | The target database is not configured. |
+| `freeze_allow` | Freeze write allowed via `freeze.groups` membership. |
+| `not_freeze_admin` | Freeze write denied: caller is in neither `write_groups` nor `freeze.groups`. |
+| `not_freeze_approver` | Freeze override approval denied: caller is not in `freeze.groups`; `write_groups` do not approve. |
 
 Operation names mirror the mutating endpoints (`plan`, `apply`, control
 operations, `lock_acquire`/`lock_release`/`lock_force_release`, and the
-admin-only `checks_*`, `webhook_redrive`, `settings_set`). Unrecognized
+admin-only `checks_*`, `settings_set`, and the freeze writes `freeze_create`/`freeze_lift`/`freeze_override_approve`). Unrecognized
 operation, status, or reason values are recorded as `unknown` to keep
 cardinality bounded. `database` and `environment` use the `unknown` sentinel
 when the operation has no such dimension (admin-only operations have no single
@@ -652,8 +706,11 @@ The OTel SDK deduplicates instruments with the same name, so calling `Int64Count
 
 HTTP attempt metrics remain unchanged. A primary quota rejection increments
 `primary_rate_limit_rejections_total` once at its producing layer, with
-`origin=http` for an actual quota response and `origin=local` for a prevented
-request. A bypass advisory is not a local rejection. Generic permission failures
+`origin=http` for an actual quota response, `origin=local` for a prevented
+request, and `origin=reserve` for a schema file, blob, or tree read SchemaBot
+did not send because the installation's core quota was at its configured
+`quota-reserve` (see [GitHub quota reserve](../../docs/configuration.md#github-quota-reserve)).
+A bypass advisory is not a local rejection. Generic permission failures
 remain HTTP errors. HTTP-origin quota rejections intentionally overlap HTTP
 errors; never add these counters together into one error total.
 Quota refusals with a missing or unrecognized resource header still count as
@@ -670,7 +727,7 @@ On a quota alert, find this warning for the installation/resource and check the
 reset time. The logged repository encountered exhaustion; it is not necessarily
 the repository that consumed the shared budget. Compare `requests_total` volume
 by repository and operation for that installation/resource before exhaustion to
-locate excess traffic, then reduce avoidable requests or repeated redrives. After
+locate excess traffic, then reduce avoidable requests or repeated backfills. After
 reset, verify fresh successful checks for affected repositories before declaring
 recovery. Keep the rejection counter as the direct alert signal, including
 locally blocked calls; use the warning for investigation context.

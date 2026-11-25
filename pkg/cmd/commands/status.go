@@ -298,12 +298,38 @@ func applyHistoryDataFromResponse(a *apitypes.ApplyHistoryResponse) templates.Ap
 	}
 }
 
+// getAllHistoryPages fetches every page of a database's apply history, each
+// page after the last apply of the one before, until the server reports no
+// more, and merges them into one response. The history is ordered by when each
+// apply was created, so the walk lists every apply created before it began
+// exactly once.
+func getAllHistoryPages(endpoint, database, environment string) (*apitypes.DatabaseHistoryResponse, error) {
+	merged, err := client.GetDatabaseHistory(endpoint, database, environment, "")
+	if err != nil {
+		return nil, err
+	}
+	page := merged
+	for page.HasMore && len(page.Applies) > 0 {
+		after := page.Applies[len(page.Applies)-1].ApplyID
+		page, err = client.GetDatabaseHistory(endpoint, database, environment, after)
+		if err != nil {
+			return nil, fmt.Errorf("fetch the history page of %s after apply %s: %w", database, after, err)
+		}
+		if page.StartingAfter != after {
+			return nil, fmt.Errorf("the server did not continue after apply %s; it predates paging, so -d cannot list every apply", after)
+		}
+		merged.Applies = append(merged.Applies, page.Applies...)
+	}
+	merged.HasMore = false
+	return merged, nil
+}
+
 // showDatabaseHistory shows all applies for a database.
 func showDatabaseHistory(endpoint, database, environment string, outputJSON, showLoader bool) error {
 	var result *apitypes.DatabaseHistoryResponse
 	err := withLoading("Loading schema change history...", showLoader, func() error {
 		var loadErr error
-		result, loadErr = client.GetDatabaseHistory(endpoint, database, environment)
+		result, loadErr = getAllHistoryPages(endpoint, database, environment)
 		return loadErr
 	})
 	if err != nil {
@@ -321,8 +347,9 @@ func showDatabaseHistory(endpoint, database, environment string, outputJSON, sho
 	}
 
 	templates.WriteDatabaseHistory(templates.DatabaseHistoryData{
-		Database: database,
-		Applies:  applies,
+		Database:    database,
+		Environment: environment,
+		Applies:     applies,
 	})
 
 	return nil

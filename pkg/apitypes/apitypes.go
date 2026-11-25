@@ -98,19 +98,25 @@ const (
 	ErrCodeActiveApplyExists       = "active_apply_exists"       // Another active apply already exists for the target
 	ErrCodeSourcePolicyDenied      = "source_policy_denied"      // Source repo/path is not authorized for the database
 	ErrCodeLockNotOwned            = "lock_not_owned"            // Lock release denied because the caller is not the owner
+	ErrCodeLockInUse               = "lock_in_use"               // Lock release pinned to a lock row refused: an apply that can still change records that row as its lock; lock_holder names it
+	ErrCodeLockReplaced            = "lock_replaced"             // Lock release pinned to a lock row refused: a different lock now holds the database; nothing was released
 	ErrCodeRateLimited             = "rate_limited"              // Caller or target exceeded its request budget; retry after the advertised delay
 	ErrCodeUnsafeOptInRequired     = "unsafe_opt_in_required"    // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
 	ErrCodePlanBlocked             = "plan_blocked"              // Plan carries a change the engine refuses; no retry or option can apply it
 	ErrCodeAlreadyStopped          = "already_stopped"           // Stop refused: the schema change is already stopped and no start is queued behind it
 	ErrCodeDeferredCutoverCapacity = "deferred_cutover_capacity" // --defer-cutover refused: the apply would hold more drivers at its cutover than are left for deferred work; apply without the flag
+	ErrCodeChangeGateRefused       = "change_gate_refused"       // Apply, start or cutover refused by a change gate, such as a freeze; the blockers say why
+	ErrCodeChangeGateUnavailable   = "change_gate_unavailable"   // SchemaBot could not check the change gates, so nothing started; retry
+	ErrCodeLockChanged             = "lock_changed"              // Apply refused: the database lock it would record was released, or released and taken again, while it was queued; nothing was stored
 )
 
 var retryableErrorCodes = map[string]bool{
-	ErrCodeEngineErrorRetryable: true,
-	ErrCodeStorageError:         true,
-	ErrCodeEngineUnavailable:    true,
-	ErrCodeStateSyncFailed:      true,
-	ErrCodeRateLimited:          true,
+	ErrCodeEngineErrorRetryable:  true,
+	ErrCodeStorageError:          true,
+	ErrCodeEngineUnavailable:     true,
+	ErrCodeStateSyncFailed:       true,
+	ErrCodeRateLimited:           true,
+	ErrCodeChangeGateUnavailable: true,
 }
 
 // IsRetryableErrorCode reports whether the given API error code represents a
@@ -135,6 +141,51 @@ type ErrorResponse struct {
 	// header in the body so a client that reads only the error body, such as
 	// an older CLI, still sees the wait.
 	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
+
+	// Blockers lists what refused a change_gate_refused apply, start or
+	// cutover.
+	Blockers []ChangeGateBlocker `json:"blockers,omitempty"`
+
+	// OverrideRequest is the override request SchemaBot recorded when it
+	// refused a change for a caller who gave an override reason. A freeze
+	// approver other than the requester approves it, and the caller then
+	// repeats the command.
+	OverrideRequest *FreezeOverrideRequest `json:"override_request,omitempty"`
+
+	// OverrideOnReason says the server's override policy lets a change
+	// through on its requester's reason, with no approver: a
+	// change_gate_refused command repeated with --override runs at once. A
+	// server that predates the policy omits it, and always asks an approver.
+	OverrideOnReason bool `json:"override_on_reason,omitempty"`
+
+	// LockHolder is the apply that kept a lock_in_use lock release from
+	// releasing the lock.
+	LockHolder *LockHolder `json:"lock_holder,omitempty"`
+}
+
+// LockHolder is an apply that records a lock row as its lock and can still
+// change, so a release pinned to that row keeps the lock.
+type LockHolder struct {
+	// ApplyID is the apply's identifier, such as "apply-a1b2c3d4".
+	ApplyID string `json:"apply_id"`
+	// State is the apply's state, such as "running" or "stopped".
+	State string `json:"state"`
+	// Environment is the environment the apply runs in.
+	Environment string `json:"environment,omitempty"`
+}
+
+// ChangeGateBlocker is one reason a change gate refused an apply, start or
+// cutover.
+type ChangeGateBlocker struct {
+	// Gate names the gate that refused, such as "freeze".
+	Gate string `json:"gate"`
+	// ID identifies what blocks, such as the freeze identifier.
+	ID string `json:"id"`
+	// Reason is the blocker's own explanation, such as the freeze reason.
+	Reason string `json:"reason"`
+	// EndsAt is when the blocker ends on its own. Empty when it ends only
+	// when someone lifts it.
+	EndsAt *time.Time `json:"ends_at,omitempty"`
 }
 
 // RetryAfter reports whether a client should retry this error and how long it
@@ -195,61 +246,6 @@ func NewRateLimitedResponse(reason string, retryAfter time.Duration) ErrorRespon
 	}
 }
 
-type WebhookRedriveRequest struct {
-	WindowStart string `json:"window_start"`
-	WindowEnd   string `json:"window_end"`
-	App         string `json:"app,omitempty"`
-	Repo        string `json:"repo,omitempty"`
-	PR          int    `json:"pr,omitempty"`
-	MaxPages    int    `json:"max_pages"`
-	DryRun      bool   `json:"dry_run,omitempty"`
-	// Cursor continues a previous request's listing for one App. Each request
-	// processes a bounded number of pages so it finishes well within any
-	// intermediary HTTP timeout; the caller loops until next_cursor is empty.
-	Cursor string `json:"cursor,omitempty"`
-	// DeliveryIDs redelivers exactly these deliveries for App, skipping the
-	// window listing entirely — for callers that already identified the
-	// failed deliveries (for example a checks backfill classification pass).
-	DeliveryIDs []int64 `json:"delivery_ids,omitempty"`
-}
-
-type WebhookRedriveResponse struct {
-	Results []WebhookRedriveResult `json:"results"`
-}
-
-type WebhookRedriveResult struct {
-	AppName            string `json:"app_name"`
-	DryRun             bool   `json:"dry_run"`
-	Fetched            int    `json:"fetched"`
-	Pages              int    `json:"pages"`
-	OldestFetched      string `json:"oldest_fetched,omitempty"`
-	ReachedWindowStart bool   `json:"reached_window_start"`
-	// HistoryExhausted is true when GitHub's retained delivery history ended
-	// before the window start was reached: older deliveries no longer exist.
-	HistoryExhausted bool `json:"history_exhausted,omitempty"`
-	// NextCursor continues the listing in a follow-up request (with app set);
-	// empty when the window is covered or history is exhausted.
-	NextCursor string                    `json:"next_cursor,omitempty"`
-	Selected   []WebhookRedriveSelection `json:"selected"`
-	// Skipped counts in-window eligible deliveries whose detail could not be
-	// resolved for repo/PR filtering; they are left out of Selected rather
-	// than aborting the crawl.
-	Skipped     int `json:"skipped,omitempty"`
-	Redelivered int `json:"redelivered"`
-	Failed      int `json:"failed"`
-}
-
-type WebhookRedriveSelection struct {
-	ID          int64  `json:"id"`
-	DeliveredAt string `json:"delivered_at"`
-	Event       string `json:"event"`
-	Action      string `json:"action"`
-	Status      string `json:"status"`
-	StatusCode  int    `json:"status_code"`
-	Repo        string `json:"repo,omitempty"`
-	PR          int    `json:"pr,omitempty"`
-}
-
 type ChecksScanRequest struct {
 	Repo        string `json:"repo"`
 	Environment string `json:"environment,omitempty"`
@@ -286,6 +282,11 @@ type ChecksScanRequest struct {
 	// named PR that is not open is left out. Page and UpdatedSince must be
 	// unset alongside it.
 	PRs []int `json:"prs,omitempty"`
+	// MergeQueue also scans the merge groups the repository's merge queues
+	// are testing, on the first page only. A merge group missing SchemaBot's
+	// required check blocks every PR queued behind it. It cannot be set
+	// alongside PRs.
+	MergeQueue bool `json:"merge_queue,omitempty"`
 }
 
 type ChecksScanResponse struct {
@@ -331,6 +332,15 @@ type ChecksScanResponse struct {
 	// the live webhook path that shares the same budget. Nil when the rate
 	// state could not be read (advisory only; the scan itself succeeded).
 	RateLimit *GitHubRateLimit `json:"rate_limit,omitempty"`
+	// MergeQueueScanned counts the merge groups this page read, when the
+	// request set MergeQueue.
+	MergeQueueScanned int `json:"merge_queue_scanned,omitempty"`
+	// MergeQueue lists the merge groups missing an expected SchemaBot check.
+	MergeQueue []MissingMergeQueueCheck `json:"merge_queue,omitempty"`
+	// MergeQueueError says why the merge queue could not be read. The PRs on
+	// this page are still reported, and MergeQueue and MergeQueueScanned are
+	// empty, so the caller can report the queue as unchecked rather than clear.
+	MergeQueueError string `json:"merge_queue_error,omitempty"`
 	// Supports names the backfill behaviors this server implements. A server
 	// that predates one ignores the request field that asks for it, so the
 	// CLI checks this before relying on a behavior rather than finding out
@@ -348,6 +358,26 @@ type ChecksBackfillSupport struct {
 	// that changes managed schema before writing any Check Run or check state,
 	// and checks rate_limit_floor_percent before every PR it starts.
 	DeferSchemaPRs bool `json:"defer_schema_prs,omitempty"`
+	// MergeQueue means a scan request with merge_queue reports the merge
+	// groups missing a check, and a synthesize request with
+	// merge_queue_heads posts their passing checks.
+	MergeQueue bool `json:"merge_queue,omitempty"`
+}
+
+// MissingMergeQueueCheck is a merge group the merge queue is testing whose
+// head commit lacks an expected SchemaBot check.
+type MissingMergeQueueCheck struct {
+	// Ref is the merge group's temporary branch.
+	Ref     string `json:"ref"`
+	BaseRef string `json:"base_ref"`
+	// PR is the pull request whose queue entry built this merge group, and URL
+	// its address; both are empty when the branch name does not carry it.
+	PR           int      `json:"pr,omitempty"`
+	URL          string   `json:"url,omitempty"`
+	HeadSHA      string   `json:"head_sha"`
+	MissingNames []string `json:"missing_check_names"`
+	// UntrustedConflictNames mirrors MissingCheckPR.UntrustedConflictNames.
+	UntrustedConflictNames []string `json:"untrusted_conflict_check_names,omitempty"`
 }
 
 // GitHubRateLimit is a point-in-time snapshot of a GitHub installation's
@@ -374,8 +404,8 @@ type ChecksReposResponse struct {
 
 // ChecksSynthesizeRequest asks the server to recreate missing Check Runs for
 // specific PRs by replaying the auto-plan flow, as if the check-creating
-// webhook delivery had arrived. Used for PRs with no delivery to redrive
-// (for example PRs opened before check enablement).
+// webhook delivery had arrived. Used for PRs whose check-creating delivery
+// never arrived or failed (for example PRs opened before check enablement).
 type ChecksSynthesizeRequest struct {
 	Repo string `json:"repo"`
 	PRs  []int  `json:"prs"`
@@ -387,11 +417,23 @@ type ChecksSynthesizeRequest struct {
 	// budget left is below this percentage of its limit. The PRs not started
 	// come back with RateLimited set. Zero turns the check off.
 	RateLimitFloorPercent int `json:"rate_limit_floor_percent,omitempty"`
+	// MergeQueueHeads are merge group head commits to post SchemaBot's
+	// passing merge-queue check on. The server lists the merge queue again
+	// and posts only on heads it is still testing, so a commit that is not a
+	// live merge group never gets a passing check. They are handled before
+	// PRs, since each one blocks the PRs queued behind it.
+	MergeQueueHeads []string `json:"merge_queue_heads,omitempty"`
+	// Environment and CheckName are the run's scope, as on the scan request.
+	// They limit the checks posted on MergeQueueHeads to the ones the scan
+	// looked for. A head gets only the checks in scope it is still missing.
+	Environment string `json:"environment,omitempty"`
+	CheckName   string `json:"check_name,omitempty"`
 }
 
 type ChecksSynthesizeResponse struct {
-	Repo    string                   `json:"repo"`
-	Results []ChecksSynthesizeResult `json:"results"`
+	Repo       string                   `json:"repo"`
+	Results    []ChecksSynthesizeResult `json:"results"`
+	MergeQueue []ChecksMergeQueueResult `json:"merge_queue,omitempty"`
 	// RateLimit mirrors ChecksScanResponse.RateLimit: the installation's
 	// remaining GitHub budget after this batch, for caller-side pacing.
 	RateLimit *GitHubRateLimit `json:"rate_limit,omitempty"`
@@ -411,6 +453,16 @@ type ChecksSynthesizeResult struct {
 	ChangedFiles int `json:"changed_files,omitempty"`
 	// RateLimited is true when the batch stopped before this PR because the
 	// GitHub budget fell below the request's floor. Nothing was done for it.
+	RateLimited bool `json:"rate_limited,omitempty"`
+}
+
+// ChecksMergeQueueResult is what a synthesize request did for one merge
+// group head.
+type ChecksMergeQueueResult struct {
+	HeadSHA string `json:"head_sha"`
+	Outcome string `json:"outcome"`
+	Error   string `json:"error,omitempty"`
+	// RateLimited mirrors ChecksSynthesizeResult.RateLimited.
 	RateLimited bool `json:"rate_limited,omitempty"`
 }
 
@@ -832,6 +884,12 @@ type PlanRequest struct {
 	// target, not in the repository — so the data plane applies it and reports
 	// what it actually withheld through ExemptTables on the response.
 	IgnoreTables []string `json:"ignore_tables,omitempty"`
+	// DropTables lists live tables the config's drop_tables asks the planner
+	// to drop although no schema file declares them, including tables the
+	// engine otherwise skips by their names. Each entry is one exact table
+	// name. The stored plan records the list, so every re-plan of the plan
+	// proposes the same drops.
+	DropTables []string `json:"drop_tables,omitempty"`
 	// GroupedExecution reports whether an apply of this plan will hand the
 	// engine every ALTER at once or one table at a time. Engines predicting what
 	// an apply will do to unfinished work already on the target need the
@@ -871,6 +929,9 @@ type ApplyRequest struct {
 	// rollout-wide apply of an environment with more than one member from a
 	// caller that does not set it.
 	RendersRollout bool `json:"renders_rollout,omitempty"`
+	// Override is the reason to ask for a freeze override when a freeze
+	// refuses the apply. At most 500 characters after trimming.
+	Override string `json:"override,omitempty"`
 }
 
 // ControlRequest is the HTTP request body for control operations
@@ -879,6 +940,11 @@ type ControlRequest struct {
 	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id"`
 	Caller      string `json:"caller,omitempty"`
+	// Override is the reason to ask for a freeze override when a freeze
+	// refuses a start or cutover. A caller outside the HTTP routes sets it
+	// and validates it: the routes read the same field from their own
+	// request types and validate it themselves.
+	Override string `json:"override,omitempty"`
 }
 
 // =============================================================================
@@ -933,12 +999,27 @@ type PlanResponse struct {
 	// on the response to the plan request only; a stored plan does not retain
 	// it. Empty when nothing was exempted, which is the ordinary case.
 	ExemptTables []*ExemptTablesResponse `json:"exempt_tables,omitempty"`
+	// UnmatchedDropTables lists the drop_tables entries that name no live
+	// table on the target, in the order the config lists them, so the plan
+	// says the entry drops nothing instead of reading as if the table were
+	// seen and kept. Like ExemptTables it describes the target at planning
+	// time and a stored plan does not retain it. Empty when every entry
+	// matched or the config lists none.
+	UnmatchedDropTables []string `json:"unmatched_drop_tables,omitempty"`
 	// Rollout describes the plan of every member of the rollout when the
 	// environment fans out to more than one: the members grouped by the plan
 	// each runs, and the members that need attention before an apply can run
 	// on them. Nil when the environment has a single member. The top-level
 	// Changes and Shards are the primary member's plan.
 	Rollout *PlanRolloutResponse `json:"rollout,omitempty"`
+	// Freezes are the freezes that cover a change to this database in this
+	// environment when it was planned: those in effect, which would refuse
+	// its apply now, then those scheduled, which will once they start. They
+	// only inform: the apply checks the freezes again, and that check
+	// decides. Like ExemptTables they are carried on the response to the plan
+	// request only. Empty when no freeze covers the change, or when SchemaBot
+	// could not read the freezes.
+	Freezes []Freeze `json:"freezes,omitempty"`
 }
 
 // PlanRolloutResponse is the plan of every member of a rollout.
@@ -1738,9 +1819,6 @@ const (
 	executionModeDirect  = "direct"
 )
 
-// GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
-func (t *TableChangeResponse) GetTableName() string { return t.TableName }
-
 // EngineBlocked reports whether the planner's execution-mode verdict says the
 // engine deterministically refuses this change: an apply will fail on it.
 func (t *TableChangeResponse) EngineBlocked() bool {
@@ -1885,6 +1963,22 @@ type ProgressResponse struct {
 	// VSchema change. Operations still lists every shard and finalizer row,
 	// but a client renders the apply as one change, the way its PR comments do.
 	Sharded bool `json:"sharded,omitempty"`
+	// StoppedByFreeze names the freeze that stopped this apply, set only while
+	// the apply is stopped and the stop that stopped it was a freeze's (one
+	// with running "stop"), not an operator's.
+	StoppedByFreeze *FreezeStopRef `json:"stopped_by_freeze,omitempty"`
+}
+
+// FreezeStopRef names the freeze that stopped an apply.
+type FreezeStopRef struct {
+	ID string `json:"id"`
+	// Reason is the freeze's reason, empty when SchemaBot could not read the
+	// freeze.
+	Reason string `json:"reason,omitempty"`
+	// Ended is true once the freeze has ended or been lifted, by the database
+	// clock, so a plain start resumes the apply. It is false while the
+	// freeze is in effect, and when SchemaBot could not read the freeze.
+	Ended bool `json:"ended,omitempty"`
 }
 
 // ProgressOperationResponse represents progress for one deployment operation.
@@ -1923,6 +2017,12 @@ type ProgressOperationResponse struct {
 	RolloutStep int    `json:"rollout_step,omitempty"`
 	StartedAt   string `json:"started_at,omitempty"`
 	CompletedAt string `json:"completed_at,omitempty"`
+	// Metadata is the progress display metadata this operation's driver last
+	// recorded, such as its statement position and the server's report of the
+	// work in flight. The response's top-level metadata speaks for one
+	// operation only, so a table in a rollout reads its work from here, on the
+	// operation that runs it (TableProgressResponse.OperationKey).
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // ProgressOperationRef names one operation of an apply by its deployment and
@@ -1944,7 +2044,12 @@ type TableProgressResponse struct {
 	// deployment can address several targets, each running its own copy of the
 	// change, so the deployment alone does not say which member's progress this
 	// row reports.
-	Target          string `json:"target,omitempty"`
+	Target string `json:"target,omitempty"`
+	// OperationKey names, with Deployment, the operation that runs this table,
+	// since one target can run several operations. Empty when the table
+	// belongs to no listed operation, and on an operation with the legacy
+	// single-operation key.
+	OperationKey    string `json:"operation_key,omitempty"`
 	Keyspace        string `json:"keyspace,omitempty"`
 	ChangeType      string `json:"change_type,omitempty"` // create, alter, drop
 	Status          string `json:"status"`
@@ -1998,10 +2103,11 @@ type ShardProgressResponse struct {
 	// Non-zero only while the shard is checksumming (verifying copied data).
 	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`
 	ChecksumRowsTotal   int64 `json:"checksum_rows_total,omitempty"`
+	// CopiesNoRows is true when every change this shard runs on the table
+	// copies no rows (a CREATE TABLE, a DROP TABLE, or an instant ALTER), so
+	// a running shard reads as applying rather than running a table copy.
+	CopiesNoRows bool `json:"copies_no_rows,omitempty"`
 }
-
-// GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
-func (t *TableProgressResponse) GetTableName() string { return t.TableName }
 
 // ApplyHistoryResponse represents a single apply in the history.
 type ApplyHistoryResponse struct {
@@ -2016,10 +2122,21 @@ type ApplyHistoryResponse struct {
 	State       string `json:"state"`
 }
 
-// DatabaseHistoryResponse is the response for GET /api/history/{database}.
+// DatabaseHistoryResponse is the response for GET /api/history/{database}:
+// one page of the database's applies, newest first.
 type DatabaseHistoryResponse struct {
-	Database string                  `json:"database"`
-	Applies  []*ApplyHistoryResponse `json:"applies"`
+	Database string `json:"database"`
+	Limit    int    `json:"limit,omitempty"`
+	MaxLimit int    `json:"max_limit,omitempty"`
+	// HasMore reports that more applies match than this page holds. Request
+	// the next page with the same environment and starting_after set to the
+	// last apply's ID.
+	HasMore bool `json:"has_more"`
+	// StartingAfter echoes the starting_after apply the page continues from,
+	// so a client can tell this page apart from a first page served by a
+	// server that ignores the parameter.
+	StartingAfter string                  `json:"starting_after,omitempty"`
+	Applies       []*ApplyHistoryResponse `json:"applies"`
 }
 
 // ActiveApplyResponse represents a schema change in the status list.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -136,6 +137,51 @@ func TestDriftGuard_MaterializedPlanRecordsIgnoreTables(t *testing.T) {
 		"a later re-plan on this deployment withholds what the reviewed plan withheld")
 }
 
+// A plan that dropped a table its drop_tables named was reviewed with that
+// DROP TABLE, and the drift guard's re-plan has to be asked to drop the same
+// table to reproduce it: the table is one the engine skips by its name, so a
+// re-plan without the list leaves the drop out and the guard would refuse the
+// apply as drift. The materialized row records the list too, so a later
+// rollback or resume on this deployment re-plans the same drop.
+func TestDriftGuard_DropTablesTravelToTheReplanAndTheMaterializedPlan(t *testing.T) {
+	const leftover = "_users_old"
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 12}
+	c := newPlanMaterializeClient(store)
+	c.config.TargetDSN = "user:pass@tcp(127.0.0.1:3306)/testapp"
+	var shown []string
+	c.spiritEngine = fakePlanEngine{
+		planFn: func(_ context.Context, req *engine.PlanRequest) (*engine.PlanResult, error) {
+			shown = req.DropTables
+			result := alterUsersEmailPlan()
+			if slices.Contains(req.DropTables, leftover) {
+				result.Changes[0].TableChanges = append(result.Changes[0].TableChanges, engine.TableChange{
+					Table:     leftover,
+					Operation: ddl.StatementDropTable,
+					DDL:       "DROP TABLE `" + leftover + "`",
+				})
+			}
+			return result, nil
+		},
+	}
+
+	got, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+		PlanId:     "plan_drops",
+		DropTables: []string{leftover},
+		DdlChanges: []*ternv1.TableChange{
+			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
+			{TableName: leftover, Ddl: "DROP TABLE `" + leftover + "`", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP, Namespace: "testapp"},
+		},
+	})
+
+	require.NoError(t, err, "the re-plan proposes the reviewed drop, so there is no drift")
+	require.NotNil(t, got)
+	assert.Equal(t, int64(12), got.ID)
+	assert.Equal(t, []string{leftover}, shown, "the re-plan is shown the plan's own drop list")
+	require.NotNil(t, store.created)
+	assert.Equal(t, []string{leftover}, store.created.DropTables(),
+		"a later re-plan on this deployment drops what the reviewed plan dropped")
+}
+
 // The exclusion comes from the dispatched plan's record and from nowhere else: a
 // dispatch that withheld nothing gets a re-plan that sees the whole live schema,
 // so the drop the reviewed DDL does not carry is drift and fails closed.
@@ -245,17 +291,77 @@ func TestDriftGuard_ShardScopedMatchMaterializes(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 8}
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailShardPlan("-80"))
 
-	got, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
-		PlanId:       "plan_shard_ok",
-		TargetShards: []string{"-80"},
-		DdlChanges: []*ternv1.TableChange{
-			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
-		},
-	})
+	got, _, err := c.planForApplyRequest(t.Context(), alterUsersEmailDispatch("plan_shard_ok", "-80"))
 
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, int64(8), got.ID)
+}
+
+// A shard dispatch for a plan this deployment has not stored, and that carries
+// no schema files, is refused before anything is re-planned or stored: there
+// is no reviewed schema to judge the shard's change against. The refusal is
+// permanent and names the next step.
+func TestDriftGuard_ShardScopedWithoutSchemaFilesIsRefusedWhenItMaterializesThePlan(t *testing.T) {
+	var replans atomic.Int32
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 8}
+	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailShardPlan("-80"))
+	c.spiritEngine = fakePlanEngine{planFn: func(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+		replans.Add(1)
+		return alterUsersEmailShardPlan("-80"), nil
+	}}
+	req := alterUsersEmailDispatch("plan_not_stored", "-80")
+	req.SchemaFiles = nil
+
+	got, _, err := c.planForApplyRequest(t.Context(), req)
+
+	require.Error(t, err, "a shard dispatch with no schema files has nothing to be re-planned against")
+	assert.Contains(t, err.Error(), "carries no schema files")
+	assert.Contains(t, err.Error(), missingSchemaFilesRecoveryHint)
+	assert.False(t, engine.IsRetryable(err))
+	assert.Nil(t, got)
+	assert.Zero(t, replans.Load(), "the refusal comes before the re-plan")
+	assert.Nil(t, store.created, "nothing is stored for a refused dispatch")
+}
+
+// A namespace declared empty (every table in it dropped) is still a reviewed
+// schema to re-plan against, so a shard dispatch carrying one passes the
+// schema files gate and reaches the re-plan, on both the stored-plan path and
+// the path that materializes the plan.
+func TestShardDispatchWithADeclaredEmptyNamespaceIsReplanned(t *testing.T) {
+	declaredEmpty := map[string]*ternv1.SchemaFiles{"testapp": {Files: map[string]string{}}}
+
+	t.Run("stored plan", func(t *testing.T) {
+		var replans atomic.Int32
+		c := newPlanMaterializeClientWithPlan(&fakePlanStore{}, alterUsersEmailShardPlan("-80"))
+		c.spiritEngine = fakePlanEngine{planFn: func(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+			replans.Add(1)
+			return alterUsersEmailShardPlan("-80"), nil
+		}}
+		req := alterUsersEmailDispatch("plan_declared_empty", "-80")
+		req.SchemaFiles = declaredEmpty
+		plan := &storage.Plan{ID: 35, PlanIdentifier: "plan_declared_empty", Namespaces: map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{
+			{Namespace: "testapp", Table: "users", Operation: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}}}}
+		scope, err := c.dispatchScopeForApply(plan, req)
+		require.NoError(t, err)
+
+		require.NoError(t, c.verifyShardDispatchAgainstLiveSchema(t.Context(), req, &scope))
+		assert.Equal(t, int32(1), replans.Load())
+	})
+
+	t.Run("materialized plan", func(t *testing.T) {
+		store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 9}
+		c := newPlanMaterializeClientWithPlan(store, alterUsersEmailShardPlan("-80"))
+		req := alterUsersEmailDispatch("plan_declared_empty_materialized", "-80")
+		req.SchemaFiles = declaredEmpty
+
+		got, _, err := c.planForApplyRequest(t.Context(), req)
+
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, int64(9), got.ID)
+	})
 }
 
 // A shard-scoped apply whose reviewed DDL targets one shard but whose live
@@ -265,13 +371,7 @@ func TestDriftGuard_ShardScopedWrongShardFailsClosed(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailShardPlan("80-"))
 
-	_, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
-		PlanId:       "plan_shard_drift",
-		TargetShards: []string{"-80"},
-		DdlChanges: []*ternv1.TableChange{
-			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
-		},
-	})
+	_, _, err := c.planForApplyRequest(t.Context(), alterUsersEmailDispatch("plan_shard_drift", "-80"))
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "drifted")
@@ -295,13 +395,7 @@ func twoTableShardPlan(shard, usersDDL string) *engine.PlanResult {
 // firstUsersShardDispatch is the first dispatch of a sharded plan: one shard,
 // carrying only the users change, with no stored plan row to attach to.
 func firstUsersShardDispatch(planID string) *ternv1.ApplyRequest {
-	return &ternv1.ApplyRequest{
-		PlanId:       planID,
-		TargetShards: []string{"-80"},
-		DdlChanges: []*ternv1.TableChange{
-			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
-		},
-	}
+	return alterUsersEmailDispatch(planID, "-80")
 }
 
 // A shard dispatch carries one table's change, while this deployment's re-plan
