@@ -214,13 +214,17 @@ any size, so the size limit does not apply to them.
 | Change | Catalog-only when |
 |---|---|
 | `ADD COLUMN` | pg-sprite proves against the live table that it neither rewrites nor scans the rows, its default is absent or a constant, and its type is built in or an enum |
-| `DROP COLUMN`, `SET DEFAULT`, `DROP DEFAULT`, `DROP NOT NULL`, `DROP CONSTRAINT` | Always |
+| `DROP COLUMN`, `DROP DEFAULT`, `DROP NOT NULL`, `DROP CONSTRAINT` | Always |
 
 A `NOT NULL` column with no default still counts against the size limit,
 because PostgreSQL scans the rows to check it. So does a default such as
 `now()`, any user-defined type other than an enum (a domain, composite, or
 range type), and a statement that mixes a catalog-only change with any other
 change.
+
+`SET DEFAULT` counts against the size limit too. PostgreSQL converts the new
+default to the column's type while it holds the table lock, and for a
+user-defined type that runs the type's own code, which can read any table.
 
 pg-sprite proves the change against the live table when SchemaBot plans it,
 and again when the apply starts. What happens at the second proof:
