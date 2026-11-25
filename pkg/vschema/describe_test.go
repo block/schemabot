@@ -155,3 +155,29 @@ func TestDescribeRejectsAnUnreadableDocument(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "parse desired VSchema")
 }
+
+// A VSchema name is free text, so it renders as a code span it cannot break
+// out of: line breaks and control characters cannot start a new markdown line,
+// and a backtick inside the name cannot close the span early.
+func TestCodeKeepsANameInsideItsSpan(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"orders", "`orders`"},
+		{"odd`name", "`` odd`name ``"},
+		{"two``ticks", "``` two``ticks ```"},
+		{"line\nbreak", "`line break`"},
+		{"tab\tand\r\nreturn", "`tab and return`"},
+		{"bell\x07zero\u200bwidth", "`bellzerowidth`"},
+		{"", "` `"},
+	} {
+		assert.Equal(t, tc.want, code(tc.in), "%q", tc.in)
+	}
+}
+
+// A table's type reads in fixed words, so a type Vitess does not define is
+// never echoed into the summary.
+func TestTableKindNamesOnlyTheTypesVitessDefines(t *testing.T) {
+	assert.Equal(t, "", tableKind(""))
+	assert.Equal(t, "sequence table", tableKind("sequence"))
+	assert.Equal(t, "reference table", tableKind("reference"))
+	assert.Equal(t, "table of an unknown type", tableKind("**bold**\n# heading"))
+}

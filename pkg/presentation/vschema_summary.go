@@ -12,10 +12,27 @@ const maxVSchemaSummaryLines = 20
 // by a line counting the rest. The CLI and the PR comment both list these, so
 // a long change is cut at the same place on each.
 func VSchemaSummaryLines(summary []string) []string {
-	if len(summary) <= maxVSchemaSummaryLines {
-		return summary
+	shown, omitted := VSchemaSummaryCut(summary)
+	if omitted == 0 {
+		return shown
 	}
-	shown := maxVSchemaSummaryLines - 1
-	lines := append([]string(nil), summary[:shown]...)
-	return append(lines, fmt.Sprintf("and %d more changes, shown in the diff", len(summary)-shown))
+	return append(append([]string(nil), shown...), VSchemaMoreChangesLine(omitted))
+}
+
+// VSchemaSummaryCut returns the lines of a VSchema change's description a
+// surface lists and how many lines it folds into a count after them. It is
+// VSchemaSummaryLines without the count line, for a surface that may have to
+// cut the list shorter still and count what it leaves out itself.
+func VSchemaSummaryCut(summary []string) (shown []string, omitted int) {
+	if len(summary) <= maxVSchemaSummaryLines {
+		return summary, 0
+	}
+	kept := maxVSchemaSummaryLines - 1
+	return summary[:kept], len(summary) - kept
+}
+
+// VSchemaMoreChangesLine is the line that counts the n description lines a
+// surface leaves out.
+func VSchemaMoreChangesLine(n int) string {
+	return fmt.Sprintf("and %d more changes, shown in the diff", n)
 }

@@ -901,13 +901,17 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 // application is not a per-table task. Renders nothing when the apply carries
 // no VSchema change.
 func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
+	writeVSchemaStatusWithin(sb, changes, newVSchemaCommentBudget(vschemaDiffCount(changes)))
+}
+
+// writeVSchemaStatusWithin is writeVSchemaStatus drawing from a budget the
+// comment's other VSchema sections share, so the section adds nothing past
+// the comment's allowance.
+func writeVSchemaStatusWithin(sb *strings.Builder, changes []apitypes.VSchemaChange, budget *vschemaCommentBudget) {
 	if len(changes) == 0 {
 		return
 	}
 	sb.WriteString("\n### VSchema\n\n")
-	// The diff budget is per comment, not per keyspace: split it across the
-	// entries that carry a diff so a multi-keyspace apply stays bounded.
-	budget := vschemaDiffBudget(vschemaDiffCount(changes))
 	for _, c := range changes {
 		fmt.Fprintf(sb, "**%s**: %s\n\n", inlineCode(c.Namespace), ui.VSchemaStatusLabel(c.Status))
 		writeVSchemaChangeBody(sb, c.Summary, c.Diff, budget)

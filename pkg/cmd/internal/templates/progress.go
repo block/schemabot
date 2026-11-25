@@ -380,7 +380,7 @@ func FormatVSchemaStatus(changes []apitypes.VSchemaChange) string {
 func FormatVSchemaChangeBody(summary []string, diff, indent string) string {
 	var b strings.Builder
 	for _, line := range presentation.VSchemaSummaryLines(summary) {
-		fmt.Fprintf(&b, "%s- %s\n", indent, plainCodeSpans.Replace(line))
+		fmt.Fprintf(&b, "%s- %s\n", indent, plainCodeSpans(line))
 	}
 	if diff != "" {
 		if b.Len() > 0 {
@@ -391,9 +391,62 @@ func FormatVSchemaChangeBody(summary []string, diff, indent string) string {
 	return b.String()
 }
 
-// plainCodeSpans strips the markdown code-span fences a VSchema description
-// carries, the double fence first so a name holding a backtick keeps it.
-var plainCodeSpans = strings.NewReplacer("`` ", "", " ``", "", "`", "")
+// plainCodeSpans replaces each markdown code span in line with the text it
+// encloses, so a terminal shows a name as written. A span opens with a run of
+// backticks and closes at the next run of the same length; the space a
+// renderer pads a span with when its text holds a backtick is dropped too, so
+// a name holding a backtick keeps it. A backtick run with no closing run is
+// literal text.
+func plainCodeSpans(line string) string {
+	var b strings.Builder
+	for i := 0; i < len(line); {
+		if line[i] != '`' {
+			b.WriteByte(line[i])
+			i++
+			continue
+		}
+		open := backtickRunAt(line, i)
+		end, ok := closingBacktickRun(line, i+open, open)
+		if !ok {
+			b.WriteString(line[i : i+open])
+			i += open
+			continue
+		}
+		content := line[i+open : end]
+		if len(content) >= 2 && content[0] == ' ' && content[len(content)-1] == ' ' && strings.Trim(content, " ") != "" {
+			content = content[1 : len(content)-1]
+		}
+		b.WriteString(content)
+		i = end + open
+	}
+	return b.String()
+}
+
+// backtickRunAt returns the length of the run of backticks starting at i.
+func backtickRunAt(s string, i int) int {
+	n := 0
+	for i+n < len(s) && s[i+n] == '`' {
+		n++
+	}
+	return n
+}
+
+// closingBacktickRun finds the first run of exactly n backticks at or after
+// from and returns where it starts.
+func closingBacktickRun(s string, from, n int) (int, bool) {
+	for i := from; i < len(s); {
+		if s[i] != '`' {
+			i++
+			continue
+		}
+		run := backtickRunAt(s, i)
+		if run == n {
+			return i, true
+		}
+		i += run
+	}
+	return 0, false
+}
 
 // FormatVSchemaDiff returns a VSchema diff with colorized +/- lines as a string,
 // stripping ---/+++/@@ headers. Shared between plan and progress views.

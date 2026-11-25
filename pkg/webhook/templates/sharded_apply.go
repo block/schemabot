@@ -467,7 +467,7 @@ func writeShardKeyspaceSections(sb *strings.Builder, data ShardedApplyData, form
 	for _, c := range data.VSchemaChanges {
 		vschemaChanges[c.Namespace] = c
 	}
-	vschemaBudget := vschemaDiffBudget(vschemaDiffCount(data.VSchemaChanges))
+	vschemaBudget := newVSchemaCommentBudget(vschemaDiffCount(data.VSchemaChanges))
 	placed := make(map[string]bool, len(keyspaces))
 	for _, ks := range keyspaces {
 		placed[ks.Keyspace] = true
@@ -488,7 +488,7 @@ func writeShardKeyspaceSections(sb *strings.Builder, data ShardedApplyData, form
 			unplaced = append(unplaced, c)
 		}
 	}
-	writeVSchemaStatus(sb, unplaced)
+	writeVSchemaStatusWithin(sb, unplaced, vschemaBudget)
 }
 
 // writeShardDetail writes a keyspace's per-shard status tables when the
@@ -513,7 +513,7 @@ func writeShardDetail(sb *strings.Builder, ks ShardedKeyspace, applyHasShardFail
 // writeKeyspaceVSchema writes a keyspace's VSchema change inside that
 // keyspace's section, as a Vitess plan does, so a reader sees the routing
 // change next to the tables it routes.
-func writeKeyspaceVSchema(sb *strings.Builder, c apitypes.VSchemaChange, budget int) {
+func writeKeyspaceVSchema(sb *strings.Builder, c apitypes.VSchemaChange, budget *vschemaCommentBudget) {
 	fmt.Fprintf(sb, "\n**VSchema**: %s\n\n", ui.VSchemaStatusLabel(c.Status))
 	writeVSchemaChangeBody(sb, c.Summary, c.Diff, budget)
 }

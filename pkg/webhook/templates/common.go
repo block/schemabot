@@ -216,9 +216,30 @@ const maxCommentErrorLen = 500
 // diff.
 const maxCommentVSchemaDiffLen = 16384
 
+// maxCommentVSchemaSummaryLen bounds the VSchema descriptions rendered into
+// one comment, across every keyspace. A description line names each routing
+// association of its table, so a line count alone does not bound its size;
+// lines that do not fit are counted instead of listed, and each listed line is
+// whole, so a code span is never cut.
+const maxCommentVSchemaSummaryLen = 8192
+
+// vschemaCommentBudget is one comment's allowance for VSchema content. Each
+// diff gets an even share of maxCommentVSchemaDiffLen, and the descriptions
+// draw in turn from one shared maxCommentVSchemaSummaryLen, so a
+// multi-keyspace comment stays bounded no matter how many keyspaces carry a
+// change. Every section of the comment that renders a VSchema change draws
+// from the same budget.
+type vschemaCommentBudget struct {
+	diff    int
+	summary int
+}
+
+func newVSchemaCommentBudget(diffCount int) *vschemaCommentBudget {
+	return &vschemaCommentBudget{diff: vschemaDiffBudget(diffCount), summary: maxCommentVSchemaSummaryLen}
+}
+
 // vschemaDiffBudget splits the per-comment VSchema diff budget evenly across
-// the diffs the comment will render, so a multi-keyspace comment stays
-// bounded no matter how many keyspaces carry a diff.
+// the diffs the comment will render.
 func vschemaDiffBudget(diffCount int) int {
 	if diffCount <= 0 {
 		return maxCommentVSchemaDiffLen
@@ -232,23 +253,41 @@ func vschemaDiffBudget(diffCount int) int {
 // which table an added or removed entry belongs to, which the description
 // does. A change recorded without a description shows its diff open, since
 // the diff is then the only account of the change.
-func writeVSchemaChangeBody(sb *strings.Builder, summary []string, diff string, budget int) {
+func writeVSchemaChangeBody(sb *strings.Builder, summary []string, diff string, budget *vschemaCommentBudget) {
 	if len(summary) == 0 {
 		if diff != "" {
-			writeVSchemaDiffFence(sb, diff, budget)
+			writeVSchemaDiffFence(sb, diff, budget.diff)
 		}
 		return
 	}
-	for _, line := range presentation.VSchemaSummaryLines(summary) {
-		fmt.Fprintf(sb, "- %s\n", line)
-	}
+	writeVSchemaSummary(sb, summary, budget)
 	sb.WriteString("\n")
 	if diff == "" {
 		return
 	}
 	sb.WriteString("<details><summary>VSchema diff</summary>\n\n")
-	writeVSchemaDiffFence(sb, diff, budget)
+	writeVSchemaDiffFence(sb, diff, budget.diff)
 	sb.WriteString("</details>\n\n")
+}
+
+// writeVSchemaSummary lists a VSchema change's description lines while they
+// fit the comment's summary budget, then counts the lines it left out. The
+// list is first cut where the CLI cuts it; the comment may cut it shorter,
+// since unlike a terminal it has a size limit.
+func writeVSchemaSummary(sb *strings.Builder, summary []string, budget *vschemaCommentBudget) {
+	shown, omitted := presentation.VSchemaSummaryCut(summary)
+	for i, line := range shown {
+		item := "- " + line + "\n"
+		if len(item) > budget.summary {
+			omitted += len(shown) - i
+			break
+		}
+		budget.summary -= len(item)
+		sb.WriteString(item)
+	}
+	if omitted > 0 {
+		fmt.Fprintf(sb, "- %s\n", presentation.VSchemaMoreChangesLine(omitted))
+	}
 }
 
 // writeVSchemaDiffFence renders a VSchema diff inside a diff fence sized so

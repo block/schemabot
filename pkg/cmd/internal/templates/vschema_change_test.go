@@ -21,11 +21,12 @@ func TestFormatVSchemaStatusReadsTableByTable(t *testing.T) {
 		Namespace: "commerce",
 		Status:    "applying",
 		Diff:      "+    \"orders_archive\": {}",
-		Summary:   []string{"adds table `orders_archive`: vindex `hash` on `id`", "adds vindex `odd``name`: type `hash`"},
+		Summary:   []string{"adds table `orders_archive`: vindex `hash` on `id`", "adds vindex `` odd`name ``: type `hash`"},
 	}}), "")
 
 	assert.Contains(t, out, "    ~ VSchema (commerce): Applying...\n")
 	assert.Contains(t, out, indentContent+"- adds table orders_archive: vindex hash on id\n")
+	assert.Contains(t, out, indentContent+"- adds vindex odd`name: type hash\n", "a backtick inside a name is kept")
 	assert.Contains(t, out, "+    \"orders_archive\": {}", "the diff follows the description")
 	assert.Less(t, strings.Index(out, "- adds table"), strings.Index(out, "orders_archive\": {}"))
 }
@@ -59,5 +60,19 @@ func TestVSchemaDescriptionIsCappedTheSameOnEverySurface(t *testing.T) {
 		assert.Contains(t, out, "t18")
 		assert.NotContains(t, out, "t19", "the twentieth line is the count of what was left out")
 		assert.Contains(t, out, "- and 6 more changes, shown in the diff")
+	}
+}
+
+// The terminal drops only the code-span delimiters: a backtick that belongs to
+// a name stays, and a backtick with no closing run is literal text.
+func TestPlainCodeSpans(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"adds table `orders`", "adds table orders"},
+		{"adds vindex `` odd`name ``", "adds vindex odd`name"},
+		{"adds vindex ``` a``b ```", "adds vindex a``b"},
+		{"a lone ` backtick", "a lone ` backtick"},
+		{"`a` and `b`", "a and b"},
+	} {
+		assert.Equal(t, tc.want, plainCodeSpans(tc.in), tc.in)
 	}
 }

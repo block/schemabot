@@ -5,6 +5,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"unicode"
 
 	"google.golang.org/protobuf/proto"
 
@@ -100,8 +101,8 @@ func describeKeyspaceSettings(current, desired *vschemapb.Keyspace) []string {
 // column vindexes, and sequence. Returns "" for a plain table with none.
 func tableRouting(t *vschemapb.Table) string {
 	var parts []string
-	if t.GetType() != "" {
-		parts = append(parts, fmt.Sprintf("%s table", t.GetType()))
+	if kind := tableKind(t.GetType()); kind != "" {
+		parts = append(parts, kind)
 	}
 	if source := t.GetSource(); source != "" {
 		parts = append(parts, fmt.Sprintf("source %s", code(source)))
@@ -197,15 +198,71 @@ func orNone(routing string) string {
 	return routing
 }
 
-// code renders a name as inline code. A VSchema name is free text, so a
-// newline is folded to a space (a summary is one line per element) and a name
-// holding a backtick is fenced with two.
-func code(s string) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	if strings.Contains(s, "`") {
-		return "`` " + s + " ``"
+// The table types Vitess defines, as a VSchema document spells them.
+const (
+	tableTypeSequence  = "sequence"
+	tableTypeReference = "reference"
+)
+
+// tableKind names a table's Vitess type in fixed words: "sequence table",
+// "reference table", or "" for a plain table. The type is free text in the
+// document, so a value Vitess does not define reads as a fixed phrase rather
+// than being echoed into the summary.
+func tableKind(tableType string) string {
+	switch tableType {
+	case "":
+		return ""
+	case tableTypeSequence:
+		return "sequence table"
+	case tableTypeReference:
+		return "reference table"
+	default:
+		return "table of an unknown type"
 	}
-	return "`" + s + "`"
+}
+
+// code renders a name as a markdown code span the name cannot break out of.
+// A VSchema name is free text, so control and format characters are removed
+// and whitespace runs, line breaks included, collapse to one space (a summary
+// is one line per element). The delimiter is a backtick run longer than any
+// run inside the name, padded with a space on each side when the name holds a
+// backtick so the name never touches the delimiter. An empty name renders as
+// a span holding one space.
+func code(s string) string {
+	flat := strings.Join(strings.Fields(strings.Map(dropControl, s)), " ")
+	if flat == "" {
+		flat = " "
+	}
+	delimiter := strings.Repeat("`", longestBacktickRun(flat)+1)
+	if strings.ContainsRune(flat, '`') {
+		flat = " " + flat + " "
+	}
+	return delimiter + flat + delimiter
+}
+
+// dropControl maps a control or format character to a space when it is
+// whitespace and removes it otherwise, for use with strings.Map.
+func dropControl(r rune) rune {
+	if unicode.IsSpace(r) {
+		return ' '
+	}
+	if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+		return -1
+	}
+	return r
+}
+
+func longestBacktickRun(s string) int {
+	longest, current := 0, 0
+	for _, r := range s {
+		if r != '`' {
+			current = 0
+			continue
+		}
+		current++
+		longest = max(longest, current)
+	}
+	return longest
 }
 
 func codeList(items []string) string {
