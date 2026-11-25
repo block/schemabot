@@ -177,6 +177,13 @@ func readRunning(f TableFacts) TableReading {
 		// saying none have moved, so the label says the copy is starting and
 		// the rows line gives the total.
 		return TableReading{Label: "⏳ Starting copy...", Details: []TableDetail{{Text: RowsLine(f)}}}
+	case copyFinishedShortOfEstimate(f):
+		// The engine reports the copy done, but it inserted fewer rows than
+		// the estimated total, as when the estimate ran high or the copy
+		// skipped rows. A percent of the estimate would sit beside a full
+		// bar, so the table reads as fully copied, with the rows it copied,
+		// as the post-copy phases do.
+		return TableReading{Bar: ui.ProgressBarRowCopy(100), Label: ui.FormatRowCopyPercent(100, f.RowsTotal, f.RowsTotal) + ShardCoverageSuffix(f), Details: rowsCopiedDetail(f)}
 	case f.RowsTotal > 0:
 		return TableReading{
 			Bar:     ui.ProgressBarRowCopy(ui.RowCopyDisplayPercent(f.PercentComplete, f.RowsCopied)),
@@ -198,6 +205,15 @@ func readRunning(f TableFacts) TableReading {
 		// drawn, since a bar would claim a measure the engine never gave.
 		return TableReading{Label: applyingLabel(f)}
 	}
+}
+
+// copyFinishedShortOfEstimate reports whether the engine says a table's copy
+// is done while the rows it copied fall short of the estimated total. An
+// engine's percent reaches 100 short of the total only when the engine itself
+// declares the copy finished, since a percent read from the rows stays below
+// 100 until the rows reach the total.
+func copyFinishedShortOfEstimate(f TableFacts) bool {
+	return f.PercentComplete >= 100 && f.RowsCopied > 0 && f.RowsCopied < f.RowsTotal
 }
 
 // applyingLabel names a change that reports no progress by what it does.
