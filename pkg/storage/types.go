@@ -994,13 +994,15 @@ func (tc TableChange) TaskEstimatedBytes(shard string) *int64 {
 // TaskEstimatedRows returns the row estimate a task created from this change
 // carries, under the same whole-table rule as TaskEstimatedBytes: a task
 // scoped to one shard carries none rather than the whole table's count. Only
-// an ALTER copies rows, so a task for any other change carries none either:
-// the plan sizes a table it drops, but that is not work the task will copy.
+// a change that works through the table's rows carries one: an ALTER copies
+// them, and a separate CREATE INDEX statement, which is how PostgreSQL adds an
+// index, reads them all to build it. A task for any other change carries none:
+// the plan sizes a table it drops, but that is not work the task will do.
 func (tc TableChange) TaskEstimatedRows(shard string) *int64 {
 	if shard != "" || tc.EstimatedRows == nil {
 		return nil
 	}
-	if !strings.EqualFold(tc.Operation, "alter") {
+	if !strings.EqualFold(tc.Operation, "alter") && !strings.EqualFold(tc.Operation, "create_index") {
 		return nil
 	}
 	rows := *tc.EstimatedRows

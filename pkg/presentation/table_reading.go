@@ -23,8 +23,11 @@ type TableFacts struct {
 	RowsTotal       int64
 	// RowsTotalPlanned marks a row total taken from the plan's estimate
 	// because some shards or targets have not reported one yet.
-	RowsTotalPlanned    bool
-	ETASeconds          int64
+	RowsTotalPlanned bool
+	ETASeconds       int64
+	// EstimatedRows is the table's row count when it was planned, nil when
+	// the plan could not count it.
+	EstimatedRows       *int64
 	EstimatedBytes      *int64
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
@@ -193,10 +196,16 @@ func readRunning(f TableFacts) TableReading {
 	case f.BuildWork.IsConcurrentIndexBuild():
 		// The engine's whole-build percent draws the bar. The current phase's
 		// counters sit under the statement and carry no percent of their own,
-		// so the table never shows two.
+		// so the table never shows two. The build reads every row, so the
+		// table's planned rows and size stay under it, as they read while the
+		// build was queued: the phase counters say how far it is, and the size
+		// says how long the rest will take.
 		r := TableReading{Label: ui.IndexBuildProgress(f.PercentComplete, f.BuildWork)}
 		if line := ui.FormatBuildWork(f.BuildWork); line != "" {
-			r.Details = []TableDetail{{Text: line}}
+			r.Details = append(r.Details, TableDetail{Text: line})
+		}
+		if line := PlannedRowsText(f.EstimatedRows, f.EstimatedBytes, ""); line != "" {
+			r.Details = append(r.Details, TableDetail{Text: line})
 		}
 		return r
 	default:
