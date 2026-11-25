@@ -220,6 +220,26 @@ func (e *ActiveApplyError) Unwrap() error {
 	return ErrActiveApplyExists
 }
 
+// ApplyNotActiveError reports an apply that a write needed to be active but
+// that the store found terminal. It matches ErrApplyNotActive, and carries the
+// state the store read under the apply's row lock, which a caller's copy of the
+// apply can lag: the apply may have settled after the caller read it.
+type ApplyNotActiveError struct {
+	ApplyID string
+	// State is the apply's state as the store read it.
+	State string
+	// Detail is the store's full account of the refused write, for the log line.
+	Detail string
+}
+
+func (e *ApplyNotActiveError) Error() string {
+	return e.Detail + ": " + ErrApplyNotActive.Error()
+}
+
+func (e *ApplyNotActiveError) Unwrap() error {
+	return ErrApplyNotActive
+}
+
 // LockInUseError reports the apply that kept a lock row from being released.
 // It matches ErrLockInUse, and carries the apply so a caller can log it with
 // Apply.LogAttrs and tell the operator which apply to wait for.

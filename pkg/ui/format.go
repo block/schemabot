@@ -234,6 +234,28 @@ func ClampRows(copied, total int64) int64 {
 	return copied
 }
 
+// CopyFinishedShortOfEstimate reports whether the engine says a table's copy
+// is done while the rows it copied fall short of the estimated total, as when
+// the estimate ran high or the copy skipped rows. An engine's percent reaches
+// 100 short of the total only when the engine itself declares the copy
+// finished, since a percent read from the rows stays below 100 until the rows
+// reach the total.
+func CopyFinishedShortOfEstimate(pct int, copied, total int64) bool {
+	return pct >= 100 && copied >= 0 && copied < total
+}
+
+// CopyCoveredRows is how many rows of its total a copy accounts for: the
+// rows it copied, clamped to the total, or the whole total once the engine
+// reports the copy finished short of it. Percents and sums across tables,
+// shards and targets read a copy through this, so a finished copy never
+// counts as a fraction of its estimate.
+func CopyCoveredRows(pct int, copied, total int64) int64 {
+	if CopyFinishedShortOfEstimate(pct, copied, total) {
+		return total
+	}
+	return ClampRows(copied, total)
+}
+
 // EstimateExceeded reports whether the row copy has exceeded its estimated total.
 func EstimateExceeded(copied, total int64) bool {
 	return total > 0 && copied > total
@@ -293,6 +315,7 @@ func ChecksumDisplayPercent(rowsChecked, rowsTotal int64) int {
 // percent. Renderers comparing tables or shards by progress should compare
 // this value so the selection agrees with what FormatRowCopyPercent displays.
 func RowCopyFraction(pct int, rowsCopied, rowsTotal int64) float64 {
+	rowsCopied = CopyCoveredRows(pct, rowsCopied, rowsTotal)
 	if rowsCopied > 0 && rowsTotal > 0 {
 		return math.Min(float64(rowsCopied)/float64(rowsTotal)*100, 100)
 	}
@@ -307,10 +330,12 @@ func RowCopyFraction(pct int, rowsCopied, rowsTotal int64) float64 {
 // floored at 0.01% so an in-flight copy never reads as 0.00%, and capped at
 // 99.99% while copied rows still trail the total, so a copy never reads as
 // finished before it is — an operator deciding whether to keep waiting takes
-// "100.00%" as done. Without row counts it falls back to the engine's
+// "100.00%" as done. A copy the engine reports finished short of its total
+// reads 100.00%, since its rows can no longer measure it. Without row counts it falls back to the engine's
 // whole-number percent, or "<1%" when copying has begun but there is no
 // total to compute a fraction from.
 func FormatRowCopyPercent(pct int, rowsCopied, rowsTotal int64) string {
+	rowsCopied = CopyCoveredRows(pct, rowsCopied, rowsTotal)
 	if rowsCopied > 0 && rowsTotal > 0 {
 		frac := math.Max(RowCopyFraction(pct, rowsCopied, rowsTotal), 0.01)
 		if rowsCopied < rowsTotal {

@@ -1,9 +1,19 @@
 package storage
 
+import (
+	"log/slog"
+
+	"github.com/block/schemabot/pkg/changeevents"
+)
+
 // Options carries deployment-tunable storage behavior. It holds only settings
 // the storage layer itself enforces — things a claim query or a store decides,
 // not anything the caller could apply on its own.
 type Options struct {
+	ChangeEvents   *changeevents.Sender
+	ChangeEventApp func(database string) string
+	ChangeEventLog *slog.Logger
+
 	// MaxDriversPerApply caps how many operation leases one apply may hold at
 	// once. Zero or negative selects DefaultMaxDriversPerApply; there is no
 	// uncapped mode, because an uncapped claim path is what lets one wide
@@ -20,6 +30,15 @@ type Option func(*Options)
 func WithMaxDriversPerApply(n int) Option {
 	return func(o *Options) {
 		o.MaxDriversPerApply = n
+	}
+}
+
+// WithChangeEvents observes committed lifecycle writes on the server's store.
+func WithChangeEvents(sender *changeevents.Sender, app func(database string) string, logger *slog.Logger) Option {
+	return func(o *Options) {
+		o.ChangeEvents = sender
+		o.ChangeEventApp = app
+		o.ChangeEventLog = logger
 	}
 }
 
