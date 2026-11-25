@@ -173,6 +173,15 @@ func readRunning(f TableFacts) TableReading {
 			{Text: fmt.Sprintf("Rows copied: %s so far", ui.FormatNumber(f.RowsCopied))},
 			{Text: ui.EstimateExceededTooltip, Note: true},
 		}}
+	case copyFinishedShortOfEstimate(f):
+		// The engine reports the copy done, but it inserted fewer rows than
+		// the estimated total, as when the estimate ran high or the copy
+		// skipped rows. It can insert none at all, when the source emptied
+		// after the estimate or the binlog applier moved every row first, so
+		// this comes before the starting-copy case. A percent of the estimate
+		// would sit beside a full bar, so the table reads as fully copied,
+		// with the rows it copied, as the post-copy phases do.
+		return TableReading{Bar: ui.ProgressBarRowCopy(100), Label: ui.FormatRowCopyPercent(100, f.RowsTotal, f.RowsTotal) + ShardCoverageSuffix(f), Details: rowsCopiedDetail(f)}
 	case f.RowsTotal > 0 && f.RowsCopied == 0:
 		// The row total is known but no rows have moved yet, which can take a
 		// while on a large table. A 0% bar reads as stuck, and a percent the
@@ -180,13 +189,6 @@ func readRunning(f TableFacts) TableReading {
 		// saying none have moved, so the label says the copy is starting and
 		// the rows line gives the total.
 		return TableReading{Label: "⏳ Starting copy...", Details: []TableDetail{{Text: RowsLine(f)}}}
-	case copyFinishedShortOfEstimate(f):
-		// The engine reports the copy done, but it inserted fewer rows than
-		// the estimated total, as when the estimate ran high or the copy
-		// skipped rows. A percent of the estimate would sit beside a full
-		// bar, so the table reads as fully copied, with the rows it copied,
-		// as the post-copy phases do.
-		return TableReading{Bar: ui.ProgressBarRowCopy(100), Label: ui.FormatRowCopyPercent(100, f.RowsTotal, f.RowsTotal) + ShardCoverageSuffix(f), Details: rowsCopiedDetail(f)}
 	case f.RowsTotal > 0:
 		return TableReading{
 			Bar:     ui.ProgressBarRowCopy(ui.RowCopyDisplayPercent(f.PercentComplete, f.RowsCopied)),
@@ -222,7 +224,7 @@ func readRunning(f TableFacts) TableReading {
 // declares the copy finished, since a percent read from the rows stays below
 // 100 until the rows reach the total.
 func copyFinishedShortOfEstimate(f TableFacts) bool {
-	return f.PercentComplete >= 100 && f.RowsCopied > 0 && f.RowsCopied < f.RowsTotal
+	return f.PercentComplete >= 100 && f.RowsCopied >= 0 && f.RowsCopied < f.RowsTotal
 }
 
 // applyingLabel names a change that reports no progress by what it does.

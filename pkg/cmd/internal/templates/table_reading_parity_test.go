@@ -50,6 +50,8 @@ func inFlightCases() []inFlightCase {
 		{name: "copy past its estimate", table: running(apitypes.TableProgressResponse{ChangeType: "alter", RowsCopied: 7_500_000, RowsTotal: 7_200_000, PercentComplete: 100}), headline: "Finalizing copy"},
 		{name: "copy finished short of its estimate", table: running(apitypes.TableProgressResponse{ChangeType: "alter", RowsCopied: 1, RowsTotal: 200_000, PercentComplete: 100}),
 			headline: "100.00%", details: []string{"Rows copied: 1"}},
+		{name: "copy finished with no rows copied", table: running(apitypes.TableProgressResponse{ChangeType: "alter", RowsTotal: 200_000, PercentComplete: 100}),
+			headline: "100.00%"},
 		{name: "index build", table: running(apitypes.TableProgressResponse{ChangeType: "alter", PercentComplete: 25}),
 			metadata: map[string]string{"executor_operation": "concurrent-index-build", "server_phase": "building index: scanning table", "blocks_done": "30000", "blocks_total": "48000"},
 			headline: "25%"},
@@ -108,33 +110,49 @@ func TestInFlightTableReadsTheSameOnEverySurface(t *testing.T) {
 }
 
 // One table's copy finishes short of its estimate while another table is
-// still copying, so the finished table's task stays running. Both surfaces
-// read it as fully copied, with the rows it copied, and never as a percent of
-// the estimate beside a full bar. The copying table keeps its own percent
-// (UX-8).
+// still copying, so the finished table's task stays running. The finished copy
+// may have inserted no rows at all, when the source emptied after its estimate
+// or the binlog applier moved every row first. Both surfaces read it as fully
+// copied, with the rows it copied, and never as a percent of the estimate
+// beside a full bar or as a copy that is starting. The copying table keeps its
+// own percent (UX-8).
 func TestFinishedCopyReadsAsCopiedBesideATableStillCopying(t *testing.T) {
-	resp := &apitypes.ProgressResponse{
-		ApplyID: "apply-5e6f7a8b", Database: "shop", Environment: "staging",
-		State: state.Apply.Running, Engine: storage.EngineSpirit,
-		Tables: []*apitypes.TableProgressResponse{
-			{TableName: "events", DDL: "ALTER TABLE events ADD UNIQUE KEY uk_email (email)", ChangeType: "alter",
-				Status: state.Task.Running, RowsCopied: 1, RowsTotal: 200_000, PercentComplete: 100},
-			{TableName: "orders", DDL: "ALTER TABLE orders ADD INDEX idx_created (created_at)", ChangeType: "alter",
-				Status: state.Task.Running, RowsCopied: 3_500_000, RowsTotal: 7_200_000, PercentComplete: 48},
-		},
-	}
-	data := ParseProgressResponse(resp)
-	require.Len(t, data.Tables, 2)
-	cli := ansiEscape.ReplaceAllString(FormatTableProgress(data.Tables[0])+FormatTableProgress(data.Tables[1]), "")
-	pr := webhooktemplates.RenderApplyStatusComment(webhooktemplates.ApplyStatusFromProgress(resp, "octocat"))
+	for _, tc := range []struct {
+		name       string
+		rowsCopied int64
+		rowsLine   string
+	}{
+		{name: "some rows copied", rowsCopied: 1, rowsLine: "Rows copied: 1"},
+		{name: "no rows copied", rowsCopied: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &apitypes.ProgressResponse{
+				ApplyID: "apply-5e6f7a8b", Database: "shop", Environment: "staging",
+				State: state.Apply.Running, Engine: storage.EngineSpirit,
+				Tables: []*apitypes.TableProgressResponse{
+					{TableName: "events", DDL: "ALTER TABLE events ADD UNIQUE KEY uk_email (email)", ChangeType: "alter",
+						Status: state.Task.Running, RowsCopied: tc.rowsCopied, RowsTotal: 200_000, PercentComplete: 100},
+					{TableName: "orders", DDL: "ALTER TABLE orders ADD INDEX idx_created (created_at)", ChangeType: "alter",
+						Status: state.Task.Running, RowsCopied: 3_500_000, RowsTotal: 7_200_000, PercentComplete: 48},
+				},
+			}
+			data := ParseProgressResponse(resp)
+			require.Len(t, data.Tables, 2)
+			cli := ansiEscape.ReplaceAllString(FormatTableProgress(data.Tables[0])+FormatTableProgress(data.Tables[1]), "")
+			pr := webhooktemplates.RenderApplyStatusComment(webhooktemplates.ApplyStatusFromProgress(resp, "octocat"))
 
-	for surface, out := range map[string]string{"CLI": cli, "PR comment": pr} {
-		assert.Contains(t, out, "100.00%", "%s: the finished table reads as fully copied", surface)
-		assert.Contains(t, out, "Rows copied: 1", "%s: the finished table shows the rows it copied", surface)
-		assert.NotContains(t, out, "0.01%", "%s: the finished table reads as a percent of its estimate", surface)
-		assert.NotContains(t, out, "Rows: 1 / 200,000", "%s: the finished table's rows line contradicts its bar", surface)
-		assert.Contains(t, out, "48.61%", "%s: the copying table keeps its own percent", surface)
-		assert.Contains(t, out, "Rows: 3,500,000 / 7,200,000", "%s: the copying table keeps its rows line", surface)
+			for surface, out := range map[string]string{"CLI": cli, "PR comment": pr} {
+				assert.Contains(t, out, "100.00%", "%s: the finished table reads as fully copied", surface)
+				if tc.rowsLine != "" {
+					assert.Contains(t, out, tc.rowsLine, "%s: the finished table shows the rows it copied", surface)
+				}
+				assert.NotContains(t, out, "Starting copy", "%s: the finished table reads as a copy that is starting", surface)
+				assert.NotContains(t, out, "0.01%", "%s: the finished table reads as a percent of its estimate", surface)
+				assert.NotContains(t, out, "/ 200,000", "%s: the finished table's rows line contradicts its bar", surface)
+				assert.Contains(t, out, "48.61%", "%s: the copying table keeps its own percent", surface)
+				assert.Contains(t, out, "Rows: 3,500,000 / 7,200,000", "%s: the copying table keeps its rows line", surface)
+			}
+		})
 	}
 }
 
