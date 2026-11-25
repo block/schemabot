@@ -43,19 +43,71 @@ type Conn interface {
 
 // Read returns the estimates statistics report for the named base tables,
 // keyed by the Table as the caller named it. A table that does not exist, is
-// not a base table, or whose statistics report neither figure has no entry.
+// not a base table, or whose statistics report neither figure has no entry. A
+// nil logger logs to slog.Default().
 //
 // It disables statistics caching for the session first, as the direct
 // execution size gate does, so a plan never shows a size older than the one
 // that gate reads. The setting stays on conn's session after Read returns.
+//
+// A request too large for one statement's placeholders is read in several
+// statements on the same session.
 func Read(ctx context.Context, conn Conn, logger *slog.Logger, tables []Table) (map[Table]Estimate, error) {
 	if len(tables) == 0 {
 		return nil, nil
 	}
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if _, err := conn.ExecContext(ctx, "SET SESSION information_schema_stats_expiry = 0"); err != nil {
 		return nil, fmt.Errorf("disable cached statistics for size estimates: %w", err)
 	}
+	foldCase, err := namesCompareIgnoringCase(ctx, conn)
+	if err != nil {
+		return nil, err
+	}
 
+	var found []sizeRow
+	for _, batch := range batchesWithin(tables, maxPlaceholders) {
+		rows, err := readBatch(ctx, conn, batch)
+		if err != nil {
+			return nil, err
+		}
+		found = append(found, rows...)
+	}
+	return matchEstimates(logger, tables, found, foldCase), nil
+}
+
+// maxPlaceholders is the most bound parameters one MySQL prepared statement
+// accepts.
+const maxPlaceholders = 65535
+
+// namesCompareIgnoringCase reports whether the server compares schema and
+// table names ignoring case, which lower_case_table_names sets to 1 or 2. On
+// such a server information_schema returns a table in its own case, which
+// can differ from the case the caller asked in.
+func namesCompareIgnoringCase(ctx context.Context, conn Conn) (bool, error) {
+	rows, err := conn.QueryContext(ctx, "SELECT @@lower_case_table_names")
+	if err != nil {
+		return false, fmt.Errorf("read lower_case_table_names for size estimates: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return false, fmt.Errorf("read lower_case_table_names for size estimates: %w", err)
+		}
+		return false, fmt.Errorf("read lower_case_table_names for size estimates: the server returned no row")
+	}
+	var mode int
+	if err := rows.Scan(&mode); err != nil {
+		return false, fmt.Errorf("scan lower_case_table_names for size estimates: %w", err)
+	}
+	return mode != 0, nil
+}
+
+// readBatch returns the statistics information_schema reports for one batch
+// of tables.
+func readBatch(ctx context.Context, conn Conn, tables []Table) ([]sizeRow, error) {
 	schemas, names := distinctSchemasAndNames(tables)
 	args := make([]any, 0, len(schemas)+len(names))
 	for _, s := range schemas {
@@ -91,7 +143,35 @@ func Read(ctx context.Context, conn Conn, logger *slog.Logger, tables []Table) (
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate table size estimates: %w", err)
 	}
-	return matchEstimates(logger, tables, found), nil
+	return found, nil
+}
+
+// batchesWithin splits tables, in order, into batches whose distinct schemas
+// and names together need at most limit placeholders.
+func batchesWithin(tables []Table, limit int) [][]Table {
+	var batches [][]Table
+	var batch []Table
+	schemas := make(map[string]bool)
+	names := make(map[string]bool)
+	for _, t := range tables {
+		added := 0
+		if !schemas[t.Schema] {
+			added++
+		}
+		if !names[t.Name] {
+			added++
+		}
+		if len(batch) > 0 && len(schemas)+len(names)+added > limit {
+			batches = append(batches, batch)
+			batch = nil
+			schemas = make(map[string]bool)
+			names = make(map[string]bool)
+		}
+		batch = append(batch, t)
+		schemas[t.Schema] = true
+		names[t.Name] = true
+	}
+	return append(batches, batch)
 }
 
 // sizeRow is one table's statistics as information_schema returned them.
@@ -101,15 +181,15 @@ type sizeRow struct {
 }
 
 // matchEstimates keys the returned statistics by the Table each caller asked
-// for. A row whose schema and name match a request exactly belongs to it. On
-// a server that compares names case-insensitively, information_schema returns
-// a table in its own case, so a request with no exact row takes the one row
-// that matches it ignoring case, provided no other request matched that row
-// exactly. A server that compares names case-sensitively only returns exact
-// matches, so two tables whose names differ only in case each keep their own
-// estimate. A request that would match more than one row ignoring case is
-// left without an estimate rather than given either.
-func matchEstimates(logger *slog.Logger, tables []Table, found []sizeRow) map[Table]Estimate {
+// for. A row whose schema and name match a request exactly belongs to it, and
+// on a server that compares names case-sensitively (foldCase false) that is
+// the only match: a row that differs from a request only in case is another
+// table. On a server that compares names ignoring case, information_schema
+// returns a table in its own case, so a request with no exact row takes the
+// one row that matches it ignoring case, provided no other request matched
+// that row exactly. A request that would match more than one row ignoring case
+// is left without an estimate rather than given either.
+func matchEstimates(logger *slog.Logger, tables []Table, found []sizeRow, foldCase bool) map[Table]Estimate {
 	requested := make(map[Table]bool, len(tables))
 	requestedFolded := make(map[Table]bool, len(tables))
 	for _, t := range tables {
@@ -123,7 +203,7 @@ func matchEstimates(logger *slog.Logger, tables []Table, found []sizeRow) map[Ta
 			exact[r.table] = r
 			continue
 		}
-		if !requestedFolded[foldTable(r.table)] {
+		if !foldCase || !requestedFolded[foldTable(r.table)] {
 			logger.Debug("size read returned a table no caller asked for in that schema; ignoring it",
 				"schema", r.table.Schema, "table", r.table.Name)
 			continue
