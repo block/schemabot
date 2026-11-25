@@ -81,7 +81,9 @@ type OperationClaimFilter struct {
 	// locks every operation of the apply. With this set, a claim that takes
 	// nothing repeats its read without locking rows, and returns
 	// ErrOperationClaimContended when that read finds an operation. It costs a
-	// second query only when the claim takes nothing.
+	// second query whenever the claim takes nothing, which on an idle plane is
+	// every claim, so a caller sets it only when it has reason to expect
+	// claimable work.
 	ReportContention bool
 }
 
