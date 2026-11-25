@@ -1414,9 +1414,14 @@ func planUnsafeChanges(planResp *apitypes.PlanResponse) []templates.UnsafeChange
 // unsafe reason lists it. The plan comment matches an attribution against the
 // one clause a finding concerns rather than the whole statement, so a compound
 // ALTER TABLE that drops another pull request's index beside a column of its
-// own does not attribute the column drop.
+// own does not attribute the column drop. A finding whose text the table's
+// reason lists for more than one column cannot be told apart by that text, so
+// it is left out and its attribution is matched against the whole statement:
+// keying it to either column would attribute the other column's line by the
+// wrong clause.
 func unsafeFindingColumns(planResp *apitypes.PlanResponse) map[string]map[string]string {
 	columns := map[string]map[string]string{}
+	ambiguous := map[string]map[string]bool{}
 	for _, v := range planResp.LintErrors() {
 		if v.Table == "" || v.Column == "" {
 			continue
@@ -1429,10 +1434,24 @@ func unsafeFindingColumns(planResp *apitypes.PlanResponse) map[string]map[string
 				"table", v.Table, "column", v.Column, "findings", len(findings))
 			continue
 		}
+		finding := findings[0]
+		if ambiguous[v.Table][finding] {
+			continue
+		}
 		if columns[v.Table] == nil {
 			columns[v.Table] = map[string]string{}
 		}
-		columns[v.Table][findings[0]] = v.Column
+		if other, ok := columns[v.Table][finding]; ok && other != v.Column {
+			slog.Debug("unsafe finding is attributed by its whole statement: the same finding text names more than one column",
+				"table", v.Table, "column", v.Column, "other_column", other)
+			delete(columns[v.Table], finding)
+			if ambiguous[v.Table] == nil {
+				ambiguous[v.Table] = map[string]bool{}
+			}
+			ambiguous[v.Table][finding] = true
+			continue
+		}
+		columns[v.Table][finding] = v.Column
 	}
 	return columns
 }

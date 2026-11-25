@@ -390,6 +390,37 @@ func TestPlanUnsafeChanges_KeysEachFindingToItsColumn(t *testing.T) {
 	}
 }
 
+// Two clauses of one ALTER TABLE drop different columns with the same finding
+// text. The reason lists both findings, but the text alone cannot say which
+// line is which column, so that text is keyed to no column and both lines are
+// matched against the whole statement. A finding with its own text still keys
+// its column.
+func TestPlanUnsafeChanges_LeavesFindingTextSharedByTwoColumnsUnkeyed(t *testing.T) {
+	dropsData := "Unsafe operation detected: dropping a column discards its data"
+	dropNickname := `Unsafe operation detected: "DROP COLUMN ` + "`nickname`" + `"`
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "keyspace",
+			TableChanges: []*apitypes.TableChangeResponse{{
+				TableName: "users", ChangeType: "alter", IsUnsafe: true,
+				DDL:          "ALTER TABLE `users` DROP COLUMN `email`, DROP COLUMN `phone`, DROP COLUMN `nickname`",
+				UnsafeReason: lintReasonOf(dropsData, dropsData, dropNickname),
+			}},
+		}},
+		LintResults: []*apitypes.LintViolationResponse{
+			{Severity: "error", Table: "users", Column: "email", Message: dropsData},
+			{Severity: "error", Table: "users", Column: "phone", Message: dropsData},
+			{Severity: "error", Table: "users", Column: "nickname", Message: dropNickname},
+		},
+	}
+
+	unsafe := planUnsafeChanges(planResp)
+	require.Len(t, unsafe, 1)
+	assert.Equal(t, map[string]string{
+		ui.LintReasons(lint.UnsafeFindingText(dropNickname))[0]: "nickname",
+	}, unsafe[0].FindingColumns)
+}
+
 // lintReasonOf joins error messages the way the engine's unsafe reason does.
 func lintReasonOf(messages ...string) string {
 	findings := make([]string, len(messages))
