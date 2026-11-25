@@ -3284,30 +3284,21 @@ func OperationsOnTarget(ops []*ApplyOperation, target string) []*ApplyOperation 
 // ("shop-002/main/group_finalizer") has as many components as a shard key on
 // its own, so the operation's kind rules it out.
 func OperationShard(kind, key, target string) (string, bool) {
-	_, shard, ok := OperationNamespaceShard(kind, key, target)
-	return shard, ok
-}
-
-// OperationNamespaceShard returns the namespace and shard a sharded work
-// operation runs on, read the same way as OperationShard. A shard name such as
-// "-80" repeats across the namespaces of one target, so the pair is what names
-// one shard, and every table step on that shard reports the same pair.
-func OperationNamespaceShard(kind, key, target string) (namespace, shard string, ok bool) {
 	if kind == ApplyOperationKindGroupFinalizer {
-		return "", "", false
+		return "", false
 	}
 	// A key whose namespace happens to equal the target ("main/-80/orders" on
 	// target "main") is a shard key on its own, so the target prefix is
 	// stripped only when what remains is a whole shard key.
 	if target != "" {
-		if rest, cut := strings.CutPrefix(key, target+OperationKeyDelimiter); cut {
-			if ns, sh, _, isShard := state.ShardWorkKey(rest); isShard {
-				return ns, sh, true
+		if rest, ok := strings.CutPrefix(key, target+OperationKeyDelimiter); ok {
+			if _, shard, _, ok := state.ShardWorkKey(rest); ok {
+				return shard, true
 			}
 		}
 	}
-	namespace, shard, _, ok = state.ShardWorkKey(key)
-	return namespace, shard, ok
+	_, shard, _, ok := state.ShardWorkKey(key)
+	return shard, ok
 }
 
 // LogOperationsOnShard returns the ApplyLogFilter.OperationIDs of a log read

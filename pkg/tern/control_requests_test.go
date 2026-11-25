@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"testing"
+	"time"
+
+	"github.com/block/schemabot/pkg/presentation"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -584,26 +587,46 @@ func TestSettlePendingRequestsForCancelledApplyCompletesTheCancel(t *testing.T) 
 func failedRolloutWithPendingCancel(sharded bool, opStates ...string) (*storage.Apply, *testControlRequestStore, *mockApplyLogStore, *mockStorage) {
 	ops := make([]*storage.ApplyOperation, 0, len(opStates))
 	for i, opState := range opStates {
-		target := fmt.Sprintf("target-%03d", i+1)
-		key := storage.TargetOperationKey(target, storage.RolloutStepOperationKey(1))
 		if sharded {
-			target = "commerce"
-			key = fmt.Sprintf("commerce/%d0-/orders", i)
+			ops = append(ops, shardWorkOperation(fmt.Sprintf("commerce/%d0-/orders", i), opState))
+			continue
 		}
-		ops = append(ops, rolloutWorkOperation(target, key, opState))
+		ops = append(ops, targetStepOperation(fmt.Sprintf("target-%03d", i+1), 1, opState, true))
 	}
 	return failedRolloutWithOperations(ops...)
 }
 
-// rolloutWorkOperation is one work operation of a failed rollout's fixture.
-func rolloutWorkOperation(target, key, opState string) *storage.ApplyOperation {
+// shardWorkOperation is one shard's table change in a failed sharded apply's
+// fixture: every shard of the commerce deployment, keyed namespace/shard/table.
+// Each one started, since the fixture's cancel stopped running work.
+func shardWorkOperation(key, opState string) *storage.ApplyOperation {
+	started := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 	return &storage.ApplyOperation{
-		Deployment:    target,
-		Target:        target,
+		Deployment:    "commerce",
 		OperationKey:  key,
 		OperationKind: storage.ApplyOperationKindWork,
 		State:         opState,
+		StartedAt:     &started,
 	}
+}
+
+// targetStepOperation is one table step of one target in a failed multi-target
+// rollout's fixture: the orders deployment runs table by table across its
+// targets. started says whether a driver ever claimed the step.
+func targetStepOperation(target string, step int, opState string, started bool) *storage.ApplyOperation {
+	op := &storage.ApplyOperation{
+		Deployment:    "orders",
+		Target:        target,
+		OperationKey:  storage.TargetOperationKey(target, storage.RolloutStepOperationKey(step)),
+		OperationKind: storage.ApplyOperationKindWork,
+		State:         opState,
+		RolloutStep:   step,
+	}
+	if started {
+		startedAt := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+		op.StartedAt = &startedAt
+	}
+	return op
 }
 
 // failedRolloutWithOperations returns a failed apply made of ops, with a cancel
@@ -678,12 +701,12 @@ func TestCancelThatLandsOnAFailedRolloutWithNoFailedMemberNamesNoFailureCount(t 
 // PR comment lists.
 func TestCancelOnAFailedShardedRolloutCountsShardsNotTableSteps(t *testing.T) {
 	apply, controlRequests, logs, store := failedRolloutWithOperations(
-		rolloutWorkOperation("commerce", "commerce/-80/orders", state.ApplyOperation.Failed),
-		rolloutWorkOperation("commerce", "commerce/-80/users", state.ApplyOperation.Cancelled),
-		rolloutWorkOperation("commerce", "commerce/80-c0/orders", state.ApplyOperation.Cancelled),
-		rolloutWorkOperation("commerce", "commerce/80-c0/users", state.ApplyOperation.Cancelled),
-		rolloutWorkOperation("commerce", "commerce/c0-/orders", state.ApplyOperation.Completed),
-		rolloutWorkOperation("commerce", "commerce/c0-/users", state.ApplyOperation.Cancelled),
+		shardWorkOperation("commerce/-80/orders", state.ApplyOperation.Failed),
+		shardWorkOperation("commerce/-80/users", state.ApplyOperation.Cancelled),
+		shardWorkOperation("commerce/80-c0/orders", state.ApplyOperation.Cancelled),
+		shardWorkOperation("commerce/80-c0/users", state.ApplyOperation.Cancelled),
+		shardWorkOperation("commerce/c0-/orders", state.ApplyOperation.Completed),
+		shardWorkOperation("commerce/c0-/users", state.ApplyOperation.Cancelled),
 	)
 
 	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
@@ -697,17 +720,18 @@ func TestCancelOnAFailedShardedRolloutCountsShardsNotTableSteps(t *testing.T) {
 		logs.logs[0].Message)
 }
 
-// A multi-target rollout runs two table steps on each of two targets. One
-// target failed its first step and its second step ended cancelled behind the
-// failure; the other target had finished both. No member that had not failed
-// was cancelled, so the cancel reached nothing: the request fails with the
-// outrun reason rather than claiming it cancelled zero targets.
-func TestCancelOnAFailedRolloutWhoseOnlyCancelledStepsAreOnTheFailedMemberStillFails(t *testing.T) {
+// A multi-target rollout runs two table steps on each of two targets. Target
+// us failed its first step, and eu finished its first step. Neither target's
+// second step could ever start, since a step starts only once every earlier
+// step has completed, and the pending cancel's sweep ended both cancelled. The
+// cancel stopped nothing that could have run, so the request fails with the
+// outrun reason rather than claiming it cancelled eu.
+func TestCancelOnAFailedRolloutWhoseCancelledStepsCouldNeverStartStillFails(t *testing.T) {
 	apply, controlRequests, _, store := failedRolloutWithOperations(
-		rolloutWorkOperation("us", storage.TargetOperationKey("us", storage.RolloutStepOperationKey(1)), state.ApplyOperation.Failed),
-		rolloutWorkOperation("us", storage.TargetOperationKey("us", storage.RolloutStepOperationKey(2)), state.ApplyOperation.Cancelled),
-		rolloutWorkOperation("eu", storage.TargetOperationKey("eu", storage.RolloutStepOperationKey(1)), state.ApplyOperation.Completed),
-		rolloutWorkOperation("eu", storage.TargetOperationKey("eu", storage.RolloutStepOperationKey(2)), state.ApplyOperation.Completed),
+		targetStepOperation("us", 1, state.ApplyOperation.Failed, true),
+		targetStepOperation("us", 2, state.ApplyOperation.Cancelled, false),
+		targetStepOperation("eu", 1, state.ApplyOperation.Completed, true),
+		targetStepOperation("eu", 2, state.ApplyOperation.Cancelled, false),
 	)
 
 	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
@@ -868,4 +892,45 @@ func TestFailPendingControlRequestsRecordsTheOperatorApplyID(t *testing.T) {
 				"the stored rejection must name the apply the operator asked about")
 		})
 	}
+}
+
+// A rollout of the orders deployment runs one schema change across two
+// sharded targets, keyed target/namespace/shard/table. Shard -80 of orders-001
+// failed, and the cancel stopped the other three shards before they finished.
+// The history counts the members the PR comment's rollup counts, by the same
+// noun, so the two never disagree about what the cancel did.
+func TestCancelOnAFailedRolloutCountsTheMembersThePRCommentLists(t *testing.T) {
+	shardOf := func(target, shard, opState string) *storage.ApplyOperation {
+		started := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+		return &storage.ApplyOperation{
+			Deployment:    "orders",
+			Target:        target,
+			OperationKey:  storage.TargetOperationKey(target, storage.ShardOperationKey("main", shard, "orders")),
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         opState,
+			StartedAt:     &started,
+		}
+	}
+	operations := []*storage.ApplyOperation{
+		shardOf("orders-001", "-80", state.ApplyOperation.Failed),
+		shardOf("orders-001", "80-", state.ApplyOperation.Cancelled),
+		shardOf("orders-002", "-80", state.ApplyOperation.Cancelled),
+		shardOf("orders-002", "80-", state.ApplyOperation.Cancelled),
+	}
+	apply, controlRequests, logs, store := failedRolloutWithOperations(operations...)
+
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestCompleted, settled.Status)
+
+	rows := workRowsForMemberOutcomes(operations)
+	comment := presentation.Derive(rows)
+	noun := presentation.MemberNoun(comment.Groups())
+	assert.Equal(t, []presentation.StateCount{{Label: "failed", Count: 1}, {Label: "cancelled", Count: 3}}, comment.Counts)
+	require.Len(t, logs.logs, 1)
+	assert.Equal(t, fmt.Sprintf("Cancel took effect: %s that had not finished were cancelled. The apply ended failed because %s failed (caller: alice)",
+		noun.Count(3), noun.Count(1)), logs.logs[0].Message)
 }

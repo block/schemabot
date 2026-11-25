@@ -579,7 +579,7 @@ func settlePendingCancelForTerminalApply(ctx context.Context, store storage.Stor
 	if err != nil {
 		return err
 	}
-	if landed.tookEffect() {
+	if cancelTookEffect(landed) {
 		if err := completePendingControlRequests(ctx, store, apply, storage.ControlOperationCancel); err != nil {
 			return err
 		}
@@ -598,103 +598,61 @@ func settlePendingCancelForTerminalApply(ctx context.Context, store storage.Stor
 	return nil
 }
 
-// cancelledRolloutMembers counts how a failed rollout's members ended, for a
-// cancel that was pending while it settled. A member is one shard of a sharded
-// apply or one target of a multi-target rollout, however many table steps it
-// runs, so the counts match the members the PR comment lists.
-type cancelledRolloutMembers struct {
-	noun      presentation.Noun
-	cancelled int
-	failed    int
+// cancelTookEffect reports whether a cancel that was pending while a rollout
+// settled failed reached the outcome the operator asked for: a member that had
+// not finished ended cancelled rather than running on. The apply reads failed
+// only because other members failed, and failed outranks cancelled in the
+// rollout's derived state. Cancelled rows on a member that failed, and table
+// steps a failed earlier step held for good, do not count: they are what the
+// failure left behind, not work the cancel stopped.
+func cancelTookEffect(members presentation.MemberOutcomes) bool {
+	return members.Cancelled > 0
 }
 
-// tookEffect reports whether the cancel reached the outcome the operator asked
-// for: a member that had not finished ended cancelled rather than running on.
-// The apply reads failed only because other members failed, and failed
-// outranks cancelled in the rollout's derived state. Cancelled steps on a
-// member that failed do not count: they are what the failure left behind, not
-// work the cancel stopped.
-func (m cancelledRolloutMembers) tookEffect() bool {
-	return m.cancelled > 0
-}
-
-// memberOutcome is how one rollout member's table steps ended, for the counts
-// in a cancel's history event.
-type memberOutcome struct {
-	cancelled bool
-	failed    bool
-}
-
-// cancelLandedOnFailedRollout reads how the members of a failed apply ended.
+// cancelLandedOnFailedRollout reads how the members of a failed apply ended,
+// counted the way the PR comment lists them (presentation.SettledMemberOutcomes).
 // A cancel accepted while some members were still running cancels the ones
 // that have not finished, and when other members have already failed the
 // rollout settles failed. Reading that state alone as the cancel being outrun
 // would tell the operator their command did nothing while it cancelled most of
 // the rollout. Any apply other than a failed one returns no members, and the
 // state alone decides the outcome.
-//
-// A member with a failed step counts as failed, even when its later steps were
-// cancelled, because failed outranks cancelled for the member as it does for
-// the apply. A member counts as cancelled when a step of it was cancelled and
-// none failed.
-func cancelLandedOnFailedRollout(ctx context.Context, store storage.Storage, apply *storage.Apply) (cancelledRolloutMembers, error) {
-	members := cancelledRolloutMembers{noun: presentation.TargetNoun}
+func cancelLandedOnFailedRollout(ctx context.Context, store storage.Storage, apply *storage.Apply) (presentation.MemberOutcomes, error) {
 	if !state.IsState(apply.State, state.Apply.Failed) {
-		return members, nil
+		return presentation.MemberOutcomes{}, nil
 	}
 	operations := store.ApplyOperations()
 	if operations == nil {
-		return members, fmt.Errorf("settle pending cancel for failed apply %s: apply operation store is not available", apply.ApplyIdentifier)
+		return presentation.MemberOutcomes{}, fmt.Errorf("settle pending cancel for failed apply %s: apply operation store is not available", apply.ApplyIdentifier)
 	}
 	ops, err := operations.ListByApply(ctx, apply.ID)
 	if err != nil {
-		return members, fmt.Errorf("list operations of failed apply %s to settle its pending cancel: %w", apply.ApplyIdentifier, err)
+		return presentation.MemberOutcomes{}, fmt.Errorf("list operations of failed apply %s to settle its pending cancel: %w", apply.ApplyIdentifier, err)
 	}
-	outcomes := make(map[string]*memberOutcome)
-	var order []string
+	return presentation.SettledMemberOutcomes(workRowsForMemberOutcomes(ops)), nil
+}
+
+// workRowsForMemberOutcomes maps an apply's work operations, in resolved
+// order, to the rows presentation.SettledMemberOutcomes counts members over.
+// Finalizers are left out: they finish a keyspace's change and are not members
+// of the rollout.
+func workRowsForMemberOutcomes(ops []*storage.ApplyOperation) []presentation.Operation {
+	rows := make([]presentation.Operation, 0, len(ops))
 	for _, op := range ops {
 		if op == nil || op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
 			continue
 		}
-		member, sharded := rolloutMember(op)
-		if sharded {
-			members.noun = presentation.ShardNoun
-		}
-		outcome, seen := outcomes[member]
-		if !seen {
-			outcome = &memberOutcome{}
-			outcomes[member] = outcome
-			order = append(order, member)
-		}
-		switch {
-		case state.IsState(op.State, state.ApplyOperation.Cancelled):
-			outcome.cancelled = true
-		case state.IsState(op.State, state.ApplyOperation.Failed):
-			outcome.failed = true
-		}
+		rows = append(rows, presentation.Operation{
+			Deployment:   op.Deployment,
+			Target:       op.Target,
+			State:        op.State,
+			OperationKey: op.OperationKey,
+			Work:         op.OperationKind == storage.ApplyOperationKindWork,
+			NeverStarted: op.StartedAt == nil,
+			RolloutStep:  op.RolloutStep,
+		})
 	}
-	for _, member := range order {
-		switch outcome := outcomes[member]; {
-		case outcome.failed:
-			members.failed++
-		case outcome.cancelled:
-			members.cancelled++
-		}
-	}
-	return members, nil
-}
-
-// rolloutMember names the rollout member a work operation belongs to, and
-// reports whether that member is a shard. Every table step on one shard, or on
-// one target of a multi-target rollout, names the same member.
-func rolloutMember(op *storage.ApplyOperation) (string, bool) {
-	if namespace, shard, ok := storage.OperationNamespaceShard(op.OperationKind, op.OperationKey, op.Target); ok {
-		return op.Target + storage.OperationKeyDelimiter + namespace + storage.OperationKeyDelimiter + shard, true
-	}
-	if op.Target != "" {
-		return op.Target, false
-	}
-	return op.OperationKey, false
+	return rows
 }
 
 // discloseCancelLandedOnFailedRollout records in the server log and the apply
@@ -703,17 +661,17 @@ func rolloutMember(op *storage.ApplyOperation) (string, bool) {
 // read as a cancel followed by an unexplained failure.
 //
 // Best-effort for the same reason as discloseSettledTerminalCancel.
-func discloseCancelLandedOnFailedRollout(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, members cancelledRolloutMembers) {
+func discloseCancelLandedOnFailedRollout(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, members presentation.MemberOutcomes) {
 	caller := controlRequestCaller(controlReq)
 	failure := "The apply ended failed"
-	if members.failed > 0 {
-		failure = fmt.Sprintf("The apply ended failed because %s failed", members.noun.Count(members.failed))
+	if members.Failed > 0 {
+		failure = fmt.Sprintf("The apply ended failed because %s failed", members.Noun.Count(members.Failed))
 	}
 	message := fmt.Sprintf("Cancel took effect: %s that had not finished %s cancelled. %s%s",
-		members.noun.Count(members.cancelled), wasOrWere(members.cancelled), failure, callerApplyLogSuffix(caller))
+		members.Noun.Count(members.Cancelled), wasOrWere(members.Cancelled), failure, callerApplyLogSuffix(caller))
 	logger.InfoContext(ctx, "completing pending cancel request: the cancel took effect on a rollout that settled failed",
 		append(apply.LogAttrs(), "requested_by", caller,
-			"cancelled_member_count", members.cancelled, "failed_member_count", members.failed)...)
+			"cancelled_member_count", members.Cancelled, "failed_member_count", members.Failed)...)
 	appendSettledRequestEvent(ctx, store, logger, apply, storage.LogLevelInfo, storage.LogEventCancelRequested, message)
 }
 
