@@ -135,6 +135,11 @@ type baselinePolicy struct {
 	// referenced table whose incoming foreign key lives on a table the
 	// baseline does not write, since that key would be in no file.
 	includeForeignKeys bool
+	// refuseNotValidForeignKeys refuses a table holding a foreign key added
+	// NOT VALID. The renderer writes every key as a validated one, so a
+	// baseline carrying it would plan a VALIDATE CONSTRAINT the forward apply
+	// never ran, and existing rows that break the key would fail it.
+	refuseNotValidForeignKeys bool
 	// refuseUnmodeledObjects refuses a table that carries objects the
 	// declarative format does not represent — a trigger or a table/column comment
 	// — even though the renderer would happily render its columns and
@@ -161,9 +166,12 @@ var pulledBaseline = baselinePolicy{refuseUnmodeledObjects: true, includeRowSecu
 // are carried, so a namespace that has them keeps its rollback: a key the
 // forward plan did not touch diffs to nothing, and a key it added comes
 // back as a drop, which the re-plan shows blocked like any foreign key drop.
+// A key added NOT VALID cannot be carried as it is, so a namespace holding
+// one has no rollback baseline (RV-7).
 func rollbackBaseline(declared map[string]bool, ignored engine.IgnoredTables) baselinePolicy {
 	return baselinePolicy{
 		includeForeignKeys:          true,
+		refuseNotValidForeignKeys:   true,
 		skipUndeclaredArchiveTables: true,
 		declaredTables:              declared,
 		ignoredTables:               ignored,
@@ -423,6 +431,11 @@ func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, tab
 	if err != nil {
 		return nil, fmt.Errorf("introspect schema %q table %q: %w", namespace, table, err)
 	}
+	if policy.refuseNotValidForeignKeys {
+		if key, ok := notValidForeignKey(model); ok {
+			return &renderedTable{renderErr: fmt.Errorf("schema %q table %q: %w: %s", namespace, table, errNotValidForeignKey, key)}, nil
+		}
+	}
 	opts := schemadiff.RenderOptions{ForeignKeys: policy.includeForeignKeys}
 	content, err := schemadiff.RenderWith(model, opts)
 	if policy.includeRowSecurity && errors.Is(err, schemadiff.ErrUnrenderableRowSecurity) {
@@ -436,6 +449,21 @@ func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, tab
 		}}, nil
 	}
 	return &renderedTable{content: content, incoming: model.IncomingForeignKeys}, nil
+}
+
+// errNotValidForeignKey refuses a table holding a foreign key added NOT
+// VALID from a baseline that must reproduce the key exactly.
+var errNotValidForeignKey = errors.New("holds a foreign key added NOT VALID, which a schema file cannot declare")
+
+// notValidForeignKey names the first foreign key on the table that was added
+// NOT VALID and not yet validated.
+func notValidForeignKey(model schemadiff.Model) (string, bool) {
+	for _, c := range model.Constraints {
+		if c.ForeignKey && c.NotValid {
+			return c.Name, true
+		}
+	}
+	return "", false
 }
 
 // pullNamespaces discovers every non-reserved schema by default. Callers use
