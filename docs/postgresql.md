@@ -649,8 +649,10 @@ drop.
 A plan is blocked when any of its statements cannot run as native DDL. That
 covers changes that need a copy of the table, changes pg-sprite refuses, and
 verdicts SchemaBot does not recognize. A native statement is also blocked when
-it is not an `ALTER TABLE`, `CREATE TABLE`, or `CREATE INDEX`. Enum labels are
-checked separately; see [Enum types](#enum-types).
+it is not an `ALTER TABLE`, `CREATE TABLE`, `CREATE INDEX`, or the `DROP TABLE`
+of a table with no schema file. Enum labels are checked separately; see
+[Enum types](#enum-types), and for table drops see
+[Tables with no schema file](#tables-with-no-schema-file).
 
 The pinned pg-sprite version defines which shapes run, so upgrading pg-sprite
 can admit more without a SchemaBot change.
@@ -733,7 +735,8 @@ plan Check Run fails:
 |---|---|
 | Partitioned, a partition's parent, or in an inheritance hierarchy | The drop reaches tables or rows the plan does not show |
 | Referenced by a foreign key of a table that stays | PostgreSQL refuses the drop without `CASCADE` |
-| Read by a view, a function, a policy, or another object that stays | PostgreSQL refuses the drop without `CASCADE` |
+| Referenced by a foreign key in another namespace | Drops in different namespaces have no guaranteed order |
+| Read by a view, a function, a policy, or another object that stays, including another table's default that draws from its sequence | PostgreSQL refuses the drop without `CASCADE` |
 | Owned by a role the engine role cannot act as | Only a table's owner can drop it. The reason gives the grant to run |
 | In a cycle of foreign keys with other dropped tables | No drop order works |
 
@@ -887,7 +890,7 @@ Recognize each outcome by its signal:
 | Blocked plan | The plan Check Run fails, and the plan comment names each blocked table with the reason. No flag unblocks it: `--allow-unsafe` accepts a destructive change, but it does not make a blocked change runnable |
 | Refused at apply time | The apply fails and names what to change. Applying the same plan again meets the same refusal |
 | Retryable failure | The apply names what it is waiting for, such as a build that is still running. SchemaBot retries it on the next drive |
-| Changed since review | A column or constraint the plan drops was replaced after review, so the drop does not run. An automatic apply posts a new plan in a new comment. Nobody has reviewed it, so the agent asks the user before confirming, per the command policy for `apply-confirm` |
+| Changed since review | A table, column, or constraint the plan drops changed after review, so the drop does not run. An automatic apply posts a new plan in a new comment. Nobody has reviewed it, so the agent asks the user before confirming, per the command policy for `apply-confirm` |
 
 When SchemaBot blocks or refuses a change, the agent:
 

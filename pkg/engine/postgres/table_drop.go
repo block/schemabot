@@ -52,8 +52,10 @@ type tableDropPlan struct {
 // dropped, and a table whose referencing tables are dropped too is dropped
 // after them, so by the time the apply reaches it no foreign key references
 // it. Its definition leaves out those references for the same reason: it is
-// the table the apply will find. Tables whose foreign keys form a cycle have
-// no such order and are blocked.
+// the table the apply will find. Tables on a cycle of foreign keys have no
+// such order and are blocked, and so, in turn, are the tables they
+// reference. A table that a foreign key in another namespace references is
+// blocked, since drops in different namespaces have no guaranteed order.
 func planTableDrops(namespace string, models map[string]schemadiff.Model, refused map[string][]string) tableDropPlan {
 	blocked := map[string][]string{}
 	for name, m := range models {
@@ -100,8 +102,9 @@ func inTableHierarchy(m schemadiff.Model) bool {
 }
 
 // blockKeptReferences blocks every table still to be dropped that a foreign
-// key of a kept table references, until no such table remains: blocking a
-// table keeps it, which can in turn keep a table it references.
+// key of a kept table, or of a table in another namespace, references, until
+// no such table remains: blocking a table keeps it, which can in turn keep a
+// table it references.
 func blockKeptReferences(namespace string, models map[string]schemadiff.Model, blocked map[string][]string) {
 	for changed := true; changed; {
 		changed = false
@@ -109,14 +112,25 @@ func blockKeptReferences(namespace string, models map[string]schemadiff.Model, b
 			if _, ok := blocked[name]; ok {
 				continue
 			}
-			var kept []string
+			var kept, otherNamespaces []string
 			for _, fk := range models[name].IncomingForeignKeys {
+				if fk.Schema != namespace {
+					otherNamespaces = append(otherNamespaces, foreignKeyName(namespace, fk))
+					continue
+				}
 				if _, dropped := droppedReferrer(namespace, fk, models, blocked); !dropped {
 					kept = append(kept, foreignKeyName(namespace, fk))
 				}
 			}
+			var reasons []string
 			if len(kept) > 0 {
-				blocked[name] = []string{keptReferenceDropReason(kept)}
+				reasons = append(reasons, keptReferenceDropReason(kept))
+			}
+			if len(otherNamespaces) > 0 {
+				reasons = append(reasons, otherNamespaceReferenceDropReason(otherNamespaces))
+			}
+			if len(reasons) > 0 {
+				blocked[name] = reasons
 				changed = true
 			}
 		}
@@ -126,8 +140,8 @@ func blockKeptReferences(namespace string, models map[string]schemadiff.Model, b
 // droppedReferrer resolves an incoming foreign key to the table the plan
 // drops that holds it: a table in the plan's namespace, not blocked, with a
 // foreign key constraint of that name. A foreign key it cannot resolve that
-// way belongs to a table that stays, including a table of the same name in
-// another schema.
+// way belongs to a table that stays or to a table in another schema, even
+// one with the same name.
 func droppedReferrer(namespace string, fk schemadiff.IncomingForeignKey, models map[string]schemadiff.Model, blocked map[string][]string) (string, bool) {
 	if fk.Schema != namespace {
 		return "", false
@@ -158,9 +172,11 @@ func foreignKeyName(namespace string, fk schemadiff.IncomingForeignKey) string {
 
 // dropOrder orders the tables to drop so each comes after every dropped table
 // that references it, choosing by name among tables that are ready so the
-// order is stable. Tables left over sit on a cycle of foreign keys. The
-// caller has blocked every table a kept table references, so each incoming
-// foreign key of a table here resolves to a dropped table.
+// order is stable. When no table is ready, it returns the tables that sit on
+// a cycle of foreign keys; the tables those reference wait on the cycle
+// without being on it. The caller has blocked every table a kept table
+// references, so each incoming foreign key of a table here resolves to a
+// dropped table.
 func dropOrder(namespace string, models map[string]schemadiff.Model, blocked map[string][]string) (order, cycle []string) {
 	waiting := map[string]int{}
 	referencedBy := map[string][]string{}
@@ -183,7 +199,7 @@ func dropOrder(namespace string, models map[string]schemadiff.Model, blocked map
 			}
 		}
 		if len(ready) == 0 {
-			return order, sortedKeys(waiting)
+			return order, onACycle(waiting, referencedBy)
 		}
 		slices.Sort(ready)
 		next := ready[0]
@@ -196,6 +212,32 @@ func dropOrder(namespace string, models map[string]schemadiff.Model, blocked map
 	return order, nil
 }
 
+// onACycle returns the waiting tables that reach themselves through the
+// foreign keys between waiting tables. When no waiting table is ready, at
+// least one cycle exists: each waiting table is referenced by another
+// waiting table.
+func onACycle(waiting map[string]int, references map[string][]string) []string {
+	var members []string
+	for _, start := range sortedKeys(waiting) {
+		seen := map[string]bool{}
+		next := slices.Clone(references[start])
+		for len(next) > 0 {
+			table := next[len(next)-1]
+			next = next[:len(next)-1]
+			if _, ok := waiting[table]; !ok || seen[table] {
+				continue
+			}
+			if table == start {
+				members = append(members, start)
+				break
+			}
+			seen[table] = true
+			next = append(next, references[table]...)
+		}
+	}
+	return members
+}
+
 func undeclaredTablePreamble(namespace, table string) string {
 	return fmt.Sprintf("table %q exists on the target but no schema file in namespace %q declares it", table, namespace)
 }
@@ -206,6 +248,11 @@ const hierarchyDropReason = "SchemaBot does not drop a partitioned table or a ta
 func keptReferenceDropReason(refs []string) string {
 	return fmt.Sprintf("foreign key constraint(s) %s of tables that stay reference it, so PostgreSQL refuses to drop it", strings.Join(quoteAll(refs), ", ")) +
 		" — remove those constraints or their tables' schema files too and plan again, or declare the table in a schema file"
+}
+
+func otherNamespaceReferenceDropReason(refs []string) string {
+	return fmt.Sprintf("foreign key constraint(s) %s in other namespaces reference it, and drops in different namespaces have no guaranteed order", strings.Join(quoteAll(refs), ", ")) +
+		" — drop those constraints or their tables first, then plan again, or declare the table in a schema file"
 }
 
 const cycleDropReason = "its foreign keys form a cycle with other tables the plan drops, so no drop order satisfies PostgreSQL" +

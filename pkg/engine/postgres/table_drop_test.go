@@ -46,9 +46,10 @@ func TestPlanTableDropsOrdersReferencingTablesFirst(t *testing.T) {
 }
 
 // A table and a constraint can share their names with a table and a
-// constraint in another schema. A foreign key of billing.orders, which
-// stays, keeps accounts, even though public.orders, which the plan drops,
-// has a foreign key of the same name.
+// constraint in another schema. A foreign key of billing.orders keeps
+// accounts, even though public.orders, which the plan drops, has a foreign
+// key of the same name. The reason says the referrer is in another
+// namespace, whose drops this plan cannot order its own after.
 func TestPlanTableDropsKeepsATableReferencedFromAnotherSchema(t *testing.T) {
 	plan := planTableDrops("public", map[string]schemadiff.Model{
 		"accounts": {Table: "accounts", IncomingForeignKeys: []schemadiff.IncomingForeignKey{
@@ -57,7 +58,8 @@ func TestPlanTableDropsKeepsATableReferencedFromAnotherSchema(t *testing.T) {
 		"orders": referencing("orders", "orders_user_fkey"),
 	}, nil)
 	assert.Equal(t, []string{"orders"}, plan.order)
-	assert.Contains(t, plan.blocked["accounts"][0], `foreign key constraint(s) "billing.orders.orders_user_fkey" of tables that stay reference it`)
+	assert.Contains(t, plan.blocked["accounts"][0],
+		`foreign key constraint(s) "billing.orders.orders_user_fkey" in other namespaces reference it, and drops in different namespaces have no guaranteed order`)
 }
 
 // A table that a kept table references is blocked, and blocking it keeps
@@ -90,14 +92,20 @@ func TestPlanTableDropsBlocksATableTheTargetRefuses(t *testing.T) {
 }
 
 // Partitioned tables, partitions, and inheritance parents and children are
-// blocked, and so is a cycle of foreign keys, which no order satisfies.
+// blocked, and so is a cycle of foreign keys, which no order satisfies. A
+// table the cycle references is not on it: colors is blocked because ping,
+// which stays, references it.
 func TestPlanTableDropsBlocksHierarchiesAndCycles(t *testing.T) {
 	plan := planTableDrops("public", map[string]schemadiff.Model{
 		"events":  {Table: "events", PartitionKey: "RANGE (day)"},
 		"base":    {Table: "base", InheritanceChildren: []string{"public.derived"}},
 		"derived": {Table: "derived", InheritsParents: []string{"public.base"}},
-		"ping":    referencing("ping", "ping_pong_fkey", fk("pong", "pong_ping_fkey")),
-		"pong":    referencing("pong", "pong_ping_fkey", fk("ping", "ping_pong_fkey")),
+		"ping": {Table: "ping", Constraints: []schemadiff.Constraint{
+			{Name: "ping_pong_fkey", Def: "FOREIGN KEY (pong_id) REFERENCES pong(id)"},
+			{Name: "ping_color_fkey", Def: "FOREIGN KEY (color_id) REFERENCES colors(id)"},
+		}, IncomingForeignKeys: []schemadiff.IncomingForeignKey{fk("pong", "pong_ping_fkey")}},
+		"pong":   referencing("pong", "pong_ping_fkey", fk("ping", "ping_pong_fkey")),
+		"colors": {Table: "colors", IncomingForeignKeys: []schemadiff.IncomingForeignKey{fk("ping", "ping_color_fkey")}},
 	}, nil)
 	assert.Empty(t, plan.order)
 	for _, table := range []string{"events", "base", "derived"} {
@@ -106,6 +114,7 @@ func TestPlanTableDropsBlocksHierarchiesAndCycles(t *testing.T) {
 	for _, table := range []string{"ping", "pong"} {
 		assert.Contains(t, plan.blocked[table][0], "its foreign keys form a cycle", table)
 	}
+	assert.Contains(t, plan.blocked["colors"][0], `foreign key constraint(s) "ping.ping_color_fkey" of tables that stay reference it`)
 }
 
 // The apply admits a DROP TABLE only when it is exactly the plan's drop of

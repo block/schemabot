@@ -139,6 +139,25 @@ func TestEnginePlanBlocksATableDropAViewDependsOn(t *testing.T) {
 	assert.Contains(t, changes[0].ModeReason, `"view public.legacy_emails" depends on it, so PostgreSQL refuses to drop it`)
 }
 
+// A table SchemaBot does not manage draws its ids from the sequence of an
+// undeclared table. Dropping the table would drop its sequence, so
+// PostgreSQL refuses the drop, and the plan blocks it and names the default.
+func TestEnginePlanBlocksATableDropWhoseSequenceAnotherTableUses(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "table_drop_sequence_plan")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.legacy_users (id bigserial PRIMARY KEY);
+		CREATE SCHEMA reporting;
+		CREATE TABLE reporting.imports (id bigint DEFAULT nextval('public.legacy_users_id_seq') PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	changes := planUndeclared(t, dsn).Changes[0].TableChanges
+	require.Len(t, changes, 1)
+	assert.Equal(t, "legacy_users", changes[0].Table)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+	assert.Contains(t, changes[0].ModeReason, `"default value for column id of table reporting.imports" depends on it, so PostgreSQL refuses to drop it`)
+}
+
 // A view that counts the table's rows is created after the plan was
 // reviewed. It reads no column, so the table's reviewed definition does not
 // change, but the server refuses the drop, because SchemaBot never
