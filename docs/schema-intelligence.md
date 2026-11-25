@@ -363,6 +363,10 @@ A caller that writes the files must add every skipped table to
 `DROP TABLE`. Without the flag, the pull refuses as before, and so does a data
 plane too old to know the flag.
 
+On a database with several targets, a table any target skips is skipped for
+all of them, because every target is planned from the same files. It is left
+out of the schema and of the `targets` comparison.
+
 ### Databases that span several targets
 
 A database whose environment lists `targets` addresses several targets at once,

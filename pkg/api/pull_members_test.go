@@ -497,3 +497,37 @@ func TestExecutePullSchema_SkippedTablesReachTheCaller(t *testing.T) {
 		{Table: "audit_log", Reason: "schema files cannot describe an UNLOGGED table"},
 	}, resp.Namespaces["testapp"].SkippedTables)
 }
+
+// Every target is planned from the same schema files, so a table one target
+// skipped has no file on any of them. A table only the second target skipped is
+// reported as skipped for the environment and left out of the schema, rather
+// than written from the primary or hidden from the caller; it is not reported
+// as divergence, since no file will manage it on any target.
+func TestExecutePullSchema_ATableAnyTargetSkippedIsSkippedForTheEnvironment(t *testing.T) {
+	primary := pulledTables(map[string]string{"users": pullUsersDDL, "audits": pullAuditsDDL})
+	second := pulledTables(map[string]string{"users": pullUsersDDL})
+	second.Namespaces["testapp"].SkippedTables = []*ternv1.SkippedTable{
+		{Table: "audits", Reason: "unlogged tables cannot be rendered as a desired schema"},
+		{Table: "events", Reason: "schema files cannot describe its trigger"},
+	}
+	client := newPerTargetPullClient(map[string]*ternv1.PullSchemaResponse{
+		"testapp-001": primary,
+		"testapp-002": second,
+	}, nil)
+	svc := pullTargetService(t, multiTargetPullEnv(), map[string]tern.Client{"eu/production": client})
+
+	req := pullRequest()
+	req.SkipUnrepresentableTables = true
+	resp, err := svc.ExecutePullSchema(t.Context(), req)
+	require.NoError(t, err)
+
+	ns := resp.Namespaces["testapp"]
+	assert.Equal(t, map[string]string{"users": pullUsersDDL}, ns.Tables, "a table one target skipped gets no file")
+	assert.Equal(t, []apitypes.SkippedTable{
+		{Table: "audits", Reason: "unlogged tables cannot be rendered as a desired schema"},
+		{Table: "events", Reason: "schema files cannot describe its trigger"},
+	}, ns.SkippedTables)
+	assert.Equal(t, int32(1), resp.TableCount)
+	require.Len(t, resp.Targets, 2)
+	assert.Empty(t, resp.Targets[1].DivergedTables, "a skipped table is not compared")
+}

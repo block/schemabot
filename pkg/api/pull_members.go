@@ -304,6 +304,18 @@ func (s *Service) pullRolloutMembers(
 		}
 	}
 
+	// Every member is planned from the same schema files, so a table one member
+	// skipped has no file on any of them. It is skipped for the environment:
+	// listed once, left out of the schema, and left out of the comparison,
+	// where it would otherwise read as missing from the members that skipped it.
+	skipped := skippedTablesAcrossMembers(pulled)
+	for i := range canonical {
+		maps.DeleteFunc(canonical[i], func(key namespaceTable, _ string) bool {
+			_, ok := skipped[key.namespace][key.table]
+			return ok
+		})
+	}
+
 	merged := &ternv1.PullSchemaResponse{
 		Database:    req.Database,
 		Type:        targets[0].DatabaseType,
@@ -315,6 +327,7 @@ func (s *Service) pullRolloutMembers(
 			if apitypes.BaselineTarget(members, namespace) != i {
 				continue
 			}
+			withholdSkippedTables(content, skipped[namespace])
 			merged.Namespaces[namespace] = content
 			merged.TableCount += int32(len(content.GetTables()))
 		}
@@ -358,6 +371,46 @@ func (s *Service) pullRolloutMembers(
 		member.DivergedTables = divergedTables(baseline, compared)
 	}
 	return merged, members, nil
+}
+
+// skippedTablesAcrossMembers collects, per namespace, every table any member
+// skipped, with the reason the first member in rollout order gave.
+func skippedTablesAcrossMembers(pulled []*ternv1.PullSchemaResponse) map[string]map[string]string {
+	skipped := make(map[string]map[string]string)
+	for _, memberSchema := range pulled {
+		for namespace, content := range memberSchema.GetNamespaces() {
+			for _, table := range content.GetSkippedTables() {
+				if skipped[namespace] == nil {
+					skipped[namespace] = make(map[string]string)
+				}
+				if _, ok := skipped[namespace][table.GetTable()]; !ok {
+					skipped[namespace][table.GetTable()] = table.GetReason()
+				}
+			}
+		}
+	}
+	return skipped
+}
+
+// withholdSkippedTables makes a namespace's baseline report every table the
+// environment skipped, and removes those tables from its schema, so the
+// caller adds them to ignore_tables rather than writing a file one member
+// cannot plan from.
+func withholdSkippedTables(content *ternv1.PulledNamespace, skipped map[string]string) {
+	if len(skipped) == 0 {
+		return
+	}
+	for table := range skipped {
+		delete(content.Tables, table)
+		delete(content.TableCatalog, table)
+	}
+	if content.NamespaceCatalog != nil {
+		content.NamespaceCatalog.TableCount = int32(len(content.Tables))
+	}
+	content.SkippedTables = make([]*ternv1.SkippedTable, 0, len(skipped))
+	for _, table := range slices.Sorted(maps.Keys(skipped)) {
+		content.SkippedTables = append(content.SkippedTables, &ternv1.SkippedTable{Table: table, Reason: skipped[table]})
+	}
 }
 
 // namespaceTable identifies one pulled table within its namespace.
