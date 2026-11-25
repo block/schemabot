@@ -1002,7 +1002,7 @@ schema file format. These include tables with:
 - Table inheritance, or `UNLOGGED`
 - Explicit collations
 - Sequence defaults it cannot represent safely
-- Triggers, or table or column comments
+- Triggers, or table or column comments. See [Triggers](#triggers)
 
 Storage parameters, such as `fillfactor` or `autovacuum_enabled`, are not on
 this list. `pull` writes them into the table's `WITH (...)` clause. SchemaBot
@@ -1019,6 +1019,44 @@ to match.
 An `ignore_tables` entry is a bare table name, so it also withholds a table of
 the same name in every other namespace. A skipped table whose name reads as an
 `ignore_tables` pattern refuses onboarding; rename it first.
+
+### Triggers
+
+SchemaBot does not manage triggers, by design. A schema file declares a
+table's shape: its columns, constraints, and indexes. A trigger runs a
+function, and a function is procedural code. pg-sprite cannot compare it with
+a file, show its effect in a plan, or change it online, so triggers stay
+outside the declarative model.
+
+`onboard` and `init` skip a table with a trigger and list it in
+`ignore_tables`, so SchemaBot never changes or drops it. To manage the table, move the trigger's work
+out of the database and remove the trigger.
+
+| The trigger | Replace it with |
+|---|---|
+| Sets `updated_at` on every update | The application sets `updated_at` in each `UPDATE`. A `DEFAULT now()` still covers inserts |
+| Writes an audit or history row | The application writes the row in the same transaction, or change data capture reads the change from the write-ahead log |
+| Keeps a count, total, or copied column in sync | The application updates both in one transaction, or computes the value when it reads it |
+| Enforces a rule across rows | A `CHECK`, `UNIQUE`, or foreign key constraint when one fits, otherwise the application |
+
+**Steps:**
+
+1. Deploy the application change that does the trigger's work.
+2. Drop the trigger outside SchemaBot, then its function if nothing else
+   calls it:
+   ```sql
+   DROP TRIGGER orders_set_updated_at ON orders;
+   DROP FUNCTION set_updated_at();
+   ```
+3. In one pull request, add the table's file from `schemabot pull -d shop -e
+   staging` and remove the table from `ignore_tables`. Removing the entry
+   without the file makes the plan show a `DROP TABLE`.
+
+The plan for that pull request shows no change to the table.
+
+Table and column comments, and explicit column collations, are skipped the
+same way. Changing a column's collation rewrites the column, so it stays out
+of the files.
 
 The schema intelligence API's detailed catalog output is not available for
 PostgreSQL. A request for it is rejected rather than answered with the basic
