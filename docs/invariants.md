@@ -1019,7 +1019,9 @@ per-operation budget in the redispatch claim (`FindNextApplyOperation`,
 Multi-member rollouts claim operations in member order, where a member is a (deployment, target)
 pair taken in `deployment_order` and then in each deployment's `targets` order, and a failed
 earlier member blocks later ones unless the config says otherwise. Copy start is ordered per
-member, not per operation: one member's work never waits on its own member's work to start, and a
+member, not per operation: one member's work never waits on its own member's work to start, but
+once some of a member's work has failed, its work that has not started is held by that failure
+exactly as a later member's work would be, since it would run the same change, and a
 later member's work waits on every earlier member's, until it completes under `rolling` or reaches
 the cutover barrier under `barrier`, while `parallel` does not order copy start at all. Where a
 rollout is laid out table by table, work on a table starts on any target only once every earlier
@@ -1060,7 +1062,8 @@ without completing the request would refuse the start the hold exists to preserv
 *Enforced:* the ordered-claim gates in `FindNextApplyOperation`, whose work and finalizer arms
 each gate on earlier members and whose stopped+start arm holds a finalizer, and work that never
 started, to the same gate, with the failure exemption shared by every gate and the table-step
-boundary `rolloutStepGateSQL` in the work gate, and `FindNextApplyOperationCutover`, whose start
+boundary `rolloutStepGateSQL` and the same-member failure gate `sameMemberFailureGateSQL` in the
+work gate, and `FindNextApplyOperationCutover`, whose start
 arm gates on the hold rule `earlierSiblingHoldsCutoverSQL` that `CutoverBlocker` shares
 (`pkg/storage/internal/sqlstore/apply_operations.go`), pinned per policy on both dialects by the
 storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a

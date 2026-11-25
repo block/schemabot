@@ -1369,8 +1369,43 @@ NOT EXISTS (
 		)
 		AND ` + releasedFailureExemptionSQL(d) + `
 )
+AND ` + sameMemberFailureGateSQL(d) + `
 AND ` + rolloutStepGateSQL + `
 )`
+}
+
+// sameMemberFailureGateSQL holds a work row back once another work row of its
+// own rollout member has failed, under the same on_failure exemption that lets
+// a later member past an earlier one's failure. One member's work rows, such
+// as a target's per-shard work, start in parallel rather than in order, so the
+// member gate above never compares them. Every one of them runs the same
+// change on the same schema, so a failure on one usually repeats on the rest,
+// and starting them anyway spends a copy on each for a known result. The
+// failed row takes the earlier alias only so the exemption can be shared with
+// the member gate; it is a sibling of the same member, not an earlier one. As
+// with the member gate, an apply a remote dispatch created leaves this to its
+// dispatcher (rolloutMembersOrderedHereSQL). The fragment references the
+// apply_operations alias; see sameMemberFailureGateArgs for its placeholders.
+func sameMemberFailureGateSQL(d Dialect) string {
+	return `NOT EXISTS (
+	SELECT 1
+	FROM apply_operations AS earlier
+	WHERE earlier.apply_id = apply_operations.apply_id
+		AND earlier.deployment = apply_operations.deployment
+		AND earlier.target = apply_operations.target
+		AND earlier.id <> apply_operations.id
+		AND earlier.operation_kind = ?
+		AND earlier.state = ?
+		AND ` + rolloutMembersOrderedHereSQL + `
+		AND ` + releasedFailureExemptionSQL(d) + `
+)`
+}
+
+// sameMemberFailureGateArgs returns the positional arguments for
+// sameMemberFailureGateSQL, in placeholder order.
+func sameMemberFailureGateArgs() []any {
+	args := []any{storage.ApplyOperationKindWork, state.ApplyOperation.Failed}
+	return append(args, releasedFailureExemptionArgs()...)
 }
 
 // rolloutStepGateSQL is the table-step boundary of a rollout that runs table by
@@ -1414,6 +1449,7 @@ func workStartGateArgs() []any {
 		state.ApplyOperation.Completed,
 	)
 	args = append(args, releasedFailureExemptionArgs()...)
+	args = append(args, sameMemberFailureGateArgs()...)
 	return append(args, state.ApplyOperation.Completed)
 }
 
