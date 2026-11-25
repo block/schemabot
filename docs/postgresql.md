@@ -174,9 +174,10 @@ supply a DSN.
 | Cancel an index build | Nothing more. Membership in `pg_signal_backend` lets the cancel reach the build's backend directly |
 
 SchemaBot checks the privileges each statement needs on its own table before
-running it, and a missing grant fails with the `GRANT` that fixes it. Only
-PostgreSQL checks `REFERENCES` on the referenced table: without it, the apply
-fails, says a grant is missing, and retries once you grant it. If your tables belong to a
+running it, and a missing grant fails with the `GRANT` that fixes it. A plan
+that adds a foreign key also checks `REFERENCES` on the referenced table, and
+fails with the grant to add when it is missing. If the grant is revoked after
+the plan, the apply fails, says a grant is missing, and retries once you grant it. If your tables belong to a
 dedicated owner role, read [Table ownership](#table-ownership) before the first
 `CREATE TABLE`.
 
