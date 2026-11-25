@@ -1078,7 +1078,11 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 		return fmt.Errorf("lock apply %s to attach operation %s: %w", apply.ApplyIdentifier, operation.OperationKey, err)
 	}
 	if !isActiveApplyState(currentState) {
-		return fmt.Errorf("attach operation %s to apply %s in state %s: %w", operation.OperationKey, apply.ApplyIdentifier, currentState, storage.ErrApplyNotActive)
+		return &storage.ApplyNotActiveError{
+			ApplyID: apply.ApplyIdentifier,
+			State:   currentState,
+			Detail:  fmt.Sprintf("attach operation %s to apply %s in state %s", operation.OperationKey, apply.ApplyIdentifier, currentState),
+		}
 	}
 	// A newer generation admitted past this one took over its work
 	// (markAdmittedPast). A late operation of this generation must not join

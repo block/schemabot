@@ -3187,18 +3187,43 @@ func normalizedManifest(keys []string) []string {
 // refuseAttachToTerminalApply is the fail-closed rejection for an attach
 // against an apply that is (or just became) terminal: its target reservation
 // is released and no drive will pick new work up, so accepting the operation
-// would strand it. The deployment's remaining operations cannot dispatch until
-// an operator reconciles the apply.
-func (c *LocalClient) refuseAttachToTerminalApply(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string) *ternv1.ApplyResponse {
+// would strand it.
+//
+// storedState is the apply's state as the store last read it. The attach
+// re-reads it under the apply's row lock, so a refusal from there names the
+// state the apply actually ended in, which the copy loaded before the attach
+// can lag. The response carries it as a field so the caller settles the
+// refused work to match the apply rather than parsing this message.
+func (c *LocalClient) refuseAttachToTerminalApply(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, storedState, operationKey string) *ternv1.ApplyResponse {
 	c.logger.Warn("Apply: refusing to attach operation to terminal keyed apply; dispatch is rejected",
 		append(apply.LogAttrs(),
+			"stored_state", storedState,
 			"operation_key", operationKey,
 			"idempotency_key", req.IdempotencyKey)...)
 	metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "terminal_refused")
-	return &ternv1.ApplyResponse{
-		Accepted:     false,
-		ErrorMessage: fmt.Sprintf("apply %s for this idempotency key is terminal (%s); operation %s cannot attach", apply.ApplyIdentifier, apply.State, operationKey),
+	if storedState == "" {
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: fmt.Sprintf("apply %s for this idempotency key is no longer active; operation %s cannot attach", apply.ApplyIdentifier, operationKey),
+		}
 	}
+	return &ternv1.ApplyResponse{
+		Accepted:         false,
+		ErrorMessage:     fmt.Sprintf("apply %s for this idempotency key is terminal (%s); operation %s cannot attach", apply.ApplyIdentifier, storedState, operationKey),
+		ClosedApplyState: storedState,
+	}
+}
+
+// storedStateOfInactiveApply returns the state the store read for an apply it
+// refused to attach to, or "" when the refusal does not carry one. Without a
+// state the refusal still holds, but names none: the copy loaded before the
+// attach may read active, and a caller must not settle the work against it.
+func storedStateOfInactiveApply(err error) string {
+	var notActive *storage.ApplyNotActiveError
+	if !errors.As(err, &notActive) {
+		return ""
+	}
+	return notActive.State
 }
 
 // refuseAttachToTakenOverApply refuses an operation arriving for an apply whose
@@ -3224,7 +3249,7 @@ func (c *LocalClient) refuseAttachToTakenOverApply(req *ternv1.ApplyRequest, app
 // would have refused, and it fails closed on a terminal apply.
 func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, plan *storage.Plan, scope dispatchScope, operationKey, operationKind string) (*ternv1.ApplyResponse, error) {
 	if state.IsTerminalApplyState(apply.State) {
-		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
+		return c.refuseAttachToTerminalApply(ctx, req, apply, apply.State, operationKey), nil
 	}
 	if refusal := c.validateDispatchAgainstManifest(ctx, req, apply, operationKey); refusal != nil {
 		return refusal, nil
@@ -3349,7 +3374,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		}
 		return c.replayConcurrentAttachWinner(ctx, req, apply, winner, operationKey, "operation insert"), nil
 	case errors.Is(err, storage.ErrApplyNotActive):
-		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
+		return c.refuseAttachToTerminalApply(ctx, req, apply, storedStateOfInactiveApply(err), operationKey), nil
 	case errors.Is(err, storage.ErrApplyOperationKeyingMismatch):
 		return c.refuseAttachKeyingMismatch(req, apply, plan, scope, operationKey, err), nil
 	case errors.Is(err, storage.ErrApplyTakenOver):
