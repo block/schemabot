@@ -135,6 +135,14 @@ comment says the change was not applied. The comment lists up to ten freezes
 and counts the rest. The API answers `409`; see
 [read a refusal](#read-a-refusal).
 
+A pull request warns you sooner. When a freeze covers the change, the plan
+comment names it above the DDL, before anyone comments an apply, and its apply
+command already carries `--override "<why it can't wait>"`. A freeze that is
+scheduled but has not started is named with when it starts, so you can apply
+before it does. The notice only informs: the apply checks the freezes again,
+and that check decides. If an apply is refused for an unsafe change first, the
+retry command it offers keeps your `--override`.
+
 You have two choices:
 
 1. **Wait for the freeze to end**, then run the same command again. This is the right choice for almost every change. `schemabot freeze show <freeze-id>` says when it ends.
@@ -563,6 +571,10 @@ When a freeze refuses a change, the agent:
 1. Stops. It does not retry in a loop, rewrite the change, or try another environment, deployment or credential to get past the freeze.
 2. Tells the user which freeze holds the change, its reason, and when it ends.
 3. Hands over the exact `--override` command if the user says the change can't wait. The override reason is recorded as the user's, so the user writes it and runs it.
+
+A plan comment's `❄️ <environment> is frozen` notice is a warning, not a
+refusal, and the same rules hold: the agent tells the user, and the apply
+command with `--override` in that comment is the user's to post.
 
 `change_gate_unavailable` is different: it is a retryable storage problem.
 Retry it with backoff, like any other `503`.

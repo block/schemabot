@@ -219,7 +219,10 @@ records the desired state the databases already run.
   wait, run it with `--override "<reason>"`. By default your reason lets it
   through at once. A server set to the `approval` override policy waits for a
   freeze approver other than you and the PR author, and then your next apply
-  runs. See [freeze an environment](freeze.md#ask-for-an-override)
+  runs. The plan comment warns you first: it names the freezes that cover the
+  change, in effect or scheduled, and while one is in effect its apply command
+  carries `--override "<why it can't wait>"`. See
+  [freeze an environment](freeze.md#ask-for-an-override)
 
 ![The freeze refuses the apply, the PR author comments the same command with an override reason, and the apply runs at once and the PR merges](../assets/pr-freeze-reason-demo.gif)
 

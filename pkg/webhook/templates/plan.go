@@ -131,6 +131,15 @@ type AttributedChangeData struct {
 type PlanCommentData struct {
 	Database string
 
+	// Freezes are the freezes covering this environment's change when it was
+	// planned, nil when none does, when they could not be read, or when the
+	// comment offers no apply.
+	Freezes *PlanFreezeNotice
+	// Override is the reason the refused command gave with --override. A
+	// refusal's retry command carries it while a freeze still holds the
+	// change, so the author does not type it again.
+	Override string
+
 	// ScopedDatabase is the database this comment's copy-paste commands name,
 	// so the follow-up an operator is being asked for is one they can paste in
 	// a repository that configures several databases rather than one rejected
@@ -633,6 +642,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// A branch missing newer base-branch schema changes is shown first, since
 	// it says the plan below may not be the change the PR means to make.
 	writeBaseSchema(&sb, data.BaseSchema)
+	writePlanFreezes(&sb, data.Environment, data.Freezes)
 	// Review-time deployment drift is shown before the change list — and before
 	// the no-changes short-circuit — because a non-primary deployment can drift
 	// even when the primary plan is a clean no-op.
@@ -818,7 +828,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		if data.Tenant != "" {
 			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 		}
-		writeApplyInstruction(&sb, applyCmd, data)
+		writeApplyInstruction(&sb, appendFreezeOverride(applyCmd, data.Freezes), data)
 		writeWhoCanApply(&sb, data.Database, data.ApplyAuthorization)
 	}
 
@@ -4158,6 +4168,7 @@ func titleDatabaseType(databaseType string) string {
 // writeEnvironmentPlanSection writes the plan body for a single environment within a multi-env comment.
 func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, budget *ddlBlockBudget) {
 	writeBaseSchema(sb, plan.BaseSchema)
+	writePlanFreezes(sb, plan.Environment, plan.Freezes)
 	// Deployment drift is shown before the change list and before the no-changes
 	// short-circuit: a non-primary deployment can drift even when this
 	// environment's primary plan is a clean no-op.
@@ -4326,20 +4337,25 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	command := func(baseCommand, environment string) string {
 		return scopedCommand(baseCommand, environment, data.ScopedDatabase, data.Tenant)
 	}
+	// An environment a freeze holds is applied with --override, so the
+	// command its author copies is the one the freeze lets through.
+	applyCommand := func(environment string) string {
+		return appendFreezeOverride(command("schemabot apply", environment), data.Plans[environment].Freezes)
+	}
 
 	// Apply instructions for environments with changes.
 	switch {
 	case len(envsWithChanges) >= 2:
-		writeEnvApplyCommand(sb, "▶️ **To apply** these changes, start with the first environment", data.Plans[envsWithChanges[0]], command("schemabot apply", envsWithChanges[0]))
+		writeEnvApplyCommand(sb, "▶️ **To apply** these changes, start with the first environment", data.Plans[envsWithChanges[0]], applyCommand(envsWithChanges[0]))
 		for i := 1; i < len(envsWithChanges); i++ {
-			writeEnvApplyCommand(sb, fmt.Sprintf("\nAfter verifying %s, apply to %s", envsWithChanges[i-1], envsWithChanges[i]), data.Plans[envsWithChanges[i]], command("schemabot apply", envsWithChanges[i]))
+			writeEnvApplyCommand(sb, fmt.Sprintf("\nAfter verifying %s, apply to %s", envsWithChanges[i-1], envsWithChanges[i]), data.Plans[envsWithChanges[i]], applyCommand(envsWithChanges[i]))
 		}
 	case len(envsWithChanges) == 1:
 		if consent, ok := planUnsafeConsent(*data.Plans[envsWithChanges[0]]); ok {
-			writeUnsafeConsentCommand(sb, "▶️ **To apply** these changes", consent, command("schemabot apply", envsWithChanges[0]))
+			writeUnsafeConsentCommand(sb, "▶️ **To apply** these changes", consent, applyCommand(envsWithChanges[0]))
 		} else {
 			sb.WriteString("▶️ **To apply** these changes, comment:\n")
-			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
+			fmt.Fprintf(sb, "```\n%s\n```\n", applyCommand(envsWithChanges[0]))
 		}
 	case len(envsWithErrors) == 0 && len(envsRefused) == 0:
 		sb.WriteString("No changes to apply.\n")

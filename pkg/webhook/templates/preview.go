@@ -467,7 +467,12 @@ func PreviewCommentPlanBlockedPostgres() string {
 // holds until the apply carries --allow-unsafe. The footer states that
 // requirement under the plain command, which never carries the flag itself.
 func PreviewCommentPlanUnsafe() string {
-	return RenderPlanComment(PlanCommentData{
+	return RenderPlanComment(previewUnsafePlanData())
+}
+
+// previewUnsafePlanData is a plan with one unsafe change, a dropped column.
+func previewUnsafePlanData() PlanCommentData {
+	return PlanCommentData{
 		Database:     "testapp",
 		SchemaName:   "testapp",
 		Environment:  "staging",
@@ -489,7 +494,7 @@ func PreviewCommentPlanUnsafe() string {
 		UnsafeChanges: []UnsafeChangeData{
 			{Table: "orders", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `orders` DROP COLUMN `legacy_ref`;"},
 		},
-	})
+	}
 }
 
 // PreviewCommentPlanManyUnsafeChanges renders a sample plan whose unsafe list
@@ -898,6 +903,57 @@ func PreviewCommentPlanBaseSchemaChanged() string {
 func PreviewCommentPlanBaseSchemaUnverified() string {
 	data := previewPlanData()
 	data.BaseSchema = &BaseSchemaData{BaseBranch: "main", Unverified: true}
+	return RenderPlanComment(data)
+}
+
+// previewFreezeEnd is when the preview freezes end.
+var previewFreezeEnd = time.Date(2026, 12, 26, 0, 0, 0, 0, time.UTC)
+
+// PreviewCommentPlanFrozen renders a plan of a change a freeze in effect
+// covers, under the default override policy: the apply would be refused now.
+func PreviewCommentPlanFrozen() string {
+	data := previewPlanData()
+	data.Freezes = &PlanFreezeNotice{
+		InEffect:         []RefusingFreeze{{ID: "freeze-3f9a1c2e7b4d8a06", Reason: "Holiday code freeze", EndsAt: &previewFreezeEnd}},
+		OverrideOnReason: true,
+	}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanFrozenUnsafe renders a plan of a frozen change that also
+// carries an unsafe change: the --allow-unsafe instruction leads into the
+// command that already carries --override, so one apply gives both consents.
+func PreviewCommentPlanFrozenUnsafe() string {
+	data := previewUnsafePlanData()
+	data.Freezes = &PlanFreezeNotice{
+		InEffect:         []RefusingFreeze{{ID: "freeze-3f9a1c2e7b4d8a06", Reason: "Holiday code freeze", EndsAt: &previewFreezeEnd}},
+		OverrideOnReason: true,
+	}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanFreezeScheduled renders a plan of a change a scheduled
+// code freeze will cover once it starts.
+func PreviewCommentPlanFreezeScheduled() string {
+	data := previewPlanData()
+	data.Freezes = &PlanFreezeNotice{
+		Scheduled: []ScheduledFreeze{{
+			ID: "freeze-8c41d2e9a7f03b56", Reason: "Holiday code freeze",
+			StartsAt: time.Date(2026, 12, 19, 0, 0, 0, 0, time.UTC), EndsAt: &previewFreezeEnd,
+		}},
+		OverrideOnReason: true,
+	}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanFrozenApproval renders a plan of a frozen change on a
+// server whose override policy needs a second approver.
+func PreviewCommentPlanFrozenApproval() string {
+	data := previewPlanData()
+	data.Freezes = &PlanFreezeNotice{
+		InEffect:  []RefusingFreeze{{ID: "freeze-3f9a1c2e7b4d8a06", Reason: "INC-1234: payments latency"}},
+		Approvers: []string{"acme/freeze-approvers"},
+	}
 	return RenderPlanComment(data)
 }
 

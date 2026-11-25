@@ -2529,6 +2529,245 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="plan-of-a-frozen-change"></a><strong>Plan Of A Frozen Change</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+❄️ **`staging` is frozen, so applying this plan would be refused now.**
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `freeze-3f9a1c2e7b4d8a06` | until 2026-12-26T00:00:00Z | Holiday code freeze |
+
+Wait for the freeze to end before you apply. If this change can't wait, apply with `--override` and your reason, as the command below does: SchemaBot lets it through and records your reason.
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
+💡 **Lint Warnings**: 2 advisory findings
+1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging --override "<why it can't wait>"
+```
+
+</details>
+
+<details>
+<summary><a name="plan-of-a-change-a-scheduled-freeze-covers"></a><strong>Plan Of A Change A Scheduled Freeze Covers</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+❄️ **A freeze is scheduled in `staging`.** Apply before it starts, or the apply is refused while it holds.
+
+| Freeze | Starts | Holds | Reason |
+| :-- | :-- | :-- | :-- |
+| `freeze-8c41d2e9a7f03b56` | 2026-12-19T00:00:00Z | until 2026-12-26T00:00:00Z | Holiday code freeze |
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
+💡 **Lint Warnings**: 2 advisory findings
+1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="plan-of-a-frozen-change-approval-policy"></a><strong>Plan Of A Frozen Change (Approval Policy)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+❄️ **`staging` is frozen, so applying this plan would be refused now.**
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `freeze-3f9a1c2e7b4d8a06` | until lifted | INC-1234: payments latency |
+
+Wait for the freeze to end before you apply. If this change can't wait, apply with `--override` and your reason, as the command below does: a freeze approver other than you and the PR author must approve it before it runs, a member of `acme/freeze-approvers`.
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
+💡 **Lint Warnings**: 2 advisory findings
+1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging --override "<why it can't wait>"
+```
+
+</details>
+
+<details>
+<summary><a name="plan-of-a-frozen-change-with-an-unsafe-change"></a><strong>Plan Of A Frozen Change With An Unsafe Change</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+❄️ **`staging` is frozen, so applying this plan would be refused now.**
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `freeze-3f9a1c2e7b4d8a06` | until 2026-12-26T00:00:00Z | Holiday code freeze |
+
+Wait for the freeze to end before you apply. If this change can't wait, apply with `--override` and your reason, as the command below does: SchemaBot lets it through and records your reason.
+
+```sql
+ALTER TABLE `orders` DROP COLUMN `legacy_ref`;
+```
+
+```sql
+ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `orders`: DROP COLUMN discards the column's data
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply**:
+1. Deploy application code that no longer reads from or writes to the dropped column.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `orders`:
+   ```
+   schemabot apply -e staging --override "<why it can't wait>"
+   ```
+
+</details>
+
+<details>
 <summary><a name="rollout-plans-converging"></a><strong>Rollout Plans (Converging)</strong></summary>
 
 

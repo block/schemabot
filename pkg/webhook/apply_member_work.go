@@ -370,6 +370,12 @@ func (h *Handler) blockUnsafeWithoutOptIn(ctx context.Context, client *ghclient.
 		commentData.DeploymentDrift = rolloutPreview
 	}
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, commentData.DeploymentDrift, repo, pr, environment)
+	// The retry the refusal offers meets the freeze gate next, so the refusal
+	// names the freezes and its command keeps the override the author gave.
+	h.annotatePlanFreezes(ctx, &commentData, planResp, schemaResult.Database, environment, planResp.NarrowedTo != "", repo, pr)
+	if result.OverrideGiven {
+		commentData.Override = result.Override
+	}
 	h.logger.Info("apply blocked by unsafe changes",
 		"repo", repo, "pr", pr, "database", schemaResult.Database, "database_type", schemaResult.Type, "environment", environment,
 		"plan_id", planResp.PlanID, "primary_unsafe", len(planResp.UnsafeChanges()), "other_targets_unsafe", len(memberUnsafe))
