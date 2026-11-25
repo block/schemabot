@@ -75,12 +75,12 @@ type ShardedTableCopy struct {
 	// over active work, active work over waiting, waiting over done.
 	Status string
 
-	// RowsCopied, RowsTotal, and ETASeconds cover the shards that have
-	// reported a row total, counted in ShardsReporting: rows sum across them
-	// and the ETA is when the slowest of them finishes (ShardedTableETA). A shard
-	// counts only once it carries a total, so a shard with copied rows but no
-	// total cannot inflate the numerator alone. A renderer discloses the coverage rather than passing
-	// one wave's fraction off as the table's.
+	// RowsCopied and RowsTotal cover the shards that have reported a row
+	// total, counted in ShardsReporting. A shard counts only once it carries a
+	// total, so a shard with copied rows but no total cannot inflate the
+	// numerator alone. A renderer discloses the coverage rather than passing
+	// one wave's fraction off as the table's. ETASeconds is when the slowest
+	// shard finishes (ShardedTableETA), whether or not it reported a total.
 	RowsCopied      int64
 	RowsTotal       int64
 	ETASeconds      int64
