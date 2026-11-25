@@ -3,6 +3,7 @@
 package postgresconn
 
 import (
+	"context"
 	"database/sql"
 	"net/url"
 	"sync/atomic"
@@ -234,6 +235,48 @@ func TestWithStatementTimeoutZeroDisablesInheritedBudget(t *testing.T) {
 	// completion.
 	_, err = db.ExecContext(t.Context(), "SELECT pg_sleep(0.5)")
 	assert.NoError(t, err)
+}
+
+// The SET that arms SchemaBot's budget runs under the budget it replaces, so a
+// platform budget tight enough to outlast it cancels the SET and, with it, the
+// connection. A cancelled SET leaves the session as it was, so the hook sends
+// it again and the connection comes up under the stated budget. A real SET
+// finishes in microseconds, too fast for any budget to cancel on demand, so the
+// first attempt here is a statement that does outlast the database budget: the
+// server cancels it over the real session exactly as it cancels a SET that a
+// slow server could not finish in time.
+func TestWithStatementTimeoutArmsUnderABudgetThatCancelsTheFirstAttempt(t *testing.T) {
+	dsn, adminDB := testutil.StartPostgres(t, "postgresconn_stmt_cancel")
+
+	_, err := adminDB.ExecContext(t.Context(),
+		`ALTER DATABASE postgresconn_stmt_cancel SET statement_timeout = '50ms'`)
+	require.NoError(t, err)
+
+	var (
+		attempts     atomic.Int32
+		firstAttempt error
+	)
+	original := execStatementTimeout
+	t.Cleanup(func() { execStatementTimeout = original })
+	execStatementTimeout = func(ctx context.Context, conn *pgconn.PgConn, stmt string) error {
+		if attempts.Add(1) == 1 {
+			firstAttempt = original(ctx, conn, "SELECT pg_sleep(5)")
+			return firstAttempt
+		}
+		return original(ctx, conn, stmt)
+	}
+
+	db, err := Open(dsn, WithStatementTimeout(0))
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	db.SetMaxOpenConns(1)
+	require.NoError(t, db.PingContext(t.Context()))
+
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, firstAttempt, &pgErr, "the database budget must have cancelled the first attempt on the server")
+	assert.Equal(t, "57014", pgErr.Code)
+	assert.Equal(t, int32(2), attempts.Load(), "the hook must arm the budget again after the cancelled attempt, and only once")
+	requireSessionStatementTimeout(t, db, "0")
 }
 
 // Omitting the option leaves whatever the platform set in place, so callers
