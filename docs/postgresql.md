@@ -1289,6 +1289,12 @@ leaves. See [Index builds](#index-builds).
 - A plan can be rolled back only when SchemaBot captured the original of every
   table it manages. A namespace with managed RLS tables cannot be rolled back
   yet.
+- The originals carry foreign keys. Rolling back a plan that added a foreign
+  key shows the key's drop as a blocked step, since SchemaBot does not drop
+  foreign keys yet.
+- A namespace cannot be rolled back when one of its managed tables has a
+  foreign key to or from another namespace, or is referenced by a table the
+  plan does not manage.
 - Rollback never removes an enum label, since PostgreSQL cannot drop one. The
   plan's table changes are reversed, and the label stays.
 - [RV-7](invariants.md#rv-7-rollback-needs-the-originals) requires complete
