@@ -129,7 +129,7 @@ func TestDurableWebhookDriverChargesPrimaryRateLimitAfterUnchargedWindow(t *test
 	t.Run("each claim retries at the reset and spends an attempt until the cap", func(t *testing.T) {
 		for claim := 1; claim <= maxDurableWebhookAttempts; claim++ {
 			event := durablePullRequestEvent(t)
-			event.ReceivedAt = time.Now().Add(-quotaReserveUnchargedWindow - time.Minute)
+			event.ReceivedAt = time.Now().Add(-unchargedRefusalWindow - time.Minute)
 			event.Attempts = claim - 1 // FindNext claim increments to claim
 			resetAt := time.Now().Add(25 * time.Minute).Truncate(time.Second)
 
@@ -202,27 +202,31 @@ func TestDurableWebhookDriverDoesNotWaitForRateLimitOnPermanentFailure(t *testin
 // duration outcome, the webhook event status, and one log line that says when
 // the delivery runs again and which installation's quota refused it. A refusal
 // inside the uncharged window reads as rate_limit_deferred; one past it reads
-// as retrying, because it spent an attempt.
+// as retrying, because it spent an attempt. The failure line reports the
+// attempts the row holds afterwards: a deferral gives the claim's attempt back.
 func TestDurableWebhookDriverRecordsPrimaryRateLimitRetry(t *testing.T) {
 	tests := []struct {
-		name        string
-		receivedAgo time.Duration
-		wantOutcome string
-		wantLevel   string
-		wantMessage string
+		name         string
+		receivedAgo  time.Duration
+		wantOutcome  string
+		wantLevel    string
+		wantMessage  string
+		wantAttempts float64
 	}{
 		{
-			name:        "inside the uncharged window",
-			wantOutcome: "rate_limit_deferred",
-			wantLevel:   "INFO",
-			wantMessage: "durable webhook delivery was refused by the GitHub primary rate limit; it will be retried when the limit resets without spending an attempt",
+			name:         "inside the uncharged window",
+			wantAttempts: 2,
+			wantOutcome:  "rate_limit_deferred",
+			wantLevel:    "INFO",
+			wantMessage:  "durable webhook delivery was refused by the GitHub primary rate limit; it will be retried when the limit resets without spending an attempt",
 		},
 		{
-			name:        "past the uncharged window",
-			receivedAgo: quotaReserveUnchargedWindow + time.Minute,
-			wantOutcome: "retrying",
-			wantLevel:   "WARN",
-			wantMessage: "durable webhook delivery was refused by the GitHub primary rate limit more than the uncharged window after it was received; it will be retried when the limit resets and this refusal spent an attempt",
+			name:         "past the uncharged window",
+			receivedAgo:  unchargedRefusalWindow + time.Minute,
+			wantAttempts: 3,
+			wantOutcome:  "retrying",
+			wantLevel:    "WARN",
+			wantMessage:  "durable webhook delivery was refused by the GitHub primary rate limit more than the uncharged window after it was received; it will be retried when the limit resets and this refusal spent an attempt",
 		},
 	}
 	for _, tc := range tests {
@@ -230,6 +234,7 @@ func TestDurableWebhookDriverRecordsPrimaryRateLimitRetry(t *testing.T) {
 			reader := newDispatchMetricsReader(t)
 			event := durablePullRequestEvent(t)
 			event.ReceivedAt = time.Now().Add(-tc.receivedAgo)
+			event.Attempts = 2
 			resetAt := time.Now().Add(40 * time.Minute).Truncate(time.Second)
 			store := newScriptedWebhookEventStore(event)
 			h := newDurableDriverHandler(t, store, nil, nil)
@@ -246,10 +251,14 @@ func TestDurableWebhookDriverRecordsPrimaryRateLimitRetry(t *testing.T) {
 			require.Len(t, durationPoints, 1)
 			assertStringAttr(t, durationPoints[0].Attributes, "outcome", tc.wantOutcome)
 
-			var matched int
+			var matched, failureLines int
 			for line := range strings.Lines(logs.String()) {
 				var entry map[string]any
 				require.NoError(t, json.Unmarshal([]byte(line), &entry))
+				if entry["msg"] == "durable webhook driver recorded delivery failure" {
+					failureLines++
+					assert.Equal(t, tc.wantAttempts, entry["attempts"], "the failure line reports the attempts the row holds")
+				}
 				if entry["msg"] != tc.wantMessage {
 					continue
 				}
@@ -264,6 +273,7 @@ func TestDurableWebhookDriverRecordsPrimaryRateLimitRetry(t *testing.T) {
 				assert.Equal(t, resetAt.UTC().Format(time.RFC3339), entry["retry_at"])
 			}
 			assert.Equal(t, 1, matched, "exactly one primary rate limit retry log line: %s", logs.String())
+			assert.Equal(t, 1, failureLines, "exactly one delivery failure line: %s", logs.String())
 		})
 	}
 }
