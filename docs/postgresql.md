@@ -801,7 +801,7 @@ The plan lists the tables it exempted, by namespace, in the PR comment and in
 
 **Tables `pull` cannot write.** `pull` refuses the whole pull when any of
 its tables has something the file format cannot represent: triggers, table or
-column comments, table options, inheritance, or a foreign key it cannot write
+column comments, inheritance, or a foreign key it cannot write
 (see the table below). Write those files by hand, or drop the tables through a
 reviewed process, before you pull the rest.
 
@@ -999,7 +999,10 @@ schema file format. These include tables with:
 - Table inheritance, or `UNLOGGED`
 - Explicit collations
 - Sequence defaults it cannot represent safely
-- Triggers, table or column comments, or non-default table options
+- Triggers, or table or column comments
+
+Storage parameters, such as `fillfactor` or `autovacuum_enabled`, are not on
+this list. `pull` writes them into the table's `WITH (...)` clause.
 
 | Command | What happens to such a table |
 |---|---|
