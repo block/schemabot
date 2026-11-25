@@ -17,6 +17,20 @@ import (
 	"github.com/block/schemabot/pkg/testutil"
 )
 
+// claimContentionDeadline bounds each claim and reread in these tests. A row
+// lock held by the test stays held until the claim returns, so a claim that
+// waits on the lock instead of skipping it fails at this deadline instead of
+// hanging until the package timeout.
+const claimContentionDeadline = 30 * time.Second
+
+// claimContext is a context for one claim in a test that holds a row lock.
+func claimContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), claimContentionDeadline)
+	t.Cleanup(cancel)
+	return ctx
+}
+
 func TestMySQLOperationClaimContention(t *testing.T) {
 	testOperationClaimContention(t, func(t *testing.T) *Storage {
 		clearTables(t)
@@ -45,7 +59,7 @@ func testOperationClaimContention(t *testing.T, newStore func(*testing.T) *Stora
 	// there and claimable, and one that does not reports nothing to claim.
 	// Once the transaction ends, the claim takes the operation.
 	t.Run("a claimable operation locked by another transaction is reported as contended", func(t *testing.T) {
-		ctx := t.Context()
+		ctx := claimContext(t)
 		store := newStore(t)
 		apply := createQueueApply(t, store, "apply_claim_contended", state.Apply.Running, false, time.Minute)
 		opID := insertQueueOperation(t, store, apply, "shard-1", state.ApplyOperation.Pending, false)
@@ -73,7 +87,7 @@ func testOperationClaimContention(t *testing.T, newStore func(*testing.T) *Stora
 	// only other operation is already leased to a live driver, and the locked
 	// one belongs to an apply that has settled.
 	t.Run("a locked operation the claim could not take is not contention", func(t *testing.T) {
-		ctx := t.Context()
+		ctx := claimContext(t)
 		store := newStore(t)
 		apply := createQueueApply(t, store, "apply_claim_settled", state.Apply.Completed, false, time.Minute)
 		opID := insertQueueOperation(t, store, apply, "shard-1", state.ApplyOperation.Pending, false)
