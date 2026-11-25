@@ -657,7 +657,7 @@ func revertWindowCountdown(revertExpiresAt string) string {
 	if remaining <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("Closes in %s", formatDuration(remaining))
+	return fmt.Sprintf("Closes in %s", ui.FormatExactDuration(remaining))
 }
 
 // taskSettledBeforeCutover reports whether a row is out of the cutover's way:
@@ -1716,52 +1716,7 @@ func durationDisplay(startedAt, completedAt string) string {
 	if endTime.Before(startTime) {
 		return ""
 	}
-	return formatDuration(endTime.Sub(startTime))
-}
-
-// formatDuration formats a time.Duration as a human-readable string.
-func formatDuration(d time.Duration) string {
-	d = d.Truncate(time.Second)
-	if d < time.Minute {
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	}
-	if d < time.Hour {
-		m := int(d.Minutes())
-		s := int(d.Seconds()) % 60
-		if s > 0 {
-			return fmt.Sprintf("%dm %ds", m, s)
-		}
-		return fmt.Sprintf("%dm", m)
-	}
-	totalHours := int(d.Hours())
-	if totalHours < 24 {
-		m := int(d.Minutes()) % 60
-		if m > 0 {
-			return fmt.Sprintf("%dh %dm", totalHours, m)
-		}
-		return fmt.Sprintf("%dh", totalHours)
-	}
-	totalDays := totalHours / 24
-	hours := totalHours % 24
-	m := int(d.Minutes()) % 60
-	var parts []string
-	if totalDays >= 7 {
-		weeks := totalDays / 7
-		days := totalDays % 7
-		parts = append(parts, fmt.Sprintf("%dw", weeks))
-		if days > 0 {
-			parts = append(parts, fmt.Sprintf("%dd", days))
-		}
-	} else {
-		parts = append(parts, fmt.Sprintf("%dd", totalDays))
-	}
-	if hours > 0 {
-		parts = append(parts, fmt.Sprintf("%dh", hours))
-	}
-	if m > 0 {
-		parts = append(parts, fmt.Sprintf("%dm", m))
-	}
-	return strings.Join(parts, " ")
+	return ui.FormatExactDuration(endTime.Sub(startTime))
 }
 
 func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentData, budget *ddlBlockBudget) {

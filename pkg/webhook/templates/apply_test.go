@@ -1942,6 +1942,10 @@ func TestRenderApplySummaryComment_Duration(t *testing.T) {
 	}
 	assert.Contains(t, RenderApplySummaryComment(data), "**Duration**: 17m")
 
+	// An apply that runs past a day keeps its minutes.
+	data.CompletedAt = "2026-06-17T20:43:00Z"
+	assert.Contains(t, RenderApplySummaryComment(data), "**Duration**: 1d 1h 1m")
+
 	data.CompletedAt = "2026-06-16T19:00:00Z"
 	assert.NotContains(t, RenderApplySummaryComment(data), "**Duration**:")
 }
@@ -2900,6 +2904,14 @@ func TestRenderApplyStatusComment_RevertWindowDeadline(t *testing.T) {
 	pastDue := base
 	pastDue.RevertExpiresAt = time.Now().Add(-1 * time.Minute).UTC().Format(time.RFC3339)
 	assert.NotContains(t, RenderApplyStatusComment(pastDue), "Closes in")
+
+	// A window longer than a day keeps its minutes in the countdown.
+	now := time.Date(2026, 6, 16, 19, 42, 0, 0, time.UTC)
+	NowFunc = func() time.Time { return now }
+	t.Cleanup(func() { NowFunc = time.Now })
+	longWindow := base
+	longWindow.RevertExpiresAt = now.Add(25*time.Hour + time.Minute).Format(time.RFC3339)
+	assert.Contains(t, RenderApplyStatusComment(longWindow), "**Status**: Revert Window | Closes in 1d 1h 1m")
 }
 
 // TestRenderApplyStatusComment_Rollback verifies that a rollback apply's
