@@ -407,6 +407,12 @@ type PlanCommentData struct {
 	// database (nothing to compare) or when drift was not evaluated.
 	DeploymentDrift *DeploymentDriftData
 
+	// OperationsAtOnce is how many of an apply's operations SchemaBot runs at
+	// once (max_drivers_per_apply). The plan summary states it when the plan
+	// rolls out to more targets or shards than that, so a reviewer knows before
+	// applying that the rest will wait their turn. Zero states nothing.
+	OperationsAtOnce int
+
 	// BaseSchema says whether the PR's base branch changed this environment's
 	// schema after the PR branched off it. Nil when it was not checked.
 	BaseSchema *BaseSchemaData
@@ -1466,6 +1472,15 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	text := planSummaryText(data.Changes, data.DatabaseType, data.IsMySQL, totalStatements)
 	if data.summaryRollout != nil {
 		text += " · " + rolloutScope(data.summaryRollout)
+		changing := changingTargetCount(data.summaryRollout)
+		if limit := presentation.LimitPhrase(changing, changing, data.OperationsAtOnce); limit != "" {
+			text += ", " + limit
+		}
+	}
+	if shards, operations := plannedShardWork(data.Changes); shards > 0 {
+		if limit := presentation.LimitPhrase(shards, operations, data.OperationsAtOnce); limit != "" {
+			text += fmt.Sprintf(" · %d %s, %s", shards, pluralize("shard", shards), limit)
+		}
 	}
 	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", text)
 
@@ -1475,6 +1490,23 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 	writeExemptTables(sb, data.ExemptTables)
 	writeUnmatchedDropTables(sb, data.shownUnmatchedDropTables())
+}
+
+// plannedShardWork counts a sharded plan's shards that have work and the
+// operations an apply would run on them, one per statement on each shard, as
+// the apply runs one operation per table on each shard. Both are zero for a
+// plan with no sharded keyspace.
+func plannedShardWork(changes []KeyspaceChangeData) (shards, operations int) {
+	for _, ks := range changes {
+		for _, sh := range ks.Shards {
+			if sh.Satisfied || len(sh.Statements) == 0 {
+				continue
+			}
+			shards++
+			operations += len(sh.Statements)
+		}
+	}
+	return shards, operations
 }
 
 // planSummaryText renders what a plan would do as the plan summary counts it,

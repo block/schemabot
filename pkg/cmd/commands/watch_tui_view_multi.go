@@ -18,6 +18,7 @@ import (
 // and the keys the operator can press).
 func (m WatchModel) multiDeploymentProgressSections() (string, string) {
 	model := presentation.Derive(presentation.ResumeClaimed(m.state, templates.ProgressOperationsForPresentation(m.operations, m.tables, m.released)))
+	model.OperationsAtOnce = m.maxOperationsAtOnce
 	groups := model.Groups()
 	view := templates.RolloutView{
 		ApplyID:      m.applyID,

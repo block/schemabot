@@ -43,6 +43,9 @@ type WatchModel struct {
 	// sharded is whether the apply is one change fanned out across its
 	// keyspaces' shards, so it renders without operation sections.
 	sharded bool
+	// maxOperationsAtOnce is how many of the apply's operations the server
+	// runs at once, stated beside a running rollout's counts.
+	maxOperationsAtOnce int
 	// deferCutover is whether the apply waits for an operator at each cutover.
 	deferCutover bool
 	// stoppedByFreeze names the freeze that stopped the apply, nil when an
@@ -97,6 +100,7 @@ type progressMsg struct {
 	operations   []templates.ProgressOperation
 	released     bool                    // apply-level release latch: a released pause runs degraded, not paused
 	sharded      bool                    // one change fanned out across its keyspaces' shards
+	atOnce       int                     // how many of the apply's operations the server runs at once
 	deferCutover bool                    // the apply waits for an operator at each cutover
 	stoppedBy    *apitypes.FreezeStopRef // the freeze that stopped the apply, nil when none did
 	errorMsg     string                  // Human-readable error message
@@ -229,6 +233,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.operations = msg.operations
 		m.released = msg.released
 		m.sharded = msg.sharded
+		m.maxOperationsAtOnce = msg.atOnce
 		m.deferCutover = msg.deferCutover
 		m.stoppedByFreeze = msg.stoppedBy
 		m.errorMsg = msg.errorMsg

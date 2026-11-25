@@ -136,6 +136,32 @@ func TestRenderPlanComment_ShardedUniform(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(out, "```sql"), "the shared DDL is shown once")
 }
 
+// A sharded plan alters mutes on four shards, and SchemaBot runs two of an
+// apply's operations at a time. The plan summary says so, so a reviewer knows
+// before applying that half the shards will wait their turn. When each shard
+// also changes follows, the limit counts table changes rather than shards.
+func TestRenderPlanComment_ShardedStatesHowManyRunAtOnce(t *testing.T) {
+	mutes := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	follows := "ALTER TABLE `follows` ADD COLUMN `muted` tinyint"
+	plan := func(statements ...string) PlanCommentData {
+		var shards []KeyspaceShardChange
+		for _, shard := range []string{"-40", "40-80", "80-c0", "c0-"} {
+			shards = append(shards, KeyspaceShardChange{Shard: shard, Statements: statements})
+		}
+		return PlanCommentData{
+			Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata", OperationsAtOnce: 2,
+			Changes: []KeyspaceChangeData{{Keyspace: "cdb_resolute_sharded", Statements: statements, Shards: shards}},
+		}
+	}
+
+	assert.Contains(t, RenderPlanComment(plan(mutes)), "📋 **Plan**: **1** table to alter · 4 shards, 2 at a time\n")
+	assert.Contains(t, RenderPlanComment(plan(mutes, follows)), "📋 **Plan**: **2** tables to alter · 4 shards, 2 table changes at a time\n")
+
+	unlimited := plan(mutes)
+	unlimited.OperationsAtOnce = 0
+	assert.Contains(t, RenderPlanComment(unlimited), "📋 **Plan**: **1** table to alter\n", "an unknown limit states nothing")
+}
+
 // A sharded plan whose DDL lives only per-shard (no collapsed namespace-level
 // Statements) must not short-circuit to "no changes" — the count incorporates
 // the per-shard statements.

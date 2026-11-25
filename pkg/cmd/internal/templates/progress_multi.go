@@ -14,6 +14,7 @@ import (
 
 func writeMultiDeploymentProgress(data ProgressData) {
 	model := presentation.Derive(presentation.ResumeClaimed(data.State, ProgressOperationsForPresentation(data.Operations, data.Tables, data.Released)))
+	model.OperationsAtOnce = data.MaxOperationsAtOnce
 	groups := model.Groups()
 	view := RolloutView{
 		ApplyID:      data.ApplyID,

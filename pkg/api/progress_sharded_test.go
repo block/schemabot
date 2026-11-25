@@ -96,6 +96,8 @@ func TestProgressByApplyIDRollsAShardedApplyUpByTable(t *testing.T) {
 	resp := shardedProgress(t, ops, []*storage.Task{shardTask(1, state.Task.Running, 620, 1000)}, &staticPlanStore{plan: plan})
 
 	assert.True(t, resp.Sharded)
+	assert.Equal(t, storage.DefaultMaxDriversPerApply, resp.MaxOperationsAtOnce,
+		"the response says how many of the apply's operations the server runs at once, its default when unset")
 	assert.Len(t, resp.Operations, 3, "every shard and finalizer row is still listed")
 	require.Len(t, resp.Tables, 1, "the table reads once across its shards")
 	table := resp.Tables[0]

@@ -172,7 +172,7 @@ func (s *Service) deferredCutoverCapacityRefusal(ctx context.Context, plan *stor
 		refused.Operations = operations
 		return refused
 	}
-	perApplyCap := storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply
+	perApplyCap := s.config.OperationsAtOnce()
 	if operations > perApplyCap {
 		return refusal(&DeferredCutoverCapacityError{PerApplyCap: perApplyCap},
 			"deferred cutover would keep more drivers waiting at once than max_drivers_per_apply gives one apply"), nil

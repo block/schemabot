@@ -453,6 +453,14 @@ func TestRenderPlanComment_OneTargetPlanRendersOnceAndCountsTheTargets(t *testin
 	assert.NotContains(t, out, "### ", "one plan renders with no target heading")
 	assert.Contains(t, out, "```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
 	assert.Contains(t, out, "📋 **Plan**: **1** table to alter · rolling out to all 3 targets\n")
+
+	// Under a limit of two operations at once, the third target waits its
+	// turn, and the plan says so before anyone applies it.
+	data.OperationsAtOnce = 2
+	assert.Contains(t, RenderPlanComment(data), "📋 **Plan**: **1** table to alter · rolling out to all 3 targets, 2 at a time\n")
+	data.OperationsAtOnce = 3
+	assert.Contains(t, RenderPlanComment(data), "📋 **Plan**: **1** table to alter · rolling out to all 3 targets\n",
+		"a limit that holds no target back is not stated")
 }
 
 // Targets whose plans differ render the way shards whose plans differ do: each

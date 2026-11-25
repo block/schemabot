@@ -74,6 +74,12 @@ type ShardedApplyData struct {
 	// vocabulary from "apply" to "rollback", matching the single-deployment
 	// comment.
 	Rollback bool
+
+	// MaxOperationsAtOnce is how many of the apply's operations SchemaBot runs
+	// at once (max_drivers_per_apply). While the apply runs, the Shards line
+	// states it whenever the apply has more operations than that, so shards
+	// queued behind it read as waiting their turn. Zero leaves it unstated.
+	MaxOperationsAtOnce int
 }
 
 // ShardedKeyspace is one keyspace's slice of a sharded apply: its tables in
@@ -226,7 +232,7 @@ func renderShardedApplyComment(data ShardedApplyData, renderedAt string, formatt
 		sb.WriteString("\n" + queuedApplyExplanation + "\n")
 	}
 
-	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
+	writeShardCounts(&sb, data)
 	writeShardedFailure(&sb, data)
 	writeShardsStoppedAtCutover(&sb, data)
 	writeShardKeyspaceSections(&sb, data, formatter, budget)
@@ -262,7 +268,7 @@ func renderShardedApplySummaryComment(data ShardedApplyData, formatter *shardedD
 	if state.IsState(data.State, state.Apply.Completed) {
 		writeSuccessBlock(&sb, completedOutcomeMessage(shardedChangeIsSingular(data), data.Rollback))
 	}
-	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
+	writeShardCounts(&sb, data)
 	writeShardedFailure(&sb, data)
 	writeShardsStoppedAtCutover(&sb, data)
 	writeShardedSummaryDetails(&sb, data, formatter, budget)
@@ -851,8 +857,10 @@ func shardList(shards []ShardStatus, totalShards int) string {
 }
 
 // writeShardCounts writes the per-status histogram across shards so rollout
-// health is visible at a glance (presentation.ShardCounts).
-func writeShardCounts(sb *strings.Builder, shards []ShardStatus) {
+// health is visible at a glance (presentation.ShardCounts), ending with how
+// many operations run at once while the apply runs (presentation.WithLimit).
+func writeShardCounts(sb *strings.Builder, data ShardedApplyData) {
+	shards := allShardStatuses(data.Keyspaces)
 	if len(shards) == 0 {
 		return
 	}
@@ -860,7 +868,15 @@ func writeShardCounts(sb *strings.Builder, shards []ShardStatus) {
 	for _, s := range shards {
 		labels = append(labels, s.Label)
 	}
-	fmt.Fprintf(sb, "\n**Shards**: %s\n", presentation.ShardCounts(labels))
+	counts := presentation.ShardCounts(labels)
+	if !state.IsTerminalApplyState(data.State) {
+		operations := 0
+		for _, ks := range data.Keyspaces {
+			operations += len(ks.Cells)
+		}
+		counts = presentation.WithLimit(counts, len(shards), operations, data.MaxOperationsAtOnce)
+	}
+	fmt.Fprintf(sb, "\n**Shards**: %s\n", counts)
 }
 
 // isShardFailureState reports whether a shard's state carries an operator-facing
