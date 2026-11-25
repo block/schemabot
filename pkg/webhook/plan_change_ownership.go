@@ -97,6 +97,10 @@ func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclien
 		return []templates.AttributedChangeData{{Table: table, Unresolved: true}}
 	}
 
+	planned := make([]*ddl.ObjectChanges, len(statements))
+	for i, stmt := range statements {
+		planned[i] = templates.ReadPlannedChange(table, stmt, lookup.parser)
+	}
 	var checked int
 	var attributedOwners []templates.AttributedChangeData
 	for _, owner := range owners {
@@ -128,8 +132,8 @@ func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclien
 			PullRequest:  owner.PullRequest,
 			OwnerChanges: lookup.ownerChanges(ctx, ref, owner, repo, pr),
 		}
-		if !slices.ContainsFunc(statements, func(stmt string) bool {
-			return templates.UndoesAttributedWork(attributed, stmt, lookup.parser)
+		if !slices.ContainsFunc(planned, func(change *ddl.ObjectChanges) bool {
+			return templates.UndoesAttributedWork(attributed, change)
 		}) {
 			h.logger.Debug("planned destructive change is not attributed to this owner: its open pull request changed other objects on the table",
 				"repo", repo, "pr", pr, "database", ref.Database, "environment", ref.Environment,

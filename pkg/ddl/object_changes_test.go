@@ -54,6 +54,16 @@ func TestTiDBObjectChanges(t *testing.T) {
 			want: ObjectChanges{Added: objs(idx("idx_created_at")), Referenced: objs(col("created_at"))},
 		},
 		{
+			name: "an index added without a name references the table",
+			stmt: "ALTER TABLE events ADD INDEX (created_at)",
+			want: ObjectChanges{Referenced: objs(tbl("events"), col("created_at"))},
+		},
+		{
+			name: "keys declared on an added column",
+			stmt: "ALTER TABLE events ADD COLUMN code int UNIQUE, ADD COLUMN id2 bigint PRIMARY KEY",
+			want: ObjectChanges{Added: objs(col("code"), col("id2"), idx("primary")), Referenced: objs(tbl("events"))},
+		},
+		{
 			name: "a column visibility change modifies that column",
 			stmt: "ALTER TABLE events ALTER COLUMN Payload SET INVISIBLE",
 			want: ObjectChanges{Modified: objs(col("payload"))},
@@ -175,6 +185,21 @@ func TestPostgresObjectChanges(t *testing.T) {
 			name: "create index",
 			stmt: "CREATE INDEX CONCURRENTLY idx_created_at ON events (created_at) INCLUDE (kind)",
 			want: ObjectChanges{Added: objs(idx("idx_created_at")), Referenced: objs(col("created_at"), col("kind"))},
+		},
+		{
+			name: "an index created without a name references the table",
+			stmt: "CREATE INDEX ON events (created_at)",
+			want: ObjectChanges{Referenced: objs(tbl("events"), col("created_at"))},
+		},
+		{
+			name: "constraints declared on an added column",
+			stmt: "ALTER TABLE events ADD COLUMN code int NOT NULL UNIQUE, ADD COLUMN ref int CONSTRAINT fk_ref REFERENCES refs (id)",
+			want: ObjectChanges{Added: objs(col("code"), col("ref"), cons("fk_ref")), Referenced: objs(tbl("events"))},
+		},
+		{
+			name: "a table constraint added without a name references the table",
+			stmt: "ALTER TABLE events ADD UNIQUE (ref)",
+			want: ObjectChanges{Referenced: objs(tbl("events"), col("ref"))},
 		},
 		{
 			name: "a partial index references the table its predicate reads",

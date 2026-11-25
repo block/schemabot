@@ -59,6 +59,27 @@ func TestUndoesAttributedWork(t *testing.T) {
 			want:    true,
 		},
 		{
+			name:    "dropping an index the owner added without naming it",
+			parser:  mysql,
+			owner:   []string{"ALTER TABLE `events` ADD INDEX (`created_at`)"},
+			planned: "ALTER TABLE `events` DROP INDEX `created_at`",
+			want:    true,
+		},
+		{
+			name:    "dropping a key the owner declared on the column it added",
+			parser:  mysql,
+			owner:   []string{"ALTER TABLE `events` ADD COLUMN `code` int UNIQUE"},
+			planned: "ALTER TABLE `events` DROP INDEX `code`",
+			want:    true,
+		},
+		{
+			name:    "postgres: dropping an index the owner created without naming it",
+			parser:  postgres,
+			owner:   []string{"CREATE INDEX ON events (created_at)"},
+			planned: "DROP INDEX events_created_at_idx",
+			want:    true,
+		},
+		{
 			name:    "dropping the column the owner indexed",
 			parser:  mysql,
 			owner:   []string{"CREATE INDEX `idx_created_at` ON `events` (`created_at`)"},
@@ -146,25 +167,25 @@ func TestUndoesAttributedWork(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			a := AttributedChangeData{Table: "events", Repository: "acme/orders", PullRequest: 190, OwnerChanges: ownerDid(t, tt.parser, tt.owner...)}
-			assert.Equal(t, tt.want, UndoesAttributedWork(a, tt.planned, tt.parser))
+			assert.Equal(t, tt.want, UndoesAttributedWork(a, ReadPlannedChange(a.Table, tt.planned, tt.parser)))
 		})
 	}
 
 	t.Run("an unresolved owner is always attributed", func(t *testing.T) {
 		a := AttributedChangeData{Table: "events", Unresolved: true}
-		assert.True(t, UndoesAttributedWork(a, "ALTER TABLE `events` DROP COLUMN `payload`", mysql))
+		assert.True(t, UndoesAttributedWork(a, ReadPlannedChange(a.Table, "ALTER TABLE `events` DROP COLUMN `payload`", mysql)))
 	})
 	t.Run("unknown owner changes are always attributed", func(t *testing.T) {
 		a := AttributedChangeData{Table: "events", Repository: "acme/orders", PullRequest: 190}
-		assert.True(t, UndoesAttributedWork(a, "ALTER TABLE `events` DROP COLUMN `payload`", mysql))
+		assert.True(t, UndoesAttributedWork(a, ReadPlannedChange(a.Table, "ALTER TABLE `events` DROP COLUMN `payload`", mysql)))
 	})
 	t.Run("no parser means every change is attributed", func(t *testing.T) {
 		a := AttributedChangeData{Table: "events", Repository: "acme/orders", PullRequest: 190, OwnerChanges: &ddl.ObjectChanges{}}
-		assert.True(t, UndoesAttributedWork(a, "ALTER TABLE `events` DROP COLUMN `payload`", nil))
+		assert.True(t, UndoesAttributedWork(a, ReadPlannedChange(a.Table, "ALTER TABLE `events` DROP COLUMN `payload`", nil)))
 	})
 	t.Run("a change with no statement is attributed", func(t *testing.T) {
 		a := AttributedChangeData{Table: "events", Repository: "acme/orders", PullRequest: 190, OwnerChanges: &ddl.ObjectChanges{}}
-		assert.True(t, UndoesAttributedWork(a, "  ", mysql))
+		assert.True(t, UndoesAttributedWork(a, ReadPlannedChange(a.Table, "  ", mysql)))
 	})
 }
 
@@ -316,4 +337,50 @@ func TestRenderPlanComment_FindingThatUndoesTwoOwnersNamesBoth(t *testing.T) {
 		assert.Contains(t, sb.String(), "**Check before applying**: 1 destructive change SchemaBot cannot attribute to this PR\n")
 		assert.Contains(t, sb.String(), "- `users`: changed by [acme/orders#3](https://github.com/acme/orders/pull/3) and [acme/orders#2](https://github.com/acme/orders/pull/2), which are still open\n")
 	})
+}
+
+// countingParser counts the statements it is asked to read.
+type countingParser struct {
+	ddl.StatementParser
+	reads int
+}
+
+func (p *countingParser) ObjectChanges(stmt string) (ddl.ObjectChanges, error) {
+	p.reads++
+	return p.StatementParser.ObjectChanges(stmt)
+}
+
+// A render consults each finding once per owner, several times over, and a
+// statement that does not parse would otherwise log a warning on every
+// consultation. Each planned statement is read once per render, and a
+// statement that does not parse still attributes every finding to every owner.
+func TestUnsafeAttributionReadsEachPlannedStatementOnce(t *testing.T) {
+	mysql, err := ddl.ParserForDialect(schema.DialectMySQL)
+	require.NoError(t, err)
+	parser := &countingParser{StatementParser: mysql}
+
+	owners := []AttributedChangeData{
+		{Table: "users", Repository: "acme/orders", PullRequest: 3, OwnerChanges: ownerDid(t, mysql, "ALTER TABLE `users` ADD COLUMN `nickname` varchar(64)")},
+		{Table: "users", Repository: "acme/orders", PullRequest: 2, OwnerChanges: ownerDid(t, mysql, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")},
+	}
+	notes := &unsafeAttribution{
+		byTable:     map[string][]AttributedChangeData{"users": owners},
+		parser:      parser,
+		commentRepo: "acme/orders",
+		planned:     map[string]*ddl.ObjectChanges{},
+	}
+	change := UnsafeChangeData{
+		Table:  "users",
+		DDL:    "ALTER TABLE `users` DROP COLUMN",
+		Reason: "DROP COLUMN email discards its data; DROP COLUMN nickname discards its data",
+	}
+
+	for _, finding := range unsafeFindings(change) {
+		assert.Equal(t, "changed by open PRs [#3](https://github.com/acme/orders/pull/3) and [#2](https://github.com/acme/orders/pull/2)", notes.noteFor(change, finding))
+	}
+	assert.True(t, notes.carriesNote(change))
+	for _, a := range owners {
+		assert.True(t, notes.namesOwner([]UnsafeChangeData{change}, a))
+	}
+	assert.Equal(t, 1, parser.reads, "the planned statement is read once however many findings and owners consult it")
 }

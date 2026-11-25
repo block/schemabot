@@ -71,6 +71,18 @@ func (c *ObjectChanges) reference(kind SchemaObjectKind, name string) {
 	}
 }
 
+// addKey records an index or constraint a statement adds. One added without a
+// name gets a name the server picks, which the statement does not say, so it
+// is recorded as a reference to its whole table: any later change that
+// destroys part of the table may be destroying it.
+func (c *ObjectChanges) addKey(kind SchemaObjectKind, name, table string) {
+	if name == "" {
+		c.reference(ObjectTable, table)
+		return
+	}
+	c.add(kind, name)
+}
+
 // mysqlPrimaryKeyName is the name MySQL gives every primary key.
 const mysqlPrimaryKeyName = "primary"
 
@@ -89,7 +101,7 @@ func (tidbStatementParser) ObjectChanges(stmt string) (ObjectChanges, error) {
 	case *ast.CreateTableStmt:
 		changes.add(ObjectTable, node.Table.Name.L)
 		for _, col := range node.Cols {
-			changes.add(ObjectColumn, col.Name.Name.L)
+			addMySQLColumn(&changes, node.Table.Name.L, col)
 		}
 		for _, c := range node.Constraints {
 			addMySQLConstraint(&changes, node.Table.Name.L, c)
@@ -117,7 +129,7 @@ func alterSpecObjectChanges(changes *ObjectChanges, table string, spec *ast.Alte
 	switch spec.Tp {
 	case ast.AlterTableAddColumns:
 		for _, col := range spec.NewColumns {
-			changes.add(ObjectColumn, col.Name.Name.L)
+			addMySQLColumn(changes, table, col)
 		}
 		for _, c := range spec.NewConstraints {
 			addMySQLConstraint(changes, table, c)
@@ -187,14 +199,30 @@ func addMySQLConstraint(changes *ObjectChanges, table string, c *ast.Constraint)
 	case ast.ConstraintPrimaryKey:
 		changes.add(ObjectIndex, mysqlPrimaryKeyName)
 	case ast.ConstraintForeignKey:
-		changes.add(ObjectConstraint, lowerName(c.Name))
+		changes.addKey(ObjectConstraint, lowerName(c.Name), table)
 	case ast.ConstraintCheck:
-		changes.add(ObjectConstraint, lowerName(c.Name))
+		changes.addKey(ObjectConstraint, lowerName(c.Name), table)
 		changes.reference(ObjectTable, table)
 	default:
-		changes.add(ObjectIndex, lowerName(c.Name))
+		changes.addKey(ObjectIndex, lowerName(c.Name), table)
 	}
 	referenceMySQLIndexParts(changes, table, c.Keys)
+}
+
+// addMySQLColumn records a column a statement adds, with the keys and
+// constraints declared on it. An inline primary key is the table's primary
+// key. Any other inline key or constraint has no name of its own, so it is
+// recorded as a reference to the table.
+func addMySQLColumn(changes *ObjectChanges, table string, col *ast.ColumnDef) {
+	changes.add(ObjectColumn, col.Name.Name.L)
+	for _, opt := range col.Options {
+		switch opt.Tp {
+		case ast.ColumnOptionPrimaryKey:
+			changes.add(ObjectIndex, mysqlPrimaryKeyName)
+		case ast.ColumnOptionUniqKey, ast.ColumnOptionCheck, ast.ColumnOptionReference:
+			changes.reference(ObjectTable, table)
+		}
+	}
 }
 
 // referenceMySQLIndexParts records the columns an index or key covers, and the
@@ -238,15 +266,15 @@ func (postgresStatementParser) ObjectChanges(stmt string) (ObjectChanges, error)
 		changes.add(ObjectTable, node.CreateStmt.GetRelation().GetRelname())
 		for _, elt := range node.CreateStmt.GetTableElts() {
 			if col := elt.GetColumnDef(); col != nil {
-				addPostgresColumn(&changes, col)
+				addPostgresColumn(&changes, node.CreateStmt.GetRelation().GetRelname(), col)
 			}
 			if c := elt.GetConstraint(); c != nil {
 				addPostgresConstraint(&changes, node.CreateStmt.GetRelation().GetRelname(), c)
 			}
 		}
 	case *pgproto.Node_IndexStmt:
-		changes.add(ObjectIndex, node.IndexStmt.GetIdxname())
 		table := node.IndexStmt.GetRelation().GetRelname()
+		changes.addKey(ObjectIndex, node.IndexStmt.GetIdxname(), table)
 		for _, param := range node.IndexStmt.GetIndexParams() {
 			referencePostgresIndexElem(&changes, table, param.GetIndexElem())
 		}
@@ -300,12 +328,34 @@ func postgresDropKind(t pgproto.ObjectType) (SchemaObjectKind, bool) {
 	}
 }
 
-// addPostgresColumn records a column a statement adds, with the named
-// constraints declared on it.
-func addPostgresColumn(changes *ObjectChanges, col *pgproto.ColumnDef) {
+// addPostgresColumn records a column a statement adds, with the constraints
+// declared on it. A key, check or foreign key declared without a name is
+// recorded as a reference to the table, since the server names it.
+func addPostgresColumn(changes *ObjectChanges, table string, col *pgproto.ColumnDef) {
 	changes.add(ObjectColumn, col.GetColname())
-	for _, c := range col.GetConstraints() {
-		changes.add(ObjectConstraint, c.GetConstraint().GetConname())
+	for _, node := range col.GetConstraints() {
+		c := node.GetConstraint()
+		if postgresConstraintIsObject(c.GetContype()) {
+			changes.addKey(ObjectConstraint, c.GetConname(), table)
+			continue
+		}
+		changes.add(ObjectConstraint, c.GetConname())
+	}
+}
+
+// postgresConstraintIsObject reports whether a column constraint of this type
+// creates a constraint or index of its own, rather than a column property
+// such as NOT NULL or a default.
+func postgresConstraintIsObject(t pgproto.ConstrType) bool {
+	switch t {
+	case pgproto.ConstrType_CONSTR_PRIMARY,
+		pgproto.ConstrType_CONSTR_UNIQUE,
+		pgproto.ConstrType_CONSTR_CHECK,
+		pgproto.ConstrType_CONSTR_FOREIGN,
+		pgproto.ConstrType_CONSTR_EXCLUSION:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -315,7 +365,7 @@ func alterCmdObjectChanges(changes *ObjectChanges, table string, cmd *pgproto.Al
 	switch cmd.GetSubtype() {
 	case pgproto.AlterTableType_AT_AddColumn:
 		if col := cmd.GetDef().GetColumnDef(); col != nil {
-			addPostgresColumn(changes, col)
+			addPostgresColumn(changes, table, col)
 		}
 	case pgproto.AlterTableType_AT_DropColumn:
 		changes.drop(ObjectColumn, cmd.GetName())
@@ -342,7 +392,7 @@ func alterCmdObjectChanges(changes *ObjectChanges, table string, cmd *pgproto.Al
 // columns it covers. A check, and an exclusion constraint with a predicate,
 // read an expression, so they reference the table.
 func addPostgresConstraint(changes *ObjectChanges, table string, c *pgproto.Constraint) {
-	changes.add(ObjectConstraint, c.GetConname())
+	changes.addKey(ObjectConstraint, c.GetConname(), table)
 	if c.GetContype() == pgproto.ConstrType_CONSTR_CHECK || c.GetWhereClause() != nil {
 		changes.reference(ObjectTable, table)
 	}

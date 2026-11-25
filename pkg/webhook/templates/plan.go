@@ -138,8 +138,8 @@ type AttributedChangeData struct {
 	OwnerChanges *ddl.ObjectChanges
 }
 
-// UndoesAttributedWork reports whether a planned change with this statement
-// would undo something the attributed pull request did to its table: drop or
+// UndoesAttributedWork reports whether a planned change, as ReadPlannedChange
+// read its statement, would undo something the attributed pull request did to its table: drop or
 // change an object the owner added, changed or built an index or constraint
 // on, put back an object the owner dropped, or drop the table itself. A change
 // that touches only objects the owner never did is this pull request's own,
@@ -147,26 +147,48 @@ type AttributedChangeData struct {
 // owner, unknown owner changes, a missing parser, or a statement that does not
 // parse) counts as undoing the owner's work, since over-attributing is the
 // safe direction.
-func UndoesAttributedWork(a AttributedChangeData, stmt string, parser ddl.StatementParser) bool {
-	return undoesAttributedWorkOnColumn(a, stmt, parser, "")
+func UndoesAttributedWork(a AttributedChangeData, planned *ddl.ObjectChanges) bool {
+	return undoesOwnerWork(a, planned, "")
 }
 
-// undoesAttributedWorkOnColumn is UndoesAttributedWork for the one finding of a
-// statement that concerns column, so a compound ALTER TABLE whose other
-// clauses undo the owner's work does not lend this finding the owner's note.
-// An empty column, or one the statement does not change, matches the whole
-// statement. Names compare without case, which over-attributes on a dialect
-// whose quoted names keep their case: the safe direction.
-func undoesAttributedWorkOnColumn(a AttributedChangeData, stmt string, parser ddl.StatementParser, column string) bool {
-	if a.Unresolved || a.OwnerChanges == nil || parser == nil || strings.TrimSpace(stmt) == "" {
-		return true
+// ReadPlannedChange reads what a planned statement does to its table's
+// objects, or returns nil when it cannot: no statement, no parser, or a
+// statement the parser rejects. A nil result attributes every finding of the
+// statement to each owner (undoesOwnerWork). Callers read each statement
+// once and match the result against every owner, so a failure is logged once.
+func ReadPlannedChange(table, stmt string, parser ddl.StatementParser) *ddl.ObjectChanges {
+	if parser == nil {
+		slog.Debug("planned change is attributed to every owning pull request because no statement parser is known for its database type",
+			"table", table)
+		return nil
+	}
+	if strings.TrimSpace(stmt) == "" {
+		slog.Debug("planned change is attributed to every owning pull request because it carries no statement",
+			"table", table)
+		return nil
 	}
 	change, err := parser.ObjectChanges(stmt)
 	if err != nil {
-		slog.Warn("planned change is attributed to the owning pull request because its statement's objects could not be read",
-			"table", a.Table, "owner_repo", a.Repository, "owner_pr", a.PullRequest, "error", err)
+		slog.Warn("planned change is attributed to every owning pull request because its statement's objects could not be read",
+			"table", table, "error", err)
+		return nil
+	}
+	return &change
+}
+
+// undoesOwnerWork is UndoesAttributedWork for the one finding of a planned
+// change that concerns column, so a compound ALTER TABLE whose other clauses
+// undo the owner's work does not lend this finding the owner's note. An empty
+// column, or one the statement does not change, matches the whole statement.
+// A nil change is one ReadPlannedChange could not read, and it counts as
+// undoing the owner's work. Objects compare exactly: each parser folds names
+// the way its dialect does before they get here, and only the finding's column
+// name, which comes from the linter, is matched without case.
+func undoesOwnerWork(a AttributedChangeData, planned *ddl.ObjectChanges, column string) bool {
+	if a.Unresolved || a.OwnerChanges == nil || planned == nil {
 		return true
 	}
+	change := *planned
 	if column != "" {
 		if narrowed, ok := narrowToColumn(change, column); ok {
 			change = narrowed
@@ -3419,6 +3441,20 @@ type unsafeAttribution struct {
 	byTable     map[string][]AttributedChangeData
 	parser      ddl.StatementParser
 	commentRepo string
+	// planned caches each planned statement's objects, so a statement is
+	// parsed once per render however many findings and owners consult it.
+	planned map[string]*ddl.ObjectChanges
+}
+
+// plannedChange is what a change's statement does to its table's objects,
+// read once and then reused (ReadPlannedChange).
+func (n *unsafeAttribution) plannedChange(c UnsafeChangeData) *ddl.ObjectChanges {
+	if change, ok := n.planned[c.DDL]; ok {
+		return change
+	}
+	change := ReadPlannedChange(c.Table, c.DDL, n.parser)
+	n.planned[c.DDL] = change
+	return change
 }
 
 // ownersFor is every owner whose work one finding of a change undoes, in the
@@ -3431,10 +3467,15 @@ func (n *unsafeAttribution) ownersFor(c UnsafeChangeData, finding string) []Attr
 	if n == nil || createsItsTable(c) {
 		return nil
 	}
+	attributed := n.byTable[c.Table]
+	if len(attributed) == 0 {
+		return nil
+	}
 	column := c.FindingColumns[finding]
+	planned := n.plannedChange(c)
 	var owners []AttributedChangeData
-	for _, a := range n.byTable[c.Table] {
-		if undoesAttributedWorkOnColumn(a, c.DDL, n.parser, column) {
+	for _, a := range attributed {
+		if undoesOwnerWork(a, planned, column) {
 			owners = append(owners, a)
 		}
 	}
@@ -3490,6 +3531,7 @@ func unsafeAttributionNotes(data PlanCommentData, unsafeShown bool) (*unsafeAttr
 		byTable:     make(map[string][]AttributedChangeData, len(data.AttributedChanges)),
 		parser:      dropStatementParser(data.DatabaseType),
 		commentRepo: data.Repository,
+		planned:     make(map[string]*ddl.ObjectChanges, len(data.UnsafeChanges)),
 	}
 	for _, a := range data.AttributedChanges {
 		notes.byTable[a.Table] = append(notes.byTable[a.Table], a)
