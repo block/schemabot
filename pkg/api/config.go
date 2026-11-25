@@ -22,6 +22,7 @@ import (
 	gomysql "github.com/block/mysql"
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/changeevents"
+	"github.com/block/schemabot/pkg/changeevents/sqspublisher"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
@@ -47,7 +48,8 @@ var configIdentifierPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 // This is loaded from a YAML file specified by SCHEMABOT_CONFIG_FILE.
 type ServerConfig struct {
 	// ChangeEvents asynchronously reports selected operation and apply lifecycle events.
-	ChangeEvents []changeevents.Destination `yaml:"change_events,omitempty"`
+	ChangeEvents    []changeevents.Destination `yaml:"change_events,omitempty"`
+	SQSChangeEvents []sqspublisher.Destination `yaml:"sqs_change_events,omitempty"`
 
 	liveDatabases *liveDatabaseRegistry
 

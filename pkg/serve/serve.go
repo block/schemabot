@@ -31,6 +31,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/changeevents"
+	"github.com/block/schemabot/pkg/changeevents/sqspublisher"
 	"github.com/block/schemabot/pkg/drain"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
@@ -679,7 +680,11 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 	logger.Info("building server", "version", version, "commit", o.commit, "built", o.date)
 
-	events, err := changeevents.New(cfg.ChangeEvents, logger)
+	queues, err := sqspublisher.NewDestinations(ctx, cfg.SQSChangeEvents)
+	if err != nil {
+		return nil, err
+	}
+	events, err := changeevents.NewWithPublishers(cfg.ChangeEvents, queues, logger)
 	if err != nil {
 		return nil, err
 	}

@@ -4,7 +4,7 @@ package sqlstore
 
 import (
 	"database/sql"
-	"io"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/changeevents"
@@ -41,24 +42,29 @@ func TestChangeEventLifecycle(t *testing.T) {
 	})
 }
 
+type renderedChangeEvent struct {
+	Summary json.RawMessage
+	Details changeevents.EventDetails
+}
+
 func testChangeEventLifecycle(t *testing.T, db *sql.DB, newStore func(*sql.DB, ...storage.Option) *Storage) {
 	t.Helper()
 	ctx := t.Context()
-	delivered := make(chan string, 10)
+	delivered := make(chan renderedChangeEvent, 10)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		body, err := io.ReadAll(req.Body)
-		if err != nil {
+		var body renderedChangeEvent
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		delivered <- string(body)
+		delivered <- body
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 	sender, err := changeevents.New([]changeevents.Destination{{
 		URL: server.URL, Environments: []string{"staging"},
 		Events: []string{changeevents.OperationStarted, changeevents.OperationFinished, changeevents.ApplyFinished},
-		Body:   `{"app":{{json .App}},"description":{{json .Description}}}`,
+		Body:   `{"summary":{"app":{{json .App}},"description":{{json .Description}}},"details":{{json .Details}}}`,
 	}}, slog.Default())
 	require.NoError(t, err)
 	defer sender.Close()
@@ -128,13 +134,40 @@ func testChangeEventLifecycle(t *testing.T, db *sql.DB, newStore func(*sql.DB, .
 	}
 	deadline := time.NewTimer(changeEventTestDeadline)
 	defer deadline.Stop()
+	var snapshots []changeevents.EventDetails
 	for _, event := range want {
 		select {
 		case received := <-delivered:
+			snapshots = append(snapshots, received.Details)
 			description := strconv.Quote(event + " https://github.com/org/repo/pull/123")
-			require.JSONEq(t, `{"app":"registered-app","description":`+description+`}`, received)
+			require.JSONEq(t, `{"app":"registered-app","description":`+description+`}`, string(received.Summary))
 		case <-deadline.C:
 			t.Fatalf("did not receive %s", event)
+		}
+	}
+	seen := make(map[string]bool)
+	for i, outcome := range []string{"", "", "completed", "completed"} {
+		details := snapshots[i]
+		require.NoError(t, uuid.Validate(details.EventID))
+		require.False(t, seen[details.EventID])
+		seen[details.EventID] = true
+		require.Equal(t, apply.ApplyIdentifier, details.ApplyID)
+		require.Equal(t, apply.Database, details.Database)
+		require.Equal(t, apply.DatabaseType, details.DatabaseType)
+		require.Equal(t, apply.Repository, details.Repository)
+		require.Equal(t, apply.PullRequest, details.PullRequest)
+		require.Equal(t, outcome, details.Outcome)
+		if i < 3 {
+			require.Equal(t, opID, details.OperationID)
+			require.Equal(t, "local-engine", details.Deployment)
+			require.Equal(t, []int{1, 2, 2}[i], details.Attempt)
+			require.True(t, details.CompletedAt.IsZero())
+		} else {
+			require.Zero(t, details.OperationID)
+			saved, err := store.Applies().Get(ctx, apply.ID)
+			require.NoError(t, err)
+			require.NotNil(t, saved.CompletedAt)
+			require.True(t, saved.CompletedAt.Equal(details.CompletedAt))
 		}
 	}
 	audit, err = store.ApplyLogs().GetByApply(ctx, apply.ID)
@@ -149,7 +182,7 @@ func testChangeEventLifecycle(t *testing.T, db *sql.DB, newStore func(*sql.DB, .
 	require.NoError(t, store.Applies().Update(ctx, cancelled))
 	select {
 	case received := <-delivered:
-		require.JSONEq(t, `{"app":"registered-app","description":"apply.finished apply=apply_cancelled outcome=cancelled https://github.com/org/repo/pull/123"}`, received)
+		require.JSONEq(t, `{"app":"registered-app","description":"apply.finished apply=apply_cancelled outcome=cancelled https://github.com/org/repo/pull/123"}`, string(received.Summary))
 	case <-deadline.C:
 		t.Fatal("cancelling before dispatch did not publish an aggregate outcome")
 	}
@@ -191,7 +224,7 @@ func testChangeEventLifecycle(t *testing.T, db *sql.DB, newStore func(*sql.DB, .
 	select {
 	case received := <-delivered:
 		description := strconv.Quote("operation.finished apply=apply_remote_copy operation=" + strconv.FormatInt(remoteOpID, 10) + " deployment=remote-engine attempt=1 outcome=completed")
-		require.JSONEq(t, `{"app":"events-app","description":`+description+`}`, received)
+		require.JSONEq(t, `{"app":"events-app","description":`+description+`}`, string(received.Summary))
 	case <-deadline.C:
 		t.Fatal("a recovered worker that reached the engine did not report its finish")
 	}
@@ -205,7 +238,7 @@ func testChangeEventLifecycle(t *testing.T, db *sql.DB, newStore func(*sql.DB, .
 // A parent-lease retry can record the same failed_retryable state even after
 // the next attempt has reached the engine. A rollout can likewise settle while
 // its parent already says failed, but only a winning state swap can report it.
-func testRetryAndRolloutFinishEvents(t *testing.T, store *Storage, delivered <-chan string) {
+func testRetryAndRolloutFinishEvents(t *testing.T, store *Storage, delivered <-chan renderedChangeEvent) {
 	t.Helper()
 	ctx := t.Context()
 	now := time.Now()
@@ -305,7 +338,7 @@ func testRetryAndRolloutFinishEvents(t *testing.T, store *Storage, delivered <-c
 		select {
 		case received := <-delivered:
 			description := strconv.Quote(want + " https://github.com/org/repo/pull/123")
-			require.JSONEq(t, `{"app":"registered-app","description":`+description+`}`, received)
+			require.JSONEq(t, `{"app":"registered-app","description":`+description+`}`, string(received.Summary))
 		case <-deadline.C:
 			t.Fatalf("did not receive %s", want)
 		}

@@ -38,6 +38,25 @@ type Event struct {
 	Environment     string
 	OccurredAtNanos int64
 	Description     string
+	// Details holds structured lifecycle fields for publishers. HTTP templates
+	// that encode the entire event retain their existing JSON representation.
+	Details EventDetails `json:"-"`
+}
+
+// EventDetails identifies the apply, and the operation attempt when applicable.
+// EventID is shared by all destinations that receive this event.
+type EventDetails struct {
+	EventID      string    `json:"event_id"`
+	ApplyID      string    `json:"id"`
+	Database     string    `json:"database"`
+	DatabaseType string    `json:"database_type"`
+	Repository   string    `json:"repository,omitempty"`
+	PullRequest  int       `json:"pull_request,omitempty"`
+	Outcome      string    `json:"outcome,omitempty"`
+	CompletedAt  time.Time `json:"completed_at,omitzero"`
+	OperationID  int64     `json:"operation_id,omitempty"`
+	Deployment   string    `json:"deployment,omitempty"`
+	Attempt      int       `json:"attempt,omitempty"`
 }
 
 // Publisher sends one encoded JSON payload. Publish respects ctx and returns
