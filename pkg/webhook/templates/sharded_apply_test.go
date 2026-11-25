@@ -405,6 +405,46 @@ func TestRenderShardedApplySummaryComment_CompletedCollapsesDetail(t *testing.T)
 	assert.Contains(t, failed, "#### Keyspace `cdb_resolute_sharded`")
 }
 
+// A completed sharded apply across two keyspaces folds both keyspace sections
+// into one collapsed block, labelled with the tables of both.
+func TestRenderShardedApplySummaryComment_CompletedCollapsesEveryKeyspace(t *testing.T) {
+	completed := []ShardStatus{{Shard: "-80", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed}}
+	out := RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Completed, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{
+			{Keyspace: "cdb_resolute_sharded", Shards: completed, Cells: []ShardCell{mutesCell("-80")}},
+			{Keyspace: "cdb_resolute_lookup", Shards: completed, Cells: []ShardCell{{Shard: "-80", Table: "mutes_lookup", Statements: []string{mutesDDL}}}},
+		},
+	})
+
+	const label = "<details><summary>Apply details (2 tables)</summary>"
+	require.Contains(t, out, label)
+	assert.Equal(t, 1, strings.Count(out, "<details><summary>Apply details ("), "both keyspaces share one block")
+	open := strings.Index(out, label)
+	closeAt := strings.LastIndex(out, "</details>")
+	for _, keyspace := range []string{"cdb_resolute_sharded", "cdb_resolute_lookup"} {
+		section := strings.Index(out, "#### Keyspace `"+keyspace+"`")
+		assert.Greater(t, section, open, "keyspace %s is inside the block", keyspace)
+		assert.Less(t, section, closeAt, "keyspace %s is inside the block", keyspace)
+	}
+}
+
+// A completed sharded apply with no table and no VSchema detail has nothing to
+// fold, so its summary carries no empty collapsed block.
+func TestRenderShardedApplySummaryComment_CompletedWithNoDetailStaysExpanded(t *testing.T) {
+	out := RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Completed, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: oneKeyspace([]ShardStatus{
+			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+		}, nil),
+	})
+
+	assert.NotContains(t, out, "<details>")
+	assert.NotContains(t, out, "Apply details (")
+}
+
 // A completed rollback's terminal summary keeps the rollback vocabulary in both
 // the header and the outcome line.
 func TestRenderShardedApplySummaryComment_Rollback(t *testing.T) {
@@ -419,6 +459,10 @@ func TestRenderShardedApplySummaryComment_Rollback(t *testing.T) {
 
 	assert.Contains(t, out, "Rolled back successfully — the schema change has been reverted.")
 	assert.NotContains(t, out, "Schema Change Status")
+
+	const label = "<details><summary>Apply details (1 table)</summary>"
+	require.Contains(t, out, label, "a completed rollback folds its detail like a completed apply")
+	assert.Greater(t, strings.Index(out, "#### Keyspace `cdb_resolute_sharded`"), strings.Index(out, label))
 }
 
 // A cancelled sharded apply's terminal summary is permanent: it offers no
