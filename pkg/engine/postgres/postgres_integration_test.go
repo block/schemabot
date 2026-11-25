@@ -1036,8 +1036,8 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	assert.Contains(t, change.ModeReason, `statement for table "users":`)
 	assert.Contains(t, change.ModeReason, "1-byte threshold")
 	assert.Contains(t, change.ModeReason, "SchemaBot's ceiling for a native-safe apply")
-	// The blocked table still shows the size the ceiling measured; the
-	// refusal carries no row estimate, so the row count is omitted.
+	// The blocked table still shows the size the ceiling measured. It has
+	// never been analyzed, so the row count is omitted rather than zero.
 	var size int64
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT pg_catalog.pg_total_relation_size('public.users'::regclass)").Scan(&size))
 	assert.Equal(t, &size, change.EstimatedBytes)
@@ -1105,8 +1105,8 @@ func TestEnginePlanOversizedTableAdmitsConcurrentIndex(t *testing.T) {
 
 // An index build on a table over the native-safe ceiling stays executable,
 // and its plan carries the size the ceiling measured, so the operator sees how
-// large a table the build has to read. The ceiling's refusal carries no row
-// estimate, so the row count is left out rather than reported as zero.
+// large a table the build has to read. The table has been analyzed, so the
+// plan carries the row estimate the ceiling read in the same lookup.
 func TestEnginePlanOversizedIndexBuildCarriesItsSize(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_oversized_index_size_test")
 	_, err := db.ExecContext(t.Context(), `
@@ -1134,7 +1134,7 @@ func TestEnginePlanOversizedIndexBuildCarriesItsSize(t *testing.T) {
 	var size int64
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT pg_catalog.pg_total_relation_size('public.users'::regclass)").Scan(&size))
 	assert.Equal(t, &size, index.EstimatedBytes)
-	assert.Nil(t, index.EstimatedRows)
+	assert.Equal(t, new(int64(1000)), index.EstimatedRows)
 }
 
 // TestEnginePlanOversizedTableIndexOnlyDiffHasNoBlockedChange proves the
