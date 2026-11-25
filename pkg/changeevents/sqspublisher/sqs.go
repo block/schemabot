@@ -49,7 +49,8 @@ func NewDestinations(ctx context.Context, queues []Destination) ([]changeevents.
 			o.RetryMaxAttempts = 1
 		})
 		destinations = append(destinations, changeevents.PublisherDestination{
-			Events: queue.Events, Environments: queue.Environments,
+			ConfigPath: fmt.Sprintf("sqs_change_events[%d]", i),
+			Events:     queue.Events, Environments: queue.Environments,
 			Encode: encode, Publisher: &publisher{client: client, queueURL: queue.QueueURL},
 		})
 	}

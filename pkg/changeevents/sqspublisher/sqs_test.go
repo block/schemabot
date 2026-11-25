@@ -126,3 +126,17 @@ func TestSQSConfig(t *testing.T) {
 		require.ErrorContains(t, err, "sqs_change_events[0]")
 	}
 }
+
+func TestSQSFilterErrorWithHTTPDestination(t *testing.T) {
+	t.Setenv("AWS_REGION", "us-east-1")
+	queues, err := NewDestinations(t.Context(), []Destination{{
+		QueueURL: queueURL, Environments: []string{"prod"}, Events: []string{"apply.unknown"},
+	}})
+	require.NoError(t, err)
+	hooks := []changeevents.Destination{{
+		URL: "https://example.com/hook", Environments: []string{"prod"},
+		Events: []string{changeevents.ApplyFinished}, Body: "{}",
+	}}
+	_, err = changeevents.NewWithPublishers(hooks, queues, slog.Default())
+	require.EqualError(t, err, `sqs_change_events[0]: unknown event "apply.unknown"`)
+}

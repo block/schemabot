@@ -1092,7 +1092,13 @@ An `apply.finished` message for a successful apply looks like this:
 }
 ```
 
-Use `event_id` to deduplicate and `id` to correlate events for an apply. Apply
+Use `event_id` to deduplicate deliveries. With a local worker, operation events
+and the control plane’s `apply.finished` event share the same apply `id`. With a
+remote worker, operation events carry the worker’s apply ID and `apply.finished`
+carries the control plane’s apply ID. Joining on `id` only correlates events
+within the same apply record.
+
+Apply
 outcomes include `completed`, `failed`, `cancelled`, and `reverted`. Consumers
 that react only to successful schema changes should select `outcome == "completed"`.
 `occurred_at_nanos` is when the hook observed the event. `completed_at` is the
