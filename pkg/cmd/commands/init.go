@@ -265,6 +265,15 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 		// ignore_tables, so the baseline is verified with them withheld.
 		exclusions = plan.exclusions
 		skipped = plan.skipped
+	} else {
+		// The reused config keeps its own ignore_tables, and verification
+		// below fails if it does not withhold every skipped table. The
+		// tables are disclosed either way, so a rerun reports them as the
+		// first run did.
+		skipped, err = pulledSkippedTables(sortedPulledNamespaces(pulled), pulled.Namespaces)
+		if err != nil {
+			return nil, err
+		}
 	}
 	cmd.reportProgress("Checking that your schema files match...")
 	// The baseline is verified on every rollout member's plan, the way
