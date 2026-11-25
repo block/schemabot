@@ -32,26 +32,29 @@ func validatesConstraint(sql string) (bool, error) {
 }
 
 // stepValidationMetadata returns the metadata one rendered step of a planned
-// statement carries when the planner validates a live NOT VALID constraint
-// in place. Only the VALIDATE CONSTRAINT step carries the record. The
-// validation step of a newly added constraint carries none: the step before
-// it in the same plan added that constraint.
-func stepValidationMetadata(statement pgplan.Statement, sql string) (map[string]string, error) {
-	if statement.Validates == nil {
-		return nil, nil
-	}
+// statement carries when that step is a VALIDATE CONSTRAINT: the planner's
+// record of the constraint it validates. The planner records one for a live
+// NOT VALID constraint it validates in place, and for a constraint it adds
+// NOT VALID and validates in a later step, since that step can run apart
+// from its add after a retry or a resume. unrecorded is set for a VALIDATE
+// CONSTRAINT step that carries no record, which the apply could not check
+// and the caller blocks.
+func stepValidationMetadata(statement pgplan.Statement, sql string) (metadata map[string]string, unrecorded bool, err error) {
 	validates, err := validatesConstraint(sql)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !validates {
-		return nil, nil
+		return nil, false, nil
+	}
+	if statement.Validates == nil {
+		return nil, true, nil
 	}
 	raw, err := json.Marshal(*statement.Validates)
 	if err != nil {
-		return nil, fmt.Errorf("encode the reviewed validation of constraint %q: %w", statement.Validates.Constraint, err)
+		return nil, false, fmt.Errorf("encode the reviewed validation of constraint %q: %w", statement.Validates.Constraint, err)
 	}
-	return map[string]string{reviewedValidationMetadataKey: string(raw)}, nil
+	return map[string]string{reviewedValidationMetadataKey: string(raw)}, false, nil
 }
 
 // reviewedValidationFromMetadata reads back the record stepValidationMetadata

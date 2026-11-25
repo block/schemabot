@@ -349,9 +349,14 @@ func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, database, nam
 			if _, ok := rendered[table]; !ok {
 				continue
 			}
-			if err := unwrittenIncomingForeignKeysError(namespace, table, results[i].incoming, written); err != nil {
+			unwritten, err := unwrittenIncomingForeignKeys(ctx, pool, namespace, results[i].incoming, written)
+			if err != nil {
+				return nil, nil, err
+			}
+			if len(unwritten) > 0 {
 				delete(rendered, table)
-				renderErrors = append(renderErrors, err)
+				detail := fmt.Sprintf("%s: %s", errUnwrittenReferencingTable, strings.Join(unwritten, ", "))
+				renderErrors = append(renderErrors, &tableRefusal{namespace: namespace, table: table, detail: detail, reason: detail, cause: errUnwrittenReferencingTable})
 			}
 		}
 	}
@@ -364,25 +369,50 @@ func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, database, nam
 // would not carry the relationship.
 var errUnwrittenReferencingTable = errors.New("referenced by a foreign key on a table this pull does not write")
 
-// unwrittenIncomingForeignKeysError names every incoming foreign key of the
-// table that lives outside the pulled files: on a table in another schema,
-// which a desired file cannot reference, or on a table in this schema that
-// has no file of its own, such as a partition or an extension-owned table.
-func unwrittenIncomingForeignKeysError(namespace, table string, incoming []schemadiff.IncomingForeignKey, written map[string]bool) error {
+// unwrittenIncomingForeignKeys describes every incoming foreign key that lives
+// outside the pulled files, with what the operator can do about it: a key on
+// a table in another schema, which a desired file cannot reference; a key on
+// a partition, which belongs on the partitioned parent; or a key on another
+// table in this schema that has no file of its own, such as one an extension
+// owns. It fails only when the catalog cannot say whether the referencing
+// table is a partition.
+func unwrittenIncomingForeignKeys(ctx context.Context, pool *pgxpool.Pool, namespace string, incoming []schemadiff.IncomingForeignKey, written map[string]bool) ([]string, error) {
 	var unwritten []string
 	for _, fk := range incoming {
+		name := foreignKeyName(namespace, fk)
 		switch {
 		case fk.Schema != namespace:
-			unwritten = append(unwritten, fmt.Sprintf("%s.%s.%s (another schema)", fk.Schema, fk.Table, fk.Constraint))
-		case !written[fk.Table]:
-			unwritten = append(unwritten, fmt.Sprintf("%s.%s.%s (no schema file of its own)", fk.Schema, fk.Table, fk.Constraint))
+			unwritten = append(unwritten, name+" (in another schema; a schema file cannot reference it)")
+		case written[fk.Table]:
+			// The key is declared in its referencing table's file, which this pull writes.
+		default:
+			partition, err := isPostgresPartition(ctx, pool, fk.Schema, fk.Table)
+			if err != nil {
+				return nil, err
+			}
+			if partition {
+				unwritten = append(unwritten, name+" (on a partition; declare the key on the partitioned parent)")
+			} else {
+				unwritten = append(unwritten, name+" (on a table this pull does not write, such as one an extension owns; remove the key)")
+			}
 		}
 	}
-	if len(unwritten) == 0 {
-		return nil
+	return unwritten, nil
+}
+
+const postgresTableIsPartition = `
+SELECT c.relispartition
+FROM pg_catalog.pg_class AS c
+JOIN pg_catalog.pg_namespace AS n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+WHERE n.nspname OPERATOR(pg_catalog.=) $1 AND c.relname OPERATOR(pg_catalog.=) $2`
+
+// isPostgresPartition reports whether the table is a partition of another.
+func isPostgresPartition(ctx context.Context, pool *pgxpool.Pool, schema, table string) (bool, error) {
+	var partition bool
+	if err := pool.QueryRow(ctx, postgresTableIsPartition, schema, table).Scan(&partition); err != nil {
+		return false, fmt.Errorf("check whether PostgreSQL table %q in schema %q is a partition: %w", table, schema, err)
 	}
-	detail := fmt.Sprintf("%s: %s", errUnwrittenReferencingTable, strings.Join(unwritten, ", "))
-	return &tableRefusal{namespace: namespace, table: table, detail: detail, reason: detail, cause: errUnwrittenReferencingTable}
+	return partition, nil
 }
 
 // renderPostgresTable renders one table for a baseline. A refusal the

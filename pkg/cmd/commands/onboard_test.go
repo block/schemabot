@@ -1265,3 +1265,62 @@ func TestBuildOnboardWritePlanRefusesASkippedTableThatReadsAsAPattern(t *testing
 	require.ErrorContains(t, err, "ignore_tables would read its name as a pattern")
 	assert.NoFileExists(t, filepath.Join(root, "schemabot.yaml"))
 }
+
+// A skipped table whose name ignore_tables does not accept as an entry, such
+// as one with a slash or surrounding whitespace, would leave a config no plan
+// can read. Onboarding refuses before writing anything.
+func TestBuildOnboardWritePlanRefusesASkippedTableIgnoreTablesCannotName(t *testing.T) {
+	for _, name := range []string{"audit/log", " audit_log"} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			_, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+				Database: "app", Type: "postgres", Environment: "development",
+				Namespaces: map[string]*apitypes.PulledNamespace{
+					"public": {
+						Tables:        map[string]string{"orders": "CREATE TABLE orders (id bigint PRIMARY KEY);\n"},
+						SkippedTables: []apitypes.SkippedTable{{Table: name, Reason: "unlogged tables cannot be rendered as a desired schema"}},
+					},
+				},
+			}, client.PlanExclusions{})
+			require.ErrorContains(t, err, "onboarding refused; no files were written")
+			require.ErrorContains(t, err, "ignore_tables cannot name it")
+			assert.NoFileExists(t, filepath.Join(root, "schemabot.yaml"))
+		})
+	}
+}
+
+// A table onboarded earlier that has since gained something schema files
+// cannot describe is skipped and withheld on the next onboard. Its leftover
+// file is reported with the withheld tables, whose remedy is deleting it, not
+// as a missing table to restore.
+func TestOnboardWritePlanSeparatesASkippedTablesLeftoverFile(t *testing.T) {
+	root := t.TempDir()
+	before, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database: "app", Type: "postgres", Environment: "development",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"public": {Tables: map[string]string{
+				"orders":   "CREATE TABLE orders (id bigint PRIMARY KEY);\n",
+				"accounts": "CREATE TABLE accounts (id bigint PRIMARY KEY);\n",
+			}},
+		},
+	}, client.PlanExclusions{})
+	require.NoError(t, err)
+	require.NoError(t, before.write())
+
+	after, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database: "app", Type: "postgres", Environment: "development",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"public": {
+				Tables:        map[string]string{"orders": "CREATE TABLE orders (id bigint PRIMARY KEY);\n"},
+				SkippedTables: []apitypes.SkippedTable{{Table: "accounts", Reason: "schema files cannot describe its trigger"}},
+			},
+		},
+	}, client.PlanExclusions{})
+	require.NoError(t, err)
+	require.NoError(t, after.write())
+
+	strays, withheldStrays, err := after.strayFiles()
+	require.NoError(t, err)
+	assert.Empty(t, strays, "the leftover file is not an absent table to restore")
+	assert.Equal(t, []string{filepath.Join(root, "public", "accounts.sql")}, withheldStrays)
+}

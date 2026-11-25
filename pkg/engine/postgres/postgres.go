@@ -590,7 +590,7 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("record the reviewed drop for table %q: %w", report.Table, err)
 			}
-			validationMetadata, err := stepValidationMetadata(statement, sql)
+			validationMetadata, unrecordedValidation, err := stepValidationMetadata(statement, sql)
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("record the reviewed validation for table %q: %w", report.Table, err)
 			}
@@ -604,6 +604,10 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 			if unrecordedDrop && stepMode == "" {
 				stepMode = engine.ExecutionModeBlocked
 				stepReason = fmt.Sprintf("statement for table %q drops an object the planner did not record, so the apply cannot check that it is still the object this plan reviewed; make the change outside SchemaBot", table)
+			}
+			if unrecordedValidation && stepMode == "" {
+				stepMode = engine.ExecutionModeBlocked
+				stepReason = fmt.Sprintf("statement for table %q validates a constraint the planner did not record, so the apply cannot check that it is still the constraint this plan reviewed; make the change outside SchemaBot", table)
 			}
 			// Verdict reasons quote the table name, a planner-sourced
 			// identifier, so the reserved cause separator is neutralized

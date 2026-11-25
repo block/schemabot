@@ -254,11 +254,7 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		return nil, fmt.Errorf("locate environment schema root %s under %s: %w", environmentRoot, root, err)
 	}
 
-	namespaces := make([]string, 0, len(resp.Namespaces))
-	for namespace := range resp.Namespaces {
-		namespaces = append(namespaces, namespace)
-	}
-	sort.Strings(namespaces)
+	namespaces := sortedPulledNamespaces(resp)
 	if err := rejectCaseCollisions("namespace", namespaces); err != nil {
 		return nil, err
 	}
@@ -659,6 +655,16 @@ func (p *onboardWritePlan) printExclusionDisclosure() {
 	}
 }
 
+// sortedPulledNamespaces returns the namespaces a pull answered, in order.
+func sortedPulledNamespaces(resp *apitypes.PullSchemaResponse) []string {
+	namespaces := make([]string, 0, len(resp.Namespaces))
+	for namespace := range resp.Namespaces {
+		namespaces = append(namespaces, namespace)
+	}
+	sort.Strings(namespaces)
+	return namespaces
+}
+
 // skippedTableGroup is the tables a pull skipped in one namespace.
 type skippedTableGroup struct {
 	Namespace string
@@ -666,9 +672,11 @@ type skippedTableGroup struct {
 }
 
 // pulledSkippedTables collects the tables the pull skipped, by namespace in
-// order. Each goes into ignore_tables under its own name, so a name that reads
-// as an ignore_tables pattern is refused: the entry would withhold every table
-// the pattern matches, not the one table.
+// order. Each goes into ignore_tables under its own name, so a name that
+// reads as an ignore_tables pattern is refused, since the entry would
+// withhold every table the pattern matches, not the one table. So is a name
+// ignore_tables does not accept as an entry, which would leave a config no
+// plan can read. Both refusals come before any file is written.
 func pulledSkippedTables(namespaces []string, pulled map[string]*apitypes.PulledNamespace) ([]skippedTableGroup, error) {
 	var groups []skippedTableGroup
 	for _, namespace := range namespaces {
@@ -680,6 +688,10 @@ func pulledSkippedTables(namespaces []string, pulled map[string]*apitypes.Pulled
 			if schema.IsIgnoreTablePattern(table.Table) {
 				return nil, fmt.Errorf("onboarding refused; no files were written. Schema files cannot describe table %s in namespace %q (%s), and ignore_tables would read its name as a pattern. Rename the table, then onboard again",
 					schema.QuoteIgnoreTablesEntry(table.Table), namespace, table.Reason)
+			}
+			if err := schema.ValidateIgnoreTables([]string{table.Table}); err != nil {
+				return nil, fmt.Errorf("onboarding refused; no files were written. Schema files cannot describe table %s in namespace %q (%s), and ignore_tables cannot name it: %w. Rename the table, then onboard again",
+					schema.QuoteIgnoreTablesEntry(table.Table), namespace, table.Reason, err)
 			}
 		}
 		groups = append(groups, skippedTableGroup{Namespace: namespace, Tables: ns.SkippedTables})
@@ -701,14 +713,21 @@ func ignoreSkippedTables(entries []string, groups []skippedTableGroup) []string 
 	return out
 }
 
-// withheldTableFilePaths returns the file each withheld table would have been
-// written to. A repository onboarded before an entry was added still carries
-// those files, and they are strays this pull deliberately did not write.
+// withheldTableFilePaths returns the file each withheld or skipped table
+// would have been written to. A repository onboarded before an entry was
+// added, or before a table gained something schema files cannot describe,
+// still carries those files, and they are strays this pull deliberately did
+// not write.
 func (p *onboardWritePlan) withheldTableFilePaths() map[string]bool {
 	paths := make(map[string]bool)
 	for _, group := range p.withheld {
 		for _, table := range group.Tables {
 			paths[filepath.Join(p.namespacePrefix, group.Namespace, table+".sql")] = true
+		}
+	}
+	for _, group := range p.skipped {
+		for _, table := range group.Tables {
+			paths[filepath.Join(p.namespacePrefix, group.Namespace, table.Table+".sql")] = true
 		}
 	}
 	return paths
