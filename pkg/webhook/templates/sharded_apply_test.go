@@ -366,6 +366,85 @@ func TestRenderShardedApplySummaryComment_FailedSurfacesErrorAndRetry(t *testing
 	assert.Contains(t, out, "To retry:")
 }
 
+// A completed sharded apply's summary has the regular summary's shape: the
+// outcome and shard counts stay in view, and the keyspace, table, DDL, and
+// VSchema detail folds into a collapsed block labelled the way the regular
+// summary labels it. A failed one leaves that detail open, since it is where
+// the reader finds which shard to look at.
+func TestRenderShardedApplySummaryComment_CompletedCollapsesDetail(t *testing.T) {
+	shards := []ShardStatus{
+		{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+		{Shard: "80-", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+	}
+	cells := []ShardCell{mutesCell("-40"), mutesCell("80-")}
+	out := RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Completed, Environment: "staging", Database: "cdb_resolute",
+		ApplyID:        "apply-x",
+		Keyspaces:      oneKeyspace(shards, cells),
+		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "applied"}},
+	})
+
+	const label = "<details><summary>Apply details (1 table, 1 VSchema update)</summary>"
+	require.Contains(t, out, label)
+	open := strings.Index(out, label)
+	assert.Less(t, strings.Index(out, "**Shards**: 2 completed"), open, "shard counts stay above the collapsed detail")
+	assert.Greater(t, strings.Index(out, "#### Keyspace `cdb_resolute_sharded`"), open, "the keyspace section is inside the block")
+	assert.Greater(t, strings.Index(out, "### VSchema"), open, "the VSchema section is inside the block")
+	assert.Greater(t, strings.LastIndex(out, "</details>"), strings.Index(out, "### VSchema"), "the block closes after the VSchema section")
+	assert.Equal(t, label, "<details><summary>"+completedSummaryDetailsLabel(ApplyStatusCommentData{
+		Tables:         []TableProgressData{{Namespace: "cdb_resolute_sharded", TableName: "mutes"}},
+		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded"}},
+	})+"</summary>", "a sharded summary labels its detail the way a regular one does")
+
+	shards[0] = ShardStatus{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: "boom"}
+	failed := RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Failed, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x", Keyspaces: oneKeyspace(shards, cells),
+	})
+	assert.NotContains(t, failed, "Apply details (", "a failed summary keeps its detail open")
+	assert.Contains(t, failed, "#### Keyspace `cdb_resolute_sharded`")
+}
+
+// A completed sharded apply across two keyspaces folds both keyspace sections
+// into one collapsed block, labelled with the tables of both.
+func TestRenderShardedApplySummaryComment_CompletedCollapsesEveryKeyspace(t *testing.T) {
+	completed := []ShardStatus{{Shard: "-80", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed}}
+	out := RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Completed, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{
+			{Keyspace: "cdb_resolute_sharded", Shards: completed, Cells: []ShardCell{mutesCell("-80")}},
+			{Keyspace: "cdb_resolute_lookup", Shards: completed, Cells: []ShardCell{{Shard: "-80", Table: "mutes_lookup", Statements: []string{mutesDDL}}}},
+		},
+	})
+
+	const label = "<details><summary>Apply details (2 tables)</summary>"
+	require.Contains(t, out, label)
+	assert.Equal(t, 1, strings.Count(out, "<details><summary>Apply details ("), "both keyspaces share one block")
+	open := strings.Index(out, label)
+	closeAt := strings.LastIndex(out, "</details>")
+	for _, keyspace := range []string{"cdb_resolute_sharded", "cdb_resolute_lookup"} {
+		section := strings.Index(out, "#### Keyspace `"+keyspace+"`")
+		assert.Greater(t, section, open, "keyspace %s is inside the block", keyspace)
+		assert.Less(t, section, closeAt, "keyspace %s is inside the block", keyspace)
+	}
+}
+
+// A completed sharded apply with no table and no VSchema detail has nothing to
+// fold, so its summary carries no empty collapsed block.
+func TestRenderShardedApplySummaryComment_CompletedWithNoDetailStaysExpanded(t *testing.T) {
+	out := RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Completed, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: oneKeyspace([]ShardStatus{
+			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+		}, nil),
+	})
+
+	assert.NotContains(t, out, "<details>")
+	assert.NotContains(t, out, "Apply details (")
+}
+
 // A completed rollback's terminal summary keeps the rollback vocabulary in both
 // the header and the outcome line.
 func TestRenderShardedApplySummaryComment_Rollback(t *testing.T) {
@@ -380,6 +459,10 @@ func TestRenderShardedApplySummaryComment_Rollback(t *testing.T) {
 
 	assert.Contains(t, out, "Rolled back successfully — the schema change has been reverted.")
 	assert.NotContains(t, out, "Schema Change Status")
+
+	const label = "<details><summary>Apply details (1 table)</summary>"
+	require.Contains(t, out, label, "a completed rollback folds its detail like a completed apply")
+	assert.Greater(t, strings.Index(out, "#### Keyspace `cdb_resolute_sharded`"), strings.Index(out, label))
 }
 
 // A cancelled sharded apply's terminal summary is permanent: it offers no

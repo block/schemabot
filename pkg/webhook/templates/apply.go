@@ -1742,12 +1742,20 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 }
 
 func completedSummaryDetailsLabel(data ApplyStatusCommentData) string {
+	return applyDetailsLabel(len(data.Tables), progressUnit(data.Tables), len(data.VSchemaChanges))
+}
+
+// applyDetailsLabel is the summary line of a completed apply's collapsed
+// detail block, shared by every apply shape so a sharded summary and a
+// regular one word it the same way: the changes counted in unit ("table" or
+// "statement"), then the VSchema updates.
+func applyDetailsLabel(changes int, unit string, vschemaUpdates int) string {
 	var parts []string
-	if len(data.Tables) > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s", len(data.Tables), pluralize(progressUnit(data.Tables), len(data.Tables))))
+	if changes > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", changes, pluralize(unit, changes)))
 	}
-	if len(data.VSchemaChanges) > 0 {
-		parts = append(parts, fmt.Sprintf("%d VSchema %s", len(data.VSchemaChanges), pluralize("update", len(data.VSchemaChanges))))
+	if vschemaUpdates > 0 {
+		parts = append(parts, fmt.Sprintf("%d VSchema %s", vschemaUpdates, pluralize("update", vschemaUpdates)))
 	}
 	return fmt.Sprintf("Apply details (%s)", strings.Join(parts, ", "))
 }
