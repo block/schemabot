@@ -718,6 +718,9 @@ func ExitWithJSON(code, message string) error {
 
 // LockInfo represents lock information returned from the API.
 type LockInfo struct {
+	// ID identifies the lock row. It is zero from a server that does not
+	// report it.
+	ID           int64     `json:"id"`
 	Database     string    `json:"database"`
 	DatabaseType string    `json:"database_type"`
 	Owner        string    `json:"owner"`
@@ -854,6 +857,55 @@ func ReleaseLock(endpoint, database, dbType, owner string) error {
 	return err
 }
 
+// ReleaseLockIfUnused releases the lock row id, the row a lock acquire
+// reported, under owner, only while no apply that can still change runs under
+// it. It returns ErrLockNotFound when no lock is held, ErrLockReplaced when a
+// different lock now holds the database, ErrLockNotOwned when the row is held
+// under another owner, and a *LockInUseError naming the apply that kept the
+// lock. Every refusal leaves the lock held now as it is.
+func ReleaseLockIfUnused(endpoint, database, dbType, owner string, id int64) error {
+	err := doSendBody(endpoint, http.MethodDelete, "/api/locks", map[string]any{
+		"database":      database,
+		"database_type": dbType,
+		"owner":         owner,
+		"id":            id,
+	})
+	apiErr, ok := errors.AsType[*APIError](err)
+	if !ok {
+		return err
+	}
+	switch {
+	case apiErr.Status == http.StatusForbidden && apiErr.ErrorCode == apitypes.ErrCodeLockNotOwned:
+		return ErrLockNotOwned
+	case apiErr.Status == http.StatusNotFound:
+		return ErrLockNotFound
+	case apiErr.Status == http.StatusConflict && apiErr.ErrorCode == apitypes.ErrCodeLockReplaced:
+		return ErrLockReplaced
+	case apiErr.Status == http.StatusConflict && apiErr.ErrorCode == apitypes.ErrCodeLockInUse:
+		inUse := &LockInUseError{}
+		if apiErr.LockHolder != nil {
+			inUse.Holder = *apiErr.LockHolder
+		}
+		return inUse
+	default:
+		return err
+	}
+}
+
+// LockInUseError is a release that kept the lock because an apply that can
+// still change runs under it. Holder names that apply; it is empty when the
+// server did not name it.
+type LockInUseError struct {
+	Holder apitypes.LockHolder
+}
+
+func (e *LockInUseError) Error() string {
+	if e.Holder.ApplyID == "" {
+		return "lock is in use by an apply"
+	}
+	return fmt.Sprintf("lock is in use by apply %s (%s)", e.Holder.ApplyID, e.Holder.State)
+}
+
 // ForceReleaseLock releases a lock regardless of owner (admin override).
 func ForceReleaseLock(endpoint, database, dbType string) error {
 	err := doSendBody(endpoint, http.MethodDelete, "/api/locks", map[string]any{
@@ -899,6 +951,7 @@ var (
 	ErrLockHeld     = fmt.Errorf("lock is already held by another owner")
 	ErrLockNotOwned = fmt.Errorf("lock is not owned by you")
 	ErrLockNotFound = fmt.Errorf("lock not found")
+	ErrLockReplaced = fmt.Errorf("lock was released and taken again since")
 )
 
 // StatusOptions controls the status list request.

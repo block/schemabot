@@ -59,7 +59,7 @@ func gateApplyServer(t *testing.T, status int, body any) (*httptest.Server, *[]a
 		case "POST /api/plan":
 			assert.NoError(t, json.NewEncoder(w).Encode(plan))
 		case "POST /api/locks/acquire":
-			_, _ = w.Write([]byte(`{"lock":{"database":"testdb","database_type":"mysql"},"created":true}`))
+			_, _ = w.Write([]byte(acquireCreatedLock))
 		case "POST /api/apply":
 			var req apitypes.ApplyRequest
 			assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))

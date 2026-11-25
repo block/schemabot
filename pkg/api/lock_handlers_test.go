@@ -199,6 +199,9 @@ type memoryLockStore struct {
 	// getError, when set, fails every read of the lock.
 	getError error
 	lastID   int64
+	// applyUsingLock, when set, is an apply that can still change and records
+	// its LockID as its lock, so ReleaseByIDIfUnused keeps that row.
+	applyUsingLock *storage.Apply
 }
 
 func (s *memoryLockStore) holds(database, dbType string) bool {
@@ -266,6 +269,28 @@ func (s *memoryLockStore) ReleaseByID(_ context.Context, id int64, database, dbT
 	}
 	if s.lock.PendingPlanID != pendingPlanID {
 		return storage.ErrLockIntentChanged
+	}
+	s.lock = nil
+	return nil
+}
+
+// ReleaseByIDIfUnused releases like ReleaseByID, and keeps the lock while
+// applyUsingLock, an apply that can still change, records the row as its lock.
+func (s *memoryLockStore) ReleaseByIDIfUnused(_ context.Context, id int64, database, dbType, owner, pendingPlanID string) error {
+	if !s.holds(database, dbType) {
+		return storage.ErrLockNotFound
+	}
+	if s.lock.ID != id {
+		return storage.ErrLockReplaced
+	}
+	if s.lock.Owner != owner {
+		return storage.ErrLockNotOwned
+	}
+	if s.lock.PendingPlanID != pendingPlanID {
+		return storage.ErrLockIntentChanged
+	}
+	if s.applyUsingLock != nil && s.applyUsingLock.LockID == id {
+		return &storage.LockInUseError{LockID: id, Apply: s.applyUsingLock}
 	}
 	s.lock = nil
 	return nil
@@ -729,6 +754,7 @@ func TestLockAcquireReportsWhetherItCreatedTheLock(t *testing.T) {
 			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 			require.NotNil(t, resp.Lock)
 			assert.Equal(t, "payments", resp.Lock.Database)
+			assert.Equal(t, tc.storedID, resp.Lock.ID, "the answer names the lock row the caller holds, so a release can name it back")
 			assert.Equal(t, tc.created, resp.Created)
 		})
 	}

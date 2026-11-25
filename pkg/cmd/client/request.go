@@ -254,6 +254,10 @@ type APIError struct {
 	OverrideRequest  *apitypes.FreezeOverrideRequest
 	OverrideOnReason bool
 
+	// LockHolder is set on a lock_in_use answer: the apply that kept the
+	// lock.
+	LockHolder *apitypes.LockHolder
+
 	// RetryAfterSeconds is the delay the server asked the client to wait, set
 	// only on responses that advertise one. Read it through RetryAfter rather
 	// than on its own, so a retry is never scheduled without it.
@@ -536,6 +540,7 @@ func parseAPIError(resp *http.Response, body []byte) *APIError {
 		apiErr.Blockers = errResp.Blockers
 		apiErr.OverrideRequest = errResp.OverrideRequest
 		apiErr.OverrideOnReason = errResp.OverrideOnReason
+		apiErr.LockHolder = errResp.LockHolder
 	}
 	return apiErr
 }

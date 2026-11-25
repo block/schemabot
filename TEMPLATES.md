@@ -4409,6 +4409,51 @@ Options:
 </details>
 
 <details>
+<summary><a name="lock-kept-an-apply-runs-under-it"></a><strong>Lock Kept (An Apply Runs Under It)</strong></summary>
+
+```
+
+🔒 Lock kept for testapp (mysql): apply apply-b2c3d4e5 (running) runs under it.
+   Watch that apply: schemabot progress apply-b2c3d4e5 -e staging
+
+```
+</details>
+
+<details>
+<summary><a name="lock-left-in-place-taken-again-since"></a><strong>Lock Left In Place (Taken Again Since)</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) was released and taken again since this command took it, so it was left in place.
+   This command released nothing. See who holds it: schemabot locks
+
+```
+</details>
+
+<details>
+<summary><a name="apply-settled-lock-now-held-by-another-owner"></a><strong>Apply Settled, Lock Now Held By Another Owner</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) is now held by another owner, so it was left in place.
+   This command released nothing. See who holds it: schemabot locks
+
+```
+</details>
+
+<details>
+<summary><a name="lock-kept-server-reported-no-lock-id"></a><strong>Lock Kept (Server Reported No Lock ID)</strong></summary>
+
+```
+
+🔒 Lock kept for testapp (mysql): the server did not say which lock this command took, so releasing it could remove a lock another command uses.
+   See who holds it: schemabot locks
+   If no apply of yours runs under it, release it: schemabot unlock -d testapp -t mysql
+
+```
+</details>
+
+<details>
 <summary><a name="no-lock-found"></a><strong>No Lock Found</strong></summary>
 
 ```
