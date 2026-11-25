@@ -1876,7 +1876,7 @@ func TestEngineApplyOversizedTableRefusesWhenTheLiveProofNoLongerHolds(t *testin
 		CREATE DOMAIN public.tier AS text CHECK (VALUE IN ('free', 'paid'))`)
 	require.NoError(t, err)
 
-	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN plan public.tier"))
+	_, err = eng.Apply(t.Context(), plannedApplyRequest(dsn, planned.Changes[0].TableChanges[0]))
 	require.NoError(t, err)
 	progress := awaitPostgresProgress(t, eng, "users")
 	assert.Equal(t, engine.StateFailed, progress.State)
@@ -1886,11 +1886,12 @@ func TestEngineApplyOversizedTableRefusesWhenTheLiveProofNoLongerHolds(t *testin
 	assertColumnAbsent(t, db, "users", "plan")
 }
 
-// TestEngineApplyOversizedTableRefusesWhenTheLiveProofFails proves a proof
-// that cannot be made leaves the size refusal standing. The column's type
-// does not exist, so pg-sprite cannot prove the statement changes only the
-// catalog, and the apply refuses on size and names the failed proof.
-func TestEngineApplyOversizedTableRefusesWhenTheLiveProofFails(t *testing.T) {
+// TestEngineApplyOversizedTableFailsWhenTheLiveProofFails proves a proof
+// that cannot be made runs nothing. The column's type does not exist, so
+// pg-sprite cannot prove the statement changes only the catalog. A failed
+// proof is not a size verdict, so the apply fails as retryable rather than
+// as a permanent size refusal, and adds no column.
+func TestEngineApplyOversizedTableFailsWhenTheLiveProofFails(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "oversized_failed_proof_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
 	require.NoError(t, err)
@@ -1900,14 +1901,14 @@ func TestEngineApplyOversizedTableRefusesWhenTheLiveProofFails(t *testing.T) {
 	require.NoError(t, err)
 	progress := awaitPostgresProgress(t, eng, "users")
 	assert.Equal(t, engine.StateFailed, progress.State)
-	assert.Equal(t, "refused", progress.Metadata["phase"])
-	assert.False(t, progress.Retryable)
-	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+	assert.Equal(t, "failed", progress.Metadata["phase"])
+	assert.True(t, progress.Retryable, "a failed proof is not a size verdict; a retry may prove the statement")
+	assert.NotContains(t, progress.ErrorMessage, "1-byte threshold")
 	assertColumnAbsent(t, db, "users", "plan")
 
-	// The refusal renders only the fixed size sentence, so check the failed
-	// proof itself: it must be an error, not a false that looks like a
-	// decided answer.
+	// The failure renders only a fixed sentence, so check the failed proof
+	// itself: it must be an error, not a false that looks like a decided
+	// answer.
 	pool, err := pgxpool.New(t.Context(), dsn)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
@@ -1916,6 +1917,37 @@ func TestEngineApplyOversizedTableRefusesWhenTheLiveProofFails(t *testing.T) {
 	_, err = provenCatalogOnly(t.Context(), pool, stmt)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing_type")
+}
+
+// TestEngineApplyOversizedTableNamesTheMissingTemporaryGrant proves the
+// operator learns which grant lets a catalog-only change run. The table is
+// over the limit and the engine role owns it, but the role cannot create the
+// temporary table the add-column proof needs. The apply refuses with the
+// grant to provision, not with the size threshold, and adds no column.
+func TestEngineApplyOversizedTableNamesTheMissingTemporaryGrant(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "oversized_no_temp_test")
+	_, err := db.ExecContext(t.Context(), `
+		REVOKE TEMPORARY ON DATABASE oversized_no_temp_test FROM PUBLIC;
+		CREATE ROLE no_temp LOGIN PASSWORD 'no_temp';
+		GRANT CONNECT ON DATABASE oversized_no_temp_test TO no_temp;
+		GRANT USAGE ON SCHEMA public TO no_temp;
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		ALTER TABLE public.users OWNER TO no_temp`)
+	require.NoError(t, err)
+	noTemp, err := url.Parse(dsn)
+	require.NoError(t, err)
+	noTemp.User = url.UserPassword("no_temp", "no_temp")
+
+	eng := NewWithTableSizeLimit(1)
+	_, err = eng.Apply(t.Context(), applyRequest(noTemp.String(), "users", "ALTER TABLE public.users ADD COLUMN email text"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "the grant must be provisioned before a retry can succeed")
+	assert.Contains(t, progress.ErrorMessage, "grant TEMPORARY on the database to the engine role")
+	assert.NotContains(t, progress.ErrorMessage, "1-byte threshold")
+	assertColumnAbsent(t, db, "users", "email")
 }
 
 // assertColumnAbsent fails the test when column exists on public.table.
