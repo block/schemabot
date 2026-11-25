@@ -97,6 +97,9 @@ type Storage interface {
 	// Applies returns the apply store.
 	Applies() ApplyStore
 
+	// OutboxEvents returns completion notifications awaiting publication.
+	OutboxEvents() OutboxStore
+
 	// Tasks returns the task store.
 	Tasks() TaskStore
 

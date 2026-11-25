@@ -55,6 +55,8 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 | Metric | Type | Attributes | Description |
 |---|---|---|---|
+| `schemabot.outbox.recording_failures_total` | Counter | environment | Committed outcomes without notification intent when best-effort intent insertion fails; investigate the paired error log and repair recording. Failed outer commits emit no sample; signals are best-effort after commit |
+| `schemabot.outbox.oldest_unpublished_age` | Gauge | environment | Age in seconds of the oldest unpublished outcome notification, including quarantined intent; zero only when none remain, recorded by an enabled sender |
 | `schemabot.telemetry.heartbeat` | Observable gauge | environment | Constant `1` on every collection, including idle processes and storage outages; unit `1` |
 | `schemabot.plans.total` | Counter | repository, database, deployment, environment, status | Plan attempts, each counted once by the API; `success` only once the plan is stored |
 | `schemabot.plan.duration_seconds` | Histogram | repository, database, environment, status | Plan execution time |

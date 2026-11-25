@@ -4,6 +4,10 @@ package storage
 // the storage layer itself enforces — things a claim query or a store decides,
 // not anything the caller could apply on its own.
 type Options struct {
+	// ChangeEventApp resolves a logical database's application label at intent
+	// creation. An empty result falls back to the database name.
+	ChangeEventApp func(database string) string
+
 	// MaxDriversPerApply caps how many operation leases one apply may hold at
 	// once. Zero or negative selects DefaultMaxDriversPerApply; there is no
 	// uncapped mode, because an uncapped claim path is what lets one wide
@@ -21,6 +25,11 @@ func WithMaxDriversPerApply(n int) Option {
 	return func(o *Options) {
 		o.MaxDriversPerApply = n
 	}
+}
+
+// WithChangeEventApp supplies the application label resolver for durable events.
+func WithChangeEventApp(resolve func(database string) string) Option {
+	return func(o *Options) { o.ChangeEventApp = resolve }
 }
 
 // BuildOptions applies opts over the defaults and returns the resolved settings.

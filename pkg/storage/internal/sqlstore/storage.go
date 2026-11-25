@@ -31,6 +31,7 @@ type Storage struct {
 	freezeOverrides *freezeOverrideStore
 	webhookEvents   *webhookEventStore
 	driverPools     *driverPoolStore
+	outboxEvents    *outboxStore
 }
 
 var _ storage.Storage = (*Storage)(nil)
@@ -90,7 +91,7 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		db:              rdb,
 		locks:           &lockStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 		plans:           &planStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier},
-		applies:         &applyStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
+		applies:         &applyStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier, changeEventApp: deps.Options.ChangeEventApp},
 		tasks:           &taskStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
 		applyLogs:       &applyLogStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity},
 		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier, dialect: deps.Dialect, locker: deps.Locker},
@@ -103,6 +104,7 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		freezeOverrides: &freezeOverrideStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 		webhookEvents:   &webhookEventStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 		driverPools:     &driverPoolStore{db: rdb, dialect: deps.Dialect},
+		outboxEvents:    &outboxStore{db: rdb},
 	}
 }
 
@@ -119,6 +121,11 @@ func (s *Storage) Plans() storage.PlanStore {
 // Applies returns the apply store.
 func (s *Storage) Applies() storage.ApplyStore {
 	return s.applies
+}
+
+// OutboxEvents returns the completion notification store.
+func (s *Storage) OutboxEvents() storage.OutboxStore {
+	return s.outboxEvents
 }
 
 // Tasks returns the task store.

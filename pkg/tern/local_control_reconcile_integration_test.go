@@ -4,6 +4,7 @@ package tern
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -120,6 +121,25 @@ func TestLocalClient_DriveAdoptsEngineTerminalTruthBeforeConsumingCancel(t *test
 	assert.Equal(t, state.Apply.Completed, settled.State,
 		"the apply must adopt the engine's completed outcome, not cancelled")
 	assert.NotNil(t, settled.CompletedAt, "a completed apply must carry its completion time")
+
+	var completions []storage.ApplyFinishedEvent
+	for afterID := int64(0); ; {
+		pendingEvents, err := stor.OutboxEvents().ListUnpublished(ctx, afterID, 100)
+		require.NoError(t, err)
+		for _, event := range pendingEvents {
+			if event.ApplyID == apply.ID {
+				var completion storage.ApplyFinishedEvent
+				require.NoError(t, json.Unmarshal(event.Payload, &completion))
+				completions = append(completions, completion)
+			}
+		}
+		if len(pendingEvents) < 100 {
+			break
+		}
+		afterID = pendingEvents[len(pendingEvents)-1].ID
+	}
+	require.Len(t, completions, 1, "adopting terminal engine truth must persist completion intent")
+	assert.Equal(t, apply.ApplyIdentifier, completions[0].ID)
 
 	settledTasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
 	require.NoError(t, err)

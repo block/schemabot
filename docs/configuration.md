@@ -12,6 +12,7 @@
 - [Hybrid Mode](#hybrid-mode)
 - [Drivers](#drivers)
 - [Metrics](#metrics)
+- [Apply completion notifications](#apply-completion-notifications)
 - [Rate Limits](#rate-limits)
 - [Pending Drops](#pending-drops)
 - [Direct Execution](#direct-execution)
@@ -1018,6 +1019,87 @@ The cap applies only to *starting* new operations — a first start, a resume af
 
 A multi-shard apply started with a manual `--defer-cutover` keeps its drivers while it waits: unlike the automatic barrier park, a manually deferred operation holds its claim and keeps heartbeating, so it stays counted. Its cutover is accepted only once every operation waits, which takes a cap no smaller than the apply's width, so a deferred apply that would hold more operations at once than `max_drivers_per_apply` is [refused at the start](#deferred-cutover-capacity). Run it without `--defer-cutover`, or raise `max_drivers_per_apply` to at least its width.
 
+## Apply completion notifications
+
+A winning transition to `completed` attempts notification intent in the same storage
+transaction on MySQL and PostgreSQL. Initial completed creation and same-state
+refreshes do not emit events; historical completions are not backfilled.
+
+**Notification recording is best-effort: an intent insert failure permits
+completion without a notification.** State, ownership, lease, CAS, payload-read,
+savepoint and commit errors still fail. The insert runs behind a savepoint so
+PostgreSQL can recover its aborted statement without losing the completion;
+MySQL uses the same boundary. There is no recording-policy setting.
+
+After a committed loss, an error log identifies the apply and
+`schemabot.outbox.recording_failures_total` increments for its environment. Repair
+storage recording; missing notifications are permanently lost, not retried or
+backfilled. These post-commit signals are best-effort and can be lost on a process
+crash; a failed commit emits neither. This behavior also applies when delivery is
+disabled. Configurable hard-fail recording and additional outcomes are deferred.
+
+Delivery is disabled by default, but recording continues. Enabling delivery sends
+accumulated pending rows. Configure the server that owns apply storage:
+
+```yaml
+apply_notifications:
+  publisher: sqs
+  queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/apply-completed
+  region: us-east-1
+```
+
+SQS requires a standard queue (not FIFO), the AWS SDK credential chain and
+`sqs:SendMessage` permission. Omit `region` if AWS configuration supplies it;
+an empty `publisher` disables delivery without discarding intent.
+
+Each message body is JSON:
+
+```json
+{
+  "event_id": "103dfb3a-5cb6-4b2c-b36a-6bc0d75ce5c7",
+  "type": "apply.finished",
+  "app": "checkout",
+  "outcome": "completed",
+  "occurred_at_nanos": 1795132800000000000,
+  "id": "apply_example",
+  "database": "orders",
+  "database_type": "mysql",
+  "environment": "production",
+  "repository": "example/schemas",
+  "pull_request": 42,
+  "completed_at": "2026-11-20T00:00:00Z"
+}
+```
+
+Deduplicate by `event_id`; `id` identifies the apply. Multiple senders or a restart
+after SQS acceptance but before its storage mark can duplicate delivery. Acceptance
+does not mean a receiver processed the message. `app` captures `DatabaseConfig.App`,
+falling back to the logical database name. `repository` and `pull_request` are
+omitted when absent. `occurred_at_nanos` captures intent creation inside the state
+transaction, not commit or delivery time; `completed_at` uses the stored completion
+(or update) timestamp and its database precision.
+
+The sender scans bounded batches, continues past failed rows and revisits earlier
+pending IDs even under sustained arrivals. Ordinary transport errors retry without
+an attempt limit. Failed batches back off up to 30 seconds; that is not an end-to-end
+delivery bound. Shutdown cancels delivery and waits at most five seconds.
+
+`status` alone selects delivery: only `pending` rows are selected. A per-row panic
+atomically records `quarantined` and an apply-log diagnostic without changing the
+payload or apply. Diagnostic failure rolls back quarantine; panic details remain
+in server logs. `published_at` records acceptance, not disposition: a prefetched
+send may finish after quarantine without clearing the hold. Conversely, a stale
+panic cannot quarantine a published row. Stop and drain all senders to rule out
+in-flight sends. Quarantined rows remain held; no release operation is available.
+Do not edit SchemaBot storage by hand.
+
+All rows, including `published`, are retained indefinitely; the table grows by
+design. There is no cleanup or consumer. While delivery is enabled,
+`schemabot.outbox.oldest_unpublished_age` measures the oldest `pending` or
+`quarantined` row, including a held row with recorded acceptance. A growing age
+calls for checking sender logs, quarantines, queue permissions and reachability.
+An empty backlog records zero; a failed read does not.
+
 ## Rate Limits
 
 `POST /api/pull` reads a database's live schema. Per namespace, that opens a
@@ -1476,7 +1558,7 @@ an unknown dialect never falls back to the MySQL flow.
 
 The DSN format follows the dialect: a Go MySQL driver DSN
 (`user:pass@tcp(host:3306)/schemabot`) for `mysql`, and a PostgreSQL URL or
-keyword/value string (`postgres://user:pass@host:5432/schemabot`) for
+keyword/value string (`postgres://user@host:5432/schemabot`) for
 `postgres`. Both dialects support the same secret reference formats (`env:`,
 `file:`, `secretsmanager:`). When `storage.dsn` is unset, the DSN is read
 from the `STORAGE_DSN` environment variable, falling back to `MYSQL_DSN` — a
