@@ -545,7 +545,8 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "remote unavailability during plan generation must stay retryable")
 		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released so a re-drive can start over")
 		body := requireComment(t, comments, "plan unavailability comment")
-		assert.Contains(t, body, "connection refused")
+		assert.Contains(t, body, "SchemaBot could not reach the remote schema change service. Run the command again once the service is healthy; if it fails again, the SchemaBot server logs have the cause.")
+		assert.NotContains(t, body, "connection refused")
 	})
 }
 
