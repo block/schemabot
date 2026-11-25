@@ -937,7 +937,7 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 		Database: "plan_privilege_test",
 		SchemaFiles: schema.SchemaFiles{
 			"public": {Files: map[string]string{
-				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, created_at timestamptz DEFAULT now())",
 			}},
 		},
 		Credentials: &engine.Credentials{DSN: limitedDSN.String()},
@@ -1012,7 +1012,9 @@ func TestEnginePlanPrivilegeRefusalPerTier(t *testing.T) {
 }
 
 // TestEnginePlanTableSizeRefusal proves the configured native-safe ceiling
-// blocks an otherwise executable plan when the target table exceeds it.
+// blocks an otherwise executable plan when the target table exceeds it. The
+// added column's default is an expression, so the change is not proven to
+// touch only the catalog and the ceiling applies.
 func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_size_limit_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
@@ -1021,7 +1023,7 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 		Database: "plan_size_limit_test",
 		SchemaFiles: schema.SchemaFiles{
 			"public": {Files: map[string]string{
-				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, created_at timestamptz DEFAULT now())",
 			}},
 		},
 		Credentials: &engine.Credentials{DSN: dsn},
@@ -1038,6 +1040,35 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	assert.Contains(t, change.ModeReason, "SchemaBot's ceiling for a native-safe apply")
 }
 
+// TestEnginePlanOversizedTableAdmitsCatalogOnlyChange proves the ceiling does
+// not block a change that only writes the catalog. Adding a nullable column
+// with no default rewrites no rows, so its cost does not grow with the table,
+// and the plan keeps it executable on a table far past a one-byte ceiling.
+func TestEnginePlanOversizedTableAdmitsCatalogOnlyChange(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_oversized_catalog_only_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_oversized_catalog_only_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	change := result.Changes[0].TableChanges[0]
+	assert.Empty(t, change.ExecutionMode, "a catalog-only change must stay executable above the ceiling")
+	assert.Empty(t, change.ModeReason)
+	assert.Contains(t, change.DDL, "ADD COLUMN")
+	assert.Contains(t, change.DDL, "email")
+}
+
 // TestEnginePlanTableSizeRefusalKeepsTableNameVerbatim proves the size verdict
 // names the table exactly as the database spells it: a quoted PostgreSQL
 // identifier may carry Markdown delimiters, and the operator reading the
@@ -1052,7 +1083,7 @@ func TestEnginePlanTableSizeRefusalKeepsTableNameVerbatim(t *testing.T) {
 		Database: "plan_size_limit_odd_name_test",
 		SchemaFiles: schema.SchemaFiles{
 			"public": {Files: map[string]string{
-				"odd_users.sql": `CREATE TABLE "odd|users" (id bigint PRIMARY KEY, email text)`,
+				"odd_users.sql": `CREATE TABLE "odd|users" (id bigint PRIMARY KEY, created_at timestamptz DEFAULT now())`,
 			}},
 		},
 		Credentials: &engine.Credentials{DSN: dsn},
@@ -1079,7 +1110,7 @@ func TestEnginePlanOversizedTableAdmitsConcurrentIndex(t *testing.T) {
 		Database: "plan_oversized_concurrent_index_test",
 		SchemaFiles: schema.SchemaFiles{
 			"public": {Files: map[string]string{
-				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text); CREATE INDEX users_email_idx ON users (email)",
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, created_at timestamptz DEFAULT now()); CREATE INDEX users_created_at_idx ON users (created_at)",
 			}},
 		},
 		Credentials: &engine.Credentials{DSN: dsn},
@@ -1713,20 +1744,45 @@ func TestEngineApplyTableNotFoundRefusal(t *testing.T) {
 }
 
 // TestEngineApplyTableSizeRefusal proves the configured native-safe ceiling
-// reaches preflight and permanently refuses an ALTER when the table exceeds it.
+// reaches preflight and permanently refuses an ALTER when the table exceeds it
+// and the ALTER is not proven to touch only the catalog.
 func TestEngineApplyTableSizeRefusal(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "size_limit_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
 	require.NoError(t, err)
 
 	eng := NewWithTableSizeLimit(1)
-	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN email text"))
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN created_at timestamptz DEFAULT now()"))
 	require.NoError(t, err)
 	progress := awaitPostgresProgress(t, eng, "users")
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "a size refusal is permanent until the ceiling or target changes")
 	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+}
+
+// TestEngineApplyOversizedTableRunsCatalogOnlyChange proves apply re-proves a
+// change against the live table before it waives the ceiling: a nullable
+// column with no default changes only the catalog, so it runs to completion
+// on a table past a one-byte ceiling and the column exists afterward.
+func TestEngineApplyOversizedTableRunsCatalogOnlyChange(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "oversized_catalog_only_apply_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+
+	eng := NewWithTableSizeLimit(1)
+	result, err := eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN email text"))
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	progress := awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateCompleted, progress.State, progress.ErrorMessage)
+
+	var dataType string
+	err = db.QueryRowContext(t.Context(),
+		`SELECT data_type FROM information_schema.columns
+		 WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'email'`).Scan(&dataType)
+	require.NoError(t, err)
+	assert.Equal(t, "text", dataType)
 }
 
 // TestEngineApplyOversizedTableUsesKindSpecificBounds proves a concurrent
@@ -1751,7 +1807,7 @@ func TestEngineApplyOversizedTableUsesKindSpecificBounds(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, valid)
 
-	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN nickname text"))
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN created_at timestamptz DEFAULT now()"))
 	require.NoError(t, err)
 	progress = awaitPostgresProgress(t, eng, "users")
 	assert.Equal(t, engine.StateFailed, progress.State)
