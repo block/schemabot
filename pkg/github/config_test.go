@@ -457,6 +457,36 @@ func TestFindConfigForPRRejectsMultipleDiscoveredConfigs(t *testing.T) {
 	assert.Equal(t, []string{"gadgets", "widgets"}, multiple.Databases())
 }
 
+// The full-tree scan is the fallback when the PR's files name no config, and it
+// reports several configs with the same typed error, so the webhook can list
+// the candidates instead of its fixed fallback line.
+func TestFindConfigInRepoRejectsMultipleConfigsWithCandidates(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"truncated": false,
+			"tree": []map[string]any{
+				{"path": "apps/gadgets/schema/schemabot.yaml", "type": "blob", "sha": "blob-gadgets", "mode": "100644"},
+				{"path": "apps/widgets/schema/schemabot.yaml", "type": "blob", "sha": "blob-widgets", "mode": "100644"},
+			},
+		}))
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/gadgets/schema/schemabot.yaml", "database: gadgets\ntype: mysql\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, _, _, err := ic.FindConfigInRepo(t.Context(), "octocat/hello-world", 1)
+
+	require.ErrorIs(t, err, ErrMultipleConfigs)
+	var multiple *MultipleConfigsError
+	require.ErrorAs(t, err, &multiple)
+	assert.Equal(t, []ConfigCandidate{
+		{Database: "gadgets", SchemaDir: "apps/gadgets/schema"},
+		{Database: "widgets", SchemaDir: "apps/widgets/schema"},
+	}, multiple.Candidates)
+}
+
 func TestSingleDiscoveredConfigMultipleConfigsErrorCarriesCandidates(t *testing.T) {
 	_, _, err := SingleDiscoveredConfig([]DiscoveredConfig{
 		{Config: &SchemabotConfig{Database: "orders: v2"}, SchemaDir: "services/a: b"},
