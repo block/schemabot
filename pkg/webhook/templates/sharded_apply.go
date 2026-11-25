@@ -45,6 +45,12 @@ type ShardedApplyData struct {
 	// failed shard row to carry the cause.
 	ErrorMessage string
 
+	// FailedFinalizer is the first keyspace finalizer in a failure state, nil
+	// when none is. The failure callout names its keyspace in every apply
+	// state, because the error text need not name it and a finalizer can fail
+	// while other keyspaces' shards keep running.
+	FailedFinalizer *FinalizerFailure
+
 	// Keyspaces is the per-keyspace shard rollup in resolved order: each entry
 	// renders its own keyspace section, and together they drive the
 	// cross-keyspace count histogram and the first-failure callout.
@@ -57,13 +63,6 @@ type ShardedApplyData struct {
 	// the change the operator approved at plan time — and the section omits it
 	// when the stored plan carries none.
 	VSchemaChanges []apitypes.VSchemaChange
-
-	// Finalizes holds the keyspaces the engine finalizes without a VSchema
-	// change, one per finalizer operation, rendered in their own section so
-	// the comment never shows a VSchema change the plan did not carry. They
-	// are work the apply runs rather than schema changes, so they do not count
-	// toward the outcome line's grammar or the status line's fraction.
-	Finalizes []ShardedFinalize
 
 	// Tenant is the deployment's tenant identity, appended as --tenant to every
 	// pasteable command hint so copied commands address this deployment in
@@ -226,7 +225,6 @@ func renderShardedApplyComment(data ShardedApplyData, renderedAt string, formatt
 	writeShardsStoppedAtCutover(&sb, data)
 	writeShardKeyspaceSections(&sb, data, formatter, budget)
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
-	writeFinalizeStatus(&sb, data.Finalizes)
 
 	writeShardedFooter(&sb, data)
 	if !state.IsTerminalApplyState(data.State) {
@@ -263,42 +261,8 @@ func renderShardedApplySummaryComment(data ShardedApplyData, formatter *shardedD
 	writeShardsStoppedAtCutover(&sb, data)
 	writeShardKeyspaceSections(&sb, data, formatter, budget)
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
-	writeFinalizeStatus(&sb, data.Finalizes)
 	writeShardedFooter(&sb, data)
 	return sb.String()
-}
-
-// ShardedFinalize is one keyspace's finalize in a sharded apply: the keyspace,
-// and its finalizer's display status in the VSchema status vocabulary
-// ("applying", "applied", "failed", "cancelled", "stopped", or "" for pending).
-type ShardedFinalize struct {
-	Keyspace string
-	Status   string
-}
-
-// writeFinalizeStatus writes the section listing each keyspace the engine
-// finalizes without a VSchema change, with its finalizer's status.
-func writeFinalizeStatus(sb *strings.Builder, finalizes []ShardedFinalize) {
-	if len(finalizes) == 0 {
-		return
-	}
-	sb.WriteString("\n### Finalize\n\n")
-	for _, f := range finalizes {
-		fmt.Fprintf(sb, "**%s**: %s\n\n", inlineCode(f.Keyspace), finalizeStatusLabel(f.Status))
-	}
-}
-
-// finalizeStatusLabel renders a finalizer's display status as the Finalize
-// section words it.
-func finalizeStatusLabel(status string) string {
-	switch status {
-	case "applying":
-		return "Finalizing..."
-	case "applied":
-		return "Finalized"
-	default:
-		return ui.VSchemaStatusLabel(status)
-	}
 }
 
 // allShardStatuses flattens every keyspace's shards in resolved order, feeding
@@ -893,11 +857,40 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 		}
 		return
 	}
+	writeFinalizerFailure(sb, data.FailedFinalizer)
 	if !state.IsState(data.State, state.Apply.Failed, state.Apply.FailedRetryable) {
+		return
+	}
+	if data.FailedFinalizer != nil && data.ErrorMessage == data.FailedFinalizer.Error {
+		// The finalizer callout already carries this error.
 		return
 	}
 	if msg := SanitizeInlineError(data.ErrorMessage); msg != "" {
 		fmt.Fprintf(sb, "\n> %s **Failure:** %s\n", failureSeverity(state.IsState(data.State, state.Apply.FailedRetryable)), html.EscapeString(msg))
+	}
+}
+
+// FinalizerFailure is a keyspace finalizer in a failure state: the keyspace,
+// the operation state, and its operation-scoped error.
+type FinalizerFailure struct {
+	Keyspace string
+	State    string
+	Error    string
+}
+
+// writeFinalizerFailure names the keyspace whose finalize failed. Outside the
+// VSchema section, which only shows a VSchema change's state, nothing else in
+// the comment says which keyspace failed to finalize or why.
+func writeFinalizerFailure(sb *strings.Builder, f *FinalizerFailure) {
+	if f == nil {
+		return
+	}
+	severity := failureSeverity(state.IsState(f.State, state.ApplyOperation.FailedRetryable))
+	keyspace := html.EscapeString(f.Keyspace)
+	if msg := SanitizeInlineError(f.Error); msg == "" {
+		fmt.Fprintf(sb, "\n> %s **Failure:** finalizing keyspace <code>%s</code>\n", severity, keyspace)
+	} else {
+		fmt.Fprintf(sb, "\n> %s **Failure:** finalizing keyspace <code>%s</code> — %s\n", severity, keyspace, html.EscapeString(msg))
 	}
 }
 

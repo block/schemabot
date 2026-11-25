@@ -154,8 +154,10 @@ func WriteProgress(data ProgressData) {
 	WriteBox(rows, "State", colorFn)
 	writeProgressStep(data)
 
-	// Error below the box
-	if data.State == state.Apply.Failed && data.ErrorMessage != "" {
+	// Error below the box. A sharded apply shows it in every state, as the PR
+	// comment's failure callout does: a shard or a keyspace finalize can fail
+	// while other shards keep running, and nothing else on screen names it.
+	if (data.State == state.Apply.Failed || data.Sharded) && data.ErrorMessage != "" {
 		fmt.Printf("\n  %s%s%s\n", ANSIRed, data.ErrorMessage, ANSIReset)
 	}
 	writeStoppedByFreeze(data)

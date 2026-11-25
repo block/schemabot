@@ -214,10 +214,10 @@ func TestBuildShardedApplyData_FinalizerBecomesVSchemaChange(t *testing.T) {
 }
 
 // A sharded apply adds refunds to commerce, whose engine asked to finalize the
-// keyspace once the table exists, with no VSchema change in the plan. The
-// finalizer renders in the Finalize section with its own status, not as a
-// VSchema change the plan never carried, and it is not counted as a change.
-// payments, which does change its VSchema, still renders as one.
+// keyspace once the table exists, with no VSchema change in the plan. That
+// finalize is an engine step with nothing for the operator to review, so it is
+// not listed as a VSchema change the plan never carried. payments, which does
+// change its VSchema, still renders as one.
 func TestBuildShardedApplyData_FinalizeOnlyKeyspaceIsNotAVSchemaChange(t *testing.T) {
 	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Running}
 	mk := func(id int64, key, opState string) *storage.ApplyOperation {
@@ -233,21 +233,94 @@ func TestBuildShardedApplyData_FinalizeOnlyKeyspaceIsNotAVSchemaChange(t *testin
 
 	data := buildShardedApplyData(apply, ops, false, nil, view, "")
 
-	assert.Equal(t, []templates.ShardedFinalize{{Keyspace: "commerce", Status: "applying"}}, data.Finalizes)
 	require.Len(t, data.VSchemaChanges, 1)
 	assert.Equal(t, "payments", data.VSchemaChanges[0].Namespace)
 	body := templates.RenderShardedApplyComment(data)
-	assert.Contains(t, body, "### Finalize\n\n**`commerce`**: Finalizing...\n")
 	assert.Contains(t, body, "### VSchema\n\n**`payments`**: Pending\n")
-	assert.NotContains(t, body, "**`commerce`**: Applying")
+	assert.NotContains(t, body, "### Finalize", "a keyspace's finalize is not listed as its own step")
 
 	apply.State = state.Apply.Completed
 	for _, op := range ops {
 		op.State = state.ApplyOperation.Completed
 	}
 	summary := templates.RenderShardedApplySummaryComment(buildShardedApplyData(apply, ops, false, nil, view, ""))
-	assert.Contains(t, summary, "### Finalize\n\n**`commerce`**: Finalized\n")
 	assert.Contains(t, summary, "### VSchema\n\n**`payments`**: Applied\n")
+	assert.NotContains(t, summary, "### Finalize", "a keyspace's finalize is not listed as its own step")
+}
+
+// A sharded apply copies refunds onto both of commerce's shards, then its
+// engine's finalize of the keyspace fails and the apply fails. The finalize is
+// not listed on its own, so the status comment and the summary both name the
+// keyspace in the failure callout, whatever the finalize error says: with its
+// error, with no error at all, and alongside an apply-level error that differs
+// from it.
+func TestShardedCommentsNameAFailedFinalize(t *testing.T) {
+	const finalizeErr = "publish routing rules: target is read-only"
+	const named = "\n> ❌ **Failure:** finalizing keyspace <code>commerce</code>"
+	mk := func(id int64, key, opState, errMsg string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	for _, tc := range []struct {
+		name, applyErr, finalizerErr string
+		want                         []string
+	}{
+		{name: "finalize error", finalizerErr: finalizeErr, want: []string{named + " — " + finalizeErr + "\n"}},
+		{name: "no error text", want: []string{named + "\n"}},
+		{
+			name: "apply error differs", applyErr: "apply deadline exceeded", finalizerErr: finalizeErr,
+			want: []string{named + " — " + finalizeErr + "\n", "\n> ❌ **Failure:** apply deadline exceeded\n"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Failed, ErrorMessage: tc.applyErr}
+			ops := []*storage.ApplyOperation{
+				mk(1, "commerce/-80/refunds", state.ApplyOperation.Completed, ""),
+				mk(2, "commerce/80-/refunds", state.ApplyOperation.Completed, ""),
+				mk(3, "commerce/group_finalizer", state.ApplyOperation.Failed, tc.finalizerErr),
+			}
+			data := buildShardedApplyData(apply, ops, false, nil, finalizesOnly("commerce"), "")
+			status := templates.RenderShardedApplyComment(data)
+			summary := templates.RenderShardedApplySummaryComment(data)
+			for _, want := range tc.want {
+				assert.Equal(t, 1, strings.Count(status, want), "status comment:\n%s", status)
+				assert.Equal(t, 1, strings.Count(summary, want), "summary comment:\n%s", summary)
+			}
+			assert.NotContains(t, summary, "**Failure:** "+finalizeErr, "the finalize error appears once, under its keyspace")
+		})
+	}
+}
+
+// A sharded apply spans two keyspaces. commerce's shards finish and its
+// finalize fails, while payments still copies, so the apply keeps running.
+// The finalize is not listed on its own, so the status comment's failure
+// callout names the keyspace and its error before the apply settles; a
+// finalize that SchemaBot is still retrying reads as an attention, not a
+// failure.
+func TestShardedStatusCommentNamesAFailedFinalizeWhileOtherKeyspacesRun(t *testing.T) {
+	const finalizeErr = "apply VSchema for commerce: keyspace not found"
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.RunningDegraded}
+	mk := func(id int64, key, opState, errMsg string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	for _, tc := range []struct {
+		name, finalizerState, glyph string
+	}{
+		{"failed", state.ApplyOperation.Failed, "❌"},
+		{"retrying", state.ApplyOperation.FailedRetryable, "⚠️"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := []*storage.ApplyOperation{
+				mk(1, "commerce/-80/refunds", state.ApplyOperation.Completed, ""),
+				mk(2, "commerce/80-/refunds", state.ApplyOperation.Completed, ""),
+				mk(3, "commerce/group_finalizer", tc.finalizerState, finalizeErr),
+				mk(4, "payments/-/ledger", state.ApplyOperation.Running, ""),
+			}
+			data := buildShardedApplyData(apply, ops, false, nil, finalizesOnly("commerce"), "")
+
+			assert.Contains(t, templates.RenderShardedApplyComment(data),
+				"\n> "+tc.glyph+" **Failure:** finalizing keyspace <code>commerce</code> — "+finalizeErr+"\n")
+		})
+	}
 }
 
 // stubPlanStorage serves one stored plan (or a load error) for resolver tests.
