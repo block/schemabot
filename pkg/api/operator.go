@@ -774,10 +774,63 @@ func claimGateClosed(stop <-chan struct{}) bool {
 // Every repeated pass goes back through driveTick, so it re-reads the context
 // and the claim gate before its first claim query exactly as a polled pass
 // does, and the ladder keeps its rung order on every pass.
+//
+// A pass whose claim lost a claimable operation to a transaction holding its
+// row (claimContended) runs again after a short backoff, a bounded number of
+// times, since the row is free again as soon as that transaction ends. Without
+// the retry, a driver woken for exactly that operation would go back to sleep
+// and leave it unstarted for a poll interval.
 func (s *Service) drivePasses(ctx context.Context, driverID int, stop <-chan struct{}) {
-	for s.driveTick(ctx, driverID, stop) {
-		s.logger.Debug("operator: claimed work settled and may have made other work claimable; running the claim ladder again before waiting for a wake or tick",
-			"driver", driverID)
+	contendedRetries := 0
+	for {
+		switch s.driveTick(ctx, driverID, stop) {
+		case claimSettled:
+			contendedRetries = 0
+			s.logger.Debug("operator: claimed work settled and may have made other work claimable; running the claim ladder again before waiting for a wake or tick",
+				"driver", driverID)
+		case claimContended:
+			if contendedRetries >= contendedClaimRetries {
+				s.logger.Debug("operator: a claimable apply_operation stayed locked by another transaction through every retry; the next wake or tick claims it",
+					"driver", driverID, "retries", contendedRetries)
+				return
+			}
+			backoff := contendedClaimBackoff << contendedRetries
+			contendedRetries++
+			if !s.waitForContendedClaimRetry(ctx, driverID, stop, backoff) {
+				return
+			}
+		default:
+			return
+		}
+	}
+}
+
+// contendedClaimRetries bounds how many times in a row a driver claims again
+// after a contended claim before it leaves the work to its next wake or tick.
+// The transactions that hold a claimable row are short, so the first retry
+// almost always takes it; the bound keeps a row held by a long transaction
+// from turning the driver into a polling loop.
+const contendedClaimRetries = 5
+
+// contendedClaimBackoff is the wait before the first retry of a contended
+// claim. Each further retry doubles it.
+const contendedClaimBackoff = 25 * time.Millisecond
+
+// waitForContendedClaimRetry waits out the backoff before a contended claim
+// runs again. It reports false when the operator is shutting down or has
+// stopped claiming, so the driver returns instead of claiming.
+func (s *Service) waitForContendedClaimRetry(ctx context.Context, driverID int, stop <-chan struct{}, backoff time.Duration) bool {
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-stop:
+		s.logger.Debug("operator: not retrying a contended claim; claiming has stopped", "driver", driverID)
+		return false
+	case <-ctx.Done():
+		s.logger.Debug("operator: not retrying a contended claim; the operator is shutting down", "driver", driverID)
+		return false
 	}
 }
 
@@ -794,27 +847,28 @@ func (s *Service) drivePasses(ctx context.Context, driverID int, stop <-chan str
 // it again before each claim query, so a pass overlapping StopClaiming claims
 // nothing after the closure it can observe (AV-14).
 //
-// It reports whether the pass settled the work it claimed, which is the only
-// case in which the driver runs another pass without waiting.
-func (s *Service) driveTick(ctx context.Context, driverID int, stop <-chan struct{}) (settled bool) {
+// It reports what the pass did with its claim. A pass that settled the work
+// it claimed runs again at once, and a contended one runs again after a short
+// backoff; every other outcome waits for the next wake or tick.
+func (s *Service) driveTick(ctx context.Context, driverID int, stop <-chan struct{}) (outcome claimOutcome) {
 	// The driver's select can pick a ready ticker over an equally ready
 	// ctx.Done(), so a tick can start after the operator has already been told
 	// to stop. Every claim it made would fail against the cancelled context and
 	// report a failure the successor driver is about to retry.
 	if ctx.Err() != nil {
 		s.logger.Debug("operator: skipping the claim ladder; the operator is shutting down", "driver", driverID)
-		return false
+		return claimFellThrough
 	}
 	if claimGateClosed(stop) {
 		s.logger.Debug("operator: skipping the claim ladder; claiming has stopped", "driver", driverID)
-		return false
+		return claimFellThrough
 	}
 	err := panicsafe.Call(func() error {
-		settled = s.recoverApplies(ctx, driverID, stop) == claimSettled
+		outcome = s.recoverApplies(ctx, driverID, stop)
 		return nil
 	})
 	if err == nil {
-		return settled
+		return outcome
 	}
 	var tickPanic *panicsafe.Error
 	if !errors.As(err, &tickPanic) {
@@ -822,14 +876,14 @@ func (s *Service) driveTick(ctx context.Context, driverID int, stop <-chan struc
 		// only a contained panic reaches here today; keep the signal if that
 		// invariant ever changes.
 		s.logger.Error("operator: drive tick failed", "driver", driverID, "error", err)
-		return false
+		return claimSpent
 	}
 	s.logger.Error("operator: drive tick panicked; the driver continues and retries on the next tick",
 		"driver", driverID,
 		"panic", fmt.Sprint(tickPanic.Value),
 		"stack", string(tickPanic.Stack))
 	metrics.RecordRecoveredPanic(ctx, "operator_tick")
-	return false
+	return claimSpent
 }
 
 // claimOutcome is what one rung of the claim ladder did with its pass. It keeps
@@ -848,6 +902,12 @@ const (
 	// flight, or it ended in a retry. The driver waits for its next wake or
 	// tick.
 	claimSpent
+	// claimContended means the rung took nothing because the operation it
+	// would have claimed was row-locked by another transaction for an instant
+	// (storage.ErrOperationClaimContended). The pass ends, and the driver
+	// claims again after a short backoff rather than waiting for its next wake
+	// or tick.
+	claimContended
 	// claimSettled means the rung drove the work it claimed to a settled
 	// outcome, which can make other work claimable. The driver runs the ladder
 	// again at once.
@@ -1078,8 +1138,13 @@ func (s *Service) claimGateClosedBeforeRung(stop <-chan struct{}, driverID int, 
 // the same tasks as the whole apply. It reports claimSettled only when the
 // drive succeeded and settled the operation it claimed.
 func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner string) claimOutcome {
-	claimOptions := s.operationClaimOptions(driverID)
+	claimOptions := append(s.operationClaimOptions(driverID), storage.ReportClaimContention())
 	op, err := s.storage.ApplyOperations().FindNextApplyOperation(ctx, owner, claimOptions...)
+	if errors.Is(err, storage.ErrOperationClaimContended) {
+		s.logger.Debug("operator: a claimable apply_operation was locked by another transaction; claiming again shortly",
+			"driver", driverID, "error", err)
+		return claimContended
+	}
 	if err != nil {
 		s.logClaimFailure(ctx, "operator: failed to claim apply_operation", "operation_storage_error",
 			"driver", driverID, "lease_owner", owner, "error", err)

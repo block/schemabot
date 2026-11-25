@@ -67,3 +67,61 @@ func TestClaimStartsOperationOnlyForStarts(t *testing.T) {
 			"a claim from %s", claimedFrom)
 	}
 }
+
+// A woken driver's claim finds the operation it was woken for row-locked by
+// another transaction for an instant, such as a peer's claim scanning past it.
+// The driver claims again after a short backoff in the same run instead of
+// going back to sleep with the operation unstarted until its next tick.
+func TestDrivePassesRetriesAContendedClaim(t *testing.T) {
+	ops := &claimLadderOperationStore{
+		recoverOperationStore: &recoverOperationStore{},
+		contendedClaims:       2,
+	}
+	applies := &operationClaimApplyStore{}
+	store := &mockStorageWithApplyStores{applies: applies, operations: ops}
+	svc := New(store, testServerConfig(), nil, slog.New(slog.DiscardHandler))
+
+	drivePassesWithin(t, svc, openClaimGate())
+
+	assert.Equal(t, 3, ops.claims, "the driver claims again after each contended claim, and stops once a claim finds nothing")
+	for i, filter := range ops.claimFilters {
+		assert.True(t, filter.ReportContention, "claim %d asks storage to report contention", i)
+	}
+}
+
+// A claimable operation stays locked through every retry, as under a long
+// transaction. The driver gives up after a bounded number of retries and
+// leaves the operation to its next wake or tick, rather than polling storage.
+func TestDrivePassesBoundsContendedClaimRetries(t *testing.T) {
+	ops := &claimLadderOperationStore{
+		recoverOperationStore: &recoverOperationStore{},
+		contendedClaims:       contendedClaimRetries + 10,
+	}
+	applies := &operationClaimApplyStore{}
+	store := &mockStorageWithApplyStores{applies: applies, operations: ops}
+	svc := New(store, testServerConfig(), nil, slog.New(slog.DiscardHandler))
+
+	drivePassesWithin(t, svc, openClaimGate())
+
+	assert.Equal(t, 1+contendedClaimRetries, ops.claims, "one claim plus a bounded number of retries")
+}
+
+// Claiming stops while a contended claim waits to retry. The driver returns
+// without claiming again.
+func TestDrivePassesDoesNotRetryAContendedClaimAfterClaimingStops(t *testing.T) {
+	ops := &claimLadderOperationStore{
+		recoverOperationStore: &recoverOperationStore{},
+		contendedClaims:       contendedClaimRetries + 10,
+	}
+	applies := &operationClaimApplyStore{}
+	store := &mockStorageWithApplyStores{applies: applies, operations: ops}
+	svc := New(store, testServerConfig(), nil, slog.New(slog.DiscardHandler))
+
+	stop := make(chan struct{})
+	ctx, cancel := context.WithTimeout(t.Context(), drivePassesDeadline)
+	defer cancel()
+	assert.Equal(t, claimContended, svc.driveTick(ctx, 1, stop), "the first claim is contended")
+	close(stop)
+	assert.False(t, svc.waitForContendedClaimRetry(ctx, 1, stop, time.Hour), "a closed claim gate ends the wait at once")
+	assert.Equal(t, 1, ops.claims)
+}

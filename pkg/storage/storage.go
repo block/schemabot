@@ -2028,7 +2028,10 @@ type ApplyOperationStore interface {
 	// state it was claimed from, which is how the caller tells a claim that
 	// starts an operation from a retry or a recovery.
 	//
-	// opts narrow what the claim may match; see OperationClaimFilter.
+	// opts narrow what the claim may match; see OperationClaimFilter. With
+	// ReportClaimContention, a claim that took nothing because the operation it
+	// would take was row-locked by another transaction returns
+	// ErrOperationClaimContended instead of nil.
 	FindNextApplyOperation(ctx context.Context, owner string, opts ...OperationClaimOption) (*ApplyOperation, error)
 
 	// FindNextApplyOperationCutover atomically claims the next operation parked

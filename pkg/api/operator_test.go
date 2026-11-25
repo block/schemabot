@@ -2891,6 +2891,10 @@ type claimLadderOperationStore struct {
 	claimFilters []storage.OperationClaimFilter
 	claimErr     error
 	claimPanic   string
+	// contendedClaims is how many claims in a row report that the operation
+	// they would take was locked by another transaction before claims go on
+	// as usual.
+	contendedClaims int
 }
 
 func (s *claimLadderOperationStore) FindNextApplyOperationCutover(context.Context, string) (*storage.ApplyOperation, error) {
@@ -2908,6 +2912,10 @@ func (s *claimLadderOperationStore) FindNextApplyOperation(ctx context.Context, 
 	}
 	if s.claimErr != nil {
 		return nil, s.claimErr
+	}
+	if s.contendedClaims > 0 {
+		s.contendedClaims--
+		return nil, fmt.Errorf("apply_operation 1 of apply 1 is claimable but another transaction holds its row: %w", storage.ErrOperationClaimContended)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
