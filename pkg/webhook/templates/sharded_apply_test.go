@@ -63,9 +63,9 @@ func TestRenderShardedApplyComment_StatesHowManyRunAtOnce(t *testing.T) {
 		var shards []ShardStatus
 		var cells []ShardCell
 		for i, shard := range shardNames {
-			status := ShardStatus{Shard: shard, Emoji: "⏳", Label: "queued", State: state.ApplyOperation.Pending}
+			status := ShardStatus{Shard: shard, Emoji: "⏳", Label: "queued", State: state.ApplyOperation.Pending, CompetesForSlot: true}
 			if i < 2 {
-				status = ShardStatus{Shard: shard, Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running}
+				status = ShardStatus{Shard: shard, Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running, CompetesForSlot: true}
 			}
 			shards = append(shards, status)
 			cells = append(cells, mutesCell(shard))
@@ -97,14 +97,14 @@ func TestRenderShardedApplyComment_StatesHowManyRunAtOnceOnlyWhileWorkIsQueued(t
 		var cells []ShardCell
 		var progress []ShardProgressData
 		for i, shard := range shardNames {
-			status := ShardStatus{Shard: shard, Emoji: "⏳", Label: "queued", State: state.ApplyOperation.Pending}
+			status := ShardStatus{Shard: shard, Emoji: "⏳", Label: "queued", State: state.ApplyOperation.Pending, CompetesForSlot: true}
 			taskState := state.Task.Pending
 			switch {
 			case i < landed:
 				status = ShardStatus{Shard: shard, Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed}
 				taskState = state.Task.Completed
 			case i < landed+2:
-				status = ShardStatus{Shard: shard, Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running}
+				status = ShardStatus{Shard: shard, Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running, CompetesForSlot: true}
 				taskState = state.Task.Running
 			}
 			shards = append(shards, status)

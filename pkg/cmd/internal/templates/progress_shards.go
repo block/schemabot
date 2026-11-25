@@ -10,9 +10,10 @@ import (
 // every keyspace runs on its only shard, which needs no count. The shards of
 // an apply in applyState read as presentation.DeriveShards reads them. While
 // the apply runs, the count ends with how many of its operations run at once
-// when atOnce holds some of the unfinished ones back (presentation.WithLimit).
+// when more of them compete for a slot than atOnce allows
+// (presentation.WithLimit).
 func ShardCounts(applyState string, ops []ProgressOperation, tables []TableProgress, released bool, atOnce int) string {
-	statuses, operations, unfinished, ok := shardStatuses(applyState, ops, tables, released)
+	statuses, operations, competing, ok := shardStatuses(applyState, ops, tables, released)
 	if !ok {
 		return ""
 	}
@@ -24,7 +25,7 @@ func ShardCounts(applyState string, ops []ProgressOperation, tables []TableProgr
 	if state.IsTerminalApplyState(applyState) {
 		return counts
 	}
-	return presentation.WithLimit(counts, len(statuses), operations, unfinished, atOnce)
+	return presentation.WithLimit(counts, len(statuses), operations, competing, atOnce)
 }
 
 // ShardedStoppedAtCutoverNote explains the work of a sharded apply that
@@ -67,9 +68,9 @@ func tablesStoppedAtCutover(ops []ProgressOperation) presentation.StoppedAtCutov
 
 // shardStatuses derives one status per keyspace shard of the apply's shard
 // work, and counts the shard work operations behind them and how many of those
-// have yet to finish. It reports false when every keyspace runs on its only
-// shard.
-func shardStatuses(applyState string, ops []ProgressOperation, tables []TableProgress, released bool) (statuses []presentation.ShardStatus, operations, unfinished int, sharded bool) {
+// compete for a slot (presentation.CompetingShardOperations). It reports false
+// when every keyspace runs on its only shard.
+func shardStatuses(applyState string, ops []ProgressOperation, tables []TableProgress, released bool) (statuses []presentation.ShardStatus, operations, competing int, sharded bool) {
 	type keyspaceShard struct{ keyspace, shard string }
 	index := make(map[keyspaceShard]int)
 	var work []presentation.ShardWork
@@ -91,14 +92,12 @@ func shardStatuses(applyState string, ops []ProgressOperation, tables []TablePro
 		}
 		work[j].Operations = append(work[j].Operations, op)
 		operations++
-		if presentation.OperationUnfinished(op.State) {
-			unfinished++
-		}
 	}
 	if !sharded {
 		return nil, 0, 0, false
 	}
-	return presentation.DeriveShards(applyState, work), operations, unfinished, true
+	statuses = presentation.DeriveShards(applyState, work)
+	return statuses, operations, presentation.CompetingShardOperations(work, statuses), true
 }
 
 // shardTableCopiesNoRows reports whether one shard's changes to a keyspace

@@ -77,8 +77,9 @@ type ShardedApplyData struct {
 
 	// MaxOperationsAtOnce is how many of the apply's operations SchemaBot runs
 	// at once (max_drivers_per_apply). While the apply runs, the Shards line
-	// states it whenever the apply has more operations than that, so shards
-	// queued behind it read as waiting their turn. Zero leaves it unstated.
+	// states it whenever more unfinished operations compete for a slot than
+	// that, so shards queued behind it read as waiting their turn. Zero leaves
+	// it unstated.
 	MaxOperationsAtOnce int
 }
 
@@ -180,6 +181,12 @@ type ShardStatus struct {
 	// can be a landed one while another table's change on the shard is
 	// still queued.
 	Landed bool
+	// CompetesForSlot is true while the shard holds one of the apply's
+	// operation slots or is queued for one
+	// (presentation.PresentationState.CompetesForSlot). A shard waiting on
+	// another member, halted, or paused is not held back by the limit, so its
+	// operations do not count toward it.
+	CompetesForSlot bool
 }
 
 // ShardCell is one (shard, table) operation: the statements that table runs
@@ -870,29 +877,38 @@ func writeShardCounts(sb *strings.Builder, data ShardedApplyData) {
 	}
 	counts := presentation.ShardCounts(labels)
 	if !state.IsTerminalApplyState(data.State) {
-		operations, unfinished := shardedOperationCounts(data)
-		counts = presentation.WithLimit(counts, len(shards), operations, unfinished, data.MaxOperationsAtOnce)
+		operations, competing := shardedOperationCounts(data)
+		counts = presentation.WithLimit(counts, len(shards), operations, competing, data.MaxOperationsAtOnce)
 	}
 	fmt.Fprintf(sb, "\n**Shards**: %s\n", counts)
 }
 
 // shardedOperationCounts counts a sharded apply's (shard, table) operations
-// and how many of them have yet to finish. An operation the progress does not
-// list yet, because dispatch has not attached its shard, has not finished
-// either.
-func shardedOperationCounts(data ShardedApplyData) (operations, unfinished int) {
-	finished := 0
+// and how many unfinished ones compete for a slot: those of the shards that
+// hold a slot or are queued for one. An operation the progress does not list
+// yet, because dispatch has not attached its shard, has not finished either.
+func shardedOperationCounts(data ShardedApplyData) (operations, competing int) {
 	for _, ks := range data.Keyspaces {
 		operations += len(ks.Cells)
+		opsByShard := make(map[string]int)
+		for _, cell := range ks.Cells {
+			opsByShard[cell.Shard]++
+		}
+		finishedByShard := make(map[string]int)
 		for _, table := range ks.Tables {
 			for _, shard := range table.Shards {
 				if !presentation.OperationUnfinished(shard.Status) {
-					finished++
+					finishedByShard[shard.Shard]++
 				}
 			}
 		}
+		for _, shard := range ks.Shards {
+			if shard.CompetesForSlot {
+				competing += max(opsByShard[shard.Shard]-finishedByShard[shard.Shard], 0)
+			}
+		}
 	}
-	return operations, max(operations-finished, 0)
+	return operations, competing
 }
 
 // isShardFailureState reports whether a shard's state carries an operator-facing

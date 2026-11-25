@@ -1480,7 +1480,7 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 			text += ", " + limit
 		}
 	}
-	if shards, operations := plannedShardWork(data.Changes); shards > 0 {
+	if shards, operations := plannedShardWork(data.Changes, data.DatabaseType); shards > 0 {
 		if limit := presentation.LimitPhrase(shards, operations, data.OperationsAtOnce); limit != "" {
 			text += fmt.Sprintf(" · %d %s, %s", shards, pluralize("shard", shards), limit)
 		}
@@ -1519,7 +1519,7 @@ func plannedRolloutOperations(data PlanCommentData) int {
 			continue
 		}
 		perTarget := 1
-		if _, shardOperations := plannedShardWork(targetPlanChanges(g, data)); shardOperations > 0 {
+		if _, shardOperations := plannedShardWork(targetPlanChanges(g, data), data.DatabaseType); shardOperations > 0 {
 			perTarget = shardOperations
 		}
 		operations += perTarget * len(g.Members)
@@ -1528,20 +1528,56 @@ func plannedRolloutOperations(data PlanCommentData) int {
 }
 
 // plannedShardWork counts a sharded plan's shards that have work and the
-// operations an apply would run on them, one per statement on each shard, as
-// the apply runs one operation per table on each shard. Both are zero for a
+// operations an apply would run on them. The apply runs one operation per
+// table on each shard, however many statements that table's change has, so
+// statements are counted by the distinct table each names. A statement the
+// dialect's parser cannot name a table for counts as an operation of its own,
+// which can only overstate the work the limit holds back. Both are zero for a
 // plan with no sharded keyspace.
-func plannedShardWork(changes []KeyspaceChangeData) (shards, operations int) {
+func plannedShardWork(changes []KeyspaceChangeData, databaseType string) (shards, operations int) {
+	parser, parserErr := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
+	if parserErr != nil {
+		slog.Warn("plan summary cannot classify shard statements; it will count one operation per statement for the operation limit",
+			"database_type", databaseType, "error", parserErr)
+	}
 	for _, ks := range changes {
 		for _, sh := range ks.Shards {
 			if sh.Satisfied || len(sh.Statements) == 0 {
 				continue
 			}
 			shards++
-			operations += len(sh.Statements)
+			operations += shardTableCount(parser, ks.Keyspace, sh)
 		}
 	}
 	return shards, operations
+}
+
+// shardTableCount is how many tables one shard's planned statements change,
+// the operations an apply runs on that shard. With no parser, or for a
+// statement the parser names no table for, each statement counts as one.
+func shardTableCount(parser ddl.StatementParser, keyspace string, sh KeyspaceShardChange) int {
+	if parser == nil {
+		return len(sh.Statements)
+	}
+	tables := make(map[string]bool, len(sh.Statements))
+	unnamed := 0
+	for _, stmt := range sh.Statements {
+		_, table, err := parser.Classify(stmt)
+		if err != nil {
+			slog.Debug("plan summary could not classify a shard statement; it counts as one operation for the operation limit",
+				"keyspace", keyspace, "shard", sh.Shard, "error", err)
+			unnamed++
+			continue
+		}
+		if table == "" {
+			slog.Debug("plan summary found no table in a shard statement; it counts as one operation for the operation limit",
+				"keyspace", keyspace, "shard", sh.Shard)
+			unnamed++
+			continue
+		}
+		tables[table] = true
+	}
+	return len(tables) + unnamed
 }
 
 // planSummaryText renders what a plan would do as the plan summary counts it,

@@ -162,6 +162,31 @@ func TestRenderPlanComment_ShardedStatesHowManyRunAtOnce(t *testing.T) {
 	assert.Contains(t, RenderPlanComment(unlimited), "📋 **Plan**: **1** table to alter\n", "an unknown limit states nothing")
 }
 
+// A sharded plan makes two changes to mutes on each of four shards. The apply
+// runs one operation per table on each shard, so the plan counts four
+// operations, not eight. A limit of four holds none of them back and is not
+// stated, and a limit of two states it in shards, since each shard changes one
+// table.
+func TestRenderPlanComment_ShardedLimitCountsTablesPerShard(t *testing.T) {
+	statements := []string{
+		"ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)",
+		"ALTER TABLE `mutes` ADD COLUMN `muted` tinyint",
+	}
+	plan := func(limit int) PlanCommentData {
+		var shards []KeyspaceShardChange
+		for _, shard := range []string{"-40", "40-80", "80-c0", "c0-"} {
+			shards = append(shards, KeyspaceShardChange{Shard: shard, Statements: statements})
+		}
+		return PlanCommentData{
+			Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata", OperationsAtOnce: limit,
+			Changes: []KeyspaceChangeData{{Keyspace: "cdb_resolute_sharded", Statements: statements, Shards: shards}},
+		}
+	}
+
+	assert.NotContains(t, RenderPlanComment(plan(4)), "at a time", "four table changes fit a limit of four")
+	assert.Contains(t, RenderPlanComment(plan(2)), " · 4 shards, 2 at a time\n")
+}
+
 // A sharded plan whose DDL lives only per-shard (no collapsed namespace-level
 // Statements) must not short-circuit to "no changes" — the count incorporates
 // the per-shard statements.

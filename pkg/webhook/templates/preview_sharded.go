@@ -36,7 +36,7 @@ func previewShardStatuses(applyState string, ops []presentation.Operation) []Sha
 		out = append(out, ShardStatus{
 			Shard: d.Shard, Emoji: d.Emoji, Label: d.Label, State: d.State, Error: d.Error,
 			StoppedAtCutover: d.Presentation == presentation.StateStoppedAtCutover, EndedBy: d.EndedBy,
-			Landed: d.Landed,
+			Landed: d.Landed, CompetesForSlot: d.Presentation.CompetesForSlot(),
 		})
 	}
 	return out
