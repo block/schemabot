@@ -354,6 +354,15 @@ func (c completionCommitConnector) Connect(context.Context) (driver.Conn, error)
 
 type completionCommitConn struct{ driver.Conn }
 
+// Preserve direct execution: MySQL savepoints cannot use prepared statements.
+func (c completionCommitConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	return c.Conn.(driver.ExecerContext).ExecContext(ctx, query, args)
+}
+
+func (c completionCommitConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	return c.Conn.(driver.QueryerContext).QueryContext(ctx, query, args)
+}
+
 func (c completionCommitConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	tx, err := c.Conn.(driver.ConnBeginTx).BeginTx(ctx, opts)
 	if err != nil {
@@ -375,6 +384,9 @@ func failingCompletionCommitPool(t *testing.T, d driver.Driver, dsn string) *sql
 	t.Helper()
 	db := sql.OpenDB(completionCommitConnector{driver: d, dsn: dsn})
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	require.NoError(t, db.PingContext(ctx))
 	return db
 }
 
