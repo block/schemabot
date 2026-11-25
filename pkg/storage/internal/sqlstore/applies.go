@@ -3266,7 +3266,7 @@ func (s *applyStore) ExpireRetryable(ctx context.Context, endedOperationStopType
 		})
 	if err == nil {
 		for _, result := range expired {
-			s.events.finishApply(ctx, result.Apply.ID, result.Apply.State, false)
+			s.events.offerReapedApplyFinish(result.Apply)
 		}
 	}
 	return expired, err

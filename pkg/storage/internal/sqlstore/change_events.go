@@ -105,23 +105,41 @@ func (r *changeEventRecorder) finishApply(ctx context.Context, applyID int64, ou
 	if r == nil || !r.sender.Selects(changeevents.ApplyFinished) || !state.IsState(outcome, state.SettledApplyStates...) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), changeEventStorageTimeout)
+	if event, ready := r.loadApplyFinish(context.WithoutCancel(ctx), applyID, outcome, directWrite, time.Now().UnixNano()); ready {
+		r.sender.Offer(event)
+	}
+}
+
+// offerReapedApplyFinish queues the committed outcome so the reaper can
+// return its batch before any reads for event delivery.
+func (r *changeEventRecorder) offerReapedApplyFinish(apply *storage.Apply) {
+	if !r.selectsApplyFinish(apply) {
+		return
+	}
+	applyID, outcome, occurredAt := apply.ID, apply.State, time.Now().UnixNano()
+	r.sender.OfferDeferred(changeevents.ApplyFinished, apply.Environment, func(ctx context.Context) (changeevents.Event, bool) {
+		return r.loadApplyFinish(ctx, applyID, outcome, false, occurredAt)
+	})
+}
+
+func (r *changeEventRecorder) loadApplyFinish(ctx context.Context, applyID int64, outcome string, directWrite bool, occurredAt int64) (changeevents.Event, bool) {
+	ctx, cancel := context.WithTimeout(ctx, changeEventStorageTimeout)
 	defer cancel()
 	apply, err := r.store.Applies().Get(ctx, applyID)
 	if err != nil {
 		r.logReadError(changeevents.ApplyFinished, applyID, err)
-		return
+		return changeevents.Event{}, false
 	}
 	// A keyed apply created by remote dispatch is the worker's copy. Only
 	// the control-plane parent reports the aggregate outcome.
 	if apply == nil || strings.HasPrefix(apply.IdempotencyKey, "schemabot:v1:") ||
 		!state.IsState(apply.State, outcome) || !r.sender.Enabled(changeevents.ApplyFinished, apply.Environment) {
-		return
+		return changeevents.Event{}, false
 	}
 	ops, err := r.store.ApplyOperations().ListByApply(ctx, applyID)
 	if err != nil {
 		r.logReadError(changeevents.ApplyFinished, applyID, err)
-		return
+		return changeevents.Event{}, false
 	}
 	if directWrite && state.IsState(outcome, state.Apply.Failed) {
 		settled, err := r.rolloutFailureSettled(ctx, applyID, ops)
@@ -129,16 +147,16 @@ func (r *changeEventRecorder) finishApply(ctx context.Context, applyID int64, ou
 			r.logReadError(changeevents.ApplyFinished, applyID, err)
 		}
 		if !settled {
-			return
+			return changeevents.Event{}, false
 		}
 	}
 	summary := changeEventDeploymentSummary(ops, outcome)
-	r.sender.Offer(changeevents.Event{
+	return changeevents.Event{
 		Type: changeevents.ApplyFinished, App: r.application("", apply.Database), Environment: apply.Environment,
-		OccurredAtNanos: time.Now().UnixNano(),
+		OccurredAtNanos: occurredAt,
 		Description: fmt.Sprintf("%s apply=%s outcome=%s%s%s", changeevents.ApplyFinished, apply.ApplyIdentifier,
 			outcome, summary, changeEventCaller(apply.Caller, apply.Repository, apply.PullRequest)),
-	})
+	}, true
 }
 
 func (r *changeEventRecorder) application(app, database string) string {

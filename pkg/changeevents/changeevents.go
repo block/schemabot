@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -56,8 +57,13 @@ type PublisherDestination struct {
 
 type delivery struct {
 	destination PublisherDestination
-	queue       chan Event
+	queue       chan queuedEvent
 	drops       atomic.Uint64
+}
+
+type queuedEvent struct {
+	event   Event
+	resolve func() (Event, bool)
 }
 
 // Sender queues events for independent destinations. A nil Sender is disabled.
@@ -109,7 +115,7 @@ func NewWithPublishers(httpDestinations []Destination, publishers []PublisherDes
 		dest.Environments = slices.Clone(dest.Environments)
 		dest.Events = slices.Clone(dest.Events)
 		sender.deliveries = append(sender.deliveries, &delivery{
-			destination: dest, queue: make(chan Event, queueCapacity),
+			destination: dest, queue: make(chan queuedEvent, queueCapacity),
 		})
 	}
 	sender.ctx, sender.cancel = context.WithCancel(context.Background())
@@ -139,15 +145,32 @@ func (s *Sender) Enabled(kind, env string) bool {
 
 // Offer queues an event without waiting for a receiver or calling the logger.
 func (s *Sender) Offer(event Event) {
+	s.offer(queuedEvent{event: event})
+}
+
+// OfferDeferred queues preparation on the delivery workers. The workers
+// share one resolution, which uses the sender's shutdown context. A false
+// result discards the event.
+func (s *Sender) OfferDeferred(kind, environment string, resolve func(context.Context) (Event, bool)) {
+	if !s.Enabled(kind, environment) {
+		return
+	}
+	s.offer(queuedEvent{
+		event:   Event{Type: kind, Environment: environment},
+		resolve: sync.OnceValues(func() (Event, bool) { return resolve(s.ctx) }),
+	})
+}
+
+func (s *Sender) offer(work queuedEvent) {
 	if s == nil || s.ctx.Err() != nil {
 		return
 	}
 	for _, d := range s.deliveries {
-		if !d.accepts(event.Type, event.Environment) {
+		if !d.accepts(work.event.Type, work.event.Environment) {
 			continue
 		}
 		select {
-		case d.queue <- event:
+		case d.queue <- work:
 		default:
 			d.drops.Add(1)
 		}
@@ -172,7 +195,15 @@ func (d *delivery) run(ctx context.Context, logger *slog.Logger) {
 	defer reportDrops()
 	for ctx.Err() == nil {
 		select {
-		case event := <-d.queue:
+		case work := <-d.queue:
+			event := work.event
+			if work.resolve != nil {
+				var ready bool
+				event, ready = work.resolve()
+				if !ready || !d.accepts(event.Type, event.Environment) {
+					continue
+				}
+			}
 			if err := d.send(ctx, event); err != nil && ctx.Err() == nil {
 				logger.Warn("change event delivery failed", "event", event.Type, "environment", event.Environment, "error", err)
 			}

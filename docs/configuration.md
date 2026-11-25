@@ -1059,7 +1059,9 @@ The worker receives the managed app label in the existing dispatch options.
 Delivery is best effort. The server offers events in memory without writing
 event records. Each destination has a bounded queue and a short HTTP timeout.
 Full queues drop events, delivery failures are logged, and there are no delivery
-retries. Shutting down the server can discard events still in memory.
+retries. When a reaper settles an apply, the delivery workers load event details
+in the background so the reaper can update GitHub without waiting. Shutting down
+the server can discard events still in memory.
 
 ## Rate Limits
 

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -134,6 +135,64 @@ func TestPublisherOnlyDestination(t *testing.T) {
 			t.Fatalf("publisher did not receive %s", want)
 		}
 	}
+}
+
+func TestDeferredOfferReturnsBeforeResolvingAndSharesResult(t *testing.T) {
+	published := make(chan string, 2)
+	dest := PublisherDestination{
+		Events: []string{ApplyFinished}, Environments: []string{"staging"},
+		Encode: func(event Event) (json.RawMessage, error) {
+			return json.Marshal(event.Description)
+		},
+		Publisher: publisherFunc(func(_ context.Context, payload json.RawMessage) error {
+			published <- string(payload)
+			return nil
+		}),
+	}
+	sender, err := NewWithPublishers(nil, []PublisherDestination{dest, dest}, slog.Default())
+	require.NoError(t, err)
+	t.Cleanup(sender.Close)
+
+	var resolutions atomic.Int32
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	offered := make(chan struct{})
+	go func() {
+		defer close(offered)
+		sender.OfferDeferred(ApplyFinished, "staging", func(ctx context.Context) (Event, bool) {
+			resolutions.Add(1)
+			started <- struct{}{}
+			select {
+			case <-release:
+				return Event{Type: ApplyFinished, Environment: "staging", Description: "settled"}, true
+			case <-ctx.Done():
+				return Event{}, false
+			}
+		})
+	}()
+
+	deadline := time.After(eventTestDeadline)
+	select {
+	case <-started:
+	case <-deadline:
+		t.Fatal("workers did not start event preparation")
+	}
+	select {
+	case <-offered:
+	case <-deadline:
+		t.Fatal("offering the event waited for preparation")
+	}
+
+	close(release)
+	for range 2 {
+		select {
+		case payload := <-published:
+			require.Equal(t, `"settled"`, payload)
+		case <-deadline:
+			t.Fatal("a destination did not receive the prepared event")
+		}
+	}
+	require.EqualValues(t, 1, resolutions.Load(), "matching destinations share a single lookup")
 }
 
 func TestBlockedPublisherIsolatedFromHTTP(t *testing.T) {
