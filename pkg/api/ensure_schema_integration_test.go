@@ -640,6 +640,63 @@ func TestEnsureSchema_MakesAHiddenDeclaredIndexVisibleAgain(t *testing.T) {
 		"a visibility change removes nothing and is not a destructive refusal")
 }
 
+// The embedded schema declares the two unused `apply_logs` indexes invisible, so
+// that every pod of a release stops planning around them before a later release
+// drops them. A fresh install creates them invisible. A database bootstrapped by
+// the previous release holds them visible, and the next boot hides them: a
+// visibility change removes nothing, so it runs under the default policy with no
+// refusal, and a repeat boot finds nothing left to do.
+func TestEnsureSchema_HidesAnIndexDeclaredInvisible(t *testing.T) {
+	ctx := t.Context()
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+	hiddenIndexes := []string{"idx_level", "idx_event_type"}
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+	for _, index := range hiddenIndexes {
+		assert.Equal(t, "NO", indexVisibility(t, db, sdb.Name, "apply_logs", index),
+			"a fresh install must create %s invisible", index)
+	}
+
+	// A database bootstrapped by the previous release holds both visible.
+	for _, index := range hiddenIndexes {
+		_, err := db.ExecContext(ctx,
+			fmt.Sprintf("ALTER TABLE `apply_logs` ALTER INDEX `%s` VISIBLE", index))
+		require.NoError(t, err)
+		require.Equal(t, "YES", indexVisibility(t, db, sdb.Name, "apply_logs", index))
+	}
+
+	var hideBuf syncBuffer
+	hideLogger := slog.New(slog.NewTextHandler(&hideBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.NoError(t, EnsureSchema(dsn, hideLogger), "hiding an index must not fail startup")
+
+	hideLogs := hideBuf.String()
+	for _, index := range hiddenIndexes {
+		assert.Equal(t, "NO", indexVisibility(t, db, sdb.Name, "apply_logs", index),
+			"the default policy must hide %s", index)
+		assert.Contains(t, hideLogs, "ALTER INDEX `"+index+"` INVISIBLE")
+	}
+	assert.NotContains(t, hideLogs, "refusing destructive storage-schema change",
+		"a visibility change removes nothing and is not a destructive refusal")
+	assert.NotContains(t, hideLogs, "withholding the destructive clauses")
+
+	// The live definition must match the embedded one, so a repeat boot is a no-op.
+	var repeatBuf syncBuffer
+	repeatLogger := slog.New(slog.NewTextHandler(&repeatBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.NoError(t, EnsureSchema(dsn, repeatLogger))
+	assert.NotContains(t, repeatBuf.String(), "ALTER TABLE", "a repeat boot must find no schema change to run")
+
+	// The embedded file spells the visibility the way MySQL prints it, so the
+	// canonical form Spirit diffs against is the one that is stored.
+	var table, createTable string
+	require.NoError(t, db.QueryRowContext(ctx, "SHOW CREATE TABLE `apply_logs`").Scan(&table, &createTable))
+	assert.Contains(t, createTable, "KEY `idx_level` (`level`) /*!80000 INVISIBLE */")
+	assert.Contains(t, createTable, "KEY `idx_event_type` (`event_type`) /*!80000 INVISIBLE */")
+}
+
 // indexVisibility reports MySQL's IS_VISIBLE flag ("YES" or "NO") for one index.
 func indexVisibility(t *testing.T, db *sql.DB, schemaName, tableName, indexName string) string {
 	t.Helper()
