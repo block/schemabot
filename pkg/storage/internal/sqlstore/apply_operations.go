@@ -1378,9 +1378,11 @@ AND ` + rolloutStepGateSQL + `
 // own rollout member has failed, under the same on_failure exemption that lets
 // a later member past an earlier one's failure. One member's work rows, such
 // as a target's per-shard work, start in parallel rather than in order, so the
-// member gate above never compares them. Every one of them runs the same
-// change on the same schema, so a failure on one usually repeats on the rest,
-// and starting them anyway spends a copy on each for a known result. The
+// member gate above never compares them. The gate holds every work row of
+// the member, whatever change it runs. Most of them are the member's shards,
+// which run the same change on the same schema, so a failure on one usually
+// repeats on the rest; holding the member's other work too is the fail-safe
+// side of the same rule. The
 // failed row takes the earlier alias only so the exemption can be shared with
 // the member gate; it is a sibling of the same member, not an earlier one. As
 // with the member gate, an apply a remote dispatch created leaves this to its

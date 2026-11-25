@@ -11613,7 +11613,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 **Status**: Failed — 0 of 1 change applied
 
-**Shards**: 1 failed, 3 not started
+**Shards**: 1 failed, 3 halted
 
 > ❌ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
 
@@ -11628,9 +11628,9 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 | Shard | Status |
 | --- | --- |
 | `-40` | ❌ failed — resolve shard primary for `-40`: context deadline exceeded |
-| `40-80` | ⏸️ not started |
-| `80-c0` | ⏸️ not started |
-| `c0-` | ⏸️ not started |
+| `40-80` | ⏸️ halted — -40 failed |
+| `80-c0` | ⏸️ halted — -40 failed |
+| `c0-` | ⏸️ halted — -40 failed |
 
 ---
 
@@ -11825,7 +11825,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 *Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
 
-**Shards**: 1 failed, 3 not started
+**Shards**: 1 failed, 3 halted
 
 > ❌ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
 
@@ -11840,9 +11840,9 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 | Shard | Status |
 | --- | --- |
 | `-40` | ❌ failed — resolve shard primary for `-40`: context deadline exceeded |
-| `40-80` | ⏸️ not started |
-| `80-c0` | ⏸️ not started |
-| `c0-` | ⏸️ not started |
+| `40-80` | ⏸️ halted — -40 failed |
+| `80-c0` | ⏸️ halted — -40 failed |
+| `c0-` | ⏸️ halted — -40 failed |
 
 ### VSchema
 

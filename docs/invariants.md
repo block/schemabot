@@ -1021,7 +1021,7 @@ pair taken in `deployment_order` and then in each deployment's `targets` order, 
 earlier member blocks later ones unless the config says otherwise. Copy start is ordered per
 member, not per operation: one member's work never waits on its own member's work to start, but
 once some of a member's work has failed, its work that has not started is held by that failure
-exactly as a later member's work would be, since it would run the same change, and a
+exactly as a later member's work would be, and a
 later member's work waits on every earlier member's, until it completes under `rolling` or reaches
 the cutover barrier under `barrier`, while `parallel` does not order copy start at all. Where a
 rollout is laid out table by table, work on a table starts on any target only once every earlier
@@ -1075,8 +1075,9 @@ check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sha
 `earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request
 (`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`) and at request intake
 (`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
-(`DeriveRolloutApplyState`, `deriveCancelledRollout`, `deriveStoppedRollout`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
-`pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`, whose
+(`DeriveRolloutApplyState`, `deriveCancelledRollout`, `deriveStoppedRollout`, `hasStartedUnsettledWork`, `childHoldsItsTarget`,
+and `pauseHoldsWork` with `heldBySameMemberFailure`, `pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`,
+whose `workMember` groups work rows into members as the same-member failure gate does, and whose
 `stepOrphanedByEarlierStep` marks work held behind a table that settled without completing, read through `StepRowCanNeverPass`), through which every
 projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/apply.go`), which
 `updateApplyStateFromOperations` consults to keep a held-open rollout's recovery claim quiet, and

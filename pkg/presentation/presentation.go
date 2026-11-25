@@ -94,9 +94,11 @@ type Operation struct {
 	// the row is a member of its own. The claim gate starts the copies of one
 	// member's shards in parallel and holds them back only at the apply's
 	// driver cap, so an earlier row of the same member never orders this
-	// row's copy start or holds it on a failure: a pending row reads as
-	// waiting for or halted behind only rows of other members, and as queued
-	// when none of those come before it. Cutover ordering is unchanged.
+	// row's copy start: a pending row reads as waiting for or halted behind
+	// only rows of other members, and as queued when none of those come
+	// before it. A failed shard of the same member is the exception, since
+	// the claim holds the member's unstarted shards behind it
+	// (sameMemberFailure). Cutover ordering is unchanged.
 	CopyMember string
 
 	// ContinueOnFailure is true only when the operation's on_failure policy is
@@ -696,6 +698,10 @@ func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 		deriveFinalizerPending(d, ops, names, i)
 		return
 	}
+	if h := sameMemberFailure(ops, i); h >= 0 {
+		setHeldByFailure(d, op, names[h])
+		return
+	}
 	if op.CopyMember != "" {
 		ops, names, i = otherMembersBefore(ops, names, i)
 		if i == 0 {
@@ -719,6 +725,39 @@ func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 		return
 	}
 	deriveOrderedPending(d, ops, names, i)
+}
+
+// sameMemberFailure returns the index of a terminal-failed row of row i's own
+// member, wherever it sits, or -1 when there is none or row i's policy
+// continues past a failure. It mirrors the claim's same-member failure gate
+// (sameMemberFailureGateSQL in FindNextApplyOperation), which holds a member's
+// unstarted work once any of its work has failed, so a pending shard of a
+// failed shard's target reads as held rather than as queued.
+func sameMemberFailure(ops []Operation, i int) int {
+	member := failureMember(ops[i])
+	if member == "" || ops[i].continuesPastFailure() {
+		return -1
+	}
+	for j, o := range ops {
+		if j != i && o.State == state.ApplyOperation.Failed && failureMember(o) == member {
+			return j
+		}
+	}
+	return -1
+}
+
+// failureMember names the member the same-member failure gate groups a row
+// under: its CopyMember on a shard row, its deployment and target on a work
+// row, or "" for a row the gate does not hold. Work rows with no target in
+// one deployment form one member, as the gate compares targets as stored.
+func failureMember(o Operation) string {
+	if o.CopyMember != "" {
+		return o.CopyMember
+	}
+	if o.Work {
+		return o.Deployment + "\x00" + o.Target
+	}
+	return ""
 }
 
 // otherMembersBefore returns the rows before row i that belong to another

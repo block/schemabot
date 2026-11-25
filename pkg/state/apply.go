@@ -299,8 +299,8 @@ type RolloutChild struct {
 	// State is the child operation's derived apply state.
 	State string
 	// Member identifies the rollout member whose work this child is, or is
-	// empty for a child that is not work. A pause-held failure holds the
-	// unsettled work of its own member wherever that work sits in deployment
+	// empty for a child that is not work. A pause-held failure holds its own
+	// member's work that waits to start wherever that work sits in deployment
 	// order, because the claim holds a member's unstarted work once any of
 	// its work has failed.
 	Member string
@@ -586,9 +586,9 @@ func RolloutHeldByResumableChild(derived string, children []RolloutChild) bool {
 // pauseHoldsWork reports whether the pause-held failure at failedIndex holds
 // any work for the operator to release, start or stop: a child after it (in
 // deployment order) that still holds its target, or another child of its own
-// member that still does. A member's work starts in parallel rather than in
-// order, so its unstarted work can sit before the failure in deployment order
-// and still be held by it.
+// member that the failure keeps from starting. A member's work starts in
+// parallel rather than in order, so its unstarted work can sit before the
+// failure in deployment order and still be held by it.
 func pauseHoldsWork(children []RolloutChild, failedIndex int) bool {
 	failed := children[failedIndex]
 	for i, c := range children {
@@ -598,11 +598,23 @@ func pauseHoldsWork(children []RolloutChild, failedIndex int) bool {
 		if i > failedIndex {
 			return true
 		}
-		if failed.Member != "" && c.Member == failed.Member {
+		if heldBySameMemberFailure(failed, c) {
 			return true
 		}
 	}
 	return false
+}
+
+// heldBySameMemberFailure reports whether the claim's same-member failure gate
+// holds c back behind failed: c is work of the same member that waits on a
+// claim to start, either pending or stopped (start resumes a stopped row only
+// through the same gate). A sibling a driver is already running is past the
+// gate, so a release would have nothing of it to admit.
+func heldBySameMemberFailure(failed, c RolloutChild) bool {
+	if failed.Member == "" || c.Member != failed.Member {
+		return false
+	}
+	return IsState(c.State, Apply.Pending, Apply.Stopped)
 }
 
 // normalizeApplyState converts a task or apply state string in any format to

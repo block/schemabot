@@ -40,12 +40,14 @@ func TestDeriveShardsQueuesTheShardsTheDriverCapHoldsBack(t *testing.T) {
 	assert.Equal(t, "2 running table copy, 6 queued", ShardCounts(labels))
 }
 
-// A failed shard does not hold the other shards of its target, since the
-// claim gate never holds one member's work on its own failure: while the apply
-// runs, the pending shard reads as queued. Once the apply has settled nothing
-// will start it, so it reads as not started. A shard reads as its most
-// attention-worthy table, with that table's error.
-func TestDeriveShardsTakesTheFailedTableAndDoesNotHoldItsTarget(t *testing.T) {
+// A failed shard holds the other shards of its target that have not started,
+// since the claim gate holds a member's unstarted work once any of it has
+// failed: the pending shard reads as halted behind the failure, while the
+// apply runs and after it has settled. Under on_failure=pause it reads as
+// paused with the release the operator needs, and under continue, or once the
+// pause is released, it reads as queued, since the claim lets it start. A
+// shard reads as its most attention-worthy table, with that table's error.
+func TestDeriveShardsTakesTheFailedTableAndHoldsItsTarget(t *testing.T) {
 	work := []ShardWork{
 		{Keyspace: "shop_001", Shard: "-", Operations: []Operation{
 			{Deployment: "default", State: state.ApplyOperation.Completed},
@@ -58,13 +60,34 @@ func TestDeriveShardsTakesTheFailedTableAndDoesNotHoldItsTarget(t *testing.T) {
 	require.Len(t, running, 2)
 	assert.Equal(t, state.ApplyOperation.Failed, running[0].State)
 	assert.Equal(t, "duplicate key", running[0].Error)
-	assert.Equal(t, PendingQueued, running[1].Label)
-	assert.Equal(t, "1 failed, 1 queued", ShardCounts([]string{running[0].Label, running[1].Label}))
+	assert.Equal(t, "halted — shop_001/- failed", running[1].Label)
+	assert.Equal(t, "1 failed, 1 halted", ShardCounts([]string{running[0].Label, running[1].Label}))
 
 	settled := DeriveShards(state.Apply.Failed, work)
 	require.Len(t, settled, 2)
-	assert.Equal(t, PendingNotStarted, settled[1].Label)
-	assert.Equal(t, "1 failed, 1 not started", ShardCounts([]string{settled[0].Label, settled[1].Label}))
+	assert.Equal(t, "halted — shop_001/- failed", settled[1].Label)
+	assert.Equal(t, "1 failed, 1 halted", ShardCounts([]string{settled[0].Label, settled[1].Label}))
+
+	withPolicy := func(set func(*Operation)) []ShardWork {
+		out := make([]ShardWork, len(work))
+		for i, sw := range work {
+			ops := make([]Operation, len(sw.Operations))
+			for j, op := range sw.Operations {
+				set(&op)
+				ops[j] = op
+			}
+			out[i] = ShardWork{Keyspace: sw.Keyspace, Shard: sw.Shard, Operations: ops}
+		}
+		return out
+	}
+	paused := DeriveShards(state.Apply.Paused, withPolicy(func(op *Operation) { op.PauseOnFailure = true }))
+	assert.Equal(t, "paused — shop_001/- failed; release or stop", paused[1].Label)
+
+	released := DeriveShards(state.Apply.Running, withPolicy(func(op *Operation) { op.PauseOnFailure, op.Released = true, true }))
+	assert.Equal(t, PendingQueued, released[1].Label)
+
+	continued := DeriveShards(state.Apply.Running, withPolicy(func(op *Operation) { op.ContinueOnFailure = true }))
+	assert.Equal(t, PendingQueued, continued[1].Label)
 }
 
 // Shards that span rollout members keep the ordering the claim gate applies
@@ -84,10 +107,11 @@ func TestDeriveShardsOrdersShardsAcrossMembers(t *testing.T) {
 
 // In an apply with two rollout members, each with two shards, a member's
 // shards never order one another: us's second shard reads as queued behind
-// nothing while its first copies, and stays queued when that first shard
-// fails. eu's shards still wait for, or halt behind, us's shards, since the
-// claim gate orders copy starts across members, and eu's second shard names
-// us's shard rather than eu's own first.
+// nothing while its first copies. When that first shard fails, us's second
+// halts behind it, since the claim holds a member's unstarted shards once one
+// of them has failed. eu's shards still wait for, or halt behind, us's shards,
+// since the claim gate orders copy starts across members, and eu's second
+// shard names us's shard rather than eu's own first.
 func TestDeriveShardsOrdersOnlyAcrossMembers(t *testing.T) {
 	derive := func(firstState string) []string {
 		op := func(deployment, opState string) []Operation {
@@ -113,7 +137,7 @@ func TestDeriveShardsOrdersOnlyAcrossMembers(t *testing.T) {
 
 	failed := derive(state.ApplyOperation.Failed)
 	require.Len(t, failed, 4)
-	assert.Equal(t, PendingQueued, failed[1], "a failure on us's first shard does not hold us's second")
+	assert.Equal(t, "halted — shop_001/-40 failed", failed[1], "a failure on us's first shard holds us's second")
 	assert.Equal(t, "halted — shop_001/-40 failed", failed[2])
 	assert.Equal(t, "halted — shop_001/-40 failed", failed[3])
 }

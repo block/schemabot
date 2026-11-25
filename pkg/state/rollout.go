@@ -87,12 +87,14 @@ func RolloutChildren(ops []RolloutOperation) []RolloutChild {
 }
 
 // workMember names the rollout member a work row belongs to, its deployment
-// and target, or returns "" for a row that is not work or has no target. The
-// claim's same-member failure gate (sameMemberFailureGateSQL) holds a work row
-// back once another work row of the same deployment and target has failed, so
-// the projection groups the same rows.
+// and target, or returns "" for a row that is not work. The claim's
+// same-member failure gate (sameMemberFailureGateSQL) holds a work row back
+// once another work row of the same deployment and target has failed, so the
+// projection groups the same rows. That includes work rows with no target:
+// the gate compares targets as stored, so a deployment's rows without one
+// form one member there and here.
 func workMember(op RolloutOperation) string {
-	if !op.Work || op.Target == "" {
+	if !op.Work {
 		return ""
 	}
 	return op.Deployment + OperationKeyDelimiter + op.Target
