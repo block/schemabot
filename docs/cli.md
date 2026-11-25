@@ -554,7 +554,8 @@ older server refuses a request from a newer CLI as an unknown field.
 
 A targeted apply checks for a schema change already in progress on its
 target's deployment, which every target of a `targets:` list shares, and
-refuses to start while one is queued or running there.
+refuses to start while one that has not finished holds it, whether it is
+queued, running, paused, retrying or in its revert window.
 
 `rollback` runs the same check on its database and environment, before it asks
 for confirmation or takes a lock, and gives the same refusal. If the check

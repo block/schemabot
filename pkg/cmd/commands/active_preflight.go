@@ -12,8 +12,10 @@ import (
 
 // refuseActiveSchemaChange runs the active schema change preflight shared by
 // apply and rollback, and refuses the command, with guidance for the schema
-// change already in progress, when check reports one. showLoading controls the
-// spinner, which JSON output suppresses.
+// change already in progress, when check reports one. Every active state is
+// refused, as the server refuses a new apply while any non-terminal apply holds
+// the target, so the operator learns it before the plan, prompt and lock rather
+// than after. showLoading controls the spinner, which JSON output suppresses.
 //
 // A preflight that fails is not a refusal: the server guards the same conflict
 // when the apply is created, so the command goes on, and the failure is logged
@@ -26,7 +28,7 @@ func refuseActiveSchemaChange(database, environment string, showLoading bool, ch
 		return checkErr
 	})
 	if err != nil {
-		slog.Warn("could not check for an active schema change, proceeding without it",
+		slog.Warn("could not check for an active schema change; proceeding, and the server will refuse the apply if a schema change holds the database",
 			"database", database, "environment", environment, "error", err)
 		return nil
 	}
@@ -45,11 +47,8 @@ func refuseActiveSchemaChange(database, environment string, showLoading bool, ch
 		stateMsg = "A schema change is already running."
 	case state.IsState(active.State, state.Apply.CuttingOver):
 		stateMsg = "A schema change is currently cutting over."
-	}
-	if stateMsg == "" {
-		slog.Debug("active schema change is in a state the preflight does not refuse on",
-			"database", database, "environment", environment, "apply_id", active.ApplyID, "state", active.State)
-		return nil
+	default:
+		stateMsg = heldByStateMessage(active.State)
 	}
 	fmt.Println()
 	fmt.Println("⏳ Schema Change In Progress")
@@ -64,4 +63,15 @@ func refuseActiveSchemaChange(database, environment string, showLoading bool, ch
 	}
 	fmt.Printf("To watch and manage: %s\n", cliname.Command("status", active.ApplyID))
 	return fmt.Errorf("schema change already in progress")
+}
+
+// heldByStateMessage names the state of an active schema change the preflight
+// has no specific wording for, and, when the state registry says, what it does
+// to the database it holds.
+func heldByStateMessage(activeState string) string {
+	msg := "A schema change is active (" + state.Label(state.NormalizeState(activeState)) + ")"
+	if hold := state.Hold(activeState); hold != "" {
+		return msg + "; " + hold + "."
+	}
+	return msg + "."
 }

@@ -193,7 +193,7 @@ func TestRollbackCmd_ProceedsAndLogsWhenThePreflightFails(t *testing.T) {
 	assert.Contains(t, out, "Rollback Plan")
 	assert.Contains(t, out, "Rollback cancelled.")
 	assert.Equal(t, []string{"POST /api/rollback/plan", "GET /api/status"}, *requests)
-	assert.Contains(t, logs.String(), "could not check for an active schema change, proceeding without it")
+	assert.Contains(t, logs.String(), "could not check for an active schema change; proceeding, and the server will refuse the apply if a schema change holds the database")
 	assert.Contains(t, logs.String(), "database=shop")
 	assert.Contains(t, logs.String(), "environment=production")
 }

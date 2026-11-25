@@ -497,6 +497,10 @@ func findActiveSchemaChange(endpoint, database, environment, deployment string, 
 		var result apitypes.StatusResponse
 		query := url.Values{}
 		query.Set("environment", environment)
+		// The server canonicalizes the database filter the same way, so this
+		// narrows every page to the one database; the comparison below stays
+		// for a server that ignores the filter.
+		query.Set("database", database)
 		if deployment != "" {
 			query.Set("deployment", deployment)
 		}
@@ -544,7 +548,11 @@ func findActiveSchemaChange(endpoint, database, environment, deployment string, 
 		if len(result.Applies) == 0 {
 			return nil, fmt.Errorf("the server reports more active schema changes in %s but listed none to continue from", environment)
 		}
-		after = result.Applies[len(result.Applies)-1].ApplyID
+		next := result.Applies[len(result.Applies)-1].ApplyID
+		if next == after {
+			return nil, fmt.Errorf("the server reports more active schema changes in %s but served the page ending at apply %s again", environment, after)
+		}
+		after = next
 	}
 	return nil, fmt.Errorf("there are more than %d active schema changes in %s, so the check for one on %s stopped without reading them all", maxActiveSchemaChangePages*activeSchemaChangePageSize, environment, database)
 }
