@@ -735,7 +735,13 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
 		}
-		if t.RowsTotal > 0 && (t.PercentComplete > 0 || t.RowsCopied > 0) {
+		if ui.CopyFinishedShortOfEstimate(t.PercentComplete, t.RowsCopied, t.RowsTotal) {
+			// A copy finished short of its estimate shows the rows it copied,
+			// as a running one does.
+			if line := presentation.FinishedCopyRowsText(t.RowsCopied); line != "" {
+				b.WriteString(indentDetail + line + "\n")
+			}
+		} else if t.RowsTotal > 0 && (t.PercentComplete > 0 || t.RowsCopied > 0) {
 			// A stopped copy is not advancing, so its rows line carries no ETA.
 			f := tableFacts(t)
 			f.ETASeconds = 0

@@ -173,6 +173,15 @@ func readRunning(f TableFacts) TableReading {
 			{Text: fmt.Sprintf("Rows copied: %s so far", ui.FormatNumber(f.RowsCopied))},
 			{Text: ui.EstimateExceededTooltip, Note: true},
 		}}
+	case ui.CopyFinishedShortOfEstimate(f.PercentComplete, f.RowsCopied, f.RowsTotal):
+		// The engine reports the copy done, but it inserted fewer rows than
+		// the estimated total, as when the estimate ran high or the copy
+		// skipped rows. It can insert none at all, when the source emptied
+		// after the estimate or the binlog applier moved every row first, so
+		// this comes before the starting-copy case. A percent of the estimate
+		// would sit beside a full bar, so the table reads as fully copied,
+		// with the rows it copied, as the post-copy phases do.
+		return TableReading{Bar: ui.ProgressBarRowCopy(100), Label: ui.FormatRowCopyPercent(100, f.RowsTotal, f.RowsTotal) + ShardCoverageSuffix(f), Details: rowsCopiedDetail(f)}
 	case f.RowsTotal > 0 && f.RowsCopied == 0:
 		// The row total is known but no rows have moved yet, which can take a
 		// while on a large table. A 0% bar reads as stuck, and a percent the
@@ -224,10 +233,21 @@ func applyingLabel(f TableFacts) string {
 
 // rowsCopiedDetail reports the rows a finished copy moved, once it moved any.
 func rowsCopiedDetail(f TableFacts) []TableDetail {
-	if f.RowsCopied <= 0 {
-		return nil
+	if line := FinishedCopyRowsText(f.RowsCopied); line != "" {
+		return []TableDetail{{Text: line}}
 	}
-	return []TableDetail{{Text: "Rows copied: " + ui.FormatNumber(f.RowsCopied)}}
+	return nil
+}
+
+// FinishedCopyRowsText is the rows line of a copy the engine reports finished
+// short of its estimate: the rows it copied, since a line against the
+// estimate would contradict the full bar beside it. It is empty when the copy
+// inserted none.
+func FinishedCopyRowsText(rowsCopied int64) string {
+	if rowsCopied <= 0 {
+		return ""
+	}
+	return "Rows copied: " + ui.FormatNumber(rowsCopied)
 }
 
 // RowsLine is a copy's rows line: rows copied of the total, the shards the
