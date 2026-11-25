@@ -198,3 +198,38 @@ func TestRenderUnsafeChangesBlockedWithoutAFreezeOffersNoOverride(t *testing.T) 
 
 	assert.NotContains(t, RenderUnsafeChangesBlocked(plan), "--override")
 }
+
+// A freeze notice points at the apply command below it, so a plan whose apply
+// the footer withholds shows none: behind an earlier environment's refused
+// apply, or under a member apply refusal.
+func TestRenderPlanCommentFreezeNoticeNeedsAnOfferedApply(t *testing.T) {
+	notice := func() *PlanFreezeNotice {
+		return &PlanFreezeNotice{InEffect: []RefusingFreeze{{ID: "freeze-3f9a1c2e7b4d8a06"}}, OverrideOnReason: true}
+	}
+	t.Run("behind a refused environment", func(t *testing.T) {
+		staging := frozenPlan("staging", nil)
+		staging.BlockedChanges = []BlockedChangeData{{Table: "users", Reason: "the engine refuses it"}}
+		production := frozenPlan("production", notice())
+
+		out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+			Database:     "testapp",
+			Environments: []string{"staging", "production"},
+			Plans:        map[string]*PlanCommentData{"staging": &staging, "production": &production},
+		})
+
+		require.Contains(t, out, "applies only after staging")
+		assert.NotContains(t, out, "is frozen")
+		assert.NotContains(t, out, "--override")
+	})
+	t.Run("member apply refusal", func(t *testing.T) {
+		plan := frozenPlan("production", notice())
+		plan.MemberApplyRefusalTarget = "eu"
+		plan.MemberApplyRefusal = "its plan is stale"
+
+		out := RenderPlanComment(plan)
+
+		require.Contains(t, out, "This PR cannot apply every target's plan")
+		assert.NotContains(t, out, "is frozen")
+		assert.NotContains(t, out, "--override")
+	})
+}

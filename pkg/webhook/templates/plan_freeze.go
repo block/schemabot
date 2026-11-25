@@ -85,6 +85,18 @@ func writePlanFreezes(sb *strings.Builder, environment string, notice *PlanFreez
 	}
 }
 
+// writePlanFreezesIfApplyOffered writes the plan's freeze notice only when
+// its footer offers the apply. The notice points at that command, so a plan
+// whose apply is withheld, by a member apply refusal or behind an earlier
+// environment's refused apply, shows none: it would send the author to a
+// command the comment does not give.
+func writePlanFreezesIfApplyOffered(sb *strings.Builder, data PlanCommentData) {
+	if !data.OffersApply() || data.MemberApplyRefusal != "" || data.applyWithheld {
+		return
+	}
+	writePlanFreezes(sb, data.Environment, data.Freezes)
+}
+
 // appendFreezeOverride adds the --override placeholder to an apply command
 // when a freeze in effect would refuse it, so the command the author copies is
 // the one that gets an urgent change through. A scheduled freeze adds nothing:

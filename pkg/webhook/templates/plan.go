@@ -638,7 +638,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// A branch missing newer base-branch schema changes is shown first, since
 	// it says the plan below may not be the change the PR means to make.
 	writeBaseSchema(&sb, data.BaseSchema)
-	writePlanFreezes(&sb, data.Environment, data.Freezes)
+	writePlanFreezesIfApplyOffered(&sb, data)
 	// Review-time deployment drift is shown before the change list — and before
 	// the no-changes short-circuit — because a non-primary deployment can drift
 	// even when the primary plan is a clean no-op.
@@ -4164,7 +4164,7 @@ func titleDatabaseType(databaseType string) string {
 // writeEnvironmentPlanSection writes the plan body for a single environment within a multi-env comment.
 func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, budget *ddlBlockBudget) {
 	writeBaseSchema(sb, plan.BaseSchema)
-	writePlanFreezes(sb, plan.Environment, plan.Freezes)
+	writePlanFreezesIfApplyOffered(sb, *plan)
 	// Deployment drift is shown before the change list and before the no-changes
 	// short-circuit: a non-primary deployment can drift even when this
 	// environment's primary plan is a clean no-op.
