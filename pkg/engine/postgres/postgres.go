@@ -590,6 +590,17 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("record the reviewed drop for table %q: %w", report.Table, err)
 			}
+			validationMetadata, err := stepValidationMetadata(statement, sql)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("record the reviewed validation for table %q: %w", report.Table, err)
+			}
+			if validationMetadata != nil {
+				if metadata == nil {
+					metadata = validationMetadata
+				} else {
+					maps.Copy(metadata, validationMetadata)
+				}
+			}
 			if unrecordedDrop && stepMode == "" {
 				stepMode = engine.ExecutionModeBlocked
 				stepReason = fmt.Sprintf("statement for table %q drops an object the planner did not record, so the apply cannot check that it is still the object this plan reviewed; make the change outside SchemaBot", table)

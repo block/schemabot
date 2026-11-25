@@ -122,6 +122,10 @@ type nativeApply struct {
 	// dropped is the plan's record of the live object the statement drops,
 	// which the apply checks under the table's lock before dropping it.
 	dropped *schemadiff.DroppedObject
+	// validates is the plan's record of the live NOT VALID constraint the
+	// statement validates, which the apply checks under the validation's
+	// lock before validating it.
+	validates *schemadiff.ConstraintValidation
 	// database names the target for the logs and metrics of a table drop.
 	database string
 	// droppedTable is the definition the plan recorded for a table the
@@ -303,8 +307,26 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		if err != nil {
 			return nativeApply{}, err
 		}
+		change.validates, err = reviewedValidationForApply(req.Database, tc)
+		if err != nil {
+			return nativeApply{}, err
+		}
 	}
 	return change, nil
+}
+
+// reviewedValidationForApply returns the plan's record of the live NOT VALID
+// constraint a statement validates, nil when the plan recorded none. A
+// record that is present but unreadable refuses the apply before any work
+// is queued, because validating without it could validate a constraint that
+// replaced the reviewed one under the same name.
+func reviewedValidationForApply(database string, tc engine.TableChange) (*schemadiff.ConstraintValidation, error) {
+	validates, err := reviewedValidationFromMetadata(tc.Metadata)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission rejected the reviewed validation record", "database", database, "table", tc.Table, "error", err)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: the plan's record of the constraint this statement validates is unreadable; re-plan and apply again", tc.Table)
+	}
+	return validates, nil
 }
 
 // reviewedDropForApply returns the plan's record of the object a statement
@@ -1715,6 +1737,17 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	// inside its create sequence.
 	if change.dropped != nil {
 		return executeReviewedDrop(ctx, pool, table, change, statement.SQL(), tracker)
+	}
+	if change.validates != nil {
+		// pg-sprite reads the constraint again under the validation's lock
+		// and refuses with ErrValidatedConstraintDrift, validating nothing,
+		// when it no longer has the definition the plan recorded.
+		if err := executor.ExecuteNativeValidatingWithProgress(ctx, pool, table, statement, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		}, executor.DefaultRetryPolicy(), *change.validates, tracker); err != nil {
+			return fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", change.validates.Constraint, change.table, err)
+		}
+		return nil
 	}
 	if err := executor.ExecuteNativeWithProgress(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,

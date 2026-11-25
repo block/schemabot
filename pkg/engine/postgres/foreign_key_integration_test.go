@@ -83,7 +83,7 @@ func TestEnginePlanForeignKeys(t *testing.T) {
 	assert.Equal(t, `statement for table "invoices" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan; foreign key constraint(s) "invoices_account_id_fkey" reference another namespace and cannot be declared, so the plan stays blocked until they are removed through a separately reviewed process`, dropCrossNamespaceFK.ModeReason)
 
 	assert.Equal(t, []string{
-		"CREATE TABLE public.shipments (id bigint PRIMARY KEY, order_id bigint NOT NULL REFERENCES orders (id))",
+		"CREATE TABLE public.shipments (id bigint PRIMARY KEY, order_id bigint NOT NULL REFERENCES public.orders (id))",
 	}, executableDDL(t, result, "shipments"), "the new table is created with its foreign key")
 }
 
@@ -234,4 +234,47 @@ func TestEngineApplyForeignKeyOverABrokenRow(t *testing.T) {
 	require.Len(t, outcomes, 1)
 	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
 	assert.True(t, foreignKeyValidated(t, db, "orders_user_id_fkey"))
+}
+
+// A plan validates a live foreign key left NOT VALID. Before the apply runs,
+// another session replaces the key with a different one under the same name.
+// The apply reads the key again under the validation's lock, finds it is not
+// the key the plan reviewed, and validates nothing; the operator is told to
+// re-plan.
+func TestEngineApplyRefusesToValidateAReplacedForeignKey(t *testing.T) {
+	const database = "apply_foreign_key_replaced_test"
+	dsn, db := testutil.StartPostgres(t, database)
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.accounts (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL);
+		INSERT INTO public.users VALUES (1);
+		INSERT INTO public.accounts VALUES (1);
+		INSERT INTO public.orders VALUES (10, 1);
+		ALTER TABLE public.orders ADD CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users (id) NOT VALID`)
+	require.NoError(t, err)
+	files := map[string]string{
+		"users.sql":    "CREATE TABLE users (id bigint PRIMARY KEY)",
+		"accounts.sql": "CREATE TABLE accounts (id bigint PRIMARY KEY)",
+		"orders.sql":   "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES users (id))",
+	}
+	eng := New()
+	planned := planForeignKeyFiles(t, eng, database, dsn, files)
+	require.Len(t, planned.Changes, 1)
+	require.Len(t, planned.Changes[0].TableChanges, 1)
+	validate := planned.Changes[0].TableChanges[0]
+	assert.Equal(t, "ALTER TABLE public.orders VALIDATE CONSTRAINT orders_user_id_fkey", validate.DDL)
+	assert.Contains(t, validate.Metadata, reviewedValidationMetadataKey, "the plan records the key it reviewed")
+
+	_, err = db.ExecContext(t.Context(), `
+		ALTER TABLE public.orders DROP CONSTRAINT orders_user_id_fkey;
+		ALTER TABLE public.orders ADD CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.accounts (id) NOT VALID`)
+	require.NoError(t, err)
+
+	outcomes := applyPlannedSteps(t, eng, dsn, planned)
+	require.Len(t, outcomes, 1)
+	assert.Equal(t, engine.StateFailed, outcomes[0].State)
+	assert.Contains(t, outcomes[0].ErrorMessage, `the index or constraint the planned statement for "orders" names changed after planning`)
+	assert.Contains(t, outcomes[0].ErrorMessage, "re-plan against the current schema")
+	assert.False(t, foreignKeyValidated(t, db, "orders_user_id_fkey"), "the replacement key is not validated")
 }
