@@ -185,17 +185,17 @@ func TestShardedInFlightTableReadsTheSameOnEverySurface(t *testing.T) {
 
 // A sharded table whose first shard has copied its 1,000 rows and moved on
 // to verifying, beside a queued shard the plan estimates at 9,000 rows, reads
-// 10% in the terminal and in the sharded PR comment, the same fraction its
-// rows line shows: the bar that stays across shards in different phases
-// counts the queued shard's estimate, so it does not jump to half done when
-// the first shard leaves its copy (UX-8).
+// 10% on every surface, the same fraction its rows line shows: the bar that
+// stays across shards in different phases counts the queued shard's estimate,
+// so it does not jump to half done when the first shard leaves its copy
+// (UX-8).
 func TestShardedPhaseBarCountsThePlannedRows(t *testing.T) {
 	shards := []*apitypes.ShardProgressResponse{
 		{Shard: "-80", Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, PercentComplete: 100, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000},
 		{Shard: "80-", Status: state.Task.Pending},
 	}
 	table := &apitypes.TableProgressResponse{
-		TableName: "orders", Keyspace: "shop_sharded", ChangeType: "alter",
+		TableName: "orders", Keyspace: "shop_sharded", DDL: "ALTER TABLE orders ADD COLUMN note text", ChangeType: "alter",
 		Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 10_000, RowsTotalPlanned: true, PlannedShards: 2, Shards: shards,
 	}
 	cli := FormatTableProgress(ParseProgressResponse(&apitypes.ProgressResponse{State: state.Apply.Running, Sharded: true, Tables: []*apitypes.TableProgressResponse{table}}).Tables[0])
@@ -210,14 +210,22 @@ func TestShardedPhaseBarCountsThePlannedRows(t *testing.T) {
 		}}}},
 	})
 
+	status := webhooktemplates.RenderApplyStatusComment(webhooktemplates.ApplyStatusFromProgress(&apitypes.ProgressResponse{
+		ApplyID: "apply-5e6f7a8b", Database: "shop", Environment: "staging", State: state.Apply.Running,
+		Tables: []*apitypes.TableProgressResponse{table},
+	}, "octocat"))
+
 	cliHeadline, cliDetails := cliInFlightReading(t, cli)
 	prHeadline, prDetails := shardedPRInFlightReading(t, pr)
+	statusHeadline, statusDetails := shardedPRInFlightReading(t, status)
 	assert.True(t, hasBar(cliHeadline), "the table keeps its bar across shards in different phases: %s", cliHeadline)
 	assert.Equal(t, "10%", withoutBar(cliHeadline), "CLI headline")
 	assert.Equal(t, withoutBar(cliHeadline), withoutBar(prHeadline), "the sharded PR comment's headline reads as the CLI's")
+	assert.Equal(t, withoutBar(cliHeadline), withoutBar(statusHeadline), "the apply status comment's headline reads as the CLI's")
 	require.NotEmpty(t, withoutShardList(cliDetails), "the table has a rows line")
 	assert.Equal(t, "Rows: 1,000 / ~10k", withoutShardList(cliDetails)[0], "rows line")
 	assert.Equal(t, withoutShardList(cliDetails), withoutShardList(prDetails), "the sharded PR comment's detail lines read as the CLI's")
+	assert.Equal(t, withoutShardList(cliDetails), withoutShardList(statusDetails), "the apply status comment's detail lines read as the CLI's")
 }
 
 // shardedPRInFlightReading returns the sharded PR comment's headline for the

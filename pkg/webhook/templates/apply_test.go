@@ -3010,3 +3010,26 @@ func TestRenderApplyComments_CancelledTableSaysHowFarItGot(t *testing.T) {
 	assert.Contains(t, summary, "**`users`** — Cancelled\n", "%s", summary)
 	assert.Contains(t, summary, "**`products`** — Cancelled\n", "%s", summary)
 }
+
+// A sharded table in a single-deployment apply whose shards are in different
+// phases keeps its bar across every shard, as the sharded comment and the CLI
+// show it: one verified shard of four, with the rest queued or not yet
+// attached, reads 25% with its rows line, not the verifying shard's phase.
+func TestRenderApplyStatusComment_ShardedPhaseBarSpansEveryShard(t *testing.T) {
+	out := RenderApplyStatusComment(ApplyStatusFromProgress(&apitypes.ProgressResponse{
+		ApplyID: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Running,
+		Tables: []*apitypes.TableProgressResponse{{
+			TableName: "orders", Keyspace: "shop_001", DDL: "ALTER TABLE orders ADD COLUMN note text", ChangeType: "alter",
+			Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, PlannedShards: 4,
+			Shards: []*apitypes.ShardProgressResponse{
+				{Shard: "-40", Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, PercentComplete: 100, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000},
+				{Shard: "40-80", Status: state.Task.Pending},
+			},
+		}},
+	}, "octocat"))
+
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(25)+" 25%\n", "%s", out)
+	assert.Contains(t, out, "- Rows: 1,000 / 1,000 across 1 of 4 shards\n", "%s", out)
+	assert.Contains(t, out, "  - ◉ `-40`: checksumming 25.00% · 250 / 1,000 rows verified\n", "%s", out)
+	assert.NotContains(t, out, "Checksumming to verify data")
+}
