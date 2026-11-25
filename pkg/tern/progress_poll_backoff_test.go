@@ -94,12 +94,14 @@ func TestProgressPollWait_RandomJitterStaysWithinBounds(t *testing.T) {
 // scheduleRecordingEngine answers progress polls from a script, one step per
 // call, repeating the last step once the script runs out, and records when
 // each poll arrived. When cancelOnCall is set, the poll with that number
-// cancels the drive's context before answering.
+// cancels the drive's context before answering. Each poll takes work to
+// answer.
 type scheduleRecordingEngine struct {
 	engine.Engine
 	steps        []finalizerPollStep
 	cancelOnCall int
 	cancel       context.CancelFunc
+	work         time.Duration
 
 	mu       sync.Mutex
 	polledAt []time.Time
@@ -111,12 +113,13 @@ func (e *scheduleRecordingEngine) ProgressIsExternallyAuthoritative() bool { ret
 
 func (e *scheduleRecordingEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.polledAt = append(e.polledAt, time.Now())
 	if len(e.polledAt) == e.cancelOnCall {
 		e.cancel()
 	}
 	step := e.steps[min(len(e.polledAt)-1, len(e.steps)-1)]
+	e.mu.Unlock()
+	time.Sleep(e.work)
 	return step.result, step.err
 }
 
@@ -241,6 +244,40 @@ func TestProgressDrives_AnsweredPollReturnsToThePlainInterval(t *testing.T) {
 
 				s := progressDriveTestInterval
 				assert.Equal(t, []time.Duration{s, 2 * s, 4 * s, s, s}, eng.gaps())
+			})
+		})
+	}
+}
+
+// The time a poll takes to answer does not stretch the drive's cadence: each
+// wait runs from when the last poll began, so a healthy drive polls on the
+// plain interval and a failing one on its backoff schedule, however slowly the
+// provider answers.
+func TestProgressDrives_PollTimeDoesNotStretchTheInterval(t *testing.T) {
+	pollErr := errors.New("get deploy request: rate limited")
+	running := &engine.ProgressResult{State: engine.StateRunning}
+	for _, drive := range progressDrives() {
+		t.Run(drive.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				eng := &scheduleRecordingEngine{
+					steps: []finalizerPollStep{
+						{result: running},
+						{result: running},
+						{err: pollErr},
+						{err: pollErr},
+						{result: running},
+					},
+					cancelOnCall: 6,
+					cancel:       cancel,
+					work:         progressDriveTestInterval * 3 / 10,
+				}
+
+				_ = drive.run(ctx, eng, progressDriveTestInterval)
+
+				s := progressDriveTestInterval
+				assert.Equal(t, []time.Duration{s, s, s, 2 * s, s}, eng.gaps())
 			})
 		})
 	}

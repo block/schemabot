@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -467,24 +468,34 @@ func TestPollTaskToCompletion_LostEngineWorkNeverCompletesAShardTaskOnWholeNames
 // against the same bounded error budget as a failed poll, and exhausting it
 // rests the task retryable for a fresh claim to re-drive — never permanently
 // failed, because nothing proved the target is broken.
+// Each failed verification also backs off the next poll, as a failed poll does.
 func TestPollTaskToCompletion_LostEngineWorkVerificationErrorsAreBounded(t *testing.T) {
-	eng := &lostWorkEngine{
-		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
-			{State: engine.StatePending},
-		}},
-		planResult: &engine.PlanResult{NoChanges: true},
-	}
-	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetReached)
-	client.storage.(*exactProgressStorage).plans = &scriptedPlanStore{err: fmt.Errorf("storage read failed")}
+	synctest.Test(t, func(t *testing.T) {
+		eng := &lostWorkEngine{
+			phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+				{State: engine.StatePending},
+			}},
+			planResult: &engine.PlanResult{NoChanges: true},
+		}
+		client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetReached)
+		client.storage.(*exactProgressStorage).plans = &scriptedPlanStore{err: fmt.Errorf("storage read failed")}
+		client.progressPollJitter = noProgressPollJitter
 
-	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+		start := time.Now()
+		action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
 
-	assert.Equal(t, taskFailed, action)
-	assert.Equal(t, state.Task.FailedRetryable, task.State, "an unverifiable target is retryable, never permanently failed")
-	assert.Nil(t, task.CompletedAt, "a retryable task carries no completion timestamp")
-	assert.Contains(t, task.ErrorMessage, "could not be verified")
-	assert.Contains(t, task.ErrorMessage, "consecutive errors")
-	assert.Equal(t, 0, eng.planCalls, "a failed plan read settles nothing; the engine re-plan is never reached")
+		// Polls arrive one interval apart until the sixth spends the trust
+		// budget of five intervals. Its failed verification and the nine
+		// after it wait 1, 2, 4, 8, and then the cap of 16 intervals five
+		// times: 6 + 95 intervals.
+		assert.Equal(t, 101*client.taskPollInterval(), time.Since(start), "failed verifications back off the drive")
+		assert.Equal(t, taskFailed, action)
+		assert.Equal(t, state.Task.FailedRetryable, task.State, "an unverifiable target is retryable, never permanently failed")
+		assert.Nil(t, task.CompletedAt, "a retryable task carries no completion timestamp")
+		assert.Contains(t, task.ErrorMessage, "could not be verified")
+		assert.Contains(t, task.ErrorMessage, "consecutive errors")
+		assert.Equal(t, 0, eng.planCalls, "a failed plan read settles nothing; the engine re-plan is never reached")
+	})
 }
 
 // A freshly restarted engine can serve a stale snapshot that omits in-flight

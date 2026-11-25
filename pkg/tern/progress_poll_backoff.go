@@ -6,11 +6,14 @@ import (
 )
 
 // progressPollBackoffCapMultiple caps a failing drive's wait between progress
-// polls at this multiple of its plain poll interval. A drive that spends its
-// whole error budget at the cap still settles well inside
-// storage.ApplyDriveStallAfter, and no single wait comes near
-// storage.ApplyLeaseStaleAfter. The drive's lease is renewed by its own
-// heartbeat goroutine, which keeps running through every wait.
+// polls at this multiple of its plain poll interval. At the default interval
+// the waits before a drive's error budget is spent total at most 48s, well
+// inside storage.ApplyDriveStallAfter, and no single wait comes near
+// storage.ApplyLeaseStaleAfter. That bound covers the waits only: the engine
+// and storage calls a failing poll makes take their own time, and a provider
+// that takes about 30s to fail each call can reach the stall bound before the
+// budget is spent, which ends the drive in a stall cancel instead. The drive's lease is renewed by its own heartbeat goroutine, which
+// keeps running through every wait.
 const progressPollBackoffCapMultiple = 16
 
 // progressPollWait returns how long a progress drive waits before its next
@@ -24,7 +27,10 @@ const progressPollBackoffCapMultiple = 16
 // or shortens one below the plain interval.
 //
 // Every progress drive paces its polls through this one function, so the
-// sequential, grouped, and group_finalizer drives cannot drift apart.
+// sequential, grouped, and group_finalizer drives cannot drift apart. Each
+// drive measures the wait from when its last poll began, so the time a poll
+// takes is not added to the interval, and draws it once per failure, so the
+// next_poll_in its failure log reports is the wait it keeps.
 func (c *LocalClient) progressPollWait(consecutiveErrors int) time.Duration {
 	interval := c.taskPollInterval()
 	limit := interval * progressPollBackoffCapMultiple
