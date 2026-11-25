@@ -165,10 +165,12 @@ func TestParseProgressResponseCarriesTableAndShardETA(t *testing.T) {
 	assert.Equal(t, int64(480), data.Tables[0].Shards[0].ETASeconds)
 }
 
-// A sharded table without its own estimate takes the slowest shard's ETA, and
-// a shard reporting rows but no percent gets its percent derived from them —
-// clamped to 100, since row totals are estimates a copy can exceed.
-func TestParseProgressResponsePromotesSlowestShardETAAndDerivesShardPercent(t *testing.T) {
+// A sharded table without its own estimate takes the time its copying shards
+// take together (presentation.CombinedShardETA): 305,000 rows left at about
+// 460 rows a second, not the slowest shard's 900 seconds. A shard reporting
+// rows but no percent gets its percent derived from them, clamped to 100,
+// since row totals are estimates a copy can exceed.
+func TestParseProgressResponseCombinesShardETAsAndDerivesShardPercent(t *testing.T) {
 	result := &apitypes.ProgressResponse{
 		State: state.Apply.Running,
 		Tables: []*apitypes.TableProgressResponse{
@@ -189,7 +191,7 @@ func TestParseProgressResponsePromotesSlowestShardETAAndDerivesShardPercent(t *t
 	data := ParseProgressResponse(result)
 
 	require.Len(t, data.Tables, 1)
-	assert.Equal(t, int64(900), data.Tables[0].ETASeconds)
+	assert.Equal(t, int64(663), data.Tables[0].ETASeconds)
 	require.Len(t, data.Tables[0].Shards, 4)
 	assert.Equal(t, 50, data.Tables[0].Shards[0].PercentComplete)
 	assert.Equal(t, 25, data.Tables[0].Shards[1].PercentComplete)

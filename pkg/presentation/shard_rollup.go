@@ -1,6 +1,10 @@
 package presentation
 
-import "github.com/block/schemabot/pkg/state"
+import (
+	"math"
+
+	"github.com/block/schemabot/pkg/state"
+)
 
 // ShardCopy is one shard's progress on one table's change: its status in
 // task vocabulary and the copy figures its engine reported.
@@ -70,9 +74,9 @@ type ShardedTableCopy struct {
 
 	// RowsCopied, RowsTotal, and ETASeconds cover the shards that have
 	// reported a row total, counted in ShardsReporting: rows sum across them
-	// and the ETA is the slowest one's. A shard counts only once it carries a
-	// total, so a shard with copied rows but no total cannot inflate the
-	// numerator alone. A renderer discloses the coverage rather than passing
+	// and the ETA is the time they take together (CombinedShardETA). A shard
+	// counts only once it carries a total, so a shard with copied rows but no
+	// total cannot inflate the numerator alone. A renderer discloses the coverage rather than passing
 	// one wave's fraction off as the table's.
 	RowsCopied      int64
 	RowsTotal       int64
@@ -107,6 +111,7 @@ func RollUpShardedTable(shards []ShardCopy, plannedShards int) ShardedTableCopy 
 	var planned int64
 	estimatesCoverUnreported := everyPlannedShardListed(len(shards), plannedShards)
 	unreported, inFlight := 0, false
+	var reporting []ShardCopy
 	for _, sh := range shards {
 		if TaskAttentionRank(sh.Status) > TaskAttentionRank(out.Status) {
 			out.Status = sh.Status
@@ -126,13 +131,43 @@ func RollUpShardedTable(shards []ShardCopy, plannedShards int) ShardedTableCopy 
 		out.ShardsReporting++
 		out.RowsCopied += sh.RowsCopied
 		out.RowsTotal += sh.RowsTotal
-		out.ETASeconds = max(out.ETASeconds, sh.ETASeconds)
+		reporting = append(reporting, sh)
 	}
+	out.ETASeconds = CombinedShardETA(reporting)
 	if inFlight && unreported > 0 && estimatesCoverUnreported {
 		out.RowsTotal += planned
 		out.RowsTotalPlanned = true
 	}
 	return out
+}
+
+// CombinedShardETA is the time a table's copy has left at the rate its
+// copying shards copy together: the rows they have left over the sum of their
+// rates, each shard's rate being its rows left over its own ETA. A throttled
+// shard then slows the table by its share of that rate, rather than setting
+// the table's ETA alone from its own momentary rate. A shard with no ETA or no
+// rows left adds nothing, so the work of a queued shard stays out until it is
+// copying and has a rate. When no shard has both, the ETA is the longest any
+// shard reports, zero when none reports one.
+func CombinedShardETA(shards []ShardCopy) int64 {
+	var rowsLeft, rowsPerSecond float64
+	var longest int64
+	for _, sh := range shards {
+		if sh.ETASeconds <= 0 {
+			continue
+		}
+		longest = max(longest, sh.ETASeconds)
+		left := sh.RowsTotal - sh.RowsCopied
+		if left <= 0 {
+			continue
+		}
+		rowsLeft += float64(left)
+		rowsPerSecond += float64(left) / float64(sh.ETASeconds)
+	}
+	if rowsPerSecond == 0 {
+		return longest
+	}
+	return int64(math.Ceil(rowsLeft / rowsPerSecond))
 }
 
 // everyPlannedShardListed reports whether the listed shards are known to
