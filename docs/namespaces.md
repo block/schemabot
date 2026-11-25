@@ -149,10 +149,11 @@ unsafe change and requires the same
 Deleting every schema file in a namespace, or moving them all out of it, does
 not remove the namespace from the plan while another namespace still declares
 files under the schema root. Every table the emptied namespace still holds is
-planned as a `DROP TABLE` change: on MySQL and Vitess an unsafe change that
-needs the explicit drop approval before it can run, on PostgreSQL a blocked
-change that fails the check until the tables are declared again or dropped
-through a reviewed schema change. Only the files the pull request itself
+planned as a `DROP TABLE` change: an unsafe change that needs the explicit
+drop approval before it can run. On PostgreSQL some of these drops are blocked
+instead, such as a table that a view reads; see
+[Tables with no schema file](./postgresql.md#tables-with-no-schema-file). Only
+the files the pull request itself
 removes count — a deletion it inherited from history its base branch has not
 caught up with is not one it proposes.
 

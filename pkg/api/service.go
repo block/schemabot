@@ -851,9 +851,10 @@ func (s *Service) createRemoteTernClient(key, deployment, environment string) (t
 	// Create gRPC client lazily
 	// Pass storage so GRPCClient can manage applies (heartbeats, progress tracking)
 	client, err := tern.NewGRPCClient(tern.Config{
-		Address: address,
-		Storage: s.storage,
-		Logger:  s.logger,
+		Address:        address,
+		Storage:        s.storage,
+		Logger:         s.logger,
+		ChangeEventApp: s.config.DatabaseApp,
 	})
 	if err != nil {
 		// The client dials lazily, so a failure here is the address itself,

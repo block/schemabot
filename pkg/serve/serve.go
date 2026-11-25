@@ -30,6 +30,8 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/changeevents"
+	"github.com/block/schemabot/pkg/changeevents/sqspublisher"
 	"github.com/block/schemabot/pkg/drain"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
@@ -572,6 +574,7 @@ func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os
 // the embedding seam: a data plane consuming SchemaBot as a module configures it
 // entirely through ServerConfig rather than reimplementing this wiring.
 type Server struct {
+	changeEvents    *changeevents.Sender
 	cfg             *api.ServerConfig
 	svc             *api.Service
 	storage         storage.Storage
@@ -677,6 +680,21 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 	logger.Info("building server", "version", version, "commit", o.commit, "built", o.date)
 
+	queues, err := sqspublisher.NewDestinations(ctx, cfg.SQSChangeEvents)
+	if err != nil {
+		return nil, err
+	}
+	events, err := changeevents.NewWithPublishers(cfg.ChangeEvents, queues, logger)
+	if err != nil {
+		return nil, err
+	}
+	keepEvents := false
+	defer func() {
+		if !keepEvents {
+			events.Close()
+		}
+	}()
+
 	// Register PlanetScale mTLS before anything else so a worker with
 	// missing or unreadable certificate material fails startup immediately
 	// instead of failing every Vitess connection it later opens.
@@ -760,7 +778,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 
 	// Create service with dependencies
-	store, err := newStore(dialect, db, storage.WithMaxDriversPerApply(cfg.MaxDriversPerApply))
+	store, err := newStore(dialect, db, storage.WithMaxDriversPerApply(cfg.MaxDriversPerApply), storage.WithChangeEvents(events, cfg.DatabaseApp, logger))
 	if err != nil {
 		return nil, err
 	}
@@ -830,6 +848,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		targetResolver = router.Resolver()
 	}
 	srv := &Server{
+		changeEvents:    events,
 		cfg:             cfg,
 		svc:             svc,
 		storage:         store,
@@ -851,6 +870,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 
 	success = true
+	keepEvents = true
 	return srv, nil
 }
 
@@ -1314,6 +1334,7 @@ func (s *Server) Close() error {
 	// shutdown-window drive a closed client. StopOperator waits for in-flight
 	// drivers and is idempotent, so svc.Close repeating it is a no-op.
 	s.svc.StopOperator()
+	s.changeEvents.Close()
 
 	var errs []error
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

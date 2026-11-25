@@ -12,6 +12,7 @@
 - [Hybrid Mode](#hybrid-mode)
 - [Drivers](#drivers)
 - [Metrics](#metrics)
+- [Change Events](#change-events)
 - [Rate Limits](#rate-limits)
 - [Pending Drops](#pending-drops)
 - [Direct Execution](#direct-execution)
@@ -1017,6 +1018,102 @@ The cap applies only to *starting* new operations — a first start, a resume af
 **The cap is a steady-state bound, not a hard admission limit.** Each claim evaluates the count independently, so drivers polling in the same instant can all read the same pre-claim value and admit together — a pod restart or rolling deploy, where every driver's first poll lands at once, is the shape that produces it. The transient ceiling is the number of drivers claiming in that window; once those leases commit, the next claim counts them and the cap binds again. Size against the steady-state number, and do not treat the cap as a guarantee that an apply can never briefly exceed it.
 
 A multi-shard apply started with a manual `--defer-cutover` keeps its drivers while it waits: unlike the automatic barrier park, a manually deferred operation holds its claim and keeps heartbeating, so it stays counted. Its cutover is accepted only once every operation waits, which takes a cap no smaller than the apply's width, so a deferred apply that would hold more operations at once than `max_drivers_per_apply` is [refused at the start](#deferred-cutover-capacity). Run it without `--defer-cutover`, or raise `max_drivers_per_apply` to at least its width.
+
+## Change Events
+
+Use `change_events` to send JSON lifecycle events to HTTP destinations. Each
+destination selects its environments and events. A server with no destinations
+configured sends no events.
+
+```yaml
+change_events:
+  - url: https://events.example.com/schema
+    environments: [production]
+    events: [operation.started, operation.finished, apply.finished]
+    body: |
+      {"app":{{json .App}},"environment":{{json .Environment}},
+       "timestamp":{{.OccurredAtNanos}},"description":{{json .Description}}}
+```
+
+Templates receive `.Type`, `.App`, `.Environment`, `.OccurredAtNanos`, and
+`.Description`. Use the `json` function to encode string values. `.App` comes
+from the database registration's `app` field and falls back to the logical
+database name when no application is registered.
+
+- The executing worker reports `operation.started` when a fresh attempt reaches
+  the engine. It reports `operation.finished` when a drive that called the engine
+  commits the attempt outcome. After a takeover, the finish can be omitted if
+  the drive cannot establish a new outcome for the attempt. An automatic retry opens a
+  new attempt even when its outcome is again `failed_retryable`.
+- The control plane reports `apply.finished` when a state transition records
+  the settled rollout outcome. If the rollout settles while the apply already
+  has that outcome, the event is omitted. The description includes the apply
+  ID and deployment outcomes for pull request and CLI applies.
+
+Each server configures its own destinations. For a remote apply, configure the
+worker to report operation events and the control plane to report the aggregate
+outcome. Worker events use the executing deployment's apply and operation IDs.
+The worker receives the managed app label in the existing dispatch options.
+
+### Amazon SQS destinations
+
+Use `sqs_change_events` to publish structured JSON to an existing standard SQS
+queue. Each queue selects its own events and environments. It works on its own
+or alongside the HTTP destinations above.
+
+```yaml
+sqs_change_events:
+  - queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/schema-events
+    region: us-east-1
+    environments: [production]
+    events: [apply.finished]
+```
+
+Grant the server role `sqs:SendMessage` on that queue. The publisher uses the AWS
+SDK credential chain. Set `region` to the queue's region or supply it through
+the AWS SDK configuration. Omitting `sqs_change_events` disables SQS delivery.
+
+An `apply.finished` message for a successful apply looks like this:
+
+```json
+{
+  "event_id": "103dfb3a-5cb6-4b2c-b36a-6bc0d75ce5c7",
+  "type": "apply.finished",
+  "id": "apply_example",
+  "app": "checkout",
+  "database": "orders",
+  "database_type": "mysql",
+  "environment": "production",
+  "repository": "example/schemas",
+  "pull_request": 42,
+  "outcome": "completed",
+  "completed_at": "2026-11-20T00:00:00Z",
+  "occurred_at_nanos": 1795132800000000000
+}
+```
+
+Use `event_id` to deduplicate deliveries. With a local worker, operation events
+and the control plane’s `apply.finished` event share the same apply `id`. With a
+remote worker, operation events carry the worker’s apply ID and `apply.finished`
+carries the control plane’s apply ID. Joining on `id` only correlates events
+within the same apply record.
+
+Apply
+outcomes include `completed`, `failed`, `cancelled`, and `reverted`. Consumers
+that react only to successful schema changes should select `outcome == "completed"`.
+`occurred_at_nanos` is when the hook observed the event. `completed_at` is the
+stored apply completion time, falling back to the stored update time. Operation
+events include `operation_id`, `deployment`, and `attempt`. Only finish events
+carry an outcome, and only aggregate finish events carry `completed_at`.
+Repository and pull request fields are omitted when absent.
+
+Delivery is best effort for both transports. Each destination uses a bounded
+in-memory queue and a three-second send deadline. A full queue, a failed send,
+or shutdown can lose events. The SQS publisher makes one send attempt. Once
+SQS accepts a message, the queue's retention and delivery policies apply.
+Delivery failures are logged. SchemaBot writes no outbox rows. When a reaper
+settles an apply, delivery workers load the event details in the background
+so the reaper can update GitHub without waiting.
 
 ## Rate Limits
 

@@ -120,9 +120,8 @@ func TestDrainedFailureKeepsLastObservedCopyPosition(t *testing.T) {
 }
 
 // A completed schema change copied everything, so the drained outcome reports
-// a full bar with the row total reconciled to the copied count — the count is
-// ground truth once the copy finished, and a full bar contradicted by its own
-// rows line would misreport a change that landed.
+// a full bar. Its last live counters were read before the copy finished, so
+// the row total stays the estimate rather than the count the copy had reached.
 func TestDrainedCompletionReportsFullProgressWithLastCounters(t *testing.T) {
 	eng := New(Config{})
 	rm := registerRunningSchemaChange(eng)
@@ -152,8 +151,8 @@ func TestDrainedCompletionReportsFullProgressWithLastCounters(t *testing.T) {
 	assert.Equal(t, string(engine.StateCompleted), tp.State)
 	assert.Equal(t, 100, tp.Progress)
 	assert.Equal(t, int64(49000), tp.RowsCopied)
-	assert.Equal(t, int64(49000), tp.RowsTotal,
-		"the estimated total reconciles to the copied count once the copy is complete")
+	assert.Equal(t, int64(50000), tp.RowsTotal,
+		"a count short of the estimate keeps the estimate as the finished table's size")
 }
 
 // Draining an engine that is not tracking any schema change changes nothing:

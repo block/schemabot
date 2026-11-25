@@ -2529,6 +2529,245 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="plan-of-a-frozen-change"></a><strong>Plan Of A Frozen Change</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+❄️ **`staging` is frozen, so applying this plan would be refused now.**
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `freeze-3f9a1c2e7b4d8a06` | until 2026-12-26T00:00:00Z | Holiday code freeze |
+
+Wait for the freeze to end before you apply. If this change can't wait, apply with `--override` and your reason, as the command below does: SchemaBot lets it through and records your reason.
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
+💡 **Lint Warnings**: 2 advisory findings
+1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging --override "<why it can't wait>"
+```
+
+</details>
+
+<details>
+<summary><a name="plan-of-a-change-a-scheduled-freeze-covers"></a><strong>Plan Of A Change A Scheduled Freeze Covers</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+❄️ **A freeze is scheduled in `staging`.** Apply before it starts, and let the change finish: while it holds, the apply is refused, and so is a `start` or `cutover` the change still needs.
+
+| Freeze | Starts | Holds | Reason |
+| :-- | :-- | :-- | :-- |
+| `freeze-8c41d2e9a7f03b56` | 2026-12-19T00:00:00Z | until 2026-12-26T00:00:00Z | Holiday code freeze |
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
+💡 **Lint Warnings**: 2 advisory findings
+1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="plan-of-a-frozen-change-approval-policy"></a><strong>Plan Of A Frozen Change (Approval Policy)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+❄️ **`staging` is frozen, so applying this plan would be refused now.**
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `freeze-3f9a1c2e7b4d8a06` | until lifted | INC-1234: payments latency |
+
+Wait for the freeze to end before you apply. If this change can't wait, apply with `--override` and your reason, as the command below does. A freeze approver other than you and the PR author, a member of `acme/freeze-approvers`, must approve it, and then you run the command again.
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
+💡 **Lint Warnings**: 2 advisory findings
+1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging --override "<why it can't wait>"
+```
+
+</details>
+
+<details>
+<summary><a name="plan-of-a-frozen-change-with-an-unsafe-change"></a><strong>Plan Of A Frozen Change With An Unsafe Change</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+❄️ **`staging` is frozen, so applying this plan would be refused now.**
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `freeze-3f9a1c2e7b4d8a06` | until 2026-12-26T00:00:00Z | Holiday code freeze |
+
+Wait for the freeze to end before you apply. If this change can't wait, apply with `--override` and your reason, as the command below does: SchemaBot lets it through and records your reason.
+
+```sql
+ALTER TABLE `orders` DROP COLUMN `legacy_ref`;
+```
+
+```sql
+ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `orders`: DROP COLUMN discards the column's data
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply**:
+1. Deploy application code that no longer reads from or writes to the dropped column.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `orders`:
+   ```
+   schemabot apply -e staging --override "<why it can't wait>"
+   ```
+
+</details>
+
+<details>
 <summary><a name="rollout-plans-converging"></a><strong>Rollout Plans (Converging)</strong></summary>
 
 
@@ -11342,7 +11581,7 @@ ALTER TABLE `mutes`
 
 **Status**: In Progress — 0 of 1 change applied
 
-**Shards**: 1 running table copy, 3 waiting for -40
+**Shards**: 1 running table copy, 3 queued
 
 #### Keyspace `cdb_resolute_sharded`
 
@@ -11414,7 +11653,7 @@ schemabot apply -e production
 
 **Status**: In Progress — 0 of 1 change applied
 
-**Shards**: 1 running table copy, 2 waiting for -40
+**Shards**: 1 running table copy, 2 queued
 
 #### Keyspace `cdb_resolute_sharded`
 
@@ -11443,13 +11682,13 @@ Shards diverge — grouped by change:
 | Shard | Status |
 | --- | --- |
 | `-40` | 🔄 running table copy |
-| `80-c0` | ⏳ waiting for -40 |
+| `80-c0` | ⏳ queued |
 
 **shard `40-80`**
 
 | Shard | Status |
 | --- | --- |
-| `40-80` | ⏳ waiting for -40 |
+| `40-80` | ⏳ queued |
 
 _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
@@ -11467,7 +11706,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 **Status**: In Progress — 1 of 4 changes applied (done on 1 of 6 shards)
 
-**Shards**: 1 completed, 1 running table copy, 4 waiting for cdb_resolute_lookup/-
+**Shards**: 1 completed, 1 running table copy, 4 queued
 
 #### Keyspace `cdb_resolute`
 
@@ -11517,6 +11756,8 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 **Shards**: 4 completed
 
+<details><summary>Apply details (1 table, 1 VSchema update)</summary>
+
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: ✅ Complete (4 shards)
@@ -11545,33 +11786,6 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 
 </details>
-
-<details>
-<summary><a name="summary-keyspace-finalized"></a><strong>Summary: Keyspace Finalized</strong></summary>
-
-
-## ✅ Schema Change Applied — Production
-
-**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
-
-*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
-
-> Applied successfully — your schema change is live!
-
-**Shards**: 2 completed
-
-#### Keyspace `cdb_resolute_sharded`
-
-**`mutes`**: ✅ Complete (2 shards)
-
-```sql
-ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
-```
-
-### Finalize
-
-**`cdb_resolute_sharded`**: Finalized
-
 
 </details>
 
@@ -11609,6 +11823,38 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 **`cdb_resolute_sharded`**: Cancelled
 
+
+---
+
+To retry:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="summary-keyspace-finalize-failed"></a><strong>Summary: Keyspace Finalize Failed</strong></summary>
+
+
+## ❌ Schema Change Failed — Production
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `shop` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
+
+*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
+
+**Shards**: 4 completed
+
+> ❌ **Failure:** finalizing keyspace <code>commerce</code> — publish routing rules: target is read-only
+
+#### Keyspace `commerce`
+
+**`mutes`**: ✅ Complete (4 shards)
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
 
 ---
 
@@ -12090,17 +12336,17 @@ To resume from where it stopped:
 
 ```
 
-┌─────────────────────────────────────────────────────────┐
-│  Apply ID:     apply-shard-e5f6a7b8                     │
-│  Database:     shop                                     │
-│  Environment:  production                               │
-│  State:        Running                                  │
-│  Shards:       1 running table copy, 3 waiting for -40  │
-│  Caller:       github:octocat                           │
-│  Source:       https://github.com/acme/shop/pull/412    │
-│  Started:      Jan 15 14:26:00 UTC                      │
-│  Duration:     4m                                       │
-└─────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-e5f6a7b8                   │
+│  Database:     shop                                   │
+│  Environment:  production                             │
+│  State:        Running                                │
+│  Shards:       1 running table copy, 3 queued         │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:26:00 UTC                    │
+│  Duration:     4m                                     │
+└───────────────────────────────────────────────────────┘
 
 
   ── shop_001 ──

@@ -1019,7 +1019,9 @@ per-operation budget in the redispatch claim (`FindNextApplyOperation`,
 Multi-member rollouts claim operations in member order, where a member is a (deployment, target)
 pair taken in `deployment_order` and then in each deployment's `targets` order, and a failed
 earlier member blocks later ones unless the config says otherwise. Copy start is ordered per
-member, not per operation: one member's work never waits on its own member's work to start, and a
+member, not per operation: one member's work never waits on its own member's work to start, but
+once some of a member's work has failed, its work that has not started is held by that failure
+exactly as a later member's work would be, and a
 later member's work waits on every earlier member's, until it completes under `rolling` or reaches
 the cutover barrier under `barrier`, while `parallel` does not order copy start at all. Where a
 rollout is laid out table by table, work on a table starts on any target only once every earlier
@@ -1060,7 +1062,8 @@ without completing the request would refuse the start the hold exists to preserv
 *Enforced:* the ordered-claim gates in `FindNextApplyOperation`, whose work and finalizer arms
 each gate on earlier members and whose stopped+start arm holds a finalizer, and work that never
 started, to the same gate, with the failure exemption shared by every gate and the table-step
-boundary `rolloutStepGateSQL` in the work gate, and `FindNextApplyOperationCutover`, whose start
+boundary `rolloutStepGateSQL` and the same-member failure gate `sameMemberFailureGateSQL` in the
+work gate, and `FindNextApplyOperationCutover`, whose start
 arm gates on the hold rule `earlierSiblingHoldsCutoverSQL` that `CutoverBlocker` shares
 (`pkg/storage/internal/sqlstore/apply_operations.go`), pinned per policy on both dialects by the
 storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a
@@ -1072,8 +1075,9 @@ check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sha
 `earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request
 (`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`) and at request intake
 (`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
-(`DeriveRolloutApplyState`, `deriveCancelledRollout`, `deriveStoppedRollout`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
-`pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`, whose
+(`DeriveRolloutApplyState`, `deriveCancelledRollout`, `deriveStoppedRollout`, `hasStartedUnsettledWork`, `childHoldsItsTarget`,
+and `pauseHoldsWork` with `heldBySameMemberFailure`, `pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`,
+whose `workMember` groups work rows into members as the same-member failure gate does, and whose
 `stepOrphanedByEarlierStep` marks work held behind a table that settled without completing, read through `StepRowCanNeverPass`), through which every
 projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/apply.go`), which
 `updateApplyStateFromOperations` consults to keep a held-open rollout's recovery claim quiet, and
@@ -1581,6 +1585,21 @@ deployment still holds rows naming it. *Enforced:* the retired-operation list
 (`RetiredControlOperations()` in `pkg/storage/types.go`), consulted by the terminal sweep
 (`pkg/tern/control_requests.go`).
 
+### CO-11: A control command names the apply it acts on
+
+Every control command, and rollback, acts only on the apply the operator names by its apply ID,
+on every surface. A command without one is refused before SchemaBot looks up any apply, and no
+control request is recorded. SchemaBot never infers the apply, not even when exactly one apply is
+active. *Breaks if violated:* the apply that was active when the operator looked may have finished
+by the time the command lands, so a guess can stop, revert, or run the cutover for a schema change the
+operator never meant to touch. *Enforced:* the PR comment usage reply (`loadApplyForPRControl` in
+`pkg/webhook/control.go`, and the rollback gate in `pkg/webhook/issue_comment.go`); the CLI
+(`RequireApplyID` and `requireControlScope` in `pkg/cmd/commands/common.go`, and rollback's
+required argument); the HTTP API (`decodeControlRequest`, `controlTarget`,
+`ValidateRollbackSourceApply`, and `handleRollbackPlan` in `pkg/api/control_handlers.go`). A completeness test on each surface walks the operation
+registry (`ControlOperations()` in `pkg/storage/types.go`), so a new operation is held to the rule
+without anyone adding it to a list.
+
 ## Operator surfaces (UX)
 
 The rest of this document is about what the system does. This family is about what the operator is
@@ -1911,12 +1930,13 @@ the re-plan speaks for a shard-tagged task at all. `remainingPlannedChanges` on 
 path of the PlanetScale engine (`pkg/engine/planetscale/apply.go`) runs only reviewed DDL for the
 tables the branch still lacks, refuses a branch that differs outside the reviewed DDL, and
 validates the branch against the declared schema before creating or adopting the deploy request.
-On PostgreSQL, a statement that drops a column, a constraint, or a NOT NULL runs only with the
+On PostgreSQL, a statement that drops a table, a column, a constraint, or a NOT NULL runs only with the
 planner's record of that object, which the plan stores with the change and every apply path passes
 back, matching a task to its change by the statement's canonical form (`planChangeMetadata` in
 `pkg/tern/plan_change_metadata.go`); the apply refuses a drop with no record
 and drops nothing when the object no longer matches it under the table's lock
-(`reviewedDropForApply` and `executeReviewedDrop` in `pkg/engine/postgres/apply.go`).
+(`reviewedDropForApply` and `executeReviewedDrop` in `pkg/engine/postgres/apply.go`;
+`tableDropForApply` and `executeTableDrop` in `pkg/engine/postgres/table_drop.go`).
 The re-plan an apply runs after a confirmation, or after an automatic apply posts its plan, holds
 each statement the confirmed plan ran to the engine's record of the objects it acts on: a record
 that differs refuses the confirmation, or stops the automatic apply for manual confirmation
@@ -1991,7 +2011,8 @@ The byte bound has no exact corroboration and approves on its estimate. The verd
 belongs to the target that will run the statement: a deployment that applies a plan it did not
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
 planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the
-privilege, size, and partitioned index shape gates in `pkg/engine/postgres/postgres.go`, plus RLS admission refusals
+privilege, size, and partitioned index shape gates in `pkg/engine/postgres/postgres.go` and the
+table drop gates in `pkg/engine/postgres/table_drop.go`, plus RLS admission refusals
 in `pkg/engine/postgres/row_security.go` and enum type refusals, the type privilege gate, and
 blocked label additions in `pkg/engine/postgres/enum_type.go` that abort plan creation or mark the
 plan blocked, and the apply-time gates in `pkg/engine/postgres/row_security_apply.go` and

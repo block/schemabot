@@ -15,6 +15,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
@@ -236,6 +237,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	commentData.DeploymentDrift = driftPreview
 	h.annotateMemberApplyRefusal(ctx, &commentData, planResp, environment, drift, repo, pr)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, driftPreview, repo, pr, environment)
+	h.annotatePlanFreezes(ctx, &commentData, planResp, schemaResult.Database, environment, false, repo, pr)
 	if commentData.OffersApply() {
 		commentData.ApplyAuthorization = h.applyAuthorizationForPlanComment(ctx, client, repo, pr, schemaResult.Database, requestedBy)
 	}
@@ -296,6 +298,7 @@ func (h *Handler) postNarrowedPlan(ctx context.Context, client *ghclient.Install
 	commentData.ScopedDatabase = databaseName
 	commentData.Target = target
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, nil, repo, pr, environment)
+	h.annotatePlanFreezes(ctx, &commentData, planResp, schemaResult.Database, environment, true, repo, pr)
 	if commentData.OffersApply() {
 		commentData.ApplyAuthorization = h.applyAuthorizationForPlanComment(ctx, client, repo, pr, schemaResult.Database, requestedBy)
 	}
@@ -932,6 +935,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		commentData.DeploymentDrift = driftPreview
 		h.annotateMemberApplyRefusal(ctx, &commentData, planResp, env, drift, repo, pr)
+		h.annotatePlanFreezes(ctx, &commentData, planResp, schemaResult.Database, env, false, repo, pr)
 		multiEnvData.Plans[env] = &commentData
 	}
 	for env, base := range h.planBaseSchemas(ctx, client, repo, pr, plannedSchemas) {
@@ -1385,6 +1389,10 @@ func planUnsafeChanges(planResp *apitypes.PlanResponse) []templates.UnsafeChange
 			}
 		}
 	}
+	columns := unsafeFindingColumns(planResp)
+	for i := range unsafe {
+		unsafe[i].FindingColumns = columns[unsafe[i].Table]
+	}
 	for _, sc := range planResp.Changes {
 		if sc == nil {
 			continue
@@ -1400,6 +1408,53 @@ func planUnsafeChanges(planResp *apitypes.PlanResponse) []templates.UnsafeChange
 		}
 	}
 	return unsafe
+}
+
+// unsafeFindingColumns maps, for each table, every unsafe finding of the plan
+// that names a column to that column, keyed by the finding as the table's
+// unsafe reason lists it. The plan comment matches an attribution against the
+// one clause a finding concerns rather than the whole statement, so a compound
+// ALTER TABLE that drops another pull request's index beside a column of its
+// own does not attribute the column drop. A finding whose text the table's
+// reason lists for more than one column cannot be told apart by that text, so
+// it is left out and its attribution is matched against the whole statement:
+// keying it to either column would attribute the other column's line by the
+// wrong clause.
+func unsafeFindingColumns(planResp *apitypes.PlanResponse) map[string]map[string]string {
+	columns := map[string]map[string]string{}
+	ambiguous := map[string]map[string]bool{}
+	for _, v := range planResp.LintErrors() {
+		if v.Table == "" || v.Column == "" {
+			continue
+		}
+		findings := ui.LintReasons(lint.UnsafeFindingText(v.Message))
+		if len(findings) != 1 {
+			// The finding cannot be told apart in the reason, so its
+			// attribution is matched against the whole statement instead.
+			slog.Debug("unsafe finding is attributed by its whole statement: its message does not read as one finding",
+				"table", v.Table, "column", v.Column, "findings", len(findings))
+			continue
+		}
+		finding := findings[0]
+		if ambiguous[v.Table][finding] {
+			continue
+		}
+		if columns[v.Table] == nil {
+			columns[v.Table] = map[string]string{}
+		}
+		if other, ok := columns[v.Table][finding]; ok && other != v.Column {
+			slog.Debug("unsafe finding is attributed by its whole statement: the same finding text names more than one column",
+				"table", v.Table, "column", v.Column, "other_column", other)
+			delete(columns[v.Table], finding)
+			if ambiguous[v.Table] == nil {
+				ambiguous[v.Table] = map[string]bool{}
+			}
+			ambiguous[v.Table][finding] = true
+			continue
+		}
+		columns[v.Table][finding] = v.Column
+	}
+	return columns
 }
 
 // plannedShardCount counts the shards the plan actually covers, so a shard
