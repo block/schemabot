@@ -266,12 +266,16 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 		exclusions = plan.exclusions
 		skipped = plan.skipped
 	} else {
-		// The reused config keeps its own ignore_tables, and verification
-		// below fails if it does not withhold every skipped table. The
-		// tables are disclosed either way, so a rerun reports them as the
-		// first run did.
+		// The reused config keeps its own ignore_tables, so each table the
+		// pull skipped must already be withheld by it. A skipped table the
+		// config still manages would be read as dropped by the next plan.
+		// The tables are disclosed either way, so a rerun reports them as
+		// the first run did.
 		skipped, err = pulledSkippedTables(sortedPulledNamespaces(pulled), pulled.Namespaces)
 		if err != nil {
+			return nil, err
+		}
+		if err := requireReusedConfigWithholdsSkipped(exclusions, skipped); err != nil {
 			return nil, err
 		}
 	}
