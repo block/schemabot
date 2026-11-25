@@ -599,7 +599,9 @@ func settlePendingCancelForTerminalApply(ctx context.Context, store storage.Stor
 }
 
 // cancelledRolloutMembers counts how a failed rollout's members ended, for a
-// cancel that was pending while it settled.
+// cancel that was pending while it settled. A member is one shard of a sharded
+// apply or one target of a multi-target rollout, however many table steps it
+// runs, so the counts match the members the PR comment lists.
 type cancelledRolloutMembers struct {
 	noun      presentation.Noun
 	cancelled int
@@ -607,11 +609,20 @@ type cancelledRolloutMembers struct {
 }
 
 // tookEffect reports whether the cancel reached the outcome the operator asked
-// for: the members that had not finished ended cancelled rather than running
-// on. The apply reads failed only because other members failed, and failed
-// outranks cancelled in the rollout's derived state.
+// for: a member that had not finished ended cancelled rather than running on.
+// The apply reads failed only because other members failed, and failed
+// outranks cancelled in the rollout's derived state. Cancelled steps on a
+// member that failed do not count: they are what the failure left behind, not
+// work the cancel stopped.
 func (m cancelledRolloutMembers) tookEffect() bool {
 	return m.cancelled > 0
+}
+
+// memberOutcome is how one rollout member's table steps ended, for the counts
+// in a cancel's history event.
+type memberOutcome struct {
+	cancelled bool
+	failed    bool
 }
 
 // cancelLandedOnFailedRollout reads how the members of a failed apply ended.
@@ -621,6 +632,11 @@ func (m cancelledRolloutMembers) tookEffect() bool {
 // would tell the operator their command did nothing while it cancelled most of
 // the rollout. Any apply other than a failed one returns no members, and the
 // state alone decides the outcome.
+//
+// A member with a failed step counts as failed, even when its later steps were
+// cancelled, because failed outranks cancelled for the member as it does for
+// the apply. A member counts as cancelled when a step of it was cancelled and
+// none failed.
 func cancelLandedOnFailedRollout(ctx context.Context, store storage.Storage, apply *storage.Apply) (cancelledRolloutMembers, error) {
 	members := cancelledRolloutMembers{noun: presentation.TargetNoun}
 	if !state.IsState(apply.State, state.Apply.Failed) {
@@ -634,21 +650,51 @@ func cancelLandedOnFailedRollout(ctx context.Context, store storage.Storage, app
 	if err != nil {
 		return members, fmt.Errorf("list operations of failed apply %s to settle its pending cancel: %w", apply.ApplyIdentifier, err)
 	}
+	outcomes := make(map[string]*memberOutcome)
+	var order []string
 	for _, op := range ops {
 		if op == nil || op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
 			continue
 		}
-		if _, sharded := storage.OperationShard(op.OperationKind, op.OperationKey, op.Target); sharded {
+		member, sharded := rolloutMember(op)
+		if sharded {
 			members.noun = presentation.ShardNoun
+		}
+		outcome, seen := outcomes[member]
+		if !seen {
+			outcome = &memberOutcome{}
+			outcomes[member] = outcome
+			order = append(order, member)
 		}
 		switch {
 		case state.IsState(op.State, state.ApplyOperation.Cancelled):
-			members.cancelled++
+			outcome.cancelled = true
 		case state.IsState(op.State, state.ApplyOperation.Failed):
+			outcome.failed = true
+		}
+	}
+	for _, member := range order {
+		switch outcome := outcomes[member]; {
+		case outcome.failed:
 			members.failed++
+		case outcome.cancelled:
+			members.cancelled++
 		}
 	}
 	return members, nil
+}
+
+// rolloutMember names the rollout member a work operation belongs to, and
+// reports whether that member is a shard. Every table step on one shard, or on
+// one target of a multi-target rollout, names the same member.
+func rolloutMember(op *storage.ApplyOperation) (string, bool) {
+	if namespace, shard, ok := storage.OperationNamespaceShard(op.OperationKind, op.OperationKey, op.Target); ok {
+		return op.Target + storage.OperationKeyDelimiter + namespace + storage.OperationKeyDelimiter + shard, true
+	}
+	if op.Target != "" {
+		return op.Target, false
+	}
+	return op.OperationKey, false
 }
 
 // discloseCancelLandedOnFailedRollout records in the server log and the apply
