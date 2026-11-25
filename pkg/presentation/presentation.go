@@ -494,6 +494,7 @@ func Derive(ops []Operation) Apply {
 	for i, op := range ops {
 		rolloutOps[i] = state.RolloutOperation{
 			Deployment:        op.Deployment,
+			Target:            op.Target,
 			OperationKey:      op.OperationKey,
 			Work:              op.Work,
 			Finalizer:         op.Finalizer,
