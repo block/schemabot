@@ -119,7 +119,12 @@ type nativeApply struct {
 	enumValueAdd     bool
 	// dropped is the plan's record of the live object the statement drops,
 	// which the apply checks under the table's lock before dropping it.
-	dropped                    *schemadiff.DroppedObject
+	dropped *schemadiff.DroppedObject
+	// database names the target for the logs and metrics of a table drop.
+	database string
+	// droppedTable is the definition the plan recorded for a table the
+	// statement drops whole, which pg-sprite checks under the table's lock.
+	droppedTable               string
 	concurrentIndexMaxDuration time.Duration
 	cancelRequested            func() bool
 }
@@ -254,6 +259,15 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if err != nil {
 		slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned DDL is not one statement or a valid greenfield create set", tc.Table)
+	}
+	// A table drop is not a shape pg-sprite's migrate path executes, so it is
+	// admitted on its own terms, against the definition the plan recorded.
+	drop, isTableDrop, err := tableDropForApply(req.Database, req.Changes[0].Namespace, tc, statements)
+	if err != nil {
+		return nativeApply{}, err
+	}
+	if isTableDrop {
+		return drop, nil
 	}
 	// A label addition to an enum type is the one shape that names a type
 	// rather than a table, so it is admitted on its own terms before the
@@ -1158,6 +1172,31 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "dropped-object-has-descendants",
 			cause:  fmt.Sprintf("the planned drop on %s would also reach unreviewed partitions or child tables", quotedTable(table)),
 			remedy: "make the drop outside SchemaBot on the whole table tree, then " + replanRemedy}, true
+	case executor.CodeDroppedColumnPartitionKey:
+		// PostgreSQL never drops a column in a partition key, read under the
+		// table's lock; nothing was dropped.
+		return &refusal{reason: "dropped-column-partition-key",
+			cause:  fmt.Sprintf("the planned column drop on %s names a column in a partition key, which PostgreSQL cannot drop", quotedTable(table)),
+			remedy: "declare the column again in the schema file, then " + replanRemedy}, true
+	case executor.CodeDroppedColumnPartitionDependent:
+		// A partition has an object of its own on the column, which the
+		// drop would remove without review; nothing was dropped.
+		return &refusal{reason: "dropped-column-partition-dependent",
+			cause:  fmt.Sprintf("the planned column drop on %s would also remove an index, constraint, or other object a partition has on that column", quotedTable(table)),
+			remedy: "drop or change that object on the partition, then " + replanRemedy}, true
+	case executor.CodeDroppedTableHasParent:
+		// The table the plan drops became a partition or an inheritance
+		// child after planning, read under its lock; nothing was dropped.
+		// Dropping it would remove rows of the table above it.
+		return &refusal{reason: "dropped-table-has-parent",
+			cause:  fmt.Sprintf("table %s is now a partition or inheritance child", quotedTable(table)),
+			remedy: "make the drop outside SchemaBot on the whole table tree, then " + replanRemedy}, true
+	case executor.CodeDroppedTableHasDependents:
+		// A view or another object depends on the table, and the drop never
+		// cascades, so PostgreSQL refused it; nothing was dropped.
+		return &refusal{reason: "dropped-table-has-dependents",
+			cause:  fmt.Sprintf("a view or other object depends on table %s", quotedTable(table)),
+			remedy: "drop or change the objects that depend on the table, then apply again"}, true
 	case executor.CodeAdoptedIndexDrift, executor.CodeValidatedConstraintDrift,
 		executor.CodeRenamedIndexDrift, executor.CodeDroppedIndexDrift:
 		// The index or constraint the planned statement names changed after
@@ -1168,8 +1207,8 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 			cause:  fmt.Sprintf("the index or constraint the planned statement for %s names changed after planning", quotedTable(table)),
 			remedy: replanRemedy}, true
 	case executor.CodeDroppedObjectDrift:
-		// The column, constraint, or NOT NULL the planned drop removes no
-		// longer has the definition the plan recorded, read again under the
+		// The table, column, constraint, or NOT NULL the planned drop removes
+		// no longer has the definition the plan recorded, read again under the
 		// table's lock; nothing was dropped. The plan is stale, so only a
 		// re-plan changes the outcome.
 		return &refusal{reason: "planned-object-drift",
@@ -1570,6 +1609,9 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	}
 	if change.enumValueAdd {
 		return executeEnumValueAdd(ctx, pool, change)
+	}
+	if change.droppedTable != "" {
+		return executeTableDrop(ctx, pool, change, tracker, logger)
 	}
 	statements, err := postgresCreateSetStatements(change.sql)
 	if err != nil {
