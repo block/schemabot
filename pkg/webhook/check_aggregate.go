@@ -262,11 +262,12 @@ const awaitingCurrentCommitTitle = "Awaiting results for the latest commit"
 // placeholder instead of its stored status and conclusion: results computed
 // for another commit say nothing about the current one, so they must hold the
 // aggregate open until the current commit's plan or apply results replace
-// them. Rows for the current commit pass through unchanged.
+// them. Rows for the current commit pass through unchanged, and so does a
+// failed apply's row on any commit (see settledApplyFailure).
 func normalizeStaleContributions(checks []*storage.Check, headSHA string) (contributions []*storage.Check, staleCount int) {
 	contributions = make([]*storage.Check, 0, len(checks))
 	for _, c := range checks {
-		if c.HeadSHA == headSHA {
+		if c.HeadSHA == headSHA || settledApplyFailure(c) {
 			contributions = append(contributions, c)
 			continue
 		}
@@ -277,6 +278,42 @@ func normalizeStaleContributions(checks []*storage.Check, headSHA string) (contr
 		staleCount++
 	}
 	return contributions, staleCount
+}
+
+// settledApplyFailure reports whether c is the outcome of an apply that
+// settled failed. The row keeps naming the commit the apply started on, which
+// is older than the PR head whenever a push landed while the apply ran. Its
+// outcome still describes the target, so it folds as the failure it is rather
+// than as a placeholder awaiting results for the newer commit: the Check Run
+// says the apply failed, and a failure can only block the aggregate, never
+// pass it.
+func settledApplyFailure(c *storage.Check) bool {
+	return c.ApplyID != 0 && c.Status == checkStatusCompleted && c.Conclusion == checkConclusionFailure
+}
+
+// failedApplyRemedy names what clears a failed apply's block, or returns ""
+// when no contribution is a failed apply. A plan replaces the failed result:
+// it diffs the pull request against the target as it is now, so it passes
+// only when the target already matches and otherwise lists what is left to
+// apply. The apply's failure therefore never clears without a fresh look at
+// the target.
+func failedApplyRemedy(checks []*storage.Check) string {
+	var environments []string
+	for _, c := range checks {
+		if settledApplyFailure(c) && !slices.Contains(environments, c.Environment) {
+			environments = append(environments, c.Environment)
+		}
+	}
+	if len(environments) == 0 {
+		return ""
+	}
+	slices.Sort(environments)
+	commands := make([]string, len(environments))
+	for i, environment := range environments {
+		commands[i] = "`schemabot plan -e " + environment + "`"
+	}
+	return "\n**To clear this:** comment " + strings.Join(commands, " and ") +
+		" on the pull request. If the target matches the pull request, the plan clears the failure. If not, the plan shows what is left to apply.\n"
 }
 
 // anyInProgressOnCommit reports whether any check recorded for headSHA is
@@ -349,7 +386,7 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		summary = buildAggregateTable(checks, stopped, progress)
 	case checkConclusionFailure:
 		title = "Apply failed"
-		summary = buildAggregateTable(checks, stopped, progress)
+		summary = buildAggregateTable(checks, stopped, progress) + failedApplyRemedy(checks)
 	case checkConclusionActionRequired:
 		pending := 0
 		unresolved := 0

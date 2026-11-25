@@ -99,8 +99,10 @@ const (
 	// person controls has to change before a re-plan can lift it.
 	blockGuard blockClass = iota
 	// blockReconciliation: work may have reached the target, so the target and
-	// the pull request may no longer describe the same schema. No plan and no
-	// new commit settles that question.
+	// the pull request may no longer describe the same schema. SchemaBot does
+	// not settle that question on its own: a person plans the environment once
+	// the apply has settled, and that plan replaces the block, passing only if
+	// the target already matches the pull request.
 	blockReconciliation
 	// blockAwaitingReport: another deployment owes a result. SchemaBot lifts
 	// the block when that result arrives.
@@ -218,7 +220,7 @@ const (
 	// row is folded from.
 	ReasonAwaitingParticipantResult = "awaiting_participant_result"
 	// ReasonReconciliationOwed: a terminal outcome left the target diverged
-	// from the PR. No plan clears this one.
+	// from the PR. A plan run by a person clears it once the target matches.
 	ReasonReconciliationOwed = "reconciliation_owed"
 	// ReasonAggregateRollup: the row is the aggregate. It says nothing of its
 	// own; it reports what the per-database rows add up to.
@@ -345,6 +347,11 @@ func Diagnose(check *storage.Check, headSHA string, apply *storage.Apply, planEn
 	}
 }
 
+// reconciliationRemedy is what clears a reconciliation block. The plan diffs
+// the pull request against the target as it is now, so it passes only when
+// the target already matches and otherwise shows what is left to apply.
+const reconciliationRemedy = "Once the apply has settled, comment `schemabot plan -e <environment>` on the pull request. If the target matches the pull request, the plan clears this block. If not, the plan shows what is left to apply."
+
 // blockingReasonDisposition reads a row a durable guard failed closed. The
 // stored reason, not the row's status or ownership, is what says who has to
 // move: a rollback clears its apply ownership on the way out, so ownership
@@ -355,7 +362,7 @@ func blockingReasonDisposition(check *storage.Check) Disposition {
 		return Disposition{
 			Reason:   ReasonReconciliationOwed,
 			Summary:  "A terminal outcome left this check blocking, and the target may not match the pull request.",
-			Remedy:   "Reconcile the target environment. No plan and no new commit clears this on its own.",
+			Remedy:   reconciliationRemedy,
 			Blocking: true,
 		}
 	case blockAwaitingReport:
@@ -479,7 +486,7 @@ func terminalBlockDisposition(check *storage.Check, coversHead bool) Disposition
 		return Disposition{
 			Reason:   ReasonReconciliationOwed,
 			Summary:  "A terminal apply left this check blocking, and the target may not match the pull request.",
-			Remedy:   "Reconcile the target environment. No plan and no new commit clears this on its own.",
+			Remedy:   reconciliationRemedy,
 			Blocking: true,
 		}
 	}

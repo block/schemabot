@@ -1546,6 +1546,92 @@ func TestE2EAggregateBlockedStateSurvivesRecompute(t *testing.T) {
 	assert.Equal(t, "abc123", stored.HeadSHA)
 }
 
+// A push lands while an apply is running, and the apply then fails. The
+// failure is stored on the commit the apply started on, which is now older
+// than the PR head. The aggregate on the head reports the failure and names
+// the plan that clears it, rather than reading "Awaiting results for the
+// latest commit" as if results were still on their way. The failure blocks the
+// merge gate either way, so the older commit never passes the newer head.
+func TestE2EAggregateReportsFailedApplyFromEarlierCommit(t *testing.T) {
+	dbName := "webhook_agg_failed_apply_sha"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-failed-earlier-commit",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		Environment:     "staging",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+	}
+	applyID, err := svc.Storage().Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   100,
+		ApplyID:      applyID,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	checkRuns := setupFakeGitHubHeadAndCheckRuns(t, mux, "newsha222")
+
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+
+	apply.State = state.Apply.Failed
+	updated, err := h.updateCheckRecordForApplyResult(ctx, "octocat/hello-world", 1, apply)
+	require.NoError(t, err)
+	require.True(t, updated)
+
+	failed, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, failed)
+	assert.Equal(t, "oldsha111", failed.HeadSHA, "the terminal write keeps the row on the apply's commit")
+	assert.Equal(t, applyID, failed.ApplyID)
+	assert.Equal(t, checkConclusionFailure, failed.Conclusion)
+
+	h.updateAggregateCheck(ctx, installClient, "octocat/hello-world", 1, "newsha222")
+
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, "newsha222", cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionFailure, cr.Conclusion)
+		require.NotNil(t, cr.Output)
+		assert.Equal(t, "Apply failed", cr.Output.Title)
+		assert.Contains(t, cr.Output.Summary, "| `"+dbName+"` | mysql |")
+		assert.Contains(t, cr.Output.Summary, "| Failed |")
+		assert.Contains(t, cr.Output.Summary, "**To clear this:** comment `schemabot plan -e staging` on the pull request.")
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		require.FailNow(t, "timed out waiting for the failed aggregate check run on the new commit")
+	}
+
+	stored, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1,
+		aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, "newsha222", stored.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, stored.Status)
+	assert.Equal(t, checkConclusionFailure, stored.Conclusion)
+}
+
 // Stored per-database results are keyed to the commit they were computed for.
 // When the aggregate is recomputed on a newer commit — for example a CI
 // check_run completion arriving right after a push, before auto-plan has

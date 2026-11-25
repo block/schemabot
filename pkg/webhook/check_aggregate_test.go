@@ -558,6 +558,31 @@ func TestNormalizeStaleContributions(t *testing.T) {
 		assert.Equal(t, checkStatusInProgress, status)
 	})
 
+	t.Run("a failed apply's row on another commit folds as the failure", func(t *testing.T) {
+		checks := []*storage.Check{
+			{HeadSHA: "previous", Environment: "staging", DatabaseName: "orders", ApplyID: 7, Status: checkStatusCompleted, Conclusion: checkConclusionFailure},
+		}
+		contributions, staleCount := normalizeStaleContributions(checks, "current")
+		require.Len(t, contributions, 1)
+		assert.Zero(t, staleCount)
+		assert.Equal(t, checkStatusCompleted, contributions[0].Status)
+		assert.Equal(t, checkConclusionFailure, contributions[0].Conclusion)
+		conclusion, status := computeAggregate(contributions, nil)
+		assert.Equal(t, checkConclusionFailure, conclusion)
+		assert.Equal(t, checkStatusCompleted, status)
+	})
+
+	t.Run("a successful apply's row on another commit stays a placeholder", func(t *testing.T) {
+		checks := []*storage.Check{
+			{HeadSHA: "previous", Environment: "staging", DatabaseName: "orders", ApplyID: 7, Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+		}
+		contributions, staleCount := normalizeStaleContributions(checks, "current")
+		require.Len(t, contributions, 1)
+		assert.Equal(t, 1, staleCount)
+		assert.Equal(t, checkStatusInProgress, contributions[0].Status)
+		assert.Empty(t, contributions[0].Conclusion)
+	})
+
 	t.Run("normalization copies rows so stored state is untouched", func(t *testing.T) {
 		original := &storage.Check{HeadSHA: "previous", DatabaseName: "orders", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess}
 		contributions, staleCount := normalizeStaleContributions([]*storage.Check{original}, "current")
@@ -565,6 +590,26 @@ func TestNormalizeStaleContributions(t *testing.T) {
 		assert.Equal(t, 1, staleCount)
 		assert.Equal(t, checkStatusCompleted, original.Status)
 		assert.Equal(t, checkConclusionSuccess, original.Conclusion)
+	})
+}
+
+func TestAggregateSummary_FailedApplyNamesThePlanThatClearsIt(t *testing.T) {
+	checks := []*storage.Check{
+		{Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders", ApplyID: 7, Status: checkStatusCompleted, Conclusion: checkConclusionFailure},
+		{Environment: "production", DatabaseType: "mysql", DatabaseName: "orders", ApplyID: 8, Status: checkStatusCompleted, Conclusion: checkConclusionFailure},
+		{Environment: "staging", DatabaseType: "mysql", DatabaseName: "users", ApplyID: 9, Status: checkStatusCompleted, Conclusion: checkConclusionFailure},
+	}
+	title, summary := aggregateSummary(checks, checkConclusionFailure, nil, nil)
+	assert.Equal(t, "Apply failed", title)
+	assert.True(t, strings.HasSuffix(summary, "\n**To clear this:** comment `schemabot plan -e production` and `schemabot plan -e staging` on the pull request. "+
+		"If the target matches the pull request, the plan clears the failure. If not, the plan shows what is left to apply.\n"), summary)
+
+	t.Run("a failed plan names no remedy", func(t *testing.T) {
+		planFailed := []*storage.Check{
+			{Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders", Status: checkStatusCompleted, Conclusion: checkConclusionFailure},
+		}
+		_, summary := aggregateSummary(planFailed, checkConclusionFailure, nil, nil)
+		assert.NotContains(t, summary, "To clear this")
 	})
 }
 
