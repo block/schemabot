@@ -1172,6 +1172,18 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "dropped-object-has-descendants",
 			cause:  fmt.Sprintf("the planned drop on %s would also reach unreviewed partitions or child tables", quotedTable(table)),
 			remedy: "make the drop outside SchemaBot on the whole table tree, then " + replanRemedy}, true
+	case executor.CodeDroppedColumnPartitionKey:
+		// PostgreSQL never drops a column in a partition key, read under the
+		// table's lock; nothing was dropped.
+		return &refusal{reason: "dropped-column-partition-key",
+			cause:  fmt.Sprintf("the planned column drop on %s names a column in a partition key, which PostgreSQL cannot drop", quotedTable(table)),
+			remedy: "declare the column again in the schema file, then " + replanRemedy}, true
+	case executor.CodeDroppedColumnPartitionDependent:
+		// A partition has an object of its own on the column, which the
+		// drop would remove without review; nothing was dropped.
+		return &refusal{reason: "dropped-column-partition-dependent",
+			cause:  fmt.Sprintf("the planned column drop on %s would also remove an index, constraint, or other object a partition has on that column", quotedTable(table)),
+			remedy: "drop or change that object on the partition, then " + replanRemedy}, true
 	case executor.CodeDroppedTableHasParent:
 		// The table the plan drops became a partition or an inheritance
 		// child after planning, read under its lock; nothing was dropped.
