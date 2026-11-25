@@ -363,9 +363,12 @@ A caller that writes the files must add every skipped table to
 `DROP TABLE`. Without the flag, the pull refuses as before, and so does a data
 plane too old to know the flag.
 
-On a database with several targets, a table any target skips is skipped for
-all of them, because every target is planned from the same files. It is left
-out of the schema and of the `targets` comparison.
+On a database with several targets, a table that any target the pull reads
+skips is skipped for all of them, because every target is planned from the
+same files. It is left out of the schema and of the `targets` comparison. A
+pull reads only the environment's
+[primary deployment](#whats-in-this-database), so it cannot report a skip that
+only another deployment would need.
 
 `schemabot pull` always sets the flag, since it writes no files, and lists the
 skipped tables under their namespace:
