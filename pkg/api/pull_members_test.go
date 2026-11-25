@@ -464,3 +464,36 @@ func TestExecutePullSchema_UnselectingPrimaryMissingASelectedNamespace(t *testin
 		{Namespace: "testapp_0", Table: "audits", Difference: apitypes.DivergenceOnlyOnTarget},
 	}, resp.Targets[1].DivergedTables)
 }
+
+// A caller that writes schema files asks the data plane to skip the tables those
+// files cannot describe. The request reaches every target with the flag set, and
+// each skipped table comes back with its reason so the caller can add it to
+// ignore_tables instead of planning it as a drop.
+func TestExecutePullSchema_SkippedTablesReachTheCaller(t *testing.T) {
+	pulled := pulledTables(map[string]string{"users": pullUsersDDL})
+	pulled.Namespaces["testapp"].SkippedTables = []*ternv1.SkippedTable{
+		{Table: "audit_log", Reason: "schema files cannot describe an UNLOGGED table"},
+	}
+	client := newPerTargetPullClient(map[string]*ternv1.PullSchemaResponse{"testapp": pulled}, nil)
+	env := EnvironmentConfig{
+		Deployments:     map[string]DeploymentTarget{"eu": {Target: "testapp"}},
+		DeploymentOrder: []string{"eu"},
+	}
+	svc := pullTargetService(t, env, map[string]tern.Client{"eu/production": client})
+
+	req := pullRequest()
+	req.SkipUnrepresentableTables = true
+	resp, err := svc.ExecutePullSchema(t.Context(), req)
+	require.NoError(t, err)
+
+	client.pullSchemaMu.Lock()
+	reqs := slices.Clone(client.pullSchemaReqs)
+	client.pullSchemaMu.Unlock()
+	require.Len(t, reqs, 1)
+	assert.True(t, reqs[0].GetSkipUnrepresentableTables(), "the data plane is asked to skip")
+
+	assert.Equal(t, map[string]string{"users": pullUsersDDL}, resp.Namespaces["testapp"].Tables)
+	assert.Equal(t, []apitypes.SkippedTable{
+		{Table: "audit_log", Reason: "schema files cannot describe an UNLOGGED table"},
+	}, resp.Namespaces["testapp"].SkippedTables)
+}

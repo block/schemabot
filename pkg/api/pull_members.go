@@ -92,6 +92,9 @@ func (s *Service) pullTargetSchema(
 			Environment:   req.Environment,
 			Namespace:     namespace,
 			CatalogDetail: catalogDetail,
+			// Passed through rather than decided here: only the caller knows
+			// whether it reports every skipped table.
+			SkipUnrepresentableTables: req.SkipUnrepresentableTables,
 		})
 		if pullErr != nil {
 			span.RecordError(pullErr, trace.WithAttributes(attribute.String("namespace", namespace)))
