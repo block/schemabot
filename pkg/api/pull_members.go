@@ -293,22 +293,23 @@ func (s *Service) pullRolloutMembers(
 		return nil, nil, err
 	}
 
+	// Every member is planned from the same schema files, so a table one member
+	// skipped has no file on any of them. It is skipped for the environment:
+	// listed once, left out of the schema, left out of each member's table
+	// count, and left out of the comparison, where it would otherwise read as
+	// missing from the members that skipped it.
+	skipped := skippedTablesAcrossMembers(pulled)
+
 	members := make([]*apitypes.TargetDivergence, len(targets))
 	for i, target := range targets {
 		members[i] = &apitypes.TargetDivergence{
 			Deployment: target.Deployment,
 			Target:     target.Target,
-			TableCount: pulled[i].TableCount,
+			TableCount: tablesOutsideSkipped(pulled[i], skipped),
 			Primary:    i == 0,
 			Namespaces: slices.Clone(target.Namespaces),
 		}
 	}
-
-	// Every member is planned from the same schema files, so a table one member
-	// skipped has no file on any of them. It is skipped for the environment:
-	// listed once, left out of the schema, and left out of the comparison,
-	// where it would otherwise read as missing from the members that skipped it.
-	skipped := skippedTablesAcrossMembers(pulled)
 	for i := range canonical {
 		maps.DeleteFunc(canonical[i], func(key namespaceTable, _ string) bool {
 			_, ok := skipped[key.namespace][key.table]
@@ -331,6 +332,23 @@ func (s *Service) pullRolloutMembers(
 			merged.Namespaces[namespace] = content
 			merged.TableCount += int32(len(content.GetTables()))
 		}
+	}
+	// A namespace's baseline member may not hold the namespace at all while
+	// another member skipped a table in it. The namespace still reports that
+	// table, so the caller adds it to ignore_tables instead of never hearing
+	// of it.
+	for namespace, tables := range skipped {
+		if _, ok := merged.Namespaces[namespace]; ok {
+			continue
+		}
+		s.logger.Info("pull reports skipped tables in a namespace its baseline member does not hold",
+			"database", req.Database,
+			"environment", req.Environment,
+			"namespace", namespace,
+			"skipped_tables", len(tables))
+		content := &ternv1.PulledNamespace{Tables: map[string]string{}}
+		withholdSkippedTables(content, tables)
+		merged.Namespaces[namespace] = content
 	}
 
 	// Each namespace's baseline is resolved once, so comparing every member
@@ -390,6 +408,20 @@ func skippedTablesAcrossMembers(pulled []*ternv1.PullSchemaResponse) map[string]
 		}
 	}
 	return skipped
+}
+
+// tablesOutsideSkipped counts the tables a member wrote that the environment
+// did not skip, so a member's table count matches the schema the pull returns.
+func tablesOutsideSkipped(memberSchema *ternv1.PullSchemaResponse, skipped map[string]map[string]string) int32 {
+	var count int32
+	for namespace, content := range memberSchema.GetNamespaces() {
+		for table := range content.GetTables() {
+			if _, ok := skipped[namespace][table]; !ok {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 // withholdSkippedTables makes a namespace's baseline report every table the
