@@ -1121,6 +1121,8 @@ type mockApplyOperationStore struct {
 	operationIDWriteErr error
 	// getByKeyErr fails GetByApplyDeploymentAndOperationKey.
 	getByKeyErr error
+	// markTerminalErr fails MarkTerminal.
+	markTerminalErr error
 }
 
 func (m *mockApplyOperationStore) GetByApplyDeploymentAndOperationKey(_ context.Context, applyID int64, deployment, operationKey string) (*storage.ApplyOperation, error) {
@@ -1177,6 +1179,9 @@ func (m *mockApplyOperationStore) UpdateState(_ context.Context, id int64, newSt
 }
 
 func (m *mockApplyOperationStore) MarkTerminal(_ context.Context, id int64, newState string) error {
+	if m.markTerminalErr != nil {
+		return m.markTerminalErr
+	}
 	op, ok := m.ops[id]
 	if !ok {
 		return storage.ErrApplyOperationNotFound

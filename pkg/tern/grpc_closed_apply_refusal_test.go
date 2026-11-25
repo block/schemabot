@@ -182,13 +182,23 @@ func TestClosedApplyTerminalization(t *testing.T) {
 		"a stopped apply settles a shard the way an undispatched stop does on that engine")
 }
 
-// A VSchema-only change has one work operation and no task rows. The operator
-// cancels the apply while that operation is still being dispatched, and the
-// data plane refuses it. The operator drives the operation under its own
-// lease. The operation never started, so its own row settles cancelled: with
-// no task to derive it from, a row left running would hold the apply open
-// forever.
-func TestGRPCClient_TasklessOperationRefusedByACancelledApplySettlesItsRow(t *testing.T) {
+// refusedTasklessDrive is a VSchema-only operation's drive against a data
+// plane that refused its dispatch because the apply had been cancelled.
+type refusedTasklessDrive struct {
+	client      *GRPCClient
+	server      *capturingTernServer
+	apply       *storage.Apply
+	operationID int64
+	tasks       *mockTaskStore
+	logs        *mockApplyLogStore
+	operations  *mockApplyOperationStore
+}
+
+// newRefusedTasklessDrive builds a VSchema-only change with one work
+// operation and no task rows, against a data plane that refuses its dispatch
+// because the apply it would join has been cancelled.
+func newRefusedTasklessDrive(t *testing.T) refusedTasklessDrive {
+	t.Helper()
 	server := &capturingTernServer{applyResponse: &ternv1.ApplyResponse{
 		Accepted:         false,
 		ErrorMessage:     closedApplyRefusal,
@@ -209,51 +219,102 @@ func TestGRPCClient_TasklessOperationRefusedByACancelledApplySettlesItsRow(t *te
 	apply.SetOptions(storage.ApplyOptions{Target: "commerce-target"})
 	operationID := int64(61)
 	vschema := `{"sharded":true,"vindexes":{"xxhash":{"type":"xxhash"}}}`
-	tasks := &mockTaskStore{}
-	logs := &mockApplyLogStore{}
-	operations := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
-		operationID: {
-			ID:            operationID,
-			ApplyID:       apply.ID,
-			Deployment:    "commerce-deployment",
-			OperationKind: storage.ApplyOperationKindWork,
-			State:         state.ApplyOperation.Running,
-		},
-	}}
+	d := refusedTasklessDrive{
+		client:      client,
+		server:      server,
+		apply:       apply,
+		operationID: operationID,
+		tasks:       &mockTaskStore{},
+		logs:        &mockApplyLogStore{},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {
+				ID:            operationID,
+				ApplyID:       apply.ID,
+				Deployment:    "commerce-deployment",
+				OperationKind: storage.ApplyOperationKindWork,
+				State:         state.ApplyOperation.Running,
+			},
+		}},
+	}
 	client.storage = &mockStorage{
 		applies: &mockApplyStore{apply: apply},
-		tasks:   tasks,
-		logs:    logs,
+		tasks:   d.tasks,
+		logs:    d.logs,
 		plans: &mockPlanStore{plan: &storage.Plan{
 			ID:             apply.PlanID,
 			PlanIdentifier: "plan-vschema-only",
 			SchemaFiles:    schema.SchemaFiles{"commerce": {Files: map[string]string{storage.VSchemaArtifactName: vschema}}},
 			Namespaces:     map[string]*storage.NamespacePlanData{"commerce": {Artifacts: map[string]string{storage.VSchemaArtifactName: vschema}}},
 		}},
-		operations: operations,
+		operations: d.operations,
 	}
+	return d
+}
 
+// drive runs one claim of the operation under its own lease.
+func (d refusedTasklessDrive) drive(t *testing.T) error {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	ctx = storage.WithOperationLease(ctx, storage.OperationLease{
-		ApplyID:     apply.ID,
-		OperationID: operationID,
+		ApplyID:     d.apply.ID,
+		OperationID: d.operationID,
 		Owner:       "host/1/driver-0",
 		Token:       "operation-token",
 	})
-	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+	return d.client.ResumeApplyOperation(ctx, d.apply, d.operationID)
+}
 
-	require.NotNil(t, server.getApplyRequest(), "the operation reached the data plane before it was refused")
-	op := operations.ops[operationID]
+// assertSettledCancelled checks the operation's row settled cancelled with
+// one apply log entry, and that nothing else was written.
+func (d refusedTasklessDrive) assertSettledCancelled(t *testing.T) {
+	t.Helper()
+	op := d.operations.ops[d.operationID]
 	assert.Equal(t, state.ApplyOperation.Cancelled, op.State)
 	require.NotNil(t, op.CompletedAt)
-	assert.Empty(t, tasks.updated, "a taskless operation has no task to settle")
-	assert.Equal(t, state.Apply.Running, apply.State, "an operation-scoped drive never writes the parent apply")
-	assert.Nil(t, server.getProgressRequest(), "a refused operation is never polled")
-	require.Len(t, logs.logs, 1)
-	assert.Equal(t, "Remote apply operation 61 (deployment commerce-deployment) cancelled before it started: the apply had already ended (cancelled)", logs.logs[0].Message)
-	assert.Empty(t, logs.logs[0].OldState, "the apply-scoped entry names no transition the apply did not make")
-	assert.Empty(t, logs.logs[0].NewState)
+	assert.Empty(t, d.tasks.updated, "a taskless operation has no task to settle")
+	assert.Equal(t, state.Apply.Running, d.apply.State, "an operation-scoped drive never writes the parent apply")
+	assert.Nil(t, d.server.getProgressRequest(), "a refused operation is never polled")
+	require.Len(t, d.logs.logs, 1)
+	assert.Equal(t, "Remote apply operation 61 (deployment commerce-deployment) cancelled before it started: the apply had already ended (cancelled)", d.logs.logs[0].Message)
+	assert.Empty(t, d.logs.logs[0].OldState, "the apply-scoped entry names no transition the apply did not make")
+	assert.Empty(t, d.logs.logs[0].NewState)
+}
+
+// A VSchema-only change has one work operation and no task rows. The operator
+// cancels the apply while that operation is still being dispatched, and the
+// data plane refuses it. The operator drives the operation under its own
+// lease. The operation never started, so its own row settles cancelled: with
+// no task to derive it from, a row left running would hold the apply open
+// forever.
+func TestGRPCClient_TasklessOperationRefusedByACancelledApplySettlesItsRow(t *testing.T) {
+	d := newRefusedTasklessDrive(t)
+	require.NoError(t, d.drive(t))
+	require.NotNil(t, d.server.getApplyRequest(), "the operation reached the data plane before it was refused")
+	d.assertSettledCancelled(t)
+}
+
+// The same VSchema-only operation is refused, and storage refuses the write
+// that settles its row. The drive returns an error that names the operation,
+// the row stays running and claimable, and no apply log entry claims a
+// settlement that did not land. The next claim is refused again, and this
+// time its row settles cancelled.
+func TestGRPCClient_TasklessOperationRefusedByACancelledApplyRetriesItsRowWrite(t *testing.T) {
+	d := newRefusedTasklessDrive(t)
+	d.operations.markTerminalErr = errors.New("storage unavailable")
+
+	err := d.drive(t)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "apply_operation 61")
+	assert.Contains(t, err.Error(), "storage unavailable")
+	op := d.operations.ops[d.operationID]
+	assert.Equal(t, state.ApplyOperation.Running, op.State, "the row stays claimable for the next drive")
+	assert.Nil(t, op.CompletedAt)
+	assert.Empty(t, d.logs.logs, "no log entry claims a settlement storage refused")
+
+	d.operations.markTerminalErr = nil
+	require.NoError(t, d.drive(t))
+	d.assertSettledCancelled(t)
 }
 
 // A whole-apply drive has no siblings whose outcome a refused dispatch could
