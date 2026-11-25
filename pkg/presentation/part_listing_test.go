@@ -70,6 +70,8 @@ func TestPartDetail(t *testing.T) {
 		{Part{Status: task.Checksumming, ChecksumRowsChecked: 450, ChecksumRowsTotal: 1000}, "checksumming 45.00% · 450 / 1,000 rows verified"},
 		{Part{Status: task.Failed}, "failed"},
 		{Part{Status: task.Cancelled, RowsCopied: 800000, RowsTotal: 2100000}, "cancelled at 38.10% · 800,000 / 2,100,000 rows"},
+		{Part{Status: task.Running, PercentComplete: 100, RowsCopied: 1, RowsTotal: 200_000}, "100.00% · 1 row copied"},
+		{Part{Status: task.Running, PercentComplete: 100, RowsCopied: 3, RowsTotal: 200_000}, "100.00% · 3 rows copied"},
 		{Part{Status: task.Stopped}, "stopped"},
 	}
 	for _, tt := range tests {
@@ -258,6 +260,12 @@ func TestPercentAcrossTargets(t *testing.T) {
 		{Status: task.Running, RowsCopied: 900, RowsTotal: 1000},
 		{Status: task.Checksumming, RowsCopied: 100, RowsTotal: 1000},
 	}, 0))
+	// A target whose copy finished short of its estimate and is now verifying
+	// counts in full: 1,000 + 500 of 2,000.
+	assert.Equal(t, 75, PercentAcrossTargets([]Part{
+		{Status: task.Checksumming, PercentComplete: 100, RowsCopied: 1, RowsTotal: 1000},
+		{Status: task.Running, RowsCopied: 500, RowsTotal: 1000},
+	}, 0))
 	// A failed target has not landed the change, so the table reads its share
 	// across all three rather than the rows of the two still in play.
 	assert.Equal(t, 50, PercentAcrossTargets([]Part{
@@ -363,6 +371,11 @@ func TestSumTargetRows(t *testing.T) {
 
 	rows = SumTargetRows([]Part{copying, {Status: task.Failed, RowsCopied: 300, RowsTotal: 1000}})
 	assert.Equal(t, TargetRows{Copied: 420, Total: 1000, Counted: 1, ETASeconds: 120}, rows)
+
+	// A target whose copy finished short of its estimate counts its whole
+	// total, so it does not pull the rows across targets down.
+	rows = SumTargetRows([]Part{copying, {Status: task.Running, PercentComplete: 100, RowsCopied: 1, RowsTotal: 1000}})
+	assert.Equal(t, TargetRows{Copied: 1420, Total: 2000, Counted: 2, ETASeconds: 120}, rows)
 
 	// A target past its copy with no rows had none to copy.
 	rows = SumTargetRows([]Part{copying, {Status: task.WaitingForCutover}})

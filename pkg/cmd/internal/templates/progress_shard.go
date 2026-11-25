@@ -52,14 +52,14 @@ func keepsShardedBar(t TableProgress) bool {
 
 // formatShardedPhaseProgress renders a sharded table that keeps its bar
 // (keepsShardedBar): the bar across every shard the table spans
-// (presentation.PercentAcrossTargets), counting a shard that has not reported
-// as nothing, then the rows line and each shard's line.
+// (presentation.ShardedPhasePercent), then the rows line and each shard's
+// line.
 func formatShardedPhaseProgress(t TableProgress) string {
 	parts := make([]presentation.Part, len(t.Shards))
 	for i, s := range t.Shards {
 		parts[i] = shardPart(s)
 	}
-	pct := presentation.PercentAcrossTargets(parts, shardTotal(t)-len(t.Shards))
+	pct := presentation.ShardedPhasePercent(parts, shardTotal(t)-len(t.Shards), t.RowsCopied, t.RowsTotal, t.RowsTotalPlanned)
 	var b strings.Builder
 	writeTableLine(&b, t, "%s %d%%%s", ui.ProgressBarRowCopy(pct), pct, ui.ThrottledSuffix(t.Throttled))
 	if t.DDL != "" {

@@ -2,13 +2,14 @@ package webhook
 
 import (
 	"context"
+	"maps"
 	"slices"
-	"sort"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -17,11 +18,15 @@ import (
 // tables the plan would destroy something on that SchemaBot cannot vouch for as
 // this pull request's to destroy.
 //
-// Attribution is table-grained. Stored task history names the table a task
-// changed and nothing finer, so the notice can say an open pull request last
-// changed this table, never that it created the column or index being dropped.
-// Over-attributing is the safe direction: it annotates a destructive change
-// rather than leaving one unremarked.
+// Attribution matches objects, not just tables. Stored task history names the
+// table each task changed and keeps the statement it ran, so a table is
+// attributed to an open pull request only when one of the plan's destructive
+// changes undoes what that pull request's statements did to it
+// (templates.UndoesAttributedWork): dropping a column it added, for example,
+// but not dropping a column it never touched beside an index it added.
+// Whatever the match cannot read is attributed. Over-attributing is the safe
+// direction: it annotates a destructive change rather than leaving one
+// unremarked.
 //
 // SchemaBot's workflow is schema-first — a pull request applies its schema
 // change and merges afterwards — so between those two moments the live database
@@ -46,16 +51,22 @@ func (h *Handler) annotateAttributedChanges(ctx context.Context, client *ghclien
 	if data == nil {
 		return
 	}
-	tables := plannedDestructiveTables(planResp)
-	for _, table := range targetPlanDestructiveTables(rollout) {
-		if !slices.Contains(tables, table) {
-			tables = append(tables, table)
-		}
+	statements := plannedDestructiveStatements(planResp)
+	for table, stmts := range targetPlanDestructiveStatements(rollout) {
+		statements[table] = append(statements[table], stmts...)
 	}
-	slices.Sort(tables)
-	if len(tables) == 0 {
+	if len(statements) == 0 {
 		return
 	}
+	tables := slices.Sorted(maps.Keys(statements))
+	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(data.DatabaseType))
+	if err != nil {
+		h.logger.Warn("planned destructive changes are attributed by table alone: no statement parser serves the database type",
+			"repo", repo, "pr", pr, "database", data.Database, "database_type", data.DatabaseType,
+			"environment", environment, "error", err)
+		parser = nil
+	}
+	lookup := ownerWorkLookup{h: h, parser: parser, tasks: map[ownerKey][]*storage.Task{}}
 	for _, table := range tables {
 		ref := storage.TableRef{
 			Database:     data.Database,
@@ -63,28 +74,35 @@ func (h *Handler) annotateAttributedChanges(ctx context.Context, client *ghclien
 			Environment:  environment,
 			TableName:    table,
 		}
-		change, annotate := h.classifyDestructiveChange(ctx, client, ref, repo, pr, table)
-		if annotate {
-			data.AttributedChanges = append(data.AttributedChanges, change)
-		}
+		data.AttributedChanges = append(data.AttributedChanges,
+			h.classifyDestructiveChange(ctx, client, &lookup, ref, repo, pr, table, statements[table])...)
 	}
 }
 
-// classifyDestructiveChange decides whether one table's destructive change must
-// be annotated, and how it should read. annotate is false only when the lookup
-// positively established that no other pull request has an open claim on the
-// table.
-func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclient.InstallationClient, ref storage.TableRef, repo string, pr int, table string) (change templates.AttributedChangeData, annotate bool) {
+// classifyDestructiveChange decides whether one table's destructive changes
+// must be annotated, and how they should read. statements are the planned
+// destructive statements on the table. It returns one entry for every open
+// pull request whose work one of them undoes, most recent first, since
+// different open pull requests can own different objects on the same table and
+// each finding carries the note of the owners it undoes. It returns nothing
+// only when the lookup positively established that no other open pull request
+// did anything to the table that the plan would undo.
+func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclient.InstallationClient, lookup *ownerWorkLookup, ref storage.TableRef, repo string, pr int, table string, statements []string) []templates.AttributedChangeData {
 	owners, err := h.service.Storage().Tasks().FindTableOwners(ctx, ref)
 	if err != nil {
 		h.logger.Error("planned destructive change's ownership is unresolved: table-ownership lookup failed",
 			"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
 			"environment", ref.Environment, "table", table, "error", err)
 		metrics.RecordPlanChangeOwnership(ctx, repo, ref.Database, ref.Environment, "storage_error")
-		return templates.AttributedChangeData{Table: table, Unresolved: true}, true
+		return []templates.AttributedChangeData{{Table: table, Unresolved: true}}
 	}
 
+	planned := make([]*ddl.ObjectChanges, len(statements))
+	for i, stmt := range statements {
+		planned[i] = templates.ReadPlannedChange(table, stmt, lookup.parser)
+	}
 	var checked int
+	var attributedOwners []templates.AttributedChangeData
 	for _, owner := range owners {
 		if owner.Repository == repo && owner.PullRequest == pr {
 			// The planning pull request's own earlier apply. Dropping what it
@@ -99,7 +117,7 @@ func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclien
 				"environment", ref.Environment, "table", table,
 				"owner_repo", owner.Repository, "owner_pr", owner.PullRequest, "error", err)
 			metrics.RecordPlanChangeOwnership(ctx, repo, ref.Database, ref.Environment, "pr_state_error")
-			return templates.AttributedChangeData{Table: table, Unresolved: true}, true
+			return []templates.AttributedChangeData{{Table: table, Unresolved: true}}
 		}
 		if info.IsClosed() {
 			h.logger.Debug("planned destructive change is not attributed to this owner: its pull request is closed",
@@ -108,41 +126,53 @@ func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclien
 				"owner_merged", info.Merged)
 			continue
 		}
-		h.logger.Warn("planned destructive change is attributed to another open pull request: it last changed this table",
+		attributed := templates.AttributedChangeData{
+			Table:        table,
+			Repository:   owner.Repository,
+			PullRequest:  owner.PullRequest,
+			OwnerChanges: lookup.ownerChanges(ctx, ref, owner, repo, pr),
+		}
+		if !slices.ContainsFunc(planned, func(change *ddl.ObjectChanges) bool {
+			return templates.UndoesAttributedWork(attributed, change)
+		}) {
+			h.logger.Debug("planned destructive change is not attributed to this owner: its open pull request changed other objects on the table",
+				"repo", repo, "pr", pr, "database", ref.Database, "environment", ref.Environment,
+				"table", table, "owner_repo", owner.Repository, "owner_pr", owner.PullRequest)
+			continue
+		}
+		h.logger.Warn("planned destructive change is attributed to another open pull request: it undoes that pull request's change to this table",
 			"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
 			"environment", ref.Environment, "table", table,
 			"owner_repo", owner.Repository, "owner_pr", owner.PullRequest)
+		attributedOwners = append(attributedOwners, attributed)
+	}
+	if len(attributedOwners) > 0 {
 		metrics.RecordPlanChangeOwnership(ctx, repo, ref.Database, ref.Environment, "owned")
-		return templates.AttributedChangeData{
-			Table:       table,
-			Repository:  owner.Repository,
-			PullRequest: owner.PullRequest,
-		}, true
+		return attributedOwners
 	}
 
-	if checked == 0 {
-		h.logger.Debug("planned destructive change is this pull request's to make: no other pull request is attributed the table",
-			"repo", repo, "pr", pr, "database", ref.Database, "environment", ref.Environment, "table", table)
-	}
+	h.logger.Debug("planned destructive change is this pull request's to make: it undoes no other open pull request's change to the table",
+		"repo", repo, "pr", pr, "database", ref.Database, "environment", ref.Environment, "table", table,
+		"other_pull_requests_checked", checked)
 	metrics.RecordPlanChangeOwnership(ctx, repo, ref.Database, ref.Environment, "unowned")
-	return templates.AttributedChangeData{}, false
+	return nil
 }
 
-// plannedDestructiveTables returns the distinct tables the plan would destroy
-// something on — a dropped table, column, or index — in a stable order. Each
-// table is judged by the same predicate --allow-unsafe is gated on, over the
-// same view: both the namespace-level changes and the per-shard ones are read,
-// since a sharded plan can carry a destructive change on individual shards that
-// the collapsed view omits, and one confined to a single shard is still
-// destructive. The changes that create a table (createsTable) are left out: a
-// table the plan creates holds no other pull request's work to attribute. Its
-// unsafe findings still require the opt-in, so the annotated tables are a
-// subset of the gated ones.
-func plannedDestructiveTables(planResp *apitypes.PlanResponse) []string {
+// plannedDestructiveStatements returns, keyed by table, the statements of the
+// plan's changes that destroy something on the table — a dropped table,
+// column, or index. Each change is judged by the same predicate --allow-unsafe
+// is gated on, over the same view: both the namespace-level changes and the
+// per-shard ones are read, since a sharded plan can carry a destructive change
+// on individual shards that the collapsed view omits, and one confined to a
+// single shard is still destructive. The changes that create a table
+// (createsTable) are left out: a table the plan creates holds no other pull
+// request's work to attribute. Its unsafe findings still require the opt-in,
+// so the annotated tables are a subset of the gated ones.
+func plannedDestructiveStatements(planResp *apitypes.PlanResponse) map[string][]string {
+	statements := map[string][]string{}
 	if planResp == nil {
-		return nil
+		return statements
 	}
-	seen := map[string]struct{}{}
 	add := func(t *apitypes.TableChangeResponse) {
 		if t.TableName == "" {
 			return
@@ -150,7 +180,9 @@ func plannedDestructiveTables(planResp *apitypes.PlanResponse) []string {
 		if _, unsafe := t.UnsafeChange(); !unsafe || createsTable(t.ChangeType) {
 			return
 		}
-		seen[t.TableName] = struct{}{}
+		if !slices.Contains(statements[t.TableName], t.DDL) {
+			statements[t.TableName] = append(statements[t.TableName], t.DDL)
+		}
 	}
 	for _, sc := range planResp.Changes {
 		if sc == nil {
@@ -168,12 +200,7 @@ func plannedDestructiveTables(planResp *apitypes.PlanResponse) []string {
 			add(t)
 		}
 	}
-	tables := make([]string, 0, len(seen))
-	for table := range seen {
-		tables = append(tables, table)
-	}
-	sort.Strings(tables)
-	return tables
+	return statements
 }
 
 // createsTable reports whether a change of this type creates its table. Such a
@@ -186,21 +213,96 @@ func createsTable(changeType string) bool {
 	return ddl.OpToStatementType(changeType) == ddl.StatementCreateTable
 }
 
-// targetPlanDestructiveTables returns the distinct tables the rendered target
-// plans destroy something on beyond the primary plan, in a stable order. They
-// are the tables of the unsafe changes the unsafe gate counts for those plans
+// targetPlanDestructiveStatements returns, keyed by table, the statements of
+// the rendered target plans' changes that destroy something beyond the primary
+// plan. They are the unsafe changes the unsafe gate counts for those plans
 // (templates.TargetPlanUnsafeChanges), so a table a target's plan drops, or
 // drops a column or index on, is looked up the way the primary plan's are. A
 // VSchema change is not a table's, and a change that creates its table
 // destroys nothing, so both are left out as the primary plan's are.
-func targetPlanDestructiveTables(rollout *templates.DeploymentDriftData) []string {
-	var tables []string
+func targetPlanDestructiveStatements(rollout *templates.DeploymentDriftData) map[string][]string {
+	statements := map[string][]string{}
 	for _, change := range templates.TargetPlanUnsafeChanges(rollout) {
-		if change.Table == "" || change.ChangeType == apitypes.VSchemaChangeType || createsTable(change.ChangeType) || slices.Contains(tables, change.Table) {
+		if change.Table == "" || change.ChangeType == apitypes.VSchemaChangeType || createsTable(change.ChangeType) {
 			continue
 		}
-		tables = append(tables, change.Table)
+		if !slices.Contains(statements[change.Table], change.DDL) {
+			statements[change.Table] = append(statements[change.Table], change.DDL)
+		}
 	}
-	slices.Sort(tables)
-	return tables
+	return statements
+}
+
+// ownerKey names one pull request in stored task history.
+type ownerKey struct {
+	repository  string
+	pullRequest int
+}
+
+// ownerWorkLookup reads what other pull requests' stored statements did to a
+// table, loading each pull request's tasks once per plan comment.
+type ownerWorkLookup struct {
+	h      *Handler
+	parser ddl.StatementParser
+	tasks  map[ownerKey][]*storage.Task
+}
+
+// ownerChanges merges what the owner's stored statements did to the table in
+// ref. It returns nil, so that every planned change on the table is
+// attributed, when the owner's tasks cannot be read, when no parser serves
+// the database type, or when any of the owner's statements on the table does
+// not parse.
+func (l *ownerWorkLookup) ownerChanges(ctx context.Context, ref storage.TableRef, owner storage.TableOwner, repo string, pr int) *ddl.ObjectChanges {
+	logAttrs := []any{"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
+		"environment", ref.Environment, "table", ref.TableName,
+		"owner_repo", owner.Repository, "owner_pr", owner.PullRequest}
+	if l.parser == nil {
+		return nil
+	}
+	key := ownerKey{repository: owner.Repository, pullRequest: owner.PullRequest}
+	tasks, loaded := l.tasks[key]
+	if !loaded {
+		var err error
+		tasks, err = l.h.service.Storage().Tasks().GetByPR(ctx, owner.Repository, owner.PullRequest)
+		if err != nil {
+			l.h.logger.Error("planned destructive changes are attributed to the owning pull request without matching objects: its stored tasks could not be read",
+				append(logAttrs, "error", err)...)
+			return nil
+		}
+		l.tasks[key] = tasks
+	}
+
+	var merged ddl.ObjectChanges
+	var matched int
+	for _, task := range tasks {
+		if !taskChangedTable(task, ref) {
+			continue
+		}
+		matched++
+		changes, err := l.parser.ObjectChanges(task.DDL)
+		if err != nil {
+			l.h.logger.Warn("planned destructive changes are attributed to the owning pull request without matching objects: one of its stored statements does not parse",
+				append(logAttrs, "task_id", task.TaskIdentifier, "error", err)...)
+			return nil
+		}
+		merged.Added = append(merged.Added, changes.Added...)
+		merged.Dropped = append(merged.Dropped, changes.Dropped...)
+		merged.Modified = append(merged.Modified, changes.Modified...)
+		merged.Referenced = append(merged.Referenced, changes.Referenced...)
+	}
+	if matched == 0 {
+		l.h.logger.Warn("planned destructive changes are attributed to the owning pull request without matching objects: none of its stored tasks changed the table",
+			logAttrs...)
+		return nil
+	}
+	return &merged
+}
+
+// taskChangedTable reports whether a stored task changed the table in ref, in
+// the same database and environment.
+func taskChangedTable(task *storage.Task, ref storage.TableRef) bool {
+	return task.Database == ref.Database &&
+		task.DatabaseType == ref.DatabaseType &&
+		task.Environment == ref.Environment &&
+		task.TableName == ref.TableName
 }

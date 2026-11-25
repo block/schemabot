@@ -436,6 +436,10 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 				copied := t.RowsCopied
 				if state.IsState(status, state.Task.Completed, state.Task.RevertWindow) {
 					copied = t.RowsTotal
+				} else if ui.CopyFinishedShortOfEstimate(t.PercentComplete, t.RowsCopied, t.RowsTotal) {
+					// A target past its copy counts its whole total, as
+					// presentation.SumTargetRows counts it.
+					copied = t.RowsTotal
 				}
 				rolled.RowsCopied += copied
 				rolled.RowsTotal += t.RowsTotal

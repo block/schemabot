@@ -321,6 +321,7 @@ func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Ap
 	if err != nil {
 		return nil, fmt.Errorf("build deferred deploy request for task %s: %w", applyTasks[0].TaskIdentifier, err)
 	}
+	c.observeOperationDispatch(ctx)
 	result, err := eng.Start(withDriveWorkOwner(ctx), controlReq)
 	if err != nil {
 		return nil, fmt.Errorf("start deferred deploy: %w", err)
@@ -1957,6 +1958,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 // are loaded scoped to the operation rather than the whole apply, so a driver
 // can advance one deployment independently of its siblings.
 func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	ctx = withChangeDispatchApply(ctx, apply)
 	if err := c.guardDriveScope(apply); err != nil {
 		return err
 	}
@@ -2031,6 +2033,7 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 // operation, so an empty result fails closed the same way ResumeApplyOperation
 // does rather than failing the whole parent apply.
 func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	ctx = withChangeDispatchApply(ctx, apply)
 	if apply == nil {
 		return fmt.Errorf("stored apply is required to drive apply_operation %d cutover", applyOperationID)
 	}
@@ -3296,6 +3299,10 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 	}
 	if suppressParentApplyWrites(ctx) {
 		return nil
+	}
+	if _, operationDrive := storage.OperationLeaseFromContext(ctx); operationDrive &&
+		ctx.Err() == nil && state.IsState(apply.State, state.Apply.Failed) {
+		return fmt.Errorf("%w: %w", ErrGroupedResumeFailureCommitted, err)
 	}
 	return err
 }

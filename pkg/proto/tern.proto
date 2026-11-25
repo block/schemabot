@@ -1012,6 +1012,12 @@ message ApplyResponse {
   // database, so the caller can render the refusal instead of the engine's
   // unsafe error text. Absent for every other rejection.
   ApplyConflict conflict = 6;
+  // Set when the dispatch was refused because the apply it would have joined
+  // had already ended, to that apply's state as the data plane's store read
+  // it. The refused work never started, so the caller can settle it to match
+  // the apply, cancelled with a cancelled apply and stopped with a stopped one,
+  // instead of recording it as failed. Absent for every other rejection.
+  string closed_apply_state = 7;
 }
 
 // ProgressRequest requests detailed progress for an active schema change.

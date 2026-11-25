@@ -38,6 +38,10 @@ type TableProgressData struct {
 	// the table is queued and before the engine reports RowsTotal. Nil when
 	// the plan had no estimate.
 	EstimatedRows *int64
+	// RowsTotalPlanned marks a sharded table's RowsTotal that counts the
+	// plan's estimate for the shards that have not reported, so it renders
+	// as approximate (apitypes.TableProgressResponse.RowsTotalPlanned).
+	RowsTotalPlanned bool
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -728,7 +732,7 @@ func runningPercentText(running []TableProgressData) string {
 		if t.RowsTotal <= 0 {
 			return ""
 		}
-		copied += ui.ClampRows(t.RowsCopied, t.RowsTotal)
+		copied += ui.CopyCoveredRows(t.PercentComplete, t.RowsCopied, t.RowsTotal)
 		total += t.RowsTotal
 	}
 	if copied == 0 {
@@ -1110,6 +1114,15 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	// Normalize to canonical Task state for consistent matching.
 	status := state.NormalizeTaskStatus(table.Status)
 
+	if sharded := shardedTableStatus(table); keepsShardedProgressBar(status, sharded) {
+		// A sharded table whose shards are in different phases keeps its bar
+		// across them, as the sharded comment and the CLI show it (UX-8).
+		writeShardedTablePhaseProgress(sb, sharded, func() { writeDDLLine(sb, dialect, table.DDL, budget) })
+		renderShardSummary(sb, table, presentation.RunningCopying, budget)
+		sb.WriteString("\n")
+		return
+	}
+
 	switch status {
 	case state.Task.Pending:
 		fmt.Fprintf(sb, "**%s**: \u23f3 Queued\n", inlineCode(table.TableName))
@@ -1225,6 +1238,29 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	sb.WriteString("\n")
 }
 
+// shardedTableStatus is a table row as the sharded comment reads it, so a
+// sharded table in a single-deployment apply renders the way it does there.
+func shardedTableStatus(table TableProgressData) ShardedTableStatus {
+	reporting := 0
+	for _, sh := range table.Shards {
+		if sh.RowsTotal > 0 {
+			reporting++
+		}
+	}
+	return ShardedTableStatus{
+		Table:            table.TableName,
+		Status:           table.Status,
+		RowsCopied:       table.RowsCopied,
+		RowsTotal:        table.RowsTotal,
+		RowsTotalPlanned: table.RowsTotalPlanned,
+		ETASeconds:       table.ETASeconds,
+		EstimatedBytes:   table.EstimatedBytes,
+		ShardsReporting:  reporting,
+		PlannedShards:    table.PlannedShards,
+		Shards:           table.Shards,
+	}
+}
+
 // renderShardSummary lists a sharded table's shards while it is in flight. A
 // settled table's line already says where it ended, so the listing stays out
 // of the way then. runningWord names the shards working on the change
@@ -1301,7 +1337,9 @@ func tableFacts(table TableProgressData, work apitypes.BuildWork) presentation.T
 		PercentComplete:     table.PercentComplete,
 		RowsCopied:          table.RowsCopied,
 		RowsTotal:           table.RowsTotal,
+		RowsTotalPlanned:    table.RowsTotalPlanned,
 		ETASeconds:          table.ETASeconds,
+		EstimatedRows:       table.EstimatedRows,
 		EstimatedBytes:      table.EstimatedBytes,
 		ChecksumRowsChecked: table.ChecksumRowsChecked,
 		ChecksumRowsTotal:   table.ChecksumRowsTotal,
@@ -1392,8 +1430,13 @@ func renderStoppedTable(sb *strings.Builder, dialect schema.Dialect, table Table
 
 	writeDDLLine(sb, dialect, table.DDL, budget)
 
-	// Show rows (no ETA) for stopped tables with progress
-	if table.RowsTotal > 0 && (table.PercentComplete > 0 || table.RowsCopied > 0) {
+	// Show rows (no ETA) for stopped tables with progress. A copy finished
+	// short of its estimate shows the rows it copied, as a running one does.
+	if ui.CopyFinishedShortOfEstimate(table.PercentComplete, table.RowsCopied, table.RowsTotal) {
+		if line := presentation.FinishedCopyRowsText(table.RowsCopied); line != "" {
+			fmt.Fprintf(sb, "- %s\n", line)
+		}
+	} else if table.RowsTotal > 0 && (table.PercentComplete > 0 || table.RowsCopied > 0) {
 		fmt.Fprintf(sb, "- Rows: %s / %s%s\n",
 			ui.FormatNumber(ui.ClampRows(table.RowsCopied, table.RowsTotal)),
 			ui.FormatNumber(table.RowsTotal),
@@ -1449,8 +1492,9 @@ func countTablesWithDDL(tables []TableProgressData) int {
 
 // writePlannedRows writes the rows line of a table no engine has reported on
 // yet (presentation.PlannedRowsText). span names the targets the estimate
-// covers when it is summed across several. It writes nothing when the plan
-// had no row estimate.
+// covers when it is summed across several. It writes the size alone when the
+// plan sized the table but could not count its rows, and nothing when the plan
+// had neither.
 func writePlannedRows(sb *strings.Builder, estimatedRows, estimatedBytes *int64, span string) {
 	if text := presentation.PlannedRowsText(estimatedRows, estimatedBytes, span); text != "" {
 		fmt.Fprintf(sb, "- %s\n", text)
@@ -1742,12 +1786,20 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 }
 
 func completedSummaryDetailsLabel(data ApplyStatusCommentData) string {
+	return applyDetailsLabel(len(data.Tables), progressUnit(data.Tables), len(data.VSchemaChanges))
+}
+
+// applyDetailsLabel is the summary line of a completed apply's collapsed
+// detail block, shared by every apply shape so a sharded summary and a
+// regular one word it the same way: the changes counted in unit ("table" or
+// "statement"), then the VSchema updates.
+func applyDetailsLabel(changes int, unit string, vschemaUpdates int) string {
 	var parts []string
-	if len(data.Tables) > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s", len(data.Tables), pluralize(progressUnit(data.Tables), len(data.Tables))))
+	if changes > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", changes, pluralize(unit, changes)))
 	}
-	if len(data.VSchemaChanges) > 0 {
-		parts = append(parts, fmt.Sprintf("%d VSchema %s", len(data.VSchemaChanges), pluralize("update", len(data.VSchemaChanges))))
+	if vschemaUpdates > 0 {
+		parts = append(parts, fmt.Sprintf("%d VSchema %s", vschemaUpdates, pluralize("update", vschemaUpdates)))
 	}
 	return fmt.Sprintf("Apply details (%s)", strings.Join(parts, ", "))
 }
@@ -2046,6 +2098,7 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 			EstimatedBytes:  t.EstimatedBytes,
 			EstimatedRows:   t.EstimatedRows,
 
+			RowsTotalPlanned:    t.RowsTotalPlanned,
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
 			Throttled:           t.Throttled,
