@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/block/schemabot/pkg/changeevents"
 	"github.com/stretchr/testify/require"
 )
@@ -112,7 +113,11 @@ func TestSQSPublishReturnsFirstFailure(t *testing.T) {
 	})
 	queues, err := NewDestinations(t.Context(), []Destination{{QueueURL: queueURL}})
 	require.NoError(t, err)
-	require.Error(t, queues[0].Publisher.Publish(t.Context(), json.RawMessage("{}")))
+	err = queues[0].Publisher.Publish(t.Context(), json.RawMessage("{}"))
+	require.ErrorContains(t, err, queueURL)
+	var responseErr *awshttp.ResponseError
+	require.ErrorAs(t, err, &responseErr)
+	require.Equal(t, http.StatusServiceUnavailable, responseErr.HTTPStatusCode())
 	require.EqualValues(t, 1, attempts.Load())
 }
 

@@ -79,5 +79,8 @@ func (p *publisher) Publish(ctx context.Context, payload json.RawMessage) error 
 	_, err := p.client.SendMessage(ctx, &sqs.SendMessageInput{
 		QueueUrl: aws.String(p.queueURL), MessageBody: aws.String(string(payload)),
 	})
-	return err
+	if err != nil {
+		return fmt.Errorf("send message to SQS queue %q: %w", p.queueURL, err)
+	}
+	return nil
 }
