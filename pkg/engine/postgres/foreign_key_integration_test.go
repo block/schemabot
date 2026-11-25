@@ -4,6 +4,7 @@ package postgres
 
 import (
 	"database/sql"
+	"strings"
 	"testing"
 
 	"github.com/block/pg-sprite/pkg/schemadiff"
@@ -449,4 +450,41 @@ func TestEnginePlanForeignKeyAcrossNamespacesIsRollbackIncapable(t *testing.T) {
 			assert.Nil(t, result.Changes[0].OriginalFiles)
 		})
 	}
+}
+
+// A namespace already holds a foreign key added NOT VALID, and a pull request
+// adds a column to another table. A schema file cannot declare the key as NOT
+// VALID, so originals captured from the live namespace would write it as a
+// validated key, and a rollback would run a VALIDATE CONSTRAINT the forward
+// apply never ran. The plan proceeds with the column and is
+// rollback-incapable.
+func TestEnginePlanBesideNotValidForeignKeyIsRollbackIncapable(t *testing.T) {
+	const database = "rollback_fk_not_valid_test"
+	dsn, db := testutil.StartPostgres(t, database)
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint);
+		ALTER TABLE public.orders ADD CONSTRAINT orders_user_id_fkey
+			FOREIGN KEY (user_id) REFERENCES public.users (id) NOT VALID`)
+	require.NoError(t, err)
+
+	result, err := New().Plan(t.Context(), &engine.PlanRequest{
+		Database: database,
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"users.sql":  "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+			"orders.sql": "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint, CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES users (id))",
+		}}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	var addsEmail bool
+	for _, change := range result.Changes[0].TableChanges {
+		if change.Table == "users" && strings.Contains(change.DDL, "ADD COLUMN") && strings.Contains(change.DDL, "email") {
+			addsEmail = true
+		}
+	}
+	assert.True(t, addsEmail, "the plan still adds the column: %+v", result.Changes[0].TableChanges)
+	assert.False(t, result.Changes[0].OriginalFilesCaptured)
+	assert.Nil(t, result.Changes[0].OriginalFiles)
 }
