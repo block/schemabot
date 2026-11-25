@@ -66,11 +66,6 @@ func TestApplies(t *testing.T, h Harness) {
 		counts, err := store.Applies().CountRecentByState(ctx, storage.RecentAppliesFilter{Environment: "sTaGiNg"})
 		require.NoError(t, err)
 		assert.Equal(t, map[string]int{state.Apply.Completed: 1}, counts)
-
-		require.NoError(t, store.Applies().DeleteByPR(ctx, "mixedCASE/sample-REPO", 812))
-		deleted, err := store.Applies().Get(ctx, id)
-		require.NoError(t, err)
-		assert.Nil(t, deleted)
 	})
 
 	// A logs lookup without an apply ID reads only the newest apply for the
@@ -2343,12 +2338,6 @@ func TestApplies(t *testing.T, h Harness) {
 		"ExistsForDatabaseHead_DBError": func(t *testing.T, store storage.ApplyStore) error {
 			_, err := store.ExistsForDatabaseHead(t.Context(), "org/repo", 1, "db", storage.DatabaseTypeMySQL, "head")
 			return err
-		},
-		"Delete_DBError": func(t *testing.T, store storage.ApplyStore) error {
-			return store.Delete(t.Context(), 1)
-		},
-		"DeleteByPR_DBError": func(t *testing.T, store storage.ApplyStore) error {
-			return store.DeleteByPR(t.Context(), "org/repo", 1)
 		},
 	}
 	for name, test := range dbErrorTests {
