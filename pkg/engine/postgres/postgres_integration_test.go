@@ -1785,6 +1785,94 @@ func TestEngineApplyOversizedTableRunsCatalogOnlyChange(t *testing.T) {
 	assert.Equal(t, "text", dataType)
 }
 
+// TestEngineApplyOversizedTableRefusesWhenTheLiveProofNoLongerHolds proves
+// apply judges the statement against the table as it is now, not as it was
+// planned. Adding a column of an enum type is catalog-only, so the plan keeps
+// it executable on an oversized table. If the type is then replaced by a
+// domain with a CHECK before the apply runs, the same statement would run
+// that check under the lock, so the apply keeps the size refusal and adds
+// no column.
+func TestEngineApplyOversizedTableRefusesWhenTheLiveProofNoLongerHolds(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "oversized_stale_proof_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TYPE public.tier AS ENUM ('free', 'paid');
+		CREATE TABLE public.users (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	eng := NewWithTableSizeLimit(1)
+	planned, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "oversized_stale_proof_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"tier.sql":  "CREATE TYPE tier AS ENUM ('free', 'paid')",
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, plan tier)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, planned.Changes, 1)
+	require.Len(t, planned.Changes[0].TableChanges, 1)
+	assert.Empty(t, planned.Changes[0].TableChanges[0].ExecutionMode, "an enum column is catalog-only when planned")
+
+	_, err = db.ExecContext(t.Context(), `
+		DROP TYPE public.tier;
+		CREATE DOMAIN public.tier AS text CHECK (VALUE IN ('free', 'paid'))`)
+	require.NoError(t, err)
+
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN plan public.tier"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable)
+	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+	assertColumnAbsent(t, db, "users", "plan")
+}
+
+// TestEngineApplyOversizedTableRefusesWhenTheLiveProofFails proves a proof
+// that cannot be made leaves the size refusal standing. The column's type
+// does not exist, so pg-sprite cannot prove the statement changes only the
+// catalog, and the apply refuses on size and names the failed proof.
+func TestEngineApplyOversizedTableRefusesWhenTheLiveProofFails(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "oversized_failed_proof_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+
+	eng := NewWithTableSizeLimit(1)
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN plan public.missing_type"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable)
+	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+	assertColumnAbsent(t, db, "users", "plan")
+
+	// The refusal renders only the fixed size sentence, so check the failed
+	// proof itself: it must be an error, not a false that looks like a
+	// decided answer.
+	pool, err := pgxpool.New(t.Context(), dsn)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	stmt, err := statement.ParseOne("ALTER TABLE public.users ADD COLUMN plan public.missing_type")
+	require.NoError(t, err)
+	_, err = provenCatalogOnly(t.Context(), pool, stmt)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing_type")
+}
+
+// assertColumnAbsent fails the test when column exists on public.table.
+func assertColumnAbsent(t *testing.T, db *sql.DB, table, column string) {
+	t.Helper()
+	var count int
+	err := db.QueryRowContext(t.Context(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2`, table, column).Scan(&count)
+	require.NoError(t, err)
+	assert.Zero(t, count, "column %q must not exist on %q", column, table)
+}
+
 // TestEngineApplyOversizedTableUsesKindSpecificBounds proves a concurrent
 // index build completes under its duration envelope on a table above the
 // rewrite ceiling, while a native ALTER on that table remains refused.

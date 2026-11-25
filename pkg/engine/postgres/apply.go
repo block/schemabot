@@ -1746,6 +1746,11 @@ func checkTableUnlessCatalogOnly(ctx context.Context, pool *pgxpool.Pool, change
 	}
 	catalogOnly, proofErr := provenCatalogOnly(ctx, pool, statement)
 	if proofErr != nil {
+		logger.Warn("PostgreSQL table is over the size limit and the statement could not be proven to change only the catalog; the apply will be refused on size",
+			"namespace", change.namespace,
+			"table", change.table,
+			"size_limit_bytes", limit,
+			"error", proofErr)
 		return preflight.PreflightedTable{}, fmt.Errorf("preflight PostgreSQL table %q: %w; prove the statement changes only the catalog: %w", change.table, err, proofErr)
 	}
 	if !catalogOnly {
