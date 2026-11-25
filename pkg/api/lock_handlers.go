@@ -33,8 +33,8 @@ type LockReleaseRequest struct {
 	// release deletes only that row, and only while no apply that can still
 	// change records the row as its lock; a lock released and taken again
 	// since, even under the same owner, is left held. Without it the release
-	// is by owner.
-	ID int64 `json:"id,omitempty"`
+	// is by owner. A supplied ID below 1 is refused rather than read as absent.
+	ID *int64 `json:"id,omitempty"`
 }
 
 // LockResponse is the response for lock operations.
@@ -284,11 +284,11 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "database and database_type are required")
 		return
 	}
-	if req.ID < 0 {
+	if req.ID != nil && *req.ID < 1 {
 		s.writeError(w, http.StatusBadRequest, "id must be the positive lock ID a lock acquire reported")
 		return
 	}
-	if req.Force && req.ID != 0 {
+	if req.Force && req.ID != nil {
 		s.writeError(w, http.StatusBadRequest, "id cannot be combined with force: a forced release removes whichever lock is held")
 		return
 	}
@@ -349,7 +349,7 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 		s.releaseScopedLock(w, r, req)
 		return
 	}
-	if req.ID != 0 {
+	if req.ID != nil {
 		s.releaseLockRowIfUnused(w, r, req)
 		return
 	}
@@ -438,8 +438,8 @@ func (s *Service) releaseScopedLock(w http.ResponseWriter, r *http.Request, req 
 		"repository", lock.Repository, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
 		"owner", lock.Owner, "subject", subject,
 	}
-	if req.ID != 0 && lock.ID != req.ID {
-		s.writeLockReplaced(w, r, req, append(logAttrs, "lock_id", req.ID, "held_lock_id", lock.ID))
+	if req.ID != nil && lock.ID != *req.ID {
+		s.writeLockReplaced(w, r, req, lockReplacedReasonRetaken, append(logAttrs, "lock_id", *req.ID, "held_lock_id", lock.ID))
 		return
 	}
 	if lock.Owner != req.Owner {
@@ -462,7 +462,7 @@ func (s *Service) releaseScopedLock(w http.ResponseWriter, r *http.Request, req 
 		s.writeError(w, http.StatusForbidden, s.scopedLockDenialMessage("lock_release", "releasing", lock, refusal))
 		return
 	}
-	if req.ID != 0 {
+	if req.ID != nil {
 		s.releaseLockRowIfUnused(w, r, req)
 		return
 	}
@@ -511,15 +511,19 @@ func (s *Service) releaseScopedLock(w http.ResponseWriter, r *http.Request, req 
 func (s *Service) releaseLockRowIfUnused(w http.ResponseWriter, r *http.Request, req LockReleaseRequest) {
 	ctx := r.Context()
 	logAttrs := []any{
-		"database", req.Database, "database_type", req.DatabaseType, "owner", req.Owner, "lock_id", req.ID,
+		"database", req.Database, "database_type", req.DatabaseType, "owner", req.Owner, "lock_id", *req.ID,
 	}
-	err := s.storage.Locks().ReleaseByIDIfUnused(ctx, req.ID, req.Database, req.DatabaseType, req.Owner, "")
+	err := s.storage.Locks().ReleaseByIDIfUnused(ctx, *req.ID, req.Database, req.DatabaseType, req.Owner, "")
 	if errors.Is(err, storage.ErrLockInUse) {
 		s.writeLockInUse(w, r, req, err, logAttrs)
 		return
 	}
-	if errors.Is(err, storage.ErrLockReplaced) || errors.Is(err, storage.ErrLockIntentChanged) {
-		s.writeLockReplaced(w, r, req, append(logAttrs, "error", err))
+	if errors.Is(err, storage.ErrLockReplaced) {
+		s.writeLockReplaced(w, r, req, lockReplacedReasonRetaken, append(logAttrs, "error", err))
+		return
+	}
+	if errors.Is(err, storage.ErrLockIntentChanged) {
+		s.writeLockReplaced(w, r, req, lockReplacedReasonPlanPinned, append(logAttrs, "error", err))
 		return
 	}
 	if errors.Is(err, storage.ErrLockNotFound) {
@@ -562,7 +566,7 @@ func (s *Service) writeLockInUse(w http.ResponseWriter, r *http.Request, req Loc
 	}
 	apply := inUse.Apply
 	s.logger.Info("lock release pinned to a lock row kept the lock: an apply that can still change records the row as its lock",
-		append(apply.LogAttrs(), "owner", req.Owner, "lock_id", req.ID)...)
+		append(apply.LogAttrs(), "owner", req.Owner, "lock_id", *req.ID)...)
 	s.writeJSON(w, http.StatusConflict, apitypes.ErrorResponse{
 		Error: fmt.Sprintf("lock on database %q was kept: apply %s (%s) runs under it; nothing was released",
 			req.Database, apply.ApplyIdentifier, apply.State),
@@ -571,17 +575,24 @@ func (s *Service) writeLockInUse(w http.ResponseWriter, r *http.Request, req Loc
 	})
 }
 
-// writeLockReplaced answers a release pinned to a lock row that found a
-// different lock holding the database: the row was released and the lock taken
-// again since, possibly under the same owner. The lock held now is not the
-// one the caller named, so nothing was released.
-func (s *Service) writeLockReplaced(w http.ResponseWriter, r *http.Request, req LockReleaseRequest, logAttrs []any) {
+// Reasons a release pinned to a lock row finds the lock is no longer the one
+// it named.
+const (
+	lockReplacedReasonRetaken    = "it was released and taken again since"
+	lockReplacedReasonPlanPinned = "a plan was pinned to it since"
+)
+
+// writeLockReplaced answers a release pinned to a lock row that found the
+// lock is no longer the one the caller named: the row was released and the
+// lock taken again since, possibly under the same owner, or a plan was pinned
+// to the row. reason says which, so nothing was released.
+func (s *Service) writeLockReplaced(w http.ResponseWriter, r *http.Request, req LockReleaseRequest, reason string, logAttrs []any) {
 	ctx := r.Context()
 	metrics.RecordLockOperation(ctx, "release", req.Database, "conflict")
-	s.logger.Warn("lock release pinned to a lock row refused: a different lock now holds the database; the lock held now stays held",
-		logAttrs...)
+	s.logger.Warn("lock release pinned to a lock row refused: the lock is no longer the one it named; the lock held now stays held",
+		append(logAttrs, "reason", reason)...)
 	s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeLockReplaced,
-		fmt.Sprintf("lock on database %q is no longer the lock this release named: it was released and taken again since; nothing was released", req.Database))
+		fmt.Sprintf("lock on database %q is no longer the lock this release named: %s; nothing was released", req.Database, reason))
 }
 
 // scopedLockRefusal reports why a scoped operator holding callerGroups (their

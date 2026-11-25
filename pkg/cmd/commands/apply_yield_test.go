@@ -279,6 +279,41 @@ func TestYieldLock_LeavesALockTakenAgainSinceInPlace(t *testing.T) {
 	assert.NotContains(t, out, "Lock released")
 }
 
+// The apply completed, but its lock is already gone or now held by another
+// owner. --yield has nothing to release, says so, and does not fail the
+// command or offer an unlock.
+func TestYieldLock_NothingToReleaseIsNotAFailure(t *testing.T) {
+	cases := map[string]struct {
+		status int
+		body   string
+		want   string
+	}{
+		"lock already released": {
+			status: http.StatusNotFound,
+			body:   `{"error":"lock not found","error_code":"not_found"}`,
+			want:   "🔓 Lock for testdb (mysql) was already released, so nothing is left to unlock.\n",
+		},
+		"lock held by another owner": {
+			status: http.StatusForbidden,
+			body:   `{"error":"lock is not owned by you","error_code":"lock_not_owned"}`,
+			want: "🔒 Lock for testdb (mysql) is now held by another owner, so it was left in place.\n" +
+				"   This command released nothing. See who holds it: schemabot locks\n",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			server, releases := settledYieldServer(t, tc.status, tc.body)
+
+			out, err := runSettledYield(server, acquiredLockRowID)
+
+			require.NoError(t, err, out)
+			assert.Equal(t, int32(1), releases.Load(), out)
+			assert.Contains(t, out, tc.want)
+			assert.NotContains(t, out, "schemabot unlock")
+		})
+	}
+}
+
 // A server too old to report the lock row leaves --yield no release that
 // spares another command's apply, so it keeps the lock, sends no release, and
 // shows how to check and release it.

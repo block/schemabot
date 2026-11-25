@@ -130,6 +130,52 @@ func TestScopedLockReleaseByIDKeepsALockItDidNotTakeOrThatAnApplyUses(t *testing
 	}
 }
 
+// A release that names a lock row keeps the lock when that row is held by
+// another owner, or when a plan has been pinned to it since, and says which.
+func TestLockReleaseByIDKeepsAnotherOwnersRowAndAPinnedPlan(t *testing.T) {
+	admin := &auth.User{Subject: "alice", Groups: []string{"schema-admins"}}
+	t.Run("another owner holds the row", func(t *testing.T) {
+		runLockReleaseByIDCase(t, scopedWriteConfig(), admin, lockReleaseByIDCase{
+			held:        paymentsLock(7, "cli:carol@laptop", nil),
+			body:        releaseLockRow7,
+			wantStatus:  http.StatusForbidden,
+			wantCode:    apitypes.ErrCodeLockNotOwned,
+			wantMessage: "lock is not owned by you",
+			wantHeld:    paymentsLock(7, "cli:carol@laptop", nil),
+		})
+	})
+	t.Run("a plan was pinned to the row", func(t *testing.T) {
+		held := paymentsLock(7, "cli:bob@laptop", nil)
+		held.PendingPlanID = "plan-1"
+		wantHeld := paymentsLock(7, "cli:bob@laptop", nil)
+		wantHeld.PendingPlanID = "plan-1"
+		runLockReleaseByIDCase(t, scopedWriteConfig(), admin, lockReleaseByIDCase{
+			held:        held,
+			body:        releaseLockRow7,
+			wantStatus:  http.StatusConflict,
+			wantCode:    apitypes.ErrCodeLockReplaced,
+			wantMessage: `lock on database "payments" is no longer the lock this release named: a plan was pinned to it since; nothing was released`,
+			wantHeld:    wantHeld,
+		})
+	})
+}
+
+// A scoped operator's release naming a row that another owner's newer row has
+// replaced says the lock was taken again, not that it belongs to someone else:
+// the row it named is gone, which is the fact the operator acts on.
+func TestScopedLockReleaseByIDReportsAReplacedRowBeforeOwnership(t *testing.T) {
+	teammate := &auth.User{Subject: "carol", Groups: []string{"payments-team"}}
+	teamAcquirer := &storage.LockAcquirer{Subject: "dave", OperatorGroups: []string{"payments-team"}}
+	runLockReleaseByIDCase(t, scopedWriteConfig(), teammate, lockReleaseByIDCase{
+		held:        paymentsLock(9, "cli:dave@laptop", teamAcquirer),
+		body:        releaseLockRow7,
+		wantStatus:  http.StatusConflict,
+		wantCode:    apitypes.ErrCodeLockReplaced,
+		wantMessage: `lock on database "payments" is no longer the lock this release named: it was released and taken again since; nothing was released`,
+		wantHeld:    paymentsLock(9, "cli:dave@laptop", teamAcquirer),
+	})
+}
+
 // A release that sends no lock row releases by owner, as it always has: an
 // older CLI and `schemabot unlock` send none.
 func TestLockReleaseWithoutIDReleasesByOwner(t *testing.T) {
@@ -157,6 +203,11 @@ func TestLockReleaseRefusesAnIDItCannotHonour(t *testing.T) {
 		{
 			name:        "negative",
 			body:        `{"database":"payments","database_type":"mysql","owner":"cli:bob@laptop","id":-7}`,
+			wantMessage: "id must be the positive lock ID a lock acquire reported",
+		},
+		{
+			name:        "zero",
+			body:        `{"database":"payments","database_type":"mysql","owner":"cli:bob@laptop","id":0}`,
 			wantMessage: "id must be the positive lock ID a lock acquire reported",
 		},
 	} {

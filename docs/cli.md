@@ -606,7 +606,10 @@ you already held before the command started also stays held. The release, and
 the one `apply --yield` sends once its apply settles, names the lock the
 command took, so a lock another of your commands started an apply under stays
 held for that apply, and a lock released and taken again since stays with
-whoever holds it now; the command says which happened. A server too old to
+whoever holds it now; the command says which happened. Only a started apply
+counts: another of your commands that has found the lock but not yet started
+its apply does not keep it, so wait for that command before you release. A
+server too old to
 name the lock gets no release at all: the command keeps the lock and tells you
 to check `schemabot locks` and run `schemabot unlock` if nothing of yours runs
 under it. Locks span the

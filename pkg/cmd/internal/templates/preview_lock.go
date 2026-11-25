@@ -59,6 +59,10 @@ func previewLockInUseOutput() {
 
 func previewLockReplacedOutput() {
 	WriteLockReplaced("testapp", "mysql")
+	fmt.Println()
+	fmt.Println("--- Apply settled, lock now held by another owner ---")
+	fmt.Println()
+	WriteLockHeldByAnotherOwner("testapp", "mysql")
 }
 
 func previewLockKeptWithoutIDOutput() {

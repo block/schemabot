@@ -105,6 +105,14 @@ func WriteLockReplaced(database, dbType string) {
 	fmt.Printf("   This command released nothing. See who holds it: %s\n", cliname.Command("locks"))
 }
 
+// WriteLockHeldByAnotherOwner writes the message when --yield finds the lock
+// its apply ran under is now held by another owner. That lock is not this
+// command's, so it is left held and no unlock command is offered.
+func WriteLockHeldByAnotherOwner(database, dbType string) {
+	fmt.Printf("🔒 Lock for %s (%s) is now held by another owner, so it was left in place.\n", database, dbType)
+	fmt.Printf("   This command released nothing. See who holds it: %s\n", cliname.Command("locks"))
+}
+
 // WriteLockKeptWithoutID writes the message when a command keeps the lock it
 // would release because the server did not report which lock row it took.
 // Releasing by owner alone could remove a lock another command of the same
