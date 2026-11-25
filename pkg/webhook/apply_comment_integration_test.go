@@ -3977,7 +3977,7 @@ func TestE2EStagnantApplySkipsIdenticalProgressEdits(t *testing.T) {
 		assert.Equal(t, progressID, edited.CommentID)
 		assert.Contains(t, edited.Body, "50.00%")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the first tick to edit the progress comment")
+		require.FailNow(t, "expected the first tick to edit the progress comment")
 	}
 
 	// A stagnant tick while the comment is young still refreshes it: the
@@ -3988,7 +3988,7 @@ func TestE2EStagnantApplySkipsIdenticalProgressEdits(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, progressID, edited.CommentID)
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected an unchanged tick inside the grace window to refresh the comment")
+		require.FailNow(t, "expected an unchanged tick inside the grace window to refresh the comment")
 	}
 
 	// Age the comment past its grace window. This crossing tick also exceeds
@@ -4000,7 +4000,7 @@ func TestE2EStagnantApplySkipsIdenticalProgressEdits(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, progressID, edited.CommentID)
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the grace-crossing tick to refresh the comment")
+		require.FailNow(t, "expected the grace-crossing tick to refresh the comment")
 	}
 
 	// Ticks past every cadence window with unchanged tasks render identical
@@ -4011,7 +4011,7 @@ func TestE2EStagnantApplySkipsIdenticalProgressEdits(t *testing.T) {
 	}
 	select {
 	case edited := <-capture.edits:
-		t.Fatalf("aged stagnant ticks with unchanged content must not edit; got edit on comment %d: %q", edited.CommentID, edited.Body)
+		require.FailNowf(t, "aged stagnant ticks with unchanged content must not edit", "got edit on comment %d: %q", edited.CommentID, edited.Body)
 	default:
 		// expected: identical renders are skipped once the grace window passed
 	}
@@ -4026,7 +4026,7 @@ func TestE2EStagnantApplySkipsIdenticalProgressEdits(t *testing.T) {
 		assert.Equal(t, progressID, edited.CommentID)
 		assert.Contains(t, edited.Body, "70.00%")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the tick after real progress to edit the comment")
+		require.FailNow(t, "expected the tick after real progress to edit the comment")
 	}
 
 	// Four edits reached GitHub: the first render, the young refresh, the
@@ -4066,7 +4066,7 @@ func TestE2EStagnantApplyHeartbeatRefreshesComment(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, progressID, edited.CommentID)
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the first tick to edit the progress comment")
+		require.FailNow(t, "expected the first tick to edit the progress comment")
 	}
 
 	// Once the heartbeat elapses, an unchanged render is written anyway so the
@@ -4078,7 +4078,7 @@ func TestE2EStagnantApplyHeartbeatRefreshesComment(t *testing.T) {
 		assert.Equal(t, progressID, edited.CommentID)
 		assert.Contains(t, edited.Body, "50.00%")
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected an unchanged render to refresh the comment after the heartbeat elapsed")
+		require.FailNow(t, "expected an unchanged render to refresh the comment after the heartbeat elapsed")
 	}
 
 	// The refresh re-anchors the heartbeat: the next unchanged tick is skipped
@@ -4087,7 +4087,7 @@ func TestE2EStagnantApplyHeartbeatRefreshesComment(t *testing.T) {
 	obs.OnProgress(apply, []*storage.Task{task})
 	select {
 	case edited := <-capture.edits:
-		t.Fatalf("unchanged tick inside the heartbeat window must not edit; got %q", edited.Body)
+		require.FailNowf(t, "unchanged tick inside the heartbeat window must not edit", "got %q", edited.Body)
 	default:
 		// expected: skipping resumes from the refreshed write
 	}
