@@ -18,6 +18,10 @@ type ShardCopy struct {
 	// the plan has none. It stands in for the shard's row total until the
 	// engine reports one (RollUpShardedTable).
 	PlannedRows *int64
+	// CopiesNoRows marks a shard whose engine reported that its change copies
+	// no rows (TasksCopyNoRows), such as an instant ALTER. It has no copy
+	// ahead of it, so the plan's estimate never stands in for its total.
+	CopiesNoRows bool
 }
 
 // ShardOperationCopy resolves one (shard, table) operation's progress from its
@@ -92,9 +96,10 @@ type ShardedTableCopy struct {
 // not read as nearly done. It stands in only when every such shard has an
 // estimate and every planned shard is listed: a total missing some shards
 // would be neither the reporting shards' nor the table's, so the figures then
-// cover the reporting shards alone. A shard that failed, stopped, or finished
-// past its copy without a total adds nothing, so the total never counts rows
-// that will not be copied.
+// cover the reporting shards alone. A shard that failed, stopped, finished
+// past its copy without a total, or copies no rows adds nothing, so the total
+// never counts rows that will not be copied. A negative estimate is not a
+// count, so it reads as no estimate.
 func RollUpShardedTable(shards []ShardCopy, plannedShards int) ShardedTableCopy {
 	out := ShardedTableCopy{Status: shards[0].Status}
 	var planned int64
@@ -106,9 +111,9 @@ func RollUpShardedTable(shards []ShardCopy, plannedShards int) ShardedTableCopy 
 		}
 		inFlight = inFlight || state.IsInFlightTaskState(sh.Status)
 		if sh.RowsTotal <= 0 {
-			if CopyStillAhead(sh.Status) {
+			if copyAheadWithoutTotal(sh) {
 				unreported++
-				if sh.PlannedRows == nil {
+				if sh.PlannedRows == nil || *sh.PlannedRows < 0 {
 					estimatesCoverUnreported = false
 				} else {
 					planned += *sh.PlannedRows
@@ -126,6 +131,13 @@ func RollUpShardedTable(shards []ShardCopy, plannedShards int) ShardedTableCopy 
 		out.RowsTotalPlanned = true
 	}
 	return out
+}
+
+// copyAheadWithoutTotal reports whether a shard that has reported no row
+// total still has a row copy ahead of it, so the plan's estimate is what its
+// total will be.
+func copyAheadWithoutTotal(sh ShardCopy) bool {
+	return CopyStillAhead(sh.Status) && !sh.CopiesNoRows
 }
 
 // TaskAttentionRank orders task states by how much they demand attention,

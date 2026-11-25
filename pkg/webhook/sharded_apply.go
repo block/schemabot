@@ -511,6 +511,7 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 		changesByTable[key] = append(changesByTable[key], presentation.TaskTableChanges(tasksByOp[op.ID]))
 		sp := shardOperationCopy(op, tasksByOp[op.ID])
 		sp.PlannedRows = view.shardCopyEstimate(ns, shard, table)
+		sp.CopiesNoRows = presentation.TasksCopyNoRows(tasksByOp[op.ID])
 		copiesByTable[key] = append(copiesByTable[key], sp)
 		shardsByTable[key] = append(shardsByTable[key], templates.ShardProgressData{
 			Shard:               shard,

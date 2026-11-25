@@ -164,6 +164,7 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 		sc := presentation.ShardOperationCopy(op.State, taskCopies(tasksByOp[op.ID]))
 		copies = append(copies, sc)
 		copies[len(copies)-1].PlannedRows = plan.ShardCopyEstimatedRows(namespace, shard, table)
+		copies[len(copies)-1].CopiesNoRows = presentation.TasksCopyNoRows(tasksByOp[op.ID])
 		row.Shards = append(row.Shards, &apitypes.ShardProgressResponse{
 			Shard:           shard,
 			Status:          sc.Status,

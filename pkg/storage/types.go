@@ -1320,8 +1320,9 @@ func (p *Plan) AllChangesDirect() bool {
 // shard runs for a table: the estimate on the shard's own change, when that
 // change is an ALTER, the only change that copies rows. It is nil when the
 // plan records no change for the table on that shard, the change copies no
-// rows, or the planner had no estimate. It never falls back to the keyspace's
-// estimate, which covers every shard.
+// rows, or the planner had no estimate. A negative estimate is a statistics
+// sentinel rather than a count, so it reads as no estimate. It never falls
+// back to the keyspace's estimate, which covers every shard.
 func (p *Plan) ShardCopyEstimatedRows(namespace, shard, table string) *int64 {
 	if p == nil || p.Namespaces[namespace] == nil {
 		return nil
@@ -1333,6 +1334,9 @@ func (p *Plan) ShardCopyEstimatedRows(namespace, shard, table string) *int64 {
 		for _, tc := range sp.Changes {
 			if tc.Table != table || tc.EstimatedRows == nil || !strings.EqualFold(tc.Operation, "alter") {
 				continue
+			}
+			if *tc.EstimatedRows < 0 {
+				return nil
 			}
 			rows := *tc.EstimatedRows
 			return &rows
