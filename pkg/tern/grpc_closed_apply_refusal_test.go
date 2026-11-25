@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -77,6 +78,8 @@ func TestGRPCClient_ShardRefusedByACancelledApplySettlesCancelled(t *testing.T) 
 	require.Len(t, logs.logs, 1)
 	assert.Equal(t, "Remote apply operation 42 (deployment default) cancelled before it started: the apply had already ended (cancelled)", logs.logs[0].Message)
 	assert.NotContains(t, logs.logs[0].Message, "idempotency key")
+	assert.Empty(t, logs.logs[0].OldState, "the apply-scoped entry names no transition the apply did not make")
+	assert.Empty(t, logs.logs[0].NewState)
 }
 
 // A sibling shard fails and closes the apply while this shard is still being
@@ -177,4 +180,128 @@ func TestClosedApplyTerminalization(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, stopUndispatchedTerminalization(storage.DatabaseTypeVitess), stopped,
 		"a stopped apply settles a shard the way an undispatched stop does on that engine")
+}
+
+// A VSchema-only change has one work operation and no task rows. The operator
+// cancels the apply while that operation is still being dispatched, and the
+// data plane refuses it. The operator drives the operation under its own
+// lease. The operation never started, so its own row settles cancelled: with
+// no task to derive it from, a row left running would hold the apply open
+// forever.
+func TestGRPCClient_TasklessOperationRefusedByACancelledApplySettlesItsRow(t *testing.T) {
+	server := &capturingTernServer{applyResponse: &ternv1.ApplyResponse{
+		Accepted:         false,
+		ErrorMessage:     closedApplyRefusal,
+		ClosedApplyState: state.Apply.Cancelled,
+	}}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	t.Cleanup(cleanup)
+
+	apply := &storage.Apply{
+		ID:              9,
+		ApplyIdentifier: "apply-vschema-only",
+		PlanID:          77,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "commerce-target"})
+	operationID := int64(61)
+	vschema := `{"sharded":true,"vindexes":{"xxhash":{"type":"xxhash"}}}`
+	tasks := &mockTaskStore{}
+	logs := &mockApplyLogStore{}
+	operations := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: {
+			ID:            operationID,
+			ApplyID:       apply.ID,
+			Deployment:    "commerce-deployment",
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         state.ApplyOperation.Running,
+		},
+	}}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   tasks,
+		logs:    logs,
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-vschema-only",
+			SchemaFiles:    schema.SchemaFiles{"commerce": {Files: map[string]string{storage.VSchemaArtifactName: vschema}}},
+			Namespaces:     map[string]*storage.NamespacePlanData{"commerce": {Artifacts: map[string]string{storage.VSchemaArtifactName: vschema}}},
+		}},
+		operations: operations,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	ctx = storage.WithOperationLease(ctx, storage.OperationLease{
+		ApplyID:     apply.ID,
+		OperationID: operationID,
+		Owner:       "host/1/driver-0",
+		Token:       "operation-token",
+	})
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+
+	require.NotNil(t, server.getApplyRequest(), "the operation reached the data plane before it was refused")
+	op := operations.ops[operationID]
+	assert.Equal(t, state.ApplyOperation.Cancelled, op.State)
+	require.NotNil(t, op.CompletedAt)
+	assert.Empty(t, tasks.updated, "a taskless operation has no task to settle")
+	assert.Equal(t, state.Apply.Running, apply.State, "an operation-scoped drive never writes the parent apply")
+	assert.Nil(t, server.getProgressRequest(), "a refused operation is never polled")
+	require.Len(t, logs.logs, 1)
+	assert.Equal(t, "Remote apply operation 61 (deployment commerce-deployment) cancelled before it started: the apply had already ended (cancelled)", logs.logs[0].Message)
+	assert.Empty(t, logs.logs[0].OldState, "the apply-scoped entry names no transition the apply did not make")
+	assert.Empty(t, logs.logs[0].NewState)
+}
+
+// A whole-apply drive has no siblings whose outcome a refused dispatch could
+// take, so a refusal that names a closed state still fails the apply closed
+// with the data plane's reason, and an operator looks at the target.
+func TestGRPCClient_WholeApplyRefusedByAClosedApplyFailsClosed(t *testing.T) {
+	server := &capturingTernServer{applyResponse: &ternv1.ApplyResponse{
+		Accepted:         false,
+		ErrorMessage:     closedApplyRefusal,
+		ClosedApplyState: state.Apply.Cancelled,
+	}}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	t.Cleanup(cleanup)
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-whole",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb-target"})
+	tasks := &mockTaskStore{tasks: []*storage.Task{{
+		ID:             11,
+		TaskIdentifier: "task-users",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		DDL:            "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:      "alter",
+		Namespace:      "default",
+		State:          state.Task.Pending,
+	}}}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   tasks,
+		plans:   &mockPlanStore{plan: &storage.Plan{ID: apply.PlanID, PlanIdentifier: "plan-whole"}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApply(ctx, apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), closedApplyRefusal)
+	assert.Equal(t, state.Apply.Failed, apply.State, "the refusal fails the apply closed rather than settling it cancelled")
+	require.NotEmpty(t, tasks.updated)
+	failed := tasks.updated[len(tasks.updated)-1]
+	assert.Equal(t, "task-users", failed.TaskIdentifier)
+	assert.Equal(t, state.Task.Failed, failed.State)
 }

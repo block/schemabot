@@ -51,9 +51,11 @@ func closedApplyTerminalization(closedState, databaseType string) (undispatchedT
 // way has no siblings whose outcome it could take, so its refusal stays a
 // failure. The operation's tasks carry no error message, because the shard
 // did not fail; the data plane's refusal text is logged here, never stored
-// where a pull request renders it. The parent apply is not written, and an
-// apply-level stop or cancel request stays pending for the projection to
-// settle once every operation is terminal.
+// where a pull request renders it. The apply log entry carries no state pair:
+// it is scoped to the apply, and the operation's own transition, which the
+// server log carries, would read there as the apply's. The parent apply is
+// not written, and an apply-level stop or cancel request stays pending for the
+// projection to settle once every operation is terminal.
 func (c *GRPCClient) settleDispatchRefusedByClosedApply(ctx context.Context, apply *storage.Apply, scope applyTaskScope, resp *ternv1.ApplyResponse, refusal string) (bool, error) {
 	closedState := resp.GetClosedApplyState()
 	if closedState == "" {
@@ -93,6 +95,6 @@ func (c *GRPCClient) settleDispatchRefusedByClosedApply(ctx context.Context, app
 			"refusal", refusal)...)
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo,
 		fmt.Sprintf("Remote apply operation %d (deployment %s) %s before it started: the apply had already ended (%s)", op.ID, op.Deployment, terminalization.verb, closedState),
-		oldState, terminalization.operationState)
+		"", "")
 	return true, nil
 }
