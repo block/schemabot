@@ -1580,6 +1580,23 @@ func TestClassifyApplyFailureCommittedCreatePrefix(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(failure.detail, "re-plan"))
 }
 
+// A validation that existing rows fail names the key and the fix, and leaves
+// the row values the server quotes in its message out of the detail.
+func TestClassifyApplyFailureBrokenForeignKey(t *testing.T) {
+	err := fmt.Errorf("validate: %w", &pgconn.PgError{
+		Code:           "23503",
+		Message:        `insert or update on table "orders" violates foreign key constraint "orders_user_id_fkey"`,
+		Detail:         `Key (user_id)=(99) is not present in table "users".`,
+		ConstraintName: "orders_user_id_fkey",
+	})
+
+	failure := classifyApplyFailure(err, "orders")
+
+	assert.True(t, failure.retryable)
+	assert.Equal(t, `existing rows in "orders" break foreign key "orders_user_id_fkey"; the key is in place and checks new writes; fix those rows, then retry`, failure.detail)
+	assert.NotContains(t, failure.detail, "99")
+}
+
 func TestProgressResultReportsCreateSequenceLength(t *testing.T) {
 	result := progressResult(engine.StateRunning, "running", time.Now(), nativeApply{
 		namespace: "public",

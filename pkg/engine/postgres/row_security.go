@@ -88,7 +88,7 @@ func plannerRefusal(err error) error {
 func referencedTableRemedy(err error) string {
 	switch {
 	case errors.Is(err, schemadiff.ErrReferencedTableNotFound):
-		return "; a foreign key can reference only a table that already exists on the target, so leave the foreign key out of the schema file, apply the referenced table first, then run the ADD CONSTRAINT outside SchemaBot and add the foreign key back to the file"
+		return "; a foreign key can reference only a table that already exists on the target, so apply the referenced table first, then add the foreign key to the file in a later change"
 	case errors.Is(err, schemadiff.ErrReferencedTableNotReadable):
 		return "; grant the planning role SELECT on the referenced table, then re-plan"
 	}

@@ -132,8 +132,8 @@ func TestEnginePullSchemaRefusesCrossSchemaForeignKeys(t *testing.T) {
 // A foreign key added NOT VALID is pulled as an enforced one, because a
 // schema file declares what the table should be and cannot declare that
 // existing rows are unchecked. Planning the pulled files therefore plans the
-// key's validation, which is blocked for review like any foreign key change,
-// rather than leaving the key unchecked silently.
+// key's validation, which runs while writes keep flowing, rather than leaving
+// the key unchecked silently.
 func TestEnginePullSchemaPlansValidationOfANotValidForeignKey(t *testing.T) {
 	eng, credentials := pullForeignKeyTarget(t, "pull_not_valid_fk_test", `
 		CREATE SCHEMA app;
@@ -156,8 +156,7 @@ func TestEnginePullSchemaPlansValidationOfANotValidForeignKey(t *testing.T) {
 	require.Len(t, result.Changes[0].TableChanges, 1)
 	validate := result.Changes[0].TableChanges[0]
 	assert.Equal(t, "ALTER TABLE app.orders VALIDATE CONSTRAINT orders_user_id_fkey", validate.DDL)
-	assert.Equal(t, engine.ExecutionModeBlocked, validate.ExecutionMode,
-		"SchemaBot does not run foreign key changes on PostgreSQL yet, so the validation is shown for review")
+	assert.Empty(t, validate.ExecutionMode, "the validation runs as planned: %s", validate.ModeReason)
 }
 
 // A schema file cannot declare row-level security and a foreign key together

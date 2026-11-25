@@ -567,7 +567,30 @@ func classifyApplyFailure(err error, table string) applyFailure {
 			lockBudget: true,
 		}
 	}
+	if detail, ok := brokenForeignKeyDetail(err, table); ok {
+		return applyFailure{detail: detail, retryable: true}
+	}
 	return applyFailure{detail: "PostgreSQL schema change failed; see server logs", retryable: true}
+}
+
+// sqlstateForeignKeyViolation is the SQLSTATE the server raises when a row
+// breaks a foreign key, which for a schema change means validating a key
+// that existing rows do not satisfy.
+const sqlstateForeignKeyViolation = "23503"
+
+// brokenForeignKeyDetail names the foreign key whose validation failed on
+// existing rows. The key was added NOT VALID in an earlier step, so it stays
+// in place and checks new writes; the apply can finish once the owner fixes
+// the rows. The detail is built from the server's typed fields, never its
+// message, because the message quotes the offending row's values.
+func brokenForeignKeyDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateForeignKeyViolation {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"existing rows in %q break foreign key %q; the key is in place and checks new writes; fix those rows, then retry",
+		table, pgErr.ConstraintName)), true
 }
 
 // invalidIndexAdvice renders the operator-facing cause and next step for an
