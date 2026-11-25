@@ -14,9 +14,9 @@ import (
 // renderIfDue runs one progress tick against the cadence and, when the tick is
 // due, records a shown edit, as OnProgress does after GitHub accepts it.
 func renderIfDue(o *CommentObserver, now time.Time, snapshot progressSnapshot) bool {
-	_, due := o.progressCommentDue(now, snapshot)
+	cadence, due := o.progressCommentDue(now, snapshot)
 	if due {
-		o.recordProgressEdit(now, snapshot, trackedCommentEdit{shown: true})
+		o.recordProgressEdit(now, snapshot, cadence, trackedCommentEdit{shown: true})
 	}
 	return due
 }
@@ -189,7 +189,7 @@ func TestRecordProgressEditFailedEditKeepsChangePending(t *testing.T) {
 	failedAt := t0.Add(time.Second)
 	_, due := o.progressCommentDue(failedAt, cutover)
 	require.True(t, due, "the state change is due at once")
-	o.recordProgressEdit(failedAt, cutover, trackedCommentEdit{shown: false})
+	o.recordProgressEdit(failedAt, cutover, freshProgressCommentCadence(), trackedCommentEdit{shown: false})
 	assert.Equal(t, running, o.lastRendered, "a failed edit does not count as rendered")
 	assert.Equal(t, t0, o.lastProgressPost, "a failed edit does not reset the spacing")
 
@@ -211,11 +211,40 @@ func TestRecordProgressEditLearnsCommentAge(t *testing.T) {
 	require.True(t, due)
 	assert.Equal(t, freshProgressCommentCadence(), cadence, "an unknown age starts at the fastest spacing")
 
-	o.recordProgressEdit(t0, snapshot, trackedCommentEdit{shown: true, commentCreatedAt: t0.Add(-3 * time.Hour)})
+	o.recordProgressEdit(t0, snapshot, cadence, trackedCommentEdit{shown: true, commentCreatedAt: t0.Add(-3 * time.Hour)})
 	cadence, _ = o.progressCommentDue(t0.Add(time.Second), snapshot)
 	assert.Equal(t, 2*time.Minute, cadence, "the spacing follows the age GitHub reported")
 
 	o.restartProgressCommentAge(t0.Add(2 * time.Second))
 	cadence, _ = o.progressCommentDue(t0.Add(3*time.Second), snapshot)
 	assert.Equal(t, freshProgressCommentCadence(), cadence, "a rotation starts the new comment at the fastest spacing")
+}
+
+// The footer promises how long a change can take to show, so a longer spacing
+// is published before it applies. When the comment's age crosses into a slower
+// step, the next tick edits even though nothing moved, and the spacing that
+// tick reports is the one the new footer shows.
+func TestProgressCommentDuePublishesLongerSpacingBeforeApplyingIt(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	o := &CommentObserver{progressCommentCreatedAt: t0.Add(-10*time.Minute + time.Second)}
+	snapshot := progressSnapshot{state: state.Apply.Running, rowsCopied: 100}
+
+	require.True(t, renderIfDue(o, t0, snapshot))
+	assert.Equal(t, 5*time.Second, o.progressShownCadence)
+
+	cadence, due := o.progressCommentDue(t0.Add(2*time.Second), snapshot)
+	assert.Equal(t, 30*time.Second, cadence)
+	assert.True(t, due, "crossing into a slower step publishes the new footer at once")
+	o.recordProgressEdit(t0.Add(2*time.Second), snapshot, cadence, trackedCommentEdit{shown: true})
+	assert.Equal(t, 30*time.Second, o.progressShownCadence)
+
+	_, due = o.progressCommentDue(t0.Add(4*time.Second), snapshot)
+	assert.False(t, due, "once the footer shows the longer spacing, it applies")
+
+	// A rotation resets the promise to the fastest spacing with the fresh
+	// comment, so a shorter spacing never forces an edit.
+	o.restartProgressCommentAge(t0.Add(5 * time.Second))
+	assert.Equal(t, freshProgressCommentCadence(), o.progressShownCadence)
+	_, due = o.progressCommentDue(t0.Add(6*time.Second), snapshot)
+	assert.False(t, due, "a faster spacing than the footer promises needs no edit")
 }

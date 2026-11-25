@@ -4304,8 +4304,9 @@ func TestE2EProgressEditCadenceDecaysWithCommentAge(t *testing.T) {
 
 // A pod restart or lease handover builds a fresh observer, but the comment it
 // takes over is as old as GitHub says it is: the first edit learns the
-// comment's real age from GitHub and the observer resumes at that age's
-// spacing rather than at the fastest one.
+// comment's real age from GitHub, the next tick publishes that age's spacing in
+// the footer, and the observer resumes at that spacing rather than at the
+// fastest one.
 func TestE2EProgressCadenceResumesAtCommentAgeAfterRestart(t *testing.T) {
 	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
 		repo:       "org/repo-decay-restart",
@@ -4323,7 +4324,16 @@ func TestE2EProgressCadenceResumesAtCommentAgeAfterRestart(t *testing.T) {
 	obs := f.newObserver(st, fake)
 
 	obs.OnProgress(apply, []*storage.Task{task})
-	requireProgressEdit(t, capture, "expected the first tick after a restart to edit")
+	edited := requireProgressEdit(t, capture, "expected the first tick after a restart to edit")
+	assert.Contains(t, edited.Body, "changes show within ~5s", "the first edit has not learned the comment's age yet")
+
+	// That edit learned the comment is three hours old. The next tick
+	// publishes the longer spacing before applying it, even though nothing
+	// moved, so the footer never promises a shorter wait than a change gets.
+	fake.Advance(time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	edited = requireProgressEdit(t, capture, "expected the learned spacing to be published at once")
+	assert.Contains(t, edited.Body, "changes show within ~2m")
 
 	fake.Advance(31 * time.Second)
 	task.RowsCopied, task.ProgressPercent = 600, 60
@@ -4333,7 +4343,7 @@ func TestE2EProgressCadenceResumesAtCommentAgeAfterRestart(t *testing.T) {
 	fake.Advance(2 * time.Minute)
 	task.RowsCopied, task.ProgressPercent = 650, 65
 	obs.OnProgress(apply, []*storage.Task{task})
-	edited := requireProgressEdit(t, capture, "expected an edit once the comment's spacing elapsed")
+	edited = requireProgressEdit(t, capture, "expected an edit once the comment's spacing elapsed")
 	assert.Contains(t, edited.Body, "65.00%")
 	assert.Contains(t, edited.Body, "changes show within ~2m")
 }

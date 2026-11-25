@@ -157,6 +157,13 @@ type CommentObserver struct {
 	// every tick while GitHub keeps failing. Zero when the last edit succeeded.
 	progressEditRetryAt time.Time
 
+	// progressShownCadence is the spacing the progress comment's footer
+	// currently promises ("changes show within ~X"). When the comment's age
+	// earns a longer spacing, the next tick publishes the new footer before the
+	// longer spacing applies, so the comment never promises a shorter wait than
+	// a change will get. Zero until this observer has shown an edit.
+	progressShownCadence time.Duration
+
 	// authorityMu guards the per-callback memo of the durable progress-comment
 	// authority decision below. It is separate from mu because OnProgress holds
 	// mu for its entire tick while OnTerminal runs without it, and the gate is
@@ -582,7 +589,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	// lands within it.
 	body := o.statusCommentFromOps(apply, ops, opsErr, tasks, o.shardsByTable(ctx, apply, ops), cadence)
 	edit := o.editTrackedComment(apply, state.Comment.Progress, body)
-	o.recordProgressEdit(now, snapshot, edit)
+	o.recordProgressEdit(now, snapshot, cadence, edit)
 	if !edit.shown {
 		return
 	}
@@ -676,6 +683,9 @@ func (o *CommentObserver) progressCommentDue(now time.Time, current progressSnap
 	if now.Before(o.progressEditRetryAt) {
 		return cadence, false // a failed edit is waiting out its retry spacing
 	}
+	if o.footerPromisesShorterWait(cadence) {
+		return cadence, true // publish the longer spacing before enforcing it
+	}
 	sinceLastPost := now.Sub(o.lastProgressPost)
 
 	if current == o.lastRendered {
@@ -693,12 +703,21 @@ func (o *CommentObserver) progressCommentDue(now time.Time, current progressSnap
 	return cadence, sinceLastPost >= cadence
 }
 
+// footerPromisesShorterWait reports whether the comment's footer promises a
+// change will show sooner than the spacing the comment's age now earns. That
+// happens when the age crosses into a slower step, and after a restart once the
+// first edit learns the comment's real age from GitHub.
+func (o *CommentObserver) footerPromisesShorterWait(cadence time.Duration) bool {
+	return o.progressShownCadence > 0 && cadence > o.progressShownCadence
+}
+
 // recordProgressEdit settles a due progress tick. A shown edit (written, or
 // skipped because GitHub already shows that content) records the snapshot as
 // rendered and, when GitHub reported it, the comment's creation time. A failed
 // edit records nothing, so the change stays pending, and holds the retry back
-// by the fastest cadence.
-func (o *CommentObserver) recordProgressEdit(now time.Time, current progressSnapshot, edit trackedCommentEdit) {
+// by the fastest cadence. A shown edit also records the cadence its footer
+// promised.
+func (o *CommentObserver) recordProgressEdit(now time.Time, current progressSnapshot, cadence time.Duration, edit trackedCommentEdit) {
 	if !edit.shown {
 		o.progressEditRetryAt = now.Add(freshProgressCommentCadence())
 		return
@@ -706,6 +725,7 @@ func (o *CommentObserver) recordProgressEdit(now time.Time, current progressSnap
 	o.progressEditRetryAt = time.Time{}
 	o.lastRendered = current
 	o.lastProgressPost = now
+	o.progressShownCadence = cadence
 	if !edit.commentCreatedAt.IsZero() {
 		o.progressCommentCreatedAt = edit.commentCreatedAt
 	}
@@ -728,6 +748,7 @@ func (o *CommentObserver) progressCommentAge(now time.Time) time.Duration {
 func (o *CommentObserver) restartProgressCommentAge(now time.Time) {
 	o.progressCommentCreatedAt = now
 	o.progressEditRetryAt = time.Time{}
+	o.progressShownCadence = freshProgressCommentCadence()
 }
 
 // OnTerminal is called when the apply reaches a terminal state.
