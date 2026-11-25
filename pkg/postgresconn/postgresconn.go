@@ -184,15 +184,16 @@ const armStatementTimeoutAttempts = 5
 
 // armStatementTimeout sends the budget statement until the server accepts it.
 // The SET runs under the budget it replaces, the one the platform set at the
-// role or database level, so a budget tight enough to outlast it cancels it. A
-// cancelled SET changes nothing on the session, so sending it again is safe,
+// role or database level, so a budget tight enough to outlast it cancels it.
+// A cancel request from another session ends it the same way. A cancelled SET
+// changes nothing on the session, so sending it again is safe,
 // and the next attempt starts with a fresh budget of its own. Any other error,
 // or a cancellation the caller's context caused, is returned as is.
 func armStatementTimeout(ctx context.Context, conn *pgconn.PgConn, stmt, host, database string) error {
 	var err error
 	for attempt := 1; attempt <= armStatementTimeoutAttempts; attempt++ {
 		err = execStatementTimeout(ctx, conn, stmt)
-		if !cancelledByInheritedBudget(ctx, err) {
+		if !serverCancelledWhileCallerWaits(ctx, err) {
 			return err
 		}
 		if attempt == armStatementTimeoutAttempts {
@@ -216,10 +217,14 @@ func armStatementTimeout(ctx context.Context, conn *pgconn.PgConn, stmt, host, d
 // cancelled, whether a statement_timeout fired or a cancel request arrived.
 const sqlstateQueryCanceled = "57014"
 
-// cancelledByInheritedBudget reports whether the server cancelled the budget
-// statement while the caller still wanted the connection. A cancellation the
-// caller's context caused is not retried: the caller has given up.
-func cancelledByInheritedBudget(ctx context.Context, err error) bool {
+// serverCancelledWhileCallerWaits reports whether the server cancelled the
+// budget statement (SQLSTATE 57014) while the caller's context was still live.
+// The server reports the same code for an inherited statement_timeout and for
+// a cancel request from another session, such as pg_cancel_backend, and the
+// two cannot be told apart, so both count. Either way the SET changed nothing
+// on the session and is safe to send again. A cancellation the caller's
+// context caused is not retried: the caller has given up.
+func serverCancelledWhileCallerWaits(ctx context.Context, err error) bool {
 	if err == nil || ctx.Err() != nil {
 		return false
 	}
