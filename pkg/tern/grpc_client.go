@@ -1935,47 +1935,12 @@ func (c *GRPCClient) terminalizeUndispatchedApplyOperation(ctx context.Context, 
 		return fmt.Errorf("undispatched operation %s for apply %s requires multi-operation scope", terminalization.controlOperation, apply.ApplyIdentifier)
 	}
 	op := scope.operation
-	now := time.Now()
-	tasks, err := c.loadApplyTasks(ctx, apply, scope)
-	if err != nil {
-		return fmt.Errorf("load tasks for undispatched operation %s %s apply_operation %d: %w", terminalization.controlOperation, apply.ApplyIdentifier, op.ID, err)
-	}
 	logger := c.applyLogger(apply)
-	for _, task := range tasks {
-		if state.IsTerminalTaskState(task.State) {
-			logger.InfoContext(ctx, "leaving terminal gRPC task unchanged while settling an undispatched operation's control request",
-				append(apply.MutableLogAttrs(),
-					"apply_operation_id", op.ID,
-					"operation_deployment", op.Deployment,
-					"task_id", task.TaskIdentifier,
-					"table", task.TableName,
-					"task_state", task.State,
-					"control_operation", terminalization.controlOperation)...)
-			continue
-		}
-		task.State = terminalization.taskState
-		if state.IsState(terminalization.taskState, state.Task.Cancelled) {
-			task.CompletedAt = &now
-		}
-		task.UpdatedAt = now
-		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			return fmt.Errorf("update task %s for undispatched operation %s %s apply_operation %d: %w", task.TaskIdentifier, terminalization.controlOperation, apply.ApplyIdentifier, op.ID, err)
-		}
+	oldState, err := c.settleUndispatchedOperationRows(ctx, apply, scope, terminalization.taskState, terminalization.operationState,
+		"requested_by", caller, "control_operation", terminalization.controlOperation)
+	if err != nil {
+		return fmt.Errorf("settle undispatched operation %s %s: %w", terminalization.controlOperation, apply.ApplyIdentifier, err)
 	}
-	oldState := op.State
-	if state.IsState(terminalization.operationState, state.ApplyOperation.Cancelled) {
-		if err := c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, terminalization.operationState); err != nil {
-			return fmt.Errorf("mark undispatched gRPC apply_operation %d cancelled for apply %s: %w", op.ID, apply.ApplyIdentifier, err)
-		}
-		op.CompletedAt = &now
-	} else {
-		if err := c.storage.ApplyOperations().UpdateState(ctx, op.ID, terminalization.operationState); err != nil {
-			return fmt.Errorf("mark undispatched gRPC apply_operation %d %s for apply %s: %w", op.ID, terminalization.controlOperation, apply.ApplyIdentifier, err)
-		}
-		op.CompletedAt = nil
-	}
-	op.State = terminalization.operationState
-	op.UpdatedAt = now
 	logger.InfoContext(ctx, "settled undispatched multi-operation gRPC apply operation; apply-level control request remains pending for siblings",
 		append(apply.MutableLogAttrs(),
 			"apply_operation_id", op.ID,
@@ -1987,6 +1952,63 @@ func (c *GRPCClient) terminalizeUndispatchedApplyOperation(ctx context.Context, 
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, terminalization.logEvent,
 		fmt.Sprintf("Remote apply operation %d (deployment %s) %s before dispatch: %s%s; pending apply %s request remains for sibling operations", op.ID, op.Deployment, terminalization.verb, terminalization.operationState, callerApplyLogSuffix(caller), terminalization.controlOperation), "", "")
 	return nil
+}
+
+// settleUndispatchedOperationRows moves an undispatched operation's tasks and
+// its operation row to the given states, in control-plane storage alone, and
+// returns the operation's state before the write. Tasks already terminal are
+// left as they are, and the line logged for each carries reasonAttrs, which
+// say why the operation is being settled. The parent apply is never written:
+// in a multi-operation apply the rollout projection derives it from its
+// operations.
+func (c *GRPCClient) settleUndispatchedOperationRows(ctx context.Context, apply *storage.Apply, scope applyTaskScope, taskState, operationState string, reasonAttrs ...any) (string, error) {
+	op := scope.operation
+	now := time.Now()
+	tasks, err := c.loadApplyTasks(ctx, apply, scope)
+	if err != nil {
+		return "", fmt.Errorf("load tasks for apply_operation %d: %w", op.ID, err)
+	}
+	logger := c.applyLogger(apply)
+	for _, task := range tasks {
+		if state.IsTerminalTaskState(task.State) {
+			logger.InfoContext(ctx, "leaving terminal gRPC task unchanged while settling an undispatched operation",
+				append(append(apply.MutableLogAttrs(),
+					"apply_operation_id", op.ID,
+					"operation_deployment", op.Deployment,
+					"task_id", task.TaskIdentifier,
+					"table", task.TableName,
+					"task_state", task.State,
+					"settled_task_state", taskState),
+					reasonAttrs...)...)
+			continue
+		}
+		task.State = taskState
+		if state.IsState(taskState, state.Task.Cancelled) {
+			task.CompletedAt = &now
+		}
+		task.UpdatedAt = now
+		if err := c.storage.Tasks().Update(ctx, task); err != nil {
+			// Tasks settled before this one stay settled, so the operation's
+			// task set is only partly settled. ErrTaskVerdictRefused leaves the
+			// operation row as found and claimable rather than derived from it.
+			return "", fmt.Errorf("%w: update task %s of apply_operation %d to %s: %w", ErrTaskVerdictRefused, task.TaskIdentifier, op.ID, taskState, err)
+		}
+	}
+	oldState := op.State
+	if state.IsState(operationState, state.ApplyOperation.Cancelled) {
+		if err := c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, operationState); err != nil {
+			return "", fmt.Errorf("mark apply_operation %d %s: %w", op.ID, operationState, err)
+		}
+		op.CompletedAt = &now
+	} else {
+		if err := c.storage.ApplyOperations().UpdateState(ctx, op.ID, operationState); err != nil {
+			return "", fmt.Errorf("mark apply_operation %d %s: %w", op.ID, operationState, err)
+		}
+		op.CompletedAt = nil
+	}
+	op.State = operationState
+	op.UpdatedAt = now
+	return oldState, nil
 }
 
 func (c *GRPCClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
@@ -3272,6 +3294,15 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 		if resp == nil || !resp.Accepted || resp.ApplyId == "" {
 			holderApplyID := c.resolveConflictHolderApplyID(ctx, apply, resp.GetConflict())
 			errMsg := remoteApplyRejectionMessage(resp, holderApplyID, fmt.Sprintf("remote %s apply was not accepted", kind))
+			if resp != nil && !resp.Accepted {
+				settled, settleErr := c.settleDispatchRefusedByClosedApply(ctx, apply, scope, resp, errMsg)
+				if settleErr != nil {
+					return settleErr
+				}
+				if settled {
+					return nil
+				}
+			}
 			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
 				return fmt.Errorf("mark %s apply_operation %d failed: %w", kind, op.ID, markErr)
 			}
@@ -4251,6 +4282,13 @@ func (c *GRPCClient) dispatchRemoteApply(ctx context.Context, apply *storage.App
 	if !resp.Accepted {
 		holderApplyID := c.resolveConflictHolderApplyID(ctx, apply, resp.GetConflict())
 		errMsg := remoteApplyRejectionMessage(resp, holderApplyID, "remote apply was not accepted")
+		settled, settleErr := c.settleDispatchRefusedByClosedApply(ctx, apply, scope, resp, errMsg)
+		if settleErr != nil {
+			return settleErr
+		}
+		if settled {
+			return nil
+		}
 		// A rejection is a refusal. The data plane resolves the idempotency key
 		// before any check that can reject, and a key that resolves to this
 		// dispatch's operation is answered with its remote apply, so a rejection

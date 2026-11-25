@@ -2985,9 +2985,15 @@ type ApplyResponse struct {
 	// Set when the apply was refused because other work already holds the
 	// database, so the caller can render the refusal instead of the engine's
 	// unsafe error text. Absent for every other rejection.
-	Conflict      *ApplyConflict `protobuf:"bytes,6,opt,name=conflict,proto3" json:"conflict,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Conflict *ApplyConflict `protobuf:"bytes,6,opt,name=conflict,proto3" json:"conflict,omitempty"`
+	// Set when the dispatch was refused because the apply it would have joined
+	// had already ended, to that apply's state as the data plane's store read
+	// it. The refused work never started, so the caller can settle it to match
+	// the apply, cancelled with a cancelled apply and stopped with a stopped one,
+	// instead of recording it as failed. Absent for every other rejection.
+	ClosedApplyState string `protobuf:"bytes,7,opt,name=closed_apply_state,json=closedApplyState,proto3" json:"closed_apply_state,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ApplyResponse) Reset() {
@@ -3060,6 +3066,13 @@ func (x *ApplyResponse) GetConflict() *ApplyConflict {
 		return x.Conflict
 	}
 	return nil
+}
+
+func (x *ApplyResponse) GetClosedApplyState() string {
+	if x != nil {
+		return x.ClosedApplyState
+	}
+	return ""
 }
 
 // ProgressRequest requests detailed progress for an active schema change.
@@ -5971,14 +5984,15 @@ const file_tern_proto_rawDesc = "" +
 	"repository\x12!\n" +
 	"\fpull_request\x18\x05 \x01(\x05R\vpullRequest\x12\x16\n" +
 	"\x06caller\x18\x06 \x01(\tR\x06caller\x12,\n" +
-	"\x12holder_external_id\x18\a \x01(\tR\x10holderExternalId\"\xf2\x01\n" +
+	"\x12holder_external_id\x18\a \x01(\tR\x10holderExternalId\"\xa0\x02\n" +
 	"\rApplyResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12\x19\n" +
 	"\bapply_id\x18\x03 \x01(\tR\aapplyId\x12,\n" +
 	"\x12apply_operation_id\x18\x04 \x01(\tR\x10applyOperationId\x12#\n" +
 	"\roperation_key\x18\x05 \x01(\tR\foperationKey\x122\n" +
-	"\bconflict\x18\x06 \x01(\v2\x16.tern.v1.ApplyConflictR\bconflict\"|\n" +
+	"\bconflict\x18\x06 \x01(\v2\x16.tern.v1.ApplyConflictR\bconflict\x12,\n" +
+	"\x12closed_apply_state\x18\a \x01(\tR\x10closedApplyState\"|\n" +
 	"\x0fProgressRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
 	"\venvironment\x18\x02 \x01(\tR\venvironment\x12,\n" +
