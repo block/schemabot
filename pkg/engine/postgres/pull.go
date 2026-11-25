@@ -234,34 +234,12 @@ func skippedTables(refusals []error) ([]*ternv1.SkippedTable, error) {
 	return skipped, nil
 }
 
-// unrenderableShapes are pg-sprite's verdicts on shapes its renderer cannot
-// write. A refused render is reported with the matching verdict's own
-// wording, which says what the table carries without repeating its name.
-var unrenderableShapes = []error{
-	schemadiff.ErrUnrenderableDefault,
-	schemadiff.ErrUnrenderablePartition,
-	schemadiff.ErrUnrenderableInheritance,
-	schemadiff.ErrUnrenderableForeignKey,
-	schemadiff.ErrUnrenderableUnlogged,
-	schemadiff.ErrUnrenderableCollation,
-	schemadiff.ErrUnrenderableVirtual,
-	schemadiff.ErrUnrenderableToastOptions,
-	schemadiff.ErrMultipleOwnedSequences,
-	schemadiff.ErrUnrenderableSequenceOptions,
-	schemadiff.ErrUnrenderableMergedConstraints,
-	schemadiff.ErrUnrenderableUnattachedIndex,
-	schemadiff.ErrUnrenderablePartitionedRowSecurity,
-	schemadiff.ErrUnrenderableRowSecurity,
-}
-
 // renderRefusalReason is the reason a table the renderer refused is skipped
-// with: the matching verdict's wording, or the render error itself for a
-// verdict this list does not name yet.
+// with: the verdict's own wording, which says what the table carries without
+// repeating its name, or the render error itself when it carries no verdict.
 func renderRefusalReason(err error) string {
-	for _, shape := range unrenderableShapes {
-		if errors.Is(err, shape) {
-			return shape.Error()
-		}
+	if verdict, ok := schemadiff.RenderRefusal(err); ok {
+		return verdict.Error()
 	}
 	return err.Error()
 }
