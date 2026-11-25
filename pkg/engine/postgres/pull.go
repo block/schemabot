@@ -129,10 +129,9 @@ type baselinePolicy struct {
 	// includeRowSecurity exports access rules for pull. Rollback cannot yet
 	// execute these definitions and must not advertise a recoverable baseline.
 	includeRowSecurity bool
-	// includeForeignKeys writes each table's own foreign keys for pull, and
-	// refuses a referenced table whose incoming foreign key lives on a table
-	// the pull does not write. Rollback cannot yet execute a foreign key
-	// change and must not advertise a recoverable baseline.
+	// includeForeignKeys writes each table's own foreign keys, and refuses a
+	// referenced table whose incoming foreign key lives on a table the
+	// baseline does not write, since that key would be in no file.
 	includeForeignKeys bool
 	// refuseUnmodeledObjects refuses a table that carries objects the
 	// declarative format does not represent — a trigger or a table/column comment
@@ -156,9 +155,13 @@ var pulledBaseline = baselinePolicy{refuseUnmodeledObjects: true, includeRowSecu
 // same table set the forward plan did. Objects the differ cannot see are
 // left in place by any apply and by any rollback, so they cost the
 // namespace nothing. Ignored tables and undeclared archives sit outside
-// management, so their shapes are not the baseline's concern.
+// management, so their shapes are not the baseline's concern. Foreign keys
+// are carried, so a namespace that has them keeps its rollback: a key the
+// forward plan did not touch diffs to nothing, and a key it added comes
+// back as a drop, which the re-plan shows blocked like any foreign key drop.
 func rollbackBaseline(declared map[string]bool, ignored engine.IgnoredTables) baselinePolicy {
 	return baselinePolicy{
+		includeForeignKeys:          true,
 		skipUndeclaredArchiveTables: true,
 		declaredTables:              declared,
 		ignoredTables:               ignored,
