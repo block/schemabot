@@ -328,3 +328,125 @@ func TestEngineApplyResumedValidationRefusesAReplacedForeignKey(t *testing.T) {
 	assert.Contains(t, outcomes[0].ErrorMessage, "re-plan against the current schema")
 	assert.False(t, foreignKeyValidated(t, db, "orders_user_id_fkey"), "the replacement key is not validated")
 }
+
+// An owner adds a column to orders, which references users. The plan captures
+// both tables with the key as rollback originals, and the apply adds the
+// column. Rolling back plans only the column's drop; it runs, and the key is
+// still in place and validated afterward.
+func TestEngineRollbackKeepsForeignKeys(t *testing.T) {
+	const database = "rollback_foreign_keys_test"
+	dsn, db := testutil.StartPostgres(t, database)
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES public.users (id));
+		INSERT INTO public.users VALUES (1);
+		INSERT INTO public.orders VALUES (10, 1)`)
+	require.NoError(t, err)
+	eng := New()
+
+	forward := planForeignKeyFiles(t, eng, database, dsn, map[string]string{
+		"users.sql":  "CREATE TABLE users (id bigint PRIMARY KEY)",
+		"orders.sql": "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES users (id), note text)",
+	})
+	require.Len(t, forward.Changes, 1)
+	require.True(t, forward.Changes[0].OriginalFilesCaptured, "a namespace with foreign keys can be rolled back")
+	originals := forward.Changes[0].OriginalFiles
+	assert.Equal(t, []string{"orders.sql", "users.sql"}, sortedKeys(originals))
+	assert.Contains(t, originals["orders.sql"], `CONSTRAINT "orders_user_id_fkey" FOREIGN KEY (user_id) REFERENCES users(id)`)
+	outcomes := applyPlannedSteps(t, eng, dsn, forward)
+	require.Len(t, outcomes, 1)
+	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
+
+	rollback := planForeignKeyFiles(t, eng, database, dsn, originals)
+	assert.Equal(t, []string{"ALTER TABLE public.orders DROP note"}, executableDDL(t, rollback, "orders"))
+	assert.Empty(t, executableDDL(t, rollback, "users"))
+	outcomes = applyPlannedSteps(t, eng, dsn, rollback)
+	require.Len(t, outcomes, 1)
+	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
+
+	converged := planForeignKeyFiles(t, eng, database, dsn, originals)
+	assert.True(t, converged.NoChanges, "the rollback converged, got %+v", converged.Changes)
+	assert.True(t, foreignKeyValidated(t, db, "orders_user_id_fkey"))
+}
+
+// An owner adds a foreign key and the apply runs it. Rolling back plans the
+// key's drop, shows it for review, and blocks it, since SchemaBot does not
+// drop foreign keys on PostgreSQL yet. The remedy names how to remove the key.
+func TestEngineRollbackOfAnAddedForeignKeyIsBlocked(t *testing.T) {
+	const database = "rollback_added_foreign_key_test"
+	dsn, db := testutil.StartPostgres(t, database)
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL);
+		INSERT INTO public.users VALUES (1);
+		INSERT INTO public.orders VALUES (10, 1)`)
+	require.NoError(t, err)
+	eng := New()
+
+	forward := planForeignKeyFiles(t, eng, database, dsn, map[string]string{
+		"users.sql":  "CREATE TABLE users (id bigint PRIMARY KEY)",
+		"orders.sql": "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES users (id))",
+	})
+	require.Len(t, forward.Changes, 1)
+	require.True(t, forward.Changes[0].OriginalFilesCaptured)
+	outcomes := applyPlannedSteps(t, eng, dsn, forward)
+	require.Len(t, outcomes, 2, "add the key, then validate it")
+	for _, progress := range outcomes {
+		assert.Equal(t, engine.StateCompleted, progress.State, progress.ErrorMessage)
+	}
+
+	rollback := planForeignKeyFiles(t, eng, database, dsn, forward.Changes[0].OriginalFiles)
+	require.Len(t, rollback.Changes, 1)
+	require.Len(t, rollback.Changes[0].TableChanges, 1)
+	drop := rollback.Changes[0].TableChanges[0]
+	assert.Equal(t, "ALTER TABLE public.orders DROP CONSTRAINT orders_user_id_fkey", drop.DDL)
+	assert.Equal(t, engine.ExecutionModeBlocked, drop.ExecutionMode)
+	assert.Equal(t, `statement for table "orders" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan`, drop.ModeReason)
+	assert.True(t, foreignKeyValidated(t, db, "orders_user_id_fkey"), "nothing ran, so the key is still in place")
+}
+
+// A schema file cannot declare a foreign key into another namespace, so the
+// originals of a table holding one, or referenced by one, would leave the
+// key out. Such a namespace plans rollback-incapable, and the plan itself
+// still proceeds.
+func TestEnginePlanForeignKeyAcrossNamespacesIsRollbackIncapable(t *testing.T) {
+	tests := []struct {
+		name     string
+		database string
+		setup    string
+	}{
+		{
+			name:     "key into another namespace",
+			database: "rollback_fk_outgoing_test",
+			setup: `CREATE SCHEMA billing;
+				CREATE TABLE billing.accounts (id bigint PRIMARY KEY);
+				CREATE TABLE public.users (id bigint PRIMARY KEY, account_id bigint REFERENCES billing.accounts (id))`,
+		},
+		{
+			name:     "key from another namespace",
+			database: "rollback_fk_incoming_test",
+			setup: `CREATE SCHEMA billing;
+				CREATE TABLE public.users (id bigint PRIMARY KEY, account_id bigint);
+				CREATE TABLE billing.invoices (id bigint PRIMARY KEY, user_id bigint REFERENCES public.users (id))`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, db := testutil.StartPostgres(t, tt.database)
+			_, err := db.ExecContext(t.Context(), tt.setup)
+			require.NoError(t, err)
+
+			result, err := New().Plan(t.Context(), &engine.PlanRequest{
+				Database: tt.database,
+				SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+					"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, account_id bigint, email text)",
+				}}},
+				Credentials: &engine.Credentials{DSN: dsn},
+			})
+			require.NoError(t, err)
+			require.Len(t, result.Changes, 1)
+			assert.False(t, result.Changes[0].OriginalFilesCaptured)
+			assert.Nil(t, result.Changes[0].OriginalFiles)
+		})
+	}
+}
