@@ -1339,6 +1339,7 @@ func tableFacts(table TableProgressData, work apitypes.BuildWork) presentation.T
 		RowsTotal:           table.RowsTotal,
 		RowsTotalPlanned:    table.RowsTotalPlanned,
 		ETASeconds:          table.ETASeconds,
+		EstimatedRows:       table.EstimatedRows,
 		EstimatedBytes:      table.EstimatedBytes,
 		ChecksumRowsChecked: table.ChecksumRowsChecked,
 		ChecksumRowsTotal:   table.ChecksumRowsTotal,
@@ -1486,8 +1487,9 @@ func countTablesWithDDL(tables []TableProgressData) int {
 
 // writePlannedRows writes the rows line of a table no engine has reported on
 // yet (presentation.PlannedRowsText). span names the targets the estimate
-// covers when it is summed across several. It writes nothing when the plan
-// had no row estimate.
+// covers when it is summed across several. It writes the size alone when the
+// plan sized the table but could not count its rows, and nothing when the plan
+// had neither.
 func writePlannedRows(sb *strings.Builder, estimatedRows, estimatedBytes *int64, span string) {
 	if text := presentation.PlannedRowsText(estimatedRows, estimatedBytes, span); text != "" {
 		fmt.Fprintf(sb, "- %s\n", text)

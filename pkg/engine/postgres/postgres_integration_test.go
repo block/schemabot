@@ -1036,6 +1036,12 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	assert.Contains(t, change.ModeReason, `statement for table "users":`)
 	assert.Contains(t, change.ModeReason, "1-byte threshold")
 	assert.Contains(t, change.ModeReason, "SchemaBot's ceiling for a native-safe apply")
+	// The blocked table still shows the size the ceiling measured; the
+	// refusal carries no row estimate, so the row count is omitted.
+	var size int64
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT pg_catalog.pg_total_relation_size('public.users'::regclass)").Scan(&size))
+	assert.Equal(t, &size, change.EstimatedBytes)
+	assert.Nil(t, change.EstimatedRows)
 }
 
 // TestEnginePlanTableSizeRefusalKeepsTableNameVerbatim proves the size verdict
@@ -1095,6 +1101,40 @@ func TestEnginePlanOversizedTableAdmitsConcurrentIndex(t *testing.T) {
 	assert.Contains(t, alter.ModeReason, "1-byte threshold")
 	assert.Empty(t, index.ExecutionMode)
 	assert.Contains(t, index.DDL, "CREATE INDEX CONCURRENTLY")
+}
+
+// An index build on a table over the native-safe ceiling stays executable,
+// and its plan carries the size the ceiling measured, so the operator sees how
+// large a table the build has to read. The ceiling's refusal carries no row
+// estimate, so the row count is left out rather than reported as zero.
+func TestEnginePlanOversizedIndexBuildCarriesItsSize(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_oversized_index_size_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY, email text);
+		INSERT INTO public.users SELECT g, 'user' || g || '@example.com' FROM pg_catalog.generate_series(1, 1000) g;
+		ANALYZE public.users;`)
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_oversized_index_size_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text); CREATE INDEX users_email_idx ON users (email)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	index := result.Changes[0].TableChanges[0]
+	assert.Empty(t, index.ExecutionMode, "the ceiling does not block an index build")
+	assert.Contains(t, index.DDL, "CREATE INDEX CONCURRENTLY")
+	var size int64
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT pg_catalog.pg_total_relation_size('public.users'::regclass)").Scan(&size))
+	assert.Equal(t, &size, index.EstimatedBytes)
+	assert.Nil(t, index.EstimatedRows)
 }
 
 // TestEnginePlanOversizedTableIndexOnlyDiffHasNoBlockedChange proves the

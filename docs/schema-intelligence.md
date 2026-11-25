@@ -705,6 +705,12 @@ rollout's table line counts each target that has not reported by its estimate,
 so the total spans every target and reads as approximate (`Rows: 500 / ~4k`).
 A sharded table rolled up across its shards carries `estimated_bytes` but not
 `estimated_rows`.
+On PostgreSQL, `estimated_bytes` counts the table's data, indexes, and TOAST,
+summed over its partitions. `estimated_rows` is omitted until the table has
+been analyzed at least once (for a partitioned table, the parent itself), and
+for a table larger than the size ceiling, including one whose index build the
+plan still runs. A table with a size and no row count shows `Size: ~3.0 GB` in
+place of its rows line.
 A PostgreSQL concurrent index build reports the whole-build percentage
 pg-sprite estimates from the server's build phase and its counters; it stays
 below 100 until the apply completes and holds its last value between phases (see

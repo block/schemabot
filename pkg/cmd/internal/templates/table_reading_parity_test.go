@@ -24,6 +24,9 @@ type inFlightCase struct {
 	metadata map[string]string
 	// headline is what both surfaces show beside the table name.
 	headline string
+	// details, when set, are the detail lines both surfaces show under the
+	// table's statement.
+	details []string
 	// noBar marks a table with no measured progress, beside whose name
 	// neither surface draws a bar.
 	noBar bool
@@ -31,6 +34,7 @@ type inFlightCase struct {
 
 func inFlightCases() []inFlightCase {
 	bytes := int64(3_400_000_000)
+	rows := int64(7_200_000)
 	running := func(t apitypes.TableProgressResponse) apitypes.TableProgressResponse {
 		t.Status = state.Task.Running
 		return t
@@ -47,6 +51,12 @@ func inFlightCases() []inFlightCase {
 		{name: "index build", table: running(apitypes.TableProgressResponse{ChangeType: "alter", PercentComplete: 25}),
 			metadata: map[string]string{"executor_operation": "concurrent-index-build", "server_phase": "building index: scanning table", "blocks_done": "30000", "blocks_total": "48000"},
 			headline: "25%"},
+		{name: "index build on a sized table", table: running(apitypes.TableProgressResponse{ChangeType: "alter", PercentComplete: 25, EstimatedRows: &rows, EstimatedBytes: &bytes}),
+			metadata: map[string]string{"executor_operation": "concurrent-index-build", "server_phase": "building index: scanning table", "blocks_done": "30000", "blocks_total": "48000"},
+			headline: "25%", details: []string{"Building index: 30,000 of 48,000 blocks", "Rows: ~7.2M · ~3.4 GB"}},
+		{name: "index build on a sized table with no row count", table: running(apitypes.TableProgressResponse{ChangeType: "alter", PercentComplete: 25, EstimatedBytes: &bytes}),
+			metadata: map[string]string{"executor_operation": "concurrent-index-build", "server_phase": "building index: scanning table", "blocks_done": "30000", "blocks_total": "48000"},
+			headline: "25%", details: []string{"Building index: 30,000 of 48,000 blocks", "Size: ~3.4 GB"}},
 		{name: "create table", table: running(apitypes.TableProgressResponse{ChangeType: "create"}), headline: "Applying...", noBar: true},
 		{name: "instant alter", table: running(apitypes.TableProgressResponse{ChangeType: "alter", IsInstant: true}), headline: "Applying instantly...", noBar: true},
 		{name: "alter reporting no progress", table: running(apitypes.TableProgressResponse{ChangeType: "alter"}), headline: "Running...", noBar: true},
@@ -85,6 +95,9 @@ func TestInFlightTableReadsTheSameOnEverySurface(t *testing.T) {
 				assert.Equal(t, tc.headline, withoutBar(cliHeadline), "CLI headline")
 				assert.Equal(t, withoutBar(cliHeadline), withoutBar(prHeadline), "the PR comment's headline reads as the CLI's")
 				assert.Equal(t, cliDetails, prDetails, "the PR comment's detail lines read as the CLI's")
+				if tc.details != nil {
+					assert.Equal(t, tc.details, cliDetails, "CLI detail lines")
+				}
 				assert.Equal(t, !tc.noBar, hasBar(cliHeadline), "CLI bar")
 				assert.Equal(t, !tc.noBar, hasBar(prHeadline), "PR comment bar")
 			})
