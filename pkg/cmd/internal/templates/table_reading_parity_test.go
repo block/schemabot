@@ -24,6 +24,9 @@ type inFlightCase struct {
 	metadata map[string]string
 	// headline is what both surfaces show beside the table name.
 	headline string
+	// details, when set, are the detail lines both surfaces show under the
+	// table's statement.
+	details []string
 	// noBar marks a table with no measured progress, beside whose name
 	// neither surface draws a bar.
 	noBar bool
@@ -31,6 +34,7 @@ type inFlightCase struct {
 
 func inFlightCases() []inFlightCase {
 	bytes := int64(3_400_000_000)
+	rows := int64(7_200_000)
 	running := func(t apitypes.TableProgressResponse) apitypes.TableProgressResponse {
 		t.Status = state.Task.Running
 		return t
@@ -47,6 +51,12 @@ func inFlightCases() []inFlightCase {
 		{name: "index build", table: running(apitypes.TableProgressResponse{ChangeType: "alter", PercentComplete: 25}),
 			metadata: map[string]string{"executor_operation": "concurrent-index-build", "server_phase": "building index: scanning table", "blocks_done": "30000", "blocks_total": "48000"},
 			headline: "25%"},
+		{name: "index build on a sized table", table: running(apitypes.TableProgressResponse{ChangeType: "alter", PercentComplete: 25, EstimatedRows: &rows, EstimatedBytes: &bytes}),
+			metadata: map[string]string{"executor_operation": "concurrent-index-build", "server_phase": "building index: scanning table", "blocks_done": "30000", "blocks_total": "48000"},
+			headline: "25%", details: []string{"Building index: 30,000 of 48,000 blocks", "Rows: ~7.2M · ~3.4 GB"}},
+		{name: "index build on a sized table with no row count", table: running(apitypes.TableProgressResponse{ChangeType: "alter", PercentComplete: 25, EstimatedBytes: &bytes}),
+			metadata: map[string]string{"executor_operation": "concurrent-index-build", "server_phase": "building index: scanning table", "blocks_done": "30000", "blocks_total": "48000"},
+			headline: "25%", details: []string{"Building index: 30,000 of 48,000 blocks", "Size: ~3.4 GB"}},
 		{name: "create table", table: running(apitypes.TableProgressResponse{ChangeType: "create"}), headline: "Applying...", noBar: true},
 		{name: "instant alter", table: running(apitypes.TableProgressResponse{ChangeType: "alter", IsInstant: true}), headline: "Applying instantly...", noBar: true},
 		{name: "alter reporting no progress", table: running(apitypes.TableProgressResponse{ChangeType: "alter"}), headline: "Running...", noBar: true},
@@ -85,6 +95,9 @@ func TestInFlightTableReadsTheSameOnEverySurface(t *testing.T) {
 				assert.Equal(t, tc.headline, withoutBar(cliHeadline), "CLI headline")
 				assert.Equal(t, withoutBar(cliHeadline), withoutBar(prHeadline), "the PR comment's headline reads as the CLI's")
 				assert.Equal(t, cliDetails, prDetails, "the PR comment's detail lines read as the CLI's")
+				if tc.details != nil {
+					assert.Equal(t, tc.details, cliDetails, "CLI detail lines")
+				}
 				assert.Equal(t, !tc.noBar, hasBar(cliHeadline), "CLI bar")
 				assert.Equal(t, !tc.noBar, hasBar(prHeadline), "PR comment bar")
 			})
@@ -100,7 +113,12 @@ type shardedInFlightCase struct {
 	rowsCopied        int64
 	rowsTotal         int64
 	reporting, shards int
-	headline          string
+	// planned marks a total that counts the plan's estimate for the shards
+	// that have not reported, which then spans the whole table.
+	planned  bool
+	headline string
+	// rowsLine, when set, is the rows line both surfaces show.
+	rowsLine string
 }
 
 // A sharded table copying across its shards reads the same in the terminal
@@ -113,6 +131,8 @@ func TestShardedInFlightTableReadsTheSameOnEverySurface(t *testing.T) {
 		{name: "later shards not reporting", rowsCopied: 914_707, rowsTotal: 1_466_232, reporting: 1, shards: 4, headline: "62.38% (1 of 4 shards)"},
 		{name: "copy past its estimate", rowsCopied: 1_600_000, rowsTotal: 1_466_232, reporting: 1, shards: 4, headline: "Finalizing copy (1 of 4 shards)"},
 		{name: "starting copy", rowsTotal: 1_466_232, reporting: 2, shards: 2, headline: "⏳ Starting copy..."},
+		{name: "later shards counted from the plan", rowsCopied: 914_707, rowsTotal: 4_000_000, reporting: 1, shards: 4, planned: true,
+			headline: "22.87%", rowsLine: "Rows: 914,707 / ~4M · ETA: ≥ 3m 15s"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cliShards := make([]ShardProgress, tc.shards)
@@ -136,13 +156,13 @@ func TestShardedInFlightTableReadsTheSameOnEverySurface(t *testing.T) {
 			total := tc.rowsTotal + int64(tc.reporting-1)
 			cli := FormatTableProgress(TableProgress{
 				TableName: "orders", Status: state.Task.Running, ChangeType: "alter",
-				RowsCopied: tc.rowsCopied, RowsTotal: total, ETASeconds: 195, PlannedShards: tc.shards, Shards: cliShards,
+				RowsCopied: tc.rowsCopied, RowsTotal: total, RowsTotalPlanned: tc.planned, ETASeconds: 195, PlannedShards: tc.shards, Shards: cliShards,
 			})
 			pr := webhooktemplates.RenderShardedApplyComment(webhooktemplates.ShardedApplyData{
 				State: state.Apply.Running, Environment: "staging", Database: "shop", ApplyID: "apply-5e6f7a8b",
 				Keyspaces: []webhooktemplates.ShardedKeyspace{{Keyspace: "shop_sharded", Tables: []webhooktemplates.ShardedTableStatus{{
 					Table: "orders", Status: state.Task.Running, RowsCopied: tc.rowsCopied, RowsTotal: total, ETASeconds: 195,
-					ShardsReporting: tc.reporting, PlannedShards: tc.shards, Shards: prShards,
+					ShardsReporting: tc.reporting, RowsTotalPlanned: tc.planned, PlannedShards: tc.shards, Shards: prShards,
 				}}}},
 			})
 
@@ -156,7 +176,7 @@ func TestShardedInFlightTableReadsTheSameOnEverySurface(t *testing.T) {
 				ApplyID: "apply-5e6f7a8b", Database: "shop", Environment: "staging", State: state.Apply.Running,
 				Tables: []*apitypes.TableProgressResponse{{
 					TableName: "orders", DDL: "ALTER TABLE orders ADD COLUMN note text", Status: state.Task.Running, ChangeType: "alter",
-					RowsCopied: tc.rowsCopied, RowsTotal: total, ETASeconds: 195, PlannedShards: int32(tc.shards), Shards: apiShards,
+					RowsCopied: tc.rowsCopied, RowsTotal: total, RowsTotalPlanned: tc.planned, ETASeconds: 195, PlannedShards: int32(tc.shards), Shards: apiShards,
 				}},
 			}, "octocat"))
 
@@ -169,8 +189,56 @@ func TestShardedInFlightTableReadsTheSameOnEverySurface(t *testing.T) {
 			assert.Equal(t, withoutShardList(cliDetails), withoutShardList(prDetails), "the sharded PR comment's detail lines read as the CLI's")
 			assert.Equal(t, withoutShardList(cliDetails), withoutShardList(statusDetails), "the apply status comment's detail lines read as the CLI's")
 			require.NotEmpty(t, withoutShardList(prDetails), "the table has a rows line")
+			if tc.rowsLine != "" {
+				assert.Equal(t, tc.rowsLine, withoutShardList(cliDetails)[0], "rows line")
+			}
 		})
 	}
+}
+
+// A sharded table whose first shard has copied its 1,000 rows and moved on
+// to verifying, beside a queued shard the plan estimates at 9,000 rows, reads
+// 10% on every surface, the same fraction its rows line shows: the bar that
+// stays across shards in different phases counts the queued shard's estimate,
+// so it does not jump to half done when the first shard leaves its copy
+// (UX-8).
+func TestShardedPhaseBarCountsThePlannedRows(t *testing.T) {
+	shards := []*apitypes.ShardProgressResponse{
+		{Shard: "-80", Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, PercentComplete: 100, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000},
+		{Shard: "80-", Status: state.Task.Pending},
+	}
+	table := &apitypes.TableProgressResponse{
+		TableName: "orders", Keyspace: "shop_sharded", DDL: "ALTER TABLE orders ADD COLUMN note text", ChangeType: "alter",
+		Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 10_000, RowsTotalPlanned: true, PlannedShards: 2, Shards: shards,
+	}
+	cli := FormatTableProgress(ParseProgressResponse(&apitypes.ProgressResponse{State: state.Apply.Running, Sharded: true, Tables: []*apitypes.TableProgressResponse{table}}).Tables[0])
+	pr := webhooktemplates.RenderShardedApplyComment(webhooktemplates.ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "shop", ApplyID: "apply-5e6f7a8b",
+		Keyspaces: []webhooktemplates.ShardedKeyspace{{Keyspace: "shop_sharded", Tables: []webhooktemplates.ShardedTableStatus{{
+			Table: "orders", Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 10_000, ShardsReporting: 1, RowsTotalPlanned: true, PlannedShards: 2,
+			Shards: []webhooktemplates.ShardProgressData{
+				{Shard: "-80", Status: state.Task.Checksumming, PercentComplete: 100, RowsCopied: 1000, RowsTotal: 1000, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000},
+				{Shard: "80-", Status: state.Task.Pending},
+			},
+		}}}},
+	})
+
+	status := webhooktemplates.RenderApplyStatusComment(webhooktemplates.ApplyStatusFromProgress(&apitypes.ProgressResponse{
+		ApplyID: "apply-5e6f7a8b", Database: "shop", Environment: "staging", State: state.Apply.Running,
+		Tables: []*apitypes.TableProgressResponse{table},
+	}, "octocat"))
+
+	cliHeadline, cliDetails := cliInFlightReading(t, cli)
+	prHeadline, prDetails := shardedPRInFlightReading(t, pr)
+	statusHeadline, statusDetails := shardedPRInFlightReading(t, status)
+	assert.True(t, hasBar(cliHeadline), "the table keeps its bar across shards in different phases: %s", cliHeadline)
+	assert.Equal(t, "10%", withoutBar(cliHeadline), "CLI headline")
+	assert.Equal(t, withoutBar(cliHeadline), withoutBar(prHeadline), "the sharded PR comment's headline reads as the CLI's")
+	assert.Equal(t, withoutBar(cliHeadline), withoutBar(statusHeadline), "the apply status comment's headline reads as the CLI's")
+	require.NotEmpty(t, withoutShardList(cliDetails), "the table has a rows line")
+	assert.Equal(t, "Rows: 1,000 / ~10k", withoutShardList(cliDetails)[0], "rows line")
+	assert.Equal(t, withoutShardList(cliDetails), withoutShardList(prDetails), "the sharded PR comment's detail lines read as the CLI's")
+	assert.Equal(t, withoutShardList(cliDetails), withoutShardList(statusDetails), "the apply status comment's detail lines read as the CLI's")
 }
 
 // shardedPRInFlightReading returns the sharded PR comment's headline for the

@@ -11756,6 +11756,8 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 **Shards**: 4 completed
 
+<details><summary>Apply details (1 table, 1 VSchema update)</summary>
+
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: ✅ Complete (4 shards)
@@ -11784,33 +11786,6 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 
 </details>
-
-<details>
-<summary><a name="summary-keyspace-finalized"></a><strong>Summary: Keyspace Finalized</strong></summary>
-
-
-## ✅ Schema Change Applied — Production
-
-**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
-
-*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
-
-> Applied successfully — your schema change is live!
-
-**Shards**: 2 completed
-
-#### Keyspace `cdb_resolute_sharded`
-
-**`mutes`**: ✅ Complete (2 shards)
-
-```sql
-ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
-```
-
-### Finalize
-
-**`cdb_resolute_sharded`**: Finalized
-
 
 </details>
 
@@ -11848,6 +11823,38 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 **`cdb_resolute_sharded`**: Cancelled
 
+
+---
+
+To retry:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="summary-keyspace-finalize-failed"></a><strong>Summary: Keyspace Finalize Failed</strong></summary>
+
+
+## ❌ Schema Change Failed — Production
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `shop` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
+
+*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
+
+**Shards**: 4 completed
+
+> ❌ **Failure:** finalizing keyspace <code>commerce</code> — publish routing rules: target is read-only
+
+#### Keyspace `commerce`
+
+**`mutes`**: ✅ Complete (4 shards)
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
 
 ---
 

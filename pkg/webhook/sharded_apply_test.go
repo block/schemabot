@@ -214,10 +214,10 @@ func TestBuildShardedApplyData_FinalizerBecomesVSchemaChange(t *testing.T) {
 }
 
 // A sharded apply adds refunds to commerce, whose engine asked to finalize the
-// keyspace once the table exists, with no VSchema change in the plan. The
-// finalizer renders in the Finalize section with its own status, not as a
-// VSchema change the plan never carried, and it is not counted as a change.
-// payments, which does change its VSchema, still renders as one.
+// keyspace once the table exists, with no VSchema change in the plan. That
+// finalize is an engine step with nothing for the operator to review, so it is
+// not listed as a VSchema change the plan never carried. payments, which does
+// change its VSchema, still renders as one.
 func TestBuildShardedApplyData_FinalizeOnlyKeyspaceIsNotAVSchemaChange(t *testing.T) {
 	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Running}
 	mk := func(id int64, key, opState string) *storage.ApplyOperation {
@@ -233,21 +233,94 @@ func TestBuildShardedApplyData_FinalizeOnlyKeyspaceIsNotAVSchemaChange(t *testin
 
 	data := buildShardedApplyData(apply, ops, false, nil, view, "")
 
-	assert.Equal(t, []templates.ShardedFinalize{{Keyspace: "commerce", Status: "applying"}}, data.Finalizes)
 	require.Len(t, data.VSchemaChanges, 1)
 	assert.Equal(t, "payments", data.VSchemaChanges[0].Namespace)
 	body := templates.RenderShardedApplyComment(data)
-	assert.Contains(t, body, "### Finalize\n\n**`commerce`**: Finalizing...\n")
 	assert.Contains(t, body, "### VSchema\n\n**`payments`**: Pending\n")
-	assert.NotContains(t, body, "**`commerce`**: Applying")
+	assert.NotContains(t, body, "### Finalize", "a keyspace's finalize is not listed as its own step")
 
 	apply.State = state.Apply.Completed
 	for _, op := range ops {
 		op.State = state.ApplyOperation.Completed
 	}
 	summary := templates.RenderShardedApplySummaryComment(buildShardedApplyData(apply, ops, false, nil, view, ""))
-	assert.Contains(t, summary, "### Finalize\n\n**`commerce`**: Finalized\n")
 	assert.Contains(t, summary, "### VSchema\n\n**`payments`**: Applied\n")
+	assert.NotContains(t, summary, "### Finalize", "a keyspace's finalize is not listed as its own step")
+}
+
+// A sharded apply copies refunds onto both of commerce's shards, then its
+// engine's finalize of the keyspace fails and the apply fails. The finalize is
+// not listed on its own, so the status comment and the summary both name the
+// keyspace in the failure callout, whatever the finalize error says: with its
+// error, with no error at all, and alongside an apply-level error that differs
+// from it.
+func TestShardedCommentsNameAFailedFinalize(t *testing.T) {
+	const finalizeErr = "publish routing rules: target is read-only"
+	const named = "\n> ❌ **Failure:** finalizing keyspace <code>commerce</code>"
+	mk := func(id int64, key, opState, errMsg string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	for _, tc := range []struct {
+		name, applyErr, finalizerErr string
+		want                         []string
+	}{
+		{name: "finalize error", finalizerErr: finalizeErr, want: []string{named + " — " + finalizeErr + "\n"}},
+		{name: "no error text", want: []string{named + "\n"}},
+		{
+			name: "apply error differs", applyErr: "apply deadline exceeded", finalizerErr: finalizeErr,
+			want: []string{named + " — " + finalizeErr + "\n", "\n> ❌ **Failure:** apply deadline exceeded\n"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Failed, ErrorMessage: tc.applyErr}
+			ops := []*storage.ApplyOperation{
+				mk(1, "commerce/-80/refunds", state.ApplyOperation.Completed, ""),
+				mk(2, "commerce/80-/refunds", state.ApplyOperation.Completed, ""),
+				mk(3, "commerce/group_finalizer", state.ApplyOperation.Failed, tc.finalizerErr),
+			}
+			data := buildShardedApplyData(apply, ops, false, nil, finalizesOnly("commerce"), "")
+			status := templates.RenderShardedApplyComment(data)
+			summary := templates.RenderShardedApplySummaryComment(data)
+			for _, want := range tc.want {
+				assert.Equal(t, 1, strings.Count(status, want), "status comment:\n%s", status)
+				assert.Equal(t, 1, strings.Count(summary, want), "summary comment:\n%s", summary)
+			}
+			assert.NotContains(t, summary, "**Failure:** "+finalizeErr, "the finalize error appears once, under its keyspace")
+		})
+	}
+}
+
+// A sharded apply spans two keyspaces. commerce's shards finish and its
+// finalize fails, while payments still copies, so the apply keeps running.
+// The finalize is not listed on its own, so the status comment's failure
+// callout names the keyspace and its error before the apply settles; a
+// finalize that SchemaBot is still retrying reads as an attention, not a
+// failure.
+func TestShardedStatusCommentNamesAFailedFinalizeWhileOtherKeyspacesRun(t *testing.T) {
+	const finalizeErr = "apply VSchema for commerce: keyspace not found"
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.RunningDegraded}
+	mk := func(id int64, key, opState, errMsg string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	for _, tc := range []struct {
+		name, finalizerState, glyph string
+	}{
+		{"failed", state.ApplyOperation.Failed, "❌"},
+		{"retrying", state.ApplyOperation.FailedRetryable, "⚠️"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := []*storage.ApplyOperation{
+				mk(1, "commerce/-80/refunds", state.ApplyOperation.Completed, ""),
+				mk(2, "commerce/80-/refunds", state.ApplyOperation.Completed, ""),
+				mk(3, "commerce/group_finalizer", tc.finalizerState, finalizeErr),
+				mk(4, "payments/-/ledger", state.ApplyOperation.Running, ""),
+			}
+			data := buildShardedApplyData(apply, ops, false, nil, finalizesOnly("commerce"), "")
+
+			assert.Contains(t, templates.RenderShardedApplyComment(data),
+				"\n> "+tc.glyph+" **Failure:** finalizing keyspace <code>commerce</code> — "+finalizeErr+"\n")
+		})
+	}
 }
 
 // stubPlanStorage serves one stored plan (or a load error) for resolver tests.
@@ -690,6 +763,99 @@ func TestBuildShardedApplyData_TableSizeFromStoredPlan(t *testing.T) {
 
 	withoutView := buildShardedApplyData(apply, ops, false, nil, nil, "")
 	assert.Nil(t, withoutView.Keyspaces[0].Tables[0].EstimatedBytes)
+}
+
+// A table copying on one shard while the next waits its turn reads its total
+// from the reported shard plus the plan's estimate for the waiting one, which
+// the comment reads from each shard's own planned change. The total spans the
+// whole table, so the comment shows the table's percent and an approximate
+// total rather than the reported shard's figures alone.
+func TestBuildShardedApplyData_CountsThePlannedRowsOfShardsStillToCopy(t *testing.T) {
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "shop_sharded/-80/orders", state.ApplyOperation.Running),
+		mk(2, "shop_sharded/80-/orders", state.ApplyOperation.Pending),
+	}
+	opID := int64(1)
+	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &opID, Shard: "-80", Namespace: "shop_sharded", TableName: "orders",
+		DDLAction: "alter", State: state.Task.Running, RowsCopied: 620, RowsTotal: 1_000, ETASeconds: 60}}
+	shardChange := func(rows int64) []storage.TableChange {
+		return []storage.TableChange{{Table: "orders", Operation: "alter", EstimatedRows: new(rows)}}
+	}
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_sharded": {
+		Tables: []storage.TableChange{{Table: "orders", Operation: "alter", EstimatedRows: new(int64(2_200)), ShardCount: 2}},
+		Shards: []storage.ShardPlan{
+			{Shard: "-80", Namespace: "shop_sharded", Changes: shardChange(1_000)},
+			{Shard: "80-", Namespace: "shop_sharded", Changes: shardChange(1_200)},
+		},
+	}}}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Running, PlanID: 7}
+	view := resolveShardedPlanView(t.Context(), &stubPlanStorage{plan: plan}, apply, ops)
+
+	data := buildShardedApplyData(apply, ops, false, tasks, view, "")
+
+	require.Len(t, data.Keyspaces, 1)
+	require.Len(t, data.Keyspaces[0].Tables, 1)
+	orders := data.Keyspaces[0].Tables[0]
+	assert.Equal(t, int64(620), orders.RowsCopied)
+	assert.Equal(t, int64(2_200), orders.RowsTotal, "the reported shard's total plus the waiting shard's estimate")
+	assert.True(t, orders.RowsTotalPlanned)
+	assert.Contains(t, templates.RenderShardedApplyComment(data), "- Rows: 620 / ~2.2k · ETA: ≥ 1m 0s")
+
+	withoutView := buildShardedApplyData(apply, ops, false, tasks, nil, "")
+	assert.Equal(t, int64(1_000), withoutView.Keyspaces[0].Tables[0].RowsTotal, "without the plan the total covers the reported shard")
+	assert.False(t, withoutView.Keyspaces[0].Tables[0].RowsTotalPlanned)
+}
+
+// The comment adds the plan's estimates for shards still to copy only when
+// every shard the plan spans has an operation listed. A plan that recorded no
+// shard count, or one spanning more shards than have operations attached so
+// far, leaves the total at the reporting shard's figure, never planned.
+func TestBuildShardedApplyData_CountsNoPlannedRowsUnlessEveryPlannedShardIsListed(t *testing.T) {
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "shop_sharded/-80/orders", state.ApplyOperation.Running),
+		mk(2, "shop_sharded/80-/orders", state.ApplyOperation.Pending),
+	}
+	opID := int64(1)
+	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &opID, Shard: "-80", Namespace: "shop_sharded", TableName: "orders",
+		DDLAction: "alter", State: state.Task.Running, RowsCopied: 620, RowsTotal: 1_000, ETASeconds: 60}}
+	shardChange := func(rows int64) []storage.TableChange {
+		return []storage.TableChange{{Table: "orders", Operation: "alter", EstimatedRows: new(rows)}}
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Running, PlanID: 7}
+
+	for _, tc := range []struct {
+		name       string
+		shardCount int
+	}{
+		{name: "no shard count", shardCount: 0},
+		{name: "more planned shards than operations", shardCount: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_sharded": {
+				Tables: []storage.TableChange{{Table: "orders", Operation: "alter", EstimatedRows: new(int64(2_200)), ShardCount: tc.shardCount}},
+				Shards: []storage.ShardPlan{
+					{Shard: "-80", Namespace: "shop_sharded", Changes: shardChange(1_000)},
+					{Shard: "80-", Namespace: "shop_sharded", Changes: shardChange(1_200)},
+				},
+			}}}
+			view := resolveShardedPlanView(t.Context(), &stubPlanStorage{plan: plan}, apply, ops)
+
+			data := buildShardedApplyData(apply, ops, false, tasks, view, "")
+
+			require.Len(t, data.Keyspaces, 1)
+			require.Len(t, data.Keyspaces[0].Tables, 1)
+			orders := data.Keyspaces[0].Tables[0]
+			assert.Equal(t, int64(620), orders.RowsCopied)
+			assert.Equal(t, int64(1_000), orders.RowsTotal, "only the reported shard's total")
+			assert.False(t, orders.RowsTotalPlanned)
+		})
+	}
 }
 
 // A sharded apply that renders as one change on one database runs on the

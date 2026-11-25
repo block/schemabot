@@ -829,6 +829,21 @@ func IndexBuildPercentAcrossTargets(parts []Part) int {
 	return percent
 }
 
+// ShardedPhasePercent is the bar of a sharded table that keeps its bar past
+// its row copy (ShardsKeepTableBar). When the table's row total counts the
+// plan's estimate for the shards still to copy (RollUpShardedTable), the bar
+// is the rows copied over that total, the same fraction its rows line and its
+// copy bar show, so it does not jump when a shard moves from copying to
+// verifying. It stops short of complete, since the table is still in flight.
+// Otherwise it is the table's share across its shards
+// (PercentAcrossTargets).
+func ShardedPhasePercent(parts []Part, silent int, rowsCopied, rowsTotal int64, rowsTotalPlanned bool) int {
+	if rowsTotalPlanned && rowsTotal > 0 {
+		return min(int(ui.ClampRows(rowsCopied, rowsTotal)*100/rowsTotal), 99)
+	}
+	return PercentAcrossTargets(parts, silent)
+}
+
 // PercentAcrossTargets is how far a table is across every target that runs it,
 // for the bar that leads its line until every target completes. While every
 // target's rows are known, it is the rows copied over the rows to copy across

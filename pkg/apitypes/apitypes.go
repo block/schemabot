@@ -2057,6 +2057,12 @@ type TableProgressResponse struct {
 	RowsTotal       int64  `json:"rows_total"`
 	PercentComplete int32  `json:"percent_complete"`
 	ETASeconds      int64  `json:"eta_seconds,omitempty"`
+	// RowsTotalPlanned marks a sharded table's rows_total that also counts
+	// the plan's estimate for each shard still to copy that has not reported
+	// a total, so rows_total and percent_complete span the whole table. The
+	// total is then approximate. False when rows_total covers only the
+	// shards that reported one.
+	RowsTotalPlanned bool `json:"rows_total_planned,omitempty"`
 	// EstimatedBytes is the plan's approximate on-disk footprint of the table
 	// (data plus indexes), for display beside the row counts. It is the
 	// table's size when planned, not a measure of copy progress. Absent when

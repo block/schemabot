@@ -994,13 +994,15 @@ func (tc TableChange) TaskEstimatedBytes(shard string) *int64 {
 // TaskEstimatedRows returns the row estimate a task created from this change
 // carries, under the same whole-table rule as TaskEstimatedBytes: a task
 // scoped to one shard carries none rather than the whole table's count. Only
-// an ALTER copies rows, so a task for any other change carries none either:
-// the plan sizes a table it drops, but that is not work the task will copy.
+// a change that works through the table's rows carries one: an ALTER copies
+// them, and a separate CREATE INDEX statement, which is how PostgreSQL adds an
+// index, reads them all to build it. A task for any other change carries none:
+// the plan sizes a table it drops, but that is not work the task will do.
 func (tc TableChange) TaskEstimatedRows(shard string) *int64 {
 	if shard != "" || tc.EstimatedRows == nil {
 		return nil
 	}
-	if !strings.EqualFold(tc.Operation, "alter") {
+	if !strings.EqualFold(tc.Operation, "alter") && !strings.EqualFold(tc.Operation, "create_index") {
 		return nil
 	}
 	rows := *tc.EstimatedRows
@@ -1314,6 +1316,35 @@ func (p *Plan) AllChangesDirect() bool {
 		}
 	}
 	return total > 0
+}
+
+// ShardCopyEstimatedRows returns the plan's row estimate for the copy one
+// shard runs for a table: the estimate on the shard's own change, when that
+// change is an ALTER, the only change that copies rows. It is nil when the
+// plan records no change for the table on that shard, the change copies no
+// rows, or the planner had no estimate. A negative estimate is a statistics
+// sentinel rather than a count, so it reads as no estimate. It never falls
+// back to the keyspace's estimate, which covers every shard.
+func (p *Plan) ShardCopyEstimatedRows(namespace, shard, table string) *int64 {
+	if p == nil || p.Namespaces[namespace] == nil {
+		return nil
+	}
+	for _, sp := range p.Namespaces[namespace].Shards {
+		if sp.Shard != shard {
+			continue
+		}
+		for _, tc := range sp.Changes {
+			if tc.Table != table || tc.EstimatedRows == nil || !strings.EqualFold(tc.Operation, "alter") {
+				continue
+			}
+			if *tc.EstimatedRows < 0 {
+				return nil
+			}
+			rows := *tc.EstimatedRows
+			return &rows
+		}
+	}
+	return nil
 }
 
 // FlatDDLChanges returns all DDL changes across namespaces, sorted by namespace key.

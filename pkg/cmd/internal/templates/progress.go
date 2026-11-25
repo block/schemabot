@@ -154,8 +154,10 @@ func WriteProgress(data ProgressData) {
 	WriteBox(rows, "State", colorFn)
 	writeProgressStep(data)
 
-	// Error below the box
-	if data.State == state.Apply.Failed && data.ErrorMessage != "" {
+	// Error below the box. A sharded apply shows it in every state, as the PR
+	// comment's failure callout does: a shard or a keyspace finalize can fail
+	// while other shards keep running, and nothing else on screen names it.
+	if (data.State == state.Apply.Failed || data.Sharded) && data.ErrorMessage != "" {
 		fmt.Printf("\n  %s%s%s\n", ANSIRed, data.ErrorMessage, ANSIReset)
 	}
 	writeStoppedByFreeze(data)
@@ -811,6 +813,7 @@ func tableFacts(t TableProgress) presentation.TableFacts {
 		RowsTotal:           t.RowsTotal,
 		RowsTotalPlanned:    t.RowsTotalPlanned,
 		ETASeconds:          t.ETASeconds,
+		EstimatedRows:       t.EstimatedRows,
 		EstimatedBytes:      t.EstimatedBytes,
 		ChecksumRowsChecked: t.ChecksumRowsChecked,
 		ChecksumRowsTotal:   t.ChecksumRowsTotal,
@@ -851,8 +854,9 @@ func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
 
 // writePlannedRows writes the rows line of a queued table
 // (presentation.PlannedRowsText). A table rolled up across targets names them,
-// since its estimate is their sum. It writes nothing when the plan had no row
-// estimate, which a table rolled up across targets lacks while some of its
+// since its estimate is their sum. It writes the size alone when the plan
+// sized the table but could not count its rows, and nothing when the plan had
+// neither. A table rolled up across targets has neither while some of its
 // targets have reported nothing at all: their estimates are not known, so a
 // sum of the rest would understate the table (tableAcrossTargets).
 func writePlannedRows(b *strings.Builder, t TableProgress) {
