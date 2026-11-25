@@ -32,7 +32,9 @@ func TestRollUpShardedTable(t *testing.T) {
 // fraction of the whole table it has copied rather than of the five shards.
 // The estimate stands in only while every shard still ahead of its copy has
 // one and every planned shard is listed; otherwise the figures cover the
-// reporting shards alone, as they do when an estimate is negative. A shard
+// reporting shards alone, as they do when an estimate is negative or the plan
+// recorded no shard count. Once every shard still queued has failed, the total
+// is the reporting shards' again. A shard
 // that failed before it reported a total adds nothing, since it will not copy
 // its rows, and neither does a shard whose change copies no rows, such as an
 // instant ALTER.
@@ -78,6 +80,18 @@ func TestRollUpShardedTableCountsPlannedRowsForShardsStillToCopy(t *testing.T) {
 
 	got = RollUpShardedTable(eightShards(), 10)
 	assert.Equal(t, int64(5000), got.RowsTotal, "planned shards not yet listed keep the reported figures")
+	assert.False(t, got.RowsTotalPlanned)
+
+	got = RollUpShardedTable(eightShards(), 0)
+	assert.Equal(t, int64(5000), got.RowsTotal, "a plan with no shard count cannot show every shard is listed")
+	assert.False(t, got.RowsTotalPlanned)
+
+	lastQueuedFailed := eightShards()
+	for i := 5; i < 8; i++ {
+		lastQueuedFailed[i] = ShardCopy{Status: state.Task.Failed, PlannedRows: rows(1000)}
+	}
+	got = RollUpShardedTable(lastQueuedFailed, 8)
+	assert.Equal(t, int64(5000), got.RowsTotal, "once no shard is still to copy, the total is the reported shards' again")
 	assert.False(t, got.RowsTotalPlanned)
 
 	queued := eightShards()

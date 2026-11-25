@@ -96,14 +96,16 @@ type ShardedTableCopy struct {
 // not read as nearly done. It stands in only when every such shard has an
 // estimate and every planned shard is listed: a total missing some shards
 // would be neither the reporting shards' nor the table's, so the figures then
-// cover the reporting shards alone. A shard that failed, stopped, finished
+// cover the reporting shards alone. A plan that recorded no shard count cannot
+// show that every shard is listed, so its estimates never stand in. A shard
+// that failed, stopped, finished
 // past its copy without a total, or copies no rows adds nothing, so the total
 // never counts rows that will not be copied. A negative estimate is not a
 // count, so it reads as no estimate.
 func RollUpShardedTable(shards []ShardCopy, plannedShards int) ShardedTableCopy {
 	out := ShardedTableCopy{Status: shards[0].Status}
 	var planned int64
-	estimatesCoverUnreported := len(shards) >= plannedShards
+	estimatesCoverUnreported := everyPlannedShardListed(len(shards), plannedShards)
 	unreported, inFlight := 0, false
 	for _, sh := range shards {
 		if TaskAttentionRank(sh.Status) > TaskAttentionRank(out.Status) {
@@ -131,6 +133,13 @@ func RollUpShardedTable(shards []ShardCopy, plannedShards int) ShardedTableCopy 
 		out.RowsTotalPlanned = true
 	}
 	return out
+}
+
+// everyPlannedShardListed reports whether the listed shards are known to
+// cover every shard the plan spans the table across. A plan with no shard
+// count gives no way to tell, so coverage is unknown and reads as not covered.
+func everyPlannedShardListed(listed, plannedShards int) bool {
+	return plannedShards > 0 && listed >= plannedShards
 }
 
 // copyAheadWithoutTotal reports whether a shard that has reported no row
