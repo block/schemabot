@@ -111,12 +111,12 @@ func (s *controlRequestStore) listStrandedPending(ctx context.Context, limit int
 	for _, req := range stranded {
 		parent, ok := parents[req.ApplyID]
 		if !ok {
-			// The apply is gone. SchemaBot never deletes an apply and the storage
-			// schema has no foreign keys, so this request was left behind by a
-			// delete from outside SchemaBot. There is no apply to answer for, so
-			// the request stays as it is.
-			slog.WarnContext(ctx, "apply is missing for a stranded control request; the request is left unchanged",
-				"operation", req.Operation, "requested_by", req.RequestedBy)
+			// The scan selects only requests whose settled apply exists, so the
+			// apply was removed between the scan and the parent read. SchemaBot
+			// never deletes an apply, so this was a delete from outside SchemaBot.
+			// There is no apply to answer for, so the request stays as it is.
+			slog.WarnContext(ctx, "apply disappeared between the stranded control request scan and the parent read; the request is left unchanged",
+				"control_request_id", req.ID, "operation", req.Operation, "requested_by", req.RequestedBy)
 			continue
 		}
 		listed = append(listed, &storage.StrandedControlRequest{Request: req, Apply: parent})

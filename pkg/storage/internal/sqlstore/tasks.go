@@ -981,11 +981,11 @@ func (s *taskStore) reapStrandedRetryable(ctx context.Context, limit int) ([]*st
 	for _, task := range stranded {
 		parent, ok := parents[task.ApplyID]
 		if !ok {
-			// The parent apply is gone. SchemaBot never deletes an apply and the
-			// storage schema has no foreign keys, so this row was left behind by
-			// a delete from outside SchemaBot. There is no apply to settle against,
-			// so the row stays as it is.
-			slog.WarnContext(ctx, "parent apply is missing for a stranded retryable task; the task is left unchanged",
+			// The scan selects only rows whose settled parent exists, so the
+			// parent was removed between the scan and the parent read. SchemaBot
+			// never deletes an apply, so this was a delete from outside SchemaBot.
+			// There is no apply to settle against, so the row stays as it is.
+			slog.WarnContext(ctx, "parent apply disappeared between the stranded retryable task scan and the parent read; the task is left unchanged",
 				task.LogAttrs()...)
 			continue
 		}
@@ -1214,11 +1214,11 @@ func (s *taskStore) reapStrandedActive(ctx context.Context, limit int) ([]*stora
 	for _, task := range stranded {
 		parent, ok := parents[task.ApplyID]
 		if !ok {
-			// The parent apply is gone. SchemaBot never deletes an apply and the
-			// storage schema has no foreign keys, so this row was left behind by
-			// a delete from outside SchemaBot. There is no apply to settle against,
-			// so the row stays as it is.
-			slog.WarnContext(ctx, "parent apply is missing for a stranded active task; the task is left unchanged",
+			// The scan selects only rows whose settled parent exists, so the
+			// parent was removed between the scan and the parent read. SchemaBot
+			// never deletes an apply, so this was a delete from outside SchemaBot.
+			// There is no apply to settle against, so the row stays as it is.
+			slog.WarnContext(ctx, "parent apply disappeared between the stranded active task scan and the parent read; the task is left unchanged",
 				task.LogAttrs()...)
 			continue
 		}
