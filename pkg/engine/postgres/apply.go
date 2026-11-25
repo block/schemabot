@@ -991,6 +991,10 @@ func refusalForCause(err error, table string) *refusal {
 		// property — so rendering it verbatim is safe by construction.
 		return &refusal{reason: "unsupported-partitioned-parent", cause: partitionErr.Error()}
 	}
+	var proofErr *catalogOnlyProofError
+	if errors.As(err, &proofErr) {
+		return catalogOnlyProofRefusal(proofErr, table)
+	}
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
 		// Name whose limit this is: read cold, the size text sounds like a
@@ -1807,7 +1811,7 @@ func checkTableUnlessCatalogOnly(ctx context.Context, pool *pgxpool.Pool, change
 			"table", change.table,
 			"size_limit_bytes", limit,
 			"error", proofErr)
-		return preflight.PreflightedTable{}, fmt.Errorf("preflight PostgreSQL table %q: %w; prove the statement changes only the catalog: %w", change.table, err, proofErr)
+		return preflight.PreflightedTable{}, fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, &catalogOnlyProofError{size: sizeErr, proof: proofErr})
 	}
 	if !catalogOnly {
 		return preflight.PreflightedTable{}, fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
@@ -1821,6 +1825,51 @@ func checkTableUnlessCatalogOnly(ctx context.Context, pool *pgxpool.Pool, change
 		return preflight.PreflightedTable{}, fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
 	}
 	return table, nil
+}
+
+// sqlstateInsufficientPrivilege is the SQLSTATE the server returns when a
+// role lacks a privilege the statement needs.
+const sqlstateInsufficientPrivilege = "42501"
+
+// catalogOnlyProofError reports a table over the size limit whose statement
+// went unproven because the proof itself failed, not because the statement
+// rewrites or scans rows. It is not a size verdict: a retry, or a grant the
+// proof needs, can let the statement run. So it unwraps to the proof's
+// failure and never to the size error, and the size refusal cannot claim it.
+type catalogOnlyProofError struct {
+	size  *preflight.SizeError
+	proof error
+}
+
+func (e *catalogOnlyProofError) Error() string {
+	return fmt.Sprintf("%s; proving the statement changes only the catalog failed: %s", e.size, e.proof)
+}
+
+func (e *catalogOnlyProofError) Unwrap() error { return e.proof }
+
+// catalogOnlyProofRefusal decides the outcome of a failed catalog-only
+// proof. A role that cannot create the proof's temporary table needs a
+// grant, so that refusal names it. Any other failure, such as a dropped
+// connection or a server that briefly accepts no writes during a failover,
+// is operational, and a retry may prove the statement.
+func catalogOnlyProofRefusal(err *catalogOnlyProofError, table string) *refusal {
+	if probeLacksTemporaryGrant(err.proof) {
+		return &refusal{reason: "insufficient-privileges",
+			cause:         fmt.Sprintf("table %s is over the size limit, and proving the statement changes only the catalog needs a temporary table the engine role cannot create", quotedTable(table)),
+			remedy:        "grant TEMPORARY on the database to the engine role, then retry the apply",
+			provisionable: true}
+	}
+	return nil
+}
+
+// probeLacksTemporaryGrant reports whether the add-column proof could not
+// create its temporary table because the engine role lacks the privilege.
+func probeLacksTemporaryGrant(err error) bool {
+	if !errors.Is(err, preflight.ErrAddColumnProbeUnavailable) {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == sqlstateInsufficientPrivilege
 }
 
 // provenCatalogOnly classifies statement against the live table and reports

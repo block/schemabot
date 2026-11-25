@@ -210,17 +210,24 @@ any size, so the size limit does not apply to them.
 
 | Change | Catalog-only when |
 |---|---|
-| `ADD COLUMN` | pg-sprite proves against the live table that it neither rewrites nor scans the rows, its default is absent or a constant, and neither its type nor its default runs a user-defined function |
+| `ADD COLUMN` | pg-sprite proves against the live table that it neither rewrites nor scans the rows, its default is absent or a constant, and its type is built in or an enum |
 | `DROP COLUMN`, `SET DEFAULT`, `DROP DEFAULT`, `DROP NOT NULL`, `DROP CONSTRAINT` | Always |
 
 A `NOT NULL` column with no default still counts against the size limit,
 because PostgreSQL scans the rows to check it. So does a default such as
-`now()`, a domain type with a `CHECK`, and a statement that mixes a
-catalog-only change with any other change.
+`now()`, any user-defined type other than an enum (a domain, composite, or
+range type), and a statement that mixes a catalog-only change with any other
+change.
 
 pg-sprite proves the change against the live table when SchemaBot plans it,
-and again when the apply starts. If the second proof fails, the size limit
-applies and an oversized table is refused.
+and again when the apply starts. What happens at the second proof:
+
+| Second proof | Apply |
+|---|---|
+| Still catalog-only | Runs |
+| No longer catalog-only | Refused on size |
+| The engine role cannot create the proof's temporary table | Refused until you grant `TEMPORARY` on the database to that role |
+| Fails for another reason, such as a dropped connection | Fails without running anything; retry it |
 
 ## Example: add a column and an index
 
@@ -785,7 +792,7 @@ the apply fails and drops nothing. Fix the cause, then apply again.
 The plan lists the tables it exempted, by namespace, in the PR comment and in
 `schemabot plan` and `schemabot apply` output.
 
-**Tables `pull` cannot write.** `pull` refuses a whole namespace when any of
+**Tables `pull` cannot write.** `pull` refuses the whole pull when any of
 its tables has something the file format cannot represent: triggers, table or
 column comments, table options, inheritance, or a foreign key it cannot write
 (see the table below). Write those files by hand, or drop the tables through a
@@ -845,14 +852,16 @@ out. To keep it, declare it in the file. To remove it, run the
 - A foreign key added `NOT VALID` is written as an enforced one. The next plan
   shows its `VALIDATE CONSTRAINT`, which runs like an added key's second step.
 
-`pull` refuses both sides of a foreign key it cannot write:
+`pull` refuses a foreign key it cannot write. The table it names depends on the
+case:
 
-| The foreign key | Why |
-|---|---|
-| Crosses namespaces | A file cannot reference a table in another namespace |
-| Sits on a partition | A partition has no file of its own |
-| References its own table through a standalone unique index | The file would declare the key before the index exists. Make the index a `UNIQUE` constraint to pull it |
-| Sits on a table with row-level security | A file cannot declare row-level security and a foreign key together yet |
+| The foreign key | Tables named | Why |
+|---|---|---|
+| Crosses namespaces | Both | A file cannot reference a table in another namespace |
+| Sits on a partition | Both | A partition has no file of its own. Declare the key on the partitioned parent |
+| Sits on a table with no file of its own, such as one an extension owns | The referenced table | The key would be lost from the baseline |
+| References its own table through a standalone unique index | The referencing table | The file would declare the key before the index exists. Make the index a `UNIQUE` constraint to pull it |
+| Sits on a table with row-level security | The referencing table | A file cannot declare row-level security and a foreign key together yet |
 
 Remove the foreign key, or drop the table through a reviewed process, then
 pull again.
@@ -978,8 +987,9 @@ you select JSON output. Each PostgreSQL schema is a SchemaBot namespace.
 schema file format, the whole pull is refused and nothing is written. That
 covers tables with:
 
-- A foreign key into another namespace or on a partition, on either side.
-  See [Foreign keys](#foreign-keys)
+- A foreign key `pull` cannot write: into another namespace, on a partition,
+  on a table with row-level security, or referencing its own table through a
+  standalone unique index. See [Foreign keys](#foreign-keys)
 - Table inheritance, or `UNLOGGED`
 - Explicit collations
 - Sequence defaults it cannot represent safely
