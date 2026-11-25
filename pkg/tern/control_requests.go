@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -574,6 +575,17 @@ func settlePendingCancelForTerminalApply(ctx context.Context, store storage.Stor
 		logger.DebugContext(ctx, "no pending cancel request to settle; leaving the recorded outcome as found", apply.LogAttrs()...)
 		return nil
 	}
+	landed, err := cancelLandedOnFailedRollout(ctx, store, apply)
+	if err != nil {
+		return err
+	}
+	if landed.tookEffect() {
+		if err := completePendingControlRequests(ctx, store, apply, storage.ControlOperationCancel); err != nil {
+			return err
+		}
+		discloseCancelLandedOnFailedRollout(ctx, store, logger, apply, controlReq, landed)
+		return nil
+	}
 	reason := cancelOutrunReason(apply.State)
 	if reason == "" {
 		if err := completePendingControlRequests(ctx, store, apply, storage.ControlOperationCancel); err != nil {
@@ -584,6 +596,87 @@ func settlePendingCancelForTerminalApply(ctx context.Context, store storage.Stor
 	}
 	discloseSettledTerminalCancel(ctx, store, logger, apply, controlReq, reason)
 	return nil
+}
+
+// cancelledRolloutMembers counts how a failed rollout's members ended, for a
+// cancel that was pending while it settled.
+type cancelledRolloutMembers struct {
+	noun      presentation.Noun
+	cancelled int
+	failed    int
+}
+
+// tookEffect reports whether the cancel reached the outcome the operator asked
+// for: the members that had not finished ended cancelled rather than running
+// on. The apply reads failed only because other members failed, and failed
+// outranks cancelled in the rollout's derived state.
+func (m cancelledRolloutMembers) tookEffect() bool {
+	return m.cancelled > 0
+}
+
+// cancelLandedOnFailedRollout reads how the members of a failed apply ended.
+// A cancel accepted while some members were still running cancels the ones
+// that have not finished, and when other members have already failed the
+// rollout settles failed. Reading that state alone as the cancel being outrun
+// would tell the operator their command did nothing while it cancelled most of
+// the rollout. Any apply other than a failed one returns no members, and the
+// state alone decides the outcome.
+func cancelLandedOnFailedRollout(ctx context.Context, store storage.Storage, apply *storage.Apply) (cancelledRolloutMembers, error) {
+	members := cancelledRolloutMembers{noun: presentation.TargetNoun}
+	if !state.IsState(apply.State, state.Apply.Failed) {
+		return members, nil
+	}
+	operations := store.ApplyOperations()
+	if operations == nil {
+		return members, fmt.Errorf("settle pending cancel for failed apply %s: apply operation store is not available", apply.ApplyIdentifier)
+	}
+	ops, err := operations.ListByApply(ctx, apply.ID)
+	if err != nil {
+		return members, fmt.Errorf("list operations of failed apply %s to settle its pending cancel: %w", apply.ApplyIdentifier, err)
+	}
+	for _, op := range ops {
+		if op == nil || op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+			continue
+		}
+		if _, sharded := storage.OperationShard(op.OperationKind, op.OperationKey, op.Target); sharded {
+			members.noun = presentation.ShardNoun
+		}
+		switch {
+		case state.IsState(op.State, state.ApplyOperation.Cancelled):
+			members.cancelled++
+		case state.IsState(op.State, state.ApplyOperation.Failed):
+			members.failed++
+		}
+	}
+	return members, nil
+}
+
+// discloseCancelLandedOnFailedRollout records in the server log and the apply
+// history that a cancel took effect on a rollout that settled failed, naming
+// how many members it cancelled and how many failed, so the history does not
+// read as a cancel followed by an unexplained failure.
+//
+// Best-effort for the same reason as discloseSettledTerminalCancel.
+func discloseCancelLandedOnFailedRollout(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, members cancelledRolloutMembers) {
+	caller := controlRequestCaller(controlReq)
+	failure := "The apply ended failed"
+	if members.failed > 0 {
+		failure = fmt.Sprintf("The apply ended failed because %s failed", members.noun.Count(members.failed))
+	}
+	message := fmt.Sprintf("Cancel took effect: %s that had not finished %s cancelled. %s%s",
+		members.noun.Count(members.cancelled), wasOrWere(members.cancelled), failure, callerApplyLogSuffix(caller))
+	logger.InfoContext(ctx, "completing pending cancel request: the cancel took effect on a rollout that settled failed",
+		append(apply.LogAttrs(), "requested_by", caller,
+			"cancelled_member_count", members.cancelled, "failed_member_count", members.failed)...)
+	appendSettledRequestEvent(ctx, store, logger, apply, storage.LogLevelInfo, storage.LogEventCancelRequested, message)
+}
+
+// wasOrWere agrees the verb with a member count.
+func wasOrWere(count int) string {
+	if count == 1 {
+		return "was"
+	}
+	return "were"
 }
 
 // cancelOutrunReason names what overtook an accepted cancel on an apply that
