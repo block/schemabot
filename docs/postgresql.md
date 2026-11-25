@@ -67,6 +67,10 @@ early release.
 - Adding an index to a partitioned table, one partition at a time. Applying
   again after a cancel or failure resumes from the partitions already built.
 - Creating a table together with its indexes.
+- Adding a foreign key to an existing table, or creating a table that has
+  one. See [Foreign keys](#foreign-keys).
+- Dropping a table whose schema file was deleted, after you approve the drop
+  with `--allow-unsafe`. See [Tables with no schema file](#tables-with-no-schema-file).
 - Adding labels to an existing enum type. See [Enum types](#enum-types).
 - Row-level security policies on an existing table.
 - `schemabot init` and `schemabot pull` for an existing database.
@@ -79,12 +83,11 @@ early release.
 | Rewriting a table, such as changing a column's type | Blocked. It needs pg-sprite's copy-and-swap, which is still in preview |
 | `ALTER TABLE` on a table larger than the size limit, unless it only changes the catalog | Blocked, for the same reason |
 | Dropping a foreign key | Blocked. See [Foreign keys](#foreign-keys) for running one yourself |
-| Dropping a table | Blocked. There is no pending-drops quarantine to hold one |
 | Creating an enum type, or removing or reordering its labels | Blocked |
 | `stop`, `start`, `cutover`, deferred cutover, `revert`, `skip-revert` | Not available. Only an index build can be cancelled. See [Unsupported workflow features](#unsupported-workflow-features) |
 | Some changes to a partitioned table's parent | Refused when the apply runs. See [Partitioned tables](#partitioned-tables) |
 | Row-level security on a new table, or mixed with structural changes | Blocked. A namespace with managed RLS cannot be rolled back. See [Row-level security](#row-level-security) |
-| Pulling every table shape | `pull` refuses tables it cannot write completely, rather than writing a partial schema. See [Schema pull](#schema-pull) |
+| Pulling every table shape | `pull` skips a table it cannot write completely and names it, rather than writing a partial file. `onboard` and `init` add it to `ignore_tables`. See [Schema pull](#schema-pull) |
 | Detailed catalog output from the schema intelligence API | Not available |
 
 **A passing plan is not a promise that the apply will succeed.** Some checks
@@ -795,11 +798,11 @@ the apply fails and drops nothing. Fix the cause, then apply again.
 The plan lists the tables it exempted, by namespace, in the PR comment and in
 `schemabot plan` and `schemabot apply` output.
 
-**Tables `pull` cannot write.** `pull` refuses the whole pull when any of
-its tables has something the file format cannot represent: triggers, table or
-column comments, inheritance, or a foreign key it cannot write
-(see the table below). Write those files by hand, or drop the tables through a
-reviewed process, before you pull the rest.
+**Tables `pull` cannot write.** `pull` skips a table that has something the
+file format cannot represent, such as a trigger, a table or column comment, or
+a foreign key it cannot write, and names it with the reason. `onboard` and
+`init` add the table to `ignore_tables`, so the next plan leaves it alone
+instead of dropping it. See [Schema pull](#schema-pull).
 
 A hand-written file can use `CREATE UNLOGGED TABLE`, `PARTITION BY`, and an
 `INHERITS` child flattened to its own columns. Each inheritance child and
@@ -855,10 +858,10 @@ out. To keep it, declare it in the file. To remove it, run the
 - A foreign key added `NOT VALID` is written as an enforced one. The next plan
   shows its `VALIDATE CONSTRAINT`, which runs like an added key's second step.
 
-`pull` refuses a foreign key it cannot write. The table it names depends on the
-case:
+`pull` skips the tables a foreign key it cannot write would leave incomplete.
+Which tables depends on the case:
 
-| The foreign key | Tables named | Why |
+| The foreign key | Tables skipped | Why |
 |---|---|---|
 | Crosses namespaces | Both | A file cannot reference a table in another namespace |
 | Sits on a partition | Both | A partition has no file of its own. Declare the key on the partitioned parent |
