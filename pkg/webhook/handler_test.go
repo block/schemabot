@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -21,7 +22,9 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -495,6 +498,12 @@ func TestCheckRunRerequestIgnoresStaleHeadSHA(t *testing.T) {
 // Returns the handler and a channel that receives posted comment bodies.
 func newTestHandler(t *testing.T) (*Handler, chan string, chan string) {
 	t.Helper()
+	return newTestHandlerWithStorage(t, &emptyStorage{})
+}
+
+// newTestHandlerWithStorage is newTestHandler backed by the given storage.
+func newTestHandlerWithStorage(t *testing.T, st storage.Storage) (*Handler, chan string, chan string) {
+	t.Helper()
 	client, mux := setupGitHubServer(t)
 
 	comments := make(chan string, 10)
@@ -524,7 +533,7 @@ func newTestHandler(t *testing.T) (*Handler, chan string, chan string) {
 
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	factory := &fakeClientFactory{client: installClient}
-	service := api.New(&emptyStorage{}, &api.ServerConfig{
+	service := api.New(st, &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{},
 	}, nil, testLogger())
 
@@ -798,24 +807,45 @@ func TestWebhookYesFlagRejectedOnNonApply(t *testing.T) {
 	}
 }
 
+// A control command that names no apply gets the usage reply before SchemaBot
+// looks for any apply, so it never acts on one it inferred (CO-11). The PR has
+// exactly one active apply, the one a guess would pick, and the command still
+// neither reads it nor records a control request against it.
+// The command list comes from the storage registry, so a new control operation
+// is held to the rule without anyone extending this test. Rollback is checked
+// beside them: it acts on the apply it reverses, and has its own usage reply.
 func TestWebhookControlCommandMissingApplyID(t *testing.T) {
-	tests := []struct {
-		name    string
-		comment string
-		action  string
-	}{
-		{name: "stop", comment: "schemabot stop -e staging", action: "stop"},
-		{name: "cancel", comment: "schemabot cancel -e staging", action: "cancel"},
-		{name: "start", comment: "schemabot start -e staging", action: "start"},
-		{name: "cutover", comment: "schemabot cutover -e staging", action: "cutover"},
+	type missingIDCase struct {
+		action string
+		usage  string
 	}
+	var tests []missingIDCase
+	for _, op := range storage.ControlOperations() {
+		tests = append(tests, missingIDCase{
+			action: op.Command(),
+			usage:  "schemabot " + op.Command() + " <apply-id> -e <environment>",
+		})
+	}
+	tests = append(tests, missingIDCase{action: action.Rollback, usage: "schemabot rollback <apply-id>"})
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h, comments, _ := newTestHandler(t)
+		t.Run(tt.action, func(t *testing.T) {
+			spec, ok := specByName[tt.action]
+			require.True(t, ok, "control operation %q has no PR comment command", tt.action)
+			require.True(t, spec.HasApplyID, "PR comment command %q must take the apply ID it acts on", tt.action)
+
+			st := newActiveApplyStorage(&storage.Apply{
+				ID:              7,
+				ApplyIdentifier: "apply-the-only-active-one",
+				Repository:      "octocat/hello-world",
+				PullRequest:     1,
+				Environment:     "staging",
+				State:           state.Apply.Running,
+			})
+			h, comments, _ := newTestHandlerWithStorage(t, st)
 
 			req := buildWebhookRequest(t, webhookPayloadOpts{
-				comment: tt.comment,
+				comment: "schemabot " + tt.action + " -e staging",
 				isPR:    true,
 			}, nil)
 
@@ -823,15 +853,20 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 			h.ServeHTTP(rr, req)
 
 			require.Equal(t, http.StatusOK, rr.Code)
-			assert.Contains(t, rr.Body.String(), tt.action+" started")
 
 			select {
 			case body := <-comments:
 				assert.Contains(t, body, "Missing Apply ID")
-				assert.Contains(t, body, "schemabot "+tt.action+" <apply-id> -e <environment>")
+				assert.Contains(t, body, tt.usage)
 			case <-time.After(2 * time.Second):
 				require.FailNow(t, "timed out waiting for missing apply ID comment")
 			}
+			drainCtx, cancel := context.WithTimeout(t.Context(), durableWebhookTestDeadline)
+			defer cancel()
+			h.DrainInProcessWebhookWork(drainCtx)
+			require.NoError(t, drainCtx.Err(), "the command's webhook work was still running")
+			assert.Zero(t, st.applyReads(), "the command looked up an apply it was not given")
+			assert.Empty(t, st.recordedControlRequests(), "the command recorded a control request against an apply it inferred")
 		})
 	}
 }
@@ -1672,4 +1707,91 @@ func TestWebhookNarrowedPlanWithoutEnvironmentAsksForIt(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		require.FailNow(t, "timed out waiting for error comment")
 	}
+}
+
+// activeApplyStorage holds one active apply for the PR and counts every read
+// of it and every control request written against it.
+type activeApplyStorage struct {
+	emptyStorage
+	apply *storage.Apply
+
+	mu       sync.Mutex
+	reads    int
+	requests []*storage.ApplyControlRequest
+}
+
+func newActiveApplyStorage(apply *storage.Apply) *activeApplyStorage {
+	return &activeApplyStorage{apply: apply}
+}
+
+func (s *activeApplyStorage) Applies() storage.ApplyStore {
+	return &seededApplyStore{owner: s}
+}
+
+func (s *activeApplyStorage) ControlRequests() storage.ControlRequestStore {
+	return &recordingControlRequestStore{owner: s}
+}
+
+func (s *activeApplyStorage) applyReads() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reads
+}
+
+func (s *activeApplyStorage) recordedControlRequests() []*storage.ApplyControlRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*storage.ApplyControlRequest(nil), s.requests...)
+}
+
+func (s *activeApplyStorage) read() *storage.Apply {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reads++
+	return s.apply
+}
+
+func (s *activeApplyStorage) record(req *storage.ApplyControlRequest) *storage.ApplyControlRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requests = append(s.requests, req)
+	return req
+}
+
+type seededApplyStore struct {
+	emptyApplyStore
+	owner *activeApplyStorage
+}
+
+func (s *seededApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	return s.owner.read(), nil
+}
+
+func (s *seededApplyStore) GetByPR(context.Context, string, int) ([]*storage.Apply, error) {
+	return []*storage.Apply{s.owner.read()}, nil
+}
+
+func (s *seededApplyStore) GetByApplyIdentifier(context.Context, string) (*storage.Apply, error) {
+	return s.owner.read(), nil
+}
+
+type recordingControlRequestStore struct {
+	storage.ControlRequestStore
+	owner *activeApplyStorage
+}
+
+func (s *recordingControlRequestStore) RequestPending(_ context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
+	return s.owner.record(req), false, nil
+}
+
+func (s *recordingControlRequestStore) RequestPendingCommand(_ context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
+	return s.owner.record(req), false, nil
+}
+
+func (s *recordingControlRequestStore) RequestPendingSuperseding(_ context.Context, req *storage.ApplyControlRequest, _ storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
+	return s.owner.record(req), false, nil
+}
+
+func (s *recordingControlRequestStore) StopQueuedStart(_ context.Context, stop *storage.ApplyControlRequest, _ bool) (*storage.ApplyControlRequest, storage.QueuedStartStop, error) {
+	return s.owner.record(stop), "", nil
 }

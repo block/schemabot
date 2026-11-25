@@ -148,28 +148,34 @@ func TestBuildSpiritTableProgress(t *testing.T) {
 		assert.Equal(t, 0, got[0].Progress)
 	})
 
-	// A completed copy is a count, not an estimate: the reported total is
-	// reconciled to the copied rows whether the statistics estimate landed
-	// high or low, so the table shows a consistent 100% with matching rows.
-	t.Run("completed copy reconciles the estimated total to the copied count", func(t *testing.T) {
+	// Spirit counts the rows its copy inserted, which falls short of the
+	// table's size whenever the copy skipped rows, so a finished copy keeps
+	// the cardinality estimate as its total unless the count exceeds it.
+	t.Run("completed copy keeps the estimate unless the count exceeds it", func(t *testing.T) {
 		prog := status.Progress{
 			Tables: []status.TableProgress{
 				{TableName: "users", RowsCopied: 3261100506, RowsTotal: 3291032158, IsComplete: true},
 				{TableName: "orders", RowsCopied: 1200, RowsTotal: 1000, IsComplete: true},
+				{TableName: "events", RowsCopied: 1, RowsTotal: 200000, IsComplete: true},
 			},
 		}
 		got := buildSpiritTableProgress(prog, status.CopyRows, ddlByTable, tableNamespace)
-		require.Len(t, got, 2)
+		require.Len(t, got, 3)
 
 		estimateHigh := got[0]
 		assert.Equal(t, int64(3261100506), estimateHigh.RowsCopied)
-		assert.Equal(t, int64(3261100506), estimateHigh.RowsTotal)
+		assert.Equal(t, int64(3291032158), estimateHigh.RowsTotal, "a short count does not prove the estimate high")
 		assert.Equal(t, 100, estimateHigh.Progress)
 
 		estimateLow := got[1]
 		assert.Equal(t, int64(1200), estimateLow.RowsCopied)
-		assert.Equal(t, int64(1200), estimateLow.RowsTotal)
+		assert.Equal(t, int64(1200), estimateLow.RowsTotal, "a count above the estimate proves it low")
 		assert.Equal(t, 100, estimateLow.Progress)
+
+		duplicatesDropped := got[2]
+		assert.Equal(t, int64(1), duplicatesDropped.RowsCopied)
+		assert.Equal(t, int64(200000), duplicatesDropped.RowsTotal, "rows a new UNIQUE key dropped leave the table's size alone")
+		assert.Equal(t, 100, duplicatesDropped.Progress)
 	})
 
 	// During Spirit's post-copy phases every table copy is already complete,

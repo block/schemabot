@@ -282,12 +282,12 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 		assert.Contains(t, plain, "eta=")
 	})
 
-	t.Run("rows override an overshooting whole-number percent", func(t *testing.T) {
+	t.Run("rows set the percent below the engine's whole-number percent", func(t *testing.T) {
 		e := &logEmitter{}
 		ts := &tableLogState{}
 		tbl := &apitypes.TableProgressResponse{
 			TableName:       "orders",
-			PercentComplete: 105,
+			PercentComplete: 96,
 			RowsCopied:      221000,
 			RowsTotal:       230000,
 		}

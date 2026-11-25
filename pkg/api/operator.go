@@ -1305,8 +1305,8 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	//   - dualLeaseCtx carries both for the engine run, which writes both the
 	//     operation's tasks and the parent applies row.
 	applyLeaseCtx := storage.WithApplyLease(ctx, applyLease)
-	operationLeaseCtx := storage.WithOperationLease(ctx, opLease)
-	dualLeaseCtx := storage.WithOperationLease(applyLeaseCtx, opLease)
+	operationLeaseCtx := storage.WithOperationChangeAttempt(storage.WithOperationLease(ctx, opLease), op)
+	dualLeaseCtx := storage.WithApplyLease(operationLeaseCtx, applyLease)
 
 	// The claimed operation row's deployment is the authoritative routing key
 	// for the drive: RoutingClient.ResumeApplyOperation reloads the operation
@@ -1352,18 +1352,14 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 			return claimSpent
 		}
 		var drivePanic *panicsafe.Error
-		if !errors.As(resumeErr, &drivePanic) && !postTerminalReconcileSettlesHere(runCtx, resumeErr) {
+		if !errors.As(resumeErr, &drivePanic) && !settledDriveErrorAllowsOperationUpdate(runCtx, resumeErr) {
 			// Transient drive failures, and a drive this driver may no longer
 			// write for, leave the operation claimable so a later poll retries
 			// it; resumeClaimedApply already logged the cause.
 			return claimSpent
 		}
-		// A contained drive panic already failed this operation's tasks and the
-		// parent apply. A drive that stored the apply's terminal outcome and then
-		// could not answer a request after it has settled the schema change, and
-		// nothing re-claims a settled apply to finish that work. Either way, fall
-		// through so the operation row is persisted from its now-terminal tasks
-		// immediately and the post-drive settlement answers the requests the
+		// The drive already recorded the outcome. Persist the operation from
+		// its settled tasks under this claim before answering any requests the
 		// outcome resolves.
 	}
 
@@ -1658,7 +1654,7 @@ func (s *Service) forgetResumeObserverGeneration(applyID int64, generation uint6
 // drive — the driver owns only its operation row and tasks; the parent state and
 // the once-only terminal summary are this method's projection responsibility.
 func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease, cutover bool) claimOutcome {
-	operationLeaseCtx := storage.WithOperationLease(ctx, opLease)
+	operationLeaseCtx := storage.WithOperationChangeAttempt(storage.WithOperationLease(ctx, opLease), op)
 
 	apply, err := s.storage.Applies().Get(operationLeaseCtx, op.ApplyID)
 	if err != nil {
@@ -2757,6 +2753,24 @@ func (s *Service) recheckOperationLease(ctx context.Context, driverID int, op *s
 // driver's own claim — keeps the row unclaimable for a full staleness window,
 // which is the stall the release exists to avoid.
 func (s *Service) releaseOperationClaimBeforeDrive(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease) {
+	if op.StartsAttempt && state.IsState(op.State, state.ApplyOperation.Pending, state.ApplyOperation.Stopped) {
+		// A claim that never dispatched should remain eligible for its first
+		// start on the next drive. The compare-and-set restores the claim's
+		// prior state only while this driver still owns the unchanged row.
+		returned, err := s.storage.ApplyOperations().ReturnUnstartedClaim(ctx, opLease, op.State)
+		if err != nil {
+			s.logClaimFailure(ctx, "operator: failed to return the claim of an operation that did not start", "unstarted_claim_return_error",
+				append(op.LogAttrs(), "driver", driverID, "error", err)...)
+			return
+		}
+		if returned {
+			return
+		}
+	}
+	s.releaseOperationClaim(ctx, driverID, op, opLease)
+}
+
+func (s *Service) releaseOperationClaim(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease) {
 	released, err := s.storage.ApplyOperations().ReleaseClaim(ctx, opLease)
 	if err != nil {
 		s.logClaimFailure(ctx, "operator: failed to release the operation lease this driver will not drive under; the operation is retried once its lease goes stale", "operation_lease_release_error",
@@ -2792,7 +2806,7 @@ func (s *Service) handBackDeferredCutoverDrive(ctx context.Context, driverID int
 	if holdsParent {
 		s.releaseParentApplyClaim(releaseCtx, driverID, apply, op)
 	}
-	s.releaseOperationClaimBeforeDrive(releaseCtx, driverID, op, opLease)
+	s.releaseOperationClaim(releaseCtx, driverID, op, opLease)
 }
 
 // releaseFinishedOperationClaim clears the operation lease a drive leaves
@@ -2918,29 +2932,7 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, 
 		return
 	}
 	metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
-	released, err := s.storage.ApplyOperations().ReleaseClaim(ctx, opLease)
-	if err != nil {
-		s.logClaimFailure(ctx, "operator: parent apply not claimable and operation lease release failed; operation will be retried once its lease goes stale", "operation_lease_release_error",
-			append(parent.LogAttrs(),
-				"driver", driverID,
-				"apply_operation_id", op.ID,
-				"operation_deployment", op.Deployment,
-				"error", err)...)
-		return
-	}
-	if !released {
-		s.logger.Warn("operator: parent apply not claimable and operation lease already rotated; the new lease owner drives the operation",
-			append(parent.LogAttrs(),
-				"driver", driverID,
-				"apply_operation_id", op.ID,
-				"operation_deployment", op.Deployment)...)
-		return
-	}
-	s.logger.Warn("operator: parent apply not claimable for operation; operation lease released for retry on the next poll",
-		append(parent.LogAttrs(),
-			"driver", driverID,
-			"apply_operation_id", op.ID,
-			"operation_deployment", op.Deployment)...)
+	s.releaseOperationClaimBeforeDrive(ctx, driverID, op, opLease)
 }
 
 func (s *Service) reconcileClaimedOperationFromTerminalParent(ctx context.Context, driverID int, op *storage.ApplyOperation, parent *storage.Apply) {
@@ -3012,19 +3004,11 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, dri
 	s.publishTerminalSummaryIfWon(applyCtx, driverID, apply, result)
 }
 
-// postTerminalReconcileSettlesHere reports whether a failed drive is one whose
-// caller settles the apply in place: the drive stored the apply's terminal
-// outcome and only an answer owed after it did not land, so the caller persists
-// the operation row from its terminal tasks and runs the post-drive settlement.
-//
-// A reconcile refused because the apply lease was lost, or cut short by the
-// drive's context, is not one, even though it carries the same sentinel:
-// resumeClaimedApplyWithOptions classifies those first, and a driver that lost
-// its lease or is stopping must write nothing more for the apply. The stored
-// outcome stands either way, and the reaper's sweep of control requests
-// stranded on settled applies answers the request instead.
-func postTerminalReconcileSettlesHere(ctx context.Context, err error) bool {
-	if !errors.Is(err, tern.ErrPostTerminalReconcile) {
+// settledDriveErrorAllowsOperationUpdate reports whether the drive proved the
+// apply outcome was stored and can still settle its own operation under the
+// current claim. A displaced or cancelled drive leaves settlement to recovery.
+func settledDriveErrorAllowsOperationUpdate(ctx context.Context, err error) bool {
+	if !errors.Is(err, tern.ErrPostTerminalReconcile) && !errors.Is(err, tern.ErrGroupedResumeFailureCommitted) {
 		return false
 	}
 	if errors.Is(err, tern.ErrApplyLeasePresumedLost) || errors.Is(err, storage.ErrApplyLeaseLost) {
@@ -3335,7 +3319,9 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 		logger.Error("operator: failed to resume apply",
 			"error", err)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "resume_error")
-		if retryableClaim {
+		// A committed grouped failure already released the active apply gauge
+		// when the drive stored the failure.
+		if retryableClaim && !errors.Is(err, tern.ErrGroupedResumeFailureCommitted) {
 			metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 		}
 		return false, err
