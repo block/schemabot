@@ -1123,6 +1123,8 @@ type mockApplyOperationStore struct {
 	getByKeyErr error
 	// markTerminalErr fails MarkTerminal.
 	markTerminalErr error
+	// listErr fails ListByApply.
+	listErr error
 }
 
 func (m *mockApplyOperationStore) GetByApplyDeploymentAndOperationKey(_ context.Context, applyID int64, deployment, operationKey string) (*storage.ApplyOperation, error) {
@@ -1146,6 +1148,9 @@ func (m *mockApplyOperationStore) Get(_ context.Context, id int64) (*storage.App
 }
 
 func (m *mockApplyOperationStore) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyOperation, error) {
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
 	var ops []*storage.ApplyOperation
 	for _, op := range m.ops {
 		if op != nil && op.ApplyID == applyID {
