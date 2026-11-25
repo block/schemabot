@@ -615,10 +615,8 @@ func newDrainedOutcome(rm *runningSchemaChange) *drainedOutcome {
 			tp.ThrottleReason = ""
 			if rm.state == engine.StateCompleted {
 				tp.Progress = 100
-				// A completed change copied everything, so the copied count is
-				// ground truth: reconcile the estimated total to it the way the
-				// live path does.
-				tp.RowsTotal = tp.RowsCopied
+				// The same total the live path reports for a finished copy.
+				tp.RowsTotal = completedCopyTotal(tp.RowsCopied, tp.RowsTotal)
 			}
 			tables = append(tables, tp)
 		}
@@ -1346,10 +1344,9 @@ func directStatementTableProgress(rm *runningSchemaChange) []engine.TableProgres
 // essentially done).
 //
 // Spirit's per-table RowsTotal is a statistics-based estimate, not a count, so
-// a finished copy can land above or below it. Once the copy is complete the
-// copied count is ground truth: the total is reconciled to it so the table
-// reports a consistent 100% instead of a full bar contradicted by its own rows
-// line (estimate high) or an over-100 ratio (estimate low).
+// a finished copy can land above or below it. A finished table reports 100%
+// and the total completedCopyTotal settles on, which surfaces read as the
+// table's size.
 func buildSpiritTableProgress(prog status.Progress, spiritState status.State, ddlByTable, tableNamespace map[string]string) []engine.TableProgress {
 	stateStr := spiritState.String()
 	var etaSeconds int64
@@ -1367,7 +1364,7 @@ func buildSpiritTableProgress(prog status.Progress, spiritState status.State, dd
 			RowsTotal:  int64(st.RowsTotal),
 		}
 		if st.IsComplete {
-			tp.RowsTotal = tp.RowsCopied
+			tp.RowsTotal = completedCopyTotal(tp.RowsCopied, tp.RowsTotal)
 			tp.Progress = 100
 			// While the runner works through its post-copy phases the table's
 			// interesting state is that phase (applying accumulated changes,
@@ -1403,6 +1400,16 @@ func buildSpiritTableProgress(prog status.Progress, spiritState status.State, dd
 		tableProgress = append(tableProgress, tp)
 	}
 	return tableProgress
+}
+
+// completedCopyTotal is the row total a finished copy reports. Spirit counts
+// the rows its copy inserted, so a copy finishes short of the table's size
+// whenever it skipped rows: the binlog applier wrote them first on a busy
+// table, or a new UNIQUE key dropped duplicates. Only a count above the
+// cardinality estimate proves the estimate low, so the total is raised to
+// the count and never lowered to it.
+func completedCopyTotal(rowsCopied, estimatedTotal int64) int64 {
+	return max(rowsCopied, estimatedTotal)
 }
 
 // tableInPacedPhase reports whether a table is doing work the runner's
