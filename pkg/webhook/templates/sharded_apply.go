@@ -681,7 +681,9 @@ func keepsShardedProgressBar(status string, t ShardedTableStatus) bool {
 
 // writeShardedTablePhaseProgress renders a sharded table whose shards are past
 // or beside the row copy: the bar across every shard the table spans
-// (presentation.ShardedPhasePercent), and the rows line. A shard that has not
+// (presentation.ShardedPhasePercent), and the rows line. When the total
+// includes the plan's estimate for the shards still to copy, the bar is the
+// rows copied over that planned total. Otherwise a shard that has not
 // reported, whether queued or not yet attached, counts as nothing, so one
 // verified shard beside three queued ones reads as a quarter done rather than
 // nearly complete.

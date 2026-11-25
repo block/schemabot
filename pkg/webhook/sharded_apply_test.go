@@ -710,6 +710,55 @@ func TestBuildShardedApplyData_CountsThePlannedRowsOfShardsStillToCopy(t *testin
 	assert.False(t, withoutView.Keyspaces[0].Tables[0].RowsTotalPlanned)
 }
 
+// The comment adds the plan's estimates for shards still to copy only when
+// every shard the plan spans has an operation listed. A plan that recorded no
+// shard count, or one spanning more shards than have operations attached so
+// far, leaves the total at the reporting shard's figure, never planned.
+func TestBuildShardedApplyData_CountsNoPlannedRowsUnlessEveryPlannedShardIsListed(t *testing.T) {
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "shop_sharded/-80/orders", state.ApplyOperation.Running),
+		mk(2, "shop_sharded/80-/orders", state.ApplyOperation.Pending),
+	}
+	opID := int64(1)
+	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &opID, Shard: "-80", Namespace: "shop_sharded", TableName: "orders",
+		DDLAction: "alter", State: state.Task.Running, RowsCopied: 620, RowsTotal: 1_000, ETASeconds: 60}}
+	shardChange := func(rows int64) []storage.TableChange {
+		return []storage.TableChange{{Table: "orders", Operation: "alter", EstimatedRows: new(rows)}}
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Running, PlanID: 7}
+
+	for _, tc := range []struct {
+		name       string
+		shardCount int
+	}{
+		{name: "no shard count", shardCount: 0},
+		{name: "more planned shards than operations", shardCount: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_sharded": {
+				Tables: []storage.TableChange{{Table: "orders", Operation: "alter", EstimatedRows: new(int64(2_200)), ShardCount: tc.shardCount}},
+				Shards: []storage.ShardPlan{
+					{Shard: "-80", Namespace: "shop_sharded", Changes: shardChange(1_000)},
+					{Shard: "80-", Namespace: "shop_sharded", Changes: shardChange(1_200)},
+				},
+			}}}
+			view := resolveShardedPlanView(t.Context(), &stubPlanStorage{plan: plan}, apply, ops)
+
+			data := buildShardedApplyData(apply, ops, false, tasks, view, "")
+
+			require.Len(t, data.Keyspaces, 1)
+			require.Len(t, data.Keyspaces[0].Tables, 1)
+			orders := data.Keyspaces[0].Tables[0]
+			assert.Equal(t, int64(620), orders.RowsCopied)
+			assert.Equal(t, int64(1_000), orders.RowsTotal, "only the reported shard's total")
+			assert.False(t, orders.RowsTotalPlanned)
+		})
+	}
+}
+
 // A sharded apply that renders as one change on one database runs on the
 // shard covering the whole keyrange, so the table's planned size is its own
 // and reaches the single-deployment progress line.

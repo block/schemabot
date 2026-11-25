@@ -148,6 +148,45 @@ func TestProgressByApplyIDCountsThePlannedRowsOfShardsStillToCopy(t *testing.T) 
 	assert.Equal(t, int32(28), table.PercentComplete)
 }
 
+// The plan's shard count decides whether its estimates can stand in for the
+// shards still to copy. A plan that recorded no shard count, or one that
+// spans more shards than have operations attached so far, leaves the total
+// at what the reporting shard says, never marked planned.
+func TestProgressByApplyIDCountsNoPlannedRowsUnlessEveryPlannedShardIsListed(t *testing.T) {
+	shardChange := func(rows int64) []storage.TableChange {
+		return []storage.TableChange{{Table: "orders", Operation: "alter", DDL: shardedTestDDL, EstimatedRows: new(rows)}}
+	}
+	for _, tc := range []struct {
+		name       string
+		shardCount int
+	}{
+		{name: "no shard count", shardCount: 0},
+		{name: "more planned shards than operations", shardCount: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := []*storage.ApplyOperation{
+				shardOp(1, "shop_001/-80/orders", state.ApplyOperation.Running),
+				shardOp(2, "shop_001/80-/orders", state.ApplyOperation.Pending),
+			}
+			plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {
+				Tables: []storage.TableChange{{Table: "orders", Operation: "alter", EstimatedRows: new(int64(2_000)), ShardCount: tc.shardCount}},
+				Shards: []storage.ShardPlan{
+					{Shard: "-80", Namespace: "shop_001", Changes: shardChange(1_000)},
+					{Shard: "80-", Namespace: "shop_001", Changes: shardChange(1_200)},
+				},
+			}}}
+
+			resp := shardedProgress(t, ops, []*storage.Task{shardTask(1, state.Task.Running, 620, 1000)}, &staticPlanStore{plan: plan})
+
+			require.Len(t, resp.Tables, 1)
+			table := resp.Tables[0]
+			assert.Equal(t, int64(620), table.RowsCopied)
+			assert.Equal(t, int64(1000), table.RowsTotal, "only the reported shard's total")
+			assert.False(t, table.RowsTotalPlanned)
+		})
+	}
+}
+
 // A table copying on -80 while 80- has no copy ahead of it keeps the
 // reported shard's exact total: 80- adds no estimate when its change copies no
 // rows, when its estimate is negative, or when it failed before reporting a
