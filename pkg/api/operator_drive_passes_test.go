@@ -118,8 +118,8 @@ func TestDrivePassesDoesNotAskAPolledClaimToReportContention(t *testing.T) {
 	assert.False(t, ops.claimFilters[0].ReportContention, "a polled claim does not ask storage to report contention")
 }
 
-// A claimable operation stays locked through every retry, as under a long
-// transaction. The driver gives up after a bounded number of retries and
+// Every claim retry takes nothing while its lock-free reread finds an
+// operation claimable. The driver gives up after a bounded number of retries and
 // leaves the operation to its next wake or tick, rather than polling storage,
 // and says so at Warn with the lease owner it claimed as.
 func TestDrivePassesBoundsContendedClaimRetries(t *testing.T) {
@@ -129,7 +129,7 @@ func TestDrivePassesBoundsContendedClaimRetries(t *testing.T) {
 	drivePassesWithin(t, svc, openClaimGate(), passExpectsWork)
 
 	assert.Equal(t, 1+contendedClaimRetries, ops.claims, "one claim plus a bounded number of retries")
-	assert.Contains(t, logs.String(), `level=WARN msg="operator: a claimable apply_operation stayed locked by another transaction through every retry`)
+	assert.Contains(t, logs.String(), `level=WARN msg="operator: every claim retry took no apply_operation while its lock-free reread found one claimable`)
 	assert.Contains(t, logs.String(), "lease_owner="+driverLeaseOwner(1))
 }
 

@@ -2929,9 +2929,10 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 // interval while the work sits claimable.
 //
 // It reruns the claim's own read, gates and order unchanged, without taking
-// row locks. A row found there was eligible but held, so it returns
-// ErrOperationClaimContended; no row means nothing is claimable, and it
-// returns nil.
+// row locks, in a fresh snapshot. A row found there was usually eligible but
+// held, and can also be one that became claimable after the claim ran; either
+// way it returns ErrOperationClaimContended. No row means nothing is
+// claimable, and it returns nil.
 func claimContention(ctx context.Context, tx *rebindTx, claimQuery string, args []any) error {
 	held, err := scanApplyOperationInto(tx.QueryRowContext(ctx, claimQuery, args...))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -2940,7 +2941,7 @@ func claimContention(ctx context.Context, tx *rebindTx, claimQuery string, args 
 	if err != nil {
 		return fmt.Errorf("reread claimable apply_operations without row locks after the claim took none: %w", err)
 	}
-	return fmt.Errorf("apply_operation %d of apply %d is claimable but another transaction holds its row: %w",
+	return fmt.Errorf("apply_operation %d of apply %d is claimable but the claim took none: %w",
 		held.ID, held.ApplyID, storage.ErrOperationClaimContended)
 }
 

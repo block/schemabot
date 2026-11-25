@@ -827,14 +827,14 @@ const (
 	passExpectsWork
 )
 
-// reportContendedClaimExhausted records that a claimable operation stayed
-// row-locked by another transaction through every retry. The transactions
-// that briefly lock a claimable row end within a retry or two, so a row still
-// locked after all of them points at a long transaction holding it: the
-// operation waits for the next wake or tick, and keeps waiting for as long as
-// that transaction runs.
+// reportContendedClaimExhausted records that every retry was contended: each
+// claim took nothing while its lock-free reread found a claimable operation.
+// Each reread is a fresh snapshot, so successive retries can find different
+// operations, and a reread can find one that became claimable after its claim
+// ran. Repeated contention is therefore the finding, not one row held by one
+// long transaction. The work waits for the driver's next wake or tick.
 func (s *Service) reportContendedClaimExhausted(ctx context.Context, driverID, retries int) {
-	s.logger.Warn("operator: a claimable apply_operation stayed locked by another transaction through every retry; the driver leaves it to the next wake or tick, and it stays unstarted while that transaction holds its row",
+	s.logger.Warn("operator: every claim retry took no apply_operation while its lock-free reread found one claimable; the driver leaves the work to its next wake or tick. The rereads are separate snapshots, so this is repeated contention, not proof that one transaction held one row",
 		"driver", driverID, "lease_owner", driverLeaseOwner(driverID), "retries", retries)
 	metrics.RecordOperatorClaimFailure(ctx, "operation_claim_contention_exhausted")
 }
@@ -936,9 +936,9 @@ const (
 	// flight, or it ended in a retry. The driver waits for its next wake or
 	// tick.
 	claimSpent
-	// claimContended means the rung took nothing because the operation it
-	// would have claimed was row-locked by another transaction for an instant
-	// (storage.ErrOperationClaimContended). The pass ends, and the driver
+	// claimContended means the rung took nothing although a lock-free reread
+	// found an operation claimable, usually because another transaction held
+	// its row for an instant (storage.ErrOperationClaimContended). The pass ends, and the driver
 	// claims again after a short backoff rather than waiting for its next wake
 	// or tick.
 	claimContended
@@ -1178,7 +1178,7 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 	}
 	op, err := s.storage.ApplyOperations().FindNextApplyOperation(ctx, owner, claimOptions...)
 	if errors.Is(err, storage.ErrOperationClaimContended) {
-		s.logger.Debug("operator: a claimable apply_operation was locked by another transaction; claiming again shortly",
+		s.logger.Debug("operator: the claim took no apply_operation but a lock-free reread found one claimable; claiming again shortly",
 			"driver", driverID, "lease_owner", owner, "error", err)
 		return claimContended
 	}

@@ -2922,7 +2922,7 @@ func (s *claimLadderOperationStore) FindNextApplyOperation(ctx context.Context, 
 		if s.onContendedClaim != nil {
 			s.onContendedClaim(s.claims)
 		}
-		return nil, fmt.Errorf("apply_operation 1 of apply 1 is claimable but another transaction holds its row: %w", storage.ErrOperationClaimContended)
+		return nil, fmt.Errorf("apply_operation 1 of apply 1 is claimable but the claim took none: %w", storage.ErrOperationClaimContended)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
