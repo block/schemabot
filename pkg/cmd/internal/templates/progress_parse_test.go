@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // An apply drops `_jobs_old`, a leftover table a repository named in
@@ -221,6 +222,28 @@ func TestParseProgressResponseCarriesCopyFieldsAndNormalizesStatus(t *testing.T)
 	assert.Equal(t, int64(71436), data.Tables[0].RowsCopied)
 	assert.Equal(t, int64(221193), data.Tables[0].RowsTotal)
 	assert.Equal(t, 32, data.Tables[0].PercentComplete)
+}
+
+// A sharded apply alters orders on eight shards of one target under a driver
+// cap of two: the first two shards copy and the other six have not started.
+// The shards of one target copy in parallel and only the cap holds the rest
+// back, so the CLI counts them as queued, as the PR comment does, rather than
+// as waiting for the first shard.
+func TestParseProgressResponseCountsShardsTheDriverCapHoldsBackAsQueued(t *testing.T) {
+	result := &apitypes.ProgressResponse{State: state.Apply.Running}
+	for i, shard := range []string{"-20", "20-40", "40-60", "60-80", "80-a0", "a0-c0", "c0-e0", "e0-"} {
+		opState := state.ApplyOperation.Pending
+		if i < 2 {
+			opState = state.ApplyOperation.Running
+		}
+		result.Operations = append(result.Operations, &apitypes.ProgressOperationResponse{
+			Deployment: "default", OperationKey: "commerce/" + shard + "/orders", State: opState, CutoverPolicy: storage.CutoverPolicyBarrier,
+		})
+	}
+
+	data := ParseProgressResponse(result)
+
+	assert.Equal(t, "2 running table copy, 6 queued", ShardCounts(data.State, data.Operations, data.Tables, data.Released))
 }
 
 // A sharded apply deferred its cutover and shard -40 failed, so SchemaBot

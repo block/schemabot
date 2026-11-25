@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
@@ -2177,6 +2178,29 @@ func TestPreviewCommentSummaryFailed(t *testing.T) {
 	assert.Contains(t, result, "**`products`** — Cancelled")
 }
 
+// A table whose copy finished short of its estimate, then halted, reads in
+// the terminal summary as halted at 100.00%, not at a percent of the estimate.
+func TestSummaryEntryReadsAFinishedCopyAsDone(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		want   string
+	}{
+		{status: state.Task.Failed, want: "**`users`** — Failed at 100.00%"},
+		{status: state.Task.Stopped, want: "**`users`** — Stopped at 100.00%"},
+		{status: state.Task.Cancelled, want: "**`users`** — Cancelled at 100.00%"},
+	} {
+		t.Run(tc.status, func(t *testing.T) {
+			var sb strings.Builder
+			writeSummaryTableEntry(&sb, schema.DialectMySQL, TableProgressData{
+				TableName: "users", Status: tc.status,
+				RowsCopied: 3_261_100_506, RowsTotal: 3_291_032_158, PercentComplete: 100,
+			}, true, nil)
+			assert.Contains(t, sb.String(), tc.want)
+			assert.NotContains(t, sb.String(), "99.09%")
+		})
+	}
+}
+
 func TestPreviewCommentSummaryStopped(t *testing.T) {
 	result := PreviewCommentSummaryStopped()
 
@@ -3009,4 +3033,27 @@ func TestRenderApplyComments_CancelledTableSaysHowFarItGot(t *testing.T) {
 	assert.Contains(t, summary, "**`orders`** — Cancelled at 40.00%\n", "%s", summary)
 	assert.Contains(t, summary, "**`users`** — Cancelled\n", "%s", summary)
 	assert.Contains(t, summary, "**`products`** — Cancelled\n", "%s", summary)
+}
+
+// A sharded table in a single-deployment apply whose shards are in different
+// phases keeps its bar across every shard, as the sharded comment and the CLI
+// show it: one verified shard of four, with the rest queued or not yet
+// attached, reads 25% with its rows line, not the verifying shard's phase.
+func TestRenderApplyStatusComment_ShardedPhaseBarSpansEveryShard(t *testing.T) {
+	out := RenderApplyStatusComment(ApplyStatusFromProgress(&apitypes.ProgressResponse{
+		ApplyID: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Running,
+		Tables: []*apitypes.TableProgressResponse{{
+			TableName: "orders", Keyspace: "shop_001", DDL: "ALTER TABLE orders ADD COLUMN note text", ChangeType: "alter",
+			Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, PlannedShards: 4,
+			Shards: []*apitypes.ShardProgressResponse{
+				{Shard: "-40", Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, PercentComplete: 100, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000},
+				{Shard: "40-80", Status: state.Task.Pending},
+			},
+		}},
+	}, "octocat"))
+
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(25)+" 25%\n", "%s", out)
+	assert.Contains(t, out, "- Rows: 1,000 / 1,000 across 1 of 4 shards\n", "%s", out)
+	assert.Contains(t, out, "  - ◉ `-40`: checksumming 25.00% · 250 / 1,000 rows verified\n", "%s", out)
+	assert.NotContains(t, out, "Checksumming to verify data")
 }

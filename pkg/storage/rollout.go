@@ -12,6 +12,7 @@ func (op *ApplyOperation) RolloutOperation(released bool) state.RolloutOperation
 	isPause := op.OnFailure == OnFailurePause
 	return state.RolloutOperation{
 		Deployment:        op.Deployment,
+		Target:            op.Target,
 		OperationKey:      op.OperationKey,
 		Work:              op.OperationKind == ApplyOperationKindWork,
 		Finalizer:         op.OperationKind == ApplyOperationKindGroupFinalizer,

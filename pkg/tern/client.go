@@ -167,6 +167,11 @@ var ErrTaskVerdictRefused = errors.New("task verdict refused")
 // rather than treating the drive as unfinished.
 var ErrPostTerminalReconcile = errors.New("reconcile after the stored terminal outcome failed")
 
+// ErrGroupedResumeFailureCommitted marks a grouped engine refusal whose tasks
+// and parent apply were recorded failed. The caller can settle the operation
+// from those tasks while it still holds the claim.
+var ErrGroupedResumeFailureCommitted = errors.New("grouped resume failure committed")
+
 var (
 	// ErrPullSchemaUnsupportedType marks a pull request for a database type that
 	// the data plane does not yet support.
