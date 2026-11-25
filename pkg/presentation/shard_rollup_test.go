@@ -28,6 +28,28 @@ func TestRollUpShardedTable(t *testing.T) {
 		"a table with an undispatched shard has work ahead of it")
 }
 
+// A table with one copying shard held back by the throttler reads as
+// throttled with that shard's reason, while its ETA stays the one the shards'
+// combined rate gives. A shard that finished while throttled does not hold the
+// table back.
+func TestRollUpShardedTableReadsAThrottledShard(t *testing.T) {
+	shards := []ShardCopy{
+		{Status: state.Task.Running, RowsCopied: 4000, RowsTotal: 10000, ETASeconds: 60},
+		{Status: state.Task.Running, RowsCopied: 4000, RowsTotal: 10000, ETASeconds: 7200, Throttled: true, ThrottleReason: "replica-lag 5s >= 2s"},
+	}
+	got := RollUpShardedTable(shards, 2)
+	assert.True(t, got.Throttled)
+	assert.Equal(t, "replica-lag 5s >= 2s", got.ThrottleReason)
+	assert.Equal(t, CombinedShardETA(shards), got.ETASeconds)
+
+	finished := RollUpShardedTable([]ShardCopy{
+		{Status: state.Task.Running, RowsCopied: 4000, RowsTotal: 10000, ETASeconds: 60},
+		{Status: state.Task.Completed, RowsCopied: 10000, RowsTotal: 10000, Throttled: true, ThrottleReason: "replica-lag 5s >= 2s"},
+	}, 2)
+	assert.False(t, finished.Throttled, "a finished shard holds nothing back")
+	assert.Empty(t, finished.ThrottleReason)
+}
+
 // A 32-shard table copies 31 shards at 100 rows a second while one shard is
 // throttled to under one, each with 6,000 rows left. The table's ETA is the
 // time its rows take at the rate the shards copy together, about a minute,

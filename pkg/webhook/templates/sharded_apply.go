@@ -133,6 +133,13 @@ type ShardedTableStatus struct {
 	// whole table and read the total as approximate.
 	RowsTotalPlanned bool
 
+	// Throttled reports that the engine's throttler is pausing at least one
+	// of the table's shards still at work, and ThrottleReason names the
+	// signal (presentation.RollUpShardedTable). The copying table then reads
+	// as throttled, as it does in the CLI.
+	Throttled      bool
+	ThrottleReason string
+
 	// EstimatedBytes is the table's on-disk size when it was planned, summed
 	// across its shards, shown beside the copy progress so the operator sees
 	// the scale of the copy. Nil when no estimate is known, which omits it.
@@ -710,6 +717,8 @@ func shardedTableFacts(t ShardedTableStatus) presentation.TableFacts {
 		ETASeconds:     t.ETASeconds,
 		EstimatedBytes: t.EstimatedBytes,
 		PlannedShards:  t.PlannedShards,
+		Throttled:      t.Throttled,
+		ThrottleReason: t.ThrottleReason,
 
 		RowsTotalPlanned: t.RowsTotalPlanned,
 	}

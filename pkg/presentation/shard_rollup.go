@@ -26,6 +26,11 @@ type ShardCopy struct {
 	// no rows (TasksCopyNoRows), such as an instant ALTER. It has no copy
 	// ahead of it, so the plan's estimate never stands in for its total.
 	CopiesNoRows bool
+	// Throttled reports that the engine's throttler is pausing this shard's
+	// work, and ThrottleReason names the signal. The reason is empty when
+	// Throttled is false.
+	Throttled      bool
+	ThrottleReason string
 }
 
 // ShardOperationCopy resolves one (shard, table) operation's progress from its
@@ -88,6 +93,14 @@ type ShardedTableCopy struct {
 	// the total and the percent span the whole table rather than the shards
 	// reporting so far. The total is then approximate.
 	RowsTotalPlanned bool
+
+	// Throttled reports that the engine's throttler is pausing at least one
+	// shard still at work, and ThrottleReason names the first such shard's
+	// signal. The table ETA comes from the shards' combined rate, so a
+	// throttled shard does not stretch it on its own. The table reads as
+	// throttled instead, so the operator still sees the shard held back.
+	Throttled      bool
+	ThrottleReason string
 }
 
 // RollUpShardedTable rolls one keyspace table's per-shard progress up into the
@@ -117,6 +130,9 @@ func RollUpShardedTable(shards []ShardCopy, plannedShards int) ShardedTableCopy 
 			out.Status = sh.Status
 		}
 		inFlight = inFlight || state.IsInFlightTaskState(sh.Status)
+		if sh.Throttled && !out.Throttled && state.IsInFlightTaskState(sh.Status) {
+			out.Throttled, out.ThrottleReason = true, sh.ThrottleReason
+		}
 		if sh.RowsTotal <= 0 {
 			if copyAheadWithoutTotal(sh) {
 				unreported++
