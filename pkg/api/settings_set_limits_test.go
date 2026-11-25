@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -44,8 +45,9 @@ func settingsSetter(t *testing.T) func(key, value string) (*httptest.ResponseRec
 		store := &valueRecordingSettingsStore{}
 		svc := New(&mockStorageWithSettings{settings: store}, scopedWriteConfig(), nil,
 			slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
-		body := fmt.Sprintf(`{"key":%q,"value":%q}`, key, value)
-		rec := scopedDenialRequest(t, svc.handleSettingsSet, admin, http.MethodPost, "/api/settings", body)
+		body, err := json.Marshal(map[string]string{"key": key, "value": value})
+		require.NoError(t, err)
+		rec := scopedDenialRequest(t, svc.handleSettingsSet, admin, http.MethodPost, "/api/settings", string(body))
 		return rec, store, logs.String()
 	}
 }
@@ -160,4 +162,34 @@ func TestSettingsLimitsMatchStorageColumns(t *testing.T) {
 	postgresSchema, err := schema.PostgresFS.ReadFile("postgres/settings.sql")
 	require.NoError(t, err)
 	assert.Contains(t, string(postgresSchema), fmt.Sprintf("setting_key varchar(%d) NOT NULL", storage.MaxSettingKeyBytes))
+	assert.Contains(t, string(postgresSchema), "setting_value text NOT NULL")
+}
+
+// The value limit counts bytes, because that is how storage sizes the column,
+// so a value of multibyte characters is refused at the byte count and stored
+// at exactly the limit.
+func TestSettingsSetValueLimitCountsBytesNotCharacters(t *testing.T) {
+	set := settingsSetter(t)
+
+	atLimit := strings.Repeat("€", storage.MaxSettingValueBytes/3)
+	rec, store, _ := set("pause_applies", atLimit)
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Equal(t, map[string]string{"pause_applies": atLimit}, store.written)
+
+	overLimit := atLimit + "€"
+	rec, store, _ = set("pause_applies", overLimit)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "setting value is 65538 bytes; the limit is 65535 bytes")
+	assert.Empty(t, store.written)
+}
+
+// PostgreSQL cannot store a NUL character in a text column, so a value that
+// carries one is refused before storage on every dialect.
+func TestSettingsSetRefusesNULInValue(t *testing.T) {
+	set := settingsSetter(t)
+
+	rec, store, _ := set("pause_applies", "true\x00")
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "setting value contains a NUL character")
+	assert.Empty(t, store.written)
 }

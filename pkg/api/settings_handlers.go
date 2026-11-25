@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -129,6 +130,15 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 			"caller", cmp.Or(resolveCaller(r.Context(), ""), "unknown"))
 		s.writeError(w, http.StatusBadRequest,
 			fmt.Sprintf("setting value is %d bytes; the limit is %d bytes", len(req.Value), storage.MaxSettingValueBytes))
+		return
+	}
+
+	// PostgreSQL text cannot hold a NUL character, so refuse it on every
+	// dialect rather than answer a 500 on one of them.
+	if strings.IndexByte(req.Value, 0) >= 0 {
+		s.logger.Warn("refused settings write of a value with a NUL character", "key", req.Key,
+			"caller", cmp.Or(resolveCaller(r.Context(), ""), "unknown"))
+		s.writeError(w, http.StatusBadRequest, "setting value contains a NUL character, which storage cannot hold")
 		return
 	}
 
