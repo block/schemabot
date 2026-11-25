@@ -124,10 +124,14 @@ func alterSpecObjectChanges(changes *ObjectChanges, table string, spec *ast.Alte
 		}
 	case ast.AlterTableDropColumn:
 		changes.drop(ObjectColumn, spec.OldColumnName.Name.L)
-	case ast.AlterTableModifyColumn, ast.AlterTableAlterColumn, ast.AlterTableAlterColumnVisibility:
+	case ast.AlterTableModifyColumn, ast.AlterTableAlterColumn:
 		for _, col := range spec.NewColumns {
 			changes.modify(ObjectColumn, col.Name.Name.L)
 		}
+	case ast.AlterTableAlterColumnVisibility:
+		// A visibility clause names its column as the old column, not as a
+		// new column definition.
+		changes.modify(ObjectColumn, spec.OldColumnName.Name.L)
 	case ast.AlterTableChangeColumn:
 		renameOrModify(changes, ObjectColumn, spec.OldColumnName.Name.L, spec.NewColumns[0].Name.Name.L)
 	case ast.AlterTableRenameColumn:
@@ -249,6 +253,11 @@ func (postgresStatementParser) ObjectChanges(stmt string) (ObjectChanges, error)
 		for _, param := range node.IndexStmt.GetIndexIncludingParams() {
 			referencePostgresIndexElem(&changes, table, param.GetIndexElem())
 		}
+		if node.IndexStmt.GetWhereClause() != nil {
+			// A partial index depends on the columns its predicate reads, and
+			// the statement does not say which those are.
+			changes.reference(ObjectTable, table)
+		}
 	case *pgproto.Node_DropStmt:
 		kind, ok := postgresDropKind(node.DropStmt.GetRemoveType())
 		if !ok {
@@ -330,10 +339,11 @@ func alterCmdObjectChanges(changes *ObjectChanges, table string, cmd *pgproto.Al
 }
 
 // addPostgresConstraint records a table constraint a statement adds, and the
-// columns it covers. A check reads an expression, so it references the table.
+// columns it covers. A check, and an exclusion constraint with a predicate,
+// read an expression, so they reference the table.
 func addPostgresConstraint(changes *ObjectChanges, table string, c *pgproto.Constraint) {
 	changes.add(ObjectConstraint, c.GetConname())
-	if c.GetContype() == pgproto.ConstrType_CONSTR_CHECK {
+	if c.GetContype() == pgproto.ConstrType_CONSTR_CHECK || c.GetWhereClause() != nil {
 		changes.reference(ObjectTable, table)
 	}
 	for _, group := range [][]*pgproto.Node{c.GetKeys(), c.GetIncluding(), c.GetFkAttrs()} {

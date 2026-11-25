@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,6 +79,14 @@ const (
 		"  `email` varchar(255) NOT NULL,\n" +
 		"  PRIMARY KEY (`id`),\n" +
 		"  KEY `idx_name` (`name`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+
+	ownershipUsersWithEmailAndNicknameSchema = "CREATE TABLE `users` (\n" +
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+		"  `name` varchar(255) NOT NULL,\n" +
+		"  `email` varchar(255) NOT NULL,\n" +
+		"  `nickname` varchar(64) DEFAULT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
 		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
 
 	ownershipReconcileSchema = "CREATE TABLE `reconcile_state` (\n" +
@@ -280,6 +289,71 @@ func TestE2EPlanAttributesADroppedColumnToThePullRequestThatAddedIt(t *testing.T
 	case <-time.After(webhookIntegrationPollDeadline):
 		require.FailNow(t, "timed out waiting for the plan comment")
 	}
+}
+
+// Two open pull requests each added a column to `users`: one added `email`,
+// the other `nickname`. This pull request's schema files predate both, so its
+// plan drops both columns in one statement. Each finding names the pull
+// request that added its own column, rather than both findings naming both
+// pull requests, and with every owner named the comment needs no separate
+// "Check before applying" section.
+func TestE2EPlanNamesEachDroppedColumnsOwnPullRequest(t *testing.T) {
+	dbName := "webhook_column_owner_per_finding"
+	svc := setupE2EService(t, dbName)
+	resetOwnershipHistory(t, dbName)
+
+	// An earlier apply from this pull request created the table.
+	applyDeclaredSchemaForPullRequest(t, svc, dbName, 1, map[string]string{"users.sql": ownershipUsersSchema})
+	applyDeclaredSchemaForPullRequest(t, svc, dbName, 2, map[string]string{"users.sql": ownershipUsersWithEmailSchema})
+	applyDeclaredSchemaForPullRequest(t, svc, dbName, 3, map[string]string{"users.sql": ownershipUsersWithEmailAndNicknameSchema})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{"users.sql": ownershipUsersSchema}, schemabotConfig, dbName)
+	registerOpenPullRequest(mux, 2)
+	registerOpenPullRequest(mux, 3)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		emailLine := commentLineContaining(t, body, "email")
+		nicknameLine := commentLineContaining(t, body, "nickname")
+		assert.Contains(t, emailLine, "(changed by open PR [#2](https://github.com/octocat/hello-world/pull/2))")
+		assert.NotContains(t, emailLine, "pull/3", "the pull request that added only `nickname` is not named on the `email` drop")
+		assert.Contains(t, nicknameLine, "(changed by open PR [#3](https://github.com/octocat/hello-world/pull/3))")
+		assert.NotContains(t, nicknameLine, "pull/2", "the pull request that added only `email` is not named on the `nickname` drop")
+		assert.NotContains(t, body, "Check before applying", "each owner is named by the finding that undoes its work")
+	case <-time.After(webhookIntegrationPollDeadline):
+		require.FailNow(t, "timed out waiting for the plan comment")
+	}
+}
+
+// commentLineContaining returns the one line of a comment that contains want.
+func commentLineContaining(t *testing.T, body, want string) string {
+	t.Helper()
+	var matches []string
+	for line := range strings.SplitSeq(body, "\n") {
+		if strings.Contains(line, want) && strings.Contains(line, "changed by") {
+			matches = append(matches, line)
+		}
+	}
+	require.Len(t, matches, 1, "expected one attributed finding line containing %q in:\n%s", want, body)
+	return matches[0]
 }
 
 // Another pull request created `stations` and applied it, then stayed open,

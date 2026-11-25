@@ -115,6 +115,20 @@ func TestUndoesAttributedWork(t *testing.T) {
 			want:    true,
 		},
 		{
+			name:    "dropping the column the owner made invisible",
+			parser:  mysql,
+			owner:   []string{"ALTER TABLE `events` ALTER COLUMN `payload` SET INVISIBLE"},
+			planned: "ALTER TABLE `events` DROP COLUMN `payload`",
+			want:    true,
+		},
+		{
+			name:    "postgres: dropping a column a partial index the owner added filters on",
+			parser:  postgres,
+			owner:   []string{"CREATE INDEX idx_live ON events (id) WHERE payload IS NOT NULL"},
+			planned: "ALTER TABLE events DROP COLUMN payload",
+			want:    true,
+		},
+		{
 			name:    "postgres: dropping a column beside an index the owner added",
 			parser:  postgres,
 			owner:   []string{"CREATE INDEX CONCURRENTLY idx_created_at ON events (created_at)"},
@@ -209,4 +223,97 @@ func TestRenderPlanComment_AttributionWithNoMatchingFindingKeepsItsSection(t *te
 	assert.NotContains(t, out, "(changed by open PR")
 	assert.NotContains(t, out, "shows up here as one to undo", "no finding carries a note to explain")
 	assert.Contains(t, out, "**Check before applying**: 1 destructive change SchemaBot cannot attribute to this PR")
+}
+
+// One ALTER TABLE drops a column and an index. Another open pull request added
+// only the index. The engine reports the dropped column as its own finding,
+// and that finding concerns the column, not the index, so it reads without the
+// other pull request's note. The attribution is not lost: no finding names
+// the owner, so it keeps its own section.
+func TestRenderPlanComment_CompoundAlterAttributesOnlyTheFindingOnTheOwnersObject(t *testing.T) {
+	mysql, err := ddl.ParserForDialect(schema.DialectMySQL)
+	require.NoError(t, err)
+
+	stmt := "ALTER TABLE `events` DROP COLUMN `payload`, DROP INDEX `idx_created_at`"
+	finding := "DROP COLUMN discards the column's data"
+	data := unsafeConsentPlan("staging")
+	data.Repository = "acme/orders"
+	data.Changes = []KeyspaceChangeData{{Keyspace: "orders", Statements: []string{stmt}}}
+	data.UnsafeChanges = []UnsafeChangeData{{
+		Table: "events", Reason: finding, DDL: stmt,
+		FindingColumns: map[string]string{finding: "payload"},
+	}}
+	data.AttributedChanges = []AttributedChangeData{{
+		Table: "events", Repository: "acme/orders", PullRequest: 190,
+		OwnerChanges: ownerDid(t, mysql, "ALTER TABLE `events` ADD INDEX `idx_created_at` (`created_at`)"),
+	}}
+	out := RenderPlanComment(*data)
+
+	assert.Contains(t, out, "`events`: DROP COLUMN discards the column's data\n", "the dropped column is this PR's own change")
+	assert.NotContains(t, out, "(changed by open PR")
+	assert.Contains(t, out, "**Check before applying**: 1 destructive change SchemaBot cannot attribute to this PR")
+	assert.Contains(t, out, "- `events`: changed by [acme/orders#190](https://github.com/acme/orders/pull/190), which is still open\n")
+
+	t.Run("a finding that names no column is matched against the whole statement", func(t *testing.T) {
+		data.UnsafeChanges[0].FindingColumns = nil
+		out := RenderPlanComment(*data)
+		assert.Contains(t, out, "`events`: DROP COLUMN discards the column's data (changed by open PR [#190](https://github.com/acme/orders/pull/190))\n")
+		assert.NotContains(t, out, "Check before applying")
+	})
+}
+
+// Two open pull requests each added a column to `users`, and this pull
+// request's plan drops both in one statement. Each finding names the pull
+// request that added its column, and since every owner is named by a finding,
+// the attribution needs no section of its own.
+func TestRenderPlanComment_EachFindingNamesTheOwnerOfItsColumn(t *testing.T) {
+	mysql, err := ddl.ParserForDialect(schema.DialectMySQL)
+	require.NoError(t, err)
+
+	stmt := "ALTER TABLE `users` DROP COLUMN `email`, DROP COLUMN `nickname`"
+	data := unsafeConsentPlan("staging")
+	data.Repository = "acme/orders"
+	data.Changes = []KeyspaceChangeData{{Keyspace: "orders", Statements: []string{stmt}}}
+	data.UnsafeChanges = []UnsafeChangeData{{
+		Table: "users", DDL: stmt,
+		Reason:         "DROP COLUMN email discards its data; DROP COLUMN nickname discards its data",
+		FindingColumns: map[string]string{"DROP COLUMN email discards its data": "email", "DROP COLUMN nickname discards its data": "nickname"},
+	}}
+	data.AttributedChanges = []AttributedChangeData{
+		{Table: "users", Repository: "acme/orders", PullRequest: 3, OwnerChanges: ownerDid(t, mysql, "ALTER TABLE `users` ADD COLUMN `nickname` varchar(64)")},
+		{Table: "users", Repository: "acme/orders", PullRequest: 2, OwnerChanges: ownerDid(t, mysql, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")},
+	}
+	out := RenderPlanComment(*data)
+
+	assert.Contains(t, out, "`users`: DROP COLUMN email discards its data (changed by open PR [#2](https://github.com/acme/orders/pull/2))\n")
+	assert.Contains(t, out, "`users`: DROP COLUMN nickname discards its data (changed by open PR [#3](https://github.com/acme/orders/pull/3))\n")
+	assert.NotContains(t, out, "Check before applying", "every owner is named by the finding that undoes its work")
+}
+
+// Two open pull requests changed the same column: one added it, the other
+// changed its type. Dropping it undoes both, so the finding names both.
+func TestRenderPlanComment_FindingThatUndoesTwoOwnersNamesBoth(t *testing.T) {
+	mysql, err := ddl.ParserForDialect(schema.DialectMySQL)
+	require.NoError(t, err)
+
+	stmt := "ALTER TABLE `users` DROP COLUMN `email`"
+	data := unsafeConsentPlan("staging")
+	data.Repository = "acme/orders"
+	data.Changes = []KeyspaceChangeData{{Keyspace: "orders", Statements: []string{stmt}}}
+	data.UnsafeChanges = []UnsafeChangeData{{Table: "users", Reason: "DROP COLUMN discards the column's data", DDL: stmt}}
+	data.AttributedChanges = []AttributedChangeData{
+		{Table: "users", Repository: "acme/orders", PullRequest: 3, OwnerChanges: ownerDid(t, mysql, "ALTER TABLE `users` MODIFY `email` varchar(320)")},
+		{Table: "users", Repository: "acme/orders", PullRequest: 2, OwnerChanges: ownerDid(t, mysql, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")},
+	}
+	out := RenderPlanComment(*data)
+
+	assert.Contains(t, out, "`users`: DROP COLUMN discards the column's data (changed by open PRs [#3](https://github.com/acme/orders/pull/3) and [#2](https://github.com/acme/orders/pull/2))\n")
+	assert.NotContains(t, out, "Check before applying")
+
+	t.Run("the section names every owner of the table", func(t *testing.T) {
+		var sb strings.Builder
+		writeAttributedChanges(&sb, data.AttributedChanges)
+		assert.Contains(t, sb.String(), "**Check before applying**: 1 destructive change SchemaBot cannot attribute to this PR\n")
+		assert.Contains(t, sb.String(), "- `users`: changed by [acme/orders#3](https://github.com/acme/orders/pull/3) and [acme/orders#2](https://github.com/acme/orders/pull/2), which are still open\n")
+	})
 }

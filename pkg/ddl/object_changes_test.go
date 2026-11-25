@@ -54,6 +54,11 @@ func TestTiDBObjectChanges(t *testing.T) {
 			want: ObjectChanges{Added: objs(idx("idx_created_at")), Referenced: objs(col("created_at"))},
 		},
 		{
+			name: "a column visibility change modifies that column",
+			stmt: "ALTER TABLE events ALTER COLUMN Payload SET INVISIBLE",
+			want: ObjectChanges{Modified: objs(col("payload"))},
+		},
+		{
 			name: "an expression index part references the table",
 			stmt: "ALTER TABLE events ADD INDEX idx_day ((DATE(created_at)), kind)",
 			want: ObjectChanges{Added: objs(idx("idx_day")), Referenced: objs(tbl("events"), col("kind"))},
@@ -170,6 +175,16 @@ func TestPostgresObjectChanges(t *testing.T) {
 			name: "create index",
 			stmt: "CREATE INDEX CONCURRENTLY idx_created_at ON events (created_at) INCLUDE (kind)",
 			want: ObjectChanges{Added: objs(idx("idx_created_at")), Referenced: objs(col("created_at"), col("kind"))},
+		},
+		{
+			name: "a partial index references the table its predicate reads",
+			stmt: "CREATE INDEX idx_live ON events (id) WHERE payload IS NOT NULL",
+			want: ObjectChanges{Added: objs(idx("idx_live")), Referenced: objs(col("id"), tbl("events"))},
+		},
+		{
+			name: "an exclusion constraint with a predicate references the table",
+			stmt: "ALTER TABLE bookings ADD CONSTRAINT no_overlap EXCLUDE USING gist (room WITH =) WHERE (active)",
+			want: ObjectChanges{Added: objs(cons("no_overlap")), Referenced: objs(tbl("bookings"))},
 		},
 		{
 			name: "an expression index element references the table",

@@ -3,11 +3,15 @@ package webhook
 import (
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/lint"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -348,4 +352,49 @@ func TestTargetPlanDestructiveTables(t *testing.T) {
 // destructiveTables lists the tables of a statements-by-table map in order.
 func destructiveTables(statements map[string][]string) []string {
 	return slices.Sorted(maps.Keys(statements))
+}
+
+// The engine names the column an unsafe finding concerns. The plan comment
+// keys that column by the finding as the change's unsafe reason lists it, so
+// each finding of a compound ALTER TABLE is attributed by its own clause. A
+// finding that names no column, and a warning, add nothing, and a message that
+// carries the reason separator still keys the one finding it became.
+func TestPlanUnsafeChanges_KeysEachFindingToItsColumn(t *testing.T) {
+	dropEmail := `Unsafe operation detected: "DROP COLUMN ` + "`email`" + `"`
+	dropNickname := `Unsafe operation detected: "DROP COLUMN ` + "`nickname`" + `"; data is lost`
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "keyspace",
+			TableChanges: []*apitypes.TableChangeResponse{{
+				TableName: "users", ChangeType: "alter", IsUnsafe: true,
+				DDL:          "ALTER TABLE `users` DROP COLUMN `email`, DROP COLUMN `nickname`, DROP PRIMARY KEY",
+				UnsafeReason: lintReasonOf(dropEmail, dropNickname, "Unsafe operation detected: DROP PRIMARY KEY"),
+			}},
+		}},
+		LintResults: []*apitypes.LintViolationResponse{
+			{Severity: "error", Table: "users", Column: "email", Message: dropEmail},
+			{Severity: "error", Table: "users", Column: "nickname", Message: dropNickname},
+			{Severity: "error", Table: "users", Message: "Unsafe operation detected: DROP PRIMARY KEY"},
+			{Severity: "warning", Table: "users", Column: "name", Message: "column `name` has no default"},
+		},
+	}
+
+	unsafe := planUnsafeChanges(planResp)
+	require.Len(t, unsafe, 1)
+	assert.Equal(t, map[string]string{
+		ui.LintReasons(lint.UnsafeFindingText(dropEmail))[0]:    "email",
+		ui.LintReasons(lint.UnsafeFindingText(dropNickname))[0]: "nickname",
+	}, unsafe[0].FindingColumns)
+	for finding := range unsafe[0].FindingColumns {
+		assert.Contains(t, ui.LintReasons(unsafe[0].Reason), finding, "each key is a finding the reason lists")
+	}
+}
+
+// lintReasonOf joins error messages the way the engine's unsafe reason does.
+func lintReasonOf(messages ...string) string {
+	findings := make([]string, len(messages))
+	for i, m := range messages {
+		findings[i] = lint.UnsafeFindingText(m)
+	}
+	return strings.Join(findings, "; ")
 }

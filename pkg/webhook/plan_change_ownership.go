@@ -74,30 +74,31 @@ func (h *Handler) annotateAttributedChanges(ctx context.Context, client *ghclien
 			Environment:  environment,
 			TableName:    table,
 		}
-		change, annotate := h.classifyDestructiveChange(ctx, client, &lookup, ref, repo, pr, table, statements[table])
-		if annotate {
-			data.AttributedChanges = append(data.AttributedChanges, change)
-		}
+		data.AttributedChanges = append(data.AttributedChanges,
+			h.classifyDestructiveChange(ctx, client, &lookup, ref, repo, pr, table, statements[table])...)
 	}
 }
 
 // classifyDestructiveChange decides whether one table's destructive changes
 // must be annotated, and how they should read. statements are the planned
-// destructive statements on the table. The owner named is the most recent open
-// pull request whose work one of them undoes. annotate is false only when the
-// lookup positively established that no other open pull request did anything
-// to the table that the plan would undo.
-func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclient.InstallationClient, lookup *ownerWorkLookup, ref storage.TableRef, repo string, pr int, table string, statements []string) (change templates.AttributedChangeData, annotate bool) {
+// destructive statements on the table. It returns one entry for every open
+// pull request whose work one of them undoes, most recent first, since
+// different open pull requests can own different objects on the same table and
+// each finding carries the note of the owners it undoes. It returns nothing
+// only when the lookup positively established that no other open pull request
+// did anything to the table that the plan would undo.
+func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclient.InstallationClient, lookup *ownerWorkLookup, ref storage.TableRef, repo string, pr int, table string, statements []string) []templates.AttributedChangeData {
 	owners, err := h.service.Storage().Tasks().FindTableOwners(ctx, ref)
 	if err != nil {
 		h.logger.Error("planned destructive change's ownership is unresolved: table-ownership lookup failed",
 			"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
 			"environment", ref.Environment, "table", table, "error", err)
 		metrics.RecordPlanChangeOwnership(ctx, repo, ref.Database, ref.Environment, "storage_error")
-		return templates.AttributedChangeData{Table: table, Unresolved: true}, true
+		return []templates.AttributedChangeData{{Table: table, Unresolved: true}}
 	}
 
 	var checked int
+	var attributedOwners []templates.AttributedChangeData
 	for _, owner := range owners {
 		if owner.Repository == repo && owner.PullRequest == pr {
 			// The planning pull request's own earlier apply. Dropping what it
@@ -112,7 +113,7 @@ func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclien
 				"environment", ref.Environment, "table", table,
 				"owner_repo", owner.Repository, "owner_pr", owner.PullRequest, "error", err)
 			metrics.RecordPlanChangeOwnership(ctx, repo, ref.Database, ref.Environment, "pr_state_error")
-			return templates.AttributedChangeData{Table: table, Unresolved: true}, true
+			return []templates.AttributedChangeData{{Table: table, Unresolved: true}}
 		}
 		if info.IsClosed() {
 			h.logger.Debug("planned destructive change is not attributed to this owner: its pull request is closed",
@@ -139,15 +140,18 @@ func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclien
 			"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
 			"environment", ref.Environment, "table", table,
 			"owner_repo", owner.Repository, "owner_pr", owner.PullRequest)
+		attributedOwners = append(attributedOwners, attributed)
+	}
+	if len(attributedOwners) > 0 {
 		metrics.RecordPlanChangeOwnership(ctx, repo, ref.Database, ref.Environment, "owned")
-		return attributed, true
+		return attributedOwners
 	}
 
 	h.logger.Debug("planned destructive change is this pull request's to make: it undoes no other open pull request's change to the table",
 		"repo", repo, "pr", pr, "database", ref.Database, "environment", ref.Environment, "table", table,
 		"other_pull_requests_checked", checked)
 	metrics.RecordPlanChangeOwnership(ctx, repo, ref.Database, ref.Environment, "unowned")
-	return templates.AttributedChangeData{}, false
+	return nil
 }
 
 // plannedDestructiveStatements returns, keyed by table, the statements of the
