@@ -1581,6 +1581,21 @@ deployment still holds rows naming it. *Enforced:* the retired-operation list
 (`RetiredControlOperations()` in `pkg/storage/types.go`), consulted by the terminal sweep
 (`pkg/tern/control_requests.go`).
 
+### CO-11: A control command names the apply it acts on
+
+Every control command, and rollback, acts only on the apply the operator names by its apply ID,
+on every surface. A command without one is refused before SchemaBot looks up any apply, and no
+control request is recorded. SchemaBot never infers the apply, not even when exactly one apply is
+active. *Breaks if violated:* the apply that was active when the operator looked may have finished
+by the time the command lands, so a guess can stop, revert, or run the cutover for a schema change the
+operator never meant to touch. *Enforced:* the PR comment usage reply (`loadApplyForPRControl` in
+`pkg/webhook/control.go`, and the rollback gate in `pkg/webhook/issue_comment.go`); the CLI
+(`RequireApplyID` and `requireControlScope` in `pkg/cmd/commands/common.go`, and rollback's
+required argument); the HTTP API (`decodeControlRequest`, `controlTarget`,
+`ValidateRollbackSourceApply`, and `handleRollbackPlan` in `pkg/api/control_handlers.go`). A completeness test on each surface walks the operation
+registry (`ControlOperations()` in `pkg/storage/types.go`), so a new operation is held to the rule
+without anyone adding it to a list.
+
 ## Operator surfaces (UX)
 
 The rest of this document is about what the system does. This family is about what the operator is
