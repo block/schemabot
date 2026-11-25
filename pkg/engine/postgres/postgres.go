@@ -457,8 +457,8 @@ func refuseTableDeclaredTwice(namespace string, files map[string]pgstatement.Des
 // complete or it is nothing, and the two ways it can fall short end
 // differently. A table the engine read but pg-sprite's renderer refuses —
 // each shape it refuses is named by one of its ErrUnrenderable errors,
-// foreign keys on either side and inheritance among them — leaves captured
-// false, and RV-7 then refuses rollback for this plan rather than
+// inheritance among them — or that a foreign key on an unmanaged table or
+// in another namespace references, leaves captured false, and RV-7 then refuses rollback for this plan rather than
 // reconstructing the originals; the plan itself still proceeds, because
 // rollback capability is not a precondition for reviewing or applying the
 // change. A table the engine could not read — the listing named it and
