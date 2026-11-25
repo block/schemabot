@@ -804,11 +804,13 @@ func (s *taskStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storag
 
 // tableOwnerLookupLimit bounds how many pull requests one ownership lookup
 // returns. A long-lived table accumulates an owner for every pull request that
-// ever changed it, and the caller resolves each one's state against GitHub
-// until it finds an open one — so an unbounded result turns a routine plan into
-// a serial walk of the table's entire history. Owners come back most recent
-// first, and a pull request old enough to fall outside this window has long
-// since been merged or closed, so the bound costs no attribution in practice.
+// ever changed it, and the caller resolves every returned owner's state
+// against GitHub, because a planned change can undo the work of several open
+// ones. So this bound is also the most pull request reads one table costs a
+// plan, and an unbounded result would turn a routine plan into a serial walk
+// of the table's entire history. Owners come back most recent first, and a
+// pull request old enough to fall outside this window has long since been
+// merged or closed, so the bound costs no attribution in practice.
 const tableOwnerLookupLimit = 20
 
 // FindTableOwners returns the pull requests stored tasks attribute a table

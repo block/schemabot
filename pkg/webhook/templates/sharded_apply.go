@@ -45,6 +45,12 @@ type ShardedApplyData struct {
 	// failed shard row to carry the cause.
 	ErrorMessage string
 
+	// FailedFinalizer is the first keyspace finalizer in a failure state, nil
+	// when none is. The failure callout names its keyspace in every apply
+	// state, because the error text need not name it and a finalizer can fail
+	// while other keyspaces' shards keep running.
+	FailedFinalizer *FinalizerFailure
+
 	// Keyspaces is the per-keyspace shard rollup in resolved order: each entry
 	// renders its own keyspace section, and together they drive the
 	// cross-keyspace count histogram and the first-failure callout.
@@ -57,13 +63,6 @@ type ShardedApplyData struct {
 	// the change the operator approved at plan time — and the section omits it
 	// when the stored plan carries none.
 	VSchemaChanges []apitypes.VSchemaChange
-
-	// Finalizes holds the keyspaces the engine finalizes without a VSchema
-	// change, one per finalizer operation, rendered in their own section so
-	// the comment never shows a VSchema change the plan did not carry. They
-	// are work the apply runs rather than schema changes, so they do not count
-	// toward the outcome line's grammar or the status line's fraction.
-	Finalizes []ShardedFinalize
 
 	// Tenant is the deployment's tenant identity, appended as --tenant to every
 	// pasteable command hint so copied commands address this deployment in
@@ -127,6 +126,12 @@ type ShardedTableStatus struct {
 	// and rows line name the coverage and the ETA renders as a floor (the
 	// unstarted shards can only add rows and time).
 	ShardsReporting int
+
+	// RowsTotalPlanned marks a RowsTotal that also counts the plan's estimate
+	// for every shard still to copy that has not reported a total
+	// (presentation.RollUpShardedTable), so the bar and rows line span the
+	// whole table and read the total as approximate.
+	RowsTotalPlanned bool
 
 	// EstimatedBytes is the table's on-disk size when it was planned, summed
 	// across its shards, shown beside the copy progress so the operator sees
@@ -226,7 +231,6 @@ func renderShardedApplyComment(data ShardedApplyData, renderedAt string, formatt
 	writeShardsStoppedAtCutover(&sb, data)
 	writeShardKeyspaceSections(&sb, data, formatter, budget)
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
-	writeFinalizeStatus(&sb, data.Finalizes)
 
 	writeShardedFooter(&sb, data)
 	if !state.IsTerminalApplyState(data.State) {
@@ -261,43 +265,26 @@ func renderShardedApplySummaryComment(data ShardedApplyData, formatter *shardedD
 	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
 	writeShardedFailure(&sb, data)
 	writeShardsStoppedAtCutover(&sb, data)
-	writeShardKeyspaceSections(&sb, data, formatter, budget)
-	writeVSchemaStatus(&sb, data.VSchemaChanges)
-	writeFinalizeStatus(&sb, data.Finalizes)
+	writeShardedSummaryDetails(&sb, data, formatter, budget)
 	writeShardedFooter(&sb, data)
 	return sb.String()
 }
 
-// ShardedFinalize is one keyspace's finalize in a sharded apply: the keyspace,
-// and its finalizer's display status in the VSchema status vocabulary
-// ("applying", "applied", "failed", "cancelled", "stopped", or "" for pending).
-type ShardedFinalize struct {
-	Keyspace string
-	Status   string
-}
-
-// writeFinalizeStatus writes the section listing each keyspace the engine
-// finalizes without a VSchema change, with its finalizer's status.
-func writeFinalizeStatus(sb *strings.Builder, finalizes []ShardedFinalize) {
-	if len(finalizes) == 0 {
-		return
+// writeShardedSummaryDetails writes the summary's keyspace, table, and VSchema
+// detail. A completed apply folds it into a collapsed block worded the same
+// as the regular summary's, so the outcome, shard counts, and timing above
+// it are what the reader sees first. Any other terminal state leaves it open,
+// since the reader needs it to see which shard or table to look at.
+func writeShardedSummaryDetails(sb *strings.Builder, data ShardedApplyData, formatter *shardedDDLFormatter, budget *ddlBlockBudget) {
+	tables := shardedTableCount(data)
+	collapse := state.IsState(data.State, state.Apply.Completed) && tables+len(data.VSchemaChanges) > 0
+	if collapse {
+		fmt.Fprintf(sb, "\n<details><summary>%s</summary>\n", applyDetailsLabel(tables, "table", len(data.VSchemaChanges)))
 	}
-	sb.WriteString("\n### Finalize\n\n")
-	for _, f := range finalizes {
-		fmt.Fprintf(sb, "**%s**: %s\n\n", inlineCode(f.Keyspace), finalizeStatusLabel(f.Status))
-	}
-}
-
-// finalizeStatusLabel renders a finalizer's display status as the Finalize
-// section words it.
-func finalizeStatusLabel(status string) string {
-	switch status {
-	case "applying":
-		return "Finalizing..."
-	case "applied":
-		return "Finalized"
-	default:
-		return ui.VSchemaStatusLabel(status)
+	writeShardKeyspaceSections(sb, data, formatter, budget)
+	writeVSchemaStatus(sb, data.VSchemaChanges)
+	if collapse {
+		sb.WriteString("\n</details>\n")
 	}
 }
 
@@ -318,13 +305,19 @@ func allShardStatuses(keyspaces []ShardedKeyspace) []ShardStatus {
 // and VSchema changes each count as one change; an apply with neither reads as
 // plural, since the shard count alone does not prove a single change.
 func shardedChangeIsSingular(data ShardedApplyData) bool {
+	return shardedTableCount(data)+len(data.VSchemaChanges) == 1
+}
+
+// shardedTableCount counts the distinct keyspace tables a sharded apply
+// changes, each once however many shards run its DDL.
+func shardedTableCount(data ShardedApplyData) int {
 	tables := make(map[string]struct{})
 	for _, ks := range data.Keyspaces {
 		for _, c := range ks.Cells {
 			tables[tableKey(ks.Keyspace, c.Table)] = struct{}{}
 		}
 	}
-	return len(tables)+len(data.VSchemaChanges) == 1
+	return len(tables)
 }
 
 // writeShardedStatusLine writes the status comment's at-a-glance line: the
@@ -674,17 +667,19 @@ func keepsShardedProgressBar(status string, t ShardedTableStatus) bool {
 }
 
 // writeShardedTablePhaseProgress renders a sharded table whose shards are past
-// or beside the row copy: the bar across every shard the table spans, the way
-// a rollout's bar spans its targets (presentation.PercentAcrossTargets), and
-// the rows line. A shard that has not reported, whether queued or not yet
-// attached, counts as nothing, so one verified shard beside three queued ones
-// reads as a quarter done rather than nearly complete.
+// or beside the row copy: the bar across every shard the table spans
+// (presentation.ShardedPhasePercent), and the rows line. When the total
+// includes the plan's estimate for the shards still to copy, the bar is the
+// rows copied over that planned total. Otherwise a shard that has not
+// reported, whether queued or not yet attached, counts as nothing, so one
+// verified shard beside three queued ones reads as a quarter done rather than
+// nearly complete.
 func writeShardedTablePhaseProgress(sb *strings.Builder, t ShardedTableStatus, writeDDL func()) {
 	parts := make([]presentation.Part, len(t.Shards))
 	for i, s := range t.Shards {
 		parts[i] = s.part()
 	}
-	pct := presentation.PercentAcrossTargets(parts, t.shardTotal()-len(t.Shards))
+	pct := presentation.ShardedPhasePercent(parts, t.shardTotal()-len(t.Shards), t.RowsCopied, t.RowsTotal, t.RowsTotalPlanned)
 	fmt.Fprintf(sb, "**%s**: %s %d%%\n", inlineCode(t.Table), ui.ProgressBarRowCopy(pct), pct)
 	writeDDL()
 	writeShardedRowsAndETA(sb, t)
@@ -705,7 +700,8 @@ func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus, wr
 
 // shardedTableFacts is what the sharded comment knows about a copying table,
 // in the form every surface reads it from. A table whose row figures cover
-// only the shards that have reported says how many.
+// only the shards that have reported says how many; one whose total counts the
+// plan's estimate for the rest spans the whole table and reads approximate.
 func shardedTableFacts(t ShardedTableStatus) presentation.TableFacts {
 	f := presentation.TableFacts{
 		Status:         state.Task.Running,
@@ -714,11 +710,13 @@ func shardedTableFacts(t ShardedTableStatus) presentation.TableFacts {
 		ETASeconds:     t.ETASeconds,
 		EstimatedBytes: t.EstimatedBytes,
 		PlannedShards:  t.PlannedShards,
+
+		RowsTotalPlanned: t.RowsTotalPlanned,
 	}
 	if t.RowsTotal > 0 {
 		f.PercentComplete = int(ui.ClampRows(t.RowsCopied, t.RowsTotal) * 100 / t.RowsTotal)
 	}
-	if t.ShardsReporting < t.shardTotal() {
+	if !t.RowsTotalPlanned && t.ShardsReporting < t.shardTotal() {
 		f.ShardsReporting, f.ShardsTotal = t.ShardsReporting, t.shardTotal()
 	}
 	return f
@@ -893,11 +891,41 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 		}
 		return
 	}
+	writeFinalizerFailure(sb, data.FailedFinalizer)
 	if !state.IsState(data.State, state.Apply.Failed, state.Apply.FailedRetryable) {
+		writeFinalizerFailure(sb, data.FailedFinalizer)
+		return
+	}
+	if data.FailedFinalizer != nil && data.ErrorMessage == data.FailedFinalizer.Error {
+		// The finalizer callout already carries this error.
 		return
 	}
 	if msg := SanitizeInlineError(data.ErrorMessage); msg != "" {
 		fmt.Fprintf(sb, "\n> %s **Failure:** %s\n", failureSeverity(state.IsState(data.State, state.Apply.FailedRetryable)), html.EscapeString(msg))
+	}
+}
+
+// FinalizerFailure is a keyspace finalizer in a failure state: the keyspace,
+// the operation state, and its operation-scoped error.
+type FinalizerFailure struct {
+	Keyspace string
+	State    string
+	Error    string
+}
+
+// writeFinalizerFailure names the keyspace whose finalize failed. Outside the
+// VSchema section, which only shows a VSchema change's state, nothing else in
+// the comment says which keyspace failed to finalize or why.
+func writeFinalizerFailure(sb *strings.Builder, f *FinalizerFailure) {
+	if f == nil {
+		return
+	}
+	severity := failureSeverity(state.IsState(f.State, state.ApplyOperation.FailedRetryable))
+	keyspace := html.EscapeString(f.Keyspace)
+	if msg := SanitizeInlineError(f.Error); msg == "" {
+		fmt.Fprintf(sb, "\n> %s **Failure:** finalizing keyspace <code>%s</code>\n", severity, keyspace)
+	} else {
+		fmt.Fprintf(sb, "\n> %s **Failure:** finalizing keyspace <code>%s</code> — %s\n", severity, keyspace, html.EscapeString(msg))
 	}
 }
 

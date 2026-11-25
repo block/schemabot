@@ -208,10 +208,16 @@ func freshLeaseSQL(d Dialect, op string) string {
 // SettleAppliesStoppedForEndedOperation elects one instance per pass and
 // settles under the lock. See storage.ApplyStore for the contract.
 func (s *applyStore) SettleAppliesStoppedForEndedOperation(ctx context.Context, limit int) ([]*storage.EndedOperationApply, error) {
-	return reapUnderElection(ctx, s.db, s.locker, endedOperationSettleSweep,
+	settled, err := reapUnderElection(ctx, s.db, s.locker, endedOperationSettleSweep,
 		func(ctx context.Context) ([]*storage.EndedOperationApply, error) {
 			return s.settleAppliesStoppedForEndedOperation(ctx, limit)
 		})
+	if err == nil {
+		for _, result := range settled {
+			s.events.offerReapedApplyFinish(result.Apply)
+		}
+	}
+	return settled, err
 }
 
 func (s *applyStore) settleAppliesStoppedForEndedOperation(ctx context.Context, limit int) ([]*storage.EndedOperationApply, error) {
