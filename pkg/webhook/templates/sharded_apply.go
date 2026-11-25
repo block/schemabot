@@ -870,13 +870,29 @@ func writeShardCounts(sb *strings.Builder, data ShardedApplyData) {
 	}
 	counts := presentation.ShardCounts(labels)
 	if !state.IsTerminalApplyState(data.State) {
-		operations := 0
-		for _, ks := range data.Keyspaces {
-			operations += len(ks.Cells)
-		}
-		counts = presentation.WithLimit(counts, len(shards), operations, data.MaxOperationsAtOnce)
+		operations, unfinished := shardedOperationCounts(data)
+		counts = presentation.WithLimit(counts, len(shards), operations, unfinished, data.MaxOperationsAtOnce)
 	}
 	fmt.Fprintf(sb, "\n**Shards**: %s\n", counts)
+}
+
+// shardedOperationCounts counts a sharded apply's (shard, table) operations
+// and how many of them have yet to finish. An operation the progress does not
+// list yet, because dispatch has not attached its shard, has not finished
+// either.
+func shardedOperationCounts(data ShardedApplyData) (operations, unfinished int) {
+	finished := 0
+	for _, ks := range data.Keyspaces {
+		operations += len(ks.Cells)
+		for _, table := range ks.Tables {
+			for _, shard := range table.Shards {
+				if !presentation.OperationUnfinished(shard.Status) {
+					finished++
+				}
+			}
+		}
+	}
+	return operations, max(operations-finished, 0)
 }
 
 // isShardFailureState reports whether a shard's state carries an operator-facing

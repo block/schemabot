@@ -250,6 +250,28 @@ func TestParseProgressResponseCountsShardsTheDriverCapHoldsBackAsQueued(t *testi
 		"a server that reports no limit leaves the counts as they are")
 }
 
+// A sharded apply alters orders on eight shards under a driver cap of two.
+// Six shards have landed and the last two are copying, so nothing waits on the
+// cap and the CLI no longer states it, as the PR comment does not.
+func TestShardCountsStatesTheDriverCapOnlyWhileWorkIsQueued(t *testing.T) {
+	result := &apitypes.ProgressResponse{State: state.Apply.Running, MaxOperationsAtOnce: 2}
+	for i, shard := range []string{"-20", "20-40", "40-60", "60-80", "80-a0", "a0-c0", "c0-e0", "e0-"} {
+		opState := state.ApplyOperation.Running
+		if i < 6 {
+			opState = state.ApplyOperation.Completed
+		}
+		result.Operations = append(result.Operations, &apitypes.ProgressOperationResponse{
+			Deployment: "default", OperationKey: "commerce/" + shard + "/orders", State: opState, CutoverPolicy: storage.CutoverPolicyBarrier,
+		})
+	}
+
+	data := ParseProgressResponse(result)
+
+	counts := ShardCounts(data.State, data.Operations, data.Tables, data.Released, data.MaxOperationsAtOnce)
+	assert.NotContains(t, counts, "at a time", "two shards left under a cap of two leave nothing queued")
+	assert.Contains(t, counts, "2 running table copy")
+}
+
 // A sharded apply deferred its cutover and shard -40 failed, so SchemaBot
 // stopped 40-80 and 80- at the cutover and failed them for -40 (ended_by).
 // Parsed from the progress response's JSON, the CLI counts those shards as

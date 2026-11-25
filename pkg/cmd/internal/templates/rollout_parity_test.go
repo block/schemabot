@@ -223,3 +223,24 @@ func TestOperationsAtOnceReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
 	assert.Contains(t, cli, "Targets:      2 running · 4 queued (2 at a time)")
 	assert.Contains(t, pr, "Rolling out: 0 of 6 targets done, 2 running, 4 queued (2 at a time)")
 }
+
+// A rollout across six targets has not started any of them under a limit of
+// two operations at once, so every target reads queued. The watch view says
+// "Queued on all 6 targets" rather than counting one state twice, and still
+// states the limit, so the queue reads as waiting on it rather than stalled.
+func TestRolloutCoverageStatesHowManyRunAtOnce(t *testing.T) {
+	ops := make([]presentation.Operation, 6)
+	for i := range ops {
+		ops[i] = presentation.Operation{
+			Deployment: "production", Target: fmt.Sprintf("payments-%03d", i+1),
+			State: state.ApplyOperation.Pending, Parallel: true, ContinueOnFailure: true,
+		}
+	}
+	model := presentation.Derive(ops)
+	model.OperationsAtOnce = 2
+
+	assert.Equal(t, "all 6 targets (2 at a time)", RolloutCoverage(model, model.Groups()))
+
+	model.OperationsAtOnce = 0
+	assert.Equal(t, "all 6 targets", RolloutCoverage(model, model.Groups()), "a server that reports no limit leaves the coverage as it is")
+}

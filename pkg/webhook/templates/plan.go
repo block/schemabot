@@ -434,6 +434,10 @@ type PlanCommentData struct {
 	// count combined across targets never reads as any one target's work. Nil
 	// when the summary is one plan's.
 	summaryRollout *DeploymentDriftData
+	// summaryRolloutOperations is how many operations an apply of the
+	// summarized rollout would run across its targets that have work, counted
+	// from each target's own plan before the summary combines them.
+	summaryRolloutOperations int
 	// applyWithheld is set on an environment's plan whose apply a multi-env
 	// footer does not offer, because an earlier environment's apply is
 	// refused, so its unsafe warning keeps the drop steps no footer carries.
@@ -764,8 +768,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			writePausedApplyCause(&sb, data.PausedApplyCause)
 		}
 		writeTargetPlans(&sb, data, budget, false)
-		summary.Changes = combinedTargetPlanChanges(data)
-		summary.summaryRollout = data.DeploymentDrift
+		summary.summarizeRollout(data)
 	}
 
 	// Count changes
@@ -1473,7 +1476,7 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	if data.summaryRollout != nil {
 		text += " · " + rolloutScope(data.summaryRollout)
 		changing := changingTargetCount(data.summaryRollout)
-		if limit := presentation.LimitPhrase(changing, changing, data.OperationsAtOnce); limit != "" {
+		if limit := presentation.LimitPhrase(changing, data.summaryRolloutOperations, data.OperationsAtOnce); limit != "" {
 			text += ", " + limit
 		}
 	}
@@ -1490,6 +1493,38 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 	writeExemptTables(sb, data.ExemptTables)
 	writeUnmatchedDropTables(sb, data.shownUnmatchedDropTables())
+}
+
+// summarizeRollout makes s the summary of data's rollout: the union of every
+// target's changes, the rollout it covers, and how many operations its apply
+// would run (plannedRolloutOperations).
+func (s *PlanCommentData) summarizeRollout(data PlanCommentData) {
+	s.Changes = combinedTargetPlanChanges(data)
+	s.summaryRollout = data.DeploymentDrift
+	s.summaryRolloutOperations = plannedRolloutOperations(data)
+}
+
+// plannedRolloutOperations counts the operations an apply of data's rollout
+// would run on its targets that have work. A target runs one operation for its
+// whole plan, and a sharded target one per table on each of its shards with
+// work (plannedShardWork), so a rollout across sharded targets has more
+// operations than targets for the limit to hold back.
+func plannedRolloutOperations(data PlanCommentData) int {
+	if data.DeploymentDrift == nil {
+		return 0
+	}
+	operations := 0
+	for _, g := range data.DeploymentDrift.Plans {
+		if g.Empty() {
+			continue
+		}
+		perTarget := 1
+		if _, shardOperations := plannedShardWork(targetPlanChanges(g, data)); shardOperations > 0 {
+			perTarget = shardOperations
+		}
+		operations += perTarget * len(g.Members)
+	}
+	return operations
 }
 
 // plannedShardWork counts a sharded plan's shards that have work and the
@@ -4417,8 +4452,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	summary := *plan
 	if targetPlans {
 		writeTargetPlans(sb, *plan, budget, true)
-		summary.Changes = combinedTargetPlanChanges(*plan)
-		summary.summaryRollout = plan.DeploymentDrift
+		summary.summarizeRollout(*plan)
 	}
 
 	totalStatements, keyspaceUpdates := countChanges(plan.Changes)

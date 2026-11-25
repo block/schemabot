@@ -116,14 +116,16 @@ func RolloutCountsLine(model presentation.Apply, groups []presentation.Group) st
 
 // RolloutCoverage is "all 4 targets" when every member of the rollout is in
 // the same state, so its state line reads "Running on all 4 targets" rather
-// than counting one state twice. It is empty otherwise.
+// than counting one state twice. While the apply runs, it ends with how many
+// members run at once, as RolloutCountsLine does: "Queued on all 128 targets
+// (32 at a time)". It is empty otherwise.
 func RolloutCoverage(model presentation.Apply, groups []presentation.Group) string {
 	label, counts := rolloutStateCounts(model, groups)
 	if counts == "" || len(model.Counts) != 1 {
 		return ""
 	}
 	n := len(model.Deployments)
-	return presentation.CoveragePhrase(rolloutNoun(label), n, n)
+	return model.CountsWithLimit(presentation.CoveragePhrase(rolloutNoun(label), n, n))
 }
 
 // RolloutStoppedAtCutoverNote explains the rollout's members that SchemaBot

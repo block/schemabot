@@ -434,3 +434,39 @@ func TestRenderPlanComment_ErrorsEscapeHTML(t *testing.T) {
 		"HTML metacharacters are escaped after sanitization")
 	assert.NotContains(t, out, "<nil>")
 }
+
+// A plan rolls a change to mutes out to two sharded targets of four shards
+// each, under a limit of four operations at once. Each target runs one
+// operation per shard, so the rollout has eight operations and half of them
+// wait their turn, although it has only two targets. The plan summary states
+// the limit, counted in table changes since the operations outnumber the
+// targets. Under a limit of eight nothing waits and the limit is not stated.
+func TestRenderPlanComment_RolloutOverShardedTargetsCountsTheirShardOperations(t *testing.T) {
+	mutes := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	var shards []KeyspaceShardChange
+	for _, shard := range []string{"-40", "40-80", "80-c0", "c0-"} {
+		shards = append(shards, KeyspaceShardChange{Shard: shard, Statements: []string{mutes}})
+	}
+	changes := []KeyspaceChangeData{{Keyspace: "cdb_resolute_sharded", Statements: []string{mutes}, Shards: shards}}
+	data := PlanCommentData{
+		Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata", OperationsAtOnce: 4,
+		Changes: changes,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "default", Target: "resolute-001", Primary: true, Class: "planned"},
+				{Deployment: "default", Target: "resolute-002", Class: "planned"},
+			},
+			Plans: []DeploymentPlanGroup{{
+				Members: []string{"default/resolute-001", "default/resolute-002"},
+				Primary: true,
+				Changes: changes,
+			}},
+		},
+	}
+
+	assert.Contains(t, RenderPlanComment(data), "· rolling out to both targets, 4 table changes at a time\n")
+
+	data.OperationsAtOnce = 8
+	assert.NotContains(t, RenderPlanComment(data), "at a time", "a limit that holds no shard operation back is not stated")
+}

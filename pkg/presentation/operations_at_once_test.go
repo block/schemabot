@@ -12,34 +12,44 @@ import (
 
 func TestWithLimit(t *testing.T) {
 	cases := []struct {
-		name                     string
-		units, operations, limit int
-		want                     string
+		name                                 string
+		units, operations, unfinished, limit int
+		want                                 string
 	}{
 		{
 			name:  "a queue behind the limit states it",
-			units: 128, operations: 128, limit: 32,
+			units: 128, operations: 128, unfinished: 128, limit: 32,
 			want: "32 running, 96 queued (32 at a time)",
 		},
 		{
 			name:  "shards with several tables state it in table changes",
-			units: 64, operations: 128, limit: 32,
+			units: 64, operations: 128, unfinished: 128, limit: 32,
 			want: "32 running, 96 queued (32 table changes at a time)",
 		},
 		{
 			name:  "a rollout the limit cannot hold back reads as its counts",
-			units: 32, operations: 32, limit: 32,
+			units: 32, operations: 32, unfinished: 32, limit: 32,
 			want: "32 running, 96 queued",
 		},
 		{
 			name:  "an unknown limit reads as the counts",
-			units: 128, operations: 128, limit: 0,
+			units: 128, operations: 128, unfinished: 128, limit: 0,
 			want: "32 running, 96 queued",
+		},
+		{
+			name:  "a rollout whose remaining work fits the limit reads as its counts",
+			units: 8, operations: 8, unfinished: 2, limit: 2,
+			want: "32 running, 96 queued",
+		},
+		{
+			name:  "a rollout with more unfinished work than the limit states it",
+			units: 8, operations: 8, unfinished: 3, limit: 2,
+			want: "32 running, 96 queued (2 at a time)",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, WithLimit("32 running, 96 queued", tc.units, tc.operations, tc.limit))
+			assert.Equal(t, tc.want, WithLimit("32 running, 96 queued", tc.units, tc.operations, tc.unfinished, tc.limit))
 		})
 	}
 }
@@ -47,13 +57,21 @@ func TestWithLimit(t *testing.T) {
 // rolloutOps is a parallel rollout of n targets: the first running members
 // run, the next converged ones already held the change, and the rest wait.
 func rolloutOps(n, running, converged int) []Operation {
+	return rolloutOpsWithCompleted(n, 0, running, converged)
+}
+
+// rolloutOpsWithCompleted is rolloutOps whose first completed members have
+// already landed the change.
+func rolloutOpsWithCompleted(n, completed, running, converged int) []Operation {
 	ops := make([]Operation, n)
 	for i := range ops {
 		op := Operation{Deployment: "prod", Target: fmt.Sprintf("payments-%03d", i+1), State: state.ApplyOperation.Pending, Parallel: true, ContinueOnFailure: true}
 		switch {
-		case i < running:
+		case i < completed:
+			op.State = state.ApplyOperation.Completed
+		case i < completed+running:
 			op.State = state.ApplyOperation.Running
-		case i < running+converged:
+		case i < completed+running+converged:
 			op.State = state.ApplyOperation.Completed
 			op.AlreadyConverged = true
 		}
@@ -63,8 +81,9 @@ func rolloutOps(n, running, converged int) []Operation {
 }
 
 // A rollout states its limit while members wait on it. Targets that already
-// held the change ran nothing, so they never count against the limit, and a
-// finished apply has nothing left to wait.
+// held the change ran nothing, so they never count against the limit. Targets
+// that landed the change hold no slot, so once the remaining work fits the
+// limit nothing waits on it, and a finished apply has nothing left to wait.
 func TestApplyLimitPhrase(t *testing.T) {
 	cases := []struct {
 		name string
@@ -73,6 +92,8 @@ func TestApplyLimitPhrase(t *testing.T) {
 	}{
 		{name: "more members than the limit", ops: rolloutOps(6, 2, 0), want: "2 running, 4 queued (2 at a time)"},
 		{name: "converged targets leave too few to wait", ops: rolloutOps(4, 2, 2), want: "2 running, 4 queued"},
+		{name: "landed targets leave nothing queued", ops: rolloutOpsWithCompleted(8, 6, 2, 0), want: "2 running, 4 queued"},
+		{name: "landed targets with work still queued", ops: rolloutOpsWithCompleted(8, 5, 2, 0), want: "2 running, 4 queued (2 at a time)"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
