@@ -160,17 +160,19 @@ type CommentObserver struct {
 	// unchanged is skipped instead of PATCHing an identical comment — until
 	// unchangedCommentHeartbeat elapses, when a refresh edit goes through so
 	// the "Last updated" footer keeps proving liveness. Guarded by its own
-	// mutex, not o.mu: editTrackedComment runs both under OnProgress (which
-	// holds o.mu) and from OnTerminal (which does not).
+	// mutex rather than o.mu: every caller already holds o.mu, and o.mu is not
+	// re-entrant, so taking it again here would deadlock.
 	lastWrittenMu sync.Mutex
 	lastWritten   map[int64]writtenContent
 }
 
 // writtenContent records what an observer last wrote to a GitHub comment and
 // when, so unchanged re-renders can be skipped until the liveness heartbeat
-// elapses. firstWrittenAt is when this observer first wrote the comment; it
-// anchors the young-comment grace window and carries forward across edits, so
-// a rotation to a fresh comment ID starts a new grace window.
+// elapses. firstWrittenAt is when this observer first wrote the comment, not
+// when the comment was created; it anchors the grace window and carries
+// forward across edits. A rotation to a fresh comment ID starts a new grace
+// window, and so does a new observer taking over an existing comment after a
+// restart or a lease handover.
 type writtenContent struct {
 	contentKey     string
 	writtenAt      time.Time
@@ -216,8 +218,10 @@ const (
 	// comment is the one being actively watched — the requester just started
 	// or resumed the apply — and an early stall (setup, throttling) must not
 	// read as SchemaBot going silent, so unchanged-edit skipping only begins
-	// once the comment ages past this window. The cost is bounded: at most a
-	// few minutes of fast identical edits per comment.
+	// once the comment ages past this window. The window is measured from
+	// when this observer first wrote the comment, so its cost recurs once per
+	// observer that drives the comment, including a new driver after a restart
+	// or a lease handover.
 	unchangedCommentGraceWindow = 10 * time.Minute
 )
 
@@ -1319,8 +1323,11 @@ func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState 
 // unchanged or not — young comments are the actively watched ones. A cache
 // miss — including a comment this observer never wrote, such as the
 // handler-posted initial progress comment — means the edit must proceed; only
-// a confirmed match may skip it, so uncertainty always degrades to an extra
-// edit, never a missed one.
+// a confirmed match may skip it, so uncertainty degrades to an extra edit.
+// The cache records what this observer wrote, not what is on GitHub: if
+// another writer edits the same comment between two ticks, a render that
+// matches this observer's last write is skipped, and the comment keeps the
+// other writer's body until the heartbeat refresh.
 func (o *CommentObserver) skipUnchangedEdit(commentID int64, contentKey string) bool {
 	o.lastWrittenMu.Lock()
 	defer o.lastWrittenMu.Unlock()
