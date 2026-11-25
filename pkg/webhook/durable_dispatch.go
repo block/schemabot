@@ -373,6 +373,14 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 	}
 
 	runCtx, cancelRun := context.WithCancel(ctx)
+	// Whether a quota reserve refusal is retried without spending an attempt
+	// is decided once, at the claim. The check's wording and the driver's
+	// disposition of a refusal both read this value, so a run that outlasts
+	// the uncharged window still does what the check told the author.
+	refusalUncharged := quotaReserveRefusalIsUncharged(event, claimedAt)
+	if quotaReserveRefusalIsRetried(event, refusalUncharged) {
+		runCtx = withDurableRetryAtQuotaReset(runCtx)
+	}
 	stopHeartbeat := h.startDurableWebhookHeartbeat(runCtx, driverID, event, cancelRun)
 	process := h.processDurableWebhookEvent
 	if h.durableWebhookProcessOverride != nil {
@@ -443,7 +451,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			// head push or a re-run of the failing SchemaBot check.
 			markErr = store.MarkFailedPermanent(finishCtx, event.ID, event.LeaseToken, processErr.Error())
 			outcome = "failed_permanent"
-		case refusedByQuotaReserve && quotaReserveRefusalIsUncharged(event, now):
+		case refusedByQuotaReserve && refusalUncharged:
 			// Every retry before the reset would be refused the same way, so
 			// the delivery waits for the reset, and the wait costs no attempt.
 			retryAt = quotaReserveRetryAt(refusal.ResetAt, now)
@@ -705,6 +713,16 @@ func (h *Handler) postDurableCommandTerminalComment(event *storage.WebhookEvent,
 		h.logger.Warn("durable webhook driver could not prepare terminal command comment",
 			"delivery_id", event.DeliveryID, "event", event.Event, "repo", event.Repository,
 			"pr", event.PullRequest, "error", err)
+		return
+	}
+	// A quota reserve refusal's text carries the installation's remaining
+	// quota and reserve, which belong in the server log (the retry budget
+	// exhaustion is logged with it) and not on the PR. What the author needs
+	// is when the reads go out again.
+	if refusal, ok := errors.AsType[*ghclient.QuotaReservedError](processErr); ok {
+		h.postCommandError(repo, pr, installationID, result.Action, result.Environment, requestedBy,
+			"SchemaBot could not complete this command because it is holding back its remaining GitHub API quota for check runs. "+
+				"Comment the command again after the quota resets at "+quotaResetTime(refusal.ResetAt)+".")
 		return
 	}
 	// The answer carries the wrapped error chain rather than the gates'
@@ -987,6 +1005,32 @@ func quotaReserveRefusalIsUncharged(event *storage.WebhookEvent, now time.Time) 
 		return false
 	}
 	return now.Sub(event.ReceivedAt) < quotaReserveUnchargedWindow
+}
+
+// quotaReserveRefusalIsRetried reports whether a quota reserve refusal of this
+// claim would be rescheduled for the reset rather than end the delivery: it is
+// while the refusal is uncharged, and while the claim has attempts left. It is
+// decided at the claim, before the processing whose refusal it covers, from
+// the same uncharged value the driver's disposition of the refusal reads.
+func quotaReserveRefusalIsRetried(event *storage.WebhookEvent, uncharged bool) bool {
+	return uncharged || event.Attempts < maxDurableWebhookAttempts
+}
+
+// durableRetryAtQuotaResetKey marks the context of a durable delivery that is
+// retried at the quota reset when the quota reserve refuses one of its reads.
+type durableRetryAtQuotaResetKey struct{}
+
+func withDurableRetryAtQuotaReset(ctx context.Context) context.Context {
+	return context.WithValue(ctx, durableRetryAtQuotaResetKey{}, true)
+}
+
+// durableRetryAtQuotaReset reports whether ctx belongs to a durable delivery
+// that is retried at the quota reset if the quota reserve refuses a read, so
+// a refusal can tell the author SchemaBot retries then. It is false on the
+// request path and for work a delivery starts but does not wait for.
+func durableRetryAtQuotaReset(ctx context.Context) bool {
+	marked, _ := ctx.Value(durableRetryAtQuotaResetKey{}).(bool)
+	return marked
 }
 
 // quotaReserveRetryAt returns when to retry a delivery the quota reserve

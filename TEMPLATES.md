@@ -4160,6 +4160,25 @@ SchemaBot cannot determine whether this PR contains managed schema changes: the 
 </details>
 
 
+## Aggregate Check — Blocked: GitHub Quota Held in Reserve
+
+<details>
+<summary><strong>Aggregate Check — Blocked: GitHub Quota Held in Reserve</strong></summary>
+
+**When SchemaBot retries at the reset**
+
+Plan failed
+
+SchemaBot is holding back its remaining GitHub API quota for check runs, so it did not read this PR's schema files. It will retry when the quota resets at 15:05 UTC.
+
+**When the check has to be re-run**
+
+Plan failed
+
+SchemaBot is holding back its remaining GitHub API quota for check runs, so it did not read this PR's schema files. Re-run this check after the quota resets at 15:05 UTC.
+</details>
+
+
 ## Aggregate Check — Stopped Apply Holds the PR
 
 <details>

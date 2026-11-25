@@ -456,6 +456,15 @@ type autoPlanDispatch struct {
 // dispatchAutoPlanForPR is runAutoPlanForPR with options; see its comment.
 func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string, opts autoPlanOptions) (autoPlanDispatch, error) {
 	repo = storage.CanonicalKey(repo)
+	// Every discovery failure below posts through this one call, so whether
+	// the check says SchemaBot retries at the quota reset is decided in one
+	// place. A schema exception delivery's retry stops before it clears the
+	// aggregate block when the PR is within the database limit, so its retry
+	// does not lift the block and the check asks for a re-run instead.
+	retriedAtReset := durableRetryAtQuotaReset(ctx) && !opts.schemaExceptionEvent
+	postDiscoveryFailure := func(err error) {
+		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err, retriedAtReset)
+	}
 	// Snapshot the base ref before anything is read, so the publish-time check
 	// below covers the whole of discovery. A base that moves mid-discovery
 	// changes which databases the PR touches, which is the case that check
@@ -465,7 +474,7 @@ func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.In
 	if err != nil {
 		h.logger.Error("failed to read the PR for auto-plan; its base branch cannot be re-verified before publishing",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
-		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+		postDiscoveryFailure(err)
 		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return autoPlanDispatch{message: "config discovery failed"}, fmt.Errorf("read %s#%d for auto-plan: %w", repo, pr, err)
 	}
@@ -494,12 +503,12 @@ func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.In
 		cacheKey = h.prPlanDiscoveryKey(repo, pr, prInfo)
 		if !cacheKey.revision.valid() {
 			err := fmt.Errorf("GitHub did not supply the PR head and base revision")
-			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			postDiscoveryFailure(err)
 			return autoPlanDispatch{message: "config discovery failed"}, err
 		}
 		discovery, err = h.cachedPRPlanDiscovery(ctx, client, cacheKey)
 		if err != nil {
-			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			postDiscoveryFailure(err)
 			return autoPlanDispatch{message: "config discovery failed"}, err
 		}
 	}
@@ -508,7 +517,7 @@ func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.In
 		discovery, err = h.readPRPlanDiscovery(ctx, client, repo, pr, prInfo, source, deliveryID)
 		if err != nil {
 			h.logConfigDiscoveryFailure("discover PR planning inputs", repo, pr, headSHA, source, deliveryID, err)
-			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			postDiscoveryFailure(err)
 			h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 			return autoPlanDispatch{message: "config discovery failed"}, err
 		}
@@ -1016,13 +1025,19 @@ func (h *Handler) logConfigDiscoveryFailure(step, repo string, pr int, headSHA, 
 	h.logger.Error("auto-plan config discovery failed", attrs...)
 }
 
-func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, discoveryErr error) {
+// postConfigDiscoveryFailure fails the aggregate closed for a discovery that
+// could not finish. retriedAtReset reports whether the caller's durable
+// delivery re-runs this discovery when a quota reserve refusal lifts, which
+// decides whether the check says SchemaBot retries or asks for a re-run.
+func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, discoveryErr error, retriedAtReset bool) {
 	// The causes stay apart because operators triage them differently: GitHub
-	// being unavailable is an outage to wait out, a PR past GitHub's per-PR
-	// changed-file cap is a property of the PR that no retry can change, and
-	// anything else is a configuration problem to investigate.
+	// being unavailable is an outage to wait out, the quota reserve lifts at a
+	// known reset time, a PR past GitHub's per-PR changed-file cap is a
+	// property of the PR that no retry can change, and anything else is a
+	// configuration problem to investigate.
 	block := configDiscoveryFailedBlock
 	discoveryStatus := "error"
+	var refusal *ghclient.QuotaReservedError
 	switch {
 	case errors.Is(discoveryErr, ghclient.ErrPRFilesIncomplete):
 		// A deterministic cap is a block, not an error: reporting it as one
@@ -1031,6 +1046,11 @@ func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclie
 		discoveryStatus = "blocked"
 	case ghclient.IsUnavailableError(discoveryErr):
 		block = githubConfigDiscoveryUnavailableBlock
+	case errors.As(discoveryErr, &refusal):
+		// The refusal is a deliberate hold on SchemaBot's own reads, not a
+		// discovery error; the quota reserve already counts and logs it.
+		block = githubQuotaReservedBlockFor(refusal.ResetAt, retriedAtReset)
+		discoveryStatus = "blocked"
 	}
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 		Operation:  "schema_config_discovery",
@@ -1038,9 +1058,15 @@ func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclie
 		Status:     discoveryStatus,
 	})
 
-	h.logger.Info("posting failing aggregate for config discovery failure",
-		"repo", repo, "pr", pr, "head_sha", headSHA,
-		"blocking_reason", block.blockingReason)
+	logAttrs := []any{"repo", repo, "pr", pr, "head_sha", headSHA, "blocking_reason", block.blockingReason}
+	if refusal != nil {
+		// The check text promises either a retry at the reset or a re-run by
+		// the author. Logging which one, and the reset it names, lets a PR
+		// that says "It will retry" be matched to the durable retry, or to
+		// its absence.
+		logAttrs = append(logAttrs, "retried_at_reset", retriedAtReset, "reset_time", refusal.ResetAt.UTC())
+	}
+	h.logger.Info("posting failing aggregate for config discovery failure", logAttrs...)
 	h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA,
 		h.aggregateMessagesForAllEnvironments(block.message), block)
 }

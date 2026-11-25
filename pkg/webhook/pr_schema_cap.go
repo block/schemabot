@@ -63,15 +63,19 @@ func (h *Handler) admitPRSchemaCommand(ctx context.Context, client *ghclient.Ins
 		return prSchemaAdmission{}, errPRSchemaMoved
 	}
 
+	// A durable apply command that fails here is retried, but its retry
+	// re-runs admission, not the auto-plan that releases a stored aggregate
+	// block, so a quota reserve refusal here asks the author to re-run the
+	// check rather than saying SchemaBot retries it.
 	discovery, err := h.cachedPRPlanDiscovery(ctx, client, key)
 	if err != nil {
-		h.postConfigDiscoveryFailure(ctx, client, repo, pr, info.HeadSHA, err)
+		h.postConfigDiscoveryFailure(ctx, client, repo, pr, info.HeadSHA, err, false)
 		return prSchemaAdmission{}, err
 	}
 	if discovery == nil {
 		discovery, err = h.readPRPlanDiscovery(ctx, client, repo, pr, info, "schema cap", "")
 		if err != nil {
-			h.postConfigDiscoveryFailure(ctx, client, repo, pr, info.HeadSHA, err)
+			h.postConfigDiscoveryFailure(ctx, client, repo, pr, info.HeadSHA, err, false)
 			return prSchemaAdmission{}, err
 		}
 		if len(discovery.unmanagedFiles) > 0 {
