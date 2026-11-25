@@ -350,6 +350,32 @@ func TestClassifyRefusal(t *testing.T) {
 			wantReason: "table-too-large",
 		},
 		{
+			name: "oversized table whose catalog-only proof lacks the TEMPORARY grant is a provisioning refusal",
+			err: fmt.Errorf("preflight: %w", &catalogOnlyProofError{
+				size: &preflight.SizeError{TotalBytes: 2, LimitBytes: 1},
+				proof: fmt.Errorf("prove: %w", fmt.Errorf("%w: grant TEMPORARY: %w",
+					preflight.ErrAddColumnProbeUnavailable, &pgconn.PgError{Code: "42501", Message: "permission denied for database app"})),
+			}),
+			wantReason:    "insufficient-privileges",
+			wantDetail:    []string{`table "users" is over the size limit`, "grant TEMPORARY on the database to the engine role"},
+			wantNotDetail: []string{"permission denied for database app"},
+		},
+		{
+			name: "oversized table whose catalog-only proof lost its connection is operational",
+			err: fmt.Errorf("preflight: %w", &catalogOnlyProofError{
+				size:  &preflight.SizeError{TotalBytes: 2, LimitBytes: 1},
+				proof: fmt.Errorf("read live facts: %w", errors.New("conn closed")),
+			}),
+		},
+		{
+			name: "oversized table whose catalog-only probe met a read-only server is operational",
+			err: fmt.Errorf("preflight: %w", &catalogOnlyProofError{
+				size: &preflight.SizeError{TotalBytes: 2, LimitBytes: 1},
+				proof: fmt.Errorf("%w: the server accepts no writes: %w",
+					preflight.ErrAddColumnProbeUnavailable, &pgconn.PgError{Code: "25006"}),
+			}),
+		},
+		{
 			name:       "missing table is a refusal",
 			err:        fmt.Errorf("preflight: %w", preflight.ErrTableNotFound),
 			wantReason: "table-not-found",
@@ -1595,6 +1621,18 @@ func TestClassifyApplyFailureBrokenForeignKey(t *testing.T) {
 	assert.True(t, failure.retryable)
 	assert.Equal(t, `existing rows in "orders" break foreign key "orders_user_id_fkey"; the key is in place and checks new writes; fix those rows, then retry`, failure.detail)
 	assert.NotContains(t, failure.detail, "99")
+}
+
+// A statement the server refuses for a missing grant, such as a foreign key
+// whose referenced table the engine role cannot reference, says a grant is
+// missing instead of reporting a generic failure.
+func TestClassifyApplyFailureMissingGrant(t *testing.T) {
+	err := fmt.Errorf("add foreign key: %w", &pgconn.PgError{Code: "42501", Message: "permission denied for table users"})
+
+	failure := classifyApplyFailure(err, "orders")
+
+	assert.True(t, failure.retryable)
+	assert.Equal(t, `the engine role lacks a privilege the statement on "orders" needs, such as REFERENCES on the table a foreign key references; the server log names it; grant it, then retry`, failure.detail)
 }
 
 func TestProgressResultReportsCreateSequenceLength(t *testing.T) {
