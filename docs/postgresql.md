@@ -1002,7 +1002,10 @@ schema file format. These include tables with:
 - Triggers, or table or column comments
 
 Storage parameters, such as `fillfactor` or `autovacuum_enabled`, are not on
-this list. `pull` writes them into the table's `WITH (...)` clause.
+this list. `pull` writes them into the table's `WITH (...)` clause. SchemaBot
+does not change them: if the file and the live table differ, the table's plan
+is refused. Change a parameter on the database directly, then update the file
+to match.
 
 | Command | What happens to such a table |
 |---|---|
