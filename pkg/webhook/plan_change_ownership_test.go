@@ -1,6 +1,8 @@
 package webhook
 
 import (
+	"maps"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -28,7 +30,7 @@ func TestPlannedDestructiveTables_CollectsFromBothViews(t *testing.T) {
 		}},
 	}
 
-	assert.Equal(t, []string{"audit_log", "orders"}, plannedDestructiveTables(planResp))
+	assert.Equal(t, []string{"audit_log", "orders"}, destructiveTables(plannedDestructiveStatements(planResp)))
 }
 
 // An ALTER that destroys something a table keeps — a dropped column, a dropped
@@ -46,7 +48,7 @@ func TestPlannedDestructiveTables_CollectsUnsafeAlters(t *testing.T) {
 		}},
 	}
 
-	assert.Equal(t, []string{"customers", "orders"}, plannedDestructiveTables(planResp),
+	assert.Equal(t, []string{"customers", "orders"}, destructiveTables(plannedDestructiveStatements(planResp)),
 		"an additive alter stays out; a destructive one is attributed by its table")
 }
 
@@ -79,10 +81,10 @@ func TestUnsafeGateCoversEveryAttributedTable(t *testing.T) {
 		gated = append(gated, unsafe.Table)
 	}
 
-	assert.Subset(t, gated, plannedDestructiveTables(planResp), "every attributed table is gated")
+	assert.Subset(t, gated, destructiveTables(plannedDestructiveStatements(planResp)), "every attributed table is gated")
 	assert.ElementsMatch(t, []string{"audit_log", "orders", "stations"}, gated,
 		"a shard-only drop solicits consent, an additive alter is not gated at all")
-	assert.Equal(t, []string{"audit_log", "orders"}, plannedDestructiveTables(planResp),
+	assert.Equal(t, []string{"audit_log", "orders"}, destructiveTables(plannedDestructiveStatements(planResp)),
 		"the created table's lint error is gated but not attributed")
 }
 
@@ -108,7 +110,7 @@ func TestPlannedDestructiveTables_LeavesOutCreatedTables(t *testing.T) {
 		}},
 	}
 
-	assert.Equal(t, []string{"docks"}, plannedDestructiveTables(planResp))
+	assert.Equal(t, []string{"docks"}, destructiveTables(plannedDestructiveStatements(planResp)))
 }
 
 func TestPlannedDestructiveTables_NoDestructiveChanges(t *testing.T) {
@@ -119,8 +121,8 @@ func TestPlannedDestructiveTables_NoDestructiveChanges(t *testing.T) {
 		}},
 	}
 
-	assert.Empty(t, plannedDestructiveTables(planResp))
-	assert.Empty(t, plannedDestructiveTables(nil))
+	assert.Empty(t, destructiveTables(plannedDestructiveStatements(planResp)))
+	assert.Empty(t, destructiveTables(plannedDestructiveStatements(nil)))
 }
 
 func TestRenderPlanComment_AttributedChangeNamesOwnerAndStillOffersApply(t *testing.T) {
@@ -336,9 +338,14 @@ func TestTargetPlanDestructiveTables(t *testing.T) {
 				}},
 		},
 	}
-	assert.Equal(t, []string{"reconcile_state", "users"}, targetPlanDestructiveTables(drift))
+	assert.Equal(t, []string{"reconcile_state", "users"}, destructiveTables(targetPlanDestructiveStatements(drift)))
 
 	drift.Clean = false
-	assert.Empty(t, targetPlanDestructiveTables(drift), "a blocked rollup renders no target plans")
-	assert.Empty(t, targetPlanDestructiveTables(nil))
+	assert.Empty(t, destructiveTables(targetPlanDestructiveStatements(drift)), "a blocked rollup renders no target plans")
+	assert.Empty(t, destructiveTables(targetPlanDestructiveStatements(nil)))
+}
+
+// destructiveTables lists the tables of a statements-by-table map in order.
+func destructiveTables(statements map[string][]string) []string {
+	return slices.Sorted(maps.Keys(statements))
 }

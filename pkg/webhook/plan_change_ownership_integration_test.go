@@ -42,6 +42,44 @@ const (
 		"  PRIMARY KEY (`id`)\n" +
 		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
 
+	ownershipUsersWithPayloadSchema = "CREATE TABLE `users` (\n" +
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+		"  `name` varchar(255) NOT NULL,\n" +
+		"  `payload` text,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+
+	ownershipUsersWithPayloadAndNameIndexSchema = "CREATE TABLE `users` (\n" +
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+		"  `name` varchar(255) NOT NULL,\n" +
+		"  `payload` text,\n" +
+		"  PRIMARY KEY (`id`),\n" +
+		"  KEY `idx_name` (`name`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+
+	ownershipUsersRenamedWithNameIndexSchema = "CREATE TABLE `users` (\n" +
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+		"  `name` varchar(255) NOT NULL,\n" +
+		"  `body` text,\n" +
+		"  PRIMARY KEY (`id`),\n" +
+		"  KEY `idx_name` (`name`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+
+	ownershipUsersWithNameIndexSchema = "CREATE TABLE `users` (\n" +
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+		"  `name` varchar(255) NOT NULL,\n" +
+		"  PRIMARY KEY (`id`),\n" +
+		"  KEY `idx_name` (`name`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+
+	ownershipUsersWithEmailAndNameIndexSchema = "CREATE TABLE `users` (\n" +
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+		"  `name` varchar(255) NOT NULL,\n" +
+		"  `email` varchar(255) NOT NULL,\n" +
+		"  PRIMARY KEY (`id`),\n" +
+		"  KEY `idx_name` (`name`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+
 	ownershipReconcileSchema = "CREATE TABLE `reconcile_state` (\n" +
 		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
 		"  `pending` tinyint(1) NOT NULL DEFAULT '0',\n" +
@@ -100,11 +138,10 @@ func TestE2EPlanFlagsDropOfTableAnOpenPullRequestOwns(t *testing.T) {
 	}
 }
 
-// Attribution is table-grained, so the same window is disclosed for a change
-// that destroys part of a table the table itself survives. Another pull request
-// adds a column and applies it without merging; a plan whose schema files
-// predate that column reads it as one to drop, and the comment names the pull
-// request that last changed the table.
+// The same window is disclosed for a change that destroys part of a table the
+// table itself survives. Another pull request adds a column and applies it
+// without merging; a plan whose schema files predate that column reads it as
+// one to drop, and the comment names the pull request that added it.
 func TestE2EPlanFlagsDroppedColumnOnTableAnOpenPullRequestOwns(t *testing.T) {
 	dbName := "webhook_column_ownership"
 	svc := setupE2EService(t, dbName)
@@ -139,9 +176,107 @@ func TestE2EPlanFlagsDroppedColumnOnTableAnOpenPullRequestOwns(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "DROP COLUMN", "the plan still shows the diff it computed")
-		assert.Contains(t, body, "`users`", "the notice names the table, the grain task history records")
+		assert.Contains(t, body, "`users`")
 		assert.Contains(t, body, "(changed by open PR [#2](https://github.com/octocat/hello-world/pull/2))")
 		assert.Contains(t, body, "▶️ **To apply**")
+	case <-time.After(webhookIntegrationPollDeadline):
+		require.FailNow(t, "timed out waiting for the plan comment")
+	}
+}
+
+// Two pull requests change `users` at once. The other one adds an index on
+// `name`, applies it, and stays open. This one renames `payload` to `body`
+// and already declares the other pull request's index. Its plan drops
+// `payload` and adds `body`, which undoes nothing the other pull request did,
+// so the comment attributes nothing: the rename is this pull request's own
+// change, and its unsafe finding reads without a note.
+func TestE2EPlanDoesNotAttributeAChangeToObjectsTheOtherPullRequestNeverTouched(t *testing.T) {
+	dbName := "webhook_rename_beside_owner_index"
+	svc := setupE2EService(t, dbName)
+	resetOwnershipHistory(t, dbName)
+
+	// An earlier apply from this pull request created the table; the open one
+	// adds an index.
+	applyDeclaredSchemaForPullRequest(t, svc, dbName, 1, map[string]string{"users.sql": ownershipUsersWithPayloadSchema})
+	applyDeclaredSchemaForPullRequest(t, svc, dbName, 2, map[string]string{"users.sql": ownershipUsersWithPayloadAndNameIndexSchema})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{"users.sql": ownershipUsersRenamedWithNameIndexSchema}, schemabotConfig, dbName)
+	registerOpenPullRequest(mux, 2)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "DROP COLUMN", "the plan still shows the rename it computed")
+		assert.Contains(t, body, "`payload`")
+		assert.NotContains(t, body, "(changed by open PR", "the rename undoes nothing the open pull request did")
+		assert.NotContains(t, body, "Check before applying")
+		assert.NotContains(t, body, "shows up here as one to undo")
+		assert.Contains(t, body, "▶️ **To apply**")
+	case <-time.After(webhookIntegrationPollDeadline):
+		require.FailNow(t, "timed out waiting for the plan comment")
+	}
+}
+
+// Two open pull requests changed `users`: the older one added `email`, and the
+// newer one added an index on `name`. This pull request's schema files
+// predate `email` and already declare the index, so its plan drops `email`.
+// The comment names the pull request whose column the plan drops, not the
+// one that changed the table last.
+func TestE2EPlanAttributesADroppedColumnToThePullRequestThatAddedIt(t *testing.T) {
+	dbName := "webhook_column_owner_not_latest"
+	svc := setupE2EService(t, dbName)
+	resetOwnershipHistory(t, dbName)
+
+	// An earlier apply from this pull request created the table.
+	applyDeclaredSchemaForPullRequest(t, svc, dbName, 1, map[string]string{"users.sql": ownershipUsersSchema})
+	applyDeclaredSchemaForPullRequest(t, svc, dbName, 2, map[string]string{"users.sql": ownershipUsersWithEmailSchema})
+	applyDeclaredSchemaForPullRequest(t, svc, dbName, 3, map[string]string{"users.sql": ownershipUsersWithEmailAndNameIndexSchema})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{"users.sql": ownershipUsersWithNameIndexSchema}, schemabotConfig, dbName)
+	registerOpenPullRequest(mux, 2)
+	registerOpenPullRequest(mux, 3)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "DROP COLUMN")
+		assert.Contains(t, body, "`email`")
+		assert.Contains(t, body, "(changed by open PR [#2](https://github.com/octocat/hello-world/pull/2))", "the note names the pull request that added the column")
+		assert.NotContains(t, body, "pull/3", "the pull request that only added an index is not named")
 	case <-time.After(webhookIntegrationPollDeadline):
 		require.FailNow(t, "timed out waiting for the plan comment")
 	}

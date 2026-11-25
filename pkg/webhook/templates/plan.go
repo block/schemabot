@@ -120,11 +120,59 @@ type DirectChangeData struct {
 // established, which is annotated the same way — the lookup fails toward
 // ownership rather than presenting a change SchemaBot cannot vouch for as one
 // this pull request proposes.
+//
+// OwnerChanges is what the owner's stored statements did to the table's
+// columns, indexes and constraints, merged across them, so each finding can be
+// matched against the owner's work (UndoesAttributedWork). It is nil when that
+// is unknown, and every finding on the table then carries the attribution.
 type AttributedChangeData struct {
-	Table       string
-	Repository  string
-	PullRequest int
-	Unresolved  bool
+	Table        string
+	Repository   string
+	PullRequest  int
+	Unresolved   bool
+	OwnerChanges *ddl.ObjectChanges
+}
+
+// UndoesAttributedWork reports whether a planned change with this statement
+// would undo something the attributed pull request did to its table: drop or
+// change an object the owner added, changed or built an index or constraint
+// on, put back an object the owner dropped, or drop the table itself. A change
+// that touches only objects the owner never did is this pull request's own,
+// so it is not attributed. Anything the match cannot read (an unresolved
+// owner, unknown owner changes, a missing parser, or a statement that does not
+// parse) counts as undoing the owner's work, since over-attributing is the
+// safe direction.
+func UndoesAttributedWork(a AttributedChangeData, stmt string, parser ddl.StatementParser) bool {
+	if a.Unresolved || a.OwnerChanges == nil || parser == nil || strings.TrimSpace(stmt) == "" {
+		return true
+	}
+	change, err := parser.ObjectChanges(stmt)
+	if err != nil {
+		slog.Warn("planned change is attributed to the owning pull request because its statement's objects could not be read",
+			"table", a.Table, "owner_repo", a.Repository, "owner_pr", a.PullRequest, "error", err)
+		return true
+	}
+	owner := *a.OwnerChanges
+	destroyed := slices.Concat(change.Dropped, change.Modified)
+	if slices.ContainsFunc(destroyed, isTableObject) {
+		return true
+	}
+	ownerBuilt := slices.Concat(owner.Added, owner.Modified, owner.Referenced)
+	if len(destroyed) > 0 && slices.ContainsFunc(ownerBuilt, isTableObject) {
+		return true
+	}
+	return sharesObject(destroyed, ownerBuilt) || sharesObject(change.Added, owner.Dropped)
+}
+
+// isTableObject reports whether an object is a whole table, which covers
+// every column, index and constraint on it.
+func isTableObject(o ddl.SchemaObject) bool {
+	return o.Kind == ddl.ObjectTable
+}
+
+// sharesObject reports whether the two lists name a common object.
+func sharesObject(a, b []ddl.SchemaObject) bool {
+	return slices.ContainsFunc(a, func(o ddl.SchemaObject) bool { return slices.Contains(b, o) })
 }
 
 // PlanCommentData contains all data needed to render a plan comment.
@@ -1169,9 +1217,9 @@ func attributionStillActionable(data PlanCommentData) bool {
 // operator's call to make; what the comment owes them is the attribution they
 // cannot see from the DDL alone.
 //
-// Attribution is table-grained: stored task history records the table a task
-// changed and nothing finer, so the notice names the table and the pull request
-// that last changed it, never the specific column or index.
+// A table is listed only when one of its planned changes undoes what the owner
+// did to it (UndoesAttributedWork); the notice names the table and the owner,
+// and the plan's own findings say which column or index is at stake.
 func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData) {
 	n := len(changes)
 	fmt.Fprintf(sb, glyph.Attention+" **Check before applying**: %d %s SchemaBot cannot attribute to this PR\n", n, pluralize("destructive change", n))
@@ -3204,17 +3252,17 @@ func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 	}
 }
 
-// writeUnsafeWarning lists the unsafe findings. attributionNotes, keyed by
-// table, carries the attribution for tables another pull request changed, so
-// the reader learns where a change came from on the finding itself. When
+// writeUnsafeWarning lists the unsafe findings. attributionNotes carries the
+// attribution for findings that undo another pull request's change, so the
+// reader learns where a change came from on the finding itself. When
 // dropTips is set, a tip on making each destructive drop safe follows the
 // list; it is unset where the comment's apply instruction carries those steps
 // instead, so the reader meets them once, beside the command they precede.
-func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL, dropTips bool) {
+func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes *unsafeAttribution, databaseType string, isMySQL, dropTips bool) {
 	drops, rest := splitDestructiveDrops(changes, databaseType)
 	fmt.Fprintf(sb, "%s **Issues**: %s\n", glyph.Attention, unsafeCountPhrase(drops, rest))
 	writeUnsafeFindingList(sb, drops, rest, attributionNotes)
-	writeUnsafeAttributionDisclosure(sb, attributionNotes)
+	writeUnsafeAttributionDisclosure(sb, changes, attributionNotes)
 	sb.WriteString("\n")
 	if dropTips {
 		writeUnsafeDropTips(sb, drops, databaseType, isMySQL)
@@ -3241,7 +3289,7 @@ func unsafeCountPhrase(drops, rest []UnsafeChangeData) string {
 // header's drop count and each finding's own text say which ones they are.
 // A long list shows its first findings and folds the rest, as
 // unsafeFindingsShown decides; numbering runs on into the fold.
-func writeUnsafeFindingList(sb *strings.Builder, drops, rest []UnsafeChangeData, attributionNotes map[string]string) {
+func writeUnsafeFindingList(sb *strings.Builder, drops, rest []UnsafeChangeData, attributionNotes *unsafeAttribution) {
 	var lines []string
 	for _, c := range drops {
 		lines = append(lines, unsafeFindingLines(c, attributionNotes)...)
@@ -3279,8 +3327,8 @@ func unsafeFindingsShown(total, drops int) int {
 
 // writeUnsafeAttributionDisclosure explains why another pull request's change
 // shows up as one to undo, when any finding carries an attribution note.
-func writeUnsafeAttributionDisclosure(sb *strings.Builder, attributionNotes map[string]string) {
-	if len(attributionNotes) > 0 {
+func writeUnsafeAttributionDisclosure(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes *unsafeAttribution) {
+	if slices.ContainsFunc(changes, func(c UnsafeChangeData) bool { return attributionNotes.noteFor(c) != "" }) {
 		sb.WriteString("\nA plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.\n")
 	}
 }
@@ -3314,35 +3362,63 @@ func unsafeChangeLabel(c UnsafeChangeData) string {
 	return table
 }
 
-// unsafeAttributionNotes returns, keyed by table, the note each attributed
-// table's unsafe findings carry, and whether the attribution is folded into
-// the unsafe warning. It folds only when that warning is shown and lists every
-// attributed table with a finding that destroys something; otherwise the
-// attribution keeps its own section, so no disclosure is lost. A finding on a
-// change that creates its table never carries the note: such a change
+// unsafeAttribution is the attribution the unsafe findings carry: for each
+// attributed table, the owner and the note a finding that undoes the owner's
+// work shows.
+type unsafeAttribution struct {
+	byTable map[string]attributionNote
+	parser  ddl.StatementParser
+}
+
+type attributionNote struct {
+	change AttributedChangeData
+	text   string
+}
+
+// noteFor is the attribution note one finding carries, empty when it carries
+// none. A change that creates its table never carries the note: such a change
 // destroys nothing, so another target's change to the same table, which the
-// attribution is about, would otherwise read as the creation's.
-func unsafeAttributionNotes(data PlanCommentData, unsafeShown bool) (map[string]string, bool) {
+// attribution is about, would otherwise read as the creation's. Nor does a
+// change that touches only objects the owner never did, since that change is
+// this pull request's own.
+func (n *unsafeAttribution) noteFor(c UnsafeChangeData) string {
+	if n == nil {
+		return ""
+	}
+	note, ok := n.byTable[c.Table]
+	if !ok || createsItsTable(c) || !UndoesAttributedWork(note.change, c.DDL, n.parser) {
+		return ""
+	}
+	return note.text
+}
+
+// unsafeAttributionNotes returns the attribution the unsafe findings carry,
+// and whether the attribution is folded into the unsafe warning. It folds only
+// when that warning is shown and every attributed table has a finding that
+// carries its note; otherwise the attribution keeps its own section, so no
+// disclosure is lost.
+func unsafeAttributionNotes(data PlanCommentData, unsafeShown bool) (*unsafeAttribution, bool) {
 	if !unsafeShown || len(data.AttributedChanges) == 0 {
 		return nil, false
 	}
-	unsafeTables := make(map[string]bool, len(data.UnsafeChanges))
-	for _, c := range data.UnsafeChanges {
-		if createsItsTable(c) {
-			continue
-		}
-		unsafeTables[c.Table] = true
+	notes := &unsafeAttribution{
+		byTable: make(map[string]attributionNote, len(data.AttributedChanges)),
+		parser:  dropStatementParser(data.DatabaseType),
 	}
-	notes := make(map[string]string, len(data.AttributedChanges))
 	for _, a := range data.AttributedChanges {
-		if !unsafeTables[a.Table] {
+		text := "changed by open PR " + pullRequestRef(data.Repository, a.Repository, a.PullRequest)
+		if a.Unresolved {
+			text = "ownership could not be established"
+		}
+		notes.byTable[a.Table] = attributionNote{change: a, text: text}
+	}
+	for _, a := range data.AttributedChanges {
+		carried := slices.ContainsFunc(data.UnsafeChanges, func(c UnsafeChangeData) bool {
+			return c.Table == a.Table && notes.noteFor(c) != ""
+		})
+		if !carried {
 			return nil, false
 		}
-		if a.Unresolved {
-			notes[a.Table] = "ownership could not be established"
-			continue
-		}
-		notes[a.Table] = "changed by open PR " + pullRequestRef(data.Repository, a.Repository, a.PullRequest)
 	}
 	return notes, true
 }
@@ -3363,15 +3439,15 @@ func pullRequestRef(commentRepo, repo string, pr int) string {
 }
 
 // unsafeFindingLines is one unnumbered line per finding in a change's unsafe
-// reason: the table, the finding, and the change's attribution note, which a
-// change that creates its table never carries. A change with no parseable reason
+// reason: the table, the finding, and the change's attribution note when it
+// carries one (unsafeAttribution.noteFor). A change with no parseable reason
 // still gets a line, carrying the engine's change type when one is known so
 // the finding explains itself. The table is already Markdown, as
 // unsafeChangeLabel renders it; each reason is rendered here by markdownReason.
-func unsafeFindingLines(c UnsafeChangeData, attributionNotes map[string]string) []string {
+func unsafeFindingLines(c UnsafeChangeData, attributionNotes *unsafeAttribution) []string {
 	table := unsafeChangeLabel(c)
 	suffix := ""
-	if note := attributionNotes[c.Table]; note != "" && !createsItsTable(c) {
+	if note := attributionNotes.noteFor(c); note != "" {
 		suffix = " (" + note + ")"
 	}
 	reasons := ui.LintReasons(c.Reason)
