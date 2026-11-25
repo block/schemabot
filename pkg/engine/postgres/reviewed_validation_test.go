@@ -21,9 +21,9 @@ func reviewedUserKey() schemadiff.ConstraintValidation {
 	return schemadiff.ConstraintValidation{Constraint: "orders_user_id_fkey", Def: "FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID"}
 }
 
-// The plan records the live NOT VALID constraint on the step that validates
-// it in place, and the apply reads that record back. The validation step of a
-// constraint the same plan adds carries none.
+// The plan records the constraint a VALIDATE CONSTRAINT step validates, and
+// the apply reads that record back. A validation step the planner left
+// unrecorded is blocked, since the apply could not check it.
 func TestTableChangesRecordsTheReviewedValidation(t *testing.T) {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	require.NoError(t, err)
@@ -54,8 +54,10 @@ func TestTableChangesRecordsTheReviewedValidation(t *testing.T) {
 	require.NotNil(t, got)
 	assert.Equal(t, key, *got)
 
-	added := plan(statement(nil))
-	assert.Empty(t, added.Metadata, "a constraint the plan adds is validated without a record")
+	unrecorded := plan(statement(nil))
+	assert.Empty(t, unrecorded.Metadata)
+	assert.Equal(t, engine.ExecutionModeBlocked, unrecorded.ExecutionMode)
+	assert.Equal(t, `statement for table "orders" validates a constraint the planner did not record, so the apply cannot check that it is still the constraint this plan reviewed; make the change outside SchemaBot`, unrecorded.ModeReason)
 }
 
 // An apply refuses a validation record it cannot read, and carries a readable
@@ -80,14 +82,15 @@ func TestValidateOptimisticApplyReadsTheReviewedValidation(t *testing.T) {
 	assert.Contains(t, err.Error(), "the plan's record of the constraint this statement validates is unreadable")
 
 	key := reviewedUserKey()
-	metadata, err := stepValidationMetadata(pgplan.Statement{Validates: &key}, reviewedValidationSQL)
+	metadata, unrecorded, err := stepValidationMetadata(pgplan.Statement{Validates: &key}, reviewedValidationSQL)
 	require.NoError(t, err)
+	require.False(t, unrecorded)
 	change, err := validateOptimisticApply(request(metadata))
 	require.NoError(t, err)
 	require.NotNil(t, change.validates)
 	assert.Equal(t, key, *change.validates)
 
-	change, err = validateOptimisticApply(request(nil))
-	require.NoError(t, err)
-	assert.Nil(t, change.validates, "a validation the plan did not record runs without one")
+	_, err = validateOptimisticApply(request(nil))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `apply PostgreSQL table "orders": the plan has no record of the constraint this statement validates; re-plan and apply again`)
 }

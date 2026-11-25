@@ -307,7 +307,7 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		if err != nil {
 			return nativeApply{}, err
 		}
-		change.validates, err = reviewedValidationForApply(req.Database, tc)
+		change.validates, err = reviewedValidationForApply(req.Database, tc, statements[0])
 		if err != nil {
 			return nativeApply{}, err
 		}
@@ -315,18 +315,31 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	return change, nil
 }
 
-// reviewedValidationForApply returns the plan's record of the live NOT VALID
-// constraint a statement validates, nil when the plan recorded none. A
-// record that is present but unreadable refuses the apply before any work
-// is queued, because validating without it could validate a constraint that
-// replaced the reviewed one under the same name.
-func reviewedValidationForApply(database string, tc engine.TableChange) (*schemadiff.ConstraintValidation, error) {
-	validates, err := reviewedValidationFromMetadata(tc.Metadata)
+// reviewedValidationForApply returns the plan's record of the constraint a
+// VALIDATE CONSTRAINT statement validates, and nil for any other statement.
+// A validation is admitted only with that record: without it the apply could
+// not tell the reviewed constraint from one that took its name after the
+// plan, so a missing or unreadable record refuses the apply before any work
+// is queued and the operator re-plans.
+func reviewedValidationForApply(database string, tc engine.TableChange, statement string) (*schemadiff.ConstraintValidation, error) {
+	validates, err := validatesConstraint(statement)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission could not classify a planned validation", "database", database, "table", tc.Table, "error", err)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
+	}
+	if !validates {
+		return nil, nil
+	}
+	reviewed, err := reviewedValidationFromMetadata(tc.Metadata)
 	if err != nil {
 		slog.Warn("PostgreSQL apply admission rejected the reviewed validation record", "database", database, "table", tc.Table, "error", err)
 		return nil, fmt.Errorf("apply PostgreSQL table %q: the plan's record of the constraint this statement validates is unreadable; re-plan and apply again", tc.Table)
 	}
-	return validates, nil
+	if reviewed == nil {
+		slog.Warn("PostgreSQL apply admission refused a validation the plan did not record", "database", database, "table", tc.Table)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: the plan has no record of the constraint this statement validates; re-plan and apply again", tc.Table)
+	}
+	return reviewed, nil
 }
 
 // reviewedDropForApply returns the plan's record of the object a statement
@@ -592,7 +605,26 @@ func classifyApplyFailure(err error, table string) applyFailure {
 	if detail, ok := brokenForeignKeyDetail(err, table); ok {
 		return applyFailure{detail: detail, retryable: true}
 	}
+	if detail, ok := missingGrantDetail(err, table); ok {
+		return applyFailure{detail: detail, retryable: true}
+	}
 	return applyFailure{detail: "PostgreSQL schema change failed; see server logs", retryable: true}
+}
+
+// missingGrantDetail names a statement the server refused because the engine
+// role lacks a privilege. The privilege check before the apply covers the
+// target table; a foreign key also needs REFERENCES on the table it
+// references, which only the server checks. The detail leaves out the
+// server's message, which names objects the plan did not, and the server log
+// keeps it.
+func missingGrantDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateInsufficientPrivilege {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"the engine role lacks a privilege the statement on %q needs, such as REFERENCES on the table a foreign key references; the server log names it; grant it, then retry",
+		table)), true
 }
 
 // sqlstateForeignKeyViolation is the SQLSTATE the server raises when a row

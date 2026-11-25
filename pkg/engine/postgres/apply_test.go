@@ -1623,6 +1623,18 @@ func TestClassifyApplyFailureBrokenForeignKey(t *testing.T) {
 	assert.NotContains(t, failure.detail, "99")
 }
 
+// A statement the server refuses for a missing grant, such as a foreign key
+// whose referenced table the engine role cannot reference, says a grant is
+// missing instead of reporting a generic failure.
+func TestClassifyApplyFailureMissingGrant(t *testing.T) {
+	err := fmt.Errorf("add foreign key: %w", &pgconn.PgError{Code: "42501", Message: "permission denied for table users"})
+
+	failure := classifyApplyFailure(err, "orders")
+
+	assert.True(t, failure.retryable)
+	assert.Equal(t, `the engine role lacks a privilege the statement on "orders" needs, such as REFERENCES on the table a foreign key references; the server log names it; grant it, then retry`, failure.detail)
+}
+
 func TestProgressResultReportsCreateSequenceLength(t *testing.T) {
 	result := progressResult(engine.StateRunning, "running", time.Now(), nativeApply{
 		namespace: "public",

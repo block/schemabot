@@ -173,8 +173,10 @@ supply a DSN.
 | Add a foreign key | The same as altering the table, plus `REFERENCES` on the referenced table. An owner role that owns both tables has it |
 | Cancel an index build | Nothing more. Membership in `pg_signal_backend` lets the cancel reach the build's backend directly |
 
-SchemaBot checks the privileges each statement needs before running it, and a
-missing grant fails with the `GRANT` that fixes it. If your tables belong to a
+SchemaBot checks the privileges each statement needs on its own table before
+running it, and a missing grant fails with the `GRANT` that fixes it. Only
+PostgreSQL checks `REFERENCES` on the referenced table: without it, the apply
+fails, says a grant is missing, and retries once you grant it. If your tables belong to a
 dedicated owner role, read [Table ownership](#table-ownership) before the first
 `CREATE TABLE`.
 
@@ -829,7 +831,7 @@ creates does not count: create the referenced table first, then add the key.
 | Step | Locks | Takes |
 |---|---|---|
 | `ADD CONSTRAINT ... NOT VALID` | `SHARE ROW EXCLUSIVE` on both tables, under the 3-second `lock_timeout` | Milliseconds. From here on, new writes are checked |
-| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE`, which lets reads and writes continue | As long as reading the table takes |
+| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` on the table and `ROW SHARE` on the referenced table. Reads and writes continue on both | Up to the 30-second statement budget. A longer scan is refused, and the key stays `NOT VALID` |
 
 A new table's `REFERENCES` takes the same brief `SHARE ROW EXCLUSIVE` on each
 referenced table. On a busy referenced table, the step times out and the apply
