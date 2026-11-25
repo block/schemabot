@@ -1733,7 +1733,7 @@ existing data, and a table that does not exist yet has none. Neither does an
 `ALTER TABLE` that pg-sprite proves changes only the catalog, such as adding a
 nullable column: it reads no rows, so its cost does not grow with the table.
 The apply proves it again against the live table and applies the ceiling if
-that proof fails. [Catalog-only changes](postgresql.md#catalog-only-changes)
+the change is no longer catalog-only. [Catalog-only changes](postgresql.md#catalog-only-changes)
 lists which changes qualify.
 
 Every engine gate still runs when an earlier gate has already blocked all of a

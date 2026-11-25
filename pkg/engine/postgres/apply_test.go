@@ -350,6 +350,32 @@ func TestClassifyRefusal(t *testing.T) {
 			wantReason: "table-too-large",
 		},
 		{
+			name: "oversized table whose catalog-only proof lacks the TEMPORARY grant is a provisioning refusal",
+			err: fmt.Errorf("preflight: %w", &catalogOnlyProofError{
+				size: &preflight.SizeError{TotalBytes: 2, LimitBytes: 1},
+				proof: fmt.Errorf("prove: %w", fmt.Errorf("%w: grant TEMPORARY: %w",
+					preflight.ErrAddColumnProbeUnavailable, &pgconn.PgError{Code: "42501", Message: "permission denied for database app"})),
+			}),
+			wantReason:    "insufficient-privileges",
+			wantDetail:    []string{`table "users" is over the size limit`, "grant TEMPORARY on the database to the engine role"},
+			wantNotDetail: []string{"permission denied for database app"},
+		},
+		{
+			name: "oversized table whose catalog-only proof lost its connection is operational",
+			err: fmt.Errorf("preflight: %w", &catalogOnlyProofError{
+				size:  &preflight.SizeError{TotalBytes: 2, LimitBytes: 1},
+				proof: fmt.Errorf("read live facts: %w", errors.New("conn closed")),
+			}),
+		},
+		{
+			name: "oversized table whose catalog-only probe met a read-only server is operational",
+			err: fmt.Errorf("preflight: %w", &catalogOnlyProofError{
+				size: &preflight.SizeError{TotalBytes: 2, LimitBytes: 1},
+				proof: fmt.Errorf("%w: the server accepts no writes: %w",
+					preflight.ErrAddColumnProbeUnavailable, &pgconn.PgError{Code: "25006"}),
+			}),
+		},
+		{
 			name:       "missing table is a refusal",
 			err:        fmt.Errorf("preflight: %w", preflight.ErrTableNotFound),
 			wantReason: "table-not-found",

@@ -208,17 +208,24 @@ any size, so the size limit does not apply to them.
 
 | Change | Catalog-only when |
 |---|---|
-| `ADD COLUMN` | pg-sprite proves against the live table that it neither rewrites nor scans the rows, its default is absent or a constant, and neither its type nor its default runs a user-defined function |
+| `ADD COLUMN` | pg-sprite proves against the live table that it neither rewrites nor scans the rows, its default is absent or a constant, and its type is built in or an enum |
 | `DROP COLUMN`, `SET DEFAULT`, `DROP DEFAULT`, `DROP NOT NULL`, `DROP CONSTRAINT` | Always |
 
 A `NOT NULL` column with no default still counts against the size limit,
 because PostgreSQL scans the rows to check it. So does a default such as
-`now()`, a domain type with a `CHECK`, and a statement that mixes a
-catalog-only change with any other change.
+`now()`, any user-defined type other than an enum (a domain, composite, or
+range type), and a statement that mixes a catalog-only change with any other
+change.
 
 pg-sprite proves the change against the live table when SchemaBot plans it,
-and again when the apply starts. If the second proof fails, the size limit
-applies and an oversized table is refused.
+and again when the apply starts. What happens at the second proof:
+
+| Second proof | Apply |
+|---|---|
+| Still catalog-only | Runs |
+| No longer catalog-only | Refused on size |
+| The engine role cannot create the proof's temporary table | Refused until you grant `TEMPORARY` on the database to that role |
+| Fails for another reason, such as a dropped connection | Fails without running anything; retry it |
 
 ## Example: add a column and an index
 
