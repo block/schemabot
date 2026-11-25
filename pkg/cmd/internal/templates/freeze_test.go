@@ -153,3 +153,28 @@ func TestChangeGateRefusedTextNamesTheOverrideCommand(t *testing.T) {
 	assert.Equal(t, `  schemabot cutover apply-`+lineAttackCleaned+` -e production --override "<reason>"`, lines[3])
 	assertNoTerminalControls(t, strings.Join(lines, "\n"))
 }
+
+// A plan names the freezes in effect, then those scheduled with when they
+// start. Their IDs and reasons come from other people, so they print with
+// control runes removed.
+func TestPlanFreezesText(t *testing.T) {
+	starts := time.Date(2026, 11, 26, 8, 0, 0, 0, time.UTC)
+	ends := starts.Add(48 * time.Hour)
+	lines := PlanFreezesText("production", []apitypes.Freeze{
+		{ID: "freeze-abc", Reason: "SEV-1234 " + lineAttack, InEffect: true},
+		{ID: "freeze-def", Reason: "deploy freeze", InEffect: true},
+		{ID: "freeze-ghi", Reason: "launch week", StartsAt: starts, EndsAt: &ends},
+	})
+
+	assert.Equal(t, []string{
+		"❄️ production is frozen, so applying this plan would be refused now.",
+		"   freeze-abc  SEV-1234 " + lineAttackCleaned + "  (until lifted)",
+		"   freeze-def  deploy freeze  (until lifted)",
+		`Wait for the freezes to end before you apply. If this change can't wait, apply with --override "<reason>".`,
+		"",
+		"❄️ A freeze is scheduled in production. Apply before it starts, and let the change finish: while it holds, the apply is refused, and so is a start or cutover the change still needs.",
+		"   freeze-ghi  launch week  (starts 2026-11-26T08:00:00Z, until 2026-11-28T08:00:00Z)",
+	}, lines)
+	assertNoTerminalControls(t, strings.Join(lines, "\n"))
+	assert.Empty(t, PlanFreezesText("production", nil), "no freeze, no notice")
+}

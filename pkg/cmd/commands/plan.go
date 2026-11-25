@@ -250,21 +250,38 @@ func outputMultiEnvPlanResult(results map[string]*apitypes.PlanResponse, databas
 		// Single environment
 		templates.WriteEnvironmentHeader(envOrder[0])
 		writeEnvPlan(results[envOrder[0]])
+		writePlanFreezes(envOrder[0], results[envOrder[0]])
 	case plansIdentical:
-		// Same plan across all environments
+		// Same plan across all environments. The freezes differ by
+		// environment, so each one's are written under the combined plan.
 		var titled []string
 		for _, env := range envOrder {
 			titled = append(titled, cases.Title(language.English).String(env))
 		}
 		fmt.Printf("  %s%s%s\n\n", templates.ANSIBold, strings.Join(titled, " & "), templates.ANSIReset)
 		writeEnvPlan(stagingResult)
+		for _, env := range envOrder {
+			writePlanFreezes(env, results[env])
+		}
 	default:
 		// Different plans — per-env sections
 		for _, env := range envOrder {
 			templates.WriteEnvironmentHeader(env)
 			writeEnvPlan(results[env])
+			writePlanFreezes(env, results[env])
 		}
 	}
+}
+
+// writePlanFreezes writes the freezes that cover environment's change, so the
+// operator learns before applying that a freeze refuses the apply now, or will
+// once it starts. A plan with errors or no changes offers no apply, so it
+// names none.
+func writePlanFreezes(environment string, result *apitypes.PlanResponse) {
+	if result == nil || len(result.Errors) > 0 || !hasResultChanges(result) {
+		return
+	}
+	templates.WritePlanFreezes(environment, result.Freezes)
 }
 
 // withUnmatchedDropTablesInEveryPlan copies results with each one's unmatched

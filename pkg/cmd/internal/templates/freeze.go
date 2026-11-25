@@ -289,3 +289,58 @@ func writeStoppedByFreeze(data ProgressData) {
 		fmt.Printf("\n  ⏹️ %s\n", text)
 	}
 }
+
+// PlanFreezesText is what a plan says about the freezes that cover its change
+// in environment: those in effect, which refuse its apply now, then those
+// scheduled, which will once they start. It says nothing when none covers it.
+// It only informs: the apply checks the freezes again, and its refusal is the
+// one that counts.
+func PlanFreezesText(environment string, freezes []apitypes.Freeze) []string {
+	var inEffect, scheduled []apitypes.Freeze
+	for _, f := range freezes {
+		if f.InEffect {
+			inEffect = append(inEffect, f)
+		} else {
+			scheduled = append(scheduled, f)
+		}
+	}
+	env := ui.TerminalSafeLine(environment)
+	var lines []string
+	if len(inEffect) > 0 {
+		lines = append(lines, fmt.Sprintf("%s %s is frozen, so applying this plan would be refused now.", glyph.Frozen, env))
+		for _, f := range inEffect {
+			lines = append(lines, fmt.Sprintf("   %s  %s  (%s)", ui.TerminalSafeLine(f.ID), ui.TerminalSafeLine(f.Reason), freezeUntil(f)))
+		}
+		subject := "the freeze"
+		if len(inEffect) > 1 {
+			subject = "the freezes"
+		}
+		lines = append(lines, fmt.Sprintf(`Wait for %s to end before you apply. If this change can't wait, apply with --override "<reason>".`, subject))
+	}
+	if len(scheduled) > 0 {
+		if len(lines) > 0 {
+			lines = append(lines, "")
+		}
+		subject := "A freeze is scheduled"
+		if len(scheduled) > 1 {
+			subject = "Freezes are scheduled"
+		}
+		lines = append(lines, fmt.Sprintf("%s %s in %s. Apply before it starts, and let the change finish: while it holds, the apply is refused, and so is a start or cutover the change still needs.", glyph.Frozen, subject, env))
+		for _, f := range scheduled {
+			lines = append(lines, fmt.Sprintf("   %s  %s  (starts %s, %s)", ui.TerminalSafeLine(f.ID), ui.TerminalSafeLine(f.Reason), freezeTime(f.StartsAt), freezeUntil(f)))
+		}
+	}
+	return lines
+}
+
+// WritePlanFreezes writes PlanFreezesText, then a blank line when it wrote
+// any.
+func WritePlanFreezes(environment string, freezes []apitypes.Freeze) {
+	lines := PlanFreezesText(environment, freezes)
+	for _, line := range lines {
+		fmt.Println(line)
+	}
+	if len(lines) > 0 {
+		fmt.Println()
+	}
+}

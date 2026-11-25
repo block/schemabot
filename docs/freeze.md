@@ -141,9 +141,15 @@ command already carries `--override "<why it can't wait>"`. Replace the
 placeholder with your reason: SchemaBot refuses a reason still in angle
 brackets, so a command pasted unedited never overrides a freeze. A freeze that
 is scheduled but has not started is named with when it starts, so you can
-apply, and let the change finish, before it does. The notice only informs: the apply checks the freezes again,
-and that check decides. If an apply is refused for an unsafe change first, the
-retry command it offers carries `--override` too.
+apply, and let the change finish, before it does. The notice only informs: the
+apply checks the freezes again, and that check decides. If an apply is refused
+for an unsafe change first, the retry command it offers carries `--override`
+too.
+
+`schemabot plan` warns you the same way. Under the plan, it names the freezes
+in effect and those scheduled, and says to apply with `--override "<reason>"`
+if the change can't wait. The response to `POST /api/plan` carries them in
+`freezes`, in effect first, each with `in_effect`.
 
 You have two choices:
 
