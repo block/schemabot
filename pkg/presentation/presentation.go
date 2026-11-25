@@ -90,6 +90,15 @@ type Operation struct {
 	// are mutually exclusive: the caller derives each from the same stored policy.
 	Parallel bool
 
+	// CopyMember names the rollout member a shard row belongs to, empty when
+	// the row is a member of its own. The claim gate starts the copies of one
+	// member's shards in parallel and holds them back only at the apply's
+	// driver cap, so an earlier row of the same member never orders this
+	// row's copy start or holds it on a failure: a pending row reads as
+	// waiting for or halted behind only rows of other members, and as queued
+	// when none of those come before it. Cutover ordering is unchanged.
+	CopyMember string
+
 	// ContinueOnFailure is true only when the operation's on_failure policy is
 	// exactly "continue". A terminal-failed earlier sibling no longer blocks
 	// later deployments and the aggregate is held running_degraded past the
@@ -686,6 +695,14 @@ func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 		deriveFinalizerPending(d, ops, names, i)
 		return
 	}
+	if op.CopyMember != "" {
+		ops, names, i = otherMembersBefore(ops, names, i)
+		if i == 0 {
+			d.set(StateQueuedNext, PendingQueued, "⏳", false)
+			return
+		}
+		op = ops[i]
+	}
 	// Under parallel the copy phase has no earlier-sibling ordering, so a
 	// pending operation never waits for an earlier sibling and a cancelled or
 	// reverted one does not hold it. Failure admission still applies: a
@@ -701,6 +718,25 @@ func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 		return
 	}
 	deriveOrderedPending(d, ops, names, i)
+}
+
+// otherMembersBefore returns the rows before row i that belong to another
+// member than its copy's (Operation.CopyMember), followed by row i, with their
+// names, and row i's index among them. Rows of the same member never order
+// its copy start, so its pending label reads only the rest.
+func otherMembersBefore(ops []Operation, names []string, i int) ([]Operation, []string, int) {
+	kept := make([]Operation, 0, i+1)
+	keptNames := make([]string, 0, i+1)
+	for j := range i {
+		if ops[j].CopyMember == ops[i].CopyMember {
+			continue
+		}
+		kept = append(kept, ops[j])
+		keptNames = append(keptNames, names[j])
+	}
+	kept = append(kept, ops[i])
+	keptNames = append(keptNames, names[i])
+	return kept, keptNames, len(kept) - 1
 }
 
 // deriveOrderedPending labels a pending row under an ordered policy: halted

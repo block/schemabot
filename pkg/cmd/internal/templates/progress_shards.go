@@ -6,7 +6,7 @@ import (
 )
 
 // ShardCounts is a sharded apply's per-status shard count, as the PR comment's
-// Shards line reads it ("1 running table copy, 3 waiting for -40"), or "" when
+// Shards line reads it ("1 running table copy, 3 queued"), or "" when
 // every keyspace runs on its only shard, which needs no count. The shards of
 // an apply in applyState read as presentation.DeriveShards reads them.
 func ShardCounts(applyState string, ops []ProgressOperation, tables []TableProgress, released bool) string {

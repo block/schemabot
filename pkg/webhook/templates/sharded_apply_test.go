@@ -106,7 +106,7 @@ func TestRenderShardedApplyComment_FailedSurfacesError(t *testing.T) {
 		ApplyID: "apply-x",
 		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: failErr},
-			{Shard: "80-", Emoji: "⏸️", Label: "halted — -40 failed", State: state.ApplyOperation.Pending},
+			{Shard: "80-", Emoji: "⏸️", Label: "not started", State: state.ApplyOperation.Pending},
 		}, []ShardCell{mutesCell("-40"), mutesCell("80-")}),
 	})
 
@@ -147,7 +147,7 @@ func TestRenderShardedApplyComment_DivergentGroupsByVariant(t *testing.T) {
 		Keyspaces: withTables(oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
 			{Shard: "40-80", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
-			{Shard: "80-c0", Emoji: "⏳", Label: "waiting for -40", State: state.ApplyOperation.Pending},
+			{Shard: "80-c0", Emoji: "⏳", Label: "queued", State: state.ApplyOperation.Pending},
 		}, []ShardCell{
 			mutesCell("-40"),
 			{Shard: "40-80", Table: "mutes", Statements: []string{driftDDL}}, // different signature → its own group
@@ -355,14 +355,14 @@ func TestRenderShardedApplySummaryComment_FailedSurfacesErrorAndRetry(t *testing
 		ApplyID: "apply-x",
 		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: failErr},
-			{Shard: "80-", Emoji: "⏸️", Label: "halted — -40 failed", State: state.ApplyOperation.Pending},
+			{Shard: "80-", Emoji: "⏸️", Label: "not started", State: state.ApplyOperation.Pending},
 		}, []ShardCell{mutesCell("-40"), mutesCell("80-")}),
 	})
 
 	assert.Contains(t, out, "## ❌ Schema Change Failed — Staging")
 	assert.NotContains(t, out, "Applied successfully", "a failed apply writes no success line")
 	assert.Contains(t, out, "> ❌ **First failure:** shard <code>-40</code> — "+failErr)
-	assert.Contains(t, out, "| `80-` | ⏸️ halted — -40 failed |", "halted siblings keep their final state in the results")
+	assert.Contains(t, out, "| `80-` | ⏸️ not started |", "siblings that never started keep their final state in the results")
 	assert.Contains(t, out, "To retry:")
 }
 
@@ -880,8 +880,8 @@ func TestRenderShardedApplyComment_TableRowsGatedToRunning(t *testing.T) {
 }
 
 // A shard in a failure state promotes the keyspace's per-shard status table
-// back into the section — the failed shard and its halted siblings need naming
-// — below the table rollup lines.
+// back into the section — the failed shard and the siblings it never started
+// need naming — below the table rollup lines.
 func TestRenderShardedApplyComment_ShardFailurePromotesShardTable(t *testing.T) {
 	const failErr = "resolve shard primary for `-40`: context deadline exceeded"
 	out := RenderShardedApplyComment(ShardedApplyData{
@@ -898,7 +898,7 @@ func TestRenderShardedApplyComment_ShardFailurePromotesShardTable(t *testing.T) 
 			}},
 			Shards: []ShardStatus{
 				{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: failErr},
-				{Shard: "80-", Emoji: "⏸", Label: "halted — -40 failed", State: state.ApplyOperation.Pending},
+				{Shard: "80-", Emoji: "⏸", Label: "not started", State: state.ApplyOperation.Pending},
 			},
 			Cells: []ShardCell{mutesCell("-40"), mutesCell("80-")},
 		}},
@@ -907,7 +907,7 @@ func TestRenderShardedApplyComment_ShardFailurePromotesShardTable(t *testing.T) 
 	assert.Contains(t, out, "**`mutes`**: ❌ Failed")
 	assert.Contains(t, out, "| Shard | Status |", "a failure promotes the per-shard table")
 	assert.Contains(t, out, "| `-40` | ❌ failed — "+failErr+" |")
-	assert.Contains(t, out, "| `80-` | ⏸ halted — -40 failed |")
+	assert.Contains(t, out, "| `80-` | ⏸ not started |")
 }
 
 // Divergent shards keep their grouped per-shard tables below the table rollup
@@ -1125,8 +1125,8 @@ func TestRenderShardedApplySummaryComment_DivergentOutcomePromotesShardTable(t *
 }
 
 // A failure in one keyspace promotes every keyspace's per-shard status table:
-// the failure halts sibling keyspaces' queued shards too, and their "halted"
-// labels carry the attribution an operator needs to see why nothing is moving.
+// the failed apply never starts sibling keyspaces' queued shards either, and
+// their rows say so, so an operator sees which shards never ran.
 func TestRenderShardedApplyComment_FailurePromotesSiblingKeyspaceShardTables(t *testing.T) {
 	const failErr = "resolve shard primary for `-40`: context deadline exceeded"
 	out := RenderShardedApplyComment(ShardedApplyData{
@@ -1148,14 +1148,14 @@ func TestRenderShardedApplyComment_FailurePromotesSiblingKeyspaceShardTables(t *
 					Table: "aliases", Status: state.Task.Pending,
 					Shards: []ShardProgressData{{Shard: "-", Status: state.Task.Pending}},
 				}},
-				Shards: []ShardStatus{{Shard: "-", Emoji: "⏸", Label: "halted — -40 failed", State: state.ApplyOperation.Pending}},
+				Shards: []ShardStatus{{Shard: "-", Emoji: "⏸", Label: "not started", State: state.ApplyOperation.Pending}},
 				Cells:  []ShardCell{{Shard: "-", Table: "aliases", Statements: []string{"ALTER TABLE `aliases` ADD COLUMN `region` varchar(32);"}}},
 			},
 		},
 	})
 
-	assert.Contains(t, out, "| `-` | ⏸ halted — -40 failed |",
-		"the sibling keyspace's shard rows carry the halt attribution")
+	assert.Contains(t, out, "| `-` | ⏸ not started |",
+		"the sibling keyspace's shard rows say they never started")
 }
 
 // Between dispatch waves a partially-landed table aggregates to pending; the

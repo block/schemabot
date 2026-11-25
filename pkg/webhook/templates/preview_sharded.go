@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -9,19 +10,33 @@ import (
 	"github.com/block/schemabot/pkg/state"
 )
 
-// previewShardStatuses derives per-shard statuses from sample operations using
-// the shard name as the operation identity — the same projection the webhook
-// uses — so the preview's emoji/labels match production rendering.
-func previewShardStatuses(ops []presentation.Operation) []ShardStatus {
-	derived := presentation.Derive(ops).Deployments
+// previewShardStatuses derives per-shard statuses from sample operations
+// through presentation.DeriveShards, the projection the webhook uses, so the
+// preview's emoji and labels match production rendering. Each sample names its
+// shard in Deployment, qualified as "keyspace/shard" when the preview spans
+// keyspaces, and an EndedBy names the shard that ended it the same way. Every
+// sample runs on one target, as a sharded apply's shards do.
+func previewShardStatuses(applyState string, ops []presentation.Operation) []ShardStatus {
+	const target = "default"
+	work := make([]presentation.ShardWork, 0, len(ops))
+	for _, op := range ops {
+		keyspace, shard, ok := strings.Cut(op.Deployment, "/")
+		if !ok {
+			keyspace, shard = "preview", op.Deployment
+		}
+		op.OperationKey, op.Deployment = op.Deployment, target
+		if op.EndedBy != nil {
+			op.EndedBy = &presentation.OperationRef{Deployment: target, OperationKey: op.EndedBy.Deployment}
+		}
+		work = append(work, presentation.ShardWork{Keyspace: keyspace, Shard: shard, Operations: []presentation.Operation{op}})
+	}
+	derived := presentation.DeriveShards(applyState, work)
 	out := make([]ShardStatus, 0, len(derived))
 	for _, d := range derived {
 		out = append(out, ShardStatus{
-			Shard: d.Deployment, Emoji: d.Emoji, Label: d.Label, State: d.State, Error: d.Error,
+			Shard: d.Shard, Emoji: d.Emoji, Label: d.Label, State: d.State, Error: d.Error,
 			StoppedAtCutover: d.Presentation == presentation.StateStoppedAtCutover, EndedBy: d.EndedBy,
-			// Each sample shard runs one operation, so its state says
-			// whether the shard has landed.
-			Landed: presentation.OperationLanded(d.State),
+			Landed: d.Landed,
 		})
 	}
 	return out
@@ -44,7 +59,7 @@ func previewMutesCell(shard string) ShardCell {
 }
 
 // PreviewCommentShardedApplyInProgress renders a sharded apply mid-rollout: the
-// first shard copying, the rest gated behind it.
+// first shard copying, the rest queued until a driver is free.
 func PreviewCommentShardedApplyInProgress() string {
 	return RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "production", Database: "cdb_resolute",
@@ -64,7 +79,7 @@ func PreviewCommentShardedApplyInProgress() string {
 					{Shard: "c0-", Status: state.Task.Pending},
 				},
 			}},
-			Shards: previewShardStatuses([]presentation.Operation{
+			Shards: previewShardStatuses(state.Apply.Running, []presentation.Operation{
 				{Deployment: "-40", State: state.ApplyOperation.Running},
 				{Deployment: "40-80", State: state.ApplyOperation.Pending},
 				{Deployment: "80-c0", State: state.ApplyOperation.Pending},
@@ -76,7 +91,7 @@ func PreviewCommentShardedApplyInProgress() string {
 }
 
 // PreviewCommentShardedApplyFailed renders a sharded apply where one shard failed
-// and the rest halted behind it, with the failed shard's error surfaced.
+// and the rest never started, with the failed shard's error surfaced.
 func PreviewCommentShardedApplyFailed() string {
 	return RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Failed, Environment: "production", Database: "cdb_resolute",
@@ -92,7 +107,7 @@ func PreviewCommentShardedApplyFailed() string {
 					{Shard: "c0-", Status: state.Task.Pending},
 				},
 			}},
-			Shards: previewShardStatuses([]presentation.Operation{
+			Shards: previewShardStatuses(state.Apply.Failed, []presentation.Operation{
 				{Deployment: "-40", State: state.ApplyOperation.Failed, Error: "resolve shard primary for `-40`: context deadline exceeded"},
 				{Deployment: "40-80", State: state.ApplyOperation.Pending},
 				{Deployment: "80-c0", State: state.ApplyOperation.Pending},
@@ -125,7 +140,7 @@ func PreviewCommentShardedSummaryCompleted() string {
 					{Shard: "c0-", Status: state.Task.Completed},
 				},
 			}},
-			Shards: previewShardStatuses([]presentation.Operation{
+			Shards: previewShardStatuses(state.Apply.Completed, []presentation.Operation{
 				{Deployment: "-40", State: state.ApplyOperation.Completed},
 				{Deployment: "40-80", State: state.ApplyOperation.Completed},
 				{Deployment: "80-c0", State: state.ApplyOperation.Completed},
@@ -152,7 +167,7 @@ func PreviewCommentShardedSummaryCompleted() string {
 }
 
 // PreviewCommentShardedSummaryFailed renders the terminal summary for a sharded
-// apply where one shard failed and the rest halted behind it: the failed
+// apply where one shard failed and the rest never started: the failed
 // verdict header, the surfaced error, the final per-shard results, the
 // keyspace's VSchema change that will now never run (Cancelled, not Pending),
 // and the retry action.
@@ -174,7 +189,7 @@ func PreviewCommentShardedSummaryFailed() string {
 					{Shard: "c0-", Status: state.Task.Pending},
 				},
 			}},
-			Shards: previewShardStatuses([]presentation.Operation{
+			Shards: previewShardStatuses(state.Apply.Failed, []presentation.Operation{
 				{Deployment: "-40", State: state.ApplyOperation.Failed, Error: "resolve shard primary for `-40`: context deadline exceeded"},
 				{Deployment: "40-80", State: state.ApplyOperation.Pending},
 				{Deployment: "80-c0", State: state.ApplyOperation.Pending},
@@ -183,6 +198,40 @@ func PreviewCommentShardedSummaryFailed() string {
 			Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
 		}},
 		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "cancelled"}},
+	})
+}
+
+// PreviewCommentShardedSummaryFinalizeFailed renders the terminal summary for
+// a sharded apply whose shards all completed and whose keyspace finalize then
+// failed. The failure callout names the keyspace, since the finalize error
+// need not, and the comment lists no other step for the finalize.
+func PreviewCommentShardedSummaryFinalizeFailed() string {
+	const finalizeErr = "publish routing rules: target is read-only"
+	shards := []string{"-40", "40-80", "80-c0", "c0-"}
+	progress := make([]ShardProgressData, 0, len(shards))
+	ops := make([]presentation.Operation, 0, len(shards))
+	cells := make([]ShardCell, 0, len(shards))
+	for _, shard := range shards {
+		progress = append(progress, ShardProgressData{Shard: shard, Status: state.Task.Completed})
+		ops = append(ops, presentation.Operation{Deployment: shard, State: state.ApplyOperation.Completed})
+		cells = append(cells, previewMutesCell(shard))
+	}
+	return RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Failed, Environment: "production", Database: "shop",
+		ApplyID:      "apply-a1b2c3d4e5f6",
+		RequestedBy:  previewRequestedBy,
+		StartedAt:    sampleTime().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
+		CompletedAt:  sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
+		ErrorMessage: finalizeErr,
+		FailedFinalizer: &FinalizerFailure{
+			Keyspace: "commerce", State: state.ApplyOperation.Failed, Error: finalizeErr,
+		},
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "commerce",
+			Tables:   []ShardedTableStatus{{Table: "mutes", Status: state.Task.Completed, Shards: progress}},
+			Shards:   previewShardStatuses(state.Apply.Failed, ops),
+			Cells:    cells,
+		}},
 	})
 }
 
@@ -211,7 +260,7 @@ func PreviewCommentShardedSummaryStoppedAtCutover() string {
 					{Shard: "c0-", Status: state.Task.Stopped},
 				},
 			}},
-			Shards: previewShardStatuses([]presentation.Operation{
+			Shards: previewShardStatuses(state.Apply.Failed, []presentation.Operation{
 				{Deployment: "-40", State: state.ApplyOperation.Failed, Barrier: true, Error: "resolve shard primary for `-40`: context deadline exceeded"},
 				{Deployment: "40-80", State: state.ApplyOperation.Failed, Barrier: true, EndedBy: endedBy},
 				{Deployment: "80-c0", State: state.ApplyOperation.Failed, Barrier: true, EndedBy: endedBy},
@@ -245,7 +294,7 @@ func PreviewCommentShardedSummaryCancelledPartial() string {
 					{Shard: "c0-", Status: state.Task.Cancelled},
 				},
 			}},
-			Shards: previewShardStatuses([]presentation.Operation{
+			Shards: previewShardStatuses(state.Apply.Cancelled, []presentation.Operation{
 				{Deployment: "-40", State: state.ApplyOperation.Completed},
 				{Deployment: "40-80", State: state.ApplyOperation.Completed},
 				{Deployment: "80-c0", State: state.ApplyOperation.Cancelled},
@@ -272,7 +321,7 @@ func PreviewCommentShardedApplyDivergent() string {
 					{Shard: "80-c0", Status: state.Task.Pending},
 				},
 			}},
-			Shards: previewShardStatuses([]presentation.Operation{
+			Shards: previewShardStatuses(state.Apply.Running, []presentation.Operation{
 				{Deployment: "-40", State: state.ApplyOperation.Running},
 				{Deployment: "40-80", State: state.ApplyOperation.Pending},
 				{Deployment: "80-c0", State: state.ApplyOperation.Pending},
@@ -290,10 +339,11 @@ func PreviewCommentShardedApplyDivergent() string {
 // several keyspaces in one deployment — the shape a database with unsharded
 // sibling keyspaces produces, where every unsharded keyspace contributes a
 // single "-" shard. Each keyspace renders its own section while the histogram
-// and rollout ordering span all of them, and the sharded keyspace's VSchema
-// change renders in the shared VSchema section.
+// spans all of them, and the sharded keyspace's VSchema change renders in the
+// shared VSchema section. Every keyspace belongs to one rollout member, so no
+// keyspace's shards wait behind another's.
 func PreviewCommentShardedApplyMultiKeyspace() string {
-	shards := previewShardStatuses([]presentation.Operation{
+	shards := previewShardStatuses(state.Apply.Running, []presentation.Operation{
 		{Deployment: "cdb_resolute/-", State: state.ApplyOperation.Completed},
 		{Deployment: "cdb_resolute_lookup/-", State: state.ApplyOperation.Running},
 		{Deployment: "cdb_resolute_sharded/-40", State: state.ApplyOperation.Pending},

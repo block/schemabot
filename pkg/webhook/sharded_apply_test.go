@@ -237,6 +237,7 @@ func TestBuildShardedApplyData_FinalizeOnlyKeyspaceIsNotAVSchemaChange(t *testin
 	assert.Equal(t, "payments", data.VSchemaChanges[0].Namespace)
 	body := templates.RenderShardedApplyComment(data)
 	assert.Contains(t, body, "### VSchema\n\n**`payments`**: Pending\n")
+	assert.NotContains(t, body, "### Finalize", "a keyspace's finalize is not listed as its own step")
 
 	apply.State = state.Apply.Completed
 	for _, op := range ops {
@@ -244,28 +245,49 @@ func TestBuildShardedApplyData_FinalizeOnlyKeyspaceIsNotAVSchemaChange(t *testin
 	}
 	summary := templates.RenderShardedApplySummaryComment(buildShardedApplyData(apply, ops, false, nil, view, ""))
 	assert.Contains(t, summary, "### VSchema\n\n**`payments`**: Applied\n")
+	assert.NotContains(t, summary, "### Finalize", "a keyspace's finalize is not listed as its own step")
 }
 
 // A sharded apply copies refunds onto both of commerce's shards, then its
-// engine's finalize of the keyspace fails. The finalize is not listed on its
-// own, but it is what failed the apply, so the status comment and the summary
-// both name its error.
+// engine's finalize of the keyspace fails and the apply fails. The finalize is
+// not listed on its own, so the status comment and the summary both name the
+// keyspace in the failure callout, whatever the finalize error says: with its
+// error, with no error at all, and alongside an apply-level error that differs
+// from it.
 func TestShardedCommentsNameAFailedFinalize(t *testing.T) {
-	const finalizeErr = "apply VSchema for commerce: keyspace not found"
-	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Failed}
+	const finalizeErr = "publish routing rules: target is read-only"
+	const named = "\n> ❌ **Failure:** finalizing keyspace <code>commerce</code>"
 	mk := func(id int64, key, opState, errMsg string) *storage.ApplyOperation {
 		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	}
-	ops := []*storage.ApplyOperation{
-		mk(1, "commerce/-80/refunds", state.ApplyOperation.Completed, ""),
-		mk(2, "commerce/80-/refunds", state.ApplyOperation.Completed, ""),
-		mk(3, "commerce/group_finalizer", state.ApplyOperation.Failed, finalizeErr),
+	for _, tc := range []struct {
+		name, applyErr, finalizerErr string
+		want                         []string
+	}{
+		{name: "finalize error", finalizerErr: finalizeErr, want: []string{named + " — " + finalizeErr + "\n"}},
+		{name: "no error text", want: []string{named + "\n"}},
+		{
+			name: "apply error differs", applyErr: "apply deadline exceeded", finalizerErr: finalizeErr,
+			want: []string{named + " — " + finalizeErr + "\n", "\n> ❌ **Failure:** apply deadline exceeded\n"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Failed, ErrorMessage: tc.applyErr}
+			ops := []*storage.ApplyOperation{
+				mk(1, "commerce/-80/refunds", state.ApplyOperation.Completed, ""),
+				mk(2, "commerce/80-/refunds", state.ApplyOperation.Completed, ""),
+				mk(3, "commerce/group_finalizer", state.ApplyOperation.Failed, tc.finalizerErr),
+			}
+			data := buildShardedApplyData(apply, ops, false, nil, finalizesOnly("commerce"), "")
+			status := templates.RenderShardedApplyComment(data)
+			summary := templates.RenderShardedApplySummaryComment(data)
+			for _, want := range tc.want {
+				assert.Equal(t, 1, strings.Count(status, want), "status comment:\n%s", status)
+				assert.Equal(t, 1, strings.Count(summary, want), "summary comment:\n%s", summary)
+			}
+			assert.NotContains(t, summary, "**Failure:** "+finalizeErr, "the finalize error appears once, under its keyspace")
+		})
 	}
-	data := buildShardedApplyData(apply, ops, false, nil, finalizesOnly("commerce"), "")
-
-	assert.Equal(t, finalizeErr, data.ErrorMessage)
-	assert.Contains(t, templates.RenderShardedApplyComment(data), finalizeErr)
-	assert.Contains(t, templates.RenderShardedApplySummaryComment(data), finalizeErr)
 }
 
 // A sharded apply spans two keyspaces. commerce's shards finish and its
@@ -516,17 +538,43 @@ func TestFormatApplyStatusComment_MultiKeyspaceRendersKeyspaceSections(t *testin
 	assert.Contains(t, out, "### VSchema", "the finalizer renders in the VSchema section, not as a shard")
 }
 
-// When the apply spans keyspaces, a shard's ordering label names its blocker
-// with the keyspace-qualified shard — every unsharded keyspace's shard is "-",
-// so a bare name would be ambiguous — while the status row itself keeps the
-// plain shard name under its keyspace heading.
+// eightShards are the shards of a keyspace split eight ways.
+var eightShards = []string{"-20", "20-40", "40-60", "60-80", "80-a0", "a0-c0", "c0-e0", "e0-"}
+
+// The shards of one target copy in parallel, and only the apply's driver cap
+// holds the rest back, so the PR comment counts the shards still to start as
+// queued, as the CLI does, rather than as waiting for the first shard.
+func TestBuildShardedApplyData_CountsShardsTheDriverCapHoldsBackAsQueued(t *testing.T) {
+	ops := make([]*storage.ApplyOperation, 0, len(eightShards))
+	for i, shard := range eightShards {
+		opState := state.ApplyOperation.Pending
+		if i < 2 {
+			opState = state.ApplyOperation.Running
+		}
+		ops = append(ops, &storage.ApplyOperation{
+			ID: int64(i + 1), ApplyID: 1, Deployment: "default", OperationKey: "commerce/" + shard + "/orders",
+			State: opState, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt,
+		})
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "commerce", Environment: "staging", State: state.Apply.Running}
+
+	out := templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, false, nil, nil, ""))
+
+	assert.Contains(t, out, "**Shards**: 2 running table copy, 6 queued")
+	assert.NotContains(t, out, "waiting for")
+}
+
+// When the apply spans keyspaces and rollout members, a shard's ordering label
+// names its blocker with the keyspace-qualified shard — every unsharded
+// keyspace's shard is "-", so a bare name would be ambiguous — while the
+// status row itself keeps the plain shard name under its keyspace heading.
 func TestBuildShardedApplyData_MultiKeyspaceQualifiesOrderingLabels(t *testing.T) {
-	mk := func(id int64, key, opState, errMsg string) *storage.ApplyOperation {
-		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	mk := func(id int64, deployment, key, opState, errMsg string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: deployment, OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	}
 	ops := []*storage.ApplyOperation{
-		mk(1, "contacts/-/entries", state.ApplyOperation.Failed, "boom"),
-		mk(2, "contacts_lookup/-/entries_lookup", state.ApplyOperation.Pending, ""),
+		mk(1, "us", "contacts/-/entries", state.ApplyOperation.Failed, "boom"),
+		mk(2, "eu", "contacts_lookup/-/entries_lookup", state.ApplyOperation.Pending, ""),
 	}
 	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_contacts", Environment: "staging", State: state.Apply.Failed}
 

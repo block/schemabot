@@ -46,8 +46,9 @@ type ShardedApplyData struct {
 	ErrorMessage string
 
 	// FailedFinalizer is the first keyspace finalizer in a failure state, nil
-	// when none is. A finalizer can fail while other keyspaces' shards keep
-	// running, so the failure callout names it before the apply settles.
+	// when none is. The failure callout names its keyspace in every apply
+	// state, because the error text need not name it and a finalizer can fail
+	// while other keyspaces' shards keep running.
 	FailedFinalizer *FinalizerFailure
 
 	// Keyspaces is the per-keyspace shard rollup in resolved order: each entry
@@ -879,8 +880,13 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 		}
 		return
 	}
+	writeFinalizerFailure(sb, data.FailedFinalizer)
 	if !state.IsState(data.State, state.Apply.Failed, state.Apply.FailedRetryable) {
 		writeFinalizerFailure(sb, data.FailedFinalizer)
+		return
+	}
+	if data.FailedFinalizer != nil && data.ErrorMessage == data.FailedFinalizer.Error {
+		// The finalizer callout already carries this error.
 		return
 	}
 	if msg := SanitizeInlineError(data.ErrorMessage); msg != "" {
@@ -896,10 +902,9 @@ type FinalizerFailure struct {
 	Error    string
 }
 
-// writeFinalizerFailure names a failed finalizer while the apply is still
-// active. The comment lists no step for a finalize, and the apply keeps
-// running while other keyspaces' shards copy, so without this callout the
-// failure would stay out of sight until the apply settles.
+// writeFinalizerFailure names the keyspace whose finalize failed. Outside the
+// VSchema section, which only shows a VSchema change's state, nothing else in
+// the comment says which keyspace failed to finalize or why.
 func writeFinalizerFailure(sb *strings.Builder, f *FinalizerFailure) {
 	if f == nil {
 		return
