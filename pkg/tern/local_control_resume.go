@@ -454,6 +454,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 
 	var failedTask *storage.Task
 	var stoppedByUser bool
+	planMetadata := c.newPlanMetadataCache(apply)
 
 	for i, task := range tasks {
 		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
@@ -582,7 +583,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			fmt.Sprintf("Resuming task %s (sequential %d/%d)", task.TaskIdentifier, i+1, len(tasks)),
 			"", "")
 
-		action = c.runEngineTask(ctx, apply, task, plan, tasks, options)
+		action = c.runEngineTask(ctx, apply, task, plan, tasks, options, planMetadata)
 
 		if action == taskFailed {
 			failedTask = task
@@ -1584,6 +1585,12 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 			append(apply.LogAttrs(), "error", err)...)
 		return err
 	}
+	changes, err := groupedResumeChanges(tasks, plan, planChangeCanonicalizer(apply, c.logger))
+	if err != nil {
+		c.logger.Error("failed to rebuild engine changes for grouped resume; current apply owner will exit for operator retry",
+			append(apply.LogAttrs(), "error", err)...)
+		return fmt.Errorf("rebuild engine changes for grouped resume apply %s: %w", apply.ApplyIdentifier, err)
+	}
 
 	// Route the engine's own log lines into this apply's log stream, so a
 	// resumed drive reads like the drive that started it. The wiring goes up
@@ -1613,7 +1620,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		ApplyIdentifier: apply.ApplyIdentifier,
 		Database:        apply.Database,
 		PlanID:          plan.PlanIdentifier,
-		Changes:         groupedResumeChanges(tasks, plan),
+		Changes:         changes,
 		TargetShards:    taskTargetShards(tasks),
 		SchemaFiles:     plan.SchemaFiles,
 		IgnoreTables:    plan.IgnoreTables(),
@@ -1836,7 +1843,8 @@ func (c *LocalClient) groupedResumeState(ctx context.Context, apply *storage.App
 // with vschema_changed so the engine applies its VSchema from the schema files
 // alongside its DDL — or on its own for a VSchema-only namespace that has no DDL
 // tasks. This mirrors how the fresh apply builds changes from the plan.
-func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan) []engine.SchemaChange {
+func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan, canon StatementCanonicalizer) ([]engine.SchemaChange, error) {
+	planMetadata := newPlanChangeMetadata(plan, canon)
 	indexByNamespace := make(map[string]int, len(tasks))
 	var changes []engine.SchemaChange
 	ensureNamespace := func(namespace string) int {
@@ -1856,11 +1864,16 @@ func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan) []engine.Sc
 		if task.DDL == "" {
 			continue
 		}
+		metadata, err := planMetadata.forTask(task)
+		if err != nil {
+			return nil, fmt.Errorf("read engine metadata for task %s: %w", task.TaskIdentifier, err)
+		}
 		idx := ensureNamespace(task.Namespace)
 		changes[idx].TableChanges = append(changes[idx].TableChanges, engine.TableChange{
 			Table:     task.TableName,
 			DDL:       task.DDL,
 			Operation: ddl.OpToStatementType(task.DDLAction),
+			Metadata:  metadata,
 		})
 	}
 	if plan != nil {
@@ -1880,7 +1893,7 @@ func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan) []engine.Sc
 			changes[idx].Metadata["vschema_changed"] = "true"
 		}
 	}
-	return changes
+	return changes, nil
 }
 
 func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*storage.Task) {

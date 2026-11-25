@@ -37,7 +37,7 @@ func TestCancelMarksRunningSchemaChangeCancelled(t *testing.T) {
 
 // registerRunningSchemaChange installs a simulated running schema change on the
 // engine the same way Apply initializes one. The caller drives the change's
-// lifecycle through rm.wg.
+// lifecycle through startTestRun.
 func registerRunningSchemaChange(eng *Engine) *runningSchemaChange {
 	rm := &runningSchemaChange{
 		database:       "testdb",
@@ -190,7 +190,7 @@ func TestControlKeepsACompletionThatLandsAfterTheCancel(t *testing.T) {
 			rm := registerRunningSchemaChange(eng)
 			runCtx, cancelRun := context.WithCancel(t.Context())
 			rm.cancelFunc = cancelRun
-			rm.wg.Go(func() {
+			startTestRun(eng, rm, func() {
 				<-runCtx.Done()
 				eng.completeSchemaChange(runCtx, eng.changeLogger(), rm.database)
 			})
@@ -209,7 +209,7 @@ func TestControlKeepsACompletionThatLandsAfterTheCancel(t *testing.T) {
 			rm := registerRunningSchemaChange(eng)
 			runCtx, cancelRun := context.WithCancel(t.Context())
 			rm.cancelFunc = cancelRun
-			rm.wg.Go(func() { <-runCtx.Done() })
+			startTestRun(eng, rm, func() { <-runCtx.Done() })
 
 			_, err := control.run(eng, t.Context())
 
@@ -237,7 +237,7 @@ func TestSecondStopDuringFirstStopWaitDoesNotReportAlreadyStopped(t *testing.T) 
 	runCtx, cancelRun := context.WithCancel(t.Context())
 	rm.cancelFunc = cancelRun
 	release := make(chan struct{})
-	rm.wg.Go(func() {
+	startTestRun(eng, rm, func() {
 		<-runCtx.Done()
 		<-release
 		eng.completeSchemaChange(runCtx, eng.changeLogger(), rm.database)
@@ -300,7 +300,7 @@ func TestControlWaitForAStuckRunnerEndsAtTheCallersContext(t *testing.T) {
 			var releaseRunner sync.Once
 			release := func() { releaseRunner.Do(func() { close(stuck) }) }
 			t.Cleanup(release)
-			rm.goRun(func() { <-stuck })
+			startTestRun(eng, rm, func() { <-stuck })
 
 			expiring := func() error {
 				ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
@@ -331,11 +331,11 @@ func TestControlWaitForAStuckRunnerEndsAtTheCallersContext(t *testing.T) {
 				assert.False(t, engine.IsUnsupportedOperation(err))
 				assert.Equal(t, control.wantState, rm.state)
 				assert.Same(t, rm, eng.runningSchemaChange, "the change stays tracked while its runner is alive")
-				assert.EqualValues(t, 1, rm.active.Load(), "the runner is still alive")
+				assert.True(t, testRunAlive(eng, rm), "the runner is still alive")
 			}
 
 			release()
-			rm.wg.Wait()
+			waitForTestRun(t, eng, rm)
 
 			result, err := control.run(eng, t.Context())
 			if name == "stop" {
@@ -362,6 +362,7 @@ func TestControlWaitForAStuckRunnerEndsAtTheCallersContext(t *testing.T) {
 // caller retries, leaving the change stopped and no second run started.
 func assertStartRefusedWhileRunnerAlive(t *testing.T, eng *Engine, rm *runningSchemaChange) {
 	t.Helper()
+	before := currentRunExit(eng, rm)
 	result, err := eng.Start(t.Context(), &engine.ControlRequest{})
 	require.Error(t, err, "a second run must not start while the first has not returned")
 	assert.Nil(t, result)
@@ -372,7 +373,8 @@ func assertStartRefusedWhileRunnerAlive(t *testing.T, eng *Engine, rm *runningSc
 	state := rm.state
 	eng.mu.Unlock()
 	assert.Equal(t, engine.StateStopped, state, "a refused start leaves the change stopped")
-	assert.EqualValues(t, 1, rm.active.Load(), "no second run was started")
+	assert.Equal(t, before, currentRunExit(eng, rm), "no second run was started")
+	assert.True(t, testRunAlive(eng, rm), "the stopped runner is still alive")
 }
 
 // A stop whose wait expired leaves the change stopped with its runner still
@@ -385,14 +387,14 @@ func TestStartIsRefusedAfterAStopWhoseWaitExpired(t *testing.T) {
 	rm.cancelFunc = func() {}
 	stuck := make(chan struct{})
 	t.Cleanup(func() { close(stuck) })
-	rm.goRun(func() { <-stuck })
+	startTestRun(eng, rm, func() { <-stuck })
 
 	stopCtx, cancelStop := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancelStop()
 	_, err := eng.Stop(stopCtx, &engine.ControlRequest{})
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Equal(t, engine.StateStopped, rm.state)
-	require.EqualValues(t, 1, rm.active.Load(), "the stopped runner is still alive")
+	require.True(t, testRunAlive(eng, rm), "the stopped runner is still alive")
 
 	assertStartRefusedWhileRunnerAlive(t, eng, rm)
 }
@@ -409,7 +411,7 @@ func TestStartIsAcceptedOnceTheStoppedRunnerHasReturned(t *testing.T) {
 	var releaseRunner sync.Once
 	release := func() { releaseRunner.Do(func() { close(stuck) }) }
 	t.Cleanup(release)
-	rm.goRun(func() { <-stuck })
+	startTestRun(eng, rm, func() { <-stuck })
 
 	waitCtx, cancelWait := context.WithTimeout(t.Context(), controlDuringConnectDeadline)
 	defer cancelWait()
@@ -436,7 +438,7 @@ func TestStartIsAcceptedOnceTheStoppedRunnerHasReturned(t *testing.T) {
 	assert.Equal(t, "Resumed from checkpoint", result.Message)
 	// The resumed run fails at the connection because this fixture runs no
 	// target; wait it out so it does not outlive the test.
-	require.NoError(t, waitForRunExit(waitCtx, rm), "the resumed run returns")
+	waitForTestRun(t, eng, rm)
 }
 
 // A stop or cancel whose caller has already given up, on a change with no
@@ -591,7 +593,7 @@ func TestControlDuringTargetConnectionKeepsTheControlOutcome(t *testing.T) {
 				runCtx, cancelRun := context.WithCancel(t.Context())
 				rm.cancelFunc = cancelRun
 				finished := make(chan bool, 1)
-				rm.wg.Go(func() {
+				startTestRun(eng, rm, func() {
 					finished <- runPhase(eng, runCtx, host)
 				})
 				select {

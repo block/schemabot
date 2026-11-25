@@ -76,7 +76,7 @@ func newLeaderHandler(t *testing.T, svc *api.Service, client *gh.Client) *Handle
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClientWithSlug(client, logger, leaderOwnAppSlug, trustedTenantAppSlug)
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 	// A fold that leaves participants unresolved arms a self-scheduled re-fold;
 	// keep those timers from firing inside the test process (pending timers at
 	// process exit are inert). Tests that exercise re-fold convergence lower

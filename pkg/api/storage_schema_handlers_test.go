@@ -424,6 +424,50 @@ func TestHandleStorageSchemaApply_RefusesUnknownField(t *testing.T) {
 	assert.Nil(t, local.applyReq, "nothing may converge on a request that was not understood")
 }
 
+// A body with a second object or stray text after its JSON value is refused
+// rather than read as its first value: dropping a trailing
+// {"allow_destructive":true} would report on, or converge, storage under
+// rules other than the ones the caller sent. An empty body still means the
+// defaults.
+func TestStorageSchemaRoutes_RefuseDataAfterTheJSONValue(t *testing.T) {
+	routes := map[string]func(*testing.T, *Service, string) *httptest.ResponseRecorder{
+		"plan":  storageSchemaPlanRequestFor,
+		"apply": storageSchemaApplyRequest,
+	}
+	refused := map[string]string{
+		"a second object": `{"deployment":""}{"allow_destructive":true}`,
+		"stray text":      `{"deployment":""} xx`,
+	}
+	for routeName, send := range routes {
+		for name, body := range refused {
+			t.Run(routeName+" followed by "+name+" is refused", func(t *testing.T) {
+				svc := newStorageSchemaService(t, &ServerConfig{})
+				local := &fakeStorageSchemaService{}
+				svc.SetStorageSchemaService(local)
+
+				rec := send(t, svc, body)
+				require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+				assert.Contains(t, rec.Body.String(), "invalid request body: the body must hold one JSON value, but more data follows it")
+				assert.Nil(t, local.planReq, "nothing is read on a request that was refused")
+				assert.Nil(t, local.applyReq, "nothing converges on a request that was refused")
+			})
+		}
+	}
+
+	t.Run("plan with a body of only white space reads this server's storage", func(t *testing.T) {
+		svc := newStorageSchemaService(t, &ServerConfig{})
+		local := &fakeStorageSchemaService{planResp: &ternv1.StorageSchemaPlanResponse{
+			Report: storageSchemaReportMessage("schemabot_storage"),
+		}}
+		svc.SetStorageSchemaService(local)
+
+		rec := storageSchemaPlanRequestFor(t, svc, " \r\n\t")
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		require.NotNil(t, local.planReq)
+		assert.False(t, local.planReq.GetAllowDestructive(), "an empty body opts into no destructive statements")
+	})
+}
+
 // An incomplete answer from the target is an error, not a convergence: without
 // both halves there is no way to tell a run that finished from one that left
 // statements behind.

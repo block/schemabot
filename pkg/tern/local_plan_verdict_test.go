@@ -102,13 +102,25 @@ func TestBlockedTaskError(t *testing.T) {
 // the reviewed ALTER: built from task rows, so it carries no execution-mode
 // verdict.
 func alterUsersEmailDispatch(planID string, targetShards ...string) *ternv1.ApplyRequest {
-	return &ternv1.ApplyRequest{
+	return withShardSchemaFiles(&ternv1.ApplyRequest{
 		PlanId:       planID,
 		TargetShards: targetShards,
 		DdlChanges: []*ternv1.TableChange{
 			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
 		},
+	})
+}
+
+// withShardSchemaFiles stamps the reviewed schema files on a shard dispatch,
+// as the control plane does for every one, so the shard can be re-planned
+// against them. A whole-deployment dispatch is returned unchanged.
+func withShardSchemaFiles(req *ternv1.ApplyRequest) *ternv1.ApplyRequest {
+	if len(req.TargetShards) > 0 {
+		req.SchemaFiles = map[string]*ternv1.SchemaFiles{
+			"testapp": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}},
+		}
 	}
+	return req
 }
 
 // A statement the primary's target admitted can be one this deployment's own
@@ -239,13 +251,13 @@ func dropUsersLegacyIDReplan(shard string) *engine.PlanResult {
 // dropUsersLegacyIDDispatch is the dispatch for the dropped column as task rows
 // build it: no unsafe flag travels with it.
 func dropUsersLegacyIDDispatch(planID string, targetShards ...string) *ternv1.ApplyRequest {
-	return &ternv1.ApplyRequest{
+	return withShardSchemaFiles(&ternv1.ApplyRequest{
 		PlanId:       planID,
 		TargetShards: targetShards,
 		DdlChanges: []*ternv1.TableChange{
 			{TableName: "users", Ddl: "ALTER TABLE `users` DROP COLUMN `legacy_id`", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
 		},
-	}
+	})
 }
 
 // A dispatched column drop carries no unsafe flag, and its operation is an
@@ -637,6 +649,27 @@ func TestReplannedChangeStampOntoOnlyTightensUnsafe(t *testing.T) {
 	replannedChange{ddl: statement}.stampOnto(&safe)
 	assert.False(t, safe.IsUnsafe)
 	assert.Empty(t, safe.UnsafeReason)
+}
+
+// A re-plan that produces one change twice with records that disagree cannot
+// say which record the change runs against, so materializing it is refused.
+func TestStampReplannedTablesRefusesConflictingEngineMetadata(t *testing.T) {
+	client := newPlanMaterializeClient(&fakePlanStore{})
+	parser, err := client.statementParser()
+	require.NoError(t, err)
+	const statement = "ALTER TABLE `users` DROP COLUMN `legacy_id`"
+	canon, err := canonicalDDLForDrift(parser, statement)
+	require.NoError(t, err)
+	key := driftChangeKey{namespace: client.planNamespace(""), table: "users", operation: "alter", ddl: canon}
+
+	replanned := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
+	replanned.record(key, replannedChange{ddl: statement, metadata: map[string]string{"record": "a"}})
+	replanned.record(key, replannedChange{ddl: statement, metadata: map[string]string{"record": "b"}})
+
+	tables := []storage.TableChange{{Table: "users", Operation: "alter", DDL: statement}}
+	err = client.stampReplannedTables(parser, tables, replanned)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "more than one copy of a change with different engine records")
 }
 
 // A blocked verdict on one shard's copy of a table already seen on another

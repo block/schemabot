@@ -207,8 +207,10 @@ func (s *Service) checkChangeGatesForApply(ctx context.Context, checkpoint chang
 // Blockers are overridden by an approved override request for this
 // environment, action and target that names every one of them. The request is
 // returned with the admitting context so the caller can record it. Without
-// one, a caller who gave an override reason has a request recorded and the
-// refusal carries it. Any storage error on that path is
+// one, a caller who gave an override reason has a request recorded. Under the
+// approval override policy the refusal carries it for someone else to
+// approve; under the reason policy, the default, it is stored approved by the
+// caller and admits this command at once, and no later one. Any storage error on that path is
 // *ChangeGateUnavailableError: an override never gets past a gate that could
 // not decide.
 //
@@ -277,11 +279,34 @@ func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, call
 			"reason", approved.Reason, "blockers", approved.Blockers)...)
 		return admitCtx, approved, nil
 	}
+	onReason := in.Override != "" && (s.config == nil || s.config.Freeze.OverrideOnReason())
+	if onReason {
+		admitted, err := s.overrideOnReason(ctx, in, blockers)
+		if err != nil {
+			metrics.RecordChangeGateError(ctx, in.Environment, string(in.Checkpoint))
+			s.logger.Error("change gate could not record the override, so the change was refused", append(attrs, "error", err)...)
+			return ctx, nil, &ChangeGateUnavailableError{Checkpoint: in.Checkpoint, Gate: "override", Err: err}
+		}
+		if admitted != nil {
+			for _, gate := range distinctChangeGateNames(blockers) {
+				metrics.RecordChangeGateOverride(ctx, in.Environment, gate, string(in.Checkpoint))
+			}
+			s.logger.Info("change gate admitted the change on the requester's override reason", append(attrs,
+				"override_request", admitted.Identifier, "requested_by", admitted.RequestedBy,
+				"reason", admitted.Reason, "blockers", admitted.Blockers)...)
+			return admitCtx, admitted, nil
+		}
+	}
 	for _, gate := range distinctChangeGateNames(blockers) {
 		metrics.RecordChangeGateRefusal(ctx, in.Environment, gate, string(in.Checkpoint))
 	}
-	refusal := &ChangeGateRefusedError{Checkpoint: in.Checkpoint, Environment: in.Environment, Blockers: blockers}
-	if in.Override != "" {
+	refusal := &ChangeGateRefusedError{Checkpoint: in.Checkpoint, Environment: in.Environment, Blockers: blockers,
+		OverrideOnReason: s.config == nil || s.config.Freeze.OverrideOnReason()}
+	if onReason {
+		// The caller is unverified, or the pull request's author is unknown,
+		// so the reason could not be recorded against anyone.
+		refusal.OverrideUnrecorded = true
+	} else if in.Override != "" {
 		requested, err := s.requestOverride(ctx, in, blockers)
 		if err != nil {
 			metrics.RecordChangeGateError(ctx, in.Environment, string(in.Checkpoint))
@@ -301,12 +326,12 @@ func (s *Service) checkChangeGates(ctx context.Context, in changeGateInput, call
 	return ctx, nil, refusal
 }
 
-// approvedOverride returns the first approved, unexpired override request for
-// the change that names every blocker and that the caller asked for, or nil
-// when there is none. Only the requester runs on an approval: anyone else asks
-// for their own. Within its window the requester may use it more than once,
-// for example to re-apply the same schema after a stop. A server without
-// override storage has none to find.
+// approvedOverride returns the first override request a second person
+// approved for the change that is unexpired, names every blocker and that the
+// caller asked for, or nil when there is none. Only the requester runs on an
+// approval: anyone else asks for their own. Within its window the requester
+// may use it more than once, for example to re-apply the same schema after a
+// stop. A server without override storage has none to find.
 func (s *Service) approvedOverride(ctx context.Context, in changeGateInput, blockers []apitypes.ChangeGateBlocker) (*storage.FreezeOverrideRequest, error) {
 	overrides := s.storage.FreezeOverrides()
 	if overrides == nil {
@@ -323,7 +348,15 @@ func (s *Service) approvedOverride(ctx context.Context, in changeGateInput, bloc
 		return nil, fmt.Errorf("list approved overrides for %s %s in %s: %w", in.Action, in.TargetID, in.Environment, err)
 	}
 	ids := changeGateBlockerIDs(blockers)
+	// An override admitted on its requester's reason covers only the command
+	// that gave the reason: a later command gives its own --override, under
+	// either policy. So it never carries over to a retry, and a server switched
+	// back to approval honors only overrides a second person approved. Work it
+	// already admitted keeps it (approvedOverridesForApply).
 	for _, request := range approved {
+		if request.OnReason() {
+			continue
+		}
 		if request.Covers(ids) && storage.CanonicalKey(request.RequestedBy) == storage.CanonicalKey(caller) && sameOverrideOrigin(ctx, request) {
 			return request, nil
 		}
@@ -333,25 +366,15 @@ func (s *Service) approvedOverride(ctx context.Context, in changeGateInput, bloc
 
 // requestOverride records a request for an approver to override the blockers
 // of this change, for the caller who asked, and returns nil when it may not
-// record one. A pull request command records the commenter, the pull request
-// and its author, all in the "github:" identity domain (see
-// storage.FreezeOverrideRequest.FromPullRequest); any other request records the verified caller's
-// subject, with no pull request. The plan does not store its pull request's
-// author, so the pull request comes from the webhook's context, never from
-// the plan.
+// record one (see newOverrideRequest). A requester who repeats the command
+// before approval gets the request already pending.
 func (s *Service) requestOverride(ctx context.Context, in changeGateInput, blockers []apitypes.ChangeGateBlocker) (*storage.FreezeOverrideRequest, error) {
 	overrides := s.storage.FreezeOverrides()
-	freezes := s.storage.Freezes()
-	if overrides == nil || freezes == nil {
+	if overrides == nil || s.storage.Freezes() == nil {
 		return nil, nil
 	}
 	requester, verified := overrideCaller(ctx)
 	if !verified {
-		return nil, nil
-	}
-	pr, fromPullRequest := pullRequestOverrideRequester(ctx)
-	if fromPullRequest && !pr.complete() {
-		// Without the author the approver check could not refuse them.
 		return nil, nil
 	}
 	// A requester who repeats the command before approval keeps the one
@@ -367,13 +390,62 @@ func (s *Service) requestOverride(ctx context.Context, in changeGateInput, block
 			return request, nil
 		}
 	}
+	request, err := s.newOverrideRequest(ctx, in, blockers)
+	if err != nil || request == nil {
+		return nil, err
+	}
+	return overrides.Create(ctx, request)
+}
+
+// overrideOnReason records an override that the caller's reason admits, for
+// the reason override policy, and returns nil when it may not record one (see
+// newOverrideRequest). The request is stored approved by its requester and
+// admits only this command: the work it starts keeps it at the claim
+// checkpoint (approvedOverridesForApply), and approvedOverride never returns
+// it, so a later command gives its own reason.
+func (s *Service) overrideOnReason(ctx context.Context, in changeGateInput, blockers []apitypes.ChangeGateBlocker) (*storage.FreezeOverrideRequest, error) {
+	overrides := s.storage.FreezeOverrides()
+	if overrides == nil {
+		return nil, nil
+	}
+	request, err := s.newOverrideRequest(ctx, in, blockers)
+	if err != nil || request == nil {
+		return nil, err
+	}
+	return overrides.CreateOnReason(ctx, request)
+}
+
+// newOverrideRequest builds an override request for the caller who asked,
+// unsaved, and returns nil when it may not record one: the caller is not
+// verified, or a pull request command does not know the pull request's
+// author. A pull request command records the commenter, the pull request and
+// its author, all in the "github:" identity domain (see
+// storage.FreezeOverrideRequest.FromPullRequest); any other request records the verified caller's
+// subject, with no pull request. The plan does not store its pull request's
+// author, so the pull request comes from the webhook's context, never from
+// the plan. The request expires storage.FreezeOverrideMaxLifetime after now
+// by the database clock.
+func (s *Service) newOverrideRequest(ctx context.Context, in changeGateInput, blockers []apitypes.ChangeGateBlocker) (*storage.FreezeOverrideRequest, error) {
+	freezes := s.storage.Freezes()
+	if freezes == nil {
+		return nil, nil
+	}
+	requester, verified := overrideCaller(ctx)
+	if !verified {
+		return nil, nil
+	}
+	pr, fromPullRequest := pullRequestOverrideRequester(ctx)
+	if fromPullRequest && !pr.complete() {
+		// Without the author the approver check could not refuse them.
+		return nil, nil
+	}
 	request := &storage.FreezeOverrideRequest{
 		Identifier:  engine.NewFreezeOverrideID(),
 		Environment: in.Environment,
 		Action:      in.Action,
 		TargetID:    in.TargetID,
 		Database:    in.Database,
-		Blockers:    ids,
+		Blockers:    changeGateBlockerIDs(blockers),
 		Reason:      in.Override,
 		RequestedBy: requester,
 	}
@@ -387,7 +459,7 @@ func (s *Service) requestOverride(ctx context.Context, in changeGateInput, block
 		return nil, fmt.Errorf("read the database clock for an override request: %w", err)
 	}
 	request.ExpiresAt = now.Add(storage.FreezeOverrideMaxLifetime)
-	return overrides.Create(ctx, request)
+	return request, nil
 }
 
 // sameOverrideOrigin reports whether request was asked for where this change
@@ -522,6 +594,9 @@ type ChangeGateRefusedError struct {
 	// is not verified, by a pull request command with no known author, or
 	// to a server with no override storage: no request was recorded.
 	OverrideUnrecorded bool
+	// OverrideOnReason reports the server's override policy: a repeat with
+	// an override reason runs at once, with no approver.
+	OverrideOnReason bool
 }
 
 func (e *ChangeGateRefusedError) Error() string {
@@ -658,6 +733,7 @@ func (s *Service) writeChangeGateError(w http.ResponseWriter, opName string, err
 	response := apitypes.ErrorResponse{Error: opName + " rejected: " + err.Error(), ErrorCode: code}
 	if refused, isRefusal := errors.AsType[*ChangeGateRefusedError](err); isRefusal {
 		response.Blockers = refused.Blockers
+		response.OverrideOnReason = refused.OverrideOnReason
 		if refused.OverrideRequest != nil {
 			overrideRequest := freezeOverrideResponse(refused.OverrideRequest)
 			response.OverrideRequest = &overrideRequest

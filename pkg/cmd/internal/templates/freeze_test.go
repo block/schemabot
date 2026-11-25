@@ -88,10 +88,10 @@ func TestStoppedByFreezeText(t *testing.T) {
 	assert.Contains(t, text, "Stopped by freeze freeze-1 (SEV-1234")
 	assert.NotContains(t, text, "\x1b", "the reason cannot write escape sequences")
 	assert.Contains(t, text, "'schemabot start apply-1 -e staging' after the freeze ends or is lifted")
-	assert.Contains(t, text, `add --override "<reason>" to ask a freeze approver to let it through`)
+	assert.Contains(t, text, `add --override "<reason>" if it can't wait`)
 
 	assert.Empty(t, StoppedByFreezeText(nil, "apply-1", "staging"))
-	assert.Equal(t, "Stopped by freeze freeze-1. Run 'schemabot start apply-1 -e staging' after the freeze ends or is lifted, or add --override \"<reason>\" to ask a freeze approver to let it through.",
+	assert.Equal(t, "Stopped by freeze freeze-1. Run 'schemabot start apply-1 -e staging' after the freeze ends or is lifted, or add --override \"<reason>\" if it can't wait.",
 		StoppedByFreezeText(&apitypes.FreezeStopRef{ID: "freeze-1"}, "apply-1", "staging"))
 }
 
@@ -114,7 +114,7 @@ func TestStoppedByFreezeTellsTheSameStoryInStatusAndThePRComment(t *testing.T) {
 		want      []string
 		wantNever []string
 	}{
-		{"InEffect", false, []string{"after the freeze ends or is lifted", "--override", "freeze approver"}, []string{"which has ended"}},
+		{"InEffect", false, []string{"after the freeze ends or is lifted", "--override", "if it can't wait"}, []string{"which has ended"}},
 		{"Ended", true, []string{"which has ended", "to resume it"}, []string{"--override", "after the freeze ends"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -149,7 +149,7 @@ func TestChangeGateRefusedTextNamesTheOverrideCommand(t *testing.T) {
 
 	require.Len(t, lines, 4)
 	assert.Equal(t, "❄️ production is frozen. This cutover did not start.", lines[0])
-	assert.Equal(t, "To ask for an override, run:", lines[2])
+	assert.Equal(t, "If this change can't wait, override the freeze with a reason:", lines[2])
 	assert.Equal(t, `  schemabot cutover apply-`+lineAttackCleaned+` -e production --override "<reason>"`, lines[3])
 	assertNoTerminalControls(t, strings.Join(lines, "\n"))
 }

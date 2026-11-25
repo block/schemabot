@@ -609,9 +609,13 @@ Release lock only
 Check still blocks if unapplied schema changes remain
 ```
 
-`schemabot unlock` releases locks. It does not make the required aggregate check
-pass; if the PR still contains unapplied schema changes, the aggregate remains
-blocked until a new plan shows no changes or the changes are applied.
+`schemabot unlock` releases locks, except a lock that an apply which has not
+settled still records, including a stopped apply. That lock stays held, and the
+command answers with the apply and what to do: wait for or cancel an active
+apply, resume or cancel a stopped one. Unlock does not make the required
+aggregate check pass; if the PR still contains unapplied schema changes, the
+aggregate remains blocked until a new plan shows no changes or the changes are
+applied.
 
 ```text
 PR closed
@@ -683,6 +687,7 @@ Run output remains human-readable and may change.
 | `rollback_completed` | Per-database row | A rollback succeeded, so the target environment no longer contains the PR's desired schema. |
 | `github_schema_config_discovery_unavailable` | Aggregate row | SchemaBot knew the PR head SHA, but GitHub was unavailable while SchemaBot inspected changed files or repository contents. |
 | `schema_config_discovery_failed` | Aggregate row | SchemaBot could reach GitHub, but could not determine the managed schema configuration or schema files. |
+| `github_quota_reserved` | Aggregate row | The installation's GitHub API quota is down to the reserve SchemaBot holds back for check runs (`github.quota-reserve`), so SchemaBot did not send the reads that discover the PR's schema changes. Nothing is wrong with the PR. The check names the time the quota resets. When the delivery that found the changes is retried at the reset, the check says so; otherwise it asks the author to re-run the check after that time. |
 | `pr_file_cap_exceeded` | Aggregate row | The PR changes more files than GitHub will report for a single pull request, so SchemaBot's changed-file list is incomplete. Unlike the reasons above this is a property of the PR itself, so it clears only when the PR is split — not by retrying. |
 | `no_allowed_configured_environments` | Aggregate row | The database has no configured environments from which scope can be established. |
 | `plan_failed_unrecorded` | Aggregate row | An environment could not plan, and its failing per-database row could not be stored, so stored check state holds nothing of the failure. No plan command releases it; a re-run of the check or a new commit re-plans every environment and does. |
@@ -728,6 +733,7 @@ Common fail-closed scenarios:
 | PR branch moved while SchemaBot was processing | The work was based on an older commit SHA. Publishing that result on the current PR could be misleading. | Usually wait for the `synchronize` webhook to auto-plan the latest commit. If the required check stays missing or stale, comment `schemabot plan -e <environment>` on the PR, or `schemabot plan` for all configured environments. |
 | Aggregate update skipped for a stale SHA | A background driver tried to publish status for a commit that is no longer the PR head. | Confirm the latest commit has a SchemaBot aggregate check. If it does not, comment `schemabot plan -e <environment>` or `schemabot plan`. |
 | GitHub unavailable during config discovery | SchemaBot cannot safely read PR metadata or repository contents. | Wait for GitHub API recovery, then comment `schemabot plan -e <environment>` or `schemabot plan`. CLI operations can still manage live schema changes while GitHub is down, but they do not make branch protection pass. |
+| GitHub quota held in reserve during config discovery | The installation's GitHub API quota is down to the reserve SchemaBot keeps for check runs, so SchemaBot did not read the PR's schema files. | Nothing to fix on the PR. If the check says SchemaBot will retry, wait for the time it names. If it asks for a re-run, re-run the SchemaBot check or push a new commit after that time; a `schemabot plan` comment does not lift this block, because a manual plan keeps a stored aggregate block in place. Logs with `blocking_reason=github_quota_reserved` show `retried_at_reset` and `reset_time`. If the reserve is reached often, look at what is spending the installation's quota. |
 | Config discovery failed for a non-GitHub reason | SchemaBot could read GitHub, but could not determine the managed schema config or schema files. | Fix `schemabot.yaml`, the schema file layout, or the invalid SQL/config state. Push the fix, or comment `schemabot plan -e <environment>` after fixing the PR. Use logs with `blocking_reason=schema_config_discovery_failed` for the underlying read or parse failure. |
 | Schema changes found but no configured environments are allowed | The database is configured only for environments this deployment is not allowed to process. Publishing success would hide a deployment/config mismatch. | Align the server database environment config with this deployment's `allowed_environments`, then push the config fix or comment `schemabot plan -e <environment>`. |
 | Accepted apply cannot be tracked | The engine accepted work, but SchemaBot could not store or reload the apply ID needed for progress and check ownership. | Treat this as a storage or apply-tracking incident. Inspect engine state and the `applies` table before retrying; do not rely on branch protection until a new plan reflects the live schema. |
@@ -1120,7 +1126,10 @@ records the time to the microsecond.
 
 A `closed` webhook releases locks held by that PR and deletes SchemaBot's stored
 check records for the PR. It does not cancel in-flight applies. Those applies
-continue to their terminal state in Tern.
+continue to their terminal state in Tern. A lock that an apply which has not
+settled still records, including a stopped apply, is kept along with the PR's
+stored check records, so the apply stays protected until an operator resumes
+or cancels it and unlocks.
 
 GitHub check runs already published to commits remain in GitHub history, but
 SchemaBot removes its internal PR safety state because the PR is no longer
@@ -1138,10 +1147,13 @@ GitHub:
 
 A merged PR cannot reopen, so a merge skips the read.
 
-The retry is limited to five attempts, one minute apart. A GitHub outage that
-lasts longer, a suspended or removed App installation, or a deleted repository
-uses up those attempts. The lock then stays held and blocks other PRs on that
-database until an operator runs `schemabot unlock`.
+The retry is limited to five attempts. The wait between them doubles: one,
+two, four, then eight minutes, at least fifteen minutes in all. Each wait
+also gets a random extra of up to a quarter of its length, so deliveries
+that failed together do not all retry at the same moment. A GitHub outage
+that lasts longer, a suspended or removed App installation, or a deleted
+repository uses up those attempts. The lock then stays held and blocks other
+PRs on that database until an operator runs `schemabot unlock`.
 
 The read is made once, before cleanup starts. A PR that reopens while cleanup
 is already running is not seen by that cleanup, which finishes as if the PR
@@ -1395,9 +1407,11 @@ rollback watcher cannot overwrite a newer plan or newer apply result.
 
 ### Unlock
 
-`schemabot unlock` releases the PR's lock. It does not mark the aggregate check
-as passing. If the PR still contains unapplied schema changes, the aggregate
-continues to block until a new plan shows no changes or the changes are applied.
+`schemabot unlock` releases the PR's lock, unless an apply which has not
+settled still records it; see [Unlock And Close](#unlock-and-close). It does
+not mark the aggregate check as passing. If the PR still contains unapplied
+schema changes, the aggregate continues to block until a new plan shows no
+changes or the changes are applied.
 
 ### Schema changes but no configured environments are allowed
 

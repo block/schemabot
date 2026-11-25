@@ -35,7 +35,7 @@ type ApplyCmd struct {
 	SkipRevert   bool          `help:"Skip revert window after completion (Vitess only)" name:"skip-revert"`
 	Branch       string        `help:"Reuse existing PlanetScale branch (syncs with main, skips branch creation)" name:"branch"`
 	AllowUnsafe  bool          `help:"Allow destructive changes (DROP TABLE, DROP COLUMN, etc.)" name:"allow-unsafe"`
-	Override     string        `help:"Reason to ask a freeze approver to let this change through a freeze" name:"override"`
+	Override     string        `help:"Why this change can't wait. It lets the change through a freeze, or asks a freeze approver to, as the server's override policy says" name:"override"`
 	Force        bool          `help:"Force acquire lock (breaks existing lock from another owner)"`
 	Yield        bool          `help:"Release the lock once the apply has finished (kept while it is still running or stopped)"`
 	NoLock       bool          `help:"Don't hold a database lock during the operation" name:"no-lock"`
@@ -145,6 +145,7 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 		// body, which discloses them on both of its own branches.
 		if cmd.Output != OutputFormatJSON {
 			templates.WriteExemptTables(planResult.ExemptTables)
+			templates.WriteUnmatchedDropTables(shownUnmatchedDropTables(planResult))
 		}
 		return nil
 	}
@@ -433,6 +434,17 @@ func yieldLock(ep, database, dbType, owner, environment, applyID string, lockID 
 		templates.WriteLockReplaced(database, dbType)
 		return nil
 	}
+	// Someone else released the lock, or it is held under another owner now:
+	// either way this command has nothing to release, and the apply it ran
+	// settled, so this is not a failure.
+	if errors.Is(err, client.ErrLockNotFound) {
+		templates.WriteUnsubmittedLockAlreadyReleased(database, dbType)
+		return nil
+	}
+	if errors.Is(err, client.ErrLockNotOwned) {
+		templates.WriteLockHeldByAnotherOwner(database, dbType)
+		return nil
+	}
 	if err != nil {
 		templates.WriteLockKept(database, dbType, fmt.Sprintf("the server did not release it (%v)", err))
 		return fmt.Errorf("release lock for %s: %w", database, err)
@@ -656,11 +668,11 @@ func (cmd *ApplyCmd) refuseActiveSchemaChange(database string, check func() (*cl
 // names each unsafe change and the command that permits them.
 func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, schemaDir, target string, output OutputFormat) error {
 	unsafeChanges := planResult.RolloutUnsafeChanges()
-	retry := fmt.Sprintf("apply -s %s -e %s", initShellArg(schemaDir), initShellArg(environment))
+	retry := []string{"apply", "-s", initShellArg(schemaDir), "-e", initShellArg(environment)}
 	if target != "" {
-		retry += " --target " + initShellArg(target)
+		retry = append(retry, "--target", initShellArg(target))
 	}
-	retry += " --allow-unsafe"
+	retry = append(retry, "--allow-unsafe")
 	if output == OutputFormatJSON {
 		return errors.New(templates.UnsafeChangesBlockedSummary(unsafeChanges, retry))
 	}
@@ -715,19 +727,19 @@ func rolloutRefusalSummary(refused []*apitypes.PlanMemberRefusalResponse, enviro
 			entries = append(entries, fmt.Sprintf("%s (%s; no apply runs it, so change the schema files)", r.Member, r.Detail))
 			continue
 		}
-		entries = append(entries, fmt.Sprintf("%s (%s; run it with: %s)", r.Member, r.Detail, cliname.Command(narrowedApplyRerun(r, environment, schemaDir))))
+		entries = append(entries, fmt.Sprintf("%s (%s; run it with: %s)", r.Member, r.Detail, cliname.Command(narrowedApplyRerun(r, environment, schemaDir)...)))
 	}
 	return strings.Join(entries, "; ")
 }
 
-// narrowedApplyRerun is the apply narrowed to one refused member, without the
-// binary name. It names the member by the selector the server accepts, which
+// narrowedApplyRerun is the words of the apply narrowed to one refused member,
+// without the binary name, one shell-escaped word per element. It names the member by the selector the server accepts, which
 // for a deployment with one target is its target rather than the deployment
 // name it is shown under.
-func narrowedApplyRerun(r *apitypes.PlanMemberRefusalResponse, environment, schemaDir string) string {
-	rerun := fmt.Sprintf("apply -s %s -e %s --target %s", initShellArg(schemaDir), initShellArg(environment), initShellArg(r.Target))
+func narrowedApplyRerun(r *apitypes.PlanMemberRefusalResponse, environment, schemaDir string) []string {
+	rerun := []string{"apply", "-s", initShellArg(schemaDir), "-e", initShellArg(environment), "--target", initShellArg(r.Target)}
 	if r.AllowUnsafe {
-		rerun += " --allow-unsafe"
+		rerun = append(rerun, "--allow-unsafe")
 	}
 	return rerun
 }
@@ -737,7 +749,7 @@ func narrowedApplyRerun(r *apitypes.PlanMemberRefusalResponse, environment, sche
 // lists, naming the narrowed apply that runs each one.
 func blockRolloutApplyRefused(planResult *apitypes.PlanResponse, rollout *apitypes.PlanRolloutResponse, database, environment, schemaDir string) error {
 	OutputPlanResult(planResult, database, environment, schemaDir, true)
-	var reruns []string
+	var reruns [][]string
 	for _, r := range rollout.Refused {
 		if r.Reason == apitypes.PlanMemberBlocked {
 			continue

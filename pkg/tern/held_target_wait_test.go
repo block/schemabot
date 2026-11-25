@@ -67,7 +67,7 @@ func runHeldTask(t *testing.T, eng *heldTargetEngine) (taskAction, *storage.Task
 	task.Shard = ""
 	task.DDL = heldTaskDDL
 	plan := &storage.Plan{ID: 7}
-	action := client.runEngineTask(t.Context(), apply, task, plan, []*storage.Task{task}, nil)
+	action := client.runEngineTask(t.Context(), apply, task, plan, []*storage.Task{task}, nil, nil)
 	return action, task
 }
 
@@ -142,7 +142,7 @@ func TestRunEngineTask_HeldTargetPastTheWaitCapHandsTheApplyBack(t *testing.T) {
 	task.Shard = ""
 	task.DDL = heldTaskDDL
 
-	action := client.runEngineTask(t.Context(), apply, task, &storage.Plan{ID: 7}, []*storage.Task{task}, nil)
+	action := client.runEngineTask(t.Context(), apply, task, &storage.Plan{ID: 7}, []*storage.Task{task}, nil, nil)
 
 	assert.Equal(t, taskHandover, action)
 	assert.Equal(t, client.targetHeldMaxWaits()+1, eng.applies, "one attempt per wait, then the drive stops waiting")
@@ -161,7 +161,7 @@ func TestRunEngineTask_HeldShardTaskIsNotSettledByTheUnitsSiblingStatement(t *te
 	logs := captureApplyLogs(client)
 	task.DDL = heldTaskDDL
 
-	action := client.runEngineTask(t.Context(), apply, task, &storage.Plan{ID: 7}, withPendingSibling(task), nil)
+	action := client.runEngineTask(t.Context(), apply, task, &storage.Plan{ID: 7}, withPendingSibling(task), nil, nil)
 
 	assert.Equal(t, taskContinue, action)
 	assert.Equal(t, 2, eng.applies, "the task starts again with its reviewed statement")
@@ -179,7 +179,7 @@ func TestRunEngineTask_HeldShardTaskStartsAgainWhenTheUnitIsSilent(t *testing.T)
 	logs := captureApplyLogs(client)
 	task.DDL = heldTaskDDL
 
-	action := client.runEngineTask(t.Context(), apply, task, &storage.Plan{ID: 7}, []*storage.Task{task}, nil)
+	action := client.runEngineTask(t.Context(), apply, task, &storage.Plan{ID: 7}, []*storage.Task{task}, nil, nil)
 
 	assert.Equal(t, taskContinue, action)
 	assert.Equal(t, 2, eng.applies, "the task starts again with its reviewed statement")

@@ -445,6 +445,27 @@ func TestBuildWebhookRuntimeGitHubAppID(t *testing.T) {
 	})
 }
 
+// A server with GitHub App credentials but an empty webhook secret could never
+// prove a delivery came from GitHub, so it refuses to start in single-App and
+// in multi-App mode rather than serving the webhook endpoint unverified.
+func TestBuildWebhookRuntimeRefusesEmptyWebhookSecret(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+
+	t.Run("single App", func(t *testing.T) {
+		cfg := &api.ServerConfig{GitHub: api.GitHubConfig{AppID: "123", PrivateKey: "some-key", WebhookSecret: ""}}
+		_, err := buildWebhookRuntime(cfg, api.New(mysqlstore.New(nil), cfg, nil, logger), logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "webhook secret is empty")
+	})
+
+	t.Run("multi App", func(t *testing.T) {
+		cfg := &api.ServerConfig{Apps: map[string]api.GitHubAppConfig{"a": {AppID: "1001", PrivateKey: "k", WebhookSecret: ""}}}
+		_, err := buildWebhookRuntime(cfg, api.New(mysqlstore.New(nil), cfg, nil, logger), logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "webhook secret resolved to empty value")
+	})
+}
+
 // staticStorageSchemaService stands in for the adapter bound to an instance's
 // own storage, answering with a report no other source could have produced.
 type staticStorageSchemaService struct{ database string }

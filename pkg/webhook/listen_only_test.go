@@ -212,3 +212,71 @@ func TestClearAggregateBlocksNamesTheMeasurementWhenListenOnlyHeadReadFails(t *t
 	}
 	assert.True(t, warned, "the failed read logs a warning that names the measurement")
 }
+
+// refusingTransport answers every request with err, the way the GitHub
+// client's listen-only guard refuses a write without sending it.
+type refusingTransport struct{ err error }
+
+func (t refusingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, t.err
+}
+
+// A best-effort PR comment that the listen-only guard refuses is the guard
+// working as designed, so it is logged at info, like SchemaBot's other
+// listen-only decisions. Any other failure to post is
+// still logged as an error, so an operator sees comments that should have
+// landed and did not.
+func TestPostCommentLogsListenOnlyRefusalAtInfo(t *testing.T) {
+	cases := []struct {
+		name      string
+		err       error
+		wantMsg   string
+		wantLevel string
+	}{
+		{
+			name:      "listen-only refusal",
+			err:       fmt.Errorf("POST create_issue_comment for octocat/hello-world: %w", ghclient.ErrListenOnlyRepository),
+			wantMsg:   "comment not posted: repository is listen-only",
+			wantLevel: "INFO",
+		},
+		{
+			name:      "GitHub unreachable",
+			err:       fmt.Errorf("dial tcp: connection refused"),
+			wantMsg:   "failed to post comment",
+			wantLevel: "ERROR",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := gh.NewClient(&http.Client{Transport: refusingTransport{err: tc.err}})
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			h := &Handler{
+				ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, logger)}),
+				logger:    logger,
+			}
+
+			h.postComment("octocat/hello-world", 42, 1, "body")
+
+			var entries []map[string]any
+			for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
+				var entry map[string]any
+				require.NoError(t, json.Unmarshal([]byte(line), &entry), line)
+				entries = append(entries, entry)
+			}
+			var matched []map[string]any
+			for _, entry := range entries {
+				if entry["msg"] == tc.wantMsg {
+					matched = append(matched, entry)
+				}
+				if tc.wantLevel == "INFO" {
+					assert.NotEqual(t, "ERROR", entry["level"], "no error log for a refused write: %v", entry)
+				}
+			}
+			require.Len(t, matched, 1, "logs:\n%s", logs.String())
+			assert.Equal(t, tc.wantLevel, matched[0]["level"])
+			assert.Equal(t, "octocat/hello-world", matched[0]["repo"])
+			assert.Equal(t, float64(42), matched[0]["pr"])
+		})
+	}
+}

@@ -145,7 +145,7 @@ func newMultiEnvPlanHarnessWithRepo(t *testing.T, productionTargets []api.Target
 	return &namespacePlacementHarness{
 		dbName:  dbName,
 		store:   st,
-		handler: NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger),
+		handler: NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger, WithInsecureSkipSignatureVerification()),
 		github:  result,
 		client:  installClient,
 		mux:     mux,

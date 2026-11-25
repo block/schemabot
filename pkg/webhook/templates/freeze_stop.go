@@ -29,7 +29,7 @@ func StoppedByFreezeNote(freeze *apitypes.FreezeStopRef) string {
 		return note + ", which has ended. Start it again to resume it."
 	}
 	return note + ". Start it again after the freeze ends or is lifted. " +
-		"To start it while the freeze is in effect, add `--override` and your reason to the start command, then have a freeze approver approve the request."
+		"To start it while the freeze is in effect, add `--override` and your reason to the start command if it can't wait."
 }
 
 // writeStoppedByFreeze writes StoppedByFreezeNote above a stopped apply's

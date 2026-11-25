@@ -28,35 +28,44 @@ func TestRenderApplyStatusCommentStep(t *testing.T) {
 	assert.NotContains(t, RenderApplyStatusComment(malformed), "step ")
 }
 
+// A running index build's counters are the running table's detail line, under
+// its statement where a row copy writes its rows, not under the step line.
 func TestRenderApplyStatusCommentBuildWork(t *testing.T) {
+	const statement = "CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"
 	base := map[string]string{
-		"step": "2", "steps_total": "3", "statement": "CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)",
+		"step": "2", "steps_total": "3", "statement": statement,
 		"executor_operation": "concurrent-index-build",
+	}
+	render := func(metadata map[string]string) string {
+		return RenderApplyStatusComment(ApplyStatusFromProgress(&apitypes.ProgressResponse{
+			State: state.Apply.Running, Metadata: metadata,
+			Tables: []*apitypes.TableProgressResponse{{
+				TableName: "orders", DDL: statement, Status: state.Task.Running, PercentComplete: 40,
+			}},
+		}, ""))
 	}
 
 	t.Run("heap scan", func(t *testing.T) {
 		metadata := maps.Clone(base)
 		metadata["server_phase"] = "building index: scanning table"
 		metadata["blocks_done"], metadata["blocks_total"] = "2500", "10000"
-		out := RenderApplyStatusComment(ApplyStatusFromProgress(&apitypes.ProgressResponse{State: state.Apply.Running, Metadata: metadata}, ""))
-		assert.Contains(t, out, "step 2 of 3 · `CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)`\n"+
-			"building index: 25% of blocks (2,500/10,000)\n")
+		out := render(metadata)
+		assert.Contains(t, out, "step 2 of 3 · `"+statement+"`\n\n")
+		assert.Contains(t, out, "```\n- Building index: 2,500 of 10,000 blocks\n")
 	})
 
 	t.Run("lockers wait and retry", func(t *testing.T) {
 		metadata := maps.Clone(base)
 		metadata["server_phase"] = "waiting for writers before validation"
 		metadata["lockers_done"], metadata["lockers_total"], metadata["attempt"] = "2", "5", "2"
-		out := RenderApplyStatusComment(ApplyStatusFromProgress(&apitypes.ProgressResponse{State: state.Apply.Running, Metadata: metadata}, ""))
-		assert.Contains(t, out, "waiting on 3 of 5 lockers · attempt 2\n")
+		assert.Contains(t, render(metadata), "- Waiting on 3 of 5 lockers · attempt 2\n")
 	})
 
 	t.Run("other operation is suppressed", func(t *testing.T) {
 		metadata := maps.Clone(base)
 		metadata["executor_operation"], metadata["server_phase"] = "brief", "building index: scanning table"
 		metadata["blocks_done"], metadata["blocks_total"] = "25", "100"
-		out := RenderApplyStatusComment(ApplyStatusFromProgress(&apitypes.ProgressResponse{State: state.Apply.Running, Metadata: metadata}, ""))
-		assert.NotContains(t, out, "building index:")
+		assert.NotContains(t, render(metadata), "Building index:")
 	})
 }
 

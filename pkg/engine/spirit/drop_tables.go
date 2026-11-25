@@ -183,12 +183,12 @@ func refuseDropsNotQuiet(writes []dropTableWrite, uptime, quietPeriod time.Durat
 	}
 	period := ui.FormatHumanDuration(quietPeriod)
 	if len(written) > 0 {
-		return fmt.Errorf("drop_tables entries were written in the last %s, so something may still be using them, such as an online schema change another tool is running: %s. Plan again once they have gone %s without a write, or remove them from drop_tables",
-			period, strings.Join(written, ", "), period)
+		return &engine.PlanRefusedError{Err: fmt.Errorf("drop_tables entries were written in the last %s, so something may still be using them, such as an online schema change another tool is running: %s. Plan again once they have gone %s without a write, or remove them from drop_tables",
+			period, strings.Join(written, ", "), period)}
 	}
 	if len(unknown) > 0 && uptime < quietPeriod {
-		return fmt.Errorf("SchemaBot cannot tell whether drop_tables entries %s were written in the last %s: the server has no write time for them and started %s ago, so it has no record of a write before that. Plan again in %s, or remove them from drop_tables",
-			strings.Join(unknown, ", "), period, ui.FormatHumanDuration(uptime), ui.FormatHumanDuration(quietPeriod-uptime))
+		return &engine.PlanRefusedError{Err: fmt.Errorf("SchemaBot cannot tell whether drop_tables entries %s were written in the last %s: the server has no write time for them and started %s ago, so it has no record of a write before that. Plan again in %s, or remove them from drop_tables",
+			strings.Join(unknown, ", "), period, ui.FormatHumanDuration(uptime), ui.FormatHumanDuration(quietPeriod-uptime))}
 	}
 	return nil
 }

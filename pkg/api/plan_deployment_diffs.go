@@ -182,7 +182,7 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 				return err
 			}
 			if err != nil {
-				s.logger.Warn("plan deployment diff failed; deployment will block the review rollup",
+				PlanFailureLog(s.logger, err)("plan deployment diff failed; deployment will block the review rollup",
 					"database", req.Database,
 					"environment", req.Environment,
 					"deployment", target.Deployment,

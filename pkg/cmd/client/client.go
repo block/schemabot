@@ -398,7 +398,7 @@ func CallCutoverAPI(endpoint, environment, applyID string) (*apitypes.ControlRes
 	return CallCutoverAPIWithOverride(endpoint, environment, applyID, "")
 }
 
-// CallCutoverAPIWithOverride is CallCutoverAPI that also asks a freeze approver
+// CallCutoverAPIWithOverride is CallCutoverAPI that also gives an override reason
 // to let the cutover through when a freeze refuses it.
 func CallCutoverAPIWithOverride(endpoint, environment, applyID, override string) (*apitypes.ControlResponse, error) {
 	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/cutover", environment, applyID, override)
@@ -679,7 +679,7 @@ func CallStartAPI(endpoint, environment, applyID string) (*apitypes.StartRespons
 	return CallStartAPIWithOverride(endpoint, environment, applyID, "")
 }
 
-// CallStartAPIWithOverride is CallStartAPI that also asks a freeze approver to
+// CallStartAPIWithOverride is CallStartAPI that also gives an override reason to
 // let the start through when a freeze refuses it.
 func CallStartAPIWithOverride(endpoint, environment, applyID, override string) (*apitypes.StartResponse, error) {
 	return callControlAPI[apitypes.StartResponse](endpoint, "/api/start", environment, applyID, override)

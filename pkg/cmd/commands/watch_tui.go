@@ -12,6 +12,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -60,6 +61,10 @@ type WatchModel struct {
 	engine           string // "Spirit", "PlanetScale", etc.
 	deployRequestURL string
 	metadata         map[string]string // Full metadata from progress response
+	// buildWork and stepsTotal say what the engine is running, which decides
+	// whether the s (or c) key can end it (presentation.StopCommand).
+	buildWork  apitypes.BuildWork
+	stepsTotal int
 
 	// UI state
 	// windowHeight is the terminal's height in rows, zero until the first
@@ -103,6 +108,8 @@ type progressMsg struct {
 	environment  string                  // Populated from apply-id progress responses
 	engine       string                  // Engine name (e.g., "Spirit", "PlanetScale")
 	metadata     map[string]string       // Engine metadata (e.g., deploy_request_url)
+	buildWork    apitypes.BuildWork      // the engine's index build in flight, if any
+	stepsTotal   int                     // statements the engine runs for the apply
 }
 
 type cutoverResultMsg struct {
@@ -171,8 +178,8 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		case "s", "c":
-			// Stop (Spirit) or cancel (PlanetScale) the schema change
-			if m.stopKeyAvailable() && !m.stopTriggered {
+			// Stop or cancel the schema change, whichever its engine accepts
+			if m.stopKeyAvailable() && !m.stopTriggered && m.keyRequestsStopCommand(msg.String()) {
 				m.stopTriggered = true
 				return m, m.triggerStop()
 			}
@@ -225,6 +232,8 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.deferCutover = msg.deferCutover
 		m.stoppedByFreeze = msg.stoppedBy
 		m.errorMsg = msg.errorMsg
+		m.buildWork = msg.buildWork
+		m.stepsTotal = msg.stepsTotal
 
 		// Timeout skip-revert if state hasn't transitioned after 10s.
 		if m.skipRevertTriggered && !m.skipRevertAt.IsZero() &&
@@ -318,10 +327,11 @@ func (m WatchModel) cuttingOver() bool {
 	return state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
 }
 
-// stopKeyAvailable reports whether the apply is in a state the s (or c) key
-// stops, so a footer advertises the key exactly where pressing it acts.
+// stopKeyAvailable reports whether the apply is in a state the s or c key
+// ends, so a footer advertises the key exactly where pressing it acts. An
+// engine that can end none of the work in flight offers no key.
 func (m WatchModel) stopKeyAvailable() bool {
-	if m.cuttingOver() {
+	if m.cuttingOver() || m.stopCommand() == presentation.StopCommandNone {
 		return false
 	}
 	return state.IsRunningApplyState(m.state) || state.IsState(m.state, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover)

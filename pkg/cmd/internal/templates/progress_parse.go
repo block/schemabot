@@ -92,6 +92,12 @@ type TableProgress struct {
 	RowsTotal       int64
 	PercentComplete int
 	ETASeconds      int64
+	// BuildWork is the build work the operation that runs this table last
+	// reported. While it is a concurrent index build, the build has no rows to
+	// count, so a running table draws its bar from PercentComplete, the
+	// engine's whole-build percent, and writes the phase's counters where a
+	// row copy writes its rows.
+	BuildWork apitypes.BuildWork
 	// EstimatedBytes is the table's on-disk size when it was planned, shown
 	// beside the row counts. Nil when the plan had no estimate.
 	EstimatedBytes *int64
@@ -156,6 +162,9 @@ type ShardProgress struct {
 	// standing in for its rows in the rolled-up total
 	// (TableProgress.RowsTotalPlanned). Nil otherwise.
 	PlannedRows *int64
+	// CopiesNoRows is true when every change the shard runs on the table
+	// copies no rows, so a running shard reads as applying.
+	CopiesNoRows bool
 }
 
 // Display-only task states. These are not persisted apply states (see pkg/applystate)
@@ -198,7 +207,14 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 	}
 	dialect := schema.DialectForDatabaseType(result.DatabaseType)
 
+	workByOperation := make(map[presentation.OperationRef]apitypes.BuildWork, len(result.Operations))
 	for _, op := range result.Operations {
+		if work, err := apitypes.ParseBuildWork(op.Metadata); err != nil {
+			slog.Warn("progress output omits an operation's build work because its progress metadata is malformed",
+				"apply_id", result.ApplyID, "deployment", op.Deployment, "operation_key", op.OperationKey, "error", err)
+		} else {
+			workByOperation[presentation.OperationRef{Deployment: op.Deployment, OperationKey: op.OperationKey}] = work
+		}
 		data.Operations = append(data.Operations, ProgressOperation{
 			Deployment:          op.Deployment,
 			OperationKey:        op.OperationKey,
@@ -269,6 +285,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 
 				ChecksumRowsChecked: sh.ChecksumRowsChecked,
 				ChecksumRowsTotal:   sh.ChecksumRowsTotal,
+				CopiesNoRows:        sh.CopiesNoRows,
 			})
 			// Table-level ETA: the table's own estimate (MySQL/Spirit), or
 			// the slowest shard's for a sharded (Vitess) table.
@@ -276,10 +293,22 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 				tp.ETASeconds = sh.ETASeconds
 			}
 		}
+		tp.BuildWork = tableBuildWork(data.BuildWork, workByOperation, len(result.Operations), tbl)
 		data.Tables = append(data.Tables, tp)
 	}
 
 	return data
+}
+
+// tableBuildWork is the work in flight on the operation that runs tbl. The
+// top-level metadata speaks for one operation, so it is the table's only when
+// the apply has one operation; with several, the table reads its own
+// operation's, and a table no listed operation claims has none.
+func tableBuildWork(applyWork apitypes.BuildWork, byOperation map[presentation.OperationRef]apitypes.BuildWork, operations int, tbl *apitypes.TableProgressResponse) apitypes.BuildWork {
+	if operations <= 1 {
+		return applyWork
+	}
+	return byOperation[presentation.OperationRef{Deployment: tbl.Deployment, OperationKey: tbl.OperationKey}]
 }
 
 // firstOperationError returns the error of the first operation, in resolved

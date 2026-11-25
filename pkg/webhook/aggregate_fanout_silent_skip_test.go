@@ -466,7 +466,7 @@ func newFleetLeader(t *testing.T, cfg *api.ServerConfig) fleetLeader {
 	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	installClient := ghclient.NewInstallationClient(client, logger)
 	installClient.SetConfigDirHints(cfg)
-	h := NewHandler(api.New(&emptyStorage{}, cfg, nil, logger), &fakeClientFactory{client: installClient}, nil, logger)
+	h := NewHandler(api.New(&emptyStorage{}, cfg, nil, logger), &fakeClientFactory{client: installClient}, nil, logger, WithInsecureSkipSignatureVerification())
 	t.Cleanup(func() { h.DrainInProcessWebhookWork(t.Context()) })
 	return fleetLeader{h: h, mux: mux, comments: comments, reactions: reactions, logs: logs}
 }

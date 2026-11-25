@@ -109,3 +109,29 @@ func TestTableChangeConversionsPreserveCollationChanges(t *testing.T) {
 		assert.Equal(t, want, stored.CollationChanges, name)
 	}
 }
+
+// The engine's plan-time metadata reaches storage, and from storage reaches
+// the data plane over the proto, unchanged, so an apply gets back exactly
+// what the engine recorded when it planned the change.
+func TestTableChangeConversionsPreserveMetadata(t *testing.T) {
+	engineChange := engine.TableChange{
+		Table:     "users",
+		DDL:       `ALTER TABLE "public"."users" DROP COLUMN "nickname"`,
+		Operation: ddl.StatementAlterTable,
+		Metadata:  map[string]string{"postgres_reviewed_drop": `{"kind":"column","name":"nickname"}`},
+	}
+	want := map[string]string{"postgres_reviewed_drop": `{"kind":"column","name":"nickname"}`}
+
+	protoChange := protoTableChangeFromEngine(engineChange, "public")
+	assert.Equal(t, want, protoChange.GetMetadata())
+	for name, stored := range map[string]storage.TableChange{
+		"from engine": storageTableChangeFromEngine(engineChange, "public"),
+		"from proto":  StorageTableChangeFromProto(protoChange, "public", protoChange.TableName, protoChange.Ddl, "alter"),
+	} {
+		assert.Equal(t, want, stored.Metadata, name)
+	}
+
+	stored := storageTableChangeFromEngine(engineChange, "public")
+	stored.Metadata["postgres_reviewed_drop"] = "changed"
+	assert.Equal(t, want, engineChange.Metadata, "conversion must copy the map, not share it")
+}

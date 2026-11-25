@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/block/pg-sprite/pkg/executor"
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/progress"
+	"github.com/block/pg-sprite/pkg/schemadiff"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -106,15 +108,45 @@ const (
 )
 
 type nativeApply struct {
-	rowSecurity                *pgstatement.DesiredWithRowSecurity
-	reviewedSecurity           []string
-	namespace                  string
-	table                      string
-	sql                        string
-	steps                      int
-	concurrentIndex            bool
+	rowSecurity      *pgstatement.DesiredWithRowSecurity
+	reviewedSecurity []string
+	namespace        string
+	table            string
+	sql              string
+	steps            int
+	concurrentIndex  bool
+	partitionedIndex bool
+	enumValueAdd     bool
+	// dropped is the plan's record of the live object the statement drops,
+	// which the apply checks under the table's lock before dropping it.
+	dropped                    *schemadiff.DroppedObject
 	concurrentIndexMaxDuration time.Duration
 	cancelRequested            func() bool
+}
+
+// durationBoundedIndexBuild reports whether the change is an index build run
+// under the concurrent index duration envelope instead of the table size
+// ceiling and the optimistic apply ceiling: a concurrent index build, or a
+// partitioned index build, whose every partition is one concurrent build. It
+// is also what makes an apply cancellable, since only these builds run long
+// enough for an operator to need to end them.
+func (c nativeApply) durationBoundedIndexBuild() bool {
+	return c.concurrentIndex || c.partitionedIndex
+}
+
+// buildShape is how an operator cancel reaches the change's work.
+type buildShape struct {
+	// cancellable is set for an index build, concurrent or partition by
+	// partition, the one PostgreSQL change an operator can cancel.
+	cancellable bool
+	// partitioned is set for a partitioned index build, which runs one
+	// concurrent build per partition, so a signal to the build in flight
+	// does not reach the partitions after it.
+	partitioned bool
+}
+
+func (c nativeApply) buildShape() buildShape {
+	return buildShape{cancellable: c.durationBoundedIndexBuild(), partitioned: c.partitionedIndex}
 }
 
 // targetConn carries one background apply's connection inputs: the raw DSN
@@ -170,7 +202,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// engine itself can end the drive — a cancel of last resort, and the
 	// halt on shutdown.
 	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
-	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.concurrentIndex, cancelApply, engine.WorkOwnerFromContext(ctx))
+	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.buildShape(), cancelApply, engine.WorkOwnerFromContext(ctx))
 	conn := targetConn{dsn: req.Credentials.DSN, caCertPath: caPath}
 	e.wg.Go(func() {
 		defer close(done)
@@ -223,23 +255,101 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned DDL is not one statement or a valid greenfield create set", tc.Table)
 	}
+	// A label addition to an enum type is the one shape that names a type
+	// rather than a table, so it is admitted on its own terms before the
+	// table privilege tiers, which have no rung for it.
+	enumStatement, enumValueAdd, err := isEnumValueAdd(statements)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
+	}
+	if enumValueAdd {
+		return validateEnumValueAdd(req, tc, enumStatement)
+	}
 	if _, err := preflight.RequiredTier(statements); err != nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: SchemaBot's PostgreSQL support does not execute this statement shape yet", tc.Table)
 	}
 	if err := plannedSchemaMatchesTarget(statements, req.Changes[0].Namespace); err != nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: %w", tc.Table, err)
 	}
-	concurrentIndex := false
+	change := nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements)}
 	if len(statements) == 1 {
 		// The tier derivation above parsed this statement already, so a
 		// parse failure here is an invariant guard; the message stays curated
 		// like the refusals above because it reaches the operator surface.
-		concurrentIndex, err = concurrentIndexStatement(statements[0])
+		build, err := classifyIndexBuild(statements[0])
 		if err != nil {
 			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
 		}
+		change.concurrentIndex = build == indexBuildConcurrent
+		change.partitionedIndex = build == indexBuildPartitioned
+		change.dropped, err = reviewedDropForApply(req.Database, tc, statements[0])
+		if err != nil {
+			return nativeApply{}, err
+		}
 	}
-	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements), concurrentIndex: concurrentIndex}, nil
+	return change, nil
+}
+
+// reviewedDropForApply returns the plan's record of the object a statement
+// drops. A statement that drops a live object is admitted only with that
+// record: without it the apply could not tell the reviewed object from one
+// that took its name or changed its definition after the plan, so it is
+// refused before any work is queued and the operator re-plans.
+func reviewedDropForApply(database string, tc engine.TableChange, statement string) (*schemadiff.DroppedObject, error) {
+	drops, err := dropsLiveObject(statement)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission could not classify a planned drop", "database", database, "table", tc.Table, "error", err)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
+	}
+	if !drops {
+		return nil, nil
+	}
+	dropped, err := reviewedDropFromMetadata(tc.Metadata)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission rejected the reviewed drop record", "database", database, "table", tc.Table, "error", err)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: the plan's record of the object this statement drops is unreadable; re-plan and apply again", tc.Table)
+	}
+	if dropped == nil {
+		slog.Warn("PostgreSQL apply admission refused a drop the plan did not record", "database", database, "table", tc.Table)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: the plan does not record the object this statement drops, so the apply cannot check it is still the object that was reviewed; re-plan and apply again", tc.Table)
+	}
+	return dropped, nil
+}
+
+// indexBuild is the executor a lone planned statement is admitted to.
+type indexBuild int
+
+const (
+	// indexBuildNone is every statement that is not a CREATE INDEX.
+	indexBuildNone indexBuild = iota
+	// indexBuildConcurrent is a CREATE INDEX CONCURRENTLY, which the
+	// planner writes for an index on an existing table.
+	indexBuildConcurrent
+	// indexBuildPartitioned is a CREATE INDEX without CONCURRENTLY. Alone,
+	// on an existing table, that statement reaches the apply only as the
+	// planner's partitioned index build: an index on a plain table is
+	// rewritten to the concurrent form or blocked at plan time, and an index
+	// declared with a new table arrives inside its create set. The apply
+	// still proves the live table is partitioned before building, so the
+	// statement never runs as written.
+	indexBuildPartitioned
+)
+
+// classifyIndexBuild says which index build executor, if any, runs sql.
+func classifyIndexBuild(sql string) (indexBuild, error) {
+	statement, err := pgstatement.ParseOne(sql)
+	if err != nil {
+		return indexBuildNone, fmt.Errorf("parse PostgreSQL statement: %w", err)
+	}
+	switch {
+	case statement.Kind() != pgstatement.KindCreateIndex:
+		return indexBuildNone, nil
+	case statement.Concurrent():
+		return indexBuildConcurrent, nil
+	default:
+		return indexBuildPartitioned, nil
+	}
 }
 
 // plannedSchemaMatchesTarget refuses an apply whose planned DDL names a
@@ -290,7 +400,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	// survive the request) and ends only when the engine cancels the drive,
 	// so boundedness comes from the ceiling instead.
 	ceiling := e.optimisticApplyCeiling
-	if change.concurrentIndex {
+	if change.durationBoundedIndexBuild() {
 		ceiling = e.concurrentIndexMaxDuration + concurrentIndexHeadroom
 		change.concurrentIndexMaxDuration = e.concurrentIndexMaxDuration
 		change.cancelRequested = cancelRequested
@@ -330,6 +440,15 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		// that it acted on the apply: a backend cancelled from outside
 		// SchemaBot is a failure the next drive retries, never a cancel
 		// nobody asked for.
+		if change.partitionedIndex {
+			// The partitioned build keeps every partition it finished and
+			// the parent's invalid index, and the next apply of the same plan
+			// resumes from them, recovering the cancelled partition's
+			// leftover first. Nothing is dropped, so there is no cleanup
+			// to report.
+			publish(progressResult(engine.StateCancelled, "cancelled", started, change, partitionedIndexCancelledDetail))
+			return
+		}
 		detail := cancelledIndexCleanupDetail(err)
 		if detail == "" && errors.As(err, &invalidErr) {
 			detail = invalidIndexDetail(invalidErr)
@@ -415,6 +534,14 @@ type applyFailure struct {
 func classifyApplyFailure(err error, table string) applyFailure {
 	if detail, committed := committedCreatePrefixDetail(err, table); committed {
 		return applyFailure{detail: detail, committedPrefix: true}
+	}
+	var partitionedBoundErr *partitionedIndexBoundError
+	if errors.As(err, &partitionedBoundErr) {
+		// A partitioned build keeps the partitions it finished, so a run
+		// that finished at least one (a run that finished none is refused
+		// above) spends its retry on the partitions left rather than
+		// starting over.
+		return applyFailure{detail: partitionedBoundErr.Error() + "; the retry resumes from the partitions already built", retryable: true}
 	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) {
@@ -549,6 +676,23 @@ func invalidIndexWordingFor(invalidErr *executor.InvalidIndexError) invalidIndex
 			lead:        "an operator must resolve it on the target",
 			remedyRest:  ", since it is a partitioned table's index, an index partition, or a constraint's index, or rename the index in the schema file and re-plan",
 		}
+	case executor.CodeDataFault:
+		// The build failed on the table's rows: duplicate values under a
+		// unique index, or a value an index expression cannot take. A rerun
+		// meets the same rows, so the rows come first. The rerun's recovery
+		// then removes the invalid index only once pg-sprite proves no build
+		// holds it, so the operator is never sent to drop it by name. The
+		// server's error is not rendered: it quotes the offending values.
+		causeAfter := ", and the failed build left it invalid on the target"
+		if !errors.Is(invalidErr.Cleanup, executor.ErrBuildLeftInvalidIndex) {
+			causeAfter = ", and an invalid index this build could not prove its own holds the name"
+		}
+		return invalidIndexWording{
+			causeBefore: "the table's rows cannot be indexed by index ",
+			causeAfter:  causeAfter,
+			lead:        "correct the rows",
+			remedyRest:  ", then re-run; the rerun removes the invalid index once it proves no build holds it",
+		}
 	default:
 		// CodeInvalidIndexUnproven and any future verdict fail safe with
 		// investigation steps: the index under the name may be healthy.
@@ -673,8 +817,9 @@ func (r *refusal) compose(err error) {
 }
 
 const (
-	replanRemedy    = "re-plan against the current schema"
-	clauseSeparator = "; "
+	replanRemedy             = "re-plan against the current schema"
+	invariantViolationRemedy = "inspect the target and server logs before re-running"
+	clauseSeparator          = "; "
 )
 
 // sequenceStepClause names the failed step of a multi-statement create set
@@ -715,6 +860,11 @@ func committedCreatePrefixDetail(err error, table string) (string, bool) {
 // and remedies leave unsanitized and classifyRefusal sanitizes the composed
 // detail at its return.
 func refusalForCause(err error, table string) *refusal {
+	// An enum step's own outcomes are decided first, so a missing grant on
+	// the type is named as the type's, not a table's.
+	if r := enumTypeRefusal(err, table); r != nil {
+		return r
+	}
 	var privilegeErr *preflight.PrivilegeError
 	if errors.As(err, &privilegeErr) {
 		object := "on table " + quotedTable(table)
@@ -758,6 +908,15 @@ func refusalForCause(err error, table string) *refusal {
 	var boundErr *concurrentIndexBoundError
 	if errors.As(err, &boundErr) {
 		return &refusal{reason: "concurrent-index-bound-exceeded", cause: boundErr.Error(),
+			remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
+	}
+	// A partitioned build that ran past its bound without finishing a
+	// partition made no progress a retry could keep, so retrying unchanged
+	// spends the same bound on the same partition again. It is refused like
+	// the concurrent build's overrun and names the same option.
+	var partitionedBoundErr *partitionedIndexBoundError
+	if errors.As(err, &partitionedBoundErr) && partitionedBoundErr.partitionsBuilt == 0 {
+		return &refusal{reason: "partitioned-index-bound-exceeded", cause: partitionedBoundErr.Error(),
 			remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
 	}
 	var budgetErr *executor.BudgetError
@@ -888,7 +1047,7 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 	case executor.CodeEmptySequence, executor.CodeUnsupportedSequenceStep,
 		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
 		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable,
-		executor.CodeUnsupportedAcceptedBlocking:
+		executor.CodeUnsupportedAcceptedBlocking, executor.CodeNotCreateIndex:
 		// Shape refusals: the executor refused the statement's form at
 		// admission, so retrying the identical plan refails the same way.
 		return &refusal{reason: "unsupported-statement-shape",
@@ -941,14 +1100,80 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "replica-identity-drop",
 			cause:  fmt.Sprintf("the planned drop on %s would remove what its replica identity index is built on", quotedTable(table)),
 			remedy: "point REPLICA IDENTITY elsewhere, then " + replanRemedy}, true
+	case executor.CodeNotPartitionedTable:
+		// The plan routed the index to the partitioned build, and the table
+		// is no longer partitioned. The build refuses before it touches the
+		// target, so the statement never runs as a blocking CREATE INDEX; a
+		// new plan routes the index to the concurrent build instead.
+		return &refusal{reason: "not-partitioned-table",
+			cause:  fmt.Sprintf("%s is no longer partitioned, so the index planned for its partitions was not built", quotedTable(table)),
+			remedy: replanRemedy}, true
+	case executor.CodePartitionedIndexNameTaken:
+		// The build left the relation holding the name alone, so only an
+		// operator freeing the name, or the schema file choosing another,
+		// changes the outcome.
+		return &refusal{reason: "partitioned-index-name-taken",
+			cause:  fmt.Sprintf("a name the index build on partitioned table %s needs is held by another relation", quotedTable(table)),
+			remedy: "rename the index in the schema file and re-plan, or drop or rename the relation that holds the name"}, true
+	case executor.CodeForeignTablePartition:
+		return &refusal{reason: "foreign-table-partition",
+			cause:  fmt.Sprintf("a partition of %s is a foreign table, which cannot have an index; nothing was created", quotedTable(table)),
+			remedy: "detach the foreign table partition, or leave the index out of the schema file, then " + replanRemedy}, true
+	case executor.CodeUniqueIndexPartitionKey:
+		return &refusal{reason: "unique-index-partition-key",
+			cause:  fmt.Sprintf("the unique index on %s does not include every partition key column", quotedTable(table)),
+			remedy: "add the partition key columns to the index in the schema file, then " + replanRemedy}, true
+	case executor.CodeTableLockUnconfirmed:
+		// The connected role cannot see when other sessions started, which
+		// the build needs to prove the table lock it waits behind is its
+		// own. The grant is target configuration, so the same environmental
+		// class as a missing privilege.
+		return &refusal{reason: "insufficient-privileges",
+			cause:         fmt.Sprintf("the connected role cannot see other sessions' start times, which the index build on %s needs", quotedTable(table)),
+			remedy:        "grant the role pg_read_all_stats, then re-run",
+			provisionable: true}, true
+	case executor.CodePartitionDetachPending:
+		return &refusal{reason: "partition-detach-pending",
+			cause:  fmt.Sprintf("a partition of %s has an unfinished concurrent detach", quotedTable(table)),
+			remedy: "finish the detach with ALTER TABLE ... DETACH PARTITION ... FINALIZE, then re-run"}, true
+	case executor.CodePartitionedIndexTablespace:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("the index on %s names a TABLESPACE, which the partitions' indexes would not use", quotedTable(table)),
+			remedy: "remove the TABLESPACE clause from the schema file, then " + replanRemedy}, true
+	case executor.CodeDropOutcomeUnknown:
+		// The drop ran, and the check of which index it removed failed.
+		// SchemaBot's retry re-runs the drop, which would act on whatever
+		// now holds the name, so the apply fails closed until an operator
+		// has read the catalog.
+		return &refusal{reason: "drop-outcome-unknown",
+			cause:  fmt.Sprintf("an index drop on %s ran, and which index it removed could not be confirmed", quotedTable(table)),
+			remedy: "inspect the table's indexes before re-running"}, true
+	case executor.CodeDroppedIndexReplaced:
+		// Unlike the drift codes, something was dropped: another session
+		// gave the name to a different index between the check and the drop.
+		return &refusal{reason: "dropped-index-replaced",
+			cause:  fmt.Sprintf("the index drop on %s removed an index created after review under the reviewed index's name", quotedTable(table)),
+			remedy: "inspect the table's indexes and recreate the dropped one if it should stay, then " + replanRemedy}, true
+	case executor.CodeDroppedObjectHasDescendants:
+		return &refusal{reason: "dropped-object-has-descendants",
+			cause:  fmt.Sprintf("the planned drop on %s would also reach unreviewed partitions or child tables", quotedTable(table)),
+			remedy: "make the drop outside SchemaBot on the whole table tree, then " + replanRemedy}, true
 	case executor.CodeAdoptedIndexDrift, executor.CodeValidatedConstraintDrift,
-		executor.CodeRenamedIndexDrift:
+		executor.CodeRenamedIndexDrift, executor.CodeDroppedIndexDrift:
 		// The index or constraint the planned statement names changed after
 		// planning — dropped, replaced, left invalid, or now backing a
 		// constraint — read again under the table's lock; nothing was
 		// applied. The plan is stale, so only a re-plan changes the outcome.
 		return &refusal{reason: "planned-object-drift",
 			cause:  fmt.Sprintf("the index or constraint the planned statement for %s names changed after planning", quotedTable(table)),
+			remedy: replanRemedy}, true
+	case executor.CodeDroppedObjectDrift:
+		// The column, constraint, or NOT NULL the planned drop removes no
+		// longer has the definition the plan recorded, read again under the
+		// table's lock; nothing was dropped. The plan is stale, so only a
+		// re-plan changes the outcome.
+		return &refusal{reason: "planned-object-drift",
+			cause:  fmt.Sprintf("the object the planned drop on %s removes changed after planning", quotedTable(table)),
 			remedy: replanRemedy}, true
 	case executor.CodeEnumTypeDrift:
 		// The type name an ADD VALUE spells resolved to a different type
@@ -957,6 +1182,15 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		// re-plan changes the outcome.
 		return &refusal{reason: "planned-object-drift",
 			cause:  fmt.Sprintf("the enum type the planned statement for %s names is a different type than the one checked", quotedTable(table)),
+			remedy: replanRemedy}, true
+	case executor.CodeEnumLabelExists, executor.CodeEnumNeighborMissing:
+		// The enum type gained the label the ADD VALUE adds, or lost the
+		// label it is placed next to, after planning, and nothing was added.
+		// enumTypeRefusal decides on the typed error first and names the
+		// labels; this arm keeps the switch total and gives the bare code the
+		// same verdict.
+		return &refusal{reason: "planned-object-drift",
+			cause:  fmt.Sprintf("the enum type the planned statement for %s names changed its labels after planning", quotedTable(table)),
 			remedy: replanRemedy}, true
 	case executor.CodeDataFault:
 		// The server rejected the table's rows as the statement would shape
@@ -978,7 +1212,7 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		// apply fails closed until an operator has inspected the target.
 		return &refusal{reason: "engine-invariant-violation",
 			cause:  fmt.Sprintf("the engine's safety invariants did not hold while changing table %s", quotedTable(table)),
-			remedy: "inspect the target and server logs before re-running"}, true
+			remedy: invariantViolationRemedy}, true
 	case executor.CodeInvalidIndexOtherTable, executor.CodeInvalidIndexNotDroppable:
 		// The permanent members of the invalid-index family: the requested
 		// name is held by an entry this change can never clear — an invalid
@@ -1001,10 +1235,11 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeCancelledExternally, executor.CodeInvalidIndexOwnLeftover,
 		executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuildInFlight,
 		executor.CodeInvalidIndexBuilderUnobservable, executor.CodeInvalidIndexUnproven,
-		executor.CodeExecutionFailed:
+		executor.CodePartitionedIndexUnsettled, executor.CodeExecutionFailed:
 		// Operational outcomes: a bounded lock race, the caller's own
 		// context ending or an external stop, an invalid-index state a retry
-		// recovers or an operator clears or waits out, or a failure outside
+		// recovers or an operator clears or waits out, a partitioned index
+		// build that a rerun resumes, or a failure outside
 		// the typed set. A retry can succeed once conditions change, so
 		// none is a permanent refusal.
 		return nil, true
@@ -1333,6 +1568,9 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		}
 		return nil
 	}
+	if change.enumValueAdd {
+		return executeEnumValueAdd(ctx, pool, change)
+	}
 	statements, err := postgresCreateSetStatements(change.sql)
 	if err != nil {
 		return fmt.Errorf("parse planned PostgreSQL DDL for table %q: %w", change.table, err)
@@ -1357,13 +1595,19 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	if _, err := preflight.CheckPrivileges(ctx, pool, change.namespace, change.table, preflight.Requirement{Tier: tier}); err != nil {
 		return fmt.Errorf("check privileges for PostgreSQL table %q: %w", change.table, err)
 	}
-	// Concurrent index builds are bounded by their caller-owned duration
+	// Concurrent and partitioned index builds are bounded by the duration
 	// envelope rather than the rewrite ceiling. NoSizeLimit still proves the
 	// target exists and is an ordinary or partitioned table.
 	preflightLimit := applyTablePreflightLimit(change, tableSizeLimit)
 	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, preflightLimit)
 	if err != nil {
 		return fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
+	}
+	if change.partitionedIndex {
+		// The build refuses a table that is no longer partitioned before it
+		// uses a session, so a plan made against a partitioned parent never
+		// runs here as a blocking CREATE INDEX on a plain table.
+		return buildPartitionedIndex(ctx, poolCfg, pool, table, change, tracker, logger)
 	}
 	if table.Partitioned() {
 		// The partition admission policy runs here, in the session window
@@ -1395,12 +1639,16 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	// sequence and its router promotes that into ExecSQL, so such an index
 	// takes the concurrent branch above. A blocking CREATE INDEX does not
 	// reach this call: a plain index on an existing table is rewritten at
-	// plan time or, when the rewrite could not be constructed, blocked; a
-	// partitioned parent's build is refused by CheckPartitionSupport above;
-	// and an index declared with a new table diverts to executeCreate,
+	// plan time or, when the rewrite could not be constructed, blocked; an
+	// index on a partitioned parent branches off above to the partitioned
+	// build, which builds each partition's index concurrently; and an index
+	// declared with a new table diverts to executeCreate,
 	// where greenfieldCreateSet keeps the blocking form on purpose — a
 	// table born in the run has no readers, and CONCURRENTLY cannot run
 	// inside its create sequence.
+	if change.dropped != nil {
+		return executeReviewedDrop(ctx, pool, table, change, statement.SQL(), tracker)
+	}
 	if err := executor.ExecuteNativeWithProgress(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	}, executor.DefaultRetryPolicy(), tracker); err != nil {
@@ -1409,8 +1657,34 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	return nil
 }
 
+// executeReviewedDrop runs a statement that drops a live object through
+// pg-sprite's drop check: under the table's lock, in the transaction that
+// drops it, the object must still have the definition the plan recorded, and
+// when it does not the executor refuses with ErrDroppedObjectDrift and drops
+// nothing. The statement runs under the same lock and statement limits as
+// every other optimistic statement; the concurrent and validation budgets
+// bound step classes a single drop never contains, and are set only because
+// the executor refuses an unbounded budget set.
+func executeReviewedDrop(ctx context.Context, pool *pgxpool.Pool, table preflight.PreflightedTable, change nativeApply, statement string, tracker *progress.Tracker) (err error) {
+	if tracker == nil {
+		return fmt.Errorf("drop reviewed %s %q on PostgreSQL table %q: progress tracker is required", change.dropped.Kind, change.dropped.Name, change.table)
+	}
+	tracker.Start(1, progress.OperationOptimistic)
+	defer func() { tracker.Finish(err) }()
+	at := executor.RunStep{Tracker: tracker, Step: 1}
+	budget := executor.SequenceBudget{
+		Brief:      executor.Budget{LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit},
+		Concurrent: executor.ConcurrentBudget{Overall: optimisticStatementLimit},
+		Validate:   executor.ValidateBudget{LockTimeout: optimisticLockTimeout, Overall: optimisticStatementLimit},
+	}
+	if _, err := executor.RunSequenceAsStep(ctx, pool, table, []string{statement}, budget, executor.DefaultRetryPolicy(), nil, nil, change.dropped, at); err != nil {
+		return fmt.Errorf("drop reviewed %s %q on PostgreSQL table %q: %w", change.dropped.Kind, change.dropped.Name, change.table, err)
+	}
+	return nil
+}
+
 func applyTablePreflightLimit(change nativeApply, tableSizeLimit int64) int64 {
-	if change.concurrentIndex {
+	if change.durationBoundedIndexBuild() {
 		return preflight.NoSizeLimit
 	}
 	return tableSizeLimit
@@ -1475,6 +1749,95 @@ var concurrentIndex = concurrentIndexExecutor{
 	build:   executor.BuildIndexConcurrentlyWithProgress,
 	rebuild: executor.RebuildAbandonedIndex,
 	drop:    executor.DropAbandonedIndex,
+}
+
+// partitionedIndexBuild is the executor entry point a partitioned index build
+// reaches. It is a test seam, so a test can observe the budget, the deadline
+// and the table the drive hands the build against an executor it scripts; the
+// package default is the executor's own function. Like concurrentIndex, it is
+// package state shared by every drive in the process, so swapping it is not
+// safe from a test that runs in parallel with another.
+var partitionedIndexBuild = executor.BuildPartitionedIndexWithProgress
+
+// partitionedIndexCancelledDetail is the operator-facing outcome of a
+// partitioned index build an operator cancelled.
+const partitionedIndexCancelledDetail = "Partitioned index build cancelled; the partitions already built keep their index, and applying the plan again resumes the build"
+
+// buildPartitionedIndex adds an index to a partitioned table through
+// pg-sprite's partitioned index build: it creates the parent's index with ON
+// ONLY, builds each partition's index concurrently and attaches it, and
+// returns once the parent's index is verified valid. The statement never runs
+// as written, which would block writes to the whole table while every
+// partition's index is built. The executor refuses a table that is not
+// partitioned before it touches the target, so a table that stopped being
+// partitioned after planning is a typed refusal rather than a blocking build.
+//
+// Each partition's build gets the concurrent index bound as its budget, and
+// the whole build gets the same bound as its deadline, so one apply is bounded
+// the way a concurrent build on a plain table is. A build that runs past the
+// deadline keeps every partition it finished, and the retry resumes from
+// them. An operator cancel signals the partition build in flight through the
+// tracker; the drive classifies the outcome.
+func buildPartitionedIndex(ctx context.Context, cfg dbconn.Config, pool *pgxpool.Pool, table preflight.PreflightedTable, change nativeApply, tracker *progress.Tracker, logger *slog.Logger) error {
+	if change.concurrentIndexMaxDuration <= 0 {
+		// The same guard as buildIndexConcurrently: the drive stamps the
+		// bound on every change, so only a nativeApply built without the
+		// drive reaches this branch.
+		return fmt.Errorf("build PostgreSQL index on partitioned table %q: build bound is unset", change.table)
+	}
+	buildCtx, cancel := context.WithTimeout(ctx, change.concurrentIndexMaxDuration)
+	defer cancel()
+	start := time.Now()
+	report, err := partitionedIndexBuild(buildCtx, cfg, pool, table, change.sql,
+		executor.ConcurrentBudget{Overall: change.concurrentIndexMaxDuration}, tracker)
+	if err == nil {
+		logger.Info("PostgreSQL partitioned index build finished",
+			"namespace", change.namespace, "table", change.table, "index", report.Index,
+			"partitions", report.Partitions, "partitions_built", len(report.Worked),
+			"parent_created", report.ParentCreated, "duration", report.Duration)
+		return nil
+	}
+	if partitionedBuildRanPastBound(ctx, buildCtx) {
+		// The deadline is the outcome, whatever the executor was doing when
+		// it fired, so the bound error does not carry the executor's error
+		// for the classifiers to read; the log does.
+		built := len(report.Worked)
+		if built == 0 {
+			logger.Warn("PostgreSQL partitioned index build ran past its bound before it finished any partition; the apply is refused until the bound is raised",
+				"namespace", change.namespace, "table", change.table, "bound", change.concurrentIndexMaxDuration, "error", err)
+		} else {
+			logger.Warn("PostgreSQL partitioned index build ran past its bound; the retry resumes from the partitions already built",
+				"namespace", change.namespace, "table", change.table, "bound", change.concurrentIndexMaxDuration,
+				"partitions_built", built, "error", err)
+		}
+		return fmt.Errorf("build PostgreSQL index on partitioned table %q: %w", change.table,
+			&partitionedIndexBoundError{bound: change.concurrentIndexMaxDuration, partitionsBuilt: built})
+	}
+	return fmt.Errorf("build PostgreSQL index on partitioned table %q: %w", change.table,
+		nameConcurrentIndexBound(err, change.concurrentIndexMaxDuration, time.Since(start)))
+}
+
+// partitionedBuildRanPastBound reports whether the build's own deadline ended
+// it, as opposed to the drive's context: an operator cancel or an engine halt
+// ends the drive's context, and is classified as what it is.
+func partitionedBuildRanPastBound(driveCtx, buildCtx context.Context) bool {
+	return driveCtx.Err() == nil && errors.Is(buildCtx.Err(), context.DeadlineExceeded)
+}
+
+// partitionedIndexBoundError reports that a partitioned index build ran past
+// the concurrent index bound before every partition had its index.
+// partitionsBuilt is how many partitions this run gave an index, which
+// decides whether a retry can make progress.
+type partitionedIndexBoundError struct {
+	bound           time.Duration
+	partitionsBuilt int
+}
+
+func (e *partitionedIndexBoundError) Error() string {
+	if e.partitionsBuilt == 0 {
+		return fmt.Sprintf("the partitioned index build ran past %s (%s) before it finished any partition", concurrentIndexBoundOption, e.bound)
+	}
+	return fmt.Sprintf("the partitioned index build ran past %s (%s) before every partition had its index", concurrentIndexBoundOption, e.bound)
 }
 
 // buildIndexConcurrently runs a CREATE INDEX CONCURRENTLY through pg-sprite's
@@ -1887,15 +2250,17 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 // loop's poll path mutates only the engine's in-memory record, while operator
 // reads use stored rows that only the drive persists.
 //
-// The percent never regresses within a record. A record hosts one build —
-// a concurrent index apply is a single statement, and the executor's
-// bounded retries apply to transactional statements, not to a build — and
-// the band scale only advances as the build moves through its phases, so a
-// poll whose row derives a lower percent than the record carries read the
-// server before a poller that has already carried a later row forward. The
-// tracker serializes the reads but not the write-backs, so the earlier
-// reading lands here second; it adopts the record's percent rather than
-// pinning a position the build has left behind.
+// The percent never regresses within an executor step. A build is one step —
+// the executor's bounded retries apply to transactional statements, not to a
+// build — and pg-sprite's percent only advances as the build moves through
+// its phases, so a poll whose row derives a lower percent than the record
+// carries read the server before a poller that has already carried a later
+// row forward. The tracker serializes the reads but not the write-backs, so
+// the earlier reading lands here second; it adopts the record's percent
+// rather than pinning a position the build has left behind. A reading from a
+// different step starts that step's own percent, and a poll that reports a
+// step other than an index build removes the precise percent from the
+// record.
 func (e *Engine) retainRunningPercent(key string, source, result *engine.ProgressResult) {
 	if len(result.Tables) == 0 {
 		return
@@ -1906,13 +2271,75 @@ func (e *Engine) retainRunningPercent(key string, source, result *engine.Progres
 	if tracked == nil || tracked.result != source || len(source.Tables) == 0 {
 		return
 	}
-	if result.Progress < source.Progress {
+	if !readsAnotherStep(result, tracked.percentStep) && runningPercentBehind(result, source) {
 		result.Progress = source.Progress
 		result.Tables[0].Progress = source.Tables[0].Progress
+		if precise, ok := source.Metadata[runningPercentMetadataKey]; ok && !reportsStepOtherThanIndexBuild(result.Metadata) {
+			result.Metadata[runningPercentMetadataKey] = precise
+		}
 		return
 	}
 	source.Progress = result.Progress
 	source.Tables[0].Progress = result.Tables[0].Progress
+	precise, ok := result.Metadata[runningPercentMetadataKey]
+	switch {
+	case ok:
+		if source.Metadata == nil {
+			source.Metadata = make(map[string]string)
+		}
+		source.Metadata[runningPercentMetadataKey] = precise
+		tracked.percentStep = result.Metadata["step"]
+	case reportsStepOtherThanIndexBuild(result.Metadata):
+		delete(source.Metadata, runningPercentMetadataKey)
+	}
+}
+
+// readsAnotherStep reports whether a poll read its precise percent from a
+// different executor step than the one the record's percent came from. Each
+// step's percent starts again from zero, so a second index build in the same
+// apply is not held at the first build's final reading.
+func readsAnotherStep(result *engine.ProgressResult, percentStep string) bool {
+	if _, ok := result.Metadata[runningPercentMetadataKey]; !ok {
+		return false
+	}
+	step := result.Metadata["step"]
+	return percentStep != "" && step != "" && step != percentStep
+}
+
+// runningPercentBehind reports whether a poll's percent trails the running
+// record's. Within one whole percent the precise percent decides, because two
+// readings there differ only in their decimals. A poll that derived no precise
+// percent of its own trails a record that carries one: it cloned the record
+// before an overlapping poll stored that reading, so it adopts the reading
+// rather than show the build as just starting.
+func runningPercentBehind(result, source *engine.ProgressResult) bool {
+	if result.Progress != source.Progress {
+		return result.Progress < source.Progress
+	}
+	sourcePrecise, sourceOK := preciseRunningPercent(source.Metadata)
+	if !sourceOK {
+		return false
+	}
+	resultPrecise, resultOK := preciseRunningPercent(result.Metadata)
+	if !resultOK {
+		return true
+	}
+	return resultPrecise < sourcePrecise
+}
+
+// preciseRunningPercent reads back the precise percent setRunningPercent
+// recorded. The engine writes the value itself, so one that does not parse
+// is treated as absent rather than compared.
+func preciseRunningPercent(metadata map[string]string) (float64, bool) {
+	raw, ok := metadata[runningPercentMetadataKey]
+	if !ok {
+		return 0, false
+	}
+	percent, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, false
+	}
+	return percent, true
 }
 
 // executorProgressMetadata folds the tracker's current position and operation
@@ -1925,9 +2352,9 @@ func (e *Engine) retainRunningPercent(key string, source, result *engine.Progres
 // progressResult's pre-execution position. The counters are the exception:
 // once the server publishes a row every counter is written, zeros included,
 // because a zero is a reading (no lockers cleared yet) and an absent key
-// means the server has not published one. A running result's percent is
-// derived from the server phase and counters through concurrentIndexPercent;
-// without a row, or in a phase the band table does not know, the percent the
+// means the server has not published one. A running result's percent is the
+// one pg-sprite derives for the step in flight; while pg-sprite reports none —
+// no row, a phase it does not know, or a read that failed — the percent the
 // result already carries stands. The statement passes through
 // sanitizeStatementText and the server phase through sanitizeReasonText
 // because the metadata is destined for operator-facing single-line rendering
@@ -1981,13 +2408,18 @@ func executorProgressMetadata(ctx context.Context, tracker buildTracker, result 
 		metadata["tuples_total"] = strconv.FormatUint(work.TuplesTotal, 10)
 		metadata["lockers_done"] = strconv.FormatUint(work.LockersDone, 10)
 		metadata["lockers_total"] = strconv.FormatUint(work.LockersTotal, 10)
-		// A build row describes work in flight, so it only refines a running
-		// result's percent. A terminal result's percent is decided by its
-		// state; a stale build snapshot must not pull a completed apply
-		// below 100.
-		if !result.State.IsTerminal() {
-			setRunningPercent(result, snapshot.Detail.ServerPhase, *work)
-		}
+	}
+	// pg-sprite's percent describes work in flight, so it only refines a
+	// running result's percent. A terminal result's percent is decided by its
+	// state; a stale build snapshot must not pull a completed apply below 100.
+	// Only a concurrent index build's percent becomes the apply's: pg-sprite
+	// also measures some other steps, such as a copy, by their own completion,
+	// and one step's completion is not the apply's.
+	if percent := snapshot.Detail.Percent; percent != nil && snapshot.Detail.Operation == progress.OperationConcurrentIndex && !result.State.IsTerminal() {
+		setRunningPercent(result, *percent)
+	}
+	if result.State.IsTerminal() || reportsStepOtherThanIndexBuild(metadata) {
+		delete(metadata, runningPercentMetadataKey)
 	}
 	if err != nil {
 		return fmt.Errorf("read pg-sprite executor progress: %w", err)
@@ -1995,16 +2427,41 @@ func executorProgressMetadata(ctx context.Context, tracker buildTracker, result 
 	return nil
 }
 
-// setRunningPercent writes the whole-build percent derived from a build row
-// onto both the apply and its single table, so the two never disagree. A
-// phase the band table does not know leaves both as they were.
-func setRunningPercent(result *engine.ProgressResult, serverPhase string, work progress.Work) {
-	percent, ok := concurrentIndexPercent(serverPhase, work)
-	if !ok || len(result.Tables) == 0 {
+// runningPercentMetadataKey is the metadata key that carries pg-sprite's
+// percent for a running index build with its decimals, so a large build
+// visibly moves between polls while its whole percent stands still. It is
+// present only while the executor reports a concurrent index build as the
+// step in flight, and it is removed once another step or a terminal state is
+// reported.
+const runningPercentMetadataKey = "percent"
+
+// reportsStepOtherThanIndexBuild reports whether the executor names a step in
+// flight that is not a concurrent index build. A poll that names no step has
+// no reading of its own and keeps the record's last-known position.
+func reportsStepOtherThanIndexBuild(metadata map[string]string) bool {
+	operation, ok := metadata["executor_operation"]
+	return ok && operation != string(progress.OperationConcurrentIndex)
+}
+
+// setRunningPercent writes pg-sprite's percent for the running step onto both
+// the apply and its single table, so the two never disagree, and records it
+// with two decimals in the metadata. Both are rounded down, the decimals to
+// hundredths, so a running step never reads as finished whatever precision
+// pg-sprite reports it with. The small offset keeps a value pg-sprite already
+// rounded to hundredths, such as 21.88, from flooring to 21.87 because its
+// binary form sits just below it.
+func setRunningPercent(result *engine.ProgressResult, percent float64) {
+	if len(result.Tables) == 0 {
 		return
 	}
-	result.Progress = percent
-	result.Tables[0].Progress = percent
+	percent = math.Floor(percent*100+1e-6) / 100
+	whole := int(math.Floor(percent))
+	result.Progress = whole
+	result.Tables[0].Progress = whole
+	if result.Metadata == nil {
+		result.Metadata = make(map[string]string)
+	}
+	result.Metadata[runningPercentMetadataKey] = strconv.FormatFloat(percent, 'f', 2, 64)
 }
 
 // progressIdentity extracts the apply identity that keys engine progress.
@@ -2069,7 +2526,7 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 //
 // The returned channel is the drive's to close once its terminal result is
 // published; Cancel waits on it for the outcome.
-func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger, concurrentIndex bool, cancelApply context.CancelFunc, owner string) chan struct{} {
+func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger, shape buildShape, cancelApply context.CancelFunc, owner string) chan struct{} {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.progress == nil {
@@ -2083,7 +2540,7 @@ func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracke
 	done := make(chan struct{})
 	e.progress[key] = &trackedApply{
 		result: result, tracker: tracker, logger: logger,
-		concurrentIndex: concurrentIndex, cancelApply: cancelApply, done: done,
+		cancellableBuild: shape.cancellable, partitionedBuild: shape.partitioned, cancelApply: cancelApply, done: done,
 		owner: owner,
 	}
 	return done

@@ -259,11 +259,18 @@ func omissionNote(omitted, droppedGroups int, hasOlder bool) string {
 	return note + "._\n\n"
 }
 
+// LogEntryTimestamp formats a log entry's time for the PR comment's log
+// section and the CLI's logs command alike, in UTC with the zone named, so an
+// operator reading one apply's log on both surfaces sees the same times.
+func LogEntryTimestamp(t time.Time) string {
+	return t.UTC().Format("2006-01-02 15:04:05 UTC")
+}
+
 // formatLogEntryLine renders one log entry in the CLI logs format, minus the
 // terminal colors: `2026-07-12 16:32:01 UTC [INF] message [running -> stopped]`.
 func formatLogEntryLine(entry LogEntryData) string {
 	line := fmt.Sprintf("%s %s %s",
-		entry.CreatedAt.UTC().Format("2006-01-02 15:04:05 UTC"),
+		LogEntryTimestamp(entry.CreatedAt),
 		LogLevelTag(sanitizeLogLevel(entry.Level)),
 		sanitizeLogText(entry.Message))
 	if entry.OldState != "" && entry.NewState != "" {

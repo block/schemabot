@@ -3600,9 +3600,11 @@ func (s *applyOperationStore) reapStranded(ctx context.Context, limit int) ([]*s
 	for _, op := range stranded {
 		parent, ok := parents[op.ApplyID]
 		if !ok {
-			// The parent was deleted between the two reads (PR cleanup races the
-			// reaper). Its rows go with it, so there is nothing left to settle.
-			slog.WarnContext(ctx, "parent apply disappeared while reaping a stranded apply_operation; the row is being deleted with it",
+			// The scan selects only rows whose settled parent exists, so the
+			// parent was removed between the scan and the parent read. SchemaBot
+			// never deletes an apply, so this was a delete from outside SchemaBot.
+			// There is no apply to settle against, so the row stays as it is.
+			slog.WarnContext(ctx, "parent apply disappeared between the stranded apply_operation scan and the parent read; the operation is left unchanged",
 				op.LogAttrs()...)
 			continue
 		}

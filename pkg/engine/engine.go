@@ -54,7 +54,11 @@ type Engine interface {
 	// Cancel terminates a running schema change permanently.
 	Cancel(ctx context.Context, req *ControlRequest) (*ControlResult, error)
 
-	// Start resumes a stopped schema change.
+	// Start resumes a stopped schema change, or starts the deploy of one
+	// waiting for it. A *PermanentError means the engine did not start the
+	// change and a retry cannot succeed; its message names the operator's next
+	// step. Return any other error when the engine cannot tell whether the
+	// change started.
 	Start(ctx context.Context, req *ControlRequest) (*ControlResult, error)
 
 	// Cutover triggers the final table swap.
@@ -575,6 +579,14 @@ type PlanResult struct {
 	// ExemptTables lists live tables intentionally excluded from a plan verdict,
 	// grouped by namespace and carrying the engine-agnostic reason for exemption.
 	ExemptTables []*ExemptTables
+
+	// UnmatchedDropTables lists the request's drop_tables entries that name no
+	// live table on the target, in the order the config lists them: a typo, a
+	// case mismatch, or a table already dropped. Such an entry plans nothing,
+	// and only the engine can tell, because a listed table that exists is
+	// planned as a drop and a missing one appears nowhere in the plan. Empty
+	// when every entry matched or the request carried none.
+	UnmatchedDropTables []string
 }
 
 // ExemptTables describes live tables exempt from a plan verdict in one namespace.
@@ -786,6 +798,19 @@ type TableChange struct {
 	// compare equal. Empty when the change re-collates no column, and for an
 	// engine that does not report it.
 	CollationChanges []CollationChange
+	// Metadata carries what the engine recorded about this change at plan
+	// time and needs back at apply time, keyed by names the engine owns. The
+	// plan stores it with the change, and every path that hands the change to
+	// the engine for apply passes it back unchanged. Empty when the engine
+	// recorded nothing.
+	//
+	// An engine records only the identity of the objects the change acts on,
+	// never a value that differs between two plans of the same objects, such
+	// as a timestamp or a row estimate. SchemaBot relies on that: two plans
+	// of one statement act on the same objects exactly when their records are
+	// equal, so a confirmation given against one plan does not cover a
+	// re-plan whose record differs.
+	Metadata map[string]string
 }
 
 // CollationChange is one existing column a planned change moves onto another

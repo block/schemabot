@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
@@ -80,13 +81,38 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 			writeDDL()
 		} else {
 			strip := targetStrip(line.listed, line.listedTargets)
-			writeTargetTableLine(sb, line.table.TableName, line.listed, strip, settled, budget, writeDDL)
+			writeTargetTableLine(sb, line.table.TableName, line.listed, strip, settled, lineRunsIndexBuild(data, line), budget, writeDDL)
 		}
 		sb.WriteString("\n")
 		restorePlan()
 		restoreScope()
 	}
 	writeFailedTargets(sb, data.Model, g)
+}
+
+// anyTargetThrottled reports whether the engine's throttler is holding back
+// any target's run of the table, so the rolled-up headline says so, as the
+// CLI's does.
+func anyTargetThrottled(cells []TableProgressData) bool {
+	for _, c := range cells {
+		if c.Throttled {
+			return true
+		}
+	}
+	return false
+}
+
+// lineRunsIndexBuild reports whether a target running the line's table is in
+// a concurrent index build, read from that target's own operation, since an
+// operation's build work says nothing about its siblings.
+func lineRunsIndexBuild(data MultiDeploymentApplyData, line targetTableLine) bool {
+	for k, i := range line.members {
+		detail := memberDetail(data.Details, i)
+		if detail != nil && detail.BuildWork.IsConcurrentIndexBuild() && state.IsState(line.cells[k].Status, state.Task.Running) {
+			return true
+		}
+	}
+	return false
 }
 
 // lineAwaitsResume reports whether a table line of a resuming apply is one the
@@ -307,15 +333,18 @@ func rankTargetTableLines(lines []targetTableLine) {
 // each target's state under the rows, the way the sharded comment lays out a
 // table and its shards. Once the rollout has settled, a target still pending
 // on the table never starts it, so the line says not started rather than
-// queued.
-func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, settled bool, budget *ddlBlockBudget, writeDDL func()) {
+// queued. A running index build has no rows to sum, so while indexBuild is set
+// its line leads with the build's percent across its targets instead.
+func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, settled, indexBuild bool, budget *ddlBlockBudget, writeDDL func()) {
 	var done, queued, failed, retrying int
 	// cancelled counts the targets where a cancel stopped the table part-way
 	// through, and neverStarted the targets where it was cancelled before it
 	// started.
 	var cancelled, neverStarted int
 	var running int
-	for _, c := range cells {
+	statuses := make([]string, len(cells))
+	for i, c := range cells {
+		statuses[i] = c.Status
 		switch state.NormalizeTaskStatus(c.Status) {
 		case state.Task.Completed, state.Task.RevertWindow:
 			// A target in its revert window has completed the change.
@@ -342,7 +371,15 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	pending := queued
 	pendingWord := presentation.PendingWord(settled)
 	coverage := presentation.TargetCoverage(done, running, pending, failed, retrying, presentation.RunningCopying, pendingWord)
-	status := rollupTaskStatus(cells)
+	status := presentation.RollupTaskStatus(statuses)
+	if indexBuild && running > 0 {
+		// The percent across targets is a whole-number mean of each target's
+		// whole percent, so it has no decimals to show.
+		fmt.Fprintf(sb, "**%s**: %s%s\n", name, ui.IndexBuildProgress(presentation.IndexBuildPercentAcrossTargets(parts), apitypes.BuildWork{}), ui.ThrottledSuffix(anyTargetThrottled(cells)))
+		writeDDL()
+		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, presentation.RunningApplying, budget)
+		return
+	}
 	if keepsTargetProgressBar(cells, status, done, pending, settled) {
 		percent := presentation.PercentAcrossTargets(parts, 0)
 		// With the rows to copy known, the bar leads from the copy's start,
@@ -351,13 +388,13 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 			// The list under the rows says where each target stands, so the
 			// headline carries only the table's progress across all of them,
 			// the way a sharded table's does.
-			fmt.Fprintf(sb, "**%s**: %s %s\n", name, ui.ProgressBarRowCopy(pct),
-				presentation.AcrossTargetsPercent(pct, rows.Exact(len(cells)), rows.Copied, rows.Total))
+			fmt.Fprintf(sb, "**%s**: %s %s%s\n", name, ui.ProgressBarRowCopy(pct),
+				presentation.AcrossTargetsPercent(pct, rows.Exact(len(cells)), rows.Copied, rows.Total), ui.ThrottledSuffix(anyTargetThrottled(cells)))
 			writeDDL()
 			if line := rows.RowsLine(len(cells), targetsTableBytes(cells)); line != "" {
 				sb.WriteString("- " + line + "\n")
 			}
-			writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
+			writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, presentation.RunningCopying, budget)
 			return
 		}
 	}
@@ -401,7 +438,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		}
 	}
 	if lists {
-		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
+		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, presentation.RunningCopying, budget)
 	}
 }
 
@@ -564,29 +601,6 @@ func targetsTableBytes(cells []TableProgressData) *int64 {
 		total += *c.EstimatedBytes
 	}
 	return &total
-}
-
-// rollupTaskStatus is a table's status across targets: a failure or halt
-// first, then any target still moving, then queued, then complete.
-func rollupTaskStatus(cells []TableProgressData) string {
-	statuses := make([]string, len(cells))
-	for i, c := range cells {
-		statuses[i] = state.NormalizeTaskStatus(c.Status)
-	}
-	for _, halting := range []string{state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled} {
-		if slices.Contains(statuses, halting) {
-			return halting
-		}
-	}
-	for _, s := range statuses {
-		if s != state.Task.Pending && s != state.Task.Completed {
-			return s
-		}
-	}
-	if slices.Contains(statuses, state.Task.Pending) {
-		return state.Task.Pending
-	}
-	return state.Task.Completed
 }
 
 // writeFailedTargets names each failed or retrying target and its error, the

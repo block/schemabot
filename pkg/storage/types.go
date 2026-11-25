@@ -378,9 +378,10 @@ type Check struct {
 	// AggregateRender is what an aggregate row's Check Run text was rendered
 	// from, so the text can be rendered again with newer rollout counts
 	// without re-reading the PR. The encoding belongs to the caller. Upsert
-	// writes it, so an Upsert that leaves it empty clears it; other reads do
-	// not load it, and GetAggregateRender returns it. Empty on per-database
-	// rows.
+	// writes it, so an Upsert that leaves it empty clears it. GetAggregateRender
+	// returns it, and ListRemovableOnPRClose loads it so close cleanup can tell
+	// a render-only rewrite from an untouched row; other reads do not load it.
+	// Empty on per-database rows.
 	AggregateRender []byte `json:"-"`
 
 	// CreatedAt is when the check was created.
@@ -573,9 +574,11 @@ const FreezeOverrideReasonMax = 500
 const FreezeOverrideMaxLifetime = 24 * time.Hour
 
 // FreezeOverrideRequest asks to let one change through the freezes that hold
-// it. Nobody overrides alone: a second person approves the request, and the
-// change goes ahead only while every blocker it meets is one the request
-// names.
+// it. Under the approval override policy nobody overrides alone: a second
+// person approves the request. Under the reason policy, the default, the
+// request is stored approved by its requester, on their reason, and admits
+// only the command that gave it. Either way the change goes
+// ahead only while every blocker it meets is one the request names.
 type FreezeOverrideRequest struct {
 	ID          int64
 	Identifier  string
@@ -682,6 +685,13 @@ func (r *FreezeOverrideRequest) IsPersonOf(who string) bool {
 	return who == CanonicalKey(r.RequestedBy) || (r.PRAuthor != "" && who == CanonicalKey(r.PRAuthor))
 }
 
+// OnReason reports whether the request was admitted on its requester's own
+// reason, under the reason override policy, rather than approved by someone
+// else. Approve refuses the requester, so only CreateOnReason stores one.
+func (r *FreezeOverrideRequest) OnReason() bool {
+	return r.ApprovedAt != nil && CanonicalKey(r.ApprovedBy) == CanonicalKey(r.RequestedBy)
+}
+
 // Setting represents an admin-level SchemaBot setting.
 // Examples: feature flags, default options, maintenance mode.
 type Setting struct {
@@ -760,6 +770,10 @@ const (
 	EngineStrata      = "strata"
 	EnginePostgres    = "postgres"
 )
+
+// Engines lists every engine constant above, for checks that must hold on
+// every engine. TestEnginesListsEveryEngineConstant keeps it complete.
+var Engines = []string{EngineSpirit, EnginePlanetScale, EngineStrata, EnginePostgres}
 
 // ApplyOperationKind constants classify operation rows by scheduling role.
 const (
@@ -918,6 +932,12 @@ type TableChange struct {
 	// moves, with how each move changes the way values compare. Empty when
 	// the change re-collates no column, or the engine does not report it.
 	CollationChanges []CollationChange `json:"collation_changes,omitempty"`
+
+	// Metadata is what the engine recorded about this change at plan time
+	// and needs back at apply time (engine.TableChange.Metadata). It is
+	// stored with the reviewed plan so the apply runs against what was
+	// reviewed rather than against a fresh read of the target.
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // CollationChange is one existing column a planned change moves onto another

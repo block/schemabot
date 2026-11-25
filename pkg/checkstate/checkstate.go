@@ -76,6 +76,7 @@ const (
 	BlockApplyCancelledAfterTaskCompleted = "apply_cancelled_after_task_completed"
 	BlockConfigDiscoveryUnavailable       = "github_schema_config_discovery_unavailable"
 	BlockConfigDiscoveryFailed            = "schema_config_discovery_failed"
+	BlockGitHubQuotaReserved              = "github_quota_reserved"
 	BlockPlanPublishVerificationFailed    = "plan_publish_verification_failed"
 	BlockPRSchemaCapExceeded              = "pr_schema_cap_exceeded"
 	BlockPRFileCapExceeded                = "pr_file_cap_exceeded"
@@ -131,6 +132,7 @@ var blockClasses = map[string]blockClass{
 	BlockNamespacePlacementRefused:        blockGuard,
 	BlockConfigDiscoveryUnavailable:       blockGuard,
 	BlockConfigDiscoveryFailed:            blockGuard,
+	BlockGitHubQuotaReserved:              blockGuard,
 	BlockPlanPublishVerificationFailed:    blockGuard,
 	BlockPRFileCapExceeded:                blockGuard,
 	BlockPRSchemaCapExceeded:              blockGuard,

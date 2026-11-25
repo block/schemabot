@@ -114,7 +114,7 @@ func TestReconcileTerminalApplyOutcomesRecoversAFailedPublish(t *testing.T) {
 	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghc, logger)}
 	svc := api.New(st, &api.ServerConfig{}, map[string]tern.Client{}, logger)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// Pass 1: the summary post fails, and the check is repaired regardless.
 	h.ReconcileTerminalApplyOutcomes(ctx)

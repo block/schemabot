@@ -84,7 +84,7 @@ func newNarrowedApplyCheckFixture(t *testing.T, repo string, pr int, database st
 	installClient := ghclient.NewInstallationClient(ghc, logger)
 
 	return &narrowedApplyCheckFixture{
-		h:       NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger),
+		h:       NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger, WithInsecureSkipSignatureVerification()),
 		st:      st,
 		client:  installClient,
 		schema:  &ghclient.SchemaRequestResult{Repository: repo, PullRequest: pr, Database: database, Type: "mysql", HeadSHA: headSHA},

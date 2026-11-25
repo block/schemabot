@@ -94,7 +94,7 @@ func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	// is as destructive as an apply that does.
 	unsafeChanges := planResult.UnsafeChanges()
 	if len(unsafeChanges) > 0 && !cmd.AllowUnsafe {
-		templates.WriteUnsafeChangesBlocked(unsafeChanges, fmt.Sprintf("rollback %s -e %s --allow-unsafe", cmd.ApplyID, cmd.Environment))
+		templates.WriteUnsafeChangesBlocked(unsafeChanges, []string{"rollback", cmd.ApplyID, "-e", cmd.Environment, "--allow-unsafe"})
 		return ErrSilent
 	}
 	if cmd.AllowUnsafe {
