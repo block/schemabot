@@ -237,6 +237,7 @@ func TestBuildShardedApplyData_FinalizeOnlyKeyspaceIsNotAVSchemaChange(t *testin
 	assert.Equal(t, "payments", data.VSchemaChanges[0].Namespace)
 	body := templates.RenderShardedApplyComment(data)
 	assert.Contains(t, body, "### VSchema\n\n**`payments`**: Pending\n")
+	assert.NotContains(t, body, "### Finalize", "a keyspace's finalize is not listed as its own step")
 
 	apply.State = state.Apply.Completed
 	for _, op := range ops {
@@ -244,6 +245,7 @@ func TestBuildShardedApplyData_FinalizeOnlyKeyspaceIsNotAVSchemaChange(t *testin
 	}
 	summary := templates.RenderShardedApplySummaryComment(buildShardedApplyData(apply, ops, false, nil, view, ""))
 	assert.Contains(t, summary, "### VSchema\n\n**`payments`**: Applied\n")
+	assert.NotContains(t, summary, "### Finalize", "a keyspace's finalize is not listed as its own step")
 }
 
 // A sharded apply copies refunds onto both of commerce's shards, then its
