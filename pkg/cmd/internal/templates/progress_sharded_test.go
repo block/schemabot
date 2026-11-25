@@ -105,21 +105,44 @@ func TestFormatTableProgressNamesThePartialShardCoverageInEveryCopyState(t *test
 
 // A sharded apply shows no operation sections, so when only a failed
 // operation recorded why the apply failed, its error stands in for the
-// apply's, naming the shard when a shard failed.
+// apply's. It names the shard when a shard failed, and otherwise the keyspace
+// whose finalize failed, since the finalize error need not name it. A shard
+// failure is named before a finalize failure, as the PR comment names them.
 func TestParseProgressResponseShardedTakesAFailedOperationsError(t *testing.T) {
-	const finalizeErr = "apply VSchema for shop_001: keyspace not found"
+	const finalizeErr = "publish routing rules: target is read-only"
 	response := func(sharded bool, ops ...*apitypes.ProgressOperationResponse) *apitypes.ProgressResponse {
 		return &apitypes.ProgressResponse{State: state.Apply.Failed, Sharded: sharded, Operations: ops}
 	}
 	completedShard := &apitypes.ProgressOperationResponse{Deployment: "data-plane", OperationKey: "shop_001/-/orders", State: state.ApplyOperation.Completed}
 	failedFinalizer := &apitypes.ProgressOperationResponse{Deployment: "data-plane", OperationKey: "shop_001/group_finalizer", State: state.ApplyOperation.Failed, ErrorMessage: finalizeErr}
+	silentFinalizer := &apitypes.ProgressOperationResponse{Deployment: "data-plane", OperationKey: "shop_001/group_finalizer", State: state.ApplyOperation.Failed}
 	failedShard := &apitypes.ProgressOperationResponse{Deployment: "data-plane", OperationKey: "shop_001/-40/orders", State: state.ApplyOperation.Failed, ErrorMessage: "resolve shard primary: context deadline exceeded"}
 
-	assert.Equal(t, finalizeErr, ParseProgressResponse(response(true, completedShard, failedFinalizer)).ErrorMessage)
+	assert.Equal(t, "finalizing keyspace shop_001: "+finalizeErr, ParseProgressResponse(response(true, completedShard, failedFinalizer)).ErrorMessage)
+	assert.Equal(t, "finalizing keyspace shop_001 failed", ParseProgressResponse(response(true, completedShard, silentFinalizer)).ErrorMessage)
 	assert.Equal(t, "shard -40: resolve shard primary: context deadline exceeded",
-		ParseProgressResponse(response(true, failedShard, failedFinalizer)).ErrorMessage)
+		ParseProgressResponse(response(true, failedFinalizer, failedShard)).ErrorMessage)
 	assert.Empty(t, ParseProgressResponse(response(false, completedShard, failedFinalizer)).ErrorMessage,
 		"an apply with operation sections shows the error on the failed section")
+}
+
+// A sharded apply spans two keyspaces. shop_001's finalize fails while
+// shop_002's shards still copy, so the apply is running_degraded. The
+// terminal names the failed finalize under the state box, as the PR comment's
+// failure callout does, instead of waiting for the apply to settle.
+func TestWriteProgressShardedNamesAFailedFinalizeWhileOtherShardsRun(t *testing.T) {
+	const finalizeErr = "publish routing rules: target is read-only"
+	data := ParseProgressResponse(&apitypes.ProgressResponse{
+		State: state.Apply.RunningDegraded, Sharded: true,
+		Operations: []*apitypes.ProgressOperationResponse{
+			{Deployment: "data-plane", OperationKey: "shop_001/-/orders", State: state.ApplyOperation.Completed},
+			{Deployment: "data-plane", OperationKey: "shop_001/group_finalizer", State: state.ApplyOperation.Failed, ErrorMessage: finalizeErr},
+			{Deployment: "data-plane", OperationKey: "shop_002/-/orders", State: state.ApplyOperation.Running},
+		},
+	})
+	output := captureStdout(t, func() { WriteProgress(data) })
+
+	assert.Contains(t, output, "finalizing keyspace shop_001: "+finalizeErr)
 }
 
 // multiShardRunningResponse is a sharded apply copying `orders` across a

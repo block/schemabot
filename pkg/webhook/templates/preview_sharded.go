@@ -201,6 +201,40 @@ func PreviewCommentShardedSummaryFailed() string {
 	})
 }
 
+// PreviewCommentShardedSummaryFinalizeFailed renders the terminal summary for
+// a sharded apply whose shards all completed and whose keyspace finalize then
+// failed. The failure callout names the keyspace, since the finalize error
+// need not, and the comment lists no other step for the finalize.
+func PreviewCommentShardedSummaryFinalizeFailed() string {
+	const finalizeErr = "publish routing rules: target is read-only"
+	shards := []string{"-40", "40-80", "80-c0", "c0-"}
+	progress := make([]ShardProgressData, 0, len(shards))
+	ops := make([]presentation.Operation, 0, len(shards))
+	cells := make([]ShardCell, 0, len(shards))
+	for _, shard := range shards {
+		progress = append(progress, ShardProgressData{Shard: shard, Status: state.Task.Completed})
+		ops = append(ops, presentation.Operation{Deployment: shard, State: state.ApplyOperation.Completed})
+		cells = append(cells, previewMutesCell(shard))
+	}
+	return RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Failed, Environment: "production", Database: "shop",
+		ApplyID:      "apply-a1b2c3d4e5f6",
+		RequestedBy:  previewRequestedBy,
+		StartedAt:    sampleTime().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
+		CompletedAt:  sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
+		ErrorMessage: finalizeErr,
+		FailedFinalizer: &FinalizerFailure{
+			Keyspace: "commerce", State: state.ApplyOperation.Failed, Error: finalizeErr,
+		},
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "commerce",
+			Tables:   []ShardedTableStatus{{Table: "mutes", Status: state.Task.Completed, Shards: progress}},
+			Shards:   previewShardStatuses(state.Apply.Failed, ops),
+			Cells:    cells,
+		}},
+	})
+}
+
 // PreviewCommentShardedSummaryStoppedAtCutover renders the terminal summary
 // for a sharded apply that deferred its cutover. Shard -40 failed while the
 // other shards had copied and waited at the cutover, which could then never

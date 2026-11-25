@@ -247,25 +247,45 @@ func TestBuildShardedApplyData_FinalizeOnlyKeyspaceIsNotAVSchemaChange(t *testin
 }
 
 // A sharded apply copies refunds onto both of commerce's shards, then its
-// engine's finalize of the keyspace fails. The finalize is not listed on its
-// own, but it is what failed the apply, so the status comment and the summary
-// both name its error.
+// engine's finalize of the keyspace fails and the apply fails. The finalize is
+// not listed on its own, so the status comment and the summary both name the
+// keyspace in the failure callout, whatever the finalize error says: with its
+// error, with no error at all, and alongside an apply-level error that differs
+// from it.
 func TestShardedCommentsNameAFailedFinalize(t *testing.T) {
-	const finalizeErr = "apply VSchema for commerce: keyspace not found"
-	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Failed}
+	const finalizeErr = "publish routing rules: target is read-only"
+	const named = "\n> ❌ **Failure:** finalizing keyspace <code>commerce</code>"
 	mk := func(id int64, key, opState, errMsg string) *storage.ApplyOperation {
 		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	}
-	ops := []*storage.ApplyOperation{
-		mk(1, "commerce/-80/refunds", state.ApplyOperation.Completed, ""),
-		mk(2, "commerce/80-/refunds", state.ApplyOperation.Completed, ""),
-		mk(3, "commerce/group_finalizer", state.ApplyOperation.Failed, finalizeErr),
+	for _, tc := range []struct {
+		name, applyErr, finalizerErr string
+		want                         []string
+	}{
+		{name: "finalize error", finalizerErr: finalizeErr, want: []string{named + " — " + finalizeErr + "\n"}},
+		{name: "no error text", want: []string{named + "\n"}},
+		{
+			name: "apply error differs", applyErr: "apply deadline exceeded", finalizerErr: finalizeErr,
+			want: []string{named + " — " + finalizeErr + "\n", "\n> ❌ **Failure:** apply deadline exceeded\n"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Failed, ErrorMessage: tc.applyErr}
+			ops := []*storage.ApplyOperation{
+				mk(1, "commerce/-80/refunds", state.ApplyOperation.Completed, ""),
+				mk(2, "commerce/80-/refunds", state.ApplyOperation.Completed, ""),
+				mk(3, "commerce/group_finalizer", state.ApplyOperation.Failed, tc.finalizerErr),
+			}
+			data := buildShardedApplyData(apply, ops, false, nil, finalizesOnly("commerce"), "")
+			status := templates.RenderShardedApplyComment(data)
+			summary := templates.RenderShardedApplySummaryComment(data)
+			for _, want := range tc.want {
+				assert.Equal(t, 1, strings.Count(status, want), "status comment:\n%s", status)
+				assert.Equal(t, 1, strings.Count(summary, want), "summary comment:\n%s", summary)
+			}
+			assert.NotContains(t, summary, "**Failure:** "+finalizeErr, "the finalize error appears once, under its keyspace")
+		})
 	}
-	data := buildShardedApplyData(apply, ops, false, nil, finalizesOnly("commerce"), "")
-
-	assert.Equal(t, finalizeErr, data.ErrorMessage)
-	assert.Contains(t, templates.RenderShardedApplyComment(data), finalizeErr)
-	assert.Contains(t, templates.RenderShardedApplySummaryComment(data), finalizeErr)
 }
 
 // A sharded apply spans two keyspaces. commerce's shards finish and its
