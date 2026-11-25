@@ -2604,7 +2604,7 @@ schemabot apply -e staging --override "<why it can't wait>"
 
 *Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-❄️ **A freeze is scheduled in `staging`.** Apply before it starts, or the apply is refused while it holds.
+❄️ **A freeze is scheduled in `staging`.** Apply before it starts, and let the change finish: while it holds, the apply is refused, and so is a `start` or `cutover` the change still needs.
 
 | Freeze | Starts | Holds | Reason |
 | :-- | :-- | :-- | :-- |
@@ -2674,7 +2674,7 @@ schemabot apply -e staging
 | :-- | :-- | :-- |
 | `freeze-3f9a1c2e7b4d8a06` | until lifted | INC-1234: payments latency |
 
-Wait for the freeze to end before you apply. If this change can't wait, apply with `--override` and your reason, as the command below does: a freeze approver other than you and the PR author must approve it before it runs, a member of `acme/freeze-approvers`.
+Wait for the freeze to end before you apply. If this change can't wait, apply with `--override` and your reason, as the command below does. A freeze approver other than you and the PR author, a member of `acme/freeze-approvers`, must approve it, and then you run the command again.
 
 ```sql
 CREATE TABLE `users` (

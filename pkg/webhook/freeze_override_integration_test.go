@@ -184,6 +184,12 @@ func TestE2EApplyOverrideOfAnUnsafeChange(t *testing.T) {
 	assert.Contains(t, refusal, "schemabot apply -e "+driftEnv+` --allow-unsafe --override "<why it can't wait>"`, "the retry carries the override")
 	requireNoApplies(t, svc, dbName)
 
+	// The retry pasted unedited still carries the placeholder, which is no
+	// reason: it is answered, and nothing runs.
+	pasted := runRolloutWebhookWithFiles(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv+` --allow-unsafe --override "<why it can't wait>"`), dropEmail)
+	assert.Contains(t, awaitCommentContaining(t, pasted, "placeholder"), "replace it with why this change can't wait")
+	requireNoApplies(t, svc, dbName)
+
 	admitted := runRolloutWebhookWithFiles(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv+` --allow-unsafe --override "fix the index"`), dropEmail)
 	created := awaitRolloutApply(t, svc, dbName, admitted)
 	require.NotEmpty(t, created.GetOptions().FreezeOverride, "the freeze let the apply through on its reason")

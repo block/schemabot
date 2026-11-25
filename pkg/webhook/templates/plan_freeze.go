@@ -69,7 +69,7 @@ func writePlanFreezes(sb *strings.Builder, environment string, notice *PlanFreez
 			for _, team := range notice.Approvers {
 				teams = append(teams, inlineCode(team))
 			}
-			fmt.Fprintf(sb, "Wait for %s to end before you apply. If this change can't wait, apply with `--override` and your reason, as the command below does: a freeze approver other than you and the PR author must approve it before it runs, a member of %s.\n\n",
+			fmt.Fprintf(sb, "Wait for %s to end before you apply. If this change can't wait, apply with `--override` and your reason, as the command below does. A freeze approver other than you and the PR author, a member of %s, must approve it, and then you run the command again.\n\n",
 				theFreezes(len(notice.InEffect)), joinWithOr(teams))
 		default:
 			fmt.Fprintf(sb, "Wait for %s to end before you apply.\n\n", theFreezes(len(notice.InEffect)))
@@ -80,7 +80,7 @@ func writePlanFreezes(sb *strings.Builder, environment string, notice *PlanFreez
 		if len(notice.Scheduled) > 1 {
 			subject = "Freezes are scheduled"
 		}
-		fmt.Fprintf(sb, "%s **%s in %s.** Apply before it starts, or the apply is refused while it holds.\n\n", glyph.Frozen, subject, env)
+		fmt.Fprintf(sb, "%s **%s in %s.** Apply before it starts, and let the change finish: while it holds, the apply is refused, and so is a `start` or `cutover` the change still needs.\n\n", glyph.Frozen, subject, env)
 		writeScheduledFreezes(sb, notice.Scheduled)
 	}
 }

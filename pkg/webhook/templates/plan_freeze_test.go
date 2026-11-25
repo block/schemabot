@@ -44,7 +44,7 @@ func TestRenderPlanCommentFreezeUnderTheApprovalPolicy(t *testing.T) {
 	}))
 
 	assert.Contains(t, out, "| `freeze-3f9a1c2e7b4d8a06` | until lifted | Holiday code freeze |")
-	assert.Contains(t, out, "a freeze approver other than you and the PR author must approve it before it runs, a member of `acme/freeze-approvers`.")
+	assert.Contains(t, out, "A freeze approver other than you and the PR author, a member of `acme/freeze-approvers`, must approve it, and then you run the command again.")
 	assert.Contains(t, out, `schemabot apply -e production --override "<why it can't wait>"`)
 	assert.NotContains(t, out, "records your reason")
 }
@@ -73,7 +73,7 @@ func TestRenderPlanCommentShowsAScheduledFreeze(t *testing.T) {
 		OverrideOnReason: true,
 	}))
 
-	assert.Contains(t, out, "❄️ **A freeze is scheduled in `production`.** Apply before it starts, or the apply is refused while it holds.")
+	assert.Contains(t, out, "❄️ **A freeze is scheduled in `production`.** Apply before it starts, and let the change finish: while it holds, the apply is refused, and so is a `start` or `cutover` the change still needs.")
 	assert.Contains(t, out, "| `freeze-8c41d2e9a7f03b56` | 2026-12-01T00:00:00Z | until 2026-12-02T00:00:00Z | Launch week code freeze |")
 	assert.NotContains(t, out, "is frozen", "nothing refuses the apply yet")
 	assert.NotContains(t, out, "--override", "an apply before the freeze starts needs no override")

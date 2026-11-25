@@ -137,9 +137,11 @@ and counts the rest. The API answers `409`; see
 
 A pull request warns you sooner. When a freeze covers the change, the plan
 comment names it above the DDL, before anyone comments an apply, and its apply
-command already carries `--override "<why it can't wait>"`. A freeze that is
-scheduled but has not started is named with when it starts, so you can apply
-before it does. The notice only informs: the apply checks the freezes again,
+command already carries `--override "<why it can't wait>"`. Replace the
+placeholder with your reason: SchemaBot refuses a reason still in angle
+brackets, so a command pasted unedited never overrides a freeze. A freeze that
+is scheduled but has not started is named with when it starts, so you can
+apply, and let the change finish, before it does. The notice only informs: the apply checks the freezes again,
 and that check decides. If an apply is refused for an unsafe change first, the
 retry command it offers carries `--override` too.
 
@@ -469,7 +471,7 @@ Every error has the standard body, `{"error": "...", "error_code": "..."}`.
 
 | Status | When |
 |---|---|
-| `400` (`invalid_request`) | A missing `environment` or `reason`, an unknown field, a bad time, a planned freeze with no end, an end in the past, or an override reason over 500 characters. |
+| `400` (`invalid_request`) | A missing `environment` or `reason`, an unknown field, a bad time, a planned freeze with no end, an end in the past, or an override reason that is over 500 characters or still a `<…>` placeholder. |
 | `403` | Setting or lifting a freeze without freeze write access; approving an override without being a freeze approver (`write_groups` alone is not enough); asking for or approving an override as an unverified caller; or approving your own request. |
 | `404` (`not_found`) | No freeze or override request with that ID. |
 | `409` | `change_gate_refused`, or a lift of a freeze already lifted or ended, or an approval of a request already approved, expired, or asked for on a pull request. |
