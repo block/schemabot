@@ -11581,7 +11581,7 @@ ALTER TABLE `mutes`
 
 **Status**: In Progress — 0 of 1 change applied
 
-**Shards**: 1 running table copy, 3 waiting for -40
+**Shards**: 1 running table copy, 3 queued
 
 #### Keyspace `cdb_resolute_sharded`
 
@@ -11613,7 +11613,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 **Status**: Failed — 0 of 1 change applied
 
-**Shards**: 1 failed, 3 halted
+**Shards**: 1 failed, 3 not started
 
 > ❌ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
 
@@ -11628,9 +11628,9 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 | Shard | Status |
 | --- | --- |
 | `-40` | ❌ failed — resolve shard primary for `-40`: context deadline exceeded |
-| `40-80` | ⏸️ halted — -40 failed |
-| `80-c0` | ⏸️ halted — -40 failed |
-| `c0-` | ⏸️ halted — -40 failed |
+| `40-80` | ⏸️ not started |
+| `80-c0` | ⏸️ not started |
+| `c0-` | ⏸️ not started |
 
 ---
 
@@ -11653,7 +11653,7 @@ schemabot apply -e production
 
 **Status**: In Progress — 0 of 1 change applied
 
-**Shards**: 1 running table copy, 2 waiting for -40
+**Shards**: 1 running table copy, 2 queued
 
 #### Keyspace `cdb_resolute_sharded`
 
@@ -11682,13 +11682,13 @@ Shards diverge — grouped by change:
 | Shard | Status |
 | --- | --- |
 | `-40` | 🔄 running table copy |
-| `80-c0` | ⏳ waiting for -40 |
+| `80-c0` | ⏳ queued |
 
 **shard `40-80`**
 
 | Shard | Status |
 | --- | --- |
-| `40-80` | ⏳ waiting for -40 |
+| `40-80` | ⏳ queued |
 
 _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
@@ -11706,7 +11706,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 **Status**: In Progress — 1 of 4 changes applied (done on 1 of 6 shards)
 
-**Shards**: 1 completed, 1 running table copy, 4 waiting for cdb_resolute_lookup/-
+**Shards**: 1 completed, 1 running table copy, 4 queued
 
 #### Keyspace `cdb_resolute`
 
@@ -11825,7 +11825,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 *Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
 
-**Shards**: 1 failed, 3 halted
+**Shards**: 1 failed, 3 not started
 
 > ❌ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
 
@@ -11840,9 +11840,9 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 | Shard | Status |
 | --- | --- |
 | `-40` | ❌ failed — resolve shard primary for `-40`: context deadline exceeded |
-| `40-80` | ⏸️ halted — -40 failed |
-| `80-c0` | ⏸️ halted — -40 failed |
-| `c0-` | ⏸️ halted — -40 failed |
+| `40-80` | ⏸️ not started |
+| `80-c0` | ⏸️ not started |
+| `c0-` | ⏸️ not started |
 
 ### VSchema
 
@@ -12329,17 +12329,17 @@ To resume from where it stopped:
 
 ```
 
-┌─────────────────────────────────────────────────────────┐
-│  Apply ID:     apply-shard-e5f6a7b8                     │
-│  Database:     shop                                     │
-│  Environment:  production                               │
-│  State:        Running                                  │
-│  Shards:       1 running table copy, 3 waiting for -40  │
-│  Caller:       github:octocat                           │
-│  Source:       https://github.com/acme/shop/pull/412    │
-│  Started:      Jan 15 14:26:00 UTC                      │
-│  Duration:     4m                                       │
-└─────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-e5f6a7b8                   │
+│  Database:     shop                                   │
+│  Environment:  production                             │
+│  State:        Running                                │
+│  Shards:       1 running table copy, 3 queued         │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:26:00 UTC                    │
+│  Duration:     4m                                     │
+└───────────────────────────────────────────────────────┘
 
 
   ── shop_001 ──

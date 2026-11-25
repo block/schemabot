@@ -1033,13 +1033,13 @@ counts the shards by status, the rows cover only the started shard, so the ETA
 is a floor, and the VSchema change shows its diff:
 
 ```text
-┌─────────────────────────────────────────────────────────┐
-│  Apply ID:     apply-example-76                         │
-│  Database:     shop                                     │
-│  Environment:  production                               │
-│  State:        Running                                  │
-│  Shards:       1 running table copy, 3 waiting for -40  │
-└─────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────┐
+│  Apply ID:     apply-example-76                │
+│  Database:     shop                            │
+│  Environment:  production                      │
+│  State:        Running                         │
+│  Shards:       1 running table copy, 3 queued  │
+└────────────────────────────────────────────────┘
 
 
   ── shop_001 ──

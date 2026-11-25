@@ -62,7 +62,8 @@ func TestWriteProgressShardRowsWithoutShardedKeepTheirSections(t *testing.T) {
 // row figures cover the one started shard, so the bar and the rows line say
 // so, and the ETA reads as a floor, rather than passing that shard's fraction
 // off as the table's, while the planned size names the shards it covers. The
-// header counts the shards by status, the finalizer's VSchema change shows
+// header counts the shards by status, the shards still to start as queued in
+// both the header and the table, the finalizer's VSchema change shows
 // under the tables, and no line counts the operation rows as deployments.
 func TestWriteProgressShardedApplyRollsShardsUpUnderTheTable(t *testing.T) {
 	data := ParseProgressResponse(multiShardRunningResponse())
@@ -70,7 +71,7 @@ func TestWriteProgressShardedApplyRollsShardsUpUnderTheTable(t *testing.T) {
 
 	assert.Equal(t, 1, strings.Count(output, "~ orders:"), "the table renders once:\n%s", output)
 	assert.Contains(t, output, "62.00% (1 of 4 shards)")
-	assert.Contains(t, output, "Shards:       1 running table copy, 3 waiting for -40")
+	assert.Contains(t, output, "Shards:       1 running table copy, 3 queued")
 	assert.Contains(t, output, "Rows: 620 / 1,000 across 1 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ ")
 	assert.Contains(t, output, "Shards: 4 (1 copying, 3 queued)")
 	assert.Contains(t, output, "◉ -40"+ANSIReset+": 62.00% · 620 / 1,000 rows")
