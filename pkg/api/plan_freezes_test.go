@@ -72,7 +72,7 @@ func TestPlanResponseFreezesListsInEffectFirst(t *testing.T) {
 	inEffect := gateTestFreeze("freeze-0000000000000002")
 	svc, _ := newGateApplyTestService(t, scheduled, inEffect)
 
-	freezes := svc.planResponseFreezes(t.Context(), "testdb", "staging", &apitypes.PlanResponse{Deployment: "default"})
+	freezes := svc.planResponseFreezes(t.Context(), "testdb", "staging", "acme/shop", &apitypes.PlanResponse{Deployment: "default"})
 
 	require.Len(t, freezes, 2)
 	assert.Equal(t, inEffect.Identifier, freezes[0].ID)
@@ -87,5 +87,5 @@ func TestPlanResponseFreezesOmitsThemOnAStorageError(t *testing.T) {
 	svc, _ := newGateApplyTestService(t, gateTestFreeze("freeze-0000000000000001"))
 	svc.storage.(*mockStorageWithApplyStores).freezes.(*memoryFreezeStore).nowErr = errors.New("connection refused")
 
-	assert.Empty(t, svc.planResponseFreezes(t.Context(), "testdb", "staging", &apitypes.PlanResponse{Deployment: "default"}))
+	assert.Empty(t, svc.planResponseFreezes(t.Context(), "testdb", "staging", "acme/shop", &apitypes.PlanResponse{Deployment: "default"}))
 }

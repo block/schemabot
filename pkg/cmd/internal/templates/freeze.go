@@ -315,7 +315,11 @@ func PlanFreezesText(environment string, freezes []apitypes.Freeze) []string {
 		if len(inEffect) > 1 {
 			subject = "the freezes"
 		}
-		lines = append(lines, fmt.Sprintf(`Wait for %s to end before you apply. If this change can't wait, apply with --override "<reason>".`, subject))
+		// The PR comment words the override by the server's policy. The plan
+		// response carries no policy, so this says what --override does under
+		// either one, as the --override help does. The CLI refusal offers
+		// --override under every policy too.
+		lines = append(lines, fmt.Sprintf(`Wait for %s to end before you apply. If this change can't wait, apply with --override "<reason>": as the server's override policy says, SchemaBot lets it through on your reason, or asks a freeze approver to approve it first.`, subject))
 	}
 	if len(scheduled) > 0 {
 		if len(lines) > 0 {

@@ -60,11 +60,11 @@ func (s *Service) FreezesCoveringPlan(ctx context.Context, environment, database
 // the request's: the response may leave it empty. A lookup that fails leaves
 // the freezes off and never fails the plan, because the apply checks them
 // again.
-func (s *Service) planResponseFreezes(ctx context.Context, database, environment string, resp *apitypes.PlanResponse) []apitypes.Freeze {
+func (s *Service) planResponseFreezes(ctx context.Context, database, environment, repository string, resp *apitypes.PlanResponse) []apitypes.Freeze {
 	freezes, err := s.FreezesCoveringPlan(ctx, environment, database, resp.Deployment, resp.NarrowedTo != "")
 	if err != nil {
 		s.logger.Warn("could not read the freezes for the plan response; it names no freeze, and the apply checks the freezes again",
-			"database", database, "environment", environment, "error", err)
+			"repository", repository, "database", database, "environment", environment, "error", err)
 		return nil
 	}
 	var out []apitypes.Freeze

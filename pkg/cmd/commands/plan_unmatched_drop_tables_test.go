@@ -18,6 +18,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/presentation"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
@@ -167,7 +168,7 @@ func TestPlanCmd_NamesTheFreezes(t *testing.T) {
 	assert.Contains(t, out, "DROP TABLE `_jobs_old`", out)
 	assert.Contains(t, out, "❄️ staging is frozen, so applying this plan would be refused now.\n"+
 		"   freeze-0000000000000001  incident 42  (until lifted)\n"+
-		`Wait for the freeze to end before you apply. If this change can't wait, apply with --override "<reason>".`+"\n", out)
+		`Wait for the freeze to end before you apply. If this change can't wait, apply with --override "<reason>": as the server's override policy says, SchemaBot lets it through on your reason, or asks a freeze approver to approve it first.`+"\n", out)
 	assert.Contains(t, out, "❄️ A freeze is scheduled in staging.", out)
 	assert.Contains(t, out, "   freeze-0000000000000002  launch week  (starts "+startsAt.Format(time.RFC3339)+", until "+endsAt.Format(time.RFC3339)+")", out)
 	assert.NotContains(t, out, "another database", "a freeze of another database is not named")
@@ -182,6 +183,19 @@ func TestOutputMultiEnvPlanResult_Freezes(t *testing.T) {
 	t.Run("no changes", func(t *testing.T) {
 		out := stripAnsi(captureStdout(func() {
 			outputMultiEnvPlanResult(map[string]*apitypes.PlanResponse{"staging": {Engine: "spirit", Freezes: frozen}}, "testdb", "testdb")
+		}))
+		assert.NotContains(t, out, "❄️", out)
+	})
+
+	t.Run("a plan apply refuses", func(t *testing.T) {
+		blocked := planWithTablesAndEngine("spirit", &apitypes.TableChangeResponse{
+			TableName: "_jobs_old", DDL: "DROP TABLE `_jobs_old`;", ChangeType: "drop",
+			ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "direct execution is disabled",
+		})
+		blocked.Freezes = frozen
+		require.NotEmpty(t, planRefusal(blocked), "the fixture is a plan apply refuses")
+		out := stripAnsi(captureStdout(func() {
+			outputMultiEnvPlanResult(map[string]*apitypes.PlanResponse{"staging": blocked}, "testdb", "testdb")
 		}))
 		assert.NotContains(t, out, "❄️", out)
 	})

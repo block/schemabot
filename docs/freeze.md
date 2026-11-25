@@ -148,7 +148,8 @@ too.
 
 `schemabot plan` warns you the same way. Under the plan, it names the freezes
 in effect and those scheduled, and says to apply with `--override "<reason>"`
-if the change can't wait. The response to `POST /api/plan` carries them in
+if the change can't wait. A plan that apply refuses whatever its flags, such
+as one with a blocked change, names no freeze, as the plan comment does not. The response to `POST /api/plan` carries them in
 `freezes`, in effect first, each with `in_effect`.
 
 You have two choices:

@@ -764,7 +764,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp.Rollout = rollout
-	resp.Freezes = s.planResponseFreezes(r.Context(), req.Database, req.Environment, resp)
+	resp.Freezes = s.planResponseFreezes(r.Context(), req.Database, req.Environment, req.Repository, resp)
 
 	s.writeJSON(w, http.StatusOK, resp)
 }

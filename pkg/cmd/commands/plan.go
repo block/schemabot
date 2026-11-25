@@ -275,10 +275,12 @@ func outputMultiEnvPlanResult(results map[string]*apitypes.PlanResponse, databas
 
 // writePlanFreezes writes the freezes that cover environment's change, so the
 // operator learns before applying that a freeze refuses the apply now, or will
-// once it starts. A plan with errors or no changes offers no apply, so it
-// names none.
+// once it starts. A plan with no changes, or one apply refuses whatever its
+// flags (planRefusal), offers no apply, so it names none: an override would
+// not get it through. The PR plan comment withholds its notice by the same
+// rule.
 func writePlanFreezes(environment string, result *apitypes.PlanResponse) {
-	if result == nil || len(result.Errors) > 0 || !hasResultChanges(result) {
+	if result == nil || !hasResultChanges(result) || planRefusal(result) != "" {
 		return
 	}
 	templates.WritePlanFreezes(environment, result.Freezes)
