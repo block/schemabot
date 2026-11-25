@@ -29,7 +29,7 @@ func TestVSchemaChangeReadsTableByTableWithTheDiffCollapsed(t *testing.T) {
 		Status:    "applying",
 		Diff:      archiveTableDiff,
 		Summary:   []string{"adds table `orders_archive`: vindex `hash` on `id`"},
-	}})
+	}}, nil)
 	out := sb.String()
 
 	assert.Contains(t, out, "**`commerce`**: Applying...\n\n- adds table `orders_archive`: vindex `hash` on `id`\n\n<details><summary>VSchema diff</summary>\n\n```diff\n")
@@ -41,7 +41,7 @@ func TestVSchemaChangeReadsTableByTableWithTheDiffCollapsed(t *testing.T) {
 // diff is then the only account of the change.
 func TestVSchemaChangeWithoutADescriptionShowsTheDiffOpen(t *testing.T) {
 	var sb strings.Builder
-	writeVSchemaStatus(&sb, []apitypes.VSchemaChange{{Namespace: "commerce", Status: "applying", Diff: archiveTableDiff}})
+	writeVSchemaStatus(&sb, []apitypes.VSchemaChange{{Namespace: "commerce", Status: "applying", Diff: archiveTableDiff}}, nil)
 	out := sb.String()
 
 	assert.Contains(t, out, "**`commerce`**: Applying...\n\n```diff\n")

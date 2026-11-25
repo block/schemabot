@@ -510,7 +510,7 @@ func collectPlanWork(result *apitypes.PlanResponse) planWork {
 			w.vschemaChanges = append(w.vschemaChanges, templates.VSchemaChange{
 				Keyspace: sc.Namespace,
 				Diff:     sc.Metadata[apitypes.VSchemaDiffMetadataKey],
-				Summary:  apitypes.VSchemaSummaryLines(sc.Metadata[apitypes.VSchemaSummaryMetadataKey]),
+				Summary:  apitypes.SplitVSchemaSummary(sc.Metadata[apitypes.VSchemaSummaryMetadataKey]),
 			})
 		} else if sc.NeedsFinalizer() {
 			w.finalizeOnly[renderedNamespace(sc.Namespace, result.Database)] = true

@@ -21,5 +21,5 @@ func TestVSchemaSummaryLinesCountsWhatItLeavesOut(t *testing.T) {
 	got := VSchemaSummaryLines(long)
 	assert.Len(t, got, 20)
 	assert.Equal(t, "adds table `t18`", got[18])
-	assert.Equal(t, "and 6 more changes, shown in the diff", got[19])
+	assert.Equal(t, "and 6 more changes; the VSchema file's diff has them all", got[19])
 }

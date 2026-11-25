@@ -310,7 +310,7 @@ func (s *Service) addFinalizerVSchemaChanges(resp *apitypes.ProgressResponse, ap
 			Namespace: ns,
 			Status:    presentation.FinalizerVSchemaStatus(apply.State, op.State),
 			Diff:      diff,
-			Summary:   apitypes.VSchemaSummaryLines(plan.Namespaces[ns].Metadata[storage.PlanMetadataVSchemaSummary]),
+			Summary:   apitypes.SplitVSchemaSummary(plan.Namespaces[ns].Metadata[storage.PlanMetadataVSchemaSummary]),
 		})
 	}
 	if len(changes) == len(existing) {

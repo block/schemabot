@@ -1981,16 +1981,17 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 	// the database name — it's redundant with the metadata line.
 	singleKeyspace := len(data.Changes) == 1 && schemaNamespaces && data.Changes[0].Keyspace == data.Database
 
-	// The VSchema budget is per comment, not per keyspace: the diffs split it
-	// across the keyspaces that will render one, and the descriptions draw
-	// from it in turn, so a multi-keyspace plan stays bounded.
+	// The VSchema budget is per comment, not per keyspace or per section: the
+	// diffs split what is left of it across the keyspaces that will render
+	// one, and the descriptions draw from it in turn, so a plan stays bounded
+	// however many keyspaces, environments, or target groups it renders.
 	diffCount := 0
 	for _, ks := range data.Changes {
 		if ks.VSchemaChanged && !data.IsMySQL && ks.VSchemaDiff != "" {
 			diffCount++
 		}
 	}
-	vschemaBudget := newVSchemaCommentBudget(diffCount)
+	vschemaBudget := budget.vschemaSection(diffCount)
 
 	for _, ks := range data.Changes {
 		hasVSchemaChanges := ks.VSchemaChanged && !data.IsMySQL

@@ -1627,7 +1627,7 @@ func setNamespaceWork(ks *templates.KeyspaceChangeData, sc *apitypes.SchemaChang
 	if sc.ShowsVSchemaChange() {
 		ks.VSchemaChanged = true
 		ks.VSchemaDiff = sc.Metadata[apitypes.VSchemaDiffMetadataKey]
-		ks.VSchemaSummary = apitypes.VSchemaSummaryLines(sc.Metadata[apitypes.VSchemaSummaryMetadataKey])
+		ks.VSchemaSummary = apitypes.SplitVSchemaSummary(sc.Metadata[apitypes.VSchemaSummaryMetadataKey])
 	}
 	ks.Finalize = sc.NeedsFinalizer()
 }

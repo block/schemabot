@@ -137,15 +137,21 @@ func columnVindexList(t *vschemapb.Table) string {
 	return "vindexes " + strings.Join(entries, ", ")
 }
 
+// tableRoutingFields are the table fields tableRouting reads, so a routing
+// change already shows their before and after.
+var tableRoutingFields = []string{"type", "source", "pinned", "column_vindexes", "auto_increment"}
+
 // tableChange describes what differs between two definitions of one table.
 // The routing reads as before and after, since that is what a reviewer
-// checks; any other field only says which fields change.
+// checks; any other field only says which fields change, after the routing
+// when both do.
 func tableChange(current, desired *vschemapb.Table) string {
+	changed := changedFields(current, desired)
 	before, after := tableRouting(current), tableRouting(desired)
 	if before != after {
-		return fmt.Sprintf("%s becomes %s", orNone(before), orNone(after))
+		return withOtherChanges(fmt.Sprintf("%s becomes %s", orNone(before), orNone(after)), changed, tableRoutingFields...)
 	}
-	return "changes " + codeList(changedFields(current, desired))
+	return "changes " + codeList(changed)
 }
 
 func vindexDefinition(v *vschemapb.Vindex) string {
@@ -162,11 +168,30 @@ func vindexDefinition(v *vschemapb.Vindex) string {
 	return strings.Join(parts, ", ")
 }
 
+// vindexChange describes what differs between two definitions of one vindex:
+// a type change as before and after, followed by any other field that also
+// changes.
 func vindexChange(current, desired *vschemapb.Vindex) string {
+	changed := changedFields(current, desired)
 	if current.GetType() != desired.GetType() {
-		return fmt.Sprintf("type %s becomes %s", code(current.GetType()), code(desired.GetType()))
+		return withOtherChanges(fmt.Sprintf("type %s becomes %s", code(current.GetType()), code(desired.GetType())), changed, "type")
 	}
-	return "changes " + codeList(changedFields(current, desired))
+	return "changes " + codeList(changed)
+}
+
+// withOtherChanges appends to a before-and-after line the changed fields it
+// does not already show, so the line names every field that changes.
+func withOtherChanges(line string, changed []string, shown ...string) string {
+	var others []string
+	for _, field := range changed {
+		if !slices.Contains(shown, field) {
+			others = append(others, field)
+		}
+	}
+	if len(others) == 0 {
+		return line
+	}
+	return line + ", and also changes " + codeList(others)
 }
 
 // changedFields names the top-level fields whose values differ between two

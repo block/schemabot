@@ -32,7 +32,9 @@ func VSchemaSummaryCut(summary []string) (shown []string, omitted int) {
 }
 
 // VSchemaMoreChangesLine is the line that counts the n description lines a
-// surface leaves out.
+// surface leaves out. It points at the VSchema file's diff rather than the
+// diff the surface renders, since a long description usually comes with a
+// diff the surface has had to cut too.
 func VSchemaMoreChangesLine(n int) string {
-	return fmt.Sprintf("and %d more changes, shown in the diff", n)
+	return fmt.Sprintf("and %d more changes; the VSchema file's diff has them all", n)
 }

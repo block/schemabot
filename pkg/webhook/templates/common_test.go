@@ -391,9 +391,9 @@ func TestWriteVSchemaDiffFence(t *testing.T) {
 // bounded near the per-comment budget — the shape that would otherwise push
 // the whole body past GitHub's cap and freeze the status surface.
 func TestVSchemaDiffBudget_SharedAcrossKeyspaces(t *testing.T) {
-	assert.Equal(t, maxCommentVSchemaDiffLen, vschemaDiffBudget(0))
-	assert.Equal(t, maxCommentVSchemaDiffLen, vschemaDiffBudget(1))
-	assert.Equal(t, maxCommentVSchemaDiffLen/4, vschemaDiffBudget(4))
+	assert.Equal(t, maxCommentVSchemaDiffLen, newVSchemaCommentBudget(0).diffShare)
+	assert.Equal(t, maxCommentVSchemaDiffLen, newVSchemaCommentBudget(1).diffShare)
+	assert.Equal(t, maxCommentVSchemaDiffLen/4, newVSchemaCommentBudget(4).diffShare)
 
 	changes := make([]apitypes.VSchemaChange, 0, 4)
 	for _, ns := range []string{"ks_a", "ks_b", "ks_c", "ks_d"} {
@@ -404,7 +404,7 @@ func TestVSchemaDiffBudget_SharedAcrossKeyspaces(t *testing.T) {
 		})
 	}
 	var sb strings.Builder
-	writeVSchemaStatus(&sb, changes)
+	writeVSchemaStatus(&sb, changes, nil)
 	assert.Less(t, sb.Len(), maxCommentVSchemaDiffLen+4*200,
 		"four oversized keyspace diffs render one budget's worth of diff, not four")
 	assert.Equal(t, 4, strings.Count(sb.String(), "Diff truncated to fit GitHub's comment size limit"))
@@ -415,7 +415,9 @@ func TestVSchemaDiffBudget_SharedAcrossKeyspaces(t *testing.T) {
 // still render a bounded section. Each listed line is whole, so no code span
 // is cut, and the lines left out are counted.
 func TestVSchemaSummaryBudget_SharedAcrossKeyspaces(t *testing.T) {
-	longLine := "adds table `orders`: " + strings.Repeat("vindex `hash` on `id`, ", 20)
+	// A name holding a backtick renders in a double-backtick span, so a line
+	// cut partway would leave a span open that the check below would catch.
+	longLine := "adds table ``` ord`ers ```: " + strings.Repeat("vindex `hash` on `id`, ", 20)
 	summary := make([]string, 19)
 	for i := range summary {
 		summary[i] = longLine
@@ -426,18 +428,22 @@ func TestVSchemaSummaryBudget_SharedAcrossKeyspaces(t *testing.T) {
 	}
 
 	var sb strings.Builder
-	writeVSchemaStatus(&sb, changes)
+	writeVSchemaStatus(&sb, changes, nil)
 	out := sb.String()
 
 	listed := strings.Count(out, "- "+longLine+"\n")
 	assert.Equal(t, maxCommentVSchemaSummaryLen/len("- "+longLine+"\n"), listed,
 		"the comment lists as many whole lines as the shared budget holds")
 	assert.Less(t, len(out), maxCommentVSchemaSummaryLen+4*200)
-	assert.Equal(t, 0, strings.Count(out, "`` "), "no code span is cut open")
+	for line := range strings.SplitSeq(out, "\n") {
+		if strings.HasPrefix(line, "- ") && !strings.HasPrefix(line, "- and ") {
+			assert.Equal(t, "- "+longLine, line, "every listed line is whole, so no code span is cut open")
+		}
+	}
 	omittedFirst := 19*(listed/19+1) - listed
-	assert.Contains(t, out, fmt.Sprintf("- and %d more changes, shown in the diff\n", omittedFirst),
+	assert.Contains(t, out, fmt.Sprintf("- and %d more changes; the VSchema file's diff has them all\n", omittedFirst),
 		"the keyspace where the budget runs out counts what it left out")
-	assert.Contains(t, out, "**`ks_d`**: Applied\n\n- and 19 more changes, shown in the diff\n",
+	assert.Contains(t, out, "**`ks_d`**: Applied\n\n- and 19 more changes; the VSchema file's diff has them all\n",
 		"a keyspace past the budget counts every line")
 }
 

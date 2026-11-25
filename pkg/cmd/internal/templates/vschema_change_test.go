@@ -59,7 +59,7 @@ func TestVSchemaDescriptionIsCappedTheSameOnEverySurface(t *testing.T) {
 	for _, out := range []string{cli, pr} {
 		assert.Contains(t, out, "t18")
 		assert.NotContains(t, out, "t19", "the twentieth line is the count of what was left out")
-		assert.Contains(t, out, "- and 6 more changes, shown in the diff")
+		assert.Contains(t, out, "- and 6 more changes; the VSchema file's diff has them all")
 	}
 }
 

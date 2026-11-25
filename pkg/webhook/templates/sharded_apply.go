@@ -467,7 +467,7 @@ func writeShardKeyspaceSections(sb *strings.Builder, data ShardedApplyData, form
 	for _, c := range data.VSchemaChanges {
 		vschemaChanges[c.Namespace] = c
 	}
-	vschemaBudget := newVSchemaCommentBudget(vschemaDiffCount(data.VSchemaChanges))
+	vschemaBudget := budget.vschemaSection(vschemaDiffCount(data.VSchemaChanges))
 	placed := make(map[string]bool, len(keyspaces))
 	for _, ks := range keyspaces {
 		placed[ks.Keyspace] = true

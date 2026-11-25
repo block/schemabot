@@ -91,7 +91,7 @@ func vschemaDiffsFromChanges(changes []engine.SchemaChange) []vschemaKeyspaceDif
 			diffs = append(diffs, vschemaKeyspaceDiff{
 				Namespace: sc.Namespace,
 				Diff:      d,
-				Summary:   apitypes.VSchemaSummaryLines(sc.Metadata[apitypes.VSchemaSummaryMetadataKey]),
+				Summary:   apitypes.SplitVSchemaSummary(sc.Metadata[apitypes.VSchemaSummaryMetadataKey]),
 			})
 		}
 	}

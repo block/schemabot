@@ -317,7 +317,7 @@ func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdate
 
 	// VSchema application status, surfaced from engine metadata rather than as a
 	// per-table task (a VSchema-only apply has no tables at all).
-	writeVSchemaStatus(&sb, data.VSchemaChanges)
+	writeVSchemaStatus(&sb, data.VSchemaChanges, budget)
 
 	// Error message for apply states that need operator attention. A failed
 	// apply gets the failure glyph — the system stopped and triage is due; a
@@ -899,9 +899,10 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 // writeVSchemaStatus renders the VSchema application status and, when
 // available, the diff. It is shown as its own section because VSchema
 // application is not a per-table task. Renders nothing when the apply carries
-// no VSchema change.
-func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
-	writeVSchemaStatusWithin(sb, changes, newVSchemaCommentBudget(vschemaDiffCount(changes)))
+// no VSchema change. The section draws from the comment's VSchema budget, which
+// every apply section in one comment shares.
+func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange, budget *ddlBlockBudget) {
+	writeVSchemaStatusWithin(sb, changes, budget.vschemaSection(vschemaDiffCount(changes)))
 }
 
 // writeVSchemaStatusWithin is writeVSchemaStatus drawing from a budget the
@@ -1789,7 +1790,7 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 	if len(data.Tables) > 0 {
 		writeSummaryTableListWithOptions(sb, data, false, budget)
 	}
-	writeVSchemaStatus(sb, data.VSchemaChanges)
+	writeVSchemaStatus(sb, data.VSchemaChanges, budget)
 	sb.WriteString("</details>\n")
 }
 

@@ -32,9 +32,11 @@ const (
 // and a change recorded without it still shows its diff.
 const VSchemaSummaryMetadataKey = "vschema_summary"
 
-// VSchemaSummaryLines splits a VSchema summary recorded under
-// VSchemaSummaryMetadataKey into its lines. Returns nil for an empty summary.
-func VSchemaSummaryLines(summary string) []string {
+// SplitVSchemaSummary splits a VSchema summary recorded under
+// VSchemaSummaryMetadataKey into its lines, every one of them. Returns nil for
+// an empty summary. A surface lists them through
+// presentation.VSchemaSummaryLines, which caps the list.
+func SplitVSchemaSummary(summary string) []string {
 	var lines []string
 	for line := range strings.SplitSeq(summary, "\n") {
 		if line = strings.TrimSpace(line); line != "" {

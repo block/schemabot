@@ -348,7 +348,7 @@ func resolveShardedPlanView(ctx context.Context, stor storage.Storage, apply *st
 		if d := nsData.Metadata[storage.PlanMetadataVSchemaDiff]; d != "" {
 			view.vschemaDiffs[namespace] = d
 		}
-		if lines := apitypes.VSchemaSummaryLines(nsData.Metadata[storage.PlanMetadataVSchemaSummary]); len(lines) > 0 {
+		if lines := apitypes.SplitVSchemaSummary(nsData.Metadata[storage.PlanMetadataVSchemaSummary]); len(lines) > 0 {
 			view.vschemaSummaries[namespace] = lines
 		}
 		if nsData.FinalizesWithoutVSchemaChange() {

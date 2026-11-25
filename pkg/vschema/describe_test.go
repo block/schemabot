@@ -120,6 +120,45 @@ func TestDescribeNamesEachChangedElement(t *testing.T) {
 			want: []string{"changes vindex `hash`: type `hash` becomes `xxhash`"},
 		},
 		{
+			name: "a lookup vindex's type and backing table changed together",
+			current: `{
+  "sharded": true,
+  "vindexes": {
+    "hash": {"type": "hash"},
+    "orders_lookup": {"type": "lookup_hash", "owner": "orders", "params": {"table": "orders_idx", "from": "email", "to": "keyspace_id"}}
+  },
+  "tables": {
+    "orders": {"column_vindexes": [{"column": "id", "name": "hash"}, {"columns": ["email"], "name": "orders_lookup"}]}
+  }
+}`,
+			desired: `{
+  "sharded": true,
+  "vindexes": {
+    "hash": {"type": "hash"},
+    "orders_lookup": {"type": "consistent_lookup", "owner": "orders", "params": {"table": "orders_idx_v2", "from": "email", "to": "keyspace_id"}}
+  },
+  "tables": {
+    "orders": {"column_vindexes": [{"column": "id", "name": "hash"}, {"columns": ["email"], "name": "orders_lookup"}]}
+  }
+}`,
+			want: []string{"changes vindex `orders_lookup`: type `lookup_hash` becomes `consistent_lookup`, and also changes `params`"},
+		},
+		{
+			name:    "a table's primary vindex and column list changed together",
+			current: describeBase,
+			desired: `{
+  "sharded": true,
+  "vindexes": {"hash": {"type": "hash"}, "xxhash": {"type": "xxhash"}},
+  "tables": {
+    "orders": {"column_vindexes": [{"column": "id", "name": "xxhash"}], "columns": [{"name": "region", "type": "VARCHAR"}]}
+  }
+}`,
+			want: []string{
+				"changes table `orders`: vindex `hash` on `id` becomes vindex `xxhash` on `id`, and also changes `columns`",
+				"adds vindex `xxhash`: type `xxhash`",
+			},
+		},
+		{
 			name:    "a sequence table and a plain table added to an unsharded keyspace",
 			current: `{}`,
 			desired: `{"tables": {"orders_seq": {"type": "sequence"}, "settings": {}}}`,
