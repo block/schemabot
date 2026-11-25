@@ -33,6 +33,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/engine/mysqlsize"
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/pendingdrops"
@@ -1703,13 +1704,28 @@ func (e *Engine) plannedTableNames(database string, changes []spiritlint.Planned
 	return names
 }
 
-// sizeProbeStatement returns stmt as the size probe sends it: unchanged
-// outside tests, rewritten by the sizeProbeSQL seam inside them.
-func (e *Engine) sizeProbeStatement(ctx context.Context, stmt string) string {
+// sizeProbeConn returns conn as the size probe uses it: unchanged outside
+// tests, and wrapped so the sizeProbeSQL seam rewrites each statement inside
+// them.
+func (e *Engine) sizeProbeConn(conn *sql.Conn) mysqlsize.Conn {
 	if e.sizeProbeSQL == nil {
-		return stmt
+		return conn
 	}
-	return e.sizeProbeSQL(ctx, stmt)
+	return rewritingConn{conn: conn, rewrite: e.sizeProbeSQL}
+}
+
+// rewritingConn sends each statement through rewrite before it reaches conn.
+type rewritingConn struct {
+	conn    *sql.Conn
+	rewrite func(ctx context.Context, stmt string) string
+}
+
+func (c rewritingConn) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return c.conn.ExecContext(ctx, c.rewrite(ctx, query), args...)
+}
+
+func (c rewritingConn) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return c.conn.QueryContext(ctx, c.rewrite(ctx, query), args...)
 }
 
 // fetchTableSizeEstimates reads the approximate row count and on-disk
@@ -1743,79 +1759,19 @@ func (e *Engine) fetchTableSizeEstimates(ctx context.Context, target *lazyTarget
 		return nil, fmt.Errorf("acquire connection for size estimates: %w", err)
 	}
 	defer utils.CloseAndLog(conn)
-	if _, err := conn.ExecContext(ctx, e.sizeProbeStatement(ctx, "SET SESSION information_schema_stats_expiry = 0")); err != nil {
-		return nil, fmt.Errorf("disable cached statistics for size estimates: %w", err)
+	probe := make([]mysqlsize.Table, len(tables))
+	for i, name := range tables {
+		probe[i] = mysqlsize.Table{Schema: database, Name: name}
 	}
-
-	args := make([]any, 0, len(tables)+1)
-	args = append(args, database)
-	for _, name := range tables {
-		args = append(args, name)
-	}
-	query := `
-		SELECT table_name, table_rows, data_length + index_length
-		FROM information_schema.tables
-		WHERE table_schema = ? AND table_type = 'BASE TABLE'
-		  AND table_name IN (?` + strings.Repeat(", ?", len(tables)-1) + `)`
-	requested := requestedTableNames(tables)
-
-	rows, err := conn.QueryContext(ctx, e.sizeProbeStatement(ctx, query), args...)
+	read, err := mysqlsize.Read(ctx, e.sizeProbeConn(conn), e.logger, probe)
 	if err != nil {
-		return nil, fmt.Errorf("query size estimates for tables %v: %w", tables, err)
+		return nil, fmt.Errorf("read size estimates for database %s: %w", database, err)
 	}
-	defer utils.CloseAndLog(rows)
-
-	estimates := make(map[string]tableSizeEstimate)
-	for rows.Next() {
-		var name string
-		var tableRows, tableBytes sql.NullInt64
-		if err := rows.Scan(&name, &tableRows, &tableBytes); err != nil {
-			return nil, fmt.Errorf("scan table size estimate: %w", err)
-		}
-		// information_schema can match a name case-insensitively and return it
-		// in the server's case; the estimate is keyed by the name the plan
-		// asked for, which is the name its changes carry.
-		asked, ok := requested[strings.ToLower(name)]
-		if !ok {
-			e.logger.Warn("size probe returned a table the plan did not ask for; ignoring it",
-				"database", database, "table", name)
-			continue
-		}
-		name = asked
-		est := tableSizeEstimate{
-			rows:  e.validSizeStatistic(database, name, "table_rows", tableRows),
-			bytes: e.validSizeStatistic(database, name, "data_length + index_length", tableBytes),
-		}
-		if est.rows == nil && est.bytes == nil {
-			// validSizeStatistic logged why each one is missing.
-			continue
-		}
-		estimates[name] = est
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate table size estimates: %w", err)
+	estimates := make(map[string]tableSizeEstimate, len(read))
+	for t, est := range read {
+		estimates[t.Name] = tableSizeEstimate{rows: est.Rows, bytes: est.Bytes}
 	}
 	return estimates, nil
-}
-
-// validSizeStatistic returns a base table's statistic as a display estimate,
-// or nil with a warning when statistics could not report it. A NULL value is a
-// base table whose statistics are unreadable (for example a discarded
-// tablespace), and a negative one is a sentinel for "no real estimate", not a
-// count, as it is for the direct execution size gate.
-func (e *Engine) validSizeStatistic(database, table, statistic string, v sql.NullInt64) *int64 {
-	if !v.Valid {
-		e.logger.Warn("table statistics report no value; the plan will omit it from the table's size",
-			"database", database, "table", table, "statistic", statistic)
-		return nil
-	}
-	if v.Int64 < 0 {
-		e.logger.Warn("table statistics report a negative value; the plan will omit it from the table's size",
-			"database", database, "table", table, "statistic", statistic, "value", v.Int64)
-		return nil
-	}
-	n := v.Int64
-	return &n
 }
 
 // logMissingSizeEstimates reports the existing tables a successful probe
@@ -1845,15 +1801,4 @@ func partitionByExistence(tables []string, currentByTable map[string]string) (ex
 		}
 	}
 	return existing, created
-}
-
-// requestedTableNames indexes the probed table names by their lower-cased
-// form, so a row information_schema returns in a different case maps back to
-// the name the plan asked for.
-func requestedTableNames(tables []string) map[string]string {
-	requested := make(map[string]string, len(tables))
-	for _, name := range tables {
-		requested[strings.ToLower(name)] = name
-	}
-	return requested
 }
