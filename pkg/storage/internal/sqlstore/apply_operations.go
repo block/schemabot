@@ -191,6 +191,41 @@ func (s *applyOperationStore) ListByApply(ctx context.Context, applyID int64) ([
 	return scanApplyOperations(rows)
 }
 
+// FailedSiblingHaltingOperation returns the earliest failed work sibling of
+// the same rollout member that halts the work row operationID, or nil. It is
+// the running-work counterpart of sameMemberFailureGateSQL, which keeps the
+// member's unstarted work from being claimed behind the same failure. The
+// apply_operations alias is the failed sibling and halted is the row asked
+// about, so rolloutMembersOrderedHereSQL reads the apply both share.
+func (s *applyOperationStore) FailedSiblingHaltingOperation(ctx context.Context, applyID, operationID int64) (*storage.ApplyOperation, error) {
+	op, err := scanApplyOperation(s.db.QueryRowContext(ctx, `
+		SELECT `+applyOperationColumns+`
+		FROM apply_operations
+		WHERE apply_operations.apply_id = ?
+			AND apply_operations.operation_kind = ?
+			AND apply_operations.state = ?
+			AND EXISTS (
+				SELECT 1
+				FROM apply_operations AS halted
+				WHERE halted.id = ?
+					AND halted.apply_id = apply_operations.apply_id
+					AND halted.deployment = apply_operations.deployment
+					AND halted.target = apply_operations.target
+					AND halted.id <> apply_operations.id
+					AND halted.operation_kind = ?
+					AND halted.on_failure NOT IN (?, ?)
+			)
+			AND `+rolloutMembersOrderedHereSQL+`
+		ORDER BY apply_operations.created_at, apply_operations.id
+		LIMIT 1
+	`, applyID, storage.ApplyOperationKindWork, state.ApplyOperation.Failed,
+		operationID, storage.ApplyOperationKindWork, storage.OnFailureContinue, storage.OnFailurePause))
+	if err != nil {
+		return nil, fmt.Errorf("find failed sibling halting apply_operation %d of apply %d: %w", operationID, applyID, err)
+	}
+	return op, nil
+}
+
 // ListByApplies returns all child rows for the requested applies in
 // (apply_id, created_at, id) order.
 func (s *applyOperationStore) ListByApplies(ctx context.Context, applyIDs []int64) ([]*storage.ApplyOperation, error) {

@@ -380,6 +380,10 @@ them. An operation has ended when it failed under the `halt` on_failure
 policy, or when it is waiting on a retry that will never come because the
 apply spent its retry budget or recovery window.
 
+Under `halt`, the other shards of the failed operation's own target do not
+wait for the steps below. Each one's drive cancels its work at its next
+checkpoint, as it would for an operator's `cancel`.
+
 SchemaBot does not leave the other operations waiting at the cutover, holding
 their targets, until the wait times out. The reaper ends the apply in two
 steps:
