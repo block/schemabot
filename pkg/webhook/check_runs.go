@@ -78,8 +78,9 @@ var applyCancelledBlock = checkBlockReason{
 // applyCancelledAfterTaskCompletedBlock is used when a forward task for the
 // target completed before a forward apply was cancelled — under the cancelled
 // apply itself, or under an earlier one. Either way the completed task is
-// durable evidence that the target may have changed, so planning alone cannot
-// release the apply-owned merge gate.
+// durable evidence that the target may have changed, so SchemaBot never
+// re-plans it on its own: a person reconciles the pull request and the target,
+// and the plan they then run releases the gate (MG-10).
 var applyCancelledAfterTaskCompletedBlock = checkBlockReason{
 	blockingReason: checkstate.BlockApplyCancelledAfterTaskCompleted,
 	message:        "Part of this PR's schema change completed in this environment before the apply was cancelled; reconcile the PR and live schema before this check can pass.",

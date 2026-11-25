@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -1233,7 +1234,7 @@ func TestE2EReconcileStaleInProgressCheckFailure(t *testing.T) {
 		assert.Equal(t, checkConclusionFailure, checkRun.Conclusion)
 		require.NotNil(t, checkRun.Output)
 		assert.Equal(t, "Apply failed", checkRun.Output.Title)
-		assert.Contains(t, checkRun.Output.Summary, "**To clear this:** comment `schemabot plan -e staging -d "+dbName+"` on the pull request.")
+		assert.Contains(t, checkRun.Output.Summary, "**To clear this:** "+checkstate.ReconciliationRemedy(checkstate.PlanCommand("staging", dbName, "")))
 	case <-time.After(webhookIntegrationPollDeadline):
 		require.FailNow(t, "timed out waiting for blocking aggregate check run")
 	}

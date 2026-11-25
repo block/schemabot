@@ -46,7 +46,7 @@ GitHub and `gh pr checks` show an `action_required` check as a red ✗ or "fail"
 
 - **An apply or a confirmation.** The next environment needs its apply, or a plan that changed needs `apply-confirm`.
 - **A fresh plan after a rollback.** A completed rollback never turns the check green, because the database no longer matches the PR. The check passes only once a plan finds nothing to change, so bring the PR's files back to what the database now holds, or change them to what you want next. Never reapply a change that was rolled back on purpose.
-- **An operator reconciling an environment.** A commit removed a change after its apply started. The check stays blocked until the apply settles and an operator reconciles that environment; no command from the PR clears it.
+- **A person reconciling an environment.** An apply failed or was cancelled after it changed something, or a commit removed a change after its apply started. SchemaBot never clears this on its own. Once the apply settles, a person makes the PR and the target agree, by applying the change again or changing the PR to match the target, and then comments the plan the check names. That plan clears the block once the two match. Don't post that plan yourself: hand it to whoever is reconciling the target.
 
 Don't report "the SchemaBot check failed" from the mark alone. Report what it is waiting for.
 

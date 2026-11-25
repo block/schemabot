@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/checkstate"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -440,6 +442,27 @@ func TestAggregateSummary_TenantSectionSurvivesDatabaseTruncation(t *testing.T) 
 	assert.Contains(t, summary, "`tenant-b`", "the participant still appears despite database truncation")
 }
 
+// A failed rollout across thousands of databases still fits the Check Run:
+// the remedy is bounded and the table makes room for it, so GitHub accepts the
+// publish and the failure is shown rather than the older blocking run.
+func TestAggregateSummary_FailedApplyRemedySurvivesDatabaseTruncation(t *testing.T) {
+	var checks []*storage.Check
+	for i := range 6000 {
+		checks = append(checks, &storage.Check{
+			DatabaseType: "mysql", DatabaseName: fmt.Sprintf("orders_%04d", i), Environment: "production",
+			ApplyID: int64(i + 1), Status: checkStatusCompleted, Conclusion: checkConclusionFailure,
+		})
+	}
+
+	_, summary := aggregateSummary(checks, checkConclusionFailure, nil, nil, "payments")
+
+	assert.Less(t, len(summary), maxCheckRunTextLength, "summary stays under the Check Run limit")
+	assert.Contains(t, summary, "more check(s)", "the Database section truncates")
+	assert.Contains(t, summary, "**To clear this:** Once the apply has settled", "the remedy is not dropped")
+	assert.Contains(t, summary, "`schemabot plan -e production -d orders_0000 --tenant payments`")
+	assert.Regexp(t, `Plan the other \d+ failed databases in the table the same way\.\n$`, summary)
+}
+
 func TestAggregateSummary_AllSuccess(t *testing.T) {
 	checks := []*storage.Check{
 		{DatabaseName: "orders", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true},
@@ -601,8 +624,10 @@ func TestAggregateSummary_FailedApplyNamesThePlanThatClearsIt(t *testing.T) {
 	}
 	title, summary := aggregateSummary(checks, checkConclusionFailure, nil, nil, "")
 	assert.Equal(t, "Apply failed", title)
-	assert.True(t, strings.HasSuffix(summary, "\n**To clear this:** comment `schemabot plan -e production -d orders` and `schemabot plan -e staging -d orders` and `schemabot plan -e staging -d users` on the pull request. "+
-		"If the target matches the pull request, the plan clears the failure. If not, the plan shows what is left to apply.\n"), summary)
+	assert.True(t, strings.HasSuffix(summary, "\n**To clear this:** Once the apply has settled, make the pull request and the target agree: "+
+		"apply the change again, or change the pull request to match the target. "+
+		"Then comment `schemabot plan -e production -d orders` and `schemabot plan -e staging -d orders` and `schemabot plan -e staging -d users` on the pull request. "+
+		"The plan clears this block once the two match, and otherwise lists what still differs.\n"), summary)
 
 	t.Run("each database's plan is named once", func(t *testing.T) {
 		repeated := []*storage.Check{
@@ -610,23 +635,29 @@ func TestAggregateSummary_FailedApplyNamesThePlanThatClearsIt(t *testing.T) {
 			{Environment: "staging", DatabaseType: "vitess", DatabaseName: "orders", ApplyID: 8, Status: checkStatusCompleted, Conclusion: checkConclusionFailure},
 		}
 		_, summary := aggregateSummary(repeated, checkConclusionFailure, nil, nil, "")
-		assert.Contains(t, summary, "**To clear this:** comment `schemabot plan -e staging -d orders` on the pull request.")
+		assert.Contains(t, summary, "Then comment `schemabot plan -e staging -d orders` on the pull request.")
 	})
 
 	t.Run("a tenanted deployment's plan carries its tenant", func(t *testing.T) {
 		_, summary := aggregateSummary(checks[:1], checkConclusionFailure, nil, nil, "payments")
-		assert.Contains(t, summary, "**To clear this:** comment `schemabot plan -e staging -d orders --tenant payments` on the pull request.")
+		assert.Contains(t, summary, "Then comment `schemabot plan -e staging -d orders --tenant payments` on the pull request.")
 	})
 
-	t.Run("a database the pull request no longer changes names the change or a rollback", func(t *testing.T) {
+	t.Run("the Check Run and checks show name the same plan", func(t *testing.T) {
+		row := checks[0]
+		_, summary := aggregateSummary([]*storage.Check{row}, checkConclusionFailure, nil, nil, "payments")
+		shown := checkstate.Diagnose(row, "", nil, "", "payments")
+		assert.Contains(t, summary, "**To clear this:** "+shown.Remedy+"\n")
+	})
+
+	t.Run("a database the pull request no longer changes owes the same reconciliation", func(t *testing.T) {
 		removed := []*storage.Check{
 			{Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders", ApplyID: 7, Status: checkStatusCompleted, Conclusion: checkConclusionFailure,
 				BlockingReason: storage.SchemaRemovedAfterApplyStartedBlockingReason},
 		}
 		_, summary := aggregateSummary(removed, checkConclusionFailure, nil, nil, "")
-		assert.NotContains(t, summary, "**To clear this:** comment")
-		assert.Contains(t, summary, "\n**To clear `orders` in staging:** the pull request no longer changes it, so a plan of it is refused. "+
-			"Add the schema change back and comment `schemabot plan -e staging -d orders`, or comment `schemabot rollback <apply-id> -e staging` to undo the apply.\n")
+		assert.Contains(t, summary, "**To clear this:** "+checkstate.ReconciliationRemedy("schemabot plan -e staging -d orders")+"\n")
+		assert.NotContains(t, summary, "rollback")
 	})
 
 	t.Run("a failed plan names no remedy", func(t *testing.T) {

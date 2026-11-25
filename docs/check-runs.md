@@ -799,14 +799,12 @@ namespace counts once per shard, and a deployment whose plan could not be
 computed or compared shows no count rather than one read from an unusable plan.
 
 It reads state and never writes: recreating a missing Check Run is
-`checks backfill` below. A `reconciliation_owed` row clears when a person
-plans its database once the apply has settled, and the row's `do:` line names
-that plan. The plan diffs the pull request against the target as it is now,
-so it clears the block only when the target already matches, and otherwise
-shows what is left to apply. A row blocked by
-`schema_removed_after_apply_started` is the exception: the pull request no
-longer changes that database, so a plan of it is refused (MG-6). Add the
-schema change back and plan it, or roll the apply back.
+`checks backfill` below. SchemaBot never clears a `reconciliation_owed` row
+on its own (MG-10). Once the apply has settled, a person makes the pull
+request and the target agree, by applying the change again or changing the
+pull request to match the target. Then they comment the plan the row's `do:`
+line names. That plan clears the block once the two match, and otherwise
+lists what still differs.
 
 ### Backfilling missing Check Runs
 

@@ -243,7 +243,7 @@ func inspectChecks(ctx context.Context, cfg *ServerConfig, store storage.Storage
 // as it would in a configured one.
 func inspectedCheck(ctx context.Context, cfg *ServerConfig, store storage.Storage, check *storage.Check, headSHA string, logger *slog.Logger) InspectedCheck {
 	apply := applyHoldingCheck(ctx, store, check, logger)
-	disposition := checkstate.Diagnose(check, headSHA, apply, planEnvironmentForUnconfiguredCheck(cfg, check, logger))
+	disposition := checkstate.Diagnose(check, headSHA, apply, planEnvironmentForUnconfiguredCheck(cfg, check, logger), tenantOf(cfg))
 	row := InspectedCheck{
 		Environment:    check.Environment,
 		DatabaseType:   check.DatabaseType,
@@ -439,4 +439,13 @@ func planEnvironmentForUnconfiguredCheck(cfg *ServerConfig, check *storage.Check
 		"repo", check.Repository, "pr", check.PullRequest, "database", check.DatabaseName,
 		"database_type", check.DatabaseType, "environment", check.Environment, "check_id", check.ID)
 	return ""
+}
+
+// tenantOf is the tenant the server serves, which the commands a remedy names
+// carry, or "" when there is no config to read it from.
+func tenantOf(cfg *ServerConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	return cfg.Tenant
 }

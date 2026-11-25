@@ -12,7 +12,6 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // aggregateCheckNameForEnv returns the environment-scoped aggregate check name.
@@ -293,61 +292,50 @@ func settledApplyFailure(c *storage.Check) bool {
 	return c.ApplyID != 0 && c.Status == checkStatusCompleted && c.Conclusion == checkConclusionFailure
 }
 
+// failedApplyRemedyBudget bounds the failed-apply remedy, so a pull request
+// with many failed databases still leaves the table its room under the Check
+// Run text limit.
+const failedApplyRemedyBudget = maxCheckRunTextLength / 8
+
 // failedApplyRemedy names what clears a failed apply's block, or returns ""
-// when no contribution is a failed apply. A plan replaces the failed result:
-// it diffs the pull request against the target as it is now, so it passes
-// only when the target already matches and otherwise lists what is left to
-// apply. The apply's failure therefore never clears without a fresh look at
-// the target. Each failed database gets its own plan, carrying the
-// deployment's tenant so the pasted command reaches this deployment.
-//
-// A database the pull request no longer changes cannot be planned while the
-// apply owns its row (MG-6), so its line says to add the change back first or
-// roll the apply back instead.
+// when no contribution is a failed apply. Each failed database gets its own
+// plan, carrying the deployment's tenant so the pasted command reaches this
+// deployment, and `checks show` names the same command for the same row
+// (checkstate.PlanCommand). The commands stop at failedApplyRemedyBudget; the
+// rest are counted, and the table above still lists every failed database.
 func failedApplyRemedy(checks []*storage.Check, tenant string) string {
 	type target struct{ environment, database string }
-	var plannable, removed []target
+	var failed []target
 	for _, c := range checks {
 		if !settledApplyFailure(c) {
 			continue
 		}
 		t := target{c.Environment, c.DatabaseName}
-		if c.BlockingReason == storage.SchemaRemovedAfterApplyStartedBlockingReason {
-			if !slices.Contains(removed, t) {
-				removed = append(removed, t)
-			}
-			continue
-		}
-		if !slices.Contains(plannable, t) {
-			plannable = append(plannable, t)
+		if !slices.Contains(failed, t) {
+			failed = append(failed, t)
 		}
 	}
-	if len(plannable) == 0 && len(removed) == 0 {
+	if len(failed) == 0 {
 		return ""
 	}
-	byName := func(a, b target) int {
+	slices.SortFunc(failed, func(a, b target) int {
 		return cmp.Or(cmp.Compare(a.environment, b.environment), cmp.Compare(a.database, b.database))
-	}
-	slices.SortFunc(plannable, byName)
-	slices.SortFunc(removed, byName)
-	plan := func(t target) string {
-		return "`" + templates.AppendTenantFlag("schemabot plan -e "+t.environment+" -d "+t.database, tenant) + "`"
-	}
-	var b strings.Builder
-	if len(plannable) > 0 {
-		commands := make([]string, len(plannable))
-		for i, t := range plannable {
-			commands[i] = plan(t)
+	})
+	var commands []string
+	size := 0
+	for _, t := range failed {
+		command := checkstate.PlanCommand(t.environment, t.database, tenant)
+		if len(commands) > 0 && size+len(command) > failedApplyRemedyBudget {
+			break
 		}
-		b.WriteString("\n**To clear this:** comment " + strings.Join(commands, " and ") +
-			" on the pull request. If the target matches the pull request, the plan clears the failure. If not, the plan shows what is left to apply.\n")
+		commands = append(commands, command)
+		size += len(command)
 	}
-	for _, t := range removed {
-		rollback := "`" + templates.AppendTenantFlag("schemabot rollback <apply-id> -e "+t.environment, tenant) + "`"
-		b.WriteString("\n**To clear `" + t.database + "` in " + t.environment + ":** the pull request no longer changes it, so a plan of it is refused. " +
-			"Add the schema change back and comment " + plan(t) + ", or comment " + rollback + " to undo the apply.\n")
+	remedy := "\n**To clear this:** " + checkstate.ReconciliationRemedy(commands...)
+	if omitted := len(failed) - len(commands); omitted > 0 {
+		remedy += fmt.Sprintf(" Plan the other %d failed databases in the table the same way.", omitted)
 	}
-	return b.String()
+	return remedy + "\n"
 }
 
 // anyInProgressOnCommit reports whether any check recorded for headSHA is
@@ -422,7 +410,8 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		summary = buildAggregateTable(checks, stopped, progress)
 	case checkConclusionFailure:
 		title = "Apply failed"
-		summary = buildAggregateTable(checks, stopped, progress) + failedApplyRemedy(checks, tenant)
+		remedy := failedApplyRemedy(checks, tenant)
+		summary = buildAggregateTableWithin(checks, stopped, progress, len(remedy)) + remedy
 	case checkConclusionActionRequired:
 		pending := 0
 		unresolved := 0
@@ -612,6 +601,12 @@ func isParticipantCheck(c *storage.Check) bool {
 // is never dropped, even when many per-database rows would otherwise fill the
 // Check Run text limit — those rows truncate instead.
 func buildAggregateTable(checks []*storage.Check, stopped stoppedApplyIDs, progress rolloutProgress) string {
+	return buildAggregateTableWithin(checks, stopped, progress, 0)
+}
+
+// buildAggregateTableWithin is buildAggregateTable leaving reserved bytes of
+// the Check Run text limit free for text the summary adds after the table.
+func buildAggregateTableWithin(checks []*storage.Check, stopped stoppedApplyIDs, progress rolloutProgress, reserved int) string {
 	var dbChecks, participantChecks []*storage.Check
 	for _, c := range checks {
 		if isParticipantCheck(c) {
@@ -625,7 +620,7 @@ func buildAggregateTable(checks []*storage.Check, stopped stoppedApplyIDs, progr
 	// The progress lines get a quarter of the text limit, so the Database
 	// table always keeps room for its own rows.
 	progressSection := renderRolloutProgress(dbChecks, progress, stopped, maxCheckRunTextLength/4)
-	dbSection := renderDatabaseSection(dbChecks, maxCheckRunTextLength-1000-len(tenantSection)-len(progressSection), stopped, progress)
+	dbSection := renderDatabaseSection(dbChecks, maxCheckRunTextLength-1000-reserved-len(tenantSection)-len(progressSection), stopped, progress)
 
 	var sb strings.Builder
 	sb.WriteString(dbSection)
