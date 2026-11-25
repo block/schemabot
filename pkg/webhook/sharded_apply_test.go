@@ -268,6 +268,39 @@ func TestShardedCommentsNameAFailedFinalize(t *testing.T) {
 	assert.Contains(t, templates.RenderShardedApplySummaryComment(data), finalizeErr)
 }
 
+// A sharded apply spans two keyspaces. commerce's shards finish and its
+// finalize fails, while payments still copies, so the apply keeps running.
+// The finalize is not listed on its own, so the status comment's failure
+// callout names the keyspace and its error before the apply settles; a
+// finalize that SchemaBot is still retrying reads as an attention, not a
+// failure.
+func TestShardedStatusCommentNamesAFailedFinalizeWhileOtherKeyspacesRun(t *testing.T) {
+	const finalizeErr = "apply VSchema for commerce: keyspace not found"
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.RunningDegraded}
+	mk := func(id int64, key, opState, errMsg string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	for _, tc := range []struct {
+		name, finalizerState, glyph string
+	}{
+		{"failed", state.ApplyOperation.Failed, "❌"},
+		{"retrying", state.ApplyOperation.FailedRetryable, "⚠️"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := []*storage.ApplyOperation{
+				mk(1, "commerce/-80/refunds", state.ApplyOperation.Completed, ""),
+				mk(2, "commerce/80-/refunds", state.ApplyOperation.Completed, ""),
+				mk(3, "commerce/group_finalizer", tc.finalizerState, finalizeErr),
+				mk(4, "payments/-/ledger", state.ApplyOperation.Running, ""),
+			}
+			data := buildShardedApplyData(apply, ops, false, nil, finalizesOnly("commerce"), "")
+
+			assert.Contains(t, templates.RenderShardedApplyComment(data),
+				"\n> "+tc.glyph+" **Failure:** finalizing keyspace <code>commerce</code> — "+finalizeErr+"\n")
+		})
+	}
+}
+
 // stubPlanStorage serves one stored plan (or a load error) for resolver tests.
 // Every store other than Plans() panics if touched, so a test that must not
 // read storage can pass a zero-valued stub and rely on the panic.

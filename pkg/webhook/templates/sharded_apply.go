@@ -45,6 +45,11 @@ type ShardedApplyData struct {
 	// failed shard row to carry the cause.
 	ErrorMessage string
 
+	// FailedFinalizer is the first keyspace finalizer in a failure state, nil
+	// when none is. A finalizer can fail while other keyspaces' shards keep
+	// running, so the failure callout names it before the apply settles.
+	FailedFinalizer *FinalizerFailure
+
 	// Keyspaces is the per-keyspace shard rollup in resolved order: each entry
 	// renders its own keyspace section, and together they drive the
 	// cross-keyspace count histogram and the first-failure callout.
@@ -852,10 +857,36 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 		return
 	}
 	if !state.IsState(data.State, state.Apply.Failed, state.Apply.FailedRetryable) {
+		writeFinalizerFailure(sb, data.FailedFinalizer)
 		return
 	}
 	if msg := SanitizeInlineError(data.ErrorMessage); msg != "" {
 		fmt.Fprintf(sb, "\n> %s **Failure:** %s\n", failureSeverity(state.IsState(data.State, state.Apply.FailedRetryable)), html.EscapeString(msg))
+	}
+}
+
+// FinalizerFailure is a keyspace finalizer in a failure state: the keyspace,
+// the operation state, and its operation-scoped error.
+type FinalizerFailure struct {
+	Keyspace string
+	State    string
+	Error    string
+}
+
+// writeFinalizerFailure names a failed finalizer while the apply is still
+// active. The comment lists no step for a finalize, and the apply keeps
+// running while other keyspaces' shards copy, so without this callout the
+// failure would stay out of sight until the apply settles.
+func writeFinalizerFailure(sb *strings.Builder, f *FinalizerFailure) {
+	if f == nil {
+		return
+	}
+	severity := failureSeverity(state.IsState(f.State, state.ApplyOperation.FailedRetryable))
+	keyspace := html.EscapeString(f.Keyspace)
+	if msg := SanitizeInlineError(f.Error); msg == "" {
+		fmt.Fprintf(sb, "\n> %s **Failure:** finalizing keyspace <code>%s</code>\n", severity, keyspace)
+	} else {
+		fmt.Fprintf(sb, "\n> %s **Failure:** finalizing keyspace <code>%s</code> — %s\n", severity, keyspace, html.EscapeString(msg))
 	}
 }
 

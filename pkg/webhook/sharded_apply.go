@@ -80,6 +80,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 	groupIndex := make(map[keyspaceShard]int)
 	var vschemaChanges []apitypes.VSchemaChange
 	finalizerError := ""
+	var failedFinalizer *templates.FinalizerFailure
 	for _, op := range ops {
 		ns, shard, table, ok := state.ShardWorkKey(op.OperationKey)
 		if !ok {
@@ -99,6 +100,9 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 			}
 			if finalizerError == "" && isOperationFailureState(op.State) && op.ErrorMessage != "" {
 				finalizerError = op.ErrorMessage
+			}
+			if failedFinalizer == nil && isOperationFailureState(op.State) {
+				failedFinalizer = &templates.FinalizerFailure{Keyspace: finalizerNS, State: op.State, Error: op.ErrorMessage}
 			}
 			continue
 		}
@@ -148,16 +152,17 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 	}
 
 	data := templates.ShardedApplyData{
-		State:          apply.State,
-		Environment:    apply.Environment,
-		Database:       apply.Database,
-		ApplyID:        apply.ApplyIdentifier,
-		RequestedBy:    actorFromCaller(apply.Caller),
-		ErrorMessage:   errorMessage,
-		Keyspaces:      keyspaces,
-		VSchemaChanges: vschemaChanges,
-		Tenant:         tenant,
-		Rollback:       apply.IsRollback(),
+		State:           apply.State,
+		Environment:     apply.Environment,
+		Database:        apply.Database,
+		ApplyID:         apply.ApplyIdentifier,
+		RequestedBy:     actorFromCaller(apply.Caller),
+		ErrorMessage:    errorMessage,
+		FailedFinalizer: failedFinalizer,
+		Keyspaces:       keyspaces,
+		VSchemaChanges:  vschemaChanges,
+		Tenant:          tenant,
+		Rollback:        apply.IsRollback(),
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)
