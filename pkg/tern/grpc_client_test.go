@@ -1119,6 +1119,20 @@ type mockApplyOperationStore struct {
 	// operation id, standing in for a pod that dies before that id reaches
 	// storage.
 	operationIDWriteErr error
+	// getByKeyErr fails GetByApplyDeploymentAndOperationKey.
+	getByKeyErr error
+}
+
+func (m *mockApplyOperationStore) GetByApplyDeploymentAndOperationKey(_ context.Context, applyID int64, deployment, operationKey string) (*storage.ApplyOperation, error) {
+	if m.getByKeyErr != nil {
+		return nil, m.getByKeyErr
+	}
+	for _, op := range m.ops {
+		if op.ApplyID == applyID && op.Deployment == deployment && op.OperationKey == operationKey {
+			return op, nil
+		}
+	}
+	return nil, nil
 }
 
 func (m *mockApplyOperationStore) Get(_ context.Context, id int64) (*storage.ApplyOperation, error) {

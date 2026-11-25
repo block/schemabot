@@ -3374,7 +3374,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		}
 		return c.replayConcurrentAttachWinner(ctx, req, apply, winner, operationKey, "operation insert"), nil
 	case errors.Is(err, storage.ErrApplyNotActive):
-		return c.refuseAttachToTerminalApply(ctx, req, apply, storedStateOfInactiveApply(err), operationKey), nil
+		return c.resolveAttachToClosedApply(ctx, req, apply, operationKey, err)
 	case errors.Is(err, storage.ErrApplyOperationKeyingMismatch):
 		return c.refuseAttachKeyingMismatch(req, apply, plan, scope, operationKey, err), nil
 	case errors.Is(err, storage.ErrApplyTakenOver):
@@ -3399,6 +3399,26 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	c.wakeOperatorForQueuedApply(apply)
 
 	return dispatchApplyResponse(apply, operation.ID, operationKey), nil
+}
+
+// resolveAttachToClosedApply answers a dispatch whose attach the store
+// refused because the apply had already closed. A concurrent attach of the
+// same operation can land, and the apply close behind it, between this
+// dispatch's operation lookup and its insert. The refusal tells the control
+// plane the work never started, so it is sent only once a re-read shows no
+// winner. A winner's row is this dispatch's replay target, as for a lost
+// insert, so the control plane adopts the outcome of work that did run. A
+// re-read that fails returns an error, which keeps the dispatch recoverable
+// rather than settling it on a guess.
+func (c *LocalClient) resolveAttachToClosedApply(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string, attachErr error) (*ternv1.ApplyResponse, error) {
+	winner, err := c.findApplyOperationByKey(ctx, apply, operationKey)
+	if err != nil {
+		return nil, fmt.Errorf("check for a concurrent attach of operation %s before refusing it on closed apply %s: %w", operationKey, apply.ApplyIdentifier, err)
+	}
+	if winner != nil {
+		return c.replayConcurrentAttachWinner(ctx, req, apply, winner, operationKey, "closed apply"), nil
+	}
+	return c.refuseAttachToTerminalApply(ctx, req, apply, storedStateOfInactiveApply(attachErr), operationKey), nil
 }
 
 // replayConcurrentAttachWinner resolves a dispatch that lost a race to a

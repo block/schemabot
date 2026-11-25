@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
@@ -42,4 +43,52 @@ func TestRefuseAttachToTerminalApplyReportsTheStoredState(t *testing.T) {
 	assert.False(t, unknown.Accepted)
 	assert.Empty(t, unknown.ClosedApplyState, "a refusal without a stored state names none")
 	assert.Equal(t, "apply apply-1 for this idempotency key is no longer active; operation payments-002 cannot attach", unknown.ErrorMessage)
+}
+
+// A concurrent dispatch of the same operation attached it, and the apply
+// closed behind it, before this dispatch's insert was refused. The operation
+// ran, so the dispatch replays the winner's row rather than telling the
+// control plane the work never started. With no winner the refusal names the
+// closed state, and a re-read that fails returns an error so the dispatch is
+// retried rather than settled on a guess.
+func TestResolveAttachToClosedApply(t *testing.T) {
+	apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-1", Database: "payments", Environment: "staging", State: state.Apply.Running}
+	req := &ternv1.ApplyRequest{Database: "payments", Environment: "staging", IdempotencyKey: "key-1"}
+	refused := &storage.ApplyNotActiveError{ApplyID: "apply-1", State: state.Apply.Failed, Detail: "attach operation payments-002 to apply apply-1 in state failed"}
+	clientWith := func(operations *mockApplyOperationStore) *LocalClient {
+		return &LocalClient{
+			config:  LocalConfig{Database: "default"},
+			storage: &mockStorage{operations: operations},
+			logger:  discardLogger(),
+		}
+	}
+
+	t.Run("a concurrent attach won", func(t *testing.T) {
+		client := clientWith(&mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			42: {ID: 42, ApplyID: apply.ID, Deployment: "default", OperationKey: "payments-002", State: state.ApplyOperation.Failed},
+		}})
+		resp, err := client.resolveAttachToClosedApply(t.Context(), req, apply, "payments-002", refused)
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted, "the dispatch replays the operation that ran")
+		assert.Equal(t, "42", resp.ApplyOperationId)
+		assert.Equal(t, "apply-1", resp.ApplyId)
+		assert.Empty(t, resp.ClosedApplyState, "work that ran is never reported as never started")
+	})
+
+	t.Run("no attach won", func(t *testing.T) {
+		client := clientWith(&mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{}})
+		resp, err := client.resolveAttachToClosedApply(t.Context(), req, apply, "payments-002", refused)
+		require.NoError(t, err)
+		assert.False(t, resp.Accepted)
+		assert.Equal(t, state.Apply.Failed, resp.ClosedApplyState)
+	})
+
+	t.Run("the re-read fails", func(t *testing.T) {
+		client := clientWith(&mockApplyOperationStore{getByKeyErr: errors.New("storage unavailable")})
+		resp, err := client.resolveAttachToClosedApply(t.Context(), req, apply, "payments-002", refused)
+		require.Error(t, err)
+		assert.Nil(t, resp)
+		assert.Contains(t, err.Error(), "payments-002")
+		assert.Contains(t, err.Error(), "storage unavailable")
+	})
 }

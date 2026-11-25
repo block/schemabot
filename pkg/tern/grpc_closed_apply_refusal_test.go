@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -26,8 +27,9 @@ type refusedMemberDrive struct {
 }
 
 // driveRefusedMember drives payments-002 against a data plane that refuses
-// its dispatch because the shared remote apply ended in closedState.
-func driveRefusedMember(t *testing.T, closedState string) refusedMemberDrive {
+// its dispatch because the shared remote apply ended in closedState. configure
+// adjusts the stores before the drive.
+func driveRefusedMember(t *testing.T, closedState string, configure ...func(*mockStorage)) refusedMemberDrive {
 	t.Helper()
 	server := &capturingTernServer{applyResponse: &ternv1.ApplyResponse{
 		Accepted:         false,
@@ -40,6 +42,9 @@ func driveRefusedMember(t *testing.T, closedState string) refusedMemberDrive {
 	store := client.storage.(*mockStorage)
 	logs := &mockApplyLogStore{}
 	store.logs = logs
+	for _, fn := range configure {
+		fn(store)
+	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
@@ -130,6 +135,20 @@ func TestGRPCClient_ShardRefusedWithoutAClosedStateFailsClosed(t *testing.T) {
 	assert.Contains(t, d.err.Error(), closedApplyRefusal)
 	require.NotEmpty(t, d.tasks.updated)
 	assert.Equal(t, state.Task.Failed, d.tasks.updated[len(d.tasks.updated)-1].State)
+}
+
+// Storage refuses the write that cancels the shard's task. The task set is
+// then only partly settled, so the drive returns ErrTaskVerdictRefused: the
+// operator leaves the operation row as found and claimable instead of
+// deriving it from that set, and the next claim settles the shard again.
+func TestGRPCClient_ShardRefusedByAClosedApplyStaysClaimableWhenItsTaskWriteFails(t *testing.T) {
+	d := driveRefusedMember(t, state.Apply.Cancelled, func(store *mockStorage) {
+		store.tasks.updateErr = errors.New("storage unavailable")
+	})
+	require.Error(t, d.err)
+	assert.ErrorIs(t, d.err, ErrTaskVerdictRefused)
+	assert.Contains(t, d.err.Error(), "task-orders-002")
+	assert.Equal(t, state.ApplyOperation.Pending, d.fx.operations.ops[d.fx.second].State, "the operation row is not written over a partly settled task set")
 }
 
 func TestClosedApplyTerminalization(t *testing.T) {

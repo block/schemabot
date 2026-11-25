@@ -1988,7 +1988,10 @@ func (c *GRPCClient) settleUndispatchedOperationRows(ctx context.Context, apply 
 		}
 		task.UpdatedAt = now
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			return "", fmt.Errorf("update task %s of apply_operation %d to %s: %w", task.TaskIdentifier, op.ID, taskState, err)
+			// Tasks settled before this one stay settled, so the operation's
+			// task set is only partly settled. ErrTaskVerdictRefused leaves the
+			// operation row as found and claimable rather than derived from it.
+			return "", fmt.Errorf("%w: update task %s of apply_operation %d to %s: %w", ErrTaskVerdictRefused, task.TaskIdentifier, op.ID, taskState, err)
 		}
 	}
 	oldState := op.State
