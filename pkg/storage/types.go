@@ -1316,6 +1316,31 @@ func (p *Plan) AllChangesDirect() bool {
 	return total > 0
 }
 
+// ShardCopyEstimatedRows returns the plan's row estimate for the copy one
+// shard runs for a table: the estimate on the shard's own change, when that
+// change is an ALTER, the only change that copies rows. It is nil when the
+// plan records no change for the table on that shard, the change copies no
+// rows, or the planner had no estimate. It never falls back to the keyspace's
+// estimate, which covers every shard.
+func (p *Plan) ShardCopyEstimatedRows(namespace, shard, table string) *int64 {
+	if p == nil || p.Namespaces[namespace] == nil {
+		return nil
+	}
+	for _, sp := range p.Namespaces[namespace].Shards {
+		if sp.Shard != shard {
+			continue
+		}
+		for _, tc := range sp.Changes {
+			if tc.Table != table || tc.EstimatedRows == nil || !strings.EqualFold(tc.Operation, "alter") {
+				continue
+			}
+			rows := *tc.EstimatedRows
+			return &rows
+		}
+	}
+	return nil
+}
+
 // FlatDDLChanges returns all DDL changes across namespaces, sorted by namespace key.
 func (p *Plan) FlatDDLChanges() []TableChange {
 	if len(p.Namespaces) == 0 {

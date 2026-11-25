@@ -38,6 +38,10 @@ type TableProgressData struct {
 	// the table is queued and before the engine reports RowsTotal. Nil when
 	// the plan had no estimate.
 	EstimatedRows *int64
+	// RowsTotalPlanned marks a sharded table's RowsTotal that counts the
+	// plan's estimate for the shards that have not reported, so it renders
+	// as approximate (apitypes.TableProgressResponse.RowsTotalPlanned).
+	RowsTotalPlanned bool
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -1301,6 +1305,7 @@ func tableFacts(table TableProgressData, work apitypes.BuildWork) presentation.T
 		PercentComplete:     table.PercentComplete,
 		RowsCopied:          table.RowsCopied,
 		RowsTotal:           table.RowsTotal,
+		RowsTotalPlanned:    table.RowsTotalPlanned,
 		ETASeconds:          table.ETASeconds,
 		EstimatedBytes:      table.EstimatedBytes,
 		ChecksumRowsChecked: table.ChecksumRowsChecked,
@@ -2046,6 +2051,7 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 			EstimatedBytes:  t.EstimatedBytes,
 			EstimatedRows:   t.EstimatedRows,
 
+			RowsTotalPlanned:    t.RowsTotalPlanned,
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
 			Throttled:           t.Throttled,

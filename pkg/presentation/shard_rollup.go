@@ -14,6 +14,10 @@ type ShardCopy struct {
 	// shard's verify has got, once its engine reports a total.
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
+	// PlannedRows is the plan's row estimate for this shard's table, nil when
+	// the plan has none. It stands in for the shard's row total until the
+	// engine reports one (RollUpShardedTable).
+	PlannedRows *int64
 }
 
 // ShardOperationCopy resolves one (shard, table) operation's progress from its
@@ -60,35 +64,66 @@ type ShardedTableCopy struct {
 	// over active work, active work over waiting, waiting over done.
 	Status string
 
-	// RowsCopied, RowsTotal, and ETASeconds cover only the shards that have
+	// RowsCopied, RowsTotal, and ETASeconds cover the shards that have
 	// reported a row total, counted in ShardsReporting: rows sum across them
 	// and the ETA is the slowest one's. A shard counts only once it carries a
 	// total, so a shard with copied rows but no total cannot inflate the
-	// numerator alone, and shards whose wave has not started add nothing. A
-	// renderer discloses the coverage rather than passing one wave's fraction
-	// off as the table's.
+	// numerator alone. A renderer discloses the coverage rather than passing
+	// one wave's fraction off as the table's.
 	RowsCopied      int64
 	RowsTotal       int64
 	ETASeconds      int64
 	ShardsReporting int
+
+	// RowsTotalPlanned marks a RowsTotal that also counts the plan's estimate
+	// for every shard that will still copy and has not reported a total, so
+	// the total and the percent span the whole table rather than the shards
+	// reporting so far. The total is then approximate.
+	RowsTotalPlanned bool
 }
 
 // RollUpShardedTable rolls one keyspace table's per-shard progress up into the
-// table's, the way the PR comment and the CLI both read a sharded table. shards
-// must not be empty.
-func RollUpShardedTable(shards []ShardCopy) ShardedTableCopy {
+// table's, the way the PR comment and the CLI both read a sharded table.
+// shards must not be empty. plannedShards is how many shards the plan spans
+// the table across, zero when it recorded none.
+//
+// While the copy is in flight, the plan's estimate stands in for each shard
+// still ahead of its copy, so a table with five of eight shards reporting is
+// not read as nearly done. It stands in only when every such shard has an
+// estimate and every planned shard is listed: a total missing some shards
+// would be neither the reporting shards' nor the table's, so the figures then
+// cover the reporting shards alone. A shard that failed, stopped, or finished
+// past its copy without a total adds nothing, so the total never counts rows
+// that will not be copied.
+func RollUpShardedTable(shards []ShardCopy, plannedShards int) ShardedTableCopy {
 	out := ShardedTableCopy{Status: shards[0].Status}
+	var planned int64
+	estimatesCoverUnreported := len(shards) >= plannedShards
+	unreported, inFlight := 0, false
 	for _, sh := range shards {
 		if TaskAttentionRank(sh.Status) > TaskAttentionRank(out.Status) {
 			out.Status = sh.Status
 		}
+		inFlight = inFlight || state.IsInFlightTaskState(sh.Status)
 		if sh.RowsTotal <= 0 {
+			if CopyStillAhead(sh.Status) {
+				unreported++
+				if sh.PlannedRows == nil {
+					estimatesCoverUnreported = false
+				} else {
+					planned += *sh.PlannedRows
+				}
+			}
 			continue
 		}
 		out.ShardsReporting++
 		out.RowsCopied += sh.RowsCopied
 		out.RowsTotal += sh.RowsTotal
 		out.ETASeconds = max(out.ETASeconds, sh.ETASeconds)
+	}
+	if inFlight && unreported > 0 && estimatesCoverUnreported {
+		out.RowsTotal += planned
+		out.RowsTotalPlanned = true
 	}
 	return out
 }

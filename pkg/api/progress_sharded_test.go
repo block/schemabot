@@ -118,6 +118,36 @@ func TestProgressByApplyIDRollsAShardedApplyUpByTable(t *testing.T) {
 	assert.Equal(t, []apitypes.VSchemaChange{{Namespace: "shop_001", Status: "", Diff: "+ orders"}}, changes)
 }
 
+// A table copying on one shard while the next waits its turn counts the
+// plan's estimate for the waiting shard in its total, so its percent is of
+// the whole table and the total reads as approximate. The estimate is each
+// shard's own, never the keyspace's figure for every shard.
+func TestProgressByApplyIDCountsThePlannedRowsOfShardsStillToCopy(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		shardOp(1, "shop_001/-80/orders", state.ApplyOperation.Running),
+		shardOp(2, "shop_001/80-/orders", state.ApplyOperation.Pending),
+	}
+	shardChange := func(rows int64) []storage.TableChange {
+		return []storage.TableChange{{Table: "orders", Operation: "alter", DDL: shardedTestDDL, EstimatedRows: new(rows)}}
+	}
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {
+		Tables: []storage.TableChange{{Table: "orders", Operation: "alter", EstimatedRows: new(int64(2_000)), ShardCount: 2}},
+		Shards: []storage.ShardPlan{
+			{Shard: "-80", Namespace: "shop_001", Changes: shardChange(1_000)},
+			{Shard: "80-", Namespace: "shop_001", Changes: shardChange(1_200)},
+		},
+	}}}
+
+	resp := shardedProgress(t, ops, []*storage.Task{shardTask(1, state.Task.Running, 620, 1000)}, &staticPlanStore{plan: plan})
+
+	require.Len(t, resp.Tables, 1)
+	table := resp.Tables[0]
+	assert.Equal(t, int64(620), table.RowsCopied)
+	assert.Equal(t, int64(2_200), table.RowsTotal, "the reported shard's total plus the waiting shard's estimate")
+	assert.True(t, table.RowsTotalPlanned)
+	assert.Equal(t, int32(28), table.PercentComplete)
+}
+
 // Each shard says whether its own change copies rows, from its own tasks, so
 // a shard running an instant ALTER reads as applying while a sibling running a
 // table copy does not. The table reads as a table copy whenever any of its

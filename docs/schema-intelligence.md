@@ -725,7 +725,17 @@ keyspace's finalizer, and the response sets `sharded: true`. Its `tables` are
 then rolled up across the shards: one entry per keyspace table, with `status`
 the shard state that needs attention first, `rows_copied` and `rows_total`
 summed over the shards that have reported a total, and `shards` listing each
-shard's own state and rows. A shard sets `copies_no_rows: true` when every
+shard's own state and rows. While the copy runs, the plan's row estimate for
+each shard still to copy is added to `rows_total`, and `rows_total_planned:
+true` marks the total as approximate, so `rows_total` and `percent_complete`
+cover the whole table rather than the shards reporting so far. With one of
+four shards at 620 of 1,000 rows and the other three planned at 1,000 each,
+the table reads 15.50% and `Rows: 620 / ~4k · ETA: ≥ 3m 15s`. The estimate is
+each shard's own from the stored plan. It is added only when every shard still
+to copy has one and every planned shard is listed. Otherwise `rows_total`
+covers the reporting shards alone, `rows_total_planned` is omitted, and the
+CLI and the PR comment name the coverage, as in the example below. A shard
+that failed or stopped before it reported adds nothing. A shard sets `copies_no_rows: true` when every
 change it runs on the table copies no rows (a `CREATE TABLE`, a `DROP TABLE`,
 or an instant `ALTER`), so a running shard reads as applying rather than as a
 table copy. `estimated_bytes` is the table's planned size
@@ -1029,8 +1039,9 @@ keyspace's four shards, of which only `-40` has started:
 ```
 
 `schemabot progress apply-example-76` renders it as one change. The header
-counts the shards by status, the rows cover only the started shard, so the ETA
-is a floor, and the VSchema change shows its diff:
+counts the shards by status. This plan recorded no per-shard row estimates, so
+the rows cover only the started shard and the ETA is a floor. The VSchema
+change shows its diff:
 
 ```text
 ┌─────────────────────────────────────────────────────────┐
