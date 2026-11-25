@@ -38,6 +38,10 @@ type TableProgressData struct {
 	// the table is queued and before the engine reports RowsTotal. Nil when
 	// the plan had no estimate.
 	EstimatedRows *int64
+	// RowsTotalPlanned marks a sharded table's RowsTotal that counts the
+	// plan's estimate for the shards that have not reported, so it renders
+	// as approximate (apitypes.TableProgressResponse.RowsTotalPlanned).
+	RowsTotalPlanned bool
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -1110,6 +1114,15 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	// Normalize to canonical Task state for consistent matching.
 	status := state.NormalizeTaskStatus(table.Status)
 
+	if sharded := shardedTableStatus(table); keepsShardedProgressBar(status, sharded) {
+		// A sharded table whose shards are in different phases keeps its bar
+		// across them, as the sharded comment and the CLI show it (UX-8).
+		writeShardedTablePhaseProgress(sb, sharded, func() { writeDDLLine(sb, dialect, table.DDL, budget) })
+		renderShardSummary(sb, table, presentation.RunningCopying, budget)
+		sb.WriteString("\n")
+		return
+	}
+
 	switch status {
 	case state.Task.Pending:
 		fmt.Fprintf(sb, "**%s**: \u23f3 Queued\n", inlineCode(table.TableName))
@@ -1225,6 +1238,29 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	sb.WriteString("\n")
 }
 
+// shardedTableStatus is a table row as the sharded comment reads it, so a
+// sharded table in a single-deployment apply renders the way it does there.
+func shardedTableStatus(table TableProgressData) ShardedTableStatus {
+	reporting := 0
+	for _, sh := range table.Shards {
+		if sh.RowsTotal > 0 {
+			reporting++
+		}
+	}
+	return ShardedTableStatus{
+		Table:            table.TableName,
+		Status:           table.Status,
+		RowsCopied:       table.RowsCopied,
+		RowsTotal:        table.RowsTotal,
+		RowsTotalPlanned: table.RowsTotalPlanned,
+		ETASeconds:       table.ETASeconds,
+		EstimatedBytes:   table.EstimatedBytes,
+		ShardsReporting:  reporting,
+		PlannedShards:    table.PlannedShards,
+		Shards:           table.Shards,
+	}
+}
+
 // renderShardSummary lists a sharded table's shards while it is in flight. A
 // settled table's line already says where it ended, so the listing stays out
 // of the way then. runningWord names the shards working on the change
@@ -1301,6 +1337,7 @@ func tableFacts(table TableProgressData, work apitypes.BuildWork) presentation.T
 		PercentComplete:     table.PercentComplete,
 		RowsCopied:          table.RowsCopied,
 		RowsTotal:           table.RowsTotal,
+		RowsTotalPlanned:    table.RowsTotalPlanned,
 		ETASeconds:          table.ETASeconds,
 		EstimatedBytes:      table.EstimatedBytes,
 		ChecksumRowsChecked: table.ChecksumRowsChecked,
@@ -2054,6 +2091,7 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 			EstimatedBytes:  t.EstimatedBytes,
 			EstimatedRows:   t.EstimatedRows,
 
+			RowsTotalPlanned:    t.RowsTotalPlanned,
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
 			Throttled:           t.Throttled,

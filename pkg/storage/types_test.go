@@ -831,3 +831,27 @@ func TestTableChangeTaskEstimatedRows(t *testing.T) {
 	drop := TableChange{Table: "orders", Operation: "drop", EstimatedRows: &rows}
 	assert.Nil(t, drop.TaskEstimatedRows(""), "a drop copies no rows, so its task carries no row estimate")
 }
+
+// A shard's copy estimate is the rows the plan read for that shard's own
+// ALTER. A shard that creates the table copies no rows, and a negative
+// estimate is a statistics sentinel rather than a count, so both have none.
+func TestShardCopyEstimatedRows(t *testing.T) {
+	rows := func(n int64) *int64 { return &n }
+	plan := &Plan{Namespaces: map[string]*NamespacePlanData{
+		"shop_sharded": {Shards: []ShardPlan{
+			{Shard: "-80", Changes: []TableChange{{Table: "orders", Operation: "alter", EstimatedRows: rows(1000)}}},
+			{Shard: "80-", Changes: []TableChange{
+				{Table: "orders", Operation: "alter", EstimatedRows: rows(-1)},
+				{Table: "widgets", Operation: "create", EstimatedRows: rows(5)},
+			}},
+		}},
+	}}
+
+	if got := plan.ShardCopyEstimatedRows("shop_sharded", "-80", "orders"); assert.NotNil(t, got) {
+		assert.Equal(t, int64(1000), *got)
+	}
+	assert.Nil(t, plan.ShardCopyEstimatedRows("shop_sharded", "80-", "orders"), "a negative estimate is no estimate")
+	assert.Nil(t, plan.ShardCopyEstimatedRows("shop_sharded", "80-", "widgets"), "a CREATE copies no rows")
+	assert.Nil(t, plan.ShardCopyEstimatedRows("shop_sharded", "c0-", "orders"), "a shard the plan does not change")
+	assert.Nil(t, plan.ShardCopyEstimatedRows("shop", "-80", "orders"), "a namespace the plan does not change")
+}

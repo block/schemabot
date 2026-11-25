@@ -127,6 +127,12 @@ type ShardedTableStatus struct {
 	// unstarted shards can only add rows and time).
 	ShardsReporting int
 
+	// RowsTotalPlanned marks a RowsTotal that also counts the plan's estimate
+	// for every shard still to copy that has not reported a total
+	// (presentation.RollUpShardedTable), so the bar and rows line span the
+	// whole table and read the total as approximate.
+	RowsTotalPlanned bool
+
 	// EstimatedBytes is the table's on-disk size when it was planned, summed
 	// across its shards, shown beside the copy progress so the operator sees
 	// the scale of the copy. Nil when no estimate is known, which omits it.
@@ -661,17 +667,19 @@ func keepsShardedProgressBar(status string, t ShardedTableStatus) bool {
 }
 
 // writeShardedTablePhaseProgress renders a sharded table whose shards are past
-// or beside the row copy: the bar across every shard the table spans, the way
-// a rollout's bar spans its targets (presentation.PercentAcrossTargets), and
-// the rows line. A shard that has not reported, whether queued or not yet
-// attached, counts as nothing, so one verified shard beside three queued ones
-// reads as a quarter done rather than nearly complete.
+// or beside the row copy: the bar across every shard the table spans
+// (presentation.ShardedPhasePercent), and the rows line. When the total
+// includes the plan's estimate for the shards still to copy, the bar is the
+// rows copied over that planned total. Otherwise a shard that has not
+// reported, whether queued or not yet attached, counts as nothing, so one
+// verified shard beside three queued ones reads as a quarter done rather than
+// nearly complete.
 func writeShardedTablePhaseProgress(sb *strings.Builder, t ShardedTableStatus, writeDDL func()) {
 	parts := make([]presentation.Part, len(t.Shards))
 	for i, s := range t.Shards {
 		parts[i] = s.part()
 	}
-	pct := presentation.PercentAcrossTargets(parts, t.shardTotal()-len(t.Shards))
+	pct := presentation.ShardedPhasePercent(parts, t.shardTotal()-len(t.Shards), t.RowsCopied, t.RowsTotal, t.RowsTotalPlanned)
 	fmt.Fprintf(sb, "**%s**: %s %d%%\n", inlineCode(t.Table), ui.ProgressBarRowCopy(pct), pct)
 	writeDDL()
 	writeShardedRowsAndETA(sb, t)
@@ -692,7 +700,8 @@ func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus, wr
 
 // shardedTableFacts is what the sharded comment knows about a copying table,
 // in the form every surface reads it from. A table whose row figures cover
-// only the shards that have reported says how many.
+// only the shards that have reported says how many; one whose total counts the
+// plan's estimate for the rest spans the whole table and reads approximate.
 func shardedTableFacts(t ShardedTableStatus) presentation.TableFacts {
 	f := presentation.TableFacts{
 		Status:         state.Task.Running,
@@ -701,11 +710,13 @@ func shardedTableFacts(t ShardedTableStatus) presentation.TableFacts {
 		ETASeconds:     t.ETASeconds,
 		EstimatedBytes: t.EstimatedBytes,
 		PlannedShards:  t.PlannedShards,
+
+		RowsTotalPlanned: t.RowsTotalPlanned,
 	}
 	if t.RowsTotal > 0 {
 		f.PercentComplete = int(ui.ClampRows(t.RowsCopied, t.RowsTotal) * 100 / t.RowsTotal)
 	}
-	if t.ShardsReporting < t.shardTotal() {
+	if !t.RowsTotalPlanned && t.ShardsReporting < t.shardTotal() {
 		f.ShardsReporting, f.ShardsTotal = t.ShardsReporting, t.shardTotal()
 	}
 	return f

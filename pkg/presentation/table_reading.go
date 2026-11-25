@@ -52,9 +52,11 @@ func (f TableFacts) partialShards() bool {
 // shard count, or the listed shards when more are listed or the plan recorded
 // none. While later shards have not reported, the figures cover the reporting
 // ones alone, so the reading says so rather than passing their fraction off
-// as the table's. A table with one shard or none listed is left as it is.
+// as the table's. A table with one shard or none listed is left as it is, and
+// so is one whose total already counts the plan's estimate for the shards that
+// have not reported, since that total spans the whole table.
 func (f TableFacts) WithShardCoverage(listed, reporting int) TableFacts {
-	if listed < 2 {
+	if listed < 2 || f.RowsTotalPlanned {
 		return f
 	}
 	if total := max(listed, f.PlannedShards); reporting > 0 && reporting < total {
