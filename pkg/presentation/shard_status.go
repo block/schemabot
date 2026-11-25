@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -35,10 +36,10 @@ type ShardStatus struct {
 // aggregate to the most attention-worthy one's state and error, then every
 // shard, across all keyspaces, is derived in one pass. The shards of one
 // rollout member never order one another's copies (the claim gate starts them
-// in parallel up to the apply's driver cap), so a pending shard of a single
-// member reads as queued, or not started once the apply has settled; only
-// shards spanning members keep ordering labels
-// ("waiting for -40", "halted — -40 failed") that name a sibling. A shard's
+// in parallel up to the apply's driver cap), so a pending shard with no shard
+// of another member before it reads as queued, or not started once the apply
+// has settled. Ordering labels ("waiting for -40", "halted — -40 failed") name
+// only a shard of another member. A shard's
 // identity is its name, qualified by keyspace ("keyspace/shard") when the
 // apply spans more than one keyspace, since shard names repeat across
 // keyspaces and a label naming a bare duplicate would be ambiguous. The
@@ -51,7 +52,6 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 	}
 	qualify := len(keyspaces) > 1
 	shardOf := shardIdentities(shards, qualify)
-	unordered := shardsOfOneMember(shards)
 	inputs := make([]Operation, 0, len(shards))
 	for _, sw := range shards {
 		if len(sw.Operations) == 0 {
@@ -72,7 +72,7 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 			ContinueOnFailure: first.ContinueOnFailure,
 			PauseOnFailure:    first.PauseOnFailure,
 			Released:          first.Released,
-			UnorderedCopy:     unordered,
+			CopyMember:        shardMember(sw.Operations),
 			CopiesNoRows:      shardCopiesNoRows(sw.Operations, sw.Operations[best].State),
 			Error:             sw.Operations[best].Error,
 			EndedBy:           shardEndedBy(sw.Operations, best, shardOf),
@@ -81,7 +81,7 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 	settled := state.IsState(applyState, state.SettledApplyStates...)
 	byIdentity := make(map[string]Deployment, len(inputs))
 	for _, d := range Derive(ResumeClaimed(applyState, inputs)).Deployments {
-		if unordered && settled && d.Presentation == StateQueuedNext {
+		if settled && d.Presentation == StateQueuedNext && d.Label == PendingQueued {
 			// The apply has settled, so nothing will start this shard: it
 			// reads as not started, as a part a settled rollout never ran
 			// does (PendingWord).
@@ -106,25 +106,22 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 	return out
 }
 
-// shardsOfOneMember reports whether every operation of the shards belongs to
-// one rollout member, a (deployment, target) pair. The claim gate orders copy
-// starts only across members, so such shards copy in parallel and wait only
-// for a free driver.
-func shardsOfOneMember(shards []ShardWork) bool {
-	var deployment, target string
-	seen := false
-	for _, sw := range shards {
-		for _, op := range sw.Operations {
-			if !seen {
-				deployment, target, seen = op.Deployment, op.Target, true
-				continue
-			}
-			if op.Deployment != deployment || op.Target != target {
-				return false
-			}
+// shardMember is the rollout member, a (deployment, target) pair, that runs
+// a shard's operations, or "" when they span members and the shard keeps the
+// ordering of a member of its own. Operations with no target share the empty
+// target, so a single-target apply's shards all belong to one member, as the
+// claim gate reads them.
+func shardMember(ops []Operation) string {
+	if len(ops) == 0 {
+		return ""
+	}
+	first := ops[0]
+	for _, op := range ops[1:] {
+		if op.Deployment != first.Deployment || op.Target != first.Target {
+			return ""
 		}
 	}
-	return true
+	return routing.ExecutionTarget{Deployment: first.Deployment, Target: first.Target}.MemberID()
 }
 
 // shardCopiesNoRows reports whether the shard's operations in the state its

@@ -335,8 +335,9 @@ func PreviewCommentShardedApplyDivergent() string {
 // several keyspaces in one deployment — the shape a database with unsharded
 // sibling keyspaces produces, where every unsharded keyspace contributes a
 // single "-" shard. Each keyspace renders its own section while the histogram
-// and rollout ordering span all of them, and the sharded keyspace's VSchema
-// change renders in the shared VSchema section.
+// spans all of them, and the sharded keyspace's VSchema change renders in the
+// shared VSchema section. Every keyspace belongs to one rollout member, so no
+// keyspace's shards wait behind another's.
 func PreviewCommentShardedApplyMultiKeyspace() string {
 	shards := previewShardStatuses(state.Apply.Running, []presentation.Operation{
 		{Deployment: "cdb_resolute/-", State: state.ApplyOperation.Completed},

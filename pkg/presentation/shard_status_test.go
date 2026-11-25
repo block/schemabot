@@ -82,6 +82,42 @@ func TestDeriveShardsOrdersShardsAcrossMembers(t *testing.T) {
 	assert.Equal(t, "1 failed, 1 halted", ShardCounts([]string{shards[0].Label, shards[1].Label}))
 }
 
+// In an apply with two rollout members, each with two shards, a member's
+// shards never order one another: us's second shard reads as queued behind
+// nothing while its first copies, and stays queued when that first shard
+// fails. eu's shards still wait for, or halt behind, us's shards, since the
+// claim gate orders copy starts across members, and eu's second shard names
+// us's shard rather than eu's own first.
+func TestDeriveShardsOrdersOnlyAcrossMembers(t *testing.T) {
+	derive := func(firstState string) []string {
+		op := func(deployment, opState string) []Operation {
+			return []Operation{{Deployment: deployment, State: opState}}
+		}
+		var labels []string
+		for _, s := range DeriveShards(state.Apply.Running, []ShardWork{
+			{Keyspace: "shop_001", Shard: "-40", Operations: op("us", firstState)},
+			{Keyspace: "shop_001", Shard: "40-", Operations: op("us", state.ApplyOperation.Pending)},
+			{Keyspace: "shop_002", Shard: "-40", Operations: op("eu", state.ApplyOperation.Pending)},
+			{Keyspace: "shop_002", Shard: "40-", Operations: op("eu", state.ApplyOperation.Pending)},
+		}) {
+			labels = append(labels, s.Label)
+		}
+		return labels
+	}
+
+	running := derive(state.ApplyOperation.Running)
+	require.Len(t, running, 4)
+	assert.Equal(t, PendingQueued, running[1], "us's second shard waits only for a free driver")
+	assert.Equal(t, "waiting for shop_001/-40", running[2])
+	assert.Equal(t, "waiting for shop_001/-40", running[3], "eu's second shard names us's shard, not eu's own")
+
+	failed := derive(state.ApplyOperation.Failed)
+	require.Len(t, failed, 4)
+	assert.Equal(t, PendingQueued, failed[1], "a failure on us's first shard does not hold us's second")
+	assert.Equal(t, "halted — shop_001/-40 failed", failed[2])
+	assert.Equal(t, "halted — shop_001/-40 failed", failed[3])
+}
+
 // A start moves a sharded apply to resuming before its shards' rows leave
 // stopped, so through that window the shards count as resuming, not stopped.
 // Stopped shards of an apply that is still stopped count as stopped.
