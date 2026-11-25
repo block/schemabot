@@ -30,7 +30,8 @@ import (
 // re-plan result is configurable so a test can choose whether the driven task
 // still has remaining work; Apply can be forced to reject or error so the
 // failure and retry paths are exercised without a real backend; Stop can be
-// forced to report the change already completed; and its progress can be
+// forced to report the change already completed; Cancel can be forced to
+// refuse; and its progress can be
 // declared externally authoritative so terminal-truth reconciliation runs.
 type multiOpResumeEngine struct {
 	engine.Engine
@@ -40,6 +41,7 @@ type multiOpResumeEngine struct {
 	rejectApply           bool
 	applyErr              error
 	stopErr               error
+	cancelErr             error
 	cancelCalls           int
 	authoritativeProgress bool
 	applyCalls            int
@@ -87,6 +89,9 @@ func (e *multiOpResumeEngine) Cancel(context.Context, *engine.ControlRequest) (*
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.cancelCalls++
+	if e.cancelErr != nil {
+		return nil, e.cancelErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 

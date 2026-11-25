@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -128,4 +130,24 @@ func TestGRPCClient_FailedShardLeavesASiblingThatIsCuttingOver(t *testing.T) {
 	require.NoError(t, f.client.cancelRemoteForFailedSibling(t.Context(), f.apply, f.scope, &sentAt))
 	assert.Zero(t, f.server.getCancelCalls(), "nothing cancels a shard mid-swap")
 	assert.Empty(t, f.logs.logs)
+}
+
+// Shard 80- of target orders-001 fails under on_failure halt, and the data
+// plane answers the halt cancel for shard -80 with an error, as it does once
+// the remote has already settled or while it restarts. The drive does not
+// abort: it keeps polling, so a settled remote's own outcome reaches the
+// operation, and it sends the cancel again only on the resend cadence.
+func TestGRPCClient_FailedShardHaltCancelErrorKeepsPolling(t *testing.T) {
+	f := newGRPCShardHaltFixture(t, state.Task.Running)
+	f.ops.ops[43].State = state.ApplyOperation.Failed
+	f.server.cancelErr = status.Error(codes.Internal, "apply remote-orders-001-a is already terminal (state: failed)")
+
+	var sentAt time.Time
+	require.NoError(t, f.client.cancelRemoteForFailedSibling(t.Context(), f.apply, f.scope, &sentAt))
+	assert.Equal(t, 1, f.server.getCancelCalls())
+	assert.False(t, sentAt.IsZero(), "the failed send starts the resend cadence")
+	assert.Empty(t, f.logs.logs, "no cancel was accepted, so the apply log records none")
+
+	require.NoError(t, f.client.cancelRemoteForFailedSibling(t.Context(), f.apply, f.scope, &sentAt))
+	assert.Equal(t, 1, f.server.getCancelCalls(), "a poll inside the resend interval sends nothing")
 }

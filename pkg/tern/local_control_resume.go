@@ -468,6 +468,12 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			break
 		}
 		if standDown, err := c.cancelForFailedSibling(ctx, logger, c.getEngine(), apply, tasks, firstTaskMidCutover, &loggedSiblingFailureAtCutover); err != nil {
+			if errors.Is(err, ErrTaskVerdictRefused) {
+				// Some tasks recorded cancelled and some did not. The error
+				// keeps the operation row claimable instead of deriving it
+				// from the partly settled tasks.
+				return err
+			}
 			logger.Warn("halting this operation behind a failed sibling failed; current apply owner will exit for operator retry",
 				"error", err)
 			return nil
@@ -608,6 +614,9 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		}
 		if action == taskHaltedBySibling {
 			if err := c.cancelTasksQueuedBehindSiblingFailure(ctx, apply, tasks); err != nil {
+				if errors.Is(err, ErrTaskVerdictRefused) {
+					return err
+				}
 				logger.Warn("cancelling the tasks queued behind a failed sibling failed; current apply owner will exit for operator retry",
 					"error", err)
 				return nil

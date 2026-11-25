@@ -143,6 +143,14 @@ func (c *LocalClient) cancelForFailedSibling(ctx context.Context, logger *slog.L
 				append(attrs, "error", err)...)
 			return false, nil
 		}
+		if engine.IsSettledOutcome(err) {
+			// The engine's run already ended on its own, typically failed.
+			// Recording it cancelled would hide that outcome (CO-3), so the
+			// drive's next poll records what the engine reports instead.
+			logger.InfoContext(ctx, "this operation's change already settled on the engine before the halt reached it; the drive records the engine's outcome and the apply settles failed",
+				append(attrs, "error", err)...)
+			return false, nil
+		}
 		return false, fmt.Errorf("cancel apply %s operation %d behind failed sibling %d: %w", apply.ApplyIdentifier, opLease.OperationID, failed.ID, err)
 	}
 	if err := c.releaseCancelledArtifacts(cancelCtx, eng, apply, own); err != nil {
@@ -154,7 +162,10 @@ func (c *LocalClient) cancelForFailedSibling(ctx context.Context, logger *slog.L
 	}
 	cancelled, skipped, _, err := c.markTasksWithState(cancelCtx, own, apply.ID, StatementIndex[engine.TableProgress]{}, state.Task.Cancelled)
 	if err != nil {
-		return true, fmt.Errorf("record apply %s operation %d cancelled behind failed sibling %d: %w", apply.ApplyIdentifier, opLease.OperationID, failed.ID, err)
+		// The engine work is cancelled but some task rows did not record it.
+		// The drive stands down without settling the operation, so the row
+		// stays claimable and the next drive records the rest.
+		return true, fmt.Errorf("%w: record apply %s operation %d cancelled behind failed sibling %d: %w", ErrTaskVerdictRefused, apply.ApplyIdentifier, opLease.OperationID, failed.ID, err)
 	}
 	c.logApplyEvent(cancelCtx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		sameMemberHaltMessage(halted, failed), "", "")
@@ -217,7 +228,15 @@ func (c *GRPCClient) cancelRemoteForFailedSibling(ctx context.Context, apply *st
 	}
 	resp, err := c.client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: remoteID, Environment: apply.Environment, Caller: sameMemberHaltCaller})
 	if err != nil {
-		return fmt.Errorf("request remote cancel of apply %s operation %d remote %s behind failed sibling %d: %w", apply.ApplyIdentifier, scope.applyOperationID, remoteID, failed.ID, err)
+		// The data plane answers with an error once the remote has settled,
+		// and a transient failure looks the same from here. Either way the
+		// poll keeps reading the remote's own state, so a settled remote
+		// reaches this operation's row, and a running one gets the cancel
+		// again on the resend cadence.
+		logger.WarnContext(ctx, "halt cancel request to the data plane failed; the drive keeps polling and sends it again on the resend cadence",
+			append(attrs, "remote_apply_id", remoteID, "error", err)...)
+		*sentAt = now
+		return nil
 	}
 	if resp == nil {
 		return fmt.Errorf("request remote cancel of apply %s operation %d remote %s behind failed sibling %d: the data plane returned neither a response nor an error", apply.ApplyIdentifier, scope.applyOperationID, remoteID, failed.ID)

@@ -60,6 +60,12 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 			break
 		}
 		if standDown, err := c.cancelForFailedSibling(ctx, logger, c.getEngine(), apply, tasks, firstTaskMidCutover, &loggedSiblingFailureAtCutover); err != nil {
+			if errors.Is(err, ErrTaskVerdictRefused) {
+				// Some tasks recorded cancelled and some did not. The error
+				// keeps the operation row claimable instead of deriving it
+				// from the partly settled tasks.
+				return err
+			}
 			logger.Warn("halting this operation behind a failed sibling failed; current apply owner will exit for operator retry",
 				"error", err)
 			return nil
@@ -119,6 +125,9 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 		}
 		if action == taskHaltedBySibling {
 			if err := c.cancelTasksQueuedBehindSiblingFailure(ctx, apply, tasks); err != nil {
+				if errors.Is(err, ErrTaskVerdictRefused) {
+					return err
+				}
 				logger.Warn("cancelling the tasks queued behind a failed sibling failed; current apply owner will exit for operator retry",
 					"error", err)
 				return nil
@@ -1243,12 +1252,22 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					return taskStopped
 				}
 			}
-			if standDown, err := c.cancelForFailedSibling(ctx, logger, eng, apply, []*storage.Task{task}, firstTaskMidCutover, &loggedSiblingFailureAtCutover); err != nil {
+			standDown, err := c.cancelForFailedSibling(ctx, logger, eng, apply, []*storage.Task{task}, firstTaskMidCutover, &loggedSiblingFailureAtCutover)
+			if standDown {
+				if err != nil {
+					// The engine work is cancelled but this task's row did not
+					// record it. The caller records every task of the operation
+					// cancelled next, this one included, and returns the error
+					// if that write is refused too.
+					logger.Warn("halted task's cancelled verdict was not recorded; the drive records it again with the tasks queued behind it",
+						"task_id", task.TaskIdentifier, "error", err)
+				}
+				return taskHaltedBySibling
+			}
+			if err != nil {
 				logger.Warn("halting this operation behind a failed sibling failed; current apply owner will exit for operator retry",
 					"task_id", task.TaskIdentifier, "error", err)
 				return taskAbort
-			} else if standDown {
-				return taskHaltedBySibling
 			}
 			if pending.has(storage.ControlOperationCutover) {
 				if err := c.processPendingCutoverControlRequest(ctx, apply, []*storage.Task{task}); err != nil {
@@ -1935,7 +1954,9 @@ func (c *LocalClient) cancelTasksQueuedBehindSiblingFailure(ctx context.Context,
 		return fmt.Errorf("cancel tasks of apply %s queued behind a failed sibling: the drive holds no operation lease", apply.ApplyIdentifier)
 	}
 	if _, _, _, err := c.markTasksWithState(ctx, tasksForOperation(tasks, opLease.OperationID), apply.ID, StatementIndex[engine.TableProgress]{}, state.Task.Cancelled); err != nil {
-		return fmt.Errorf("cancel tasks of apply %s operation %d queued behind a failed sibling: %w", apply.ApplyIdentifier, opLease.OperationID, err)
+		// A refused write leaves the operation's tasks partly settled; the
+		// error keeps the operation row claimable so the next drive finishes.
+		return fmt.Errorf("%w: cancel tasks of apply %s operation %d queued behind a failed sibling: %w", ErrTaskVerdictRefused, apply.ApplyIdentifier, opLease.OperationID, err)
 	}
 	return nil
 }

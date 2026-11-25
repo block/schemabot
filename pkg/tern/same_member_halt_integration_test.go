@@ -111,6 +111,54 @@ func TestLocalClient_FailedShardLeavesASiblingThatIsCuttingOver(t *testing.T) {
 	f.requireParentUntouched(t)
 }
 
+// Shard 80- of target testdb fails under on_failure halt just as shard -80's
+// own run fails on the engine. The engine refuses the cancel because the run
+// already settled, so shard -80's drive leaves its task to the next poll,
+// which records the engine's own outcome rather than a cancel that never
+// happened.
+func TestLocalClient_FailedShardLeavesASiblingWhoseRunAlreadySettled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newMultiOpResumeFixture(t, []string{state.Task.Running})
+	f.eng.cancelErr = engine.NewSettledOutcomeError("cancel rejected: the schema change on database testdb already failed")
+	eng := &multiOpTargetDrainerEngine{multiOpResumeEngine: f.eng}
+	f.client.spiritEngine = eng
+	insertFailedShardSibling(t, f)
+	tasks := storedOperationTasks(t, f)
+
+	standDown, err := f.client.cancelForFailedSibling(f.opCtx, f.client.logger, eng, f.apply, tasks, firstTaskAtCutover, new(bool))
+	require.NoError(t, err)
+	assert.False(t, standDown, "the drive keeps polling so it records the engine's own outcome")
+	assert.Equal(t, 1, f.eng.cancelCalls)
+	assert.Equal(t, state.Task.Running, f.taskState(t, f.tasks[0]), "a run the engine already settled is not recorded cancelled")
+	f.requireParentUntouched(t)
+}
+
+// Shard 80- of target testdb fails under on_failure halt, and shard -80's
+// drive cancels its engine work, but storage refuses the write that records
+// its task cancelled. The drive stands down with an error that carries
+// ErrTaskVerdictRefused, so the operator leaves the operation row claimable
+// rather than deriving it from tasks that are only partly settled.
+func TestLocalClient_FailedShardHaltWhoseCancelIsNotRecordedStaysClaimable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newMultiOpResumeFixture(t, []string{state.Task.Running})
+	eng := &multiOpTargetDrainerEngine{multiOpResumeEngine: f.eng}
+	f.client.spiritEngine = eng
+	insertFailedShardSibling(t, f)
+	tasks := storedOperationTasks(t, f)
+	_, err := f.leaseDB.ExecContext(t.Context(), "UPDATE `apply_operations` SET `lease_token` = ? WHERE `id` = ?", "another-driver", f.opID)
+	require.NoError(t, err)
+
+	standDown, err := f.client.cancelForFailedSibling(f.opCtx, f.client.logger, eng, f.apply, tasks, firstTaskAtCutover, new(bool))
+	require.ErrorIs(t, err, ErrTaskVerdictRefused)
+	assert.True(t, standDown, "the engine work is cancelled, so the drive stands down")
+	assert.Equal(t, 1, f.eng.cancelCalls)
+	assert.Equal(t, state.Task.Running, f.taskState(t, f.tasks[0]), "storage refused the cancelled verdict")
+}
+
 // A shard of another target fails under on_failure halt. Each target is its
 // own rollout member, so the failure halts nothing on target testdb: the drive
 // keeps copying, and later targets are held by the claim's member gate instead.
