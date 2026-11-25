@@ -699,12 +699,12 @@ func TestRenderShardedApplyComment_TableCopyProgressBar(t *testing.T) {
 // operator still sees the held-back shard.
 func TestRenderShardedApplyComment_TableCopyThrottledShard(t *testing.T) {
 	out := RenderShardedApplyComment(ShardedApplyData{
-		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		State: state.Apply.Running, Environment: "staging", Database: "commerce",
 		ApplyID: "apply-x",
 		Keyspaces: []ShardedKeyspace{{
-			Keyspace: "cdb_resolute_sharded",
+			Keyspace: "commerce_sharded",
 			Tables: []ShardedTableStatus{{
-				Table: "mutes", Status: state.Task.Running,
+				Table: "orders", Status: state.Task.Running,
 				RowsCopied: 914707, RowsTotal: 1466232, ETASeconds: 195,
 				ShardsReporting: 2, Throttled: true, ThrottleReason: "replica-lag 5s >= 2s",
 				Shards: []ShardProgressData{
@@ -715,7 +715,7 @@ func TestRenderShardedApplyComment_TableCopyThrottledShard(t *testing.T) {
 		}},
 	})
 
-	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(62)+" 62.38% (throttled)")
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(62)+" 62.38% (throttled)")
 	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s")
 	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s\n- ℹ️ _Throttled: replica-lag 5s >= 2s_\n")
 }

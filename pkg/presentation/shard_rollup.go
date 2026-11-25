@@ -122,7 +122,6 @@ func RollUpShardedTable(shards []ShardCopy, plannedShards int) ShardedTableCopy 
 	var planned int64
 	estimatesCoverUnreported := everyPlannedShardListed(len(shards), plannedShards)
 	unreported, inFlight := 0, false
-	var reporting []ShardCopy
 	for _, sh := range shards {
 		if TaskAttentionRank(sh.Status) > TaskAttentionRank(out.Status) {
 			out.Status = sh.Status
@@ -145,9 +144,11 @@ func RollUpShardedTable(shards []ShardCopy, plannedShards int) ShardedTableCopy 
 		out.ShardsReporting++
 		out.RowsCopied += sh.RowsCopied
 		out.RowsTotal += sh.RowsTotal
-		reporting = append(reporting, sh)
 	}
-	out.ETASeconds = ShardedTableETA(reporting)
+	// Every shard's ETA counts, row total or not: the data plane folds its
+	// stored shards the same way (aggregateStoredShards in pkg/tern), so the
+	// CLI and the PR comment read one ETA for the same shards.
+	out.ETASeconds = ShardedTableETA(shards)
 	if inFlight && unreported > 0 && estimatesCoverUnreported {
 		out.RowsTotal += planned
 		out.RowsTotalPlanned = true

@@ -21,7 +21,9 @@ func TestRollUpShardedTable(t *testing.T) {
 		{Status: state.Task.Pending},
 	}, 0)
 
-	assert.Equal(t, ShardedTableCopy{Status: state.Task.Running, RowsCopied: 1300, RowsTotal: 2200, ETASeconds: 90, ShardsReporting: 2}, got)
+	// The shard with no row total yet still reports 400s left, and the table
+	// finishes when it does.
+	assert.Equal(t, ShardedTableCopy{Status: state.Task.Running, RowsCopied: 1300, RowsTotal: 2200, ETASeconds: 400, ShardsReporting: 2}, got)
 	assert.Equal(t, state.Task.Failed, RollUpShardedTable([]ShardCopy{{Status: state.Task.Running}, {Status: state.Task.Failed}}, 0).Status,
 		"a failed shard outranks one still copying")
 	assert.Equal(t, state.Task.Pending, RollUpShardedTable([]ShardCopy{{Status: state.Task.RevertWindow}, {Status: state.Task.Pending}}, 0).Status,
