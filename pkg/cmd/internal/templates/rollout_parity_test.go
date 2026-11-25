@@ -92,6 +92,89 @@ func TestRolledUpTableReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
 	}
 }
 
+// The CLI and the PR comment roll a table's per-target statuses up the same
+// way, failure first: `orders` failed on one target reads as failed on both
+// surfaces however far another target has got, until a target is copying rows
+// whose progress the table's bar shows instead. A table with every other target
+// copying, queued or complete reads as its bar on both (UX-7).
+func TestRolledUpTableStatusReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
+	const bar = "🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 20%"
+	cases := []struct {
+		name     string
+		targets  []parityTarget
+		headline string
+	}{
+		{
+			name: "running on one target and failed on another, before any rows are known",
+			targets: []parityTarget{
+				{opState: state.ApplyOperation.Running, status: state.Task.Running},
+				{opState: state.ApplyOperation.Failed, status: state.Task.Failed},
+			},
+			headline: "❌ Failed",
+		},
+		{
+			name: "reverting on one target and failed on another",
+			targets: []parityTarget{
+				{opState: state.ApplyOperation.Reverting, status: state.Task.Reverting, copied: 1000, total: 1000},
+				{opState: state.ApplyOperation.Failed, status: state.Task.Failed, copied: 100, total: 1000},
+			},
+			headline: "❌ Failed",
+		},
+		{
+			name: "copying on one target and failed on another",
+			targets: []parityTarget{
+				{opState: state.ApplyOperation.Running, status: state.Task.Running, copied: 400, total: 1000},
+				{opState: state.ApplyOperation.Failed, status: state.Task.Failed, copied: 100, total: 1000},
+			},
+			headline: bar,
+		},
+		{
+			name: "copying on one target and complete on another",
+			targets: []parityTarget{
+				{opState: state.ApplyOperation.Running, status: state.Task.Running, copied: 400, total: 1000},
+				{opState: state.ApplyOperation.Completed, status: state.Task.Completed, copied: 1000, total: 1000},
+			},
+			headline: "🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70.00%",
+		},
+		{
+			name: "queued on one target and complete on another",
+			targets: []parityTarget{
+				{opState: state.ApplyOperation.Pending, status: state.Task.Pending},
+				{opState: state.ApplyOperation.Completed, status: state.Task.Completed, copied: 1000, total: 1000},
+			},
+			headline: "🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 50%",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rollout := make([]rolloutTarget, len(tc.targets))
+			for i, target := range tc.targets {
+				rollout[i] = rolloutTarget{
+					opState: target.opState, status: target.status, rowsCopied: target.copied, rowsTotal: target.total,
+				}
+			}
+			cli := tableHeadline(t, renderRollout(t, targetRolloutData(rollout)), cliTableHeadline)
+			pr := tableHeadline(t, renderPRRollout(tc.targets), prTableHeadline)
+			assert.Equal(t, tc.headline, cli, "CLI table line")
+			assert.Equal(t, tc.headline, pr, "PR comment table line")
+		})
+	}
+}
+
+var (
+	cliTableHeadline = regexp.MustCompile(`(?m)^\s*~ orders: (.+)$`)
+	prTableHeadline  = regexp.MustCompile("(?m)^\\*\\*`orders`\\*\\*: (.+)$")
+)
+
+// tableHeadline is what follows the table's name on its line: its bar and
+// percent, or its state.
+func tableHeadline(t *testing.T, out string, tableLine *regexp.Regexp) string {
+	t.Helper()
+	line := tableLine.FindStringSubmatch(out)
+	require.NotNil(t, line, "no table line:\n%s", out)
+	return strings.TrimSpace(line[1])
+}
+
 var (
 	cliTableLine  = regexp.MustCompile(`(?m)^\s*~ orders: \S+ (\S+(?: \(throttled\))?)$`)
 	prTableLine   = regexp.MustCompile("(?m)^\\*\\*`orders`\\*\\*: \\S+ (\\S+(?: \\(throttled\\))?)$")
@@ -116,6 +199,11 @@ func cliTableReading(t *testing.T, targets []parityTarget) (percent, rows string
 // percent beside the table's bar and its rows line.
 func prTableReading(t *testing.T, targets []parityTarget) (percent, rows string) {
 	t.Helper()
+	return tableReading(t, renderPRRollout(targets), prTableLine)
+}
+
+// renderPRRollout renders the targets as the PR comment of one rollout.
+func renderPRRollout(targets []parityTarget) string {
 	ops := make([]presentation.Operation, len(targets))
 	details := make([]*webhooktemplates.ApplyStatusCommentData, len(targets))
 	for i, target := range targets {
@@ -135,10 +223,9 @@ func prTableReading(t *testing.T, targets []parityTarget) (percent, rows string)
 			}},
 		}
 	}
-	out := webhooktemplates.RenderMultiDeploymentApplyComment(webhooktemplates.MultiDeploymentApplyData{
+	return webhooktemplates.RenderMultiDeploymentApplyComment(webhooktemplates.MultiDeploymentApplyData{
 		Model: presentation.Derive(ops), ApplyID: "apply-7f3c", Environment: "production", Details: details,
 	})
-	return tableReading(t, out, prTableLine)
 }
 
 // The CLI and the PR comment draw the same checksum bar for one table: the bar

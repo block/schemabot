@@ -454,7 +454,7 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 			break
 		}
 	}
-	rolled.Status = rollupTaskStatus(statuses)
+	rolled.Status = presentation.RollupTaskStatus(statuses)
 	rolled.IsInstant = reported > 0 && allInstant
 	if allPlanned && reported > 0 {
 		rolled.EstimatedRows = &plannedAll
@@ -810,38 +810,6 @@ func anyTargetStarted(targets []ShardProgress) bool {
 func countsTowardRolledRows(status string) bool {
 	return state.IsInFlightTaskState(status) ||
 		state.IsState(status, state.Task.Completed, state.Task.RevertWindow)
-}
-
-// inFlightRollupOrder is every in-flight task state, copying first and the
-// rest in the order a target passes through them.
-var inFlightRollupOrder = []string{
-	state.Task.Running,
-	state.Task.WaitingForDeploy,
-	state.Task.Recovering,
-	state.Task.CatchingUp,
-	state.Task.Checksumming,
-	state.Task.PostChecksum,
-	state.Task.WaitingForCutover,
-	state.Task.CuttingOver,
-	state.Task.Reverting,
-}
-
-// rollupTaskStatus is a table's status across targets. While any target is
-// still working on the change the table reads as in flight, never as failed:
-// copying first, so the bar keeps showing the rows still moving, otherwise
-// the earliest phase any target is in, so the table never reads further along
-// than its slowest target. The targets that failed are named in the
-// per-target lines and the attention list beneath it. With nothing in
-// flight, presentation.RollupTaskStatus decides, as it does for the PR
-// comment. Reading in-flight work ahead of a failure is the one place this
-// differs from the PR comment, which puts a failure first.
-func rollupTaskStatus(statuses []string) string {
-	for _, phase := range inFlightRollupOrder {
-		if slices.Contains(statuses, phase) {
-			return phase
-		}
-	}
-	return presentation.RollupTaskStatus(statuses)
 }
 
 // writeTargetAttention names each failed or retrying target with its error
