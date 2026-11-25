@@ -852,9 +852,9 @@ case:
 | The foreign key | Tables named | Why |
 |---|---|---|
 | Crosses namespaces | Both | A file cannot reference a table in another namespace |
-| Sits on a partition | Both | A partition has no file of its own. Declare the key on the partitioned parent |
+| Sits on a partition | The referenced table, with a reason that names the partition's key | A partition has no file of its own. Declare the key on the partitioned parent |
 | Sits on a table with no file of its own, such as one an extension owns | The referenced table | The key would be lost from the baseline |
-| References its own table through a standalone unique index | The referencing table | The file would declare the key before the index exists. Make the index a `UNIQUE` constraint to pull it |
+| References its own table through a standalone unique index | The referencing table | The file would declare the key before the index exists. Make the index an immediate `UNIQUE` constraint to pull it. A deferrable one does not count |
 | Sits on a table with row-level security | The referencing table | A file cannot declare row-level security and a foreign key together yet |
 
 Remove the foreign key, or drop the table through a reviewed process, then
