@@ -115,6 +115,7 @@ import (
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
@@ -4531,9 +4532,11 @@ func (c *LocalClient) loadStoredProgressMetadata(ctx context.Context, reads *pro
 // aggregateStoredShards computes a table's headline figures from its persisted
 // per-shard rows — the per-table number is computed at read time, never stored.
 // Rows are summed (a completed shard's copied count is clamped up to its total,
-// since row counts can lag concurrent inserts), ETA is the slowest shard, and
+// since row counts can lag concurrent inserts), ETA is when the slowest shard
+// finishes (presentation.ShardedTableETA), as the PR comment reads it, and
 // percent is derived from the summed rows.
 func aggregateStoredShards(shards []*storage.Task) (rowsCopied, rowsTotal, etaSeconds int64, percent int32) {
+	copies := make([]presentation.ShardCopy, 0, len(shards))
 	for _, sh := range shards {
 		rowsTotal += sh.RowsTotal
 		copied := sh.RowsCopied
@@ -4541,14 +4544,12 @@ func aggregateStoredShards(shards []*storage.Task) (rowsCopied, rowsTotal, etaSe
 			copied = sh.RowsTotal
 		}
 		rowsCopied += copied
-		if int64(sh.ETASeconds) > etaSeconds {
-			etaSeconds = int64(sh.ETASeconds)
-		}
+		copies = append(copies, presentation.ShardCopy{RowsCopied: sh.RowsCopied, RowsTotal: sh.RowsTotal, ETASeconds: int64(sh.ETASeconds), Throttled: sh.Throttled})
 	}
 	if rowsTotal > 0 {
 		percent = int32(min(rowsCopied*100/rowsTotal, 100))
 	}
-	return rowsCopied, rowsTotal, etaSeconds, percent
+	return rowsCopied, rowsTotal, presentation.ShardedTableETA(copies), percent
 }
 
 // shardProgressProto renders a table's per-shard breakdown from the persisted

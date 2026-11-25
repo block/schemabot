@@ -214,8 +214,11 @@ type shardedInFlightCase struct {
 	reporting, shards int
 	// planned marks a total that counts the plan's estimate for the shards
 	// that have not reported, which then spans the whole table.
-	planned  bool
-	headline string
+	planned bool
+	// throttleReason, when set, marks the table as throttled by the engine
+	// for that reason.
+	throttleReason string
+	headline       string
 	// rowsLine, when set, is the rows line both surfaces show.
 	rowsLine string
 }
@@ -232,6 +235,8 @@ func TestShardedInFlightTableReadsTheSameOnEverySurface(t *testing.T) {
 		{name: "starting copy", rowsTotal: 1_466_232, reporting: 2, shards: 2, headline: "⏳ Starting copy..."},
 		{name: "later shards counted from the plan", rowsCopied: 914_707, rowsTotal: 4_000_000, reporting: 1, shards: 4, planned: true,
 			headline: "22.87%", rowsLine: "Rows: 914,707 / ~4M · ETA: ≥ 3m 15s"},
+		{name: "a shard held back by the throttler", rowsCopied: 914_707, rowsTotal: 1_466_232, reporting: 2, shards: 2, throttleReason: "replica-lag 5s >= 2s",
+			headline: "62.38% (throttled)", rowsLine: "Rows: 914,707 / 1,466,233 · ETA: 3m 15s"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cliShards := make([]ShardProgress, tc.shards)
@@ -253,15 +258,18 @@ func TestShardedInFlightTableReadsTheSameOnEverySurface(t *testing.T) {
 				}
 			}
 			total := tc.rowsTotal + int64(tc.reporting-1)
+			throttled := tc.throttleReason != ""
 			cli := FormatTableProgress(TableProgress{
 				TableName: "orders", Status: state.Task.Running, ChangeType: "alter",
 				RowsCopied: tc.rowsCopied, RowsTotal: total, RowsTotalPlanned: tc.planned, ETASeconds: 195, PlannedShards: tc.shards, Shards: cliShards,
+				Throttled: throttled, ThrottleReason: tc.throttleReason,
 			})
 			pr := webhooktemplates.RenderShardedApplyComment(webhooktemplates.ShardedApplyData{
 				State: state.Apply.Running, Environment: "staging", Database: "shop", ApplyID: "apply-5e6f7a8b",
 				Keyspaces: []webhooktemplates.ShardedKeyspace{{Keyspace: "shop_sharded", Tables: []webhooktemplates.ShardedTableStatus{{
 					Table: "orders", Status: state.Task.Running, RowsCopied: tc.rowsCopied, RowsTotal: total, ETASeconds: 195,
 					ShardsReporting: tc.reporting, RowsTotalPlanned: tc.planned, PlannedShards: tc.shards, Shards: prShards,
+					Throttled: throttled, ThrottleReason: tc.throttleReason,
 				}}}},
 			})
 
@@ -276,6 +284,7 @@ func TestShardedInFlightTableReadsTheSameOnEverySurface(t *testing.T) {
 				Tables: []*apitypes.TableProgressResponse{{
 					TableName: "orders", DDL: "ALTER TABLE orders ADD COLUMN note text", Status: state.Task.Running, ChangeType: "alter",
 					RowsCopied: tc.rowsCopied, RowsTotal: total, RowsTotalPlanned: tc.planned, ETASeconds: 195, PlannedShards: int32(tc.shards), Shards: apiShards,
+					Throttled: throttled, ThrottleReason: tc.throttleReason,
 				}},
 			}, "octocat"))
 

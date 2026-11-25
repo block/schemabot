@@ -192,10 +192,6 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 			if r.DDL != "" && !slices.Contains(ddls, r.DDL) {
 				ddls = append(ddls, r.DDL)
 			}
-			if r.Throttled && !row.Throttled {
-				row.Throttled = true
-				row.ThrottleReason = r.ThrottleReason
-			}
 		}
 	}
 	row.DDL = strings.Join(ddls, "\n")
@@ -216,6 +212,8 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 	row.RowsTotal = rollup.RowsTotal
 	row.RowsTotalPlanned = rollup.RowsTotalPlanned
 	row.ETASeconds = rollup.ETASeconds
+	row.Throttled = rollup.Throttled
+	row.ThrottleReason = rollup.ThrottleReason
 	if rollup.RowsTotal > 0 {
 		row.PercentComplete = int32(min(100, rollup.RowsCopied*100/rollup.RowsTotal))
 	}
@@ -268,6 +266,8 @@ func taskCopies(tasks []*storage.Task) []presentation.ShardCopy {
 			RowsCopied:      t.RowsCopied,
 			RowsTotal:       t.RowsTotal,
 			ETASeconds:      int64(t.ETASeconds),
+			Throttled:       t.Throttled,
+			ThrottleReason:  t.ThrottleReason,
 
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
