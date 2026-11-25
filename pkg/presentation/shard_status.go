@@ -33,8 +33,12 @@ type ShardStatus struct {
 // DeriveShards projects each keyspace shard of a sharded apply to one status,
 // the way the PR comment and the CLI both read a shard: its operations
 // aggregate to the most attention-worthy one's state and error, then every
-// shard, across all keyspaces, is derived in one pass so ordering labels
-// ("waiting for -40", "halted — -40 failed") name sibling shards. A shard's
+// shard, across all keyspaces, is derived in one pass. The shards of one
+// rollout member never order one another's copies (the claim gate starts them
+// in parallel up to the apply's driver cap), so a pending shard of a single
+// member reads as queued, or not started once the apply has settled; only
+// shards spanning members keep ordering labels
+// ("waiting for -40", "halted — -40 failed") that name a sibling. A shard's
 // identity is its name, qualified by keyspace ("keyspace/shard") when the
 // apply spans more than one keyspace, since shard names repeat across
 // keyspaces and a label naming a bare duplicate would be ambiguous. The
@@ -47,6 +51,7 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 	}
 	qualify := len(keyspaces) > 1
 	shardOf := shardIdentities(shards, qualify)
+	unordered := shardsOfOneMember(shards)
 	inputs := make([]Operation, 0, len(shards))
 	for _, sw := range shards {
 		if len(sw.Operations) == 0 {
@@ -67,13 +72,21 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 			ContinueOnFailure: first.ContinueOnFailure,
 			PauseOnFailure:    first.PauseOnFailure,
 			Released:          first.Released,
+			UnorderedCopy:     unordered,
 			CopiesNoRows:      shardCopiesNoRows(sw.Operations, sw.Operations[best].State),
 			Error:             sw.Operations[best].Error,
 			EndedBy:           shardEndedBy(sw.Operations, best, shardOf),
 		})
 	}
+	settled := state.IsState(applyState, state.SettledApplyStates...)
 	byIdentity := make(map[string]Deployment, len(inputs))
 	for _, d := range Derive(ResumeClaimed(applyState, inputs)).Deployments {
+		if unordered && settled && d.Presentation == StateQueuedNext {
+			// The apply has settled, so nothing will start this shard: it
+			// reads as not started, as a part a settled rollout never ran
+			// does (PendingWord).
+			d.set(StateHalted, PendingWord(true), "⏸️", false)
+		}
 		byIdentity[d.Deployment] = d
 	}
 	out := make([]ShardStatus, 0, len(inputs))
@@ -91,6 +104,27 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 		out = append(out, ShardStatus{Keyspace: sw.Keyspace, Shard: sw.Shard, Landed: shardLanded(sw.Operations), Deployment: d})
 	}
 	return out
+}
+
+// shardsOfOneMember reports whether every operation of the shards belongs to
+// one rollout member, a (deployment, target) pair. The claim gate orders copy
+// starts only across members, so such shards copy in parallel and wait only
+// for a free driver.
+func shardsOfOneMember(shards []ShardWork) bool {
+	var deployment, target string
+	seen := false
+	for _, sw := range shards {
+		for _, op := range sw.Operations {
+			if !seen {
+				deployment, target, seen = op.Deployment, op.Target, true
+				continue
+			}
+			if op.Deployment != deployment || op.Target != target {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // shardCopiesNoRows reports whether the shard's operations in the state its
@@ -169,7 +203,7 @@ func shardEndedBy(ops []Operation, best int, shardOf map[OperationRef]string) *O
 
 // ShardCounts is the per-status count of a sharded apply's shards, given each
 // shard's status label, in the order each status first appears ("1 running
-// table copy, 3 waiting for -40"): the shard-unit analogue of a rollout's
+// table copy, 3 queued"): the shard-unit analogue of a rollout's
 // deployment counts. A label counts by its leading state words, without the
 // reason after " — ", so shards halted by the same failure count together.
 func ShardCounts(labels []string) string {

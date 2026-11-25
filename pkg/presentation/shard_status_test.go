@@ -9,40 +9,75 @@ import (
 	"github.com/block/schemabot/pkg/state"
 )
 
-// A keyspace's shards run in order: while the first copies, each later shard
-// waits on it, and the count reads them by status the way the PR comment's
-// Shards line does.
-func TestDeriveShardsOrdersTheShardsOfAKeyspace(t *testing.T) {
-	shards := DeriveShards(state.Apply.Running, []ShardWork{
-		{Keyspace: "shop_001", Shard: "-40", Operations: []Operation{{State: state.ApplyOperation.Running}}},
-		{Keyspace: "shop_001", Shard: "40-80", Operations: []Operation{{State: state.ApplyOperation.Pending}}},
-		{Keyspace: "shop_001", Shard: "80-", Operations: []Operation{{State: state.ApplyOperation.Pending}}},
-	})
+// The shards of one target copy in parallel, and the claim gate holds a
+// pending shard back only at the apply's driver cap. With eight shards and a
+// cap of two, two shards copy and the other six read as queued, never as
+// waiting for a sibling shard.
+func TestDeriveShardsQueuesTheShardsTheDriverCapHoldsBack(t *testing.T) {
+	names := []string{"-20", "20-40", "40-60", "60-80", "80-a0", "a0-c0", "c0-e0", "e0-"}
+	work := make([]ShardWork, 0, len(names))
+	for i, name := range names {
+		opState := state.ApplyOperation.Pending
+		if i < 2 {
+			opState = state.ApplyOperation.Running
+		}
+		work = append(work, ShardWork{Keyspace: "shop_001", Shard: name, Operations: []Operation{
+			{Deployment: "default", State: opState, Barrier: true},
+		}})
+	}
 
-	require.Len(t, shards, 3)
-	assert.Equal(t, "-40", shards[0].Shard)
-	assert.Equal(t, "waiting for -40", shards[1].Label)
-	assert.Equal(t, "waiting for -40", shards[2].Label)
-	assert.Equal(t, "1 running table copy, 2 waiting for -40", ShardCounts([]string{shards[0].Label, shards[1].Label, shards[2].Label}))
+	shards := DeriveShards(state.Apply.Running, work)
+
+	require.Len(t, shards, 8)
+	labels := make([]string, 0, len(shards))
+	for i, s := range shards {
+		assert.Equal(t, names[i], s.Shard)
+		labels = append(labels, s.Label)
+	}
+	assert.Equal(t, "running table copy", shards[1].Label)
+	assert.Equal(t, PendingQueued, shards[2].Label)
+	assert.Equal(t, PendingQueued, shards[7].Label)
+	assert.Equal(t, "2 running table copy, 6 queued", ShardCounts(labels))
 }
 
-// A shard running more than one table's change reads as its most
-// attention-worthy one, with that operation's error, and a label naming a
-// shard of an apply spanning keyspaces qualifies it by keyspace, since every
-// unsharded keyspace's shard is "-".
-func TestDeriveShardsTakesTheFailedTableAndQualifiesAcrossKeyspaces(t *testing.T) {
-	shards := DeriveShards(state.Apply.Running, []ShardWork{
+// A failed shard does not hold the other shards of its target, since the
+// claim gate never holds one member's work on its own failure: while the apply
+// runs, the pending shard reads as queued. Once the apply has settled nothing
+// will start it, so it reads as not started. A shard reads as its most
+// attention-worthy table, with that table's error.
+func TestDeriveShardsTakesTheFailedTableAndDoesNotHoldItsTarget(t *testing.T) {
+	work := []ShardWork{
 		{Keyspace: "shop_001", Shard: "-", Operations: []Operation{
-			{State: state.ApplyOperation.Completed},
-			{State: state.ApplyOperation.Failed, Error: "duplicate key"},
+			{Deployment: "default", State: state.ApplyOperation.Completed},
+			{Deployment: "default", State: state.ApplyOperation.Failed, Error: "duplicate key"},
 		}},
-		{Keyspace: "shop_002", Shard: "-", Operations: []Operation{{State: state.ApplyOperation.Pending}}},
+		{Keyspace: "shop_002", Shard: "-", Operations: []Operation{{Deployment: "default", State: state.ApplyOperation.Pending}}},
+	}
+
+	running := DeriveShards(state.Apply.Running, work)
+	require.Len(t, running, 2)
+	assert.Equal(t, state.ApplyOperation.Failed, running[0].State)
+	assert.Equal(t, "duplicate key", running[0].Error)
+	assert.Equal(t, PendingQueued, running[1].Label)
+	assert.Equal(t, "1 failed, 1 queued", ShardCounts([]string{running[0].Label, running[1].Label}))
+
+	settled := DeriveShards(state.Apply.Failed, work)
+	require.Len(t, settled, 2)
+	assert.Equal(t, PendingNotStarted, settled[1].Label)
+	assert.Equal(t, "1 failed, 1 not started", ShardCounts([]string{settled[0].Label, settled[1].Label}))
+}
+
+// Shards that span rollout members keep the ordering the claim gate applies
+// across members: a later member's shard is halted behind an earlier member's
+// failure, and the label qualifies the shard by keyspace, since every
+// unsharded keyspace's shard is "-".
+func TestDeriveShardsOrdersShardsAcrossMembers(t *testing.T) {
+	shards := DeriveShards(state.Apply.Running, []ShardWork{
+		{Keyspace: "shop_001", Shard: "-", Operations: []Operation{{Deployment: "us", State: state.ApplyOperation.Failed, Error: "duplicate key"}}},
+		{Keyspace: "shop_002", Shard: "-", Operations: []Operation{{Deployment: "eu", State: state.ApplyOperation.Pending}}},
 	})
 
 	require.Len(t, shards, 2)
-	assert.Equal(t, state.ApplyOperation.Failed, shards[0].State)
-	assert.Equal(t, "duplicate key", shards[0].Error)
-	assert.Equal(t, "shop_002", shards[1].Keyspace)
 	assert.Equal(t, "halted — shop_001/- failed", shards[1].Label)
 	assert.Equal(t, "1 failed, 1 halted", ShardCounts([]string{shards[0].Label, shards[1].Label}))
 }

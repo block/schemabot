@@ -90,6 +90,13 @@ type Operation struct {
 	// are mutually exclusive: the caller derives each from the same stored policy.
 	Parallel bool
 
+	// UnorderedCopy is true when no sibling orders this row's copy start or
+	// holds it on a failure: the shards of one rollout member, whose copies
+	// the claim gate starts in parallel and holds back only at the apply's
+	// driver cap. A pending row then reads as queued, never as waiting for or
+	// halted behind a sibling. Cutover ordering is unchanged.
+	UnorderedCopy bool
+
 	// ContinueOnFailure is true only when the operation's on_failure policy is
 	// exactly "continue". A terminal-failed earlier sibling no longer blocks
 	// later deployments and the aggregate is held running_degraded past the
@@ -684,6 +691,10 @@ func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 	}
 	if op.Finalizer {
 		deriveFinalizerPending(d, ops, names, i)
+		return
+	}
+	if op.UnorderedCopy {
+		d.set(StateQueuedNext, PendingQueued, "⏳", false)
 		return
 	}
 	// Under parallel the copy phase has no earlier-sibling ordering, so a
