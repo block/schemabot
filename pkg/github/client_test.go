@@ -153,11 +153,27 @@ func TestEditIssueCommentDoesNotRetryNonRateLimitWriteError(t *testing.T) {
 	})
 
 	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	err := ic.EditIssueComment(t.Context(), "octocat/hello-world", 5678, "hello")
+	_, err := ic.EditIssueComment(t.Context(), "octocat/hello-world", 5678, "hello")
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "401")
 	assert.Equal(t, int64(1), attempts.Load())
+}
+
+// An edit returns when GitHub created the comment, so a caller can age the
+// comment without spending a separate read on it.
+func TestEditIssueCommentReturnsCommentCreatedAt(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("PATCH /repos/octocat/hello-world/issues/comments/5678", func(w http.ResponseWriter, _ *http.Request) {
+		_, err := w.Write([]byte(`{"id":5678,"body":"hello","created_at":"2026-06-16T19:42:00Z"}`))
+		require.NoError(t, err)
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	createdAt, err := ic.EditIssueComment(t.Context(), "octocat/hello-world", 5678, "hello")
+
+	require.NoError(t, err)
+	assert.Equal(t, time.Date(2026, 6, 16, 19, 42, 0, 0, time.UTC), createdAt.UTC())
 }
 
 // TestFindCheckRunByNameIgnoresForeignAppCheckRuns covers a PR commit that

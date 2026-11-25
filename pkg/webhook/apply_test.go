@@ -36,7 +36,7 @@ func TestFormatProgressComment(t *testing.T) {
 		},
 	}
 
-	body := formatProgressComment(apply, tasks, nil, "")
+	body := formatProgressComment(apply, tasks, nil, "", 0)
 
 	// Template renders rich progress bars instead of a table
 	assert.Contains(t, body, "testdb")
@@ -62,7 +62,7 @@ func TestFormatProgressComment_ShowsStoredTableSize(t *testing.T) {
 		RowsCopied: 1_234_567, RowsTotal: 48_200_000, ProgressPercent: 2, EstimatedBytes: &bytes,
 	}}
 
-	body := formatProgressComment(apply, tasks, nil, "")
+	body := formatProgressComment(apply, tasks, nil, "", 0)
 
 	assert.Contains(t, body, "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB\n")
 }
@@ -75,7 +75,7 @@ func TestFormatProgressComment_NoTasks(t *testing.T) {
 		State:       state.Apply.Pending,
 	}
 
-	body := formatProgressComment(apply, nil, nil, "")
+	body := formatProgressComment(apply, nil, nil, "", 0)
 
 	assert.Contains(t, body, "testdb")
 	assert.Contains(t, body, "**Status**: Queued")
@@ -91,7 +91,7 @@ func TestFormatProgressComment_WithError(t *testing.T) {
 		ErrorMessage: "connection refused",
 	}
 
-	body := formatProgressComment(apply, nil, nil, "")
+	body := formatProgressComment(apply, nil, nil, "", 0)
 
 	assert.Contains(t, body, "connection refused")
 	assert.Contains(t, body, "Failed")
@@ -124,7 +124,7 @@ func TestFormatProgressCommentCutoverState(t *testing.T) {
 		{TableName: "orders", State: state.Task.WaitingForCutover},
 	}
 
-	body := formatProgressComment(apply, tasks, nil, "")
+	body := formatProgressComment(apply, tasks, nil, "", 0)
 
 	assert.Contains(t, body, "Cutover")
 	assert.Contains(t, body, "testdb")
@@ -152,7 +152,7 @@ func TestFormatProgressCommentCutoverReadinessCountsOnlyParkedTables(t *testing.
 		{TableName: "orders", State: state.Task.Running},
 	}
 
-	body := formatProgressComment(apply, tasks, nil, "")
+	body := formatProgressComment(apply, tasks, nil, "", 0)
 
 	assert.Contains(t, body, "**1/2** table(s) ready for cutover — waiting on 1")
 	assert.Contains(t, body, "Waiting for cutover")

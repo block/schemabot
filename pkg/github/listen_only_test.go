@@ -101,7 +101,10 @@ func TestListenOnlyRepositoryRefusesEveryWrite(t *testing.T) {
 			_, _, err := ic.CreateIssueComment(ctx, listenOnlyTestRepo, 1, "plan")
 			return err
 		},
-		"edit issue comment":   func() error { return ic.EditIssueComment(ctx, listenOnlyTestRepo, 7, "plan") },
+		"edit issue comment": func() error {
+			_, err := ic.EditIssueComment(ctx, listenOnlyTestRepo, 7, "plan")
+			return err
+		},
 		"delete issue comment": func() error { return ic.DeleteIssueComment(ctx, listenOnlyTestRepo, 7) },
 		"minimize comment":     func() error { return ic.MinimizeComment(ctx, listenOnlyTestRepo, "IC_7") },
 		"add reaction":         func() error { return ic.AddReactionToComment(ctx, listenOnlyTestRepo, 7, "eyes") },

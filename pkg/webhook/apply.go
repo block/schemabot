@@ -466,8 +466,12 @@ func shardCommentTableKey(applyOperationID *int64, namespace, table string) stri
 // formatProgressComment renders the progress comment using the template system.
 // It is the no-operations fallback (load error, or the initial rollback comment),
 // so it carries no VSchema — the observer refreshes VSchema once operations load.
-func formatProgressComment(apply *storage.Apply, tasks []*storage.Task, shardsByTable map[string][]*storage.Task, tenant string) string {
-	return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, operationDisplay{}, shardsByTable, tenant))
+// updateCadence is how soon a change reaches the comment, rendered beside the
+// "Last updated" footer; zero renders no note.
+func formatProgressComment(apply *storage.Apply, tasks []*storage.Task, shardsByTable map[string][]*storage.Task, tenant string, updateCadence time.Duration) string {
+	data := buildApplyCommentData(apply, tasks, operationDisplay{}, shardsByTable, tenant)
+	data.UpdateCadence = updateCadence
+	return templates.RenderApplyStatusComment(data)
 }
 
 // formatSummaryComment renders the final summary comment for a terminal apply

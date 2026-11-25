@@ -101,7 +101,7 @@ func (h *Handler) updatePRSchemaCapComment(ctx context.Context, client *ghclient
 	}
 	body := fmt.Sprintf("<!-- %s -->\n%s", key, message)
 	if claim.CommentID != 0 {
-		err = client.EditIssueComment(ctx, repo, claim.CommentID, body)
+		_, err = client.EditIssueComment(ctx, repo, claim.CommentID, body)
 		if ghclient.IsNotFoundError(err) {
 			claim.CommentID, err = 0, nil
 		}
