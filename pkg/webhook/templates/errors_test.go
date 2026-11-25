@@ -147,13 +147,53 @@ func TestRenderNoConfigUsageExample(t *testing.T) {
 // a command without scoping it to one environment.
 func TestRenderMultipleConfigsUsageExample(t *testing.T) {
 	body := RenderMultipleConfigs(SchemaErrorData{
-		RequestedBy:        "octocat",
-		Timestamp:          "2026-07-16 18:56:00",
-		CommandName:        "plan",
-		AvailableDatabases: "- `testapp`\n- `payments`",
+		RequestedBy: "octocat",
+		Timestamp:   "2026-07-16 18:56:00",
+		CommandName: "plan",
+		AvailableConfigs: []AvailableConfigData{
+			{Database: "testapp", SchemaPath: "schema/testapp"},
+			{Database: "payments", SchemaPath: "schema/payments"},
+		},
 	})
 	assert.Contains(t, body, "schemabot plan -e <environment> -d <database-name>")
 	assert.Contains(t, body, "*Requested by @octocat at 2026-07-16 18:56:00 UTC*")
+}
+
+// TestRenderMultipleConfigsAvailableDatabases pins the list a user picks the
+// -d value from: one line per config, naming its database and directory as
+// code spans, and one fixed line when no config is known.
+func TestRenderMultipleConfigsAvailableDatabases(t *testing.T) {
+	render := func(configs []AvailableConfigData) string {
+		return RenderMultipleConfigs(SchemaErrorData{
+			RequestedBy:      "octocat",
+			Timestamp:        "2026-07-16 18:56:00",
+			Environment:      "staging",
+			CommandName:      "plan",
+			AvailableConfigs: configs,
+		})
+	}
+
+	t.Run("one line per config", func(t *testing.T) {
+		body := render([]AvailableConfigData{
+			{Database: "testapp", SchemaPath: "schema/testapp"},
+			{Database: "payments", SchemaPath: "schema/payments"},
+		})
+		assert.Contains(t, body, "### Available Databases\n\n- `testapp` (`schema/testapp`)\n- `payments` (`schema/payments`)\n\n\n### How to specify a database")
+	})
+
+	t.Run("names holding separators or markdown stay inside their code spans", func(t *testing.T) {
+		body := render([]AvailableConfigData{
+			{Database: "orders: v2, legacy", SchemaPath: "services/a: b/@acme/team"},
+			{Database: "we`ird\nname", SchemaPath: "x/[link](https://example.com)"},
+		})
+		assert.Contains(t, body, "- `orders: v2, legacy` (`services/a: b/@acme/team`)\n")
+		assert.Contains(t, body, "- `` we`ird name `` (`x/[link](https://example.com)`)\n")
+	})
+
+	t.Run("no known config renders one fixed line", func(t *testing.T) {
+		body := render(nil)
+		assert.Contains(t, body, "### Available Databases\n\n- SchemaBot could not list them here. Each `schemabot.yaml` in this PR names its database under `database`.\n\n\n### How to specify a database")
+	})
 }
 
 func TestRenderUnmanagedSchemaConfigsNotice(t *testing.T) {

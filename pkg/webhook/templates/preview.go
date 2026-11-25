@@ -1502,11 +1502,14 @@ func PreviewCommentErrorNoConfig() string {
 // PreviewCommentErrorMultiple renders the "multiple databases" error comment.
 func PreviewCommentErrorMultiple() string {
 	return RenderMultipleConfigs(SchemaErrorData{
-		RequestedBy:        previewRequestedBy,
-		Timestamp:          "2026-01-15 14:30:00",
-		Environment:        "staging",
-		CommandName:        action.Plan,
-		AvailableDatabases: "- `testapp` (schema/testapp/schemabot.yaml)\n- `payments` (schema/payments/schemabot.yaml)",
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-01-15 14:30:00",
+		Environment: "staging",
+		CommandName: action.Plan,
+		AvailableConfigs: []AvailableConfigData{
+			{Database: "testapp", SchemaPath: "schema/testapp"},
+			{Database: "payments", SchemaPath: "schema/payments"},
+		},
 	})
 }
 
