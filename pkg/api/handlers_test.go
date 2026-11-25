@@ -37,6 +37,8 @@ type mockStorage struct {
 	driverPools   memoryDriverPools
 }
 
+func (m *mockStorage) Notifications() storage.NotificationStore { return nil }
+
 func (m *mockStorage) Locks() storage.LockStore                     { return nil }
 func (m *mockStorage) Plans() storage.PlanStore                     { return nil }
 func (m *mockStorage) Applies() storage.ApplyStore                  { return nil }

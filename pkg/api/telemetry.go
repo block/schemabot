@@ -132,6 +132,9 @@ func SetupTelemetry(logger *slog.Logger) (*Telemetry, error) {
 	if err := metrics.RegisterEnvironmentFreezeMetrics(mp); err != nil {
 		return nil, errors.Join(err, tel.Shutdown(ctx))
 	}
+	if err := metrics.RegisterApplyNotificationMetrics(mp); err != nil {
+		return nil, errors.Join(err, tel.Shutdown(ctx))
+	}
 	otel.SetMeterProvider(mp)
 	return tel, nil
 }

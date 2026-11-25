@@ -71,6 +71,7 @@ type parityFamily struct {
 }
 
 var parityFamilies = []parityFamily{
+	{storageMethod: "Notifications", test: TestNotifications},
 	{storageMethod: "Plans", test: TestPlans},
 	{storageMethod: "PlanComments", test: TestPlanComments},
 	{storageMethod: "Settings", test: TestSettings},

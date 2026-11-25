@@ -37,6 +37,7 @@ import (
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/notifications"
 	"github.com/block/schemabot/pkg/panicsafe"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
@@ -572,6 +573,10 @@ func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os
 // the embedding seam: a data plane consuming SchemaBot as a module configures it
 // entirely through ServerConfig rather than reimplementing this wiring.
 type Server struct {
+	notificationRunner *notifications.Runner
+	notificationCancel context.CancelFunc
+	notificationDone   chan struct{}
+
 	cfg             *api.ServerConfig
 	svc             *api.Service
 	storage         storage.Storage
@@ -657,6 +662,9 @@ func registerPlanetScaleMTLS(cfg *api.ServerConfig, logger *slog.Logger) error {
 // (RegisterGRPC / Handler), starts background work (Start), and releases
 // resources (Close). Run is Build plus SchemaBot's own gRPC/HTTP listeners.
 func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server, error) {
+	if err := cfg.Notifications.Validate(); err != nil {
+		return nil, err
+	}
 	if err := cfg.ValidateExperimentalStrata(); err != nil {
 		return nil, err
 	}
@@ -819,6 +827,18 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		}
 	}
 
+	publisher, err := notifications.NewPublisher(ctx, cfg.Notifications)
+	if err != nil {
+		return nil, fmt.Errorf("build completion publisher: %w", err)
+	}
+	var notificationRunner *notifications.Runner
+	if publisher != nil {
+		notificationRunner, err = notifications.New(store.Notifications(), publisher, cfg.Notifications, logger)
+		if err != nil {
+			return nil, fmt.Errorf("build completion catch-up: %w", err)
+		}
+	}
+
 	// Initialize telemetry (OTel metrics via Prometheus /metrics endpoint).
 	telemetry, err := api.SetupTelemetry(logger)
 	if err != nil {
@@ -830,6 +850,8 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		targetResolver = router.Resolver()
 	}
 	srv := &Server{
+		notificationRunner: notificationRunner,
+
 		cfg:             cfg,
 		svc:             svc,
 		storage:         store,
@@ -1210,6 +1232,7 @@ func (s *Server) MetricsHandler() http.Handler {
 // binds its own listeners before calling it: a process that then fails to bind
 // would exit holding claims a peer has to wait out.
 func (s *Server) Start(ctx context.Context) {
+	s.startNotifications(ctx)
 	s.reconcile = s.webhook.StartTerminalOutcomeReconciliation(ctx, s.logger)
 	if s.targetResolver != nil {
 		s.startTargetProbe(ctx)
@@ -1289,6 +1312,7 @@ func (s *Server) stopTargetProbe() {
 // anything another process cannot redo or reclaim, which is what makes stopping
 // the right move when the wait is the thing holding the process open.
 func (s *Server) Close() error {
+	s.stopNotifications()
 	s.stopTargetProbe()
 	s.webhook.stopQuotaProbes()
 	s.svc.StopPendingDropsCleaner()
@@ -1927,4 +1951,37 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups, opera
 	default:
 		return nil, fmt.Errorf("auth type %q is not yet supported", cfg.Type)
 	}
+}
+
+// startNotifications is independent of webhook configuration and completion writers.
+func (s *Server) startNotifications(ctx context.Context) {
+	if s.notificationRunner == nil || s.notificationCancel != nil {
+		s.logger.Debug("completion publisher disabled or already started")
+		return
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	s.notificationCancel = cancel
+	done := make(chan struct{})
+	s.notificationDone = done
+	go func() {
+		defer close(done)
+		s.notificationRunner.Run(runCtx)
+	}()
+	s.logger.Info("completion catch-up publisher started")
+}
+
+// stopNotifications drains before storage and telemetry close. Cancellation
+// bounds SQL/SQS calls; the outer deadline also bounds an uncooperative client.
+func (s *Server) stopNotifications() {
+	if s.notificationCancel == nil {
+		return
+	}
+	s.notificationCancel()
+	select {
+	case <-s.notificationDone:
+		s.logger.Info("completion catch-up publisher stopped")
+	case <-time.After(20 * time.Second):
+		s.logger.Warn("completion publisher drain timed out; outstanding claims expire for retry")
+	}
+	s.notificationCancel = nil
 }

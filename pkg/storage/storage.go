@@ -88,6 +88,9 @@ const DefaultMaxDriversPerApply = 2
 
 // Storage provides access to all stores.
 type Storage interface {
+	// Notifications returns per-apply publication tracking, separate from driver leases.
+	Notifications() NotificationStore
+
 	// Locks returns the lock store.
 	Locks() LockStore
 
