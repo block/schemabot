@@ -4446,3 +4446,53 @@ func TestE2EFailedProgressEditRetriesPendingStateChange(t *testing.T) {
 	edited := requireProgressEdit(t, capture, "expected the pending state change to publish after the hold-back")
 	assert.Contains(t, edited.Body, "Waiting for Cutover")
 }
+
+// A rollout target finishes while GitHub rejects every edit of the progress
+// comment, as it does once the comment is deleted. The Check Run refresh for
+// the finished target is offered anyway: it does not wait on a different
+// comment's edit landing.
+func TestE2EFinishedTargetReportedWhenProgressEditFails(t *testing.T) {
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-decay-target-report",
+		pr:         152,
+		database:   "e2e_decay_target_report_db",
+		applyState: state.Apply.Running,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+	ctx := t.Context()
+
+	insertTarget := func(target, opState string) {
+		t.Helper()
+		_, err := st.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "default", Target: target, OperationKey: target, State: opState,
+			CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt,
+		})
+		require.NoError(t, err)
+	}
+	insertTarget("region-a", state.ApplyOperation.Completed)
+	insertTarget("region-b", state.ApplyOperation.Running)
+
+	h.postAndTrackComment(ctx, "org/repo-decay-target-report", 152, 12345, apply, state.Comment.Progress, "initial progress")
+	requireCommentCreate(t, capture)
+	capture.setFailEdits(true)
+
+	var offered atomic.Int32
+	obs := NewCommentObserver(CommentObserverConfig{
+		GHClient:       f.factory,
+		Storage:        st,
+		Repo:           apply.Repository,
+		PR:             apply.PullRequest,
+		InstallationID: apply.InstallationID,
+		ApplyID:        apply.ID,
+		Logger:         f.logger,
+		Clock:          clock.NewFake(task.CreatedAt),
+		OnTargetsFinishedHook: func(*storage.Apply) bool {
+			offered.Add(1)
+			return true
+		},
+	})
+
+	obs.OnProgress(apply, []*storage.Task{task})
+	requireNoProgressEdit(t, capture, "a rejected edit must not reach the comment")
+	assert.Equal(t, int32(1), offered.Load(), "the finished target must be offered to the Check Run even though the comment edit failed")
+}

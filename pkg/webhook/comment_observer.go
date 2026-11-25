@@ -590,9 +590,9 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	body := o.statusCommentFromOps(apply, ops, opsErr, tasks, o.shardsByTable(ctx, apply, ops), cadence)
 	edit := o.editTrackedComment(apply, state.Comment.Progress, body)
 	o.recordProgressEdit(now, snapshot, cadence, edit)
-	if !edit.shown {
-		return
-	}
+	// The Check Run refresh does not depend on the comment edit landing: a
+	// deleted or unreachable progress comment must not keep a finished target
+	// off the Check Run.
 	if opsErr == nil {
 		o.reportFinishedTargets(apply, ops)
 	}
