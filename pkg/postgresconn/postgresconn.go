@@ -167,7 +167,7 @@ func WithStatementTimeout(d time.Duration) Option {
 				ctx, cancel = context.WithTimeout(ctx, timeout)
 				defer cancel()
 			}
-			if err := execStatementTimeout(ctx, conn, stmt); err != nil {
+			if err := armStatementTimeout(ctx, conn, stmt, cfg.Host, cfg.Database); err != nil {
 				return fmt.Errorf("%s: %w", stmt, err)
 			}
 			return nil
@@ -175,8 +175,66 @@ func WithStatementTimeout(d time.Duration) Option {
 	}
 }
 
-// execStatementTimeout runs the budget statement on a newly connected session.
-// It is a variable so a unit test can observe the statement the hook actually
+// armStatementTimeoutAttempts caps how many times one new session sends the
+// budget statement. Each attempt needs only the moment a SET takes, so a
+// budget that cancels this many in a row is one no statement can work under,
+// and the connection fails with the server's cancellation instead of retrying
+// until the connect budget runs out.
+const armStatementTimeoutAttempts = 5
+
+// armStatementTimeout sends the budget statement until the server accepts it.
+// The SET runs under the budget it replaces, the one the platform set at the
+// role or database level, so a budget tight enough to outlast it cancels it.
+// A cancel request from another session ends it the same way. A cancelled SET
+// changes nothing on the session, so sending it again is safe,
+// and the next attempt starts with a fresh budget of its own. Any other error,
+// or a cancellation the caller's context caused, is returned as is.
+func armStatementTimeout(ctx context.Context, conn *pgconn.PgConn, stmt, host, database string) error {
+	var err error
+	for attempt := 1; attempt <= armStatementTimeoutAttempts; attempt++ {
+		err = execStatementTimeout(ctx, conn, stmt)
+		if !serverCancelledWhileCallerWaits(ctx, err) {
+			return err
+		}
+		if attempt == armStatementTimeoutAttempts {
+			// The last cancellation is not sent again: it fails the dial, and
+			// the returned error carries it to the caller.
+			break
+		}
+		slog.Warn("PostgreSQL cancelled the statement that sets the session's statement_timeout, most likely under the role or database budget it replaces; sending it again",
+			"host", host,
+			"database", database,
+			"statement", stmt,
+			"attempt", attempt,
+			"max_attempts", armStatementTimeoutAttempts,
+			"error", err,
+		)
+	}
+	return fmt.Errorf("cancelled on all %d attempts: %w", armStatementTimeoutAttempts, err)
+}
+
+// sqlstateQueryCanceled is the SQLSTATE the server reports for a statement it
+// cancelled, whether a statement_timeout fired or a cancel request arrived.
+const sqlstateQueryCanceled = "57014"
+
+// serverCancelledWhileCallerWaits reports whether the server cancelled the
+// budget statement (SQLSTATE 57014) while the caller's context was still live.
+// The server reports the same code for an inherited statement_timeout and for
+// a cancel request from another session, such as pg_cancel_backend, and the
+// two cannot be told apart, so both count. Either way the SET changed nothing
+// on the session and is safe to send again. A cancellation the caller's
+// context caused is not retried: the caller has given up.
+func serverCancelledWhileCallerWaits(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == sqlstateQueryCanceled
+}
+
+// execStatementTimeout sends the budget statement once on a newly connected
+// session; armStatementTimeout decides whether to send it again. It is a
+// variable so a unit test can observe the statement the hook actually
 // sends: pgconn's AfterConnect takes a concrete *pgconn.PgConn, so without a
 // seam here the only assertion available off a live server is that some hook
 // was installed — which stays true no matter which statement it carries.

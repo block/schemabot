@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/presentation"
@@ -542,8 +543,9 @@ func PreviewCommentPlanManyUnsafeChanges() string {
 
 // PreviewCommentPlanAttributedChange renders a sample plan whose destructive
 // changes target tables another open pull request applied but has not merged
-// yet, so each entry is annotated with its owner. Attribution is table-grained,
-// so a dropped column is named by its table exactly as a dropped table is.
+// yet, so each finding that undoes an owner's work is annotated with that
+// owner: the dropped column is one the owner added, and the dropped table is
+// one the owner created.
 func PreviewCommentPlanAttributedChange() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
@@ -565,12 +567,18 @@ func PreviewCommentPlanAttributedChange() string {
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "orders", Reason: "DROP COLUMN discards the column's data"},
-			{Table: "reconcile_state", Reason: "DROP TABLE removes all data"},
+			{Table: "orders", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `orders` DROP COLUMN `notes`"},
+			{Table: "reconcile_state", Reason: "DROP TABLE removes all data", DDL: "DROP TABLE `reconcile_state`"},
 		},
 		AttributedChanges: []AttributedChangeData{
-			{Table: "orders", Repository: previewRepository, PullRequest: 4820},
-			{Table: "reconcile_state", Repository: previewRepository, PullRequest: 4821},
+			{
+				Table: "orders", Repository: previewRepository, PullRequest: 4820,
+				OwnerChanges: &ddl.ObjectChanges{Added: []ddl.SchemaObject{{Kind: ddl.ObjectColumn, Name: "notes"}}},
+			},
+			{
+				Table: "reconcile_state", Repository: previewRepository, PullRequest: 4821,
+				OwnerChanges: &ddl.ObjectChanges{Added: []ddl.SchemaObject{{Kind: ddl.ObjectTable, Name: "reconcile_state"}}},
+			},
 		},
 	})
 }
