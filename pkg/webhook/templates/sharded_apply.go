@@ -109,8 +109,9 @@ type ShardedTableStatus struct {
 	Status string
 
 	// RowsCopied/RowsTotal/ETASeconds aggregate the shards' live copy figures:
-	// rows summed across the shards that have reported, ETA the time those
-	// shards take together (presentation.CombinedShardETA). They drive the progress bar and rows line while the table copies;
+	// rows summed across the shards that have reported, ETA when the slowest
+	// of them finishes (presentation.ShardedTableETA). They drive the
+	// progress bar and rows line while the table copies;
 	// zero totals fall back to the state-word rendering. The totals grow as
 	// dispatch waves start their shards' copies, so ShardsReporting says how
 	// many shards the figures cover and both the headline and the rows line

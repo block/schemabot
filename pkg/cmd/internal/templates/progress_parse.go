@@ -293,9 +293,12 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		}
 		if tp.ETASeconds == 0 {
 			// The server reports a sharded table's ETA when it has one, which
-			// the PR comment shows too. Without it, the shards' ETAs combine
-			// the same way the server combines them.
-			tp.ETASeconds = presentation.CombinedShardETA(copies)
+			// the PR comment shows too. Without it, the table's ETA is the
+			// slowest shard's, as the server reads it. The response carries
+			// no per-shard throttle, but the server reports an ETA whenever a
+			// shard does, so this reading never has a throttled shard to
+			// leave out.
+			tp.ETASeconds = presentation.ShardedTableETA(copies)
 		}
 		tp.BuildWork = tableBuildWork(data.BuildWork, workByOperation, len(result.Operations), tbl)
 		data.Tables = append(data.Tables, tp)

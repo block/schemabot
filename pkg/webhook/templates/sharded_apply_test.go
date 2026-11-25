@@ -693,10 +693,10 @@ func TestRenderShardedApplyComment_TableCopyProgressBar(t *testing.T) {
 	assert.NotContains(t, out, "62% (", "full coverage carries no headline qualifier")
 }
 
-// A copying table with one shard held back by the throttler keeps the ETA the
-// shards' combined rate gives, and reads as throttled with the engine's
-// reason, the way the CLI reads it, so the operator still sees the held-back
-// shard.
+// A copying table with one shard held back by the throttler keeps the ETA of
+// its slowest unthrottled shard (presentation.ShardedTableETA), and reads as
+// throttled with the engine's reason, the way the CLI reads it, so the
+// operator still sees the held-back shard.
 func TestRenderShardedApplyComment_TableCopyThrottledShard(t *testing.T) {
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",

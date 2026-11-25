@@ -29,9 +29,8 @@ func TestRollUpShardedTable(t *testing.T) {
 }
 
 // A table with one copying shard held back by the throttler reads as
-// throttled with that shard's reason, while its ETA stays the one the shards'
-// combined rate gives. A shard that finished while throttled does not hold the
-// table back.
+// throttled with that shard's reason, while its ETA stays the unthrottled
+// shard's. A shard that finished while throttled does not hold the table back.
 func TestRollUpShardedTableReadsAThrottledShard(t *testing.T) {
 	shards := []ShardCopy{
 		{Status: state.Task.Running, RowsCopied: 4000, RowsTotal: 10000, ETASeconds: 60},
@@ -40,7 +39,7 @@ func TestRollUpShardedTableReadsAThrottledShard(t *testing.T) {
 	got := RollUpShardedTable(shards, 2)
 	assert.True(t, got.Throttled)
 	assert.Equal(t, "replica-lag 5s >= 2s", got.ThrottleReason)
-	assert.Equal(t, CombinedShardETA(shards), got.ETASeconds)
+	assert.Equal(t, int64(60), got.ETASeconds, "the throttled shard's ETA stays out while an unthrottled shard reports one")
 
 	finished := RollUpShardedTable([]ShardCopy{
 		{Status: state.Task.Running, RowsCopied: 4000, RowsTotal: 10000, ETASeconds: 60},
@@ -50,34 +49,33 @@ func TestRollUpShardedTableReadsAThrottledShard(t *testing.T) {
 	assert.Empty(t, finished.ThrottleReason)
 }
 
-// A 32-shard table copies 31 shards at 100 rows a second while one shard is
-// throttled to under one, each with 6,000 rows left. The table's ETA is the
-// time its rows take at the rate the shards copy together, about a minute,
-// not the throttled shard's two hours. A queued shard, and a copying shard
-// with no rows left, add no work. When no shard reports rows left, the ETA is
-// the longest any shard reports, and with no ETA at all it is zero.
-func TestCombinedShardETA(t *testing.T) {
+// A 32-shard table copies 31 shards that each report a minute left, while one
+// throttled shard reports two hours. Shards cannot share work, so the table
+// finishes when its slowest shard does, and the ETA is the longest any
+// unthrottled shard reports. The throttled shard's ETA stays out while any
+// unthrottled shard reports one, since the throttle can lift at any moment
+// and the table already reads "(throttled)". Once only throttled shards
+// report an ETA, the longest of theirs is the table's. A queued shard, which
+// reports no ETA, adds nothing, and with no ETA at all the table's is zero.
+func TestShardedTableETA(t *testing.T) {
 	var shards []ShardCopy
 	for range 31 {
 		shards = append(shards, ShardCopy{Status: state.Task.Running, RowsCopied: 4000, RowsTotal: 10000, ETASeconds: 60})
 	}
-	throttled := ShardCopy{Status: state.Task.Running, RowsCopied: 4000, RowsTotal: 10000, ETASeconds: 7200}
+	throttled := ShardCopy{Status: state.Task.Running, RowsCopied: 4000, RowsTotal: 10000, ETASeconds: 7200, Throttled: true}
 	shards = append(shards, throttled)
-	assert.Equal(t, int64(62), CombinedShardETA(shards))
+	assert.Equal(t, int64(60), ShardedTableETA(shards))
 
-	withIdle := slices.Concat(shards, []ShardCopy{
+	uneven := slices.Concat(shards, []ShardCopy{
 		{Status: state.Task.Pending},
-		{Status: state.Task.Running, RowsCopied: 10500, RowsTotal: 10000, ETASeconds: 30},
+		{Status: state.Task.Running, RowsCopied: 1000, RowsTotal: 10000, ETASeconds: 540},
 	})
-	assert.Equal(t, int64(62), CombinedShardETA(withIdle), "a queued shard and a shard with no rows left add no work")
+	assert.Equal(t, int64(540), ShardedTableETA(uneven), "the slowest unthrottled shard decides, and a queued shard adds nothing")
 
-	assert.Equal(t, int64(7200), CombinedShardETA([]ShardCopy{throttled}), "one shard's ETA is its own")
-	assert.Equal(t, int64(45), CombinedShardETA([]ShardCopy{
-		{Status: state.Task.Running, RowsCopied: 900, ETASeconds: 45},
-		{Status: state.Task.Running, RowsCopied: 900, ETASeconds: 20},
-	}), "shards with no rows left fall back to the longest ETA")
-	assert.Zero(t, CombinedShardETA([]ShardCopy{{Status: state.Task.Pending}}))
-	assert.Zero(t, CombinedShardETA(nil))
+	assert.Equal(t, int64(7200), ShardedTableETA([]ShardCopy{throttled}), "with only throttled shards reporting, the table waits on them")
+	assert.Equal(t, int64(7200), ShardedTableETA([]ShardCopy{throttled, {Status: state.Task.Running, ETASeconds: 900, Throttled: true}}))
+	assert.Zero(t, ShardedTableETA([]ShardCopy{{Status: state.Task.Pending}}))
+	assert.Zero(t, ShardedTableETA(nil))
 }
 
 // A table copying on five of eight shards, with three queued behind them,

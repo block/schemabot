@@ -6495,9 +6495,9 @@ func TestLocalClient_VitessProgressRendersShardsFromStored(t *testing.T) {
 	assert.Equal(t, int64(100), progress.Tables[0].RowsCopied)
 	assert.Equal(t, int64(200), progress.Tables[0].RowsTotal)
 	assert.Equal(t, int32(50), progress.Tables[0].PercentComplete, "aggregate is computed from stored shards, not the live result")
-	// The two shards have 60 and 40 rows left at 7s and 3s: together they copy
-	// the 100 rows in 5s, not the slower shard's 7s.
-	assert.Equal(t, int64(5), progress.Tables[0].EtaSeconds, "the table ETA is the time the shards take together")
+	// The two shards report 7s and 3s left. Shards cannot share work, so the
+	// table finishes with the slower one.
+	assert.Equal(t, int64(7), progress.Tables[0].EtaSeconds, "the table ETA is the slowest shard's")
 
 	shards := progress.Tables[0].Shards
 	require.Len(t, shards, 2, "renders the two persisted shards, not the single live one")

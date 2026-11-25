@@ -1,8 +1,6 @@
 package presentation
 
 import (
-	"math"
-
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -79,7 +77,7 @@ type ShardedTableCopy struct {
 
 	// RowsCopied, RowsTotal, and ETASeconds cover the shards that have
 	// reported a row total, counted in ShardsReporting: rows sum across them
-	// and the ETA is the time they take together (CombinedShardETA). A shard
+	// and the ETA is when the slowest of them finishes (ShardedTableETA). A shard
 	// counts only once it carries a total, so a shard with copied rows but no
 	// total cannot inflate the numerator alone. A renderer discloses the coverage rather than passing
 	// one wave's fraction off as the table's.
@@ -96,9 +94,9 @@ type ShardedTableCopy struct {
 
 	// Throttled reports that the engine's throttler is pausing at least one
 	// shard still at work, and ThrottleReason names the first such shard's
-	// signal. The table ETA comes from the shards' combined rate, so a
-	// throttled shard does not stretch it on its own. The table reads as
-	// throttled instead, so the operator still sees the shard held back.
+	// signal. A throttled shard's ETA stays out of the table's while another
+	// shard is not throttled (ShardedTableETA), so the table reads as
+	// throttled instead, and the operator still sees the shard held back.
 	Throttled      bool
 	ThrottleReason string
 }
@@ -149,7 +147,7 @@ func RollUpShardedTable(shards []ShardCopy, plannedShards int) ShardedTableCopy 
 		out.RowsTotal += sh.RowsTotal
 		reporting = append(reporting, sh)
 	}
-	out.ETASeconds = CombinedShardETA(reporting)
+	out.ETASeconds = ShardedTableETA(reporting)
 	if inFlight && unreported > 0 && estimatesCoverUnreported {
 		out.RowsTotal += planned
 		out.RowsTotalPlanned = true
@@ -157,33 +155,33 @@ func RollUpShardedTable(shards []ShardCopy, plannedShards int) ShardedTableCopy 
 	return out
 }
 
-// CombinedShardETA is the time a table's copy has left at the rate its
-// copying shards copy together: the rows they have left over the sum of their
-// rates, each shard's rate being its rows left over its own ETA. A throttled
-// shard then slows the table by its share of that rate, rather than setting
-// the table's ETA alone from its own momentary rate. A shard with no ETA or no
-// rows left adds nothing, so the work of a queued shard stays out until it is
-// copying and has a rate. When no shard has both, the ETA is the longest any
-// shard reports, zero when none reports one.
-func CombinedShardETA(shards []ShardCopy) int64 {
-	var rowsLeft, rowsPerSecond float64
-	var longest int64
+// ShardedTableETA is when a sharded table's copy finishes: when its slowest
+// shard does, since each shard copies only its own rows and no shard can take
+// over another's. It is the longest ETA any shard reports, zero when none
+// reports one.
+//
+// A throttled shard's ETA is left out while some shard that is not throttled
+// reports one. That ETA comes from the rate the throttler holds the shard to
+// for the moment, so it says how long the pause would last if it never
+// lifted, not when the table finishes. The table reads as throttled instead
+// (RollUpShardedTable). When every shard that reports an ETA is throttled,
+// the longest of theirs stands, since it is the only figure there is.
+func ShardedTableETA(shards []ShardCopy) int64 {
+	var unthrottled, throttled int64
 	for _, sh := range shards {
 		if sh.ETASeconds <= 0 {
 			continue
 		}
-		longest = max(longest, sh.ETASeconds)
-		left := sh.RowsTotal - sh.RowsCopied
-		if left <= 0 {
+		if sh.Throttled {
+			throttled = max(throttled, sh.ETASeconds)
 			continue
 		}
-		rowsLeft += float64(left)
-		rowsPerSecond += float64(left) / float64(sh.ETASeconds)
+		unthrottled = max(unthrottled, sh.ETASeconds)
 	}
-	if rowsPerSecond == 0 {
-		return longest
+	if unthrottled > 0 {
+		return unthrottled
 	}
-	return int64(math.Ceil(rowsLeft / rowsPerSecond))
+	return throttled
 }
 
 // everyPlannedShardListed reports whether the listed shards are known to
