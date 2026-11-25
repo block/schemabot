@@ -195,6 +195,11 @@ func armStatementTimeout(ctx context.Context, conn *pgconn.PgConn, stmt, host, d
 		if !cancelledByInheritedBudget(ctx, err) {
 			return err
 		}
+		if attempt == armStatementTimeoutAttempts {
+			// The last cancellation is not sent again: it fails the dial, and
+			// the returned error carries it to the caller.
+			break
+		}
 		slog.Warn("PostgreSQL cancelled the statement that sets the session's statement_timeout, most likely under the role or database budget it replaces; sending it again",
 			"host", host,
 			"database", database,
