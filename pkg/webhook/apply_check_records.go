@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -171,6 +172,14 @@ func isNarrowedApply(apply *storage.Apply) bool {
 	return storage.ParseApplyOptions(apply.Options).NarrowedTo != ""
 }
 
+// The two refusals updateCheckRecordForApplyStart decides on its own, wrapped
+// into its returned error so a caller can tell them from a storage or GitHub
+// failure.
+var (
+	errApplyStartDriftBlocked     = errors.New("review-time deployment drift block present")
+	errApplyStartPlacementBlocked = errors.New("namespace placement refused this environment's plan; fix the namespace placement in the server config or the schema files, or upgrade the deployment the plan comment names, and re-run plan")
+)
+
 // updateCheckRecordForApplyStart updates the stored check state to "in_progress"
 // when an apply begins execution. The aggregate check is updated to reflect the
 // state. If the apply is already terminal by the time the claim lands, the
@@ -257,8 +266,8 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 			"repo", repo, "pr", pr, "environment", environment,
 			"database_type", schema.Type, "database", schema.Database,
 			"apply_id", apply.ApplyIdentifier, "head_sha", check.HeadSHA)
-		return fmt.Errorf("apply start refused for repo %s pr %d environment %s database_type %s database %s apply_id %s: review-time deployment drift block present",
-			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier)
+		return fmt.Errorf("apply start refused for repo %s pr %d environment %s database_type %s database %s apply_id %s: %w",
+			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier, errApplyStartDriftBlocked)
 	}
 	if !keepsBlock && check != nil && check.BlockingReason == storage.NamespacePlacementRefusedBlockingReason {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -273,8 +282,8 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 			"repo", repo, "pr", pr, "environment", environment,
 			"database_type", schema.Type, "database", schema.Database,
 			"apply_id", apply.ApplyIdentifier, "head_sha", check.HeadSHA)
-		return fmt.Errorf("apply start refused for repo %s pr %d environment %s database_type %s database %s apply_id %s: namespace placement refused this environment's plan; fix the namespace placement in the server config or the schema files, or upgrade the deployment the plan comment names, and re-run plan",
-			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier)
+		return fmt.Errorf("apply start refused for repo %s pr %d environment %s database_type %s database %s apply_id %s: %w",
+			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier, errApplyStartPlacementBlocked)
 	}
 
 	if check == nil {
