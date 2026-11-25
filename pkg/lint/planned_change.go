@@ -72,7 +72,7 @@ func PlannedChangeUnsafeReason(pc spiritlint.PlannedChange) (string, bool) {
 	}
 	findings := make([]unsafeFinding, len(errs))
 	for i, v := range errs {
-		findings[i] = unsafeFinding{message: strings.ReplaceAll(v.Message, unsafeReasonSeparator, separatorInFinding)}
+		findings[i] = unsafeFinding{message: UnsafeFindingText(v.Message)}
 		if v.Location != nil && v.Location.Column != nil {
 			findings[i].column = *v.Location.Column
 		}
@@ -84,4 +84,11 @@ func PlannedChangeUnsafeReason(pc spiritlint.PlannedChange) (string, bool) {
 		msgs[i] = f.message
 	}
 	return strings.Join(msgs, unsafeReasonSeparator), true
+}
+
+// UnsafeFindingText is how an error-severity violation's message reads as one
+// finding of an unsafe reason, so a caller holding the violation can find the
+// finding it became.
+func UnsafeFindingText(message string) string {
+	return strings.ReplaceAll(message, unsafeReasonSeparator, separatorInFinding)
 }

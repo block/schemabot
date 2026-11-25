@@ -4,8 +4,12 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/changeevents"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
@@ -109,6 +114,100 @@ func TestOperator_StartUnansweredAfterTheStoredOutcomeIsSettledByTheOperator(t *
 	require.NoError(t, err)
 	require.NotNil(t, apply)
 	assert.Equal(t, state.Apply.Completed, apply.State, "the stored outcome stands")
+}
+
+type committedGroupedFailureClient struct {
+	*matrixTernClient
+	recorder storage.OperationChangeRecorder
+}
+
+func (c *committedGroupedFailureClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, operationID int64) error {
+	c.recorder.ObserveOperationDispatch(ctx, apply)
+	if err := c.matrixTernClient.ResumeApplyOperation(ctx, apply, operationID); err != nil {
+		return err
+	}
+	failed := *apply
+	now := time.Now()
+	failed.State = state.Apply.Failed
+	failed.CompletedAt = &now
+	if err := c.stor.Applies().Update(ctx, &failed); err != nil {
+		return fmt.Errorf("store failed grouped retry: %w", err)
+	}
+	return fmt.Errorf("%w: engine rejected the retry", tern.ErrGroupedResumeFailureCommitted)
+}
+
+func TestOperator_ReportsFinishAfterCommittedGroupedRetryFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	ctx := t.Context()
+	events := make(chan string, 2)
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var description string
+		if err := json.NewDecoder(r.Body).Decode(&description); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		select {
+		case events <- description:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(receiver.Close)
+	logger := slog.New(slog.DiscardHandler)
+	sender, err := changeevents.New([]changeevents.Destination{{
+		URL: receiver.URL, Environments: []string{"staging"},
+		Events: []string{changeevents.OperationStarted, changeevents.OperationFinished},
+		Body:   "{{json .Description}}",
+	}}, logger)
+	require.NoError(t, err)
+	t.Cleanup(sender.Close)
+
+	db := openMatrixStorage(t)
+	stor := mysqlstore.New(db, storage.WithChangeEvents(sender, nil, logger))
+	seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+		applyIdentifier: "grouped-retry-failure",
+		parentState:     state.Apply.FailedRetryable,
+		cutoverPolicy:   storage.CutoverPolicyRolling,
+		onFailure:       storage.OnFailureHalt,
+		deployments:     []string{"region-a"},
+		opState:         state.ApplyOperation.FailedRetryable,
+		taskState:       state.Task.FailedRetryable,
+	})
+	stalenessBackdate(t, ctx, db, seed.applyID)
+
+	op, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "retrying-driver")
+	require.NoError(t, err)
+	require.NotNil(t, op)
+	require.True(t, op.StartsAttempt)
+	require.Equal(t, 1, op.Attempt)
+
+	svc := newMatrixService(t, stor, map[string]tern.Client{
+		"region-a/staging": &committedGroupedFailureClient{
+			matrixTernClient: &matrixTernClient{
+				mockTernClient: &mockTernClient{},
+				stor:           stor,
+				deployment:     "region-a",
+				rec:            &driveRecorder{},
+				outcome:        matrixOutcome{taskState: state.Task.Failed, errMsg: "engine rejected the retry"},
+			},
+			recorder: stor,
+		},
+	})
+	svc.recoverSingleApplyOperation(ctx, 1, "retrying-driver", op, op.Lease())
+
+	assert.Equal(t, state.ApplyOperation.Failed, opState(t, ctx, stor, op.ID))
+	identity := fmt.Sprintf("apply=grouped-retry-failure operation=%d deployment=region-a attempt=2", op.ID)
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for _, want := range []string{"operation.started " + identity, "operation.finished " + identity + " outcome=failed"} {
+		select {
+		case got := <-events:
+			assert.Contains(t, got, want)
+		case <-deadline.C:
+			t.Fatalf("did not receive %q", want)
+		}
+	}
 }
 
 // refusingSettlementStorage refuses the write that settles a pending control

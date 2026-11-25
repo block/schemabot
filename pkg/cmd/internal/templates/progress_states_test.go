@@ -689,6 +689,15 @@ func TestFormatTableProgress_TableSizeBesideRows(t *testing.T) {
 	assert.Contains(t, FormatTableProgress(queued), "Rows: ~48.2M · ~23.4 GB\n")
 	queued.EstimatedRows = nil
 	assert.NotContains(t, FormatTableProgress(queued), "Rows:")
+
+	// A PostgreSQL index build is its own CREATE INDEX statement, and its
+	// queued line reads the same as the index add above.
+	queuedIndexBuild := TableProgress{
+		TableName: "orders", ChangeType: "create_index", Status: state.Apply.Pending,
+		DDL:           "CREATE INDEX CONCURRENTLY orders_created_at_idx ON public.orders (created_at)",
+		EstimatedRows: new(int64(48_200_000)), EstimatedBytes: &bytes,
+	}
+	assert.Contains(t, FormatTableProgress(queuedIndexBuild), "Rows: ~48.2M · ~23.4 GB\n")
 }
 
 // A queued table's planned-rows line sits on its own detail line, indented

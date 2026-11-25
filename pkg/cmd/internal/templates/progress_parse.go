@@ -105,9 +105,9 @@ type TableProgress struct {
 	// the table is queued and before the engine reports RowsTotal. Nil when
 	// the plan had no estimate.
 	EstimatedRows *int64
-	// RowsTotalPlanned marks a RowsTotal rolled up across targets that
-	// includes the plan's estimate for targets that have not reported their
-	// copy yet, so the total renders as approximate.
+	// RowsTotalPlanned marks a RowsTotal that includes the plan's estimate
+	// for the targets, or a sharded table's shards, that have not reported
+	// their copy yet, so the total renders as approximate.
 	RowsTotalPlanned bool
 	// PlannedShards is how many shards a sharded table's change spans per its
 	// plan, the shards EstimatedBytes covers. Zero when the plan recorded none.
@@ -254,6 +254,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			Status:              state.NormalizeTaskStatus(tbl.Status),
 			RowsCopied:          tbl.RowsCopied,
 			RowsTotal:           tbl.RowsTotal,
+			RowsTotalPlanned:    tbl.RowsTotalPlanned,
 			EstimatedBytes:      tbl.EstimatedBytes,
 			EstimatedRows:       tbl.EstimatedRows,
 			PlannedShards:       int(tbl.PlannedShards),
@@ -311,21 +312,49 @@ func tableBuildWork(applyWork apitypes.BuildWork, byOperation map[presentation.O
 	return byOperation[presentation.OperationRef{Deployment: tbl.Deployment, OperationKey: tbl.OperationKey}]
 }
 
-// firstOperationError returns the error of the first operation, in resolved
-// order, that failed with one, or "" when none did. A shard's error names the
-// shard, as the PR comment's first-failure line does, since the apply shows
-// no section per shard to say where it failed.
+// firstOperationError names the first failure among a sharded apply's
+// operations, or returns "" when none failed: a failed shard first, then a
+// failed keyspace finalize, then any other failed operation's error. It names
+// the shard or keyspace, as the PR comment's failure callout does, since the
+// apply shows no section per operation to say where it failed.
 func firstOperationError(ops []ProgressOperation) string {
+	// Shard failures come first and a finalizer's after them, the order the
+	// PR comment's failure callout names them in.
 	for _, op := range ops {
-		if !state.IsState(op.State, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable) || op.ErrorMessage == "" {
+		if !isOperationFailure(op) {
 			continue
 		}
 		if _, shard, _, ok := state.ShardWorkKey(op.OperationKey); ok {
+			if op.ErrorMessage == "" {
+				return "shard " + shard + " failed"
+			}
 			return "shard " + shard + ": " + op.ErrorMessage
 		}
-		return op.ErrorMessage
+	}
+	for _, op := range ops {
+		if !isOperationFailure(op) {
+			continue
+		}
+		if keyspace, ok := state.NamespaceFinalizerKey(op.OperationKey); ok {
+			// The finalize error need not name its keyspace, so the line does.
+			if op.ErrorMessage == "" {
+				return "finalizing keyspace " + keyspace + " failed"
+			}
+			return "finalizing keyspace " + keyspace + ": " + op.ErrorMessage
+		}
+	}
+	for _, op := range ops {
+		if isOperationFailure(op) && op.ErrorMessage != "" {
+			return op.ErrorMessage
+		}
 	}
 	return ""
+}
+
+// isOperationFailure reports whether an operation failed or is retrying a
+// failure.
+func isOperationFailure(op ProgressOperation) bool {
+	return state.IsState(op.State, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable)
 }
 
 // progressOperationRef maps the API's reference to an operation of the apply
