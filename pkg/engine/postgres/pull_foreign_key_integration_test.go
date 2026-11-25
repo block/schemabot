@@ -5,6 +5,8 @@ package postgres
 import (
 	"testing"
 
+	"github.com/block/pg-sprite/pkg/statement"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -41,7 +43,8 @@ func pulledSchemaFiles(response *ternv1.PullSchemaResponse) schema.SchemaFiles {
 
 // An application schema whose tables reference each other pulls: each table's
 // file declares its own foreign keys, with their actions and deferrability,
-// and a self-reference stays in its own table's file. Planning the pulled
+// a self-reference stays in its own table's file, and a key declared on a
+// partitioned parent stays in the parent's file. Planning the pulled
 // files against the same database plans no changes, so the baseline an owner
 // commits is the live schema, relationships included.
 func TestEnginePullSchemaWritesForeignKeys(t *testing.T) {
@@ -52,12 +55,16 @@ func TestEnginePullSchemaWritesForeignKeys(t *testing.T) {
 			id bigint PRIMARY KEY,
 			user_id bigint NOT NULL REFERENCES app.users (id) ON DELETE CASCADE,
 			contact_email text REFERENCES app.users (email) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED);
-		CREATE TABLE app.employees (id bigint PRIMARY KEY, manager_id bigint REFERENCES app.employees (id))`)
+		CREATE TABLE app.employees (id bigint PRIMARY KEY, manager_id bigint REFERENCES app.employees (id));
+		CREATE TABLE app.events (id bigint, user_id bigint REFERENCES app.users (id), day date) PARTITION BY RANGE (day);
+		CREATE TABLE app.events_2026 PARTITION OF app.events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`)
 
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
 	require.NoError(t, err)
 	tables := response.Namespaces["app"].GetTables()
-	assert.Equal(t, []string{"employees", "orders", "users"}, sortedKeys(tables))
+	assert.Equal(t, []string{"employees", "events", "orders", "users"}, sortedKeys(tables))
+	assert.Contains(t, tables["events"], `CONSTRAINT "events_user_id_fkey" FOREIGN KEY (user_id) REFERENCES users(id)`,
+		"a key declared on a partitioned parent is written in the parent's file, and its copy on each partition does not refuse the referenced table")
 	assert.Contains(t, tables["orders"], `CONSTRAINT "orders_user_id_fkey" FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE`)
 	assert.Contains(t, tables["orders"], `CONSTRAINT "orders_contact_email_fkey" FOREIGN KEY (contact_email) REFERENCES users(email) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED`)
 	assert.Contains(t, tables["employees"], `CONSTRAINT "employees_manager_id_fkey" FOREIGN KEY (manager_id) REFERENCES employees(id)`)
@@ -73,8 +80,9 @@ func TestEnginePullSchemaWritesForeignKeys(t *testing.T) {
 }
 
 // A referenced table is refused when a foreign key that references it lives on
-// a table the pull does not write: a partition, which has no schema file of
-// its own, or a table in another schema when the pull is scoped to one. A
+// a table the pull does not write: a partition or an extension-owned table,
+// which has no schema file of its own, or a table in another schema when the
+// pull is scoped to one. The refusal says what to do for each. A
 // baseline without that key's file would not carry the relationship, so the
 // whole pull is refused rather than written partially.
 func TestEnginePullSchemaRefusesForeignKeysOutsideThePull(t *testing.T) {
@@ -91,7 +99,23 @@ func TestEnginePullSchemaRefusesForeignKeysOutsideThePull(t *testing.T) {
 		require.ErrorIs(t, err, errUnwrittenReferencingTable)
 		assert.Nil(t, response)
 		assert.Contains(t, err.Error(), `schema "app" table "users"`)
-		assert.Contains(t, err.Error(), "app.events_2026.events_2026_user_id_fkey (no schema file of its own)")
+		assert.Contains(t, err.Error(), "events_2026.events_2026_user_id_fkey (on a partition; declare the key on the partitioned parent)")
+	})
+
+	t.Run("extension-owned table", func(t *testing.T) {
+		eng, _ := pullForeignKeyTarget(t, "pull_extension_fk_test", `
+			CREATE SCHEMA app;
+			CREATE TABLE app.users (id bigint PRIMARY KEY);
+			CREATE EXTENSION hstore SCHEMA app;
+			CREATE TABLE app.ext_settings (key text PRIMARY KEY, user_id bigint REFERENCES app.users (id));
+			ALTER EXTENSION hstore ADD TABLE app.ext_settings`)
+
+		response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+		require.ErrorIs(t, err, errUnwrittenReferencingTable)
+		assert.Nil(t, response)
+		assert.Contains(t, err.Error(), `schema "app" table "users"`)
+		assert.Contains(t, err.Error(), "ext_settings.ext_settings_user_id_fkey (on a table this pull does not write, such as one an extension owns; remove the key)")
 	})
 
 	t.Run("another schema", func(t *testing.T) {
@@ -106,7 +130,7 @@ func TestEnginePullSchemaRefusesForeignKeysOutsideThePull(t *testing.T) {
 		require.ErrorIs(t, err, errUnwrittenReferencingTable)
 		assert.Nil(t, response)
 		assert.Contains(t, err.Error(), `schema "billing" table "accounts"`)
-		assert.Contains(t, err.Error(), "app.invoices.invoices_account_id_fkey (another schema)")
+		assert.Contains(t, err.Error(), "app.invoices.invoices_account_id_fkey (in another schema; a schema file cannot reference it)")
 	})
 }
 
@@ -172,8 +196,29 @@ func TestEnginePullSchemaRefusesRowSecurityWithAForeignKey(t *testing.T) {
 
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{})
 
-	require.Error(t, err)
+	require.ErrorIs(t, err, statement.ErrRowSecurityForeignKey)
 	assert.Nil(t, response)
 	assert.Contains(t, err.Error(), `schema "public" table "orders": render`)
-	assert.Contains(t, err.Error(), "foreign keys are not supported in desired row security")
+	assert.NotContains(t, err.Error(), `table "users"`, "only the referencing table is refused")
+}
+
+// A plan's rollback baseline cannot carry foreign keys yet, so a namespace
+// whose only unusual shape is an ordinary foreign key pair plans
+// rollback-incapable rather than advertising originals it could not restore.
+func TestCaptureOriginalFilesRefusesForeignKeys(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "capture_fk_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.users (id bigint PRIMARY KEY);
+		CREATE TABLE app.orders (id bigint PRIMARY KEY, user_id bigint REFERENCES app.users (id))`)
+	require.NoError(t, err)
+	pool, err := pgxpool.New(t.Context(), dsn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	files, captured, err := captureOriginalFiles(t.Context(), pool, "capture_fk_test", "app", nil, engine.IgnoredTables{})
+
+	require.NoError(t, err)
+	assert.False(t, captured, "a foreign key the rollback baseline cannot write leaves the plan rollback-incapable")
+	assert.Nil(t, files)
 }
