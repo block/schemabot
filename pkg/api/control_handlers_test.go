@@ -319,16 +319,40 @@ func TestExecuteControlOperationsFoldEnvironmentCase(t *testing.T) {
 		return err.Error()
 	}
 
+	// Each operation gets an apply in a state it acts on where one is cheap to
+	// build, so the mixed-case request must be accepted, not merely refused the
+	// same way. The rest are refused by a gate after the environment check.
+	fixtures := map[string]func() *Service{
+		"start": func() *Service {
+			apply := stoppedTestApply("apply-env-case")
+			task := &storage.Task{ID: 30, TaskIdentifier: "task-env-case", ApplyID: apply.ID, State: state.Task.Stopped}
+			return newControlTestServiceWithTasks(&mockTernClient{}, apply, []*storage.Task{task})
+		},
+		"cutover": func() *Service {
+			apply := activeTestApply("apply-env-case")
+			apply.State = state.Apply.WaitingForCutover
+			return newControlTestService(&mockTernClient{}, apply)
+		},
+	}
+	acceptedOn := map[string]bool{"stop": true, "cancel": true, "start": true, "cutover": true}
+
 	for operation, execute := range executors {
 		t.Run(operation, func(t *testing.T) {
+			fixture := fixtures[operation]
+			if fixture == nil {
+				fixture = func() *Service { return newControlTestService(&mockTernClient{}, activeTestApply("apply-env-case")) }
+			}
 			run := func(environment string) error {
-				svc := newControlTestService(&mockTernClient{}, activeTestApply("apply-env-case"))
-				return execute(svc, apitypes.ControlRequest{ApplyID: "apply-env-case", Environment: environment})
+				return execute(fixture(), apitypes.ControlRequest{ApplyID: "apply-env-case", Environment: environment})
 			}
 
 			lowercase := run("staging")
 			mixedCase := run("StAgInG")
 
+			if acceptedOn[operation] {
+				assert.NoError(t, lowercase)
+				assert.NoError(t, mixedCase, "a mixed-case environment must be accepted")
+			}
 			assert.NotContains(t, outcome(mixedCase), "belongs to environment")
 			assert.Equal(t, outcome(lowercase), outcome(mixedCase),
 				"a mixed-case environment must get the answer the lowercase spelling gets")
