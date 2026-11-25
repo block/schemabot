@@ -717,6 +717,19 @@ type Setting struct {
 // shares the settings table, not configuration an operator chooses.
 const WebhookReconcileScanCursorSettingKeyPrefix = "webhook_reconcile_scan_cursor:"
 
+// MaxSettingKeyBytes is the longest settings key storage keeps whole. It is
+// the width of the setting_key column (varchar(255)) in pkg/schema/mysql and
+// pkg/schema/postgres. A key that passes IsPrintableASCIISettingKey takes one
+// byte per character, so the byte count and the column's character count agree.
+const MaxSettingKeyBytes = 255
+
+// MaxSettingValueBytes is the largest settings value storage keeps whole. It
+// is the size of a MySQL TEXT column, which holds 65,535 bytes and is what
+// setting_value is in pkg/schema/mysql. The PostgreSQL column is unbounded
+// text, but the limit is the same on every dialect so a value accepted on one
+// is accepted on the other.
+const MaxSettingValueBytes = 65535
+
 // IsComponentStateSettingKey reports whether key names a row a component
 // keeps for its own state rather than an operator setting. The settings
 // listing leaves such rows out so it shows only what an operator can act on;
