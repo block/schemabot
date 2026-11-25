@@ -1012,6 +1012,14 @@ type PlanResponse struct {
 	// on them. Nil when the environment has a single member. The top-level
 	// Changes and Shards are the primary member's plan.
 	Rollout *PlanRolloutResponse `json:"rollout,omitempty"`
+	// Freezes are the freezes that cover a change to this database in this
+	// environment when it was planned: those in effect, which would refuse
+	// its apply now, then those scheduled, which will once they start. They
+	// only inform: the apply checks the freezes again, and that check
+	// decides. Like ExemptTables they are carried on the response to the plan
+	// request only. Empty when no freeze covers the change, or when SchemaBot
+	// could not read the freezes.
+	Freezes []Freeze `json:"freezes,omitempty"`
 }
 
 // PlanRolloutResponse is the plan of every member of a rollout.

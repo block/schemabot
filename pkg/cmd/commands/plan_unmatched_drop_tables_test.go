@@ -11,12 +11,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/presentation"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
@@ -55,13 +57,29 @@ func (c *unmatchedDropTablesTernClient) IsRemote() bool   { return true }
 func (c *unmatchedDropTablesTernClient) Endpoint() string { return "remote:9090" }
 
 // planOnlyStorage stores plans without keeping them and holds no apply that
-// could still resume. Only the calls a plan request makes are implemented.
+// could still resume, and freezes, which a plan reads to name. Only the calls
+// a plan request makes are implemented.
 type planOnlyStorage struct {
 	storage.Storage
+	freezes []*storage.EnvironmentFreeze
 }
 
 func (planOnlyStorage) Plans() storage.PlanStore    { return discardingPlanStore{} }
 func (planOnlyStorage) Applies() storage.ApplyStore { return noUnsettledApplyStore{} }
+func (s planOnlyStorage) Freezes() storage.FreezeStore {
+	return listedFreezeStore{current: s.freezes}
+}
+
+// listedFreezeStore lists the freezes it holds as current, in effect or
+// scheduled.
+type listedFreezeStore struct {
+	storage.FreezeStore
+	current []*storage.EnvironmentFreeze
+}
+
+func (s listedFreezeStore) List(context.Context, string, int) (*storage.FreezeListing, error) {
+	return &storage.FreezeListing{Now: time.Now(), Current: s.current}, nil
+}
 
 type discardingPlanStore struct {
 	storage.PlanStore
@@ -107,6 +125,92 @@ func TestPlanCmd_SaysWhichDropTablesEntryNamesNoTable(t *testing.T) {
 	assert.Contains(t, out, "DROP TABLE `_jobs_old`", out)
 	assert.Contains(t, out, cliUnmatchedDropLine+"\n", out)
 	assert.NotContains(t, out, `entry "_jobs_old" names no table`, "the entry that planned a drop is not reported")
+}
+
+// `schemabot plan` of a frozen database says, before anyone applies, that
+// the apply would be refused now, and names a scheduled freeze with when it
+// starts, as the PR plan comment does. The CLI talks to the server's own plan
+// endpoint, so the output shows what the server actually returns.
+func TestPlanCmd_NamesTheFreezes(t *testing.T) {
+	cfg := &api.ServerConfig{
+		Databases: map[string]api.DatabaseConfig{
+			"testdb": {Type: storage.DatabaseTypeMySQL, Environments: map[string]api.EnvironmentConfig{
+				"staging": {Deployment: "remote", Target: "testdb"},
+			}},
+		},
+		TernDeployments: api.TernConfig{"remote": {"staging": "remote:9090"}},
+	}
+	startsAt := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	endsAt := startsAt.Add(24 * time.Hour)
+	store := planOnlyStorage{freezes: []*storage.EnvironmentFreeze{
+		{Identifier: "freeze-0000000000000001", Environment: "staging", Kind: storage.FreezeKindOnDemand,
+			StartsAt: time.Now().Add(-time.Hour), Reason: "incident 42"},
+		{Identifier: "freeze-0000000000000002", Environment: "staging", Databases: []string{"testdb"}, Kind: storage.FreezeKindPlanned,
+			StartsAt: startsAt, EndsAt: &endsAt, Reason: "launch week"},
+		{Identifier: "freeze-0000000000000003", Environment: "staging", Databases: []string{"otherdb"}, Kind: storage.FreezeKindOnDemand,
+			StartsAt: time.Now().Add(-time.Hour), Reason: "another database"},
+	}}
+	svc := api.New(store, cfg, map[string]tern.Client{"remote/staging": &unmatchedDropTablesTernClient{}}, slog.New(slog.DiscardHandler))
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	dir := writeTestSchemaDir(t)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"),
+		[]byte("database: testdb\ntype: mysql\ndrop_tables:\n  - _jobs_old\n"), 0o644))
+
+	cmd := PlanCmd{SchemaDir: dir, Environment: "staging"}
+	var runErr error
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	require.NoError(t, runErr, out)
+
+	assert.Contains(t, out, "DROP TABLE `_jobs_old`", out)
+	assert.Contains(t, out, "❄️ staging is frozen, so applying this plan would be refused now.\n"+
+		"   freeze-0000000000000001  incident 42  (until lifted)\n"+
+		`Wait for the freeze to end before you apply. If this change can't wait, apply with --override "<reason>": as the server's override policy says, SchemaBot lets it through on your reason, or asks a freeze approver to approve it first.`+"\n", out)
+	assert.Contains(t, out, "❄️ A freeze is scheduled in staging.", out)
+	assert.Contains(t, out, "   freeze-0000000000000002  launch week  (starts "+startsAt.Format(time.RFC3339)+", until "+endsAt.Format(time.RFC3339)+")", out)
+	assert.NotContains(t, out, "another database", "a freeze of another database is not named")
+}
+
+// A plan that changes nothing offers no apply, so it names no freeze; a plan
+// shown once for every environment names each environment's own freezes.
+func TestOutputMultiEnvPlanResult_Freezes(t *testing.T) {
+	frozen := []apitypes.Freeze{{ID: "freeze-0000000000000001", Reason: "incident 42", InEffect: true}}
+	drop := &apitypes.TableChangeResponse{TableName: "_jobs_old", DDL: "DROP TABLE `_jobs_old`;", ChangeType: "drop"}
+
+	t.Run("no changes", func(t *testing.T) {
+		out := stripAnsi(captureStdout(func() {
+			outputMultiEnvPlanResult(map[string]*apitypes.PlanResponse{"staging": {Engine: "spirit", Freezes: frozen}}, "testdb", "testdb")
+		}))
+		assert.NotContains(t, out, "❄️", out)
+	})
+
+	t.Run("a plan apply refuses", func(t *testing.T) {
+		blocked := planWithTablesAndEngine("spirit", &apitypes.TableChangeResponse{
+			TableName: "_jobs_old", DDL: "DROP TABLE `_jobs_old`;", ChangeType: "drop",
+			ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "direct execution is disabled",
+		})
+		blocked.Freezes = frozen
+		require.NotEmpty(t, planRefusal(blocked), "the fixture is a plan apply refuses")
+		out := stripAnsi(captureStdout(func() {
+			outputMultiEnvPlanResult(map[string]*apitypes.PlanResponse{"staging": blocked}, "testdb", "testdb")
+		}))
+		assert.NotContains(t, out, "❄️", out)
+	})
+
+	t.Run("one plan for every environment", func(t *testing.T) {
+		staging := planWithTablesAndEngine("spirit", drop)
+		production := planWithTablesAndEngine("spirit", drop)
+		production.Freezes = frozen
+		out := stripAnsi(captureStdout(func() {
+			outputMultiEnvPlanResult(map[string]*apitypes.PlanResponse{"staging": staging, "production": production}, "testdb", "testdb")
+		}))
+		assert.Contains(t, out, "Staging & Production", "the plans render as one section:\n%s", out)
+		assert.Contains(t, out, "❄️ production is frozen", out)
+		assert.NotContains(t, out, "❄️ staging", out)
+	})
 }
 
 // The plan body reports an entry that names no table on both of its branches,

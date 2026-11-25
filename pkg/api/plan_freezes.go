@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -51,4 +52,27 @@ func (s *Service) FreezesCoveringPlan(ctx context.Context, environment, database
 		}
 	}
 	return result, nil
+}
+
+// planResponseFreezes lists the freezes that cover a plan's change for its
+// response, those in effect first, so a CLI or API caller learns before
+// applying what the apply will meet, as the PR plan comment says. database is
+// the request's: the response may leave it empty. A lookup that fails leaves
+// the freezes off and never fails the plan, because the apply checks them
+// again.
+func (s *Service) planResponseFreezes(ctx context.Context, database, environment, repository string, resp *apitypes.PlanResponse) []apitypes.Freeze {
+	freezes, err := s.FreezesCoveringPlan(ctx, environment, database, resp.Deployment, resp.NarrowedTo != "")
+	if err != nil {
+		s.logger.Warn("could not read the freezes for the plan response; it names no freeze, and the apply checks the freezes again",
+			"repository", repository, "database", database, "environment", environment, "error", err)
+		return nil
+	}
+	var out []apitypes.Freeze
+	for _, freeze := range freezes.InEffect {
+		out = append(out, freezeResponse(freeze, freezes.Now))
+	}
+	for _, freeze := range freezes.Scheduled {
+		out = append(out, freezeResponse(freeze, freezes.Now))
+	}
+	return out
 }
