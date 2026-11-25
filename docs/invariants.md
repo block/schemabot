@@ -1590,9 +1590,9 @@ active. *Breaks if violated:* the apply that was active when the operator looked
 by the time the command lands, so a guess can stop, revert, or run the cutover for a schema change the
 operator never meant to touch. *Enforced:* the PR comment usage reply (`loadApplyForPRControl` in
 `pkg/webhook/control.go`, and the rollback gate in `pkg/webhook/issue_comment.go`); the CLI
-(`RequireApplyID` in `pkg/cmd/commands/common.go`, and rollback's required argument); the HTTP API
-(`decodeControlRequest`, `controlTarget`, `ValidateRollbackSourceApply`, and `handleRollbackPlan`
-in `pkg/api/control_handlers.go`). A completeness test on each surface walks the operation
+(`RequireApplyID` and `requireControlScope` in `pkg/cmd/commands/common.go`, and rollback's
+required argument); the HTTP API (`decodeControlRequest`, `controlTarget`,
+`ValidateRollbackSourceApply`, and `handleRollbackPlan` in `pkg/api/control_handlers.go`). A completeness test on each surface walks the operation
 registry (`ControlOperations()` in `pkg/storage/types.go`), so a new operation is held to the rule
 without anyone adding it to a list.
 

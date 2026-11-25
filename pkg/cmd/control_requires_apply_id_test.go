@@ -16,9 +16,11 @@ import (
 // A CLI control command that names no apply fails before it reaches the
 // server, so it never acts on an apply the server would have to infer (CO-11).
 // The command list comes from the storage registry, so a new control operation
-// is held to the rule without anyone extending this test. The endpoint is
-// unroutable: a command that skipped the check would fail on the network
-// instead, with a different error.
+// is held to the rule without anyone extending this test. Each command checks
+// twice, in RequireApplyID and again in requireControlScope when it resolves
+// its endpoint, and the endpoint is unroutable: only a command that skipped
+// both checks would reach the network, and it would fail there with a
+// different error.
 func TestEveryCLIControlCommandRequiresAnApplyID(t *testing.T) {
 	for _, op := range storage.ControlOperations() {
 		t.Run(op.Command(), func(t *testing.T) {
