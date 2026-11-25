@@ -38,6 +38,25 @@ type Event struct {
 	Environment     string
 	OccurredAtNanos int64
 	Description     string
+	// Details holds structured lifecycle fields for publishers. HTTP templates
+	// that encode the entire event retain their existing JSON representation.
+	Details EventDetails `json:"-"`
+}
+
+// EventDetails identifies the apply, and the operation attempt when applicable.
+// EventID is shared by all destinations that receive this event.
+type EventDetails struct {
+	EventID      string    `json:"event_id"`
+	ApplyID      string    `json:"id"`
+	Database     string    `json:"database"`
+	DatabaseType string    `json:"database_type"`
+	Repository   string    `json:"repository,omitempty"`
+	PullRequest  int       `json:"pull_request,omitempty"`
+	Outcome      string    `json:"outcome,omitempty"`
+	CompletedAt  time.Time `json:"completed_at,omitzero"`
+	OperationID  int64     `json:"operation_id,omitempty"`
+	Deployment   string    `json:"deployment,omitempty"`
+	Attempt      int       `json:"attempt,omitempty"`
 }
 
 // Publisher sends one encoded JSON payload. Publish respects ctx and returns
@@ -49,6 +68,8 @@ type Publisher interface {
 // PublisherDestination selects events for one publisher. Encode runs on the
 // destination's worker and must return a complete JSON value.
 type PublisherDestination struct {
+	// ConfigPath identifies the entry in configuration validation errors.
+	ConfigPath   string
 	Environments []string
 	Events       []string
 	Encode       func(Event) (json.RawMessage, error)
@@ -90,27 +111,32 @@ func NewWithPublishers(httpDestinations []Destination, publishers []PublisherDes
 		if err != nil {
 			return nil, fmt.Errorf("change_events[%d]: %w", i, err)
 		}
+		dest.ConfigPath = fmt.Sprintf("change_events[%d]", i)
 		destinations = append(destinations, dest)
 	}
 	destinations = append(destinations, publishers...)
 
 	sender := &Sender{}
 	for i, dest := range destinations {
+		path := dest.ConfigPath
+		if path == "" {
+			path = fmt.Sprintf("publishers[%d]", i-len(httpDestinations))
+		}
 		if len(dest.Environments) == 0 || slices.ContainsFunc(dest.Environments, func(env string) bool { return strings.TrimSpace(env) == "" }) {
-			return nil, fmt.Errorf("change_events[%d]: environments must name at least one environment", i)
+			return nil, fmt.Errorf("%s: environments must name at least one environment", path)
 		}
 		if len(dest.Events) == 0 {
-			return nil, fmt.Errorf("change_events[%d]: events must select at least one event", i)
+			return nil, fmt.Errorf("%s: events must select at least one event", path)
 		}
 		for _, kind := range dest.Events {
 			switch kind {
 			case OperationStarted, OperationFinished, ApplyFinished:
 			default:
-				return nil, fmt.Errorf("change_events[%d]: unknown event %q", i, kind)
+				return nil, fmt.Errorf("%s: unknown event %q", path, kind)
 			}
 		}
 		if dest.Encode == nil || dest.Publisher == nil {
-			return nil, fmt.Errorf("change_events[%d]: encoder and publisher are required", i)
+			return nil, fmt.Errorf("%s: encoder and publisher are required", path)
 		}
 		dest.Environments = slices.Clone(dest.Environments)
 		dest.Events = slices.Clone(dest.Events)
