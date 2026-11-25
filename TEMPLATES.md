@@ -11581,7 +11581,7 @@ ALTER TABLE `mutes`
 
 **Status**: In Progress — 0 of 1 change applied
 
-**Shards**: 1 running table copy, 3 waiting for -40
+**Shards**: 1 running table copy, 3 queued
 
 #### Keyspace `cdb_resolute_sharded`
 
@@ -11653,7 +11653,7 @@ schemabot apply -e production
 
 **Status**: In Progress — 0 of 1 change applied
 
-**Shards**: 1 running table copy, 2 waiting for -40
+**Shards**: 1 running table copy, 2 queued
 
 #### Keyspace `cdb_resolute_sharded`
 
@@ -11682,13 +11682,13 @@ Shards diverge — grouped by change:
 | Shard | Status |
 | --- | --- |
 | `-40` | 🔄 running table copy |
-| `80-c0` | ⏳ waiting for -40 |
+| `80-c0` | ⏳ queued |
 
 **shard `40-80`**
 
 | Shard | Status |
 | --- | --- |
-| `40-80` | ⏳ waiting for -40 |
+| `40-80` | ⏳ queued |
 
 _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
@@ -11706,7 +11706,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 **Status**: In Progress — 1 of 4 changes applied (done on 1 of 6 shards)
 
-**Shards**: 1 completed, 1 running table copy, 4 waiting for cdb_resolute_lookup/-
+**Shards**: 1 completed, 1 running table copy, 4 queued
 
 #### Keyspace `cdb_resolute`
 
@@ -11756,6 +11756,8 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 **Shards**: 4 completed
 
+<details><summary>Apply details (1 table, 1 VSchema update)</summary>
+
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: ✅ Complete (4 shards)
@@ -11784,33 +11786,6 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 
 </details>
-
-<details>
-<summary><a name="summary-keyspace-finalized"></a><strong>Summary: Keyspace Finalized</strong></summary>
-
-
-## ✅ Schema Change Applied — Production
-
-**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
-
-*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
-
-> Applied successfully — your schema change is live!
-
-**Shards**: 2 completed
-
-#### Keyspace `cdb_resolute_sharded`
-
-**`mutes`**: ✅ Complete (2 shards)
-
-```sql
-ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
-```
-
-### Finalize
-
-**`cdb_resolute_sharded`**: Finalized
-
 
 </details>
 
@@ -11848,6 +11823,38 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 **`cdb_resolute_sharded`**: Cancelled
 
+
+---
+
+To retry:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="summary-keyspace-finalize-failed"></a><strong>Summary: Keyspace Finalize Failed</strong></summary>
+
+
+## ❌ Schema Change Failed — Production
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `shop` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
+
+*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
+
+**Shards**: 4 completed
+
+> ❌ **Failure:** finalizing keyspace <code>commerce</code> — publish routing rules: target is read-only
+
+#### Keyspace `commerce`
+
+**`mutes`**: ✅ Complete (4 shards)
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
 
 ---
 
@@ -12329,17 +12336,17 @@ To resume from where it stopped:
 
 ```
 
-┌─────────────────────────────────────────────────────────┐
-│  Apply ID:     apply-shard-e5f6a7b8                     │
-│  Database:     shop                                     │
-│  Environment:  production                               │
-│  State:        Running                                  │
-│  Shards:       1 running table copy, 3 waiting for -40  │
-│  Caller:       github:octocat                           │
-│  Source:       https://github.com/acme/shop/pull/412    │
-│  Started:      Jan 15 14:26:00 UTC                      │
-│  Duration:     4m                                       │
-└─────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-e5f6a7b8                   │
+│  Database:     shop                                   │
+│  Environment:  production                             │
+│  State:        Running                                │
+│  Shards:       1 running table copy, 3 queued         │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:26:00 UTC                    │
+│  Duration:     4m                                     │
+└───────────────────────────────────────────────────────┘
 
 
   ── shop_001 ──

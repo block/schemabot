@@ -903,8 +903,11 @@ type ApplyStore interface {
 	// AttachOperationWithTasks stores one additional apply_operations row and
 	// its tasks under an existing apply in a single transaction. The apply's
 	// state is re-read under a row lock inside the transaction and the attach
-	// fails with ErrApplyNotActive when it is terminal — new work must never
-	// land on an apply no drive will pick up again. The (apply_id, deployment,
+	// fails with an *ApplyNotActiveError, which matches ErrApplyNotActive and
+	// carries the state it read, when the apply is terminal. New
+	// work must never land on an apply no drive will pick up again, and the
+	// caller settles the refused work against that stored state rather than
+	// against its own copy of the apply. The (apply_id, deployment,
 	// operation_key) unique index is the idempotency guard: a concurrent attach
 	// of the same operation loses with ErrApplyOperationExists, which the
 	// caller resolves by re-reading the winner's row. Under the same lock, an

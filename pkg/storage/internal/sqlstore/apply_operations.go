@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/block/schemabot/pkg/changeevents"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -29,6 +31,7 @@ const applyOperationColumns = `id, apply_id, plan_id, deployment, operation_key,
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
 type applyOperationStore struct {
+	events     *changeEventRecorder
 	db         *rebindDB
 	dialect    Dialect
 	identity   identityInserter
@@ -284,11 +287,64 @@ func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, err
 	args = append(args, setArgs...)
 	args = append(args, id)
 	args = append(args, guardArgs...)
-	result, err := s.db.ExecContext(ctx, guard.updateStatement(s.dialect, assignments), args...)
+	statement := guard.updateStatement(s.dialect, assignments)
+
+	var newState string
+	if len(setArgs) > 0 && assignments[0].Column == "state" {
+		newState, _ = setArgs[0].(string)
+	}
+	attempt := storage.OperationChangeAttemptFromContext(ctx)
+	if s.events != nil && s.events.sender.Selects(changeevents.OperationFinished) &&
+		guard.kind == operationGuardOperation && guard.opLease.OperationID == id &&
+		attempt != nil && attempt.OperationID == id && attempt.ObservedDispatch() &&
+		state.IsState(newState, operationFinishStates...) {
+		written, err := s.writeOperationFinish(ctx, statement, args, guard.opLease, attempt, newState)
+		if err != nil {
+			return fmt.Errorf("%s (id=%d): %w", errContext, id, err)
+		}
+		if written {
+			s.events.finishOperation(ctx, guard.opLease.ApplyID, attempt, newState)
+			return nil
+		}
+	}
+
+	result, err := s.db.ExecContext(ctx, statement, args...)
 	if err != nil {
 		return fmt.Errorf("%s (id=%d): %w", errContext, id, err)
 	}
 	return s.checkUpdatedOrExists(ctx, result, id, guard, false)
+}
+
+var operationFinishStates = append(slices.Clone(state.SettledApplyStates), state.ApplyOperation.FailedRetryable)
+
+// writeOperationFinish ties the event to a lease-fenced outcome write from an
+// open attempt. A newly admitted retry can still carry the previous attempt's
+// failed_retryable state, so its own outcome write may keep that state.
+func (s *applyOperationStore) writeOperationFinish(ctx context.Context, statement string, args []any, lease storage.OperationLease, attempt *storage.OperationChangeAttempt, outcome string) (bool, error) {
+	excluded := operationFinishStates
+	if attempt.Retry {
+		excluded = state.SettledApplyStates
+	}
+	statement += " AND ao.apply_id = ? AND ao.attempt = ? AND ao.state NOT IN (" + placeholders(len(excluded)) + ")"
+	result, err := s.db.ExecContext(ctx, statement, append(append(args, lease.ApplyID, attempt.Number-1), stringArgs(excluded)...)...)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil || rows > 0 || !attempt.Retry || !state.IsState(outcome, state.ApplyOperation.FailedRetryable) {
+		return rows > 0, err
+	}
+
+	// MySQL can return zero changed rows for a same-state retry write. Confirm
+	// the fresh claim still owns that outcome under the same attempt identity.
+	var owned bool
+	readCtx, cancel := context.WithTimeout(ctx, changeEventStorageTimeout)
+	defer cancel()
+	err = s.db.QueryRowContext(readCtx, `
+		SELECT EXISTS(SELECT 1 FROM apply_operations
+			WHERE id = ? AND apply_id = ? AND lease_token = ? AND attempt = ? AND state = ?)
+	`, lease.OperationID, lease.ApplyID, lease.Token, attempt.Number-1, outcome).Scan(&owned)
+	return err == nil && owned, nil
 }
 
 // UpdateState transitions a child row to the given state.
@@ -1369,8 +1425,45 @@ NOT EXISTS (
 		)
 		AND ` + releasedFailureExemptionSQL(d) + `
 )
+AND ` + sameMemberFailureGateSQL(d) + `
 AND ` + rolloutStepGateSQL + `
 )`
+}
+
+// sameMemberFailureGateSQL holds a work row back once another work row of its
+// own rollout member has failed, under the same on_failure exemption that lets
+// a later member past an earlier one's failure. One member's work rows, such
+// as a target's per-shard work, start in parallel rather than in order, so the
+// member gate above never compares them. The gate holds every work row of
+// the member, whatever change it runs. Most of them are the member's shards,
+// which run the same change on the same schema, so a failure on one usually
+// repeats on the rest; holding the member's other work too is the fail-safe
+// side of the same rule. The
+// failed row takes the earlier alias only so the exemption can be shared with
+// the member gate; it is a sibling of the same member, not an earlier one. As
+// with the member gate, an apply a remote dispatch created leaves this to its
+// dispatcher (rolloutMembersOrderedHereSQL). The fragment references the
+// apply_operations alias; see sameMemberFailureGateArgs for its placeholders.
+func sameMemberFailureGateSQL(d Dialect) string {
+	return `NOT EXISTS (
+	SELECT 1
+	FROM apply_operations AS earlier
+	WHERE earlier.apply_id = apply_operations.apply_id
+		AND earlier.deployment = apply_operations.deployment
+		AND earlier.target = apply_operations.target
+		AND earlier.id <> apply_operations.id
+		AND earlier.operation_kind = ?
+		AND earlier.state = ?
+		AND ` + rolloutMembersOrderedHereSQL + `
+		AND ` + releasedFailureExemptionSQL(d) + `
+)`
+}
+
+// sameMemberFailureGateArgs returns the positional arguments for
+// sameMemberFailureGateSQL, in placeholder order.
+func sameMemberFailureGateArgs() []any {
+	args := []any{storage.ApplyOperationKindWork, state.ApplyOperation.Failed}
+	return append(args, releasedFailureExemptionArgs()...)
 }
 
 // rolloutStepGateSQL is the table-step boundary of a rollout that runs table by
@@ -1414,6 +1507,7 @@ func workStartGateArgs() []any {
 		state.ApplyOperation.Completed,
 	)
 	args = append(args, releasedFailureExemptionArgs()...)
+	args = append(args, sameMemberFailureGateArgs()...)
 	return append(args, state.ApplyOperation.Completed)
 }
 
@@ -2360,6 +2454,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		if rows == 0 {
 			return nil, nil
 		}
+		ad.StartsAttempt = true
 	case state.ApplyOperation.Stopped:
 		// Stopped → resuming: a stopped operation whose parent apply has a
 		// pending start or cancel request is claimable, mirroring the
@@ -2394,6 +2489,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		if rows == 0 {
 			return nil, nil
 		}
+		ad.StartsAttempt = ad.StartedAt == nil
 	default:
 		// Re-leasing a row that already started with a stale active heartbeat:
 		// crash recovery. The row keeps its current (active) state and is driven
@@ -2462,6 +2558,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			}
 			if bumped > 0 {
 				ad.Attempt++
+				ad.StartsAttempt = true
 			}
 
 			underOperationLease, err := redispatchDrivesUnderOperationLease(ctx, tx, ad)

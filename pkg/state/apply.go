@@ -292,11 +292,18 @@ func postCopyPhaseWithQueuedWork(counts map[string]int) bool {
 // rollout gating.
 //
 // Children must be supplied in deployment order (the same (created_at, id) order
-// the claim predicate uses), because a pause-held failure only holds the rollout
-// when there is later, not-yet-terminal work to hold.
+// the claim predicate uses), because a pause-held failure holds the rollout only
+// when there is not-yet-terminal work to hold: later work, or other work of its
+// own member wherever it sits.
 type RolloutChild struct {
 	// State is the child operation's derived apply state.
 	State string
+	// Member identifies the rollout member whose work this child is, or is
+	// empty for a child that is not work. A pause-held failure holds its own
+	// member's work that waits to start wherever that work sits in deployment
+	// order, because the claim holds a member's unstarted work once any of
+	// its work has failed.
+	Member string
 	// ContinueOnFailure is true when the operation's on_failure policy lets the
 	// rollout continue past this child's terminal failure ("continue", or a
 	// released "pause").
@@ -334,8 +341,9 @@ type RolloutChild struct {
 //
 //   - halt or unrecognized (both flags false): the failure stands and the apply
 //     is failed (fail closed); this dominates every other outcome.
-//   - unreleased pause (PauseOnFailure) with later work that still holds its
-//     target: the apply is held paused so a human can release or stop it.
+//   - unreleased pause (PauseOnFailure) with later work, or other work of the
+//     failed child's own member, that still holds its target: the apply is
+//     held paused so a human can release or stop it.
 //   - continue, or a released pause (ContinueOnFailure): the failure neither
 //     forces a terminal verdict nor holds the rollout.
 //
@@ -399,8 +407,8 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		case c.ContinueOnFailure:
 			// continue, or a released pause: does not force a terminal verdict
 			// and does not hold the rollout.
-		case c.PauseOnFailure && hasLaterUnsettled(children, i):
-			// unreleased pause with later work still to run: hold for a human.
+		case c.PauseOnFailure && pauseHoldsWork(children, i):
+			// unreleased pause with work still to run: hold for a human.
 			pausedHold = true
 		case c.PauseOnFailure:
 			// unreleased pause with nothing later to hold: the rollout is
@@ -575,16 +583,38 @@ func RolloutHeldByResumableChild(derived string, children []RolloutChild) bool {
 	return held
 }
 
-// hasLaterUnsettled reports whether any child after failedIndex (in deployment
-// order) still holds its target. A pause-held failure only holds the rollout
-// when there is such later work for the operator to release, start or stop.
-func hasLaterUnsettled(children []RolloutChild, failedIndex int) bool {
-	for later := failedIndex + 1; later < len(children); later++ {
-		if childHoldsItsTarget(children[later]) {
+// pauseHoldsWork reports whether the pause-held failure at failedIndex holds
+// any work for the operator to release, start or stop: a child after it (in
+// deployment order) that still holds its target, or another child of its own
+// member that the failure keeps from starting. A member's work starts in
+// parallel rather than in order, so its unstarted work can sit before the
+// failure in deployment order and still be held by it.
+func pauseHoldsWork(children []RolloutChild, failedIndex int) bool {
+	failed := children[failedIndex]
+	for i, c := range children {
+		if i == failedIndex || !childHoldsItsTarget(c) {
+			continue
+		}
+		if i > failedIndex {
+			return true
+		}
+		if heldBySameMemberFailure(failed, c) {
 			return true
 		}
 	}
 	return false
+}
+
+// heldBySameMemberFailure reports whether the claim's same-member failure gate
+// holds c back behind failed: c is work of the same member that waits on a
+// claim to start, either pending or stopped (start resumes a stopped row only
+// through the same gate). A sibling a driver is already running is past the
+// gate, so a release would have nothing of it to admit.
+func heldBySameMemberFailure(failed, c RolloutChild) bool {
+	if failed.Member == "" || c.Member != failed.Member {
+		return false
+	}
+	return IsState(c.State, Apply.Pending, Apply.Stopped)
 }
 
 // normalizeApplyState converts a task or apply state string in any format to

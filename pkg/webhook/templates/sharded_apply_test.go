@@ -106,7 +106,7 @@ func TestRenderShardedApplyComment_FailedSurfacesError(t *testing.T) {
 		ApplyID: "apply-x",
 		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: failErr},
-			{Shard: "80-", Emoji: "⏸️", Label: "halted — -40 failed", State: state.ApplyOperation.Pending},
+			{Shard: "80-", Emoji: "⏸️", Label: "not started", State: state.ApplyOperation.Pending},
 		}, []ShardCell{mutesCell("-40"), mutesCell("80-")}),
 	})
 
@@ -147,7 +147,7 @@ func TestRenderShardedApplyComment_DivergentGroupsByVariant(t *testing.T) {
 		Keyspaces: withTables(oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
 			{Shard: "40-80", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
-			{Shard: "80-c0", Emoji: "⏳", Label: "waiting for -40", State: state.ApplyOperation.Pending},
+			{Shard: "80-c0", Emoji: "⏳", Label: "queued", State: state.ApplyOperation.Pending},
 		}, []ShardCell{
 			mutesCell("-40"),
 			{Shard: "40-80", Table: "mutes", Statements: []string{driftDDL}}, // different signature → its own group
@@ -355,15 +355,94 @@ func TestRenderShardedApplySummaryComment_FailedSurfacesErrorAndRetry(t *testing
 		ApplyID: "apply-x",
 		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: failErr},
-			{Shard: "80-", Emoji: "⏸️", Label: "halted — -40 failed", State: state.ApplyOperation.Pending},
+			{Shard: "80-", Emoji: "⏸️", Label: "not started", State: state.ApplyOperation.Pending},
 		}, []ShardCell{mutesCell("-40"), mutesCell("80-")}),
 	})
 
 	assert.Contains(t, out, "## ❌ Schema Change Failed — Staging")
 	assert.NotContains(t, out, "Applied successfully", "a failed apply writes no success line")
 	assert.Contains(t, out, "> ❌ **First failure:** shard <code>-40</code> — "+failErr)
-	assert.Contains(t, out, "| `80-` | ⏸️ halted — -40 failed |", "halted siblings keep their final state in the results")
+	assert.Contains(t, out, "| `80-` | ⏸️ not started |", "siblings that never started keep their final state in the results")
 	assert.Contains(t, out, "To retry:")
+}
+
+// A completed sharded apply's summary has the regular summary's shape: the
+// outcome and shard counts stay in view, and the keyspace, table, DDL, and
+// VSchema detail folds into a collapsed block labelled the way the regular
+// summary labels it. A failed one leaves that detail open, since it is where
+// the reader finds which shard to look at.
+func TestRenderShardedApplySummaryComment_CompletedCollapsesDetail(t *testing.T) {
+	shards := []ShardStatus{
+		{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+		{Shard: "80-", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+	}
+	cells := []ShardCell{mutesCell("-40"), mutesCell("80-")}
+	out := RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Completed, Environment: "staging", Database: "cdb_resolute",
+		ApplyID:        "apply-x",
+		Keyspaces:      oneKeyspace(shards, cells),
+		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "applied"}},
+	})
+
+	const label = "<details><summary>Apply details (1 table, 1 VSchema update)</summary>"
+	require.Contains(t, out, label)
+	open := strings.Index(out, label)
+	assert.Less(t, strings.Index(out, "**Shards**: 2 completed"), open, "shard counts stay above the collapsed detail")
+	assert.Greater(t, strings.Index(out, "#### Keyspace `cdb_resolute_sharded`"), open, "the keyspace section is inside the block")
+	assert.Greater(t, strings.Index(out, "### VSchema"), open, "the VSchema section is inside the block")
+	assert.Greater(t, strings.LastIndex(out, "</details>"), strings.Index(out, "### VSchema"), "the block closes after the VSchema section")
+	assert.Equal(t, label, "<details><summary>"+completedSummaryDetailsLabel(ApplyStatusCommentData{
+		Tables:         []TableProgressData{{Namespace: "cdb_resolute_sharded", TableName: "mutes"}},
+		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded"}},
+	})+"</summary>", "a sharded summary labels its detail the way a regular one does")
+
+	shards[0] = ShardStatus{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: "boom"}
+	failed := RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Failed, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x", Keyspaces: oneKeyspace(shards, cells),
+	})
+	assert.NotContains(t, failed, "Apply details (", "a failed summary keeps its detail open")
+	assert.Contains(t, failed, "#### Keyspace `cdb_resolute_sharded`")
+}
+
+// A completed sharded apply across two keyspaces folds both keyspace sections
+// into one collapsed block, labelled with the tables of both.
+func TestRenderShardedApplySummaryComment_CompletedCollapsesEveryKeyspace(t *testing.T) {
+	completed := []ShardStatus{{Shard: "-80", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed}}
+	out := RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Completed, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{
+			{Keyspace: "cdb_resolute_sharded", Shards: completed, Cells: []ShardCell{mutesCell("-80")}},
+			{Keyspace: "cdb_resolute_lookup", Shards: completed, Cells: []ShardCell{{Shard: "-80", Table: "mutes_lookup", Statements: []string{mutesDDL}}}},
+		},
+	})
+
+	const label = "<details><summary>Apply details (2 tables)</summary>"
+	require.Contains(t, out, label)
+	assert.Equal(t, 1, strings.Count(out, "<details><summary>Apply details ("), "both keyspaces share one block")
+	open := strings.Index(out, label)
+	closeAt := strings.LastIndex(out, "</details>")
+	for _, keyspace := range []string{"cdb_resolute_sharded", "cdb_resolute_lookup"} {
+		section := strings.Index(out, "#### Keyspace `"+keyspace+"`")
+		assert.Greater(t, section, open, "keyspace %s is inside the block", keyspace)
+		assert.Less(t, section, closeAt, "keyspace %s is inside the block", keyspace)
+	}
+}
+
+// A completed sharded apply with no table and no VSchema detail has nothing to
+// fold, so its summary carries no empty collapsed block.
+func TestRenderShardedApplySummaryComment_CompletedWithNoDetailStaysExpanded(t *testing.T) {
+	out := RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Completed, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: oneKeyspace([]ShardStatus{
+			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+		}, nil),
+	})
+
+	assert.NotContains(t, out, "<details>")
+	assert.NotContains(t, out, "Apply details (")
 }
 
 // A completed rollback's terminal summary keeps the rollback vocabulary in both
@@ -380,6 +459,10 @@ func TestRenderShardedApplySummaryComment_Rollback(t *testing.T) {
 
 	assert.Contains(t, out, "Rolled back successfully — the schema change has been reverted.")
 	assert.NotContains(t, out, "Schema Change Status")
+
+	const label = "<details><summary>Apply details (1 table)</summary>"
+	require.Contains(t, out, label, "a completed rollback folds its detail like a completed apply")
+	assert.Greater(t, strings.Index(out, "#### Keyspace `cdb_resolute_sharded`"), strings.Index(out, label))
 }
 
 // A cancelled sharded apply's terminal summary is permanent: it offers no
@@ -797,8 +880,8 @@ func TestRenderShardedApplyComment_TableRowsGatedToRunning(t *testing.T) {
 }
 
 // A shard in a failure state promotes the keyspace's per-shard status table
-// back into the section — the failed shard and its halted siblings need naming
-// — below the table rollup lines.
+// back into the section — the failed shard and the siblings it never started
+// need naming — below the table rollup lines.
 func TestRenderShardedApplyComment_ShardFailurePromotesShardTable(t *testing.T) {
 	const failErr = "resolve shard primary for `-40`: context deadline exceeded"
 	out := RenderShardedApplyComment(ShardedApplyData{
@@ -815,7 +898,7 @@ func TestRenderShardedApplyComment_ShardFailurePromotesShardTable(t *testing.T) 
 			}},
 			Shards: []ShardStatus{
 				{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: failErr},
-				{Shard: "80-", Emoji: "⏸", Label: "halted — -40 failed", State: state.ApplyOperation.Pending},
+				{Shard: "80-", Emoji: "⏸", Label: "not started", State: state.ApplyOperation.Pending},
 			},
 			Cells: []ShardCell{mutesCell("-40"), mutesCell("80-")},
 		}},
@@ -824,7 +907,7 @@ func TestRenderShardedApplyComment_ShardFailurePromotesShardTable(t *testing.T) 
 	assert.Contains(t, out, "**`mutes`**: ❌ Failed")
 	assert.Contains(t, out, "| Shard | Status |", "a failure promotes the per-shard table")
 	assert.Contains(t, out, "| `-40` | ❌ failed — "+failErr+" |")
-	assert.Contains(t, out, "| `80-` | ⏸ halted — -40 failed |")
+	assert.Contains(t, out, "| `80-` | ⏸ not started |")
 }
 
 // Divergent shards keep their grouped per-shard tables below the table rollup
@@ -1042,8 +1125,8 @@ func TestRenderShardedApplySummaryComment_DivergentOutcomePromotesShardTable(t *
 }
 
 // A failure in one keyspace promotes every keyspace's per-shard status table:
-// the failure halts sibling keyspaces' queued shards too, and their "halted"
-// labels carry the attribution an operator needs to see why nothing is moving.
+// the failed apply never starts sibling keyspaces' queued shards either, and
+// their rows say so, so an operator sees which shards never ran.
 func TestRenderShardedApplyComment_FailurePromotesSiblingKeyspaceShardTables(t *testing.T) {
 	const failErr = "resolve shard primary for `-40`: context deadline exceeded"
 	out := RenderShardedApplyComment(ShardedApplyData{
@@ -1065,14 +1148,14 @@ func TestRenderShardedApplyComment_FailurePromotesSiblingKeyspaceShardTables(t *
 					Table: "aliases", Status: state.Task.Pending,
 					Shards: []ShardProgressData{{Shard: "-", Status: state.Task.Pending}},
 				}},
-				Shards: []ShardStatus{{Shard: "-", Emoji: "⏸", Label: "halted — -40 failed", State: state.ApplyOperation.Pending}},
+				Shards: []ShardStatus{{Shard: "-", Emoji: "⏸", Label: "not started", State: state.ApplyOperation.Pending}},
 				Cells:  []ShardCell{{Shard: "-", Table: "aliases", Statements: []string{"ALTER TABLE `aliases` ADD COLUMN `region` varchar(32);"}}},
 			},
 		},
 	})
 
-	assert.Contains(t, out, "| `-` | ⏸ halted — -40 failed |",
-		"the sibling keyspace's shard rows carry the halt attribution")
+	assert.Contains(t, out, "| `-` | ⏸ not started |",
+		"the sibling keyspace's shard rows say they never started")
 }
 
 // Between dispatch waves a partially-landed table aggregates to pending; the

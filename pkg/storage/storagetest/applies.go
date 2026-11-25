@@ -1923,6 +1923,37 @@ func TestApplies(t *testing.T, h Harness) {
 			"with the newer generation finished, the held apply still running does not reserve the deployment")
 	})
 
+	// An operation that arrives after its apply ended is refused, and the
+	// refusal carries the state the store read under the apply's row lock. The
+	// caller's copy still reads running, because the apply settled after the
+	// caller loaded it, so a refused dispatch is settled against the stored
+	// state and never against that copy.
+	t.Run("AttachOperationWithTasks_RefusalNamesTheStoredState", func(t *testing.T) {
+		for _, closed := range []string{state.Apply.Cancelled, state.Apply.Stopped, state.Apply.Failed, state.Apply.Completed} {
+			t.Run(closed, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "apply_attach_closed_db", storage.DatabaseTypeMySQL)
+				apply, err := createApplyTakingOver(t, store, lock, "apply_attach_closed", 9450)
+				require.NoError(t, err)
+				apply.State = closed
+				require.NoError(t, store.Applies().Update(ctx, apply))
+				apply.State = state.Apply.Running
+
+				err = attachOperationTakingOver(t, store, apply, "target-002")
+				require.ErrorIs(t, err, storage.ErrApplyNotActive)
+				var notActive *storage.ApplyNotActiveError
+				require.ErrorAs(t, err, &notActive, "the refusal carries the stored state, not only the sentinel")
+				assert.Equal(t, closed, notActive.State)
+				assert.Equal(t, apply.ApplyIdentifier, notActive.ApplyID)
+
+				ops, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+				require.NoError(t, err)
+				assert.Len(t, ops, 1, "the refused attach leaves no operation behind")
+			})
+		}
+	})
+
 	// A deployment-keyed generation is stopped after only target-002 attached
 	// and finished. An unrelated apply then runs and finishes on the same
 	// deployment, and the generation is started again. The unrelated apply was
