@@ -258,10 +258,27 @@ func renderShardedApplySummaryComment(data ShardedApplyData, formatter *shardedD
 	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
 	writeShardedFailure(&sb, data)
 	writeShardsStoppedAtCutover(&sb, data)
-	writeShardKeyspaceSections(&sb, data, formatter, budget)
-	writeVSchemaStatus(&sb, data.VSchemaChanges)
+	writeShardedSummaryDetails(&sb, data, formatter, budget)
 	writeShardedFooter(&sb, data)
 	return sb.String()
+}
+
+// writeShardedSummaryDetails writes the summary's keyspace, table, and VSchema
+// detail. A completed apply folds it into a collapsed block worded the same
+// as the regular summary's, so the outcome, shard counts, and timing above
+// it are what the reader sees first. Any other terminal state leaves it open,
+// since the reader needs it to see which shard or table to look at.
+func writeShardedSummaryDetails(sb *strings.Builder, data ShardedApplyData, formatter *shardedDDLFormatter, budget *ddlBlockBudget) {
+	tables := shardedTableCount(data)
+	collapse := state.IsState(data.State, state.Apply.Completed) && tables+len(data.VSchemaChanges) > 0
+	if collapse {
+		fmt.Fprintf(sb, "\n<details><summary>%s</summary>\n", applyDetailsLabel(tables, "table", len(data.VSchemaChanges)))
+	}
+	writeShardKeyspaceSections(sb, data, formatter, budget)
+	writeVSchemaStatus(sb, data.VSchemaChanges)
+	if collapse {
+		sb.WriteString("\n</details>\n")
+	}
 }
 
 // allShardStatuses flattens every keyspace's shards in resolved order, feeding
@@ -281,13 +298,19 @@ func allShardStatuses(keyspaces []ShardedKeyspace) []ShardStatus {
 // and VSchema changes each count as one change; an apply with neither reads as
 // plural, since the shard count alone does not prove a single change.
 func shardedChangeIsSingular(data ShardedApplyData) bool {
+	return shardedTableCount(data)+len(data.VSchemaChanges) == 1
+}
+
+// shardedTableCount counts the distinct keyspace tables a sharded apply
+// changes, each once however many shards run its DDL.
+func shardedTableCount(data ShardedApplyData) int {
 	tables := make(map[string]struct{})
 	for _, ks := range data.Keyspaces {
 		for _, c := range ks.Cells {
 			tables[tableKey(ks.Keyspace, c.Table)] = struct{}{}
 		}
 	}
-	return len(tables)+len(data.VSchemaChanges) == 1
+	return len(tables)
 }
 
 // writeShardedStatusLine writes the status comment's at-a-glance line: the

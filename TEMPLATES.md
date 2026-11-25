@@ -11756,6 +11756,8 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 **Shards**: 4 completed
 
+<details><summary>Apply details (1 table, 1 VSchema update)</summary>
+
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: ✅ Complete (4 shards)
@@ -11782,6 +11784,8 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
  }
 ```
 
+
+</details>
 
 </details>
 
