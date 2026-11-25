@@ -2,7 +2,6 @@ package mysqlsize
 
 import (
 	"database/sql"
-	"io"
 	"log/slog"
 	"testing"
 
@@ -11,7 +10,7 @@ import (
 )
 
 func discardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return slog.New(slog.DiscardHandler)
 }
 
 // Statistics that report nothing, or a negative sentinel, become an absent
@@ -31,14 +30,41 @@ func TestValidStatistic(t *testing.T) {
 	assert.Equal(t, int64(6_200_000), *bytes)
 }
 
-// A row information_schema returns in the server's case maps back to the
-// Table the caller named, schema and name alike.
-func TestRequestedTables(t *testing.T) {
-	requested := requestedTables([]Table{{Schema: "Shop_A", Name: "Orders"}, {Schema: "shop_b", Name: "line_items"}})
-	assert.Equal(t, Table{Schema: "Shop_A", Name: "Orders"}, requested[Table{Schema: "shop_a", Name: "orders"}])
-	assert.Equal(t, Table{Schema: "shop_b", Name: "line_items"}, requested[Table{Schema: "shop_b", Name: "line_items"}])
-	_, ok := requested[Table{Schema: "shop_b", Name: "orders"}]
-	assert.False(t, ok, "a name asked for in one schema is not asked for in another")
+// Each caller's Table keeps its own estimate. On a server that compares names
+// case-sensitively, Shop.orders and shop.orders are two tables and each is
+// returned under its own name, so neither takes the other's size. On one that
+// compares them case-insensitively, a table returned in the server's case
+// reaches the Table the caller named, unless another request matched that row
+// exactly or more than one row matches ignoring case.
+func TestMatchEstimates(t *testing.T) {
+	row := func(schema, name string, rows int64) sizeRow {
+		return sizeRow{table: Table{Schema: schema, Name: name}, rows: sql.NullInt64{Int64: rows, Valid: true}, bytes: sql.NullInt64{Int64: rows * 100, Valid: true}}
+	}
+	rowsOf := func(est map[Table]Estimate, tbl Table) any {
+		e, ok := est[tbl]
+		if !ok || e.Rows == nil {
+			return nil
+		}
+		return *e.Rows
+	}
+	upper := Table{Schema: "Shop", Name: "orders"}
+	lower := Table{Schema: "shop", Name: "orders"}
+
+	got := matchEstimates(discardLogger(), []Table{upper, lower}, []sizeRow{row("shop", "orders", 1), row("Shop", "orders", 2)})
+	assert.Equal(t, int64(2), rowsOf(got, upper), "case-sensitive server: Shop.orders keeps its own size")
+	assert.Equal(t, int64(1), rowsOf(got, lower), "case-sensitive server: shop.orders keeps its own size")
+
+	got = matchEstimates(discardLogger(), []Table{upper, lower}, []sizeRow{row("shop", "orders", 1)})
+	assert.Equal(t, int64(1), rowsOf(got, lower))
+	assert.Nil(t, rowsOf(got, upper), "a row another request matched exactly is not lent to a table that differs in case")
+
+	named := Table{Schema: "Shop_A", Name: "Orders"}
+	got = matchEstimates(discardLogger(), []Table{named}, []sizeRow{row("shop_a", "orders", 7), row("shop_a", "refunds", 9)})
+	assert.Equal(t, map[Table]Estimate{named: {Rows: new(int64(7)), Bytes: new(int64(700))}}, got,
+		"case-insensitive server: the row reaches the Table the caller named, and a pair nobody asked for is dropped")
+
+	got = matchEstimates(discardLogger(), []Table{named}, []sizeRow{row("shop_a", "orders", 7), row("SHOP_A", "ORDERS", 8)})
+	assert.Empty(t, got, "more than one row matching ignoring case gives no estimate")
 }
 
 // The read filters on each schema and each table name once, in the order the

@@ -56,7 +56,6 @@ func Read(ctx context.Context, conn Conn, logger *slog.Logger, tables []Table) (
 		return nil, fmt.Errorf("disable cached statistics for size estimates: %w", err)
 	}
 
-	requested := requestedTables(tables)
 	schemas, names := distinctSchemasAndNames(tables)
 	args := make([]any, 0, len(schemas)+len(names))
 	for _, s := range schemas {
@@ -67,7 +66,7 @@ func Read(ctx context.Context, conn Conn, logger *slog.Logger, tables []Table) (
 	}
 	// Filtering schemas and names separately lets information_schema look
 	// both up directly. When different schemas ask for different tables the
-	// result can include pairs nobody asked for, which the loop below drops.
+	// result can include pairs nobody asked for, which matchEstimates drops.
 	query := `
 		SELECT table_schema, table_name, table_rows, data_length + index_length
 		FROM information_schema.tables
@@ -81,36 +80,85 @@ func Read(ctx context.Context, conn Conn, logger *slog.Logger, tables []Table) (
 	}
 	defer utils.CloseAndLog(rows)
 
-	estimates := make(map[Table]Estimate, len(tables))
+	var found []sizeRow
 	for rows.Next() {
-		var schema, name string
-		var tableRows, tableBytes sql.NullInt64
-		if err := rows.Scan(&schema, &name, &tableRows, &tableBytes); err != nil {
+		var r sizeRow
+		if err := rows.Scan(&r.table.Schema, &r.table.Name, &r.rows, &r.bytes); err != nil {
 			return nil, fmt.Errorf("scan table size estimate: %w", err)
 		}
-		// information_schema can match a name case-insensitively and return
-		// it in the server's case, so the estimate is keyed by the Table the
-		// caller asked for, which is the name its plan changes carry.
-		asked, ok := requested[foldTable(schema, name)]
-		if !ok {
-			logger.Debug("size read returned a table no caller asked for in that schema; ignoring it",
-				"schema", schema, "table", name)
+		found = append(found, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate table size estimates: %w", err)
+	}
+	return matchEstimates(logger, tables, found), nil
+}
+
+// sizeRow is one table's statistics as information_schema returned them.
+type sizeRow struct {
+	table       Table
+	rows, bytes sql.NullInt64
+}
+
+// matchEstimates keys the returned statistics by the Table each caller asked
+// for. A row whose schema and name match a request exactly belongs to it. On
+// a server that compares names case-insensitively, information_schema returns
+// a table in its own case, so a request with no exact row takes the one row
+// that matches it ignoring case, provided no other request matched that row
+// exactly. A server that compares names case-sensitively only returns exact
+// matches, so two tables whose names differ only in case each keep their own
+// estimate. A request that would match more than one row ignoring case is
+// left without an estimate rather than given either.
+func matchEstimates(logger *slog.Logger, tables []Table, found []sizeRow) map[Table]Estimate {
+	requested := make(map[Table]bool, len(tables))
+	requestedFolded := make(map[Table]bool, len(tables))
+	for _, t := range tables {
+		requested[t] = true
+		requestedFolded[foldTable(t)] = true
+	}
+	exact := make(map[Table]sizeRow, len(found))
+	unclaimed := make(map[Table][]sizeRow, len(found))
+	for _, r := range found {
+		if requested[r.table] {
+			exact[r.table] = r
 			continue
 		}
+		if !requestedFolded[foldTable(r.table)] {
+			logger.Debug("size read returned a table no caller asked for in that schema; ignoring it",
+				"schema", r.table.Schema, "table", r.table.Name)
+			continue
+		}
+		unclaimed[foldTable(r.table)] = append(unclaimed[foldTable(r.table)], r)
+	}
+
+	estimates := make(map[Table]Estimate, len(tables))
+	for t := range requested {
+		r, ok := exact[t]
+		if !ok {
+			candidates := unclaimed[foldTable(t)]
+			if len(candidates) > 1 {
+				logger.Warn("size read returned more than one table matching this name ignoring case; the plan will omit its size",
+					"schema", t.Schema, "table", t.Name, "matches", len(candidates))
+				continue
+			}
+			if len(candidates) == 0 {
+				logger.Debug("size read returned no base table for this name; the plan will omit its size",
+					"schema", t.Schema, "table", t.Name)
+				continue
+			}
+			r = candidates[0]
+		}
 		est := Estimate{
-			Rows:  validStatistic(logger, asked, "table_rows", tableRows),
-			Bytes: validStatistic(logger, asked, "data_length + index_length", tableBytes),
+			Rows:  validStatistic(logger, t, "table_rows", r.rows),
+			Bytes: validStatistic(logger, t, "data_length + index_length", r.bytes),
 		}
 		if est.Rows == nil && est.Bytes == nil {
 			// validStatistic logged why each one is missing.
 			continue
 		}
-		estimates[asked] = est
+		estimates[t] = est
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate table size estimates: %w", err)
-	}
-	return estimates, nil
+	return estimates
 }
 
 // validStatistic returns a base table's statistic as a display estimate, or
@@ -133,17 +181,6 @@ func validStatistic(logger *slog.Logger, t Table, statistic string, v sql.NullIn
 	return &n
 }
 
-// requestedTables indexes the requested tables by their case-folded schema
-// and name, so a row information_schema returns in the server's case maps
-// back to the Table the caller named.
-func requestedTables(tables []Table) map[Table]Table {
-	requested := make(map[Table]Table, len(tables))
-	for _, t := range tables {
-		requested[foldTable(t.Schema, t.Name)] = t
-	}
-	return requested
-}
-
 // distinctSchemasAndNames returns the distinct schemas and table names the
 // read filters on, each in first-seen order.
 func distinctSchemasAndNames(tables []Table) (schemas, names []string) {
@@ -162,8 +199,8 @@ func distinctSchemasAndNames(tables []Table) (schemas, names []string) {
 	return schemas, names
 }
 
-func foldTable(schema, name string) Table {
-	return Table{Schema: strings.ToLower(schema), Name: strings.ToLower(name)}
+func foldTable(t Table) Table {
+	return Table{Schema: strings.ToLower(t.Schema), Name: strings.ToLower(t.Name)}
 }
 
 func placeholders(n int) string {
