@@ -347,6 +347,8 @@ type staticApplyStore struct {
 	apply   *storage.Apply
 	applies []*storage.Apply
 	err     error
+	// revertSkipped records the apply IDs SetRevertSkipped was called for.
+	revertSkipped []int64
 }
 
 // GetInProgress returns the store's applies, as the SQL store returns the
@@ -416,7 +418,8 @@ func (s *finishedAfterReadApplyStore) Update(_ context.Context, apply *storage.A
 	*s.stored = *apply
 	return nil
 }
-func (s *staticApplyStore) SetRevertSkipped(context.Context, int64, time.Time) error {
+func (s *staticApplyStore) SetRevertSkipped(_ context.Context, id int64, _ time.Time) error {
+	s.revertSkipped = append(s.revertSkipped, id)
 	return nil
 }
 
@@ -2105,18 +2108,20 @@ func newControlTestServiceWithTasks(client tern.Client, apply *storage.Apply, ta
 // on: the control request a rejection is recorded against, and the apply log an
 // operator reads.
 type controlTestStores struct {
+	applies   *staticApplyStore
 	controls  *memoryControlRequestStore
 	applyLogs *capturingApplyLogStore
 }
 
 func newControlTestServiceWithStores(client tern.Client, apply *storage.Apply, tasks []*storage.Task) (*Service, *controlTestStores) {
 	stores := &controlTestStores{
+		applies:   &staticApplyStore{apply: apply},
 		controls:  &memoryControlRequestStore{},
 		applyLogs: &capturingApplyLogStore{},
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := New(&mockStorageWithApplyStores{
-		applies:   &staticApplyStore{apply: apply},
+		applies:   stores.applies,
 		tasks:     &capturingTaskStore{tasks: tasks},
 		controls:  stores.controls,
 		applyLogs: stores.applyLogs,
