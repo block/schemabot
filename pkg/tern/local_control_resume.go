@@ -3287,6 +3287,10 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 	if suppressParentApplyWrites(ctx) {
 		return nil
 	}
+	if _, operationDrive := storage.OperationLeaseFromContext(ctx); operationDrive &&
+		ctx.Err() == nil && state.IsState(apply.State, state.Apply.Failed) {
+		return fmt.Errorf("%w: %w", ErrGroupedResumeFailureCommitted, err)
+	}
 	return err
 }
 

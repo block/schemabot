@@ -77,30 +77,11 @@ func (r *changeEventRecorder) operationEvent(apply *storage.Apply, attempt *stor
 	return event
 }
 
-// directApplyFinishEligible checks the rollout before a direct parent write.
-// A direct failure can land while an already-started sibling still holds its
-// target. Only the projection can report a later transition in that case.
-func (r *changeEventRecorder) directApplyFinishEligible(ctx context.Context, apply *storage.Apply) bool {
-	if r == nil || !state.IsState(apply.State, state.SettledApplyStates...) ||
-		!r.sender.Enabled(changeevents.ApplyFinished, apply.Environment) {
-		return false
-	}
-	if !state.IsState(apply.State, state.Apply.Failed) {
-		return true
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, changeEventStorageTimeout)
-	defer cancel()
-	ops, err := r.store.ApplyOperations().ListByApply(ctx, apply.ID)
-	if err != nil {
-		r.logReadError(changeevents.ApplyFinished, apply.ID, err)
-		return false
-	}
-	settled, err := r.rolloutFailureSettled(ctx, apply.ID, ops)
-	if err != nil {
-		r.logReadError(changeevents.ApplyFinished, apply.ID, err)
-	}
-	return settled
+// selectsApplyFinish uses only the requested state and destination filters.
+// The recorder checks rollout settlement after the write commits.
+func (r *changeEventRecorder) selectsApplyFinish(apply *storage.Apply) bool {
+	return r != nil && state.IsState(apply.State, state.SettledApplyStates...) &&
+		r.sender.Enabled(changeevents.ApplyFinished, apply.Environment)
 }
 
 func (r *changeEventRecorder) rolloutFailureSettled(ctx context.Context, applyID int64, ops []*storage.ApplyOperation) (bool, error) {
@@ -119,7 +100,7 @@ func (r *changeEventRecorder) rolloutFailureSettled(ctx context.Context, applyID
 }
 
 // finishApply offers an event after a committed transition. A direct failure
-// also rechecks settlement against the same rows it uses for the summary.
+// checks settlement against the same rows it uses for the summary.
 func (r *changeEventRecorder) finishApply(ctx context.Context, applyID int64, outcome string, directWrite bool) {
 	if r == nil || !r.sender.Selects(changeevents.ApplyFinished) || !state.IsState(outcome, state.SettledApplyStates...) {
 		return

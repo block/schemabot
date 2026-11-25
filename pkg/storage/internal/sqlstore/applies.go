@@ -1573,7 +1573,7 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 // updateOnce runs one attempt of Update in its own transaction.
 func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease storage.ApplyLease, hasLease bool) error {
 	var err error
-	finishEligible := s.events.directApplyFinishEligible(ctx, apply)
+	finishSelected := s.events.selectsApplyFinish(apply)
 	lockTarget := isActiveApplyState(apply.State)
 	database, dbType, environment, deployment := apply.Database, apply.DatabaseType, apply.Environment, apply.Deployment
 	if lockTarget && (!hasApplyTarget(database, dbType, environment) || deployment == "") {
@@ -1652,7 +1652,7 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 	// write still uses the original statement to preserve its other updates.
 	var result sql.Result
 	var terminalTransition bool
-	if finishEligible {
+	if finishSelected {
 		result, err = writeTx.tx.ExecContext(ctx, statement+" AND state <> ?", append(args, apply.State)...)
 		if err != nil {
 			return fmt.Errorf("update apply %d: %w", apply.ID, err)

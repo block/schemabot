@@ -1352,18 +1352,14 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 			return claimSpent
 		}
 		var drivePanic *panicsafe.Error
-		if !errors.As(resumeErr, &drivePanic) && !postTerminalReconcileSettlesHere(runCtx, resumeErr) {
+		if !errors.As(resumeErr, &drivePanic) && !settledDriveErrorAllowsOperationUpdate(runCtx, resumeErr) {
 			// Transient drive failures, and a drive this driver may no longer
 			// write for, leave the operation claimable so a later poll retries
 			// it; resumeClaimedApply already logged the cause.
 			return claimSpent
 		}
-		// A contained drive panic already failed this operation's tasks and the
-		// parent apply. A drive that stored the apply's terminal outcome and then
-		// could not answer a request after it has settled the schema change, and
-		// nothing re-claims a settled apply to finish that work. Either way, fall
-		// through so the operation row is persisted from its now-terminal tasks
-		// immediately and the post-drive settlement answers the requests the
+		// The drive already recorded the outcome. Persist the operation from
+		// its settled tasks under this claim before answering any requests the
 		// outcome resolves.
 	}
 
@@ -3008,19 +3004,11 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, dri
 	s.publishTerminalSummaryIfWon(applyCtx, driverID, apply, result)
 }
 
-// postTerminalReconcileSettlesHere reports whether a failed drive is one whose
-// caller settles the apply in place: the drive stored the apply's terminal
-// outcome and only an answer owed after it did not land, so the caller persists
-// the operation row from its terminal tasks and runs the post-drive settlement.
-//
-// A reconcile refused because the apply lease was lost, or cut short by the
-// drive's context, is not one, even though it carries the same sentinel:
-// resumeClaimedApplyWithOptions classifies those first, and a driver that lost
-// its lease or is stopping must write nothing more for the apply. The stored
-// outcome stands either way, and the reaper's sweep of control requests
-// stranded on settled applies answers the request instead.
-func postTerminalReconcileSettlesHere(ctx context.Context, err error) bool {
-	if !errors.Is(err, tern.ErrPostTerminalReconcile) {
+// settledDriveErrorAllowsOperationUpdate reports whether the drive proved the
+// apply outcome was stored and can still settle its own operation under the
+// current claim. A displaced or cancelled drive leaves settlement to recovery.
+func settledDriveErrorAllowsOperationUpdate(ctx context.Context, err error) bool {
+	if !errors.Is(err, tern.ErrPostTerminalReconcile) && !errors.Is(err, tern.ErrGroupedResumeFailureCommitted) {
 		return false
 	}
 	if errors.Is(err, tern.ErrApplyLeasePresumedLost) || errors.Is(err, storage.ErrApplyLeaseLost) {
@@ -3331,7 +3319,9 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 		logger.Error("operator: failed to resume apply",
 			"error", err)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "resume_error")
-		if retryableClaim {
+		// A committed grouped failure already released the active apply gauge
+		// when the drive stored the failure.
+		if retryableClaim && !errors.Is(err, tern.ErrGroupedResumeFailureCommitted) {
 			metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 		}
 		return false, err
