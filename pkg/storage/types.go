@@ -3077,7 +3077,8 @@ type ApplyComment struct {
 	// frozen rendering had not landed. That release did not store the frozen
 	// body, so finishing its marker reads the comment from GitHub to tell
 	// whether the freeze already landed. The current release never sets it;
-	// it records owed freezes in FreezeCommentID instead.
+	// it records owed freezes in FreezeCommentID instead. The column is being
+	// retired; docs/storage-schema.md ("Retiring a column") has its plan.
 	PendingFreezeCommentID *int64
 
 	// FreezeCommentID records the GitHub comment ID of a progress comment
