@@ -24,6 +24,7 @@ func TestNamespacesWithShardPlansKeepsEveryNamespaceField(t *testing.T) {
 		Metadata:              map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
 		IgnoreTables:          []string{"_archive"},
 		DropTables:            []string{"_refunds_old"},
+		RollbackBlockers:      []storage.RollbackBlocker{{Table: "refunds", Reason: "rollback was not captured"}},
 		Finalize:              true,
 	}
 	fields := reflect.ValueOf(nsData).Elem()
