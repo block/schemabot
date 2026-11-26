@@ -62,11 +62,14 @@ func OperationUnfinished(s string) bool {
 // apply's operation slots or is queued for one, so the limit is what decides
 // when it runs. A member waiting for an earlier member, halted, or paused
 // behind a failure waits on the rollout's order or on an operator instead,
-// and the limit holds nothing back from it.
+// and the limit holds nothing back from it. That includes a copy parked at
+// its cutover behind an earlier member: the barrier releases its claim, and a
+// manual deferred cutover is refused at creation unless every operation can
+// wait at once, so its parked copies never exceed the limit.
 func (p PresentationState) CompetesForSlot() bool {
 	switch p {
-	case StateRunningCopy, StateReadyForCutoverNext, StateReadyForCutoverWaiting,
-		StateCuttingOver, StateRetrying, StateResuming, StateQueuedNext:
+	case StateRunningCopy, StateReadyForCutoverNext, StateCuttingOver,
+		StateRetrying, StateResuming, StateQueuedNext:
 		return true
 	default:
 		return false

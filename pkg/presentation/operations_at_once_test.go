@@ -133,7 +133,10 @@ func orderedOps(n int, barrier bool) []Operation {
 // neither the rolling nor the barrier policy lets the limit hold anything
 // back, so neither states it. A paused rollout whose first target failed
 // holds the other three for an operator, so it does not state the limit
-// either.
+// either. The same holds once every copy is done under the barrier: while an
+// earlier deployment runs its cutover, or after the first target failed under
+// pause, the other three wait parked at their cutover, and the limit is not
+// what holds them.
 func TestApplyLimitPhraseCountsOnlyMembersWaitingForASlot(t *testing.T) {
 	paused := rolloutOps(4, 0, 0)
 	for i := range paused {
@@ -141,6 +144,19 @@ func TestApplyLimitPhraseCountsOnlyMembersWaitingForASlot(t *testing.T) {
 		paused[i].PauseOnFailure = true
 	}
 	paused[0].State = state.ApplyOperation.Failed
+
+	parked := func(first Operation, pause bool) []Operation {
+		ops := orderedOps(4, true)
+		for i := range ops {
+			ops[i].State = state.ApplyOperation.WaitingForCutover
+			ops[i].PauseOnFailure = pause
+		}
+		ops[0].Deployment = first.Deployment
+		ops[0].State = first.State
+		return ops
+	}
+	earlierDeploymentCuttingOver := Operation{Deployment: "eu", State: state.ApplyOperation.CuttingOver}
+	firstTargetFailed := Operation{Deployment: "prod", State: state.ApplyOperation.Failed}
 
 	cases := []struct {
 		name    string
@@ -150,6 +166,8 @@ func TestApplyLimitPhraseCountsOnlyMembersWaitingForASlot(t *testing.T) {
 		{name: "rolling", ops: orderedOps(4, false), pending: StateWaiting},
 		{name: "barrier", ops: orderedOps(4, true), pending: StateWaiting},
 		{name: "paused behind a failure", ops: paused, pending: StatePaused},
+		{name: "parked behind an earlier deployment", ops: parked(earlierDeploymentCuttingOver, false), pending: StateReadyForCutoverWaiting},
+		{name: "parked behind a failure", ops: parked(firstTargetFailed, true), pending: StateReadyForCutoverWaiting},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

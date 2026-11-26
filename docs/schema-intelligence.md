@@ -732,8 +732,9 @@ runs more than one operation, sharded or across several targets, also carries
 While the apply runs, the CLI and the PR comment state it beside the counts
 while more operations are running or queued for a slot than that, as "3
 queued (1 at a time)", so the queued operations read as waiting their turn.
-Operations that wait for an earlier target, or are halted or paused behind a
-failure, are not held back by the limit and do not count. Its `tables` are
+Operations that wait for an earlier target, including copies parked at their
+cutover behind one, or are halted or paused behind a failure, are not held
+back by the limit and do not count. Its `tables` are
 then rolled up across the shards: one entry per keyspace table, with `status`
 the shard state that needs attention first, `rows_copied` and `rows_total`
 summed over the shards that have reported a total, and `shards` listing each
