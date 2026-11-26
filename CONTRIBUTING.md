@@ -42,8 +42,9 @@ make test          # Run all tests (unit + integration + e2e)
 answers the PlanetScale API over an embedded Vitess cluster, so Vitess changes
 can be developed and tested without a PlanetScale account. It is an alternative
 to `make demo-full`, not a step after it: each target resets the Compose stack
-before starting its own services, and `demo-vitess` brings up LocalScale alone,
-applying no schema and seeding no data. It builds the LocalScale image first;
+before starting its own services, and `demo-vitess` starts the server against a
+Vitess cluster without applying a schema or seeding data, so the commands it
+prints at the end are the demonstration. It builds the LocalScale image first;
 `make build-localscale-image` builds it on its own.
 
 See [docs/architecture.md](./docs/architecture.md) for an overview of how SchemaBot works.
