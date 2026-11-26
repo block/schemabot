@@ -78,6 +78,10 @@ func main() {
 		kong.Name(cliname.Name()),
 		kong.Description("Declarative schema GitOps orchestrator"),
 		kong.UsageOnError(),
+		// One line per command, with subcommands left to the parent's own --help.
+		// The top-level listing is the first thing a newcomer reads; it should fit
+		// on a screen and name what SchemaBot does, not enumerate every operation.
+		kong.ConfigureHelp(kong.HelpOptions{Compact: true, NoExpandSubcommands: true}),
 		kong.Vars{
 			"version":  fmt.Sprintf("%s (commit: %s)", version, commit),
 			"cli_name": cliname.Name(),
