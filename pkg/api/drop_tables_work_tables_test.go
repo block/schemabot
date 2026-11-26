@@ -313,6 +313,41 @@ func TestPlanRefusesATableListedUnderDropAndIgnoreTables(t *testing.T) {
 	})
 }
 
+// Spirit's sentinel table holds an apply started with a deferred cutover until
+// the table is dropped, so a drop_tables entry naming it would run that
+// cutover without anyone asking. The entry is refused before any data plane is
+// asked to plan, whatever its case, on both paths that accept the list.
+func TestPlanRefusesADropOfTheCutoverSentinel(t *testing.T) {
+	for _, entry := range []string{"_spirit_sentinel", "_SPIRIT_SENTINEL"} {
+		request := PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: map[string]*ternv1.SchemaFiles{
+				"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+			},
+			DropTables: []string{"_users_old", entry},
+		}
+		want := `drop_tables entry "` + entry + "\" is the table that holds a deferred cutover until someone runs it, so dropping it would run that cutover. Remove the entry, and run the cutover with `schemabot cutover <apply-id> -e <env>` when you are ready"
+
+		t.Run("API "+entry, func(t *testing.T) {
+			client := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-unused"}}
+			rec := postJSON(t, withheldDropService(&capturingPlanStore{}, client).handlePlan, "/api/plan", request)
+
+			assert.Equal(t, http.StatusBadRequest, rec.Code)
+			assert.Contains(t, rec.Body.String(), `drop_tables entry \"`+entry+`\" is the table that holds a deferred cutover`)
+			assert.Nil(t, client.planReq)
+		})
+		t.Run("pull request "+entry, func(t *testing.T) {
+			client := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-unused"}}
+			_, err := withheldDropService(&capturingPlanStore{}, client).ExecutePlan(t.Context(), request)
+
+			require.EqualError(t, err, want)
+			assert.Nil(t, client.planReq)
+		})
+	}
+}
+
 // A data plane that predates drop_tables plans as though the list were empty:
 // the listed leftover stays, disclosed as a table skipped by its name. The
 // plan is kept, because that is the outcome the repository had before it

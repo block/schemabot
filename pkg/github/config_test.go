@@ -1661,6 +1661,10 @@ func TestFetchConfigRejectsUnusableExclusionEntries(t *testing.T) {
 			yaml: "database: payments\ntype: mysql\ndrop_tables:\n  - /^_.*_old$/\n",
 			want: `drop_tables entry "/^_.*_old$/" must be an exact table name`,
 		},
+		"drop_tables entry naming the cutover sentinel": {
+			yaml: "database: payments\ntype: mysql\ndrop_tables:\n  - _spirit_sentinel\n",
+			want: `drop_tables entry "_spirit_sentinel" is the table that holds a deferred cutover`,
+		},
 		"padded ignore_namespaces entry": {
 			yaml: "database: payments\ntype: mysql\nignore_namespaces:\n  - \" local_fixtures\"\n",
 			want: "ignore_namespaces",

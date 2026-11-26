@@ -5,6 +5,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/block/spirit/pkg/sentinel"
+
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -26,6 +28,8 @@ type DroppedTables struct {
 // NewDroppedTables indexes the config's drop_tables entries. An entry that is
 // blank, padded with whitespace, a path, or a pattern is an error naming it:
 // a malformed entry must fail the plan rather than drop a table nobody named.
+// So is an entry naming the cutover sentinel, since dropping it runs a
+// cutover nobody asked for.
 func NewDroppedTables(entries []string) (DroppedTables, error) {
 	if len(entries) == 0 {
 		return DroppedTables{}, nil
@@ -42,6 +46,9 @@ func NewDroppedTables(entries []string) (DroppedTables, error) {
 		if strings.Contains(name, "/") {
 			return DroppedTables{}, fmt.Errorf("drop_tables entry %s must be an exact table name: drop_tables takes no patterns or paths, so list each table to drop", schema.QuoteIgnoreTablesEntry(name))
 		}
+		if namesCutoverSentinel(name) {
+			return DroppedTables{}, fmt.Errorf("drop_tables entry %s is the table that holds a deferred cutover until someone runs it, so dropping it would run that cutover. Remove the entry, and run the cutover with `schemabot cutover <apply-id> -e <env>` when you are ready", schema.QuoteIgnoreTablesEntry(name))
+		}
 		if indexed[name] {
 			continue
 		}
@@ -49,6 +56,15 @@ func NewDroppedTables(entries []string) (DroppedTables, error) {
 		order = append(order, name)
 	}
 	return DroppedTables{entries: indexed, order: order}, nil
+}
+
+// namesCutoverSentinel reports whether an entry names Spirit's sentinel table,
+// which holds an apply started with a deferred cutover until the table is
+// dropped. The comparison ignores case, because whether two spellings are one
+// table is the target's answer. Every path that accepts drop_tables indexes it
+// here, so the refusal holds for the config, the API and the engine alike.
+func namesCutoverSentinel(entry string) bool {
+	return strings.EqualFold(entry, sentinel.TableName)
 }
 
 // Empty reports whether the config names no table to drop.
