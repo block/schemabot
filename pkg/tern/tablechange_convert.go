@@ -164,3 +164,17 @@ func protoRollbackBlockers(blockers []engine.RollbackBlocker) []*ternv1.SkippedT
 	}
 	return out
 }
+
+// storageRollbackBlockers keeps the tables that kept a namespace's original
+// files from being captured on the stored plan, so a plan read back later
+// still says why an apply of it cannot be rolled back.
+func storageRollbackBlockers(blockers []engine.RollbackBlocker) []storage.RollbackBlocker {
+	if len(blockers) == 0 {
+		return nil
+	}
+	out := make([]storage.RollbackBlocker, 0, len(blockers))
+	for _, b := range blockers {
+		out = append(out, storage.RollbackBlocker{Table: b.Table, Reason: b.Reason})
+	}
+	return out
+}

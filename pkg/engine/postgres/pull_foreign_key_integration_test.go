@@ -115,7 +115,7 @@ func TestEnginePullSchemaRefusesForeignKeysOutsideThePull(t *testing.T) {
 		require.ErrorIs(t, err, errUnwrittenReferencingTable)
 		assert.Nil(t, response)
 		assert.Contains(t, err.Error(), `schema "app" table "users"`)
-		assert.Contains(t, err.Error(), "ext_settings.ext_settings_user_id_fkey (such as a table an extension owns or one the repository ignores)")
+		assert.Contains(t, err.Error(), "ext_settings.ext_settings_user_id_fkey (on a table the pull cannot write, such as one an extension owns; remove the key)")
 	})
 
 	t.Run("another schema", func(t *testing.T) {
@@ -233,7 +233,7 @@ func TestCaptureOriginalFilesCarriesForeignKeys(t *testing.T) {
 			ignored: []string{"audit_events"},
 			wantBlockers: []engine.RollbackBlocker{{
 				Table:  "users",
-				Reason: "referenced by a foreign key on a table without a schema file: audit_events.audit_events_user_id_fkey (such as a table an extension owns or one the repository ignores)",
+				Reason: "referenced by a foreign key on a table without a schema file: audit_events.audit_events_user_id_fkey (on a table without a schema file, such as one an extension owns or one the repository ignores; declare that table in a schema file or remove the key)",
 			}},
 		},
 	}

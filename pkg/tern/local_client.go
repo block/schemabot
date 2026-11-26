@@ -2550,6 +2550,9 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 				nsData.OriginalFiles = map[string]string{}
 			}
 		}
+		if len(sc.RollbackBlockers) > 0 && nsData.RollbackBlockers == nil {
+			nsData.RollbackBlockers = storageRollbackBlockers(sc.RollbackBlockers)
+		}
 		// A sharded keyspace's SchemaChanges share one nsData, so merge the
 		// gate-facing VSchema metadata key by key: a sibling shard's change
 		// carrying less of it (or none) must not clear a deletion or mutation
