@@ -42,8 +42,8 @@ func (cmd *InitCmd) prepareSample(ctx context.Context, g *Globals) error {
 	if cmd.Type == "" {
 		cmd.Type = "mysql"
 	}
-	if cmd.Type != "mysql" && cmd.Type != "postgres" {
-		return fmt.Errorf("choose --type mysql or --type postgres for a sample database")
+	if cmd.Type != "mysql" && cmd.Type != "postgres" && cmd.Type != "vitess" {
+		return fmt.Errorf("choose --type mysql, --type postgres, or --type vitess for a sample database")
 	}
 	if cmd.Environment != "" && cmd.Environment != "development" {
 		return fmt.Errorf("sample databases use the development environment")
@@ -55,12 +55,18 @@ func (cmd *InitCmd) prepareSample(ctx context.Context, g *Globals) error {
 	if _, err = validateInitSchemaReuse(cmd.SchemaDir, "shop", cmd.Type); err != nil {
 		return err
 	}
-	setupCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	// A Vitess sample brings up an embedded cluster rather than one database
+	// server, so it is given longer to come up.
+	setupTimeout := 5 * time.Minute
+	if cmd.Type == "vitess" {
+		setupTimeout = 10 * time.Minute
+	}
+	setupCtx, cancel := context.WithTimeout(ctx, setupTimeout)
 	defer cancel()
 	var sample localdemo.Database
 	provision := func(runCtx context.Context, report func(string)) (*initResult, error) {
 		var provisionErr error
-		sample, provisionErr = localdemo.Ensure(runCtx, project, cmd.Type, report)
+		sample, provisionErr = localdemo.Ensure(runCtx, project, cmd.Type, g.Version, report)
 		return nil, provisionErr
 	}
 	if !cmd.NonInteractive && !cmd.JSON && ui.IsTerminal(os.Stdin) && ui.IsTerminal(os.Stdout) {
@@ -91,9 +97,20 @@ func (cmd *InitCmd) prepareSample(ctx context.Context, g *Globals) error {
 	if err != nil {
 		return err
 	}
+	if cmd.Type == "vitess" {
+		cmd.organization = sample.Organization
+		cmd.tokenRef, err = saveInitConnection(cmd.Runtime, cmd.Database, cmd.Environment, "token", sample.Token)
+		if err != nil {
+			return err
+		}
+	}
 	if !cmd.JSON {
 		heading := lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#1A7F37", Dark: "#3FB950"}).Render("✓ Sample database connected")
-		fmt.Printf("\n  %s\n  Docker container: %s\n\n", heading, sample.Name)
+		detail := "Docker container: " + sample.Name
+		if cmd.Type == "vitess" {
+			detail = fmt.Sprintf("Docker container: %s\n  Keyspace %s is split across %d shards", sample.Name, sample.Namespace, localdemo.SampleShards)
+		}
+		fmt.Printf("\n  %s\n  %s\n\n", heading, detail)
 	}
 	return nil
 }
@@ -126,20 +143,37 @@ type initStartChoice struct {
 	confirmed      bool
 }
 
+// sampleEngines are the engines the second screen offers, in the order it
+// lists them. engine() reads the confirmed choice back out by the same index.
+var sampleEngines = []struct{ name, label, hint string }{
+	{"mysql", "MySQL", "Schema changes powered by Spirit."},
+	{"postgres", "PostgreSQL", "Schema changes powered by pg-sprite."},
+	{"vitess", "Vitess", "A sharded cluster, powered by PlanetScale deploy requests."},
+}
+
 func (m *initStartChoice) engine() string {
-	if m.choice == 1 {
-		return "postgres"
+	if m.choice < 0 || m.choice >= len(sampleEngines) {
+		return sampleEngines[0].name
 	}
-	return "mysql"
+	return sampleEngines[m.choice].name
 }
 func (m *initStartChoice) Init() tea.Cmd { return nil }
+
+// choices is how many options the current screen offers, so the keys wrap
+// around the list in front of the operator rather than a fixed count.
+func (m *initStartChoice) choices() int {
+	if m.choosingEngine {
+		return len(sampleEngines)
+	}
+	return 2
+}
 func (m *initStartChoice) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if key, ok := msg.(tea.KeyMsg); ok {
 		switch key.String() {
 		case "up", "k":
-			m.choice = (m.choice + 1) % 2
+			m.choice = (m.choice + m.choices() - 1) % m.choices()
 		case "down", "j":
-			m.choice = (m.choice + 1) % 2
+			m.choice = (m.choice + 1) % m.choices()
 		case "shift+tab":
 			if m.choosingEngine {
 				m.choosingEngine = false
@@ -172,7 +206,10 @@ func (m *initStartChoice) View() string {
 	choices := []struct{ label, hint string }{{"Connect my database", "Bring an existing database into your project."}, {"Try a sample database", "A local Docker database with a few tables to explore."}}
 	if m.choosingEngine {
 		title = "Choose your sample database"
-		choices = []struct{ label, hint string }{{"MySQL", "Schema changes powered by Spirit."}, {"PostgreSQL", "Schema changes powered by pg-sprite."}}
+		choices = nil
+		for _, e := range sampleEngines {
+			choices = append(choices, struct{ label, hint string }{e.label, e.hint})
+		}
 	}
 	b.WriteString("\n  " + lipgloss.NewStyle().Bold(true).Render(title) + "\n\n")
 	for i, choice := range choices {

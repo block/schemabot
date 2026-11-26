@@ -38,7 +38,9 @@ func TestSampleDatabaseLifecycle(t *testing.T) {
 				}
 				require.NoError(t, exec.CommandContext(ctx, "docker", "rm", "-fv", name).Run())
 			})
-			sample, err := Ensure(ctx, project, engine)
+			// The version only selects the LocalScale image a Vitess sample
+			// runs, and this test covers the two SQL engines.
+			sample, err := Ensure(ctx, project, engine, "")
 			require.NoError(t, err)
 			var db *sql.DB
 			if engine == "mysql" {
@@ -67,10 +69,10 @@ func TestSampleDatabaseLifecycle(t *testing.T) {
 			require.False(t, c.State.Running)
 			occupied, err := new(net.ListenConfig).Listen(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strings.TrimSpace(string(port))))
 			require.NoError(t, err)
-			_, startErr := Ensure(ctx, project, engine)
+			_, startErr := Ensure(ctx, project, engine, "")
 			require.NoError(t, occupied.Close())
 			require.ErrorContains(t, startErr, "keep the container to preserve your data")
-			same, err := Ensure(ctx, project, engine)
+			same, err := Ensure(ctx, project, engine, "")
 			require.NoError(t, err)
 			require.Equal(t, sample, same)
 			// Reconnect with the original saved DSN, without retaining a killed session.
