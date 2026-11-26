@@ -143,7 +143,8 @@ func IsAlreadyCompleted(err error) bool {
 
 // SettledOutcomeError wraps an error to indicate the engine refused a control
 // operation because the schema change had already settled on an outcome of its
-// own, such as failed or cancelled, that the operation must not replace. It is
+// own, such as failed or cancelled, or is committed to one, such as a cutover
+// that has begun, that the operation must not replace. It is
 // a refusal for this change at this moment, not a gap in what the engine
 // supports. Retrying can never succeed, because the outcome will not change
 // back, so a caller consuming a durable control request should resolve the

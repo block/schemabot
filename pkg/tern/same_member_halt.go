@@ -214,6 +214,19 @@ func (c *GRPCClient) cancelRemoteForFailedSibling(ctx context.Context, apply *st
 		logger.InfoContext(ctx, "a sibling of this operation failed under on_failure halt, but nothing of this operation was dispatched to the data plane to cancel", attrs...)
 		return nil
 	}
+	if scope.sharesRemoteApplyWithSiblings() {
+		// The data plane cancels a remote apply as a whole, and this one also
+		// carries the deployment's other operations, other rollout members
+		// among them. ST-10 lets a halt cancel nothing outside its own member,
+		// so the drive sends no cancel: this operation's remote work runs on,
+		// and the apply still settles failed on the sibling's failure.
+		if sentAt.IsZero() {
+			logger.WarnContext(ctx, "a sibling of this operation failed under on_failure halt, but its remote apply is shared with other operations of the deployment; no cancel is sent, the work runs on, and the apply settles failed",
+				append(attrs, "remote_apply_id", remoteID, "deployment_operation_keys", scope.deploymentOperationKeys)...)
+		}
+		*sentAt = now
+		return nil
+	}
 	tasks, err := c.loadApplyTasks(ctx, apply, scope)
 	if err != nil {
 		return fmt.Errorf("load tasks of apply %s operation %d to cancel it behind failed sibling %d: %w", apply.ApplyIdentifier, scope.applyOperationID, failed.ID, err)

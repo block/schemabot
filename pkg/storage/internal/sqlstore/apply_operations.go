@@ -1501,6 +1501,66 @@ func sameMemberFailureGateArgs() []any {
 	return append(args, releasedFailureExemptionArgs()...)
 }
 
+// haltedBySameMemberFailureSQL matches a work row whose rollout member has a
+// failed work sibling under on_failure halt, in either order: the stored-row
+// counterpart of FailedSiblingHaltingOperation, which finds the same failure
+// for a row that is still being driven. Under ST-10 such a row starts nothing
+// new, its cutover included, and its running copy is cancelled.
+// failedSiblingGuard, when not empty, is an extra condition on the failed
+// sibling (aliased failed_sibling). The fragment references the
+// apply_operations alias; see haltedBySameMemberFailureArgs for its
+// placeholders.
+func haltedBySameMemberFailureSQL(failedSiblingGuard string) string {
+	guard := ""
+	if failedSiblingGuard != "" {
+		guard = `
+			AND ` + failedSiblingGuard
+	}
+	return `(
+	apply_operations.operation_kind = ?
+	AND apply_operations.on_failure NOT IN (?, ?)
+	AND EXISTS (
+		SELECT 1
+		FROM apply_operations AS failed_sibling
+		WHERE failed_sibling.apply_id = apply_operations.apply_id
+			AND failed_sibling.deployment = apply_operations.deployment
+			AND failed_sibling.target = apply_operations.target
+			AND failed_sibling.id <> apply_operations.id
+			AND failed_sibling.operation_kind = ?
+			AND failed_sibling.state = ?` + guard + `
+	)
+	AND ` + rolloutMembersOrderedHereSQL + `
+)`
+}
+
+// haltedBySameMemberFailureArgs returns the positional arguments for
+// haltedBySameMemberFailureSQL, in placeholder order.
+func haltedBySameMemberFailureArgs() []any {
+	return []any{
+		storage.ApplyOperationKindWork, storage.OnFailureContinue, storage.OnFailurePause,
+		storage.ApplyOperationKindWork, state.ApplyOperation.Failed,
+	}
+}
+
+// parkedHaltedBySameMemberFailureSQL matches a work row parked at the cutover
+// barrier that a same-member failure halts. A parked row has no drive to
+// notice the failure, and the cutover claim will not take it, so the copy
+// claim takes it for the drive that cancels its finished copy. The claim
+// applies it only to an apply that does not defer its cutover: the reaper's
+// ended-operation sweep records a stop on a deferred one instead, which saves
+// each parked copy for the next apply. The claim
+// leaves the row parked, so like a request-gated parked claim it is admitted
+// only when the failure is newer than the row's last lease rotation, or once
+// the row's heartbeat goes stale. Its placeholders are
+// haltedBySameMemberFailureArgs.
+func parkedHaltedBySameMemberFailureSQL(staleCutoff string) string {
+	return haltedBySameMemberFailureSQL(`(
+				apply_operations.lease_acquired_at IS NULL
+				OR apply_operations.lease_acquired_at ` + string(rematchOnlyAfterLease) + ` failed_sibling.updated_at
+				OR apply_operations.updated_at < ` + staleCutoff + `
+			)`)
+}
+
 // rolloutStepGateSQL is the table-step boundary of a rollout that runs table by
 // table: a work row of step N starts only once every row of an earlier step in
 // its deployment has completed, so each table lands on every target before any
@@ -2183,6 +2243,11 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		state.ApplyOperation.WaitingForCutover,
 		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel,
 		storage.ControlOperationCancel, storage.ControlOperationStop, storage.ControlRequestPending)
+	// A failed shard of the same rollout member halts a parked sibling just as
+	// a cancel does (ST-10), but no request carries that halt: the sibling's
+	// failure is the signal, so the drive that cancels the parked copy claims
+	// it here the same way.
+	queryArgs = append(queryArgs, haltedBySameMemberFailureArgs()...)
 	// Deferred-deploy start gate keys on the PARENT apply state, not the
 	// operation state: the operation row stays active (running) while the apply
 	// parks at waiting_for_deploy, because the copy phase finished and only the
@@ -2380,13 +2445,24 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 					WHERE sibling.apply_id = apply_operations.apply_id
 						AND sibling.id <> apply_operations.id
 				)
-				AND EXISTS (
-					SELECT 1
-					FROM apply_control_requests cr
-					WHERE cr.apply_id = apply_operations.apply_id
-						AND cr.operation IN (?, ?)
-						AND cr.status = ?
-						AND `+parkedControlGuard+`
+				AND (
+					EXISTS (
+						SELECT 1
+						FROM apply_control_requests cr
+						WHERE cr.apply_id = apply_operations.apply_id
+							AND cr.operation IN (?, ?)
+							AND cr.status = ?
+							AND `+parkedControlGuard+`
+					)
+					OR (
+						NOT EXISTS (
+							SELECT 1
+							FROM applies AS parked_apply
+							WHERE parked_apply.id = apply_operations.apply_id
+								AND `+s.dialect.JSONBooleanIsTrue("parked_apply.options", []string{"defer_cutover"})+`
+						)
+						AND `+parkedHaltedBySameMemberFailureSQL(staleClaimCutoff)+`
+					)
 				)
 			)
 			OR (
@@ -2822,6 +2898,11 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	// cutover cap bounds how many of the apply's operations cut over at once.
 	queryArgs = append(queryArgs, state.ApplyOperation.WaitingForCutover)
 	queryArgs = append(queryArgs, earlierSiblingHoldsCutoverArgs()...)
+	// A failed shard of the same rollout member halts the rest of its work
+	// under ST-10, whichever of the two was ordered first, so a parked shard
+	// does not begin its cutover behind it; the copy claim takes it to cancel
+	// its finished copy instead.
+	queryArgs = append(queryArgs, haltedBySameMemberFailureArgs()...)
 	queryArgs = append(queryArgs,
 		storage.ControlOperationStop, storage.ControlRequestPending,
 	)
@@ -2859,6 +2940,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 					FROM apply_operations AS earlier
 					WHERE `+earlierSiblingHoldsCutoverSQL(s.dialect)+`
 				)
+				AND NOT `+haltedBySameMemberFailureSQL("")+`
 				AND NOT EXISTS (
 					SELECT 1
 					FROM apply_control_requests cr

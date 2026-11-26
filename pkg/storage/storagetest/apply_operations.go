@@ -1458,7 +1458,17 @@ func TestApplyOperations(t *testing.T, h Harness) {
 				}
 
 				if !tc.laterAdmitted {
-					copyStart, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+					if tc.onFailure == storage.OnFailureHalt {
+						// Under halt, a driver claims payments-001's parked
+						// shard so it can cancel it (ST-10); the claim keeps
+						// the shard parked and starts no copy.
+						halted, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+						require.NoError(t, err)
+						require.NotNil(t, halted, "the parked payments-001 shard is claimed to be cancelled under %s", tc.name)
+						assert.Equal(t, survivor, halted.ID)
+						assert.Equal(t, state.ApplyOperation.WaitingForCutover, halted.State)
+					}
+					copyStart, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
 					require.NoError(t, err)
 					assert.Nil(t, copyStart, "no payments-002 copy starts behind a failed payments-001 under %s", tc.name)
 					cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")

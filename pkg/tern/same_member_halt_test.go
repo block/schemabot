@@ -151,3 +151,20 @@ func TestGRPCClient_FailedShardHaltCancelErrorKeepsPolling(t *testing.T) {
 	require.NoError(t, f.client.cancelRemoteForFailedSibling(t.Context(), f.apply, f.scope, &sentAt))
 	assert.Equal(t, 1, f.server.getCancelCalls(), "a poll inside the resend interval sends nothing")
 }
+
+// Shard 80- of target orders-001 fails under on_failure halt, and shard -80
+// was dispatched into the remote apply its deployment shares with target
+// orders-002. The data plane cancels a remote apply as a whole, so a cancel
+// would also stop orders-002, another rollout member. The drive sends none,
+// logs why once, and keeps polling.
+func TestGRPCClient_FailedShardSendsNoCancelForASharedRemoteApply(t *testing.T) {
+	f := newGRPCShardHaltFixture(t, state.Task.Running)
+	f.ops.ops[43].State = state.ApplyOperation.Failed
+	f.scope.deploymentOperationKeys = []string{f.ops.ops[42].OperationKey, f.ops.ops[43].OperationKey, f.ops.ops[44].OperationKey}
+
+	var sentAt time.Time
+	require.NoError(t, f.client.cancelRemoteForFailedSibling(t.Context(), f.apply, f.scope, &sentAt))
+	assert.Zero(t, f.server.getCancelCalls(), "a shared remote apply is never cancelled for one member's failure")
+	assert.False(t, sentAt.IsZero())
+	assert.Empty(t, f.logs.logs)
+}
