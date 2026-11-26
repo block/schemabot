@@ -5809,6 +5809,33 @@ func TestValidateRollbackSourceApplyAcceptsLatestCompletedApplyWithOriginalFiles
 	assert.Equal(t, int64(10), gotPlan.ID)
 }
 
+// A rollback source request accepts the apply's environment in any letter
+// case, as the rollback plan route does, and still refuses a different
+// environment.
+func TestValidateRollbackSourceApplyFoldsEnvironmentCase(t *testing.T) {
+	now := time.Now().UTC()
+	apply := rollbackGuardrailApply("apply_latest", 1, 10, now)
+	svc := newRollbackGuardrailService(apply, rollbackGuardrailPlan(10, true), []*storage.Task{
+		rollbackGuardrailTask(1, 10, now),
+	})
+
+	gotApply, gotPlan, err := svc.ValidateRollbackSourceApply(t.Context(), RollbackSourceRequest{
+		ApplyIdentifier: "apply_latest",
+		Environment:     "StAgInG",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, apply, gotApply)
+	require.NotNil(t, gotPlan)
+	assert.Equal(t, int64(10), gotPlan.ID)
+
+	_, _, err = svc.ValidateRollbackSourceApply(t.Context(), RollbackSourceRequest{
+		ApplyIdentifier: "apply_latest",
+		Environment:     "Production",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `belongs to environment "staging", not "production"`)
+}
+
 func TestValidateRollbackSourceApplyRequiresEnvironment(t *testing.T) {
 	now := time.Now().UTC()
 	apply := rollbackGuardrailApply("apply_latest", 1, 10, now)

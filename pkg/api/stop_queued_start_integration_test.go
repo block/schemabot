@@ -74,7 +74,7 @@ func TestStopWithdrawsAQueuedStart(t *testing.T) {
 	}
 	stop := func(t *testing.T, apply *storage.Apply) (*apitypes.StopResponse, int, error) {
 		t.Helper()
-		return svc.executeStopForApply(ctx, nil, apply, apply.ApplyIdentifier, apply.Environment, "cli:bob")
+		return svc.executeStopForApply(ctx, nil, apply, apply.ApplyIdentifier, "cli:bob")
 	}
 
 	t.Run("WithdrawsTheStartBeforeAnyClaim", func(t *testing.T) {
@@ -161,7 +161,7 @@ func TestStopWithdrawsAQueuedStart(t *testing.T) {
 		client := &mockTernClient{stopResp: &ternv1.StopResponse{Accepted: true}}
 		apply := getApply(t, ctx, stor, applyID)
 
-		resp, _, err := svc.executeStopForApply(ctx, client, apply, apply.ApplyIdentifier, apply.Environment, "cli:bob")
+		resp, _, err := svc.executeStopForApply(ctx, client, apply, apply.ApplyIdentifier, "cli:bob")
 		require.NoError(t, err)
 		assert.True(t, resp.Accepted)
 		assert.Empty(t, resp.Status, "the stop is pending like any stop of a running rollout")

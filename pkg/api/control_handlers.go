@@ -187,8 +187,11 @@ type RollbackSourceRequest struct {
 // ValidateRollbackSourceApply rejects rollback requests that cannot be mapped
 // unambiguously to the rollback planner's current source apply. Until rollback
 // planning targets a selected apply directly, only the latest completed source
-// apply with stored original schema is safe to roll back.
+// apply with stored original schema is safe to roll back. The environment is
+// folded with the same function the rollback plan route uses, so both entry
+// points accept the same spellings.
 func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackSourceRequest) (*storage.Apply, *storage.Plan, error) {
+	req.Environment = storage.CanonicalKey(req.Environment)
 	if req.ApplyIdentifier == "" {
 		return nil, nil, controlHTTPErrorf(http.StatusBadRequest, "apply_id is required")
 	}
@@ -597,7 +600,12 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, o
 	return client, apply, resolvedApplyID, true
 }
 
+// controlTarget resolves the apply, environment check, and Tern client for an
+// in-process control request. The environment is folded with the same function
+// the HTTP prelude uses, so a spelling that one entry point accepts is accepted
+// by the other.
 func (s *Service) controlTarget(ctx context.Context, operation, applyIdentifier, environment string) (tern.Client, *storage.Apply, string, error) {
+	environment = storage.CanonicalKey(environment)
 	if applyIdentifier == "" {
 		return nil, nil, "", controlHTTPErrorf(http.StatusBadRequest, "apply_id is required")
 	}
@@ -1329,7 +1337,7 @@ func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	stopResp, httpStatus, err := s.executeStopForApply(r.Context(), client, apply, ternApplyID, req.Environment, req.Caller)
+	stopResp, httpStatus, err := s.executeStopForApply(r.Context(), client, apply, ternApplyID, req.Caller)
 	if err != nil {
 		s.writeControlError(w, "stop", apply, err)
 		return
@@ -1344,7 +1352,7 @@ func (s *Service) ExecuteStop(ctx context.Context, req apitypes.ControlRequest) 
 	if err != nil {
 		return nil, err
 	}
-	resp, _, err := s.executeStopForApply(ctx, client, apply, ternApplyID, req.Environment, req.Caller)
+	resp, _, err := s.executeStopForApply(ctx, client, apply, ternApplyID, req.Caller)
 	return resp, err
 }
 
@@ -1352,7 +1360,7 @@ func (s *Service) ExecuteStop(ctx context.Context, req apitypes.ControlRequest) 
 // immediate local stop. The returned HTTP status is meaningful only when
 // err == nil; every error path returns a zero status, and callers must derive
 // the response status from the error (e.g. via writeControlError).
-func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) (*apitypes.StopResponse, int, error) {
+func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.StopResponse, int, error) {
 	caller = resolveCaller(ctx, caller)
 	// SchemaBot's own stop of an apply whose deferred cutover can no longer
 	// run is told apart by its caller: the drive tail leaves it for the settle
@@ -1372,13 +1380,13 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "the caller %q is reserved for the stop a freeze issues; send the stop under your own name", caller)
 	}
-	return s.stopApply(ctx, client, apply, ternApplyID, environment, caller)
+	return s.stopApply(ctx, client, apply, ternApplyID, caller)
 }
 
 // stopApply records durable stop intent for an apply under a caller already
 // resolved and checked, and attempts an immediate local stop. Its returns are
 // those of executeStopForApply.
-func (s *Service) stopApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) (*apitypes.StopResponse, int, error) {
+func (s *Service) stopApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.StopResponse, int, error) {
 	if apply.Engine == storage.EnginePlanetScale {
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "stop is not supported for this schema change; use cancel to permanently cancel it")
@@ -1417,7 +1425,7 @@ func (s *Service) stopApply(ctx context.Context, client tern.Client, apply *stor
 					"requested_by", caller)...)
 			responseStatus = ""
 		default:
-			s.tryImmediateStopAfterQueue(ctx, client, apply, ternApplyID, environment, caller)
+			s.tryImmediateStopAfterQueue(ctx, client, apply, ternApplyID, caller)
 		}
 		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 	}
@@ -1435,7 +1443,7 @@ func (s *Service) stopApply(ctx context.Context, client tern.Client, apply *stor
 	}, httpStatus, nil
 }
 
-func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) {
+func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) {
 	// A multi-operation apply has no single data-plane apply id: each operation
 	// drives against its own deployment with its own remote apply. An apply-scoped
 	// immediate stop keyed on a single ternApplyID would stop at most one operation
@@ -1484,7 +1492,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 	}
 	resp, err := client.Stop(ctx, &ternv1.StopRequest{
 		ApplyId:     ternApplyID,
-		Environment: environment,
+		Environment: apply.Environment,
 		Caller:      caller,
 	})
 	if err != nil {
