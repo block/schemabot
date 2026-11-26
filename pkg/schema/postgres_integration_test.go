@@ -155,6 +155,10 @@ func expectedPostgresColumnType(col statement.Column) (string, bool) {
 		return "character varying", true
 	case "text":
 		return "text", true
+	case "mediumtext":
+		// PostgreSQL text has no small size limit, so it covers MySQL
+		// mediumtext as well as text.
+		return "text", true
 	case "datetime":
 		return "timestamp without time zone", true
 	case "json":
