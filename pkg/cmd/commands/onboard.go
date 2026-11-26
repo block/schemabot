@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -47,7 +48,10 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 	var resp *apitypes.PullSchemaResponse
 	err = withLoading("Pulling live schema...", true, func() error {
 		var pullErr error
-		resp, pullErr = client.CallPullSchemaAPI(ep, cmd.Database, cmd.Type, cmd.Environment, pullNamespaces...)
+		resp, pullErr = client.CallPullSchemaAPIWithOptions(ep, cmd.Database, cmd.Type, cmd.Environment, client.PullSchemaOptions{
+			Namespaces:                pullNamespaces,
+			SkipUnrepresentableTables: true,
+		})
 		return pullErr
 	})
 	if err != nil {
@@ -143,6 +147,9 @@ type onboardWritePlan struct {
 	// disclose a plan's exemptions, and tells a stray file describing an
 	// absent table from one describing a table the config withholds.
 	withheld []*apitypes.ExemptTablesResponse
+	// skipped names the live tables the pull skipped because schema files
+	// cannot describe them. Each is also in exclusions' ignore_tables.
+	skipped []skippedTableGroup
 }
 
 // preservedExclusions returns the ignore_namespaces, ignore_tables and
@@ -246,19 +253,8 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	if err != nil {
 		return nil, fmt.Errorf("locate environment schema root %s under %s: %w", environmentRoot, root, err)
 	}
-	configYAML, err := onboardConfigYAML(resp.Database, string(resp.Type), exclusions)
-	if err != nil {
-		return nil, err
-	}
-	files := map[string]string{
-		"schemabot.yaml": configYAML,
-	}
 
-	namespaces := make([]string, 0, len(resp.Namespaces))
-	for namespace := range resp.Namespaces {
-		namespaces = append(namespaces, namespace)
-	}
-	sort.Strings(namespaces)
+	namespaces := sortedPulledNamespaces(resp)
 	if err := rejectCaseCollisions("namespace", namespaces); err != nil {
 		return nil, err
 	}
@@ -273,6 +269,21 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	// refuse — a table both withheld from the planner and declared to it — and
 	// re-onboarding an already-configured repository is where that happens,
 	// because the entries it preserves name tables the pull just returned.
+	// A table the pull skipped has no schema file, and a live table with no
+	// file plans as DROP TABLE unless ignore_tables withholds it. So every
+	// skipped table goes into the config's ignore_tables with the files.
+	skipped, err := pulledSkippedTables(namespaces, resp.Namespaces)
+	if err != nil {
+		return nil, err
+	}
+	exclusions.Tables = ignoreSkippedTables(exclusions.Tables, skipped)
+	configYAML, err := onboardConfigYAML(resp.Database, string(resp.Type), exclusions)
+	if err != nil {
+		return nil, err
+	}
+	files := map[string]string{
+		"schemabot.yaml": configYAML,
+	}
 	ignored, err := engine.NewIgnoredTables(exclusions.Tables)
 	if err != nil {
 		return nil, fmt.Errorf("read the existing schemabot.yaml's ignore_tables: %w", err)
@@ -365,6 +376,7 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		files:           files,
 		exclusions:      exclusions,
 		withheld:        withheldGroups,
+		skipped:         skipped,
 	}, nil
 }
 
@@ -638,16 +650,84 @@ func (p *onboardWritePlan) strayFiles() (strays, withheldStrays []string, err er
 // with no stated reason.
 func (p *onboardWritePlan) printExclusionDisclosure() {
 	templates.WriteExemptTables(p.withheld)
+	for _, group := range p.skipped {
+		templates.WriteOnboardSkippedTables(group.Namespace, group.Tables)
+	}
 }
 
-// withheldTableFilePaths returns the file each withheld table would have been
-// written to. A repository onboarded before an entry was added still carries
-// those files, and they are strays this pull deliberately did not write.
+// sortedPulledNamespaces returns the namespaces a pull answered, in order.
+func sortedPulledNamespaces(resp *apitypes.PullSchemaResponse) []string {
+	namespaces := make([]string, 0, len(resp.Namespaces))
+	for namespace := range resp.Namespaces {
+		namespaces = append(namespaces, namespace)
+	}
+	sort.Strings(namespaces)
+	return namespaces
+}
+
+// skippedTableGroup is the tables a pull skipped in one namespace.
+type skippedTableGroup struct {
+	Namespace string
+	Tables    []apitypes.SkippedTable
+}
+
+// pulledSkippedTables collects the tables the pull skipped, by namespace in
+// order. Each goes into ignore_tables under its own name, so a name that
+// reads as an ignore_tables pattern is refused, since the entry would
+// withhold every table the pattern matches, not the one table. So is a name
+// ignore_tables does not accept as an entry, which would leave a config no
+// plan can read. Both refusals come before any file is written.
+func pulledSkippedTables(namespaces []string, pulled map[string]*apitypes.PulledNamespace) ([]skippedTableGroup, error) {
+	var groups []skippedTableGroup
+	for _, namespace := range namespaces {
+		ns := pulled[namespace]
+		if ns == nil || len(ns.SkippedTables) == 0 {
+			continue
+		}
+		for _, table := range ns.SkippedTables {
+			if schema.IsIgnoreTablePattern(table.Table) {
+				return nil, fmt.Errorf("onboarding refused; no files were written. Schema files cannot describe table %s in namespace %q (%s), and ignore_tables would read its name as a pattern. Rename the table, then onboard again",
+					schema.QuoteIgnoreTablesEntry(table.Table), namespace, table.Reason)
+			}
+			if err := schema.ValidateIgnoreTables([]string{table.Table}); err != nil {
+				return nil, fmt.Errorf("onboarding refused; no files were written. Schema files cannot describe table %s in namespace %q (%s), and ignore_tables cannot name it: %w. Rename the table, then onboard again",
+					schema.QuoteIgnoreTablesEntry(table.Table), namespace, table.Reason, err)
+			}
+		}
+		groups = append(groups, skippedTableGroup{Namespace: namespace, Tables: ns.SkippedTables})
+	}
+	return groups, nil
+}
+
+// ignoreSkippedTables returns entries with every skipped table appended that
+// entries do not already name.
+func ignoreSkippedTables(entries []string, groups []skippedTableGroup) []string {
+	out := slices.Clone(entries)
+	for _, group := range groups {
+		for _, table := range group.Tables {
+			if !slices.Contains(out, table.Table) {
+				out = append(out, table.Table)
+			}
+		}
+	}
+	return out
+}
+
+// withheldTableFilePaths returns the file each withheld or skipped table
+// would have been written to. A repository onboarded before an entry was
+// added, or before a table gained something schema files cannot describe,
+// still carries those files, and they are strays this pull deliberately did
+// not write.
 func (p *onboardWritePlan) withheldTableFilePaths() map[string]bool {
 	paths := make(map[string]bool)
 	for _, group := range p.withheld {
 		for _, table := range group.Tables {
 			paths[filepath.Join(p.namespacePrefix, group.Namespace, table+".sql")] = true
+		}
+	}
+	for _, group := range p.skipped {
+		for _, table := range group.Tables {
+			paths[filepath.Join(p.namespacePrefix, group.Namespace, table.Table+".sql")] = true
 		}
 	}
 	return paths

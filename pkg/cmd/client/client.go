@@ -178,6 +178,10 @@ type PullSchemaOptions struct {
 	Namespaces    []string
 	CatalogDetail string
 	Lint          bool
+	// SkipUnrepresentableTables asks for every table schema files can describe
+	// and a list of the rest, instead of a refusal. A caller that writes the
+	// files must add every skipped table to ignore_tables.
+	SkipUnrepresentableTables bool
 }
 
 // CallPullSchemaAPI fetches live schema files for a database/environment pair.
@@ -199,6 +203,8 @@ func CallPullSchemaAPIWithContext(ctx context.Context, endpoint, database, dbTyp
 		Namespaces:    opts.Namespaces,
 		CatalogDetail: opts.CatalogDetail,
 		Lint:          opts.Lint,
+
+		SkipUnrepresentableTables: opts.SkipUnrepresentableTables,
 	}
 	var result apitypes.PullSchemaResponse
 	if err := doPostIntoWithClient(ctx, httpClient, endpoint, "/api/pull", req, &result); err != nil {

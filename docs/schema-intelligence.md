@@ -370,6 +370,23 @@ pull reads only the environment's
 [primary deployment](#whats-in-this-database), so it cannot report a skip that
 only another deployment would need.
 
+`schemabot pull` always sets the flag, since it writes no files. Its summary
+box counts the skipped tables, and each namespace lists its own under a
+warning:
+
+```sh
+schemabot pull -d shop -e production
+```
+
+```sql
+-- Namespace `public` — 1 table
+-- ⚠️ Skipped 1 table, not in the output:
+--   accounts: schema files cannot describe its trigger
+```
+
+`schemabot onboard` and `schemabot init` set it too, and write each skipped
+table into `schemabot.yaml`'s `ignore_tables`.
+
 ### Databases that span several targets
 
 A database whose environment lists `targets` addresses several targets at once,

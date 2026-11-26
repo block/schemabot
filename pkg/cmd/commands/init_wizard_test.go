@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 )
 
@@ -722,4 +723,28 @@ func TestInitProgressHeading(t *testing.T) {
 			require.Contains(t, m.View(), "SchemaBot  /  "+heading)
 		})
 	}
+}
+
+// The import says which tables it left to the database and why, before the
+// next step, so the operator learns at setup that SchemaBot will not manage
+// them.
+func TestInitCompletionNamesSkippedTables(t *testing.T) {
+	output := stripAnsi(initCompletion(&initResult{SchemaDir: "schema", Profile: "default", Tables: 1, SkippedTables: []initSkippedTable{
+		{Namespace: "public", Table: "audit_log", Reason: "unlogged tables cannot be rendered as a desired schema"},
+	}}, "development", "default", "schemabot"))
+	require.Contains(t, output, "Not managed: 1 table has no schema file, so schemabot.yaml lists it in ignore_tables:\n    public.audit_log: unlogged tables cannot be rendered as a desired schema\n\n  Make your first edit")
+
+	output = initCompletion(&initResult{SchemaDir: "schema", Profile: "default", Tables: 1}, "development", "default", "schemabot")
+	require.NotContains(t, output, "Not managed")
+}
+
+func TestInitSkippedTablesFlattensEveryNamespace(t *testing.T) {
+	require.Equal(t, []initSkippedTable{
+		{Namespace: "billing", Table: "ledger", Reason: "schema files cannot describe its trigger"},
+		{Namespace: "public", Table: "audit_log", Reason: "unlogged tables cannot be rendered as a desired schema"},
+	}, initSkippedTables([]skippedTableGroup{
+		{Namespace: "billing", Tables: []apitypes.SkippedTable{{Table: "ledger", Reason: "schema files cannot describe its trigger"}}},
+		{Namespace: "public", Tables: []apitypes.SkippedTable{{Table: "audit_log", Reason: "unlogged tables cannot be rendered as a desired schema"}}},
+	}))
+	require.Nil(t, initSkippedTables(nil))
 }
