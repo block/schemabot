@@ -324,19 +324,43 @@ func TestClassifyRefusal(t *testing.T) {
 		},
 		{
 			name: "concurrent index drop that ran past its limit names the index and the drop to finish",
-			err: fmt.Errorf("drop reviewed index %q on PostgreSQL table %q.%q: %w", "orders_status_idx", "public", "orders",
-				nameIndexDropTimeout(&executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Hour}, "orders_status_idx", time.Hour)),
+			err: fmt.Errorf("drop reviewed index %q on PostgreSQL table %q.%q: %w", "orders_status_idx", "sales", "orders",
+				nameInterruptedIndexDrop(&executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Hour}, "sales", "orders_status_idx", time.Hour)),
 			wantReason: "index-drop-timed-out",
 			wantDetail: []string{
 				`the drop of index "orders_status_idx" on "users" ran past 1h0m0s and was cancelled, which can leave the index invalid`,
-				`if index "orders_status_idx" is still on the table and invalid, finish the drop outside SchemaBot with DROP INDEX CONCURRENTLY; then ` + replanRemedy,
+				`if index "orders_status_idx" is still on the table and invalid, finish the drop outside SchemaBot by running DROP INDEX CONCURRENTLY "sales"."orders_status_idx", then ` + replanRemedy,
 			},
 			wantNotDetail: []string{"statement budget"},
 		},
 		{
+			name: "concurrent index drop cancelled by the apply names the index and the drop to finish",
+			err: fmt.Errorf("drop reviewed index: %w",
+				nameInterruptedIndexDrop(fmt.Errorf("%w (after 2s: context canceled)", executor.ErrCancelledByCaller), "sales", "orders_status_idx", time.Hour)),
+			wantReason: "index-drop-cancelled",
+			wantDetail: []string{
+				`the drop of index "orders_status_idx" on "users" was cancelled before it finished, which can leave the index invalid`,
+				`finish the drop outside SchemaBot by running DROP INDEX CONCURRENTLY "sales"."orders_status_idx", then ` + replanRemedy,
+			},
+		},
+		{
+			name: "concurrent index drop cancelled from outside SchemaBot names the index and the drop to finish",
+			err: fmt.Errorf("drop reviewed index: %w",
+				nameInterruptedIndexDrop(fmt.Errorf("%w (after 2s)", executor.ErrCancelledExternally), "sales", "orders_status_idx", time.Hour)),
+			wantReason: "index-drop-cancelled",
+			wantDetail: []string{`finish the drop outside SchemaBot by running DROP INDEX CONCURRENTLY "sales"."orders_status_idx", then ` + replanRemedy},
+		},
+		{
+			name: "the drop to finish quotes an index name holding a double quote as SQL",
+			err: fmt.Errorf("drop reviewed index: %w",
+				nameInterruptedIndexDrop(&executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Hour}, "public", `orders"idx`, time.Hour)),
+			wantReason: "index-drop-timed-out",
+			wantDetail: []string{`DROP INDEX CONCURRENTLY "public"."orders""idx"`},
+		},
+		{
 			name: "a concurrent index drop that lost its lock budget is not named as a timeout",
 			err: fmt.Errorf("drop reviewed index: %w",
-				nameIndexDropTimeout(&executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}, "orders_status_idx", time.Hour)),
+				nameInterruptedIndexDrop(&executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}, "public", "orders_status_idx", time.Hour)),
 		},
 		{
 			name: "lock budget exhaustion is operational",

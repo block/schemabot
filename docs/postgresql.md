@@ -730,9 +730,10 @@ An index the schema file no longer declares is dropped with
 `DROP INDEX CONCURRENTLY`, after you approve it with `--allow-unsafe`. The
 drop reads no rows and rewrites nothing, so the size limit does not apply. It
 does not block reads or writes. It waits for the transactions already open on
-the table, for up to 4 minutes. A drop that runs out of time fails and can
-leave the index invalid, which queries no longer use. Drop that index outside
-SchemaBot, then plan again.
+the table, for up to 4 minutes. A drop that runs out of time, or is cancelled,
+fails and can leave the index invalid, which queries no longer use. The apply
+names the index and gives the schema-qualified `DROP INDEX CONCURRENTLY` that
+finishes it. Run that outside SchemaBot, then plan again.
 
 Right before the drop, the apply checks that the index still has the
 definition the plan recorded. If it changed, for example because the index was

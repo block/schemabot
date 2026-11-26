@@ -1055,14 +1055,9 @@ func refusalForCause(err error, table string) *refusal {
 	// A cancelled concurrent drop can leave the index invalid, which no plan
 	// drops, so the refusal names the index and the drop to finish by hand.
 	// Decided before the budget arm, which would hide the index.
-	var dropTimeoutErr *indexDropTimeoutError
-	if errors.As(err, &dropTimeoutErr) {
-		index := boundedQuote(dropTimeoutErr.index, quotedTableWidth)
-		return &refusal{reason: "index-drop-timed-out",
-			cause: fmt.Sprintf("the drop of index %s on %s ran past %s and was cancelled, which can leave the index invalid",
-				index, quotedTable(table), dropTimeoutErr.limit),
-			remedy: fmt.Sprintf("if index %s is still on the table and invalid, finish the drop outside SchemaBot with DROP INDEX CONCURRENTLY; then %s",
-				index, replanRemedy)}
+	var dropInterruptedErr *indexDropInterruptedError
+	if errors.As(err, &dropInterruptedErr) {
+		return indexDropInterruptedRefusal(dropInterruptedErr, table)
 	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
@@ -1468,6 +1463,24 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 // and then the operator changes the name on one side or the other.
 const createCollisionRemedy = "re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name"
 
+// indexDropInterruptedRefusal names the index whose concurrent drop was
+// cancelled and the statement that finishes it. The statement is built from
+// the plan's schema and index name with SQL identifier quoting, which
+// PostgreSQL's identifier length bounds, so it runs as shown.
+func indexDropInterruptedRefusal(err *indexDropInterruptedError, table string) *refusal {
+	index := boundedQuote(err.index, quotedTableWidth)
+	reason := "index-drop-cancelled"
+	what := "was cancelled before it finished"
+	if err.timedOut {
+		reason = "index-drop-timed-out"
+		what = fmt.Sprintf("ran past %s and was cancelled", err.limit)
+	}
+	return &refusal{reason: reason,
+		cause: fmt.Sprintf("the drop of index %s on %s %s, which can leave the index invalid", index, quotedTable(table), what),
+		remedy: fmt.Sprintf("if index %s is still on the table and invalid, finish the drop outside SchemaBot by running %s, then %s",
+			index, err.finishDropStatement(), replanRemedy)}
+}
+
 // createCollisionRefusal names the kinds of relation that can hold a name
 // the create set claims, so the operator knows where to look; the server
 // error identifying the occupant stays in the logs. The list is the
@@ -1843,6 +1856,11 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		// must not reach the transactional optimistic executor.
 		return buildIndexConcurrently(ctx, pool, change, tracker, logger)
 	}
+	if change.indexDrop {
+		// A concurrent drop cannot run inside a transaction block either, so
+		// it takes pg-sprite's checked concurrent drop.
+		return executeIndexDrop(ctx, pool, change, tracker, logger)
+	}
 	// Every other statement runs exactly as reviewed, under the
 	// per-statement and lock limits. The apply never rewrites a statement
 	// here: it executes the DDL the plan surfaced, which tableChanges
@@ -1861,9 +1879,6 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	// where greenfieldCreateSet keeps the blocking form on purpose — a
 	// table born in the run has no readers, and CONCURRENTLY cannot run
 	// inside its create sequence.
-	if change.indexDrop {
-		return executeIndexDrop(ctx, pool, change, tracker, logger)
-	}
 	if change.dropped != nil {
 		return executeReviewedDrop(ctx, pool, table, change, statement.SQL(), tracker)
 	}

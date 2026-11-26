@@ -11,6 +11,7 @@ import (
 	"github.com/block/pg-sprite/pkg/progress"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -81,7 +82,7 @@ func executeIndexDrop(ctx context.Context, pool *pgxpool.Pool, change nativeAppl
 		executor.ConcurrentBudget{Overall: indexDropLimit})
 	if err != nil {
 		return fmt.Errorf("drop reviewed index %q on PostgreSQL table %q.%q: %w", change.dropped.Name, change.namespace, change.table,
-			nameIndexDropTimeout(err, change.dropped.Name, indexDropLimit))
+			nameInterruptedIndexDrop(err, change.namespace, change.dropped.Name, indexDropLimit))
 	}
 	logger.Info("PostgreSQL index dropped concurrently",
 		"database", change.database,
@@ -92,30 +93,50 @@ func executeIndexDrop(ctx context.Context, pool *pgxpool.Pool, change nativeAppl
 	return nil
 }
 
-// indexDropTimeoutError reports that a concurrent index drop ran past its
-// limit and the server cancelled it. A cancelled DROP INDEX CONCURRENTLY can
-// leave the index in place and invalid. A plan never drops an invalid index,
-// so the operator finishes that drop by hand.
-type indexDropTimeoutError struct {
-	index string
-	limit time.Duration
-	err   error
+// indexDropInterruptedError reports that a concurrent index drop was
+// cancelled before it finished: by its own limit firing, by the apply's
+// context ending, or by a cancel from outside SchemaBot. A cancelled DROP
+// INDEX CONCURRENTLY can leave the index in place and invalid. A plan never
+// drops an invalid index, so the operator finishes that drop by hand.
+type indexDropInterruptedError struct {
+	schema string
+	index  string
+	// limit is the drop's time limit; timedOut reports that the limit is
+	// what cancelled it.
+	limit    time.Duration
+	timedOut bool
+	err      error
 }
 
-func (e *indexDropTimeoutError) Error() string {
-	return fmt.Sprintf("the concurrent drop of index %q ran past %s and was cancelled", e.index, e.limit)
-}
-
-func (e *indexDropTimeoutError) Unwrap() error { return e.err }
-
-// nameIndexDropTimeout wraps a drop failure caused by the drop's statement
-// budget firing, so the refusal names the index and how to finish the drop.
-// Every other failure passes through unchanged. The drop runs with
-// lock_timeout disabled, so only the statement cause is the limit's.
-func nameIndexDropTimeout(err error, index string, limit time.Duration) error {
-	var budgetErr *executor.BudgetError
-	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
-		return &indexDropTimeoutError{index: index, limit: limit, err: err}
+func (e *indexDropInterruptedError) Error() string {
+	if e.timedOut {
+		return fmt.Sprintf("the concurrent drop of index %q ran past %s and was cancelled", e.index, e.limit)
 	}
-	return err
+	return fmt.Sprintf("the concurrent drop of index %q was cancelled before it finished", e.index)
+}
+
+func (e *indexDropInterruptedError) Unwrap() error { return e.err }
+
+// finishDropStatement is the statement that finishes the drop by hand, with
+// the index schema-qualified and quoted as SQL identifiers so it runs as
+// shown whatever the operator's search_path.
+func (e *indexDropInterruptedError) finishDropStatement() string {
+	return "DROP INDEX CONCURRENTLY " + pgx.Identifier{e.schema, e.index}.Sanitize()
+}
+
+// nameInterruptedIndexDrop wraps a drop failure that cancelled the drop
+// mid-flight, so the refusal names the index and how to finish the drop.
+// Every other failure passes through unchanged. The drop runs with
+// lock_timeout disabled, so only the statement cause of a budget error is
+// the limit's.
+func nameInterruptedIndexDrop(err error, schema, index string, limit time.Duration) error {
+	var budgetErr *executor.BudgetError
+	switch {
+	case errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement:
+		return &indexDropInterruptedError{schema: schema, index: index, limit: limit, timedOut: true, err: err}
+	case errors.Is(err, executor.ErrCancelledByCaller), errors.Is(err, executor.ErrCancelledExternally):
+		return &indexDropInterruptedError{schema: schema, index: index, limit: limit, err: err}
+	default:
+		return err
+	}
 }
