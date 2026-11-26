@@ -898,17 +898,18 @@ func (h *Handler) deploymentTenant() string {
 // deferral, and the terminal hook.
 func (h *Handler) commentObserverConfig(factory github.GitHubClientFactory, repo string, pr int, installationID int64) CommentObserverConfig {
 	return CommentObserverConfig{
-		GHClient:       factory,
-		Storage:        h.service.Storage(),
-		Repo:           repo,
-		PR:             pr,
-		InstallationID: installationID,
-		SupportChannel: h.supportChannel(),
-		CLIName:        h.cliName(),
-		Tenant:         h.deploymentTenant(),
-		EngineLogs:     h.engineLogReader(),
-		shardedPlans:   h.shardedPlans,
-		Logger:         h.logger,
+		GHClient:         factory,
+		Storage:          h.service.Storage(),
+		Repo:             repo,
+		PR:               pr,
+		InstallationID:   installationID,
+		SupportChannel:   h.supportChannel(),
+		CLIName:          h.cliName(),
+		Tenant:           h.deploymentTenant(),
+		EngineLogs:       h.engineLogReader(),
+		OperationsAtOnce: h.operationsAtOnce(),
+		shardedPlans:     h.shardedPlans,
+		Logger:           h.logger,
 
 		OnTargetsFinishedHook: h.rolloutTargetsFinishedHook(),
 	}

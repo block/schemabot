@@ -41,6 +41,10 @@ type CommentObserver struct {
 	// ran an apply, for the engine-logs fold on a failed apply's summary.
 	// Nil where no reader was wired; see EngineLogReader.
 	engineLogs EngineLogReader
+	// operationsAtOnce is how many of an apply's operations this server's
+	// drivers run at once, stated on a running rollout's counts. Zero leaves
+	// it unstated.
+	operationsAtOnce int
 	// plans remembers the plan rows this apply's members run, so the progress
 	// comment reads each once for the observer's life, not once per render.
 	plans planIdentities
@@ -321,6 +325,11 @@ type CommentObserverConfig struct {
 	// engine-logs fold off the summary.
 	EngineLogs EngineLogReader
 
+	// OperationsAtOnce is how many of an apply's operations the server's
+	// drivers run at once (max_drivers_per_apply), which a running sharded or
+	// multi-target comment states beside its counts. Zero leaves it unstated.
+	OperationsAtOnce int
+
 	// shardedPlans is the sharded plan cache shared with every other
 	// comment render in the process. Nil gives the observer a cache of its own.
 	shardedPlans *shardedPlanCache
@@ -431,6 +440,7 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		cliName:           cfg.CLIName,
 		tenant:            cfg.Tenant,
 		engineLogs:        cfg.EngineLogs,
+		operationsAtOnce:  cfg.OperationsAtOnce,
 		shardedPlans:      shardedPlans,
 		logger:            cfg.Logger,
 		OnTerminalHook:    cfg.OnTerminalHook,
@@ -1001,7 +1011,7 @@ func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*stor
 			"apply_id", o.applyID, "error", opsErr)
 		body = formatProgressComment(apply, tasks, shardsByTable, o.tenant, updateCadence)
 	} else {
-		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveShardedPlan(apply, ops), o.tenant, o.cliName, o.resolveStoppedByFreeze(apply), updateCadence)
+		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveShardedPlan(apply, ops), o.tenant, o.cliName, o.resolveStoppedByFreeze(apply), o.operationsAtOnce, updateCadence)
 	}
 	return body + controlRejectionSection(context.Background(), o.stor, o.logger, apply, body)
 }

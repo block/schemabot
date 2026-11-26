@@ -364,6 +364,12 @@ type Apply struct {
 	// order (the order the caller supplies, which mirrors the rollout order).
 	Deployments []Deployment
 
+	// OperationsAtOnce is how many of the apply's operations SchemaBot runs
+	// at once (max_drivers_per_apply), which the surface rendering the model
+	// supplies; Derive leaves it zero. A running rollout states it beside its
+	// counts (Apply.LimitPhrase), and zero leaves it unstated.
+	OperationsAtOnce int
+
 	// rows are the operations the model was derived from, which
 	// Deployment.Rows index.
 	rows []Operation

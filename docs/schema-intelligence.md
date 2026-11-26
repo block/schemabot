@@ -785,7 +785,15 @@ cannot match to a stored task carries neither field. A matched row also carries
 `operation_key`, naming the operation that runs it, since one target can run
 several operations when a rollout goes table by table.
 A sharded apply lists one operation per shard and table it changes, plus each
-keyspace's finalizer, and the response sets `sharded: true`. Its `tables` are
+keyspace's finalizer, and the response sets `sharded: true`. An apply that
+runs more than one operation, sharded or across several targets, also carries
+`max_operations_at_once`: how many of its operations the server runs at once.
+While the apply runs, the CLI and the PR comment state it beside the counts
+while more operations are running or queued for a slot than that, as "3
+queued (1 at a time)", so the queued operations read as waiting their turn.
+Operations that wait for an earlier target, including copies parked at their
+cutover behind one, or are halted or paused behind a failure, are not held
+back by the limit and do not count. Its `tables` are
 then rolled up across the shards: one entry per keyspace table, with `status`
 the shard state that needs attention first, `rows_copied` and `rows_total`
 summed over the shards that have reported a total, and `shards` listing each
@@ -1067,6 +1075,7 @@ keyspace's four shards, of which only `-40` has started:
   "engine": "strata",
   "state": "running",
   "sharded": true,
+  "max_operations_at_once": 1,
   "operations": [
     {"deployment": "data-plane", "operation_key": "shop_001/-40/orders", "operation_kind": "work", "state": "running"},
     {"deployment": "data-plane", "operation_key": "shop_001/40-80/orders", "operation_kind": "work", "state": "pending"},
@@ -1103,18 +1112,19 @@ keyspace's four shards, of which only `-40` has started:
 ```
 
 `schemabot progress apply-example-76` renders it as one change. The header
-counts the shards by status. This plan recorded no per-shard row estimates, so
+counts the shards by status and, since this server runs one of an apply's
+operations at a time, says so beside the queued shards. This plan recorded no per-shard row estimates, so
 the rows cover only the started shard and the ETA is a floor. The VSchema
 change shows its diff:
 
 ```text
-┌────────────────────────────────────────────────┐
-│  Apply ID:     apply-example-76                │
-│  Database:     shop                            │
-│  Environment:  production                      │
-│  State:        Running                         │
-│  Shards:       1 running table copy, 3 queued  │
-└────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Apply ID:     apply-example-76                              │
+│  Database:     shop                                          │
+│  Environment:  production                                    │
+│  State:        Running                                       │
+│  Shards:       1 running table copy, 3 queued (1 at a time)  │
+└──────────────────────────────────────────────────────────────┘
 
 
   ── shop_001 ──

@@ -193,3 +193,54 @@ func tableReading(t *testing.T, out string, tableLine *regexp.Regexp) (percent, 
 	require.NotNil(t, row, "no rows line:\n%s", out)
 	return line[1], strings.TrimSpace(row[1])
 }
+
+// A rollout across six targets runs under a limit of two operations at once:
+// two targets copy and four wait their turn. The CLI and the PR comment both
+// state the limit beside the counts, so the queue reads as waiting on the
+// limit rather than stalled.
+func TestOperationsAtOnceReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
+	rollout := []rolloutTarget{copyingTarget(400), copyingTarget(300), queuedTarget(), queuedTarget(), queuedTarget(), queuedTarget()}
+
+	data := targetRolloutData(rollout)
+	data.MaxOperationsAtOnce = 2
+	cli := renderRollout(t, data)
+
+	ops := make([]presentation.Operation, len(data.Operations))
+	details := make([]*webhooktemplates.ApplyStatusCommentData, len(data.Operations))
+	for i, op := range data.Operations {
+		ops[i] = presentation.Operation{Deployment: op.Deployment, Target: op.Target, State: op.State, Parallel: true, ContinueOnFailure: true}
+		details[i] = &webhooktemplates.ApplyStatusCommentData{
+			Database: strings.ReplaceAll(op.Target, "-", "_"), State: state.Apply.Running, ApplyID: "apply-7f3c", Environment: "production",
+			Engine: storage.EngineSpirit,
+		}
+	}
+	model := presentation.Derive(ops)
+	model.OperationsAtOnce = 2
+	pr := webhooktemplates.RenderMultiDeploymentApplyComment(webhooktemplates.MultiDeploymentApplyData{
+		Model: model, ApplyID: "apply-7f3c", Environment: "production", Details: details,
+	})
+
+	assert.Contains(t, cli, "Targets:      2 running · 4 queued (2 at a time)")
+	assert.Contains(t, pr, "Rolling out: 0 of 6 targets done, 2 running, 4 queued (2 at a time)")
+}
+
+// A rollout across six targets has not started any of them under a limit of
+// two operations at once, so every target reads queued. The watch view says
+// "Queued on all 6 targets" rather than counting one state twice, and still
+// states the limit, so the queue reads as waiting on it rather than stalled.
+func TestRolloutCoverageStatesHowManyRunAtOnce(t *testing.T) {
+	ops := make([]presentation.Operation, 6)
+	for i := range ops {
+		ops[i] = presentation.Operation{
+			Deployment: "production", Target: fmt.Sprintf("payments-%03d", i+1),
+			State: state.ApplyOperation.Pending, Parallel: true, ContinueOnFailure: true,
+		}
+	}
+	model := presentation.Derive(ops)
+	model.OperationsAtOnce = 2
+
+	assert.Equal(t, "all 6 targets (2 at a time)", RolloutCoverage(model, model.Groups()))
+
+	model.OperationsAtOnce = 0
+	assert.Equal(t, "all 6 targets", RolloutCoverage(model, model.Groups()), "a server that reports no limit leaves the coverage as it is")
+}

@@ -489,6 +489,17 @@ const (
 	defaultPullPerTargetBurst             = 30
 )
 
+// OperationsAtOnce is how many operations of one apply this server's drivers
+// run at once: max_drivers_per_apply, or storage.DefaultMaxDriversPerApply
+// when it is unset. A nil config reads as the default.
+func (c *ServerConfig) OperationsAtOnce() int {
+	configured := 0
+	if c != nil {
+		configured = c.MaxDriversPerApply
+	}
+	return storage.BuildOptions(storage.WithMaxDriversPerApply(configured)).MaxDriversPerApply
+}
+
 // PullRateLimitEnabled reports whether the pull endpoint enforces its request
 // budgets. Defaults to true when not configured.
 func (c *ServerConfig) PullRateLimitEnabled() bool {

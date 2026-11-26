@@ -1072,19 +1072,37 @@ func TestRenderMultiEnvPlanComment_CollapseSummarySingular(t *testing.T) {
 	assert.Contains(t, rendered, "<summary>Show SQL (1 statement)</summary>")
 }
 
-func TestUserFacingErrorExplainsNoHealthyUpstream(t *testing.T) {
-	err := &api.RemoteDeploymentUnavailableError{
-		Deployment: "pie",
-		Target:     "orders-staging",
-		Err:        status.Error(codes.Unavailable, "no healthy upstream"),
-	}
+// A remote data plane that does not answer is named by deployment and target
+// on the PR. The transport error behind it, with its addresses, stays in the
+// server log.
+func TestUserFacingErrorHidesTheTransportErrorOfAnUnreachableRemoteDeployment(t *testing.T) {
+	const dialFailure = "dial tcp 10.1.2.3:3306: connect: connection refused"
 
-	got := userFacingError(err)
+	t.Run("a deployment and target", func(t *testing.T) {
+		got := userFacingError(&api.RemoteDeploymentUnavailableError{
+			Deployment: "pie",
+			Target:     "orders-staging",
+			Err:        status.Error(codes.Unavailable, dialFailure),
+		})
 
-	assert.Contains(t, got, "SchemaBot could not reach the remote deployment `pie`")
-	assert.Contains(t, got, "target `orders-staging`")
-	assert.Contains(t, got, "service or network path is unavailable")
-	assert.Contains(t, got, "Raw error: remote deployment \"pie\" target \"orders-staging\" unavailable: rpc error: code = Unavailable desc = no healthy upstream")
+		assert.Equal(t, "SchemaBot could not reach the remote deployment `pie` for target `orders-staging`. Run the command again once that deployment is healthy; if it fails again, the SchemaBot server logs have the cause.", got)
+		assert.NotContains(t, got, "10.1.2.3")
+	})
+	t.Run("a deployment without a target", func(t *testing.T) {
+		got := userFacingError(&api.RemoteDeploymentUnavailableError{
+			Deployment: "pie",
+			Err:        status.Error(codes.Unavailable, dialFailure),
+		})
+
+		assert.Equal(t, "SchemaBot could not reach the remote deployment `pie`. Run the command again once that deployment is healthy; if it fails again, the SchemaBot server logs have the cause.", got)
+		assert.NotContains(t, got, "10.1.2.3")
+	})
+	t.Run("a gRPC unavailable status", func(t *testing.T) {
+		got := userFacingError(fmt.Errorf("plan orders/staging: %w", status.Error(codes.Unavailable, dialFailure)))
+
+		assert.Equal(t, "SchemaBot could not reach the remote schema change service. Run the command again once the service is healthy; if it fails again, the SchemaBot server logs have the cause.", got)
+		assert.NotContains(t, got, "10.1.2.3")
+	})
 }
 
 func TestUserFacingErrorPreservesNonGRPCErrors(t *testing.T) {
@@ -1125,14 +1143,23 @@ func TestUserFacingErrorExplainsConfigOutsideAllowedDirs(t *testing.T) {
 	assert.Contains(t, got, "`databases.orders.allowed_dirs`")
 }
 
-func TestUserFacingErrorDetailDoesNotWrapFormattedRemoteErrors(t *testing.T) {
-	formatted := "SchemaBot could not reach the remote deployment `pie` for target `orders-staging`. No healthy upstream is available. Raw error: rpc error: code = Unavailable desc = no healthy upstream"
+func TestUserFacingErrorDetailKeepsTheFormattedRemoteLine(t *testing.T) {
+	formatted := userFacingError(&api.RemoteDeploymentUnavailableError{
+		Deployment: "pie",
+		Target:     "orders-staging",
+		Err:        status.Error(codes.Unavailable, "dial tcp 10.1.2.3:3306: connect: connection refused"),
+	})
 
 	got := userFacingErrorDetail(formatted)
 
-	assert.Equal(t, formatted, got)
-	assert.Equal(t, 1, strings.Count(got, "SchemaBot could not reach"))
-	assert.Equal(t, 1, strings.Count(got, "Raw error:"))
+	assert.Equal(t, "SchemaBot could not reach the remote deployment `pie` for target `orders-staging`. Run the command again once that deployment is healthy; if it fails again, the SchemaBot server logs have the cause.", got)
+}
+
+func TestUserFacingErrorDetailHidesAGRPCUnavailableStatusPassedAsText(t *testing.T) {
+	got := userFacingErrorDetail("rpc error: code = Unavailable desc = dial tcp 10.1.2.3:3306: connect: connection refused")
+
+	assert.Equal(t, "SchemaBot could not reach the remote schema change service. Run the command again once the service is healthy; if it fails again, the SchemaBot server logs have the cause.", got)
+	assert.NotContains(t, got, "10.1.2.3")
 }
 
 func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {

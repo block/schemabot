@@ -228,9 +228,10 @@ func TestParseProgressResponseCarriesCopyFieldsAndNormalizesStatus(t *testing.T)
 // cap of two: the first two shards copy and the other six have not started.
 // The shards of one target copy in parallel and only the cap holds the rest
 // back, so the CLI counts them as queued, as the PR comment does, rather than
-// as waiting for the first shard.
+// as waiting for the first shard, and states the cap the server reports so
+// the queue reads as waiting its turn.
 func TestParseProgressResponseCountsShardsTheDriverCapHoldsBackAsQueued(t *testing.T) {
-	result := &apitypes.ProgressResponse{State: state.Apply.Running}
+	result := &apitypes.ProgressResponse{State: state.Apply.Running, MaxOperationsAtOnce: 2}
 	for i, shard := range []string{"-20", "20-40", "40-60", "60-80", "80-a0", "a0-c0", "c0-e0", "e0-"} {
 		opState := state.ApplyOperation.Pending
 		if i < 2 {
@@ -243,7 +244,32 @@ func TestParseProgressResponseCountsShardsTheDriverCapHoldsBackAsQueued(t *testi
 
 	data := ParseProgressResponse(result)
 
-	assert.Equal(t, "2 running table copy, 6 queued", ShardCounts(data.State, data.Operations, data.Tables, data.Released))
+	assert.Equal(t, 2, data.MaxOperationsAtOnce)
+	assert.Equal(t, "2 running table copy, 6 queued (2 at a time)", ShardCounts(data.State, data.Operations, data.Tables, data.Released, data.MaxOperationsAtOnce))
+	assert.Equal(t, "2 running table copy, 6 queued", ShardCounts(data.State, data.Operations, data.Tables, data.Released, 0),
+		"a server that reports no limit leaves the counts as they are")
+}
+
+// A sharded apply alters orders on eight shards under a driver cap of two.
+// Six shards have landed and the last two are copying, so nothing waits on the
+// cap and the CLI no longer states it, as the PR comment does not.
+func TestShardCountsStatesTheDriverCapOnlyWhileWorkIsQueued(t *testing.T) {
+	result := &apitypes.ProgressResponse{State: state.Apply.Running, MaxOperationsAtOnce: 2}
+	for i, shard := range []string{"-20", "20-40", "40-60", "60-80", "80-a0", "a0-c0", "c0-e0", "e0-"} {
+		opState := state.ApplyOperation.Running
+		if i < 6 {
+			opState = state.ApplyOperation.Completed
+		}
+		result.Operations = append(result.Operations, &apitypes.ProgressOperationResponse{
+			Deployment: "default", OperationKey: "commerce/" + shard + "/orders", State: opState, CutoverPolicy: storage.CutoverPolicyBarrier,
+		})
+	}
+
+	data := ParseProgressResponse(result)
+
+	counts := ShardCounts(data.State, data.Operations, data.Tables, data.Released, data.MaxOperationsAtOnce)
+	assert.NotContains(t, counts, "at a time", "two shards left under a cap of two leave nothing queued")
+	assert.Contains(t, counts, "2 running table copy")
 }
 
 // A sharded apply deferred its cutover and shard -40 failed, so SchemaBot
@@ -300,7 +326,7 @@ func TestParseProgressResponseCountsShardsStoppedAtCutover(t *testing.T) {
 			assert.Nil(t, data.Operations[0].EndedBy)
 			require.NotNil(t, data.Operations[2].EndedBy)
 			assert.Equal(t, tc.wantRef, *data.Operations[2].EndedBy)
-			assert.Equal(t, tc.wantCounts, ShardCounts(data.State, data.Operations, data.Tables, data.Released))
+			assert.Equal(t, tc.wantCounts, ShardCounts(data.State, data.Operations, data.Tables, data.Released, 0))
 			assert.Equal(t, tc.wantNoteCause+" Their copies are saved, so applying again resumes them.",
 				ShardedStoppedAtCutoverNote(data.State, data.Operations, data.Tables, data.Released))
 		})
@@ -332,7 +358,7 @@ func TestParseProgressResponseCountsTablesStoppedAtCutoverOnTheOnlyShard(t *test
 
 	require.True(t, data.Sharded)
 	require.Len(t, data.Operations, 2)
-	assert.Empty(t, ShardCounts(data.State, data.Operations, data.Tables, data.Released), "the only shard needs no count")
+	assert.Empty(t, ShardCounts(data.State, data.Operations, data.Tables, data.Released, 0), "the only shard needs no count")
 	assert.Equal(t, "1 table stopped at the cutover because orders failed. Its copy is saved, so applying again resumes it.",
 		ShardedStoppedAtCutoverNote(data.State, data.Operations, data.Tables, data.Released))
 }

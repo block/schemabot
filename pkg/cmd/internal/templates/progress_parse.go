@@ -39,6 +39,10 @@ type ProgressData struct {
 	// renders as one change, the way its PR comments do, however many shard
 	// and finalizer rows it has.
 	Sharded bool
+	// MaxOperationsAtOnce is how many of the apply's operations the server
+	// runs at once, stated beside a running rollout's counts. Zero when the
+	// server does not say.
+	MaxOperationsAtOnce int
 	// StoppedByFreeze names the freeze that stopped the apply, nil when an
 	// operator stopped it or it is not stopped.
 	StoppedByFreeze *apitypes.FreezeStopRef
@@ -192,6 +196,8 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		Metadata:       result.Metadata,
 		Released:       result.Released,
 		Sharded:        result.Sharded,
+
+		MaxOperationsAtOnce: result.MaxOperationsAtOnce,
 
 		StoppedByFreeze: result.StoppedByFreeze,
 	}
