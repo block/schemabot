@@ -1118,7 +1118,9 @@ a fresh token, a heartbeat), so two processes can never pick up the same work. T
 every drive including the very first: the process that accepted the request gets no shortcut and
 claims the apply like any other driver. The wake signal sent after enqueueing only makes a driver
 check for claimable work sooner; it never hands work to a process directly. *Enforced:* the
-operator claim path (`pkg/api/operator.go`, `pkg/storage/internal/sqlstore/applies.go`).
+operator claim path (`pkg/api/operator.go`, `pkg/storage/internal/sqlstore/applies.go`), and the
+operation claim query (`pkg/storage/internal/sqlstore/apply_operations.go`), whose retry arms
+re-lease a row another driver holds only once that lease is stale.
 
 ### OW-2: Lease-scoped writes must hold the current token
 
