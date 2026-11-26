@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/block/pg-sprite/pkg/schemadiff"
@@ -53,7 +54,11 @@ type unmodeledTableObjects struct {
 // tables carrying user triggers, table or column comments, non-default
 // relation options, or table inheritance, a table referenced by a foreign key
 // that the pull does not write, as well as shapes rejected by the renderer.
-// PostgreSQL currently supports only basic catalog detail.
+// By default one refused table refuses the whole pull, so a caller never
+// mistakes a partial baseline for the namespace. A request that sets
+// skip_unrepresentable_tables gets the rest of the namespace instead, with
+// each refused table named in skipped_tables. PostgreSQL currently supports
+// only basic catalog detail.
 func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
 	if req == nil {
 		return nil, fmt.Errorf("pull PostgreSQL schema: request is required")
@@ -82,6 +87,7 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 		response.Database = e.pullDatabase
 	}
 	var renderErrors []error
+	skip := req.GetSkipUnrepresentableTables()
 	for _, namespace := range namespaces {
 		// The pull renders the same table set the plan holds schema files
 		// accountable for, so a pulled baseline declares exactly what a later
@@ -92,7 +98,22 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 			return nil, fmt.Errorf("pull PostgreSQL database %q: %w", e.pullDatabase, err)
 		}
 		pulled := &ternv1.PulledNamespace{Tables: tables}
-		renderErrors = append(renderErrors, tableErrors...)
+		if skip {
+			skipped, err := skippedTables(tableErrors)
+			if err != nil {
+				return nil, fmt.Errorf("pull PostgreSQL database %q: %w", e.pullDatabase, err)
+			}
+			for _, table := range skipped {
+				slog.Info("PostgreSQL pull skipped a table its schema file cannot describe",
+					"database", e.pullDatabase,
+					"namespace", namespace,
+					"table", table.GetTable(),
+					"reason", table.GetReason())
+			}
+			pulled.SkippedTables = skipped
+		} else {
+			renderErrors = append(renderErrors, tableErrors...)
+		}
 		response.Namespaces[namespace] = pulled
 		response.TableCount += int32(len(pulled.Tables))
 	}
@@ -187,6 +208,53 @@ func baselineIntrospectionLimit(pool *pgxpool.Pool) int {
 	return max(1, min(baselineIntrospectionConcurrency, int(pool.Config().MaxConns)))
 }
 
+// tableRefusal is one table a baseline cannot carry. Its error text names
+// the schema and table for a refused pull; its reason is the short phrase a
+// skipped table is reported with.
+type tableRefusal struct {
+	namespace string
+	table     string
+	// detail completes the refusal's error text after the table name.
+	detail string
+	// reason says what the table carries that its schema file cannot
+	// describe.
+	reason string
+	cause  error
+}
+
+func (r *tableRefusal) Error() string {
+	return fmt.Sprintf("schema %q table %q: %s", r.namespace, r.table, r.detail)
+}
+
+func (r *tableRefusal) Unwrap() error { return r.cause }
+
+// skippedTables turns a namespace's refusals into the tables a skipping pull
+// reports, in name order. Every refusal a render records is a tableRefusal,
+// so any other error is a broken contract and refuses the pull rather than
+// dropping a table without a reason.
+func skippedTables(refusals []error) ([]*ternv1.SkippedTable, error) {
+	skipped := make([]*ternv1.SkippedTable, 0, len(refusals))
+	for _, err := range refusals {
+		var refusal *tableRefusal
+		if !errors.As(err, &refusal) {
+			return nil, fmt.Errorf("a table refusal has no table to skip: %w", err)
+		}
+		skipped = append(skipped, &ternv1.SkippedTable{Table: refusal.table, Reason: refusal.reason})
+	}
+	slices.SortFunc(skipped, func(a, b *ternv1.SkippedTable) int { return strings.Compare(a.GetTable(), b.GetTable()) })
+	return skipped, nil
+}
+
+// renderRefusalReason is the reason a table the renderer refused is skipped
+// with: the verdict's own wording, which says what the table carries without
+// repeating its name, or the render error itself when it carries no verdict.
+func renderRefusalReason(err error) string {
+	if verdict, ok := schemadiff.RenderRefusal(err); ok {
+		return verdict.Error()
+	}
+	return err.Error()
+}
+
 // renderedTable is one table's outcome from a baseline render: its canonical
 // content, or the reason the baseline cannot carry it. The render records the
 // latter and carries on, so a namespace's full list of refused tables reaches
@@ -278,7 +346,8 @@ func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, database, nam
 			}
 			if len(unwritten) > 0 {
 				delete(rendered, table)
-				renderErrors = append(renderErrors, fmt.Errorf("schema %q table %q: %w: %s", namespace, table, errUnwrittenReferencingTable, strings.Join(unwritten, ", ")))
+				detail := fmt.Sprintf("%s: %s", errUnwrittenReferencingTable, strings.Join(unwritten, ", "))
+				renderErrors = append(renderErrors, &tableRefusal{namespace: namespace, table: table, detail: detail, reason: detail, cause: errUnwrittenReferencingTable})
 			}
 		}
 	}
@@ -354,8 +423,8 @@ func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, tab
 		if err != nil {
 			return nil, err
 		}
-		if err := unmodeledTableObjectsError(namespace, table, objects); err != nil {
-			return &renderedTable{renderErr: err}, nil
+		if refusal := unmodeledTableObjectsRefusal(namespace, table, objects); refusal != nil {
+			return &renderedTable{renderErr: refusal}, nil
 		}
 	}
 	model, err := schemadiff.Introspect(ctx, pool, namespace, table)
@@ -374,7 +443,10 @@ func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, tab
 		content, err = schemadiff.RenderWith(model, opts)
 	}
 	if err != nil {
-		return &renderedTable{renderErr: fmt.Errorf("schema %q table %q: render: %w", namespace, table, err)}, nil
+		return &renderedTable{renderErr: &tableRefusal{
+			namespace: namespace, table: table,
+			detail: "render: " + err.Error(), reason: renderRefusalReason(err), cause: err,
+		}}, nil
 	}
 	return &renderedTable{content: content, incoming: model.IncomingForeignKeys}, nil
 }
@@ -445,11 +517,11 @@ func pullUnmodeledTableObjects(ctx context.Context, pool *pgxpool.Pool, namespac
 	return objects, nil
 }
 
-// unmodeledTableObjectsError names every object kind on the table that the
+// unmodeledTableObjectsRefusal names every object kind on the table that the
 // declarative format cannot carry, so a refused pull tells the operator what
 // to move or drop instead of hiding the objects behind a rendered table that
-// looks complete.
-func unmodeledTableObjectsError(namespace, table string, objects unmodeledTableObjects) error {
+// looks complete. It returns nil when the table carries none.
+func unmodeledTableObjectsRefusal(namespace, table string, objects unmodeledTableObjects) *tableRefusal {
 	present := []struct {
 		kind    string
 		present bool
@@ -468,5 +540,10 @@ func unmodeledTableObjectsError(namespace, table string, objects unmodeledTableO
 	if len(kinds) == 0 {
 		return nil
 	}
-	return fmt.Errorf("schema %q table %q carries objects the declarative format does not represent: %s", namespace, table, strings.Join(kinds, ", "))
+	list := strings.Join(kinds, ", ")
+	return &tableRefusal{
+		namespace: namespace, table: table,
+		detail: "carries objects the declarative format does not represent: " + list,
+		reason: "schema files cannot describe its " + list,
+	}
 }

@@ -328,6 +328,48 @@ A clean audit returns `lint: []`; an omitted field means lint was not requested.
 Pull runs schema-shape rules only. Rules about proposed changes, such as unsafe
 drops, require a plan. See [lint and safety levels](lint-and-safety-levels.md#auditing-a-live-schema-pull---lint).
 
+### Skip tables schema files cannot describe
+
+A PostgreSQL pull refuses the whole request when one table has a shape schema
+files cannot describe, such as a trigger or an `UNLOGGED` table. A caller that
+writes schema files can set `skip_unrepresentable_tables` to get every other
+table instead. Each skipped table comes back in `skipped_tables` with the reason.
+
+```http
+POST /api/pull
+Content-Type: application/json
+
+{"database": "shop", "environment": "production", "skip_unrepresentable_tables": true}
+```
+
+```json
+{
+  "database": "shop",
+  "environment": "production",
+  "namespaces": {
+    "public": {
+      "tables": {"orders": "CREATE TABLE orders (...);"},
+      "skipped_tables": [
+        {"table": "accounts", "reason": "schema files cannot describe its trigger"}
+      ]
+    }
+  },
+  "table_count": 1
+}
+```
+
+A caller that writes the files must add every skipped table to
+`ignore_tables`. A table with no schema file and no entry plans as
+`DROP TABLE`. Without the flag, the pull refuses as before, and so does a data
+plane too old to know the flag.
+
+On a database with several targets, a table that any target the pull reads
+skips is skipped for all of them, because every target is planned from the
+same files. It is left out of the schema and of the `targets` comparison. A
+pull reads only the environment's
+[primary deployment](#whats-in-this-database), so it cannot report a skip that
+only another deployment would need.
+
 ### Databases that span several targets
 
 A database whose environment lists `targets` addresses several targets at once,

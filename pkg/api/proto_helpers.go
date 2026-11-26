@@ -41,7 +41,19 @@ func protoPulledNamespacesToAPI(namespaces map[string]*ternv1.PulledNamespace) m
 			Artifacts:        artifacts,
 			NamespaceCatalog: protoNamespaceCatalogToAPI(pulled.NamespaceCatalog),
 			TableCatalog:     protoTableCatalogToAPI(pulled.TableCatalog),
+			SkippedTables:    protoSkippedTablesToAPI(pulled.SkippedTables),
 		}
+	}
+	return result
+}
+
+func protoSkippedTablesToAPI(skipped []*ternv1.SkippedTable) []apitypes.SkippedTable {
+	if len(skipped) == 0 {
+		return nil
+	}
+	result := make([]apitypes.SkippedTable, 0, len(skipped))
+	for _, table := range skipped {
+		result = append(result, apitypes.SkippedTable{Table: table.GetTable(), Reason: table.GetReason()})
 	}
 	return result
 }

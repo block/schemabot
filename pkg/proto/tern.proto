@@ -463,6 +463,14 @@ message PullSchemaRequest {
   string namespace = 5;
   // Controls how much structured catalog data is returned alongside canonical DDL.
   PullCatalogDetail catalog_detail = 6;
+  // skip_unrepresentable_tables asks the engine to leave out a table that its
+  // schema file format cannot describe in full, and name it in the namespace's
+  // skipped_tables, instead of refusing the whole pull. A caller sets it only
+  // when it reports every skipped table, and a caller that writes schema files
+  // must keep each skipped table out of the plan, because a table with no
+  // schema file is planned as a drop. An engine that can describe every table
+  // never skips one.
+  bool skip_unrepresentable_tables = 7;
 }
 
 enum PullCatalogDetail {
@@ -487,6 +495,18 @@ message PulledNamespace {
   // detail; at BASIC detail they are absent.
   NamespaceCatalog namespace_catalog = 3;
   map<string, TableCatalog> table_catalog = 4;
+  // Tables the pull left out because the schema file format cannot describe
+  // them in full, in name order. Set only when the request asked for
+  // skip_unrepresentable_tables.
+  repeated SkippedTable skipped_tables = 5;
+}
+
+// SkippedTable is a live table a pull left out, and why.
+message SkippedTable {
+  string table = 1;
+  // What the table carries that the schema file format cannot describe, such
+  // as "trigger, comment".
+  string reason = 2;
 }
 
 message NamespaceCatalog {

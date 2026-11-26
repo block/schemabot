@@ -124,6 +124,64 @@ func TestEnginePullSchemaRejectsUnmodeledTableObjects(t *testing.T) {
 	assert.Contains(t, err.Error(), "comment")
 }
 
+// A pull that asks to skip tables its schema files cannot describe returns
+// every other table and names each skipped one with what it carries, so a
+// caller can keep them out of the plan instead of losing the whole pull.
+func TestEnginePullSchemaSkipsTablesItCannotDescribe(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_skip_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.customers (id bigint PRIMARY KEY);
+		CREATE UNLOGGED TABLE app.audit_log (id bigint PRIMARY KEY, customer_id bigint REFERENCES app.customers (id));
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY);
+		CREATE TABLE app.orders (id bigint PRIMARY KEY, account_id bigint NOT NULL REFERENCES app.accounts (id));
+		CREATE FUNCTION app.touch_account() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+		CREATE TRIGGER touch_account BEFORE INSERT ON app.accounts FOR EACH ROW EXECUTE FUNCTION app.touch_account();
+		COMMENT ON TABLE app.accounts IS 'customer accounts'`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, 0, "pull_skip_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app", SkipUnrepresentableTables: true})
+	require.NoError(t, err)
+
+	pulled := response.Namespaces["app"]
+	require.NotNil(t, pulled)
+	assert.Equal(t, int32(2), response.TableCount)
+	assert.Equal(t, []string{"customers", "orders"}, slices.Sorted(maps.Keys(pulled.Tables)))
+	require.Len(t, pulled.SkippedTables, 2)
+	assert.Equal(t, "accounts", pulled.SkippedTables[0].GetTable())
+	assert.Equal(t, "schema files cannot describe its trigger, comment", pulled.SkippedTables[0].GetReason())
+	assert.Equal(t, "audit_log", pulled.SkippedTables[1].GetTable())
+	assert.Equal(t, schemadiff.ErrUnrenderableUnlogged.Error(), pulled.SkippedTables[1].GetReason())
+
+	// The pulled files plus an ignore_tables entry per skipped table describe
+	// the target exactly: no change, and above all no DROP TABLE, even for the
+	// key on orders that references a skipped table, or the key on the skipped
+	// audit_log that references customers.
+	files := make(map[string]string, len(pulled.Tables))
+	for table, sql := range pulled.Tables {
+		files[table+".sql"] = sql
+	}
+	ignored := make([]string, 0, len(pulled.SkippedTables))
+	for _, skipped := range pulled.SkippedTables {
+		ignored = append(ignored, skipped.GetTable())
+	}
+	plan, err := New().Plan(t.Context(), &engine.PlanRequest{
+		Database:     "pull_skip_test",
+		SchemaFiles:  schema.SchemaFiles{"app": {Files: files}},
+		Credentials:  &engine.Credentials{DSN: dsn},
+		IgnoreTables: ignored,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, plan.Changes, "the pulled files and the skipped tables' ignore_tables entries plan nothing")
+
+	refused, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+	require.Error(t, err, "a pull that does not ask to skip still refuses the namespace")
+	assert.Nil(t, refused)
+	assert.Contains(t, err.Error(), `schema "app" table "accounts"`)
+	assert.Contains(t, err.Error(), `schema "app" table "audit_log"`)
+}
+
 // A child table created with PostgreSQL table inheritance is refused because
 // flattening inherited columns would lose the relationship to its parent.
 func TestEnginePullSchemaRejectsTableInheritance(t *testing.T) {
