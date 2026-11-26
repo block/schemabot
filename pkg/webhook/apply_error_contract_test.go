@@ -208,7 +208,7 @@ func TestApplyCommandCoreLockCheckFailureHidesTheCause(t *testing.T) {
 	assert.True(t, retry, "an unreadable lock is a transient storage failure a durable driver should re-drive")
 	body := requireComment(t, comments, "lock check failure comment")
 	assert.Contains(t, body, "SchemaBot could not check the lock for `orders`, so the apply did not start. Run the command again; if it fails again, the SchemaBot server logs have the cause.")
-	assert.NotContains(t, body, "10.1.2.3")
+	assert.NotContains(t, body, "dial tcp")
 	assert.NotContains(t, body, "connection refused")
 }
 
@@ -234,7 +234,7 @@ func TestApplyCommandCorePRChangesCheckFailureHidesTheCause(t *testing.T) {
 	assert.True(t, retry, "an unreadable changed-file list is a transient GitHub failure a durable driver should re-drive")
 	body := requireComment(t, comments, "PR changes check failure comment")
 	assert.Contains(t, body, "SchemaBot could not check the schema changes in this PR for `staging`, so the apply did not start. Run the command again; if it fails again, the SchemaBot server logs have the cause.")
-	assert.NotContains(t, body, "127.0.0.1")
+	assert.NotContains(t, body, "github unavailable")
 	assert.NotContains(t, body, "/repos/octocat/hello-world/pulls/1/files")
 }
 
@@ -264,7 +264,7 @@ func TestApplyCommandCorePlanRemoteUnavailableHidesTheCause(t *testing.T) {
 	assert.Positive(t, remote.calls(), "the apply must have reached the plan request")
 	body := requireComment(t, comments, "remote unavailable plan failure comment")
 	assert.Contains(t, body, "SchemaBot could not reach the remote deployment `remote` for target `orders-target`, so the apply did not start. Run the command again once that deployment is healthy; if it fails again, the SchemaBot server logs have the cause.")
-	assert.NotContains(t, body, "10.1.2.3")
+	assert.NotContains(t, body, "dial tcp")
 	assert.NotContains(t, body, "connection refused")
 	assert.NotContains(t, body, "Raw error")
 }

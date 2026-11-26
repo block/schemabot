@@ -49,7 +49,7 @@ func TestApplyRemoteUnavailableMessageHidesTheTransportError(t *testing.T) {
 			got := applyRemoteUnavailableMessage(tc.err)
 
 			assert.Equal(t, tc.want, got)
-			assert.NotContains(t, got, "10.1.2.3")
+			assert.NotContains(t, got, "dial tcp")
 			assert.NotContains(t, got, "Raw error")
 		})
 	}
@@ -59,7 +59,7 @@ func TestApplyRemoteUnavailableMessageHidesTheTransportError(t *testing.T) {
 // acquire failed for any other reason gets the fixed failure line.
 func TestApplyLockAcquireMessagesNameTheDatabase(t *testing.T) {
 	assert.Equal(t,
-		"Someone else took the lock for `orders` while this command ran, so the apply did not start. Run the command again to see who holds it.",
+		"The lock for `orders` changed while this command ran, so the apply did not start. Run the command again to see who holds it now.",
 		applyLockHeldAtAcquireMessage("orders"))
 	assert.Equal(t,
 		"SchemaBot could not take the lock for `orders`, so the apply did not start. Run the command again; if it fails again, the SchemaBot server logs have the cause.",
@@ -82,8 +82,8 @@ func TestApplyCheckUpdateFailedMessage(t *testing.T) {
 		{
 			name:         "storage failure",
 			err:          fmt.Errorf("apply start: %w", storageFailure),
-			wantContains: []string{"`orders`", "`staging`", "was accepted", "could not update the required status check", "The apply itself is not affected", "server logs have the cause"},
-			wantAbsent:   []string{"10.1.2.3", "connection refused", "dial tcp", "drift", "namespace placement", "When the apply completes"},
+			wantContains: []string{"`orders`", "`staging`", "was accepted", "could not update the required status check", "The apply itself is not affected", "Once the apply finishes, run plan again to refresh the check."},
+			wantAbsent:   []string{"connection refused", "dial tcp", "drift", "namespace placement", "server logs", "does not show it yet"},
 		},
 		{
 			name:         "deployment drift block",

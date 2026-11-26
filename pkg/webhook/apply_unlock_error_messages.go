@@ -24,10 +24,11 @@ func applyLockCheckFailedMessage(database string) string {
 	return "SchemaBot could not check the lock for `" + database + "`, so the apply did not start. " + rerunAdvice
 }
 
-// applyLockHeldAtAcquireMessage is the PR comment line for an apply that lost
-// the lock to another owner while it was planning.
+// applyLockHeldAtAcquireMessage is the PR comment line for an apply whose
+// pending lock changed while it was planning: another owner took it, or it was
+// released.
 func applyLockHeldAtAcquireMessage(database string) string {
-	return "Someone else took the lock for `" + database + "` while this command ran, so the apply did not start. Run the command again to see who holds it."
+	return "The lock for `" + database + "` changed while this command ran, so the apply did not start. Run the command again to see who holds it now."
 }
 
 // applyLockAcquireFailedMessage is the PR comment line for an apply whose lock
@@ -40,9 +41,10 @@ func applyLockAcquireFailedMessage(database string) string {
 // accepted but whose stored check state could not be moved to in progress. The
 // two refusals SchemaBot decides on its own name the fix their block calls for.
 // Any other failure is a storage or GitHub error whose text stays in the server
-// log. The line does not promise that a later apply ending refreshes the check:
-// a completed apply updates only a check row it owns, and a failed start leaves
-// the row unowned.
+// log. The line does not promise that the apply ending refreshes the check: a
+// completed apply updates only a check row it owns, and a failed start leaves
+// the row unowned. A plan writes an unowned row, so the line asks for one once
+// the apply finishes.
 func applyCheckUpdateFailedMessage(database, environment string, err error) string {
 	subject := "The apply for `" + database + "` in `" + environment + "` was accepted, but "
 	switch {
@@ -51,7 +53,7 @@ func applyCheckUpdateFailedMessage(database, environment string, err error) stri
 	case errors.Is(err, errApplyStartPlacementBlocked):
 		return subject + "the required status check still shows that namespace placement refused the plan for this environment, so SchemaBot left it as it was. The apply itself is not affected. Fix the namespace placement, then run plan again."
 	default:
-		return subject + "SchemaBot could not update the required status check, so the check does not show it yet. The apply itself is not affected. The SchemaBot server logs have the cause."
+		return subject + "SchemaBot could not update the required status check, so the check does not show this apply. The apply itself is not affected. Once the apply finishes, run plan again to refresh the check."
 	}
 }
 

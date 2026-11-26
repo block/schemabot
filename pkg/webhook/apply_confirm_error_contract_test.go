@@ -170,7 +170,7 @@ func TestApplyConfirmCommandCoreLockPathDispositions(t *testing.T) {
 		assert.True(t, retry, "storage uncertainty must be re-driven")
 		body := requireComment(t, comments, "lock lookup failure apply-confirm comment")
 		assert.Contains(t, body, "SchemaBot could not check the lock for `orders`, so the apply did not start. Run the command again; if it fails again, the SchemaBot server logs have the cause.")
-		assert.NotContains(t, body, "10.1.2.3")
+		assert.NotContains(t, body, "dial tcp")
 		assert.NotContains(t, body, "connection refused")
 	})
 
@@ -247,7 +247,7 @@ func TestApplyConfirmCommandCorePlanLoadFailureHidesTheCause(t *testing.T) {
 	assert.Empty(t, locks.releasedIfPending, "the pending lock must stay pinned while the plan cannot be read")
 	body := requireComment(t, comments, "plan load failure apply-confirm comment")
 	assert.Contains(t, body, "SchemaBot could not load the pending plan for `orders`, so the apply did not start. Run the command again; if it fails again, the SchemaBot server logs have the cause.")
-	assert.NotContains(t, body, "10.1.2.3")
+	assert.NotContains(t, body, "dial tcp")
 	assert.NotContains(t, body, "connection refused")
 }
 
@@ -273,7 +273,7 @@ func TestApplyConfirmCommandCorePRChangesCheckFailureHidesTheCause(t *testing.T)
 	assert.True(t, retry, "an unreadable changed-file list is a transient GitHub failure a durable driver should re-drive")
 	body := requireComment(t, comments, "apply-confirm PR changes check failure comment")
 	assert.Contains(t, body, "SchemaBot could not check the schema changes in this PR for `staging`, so the apply did not start. Run the command again; if it fails again, the SchemaBot server logs have the cause.")
-	assert.NotContains(t, body, "127.0.0.1")
+	assert.NotContains(t, body, "github unavailable")
 	assert.NotContains(t, body, "/repos/octocat/hello-world/pulls/1/files")
 }
 

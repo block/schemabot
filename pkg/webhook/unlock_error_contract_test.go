@@ -145,7 +145,7 @@ func TestUnlockCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "a failed GitHub read during inference must stay retryable for a durable driver")
 		body := requireComment(t, comments, "inference failure comment")
 		assert.Contains(t, body, "SchemaBot could not work out which database to force unlock for this PR, so no lock was released. Run the command again, or add `-d` and the database name to `schemabot unlock --force`.")
-		assert.NotContains(t, body, "127.0.0.1", "the GitHub client's request URL must stay in the server log")
+		assert.NotContains(t, body, "fetch PR info", "the GitHub client's error must stay in the server log")
 	})
 
 	t.Run("lock lookup failure is retryable", func(t *testing.T) {
@@ -161,7 +161,7 @@ func TestUnlockCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "a transient lock lookup failure must stay retryable for a durable driver")
 		body := requireComment(t, comments, "lock lookup failure comment")
 		assert.Contains(t, body, "SchemaBot could not look up the locks for this PR, so no lock was released. Run the command again; if it fails again, the SchemaBot server logs have the cause.")
-		assert.NotContains(t, body, "10.1.2.3")
+		assert.NotContains(t, body, "dial tcp")
 		assert.NotContains(t, body, "connection refused")
 	})
 
@@ -179,7 +179,7 @@ func TestUnlockCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "a transient lock lookup failure must stay retryable for a durable driver")
 		body := requireComment(t, comments, "named-database lock lookup failure comment")
 		assert.Contains(t, body, "SchemaBot could not look up the lock for `orders`, so no lock was released.")
-		assert.NotContains(t, body, "10.1.2.3")
+		assert.NotContains(t, body, "dial tcp")
 	})
 
 	t.Run("active-apply verification failure is retryable", func(t *testing.T) {
