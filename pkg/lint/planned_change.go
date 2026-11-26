@@ -50,6 +50,9 @@ func PlannedChangeViolations(pc spiritlint.PlannedChange) []engine.LintViolation
 		if v.Location != nil && v.Location.Column != nil {
 			lv.Column = *v.Location.Column
 		}
+		if v.Suggestion != nil {
+			lv.Suggestion = *v.Suggestion
+		}
 		violations = append(violations, lv)
 	}
 	return violations

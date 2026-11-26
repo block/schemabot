@@ -220,7 +220,12 @@ func addMemberLint(group []templates.LintViolationData, member []*ternv1.LintVio
 			return f.Table == v.GetTable() && f.Message == v.GetMessage()
 		})
 		if i < 0 {
-			group = append(group, templates.LintViolationData{Message: v.GetMessage(), Table: v.GetTable()})
+			group = append(group, templates.LintViolationData{
+				Message:    v.GetMessage(),
+				Table:      v.GetTable(),
+				LinterName: v.GetLinter(),
+				Suggestion: v.GetSuggestion(),
+			})
 			i = len(group) - 1
 		}
 		if !slices.Contains(group[i].Targets, target) {

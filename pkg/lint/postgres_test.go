@@ -23,7 +23,8 @@ func TestLintPostgresSchema_PrimaryKeyType(t *testing.T) {
 			ddl:  `CREATE TABLE orders (id integer PRIMARY KEY, total numeric(12,2));`,
 			want: []Result{{
 				Table: "orders", Column: "id", Linter: "primary_key", Severity: "warning",
-				Message: `Primary key column "id" in table "orders" uses "integer"; allowed types: bigint, uuid`,
+				Message:    `Primary key column "id" in table "orders" uses "integer"`,
+				Suggestion: `Change column "id" to a supported column type ("bigint", "uuid")`,
 			}},
 		},
 		{
@@ -41,7 +42,8 @@ func TestLintPostgresSchema_PrimaryKeyType(t *testing.T) {
 			ddl:  `CREATE TABLE order_lines (tenant_id integer, id bigint, PRIMARY KEY (tenant_id, id));`,
 			want: []Result{{
 				Table: "order_lines", Column: "tenant_id", Linter: "primary_key", Severity: "warning",
-				Message: `Primary key column "tenant_id" in table "order_lines" uses "integer"; allowed types: bigint, uuid`,
+				Message:    `Primary key column "tenant_id" in table "order_lines" uses "integer"`,
+				Suggestion: `Change column "tenant_id" to a supported column type ("bigint", "uuid")`,
 			}},
 		},
 		{
@@ -49,7 +51,8 @@ func TestLintPostgresSchema_PrimaryKeyType(t *testing.T) {
 			ddl:  `CREATE TABLE a (id serial PRIMARY KEY);`,
 			want: []Result{{
 				Table: "a", Column: "id", Linter: "primary_key", Severity: "warning",
-				Message: `Primary key column "id" in table "a" uses "serial"; allowed types: bigint, uuid`,
+				Message:    `Primary key column "id" in table "a" uses "serial"`,
+				Suggestion: `Change column "id" to a supported column type ("bigint", "uuid")`,
 			}},
 		},
 		{
@@ -67,7 +70,8 @@ func TestLintPostgresSchema_PrimaryKeyType(t *testing.T) {
 			ddl:  `CREATE TABLE orders (id custom.bigint PRIMARY KEY);`,
 			want: []Result{{
 				Table: "orders", Column: "id", Linter: "primary_key", Severity: "warning",
-				Message: `Primary key column "id" in table "orders" uses "custom.bigint"; allowed types: bigint, uuid`,
+				Message:    `Primary key column "id" in table "orders" uses "custom.bigint"`,
+				Suggestion: `Change column "id" to a supported column type ("bigint", "uuid")`,
 			}},
 		},
 		{
@@ -75,7 +79,8 @@ func TestLintPostgresSchema_PrimaryKeyType(t *testing.T) {
 			ddl:  `CREATE TABLE orders (id bigint[] PRIMARY KEY);`,
 			want: []Result{{
 				Table: "orders", Column: "id", Linter: "primary_key", Severity: "warning",
-				Message: `Primary key column "id" in table "orders" uses "bigint[]"; allowed types: bigint, uuid`,
+				Message:    `Primary key column "id" in table "orders" uses "bigint[]"`,
+				Suggestion: `Change column "id" to a supported column type ("bigint", "uuid")`,
 			}},
 		},
 		{
@@ -83,7 +88,8 @@ func TestLintPostgresSchema_PrimaryKeyType(t *testing.T) {
 			ddl:  `CREATE TABLE orders (id char(36) PRIMARY KEY);`,
 			want: []Result{{
 				Table: "orders", Column: "id", Linter: "primary_key", Severity: "warning",
-				Message: `Primary key column "id" in table "orders" uses "character(36)"; allowed types: bigint, uuid`,
+				Message:    `Primary key column "id" in table "orders" uses "character(36)"`,
+				Suggestion: `Change column "id" to a supported column type ("bigint", "uuid")`,
 			}},
 		},
 		{
@@ -91,7 +97,8 @@ func TestLintPostgresSchema_PrimaryKeyType(t *testing.T) {
 			ddl:  `CREATE TABLE orders (id timestamp(3) with time zone PRIMARY KEY);`,
 			want: []Result{{
 				Table: "orders", Column: "id", Linter: "primary_key", Severity: "warning",
-				Message: `Primary key column "id" in table "orders" uses "timestamp(3) with time zone"; allowed types: bigint, uuid`,
+				Message:    `Primary key column "id" in table "orders" uses "timestamp(3) with time zone"`,
+				Suggestion: `Change column "id" to a supported column type ("bigint", "uuid")`,
 			}},
 		},
 		{
@@ -99,7 +106,8 @@ func TestLintPostgresSchema_PrimaryKeyType(t *testing.T) {
 			ddl:  `CREATE TABLE events (occurred_at timestamptz NOT NULL, payload jsonb);`,
 			want: []Result{{
 				Table: "events", Linter: "primary_key", Severity: "warning",
-				Message: "No primary key defined",
+				Message:    "No primary key defined",
+				Suggestion: "Every table should have an explicit primary key",
 			}},
 		},
 	}
@@ -171,16 +179,18 @@ CREATE INDEX orders_customer_shipped_idx ON orders (customer_id, shipped_at);`)
 // Spirit's wording so a mixed-fleet response reads alike.
 func TestLintPostgresSchema_RedundantIndexes(t *testing.T) {
 	tests := []struct {
-		name string
-		ddl  string
-		want []string
+		name            string
+		ddl             string
+		want            []string
+		wantSuggestions []string
 	}{
 		{
 			name: "prefix of a wider index",
 			ddl: `CREATE TABLE t (id bigint PRIMARY KEY, a bigint, b bigint);
 CREATE INDEX k_a ON t (a);
 CREATE INDEX k_ab ON t (a, b);`,
-			want: []string{`Index "k_a" on column "a" is redundant - covered by index "k_ab" on columns ("a", "b")`},
+			want:            []string{`Index "k_a" on column "a" is redundant - covered by index "k_ab" on columns ("a", "b")`},
+			wantSuggestions: []string{`Consider dropping index "k_a" as it is fully covered by "k_ab". The longer index can satisfy all queries that would use the shorter index.`},
 		},
 		{
 			name: "duplicate pair reports both",
@@ -191,18 +201,24 @@ CREATE INDEX k_a2 ON t (a);`,
 				`Index "k_a1" on column "a" is a duplicate of index "k_a2"`,
 				`Index "k_a2" on column "a" is a duplicate of index "k_a1"`,
 			},
+			wantSuggestions: []string{
+				`Drop index "k_a1" as it is an exact duplicate of "k_a2". Duplicate indexes waste space and slow down writes with no benefit.`,
+				`Drop index "k_a2" as it is an exact duplicate of "k_a1". Duplicate indexes waste space and slow down writes with no benefit.`,
+			},
 		},
 		{
 			name: "duplicate of the primary key",
 			ddl: `CREATE TABLE t (id bigint PRIMARY KEY);
 CREATE INDEX t_id_idx ON t (id);`,
-			want: []string{`Index "t_id_idx" on column "id" is a duplicate of the PRIMARY KEY`},
+			want:            []string{`Index "t_id_idx" on column "id" is a duplicate of the PRIMARY KEY`},
+			wantSuggestions: []string{`Drop index "t_id_idx" as it duplicates the PRIMARY KEY. The PRIMARY KEY already provides all the functionality of this index.`},
 		},
 		{
 			name: "prefix of a composite primary key",
 			ddl: `CREATE TABLE t (tenant_id bigint, id bigint, PRIMARY KEY (tenant_id, id));
 CREATE INDEX t_tenant_idx ON t (tenant_id);`,
-			want: []string{`Index "t_tenant_idx" on column "tenant_id" is redundant - covered by PRIMARY KEY on columns ("tenant_id", "id")`},
+			want:            []string{`Index "t_tenant_idx" on column "tenant_id" is redundant - covered by PRIMARY KEY on columns ("tenant_id", "id")`},
+			wantSuggestions: []string{`Consider dropping index "t_tenant_idx" as it is fully covered by the PRIMARY KEY. The index backing the PRIMARY KEY already serves lookups on its leading columns.`},
 		},
 		{
 			name: "unique constraint duplicated by a unique index",
@@ -211,6 +227,10 @@ CREATE UNIQUE INDEX t_email_uidx ON t (email);`,
 			want: []string{
 				`Index "t_email_key" on column "email" is a duplicate of index "t_email_uidx"`,
 				`Index "t_email_uidx" on column "email" is a duplicate of index "t_email_key"`,
+			},
+			wantSuggestions: []string{
+				`Drop index "t_email_key" as it is an exact duplicate of "t_email_uidx". Duplicate indexes waste space and slow down writes with no benefit.`,
+				`Drop index "t_email_uidx" as it is an exact duplicate of "t_email_key". Duplicate indexes waste space and slow down writes with no benefit.`,
 			},
 		},
 		{
@@ -224,7 +244,8 @@ CREATE INDEX k_ab ON t (a, b);`,
 			name: "unnamed inline unique constraint is described by its definition",
 			ddl: `CREATE TABLE t (id bigint PRIMARY KEY, code text UNIQUE);
 CREATE INDEX t_code_idx ON t (code);`,
-			want: []string{`Index "t_code_idx" on column "code" is a duplicate of index "UNIQUE (code)"`},
+			want:            []string{`Index "t_code_idx" on column "code" is a duplicate of index "UNIQUE (code)"`},
+			wantSuggestions: []string{`Drop index "t_code_idx" as it is an exact duplicate of "UNIQUE (code)". Duplicate indexes waste space and slow down writes with no benefit.`},
 		},
 		{
 			name: "sort direction is part of the key",
@@ -248,15 +269,17 @@ CREATE INDEX k_ab ON t (a, b);`,
 		t.Run(tt.name, func(t *testing.T) {
 			results, err := lintOnePostgresEntry(t, tt.ddl)
 			require.NoError(t, err)
-			var messages []string
+			var messages, suggestions []string
 			for _, r := range results {
 				assert.Equal(t, "t", r.Table)
 				assert.Empty(t, r.Column)
 				assert.Equal(t, "redundant_indexes", r.Linter)
 				assert.Equal(t, "warning", r.Severity)
 				messages = append(messages, r.Message)
+				suggestions = append(suggestions, r.Suggestion)
 			}
 			assert.Equal(t, tt.want, messages)
+			assert.Equal(t, tt.wantSuggestions, suggestions)
 		})
 	}
 }

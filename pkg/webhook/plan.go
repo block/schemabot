@@ -1930,6 +1930,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			Message:    w.Message,
 			Table:      w.Table,
 			LinterName: w.Linter,
+			Suggestion: w.Suggestion,
 		})
 	}
 

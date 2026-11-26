@@ -477,3 +477,32 @@ func spiritCompatibleSeverities(plan *spiritlint.Plan, tableName string) []strin
 	}
 	return severities
 }
+
+// A linter's own advice reaches the result, so an operator reading a finding
+// SchemaBot will not fix for them is told what to change and not only what is
+// wrong.
+func TestLintSchema_CarriesTheLinterSuggestion(t *testing.T) {
+	const sql = "CREATE TABLE `t` (`id` INT AUTO_INCREMENT, PRIMARY KEY (`id`))"
+
+	results, err := New().LintSchema(map[string]string{"t.sql": sql})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, "primary_key", results[0].Linter)
+	assert.Equal(t, `Change column "id" to a supported column type ("BIGINT", "BINARY", "VARBINARY")`, results[0].Suggestion)
+
+	warnings := ToEngineWarnings(results)
+	require.Len(t, warnings, 1)
+	assert.Equal(t, results[0].Suggestion, warnings[0].Suggestion, "the advice survives the engine conversion")
+}
+
+// Not every linter offers advice. A finding without it is reported the same
+// way, carrying an empty suggestion rather than a placeholder.
+func TestLintSchema_FindingWithoutASuggestion(t *testing.T) {
+	const sql = "CREATE TABLE `t` (`id` BIGINT UNSIGNED AUTO_INCREMENT, `amt` FLOAT NOT NULL, PRIMARY KEY (`id`))"
+
+	results, err := New().LintSchema(map[string]string{"t.sql": sql})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, "has_float", results[0].Linter)
+	assert.Empty(t, results[0].Suggestion)
+}

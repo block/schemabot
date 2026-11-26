@@ -1892,6 +1892,9 @@ type LintViolationResponse struct {
 	Linter   string `json:"linter,omitempty"`
 	Severity string `json:"severity,omitempty"` // "error", "warning", or "info"
 	FixType  string `json:"fix_type,omitempty"`
+	// Suggestion is what the linter advises changing, empty when it offers
+	// none. The message says what is wrong; this says what to do about it.
+	Suggestion string `json:"suggestion,omitempty"`
 }
 
 // ApplyResponse is the HTTP response for POST /api/apply.

@@ -309,7 +309,8 @@ Content-Type: application/json
         "table": "order_events",
         "linter": "primary_key",
         "severity": "warning",
-        "message": "No primary key defined"
+        "message": "No primary key defined",
+        "suggestion": "Every table should have an explicit primary key"
       }]
     }
   }
@@ -558,7 +559,9 @@ The envelope differs by dialect:
 
 - **Lint.** The MySQL family runs Spirit's schema-shape linters. PostgreSQL
   runs the rules with a PostgreSQL analog — `primary_key`, `has_float`,
-  `name_case`, `redundant_indexes` — as warnings; see
+  `name_case`, `redundant_indexes` — as warnings. A finding's `message` says
+  what is wrong and its `suggestion` says what to change; `suggestion` is
+  omitted for the rules that offer no advice. See
   [lint and safety levels](lint-and-safety-levels.md#auditing-a-live-schema-pull---lint).
   A lint request against a database of any other type is rejected rather than
   answered clean.

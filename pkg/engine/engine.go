@@ -754,6 +754,9 @@ type LintViolation struct {
 	Linter   string // Name of the linter (e.g., "unsafe", "primary_key")
 	Message  string // Human-readable description
 	Severity string // "warning" or "error"
+	// Suggestion is the linter's own advice on what to change, empty when the
+	// linter offers none.
+	Suggestion string
 }
 
 // TableSizeProbeTimeout bounds the plan-time table-size statistics probe.

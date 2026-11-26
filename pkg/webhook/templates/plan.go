@@ -27,6 +27,10 @@ type LintViolationData struct {
 	Table      string
 	LinterName string
 	CanAutoFix bool
+	// Suggestion is what the linter advises changing, empty when it offers
+	// none. A finding SchemaBot will not fix for you is only actionable with
+	// it, so the comment shows it beside the message.
+	Suggestion string
 	// Targets names the rollout targets that raised this finding when only
 	// some of those it covers did: some of a target plan group's targets, or
 	// some of the targets with work in the comment's merged lint section.
@@ -4092,8 +4096,15 @@ func writeLintLine(sb *strings.Builder, number *int, table string, w LintViolati
 	} else {
 		fmt.Fprintf(sb, "%s%s\n", marker, message)
 	}
+	indent := strings.Repeat(" ", len(marker))
+	// The linter's own advice, indented into the list item so it reads as part
+	// of the finding rather than as another one. A finding SchemaBot will not
+	// fix for you is only actionable with it.
+	if w.Suggestion != "" {
+		fmt.Fprintf(sb, "%s*%s*\n", indent, markdownReason(w.Suggestion))
+	}
 	if len(w.Targets) > shardNamesInlineLimit {
-		writeCollapsedNameGrid(sb, strings.Repeat(" ", len(marker)), "Target names", w.Targets)
+		writeCollapsedNameGrid(sb, indent, "Target names", w.Targets)
 	}
 }
 
@@ -4140,7 +4151,13 @@ func targetLint(drift *DeploymentDriftData) []LintViolationData {
 		for _, f := range g.LintViolations {
 			i := slices.IndexFunc(merged, func(m LintViolationData) bool { return sameLintFinding(m, f) })
 			if i < 0 {
-				merged = append(merged, LintViolationData{Message: f.Message, Table: f.Table, LinterName: f.LinterName, CanAutoFix: f.CanAutoFix})
+				merged = append(merged, LintViolationData{
+					Message:    f.Message,
+					Table:      f.Table,
+					LinterName: f.LinterName,
+					CanAutoFix: f.CanAutoFix,
+					Suggestion: f.Suggestion,
+				})
 				raisers = append(raisers, nil)
 				i = len(merged) - 1
 			}

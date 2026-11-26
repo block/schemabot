@@ -37,6 +37,17 @@ const (
 	postgresLinterRedundantIndexes = "redundant_indexes"
 )
 
+// postgresLinterNames is every rule the PostgreSQL audit can report. A rule
+// added here without a cross-engine case in the suggestion parity test fails
+// that test, so the two engines cannot quietly disagree about whether a
+// finding carries advice.
+var postgresLinterNames = []string{
+	postgresLinterPrimaryKey,
+	postgresLinterHasFloat,
+	postgresLinterNameCase,
+	postgresLinterRedundantIndexes,
+}
+
 // UnlintableTableError reports a pulled table entry the PostgreSQL audit
 // cannot cover: it must be a create set — one CREATE TABLE, optionally
 // followed by CREATE INDEX statements on that same table. Anything else would
@@ -210,10 +221,11 @@ func lintPostgresCreateTable(create *pgproto.CreateStmt, allowedPKTypes []string
 
 	if len(pkColumns) == 0 {
 		results = append(results, Result{
-			Table:    tableName,
-			Linter:   postgresLinterPrimaryKey,
-			Message:  "No primary key defined",
-			Severity: "warning",
+			Table:      tableName,
+			Linter:     postgresLinterPrimaryKey,
+			Message:    "No primary key defined",
+			Severity:   "warning",
+			Suggestion: "Every table should have an explicit primary key",
 		})
 		return results
 	}
@@ -228,11 +240,12 @@ func lintPostgresCreateTable(create *pgproto.CreateStmt, allowedPKTypes []string
 			continue
 		}
 		results = append(results, Result{
-			Table:    tableName,
-			Column:   column,
-			Linter:   postgresLinterPrimaryKey,
-			Message:  fmt.Sprintf("Primary key column %q in table %q uses %q; allowed types: %s", column, tableName, columnType.display(), strings.Join(allowedPKTypes, ", ")),
-			Severity: "warning",
+			Table:      tableName,
+			Column:     column,
+			Linter:     postgresLinterPrimaryKey,
+			Message:    fmt.Sprintf("Primary key column %q in table %q uses %q", column, tableName, columnType.display()),
+			Severity:   "warning",
+			Suggestion: fmt.Sprintf("Change column %q to a supported column type (%s)", column, quotedTypeList(allowedPKTypes)),
 		})
 	}
 	return results
@@ -431,10 +444,11 @@ func lintPostgresRedundantIndexes(create *pgproto.CreateStmt, indexStmts []*pgpr
 				continue
 			}
 			results = append(results, Result{
-				Table:    tableName,
-				Linter:   postgresLinterRedundantIndexes,
-				Message:  postgresRedundancyMessage(index, other),
-				Severity: "warning",
+				Table:      tableName,
+				Linter:     postgresLinterRedundantIndexes,
+				Message:    postgresRedundancyMessage(index, other),
+				Severity:   "warning",
+				Suggestion: postgresRedundancySuggestion(index, other),
 			})
 			// Report an index against the first index that covers it.
 			break
@@ -569,6 +583,47 @@ func postgresIndexPartsPrefix(a, b []postgresIndexPart) bool {
 
 // postgresRedundancyMessage words a finding the way Spirit does so the two
 // audits read alike.
+// quotedTypeList renders a type allow-list the way a suggestion names it:
+// each type quoted, comma separated, so the advice reads the same on every
+// engine.
+func quotedTypeList(types []string) string {
+	quoted := make([]string, len(types))
+	for i, t := range types {
+		quoted[i] = fmt.Sprintf("%q", t)
+	}
+	return strings.Join(quoted, ", ")
+}
+
+// postgresRedundancySuggestion is the advice beside a redundancy finding:
+// drop the covered index, naming what covers it. It branches the same four
+// ways the message does, so the advice always names the same pair the message
+// does, and it carries the same wording Spirit uses for the MySQL rule — with
+// one departure. Spirit explains a primary-key prefix by way of InnoDB's
+// clustered index, which PostgreSQL has no equivalent of, so that case states
+// the reason that is true here instead of repeating one that is not.
+func postgresRedundancySuggestion(redundant, covering postgresIndex) string {
+	isDuplicate := len(redundant.Parts) == len(covering.Parts)
+	toPK := covering.Type == "PRIMARY KEY"
+	switch {
+	case isDuplicate && toPK:
+		return fmt.Sprintf("Drop index %q as it duplicates the PRIMARY KEY. "+
+			"The PRIMARY KEY already provides all the functionality of this index.",
+			redundant.Name)
+	case isDuplicate:
+		return fmt.Sprintf("Drop index %q as it is an exact duplicate of %q. "+
+			"Duplicate indexes waste space and slow down writes with no benefit.",
+			redundant.Name, covering.Name)
+	case toPK:
+		return fmt.Sprintf("Consider dropping index %q as it is fully covered by the PRIMARY KEY. "+
+			"The index backing the PRIMARY KEY already serves lookups on its leading columns.",
+			redundant.Name)
+	default:
+		return fmt.Sprintf("Consider dropping index %q as it is fully covered by %q. "+
+			"The longer index can satisfy all queries that would use the shorter index.",
+			redundant.Name, covering.Name)
+	}
+}
+
 func postgresRedundancyMessage(redundant, covering postgresIndex) string {
 	redundantCols := postgresIndexColumnsPhrase(redundant)
 	coveringCols := postgresIndexColumnsPhrase(covering)

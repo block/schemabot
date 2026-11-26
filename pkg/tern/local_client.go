@@ -1995,11 +1995,12 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 	violations = make([]*ternv1.LintViolation, len(result.LintViolations))
 	for i, w := range result.LintViolations {
 		violations[i] = &ternv1.LintViolation{
-			Table:    w.Table,
-			Column:   w.Column,
-			Linter:   w.Linter,
-			Message:  w.Message,
-			Severity: w.Severity,
+			Table:      w.Table,
+			Column:     w.Column,
+			Linter:     w.Linter,
+			Message:    w.Message,
+			Severity:   w.Severity,
+			Suggestion: w.Suggestion,
 		}
 	}
 

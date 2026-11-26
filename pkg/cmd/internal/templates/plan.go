@@ -454,6 +454,10 @@ func WriteLintViolations(warnings []apitypes.LintViolationResponse) {
 		} else {
 			fmt.Printf("  • %s\n", w.Message)
 		}
+		// The linter's own advice, indented under the finding it belongs to.
+		if w.Suggestion != "" {
+			fmt.Printf("    %s\n", w.Suggestion)
+		}
 	}
 	fmt.Println()
 }

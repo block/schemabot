@@ -2094,7 +2094,12 @@ func samplePlanChanges() []KeyspaceChangeData {
 func sampleLintWarnings() []LintViolationData {
 	return []LintViolationData{
 		{Message: `Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`, Table: "users", LinterName: "has_timestamp"},
-		{Message: `Index "idx_category" on column "category" is redundant - covered by index "idx_category_price" on columns ("category", "price")`, Table: "products", LinterName: "redundant_indexes"},
+		{
+			Message:    `Index "idx_category" on column "category" is redundant - covered by index "idx_category_price" on columns ("category", "price")`,
+			Table:      "products",
+			LinterName: "redundant_indexes",
+			Suggestion: `Consider dropping index "idx_category" as it is fully covered by "idx_category_price". The longer index can satisfy all queries that would use the shorter index.`,
+		},
 	}
 }
 

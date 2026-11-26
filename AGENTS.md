@@ -281,6 +281,10 @@ Every operator control operation (stop, start, cutover, cancel, revert, skip-rev
 
 **No `nolint` directives.** Always fix the underlying lint issue rather than suppressing it with `//nolint:`. If the linter flags something, the code should be changed to satisfy it.
 
+**A lint finding's message says what is wrong; its suggestion says what to change.** Keep the two apart on every engine. A finding SchemaBot will not fix for the operator is only actionable with the advice, and the advice is what the operator reads first, so burying it inside the message — or leaving it off on one dialect — gives the same schema defect a different UX depending on the database behind it. Carry the linter's own `Suggestion` through rather than composing one here, and where a rule has a MySQL and a PostgreSQL implementation, both either offer advice or neither does. `TestSuggestionParityAcrossEngines` (`pkg/lint/suggestion_parity_test.go`) enforces that over `postgresLinterNames`, so a rule added without a cross-engine case fails rather than quietly diverging.
+
+Wording follows the engine that already states the rule, with one exception: advice whose reasoning is false on the other engine is restated, not copied. Spirit explains a primary-key prefix by way of InnoDB's clustered index; PostgreSQL has no such thing, so that case gives the reason that holds there.
+
 **Instant DDL terminology:** In MySQL, "instant DDL" has a specific meaning — `ALTER TABLE` operations that only modify metadata (e.g., adding a column with `ALGORITHM=INSTANT`). `CREATE TABLE` and `DROP TABLE` are **not** instant DDL even though they complete quickly. Don't describe them as instant in code or comments.
 
 ### SQL Parsing: Real-Parser Requirement

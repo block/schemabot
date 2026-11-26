@@ -435,6 +435,7 @@ func (h *Handler) rollbackCommentData(database, dbType, environment, sourceApply
 			Message:    w.Message,
 			Table:      w.Table,
 			LinterName: w.Linter,
+			Suggestion: w.Suggestion,
 		})
 	}
 	commentData.Errors = planResp.Errors

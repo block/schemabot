@@ -84,6 +84,9 @@ func TestPlan_ReportsKeyspaceLintViolations(t *testing.T) {
 		Linter:   "primary_key",
 		Message:  `Primary key column "id" has type "int"`,
 		Severity: "error",
+		// Spirit's own advice on the finding, carried through to the plan so a
+		// reviewer sees what to change and not only what is wrong.
+		Suggestion: `Change column "id" to a supported column type ("BIGINT", "BINARY", "VARBINARY")`,
 	}}, result.LintViolations)
 }
 

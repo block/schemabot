@@ -785,6 +785,8 @@ message LintViolation {
   string linter = 4;
   string fix_type = 5;
   string severity = 6; // "error", "warning", or "info"
+  // What the linter advises changing. Empty when the linter offers none.
+  string suggestion = 7;
 }
 
 // ExistingCopy is unfinished work an earlier schema change left on the target
