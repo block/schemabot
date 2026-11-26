@@ -318,7 +318,7 @@ func TestAggregateFold_StoppedApplies(t *testing.T) {
 	}
 	failedUsers := &storage.Check{
 		DatabaseName: "users", DatabaseType: "mysql", Environment: "production",
-		Status: checkStatusCompleted, Conclusion: checkConclusionFailure, HasChanges: true,
+		ApplyID: 34, Status: checkStatusCompleted, Conclusion: checkConclusionFailure, HasChanges: true,
 	}
 	stopped := stoppedApplyIDs{22: true, 33: true}
 
@@ -354,6 +354,21 @@ func TestAggregateFold_StoppedApplies(t *testing.T) {
 		assert.Equal(t, checkStatusCompleted, status)
 		assert.Equal(t, checkConclusionFailure, conclusion)
 		assert.Equal(t, "Apply failed", title)
+	})
+
+	// The stopped row is waiting on an operator, not failed, so the only
+	// failure is the plan: the title names it and the table still lists the
+	// stopped apply.
+	t.Run("a failed plan beside a stopped apply", func(t *testing.T) {
+		failedPlan := &storage.Check{
+			DatabaseName: "users", DatabaseType: "mysql", Environment: "production",
+			Status: checkStatusCompleted, Conclusion: checkConclusionFailure,
+		}
+		conclusion, status, title, summary := fold(stoppedLedger, failedPlan)
+		assert.Equal(t, checkStatusCompleted, status)
+		assert.Equal(t, checkConclusionFailure, conclusion)
+		assert.Equal(t, "Plan failed", title)
+		assert.Contains(t, summary, "ledger", "the table still lists the stopped apply")
 	})
 
 	t.Run("a stopped apply alongside one still running", func(t *testing.T) {
@@ -708,5 +723,45 @@ func TestAggregateRequiresRecognizedTerminalSuccess(t *testing.T) {
 	} {
 		conclusion, _ := computeAggregate([]*storage.Check{check}, nil)
 		assert.NotEqual(t, checkConclusionSuccess, conclusion)
+	}
+}
+
+// A failing aggregate names what failed. A plan that failed before any apply
+// ran must not read "Apply failed": the reader would take it to mean their
+// database was changed and broken, when nothing ran against it. Whenever a
+// failed apply is present it names the Check Run, since that is the outcome
+// that touched a database.
+func TestAggregateSummary_FailureTitleNamesWhatFailed(t *testing.T) {
+	failedPlanRow := func(db string) *storage.Check {
+		return &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: db, Status: checkStatusCompleted, Conclusion: checkConclusionFailure}
+	}
+	failedApplyRow := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "ledger", ApplyID: 7, Status: checkStatusCompleted, Conclusion: checkConclusionFailure}
+	pendingRow := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "users", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, HasChanges: true}
+	gatedRow := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "users", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, BlockingReason: "prerequisite"}
+	failedParticipant := &storage.Check{Environment: "staging", DatabaseType: aggregateSentinel, DatabaseName: "tenant-b", Status: checkStatusCompleted, Conclusion: checkConclusionFailure}
+
+	cases := []struct {
+		name   string
+		checks []*storage.Check
+		want   string
+	}{
+		{"one failed plan", []*storage.Check{failedPlanRow("orders")}, "Plan failed"},
+		{"failed plans beside a pending change", []*storage.Check{failedPlanRow("orders"), failedPlanRow("payments"), pendingRow}, "Plan failed"},
+		{"a failed apply", []*storage.Check{failedApplyRow}, "Apply failed"},
+		{"a failed apply outranks a failed plan", []*storage.Check{failedPlanRow("orders"), failedApplyRow}, "Apply failed"},
+		{"a gated change beside a failed plan", []*storage.Check{failedPlanRow("orders"), gatedRow}, "Apply failed"},
+		{"a failed participant beside a failed plan", []*storage.Check{failedPlanRow("orders"), failedParticipant}, "Apply failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conclusion, status := computeAggregate(tc.checks, nil)
+			require.Equal(t, checkStatusCompleted, status)
+			require.Equal(t, checkConclusionFailure, conclusion)
+			title, summary := aggregateSummary(tc.checks, conclusion, nil, nil, "")
+			assert.Equal(t, tc.want, title)
+			if tc.want == "Plan failed" {
+				assert.NotContains(t, summary, "To clear this", "a failed plan names no apply remedy")
+			}
+		})
 	}
 }
