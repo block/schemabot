@@ -996,7 +996,7 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 		s := failed[0]
 		severity := failureSeverity(s.State == state.ApplyOperation.FailedRetryable)
 		shard := html.EscapeString(s.Shard)
-		if msg := SanitizeInlineError(s.Error); msg == "" {
+		if msg := presentation.InlineError(s.Error); msg == "" {
 			fmt.Fprintf(sb, "\n> %s **First failure:** shard <code>%s</code>\n", severity, shard)
 		} else {
 			fmt.Fprintf(sb, "\n> %s **First failure:** shard <code>%s</code> — %s\n", severity, shard, html.EscapeString(msg))
@@ -1014,7 +1014,7 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 		// The finalizer callout already carries this error.
 		return
 	}
-	if msg := SanitizeInlineError(data.ErrorMessage); msg != "" {
+	if msg := presentation.InlineError(data.ErrorMessage); msg != "" {
 		fmt.Fprintf(sb, "\n> %s **Failure:** %s\n", failureSeverity(state.IsState(data.State, state.Apply.FailedRetryable)), html.EscapeString(msg))
 	}
 }
@@ -1073,7 +1073,7 @@ func writeShardFailureReasons(sb *strings.Builder, failed []ShardStatus, totalSh
 	for i, s := range failed {
 		failures[i] = presentation.Failure{
 			Name:     s.Shard,
-			Reason:   SanitizeInlineError(s.Error),
+			Reason:   presentation.InlineError(s.Error),
 			Retrying: s.State == state.ApplyOperation.FailedRetryable,
 		}
 	}
@@ -1118,7 +1118,7 @@ func writeFinalizerFailure(sb *strings.Builder, f *FinalizerFailure) {
 	}
 	severity := failureSeverity(state.IsState(f.State, state.ApplyOperation.FailedRetryable))
 	keyspace := html.EscapeString(f.Keyspace)
-	if msg := SanitizeInlineError(f.Error); msg == "" {
+	if msg := presentation.InlineError(f.Error); msg == "" {
 		fmt.Fprintf(sb, "\n> %s **Failure:** finalizing keyspace <code>%s</code>\n", severity, keyspace)
 	} else {
 		fmt.Fprintf(sb, "\n> %s **Failure:** finalizing keyspace <code>%s</code> — %s\n", severity, keyspace, html.EscapeString(msg))

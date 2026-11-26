@@ -378,7 +378,7 @@ func writeAggregateFirstFailure(sb *strings.Builder, failure *presentation.Deplo
 		return
 	}
 	name := html.EscapeString(failure.Name)
-	msg := SanitizeInlineError(failure.Error)
+	msg := presentation.InlineError(failure.Error)
 	if msg == "" {
 		fmt.Fprintf(sb, "\n> "+glyph.Failed+" **First failure:** <code>%s</code>\n", name)
 		return

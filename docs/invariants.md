@@ -1809,8 +1809,8 @@ derived once and rendered by the CLI and the PR comment alike, so one surface ne
 shard while the other lists several reasons. *Enforced:* the shared derivation (`FailedMember`,
 `QualifyShardNames`, `SummarizeFailures`, and `FailedReach` in `pkg/presentation/failure_reasons.go`),
 each failed shard's reason read once (`ApplyOperation.FailureMessage` in `pkg/storage`, which the PR
-comment and the progress API both serve) and grouped on the PR comment's inline sanitizer on both
-surfaces, and tests that render the same failed shards through both surfaces and fail when they read
+comment and the progress API both serve) and grouped on one redacted reason on both surfaces
+(`InlineError` in `pkg/presentation/error_redaction.go`), and tests that render the same failed shards through both surfaces and fail when they read
 differently (`TestShardFailureReasonsReadTheSameOnEverySurface`,
 `TestShardFailureReasonsGroupAcrossHostsOnEverySurface`, and
 `TestShardFailureNamesQualifyRepeatedShardsOnEverySurface` in `pkg/cmd/internal/templates`), with

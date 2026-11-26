@@ -7,7 +7,6 @@ import (
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
-	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // ShardFailureCallout is the failure callout for a sharded apply: how many
@@ -84,10 +83,10 @@ func shardFailures(applyState string, ops []ProgressOperation, tables []TablePro
 		refs[i] = presentation.ShardRef{Keyspace: s.Keyspace, Shard: s.Shard}
 	}
 	names := presentation.QualifyShardNames(refs)
-	// Shards are grouped on the reason the PR comment shows
-	// (webhooktemplates.SanitizeInlineError), so both surfaces count the same
-	// shards under the same reasons (UX-9). The terminal is an operator's own
-	// view, so a reason whose shards all recorded the same error prints that
+	// Shards are grouped on the redacted reason the PR comment also groups on
+	// (presentation.InlineError), so both surfaces count the same shards under
+	// the same reasons (UX-9). The terminal is an operator's own view, so a
+	// reason whose shards all recorded the same error prints that
 	// error in full, with only the runes a terminal would act on removed
 	// (ui.TerminalSafeInline); shards that read the same only once their hosts
 	// are redacted print the redacted reason, since no one shard's host speaks
@@ -99,7 +98,7 @@ func shardFailures(applyState string, ops []ProgressOperation, tables []TablePro
 		}
 		failures = append(failures, presentation.Failure{
 			Name:     names[i],
-			Reason:   webhooktemplates.SanitizeInlineError(s.Error),
+			Reason:   presentation.InlineError(s.Error),
 			Detail:   ui.TerminalSafeInline(s.Error),
 			Retrying: state.IsState(s.State, state.ApplyOperation.FailedRetryable),
 		})

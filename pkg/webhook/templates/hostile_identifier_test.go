@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -254,7 +255,7 @@ func TestRedactedReason(t *testing.T) {
 	for limit := 2; limit < 40; limit++ {
 		got := strings.TrimSuffix(RedactedReason("x [endpoint redacted] y", limit), "…")
 		if i := strings.LastIndexByte(got, '['); i >= 0 {
-			assert.True(t, strings.HasPrefix(got[i:], redactionMarker), "limit %d: %q", limit, got)
+			assert.True(t, strings.HasPrefix(got[i:], presentation.RedactionMarker), "limit %d: %q", limit, got)
 		}
 	}
 }
