@@ -10507,7 +10507,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 *Applied by @aparajon at 2026-03-15 14:10:00 UTC*
 
-**Targets**: 40 completed, 8 running, 79 queued, 1 failed
+**Targets**: 40 completed, 8 running, 79 queued, 1 failed (8 at a time)
 
 > ❌ **First failure:** <code>us/orders_062</code> — Error 1062: Duplicate entry &#39;12345&#39; for key &#39;orders.idx_user_id&#39;
 
@@ -11366,7 +11366,7 @@ b0-b8  b8-c0  c0-c8  c8-d0  d0-d8  d8-e0  e0-e8  e8-f0  f0-f8  f8-
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
-📋 **Plan**: **1** table to alter
+📋 **Plan**: **1** table to alter · 32 shards, 8 at a time
 
 
 ---
@@ -11425,7 +11425,7 @@ fd-fe  fe-ff  ff-
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
-📋 **Plan**: **1** table to alter
+📋 **Plan**: **1** table to alter · 256 shards, 8 at a time
 
 
 ---
@@ -11582,7 +11582,7 @@ ALTER TABLE `mutes`
 
 **Status**: In Progress — 0 of 1 change applied
 
-**Shards**: 1 running table copy, 3 queued
+**Shards**: 1 running table copy, 3 queued (1 at a time)
 
 #### Keyspace `cdb_resolute_sharded`
 

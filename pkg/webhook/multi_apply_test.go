@@ -25,7 +25,7 @@ func runningApply() *storage.Apply {
 // An apply with no operation rows (legacy, predating apply_operations) renders
 // the single-deployment comment unchanged — no aggregate header.
 func TestFormatApplyStatusComment_NoOperationsRendersSingle(t *testing.T) {
-	out := formatApplyStatusComment(runningApply(), nil, false, nil, nil, nil, nil, "", "", nil, 0)
+	out := formatApplyStatusComment(runningApply(), nil, false, nil, nil, nil, nil, "", "", nil, 0, 0)
 	assert.Contains(t, out, "## Schema Change Status")
 	assert.NotContains(t, out, "**Deployments**:")
 }
@@ -36,7 +36,7 @@ func TestFormatApplyStatusComment_OneOperationRendersSingle(t *testing.T) {
 	ops := []*storage.ApplyOperation{
 		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Running},
 	}
-	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil, 0)
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil, 0, 0)
 	assert.NotContains(t, out, "**Deployments**:")
 	assert.NotContains(t, out, "- 🔄 `eu`")
 }
@@ -48,7 +48,7 @@ func TestFormatApplyStatusComment_MultipleOperationsRendersMulti(t *testing.T) {
 		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyBarrier},
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier},
 	}
-	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil, 0)
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil, 0, 0)
 	assert.Contains(t, out, "## Schema Change Status")
 	assert.Contains(t, out, "**Deployments**: 1 completed, 1 running")
 	assert.Contains(t, out, "- ✅ `eu` — completed")
@@ -65,13 +65,13 @@ func TestFormatApplyStatusComment_CutoverNextActionFollowsDeferCutover(t *testin
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier},
 	}
 
-	automatic := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil, 0)
+	automatic := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil, 0, 0)
 	assert.Contains(t, automatic, "SchemaBot will run the cutover for `eu` next — no action needed.")
 	assert.NotContains(t, automatic, "schemabot cutover")
 
 	deferred := runningApply()
 	deferred.Options = storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true})
-	manual := formatApplyStatusComment(deferred, ops, false, nil, nil, nil, nil, "", "", nil, 0)
+	manual := formatApplyStatusComment(deferred, ops, false, nil, nil, nil, nil, "", "", nil, 0, 0)
 	assert.Contains(t, manual, "To run the cutover for `eu`:")
 	assert.Contains(t, manual, "schemabot cutover apply-1 -e production")
 	assert.NotContains(t, manual, "SchemaBot will run the cutover for")
@@ -87,10 +87,10 @@ func TestFormatApplyStatusComment_ReleasedPauseRendersDegradedNotPaused(t *testi
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Pending, OnFailure: storage.OnFailurePause},
 	}
 
-	paused := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil, 0)
+	paused := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil, 0, 0)
 	assert.Contains(t, paused, "paused — eu failed; release or stop")
 
-	released := formatApplyStatusComment(runningApply(), ops, true, nil, nil, nil, nil, "", "", nil, 0)
+	released := formatApplyStatusComment(runningApply(), ops, true, nil, nil, nil, nil, "", "", nil, 0, 0)
 	assert.NotContains(t, released, "paused — eu failed; release or stop")
 }
 
@@ -159,7 +159,7 @@ func TestFormatApplyStatusComment_ResumingRolloutReadsAsResuming(t *testing.T) {
 				)
 			}
 
-			out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil, 0)
+			out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil, 0, 0)
 			assert.Contains(t, out, "🔄 0 of 2 tables done on 2 targets\n")
 			assert.Contains(t, out, "**`bikes`**: 🔄 Resuming…\n")
 			assert.Contains(t, out, "ADD INDEX `idx_status`", "the table keeps its DDL")
@@ -188,7 +188,7 @@ func TestFormatApplyStatusComment_ResumingRolloutKeepsTargetsThatMovedOn(t *test
 			first,
 			{ApplyOperationID: new(int64(2)), TableName: "bikes", DDL: bikesDDL, State: state.Task.Stopped, RowsCopied: 57, RowsTotal: 100},
 		}
-		return formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil, 0)
+		return formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil, 0, 0)
 	}
 
 	finished := render(&storage.Task{TableName: "bikes", DDL: bikesDDL, State: state.Task.Completed, RowsCopied: 100, RowsTotal: 100})
@@ -217,7 +217,7 @@ func TestFormatApplyStatusComment_ResumingSingleTargetSections(t *testing.T) {
 		)
 	}
 
-	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil, 0)
+	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil, 0, 0)
 	assert.Equal(t, 2, strings.Count(out, "**`bikes`**: 🔄 Resuming…\n"), out)
 	assert.Equal(t, 2, strings.Count(out, "**`docks`**: ⏳ Queued"), out)
 	assert.NotContains(t, out, "**`docks`**: 🔄 Resuming…")

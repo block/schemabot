@@ -1384,6 +1384,35 @@ func TestDurableWebhookDriverPostsTerminalCommandCommentAtAttemptCap(t *testing.
 	require.NotContains(t, body, "db.internal.example.com")
 }
 
+// An apply that kept failing because its remote deployment never answered is
+// answered, once its retries run out, with the deployment and target to look
+// at and without the transport error.
+func TestDurableWebhookDriverNamesTheUnreachableDeploymentAtAttemptCap(t *testing.T) {
+	event := durableIssueCommentEvent("schemabot apply -e staging")
+	event.Attempts = maxDurableWebhookAttempts - 1
+	store := newScriptedWebhookEventStore(event)
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/7/comments", commentRecorder(t, comments))
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	h := newDurableDriverHandler(t, store, nil, &fakeClientFactory{client: installClient})
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return true, fmt.Errorf("apply command plan octocat/hello-world#7: %w", &api.RemoteDeploymentUnavailableError{
+			Deployment: "tenant-a", Target: "orders-staging",
+			Err: errors.New("rpc error: code = Unavailable desc = dial tcp 10.0.4.17:9090: connect: connection refused"),
+		})
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	<-store.failed
+	body := requireComment(t, comments, "terminal command answer")
+	assert.Contains(t, body, "SchemaBot could not complete this command after retrying, because it could not reach the remote deployment `tenant-a` for target `orders-staging`. "+
+		"Comment the command again once that deployment is healthy; the SchemaBot server logs have the cause.")
+	assert.NotContains(t, body, "10.0.4.17")
+	assert.NotContains(t, body, "connection refused")
+}
+
 // Retry exhaustion for non-command deliveries remains operator-facing only
 // and must not create unrelated PR timeline noise.
 func TestDurableWebhookDriverDoesNotPostTerminalCommentForNonCommand(t *testing.T) {

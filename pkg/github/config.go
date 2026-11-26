@@ -960,8 +960,7 @@ func selectConfigByDatabaseName(databaseName string, configs []DiscoveredConfig)
 		for _, m := range matches {
 			paths = append(paths, m.SchemaDir)
 		}
-		return nil, "", false, fmt.Errorf("ambiguous: database '%s' matches multiple configs at: %s",
-			databaseName, strings.Join(paths, ", "))
+		return nil, "", false, &ambiguousDatabaseConfigError{Database: databaseName, Paths: paths}
 	}
 
 	match := matches[0]
