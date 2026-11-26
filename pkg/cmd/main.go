@@ -66,6 +66,14 @@ type CLI struct {
 	Serve      commands.ServeCmd      `cmd:"" help:"Start the SchemaBot HTTP API server"`
 }
 
+// helpOptions is how every help page renders: one line per command, with
+// subcommands left to the parent's own --help. The top-level listing is the
+// first thing a newcomer reads; it should fit on a screen and name what
+// SchemaBot does, not enumerate every operation.
+func helpOptions() kong.HelpOptions {
+	return kong.HelpOptions{Compact: true, NoExpandSubcommands: true}
+}
+
 func main() {
 	// Render command hints — and kong's own usage text — with the tool name a
 	// wrapper passes via --cli-name, so wrapper-invoked runs print commands
@@ -78,6 +86,7 @@ func main() {
 		kong.Name(cliname.Name()),
 		kong.Description("Declarative schema GitOps orchestrator"),
 		kong.UsageOnError(),
+		kong.ConfigureHelp(helpOptions()),
 		kong.Vars{
 			"version":  fmt.Sprintf("%s (commit: %s)", version, commit),
 			"cli_name": cliname.Name(),
