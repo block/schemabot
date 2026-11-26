@@ -256,6 +256,32 @@ func TestSharedSchemaParseFailureIsMarked(t *testing.T) {
 	assert.Error(t, errors.Unwrap(parseErr))
 }
 
+// splitThenRefuseParser splits a schema file into one statement and then
+// refuses to classify it, standing in for a statement the parser can delimit
+// but not read.
+type splitThenRefuseParser struct {
+	ddl.StatementParser
+}
+
+func (splitThenRefuseParser) Split(content string) ([]string, error) { return []string{content}, nil }
+
+func (splitThenRefuseParser) Classify(string) (ddl.StatementType, string, error) {
+	return ddl.StatementUnknown, "", errors.New("line 1 column 7 near \"TABLE orders\"")
+}
+
+// A statement the shared schema check splits but cannot classify is the
+// parser's complaint about the schema file, marked the same way as a file it
+// cannot split.
+func TestSharedSchemaClassifyFailureIsMarked(t *testing.T) {
+	_, err := tablesCreatedIn(splitThenRefuseParser{}, "core", &ternv1.SchemaFiles{Files: map[string]string{"orders.sql": "CREATE TABLE orders"}})
+
+	require.Error(t, err)
+	text, quotesRepository, ok := AuthoredTextOf(fmt.Errorf("schema files of database %q: %w", "payments", err))
+	require.True(t, ok)
+	assert.Equal(t, `classify statement in schema file core/orders.sql: line 1 column 7 near "TABLE orders"`, text)
+	assert.True(t, quotesRepository)
+}
+
 // parseErrorTypes parses this package's non-test source and returns the types
 // that declare an Error method and the types that declare AuthoredText, both
 // sorted.

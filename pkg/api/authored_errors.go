@@ -17,11 +17,13 @@ type AuthoredError interface {
 	// AuthoredText returns the words to show, without the cause and without any
 	// wrap an outer caller added.
 	//
-	// quotesRepository reports that those words were composed by a library from
-	// the repository's own input, such as a parser's complaint about a schema
-	// file or a planner's refusal of a statement. That text can quote the
-	// statement, so a renderer sanitizes it, where SchemaBot's own words are
-	// published as written.
+	// quotesRepository reports that a library, not SchemaBot, composed those
+	// words from the repository's own input, such as a parser's complaint about
+	// a schema file or a planner's refusal of a statement, so they can quote a
+	// whole statement. Either way the text carries names that came from the
+	// pull request or the command, such as a database or a namespace, so a
+	// renderer passes every authored text through the same sanitizer before it
+	// publishes it (AV-8); nothing authored is published raw.
 	AuthoredText() (text string, quotesRepository bool)
 }
 
@@ -43,9 +45,9 @@ func AuthoredTextOf(err error) (text string, quotesRepository, ok bool) {
 // PlanRefusedError implement the same method in their own package.
 //
 // Each returns the error's own message and never its cause. Apart from the
-// parser's complaint, the message names only identifiers the reader already
-// has: a database, an environment, a target, a namespace, a table the plan
-// names.
+// parser's complaint, SchemaBot wrote the sentence, and the names in it, such
+// as a database, an environment, a target, a namespace, or a table, come from
+// the pull request or the command, which is why a renderer still sanitizes it.
 
 func (e *DatabaseNotConfiguredError) AuthoredText() (string, bool) { return e.Error(), false }
 

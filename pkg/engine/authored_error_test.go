@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -26,4 +27,20 @@ func TestPlanRefusedErrorAuthoredTextQuotesTheRepository(t *testing.T) {
 
 	assert.Equal(t, `the schema files drop table "orders_seq"`, text)
 	assert.True(t, quotesRepository)
+}
+
+// A refusal built around SchemaBot's own message, such as the drop_tables and
+// ignore_tables overlap, gives up that message without the engine's wrap or
+// the message's cause.
+func TestPlanRefusedErrorAuthoredTextPrefersTheOperatorMessage(t *testing.T) {
+	cause := errors.New("dial tcp 10.0.0.5:3306: connect: connection refused")
+	refusal := &PlanRefusedError{Err: fmt.Errorf("plan database orders_prod: %w",
+		&OperatorMessage{Message: "drop_tables entry audit is also withheld by ignore_tables", Err: cause})}
+
+	text, quotesRepository := refusal.AuthoredText()
+
+	assert.Equal(t, "drop_tables entry audit is also withheld by ignore_tables", text)
+	assert.NotContains(t, text, "orders_prod")
+	assert.NotContains(t, text, "10.0.0.5")
+	assert.False(t, quotesRepository)
 }
