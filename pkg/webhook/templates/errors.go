@@ -29,12 +29,14 @@ type SchemaErrorData struct {
 	// names the concrete environments the failed command covered. Empty means
 	// the deployment is unscoped and the header omits the environment segment
 	// rather than rendering filler.
-	Environments       []string
-	DatabaseName       string
-	SchemaPath         string
-	CommandName        string // "plan" or "apply"
-	ErrorDetail        string
-	AvailableDatabases string
+	Environments []string
+	DatabaseName string
+	SchemaPath   string
+	CommandName  string // "plan" or "apply"
+	ErrorDetail  string
+	// AvailableConfigs lists the configs a command without -d could have
+	// targeted, rendered as the choices in the multiple databases comment.
+	AvailableConfigs []AvailableConfigData
 	// SearchedDirs lists the schema directories a database-scoped search was
 	// limited to when GitHub truncated the repository tree. Empty when the
 	// whole repository was searched.
@@ -60,6 +62,32 @@ type SchemaErrorData struct {
 type UnregisteredSchemaConfigData struct {
 	Database   string
 	SchemaPath string
+}
+
+// AvailableConfigData identifies one config a command without -d could have
+// targeted.
+type AvailableConfigData struct {
+	Database   string
+	SchemaPath string
+}
+
+// unlistedAvailableConfigsLine is the line shown when no candidate configs are
+// known. It points at where the database names live instead of repeating any
+// error text.
+const unlistedAvailableConfigsLine = "SchemaBot could not list them here. Each `schemabot.yaml` in this PR names its database under `database`."
+
+// AvailableConfigLines renders each available config as its database and the
+// directory holding it, as code spans the PR-supplied values cannot break out
+// of. With no known configs it returns one fixed line.
+func (d SchemaErrorData) AvailableConfigLines() []string {
+	if len(d.AvailableConfigs) == 0 {
+		return []string{unlistedAvailableConfigsLine}
+	}
+	lines := make([]string, 0, len(d.AvailableConfigs))
+	for _, cfg := range d.AvailableConfigs {
+		lines = append(lines, inlineCode(cfg.Database)+" ("+inlineCode(cfg.SchemaPath)+")")
+	}
+	return lines
 }
 
 // MultipleUnregisteredConfigs reports whether the error names more than one
@@ -376,7 +404,8 @@ This repository has multiple ` + "`schemabot.yaml`" + ` configurations.
 
 ### Available Databases
 
-{{.AvailableDatabases}}
+{{range .AvailableConfigLines}}- {{.}}
+{{end}}
 
 ### How to specify a database
 
@@ -658,31 +687,6 @@ func renderTemplate(tmpl *template.Template, data SchemaErrorData) string {
 		return fmt.Sprintf("Error rendering template: %v", err)
 	}
 	return sb.String()
-}
-
-// FormatAvailableDatabases formats database names from error message as markdown list.
-func FormatAvailableDatabases(errMsg string) string {
-	// Error message format: "multiple schemabot.yaml configs found...: `db1` (path1), `db2` (path2)"
-	colonIdx := strings.LastIndex(errMsg, ": ")
-	if colonIdx == -1 || colonIdx+2 >= len(errMsg) {
-		return "- (Unable to determine available databases)"
-	}
-
-	databasesPart := errMsg[colonIdx+2:]
-	parts := strings.Split(databasesPart, ", ")
-
-	var result strings.Builder
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			fmt.Fprintf(&result, "- %s\n", part)
-		}
-	}
-
-	if result.Len() == 0 {
-		return "- (Unable to determine available databases)"
-	}
-	return result.String()
 }
 
 // MemberPlanBlockedDetail is the error line for an apply whose creation refused

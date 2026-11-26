@@ -3641,8 +3641,9 @@ This repository has multiple `schemabot.yaml` configurations.
 
 ### Available Databases
 
-- `testapp` (schema/testapp/schemabot.yaml)
-- `payments` (schema/payments/schemabot.yaml)
+- `testapp` (`schema/testapp`)
+- `payments` (`schema/payments`)
+
 
 ### How to specify a database
 

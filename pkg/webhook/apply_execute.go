@@ -744,7 +744,7 @@ func (h *Handler) executeApply(
 		h.rolloutApplyChangeSummary(schemaResult, planResp, environment, rollout.work)); err != nil {
 		h.logger.Error("failed to mark check in_progress for apply",
 			append(apply.LogAttrs(), "error", err)...)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, applyCheckUpdateFailedMessage(database, environment, err))
 		return
 	}
 }

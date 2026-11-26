@@ -73,6 +73,18 @@ type OperationClaimFilter struct {
 	// of handing it the same held operation on every pass. Claims that
 	// recover a crashed drive or deliver a stop or cancel still match.
 	SkipOperationIDs []int64
+	// ReportContention makes a claim that takes nothing tell "nothing is
+	// claimable" apart from "a claimable operation was row-locked by another
+	// transaction". A claim skips locked rows instead of waiting on them, and
+	// it can lose a row it should take to a transaction that holds it for an
+	// instant: a peer claim that scans it and turns it down, or a write that
+	// locks every operation of the apply. With this set, a claim that takes
+	// nothing repeats its read without locking rows, and returns
+	// ErrOperationClaimContended when that read finds an operation. It costs a
+	// second query whenever the claim takes nothing, which on an idle plane is
+	// every claim, so a caller sets it only when it has reason to expect
+	// claimable work.
+	ReportContention bool
 }
 
 // OperationClaimOption adjusts an OperationClaimFilter.
@@ -89,6 +101,13 @@ func SkipDeferredCutoverWork() OperationClaimOption {
 func SkipOperations(ids ...int64) OperationClaimOption {
 	return func(f *OperationClaimFilter) {
 		f.SkipOperationIDs = append(f.SkipOperationIDs, ids...)
+	}
+}
+
+// ReportClaimContention sets OperationClaimFilter.ReportContention.
+func ReportClaimContention() OperationClaimOption {
+	return func(f *OperationClaimFilter) {
+		f.ReportContention = true
 	}
 }
 

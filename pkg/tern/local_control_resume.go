@@ -2696,12 +2696,14 @@ func finalizerVSchemaApplied(s engine.State) bool {
 // returns the last one, which is not a permanent error: the caller pauses the
 // finalizer for a retry instead of polling an engine that does not answer.
 // The operator does not watch a finalizer for a stalled drive, since it has no
-// task rows to mirror, so this budget is what bounds the drive.
+// task rows to mirror, so this budget is what bounds the drive. The wait
+// between polls grows while they fail (progressPollWait), so a provider that
+// throttles the drive is not polled through the budget in a few seconds.
 func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.Engine, apply *storage.Apply, creds *engine.Credentials, resumeState *engine.ResumeState, persistResume func(*engine.ResumeState)) (engine.State, error) {
-	ticker := time.NewTicker(c.taskPollInterval())
-	defer ticker.Stop()
 	consecutiveErrors := 0
+	var nextPollWait time.Duration
 	for {
+		tickStart := time.Now()
 		res, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 			Database:    apply.Database,
 			Credentials: creds,
@@ -2713,13 +2715,15 @@ func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.E
 				return "", fmt.Errorf("group_finalizer progress poll failed permanently: %w", err)
 			}
 			consecutiveErrors++
+			nextPollWait = c.progressPollWait(consecutiveErrors)
 			c.logger.Warn("group_finalizer: transient progress error",
-				append(apply.LogAttrs(), "error", err, "consecutive_errors", consecutiveErrors)...)
+				append(apply.LogAttrs(), "error", err, "consecutive_errors", consecutiveErrors, "next_poll_in", nextPollWait)...)
 			if consecutiveErrors >= maxConsecutiveProgressPollErrors {
 				return "", fmt.Errorf("group_finalizer progress poll failed after %d consecutive errors: %w", consecutiveErrors, err)
 			}
 		} else {
 			consecutiveErrors = 0
+			nextPollWait = c.progressPollWait(0)
 			if res.ResumeState != nil {
 				persistResume(res.ResumeState)
 				resumeState = res.ResumeState
@@ -2731,7 +2735,7 @@ func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.E
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-ticker.C:
+		case <-time.After(max(0, nextPollWait-time.Since(tickStart))):
 		}
 	}
 }

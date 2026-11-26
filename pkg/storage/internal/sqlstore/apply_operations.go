@@ -2373,7 +2373,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	deferredDeployGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
 	stoppedCancelGuard := requestRematchGuardSQL("apply_operations", rematchAtOrAfterLease, staleClaimCutoff)
 	parkedControlGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
-	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
+	claimQuery := fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
 		WHERE (
@@ -2516,12 +2516,16 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		)
 		ORDER BY created_at, id
 		LIMIT 1
-		FOR UPDATE SKIP LOCKED
 	`, applyOperationColumns, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders,
-		redispatchParentPlaceholders, crashRecoveryParentPlaceholders, staleClaimCutoff, staleClaimCutoff), queryArgs...)
+		redispatchParentPlaceholders, crashRecoveryParentPlaceholders, staleClaimCutoff, staleClaimCutoff)
+	row := tx.QueryRowContext(ctx, claimQuery+`
+		FOR UPDATE SKIP LOCKED`, queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
+		if claimFilter.ReportContention {
+			return nil, claimContention(ctx, tx, claimQuery, queryArgs)
+		}
 		return nil, nil // nothing to claim
 	}
 	if err != nil {
@@ -3030,6 +3034,32 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	ad.LeaseAcquiredAt = &leaseAcquiredAt
 
 	return ad, nil
+}
+
+// claimContention tells a claim that took nothing whether that was because
+// nothing is claimable or because the row it would take was locked. The claim
+// skips locked rows rather than wait on them, and a row is locked for an
+// instant far more often than it is claimed: a peer claim's scan locks each
+// row it reads before its gates turn the row down, and a write such as
+// SaveExternalID locks every operation of an apply. A driver woken for that
+// row would otherwise conclude there is nothing to do and wait out a poll
+// interval while the work sits claimable.
+//
+// It reruns the claim's own read, gates and order unchanged, without taking
+// row locks, in a fresh snapshot. A row found there was usually eligible but
+// held, and can also be one that became claimable after the claim ran; either
+// way it returns ErrOperationClaimContended. No row means nothing is
+// claimable, and it returns nil.
+func claimContention(ctx context.Context, tx *rebindTx, claimQuery string, args []any) error {
+	held, err := scanApplyOperationInto(tx.QueryRowContext(ctx, claimQuery, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reread claimable apply_operations without row locks after the claim took none: %w", err)
+	}
+	return fmt.Errorf("apply_operation %d of apply %d is claimable but the claim took none: %w",
+		held.ID, held.ApplyID, storage.ErrOperationClaimContended)
 }
 
 // admitCutoverUnderCap makes the cutover cap a hard bound per apply. The
