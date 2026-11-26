@@ -179,11 +179,19 @@ supply a DSN.
 SchemaBot checks the privileges each statement needs on its own table before
 running it, and a missing grant fails with the `GRANT` that fixes it. A plan
 that adds a foreign key also checks `REFERENCES` on the referenced table, and
-fails with the grant to add when it is missing. If the grant is revoked after
-the plan, the apply fails before any DDL runs and names the `GRANT` that fixes
-it. SchemaBot does not retry it: grant the privilege, then apply again. If your
-tables belong to a dedicated owner role, read [Table ownership](#table-ownership) before the first
-`CREATE TABLE`.
+fails with the grant to add when it is missing.
+
+If a grant is revoked after the plan, the apply fails at the statement that
+needs it, and statements before it may already have run:
+
+- A privilege on the statement's own table is checked again before the
+  statement runs. The failure names the `GRANT` that fixes it.
+- `REFERENCES` on the table a foreign key references is checked only by the
+  server. The failure says a privilege is missing, and the server log names it.
+
+Either way, grant the privilege, then plan and apply again. The new plan holds
+only the statements that did not run. If your tables belong to a dedicated owner
+role, read [Table ownership](#table-ownership) before the first `CREATE TABLE`.
 
 ## What runs and what is blocked
 
