@@ -43,7 +43,7 @@ func TestKeyspaceDDLReadsSQLFilesInNameOrder(t *testing.T) {
 // Seeding applies every keyspace's vschema before any of its tables: vtgate has
 // to know how to route a keyspace's queries before anything creates tables in
 // it, and a keyspace's vindexes can reference a table in another keyspace. Each
-// keyspace is seeded into every organization and database the server serves.
+// keyspace is seeded into every database that declares it.
 func TestSeedSchemaDirAppliesVSchemasBeforeTables(t *testing.T) {
 	dir := t.TempDir()
 	shop := filepath.Join(dir, "shop")
@@ -76,7 +76,10 @@ func TestSeedSchemaDirAppliesVSchemasBeforeTables(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	orgs := map[string]localscale.OrgConfig{
-		"sample": {Databases: map[string]localscale.DatabaseConfig{"commerce": {}}},
+		"sample": {Databases: map[string]localscale.DatabaseConfig{"commerce": {Keyspaces: []localscale.KeyspaceConfig{
+			{Name: "shop", Shards: 2},
+			{Name: "reports", Shards: 1},
+		}}}},
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	require.NoError(t, seedSchemaDir(t.Context(), server.URL, orgs, dir, logger))
@@ -88,12 +91,56 @@ func TestSeedSchemaDirAppliesVSchemasBeforeTables(t *testing.T) {
 	}, calls)
 }
 
+// One schema_dir serves every database the server holds, but each database
+// declares only the keyspaces it actually has. A keyspace directory is seeded
+// into the databases that declare it and left alone everywhere else, so a
+// database without that keyspace is not sent DDL its cluster would reject.
+func TestSeedSchemaDirSeedsOnlyDatabasesDeclaringTheKeyspace(t *testing.T) {
+	dir := t.TempDir()
+	shop := filepath.Join(dir, "shop")
+	require.NoError(t, os.MkdirAll(shop, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(shop, "vschema.json"), []byte(`{"sharded": true}`), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(shop, "customers.sql"), []byte("CREATE TABLE customers (id bigint unsigned NOT NULL, PRIMARY KEY (id))"), 0600))
+
+	type seeded struct {
+		Database string `json:"database"`
+		Keyspace string `json:"keyspace"`
+	}
+	var calls []seeded
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		var call seeded
+		require.NoError(t, json.Unmarshal(body, &call))
+		calls = append(calls, call)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	orgs := map[string]localscale.OrgConfig{
+		"sample": {Databases: map[string]localscale.DatabaseConfig{
+			"commerce":  {Keyspaces: []localscale.KeyspaceConfig{{Name: "shop", Shards: 2}}},
+			"analytics": {Keyspaces: []localscale.KeyspaceConfig{{Name: "reports", Shards: 1}}},
+		}},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	require.NoError(t, seedSchemaDir(t.Context(), server.URL, orgs, dir, logger))
+
+	// Only commerce declares shop, so analytics is never contacted at all.
+	require.Equal(t, []seeded{
+		{Database: "commerce", Keyspace: "shop"},
+		{Database: "commerce", Keyspace: "shop"},
+	}, calls)
+}
+
 // Seeding fails rather than starting a cluster whose schema is half applied, so
 // an unreadable directory or a rejected statement is surfaced to the operator.
 func TestSeedSchemaDirReportsFailures(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	orgs := map[string]localscale.OrgConfig{
-		"sample": {Databases: map[string]localscale.DatabaseConfig{"commerce": {}}},
+		"sample": {Databases: map[string]localscale.DatabaseConfig{"commerce": {
+			Keyspaces: []localscale.KeyspaceConfig{{Name: "shop", Shards: 2}},
+		}}},
 	}
 	require.ErrorContains(t, seedSchemaDir(t.Context(), "http://127.0.0.1:0", orgs, filepath.Join(t.TempDir(), "absent"), logger), "read schema dir")
 

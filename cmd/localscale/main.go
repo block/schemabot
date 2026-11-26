@@ -113,22 +113,25 @@ func main() {
 		DeployRequestDelay:    deployRequestDelay,
 		ProcessorTickInterval: processorTickInterval,
 		Logger:                logger,
+		// Seeding runs inside New, before the server reports healthy, so a
+		// dependent waiting on /health never starts against a cluster whose
+		// tables have not been created yet.
+		Seed: func(ctx context.Context, baseURL string) error {
+			if cf.SchemaDir == "" {
+				logger.Info("no schema_dir configured, skipping schema seeding")
+				return nil
+			}
+			logger.Info("seeding schema from schema_dir", "schema_dir", cf.SchemaDir)
+			if err := seedSchemaDir(ctx, baseURL, orgs, cf.SchemaDir, logger); err != nil {
+				return err
+			}
+			logger.Info("schema seeding complete")
+			return nil
+		},
 	})
 	if err != nil {
-		logger.Error("failed to start localscale", "error", err)
+		logger.Error("failed to start localscale", "schema_dir", cf.SchemaDir, "error", err)
 		os.Exit(1)
-	}
-
-	// Seed VSchema and tables from schema_dir if set
-	if cf.SchemaDir != "" {
-		logger.Info("seeding schema from schema_dir", "schema_dir", cf.SchemaDir)
-		if err := seedSchemaDir(ctx, server.URL(), orgs, cf.SchemaDir, logger); err != nil {
-			logger.Error("failed to seed schema", "schema_dir", cf.SchemaDir, "error", err)
-			os.Exit(1)
-		}
-		logger.Info("schema seeding complete")
-	} else {
-		logger.Info("no schema_dir configured, skipping schema seeding")
 	}
 
 	logger.Info("localscale running", "url", server.URL(), "orgs", len(orgs))
@@ -174,7 +177,12 @@ func seedSchemaDir(ctx context.Context, baseURL string, orgs map[string]localsca
 			return fmt.Errorf("read vschema for %s: %w", keyspace, err)
 		}
 		for orgName, orgCfg := range orgs {
-			for dbName := range orgCfg.Databases {
+			for dbName, dbCfg := range orgCfg.Databases {
+				if !databaseHasKeyspace(dbCfg, keyspace) {
+					logger.Debug("database does not declare this keyspace, skipping vschema",
+						"org", orgName, "database", dbName, "keyspace", keyspace)
+					continue
+				}
 				body := map[string]any{
 					"org":      orgName,
 					"database": dbName,
@@ -199,7 +207,12 @@ func seedSchemaDir(ctx context.Context, baseURL string, orgs map[string]localsca
 			continue
 		}
 		for orgName, orgCfg := range orgs {
-			for dbName := range orgCfg.Databases {
+			for dbName, dbCfg := range orgCfg.Databases {
+				if !databaseHasKeyspace(dbCfg, keyspace) {
+					logger.Debug("database does not declare this keyspace, skipping DDL",
+						"org", orgName, "database", dbName, "keyspace", keyspace)
+					continue
+				}
 				body := map[string]any{
 					"org":        orgName,
 					"database":   dbName,
@@ -215,6 +228,24 @@ func seedSchemaDir(ctx context.Context, baseURL string, orgs map[string]localsca
 	}
 
 	return nil
+}
+
+// adminRequestTimeout bounds a single seed request. Seeding submits a
+// keyspace's whole DDL batch in one call, so it is given more room than the
+// package's own admin calls, which carry a single operation each.
+const adminRequestTimeout = 30 * time.Second
+
+// databaseHasKeyspace reports whether a database declares the named keyspace.
+// A schema_dir is shared across every database, but each one declares only the
+// keyspaces it holds, so seeding a keyspace into a database that does not have
+// it is the configuration's answer rather than an error to surface.
+func databaseHasKeyspace(db localscale.DatabaseConfig, keyspace string) bool {
+	for _, ks := range db.Keyspaces {
+		if ks.Name == keyspace {
+			return true
+		}
+	}
+	return false
 }
 
 // keyspaceDDL reads a keyspace directory's .sql files in name order, so a
@@ -245,7 +276,12 @@ func postAdmin(ctx context.Context, baseURL, path string, body map[string]any) e
 	if err != nil {
 		return fmt.Errorf("encode %s request: %w", path, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+path, bytes.NewReader(payload))
+	// A seed statement waiting on a lock would otherwise hold startup open
+	// with no deadline to cancel it, since the admin endpoints run the SQL on
+	// the request's own context.
+	reqCtx, cancel := context.WithTimeout(ctx, adminRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, baseURL+path, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("create %s request: %w", path, err)
 	}

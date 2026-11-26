@@ -175,6 +175,12 @@ type Config struct {
 	DeployRequestDelay    time.Duration // Delay before deploy request diff computation starts
 	ProcessorTickInterval time.Duration // How often the state processor polls (default 500ms)
 	Logger                *slog.Logger
+	// Seed runs once the clusters accept DDL but before the server reports
+	// healthy, so /health never releases a dependent onto a cluster whose
+	// tables are still being created. It receives the server's own base URL,
+	// since the admin endpoints are already serving by the time it runs. A
+	// failure here fails New, leaving nothing behind that claims to be ready.
+	Seed func(ctx context.Context, baseURL string) error
 }
 
 // New creates a new LocalScale server and starts it on a random port.
@@ -452,6 +458,16 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	if err := s.waitForOnlineDDLReady(ctx); err != nil {
 		s.Close()
 		return nil, fmt.Errorf("wait for online DDL readiness: %w", err)
+	}
+
+	// Seeding runs before the server reports ready, so /health continues to
+	// mean "a schema change submitted now will land" rather than "the port is
+	// open and the tables may or may not exist yet".
+	if cfg.Seed != nil {
+		if err := cfg.Seed(ctx, s.baseURL); err != nil {
+			s.Close()
+			return nil, fmt.Errorf("seed localscale at %s: %w", s.baseURL, err)
+		}
 	}
 	s.ready.Store(true)
 
