@@ -1539,7 +1539,7 @@ The live database operation was already started and may continue independently o
      ```
      After the rollback completes, refresh the checks:
      ```
-     schemabot plan -e staging
+     schemabot plan
      ```
 <!-- schemabot:offer-support-channel -->
 
@@ -1578,7 +1578,7 @@ Choose one:
      ```
    - after the rollback completes, refresh the checks:
      ```
-     schemabot plan -e staging
+     schemabot plan
      ```
 <!-- schemabot:offer-support-channel -->
 

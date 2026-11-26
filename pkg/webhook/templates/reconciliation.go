@@ -167,7 +167,7 @@ func writeInProgressReconciliation(sb *strings.Builder, tenant string, items []S
 	sb.WriteString("   - If the live schema change should not remain, roll it back:\n")
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", rollbackCommand(tenant, items))
 	sb.WriteString("     After the rollback completes, refresh the checks:\n")
-	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", refreshChecksCommand(tenant, items))
+	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", refreshChecksCommand(tenant))
 }
 
 func writeCompletedReconciliation(sb *strings.Builder, tenant string, items []SchemaChangeReconciliationItem) {
@@ -183,7 +183,7 @@ func writeCompletedReconciliation(sb *strings.Builder, tenant string, items []Sc
 	sb.WriteString("   - comment:\n")
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", rollbackCommand(tenant, items))
 	sb.WriteString("   - after the rollback completes, refresh the checks:\n")
-	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", refreshChecksCommand(tenant, items))
+	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", refreshChecksCommand(tenant))
 }
 
 func planCommand(tenant string, items []SchemaChangeReconciliationItem) string {
@@ -199,15 +199,14 @@ func planCommand(tenant string, items []SchemaChangeReconciliationItem) string {
 }
 
 // refreshChecksCommand is the plan that clears the block once a rollback
-// completes. It names the environment but never a database: this comment only
-// posts on a PR with no SchemaBot files left, and a plan scoped to a database
-// goes to normal config discovery instead of refreshing the checks.
-func refreshChecksCommand(tenant string, items []SchemaChangeReconciliationItem) string {
-	item, ok := singleCommandItem(items)
-	if !ok {
-		return AppendTenantFlag("schemabot plan -e <environment>", tenant)
-	}
-	return AppendTenantFlag(fmt.Sprintf("schemabot plan -e %s", flattenIdentifier(item.Environment)), tenant)
+// completes. It names neither an environment nor a database: a plan that names
+// no database refreshes every environment's checks, so naming one environment
+// would suggest the refresh stops there, and a plan scoped to a database goes to
+// normal config discovery instead of refreshing the checks. This comment only
+// posts on a PR with no SchemaBot files left, which is the case the refresh
+// handles.
+func refreshChecksCommand(tenant string) string {
+	return AppendTenantFlag("schemabot plan", tenant)
 }
 
 func stopCommand(tenant string, items []SchemaChangeReconciliationItem) string {

@@ -422,11 +422,11 @@ func TestE2EPlanAfterRollbackWithNoManagedFilesConvergesPassing(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, testLogger(), WithInsecureSkipSignatureVerification())
 
-	req := buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot plan -e staging", isPR: true}, nil)
+	req := buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot plan", isPR: true}, nil)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "no managed schema changes handled")
+	assert.Contains(t, rr.Body.String(), "multi-env plan started")
 
 	select {
 	case body := <-result.comments:
