@@ -713,3 +713,24 @@ func TestCancelThatSendsNothingDoesNotWithdrawAnOverlappingCancel(t *testing.T) 
 		})
 	}
 }
+
+// A cancel that names no apply fails, even while a build runs: the engine
+// cannot tell which build the caller means, and a "nothing to cancel" answer
+// would let the caller record the build cancelled while it keeps running.
+func TestCancelThatNamesNoApplyFailsWhileABuildRuns(t *testing.T) {
+	eng := New()
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), nativeApply{namespace: "public", table: "t_a", sql: "CREATE INDEX CONCURRENTLY t_a_idx ON public.t_a (a)"}, ""), newTestTracker(t), slog.Default(), buildShape{}, nil, "")
+
+	for name, req := range map[string]*engine.ControlRequest{
+		"no resume state":   {},
+		"no apply identity": {ResumeState: &engine.ResumeState{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			result, err := eng.Cancel(t.Context(), req)
+			assert.Nil(t, result)
+			require.ErrorContains(t, err, "PostgreSQL cancel request names no apply")
+			var permanent *engine.PermanentError
+			assert.False(t, errors.As(err, &permanent), "a request that names no apply says nothing about whether work runs")
+		})
+	}
+}

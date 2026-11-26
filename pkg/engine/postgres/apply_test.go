@@ -3709,7 +3709,8 @@ func TestRecoveryFailureDetailNamesTheAbandonedIndex(t *testing.T) {
 // TestProgressIsKeyedToTheRequestingApply proves the engine answers Progress
 // for the apply the caller identifies, not for whichever apply wrote last:
 // one engine is shared for a target's lifetime, so a mismatched identity must
-// read the idle sentinel instead of another schema change's state.
+// read the idle sentinel instead of another schema change's state, and a
+// request with no identity is an error rather than that sentinel.
 func TestProgressIsKeyedToTheRequestingApply(t *testing.T) {
 	eng := New()
 	change := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
@@ -3731,9 +3732,11 @@ func TestProgressIsKeyedToTheRequestingApply(t *testing.T) {
 	assert.Equal(t, "No active schema change", other.Message)
 	assert.False(t, other.State.IsTerminal(), "another apply's identity must never read a terminal state")
 
+	// A request that names no apply has not asked about one, so it never reads
+	// the idle sentinel a caller may take as "nothing runs".
 	anonymous, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
-	require.NoError(t, err)
-	assert.Equal(t, engine.StatePending, anonymous.State)
+	require.ErrorContains(t, err, "PostgreSQL progress request names no apply")
+	assert.Nil(t, anonymous)
 }
 
 // TestConcurrentAppliesEachAnswerForTheirOwnWork proves accepting a second

@@ -52,6 +52,12 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 	if req != nil {
 		key = progressIdentity(req.ResumeState)
 	}
+	if key == "" {
+		// Without the apply's identity the engine cannot tell which build to
+		// end, or whether one runs at all, so the cancel fails rather than
+		// reporting that nothing runs.
+		return nil, errMissingApplyIdentity("cancel")
+	}
 
 	e.mu.Lock()
 	tracked := e.progress[key]
