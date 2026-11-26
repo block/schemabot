@@ -117,120 +117,6 @@ func TestFixer_FixCharset(t *testing.T) {
 	}
 }
 
-func TestFixer_FixFloat(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		contains string
-		wantFix  bool
-	}{
-		{
-			name:     "FLOAT column",
-			input:    `CREATE TABLE prices (amount FLOAT)`,
-			contains: "DECIMAL",
-			wantFix:  true,
-		},
-		{
-			name:     "FLOAT with precision",
-			input:    `CREATE TABLE prices (amount FLOAT(8,2))`,
-			contains: "DECIMAL(8,2)",
-			wantFix:  true,
-		},
-		{
-			name:     "DOUBLE column",
-			input:    `CREATE TABLE prices (amount DOUBLE)`,
-			contains: "DECIMAL",
-			wantFix:  true,
-		},
-		{
-			name:     "already DECIMAL",
-			input:    `CREATE TABLE prices (amount DECIMAL(10,2))`,
-			contains: "DECIMAL",
-			wantFix:  false,
-		},
-	}
-
-	fixer := NewFixer()
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := fixer.FixFiles(map[string]string{"test.sql": tt.input})
-			require.NoError(t, err)
-			fr := result.Files[0]
-
-			output := fr.FixedSQL
-			if output == "" {
-				output = tt.input
-			}
-
-			if tt.wantFix {
-				fixFound := false
-				for _, fix := range fr.Fixes {
-					if strings.Contains(fix, "DECIMAL") {
-						fixFound = true
-						break
-					}
-				}
-				assert.True(t, fixFound, "expected FLOAT→DECIMAL fix but didn't find it in fixes: %v", fr.Fixes)
-			}
-			assert.Contains(t, output, tt.contains)
-		})
-	}
-}
-
-func TestFixer_FixZeroDate(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		contains string
-		wantFix  bool
-	}{
-		{
-			name:     "TIMESTAMP without DEFAULT",
-			input:    `CREATE TABLE events (created_at TIMESTAMP)`,
-			contains: "DEFAULT",
-			wantFix:  true,
-		},
-		{
-			name:     "TIMESTAMP NOT NULL without DEFAULT",
-			input:    `CREATE TABLE events (created_at TIMESTAMP NOT NULL)`,
-			contains: "DEFAULT",
-			wantFix:  true,
-		},
-		{
-			name:     "already has DEFAULT",
-			input:    `CREATE TABLE events (created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
-			contains: "DEFAULT",
-			wantFix:  false,
-		},
-	}
-
-	fixer := NewFixer()
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := fixer.FixFiles(map[string]string{"test.sql": tt.input})
-			require.NoError(t, err)
-			fr := result.Files[0]
-
-			output := fr.FixedSQL
-			if output == "" {
-				output = tt.input
-			}
-
-			if tt.wantFix {
-				fixFound := false
-				for _, fix := range fr.Fixes {
-					if strings.Contains(fix, "DEFAULT") || strings.Contains(fix, "TIMESTAMP") {
-						fixFound = true
-						break
-					}
-				}
-				assert.True(t, fixFound, "expected zero date fix but didn't find it in fixes: %v", fr.Fixes)
-			}
-			assert.Contains(t, output, tt.contains)
-		})
-	}
-}
-
 func TestFixer_FixFiles(t *testing.T) {
 	fixer := NewFixer()
 
@@ -328,8 +214,8 @@ func TestTier2_Charset_Variants(t *testing.T) {
 			contains: "utf8mb4",
 		},
 		{
-			name:     "COLLATE latin1_general_ci",
-			input:    "CREATE TABLE t (id INT) COLLATE=latin1_general_ci",
+			name:     "CHARSET latin1 with an explicit COLLATE",
+			input:    "CREATE TABLE t (id INT) DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci",
 			wantFix:  true,
 			contains: "utf8mb4",
 		},
@@ -368,132 +254,6 @@ func TestTier2_Charset_Variants(t *testing.T) {
 		})
 	}
 }
-
-func TestTier2_Float_Variants(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		wantFix  bool
-		contains string
-	}{
-		{
-			name:     "FLOAT in column",
-			input:    "CREATE TABLE t (price FLOAT NOT NULL)",
-			wantFix:  true,
-			contains: "DECIMAL",
-		},
-		{
-			name:     "DOUBLE PRECISION",
-			input:    "CREATE TABLE t (price DOUBLE NOT NULL)",
-			wantFix:  true,
-			contains: "DECIMAL",
-		},
-		{
-			name:     "FLOAT(5,2) preserves precision",
-			input:    "CREATE TABLE t (price FLOAT(5,2))",
-			wantFix:  true,
-			contains: "DECIMAL(5,2)",
-		},
-		{
-			name:     "DECIMAL already - no change",
-			input:    "CREATE TABLE t (price DECIMAL(10,2))",
-			wantFix:  false,
-			contains: "DECIMAL",
-		},
-	}
-
-	fixer := NewFixer()
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := fixer.FixFiles(map[string]string{"test.sql": tt.input})
-			require.NoError(t, err)
-			fr := result.Files[0]
-
-			output := fr.FixedSQL
-			if output == "" {
-				output = tt.input
-			}
-
-			hasFloatFix := false
-			for _, fix := range fr.Fixes {
-				if strings.Contains(fix, "DECIMAL") {
-					hasFloatFix = true
-					break
-				}
-			}
-
-			if tt.wantFix {
-				assert.True(t, hasFloatFix, "wantFix=%v but no DECIMAL fix found in: %v", tt.wantFix, fr.Fixes)
-			}
-			assert.Contains(t, output, tt.contains)
-		})
-	}
-}
-
-func TestTier2_ZeroDate_Variants(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		wantFix  bool
-		contains string
-	}{
-		{
-			name:     "TIMESTAMP nullable no default",
-			input:    "CREATE TABLE t (created_at TIMESTAMP)",
-			wantFix:  true,
-			contains: "DEFAULT",
-		},
-		{
-			name:     "DATETIME NOT NULL no default",
-			input:    "CREATE TABLE t (created_at DATETIME NOT NULL)",
-			wantFix:  true,
-			contains: "DEFAULT",
-		},
-		{
-			name:     "already has DEFAULT CURRENT_TIMESTAMP",
-			input:    "CREATE TABLE t (created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
-			wantFix:  false,
-			contains: "DEFAULT",
-		},
-		{
-			name:     "already has DEFAULT NULL",
-			input:    "CREATE TABLE t (created_at TIMESTAMP DEFAULT NULL)",
-			wantFix:  false,
-			contains: "DEFAULT",
-		},
-	}
-
-	fixer := NewFixer()
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := fixer.FixFiles(map[string]string{"test.sql": tt.input})
-			require.NoError(t, err)
-			fr := result.Files[0]
-
-			output := fr.FixedSQL
-			if output == "" {
-				output = tt.input
-			}
-
-			hasZeroDateFix := false
-			for _, fix := range fr.Fixes {
-				if strings.Contains(fix, "DEFAULT") || strings.Contains(fix, "TIMESTAMP") || strings.Contains(fix, "DATETIME") {
-					hasZeroDateFix = true
-					break
-				}
-			}
-
-			if tt.wantFix {
-				assert.True(t, hasZeroDateFix, "wantFix=%v but no zero date fix found in: %v", tt.wantFix, fr.Fixes)
-			}
-			assert.Contains(t, output, tt.contains)
-		})
-	}
-}
-
-// =============================================================================
-// Tier 3 Error Tests - Unfixable issues requiring human judgment
-// =============================================================================
 
 func TestTier3_RemainingIssues(t *testing.T) {
 	// These should be reported but NOT auto-fixed
@@ -547,6 +307,9 @@ func TestTier4_UnsafeNotFixed(t *testing.T) {
 // Combined Multi-Tier Tests
 // =============================================================================
 
+// A table that carries several problems has the mechanical ones fixed and the
+// rest reported: the float column's precision and the date column's default
+// are the schema owner's to choose, so the fixer names them and moves on.
 func TestFixFiles_MultipleFixes(t *testing.T) {
 	fixer := NewFixer()
 
@@ -561,13 +324,18 @@ func TestFixFiles_MultipleFixes(t *testing.T) {
 	result, err := fixer.FixFiles(files)
 	require.NoError(t, err)
 
-	// Should fix: INT->BIGINT, FLOAT->DECIMAL, charset->utf8mb4, TIMESTAMP DEFAULT
-	assert.GreaterOrEqual(t, result.TotalFixed, 3, "expected at least 3 fixes, got: %v", result.Files[0].Fixes)
-
 	fr := result.Files[0]
-	assert.Contains(t, fr.FixedSQL, "BIGINT", "expected BIGINT fix")
-	assert.Contains(t, fr.FixedSQL, "DECIMAL", "expected DECIMAL fix")
-	assert.Contains(t, strings.ToUpper(fr.FixedSQL), "UTF8MB4", "expected utf8mb4 fix")
+	assert.Equal(t, []string{"INT → BIGINT for primary key", "charset → utf8mb4"}, fr.Fixes)
+	assert.Equal(t, 2, result.TotalFixed)
+	assert.Contains(t, fr.FixedSQL, "BIGINT")
+	assert.Contains(t, strings.ToUpper(fr.FixedSQL), "UTF8MB4")
+	assert.Contains(t, fr.FixedSQL, "FLOAT", "the float column is reported, not retyped")
+
+	var linters []string
+	for _, issue := range result.RemainingIssues {
+		linters = append(linters, issue.Linter)
+	}
+	assert.Contains(t, linters, "has_float")
 }
 
 func TestFixFiles_NoChangesNeeded(t *testing.T) {
@@ -773,34 +541,18 @@ func TestFixFiles_MultipleTablesInOneFile(t *testing.T) {
 }
 
 // A fix visits every column of a table, not only the first one that matches.
+// A table should declare at most one AUTO_INCREMENT column, but a schema file
+// is not the database and can say otherwise, and a fixer that stopped at the
+// first match would report the fix as applied while leaving the rest widened.
 func TestFixFiles_FixesEveryMatchingColumn(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  []string
-	}{
-		{
-			name:  "float columns",
-			input: "CREATE TABLE `t` (`id` BIGINT UNSIGNED AUTO_INCREMENT, `a` DOUBLE NOT NULL, `b` DOUBLE NOT NULL, `c` DOUBLE NOT NULL, PRIMARY KEY (`id`))",
-			want:  []string{"`a` DECIMAL(10,2)", "`b` DECIMAL(10,2)", "`c` DECIMAL(10,2)"},
-		},
-		{
-			name:  "date columns with no default",
-			input: "CREATE TABLE `t` (`id` BIGINT UNSIGNED AUTO_INCREMENT, `a` DATETIME NOT NULL, `b` DATETIME NOT NULL, PRIMARY KEY (`id`))",
-			want:  []string{"`a` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP()", "`b` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP()"},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := NewFixer().FixFiles(map[string]string{"t.sql": tt.input})
-			require.NoError(t, err)
-			require.Len(t, result.Files, 1)
-			require.True(t, result.Files[0].Changed)
-			for _, want := range tt.want {
-				assert.Contains(t, result.Files[0].FixedSQL, want)
-			}
-		})
-	}
+	const input = "CREATE TABLE `t` (`a` INT AUTO_INCREMENT, `b` INT AUTO_INCREMENT, PRIMARY KEY (`a`))"
+
+	result, err := NewFixer().FixFiles(map[string]string{"t.sql": input})
+	require.NoError(t, err)
+	require.Len(t, result.Files, 1)
+	require.True(t, result.Files[0].Changed)
+	assert.Contains(t, result.Files[0].FixedSQL, "`a` BIGINT AUTO_INCREMENT")
+	assert.Contains(t, result.Files[0].FixedSQL, "`b` BIGINT AUTO_INCREMENT")
 }
 
 // A finding the fixer has no fix for is reported whatever its severity. Most
@@ -822,21 +574,53 @@ func TestFixFiles_RemainingWarningsAreReported(t *testing.T) {
 	assert.ElementsMatch(t, []string{"allow_charset", "primary_key"}, linters)
 }
 
-// A zero date is a default the schema's owner chose, so the fixer leaves it
-// and reports it rather than deciding what new rows should get instead. A
-// date column with no default at all is still given one.
-func TestFixFiles_ZeroDateIsReportedNotRewritten(t *testing.T) {
+// What a date column gives new rows is the schema owner's decision, so the
+// fixer neither replaces a zero date nor invents a default for a column that
+// declares none. Both columns are left exactly as written, and the finding
+// the linter does have is reported.
+func TestFixFiles_DateDefaultsAreLeftToTheOwner(t *testing.T) {
 	const input = "CREATE TABLE `t` (`id` BIGINT UNSIGNED AUTO_INCREMENT, `placed_at` DATETIME NOT NULL DEFAULT '0000-00-00 00:00:00', `seen_at` DATETIME NOT NULL, PRIMARY KEY (`id`))"
 
 	result, err := NewFixer().FixFiles(map[string]string{"t.sql": input})
 	require.NoError(t, err)
-	require.True(t, result.Files[0].Changed)
-	assert.Contains(t, result.Files[0].FixedSQL, "'0000-00-00 00:00:00'", "the zero date is left as written")
-	assert.Contains(t, result.Files[0].FixedSQL, "`seen_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP()")
+	assert.False(t, result.Files[0].Changed, "neither date column has a mechanical fix")
+	assert.Equal(t, 0, result.TotalFixed)
 
 	require.Len(t, result.RemainingIssues, 1)
 	assert.Equal(t, "zero_date", result.RemainingIssues[0].Linter)
 	assert.Equal(t, "placed_at", result.RemainingIssues[0].Column)
+}
+
+// The precision a float column should carry is the schema owner's decision,
+// so the fixer reports the finding instead of picking one. A bare DECIMAL
+// means DECIMAL(10,0), which would silently drop the fractional part, and
+// there is no precision the fixer could infer from the file.
+func TestFixFiles_FloatPrecisionIsLeftToTheOwner(t *testing.T) {
+	const input = "CREATE TABLE `t` (`id` BIGINT UNSIGNED AUTO_INCREMENT, `amount` FLOAT NOT NULL, PRIMARY KEY (`id`))"
+
+	result, err := NewFixer().FixFiles(map[string]string{"t.sql": input})
+	require.NoError(t, err)
+	assert.False(t, result.Files[0].Changed)
+	assert.Equal(t, 0, result.TotalFixed)
+
+	require.Len(t, result.RemainingIssues, 1)
+	assert.Equal(t, "has_float", result.RemainingIssues[0].Linter)
+	assert.Equal(t, "amount", result.RemainingIssues[0].Column)
+}
+
+// A collation the fixed charset cannot accept is dropped rather than
+// replaced, so the charset's own default applies and the fixer never picks
+// the ordering a table compares under.
+func TestFixFiles_CharsetFixDropsTheOldCollation(t *testing.T) {
+	const input = "CREATE TABLE `t` (`id` BIGINT UNSIGNED AUTO_INCREMENT, PRIMARY KEY (`id`)) DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci"
+
+	result, err := NewFixer().FixFiles(map[string]string{"t.sql": input})
+	require.NoError(t, err)
+	require.True(t, result.Files[0].Changed)
+	assert.Equal(t, []string{"charset → utf8mb4"}, result.Files[0].Fixes)
+	assert.Contains(t, strings.ToUpper(result.Files[0].FixedSQL), "UTF8MB4")
+	assert.NotContains(t, strings.ToUpper(result.Files[0].FixedSQL), "COLLATE")
+	assert.Empty(t, result.RemainingIssues)
 }
 
 // A statement the fixer has no fix for is copied through as written, so

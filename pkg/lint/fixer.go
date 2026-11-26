@@ -13,37 +13,22 @@ import (
 	"github.com/block/spirit/pkg/statement"
 )
 
-// Fixer generates auto-fixes for lint violations using AST manipulation.
-// Parses SQL, walks the AST to apply fixes, and restores a fixed file to
+// Fixer applies the mechanical lint fixes to a schema file.
+//
+// A fix belongs here when the linter reports the problem and the correction
+// follows from the report with nothing left to decide. Anything that needs the
+// schema owner's judgement — which collation a table sorts under, what
+// precision a money column carries, what value new rows get by default — is
+// left alone and reported, because the fixer cannot know what the owner meant
+// and a wrong guess is a schema change nobody asked for.
+//
+// Parses SQL, walks the AST to apply fixes, and restores a fixed table to
 // canonical form. A file with nothing to fix is returned as written.
-type Fixer struct {
-	config FixerConfig
-}
+type Fixer struct{}
 
-// FixerConfig holds configuration for the fixer.
-type FixerConfig struct {
-	// DefaultDecimalPrecision is used when converting FLOAT to DECIMAL.
-	// Default: (10, 2)
-	DefaultDecimalPrecision int
-	DefaultDecimalScale     int
-}
-
-// DefaultFixerConfig returns the default fixer configuration.
-func DefaultFixerConfig() FixerConfig {
-	return FixerConfig{
-		DefaultDecimalPrecision: 10,
-		DefaultDecimalScale:     2,
-	}
-}
-
-// NewFixer creates a new Fixer with default configuration.
+// NewFixer creates a new Fixer.
 func NewFixer() *Fixer {
-	return &Fixer{config: DefaultFixerConfig()}
-}
-
-// NewFixerWithConfig creates a new Fixer with custom configuration.
-func NewFixerWithConfig(cfg FixerConfig) *Fixer {
-	return &Fixer{config: cfg}
+	return &Fixer{}
 }
 
 // FixResult contains the result of fixing a single file.
@@ -212,26 +197,12 @@ func (f *Fixer) fixStatement(stmt *statement.AbstractStatement, original string)
 func (f *Fixer) fixTable(ct *statement.CreateTable) []string {
 	var fixes []string
 
-	// Fix 1: INT AUTO_INCREMENT -> BIGINT AUTO_INCREMENT
-	for _, col := range ct.Raw.Cols {
-		if f.fixColumnPrimaryKeyType(col) {
-			fixes = append(fixes, "INT → BIGINT for primary key")
-		}
+	if applyToColumns(ct.Raw.Cols, f.fixColumnPrimaryKeyType) {
+		fixes = append(fixes, "INT → BIGINT for primary key")
 	}
 
-	// Fix 2: charset latin1/utf8 -> utf8mb4
 	if f.fixTableCharset(ct.Raw) {
 		fixes = append(fixes, "charset → utf8mb4")
-	}
-
-	// Fix 3: FLOAT/DOUBLE -> DECIMAL
-	if applyToColumns(ct.Raw.Cols, f.fixColumnFloatType) {
-		fixes = append(fixes, "FLOAT/DOUBLE → DECIMAL") // Only report once
-	}
-
-	// Fix 4: TIMESTAMP/DATETIME without DEFAULT
-	if applyToColumns(ct.Raw.Cols, f.fixColumnMissingDateDefault) {
-		fixes = append(fixes, "Added DEFAULT for TIMESTAMP/DATETIME") // Only report once
 	}
 
 	return fixes
@@ -277,98 +248,34 @@ func (f *Fixer) fixColumnPrimaryKeyType(col *ast.ColumnDef) bool {
 	return false
 }
 
-// fixTableCharset changes latin1/utf8 charset to utf8mb4.
-// Returns true if a fix was applied.
+// fixTableCharset changes a disallowed table charset to utf8mb4. Returns true
+// if a fix was applied.
+//
+// A collation the new charset cannot accept is dropped rather than replaced,
+// so the charset's own default applies. No linter asks for a particular
+// collation, and the one a table sorts and compares under is the schema
+// owner's to choose, so the fixer declines to pick one instead of inventing
+// it. Dropping it is also what makes a table that spelled its collation out
+// and one that left it off come out the same way.
 func (f *Fixer) fixTableCharset(stmt *ast.CreateTableStmt) bool {
 	fixed := false
 	for _, opt := range stmt.Options {
-		if opt.Tp == ast.TableOptionCharset {
-			charset := strings.ToLower(opt.StrValue)
-			if charset == "latin1" || charset == "utf8" {
-				opt.StrValue = "utf8mb4"
-				fixed = true
-			}
+		if opt.Tp != ast.TableOptionCharset {
+			continue
 		}
-		if opt.Tp == ast.TableOptionCollate {
-			collate := strings.ToLower(opt.StrValue)
-			if strings.HasPrefix(collate, "latin1_") || strings.HasPrefix(collate, "utf8_") {
-				opt.StrValue = "utf8mb4_unicode_ci"
-				fixed = true
-			}
+		charset := strings.ToLower(opt.StrValue)
+		if charset == "latin1" || charset == "utf8" {
+			opt.StrValue = "utf8mb4"
+			fixed = true
 		}
 	}
-	return fixed
-}
-
-// fixColumnFloatType changes FLOAT/DOUBLE to DECIMAL.
-// Returns true if a fix was applied.
-func (f *Fixer) fixColumnFloatType(col *ast.ColumnDef) bool {
-	tp := col.Tp.GetType()
-	if tp != mysql.TypeFloat && tp != mysql.TypeDouble {
+	if !fixed {
 		return false
 	}
 
-	// Preserve precision if specified, otherwise use defaults
-	flen := col.Tp.GetFlen()
-	decimal := col.Tp.GetDecimal()
-
-	if flen <= 0 {
-		flen = f.config.DefaultDecimalPrecision
-	}
-	if decimal < 0 {
-		decimal = f.config.DefaultDecimalScale
-	}
-
-	col.Tp.SetType(mysql.TypeNewDecimal)
-	col.Tp.SetFlen(flen)
-	col.Tp.SetDecimal(decimal)
-	return true
-}
-
-// fixColumnMissingDateDefault gives a TIMESTAMP/DATETIME column that declares
-// no DEFAULT one: CURRENT_TIMESTAMP when the column is NOT NULL, NULL
-// otherwise. Returns true if a fix was applied.
-//
-// A column that already declares a DEFAULT is left alone, including one whose
-// default is a zero date. Replacing a zero date changes what new rows get,
-// which is the schema owner's decision and not a mechanical fix, so the
-// zero_date finding is reported rather than resolved here.
-func (f *Fixer) fixColumnMissingDateDefault(col *ast.ColumnDef) bool {
-	tp := col.Tp.GetType()
-	if tp != mysql.TypeTimestamp && tp != mysql.TypeDatetime {
-		return false
-	}
-
-	// A column that already declares a DEFAULT, zero date or not, is the
-	// owner's to change.
-	hasDefault := false
-	isNotNull := false
-	for _, opt := range col.Options {
-		if opt.Tp == ast.ColumnOptionDefaultValue {
-			hasDefault = true
-		}
-		if opt.Tp == ast.ColumnOptionNotNull {
-			isNotNull = true
-		}
-	}
-
-	if hasDefault {
-		return false
-	}
-
-	// Add appropriate DEFAULT
-	if isNotNull {
-		// NOT NULL columns get DEFAULT CURRENT_TIMESTAMP
-		col.Options = append(col.Options, &ast.ColumnOption{
-			Tp:   ast.ColumnOptionDefaultValue,
-			Expr: &ast.FuncCallExpr{FnName: ast.NewCIStr("CURRENT_TIMESTAMP")},
-		})
-	} else {
-		// Nullable columns get DEFAULT NULL
-		col.Options = append(col.Options, &ast.ColumnOption{
-			Tp:   ast.ColumnOptionDefaultValue,
-			Expr: ast.NewValueExpr(nil, "", ""),
-		})
-	}
+	stmt.Options = slices.DeleteFunc(stmt.Options, func(opt *ast.TableOption) bool {
+		return opt.Tp == ast.TableOptionCollate &&
+			!strings.HasPrefix(strings.ToLower(opt.StrValue), "utf8mb4_")
+	})
 	return true
 }

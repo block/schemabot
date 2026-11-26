@@ -90,11 +90,18 @@ alone, comments included. A rewritten table is replaced by the parser's
 canonical rendering of it: one line, backtick-quoted identifiers, uppercase
 types, closed with a semicolon. Comments attached to that table are not kept.
 
-A fix visits every column of a table, so three columns with the same problem
-are all fixed. A zero date is the exception the fixer reports rather than
-resolves: the default a column already declares is the schema owner's choice,
-and replacing it changes what new rows get. A `TIMESTAMP` or `DATETIME` column
-that declares no default at all is still given one.
+What it fixes is deliberately narrow. A fix belongs here when the linter
+reports the problem and the correction follows from the report with nothing
+left to decide: an `INT AUTO_INCREMENT` primary key is widened to `BIGINT`,
+and a disallowed table charset becomes `utf8mb4`. A fix visits every column,
+so three columns with the same problem are all fixed.
+
+Everything that needs your judgement is reported instead. The fixer will not
+pick a collation, a `DECIMAL` precision for a `FLOAT` column, or the value new
+rows get by default — a zero date included. Each of those is a schema change
+with consequences only the schema's owner can weigh, and a guess is a change
+nobody asked for. Fixing a charset therefore drops a collation the new charset
+cannot accept rather than replacing it, so the charset's own default applies.
 
 It reads the same files `plan` does: `.sql` files directly in the schema
 directory, or one level of namespace subdirectories (`<schema-dir>/<namespace>/*.sql`),
