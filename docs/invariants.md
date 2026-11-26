@@ -1963,8 +1963,11 @@ back, matching a task to its change by the statement's canonical form (`planChan
 `pkg/tern/plan_change_metadata.go`); the apply refuses a drop with no record
 and drops nothing when the object no longer matches it under the table's lock
 (`reviewedDropForApply` and `executeReviewedDrop` in `pkg/engine/postgres/apply.go`;
-`tableDropForApply` and `executeTableDrop` in `pkg/engine/postgres/table_drop.go`;
-`indexDropForApply` and `executeIndexDrop` in `pkg/engine/postgres/index_drop.go`).
+`tableDropForApply` and `executeTableDrop` in `pkg/engine/postgres/table_drop.go`).
+An index drop runs `DROP INDEX CONCURRENTLY`, which holds no lock between its check and the
+drop: the index is checked on the dropping session right before the drop, and an index another
+session renamed aside and replaced in that window is detected after the drop and refuses the
+apply (`indexDropForApply` and `executeIndexDrop` in `pkg/engine/postgres/index_drop.go`).
 The re-plan an apply runs after a confirmation, or after an automatic apply posts its plan, holds
 each statement the confirmed plan ran to the engine's record of the objects it acts on: a record
 that differs refuses the confirmation, or stops the automatic apply for manual confirmation

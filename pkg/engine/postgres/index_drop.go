@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -79,7 +80,8 @@ func executeIndexDrop(ctx context.Context, pool *pgxpool.Pool, change nativeAppl
 	dropped, err := executor.ExecuteDropIndexConcurrently(ctx, pool, change.namespace, change.table, change.dropped.Name, change.dropped.Definition,
 		executor.ConcurrentBudget{Overall: indexDropLimit})
 	if err != nil {
-		return fmt.Errorf("drop reviewed index %q on PostgreSQL table %q.%q: %w", change.dropped.Name, change.namespace, change.table, err)
+		return fmt.Errorf("drop reviewed index %q on PostgreSQL table %q.%q: %w", change.dropped.Name, change.namespace, change.table,
+			nameIndexDropTimeout(err, change.dropped.Name, indexDropLimit))
 	}
 	logger.Info("PostgreSQL index dropped concurrently",
 		"database", change.database,
@@ -88,4 +90,32 @@ func executeIndexDrop(ctx context.Context, pool *pgxpool.Pool, change nativeAppl
 		"index", change.dropped.Name,
 		"elapsed", dropped.Duration)
 	return nil
+}
+
+// indexDropTimeoutError reports that a concurrent index drop ran past its
+// limit and the server cancelled it. A cancelled DROP INDEX CONCURRENTLY can
+// leave the index in place and invalid. A plan never drops an invalid index,
+// so the operator finishes that drop by hand.
+type indexDropTimeoutError struct {
+	index string
+	limit time.Duration
+	err   error
+}
+
+func (e *indexDropTimeoutError) Error() string {
+	return fmt.Sprintf("the concurrent drop of index %q ran past %s and was cancelled", e.index, e.limit)
+}
+
+func (e *indexDropTimeoutError) Unwrap() error { return e.err }
+
+// nameIndexDropTimeout wraps a drop failure caused by the drop's statement
+// budget firing, so the refusal names the index and how to finish the drop.
+// Every other failure passes through unchanged. The drop runs with
+// lock_timeout disabled, so only the statement cause is the limit's.
+func nameIndexDropTimeout(err error, index string, limit time.Duration) error {
+	var budgetErr *executor.BudgetError
+	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
+		return &indexDropTimeoutError{index: index, limit: limit, err: err}
+	}
+	return err
 }

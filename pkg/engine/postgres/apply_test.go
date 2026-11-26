@@ -323,6 +323,22 @@ func TestClassifyRefusal(t *testing.T) {
 			wantNotDetail: []string{"statement budget", replanRemedy},
 		},
 		{
+			name: "concurrent index drop that ran past its limit names the index and the drop to finish",
+			err: fmt.Errorf("drop reviewed index %q on PostgreSQL table %q.%q: %w", "orders_status_idx", "public", "orders",
+				nameIndexDropTimeout(&executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Hour}, "orders_status_idx", time.Hour)),
+			wantReason: "index-drop-timed-out",
+			wantDetail: []string{
+				`the drop of index "orders_status_idx" on "users" ran past 1h0m0s and was cancelled, which can leave the index invalid`,
+				`if index "orders_status_idx" is still on the table and invalid, finish the drop outside SchemaBot with DROP INDEX CONCURRENTLY; then ` + replanRemedy,
+			},
+			wantNotDetail: []string{"statement budget"},
+		},
+		{
+			name: "a concurrent index drop that lost its lock budget is not named as a timeout",
+			err: fmt.Errorf("drop reviewed index: %w",
+				nameIndexDropTimeout(&executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}, "orders_status_idx", time.Hour)),
+		},
+		{
 			name: "lock budget exhaustion is operational",
 			err:  fmt.Errorf("execute: %w", &executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}),
 		},

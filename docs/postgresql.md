@@ -740,6 +740,12 @@ dropped and created again under the same name, nothing is dropped. Plan again
 and review the new plan. An index that a table's replica identity uses is not
 dropped either: point `REPLICA IDENTITY` elsewhere first.
 
+PostgreSQL drops an index only by name, and a concurrent drop holds no lock
+between the check and the drop. If another session renames the index and
+gives its name to a new one in that moment, the new one is dropped. The apply
+detects this and fails. Inspect the table's indexes and recreate the dropped
+one if it should stay.
+
 An index of a partitioned table is blocked, because PostgreSQL cannot drop it
 concurrently. Drop it outside SchemaBot when a lock on every partition is
 acceptable, then plan again.

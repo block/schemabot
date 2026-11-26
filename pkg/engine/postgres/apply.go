@@ -1052,6 +1052,18 @@ func refusalForCause(err error, table string) *refusal {
 		return &refusal{reason: "partitioned-index-bound-exceeded", cause: partitionedBoundErr.Error(),
 			remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
 	}
+	// A cancelled concurrent drop can leave the index invalid, which no plan
+	// drops, so the refusal names the index and the drop to finish by hand.
+	// Decided before the budget arm, which would hide the index.
+	var dropTimeoutErr *indexDropTimeoutError
+	if errors.As(err, &dropTimeoutErr) {
+		index := boundedQuote(dropTimeoutErr.index, quotedTableWidth)
+		return &refusal{reason: "index-drop-timed-out",
+			cause: fmt.Sprintf("the drop of index %s on %s ran past %s and was cancelled, which can leave the index invalid",
+				index, quotedTable(table), dropTimeoutErr.limit),
+			remedy: fmt.Sprintf("if index %s is still on the table and invalid, finish the drop outside SchemaBot with DROP INDEX CONCURRENTLY; then %s",
+				index, replanRemedy)}
+	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
 		return &refusal{reason: "not-native-safe-budget-exceeded", cause: budgetErr.Error()}
@@ -1361,7 +1373,7 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeRenamedIndexDrift, executor.CodeDroppedIndexDrift:
 		// The index or constraint the planned statement names changed after
 		// planning — dropped, replaced, left invalid, or now backing a
-		// constraint — read again under the table's lock; nothing was
+		// constraint — read again right before the statement; nothing was
 		// applied. The plan is stale, so only a re-plan changes the outcome.
 		return &refusal{reason: "planned-object-drift",
 			cause:  fmt.Sprintf("the index or constraint the planned statement for %s names changed after planning", quotedTable(table)),
