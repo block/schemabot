@@ -6,6 +6,8 @@ import (
 
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
+	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // ShardFailureCallout is the failure callout for a sharded apply: how many
@@ -21,8 +23,8 @@ func ShardFailureCallout(applyState string, ops []ProgressOperation, tables []Ta
 	var b strings.Builder
 	if len(summary.Reasons) == 1 && summary.MoreReasons == 0 {
 		subject := summary.Verb() + " " + shardNameList(summary.Names, totalShards)
-		if reason := summary.Reasons[0].Reason; reason != "" {
-			subject += ": " + reason
+		if r := summary.Reasons[0]; r.Reason != "" || r.Detail != "" {
+			subject += ": " + r.Shown()
 		}
 		fmt.Fprintf(&b, "  %s %s%s%s\n", summary.Glyph(), ANSIRed, subject, ANSIReset)
 		return b.String()
@@ -30,11 +32,7 @@ func ShardFailureCallout(applyState string, ops []ProgressOperation, tables []Ta
 	// Each reason's line names its shards, so the headline only counts them.
 	fmt.Fprintf(&b, "  %s %s%s %s:%s\n", summary.Glyph(), ANSIRed, summary.Verb(), presentation.CoveragePhrase(presentation.ShardNoun, len(summary.Names), totalShards), ANSIReset)
 	for _, r := range summary.Reasons {
-		reason := r.Reason
-		if reason == "" {
-			reason = presentation.NoReasonRecorded
-		}
-		fmt.Fprintf(&b, "    - %s: %s\n", shardNameList(r.Names, totalShards), reason)
+		fmt.Fprintf(&b, "    - %s: %s\n", shardNameList(r.Names, totalShards), r.Shown())
 	}
 	if more := summary.MoreLine(presentation.ShardNoun); more != "" {
 		fmt.Fprintf(&b, "    - %s\n", more)
@@ -86,6 +84,14 @@ func shardFailures(applyState string, ops []ProgressOperation, tables []TablePro
 		refs[i] = presentation.ShardRef{Keyspace: s.Keyspace, Shard: s.Shard}
 	}
 	names := presentation.QualifyShardNames(refs)
+	// Shards are grouped on the reason the PR comment shows
+	// (webhooktemplates.SanitizeInlineError), so both surfaces count the same
+	// shards under the same reasons (UX-9). The terminal is an operator's own
+	// view, so a reason whose shards all recorded the same error prints that
+	// error in full, with only the runes a terminal would act on removed
+	// (ui.TerminalSafeInline); shards that read the same only once their hosts
+	// are redacted print the redacted reason, since no one shard's host speaks
+	// for the rest.
 	var failures []presentation.Failure
 	for i, s := range statuses {
 		if !presentation.FailedMember(s.State, s.Presentation == presentation.StateStoppedAtCutover) {
@@ -93,7 +99,8 @@ func shardFailures(applyState string, ops []ProgressOperation, tables []TablePro
 		}
 		failures = append(failures, presentation.Failure{
 			Name:     names[i],
-			Reason:   oneLineReason(s.Error),
+			Reason:   webhooktemplates.SanitizeInlineError(s.Error),
+			Detail:   ui.TerminalSafeInline(s.Error),
 			Retrying: state.IsState(s.State, state.ApplyOperation.FailedRetryable),
 		})
 	}
@@ -104,15 +111,6 @@ func shardFailures(applyState string, ops []ProgressOperation, tables []TablePro
 		}
 	}
 	return presentation.SummarizeFailures(failures), len(statuses), qualified, true
-}
-
-// oneLineReason folds a shard's error onto one line, so two shards whose
-// errors differ only in line breaks or spacing group under one reason, as the
-// PR comment groups them, and a line break cannot escape the callout's indent.
-// The PR comment also redacts connection details, since it is public; the CLI
-// is an operator's own view and shows the reason in full.
-func oneLineReason(msg string) string {
-	return strings.Join(strings.Fields(msg), " ")
 }
 
 // shardNameList names a few shards, or counts them against the apply's shards

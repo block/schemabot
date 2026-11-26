@@ -190,6 +190,61 @@ func TestShardFailureReasonsReadTheSameOnEverySurface(t *testing.T) {
 	}
 }
 
+// Four shards fail to reach their own primaries, so their errors differ only
+// in the host. Both surfaces group them under one reason, the error with the
+// host redacted, since no one shard's host speaks for the rest.
+func TestShardFailureReasonsGroupAcrossHostsOnEverySurface(t *testing.T) {
+	reasons := []string{
+		"rpc error: code = Unavailable desc = dial tcp 10.0.0.11:3306: connect: connection refused",
+		"rpc error: code = Unavailable desc = dial tcp 10.0.0.12:3306: connect: connection refused",
+		"rpc error: code = Unavailable desc = dial tcp 10.0.0.13:3306: connect: connection refused",
+		"rpc error: code = Unavailable desc = dial tcp 10.0.0.14:3306: connect: connection refused",
+	}
+	failures := make([]shardFailure, len(reasons))
+	for i, r := range reasons {
+		failures[i] = failedFor(r)
+	}
+	cli := watchShardFailure(t, shardFailureResponse(state.Apply.Failed, 0, failures...))
+
+	names := shardFailureShards()
+	shards := make([]webhooktemplates.ShardStatus, len(names))
+	for i, name := range names {
+		shards[i] = webhooktemplates.ShardStatus{Shard: name, Emoji: "⏸️", Label: "halted — -10 failed", State: state.ApplyOperation.Pending}
+		if i < len(reasons) {
+			shards[i] = webhooktemplates.ShardStatus{Shard: name, Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: reasons[i]}
+		}
+	}
+	pr := webhooktemplates.RenderShardedApplyComment(webhooktemplates.ShardedApplyData{
+		State: state.Apply.Failed, Environment: "production", Database: "shop", ApplyID: "apply-a1b2c3d4e5f6",
+		Keyspaces: []webhooktemplates.ShardedKeyspace{{Keyspace: "shop_sharded", Shards: shards}},
+	})
+	prPlain := strings.NewReplacer("> ", "", "**", "", "`", "").Replace(pr)
+
+	line := "❌ Failed on shards -10, 10-20, 20-30, 30-40: dial tcp [endpoint redacted]: connect: connection refused"
+	assert.Contains(t, cli, line, "CLI")
+	assert.Contains(t, prPlain, line, "PR comment")
+	assert.NotContains(t, cli, "10.0.0.1", "no one shard's host stands for the group")
+}
+
+// Shards that all recorded the same error group the same way on both
+// surfaces, and the terminal, an operator's own view, prints that error in
+// full where the public PR comment redacts its host.
+func TestShardFailureReasonSharedByEveryShardReadsInFullInTheTerminal(t *testing.T) {
+	reason := "dial tcp 10.0.0.11:3306: connect: connection refused"
+	cli := watchShardFailure(t, shardFailureResponse(state.Apply.Failed, 0, failedFor(reason), failedFor(reason)))
+	assert.Contains(t, cli, "  ❌ Failed on shards -10, 10-20: "+reason+"\n")
+}
+
+// A shard's error is engine text, so the runes a terminal acts on, such as
+// the escape that clears the screen, are removed before the callout prints it.
+func TestWriteProgressShardedFailureReasonDropsTerminalControls(t *testing.T) {
+	cli := watchShardFailure(t, shardFailureResponse(state.Apply.Failed, 0,
+		failedFor("\x1b[2J"+dupesReason+"\x07"), failedFor(timeoutReason)))
+	assert.NotContains(t, cli, "\x1b")
+	assert.NotContains(t, cli, "\x07")
+	assert.Contains(t, cli, "    - shard -10: [2J"+dupesReason+"\n")
+}
+
 // Keyspaces split on the same key ranges share shard names, so the CLI and the
 // PR comment both name each failed shard with its keyspace when a name repeats.
 func TestShardFailureNamesQualifyRepeatedShardsOnEverySurface(t *testing.T) {

@@ -2601,8 +2601,8 @@ func shardGroupSignature(s KeyspaceShardChange) string {
 // comment, for the shards of a keyspace and the targets of a rollout alike.
 // Beyond it, listing every name reads as a wall — a wide group collapses to a
 // count, with the names behind a collapsed block where the rendering has room
-// for one.
-const shardNamesInlineLimit = 8
+// for one. It is the CLI's limit too (presentation.MemberNamesInlineLimit).
+const shardNamesInlineLimit = presentation.MemberNamesInlineLimit
 
 // A plan group's members render through the same group headings whatever
 // they are called, so a rollout whose targets need different work reads the

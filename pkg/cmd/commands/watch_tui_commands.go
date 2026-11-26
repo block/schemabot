@@ -182,7 +182,7 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 		atOnce:       data.MaxOperationsAtOnce,
 		deferCutover: data.Options["defer_cutover"] == "true",
 		stoppedBy:    data.StoppedByFreeze,
-		errorMsg:     data.ErrorMessage,
+		errorMsg:     ui.TerminalSafe(data.ErrorMessage),
 		applyID:      result.ApplyID,
 		database:     result.Database,
 		environment:  result.Environment,

@@ -1003,6 +1003,10 @@ failed`. A table lists its targets while it is in flight on any of them or any o
 them stopped, even when another target's failure makes the table read as
 failed; any other table counts them on its own line.
 
+An operation's `error_message` is why it failed. When the operation recorded
+no error of its own, it is the first error among the operation's tasks, the
+same reason the PR comment shows for that shard.
+
 `ended_by` is set on a failed operation that did not fail on its own. Its
 apply deferred the cutover, which runs for all of a target's operations
 together, and another operation of the same deployment and target failed, so

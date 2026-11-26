@@ -9,12 +9,17 @@ import (
 )
 
 // Failure is one failed member of an apply, a shard or a target, with the
-// reason a surface shows for it. Each surface sanitizes the reason the way it
-// renders errors before grouping, so two raw errors that read the same once
-// sanitized fall into one group.
+// reason it failed for. Reason is the reading every surface groups on, so the
+// CLI and the PR comment put the same members under the same reasons (UX-9):
+// both pass the member's error through the PR comment's inline sanitizer,
+// which drops transport prefixes and connection details, so two members that
+// failed the same way against their own hosts share one reason. Detail is the
+// fuller text a surface may show in its place, such as the terminal's
+// unredacted error; it never decides the grouping.
 type Failure struct {
 	Name   string
 	Reason string
+	Detail string
 	// Retrying is whether the member is retrying the failure on its own
 	// rather than stopped by it.
 	Retrying bool
@@ -32,10 +37,26 @@ func FailedMember(opState string, stoppedAtCutover bool) bool {
 }
 
 // FailureReason is one distinct reason some members failed for, with those
-// members' names in the order they failed.
+// members' names in the order they failed. Detail is the members' fuller text
+// when every one of them recorded the same, and "" when they differ, since no
+// single member's detail then speaks for the rest.
 type FailureReason struct {
 	Reason string
+	Detail string
 	Names  []string
+}
+
+// Shown is the text a surface prints for the reason: the members' shared
+// detail when they have one, the grouped reason otherwise, and
+// NoReasonRecorded when the members recorded neither.
+func (r FailureReason) Shown() string {
+	if r.Detail != "" {
+		return r.Detail
+	}
+	if r.Reason != "" {
+		return r.Reason
+	}
+	return NoReasonRecorded
 }
 
 // GroupFailureReasons groups failed members by their reason, so a change that
@@ -51,7 +72,9 @@ func GroupFailureReasons(failures []Failure) []FailureReason {
 		if !ok {
 			i = len(groups)
 			index[f.Reason] = i
-			groups = append(groups, FailureReason{Reason: f.Reason})
+			groups = append(groups, FailureReason{Reason: f.Reason, Detail: f.Detail})
+		} else if groups[i].Detail != f.Detail {
+			groups[i].Detail = ""
 		}
 		groups[i].Names = append(groups[i].Names, f.Name)
 	}

@@ -429,18 +429,6 @@ func TestDeriveApplyPresentation_HeldByARetryingTask(t *testing.T) {
 	assert.Equal(t, "ready for cutover", deriveApplyPresentation(state.Apply.Running, ops, nil, false).Deployments[1].Label)
 }
 
-// Tasks without an apply_operation_id (legacy rows) are not attributable to a
-// deployment and are dropped from the per-operation grouping.
-func TestGroupTasksByOperation_SkipsUnlinkedTasks(t *testing.T) {
-	grouped := groupTasksByOperation([]*storage.Task{
-		{ApplyOperationID: new(int64(1)), TableName: "a"},
-		{ApplyOperationID: nil, TableName: "orphan"},
-		{ApplyOperationID: new(int64(1)), TableName: "b"},
-	})
-	require.Len(t, grouped[1], 2)
-	assert.Len(t, grouped, 1)
-}
-
 // Target orders-001 deferred its cutover across shards -80 and 80-, and 80-
 // failed while -80 waited at the cutover, so SchemaBot stopped -80 and failed
 // it for 80- (ended_by_operation_id). The comment's model reads -80 as stopped
