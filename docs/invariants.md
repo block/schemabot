@@ -1543,10 +1543,10 @@ identifier within its own database and environment scope (`resolveControlApply` 
 
 Only Spirit can pause a change. A Spirit stop checkpoints the copy, the apply settles as
 `stopped`, and `start` resumes it from there. A PlanetScale deploy request has no pause: it runs
-or it ends. The tempting shortcut is to honor a stop there by cancelling, since cancelling does
+or it ends. A PostgreSQL statement has none either: it runs until it commits or fails. The tempting shortcut is to honor a stop there by cancelling, since cancelling does
 take the load off the database. SchemaBot does not, because an operator asking to pause has said
 they intend to resume, and a cancel is permanent. The stop is refused instead, with a `400` naming
-`cancel` as the operation that does what the engine can actually do. Nothing durable is recorded,
+`cancel` as the operation that does what the engine can actually do, wherever it can. Nothing durable is recorded,
 so there is no request left pending against an engine that will never service it.
 
 The refusal is decided before any work is attempted, and it is enforced twice: once in the service
@@ -1559,7 +1559,8 @@ from the database type rather than inferred wherever a result is rendered, and k
 specifically so an apply that never reached a data plane settles the same way with no engine
 instance anywhere to ask. *Breaks if violated:* an operator asks for a pause, is told the change is
 `stopped`, waits to resume, and it is already dead. *Enforced:* the engine refusal
-(`pkg/api/control_handlers.go`, `pkg/tern/local_control.go`) and the single stop-terminality
+(`stopRefusals`, which classifies every engine, in `pkg/api/control_handlers.go`;
+`pkg/tern/local_control.go`) and the single stop-terminality
 decision behind it (`pkg/tern/stop_terminality.go`).
 
 ### CO-9: Control operations are stateless
