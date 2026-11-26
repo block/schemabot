@@ -3497,16 +3497,16 @@ That command wasn't recognized. Available commands:
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
-
-```sql
-ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-```
-
 **`products`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
@@ -6987,16 +6987,16 @@ schemabot apply -e staging
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
-
-```sql
-ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-```
-
 **`products`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
@@ -7232,16 +7232,16 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 **Schema `testapp`**
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
-
-```sql
-ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-```
-
 **`users`**: 🚫 Cancelled at 72.00%
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
@@ -9128,11 +9128,11 @@ Sequential mode: Middle table failed
      ~ orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-
      ~ products: 🚫 Cancelled (not started)
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -10518,6 +10518,15 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 <summary>❌ us — 40 completed, 4 running, 19 queued, 1 failed (64 targets)</summary>
 <dl><dd>
 
+**`orders`**: ❌ Failed · 7 queued, 1 failed
+
+**targets `orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`**
+```sql
+ALTER TABLE `orders`
+    ADD INDEX `idx_user_id`(`user_id`),
+    ADD COLUMN `note` text;
+```
+
 **`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜ 75%
 
 <details>
@@ -10536,15 +10545,6 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   - ◉ `orders_041`: 62.38% · 914,707 / 1,466,232 rows
   - ◉ `orders_042`: 62.38% · 914,707 / 1,466,232 rows
   - ◉ `orders_043`: 62.38% · 914,707 / 1,466,232 rows
-
-**`orders`**: ❌ Failed · 7 queued, 1 failed
-
-**targets `orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`**
-```sql
-ALTER TABLE `orders`
-    ADD INDEX `idx_user_id`(`user_id`),
-    ADD COLUMN `note` text;
-```
 
 
 | Target | Status |
@@ -10837,16 +10837,16 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
-
-```sql
-ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-```
-
 **`products`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
@@ -12651,11 +12651,11 @@ Sequential mode: Middle table failed
      ~ orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-
      ~ products: 🚫 Cancelled (not started)
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
 To recover: Fix the issue above, then run a new apply.
