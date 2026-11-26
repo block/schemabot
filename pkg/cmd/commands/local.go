@@ -23,7 +23,7 @@ type LocalCmd struct {
 	Managed LocalManagedCmd `cmd:"" hidden:"" help:"Internal supervised runtime child"`
 	Status  LocalStatusCmd  `cmd:"" help:"Inspect local runtime without starting it"`
 	Stop    LocalStopCmd    `cmd:"" help:"Drain and stop local runtime"`
-	Serve   LocalServeCmd   `cmd:"" help:"Run an authenticated local runtime in the foreground"`
+	Serve   LocalServeCmd   `cmd:"" hidden:"" help:"Run an authenticated local runtime in the foreground"`
 }
 
 // LocalServeCmd runs with explicit configuration and a private bearer token.
