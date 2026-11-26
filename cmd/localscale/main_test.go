@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/block/schemabot/pkg/localscale"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -153,4 +155,80 @@ func TestSeedSchemaDirReportsFailures(t *testing.T) {
 	}))
 	t.Cleanup(rejecting.Close)
 	require.ErrorContains(t, seedSchemaDir(t.Context(), rejecting.URL, orgs, dir, logger), "apply vschema for shop")
+}
+
+// A schema_dir assembled out of symbolic links seeds exactly as a directory of
+// real directories does. Pointing a link at a keyspace held elsewhere is how a
+// schema_dir is composed out of schemas a repository already keeps apart, and a
+// link that was skipped would start the cluster silently empty.
+func TestSeedSchemaDirFollowsSymlinkedKeyspaces(t *testing.T) {
+	elsewhere := t.TempDir()
+	shop := filepath.Join(elsewhere, "shop")
+	require.NoError(t, os.MkdirAll(shop, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(shop, "vschema.json"), []byte(`{"sharded": true}`), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(shop, "customers.sql"), []byte("CREATE TABLE customers (id bigint unsigned NOT NULL, PRIMARY KEY (id))"), 0600))
+
+	dir := t.TempDir()
+	require.NoError(t, os.Symlink(shop, filepath.Join(dir, "shop")))
+
+	type seeded struct {
+		Path     string `json:"-"`
+		Keyspace string `json:"keyspace"`
+	}
+	var calls []seeded
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		var call seeded
+		require.NoError(t, json.Unmarshal(body, &call))
+		call.Path = r.URL.Path
+		calls = append(calls, call)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	orgs := map[string]localscale.OrgConfig{
+		"sample": {Databases: map[string]localscale.DatabaseConfig{"commerce": {
+			Keyspaces: []localscale.KeyspaceConfig{{Name: "shop", Shards: 2}},
+		}}},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	require.NoError(t, seedSchemaDir(t.Context(), server.URL, orgs, dir, logger))
+
+	require.Equal(t, []seeded{
+		{Path: "/admin/seed-vschema", Keyspace: "shop"},
+		{Path: "/admin/seed-ddl", Keyspace: "shop"},
+	}, calls)
+}
+
+// A keyspace directory no configured database declares seeds nothing, which is
+// how a misspelled directory name presents. Seeding still succeeds, so the
+// operator is told at a level the binary prints rather than left with a cluster
+// that came up healthy and empty.
+func TestSeedSchemaDirWarnsOnKeyspaceNoDatabaseDeclares(t *testing.T) {
+	dir := t.TempDir()
+	typo := filepath.Join(dir, "shopp")
+	require.NoError(t, os.MkdirAll(typo, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(typo, "vschema.json"), []byte(`{"sharded": true}`), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(typo, "customers.sql"), []byte("CREATE TABLE customers (id bigint unsigned NOT NULL, PRIMARY KEY (id))"), 0600))
+
+	var contacted bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		contacted = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	orgs := map[string]localscale.OrgConfig{
+		"sample": {Databases: map[string]localscale.DatabaseConfig{"commerce": {
+			Keyspaces: []localscale.KeyspaceConfig{{Name: "shop", Shards: 2}},
+		}}},
+	}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	require.NoError(t, seedSchemaDir(t.Context(), server.URL, orgs, dir, logger))
+
+	assert.False(t, contacted, "a keyspace no database declares sends nothing")
+	assert.Contains(t, logs.String(), "keyspace directory matches no configured database")
+	assert.Contains(t, logs.String(), "keyspace=shopp")
 }

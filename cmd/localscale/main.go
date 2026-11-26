@@ -159,10 +159,29 @@ func seedSchemaDir(ctx context.Context, baseURL string, orgs map[string]localsca
 	}
 	var keyspaces []string
 	for _, entry := range entries {
-		if entry.IsDir() {
-			keyspaces = append(keyspaces, entry.Name())
-		} else {
+		// Stat the entry rather than trust it: os.ReadDir reports a symlink to
+		// a keyspace directory as a non-directory, so a schema_dir assembled
+		// out of links would be skipped entirely and seed nothing.
+		path := filepath.Join(schemaDir, entry.Name())
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("stat schema dir entry %s: %w", path, err)
+		}
+		if !info.IsDir() {
 			logger.Debug("skipping non-keyspace entry in schema_dir", "schema_dir", schemaDir, "entry", entry.Name())
+			continue
+		}
+		keyspaces = append(keyspaces, entry.Name())
+	}
+
+	// A keyspace directory that matches no configured database seeds nothing.
+	// That is how a misspelled directory name presents, and seeding would
+	// otherwise finish "complete" with the cluster empty, so say so at a level
+	// the binary actually prints.
+	for _, keyspace := range keyspaces {
+		if !anyDatabaseHasKeyspace(orgs, keyspace) {
+			logger.Warn("keyspace directory matches no configured database, nothing will be seeded from it",
+				"schema_dir", schemaDir, "keyspace", keyspace)
 		}
 	}
 
@@ -235,6 +254,19 @@ func seedSchemaDir(ctx context.Context, baseURL string, orgs map[string]localsca
 // package's own admin calls, which carry a single operation each.
 const adminRequestTimeout = 30 * time.Second
 
+// anyDatabaseHasKeyspace reports whether any configured database declares the
+// named keyspace, so a keyspace directory that matches none can be surfaced.
+func anyDatabaseHasKeyspace(orgs map[string]localscale.OrgConfig, keyspace string) bool {
+	for _, orgCfg := range orgs {
+		for _, dbCfg := range orgCfg.Databases {
+			if databaseHasKeyspace(dbCfg, keyspace) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // databaseHasKeyspace reports whether a database declares the named keyspace.
 // A schema_dir is shared across every database, but each one declares only the
 // keyspaces it holds, so seeding a keyspace into a database that does not have
@@ -250,6 +282,9 @@ func databaseHasKeyspace(db localscale.DatabaseConfig, keyspace string) bool {
 
 // keyspaceDDL reads a keyspace directory's .sql files in name order, so a
 // schema whose statements depend on each other can fix their order by naming.
+// Each file is submitted as one statement, so a file holding two of them fails
+// the seed loudly rather than being split here: splitting SQL by hand is what
+// the real-parser rule exists to prevent.
 func keyspaceDDL(dir string) ([]string, error) {
 	files, err := os.ReadDir(dir)
 	if err != nil {
