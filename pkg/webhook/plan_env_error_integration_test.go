@@ -74,6 +74,7 @@ func TestE2EMultiEnvPlanEnvironmentErrorFailsAggregate(t *testing.T) {
 	require.NotNil(t, aggregate, "the aggregate check run is published")
 	assert.Equal(t, checkConclusionFailure, aggregate.Conclusion, "staging passing alone must not pass the aggregate")
 	require.NotNil(t, aggregate.Output)
+	assert.Equal(t, "Plan failed", aggregate.Output.Title, "no apply ran, so the title must not say one failed")
 	assert.NotContains(t, aggregate.Output.Summary, "10.0.0.5")
 
 	byEnv := p.checksByEnv(t)
@@ -246,6 +247,7 @@ func TestE2EAllEnvPlanFailureOverOldSuccessFailsAggregate(t *testing.T) {
 	require.NotNil(t, aggregate, "the aggregate check run is published")
 	assert.Equal(t, checkConclusionFailure, aggregate.Conclusion)
 	require.NotNil(t, aggregate.Output)
+	assert.Equal(t, "Plan failed", aggregate.Output.Title)
 	assert.Contains(t, aggregate.Output.Summary, planFailedCheckSummary, "the aggregate reads each environment's stored row")
 	assert.NotContains(t, aggregate.Output.Summary, "no schema files found", "the failure text stays on the plan comment")
 

@@ -77,7 +77,7 @@ func (s *Service) handlePlansList(w http.ResponseWriter, r *http.Request) {
 			"pull_request", opts.PullRequest,
 			"starting_after", startingAfter,
 			"error", err)
-		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to list plans")
+		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to list plans; see server logs")
 		return
 	}
 	hasMore := len(plans) > limit
