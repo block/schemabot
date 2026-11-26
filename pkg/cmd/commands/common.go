@@ -694,10 +694,13 @@ func releaseUnsubmittedLock(ep, database, dbType, owner string, lockID int64, ca
 //
 // before is the lock the command saw held before it sent the acquire, or nil.
 // A lock under this owner that is that same row was not taken by this
-// command: it may guard an apply an earlier command started, so the operator
-// is not sent to unlock it. Rows are compared by the ID the server reports,
-// so a server too old to report it reads as the lock held before, which never
-// offers the unlock.
+// command: it may guard an apply an earlier command started, so it is left
+// alone. Any other row under this owner may be this acquire's, or one another
+// command of the same user on the same host took or reused, since they share
+// the owner. So it is released through the row-pinned release, which keeps a
+// lock an apply runs under, as for a lock a command took and never submitted
+// under. A lookup that reports no row ID gives neither the comparison nor a
+// row to release, so that lock is left in place and no unlock is offered.
 func reportUnansweredLockAcquire(ep, database, dbType, owner string, before *client.LockInfo, showLoading bool, acquireErr error) error {
 	cause := fmt.Errorf("acquire lock: %w", acquireErr)
 	var lock *client.LockInfo
@@ -715,16 +718,20 @@ func reportUnansweredLockAcquire(ep, database, dbType, owner string, before *cli
 		templates.WriteAcquireUnknownLockFree(database, dbType)
 	case lock.Owner != owner:
 		templates.WriteAcquireUnknownLockHeldByAnotherOwner(database, dbType, lock.Owner)
+	case lock.ID == 0:
+		templates.WriteAcquireUnknownLockWithoutID(database, dbType)
 	case sameLockHeldBefore(before, lock):
 		templates.WriteAcquireUnknownLockHeldBefore(database, dbType)
 	default:
-		templates.WriteAcquireUnknownLockTaken(database, dbType)
+		templates.WriteAcquireUnknownLockHeldByOwner(database, dbType)
+		return releaseUnsubmittedLock(ep, database, dbType, owner, lock.ID, cause)
 	}
 	return cause
 }
 
-// sameLockHeldBefore reports whether lock, held under the command's owner, is
-// the row the command saw held under that owner before it sent the acquire.
+// sameLockHeldBefore reports whether lock, held under the command's owner and
+// carrying a row ID, is the row the command saw held under that owner before
+// it sent the acquire.
 func sameLockHeldBefore(before, lock *client.LockInfo) bool {
 	return before != nil && before.Owner == lock.Owner && before.ID == lock.ID
 }

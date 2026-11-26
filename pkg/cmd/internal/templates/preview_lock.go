@@ -54,7 +54,17 @@ func previewUnsubmittedLockNotReleasedOutput() {
 }
 
 func previewAcquireUnknownOutput() {
-	WriteAcquireUnknownLockTaken("testapp", "mysql")
+	WriteAcquireUnknownLockHeldByOwner("testapp", "mysql")
+	WriteLockReleased("testapp", "mysql")
+	fmt.Println()
+	fmt.Println("--- Lock under your owner, an apply runs under it ---")
+	fmt.Println()
+	WriteAcquireUnknownLockHeldByOwner("testapp", "mysql")
+	WriteLockInUse("testapp", "mysql", "apply-b2c3d4e5", "running", "staging")
+	fmt.Println()
+	fmt.Println("--- Lock under your owner, server reported no lock ID ---")
+	fmt.Println()
+	WriteAcquireUnknownLockWithoutID("testapp", "mysql")
 	fmt.Println()
 	fmt.Println("--- Lock is the one you already held ---")
 	fmt.Println()

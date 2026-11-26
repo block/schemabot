@@ -4742,8 +4742,33 @@ Options:
 
 ```
 
-🔒 Lock for testapp (mysql) was taken, though the acquire request failed.
-   Nothing was submitted. Release it now: schemabot unlock -d testapp -t mysql
+🔒 Lock for testapp (mysql) is held under your owner, though the acquire request failed.
+   Nothing was submitted, so it is released unless an apply runs under it.
+🔓 Lock released for testapp (mysql)
+
+```
+</details>
+
+<details>
+<summary><a name="lock-under-your-owner-an-apply-runs-under-it"></a><strong>Lock Under Your Owner, An Apply Runs Under It</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) is held under your owner, though the acquire request failed.
+   Nothing was submitted, so it is released unless an apply runs under it.
+🔒 Lock kept for testapp (mysql): apply apply-b2c3d4e5 (running) runs under it.
+   Watch that apply: schemabot progress apply-b2c3d4e5 -e staging
+
+```
+</details>
+
+<details>
+<summary><a name="lock-under-your-owner-server-reported-no-lock-id"></a><strong>Lock Under Your Owner, Server Reported No Lock ID</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) is held under your owner, but the server did not say which lock it is, so it was left in place.
+   Nothing was submitted. See who holds it: schemabot locks
 
 ```
 </details>
