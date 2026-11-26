@@ -369,44 +369,35 @@ func FormatTimeAgo(t time.Time) string {
 // non-zero units, with a zero unit left out. A duration under a second, zero,
 // or negative reads "< 1s".
 // Examples: 500ms → "< 1s", 45s → "45s", 90s → "1m 30s", 30m → "30m",
-// 25h1m → "1d 1h", 8d3h → "1w 1d"
+// 25h1m → "1d 1h", 24h30m → "1d 30m", 8d3h → "1w 1d", 7d3h → "1w 3h"
 func FormatHumanDuration(d time.Duration) string {
 	if d < time.Second {
 		return "< 1s"
 	}
-	if d < time.Minute {
-		return fmt.Sprintf("%ds", int(d.Seconds()))
+	seconds := int64(d / time.Second)
+	units := []struct {
+		suffix  string
+		seconds int64
+	}{
+		{"w", 7 * 24 * 3600},
+		{"d", 24 * 3600},
+		{"h", 3600},
+		{"m", 60},
+		{"s", 1},
 	}
-	if d < time.Hour {
-		mins := int(d.Minutes())
-		secs := int(d.Seconds()) % 60
-		if secs == 0 {
-			return fmt.Sprintf("%dm", mins)
+	var parts []string
+	for _, unit := range units {
+		count := seconds / unit.seconds
+		seconds %= unit.seconds
+		if count == 0 {
+			continue
 		}
-		return fmt.Sprintf("%dm %ds", mins, secs)
-	}
-	totalHours := int(d.Hours())
-	if totalHours < 24 {
-		mins := int(d.Minutes()) % 60
-		if mins == 0 {
-			return fmt.Sprintf("%dh", totalHours)
+		parts = append(parts, fmt.Sprintf("%d%s", count, unit.suffix))
+		if len(parts) == 2 {
+			break
 		}
-		return fmt.Sprintf("%dh %dm", totalHours, mins)
 	}
-	days := totalHours / 24
-	remainHours := totalHours % 24
-	if days < 7 {
-		if remainHours == 0 {
-			return fmt.Sprintf("%dd", days)
-		}
-		return fmt.Sprintf("%dd %dh", days, remainHours)
-	}
-	weeks := days / 7
-	remainDays := days % 7
-	if remainDays == 0 {
-		return fmt.Sprintf("%dw", weeks)
-	}
-	return fmt.Sprintf("%dw %dd", weeks, remainDays)
+	return strings.Join(parts, " ")
 }
 
 // CapitalizeFirst capitalizes the first letter of a string.

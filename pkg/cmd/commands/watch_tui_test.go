@@ -866,6 +866,30 @@ func TestWatchModel_EnterTriggersSkipRevert(t *testing.T) {
 	}
 }
 
+// The watch view's running timers read the way every other SchemaBot
+// duration reads, so two minutes is "2m" in the status line and in the
+// finalizing line, never "2m0s" or "120s".
+func TestWatchModel_TimersReadAsHumanDurations(t *testing.T) {
+	t.Run("status line", func(t *testing.T) {
+		m := waitingWatchModel(state.Apply.PreparingBranch)
+		m.startedAt = time.Now().Add(-2*time.Minute - 200*time.Millisecond)
+
+		assert.Contains(t, m.View(), "Preparing branch... (2m)\n")
+	})
+	t.Run("status line hides the first seconds", func(t *testing.T) {
+		m := waitingWatchModel(state.Apply.PreparingBranch)
+		m.startedAt = time.Now().Add(-time.Second)
+
+		assert.Contains(t, m.View(), "Preparing branch...\n")
+	})
+	t.Run("finalizing line", func(t *testing.T) {
+		m := waitingWatchModel(state.Apply.SkippingRevert)
+		m.skipRevertAt = time.Now().Add(-2 * time.Minute)
+
+		assert.Contains(t, m.View(), "Finalizing — closing revert window... (2m)\n")
+	})
+}
+
 func TestFormatExitContext(t *testing.T) {
 	t.Run("includes apply ID and resume command", func(t *testing.T) {
 		result := formatExitContext("apply-abc123", "", "production")
