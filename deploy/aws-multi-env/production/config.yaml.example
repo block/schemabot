@@ -12,6 +12,9 @@ github:
   app-id: "secretsmanager:schemabot-production/github-app#app-id"
   private-key: "secretsmanager:schemabot-production/github-app#private-key"
   webhook-secret: "secretsmanager:schemabot-production/github-app#webhook-secret"
+  # While rotating the webhook secret, keep the old one here until GitHub signs
+  # with the new one (see docs/github-app-setup.md#rotating-the-webhook-secret).
+  # previous-webhook-secret: "secretsmanager:schemabot-production/github-app#previous-webhook-secret"
 
 databases:
   testapp:

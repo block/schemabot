@@ -2977,7 +2977,7 @@ Rules:
 - When `apps:` is NOT configured, repositories must not set `github_app:` — it would be silently ignored, so it is rejected at config load to surface misconfiguration early.
 - The legacy single-App `github:` shape continues to work unchanged.
 
-The map key under `apps:` is the App's stable logical name and the value that flows into log lines and metrics. Each entry MUST provide a non-empty `app-id`, `private-key`, and `webhook-secret`; all three accept the same secret-resolution prefixes as the legacy `github:` block (see [Secret Resolution](#secret-resolution)). `check-name` is optional and defaults to `SchemaBot`.
+The map key under `apps:` is the App's stable logical name and the value that flows into log lines and metrics. Each entry MUST provide a non-empty `app-id`, `private-key`, and `webhook-secret`; all three accept the same secret-resolution prefixes as the legacy `github:` block (see [Secret Resolution](#secret-resolution)). `check-name` is optional and defaults to `SchemaBot`. `previous-webhook-secret` is optional and holds the App's old webhook secret while it is rotated out; see [Rotating the webhook secret](github-app-setup.md#rotating-the-webhook-secret).
 
 ### How dispatch works
 
