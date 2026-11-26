@@ -127,6 +127,9 @@ func newReconcileFixture(fakeEngine *fakeControlEngine, requests ...*storage.App
 		tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
 		logs:            logs,
 		controlRequests: controlRequests,
+		// A single-target apply with no operation rows, so a settled cancel
+		// reads its outcome from the apply state alone.
+		applyOperations: &mockApplyOperationStore{},
 	}
 	client := &LocalClient{
 		config: LocalConfig{

@@ -1155,6 +1155,16 @@ that lasts longer, a suspended or removed App installation, or a deleted
 repository uses up those attempts. The lock then stays held and blocks other
 PRs on that database until an operator runs `schemabot unlock`.
 
+A retry that GitHub's primary rate limit refuses is the exception to that schedule.
+Retrying sooner is refused the same way, so SchemaBot retries at the reset
+time GitHub reports, plus up to 30 seconds, and for three hours after the
+event arrived that wait does not use up an attempt. After that each refusal
+uses one of the five attempts, so a delivery that GitHub keeps refusing still
+ends. While a delivery waits for the reset, its head can carry no SchemaBot
+check, or the check it already had, because the same limit refuses the check
+write. Make the SchemaBot check a required status check so that a head with no
+check cannot be merged in the meantime.
+
 The read is made once, before cleanup starts. A PR that reopens while cleanup
 is already running is not seen by that cleanup, which finishes as if the PR
 were still closed.

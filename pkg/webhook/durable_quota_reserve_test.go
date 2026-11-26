@@ -98,7 +98,7 @@ func TestDurableWebhookDriverRetriesChargedQuotaReserveRefusalAtResetOnLaterAtte
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			event := durablePullRequestEvent(t)
-			event.ReceivedAt = time.Now().Add(-quotaReserveUnchargedWindow - time.Minute)
+			event.ReceivedAt = time.Now().Add(-unchargedRefusalWindow - time.Minute)
 			event.Attempts = tc.attempt - 1 // FindNext claim increments to attempt
 			resetAt := time.Now().Add(tc.resetAfter).Truncate(time.Second)
 
@@ -120,7 +120,7 @@ func TestDurableWebhookDriverRetriesChargedQuotaReserveRefusalAtResetOnLaterAtte
 func TestDurableWebhookDriverChargesQuotaReserveRefusalsAfterUnchargedWindow(t *testing.T) {
 	t.Run("retries at the reset and charges the attempt", func(t *testing.T) {
 		event := durablePullRequestEvent(t)
-		event.ReceivedAt = time.Now().Add(-quotaReserveUnchargedWindow - time.Minute)
+		event.ReceivedAt = time.Now().Add(-unchargedRefusalWindow - time.Minute)
 		resetAt := time.Now().Add(25 * time.Minute).Truncate(time.Second)
 
 		store := driveQuotaReserveDelivery(t, event, quotaReserveRefusalError(resetAt))
@@ -134,7 +134,7 @@ func TestDurableWebhookDriverChargesQuotaReserveRefusalsAfterUnchargedWindow(t *
 
 	t.Run("goes terminal at the attempt cap", func(t *testing.T) {
 		event := durablePullRequestEvent(t)
-		event.ReceivedAt = time.Now().Add(-quotaReserveUnchargedWindow - time.Minute)
+		event.ReceivedAt = time.Now().Add(-unchargedRefusalWindow - time.Minute)
 		event.Attempts = maxDurableWebhookAttempts - 1
 
 		store := driveQuotaReserveDelivery(t, event, quotaReserveRefusalError(time.Now().Add(25*time.Minute)))
@@ -177,7 +177,7 @@ func TestDurableWebhookDriverRecordsQuotaReserveRetry(t *testing.T) {
 		},
 		{
 			name:        "past the uncharged window",
-			receivedAgo: quotaReserveUnchargedWindow + time.Minute,
+			receivedAgo: unchargedRefusalWindow + time.Minute,
 			wantOutcome: "retrying",
 			wantLevel:   "WARN",
 			wantMessage: "durable webhook delivery was refused by the GitHub quota reserve more than the uncharged window after it was received; it will be retried when the quota resets and this refusal spent an attempt",

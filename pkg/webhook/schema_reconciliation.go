@@ -104,7 +104,7 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 				"repo", repo, "pr", pr, "requested_by", requestedBy)
 			return nil
 		}
-		return fmt.Errorf("PR #%d in %s is closed; SchemaBot refreshes check state only for open PRs", pr, repo)
+		return &closedPRRefreshError{repo: repo, pr: pr}
 	}
 
 	headSHA := prInfo.HeadSHA

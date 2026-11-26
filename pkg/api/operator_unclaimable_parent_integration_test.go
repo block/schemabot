@@ -46,7 +46,7 @@ func TestOperator_UnclaimableParentReleasesOperationLease(t *testing.T) {
 	require.NotNil(t, peerApply, "the peer must hold the parent apply lease for the scenario")
 
 	svc := newMatrixService(t, stor, map[string]tern.Client{})
-	svc.recoverApplyOperation(ctx, 1, "blocked-driver")
+	svc.recoverApplyOperation(ctx, 1, "blocked-driver", passPolled)
 
 	opID := seed.opID("region-a")
 	op, err := stor.ApplyOperations().Get(ctx, opID)
