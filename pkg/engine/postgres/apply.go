@@ -1233,6 +1233,27 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "partition-detach-pending",
 			cause:  fmt.Sprintf("a partition of %s has an unfinished concurrent detach", quotedTable(table)),
 			remedy: "finish the detach with ALTER TABLE ... DETACH PARTITION ... FINALIZE, then re-run"}, true
+	case executor.CodeDetachDefaultPartition:
+		// PostgreSQL never detaches a partition concurrently from a table
+		// that has a DEFAULT partition; nothing ran, and a retry meets the
+		// same DEFAULT partition.
+		return &refusal{reason: "detach-default-partition",
+			cause:  fmt.Sprintf("%s has a DEFAULT partition, so PostgreSQL will not detach a partition from it concurrently; nothing ran", quotedTable(table)),
+			remedy: "detach the partition outside SchemaBot, then " + replanRemedy}, true
+	case executor.CodePartitionedKeyNameTaken:
+		// The build left the occupant alone, so only an operator freeing the
+		// name, or the schema file choosing another, changes the outcome.
+		return &refusal{reason: "partitioned-key-name-taken",
+			cause:  fmt.Sprintf("a name the key constraint on partitioned table %s needs on a partition is held by something else", quotedTable(table)),
+			remedy: "rename the constraint in the schema file and re-plan, or drop or rename what holds the name"}, true
+	case executor.CodePartitionedKeyConflict:
+		return &refusal{reason: "partitioned-key-conflict",
+			cause:  fmt.Sprintf("a partition of %s already has a key constraint that conflicts with the planned one; nothing was added", quotedTable(table)),
+			remedy: "drop or change the partition's key, or change the key in the schema file, then " + replanRemedy}, true
+	case executor.CodePartitionedKeyNullableColumn:
+		return &refusal{reason: "partitioned-key-nullable-column",
+			cause:  fmt.Sprintf("the planned primary key on %s covers a column a partition allows to be NULL; nothing was built", quotedTable(table)),
+			remedy: "make the column NOT NULL on every partition, then " + replanRemedy}, true
 	case executor.CodePartitionedIndexTablespace:
 		return &refusal{reason: "unsupported-statement-shape",
 			cause:  fmt.Sprintf("the index on %s names a TABLESPACE, which the partitions' indexes would not use", quotedTable(table)),
@@ -1357,12 +1378,13 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeCancelledExternally, executor.CodeInvalidIndexOwnLeftover,
 		executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuildInFlight,
 		executor.CodeInvalidIndexBuilderUnobservable, executor.CodeInvalidIndexUnproven,
-		executor.CodePartitionedIndexUnsettled, executor.CodeExecutionFailed:
+		executor.CodePartitionedIndexUnsettled, executor.CodeDetachInterrupted,
+		executor.CodeExecutionFailed:
 		// Operational outcomes: a bounded lock race, the caller's own
 		// context ending or an external stop, an invalid-index state a retry
 		// recovers or an operator clears or waits out, a partitioned index
-		// build that a rerun resumes, or a failure outside
-		// the typed set. A retry can succeed once conditions change, so
+		// build that a rerun resumes, a concurrent detach that running the
+		// same statement again finishes, or a failure outside the typed set. A retry can succeed once conditions change, so
 		// none is a permanent refusal.
 		return nil, true
 	}
