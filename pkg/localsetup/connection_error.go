@@ -17,14 +17,27 @@ import (
 type setupConnectionError struct {
 	message string
 	cause   error
+	// checksConnection marks a failure to establish the connection itself.
+	// Only then does an identified cause replace the caller's line: a
+	// timeout or cancel in a later operation on a connection already proven
+	// says nothing about the host, port, or credentials.
+	checksConnection bool
 }
 
-// Error names the cause and its fix in one line when the cause is one
-// SchemaBot can identify, and falls back to the caller's generic line, with
-// the error category or server code, for any other cause.
+// connectionCheckError is the error of a step that establishes the
+// connection, so an identified cause names itself and its fix.
+func connectionCheckError(message string, cause error) *setupConnectionError {
+	return &setupConnectionError{message: message, cause: cause, checksConnection: true}
+}
+
+// Error names the cause and its fix in one line when the step was the
+// connection check and the cause is one SchemaBot can identify. Every other
+// failure keeps the caller's line, with the error category or server code.
 func (e *setupConnectionError) Error() string {
-	if failure, ok := identifiedConnectionFailure(e.cause); ok {
-		return failure
+	if e.checksConnection {
+		if failure, ok := identifiedConnectionFailure(e.cause); ok {
+			return failure
+		}
 	}
 	return e.message + ": " + connectionFailureReason(e.cause)
 }
@@ -69,6 +82,9 @@ func identifiedConnectionFailure(err error) (string, bool) {
 			return "that database does not exist on the server; check the database name in the connection string", true
 		}
 		return "", false
+	}
+	if errors.Is(err, mysql.ErrNoTLS) {
+		return "the server does not offer TLS, which the connection's tls setting requires; connect to an endpoint that offers TLS, or change tls in the connection string", true
 	}
 	if requiresTLS(err) && serverRefusedTLS(err) {
 		return "the server does not offer TLS, which the connection's sslmode requires; connect to an endpoint that offers TLS, or change sslmode in the connection string", true
@@ -156,9 +172,23 @@ func serverRefusedTLS(err error) bool {
 	return err.Error() == pgxRefusedTLS
 }
 
-// connectionFailureReason names an unidentified failure by its category or
-// server code, for the generic line.
+// connectionFailureReason names a failure by its category or server code,
+// for the caller's line. It names the step's own failure, not the connection
+// check's, since a step after the check runs on a connection already proven.
 func connectionFailureReason(err error) string {
+	if errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timed out"
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return "the server refused the connection"
+	}
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		return "the database hostname could not be resolved"
+	}
 	var mysqlError *mysql.MySQLError
 	if errors.As(err, &mysqlError) {
 		return fmt.Sprintf("database error %d", mysqlError.Number)

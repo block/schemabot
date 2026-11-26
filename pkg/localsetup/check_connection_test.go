@@ -68,16 +68,41 @@ func TestConnectionFailureCategories(t *testing.T) {
 		{"server answer beats a refused address", errors.Join(syscall.ECONNREFUSED, &pgconn.PgError{Code: "28P01"}), "the server rejected the password"},
 		{"mysql access denied", &mysql.MySQLError{Number: 1045, Message: "private-password"}, "the server denied access for that user and password; check them in the connection string"},
 		{"mysql missing database", &mysql.MySQLError{Number: 1049, Message: "private-detail"}, "that database does not exist on the server; check the database name in the connection string"},
+		{"mysql no TLS", fmt.Errorf("connect: %w", mysql.ErrNoTLS), "the server does not offer TLS, which the connection's tls setting requires; connect to an endpoint that offers TLS, or change tls in the connection string"},
 		{"other mysql error", &mysql.MySQLError{Number: 1040, Message: "private-detail"}, "Check connection: database error 1040"},
 		{"unknown", errors.New("private-detail"), "Check connection: connection could not be verified"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := &setupConnectionError{message: "Check connection", cause: tc.cause}
+			err := connectionCheckError("Check connection", tc.cause)
 			require.ErrorIs(t, err, tc.cause)
 			require.True(t, strings.HasPrefix(err.Error(), tc.want), "got %q", err.Error())
 			require.NotContains(t, err.Error(), "private")
 		})
 	}
+}
+
+// A step after the connection is proven keeps its own line even when its
+// cause is one the connection check would name: a timeout creating the
+// storage database or an interrupted catalog read says nothing about the
+// host, port, or credentials.
+func TestLaterStepsKeepTheirOwnLine(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		message string
+		cause   error
+		want    string
+	}{
+		{"create database timed out", "could not create the schemabot database", context.DeadlineExceeded, "timed out"},
+		{"discovery interrupted", "namespace discovery was interrupted; try again", context.Canceled, "cancelled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := &setupConnectionError{message: tc.message, cause: tc.cause}
+			require.ErrorIs(t, err, tc.cause)
+			require.Equal(t, tc.message+": "+tc.want, err.Error())
+			require.NotContains(t, err.Error(), "connection check")
+		})
+	}
+	require.Equal(t, "could not create the schemabot database: timed out", integratedStorageCreationError(context.DeadlineExceeded).Error())
 }
 
 // connectErrorFor returns the connect error pgx gives for a connection with
