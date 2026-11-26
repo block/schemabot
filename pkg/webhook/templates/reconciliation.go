@@ -166,7 +166,8 @@ func writeInProgressReconciliation(sb *strings.Builder, tenant string, items []S
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", planCommand(tenant, items))
 	sb.WriteString("   - If the live schema change should not remain, roll it back:\n")
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", rollbackCommand(tenant, items))
-	sb.WriteString("     After rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan.\n")
+	sb.WriteString("     After the rollback completes, refresh the checks:\n")
+	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", refreshChecksCommand(tenant, items))
 }
 
 func writeCompletedReconciliation(sb *strings.Builder, tenant string, items []SchemaChangeReconciliationItem) {
@@ -181,7 +182,8 @@ func writeCompletedReconciliation(sb *strings.Builder, tenant string, items []Sc
 	sb.WriteString("\n2. Undo the live schema change:\n")
 	sb.WriteString("   - comment:\n")
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", rollbackCommand(tenant, items))
-	sb.WriteString("   - after rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan\n")
+	sb.WriteString("   - after the rollback completes, refresh the checks:\n")
+	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", refreshChecksCommand(tenant, items))
 }
 
 func planCommand(tenant string, items []SchemaChangeReconciliationItem) string {
@@ -194,6 +196,18 @@ func planCommand(tenant string, items []SchemaChangeReconciliationItem) string {
 		cmd += fmt.Sprintf(" -d %s", flattenIdentifier(item.Database))
 	}
 	return AppendTenantFlag(cmd, tenant)
+}
+
+// refreshChecksCommand is the plan that clears the block once a rollback
+// completes. It names the environment but never a database: this comment only
+// posts on a PR with no SchemaBot files left, and a plan scoped to a database
+// goes to normal config discovery instead of refreshing the checks.
+func refreshChecksCommand(tenant string, items []SchemaChangeReconciliationItem) string {
+	item, ok := singleCommandItem(items)
+	if !ok {
+		return AppendTenantFlag("schemabot plan -e <environment>", tenant)
+	}
+	return AppendTenantFlag(fmt.Sprintf("schemabot plan -e %s", flattenIdentifier(item.Environment)), tenant)
 }
 
 func stopCommand(tenant string, items []SchemaChangeReconciliationItem) string {

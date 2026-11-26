@@ -386,3 +386,62 @@ func TestE2EPlanCancelledApplyWithNoManagedFilesConvergesPassing(t *testing.T) {
 	aggregate := waitForStoredAggregate(t, svc, cancelledCheckRepo, cancelledCheckPR, checkStatusCompleted, checkConclusionSuccess)
 	assert.Equal(t, "abc123", aggregate.HeadSHA)
 }
+
+// A PR's only schema change was applied, then removed from the PR and rolled
+// back. The rollback leaves the check blocked as action required and releases
+// its ownership. With no SchemaBot files left in the PR, a plain plan command
+// is the step that clears the block: it finds no apply that still owns the
+// check, refreshes the check as passing, and says so on the PR. This is the
+// step the reconciliation comment names after a rollback.
+func TestE2EPlanAfterRollbackWithNoManagedFilesConvergesPassing(t *testing.T) {
+	database := "webhook_rollback_no_files"
+	svc := setupE2EService(t, database)
+	require.NoError(t, svc.Storage().Checks().Upsert(t.Context(), &storage.Check{
+		Repository:     cancelledCheckRepo,
+		PullRequest:    cancelledCheckPR,
+		HeadSHA:        "oldsha111",
+		Environment:    cancelledCheckEnv,
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		DatabaseName:   database,
+		CheckRunID:     100,
+		HasChanges:     true,
+		Status:         checkStatusCompleted,
+		Conclusion:     checkConclusionActionRequired,
+		BlockingReason: rollbackCompletedBlock.blockingReason,
+		ErrorMessage:   rollbackCompletedBlock.message,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	baseURL, err := url.Parse(server.URL + "/")
+	require.NoError(t, err)
+	client.BaseURL = baseURL
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{}, "", database)
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, testLogger(), WithInsecureSkipSignatureVerification())
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot plan -e staging", isPR: true}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "no managed schema changes handled")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "refreshed as passing")
+		assert.NotContains(t, body, "Reconciliation Required", "a rollback that released the check leaves nothing to reconcile")
+	case <-time.After(webhookIntegrationPollDeadline):
+		require.FailNow(t, "timed out waiting for passing convergence comment")
+	}
+
+	check := loadCancelledCheck(t, svc, database)
+	assert.Zero(t, check.ApplyID)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionSuccess, check.Conclusion)
+	assert.False(t, check.HasChanges)
+	assert.Empty(t, check.BlockingReason)
+	aggregate := waitForStoredAggregate(t, svc, cancelledCheckRepo, cancelledCheckPR, checkStatusCompleted, checkConclusionSuccess)
+	assert.Equal(t, "abc123", aggregate.HeadSHA)
+}
