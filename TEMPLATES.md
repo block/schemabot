@@ -6128,7 +6128,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC) · changes show within ~5s_
 
 </details>
 

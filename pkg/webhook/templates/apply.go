@@ -253,6 +253,10 @@ type ApplyStatusCommentData struct {
 	// applied it, and the one command that acts on the whole rollout, so the
 	// section leaves out all three.
 	InRolloutSection bool
+
+	// UpdateCadence is the longest a change waits before it reaches this
+	// comment, shown beside the "Last updated" footer. Zero renders no note.
+	UpdateCadence time.Duration
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -338,7 +342,7 @@ func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdate
 	// Footer with next actions
 	writeApplyFooter(&sb, data)
 	if includeLastUpdated && !state.IsTerminalApplyState(data.State) {
-		writeLastUpdatedFooter(&sb, renderedAt)
+		writeLastUpdatedFooter(&sb, renderedAt, data.UpdateCadence)
 	}
 
 	return sb.String()
