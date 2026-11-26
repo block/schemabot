@@ -69,6 +69,11 @@ storage, insert-order, and online-copy tradeoffs.
 
 ## Auto-fixing lint issues (`fix-lint`)
 
+`fix-lint` is not listed in `schemabot --help`. It runs, and this page
+documents it, but it is not advertised on the command line while a fixed
+file still comes back in the parser's canonical rendering rather than the
+`SHOW CREATE TABLE` form the rest of the schema directory keeps.
+
 `schemabot fix-lint -s <schema-dir>` rewrites the schema files in place to
 resolve the findings that have a mechanical fix, and lists the ones that need a
 human decision. `--dry-run` previews the fixes without writing anything. Run it

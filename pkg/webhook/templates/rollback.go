@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/caller"
+	"github.com/block/schemabot/pkg/presentation"
 )
 
 // RenderRollbackPlanComment renders the rollback plan comment markdown.
@@ -200,7 +201,7 @@ func RenderRollbackRejected(data RollbackRejectedData) string {
 // inside the `**Reason**: `...“ code span: full inline sanitization plus
 // neutralizing backticks so the reason cannot close the span.
 func sanitizedRollbackRejectionReason(reason string) string {
-	return strings.ReplaceAll(SanitizeInlineError(reason), "`", "'")
+	return strings.ReplaceAll(presentation.InlineError(reason), "`", "'")
 }
 
 // RenderRollbackBlockedByLock renders the message posted when a rollback cannot
@@ -371,7 +372,7 @@ func RenderRollbackAlreadyRolledBackLockHeld(database, environment, lockOwner, t
 func RenderRollbackNotAccepted(database, environment, errorMessage string) string {
 	header := fmt.Sprintf("## Rollback Not Accepted\n\n"+
 		"**Database**: `%s` | **Environment**: `%s`\n\n", database, environment)
-	if msg := SanitizeInlineError(errorMessage); msg != "" {
+	if msg := presentation.InlineError(errorMessage); msg != "" {
 		return header + "The rollback was not accepted: " + html.EscapeString(msg)
 	}
 	return header + "The rollback was not accepted."

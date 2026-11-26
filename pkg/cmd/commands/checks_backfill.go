@@ -19,8 +19,8 @@ import (
 
 // ChecksCmd groups SchemaBot Check Run operator commands.
 type ChecksCmd struct {
-	Backfill ChecksBackfillCmd `cmd:"" help:"Find open PRs with missing or stuck SchemaBot Check Runs; recreate the missing ones"`
-	Show     ChecksShowCmd     `cmd:"" help:"Show one PR's stored check state and Check Run, and what each row is waiting on"`
+	Backfill ChecksBackfillCmd `cmd:"" help:"Find open PRs with missing or stuck SchemaBot Check Runs; recreate the missing ones" group:"commands"`
+	Show     ChecksShowCmd     `cmd:"" help:"Show one PR's stored check state and Check Run, and what each row is waiting on" group:"commands"`
 }
 
 // ChecksBackfillCmd walks open PRs and asks the two questions that matter

@@ -33,37 +33,74 @@ type CLI struct {
 
 	VersionFlag kong.VersionFlag `name:"version" help:"Show version information"`
 
-	Init       commands.InitCmd       `cmd:"" help:"Initialize a local connection and verify imported schema"`
-	Plan       commands.PlanCmd       `cmd:"" help:"Create a schema change plan"`
-	Onboard    commands.OnboardCmd    `cmd:"" help:"Pull live schema into a new declarative schema directory"`
-	Pull       commands.PullCmd       `cmd:"" help:"Return live schema from a source environment"`
-	Apply      commands.ApplyCmd      `cmd:"" help:"Apply schema changes"`
-	Progress   commands.ProgressCmd   `cmd:"" help:"Get schema change progress"`
-	Cutover    commands.CutoverCmd    `cmd:"" help:"Trigger cutover for a deferred schema change"`
-	Stop       commands.StopCmd       `cmd:"" help:"Stop an in-progress schema change"`
-	Cancel     commands.CancelCmd     `cmd:"" help:"Cancel a schema change permanently"`
-	Start      commands.StartCmd      `cmd:"" help:"Resume a stopped schema change"`
-	Release    commands.ReleaseCmd    `cmd:"" help:"Release a rollout paused after an on_failure=pause failure"`
-	Revert     commands.RevertCmd     `cmd:"" help:"Revert a completed schema change during the revert window"`
-	SkipRevert commands.SkipRevertCmd `cmd:"" name:"skip-revert" help:"Skip the revert window, finalizing the schema change"`
-	Rollback   commands.RollbackCmd   `cmd:"" help:"Rollback to the previous schema state"`
-	Databases  commands.DatabasesCmd  `cmd:"" help:"List configured databases"`
-	Unlock     commands.UnlockCmd     `cmd:"" help:"Release a database lock"`
-	Locks      commands.LocksCmd      `cmd:"" help:"List all active database locks"`
-	Freeze     commands.FreezeCmd     `cmd:"" help:"Freeze an environment, or list, show and approve overrides of freezes"`
-	Unfreeze   commands.UnfreezeCmd   `cmd:"" help:"Lift an environment freeze"`
-	Logs       commands.LogsCmd       `cmd:"" help:"View apply logs"`
-	Status     commands.StatusCmd     `cmd:"" help:"Show schema change status"`
-	Plans      commands.PlansCmd      `cmd:"" name:"list-plans" help:"List recently generated schema change plans"`
-	Preview    commands.PreviewCmd    `cmd:"" help:"Preview CLI output templates (for development)"`
-	FixLint    commands.FixLintCmd    `cmd:"" name:"fix-lint" help:"Auto-fix lint issues in schema files"`
-	Configure  commands.ConfigureCmd  `cmd:"" help:"Configure CLI settings (endpoint, profiles)"`
-	Login      commands.LoginCmd      `cmd:"" help:"Log in via OIDC and cache a token for the active profile"`
-	Settings   commands.SettingsCmd   `cmd:"" help:"View or update schema change settings"`
-	Checks     commands.ChecksCmd     `cmd:"" help:"Manage SchemaBot Check Runs on PRs"`
-	Storage    commands.StorageCmd    `cmd:"" help:"Inspect and maintain SchemaBot's own storage database"`
-	Local      commands.LocalCmd      `cmd:"" hidden:"" help:"Internal local runtime host"`
-	Serve      commands.ServeCmd      `cmd:"" help:"Start the SchemaBot HTTP API server"`
+	Init      commands.InitCmd      `cmd:"" help:"Initialize a local connection and verify imported schema" group:"setup"`
+	Configure commands.ConfigureCmd `cmd:"" help:"Configure CLI settings (endpoint, profiles)" group:"setup"`
+	Login     commands.LoginCmd     `cmd:"" help:"Log in via OIDC and cache a token for the active profile" group:"setup"`
+	Local     commands.LocalCmd     `cmd:"" help:"Inspect or stop the local runtime for the active profile" group:"setup"`
+
+	Databases commands.DatabasesCmd `cmd:"" help:"List configured databases" group:"explore"`
+	Pull      commands.PullCmd      `cmd:"" help:"Return live schema from a source environment" group:"explore"`
+	Onboard   commands.OnboardCmd   `cmd:"" help:"Pull live schema into a new declarative schema directory" group:"explore"`
+	Status    commands.StatusCmd    `cmd:"" help:"Show schema change status" group:"explore"`
+	Plans     commands.PlansCmd     `cmd:"" name:"list-plans" help:"List recently generated schema change plans" group:"explore"`
+	Logs      commands.LogsCmd      `cmd:"" help:"View apply logs" group:"explore"`
+
+	Plan  commands.PlanCmd  `cmd:"" help:"Create a schema change plan" group:"change"`
+	Apply commands.ApplyCmd `cmd:"" help:"Apply schema changes" group:"change"`
+
+	Progress   commands.ProgressCmd   `cmd:"" help:"Get schema change progress" group:"control"`
+	Stop       commands.StopCmd       `cmd:"" help:"Stop an in-progress schema change" group:"control"`
+	Start      commands.StartCmd      `cmd:"" help:"Resume a stopped schema change" group:"control"`
+	Cutover    commands.CutoverCmd    `cmd:"" help:"Trigger cutover for a deferred schema change" group:"control"`
+	Cancel     commands.CancelCmd     `cmd:"" help:"Cancel a schema change permanently" group:"control"`
+	Release    commands.ReleaseCmd    `cmd:"" help:"Release a rollout paused after an on_failure=pause failure" group:"control"`
+	Revert     commands.RevertCmd     `cmd:"" help:"Revert a completed schema change during the revert window" group:"control"`
+	SkipRevert commands.SkipRevertCmd `cmd:"" name:"skip-revert" help:"Skip the revert window, finalizing the schema change" group:"control"`
+	Rollback   commands.RollbackCmd   `cmd:"" help:"Rollback to the previous schema state" group:"control"`
+
+	Freeze   commands.FreezeCmd   `cmd:"" help:"Freeze an environment, or list, show and approve overrides of freezes" group:"environment"`
+	Unfreeze commands.UnfreezeCmd `cmd:"" help:"Lift an environment freeze" group:"environment"`
+	Locks    commands.LocksCmd    `cmd:"" help:"List all active database locks" group:"environment"`
+	Unlock   commands.UnlockCmd   `cmd:"" help:"Release a database lock" group:"environment"`
+	Settings commands.SettingsCmd `cmd:"" help:"View or update schema change settings" group:"environment"`
+
+	Serve   commands.ServeCmd   `cmd:"" help:"Start the SchemaBot HTTP API server" group:"server"`
+	Checks  commands.ChecksCmd  `cmd:"" help:"Manage SchemaBot Check Runs on PRs" group:"server"`
+	Storage commands.StorageCmd `cmd:"" help:"Inspect and maintain SchemaBot's own storage database" group:"server"`
+
+	// Hidden: not part of the user-facing surface. preview is a development
+	// tool; fix-lint works but is not ready to be advertised.
+	Preview commands.PreviewCmd `cmd:"" hidden:"" help:"Preview CLI output templates (for development)"`
+	FixLint commands.FixLintCmd `cmd:"" name:"fix-lint" hidden:"" help:"Auto-fix lint issues in schema files"`
+}
+
+// helpOptions is how every help page renders: one line per command, with
+// subcommands left to the parent's own --help. The top-level listing is the
+// first thing a newcomer reads; it should fit on a screen and name what
+// SchemaBot does, not enumerate every operation.
+func helpOptions() kong.HelpOptions {
+	return kong.HelpOptions{Compact: true, NoExpandSubcommands: true}
+}
+
+// commandGroups titles the sections of a help listing. Sections print in the
+// order the CLI struct declares them, not the order of this map, and the order
+// loosely follows docs/cli.md: that page has no section for managing an
+// environment or for running the server, and it covers freezes under planning
+// and applying a change.
+//
+// Every subcommand carries "commands". A command with no group of its own
+// takes its parent's, so without it a parent's own --help would head the
+// subcommands it lists with whichever top-level section the parent sits in.
+func commandGroups() kong.Groups {
+	return kong.Groups{
+		"setup":       "Set up the CLI:",
+		"explore":     "Explore your databases:",
+		"change":      "Plan and apply a change:",
+		"control":     "Follow and control a change:",
+		"environment": "Manage an environment:",
+		"server":      "Run SchemaBot:",
+		"commands":    "Commands:",
+	}
 }
 
 func main() {
@@ -78,6 +115,8 @@ func main() {
 		kong.Name(cliname.Name()),
 		kong.Description("Declarative schema GitOps orchestrator"),
 		kong.UsageOnError(),
+		kong.ConfigureHelp(helpOptions()),
+		commandGroups(),
 		kong.Vars{
 			"version":  fmt.Sprintf("%s (commit: %s)", version, commit),
 			"cli_name": cliname.Name(),

@@ -6,6 +6,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 )
 
 // maxRenderedPlanProblems bounds how many refused statements one environment's
@@ -111,7 +112,7 @@ func planProblemLocation(problem engine.PlanProblem) string {
 // statementExcerpt is a refused statement's first non-blank line, cut to a
 // recognizable length, with "…" marking that more of the statement follows.
 func statementExcerpt(statement string) string {
-	lines := strings.Split(strings.TrimSpace(stripControlText(statement)), "\n")
+	lines := strings.Split(strings.TrimSpace(presentation.StripControlText(statement)), "\n")
 	first := strings.TrimRight(lines[0], " \t\r")
 	more := len(lines) > 1
 	if runes := []rune(first); len(runes) > maxPlanProblemExcerptRunes {

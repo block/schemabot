@@ -131,7 +131,7 @@ func singleOpDisplay(ops []*storage.ApplyOperation, displayByOp map[int64]operat
 // rollup plus each deployment's own single-deployment comment data, so each
 // deployment's section reuses the existing per-table renderer.
 func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, tenant, cliName string) templates.MultiDeploymentApplyData {
-	tasksByOp := groupTasksByOperation(tasks)
+	tasksByOp := storage.TasksByOperation(tasks)
 
 	model := deriveApplyPresentation(apply.State, ops, tasksByOp, released)
 	// Derive returns one presentation per rollout member, so the details are
@@ -173,7 +173,8 @@ func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, re
 // presentation inputs and derives the rollup. Rows are already in resolved order.
 // released is the apply-level release latch applied to every operation.
 // tasksByOp marks a row retrying while one of its tasks retries a failure, the
-// task evidence the cutover claim holds a later member on. applyState is the
+// task evidence the cutover claim holds a later member on, and supplies a failed
+// row's reason when only its tasks recorded one, as the progress API does. applyState is the
 // apply's own state, so a resuming apply's still-stopped rows read as the
 // start under way (presentation.ResumeClaimed).
 func deriveApplyPresentation(applyState string, ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task, released bool) presentation.Apply {
@@ -181,6 +182,7 @@ func deriveApplyPresentation(applyState string, ops []*storage.ApplyOperation, t
 	endedBy := endedByRefs(ops)
 	for _, op := range ops {
 		input := applyOperationToPresentation(op, released)
+		input.Error = op.FailureMessage(tasksByOp[op.ID])
 		input.Retrying = storage.TasksRetrying(tasksByOp[op.ID])
 		input.EndedBy = endedBy[op.ID]
 		inputs = append(inputs, input)
@@ -286,19 +288,4 @@ func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tas
 		data.CompletedAt = apply.CompletedAt.Format(time.RFC3339)
 	}
 	return data
-}
-
-// groupTasksByOperation buckets tasks by their owning apply_operation. Tasks with
-// no apply_operation_id (legacy rows predating the per-deployment back-fill) are
-// not attributable to a deployment and are omitted from the per-deployment
-// sections; in a genuine multi-deployment apply every task carries the id.
-func groupTasksByOperation(tasks []*storage.Task) map[int64][]*storage.Task {
-	byOp := make(map[int64][]*storage.Task)
-	for _, t := range tasks {
-		if t.ApplyOperationID == nil {
-			continue
-		}
-		byOp[*t.ApplyOperationID] = append(byOp[*t.ApplyOperationID], t)
-	}
-	return byOp
 }

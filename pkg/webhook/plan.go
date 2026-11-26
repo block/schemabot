@@ -1060,10 +1060,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		BaseSchemaNotice: templates.AnyEnvHasBaseSchemaNotice(multiEnvData),
 	}
 
-	// The caller asked not to re-post: either the push left the schema inputs
-	// unchanged, or this is the re-plan after a terminal apply, where the
-	// operator asked for an apply rather than a plan. The visible plan comment
-	// stays the PR's answer unless its outcome no longer matches this plan.
+	// The caller asked not to re-post: no schema input changed since the
+	// visible plan comment, whether this plan follows a push or is the re-plan
+	// after a terminal apply. The visible plan comment stays the PR's answer
+	// unless its outcome no longer matches this plan.
 	if !postPlanComment {
 		// A base-schema notice is new information even when the schema inputs
 		// did not change, since the base branch moves without a push to the PR.

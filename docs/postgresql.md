@@ -179,10 +179,22 @@ supply a DSN.
 SchemaBot checks the privileges each statement needs on its own table before
 running it, and a missing grant fails with the `GRANT` that fixes it. A plan
 that adds a foreign key also checks `REFERENCES` on the referenced table, and
-fails with the grant to add when it is missing. If the grant is revoked after
-the plan, the apply fails, says a grant is missing, and retries once you grant it. If your tables belong to a
-dedicated owner role, read [Table ownership](#table-ownership) before the first
-`CREATE TABLE`.
+fails with the grant to add when it is missing.
+
+If a grant is revoked after the plan, the apply fails at the statement that
+needs it, and statements before it may already have run:
+
+- A privilege on the statement's own table is checked again before the
+  statement runs. The failure names the `GRANT` that fixes it. The apply fails:
+  grant the privilege, then plan and apply again. The new plan holds only the
+  statements that did not run.
+- `REFERENCES` on the table a foreign key references is checked only by the
+  server. The failure says a privilege is missing, and the server log names it.
+  SchemaBot retries the apply on its own, so grant the privilege and it carries
+  on. If its retries run out first, plan and apply again.
+
+If your tables belong to a dedicated owner role, read
+[Table ownership](#table-ownership) before the first `CREATE TABLE`.
 
 ## What runs and what is blocked
 
@@ -199,7 +211,7 @@ dedicated owner role, read [Table ownership](#table-ownership) before the first
 | Row-level security policies on an existing table | Run in one transaction, after you explicitly approve them, because they change who can read rows. See [Row-level security](#row-level-security) |
 | Adding a foreign key | Runs in two steps: `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`, which checks existing rows while writes continue. See [Foreign keys](#foreign-keys) |
 | Dropping a foreign key | Shown in the plan, but blocked. See [Foreign keys](#foreign-keys) |
-| Making a column `NOT NULL` | Runs in four steps on a table up to the size limit: a helper `CHECK (column IS NOT NULL) NOT VALID`, `VALIDATE CONSTRAINT`, which checks existing rows while writes continue, `SET NOT NULL`, which uses the validated check instead of scanning, and the helper's drop. If a row holds `NULL`, the validation fails and names the helper. Fix those rows, then apply again |
+| Making a column `NOT NULL` | Runs in four steps on a table up to the size limit: a helper `CHECK (column IS NOT NULL) NOT VALID`, `VALIDATE CONSTRAINT`, which checks existing rows while writes continue, `SET NOT NULL`, which uses the validated check instead of scanning, and the helper's drop. If a row holds `NULL`, the validation fails and names the helper. Fix those rows and SchemaBot retries the validation on its own. If its retries run out first, drop the helper outside SchemaBot, then plan and apply again |
 | A table with no schema file, or a deleted file | Runs as `DROP TABLE` after you approve it with `--allow-unsafe`, as on MySQL. Archive tables and `ignore_tables` entries are left alone. See [Tables with no schema file](#tables-with-no-schema-file) |
 
 Once a statement starts, it runs until it commits or its timeout ends it; it
@@ -706,7 +718,8 @@ When a plan is blocked:
   names the clause to remove. A statement pg-sprite refuses gets the reason
   it would take a lock or break running code, and the safe steps that make the
   same change.
-- The plan Check Run fails.
+- The Check Run fails with the title "Plan blocked", and the database's row
+  reads Blocked.
 - An apply is rejected before anything is queued.
 - No flag overrides it. Rewrite the change into a form pg-sprite accepts, or
   make it outside SchemaBot through a separately reviewed process.

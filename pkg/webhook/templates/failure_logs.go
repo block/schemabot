@@ -5,6 +5,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/block/schemabot/pkg/presentation"
 )
 
 // LogEntryData is one apply log line rendered into the recent-logs section of
@@ -293,11 +295,11 @@ func formatLogEntryLine(entry LogEntryData) string {
 // as the comment error sanitizer.
 func sanitizeLogText(text string) string {
 	text = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(text)
-	text = stripControlText(text)
+	text = presentation.StripControlText(text)
 	for strings.Contains(text, "```") {
 		text = strings.ReplaceAll(text, "```", "`` `")
 	}
-	text = redactConnectionDetails(text)
+	text = presentation.RedactConnectionDetails(text)
 	return text
 }
 

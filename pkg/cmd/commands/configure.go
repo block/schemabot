@@ -17,8 +17,8 @@ import (
 
 // ConfigureCmd configures CLI settings.
 type ConfigureCmd struct {
-	Setup ConfigureSetupCmd `cmd:"" default:"withargs" hidden:"" help:"Configure a profile interactively"`
-	Show  ConfigureShowCmd  `cmd:"" help:"Show current configuration"`
+	Setup ConfigureSetupCmd `cmd:"" default:"withargs" hidden:"" help:"Configure a profile interactively" group:"commands"`
+	Show  ConfigureShowCmd  `cmd:"" help:"Show current configuration" group:"commands"`
 }
 
 // ConfigureSetupCmd is the default configure command (interactive profile setup).

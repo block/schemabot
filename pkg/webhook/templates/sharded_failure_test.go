@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -82,7 +83,7 @@ func TestRenderShardedApplyComment_FailureReasonsAreSanitized(t *testing.T) {
 // Shards that each fail for their own reason cannot wall the callout: past
 // the limit, the remaining reasons fold into one line with their shard count.
 func TestRenderShardedApplyComment_CapsFailureReasons(t *testing.T) {
-	statuses := make([]ShardStatus, failureReasonLimit+3)
+	statuses := make([]ShardStatus, presentation.FailureReasonLimit+3)
 	for i := range statuses {
 		statuses[i] = failedShard(fmt.Sprintf("reason %d", i))
 	}
@@ -94,7 +95,7 @@ func TestRenderShardedApplyComment_CapsFailureReasons(t *testing.T) {
 	})
 
 	assert.Contains(t, out, "> - shards `s00`, `s01`: reason 0\n", "the most common reason leads")
-	assert.Equal(t, failureReasonLimit, strings.Count(out, ": reason "))
+	assert.Equal(t, presentation.FailureReasonLimit, strings.Count(out, ": reason "))
 	assert.Contains(t, out, "> - …and 2 more reasons on 2 shards\n")
 	for i := 2; i < len(statuses); i++ {
 		assert.Contains(t, out, fmt.Sprintf("| `s%02d` | ❌ failed — reason %d |", i, i), "a reason past the limit stays reachable in the failed shards' table")
@@ -227,6 +228,20 @@ func TestRenderShardedApplyComment_FooterOffersStopWhileRunning(t *testing.T) {
 	assert.NotContains(t, failed, "schemabot stop")
 }
 
+// A keyspace finalizer that fails while other work is still running names its
+// failure once on the callout.
+func TestRenderShardedApplyComment_RunningFinalizerFailureRendersOnce(t *testing.T) {
+	const finalizeErr = "publish routing rules: target is read-only"
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "production", Database: "cdb_resolute", ApplyID: "apply-x",
+		FailedFinalizer: &FinalizerFailure{Keyspace: "commerce", State: state.ApplyOperation.Failed, Error: finalizeErr},
+		Keyspaces:       wideShards(2, runningShard(), runningShard()),
+	})
+
+	assert.Equal(t, 1, strings.Count(out, finalizeErr), out)
+	assert.Contains(t, out, "> ❌ **Failure:** finalizing keyspace <code>commerce</code> — "+finalizeErr+"\n")
+}
+
 // A failed table that already landed on some shards counts both against the
 // same total, so the two clauses never disagree about how many shards exist.
 func TestRenderShardedApplyComment_FailedTableCountsLandedShardsAgainstPlannedTotal(t *testing.T) {
@@ -257,18 +272,4 @@ func TestRenderShardedApplyComment_FooterOmitsRetryNoteWhileShardRetries(t *test
 
 	assert.Contains(t, out, "schemabot stop apply-x -e production --tenant acme")
 	assert.NotContains(t, out, "A new apply can retry")
-}
-
-// A keyspace finalizer that failed while the apply still runs is named once,
-// in the failure callout.
-func TestRenderShardedApplyComment_FinalizerFailureRendersOnce(t *testing.T) {
-	out := RenderShardedApplyComment(ShardedApplyData{
-		State: state.Apply.Running, Environment: "production", Database: "cdb_resolute", ApplyID: "apply-x",
-		Keyspaces:       wideShards(4, runningShard(), runningShard(), runningShard(), runningShard()),
-		FailedFinalizer: &FinalizerFailure{Keyspace: "cdb_resolute", State: state.ApplyOperation.Failed, Error: "vschema update rejected"},
-	})
-
-	callout := "**Failure:** finalizing keyspace <code>cdb_resolute</code> — vschema update rejected"
-	assert.Contains(t, out, callout)
-	assert.Equal(t, 1, strings.Count(out, callout))
 }

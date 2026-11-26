@@ -667,12 +667,13 @@ const sqlstateCheckViolation = "23514"
 
 // brokenCheckDetail names the check constraint whose validation failed on
 // existing rows. It applies only when the failed step validates the
-// constraint the server names: the plan added that constraint NOT VALID in an
-// earlier step, so it stays in place and checks new writes, and the apply can
-// finish once the owner fixes the rows. For the helper check a SET NOT NULL
-// validates, those are the rows that hold NULL in the column. The detail is
-// built from the server's typed fields, never its message, because the
-// message can quote row values.
+// constraint the server names. That constraint is NOT VALID on the table,
+// whether the plan added it in an earlier step or found it live, so it stays
+// in place and checks new writes, and the apply can finish once the owner
+// fixes the rows. For the helper check a SET NOT NULL validates, those are
+// the rows that hold NULL in the column. The detail is built from the
+// server's typed fields, never its message, because the message can quote
+// row values.
 func brokenCheckDetail(err error, table string, validates *schemadiff.ConstraintValidation) (string, bool) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateCheckViolation {

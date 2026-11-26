@@ -4506,6 +4506,22 @@ SchemaBot is holding back its remaining GitHub API quota for check runs, so it d
 </details>
 
 
+## Aggregate Check — Plan Blocked
+
+<details>
+<summary><strong>Aggregate Check — Plan Blocked</strong></summary>
+
+Plan blocked
+
+| Database | Type | Change | Status |
+|----------|------|--------|--------|
+| `orders` | postgres | 1 index drop | Blocked |
+
+
+The plan comment names each blocked change and why. Rewrite the change into a form SchemaBot runs, or take it out of the schema files, and push.
+</details>
+
+
 ## Aggregate Check — Multi-Target Rollout Names Its Targets
 
 <details>
@@ -12607,7 +12623,7 @@ To resume from where it stopped:
 
   ── shop_001 ──
 
-     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+     ~ orders: ❌ Failed on 1 of 4 shards
        ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
 
        • Shards: 4 (1 failed, 3 cancelled)
@@ -12654,7 +12670,7 @@ The new apply will only process tables that haven't completed.
 
   ── shop_001 ──
 
-     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+     ~ orders: ❌ Failed on 1 of 4 shards
        ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
 
        • Shards: 4 (1 failed, 3 stopped)

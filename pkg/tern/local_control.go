@@ -1052,7 +1052,8 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		return nil, fmt.Errorf("cancel schema change on database %s: %w", c.config.Database, err)
 	}
 	if applyID > 0 && cancelledCount > 0 {
-		if opLease, operationScoped := operationLeaseOnlyDrive(ctx); operationScoped {
+		opLease, operationScoped := operationLeaseOnlyDrive(ctx)
+		if operationScoped {
 			c.leaveApplyRowToProjection(targetApply, opLease, state.Task.Cancelled)
 		} else if err := c.markApplyCancelled(ctx, applyID); err != nil {
 			return nil, err
@@ -1063,6 +1064,9 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		}
 		c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			eventMsg, "", "")
+		if !operationScoped {
+			c.notifyTerminalAfterCancel(ctx, applyID, targetApply)
+		}
 	}
 	if cancelledCount == 0 && skippedCount == 0 {
 		// No apply was resolved and the database has no targetable tasks: there
@@ -2948,6 +2952,57 @@ func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context,
 	}
 	c.notifyTerminalObserver(apply, tasks)
 	return skippedCount, nil
+}
+
+// notifyTerminalAfterCancel delivers the terminal notification for an apply a
+// cancel just settled. A cancel resolves the apply directly to a terminal state
+// and surfaces through the terminal summary, and the cancel path is the writer
+// that moved it there, so it owes the summary and Check Run refresh, the same
+// as the task-less cancel path and a failed drive do. The drive it woke cannot
+// deliver them: the cancel cancelled the drive's context, so the drive hands
+// the apply back without finalizing it. An observer held by a drive in another
+// process is delivered by that drive's finalization, which finds the apply
+// already terminal; the summary-marker claim keeps the two exactly-once. When
+// the reload fails the apply stays terminal and summary reconciliation posts
+// what this could not.
+func (c *LocalClient) notifyTerminalAfterCancel(ctx context.Context, applyID int64, target *storage.Apply) {
+	if c.getObserver(applyID) == nil {
+		c.logger.Debug("cancel settled an apply this process holds no observer for; the drive that holds it delivers the terminal summary",
+			c.cancelTargetLogAttrs(target)...)
+		return
+	}
+	apply, err := c.storage.Applies().Get(ctx, applyID)
+	if err != nil {
+		c.logger.Warn("cancel settled the apply but could not reload it to post the terminal summary; summary reconciliation posts it",
+			append(c.cancelTargetLogAttrs(target), "error", err)...)
+		return
+	}
+	if apply == nil {
+		c.logger.Warn("cancel settled an apply that could not be found on reload; no terminal summary is posted",
+			c.cancelTargetLogAttrs(target)...)
+		return
+	}
+	if !state.IsState(apply.State, state.Apply.Cancelled) {
+		c.logger.Warn("cancel settled the apply's tasks but the stored apply is not cancelled; no terminal summary is posted from the cancel path",
+			apply.LogAttrs()...)
+		return
+	}
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, applyID)
+	if err != nil {
+		c.logger.Warn("could not load tasks for the terminal summary after cancel; notifying without them",
+			append(apply.LogAttrs(), "error", err)...)
+		tasks = nil
+	}
+	c.notifyTerminalObserver(apply, tasks)
+}
+
+// cancelTargetLogAttrs returns the triage attributes of the apply a cancel
+// resolved, or the database alone when it resolved none.
+func (c *LocalClient) cancelTargetLogAttrs(target *storage.Apply) []any {
+	if target == nil {
+		return []any{"database", c.config.Database}
+	}
+	return target.LogAttrs()
 }
 
 // capitalizeControlVerb upper-cases the first letter of a control verb for use
