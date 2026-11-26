@@ -1810,7 +1810,9 @@ shard while the other lists several reasons. *Enforced:* the shared derivation (
 `QualifyShardNames`, `SummarizeFailures`, and `FailedReach` in `pkg/presentation/failure_reasons.go`),
 and tests that render the same failed shards through both surfaces and fail when they read
 differently (`TestShardFailureReasonsReadTheSameOnEverySurface` and
-`TestShardFailureNamesQualifyRepeatedShardsOnEverySurface` in `pkg/cmd/internal/templates`).
+`TestShardFailureNamesQualifyRepeatedShardsOnEverySurface` in `pkg/cmd/internal/templates`), with
+`TestWatchModel_ShardedApplyGroupsFailedShards` in `pkg/cmd/commands` pinning the watch view to the same
+callout.
 
 ## Recovery (RC)
 

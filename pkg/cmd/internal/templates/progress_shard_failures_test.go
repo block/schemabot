@@ -132,6 +132,15 @@ func TestWriteProgressShardedRetryingShardsReadAsAttention(t *testing.T) {
 	output := watchShardFailure(t, shardFailureResponse(state.Apply.Running, 2,
 		shardFailure{reason: timeoutReason, retrying: true}, shardFailure{reason: timeoutReason, retrying: true}))
 	assert.Contains(t, output, "  ⚠️ Retrying after a failure on shards -10, 10-20: "+timeoutReason+"\n")
+	assert.NotContains(t, output, presentation.RetryOnceSettledNote, "SchemaBot retries these shards itself")
+}
+
+// Reasons that differ only in line breaks or spacing are one reason, as the
+// PR comment groups them, and none of them breaks the callout's indent.
+func TestWriteProgressShardedFailureReasonsGroupAcrossWhitespace(t *testing.T) {
+	output := watchShardFailure(t, shardFailureResponse(state.Apply.Failed, 0,
+		failedFor("Duplicate entry\n'42' for key 'uk_target'"), failedFor("Duplicate entry  '42' for key 'uk_target'")))
+	assert.Contains(t, output, "  ❌ Failed on shards -10, 10-20: Duplicate entry '42' for key 'uk_target'\n")
 }
 
 // A shard that fails while others still copy is named under the box, and the
@@ -224,4 +233,32 @@ func TestShardFailureNamesQualifyRepeatedShardsOnEverySurface(t *testing.T) {
 		assert.Contains(t, cli, line, "CLI")
 		assert.Contains(t, prPlain, line, "PR comment")
 	}
+}
+
+// One failed shard whose name repeats in another keyspace is named with its
+// keyspace, since the apply's error names only the bare shard.
+func TestWriteProgressShardedSingleFailureQualifiesRepeatedShardName(t *testing.T) {
+	resp := &apitypes.ProgressResponse{
+		ApplyID: "apply-a1b2c3d4e5f6", Database: "shop", DatabaseType: storage.DatabaseTypeMySQL,
+		Environment: "production", State: state.Apply.Failed, Sharded: true, ErrorMessage: "shard -80: " + dupesReason,
+	}
+	for _, ks := range []string{"shop_a", "shop_b"} {
+		opState, taskState := state.ApplyOperation.Completed, state.Task.Completed
+		reason := ""
+		if ks == "shop_a" {
+			opState, taskState, reason = state.ApplyOperation.Failed, state.Task.Failed, dupesReason
+		}
+		resp.Operations = append(resp.Operations, &apitypes.ProgressOperationResponse{
+			Deployment: "data-plane", OperationKey: ks + "/-80/mutes",
+			OperationKind: storage.ApplyOperationKindWork, State: opState, ErrorMessage: reason,
+		})
+		resp.Tables = append(resp.Tables, &apitypes.TableProgressResponse{
+			TableName: "mutes", Keyspace: ks, Deployment: "data-plane", ChangeType: "alter",
+			DDL: "ALTER TABLE `mutes` ADD UNIQUE KEY `uk_target`(`target_id`)", Status: taskState,
+			Shards: []*apitypes.ShardProgressResponse{{Shard: "-80", Status: taskState}},
+		})
+	}
+	output := watchShardFailure(t, resp)
+	assert.Contains(t, output, "  ❌ Failed on shard shop_a/-80: "+dupesReason+"\n")
+	assert.NotContains(t, output, "  shard -80: "+dupesReason, "the qualified callout stands in for the apply's error")
 }

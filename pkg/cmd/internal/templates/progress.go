@@ -247,7 +247,7 @@ func WriteProgress(data ProgressData) {
 	}
 	// A shard that failed while others still run can be retried once they
 	// settle. Watch offers the stop key, so no stop command is printed here.
-	if data.Sharded && shardFailedWhileRunning(data.State, data.Operations, data.Tables, data.Released) {
+	if data.Sharded && ShardFailedWhileRunning(data.State, data.Operations, data.Tables, data.Released) {
 		fmt.Printf("\n%s\n", presentation.RetryOnceSettledNote)
 	}
 }

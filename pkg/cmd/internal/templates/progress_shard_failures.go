@@ -8,15 +8,14 @@ import (
 	"github.com/block/schemabot/pkg/state"
 )
 
-// ShardFailureCallout is the failure callout for a sharded apply that failed
-// on more than one shard: how many failed, then each distinct reason once with
-// the shards it failed, as the PR comment's callout reads them
-// (presentation.SummarizeFailures). It is "" when at most one shard failed,
-// which the apply's error already names, or when every keyspace runs on its
-// only shard. Reasons arrive terminal-safe from ParseProgressResponse.
+// ShardFailureCallout is the failure callout for a sharded apply: how many
+// shards failed, then each distinct reason once with the shards it failed, as
+// the PR comment's callout reads them (presentation.SummarizeFailures). It is
+// "" when no shard failed, or when one failed under a name the apply's error
+// already gives in full, or when every keyspace runs on its only shard.
 func ShardFailureCallout(applyState string, ops []ProgressOperation, tables []TableProgress, released bool) string {
-	summary, totalShards, ok := shardFailures(applyState, ops, tables, released)
-	if !ok || len(summary.Names) < 2 {
+	summary, totalShards, qualified, ok := shardFailures(applyState, ops, tables, released)
+	if !ok || len(summary.Names) == 0 || !calloutNamesMoreThanError(summary, qualified) {
 		return ""
 	}
 	var b strings.Builder
@@ -43,25 +42,44 @@ func ShardFailureCallout(applyState string, ops []ProgressOperation, tables []Ta
 	return b.String()
 }
 
-// shardFailedWhileRunning reports whether a running sharded apply has a shard
-// whose own work failed, so the view says when a new apply can retry it, as
-// the PR comment's footer does.
-func shardFailedWhileRunning(applyState string, ops []ProgressOperation, tables []TableProgress, released bool) bool {
+// calloutNamesMoreThanError reports whether the callout says something the
+// apply's error does not. The error names its one shard by the bare shard
+// name, so a single failure needs the callout only when shard names repeat
+// across keyspaces and the callout qualifies them with their keyspace.
+func calloutNamesMoreThanError(summary presentation.FailureSummary, qualified bool) bool {
+	return len(summary.Names) > 1 || qualified
+}
+
+// ShardFailedWhileRunning reports whether a running sharded apply has a shard
+// that failed for good, so the view says when a new apply can retry it, as the
+// PR comment's footer does. A shard SchemaBot is still retrying does not count:
+// no new apply is needed for it.
+func ShardFailedWhileRunning(applyState string, ops []ProgressOperation, tables []TableProgress, released bool) bool {
 	if !state.IsRunningApplyState(applyState) {
 		return false
 	}
-	summary, _, ok := shardFailures(applyState, ops, tables, released)
-	return ok && len(summary.Names) > 0
+	statuses, _, _, sharded := shardStatuses(applyState, ops, tables, released)
+	if !sharded {
+		return false
+	}
+	for _, s := range statuses {
+		if presentation.FailedMember(s.State, s.Presentation == presentation.StateStoppedAtCutover) &&
+			state.IsState(s.State, state.ApplyOperation.Failed) {
+			return true
+		}
+	}
+	return false
 }
 
 // shardFailures reads the shards of a sharded apply whose own work failed or
 // is retrying after a failure as one summary (presentation.FailedMember), with
-// how many shards the apply runs on. It reports false when every keyspace runs
+// how many shards the apply runs on and whether the names carry their keyspace
+// (presentation.QualifyShardNames). It reports false when every keyspace runs
 // on its only shard.
-func shardFailures(applyState string, ops []ProgressOperation, tables []TableProgress, released bool) (presentation.FailureSummary, int, bool) {
+func shardFailures(applyState string, ops []ProgressOperation, tables []TableProgress, released bool) (summary presentation.FailureSummary, totalShards int, qualified bool, ok bool) {
 	statuses, _, _, sharded := shardStatuses(applyState, ops, tables, released)
 	if !sharded {
-		return presentation.FailureSummary{}, 0, false
+		return presentation.FailureSummary{}, 0, false, false
 	}
 	refs := make([]presentation.ShardRef, len(statuses))
 	for i, s := range statuses {
@@ -75,11 +93,26 @@ func shardFailures(applyState string, ops []ProgressOperation, tables []TablePro
 		}
 		failures = append(failures, presentation.Failure{
 			Name:     names[i],
-			Reason:   s.Error,
+			Reason:   oneLineReason(s.Error),
 			Retrying: state.IsState(s.State, state.ApplyOperation.FailedRetryable),
 		})
 	}
-	return presentation.SummarizeFailures(failures), len(statuses), true
+	for i, s := range statuses {
+		if names[i] != s.Shard {
+			qualified = true
+			break
+		}
+	}
+	return presentation.SummarizeFailures(failures), len(statuses), qualified, true
+}
+
+// oneLineReason folds a shard's error onto one line, so two shards whose
+// errors differ only in line breaks or spacing group under one reason, as the
+// PR comment groups them, and a line break cannot escape the callout's indent.
+// The PR comment also redacts connection details, since it is public; the CLI
+// is an operator's own view and shows the reason in full.
+func oneLineReason(msg string) string {
+	return strings.Join(strings.Fields(msg), " ")
 }
 
 // shardNameList names a few shards, or counts them against the apply's shards
