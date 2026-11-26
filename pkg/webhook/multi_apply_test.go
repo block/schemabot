@@ -429,18 +429,6 @@ func TestDeriveApplyPresentation_HeldByARetryingTask(t *testing.T) {
 	assert.Equal(t, "ready for cutover", deriveApplyPresentation(state.Apply.Running, ops, nil, false).Deployments[1].Label)
 }
 
-// Tasks without an apply_operation_id (legacy rows) are not attributable to a
-// deployment and are dropped from the per-operation grouping.
-func TestGroupTasksByOperation_SkipsUnlinkedTasks(t *testing.T) {
-	grouped := groupTasksByOperation([]*storage.Task{
-		{ApplyOperationID: new(int64(1)), TableName: "a"},
-		{ApplyOperationID: nil, TableName: "orphan"},
-		{ApplyOperationID: new(int64(1)), TableName: "b"},
-	})
-	require.Len(t, grouped[1], 2)
-	assert.Len(t, grouped, 1)
-}
-
 // Target orders-001 deferred its cutover across shards -80 and 80-, and 80-
 // failed while -80 waited at the cutover, so SchemaBot stopped -80 and failed
 // it for 80- (ended_by_operation_id). The comment's model reads -80 as stopped
@@ -460,5 +448,28 @@ func TestDeriveApplyPresentation_StoppedAtCutoverNamesTheFailedRow(t *testing.T)
 	assert.Equal(t, []presentation.StateCount{{Label: "failed", Count: 1}, {Label: "stopped at cutover", Count: 1}}, model.Counts)
 	require.NotNil(t, model.FirstFailure)
 	assert.Equal(t, 1, model.FirstFailure.Row)
+	assert.Equal(t, "lock wait timeout exceeded", model.FirstFailure.Error)
+}
+
+// Target orders-001 failed on a remote data plane that recorded the error on
+// its task and never stamped the operation row. The comment's model reads the
+// target's reason from that task, the same reason the progress API serves the
+// CLI, so the failed-target row names it instead of reading blank.
+func TestDeriveApplyPresentation_FailedTargetReasonFromItsTask(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 21, Deployment: "payments-a", Target: "orders-001", State: state.ApplyOperation.Failed},
+		{ID: 22, Deployment: "payments-a", Target: "orders-002", State: state.ApplyOperation.Failed, ErrorMessage: "copy failed on orders"},
+	}
+	tasksByOp := map[int64][]*storage.Task{
+		21: {{TableName: "orders", State: state.Task.Failed, ErrorMessage: "lock wait timeout exceeded"}},
+		22: {{TableName: "orders", State: state.Task.Failed, ErrorMessage: "duplicate entry"}},
+	}
+
+	model := deriveApplyPresentation(state.Apply.Failed, ops, tasksByOp, false)
+
+	require.Len(t, model.Deployments, 2)
+	assert.Equal(t, "lock wait timeout exceeded", model.Deployments[0].Error)
+	assert.Equal(t, "copy failed on orders", model.Deployments[1].Error, "a row's own error wins over its tasks'")
+	require.NotNil(t, model.FirstFailure)
 	assert.Equal(t, "lock wait timeout exceeded", model.FirstFailure.Error)
 }

@@ -9,11 +9,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -111,22 +113,25 @@ func main() {
 		DeployRequestDelay:    deployRequestDelay,
 		ProcessorTickInterval: processorTickInterval,
 		Logger:                logger,
+		// Seeding runs inside New, before the server reports healthy, so a
+		// dependent waiting on /health never starts against a cluster whose
+		// tables have not been created yet.
+		Seed: func(ctx context.Context, baseURL string) error {
+			if cf.SchemaDir == "" {
+				logger.Info("no schema_dir configured, skipping schema seeding")
+				return nil
+			}
+			logger.Info("seeding schema from schema_dir", "schema_dir", cf.SchemaDir)
+			if err := seedSchemaDir(ctx, baseURL, orgs, cf.SchemaDir, logger); err != nil {
+				return err
+			}
+			logger.Info("schema seeding complete")
+			return nil
+		},
 	})
 	if err != nil {
-		logger.Error("failed to start localscale", "error", err)
+		logger.Error("failed to start localscale", "schema_dir", cf.SchemaDir, "error", err)
 		os.Exit(1)
-	}
-
-	// Apply VSchema files from schema_dir if set
-	if cf.SchemaDir != "" {
-		logger.Info("seeding VSchema from schema_dir", "schema_dir", cf.SchemaDir)
-		if err := applyVSchemas(ctx, server.URL(), orgs, cf.SchemaDir, logger); err != nil {
-			logger.Error("failed to apply vschemas", "schema_dir", cf.SchemaDir, "error", err)
-			os.Exit(1)
-		}
-		logger.Info("VSchema seeding complete")
-	} else {
-		logger.Info("no schema_dir configured, skipping VSchema seeding")
 	}
 
 	logger.Info("localscale running", "url", server.URL(), "orgs", len(orgs))
@@ -140,55 +145,191 @@ func main() {
 	server.Close()
 }
 
-// applyVSchemas walks schemaDir looking for keyspace subdirectories containing
-// vschema.json files and applies them to all orgs/databases via the admin HTTP endpoint.
-func applyVSchemas(ctx context.Context, baseURL string, orgs map[string]localscale.OrgConfig, schemaDir string, logger *slog.Logger) error {
+// seedSchemaDir walks schemaDir, treating each subdirectory as a keyspace that
+// holds an optional vschema.json and any number of .sql files, and seeds both
+// into every org and database the server was configured with.
+//
+// VSchema goes first for every keyspace, then the tables: vtgate has to know
+// how to route a keyspace's queries before anything creates tables in it, and a
+// keyspace's vindexes can reference a table in another keyspace.
+func seedSchemaDir(ctx context.Context, baseURL string, orgs map[string]localscale.OrgConfig, schemaDir string, logger *slog.Logger) error {
 	entries, err := os.ReadDir(schemaDir)
 	if err != nil {
 		return fmt.Errorf("read schema dir %s: %w", schemaDir, err)
 	}
-
+	var keyspaces []string
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		// Stat the entry rather than trust it: os.ReadDir reports a symlink to
+		// a keyspace directory as a non-directory, so a schema_dir assembled
+		// out of links would be skipped entirely and seed nothing.
+		path := filepath.Join(schemaDir, entry.Name())
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("stat schema dir entry %s: %w", path, err)
+		}
+		if !info.IsDir() {
+			logger.Debug("skipping non-keyspace entry in schema_dir", "schema_dir", schemaDir, "entry", entry.Name())
 			continue
 		}
-		keyspace := entry.Name()
+		keyspaces = append(keyspaces, entry.Name())
+	}
+
+	// A keyspace directory that matches no configured database seeds nothing.
+	// That is how a misspelled directory name presents, and seeding would
+	// otherwise finish "complete" with the cluster empty, so say so at a level
+	// the binary actually prints.
+	for _, keyspace := range keyspaces {
+		if !anyDatabaseHasKeyspace(orgs, keyspace) {
+			logger.Warn("keyspace directory matches no configured database, nothing will be seeded from it",
+				"schema_dir", schemaDir, "keyspace", keyspace)
+		}
+	}
+
+	for _, keyspace := range keyspaces {
 		vschemaPath := filepath.Join(schemaDir, keyspace, "vschema.json")
 		data, err := os.ReadFile(vschemaPath)
 		if err != nil {
 			if os.IsNotExist(err) {
+				logger.Debug("keyspace has no vschema.json", "keyspace", keyspace)
 				continue
 			}
 			return fmt.Errorf("read vschema for %s: %w", keyspace, err)
 		}
-
 		for orgName, orgCfg := range orgs {
-			for dbName := range orgCfg.Databases {
+			for dbName, dbCfg := range orgCfg.Databases {
+				if !databaseHasKeyspace(dbCfg, keyspace) {
+					logger.Debug("database does not declare this keyspace, skipping vschema",
+						"org", orgName, "database", dbName, "keyspace", keyspace)
+					continue
+				}
 				body := map[string]any{
 					"org":      orgName,
 					"database": dbName,
 					"keyspace": keyspace,
 					"vschema":  json.RawMessage(data),
 				}
-				bodyJSON, _ := json.Marshal(body)
-				req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/admin/seed-vschema", bytes.NewReader(bodyJSON))
-				if err != nil {
-					return fmt.Errorf("create request for %s (%s/%s): %w", keyspace, orgName, dbName, err)
-				}
-				req.Header.Set("Content-Type", "application/json")
-				resp, err := http.DefaultClient.Do(req)
-				if err != nil {
+				if err := postAdmin(ctx, baseURL, "/admin/seed-vschema", body); err != nil {
 					return fmt.Errorf("apply vschema for %s (%s/%s): %w", keyspace, orgName, dbName, err)
-				}
-				_ = resp.Body.Close()
-				if resp.StatusCode != http.StatusOK {
-					return fmt.Errorf("apply vschema for %s (%s/%s): HTTP %d", keyspace, orgName, dbName, resp.StatusCode)
 				}
 				logger.Info("applied vschema", "org", orgName, "database", dbName, "keyspace", keyspace)
 			}
 		}
 	}
 
+	for _, keyspace := range keyspaces {
+		stmts, err := keyspaceDDL(filepath.Join(schemaDir, keyspace))
+		if err != nil {
+			return fmt.Errorf("read DDL for %s: %w", keyspace, err)
+		}
+		if len(stmts) == 0 {
+			logger.Debug("keyspace has no .sql files", "keyspace", keyspace)
+			continue
+		}
+		for orgName, orgCfg := range orgs {
+			for dbName, dbCfg := range orgCfg.Databases {
+				if !databaseHasKeyspace(dbCfg, keyspace) {
+					logger.Debug("database does not declare this keyspace, skipping DDL",
+						"org", orgName, "database", dbName, "keyspace", keyspace)
+					continue
+				}
+				body := map[string]any{
+					"org":        orgName,
+					"database":   dbName,
+					"keyspace":   keyspace,
+					"statements": stmts,
+				}
+				if err := postAdmin(ctx, baseURL, "/admin/seed-ddl", body); err != nil {
+					return fmt.Errorf("seed DDL for %s (%s/%s): %w", keyspace, orgName, dbName, err)
+				}
+				logger.Info("seeded tables", "org", orgName, "database", dbName, "keyspace", keyspace, "statements", len(stmts))
+			}
+		}
+	}
+
+	return nil
+}
+
+// adminRequestTimeout bounds a single seed request. Seeding submits a
+// keyspace's whole DDL batch in one call, so it is given more room than the
+// package's own admin calls, which carry a single operation each.
+const adminRequestTimeout = 30 * time.Second
+
+// anyDatabaseHasKeyspace reports whether any configured database declares the
+// named keyspace, so a keyspace directory that matches none can be surfaced.
+func anyDatabaseHasKeyspace(orgs map[string]localscale.OrgConfig, keyspace string) bool {
+	for _, orgCfg := range orgs {
+		for _, dbCfg := range orgCfg.Databases {
+			if databaseHasKeyspace(dbCfg, keyspace) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// databaseHasKeyspace reports whether a database declares the named keyspace.
+// A schema_dir is shared across every database, but each one declares only the
+// keyspaces it holds, so seeding a keyspace into a database that does not have
+// it is the configuration's answer rather than an error to surface.
+func databaseHasKeyspace(db localscale.DatabaseConfig, keyspace string) bool {
+	for _, ks := range db.Keyspaces {
+		if ks.Name == keyspace {
+			return true
+		}
+	}
+	return false
+}
+
+// keyspaceDDL reads a keyspace directory's .sql files in name order, so a
+// schema whose statements depend on each other can fix their order by naming.
+// Each file is submitted as one statement, so a file holding two of them fails
+// the seed loudly rather than being split here: splitting SQL by hand is what
+// the real-parser rule exists to prevent.
+func keyspaceDDL(dir string) ([]string, error) {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var stmts []string
+	for _, f := range files {
+		if f.IsDir() || filepath.Ext(f.Name()) != ".sql" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, f.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", f.Name(), err)
+		}
+		if stmt := strings.TrimSpace(string(data)); stmt != "" {
+			stmts = append(stmts, stmt)
+		}
+	}
+	return stmts, nil
+}
+
+func postAdmin(ctx context.Context, baseURL, path string, body map[string]any) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("encode %s request: %w", path, err)
+	}
+	// A seed statement waiting on a lock would otherwise hold startup open
+	// with no deadline to cancel it, since the admin endpoints run the SQL on
+	// the request's own context.
+	reqCtx, cancel := context.WithTimeout(ctx, adminRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, baseURL+path, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("create %s request: %w", path, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("%s returned HTTP %d: %s", path, resp.StatusCode, strings.TrimSpace(string(detail)))
+	}
 	return nil
 }
 

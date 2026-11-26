@@ -1935,6 +1935,7 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 				Metadata:              maps.Clone(sc.Metadata),
 				OriginalFiles:         sc.OriginalFiles,
 				OriginalFilesCaptured: sc.OriginalFilesCaptured,
+				RollbackBlockers:      protoRollbackBlockers(sc.RollbackBlockers),
 			}
 			protoByNS[ns] = protoSC
 			protoTableSeen[ns] = make(map[string]bool)
@@ -2548,6 +2549,9 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 			if nsData.OriginalFiles == nil {
 				nsData.OriginalFiles = map[string]string{}
 			}
+		}
+		if len(sc.RollbackBlockers) > 0 && nsData.RollbackBlockers == nil {
+			nsData.RollbackBlockers = storageRollbackBlockers(sc.RollbackBlockers)
 		}
 		// A sharded keyspace's SchemaChanges share one nsData, so merge the
 		// gate-facing VSchema metadata key by key: a sibling shard's change

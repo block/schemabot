@@ -414,7 +414,8 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			// Only a namespace with changes needs a rollback baseline, so
 			// the render is paid once per changed namespace rather than for
 			// every namespace the schema files declare.
-			schemaChange.OriginalFiles, schemaChange.OriginalFilesCaptured, err = captureOriginalFiles(ctx, pool, req.Database, namespace, desiredTables, ignored)
+			schemaChange.OriginalFiles, schemaChange.RollbackBlockers, err = captureOriginalFiles(ctx, pool, req.Database, namespace, desiredTables, ignored)
+			schemaChange.OriginalFilesCaptured = len(schemaChange.RollbackBlockers) == 0
 			if err != nil {
 				return nil, err
 			}
@@ -459,10 +460,12 @@ func refuseTableDeclaredTwice(namespace string, files map[string]pgstatement.Des
 // differently. A table the engine read but pg-sprite's renderer refuses —
 // each shape it refuses is named by one of its ErrUnrenderable errors,
 // inheritance among them — or that a foreign key on an unmanaged table or
-// in another namespace references, leaves captured false, and RV-7 then refuses rollback for this plan rather than
-// reconstructing the originals; the plan itself still proceeds, because
+// in another namespace references, is returned as a blocker in place of the
+// files, and RV-7 then refuses rollback for this plan rather than
+// reconstructing the originals. The plan itself still proceeds, because
 // rollback capability is not a precondition for reviewing or applying the
-// change. A table the engine could not read — the listing named it and
+// change, and the blockers let the plan say why it cannot be rolled back
+// before anyone applies it. A table the engine could not read — the listing named it and
 // introspection cannot find or resolve it, a catalog query fails, the
 // context is cancelled — is an error that ends the plan, whether it is one
 // table's read or the namespace's: a catalog that could not be read
@@ -473,12 +476,20 @@ func refuseTableDeclaredTwice(namespace string, files map[string]pgstatement.Des
 // not, so its cost grows with the namespace rather than with the change; the
 // introspections run concurrently within the pool's ceiling, so the wall
 // time grows more slowly than the table count does.
-func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables) (files map[string]string, captured bool, err error) {
+func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables) (files map[string]string, blockers []engine.RollbackBlocker, err error) {
 	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, database, namespace, rollbackBaseline(declared, ignored))
 	if err != nil {
-		return nil, false, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
+		return nil, nil, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
 	}
 	if len(renderErrors) > 0 {
+		refused, err := skippedTables(renderErrors)
+		if err != nil {
+			return nil, nil, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
+		}
+		blockers = make([]engine.RollbackBlocker, 0, len(refused))
+		for _, table := range refused {
+			blockers = append(blockers, engine.RollbackBlocker{Table: table.GetTable(), Reason: table.GetReason()})
+		}
 		// One representative cause is enough to start triage; the count says
 		// how far the namespace is from a complete baseline without the log
 		// line growing with the number of unrenderable tables.
@@ -487,13 +498,13 @@ func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, nam
 			"namespace", namespace,
 			"unrenderable_tables", len(renderErrors),
 			"first_error", renderErrors[0])
-		return nil, false, nil
+		return nil, blockers, nil
 	}
 	files = make(map[string]string, len(originalTables))
 	for table, content := range originalTables {
 		files[table+".sql"] = content
 	}
-	return files, true, nil
+	return files, nil, nil
 }
 
 // tierUnderived marks a step whose privilege tier could not be derived: its
@@ -1456,13 +1467,20 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 // statement's steps one at a time, each in its own transaction, and it runs a
 // partitioned index build's one step through pg-sprite's partition-by-partition
 // build, so either contract, or no steps at all, leaves the verdict to the
-// disposition and reports ok. A contract this build does not know is a blocked
-// verdict reported as vocabulary that moved, so the caller logs it: running
-// its steps one at a time may not be what the contract asks for.
+// disposition and reports ok. A blocking index drop runs only when the operator
+// accepts a lock on the whole partition tree, which SchemaBot has no way to
+// accept, so it is blocked with its remedy. A contract this build does not know
+// is a blocked verdict reported as vocabulary that moved, so the caller logs
+// it: running its steps one at a time may not be what the contract asks for.
 func executionContractVerdict(execution planner.Execution, table string) (stepVerdict, bool) {
 	switch execution {
 	case "", planner.ExecutionAutocommit, planner.ExecutionPartitionedIndexBuild:
 		return stepVerdict{}, true
+	case planner.ExecutionBlockingIndexDrop:
+		return stepVerdict{
+			mode:   engine.ExecutionModeBlocked,
+			reason: blockingIndexDropReason(table),
+		}, false
 	default:
 		return stepVerdict{
 			mode:         engine.ExecutionModeBlocked,
@@ -1470,6 +1488,14 @@ func executionContractVerdict(execution planner.Execution, table string) (stepVe
 			unrecognized: &unrecognizedPlannerVocabulary{kind: "execution", value: string(execution)},
 		}, false
 	}
+}
+
+// blockingIndexDropReason is the sentence for dropping an index of a
+// partitioned table. PostgreSQL cannot drop that index concurrently, so the
+// drop blocks reads and writes on the table and every partition until it
+// finishes.
+func blockingIndexDropReason(table string) string {
+	return fmt.Sprintf("statement for table %q drops an index of a partitioned table, which PostgreSQL cannot do without blocking reads and writes on the table and every partition until it finishes; drop the index outside SchemaBot when that lock is acceptable, then re-plan", table)
 }
 
 // partitionedIndexShapeVerdict runs the partitioned index build's own shape
@@ -1816,12 +1842,17 @@ func (e *Engine) cancelIndexBuildsLocked(selected func(*trackedApply) bool) int 
 	return halted
 }
 
+// StopUnsupportedReason is why PostgreSQL declines every stop. The control
+// plane refuses a stop with the same text, so the refusal and a stored stop's
+// ErrorMessage agree.
+const StopUnsupportedReason = "stop is not supported for PostgreSQL schema changes: concurrent index builds have no resumable midpoint, and other statements commit or fail on their own"
+
 // Stop declines: a concurrent index build has no resumable midpoint, so stop
 // would be a permanent cancel under a misleading name. Other PostgreSQL DDL
 // also has no engine phase to pause. The typed decline lets the control path
 // resolve a durable stop request terminally instead of retrying it.
 func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, engine.NewUnsupportedOperationError("stop is not supported for PostgreSQL schema changes: concurrent index builds have no resumable midpoint, and other statements commit or fail on their own")
+	return nil, engine.NewUnsupportedOperationError(StopUnsupportedReason)
 }
 
 // Start declines: PostgreSQL schema changes cannot be stopped, so there is

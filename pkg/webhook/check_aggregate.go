@@ -292,6 +292,71 @@ func settledApplyFailure(c *storage.Check) bool {
 	return c.ApplyID != 0 && c.Status == checkStatusCompleted && c.Conclusion == checkConclusionFailure
 }
 
+// failedPlan reports whether c is one of this deployment's own databases
+// whose plan failed before any apply started: no schema change ran against the
+// database.
+func failedPlan(c *storage.Check) bool {
+	if isAggregateCheck(c) || isParticipantCheck(c) {
+		return false
+	}
+	return c.ApplyID == 0 && c.Status == checkStatusCompleted && c.Conclusion == checkConclusionFailure
+}
+
+// blockedPlan reports whether c is a plan that completed and named a change
+// the engine refuses to run. It fails the aggregate as a plan error does, but
+// nothing failed: the plan worked, and the change it found is one no apply can
+// carry out. Only the plan write marks a row refused (planOnlyRefused), never
+// one that also reported errors or carries a durable block, so a row without
+// the mark, including one stored before the mark existed, reads as a failed
+// plan.
+func blockedPlan(c *storage.Check) bool {
+	return failedPlan(c) && c.PlanRefused && c.BlockingReason == ""
+}
+
+// failedAggregateTitle names what failed in a failing aggregate. A failed
+// apply means a schema change ran against a database, so it names the Check
+// Run whenever one is present. When every failing row is a plan, the title
+// says what happened to the plan: "Apply failed" would tell the reader their
+// database was changed when nothing ran. A plan error outranks a blocked plan,
+// since it is the one the reader has to investigate. Any other mix keeps
+// "Apply failed".
+func failedAggregateTitle(checks []*storage.Check) string {
+	planFailures, planBlocks := 0, 0
+	for _, c := range checks {
+		switch {
+		case settledApplyFailure(c):
+			return "Apply failed"
+		case blockedPlan(c):
+			planBlocks++
+		case failedPlan(c):
+			planFailures++
+		case failsAggregate(c):
+			return "Apply failed"
+		}
+	}
+	if planFailures > 0 {
+		return planFailedCheckText
+	}
+	if planBlocks > 0 {
+		return planBlockedCheckText
+	}
+	return "Apply failed"
+}
+
+// blockedPlanRemedy says what clears a blocked plan, or returns "" when no
+// contribution is one. The plan comment already names each blocked change and
+// why, so the remedy points there rather than repeating it.
+func blockedPlanRemedy(checks []*storage.Check) string {
+	if !slices.ContainsFunc(checks, blockedPlan) {
+		return ""
+	}
+	return "\n\n" + blockedPlanRemedyText
+}
+
+// blockedPlanRemedyText is the remedy a blocked plan's aggregate ends with.
+const blockedPlanRemedyText = "The plan comment names each blocked change and why. " +
+	"Rewrite the change into a form SchemaBot runs, or take it out of the schema files, and push."
+
 // failedApplyRemedyBudget bounds the failed-apply remedy, so a pull request
 // with many failed databases still leaves the table its room under the Check
 // Run text limit.
@@ -364,6 +429,24 @@ func anyInProgressOnCommit(checks []*storage.Check, headSHA string) bool {
 	return false
 }
 
+// failsAggregate reports whether a completed check fails the aggregate: a
+// success that still carries a blocking reason, or any conclusion other than
+// success or action required.
+func failsAggregate(c *storage.Check) bool {
+	if c.Status != checkStatusCompleted {
+		return false
+	}
+	if c.BlockingReason != "" && c.Conclusion == checkConclusionSuccess {
+		return true
+	}
+	switch c.Conclusion {
+	case checkConclusionSuccess, checkConclusionActionRequired:
+		return false
+	default:
+		return true
+	}
+}
+
 // computeAggregate determines the aggregate conclusion and status from
 // per-database checks. stopped names the applies resting in the stopped state;
 // nil reads as "nothing is stopped".
@@ -386,18 +469,8 @@ func computeAggregate(checks []*storage.Check, stopped stoppedApplyIDs) (conclus
 
 	// Every remaining check is completed or held by a stopped apply — compute
 	// the conclusion.
-	for _, c := range checks {
-		if c.Status != checkStatusCompleted {
-			continue
-		}
-		if c.BlockingReason != "" && c.Conclusion == checkConclusionSuccess {
-			return checkConclusionFailure, checkStatusCompleted
-		}
-		switch c.Conclusion {
-		case checkConclusionSuccess, checkConclusionActionRequired:
-		default:
-			return checkConclusionFailure, checkStatusCompleted
-		}
+	if slices.ContainsFunc(checks, failsAggregate) {
+		return checkConclusionFailure, checkStatusCompleted
 	}
 	if heldByStoppedApply {
 		return checkConclusionActionRequired, checkStatusCompleted
@@ -424,8 +497,8 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		}
 		summary = buildAggregateTable(checks, stopped, progress)
 	case checkConclusionFailure:
-		title = "Apply failed"
-		remedy := failedApplyRemedy(checks, tenant)
+		title = failedAggregateTitle(checks)
+		remedy := failedApplyRemedy(checks, tenant) + blockedPlanRemedy(checks)
 		summary = buildAggregateTableWithin(checks, stopped, progress, len(remedy)) + remedy
 	case checkConclusionActionRequired:
 		pending := 0
@@ -760,6 +833,9 @@ func checkStatusLabel(c *storage.Check, stopped stoppedApplyIDs, progress rollou
 	}
 	if c.Status == checkStatusInProgress {
 		return rolloutStatusLabel(c, progress)
+	}
+	if blockedPlan(c) {
+		return "Blocked"
 	}
 	return conclusionEmoji(c.Status, c.Conclusion)
 }

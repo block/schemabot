@@ -1003,6 +1003,10 @@ failed`. A table lists its targets while it is in flight on any of them or any o
 them stopped, even when another target's failure makes the table read as
 failed; any other table counts them on its own line.
 
+An operation's `error_message` is why it failed. When the operation recorded
+no error of its own, it is the first error among the operation's tasks, the
+same reason the PR comment shows for that shard.
+
 `ended_by` is set on a failed operation that did not fail on its own. Its
 apply deferred the cutover, which runs for all of a target's operations
 together, and another operation of the same deployment and target failed, so
@@ -1950,6 +1954,27 @@ field describes the primary target only, and neither the PR comment nor the
 CLI prints it. Like
 `exempt_tables`, the field is carried on the response to the plan request only
 and is omitted when every entry matched.
+
+An apply can be rolled back only if the plan saved the namespace's current
+schema as schema files. When a live table carries something a schema file
+cannot declare, such as a PostgreSQL foreign key added `NOT VALID`, the plan
+still applies but cannot save that schema. The change lists each such table in
+`rollback_blockers` with the reason:
+
+```json
+{
+  "namespace": "public",
+  "table_changes": [{"table_name": "users", "ddl": "ALTER TABLE users ADD COLUMN email text", "change_type": "alter"}],
+  "rollback_blockers": [
+    {"table": "orders", "reason": "holds a foreign key added NOT VALID, which a schema file cannot declare"}
+  ]
+}
+```
+
+- The field is stored with the plan, so `GET /api/plans/{plan_id}` returns it too.
+- The PR comment and CLI print the first 10 tables and count the rest.
+- On a plan with a `rollout`, neither prints them: rollback is refused for an environment with more than one target.
+- The field is omitted when the schema was saved.
 
 Response excerpt from the plan request (illustrative values):
 

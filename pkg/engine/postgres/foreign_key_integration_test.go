@@ -487,4 +487,8 @@ func TestEnginePlanBesideNotValidForeignKeyIsRollbackIncapable(t *testing.T) {
 	assert.True(t, addsEmail, "the plan still adds the column: %+v", result.Changes[0].TableChanges)
 	assert.False(t, result.Changes[0].OriginalFilesCaptured)
 	assert.Nil(t, result.Changes[0].OriginalFiles)
+	assert.Equal(t, []engine.RollbackBlocker{{
+		Table:  "orders",
+		Reason: "holds a foreign key added NOT VALID, which a schema file cannot declare",
+	}}, result.Changes[0].RollbackBlockers, "the plan names the table that keeps it from being rolled back, and why")
 }

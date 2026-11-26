@@ -358,8 +358,12 @@ func shardedPRInFlightReading(t *testing.T, comment string) (string, []string) {
 	start := strings.Index(comment, prefix)
 	require.GreaterOrEqual(t, start, 0, "PR comment has no line for the table:\n%s", comment)
 	headline, rest, _ := strings.Cut(comment[start+len(prefix):], "\n")
-	if _, afterFence, ok := strings.Cut(rest, "\n```\n"); ok {
-		rest = afterFence
+	// A table's DDL block sits right under its line; skip only that fence,
+	// not a later one such as the footer's command.
+	if strings.HasPrefix(strings.TrimLeft(rest, "\n"), "```") {
+		if _, afterFence, ok := strings.Cut(rest, "\n```\n"); ok {
+			rest = afterFence
+		}
 	}
 	var details []string
 	for line := range strings.SplitSeq(rest, "\n") {

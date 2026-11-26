@@ -77,7 +77,7 @@ func (s *Service) handlePlansList(w http.ResponseWriter, r *http.Request) {
 			"pull_request", opts.PullRequest,
 			"starting_after", startingAfter,
 			"error", err)
-		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to list plans")
+		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to list plans; see server logs")
 		return
 	}
 	hasMore := len(plans) > limit
@@ -298,6 +298,9 @@ func PlanContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 			continue
 		}
 		change := &apitypes.SchemaChangeResponse{Namespace: namespace}
+		for _, b := range nsData.RollbackBlockers {
+			change.RollbackBlockers = append(change.RollbackBlockers, apitypes.SkippedTable{Table: b.Table, Reason: b.Reason})
+		}
 		if nsData.ChangesVSchema() {
 			change.Metadata = map[string]string{apitypes.VSchemaChangedMetadataKey: "true"}
 			// The diff recorded at plan time is the one the plan was reviewed

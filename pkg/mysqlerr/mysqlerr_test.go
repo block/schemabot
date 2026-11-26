@@ -238,6 +238,7 @@ func TestCauseSentencesAreDistinctAndAuthored(t *testing.T) {
 	seen := map[string]string{}
 	for name, sentence := range map[string]string{
 		"Generic":        Generic,
+		"GenericOnShard": GenericOnShard,
 		"Unreachable":    Unreachable,
 		"ConnectionLost": ConnectionLost,
 		"Timeout":        Timeout,
@@ -305,4 +306,28 @@ func TestPointToRenderedLogsLeavesEveryOtherReasonAlone(t *testing.T) {
 		assert.Equal(t, rendered, PointToRenderedLogs(rendered))
 	}
 	assert.Equal(t, "", PointToRenderedLogs(""))
+}
+
+// A sharded apply runs one change on every shard of a keyspace, so the generic
+// sentence names the shard that failed rather than a target. The code it
+// carries survives the rewrite.
+func TestOnShardNamesTheShardInTheGenericReason(t *testing.T) {
+	assert.Equal(t, GenericOnShard, OnShard(Generic))
+	assert.Equal(t, GenericOnShard+" (error 1105)", OnShard(ReasonFromText("Error 1105 (HY000): something went wrong")))
+}
+
+// Every other reason already says what failed and what to do, so it reads the
+// same on a shard as anywhere else.
+func TestOnShardLeavesEveryOtherReasonAlone(t *testing.T) {
+	for sentence := range Authored() {
+		if sentence == Generic {
+			continue
+		}
+		assert.Equal(t, sentence, OnShard(sentence))
+	}
+	for code := range reasons {
+		rendered := render(code)
+		assert.Equal(t, rendered, OnShard(rendered))
+	}
+	assert.Equal(t, "", OnShard(""))
 }

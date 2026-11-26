@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -277,16 +278,23 @@ func (s *Server) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.Pla
 // the engine refused is the schema files' or the target's to fix, not a fault
 // of this server, so it is FailedPrecondition, which callers do not alert on,
 // and its message is the refusal's own text: the wraps this server added on
-// the way out can name addresses and are logged here instead. Any other
-// failure is Internal and carries the whole error.
+// the way out can name addresses and are logged here instead. The statements
+// the refusal names in the schema files travel as a PlanRefusal detail, so the
+// caller can point at each one. Any other failure is Internal and carries the
+// whole error.
 func (s *Server) planStatusError(ctx context.Context, req *ternv1.PlanRequest, err error) error {
 	refusal, ok := errors.AsType[*engine.PlanRefusedError](err)
 	if !ok {
 		return status.Error(codes.Internal, err.Error())
 	}
-	s.logger.WarnContext(ctx, "plan refused; the caller is answered with the refusal's text only",
-		"database", req.GetDatabase(), "environment", req.GetEnvironment(), "error", err)
-	return status.Error(codes.FailedPrecondition, refusal.Error())
+	s.logger.WarnContext(ctx, "plan refused; the caller is answered with the refusal's text and the statements it names",
+		"database", req.GetDatabase(), "environment", req.GetEnvironment(), "problems", len(refusal.Problems), "error", err)
+	st, detailErr := ternconv.PlanRefusalStatus(refusal.Error(), refusal.Problems)
+	if detailErr != nil {
+		s.logger.WarnContext(ctx, "plan refusal answered with its text only; the caller cannot point at each statement",
+			"database", req.GetDatabase(), "environment", req.GetEnvironment(), "error", detailErr)
+	}
+	return st.Err()
 }
 
 func (s *Server) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {

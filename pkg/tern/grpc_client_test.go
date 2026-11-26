@@ -1147,6 +1147,46 @@ func (m *mockApplyOperationStore) Get(_ context.Context, id int64) (*storage.App
 	return op, nil
 }
 
+// FailedSiblingHaltingOperation mirrors the storage rule over the mock's rows.
+func (m *mockApplyOperationStore) FailedSiblingHaltingOperation(_ context.Context, applyID, operationID int64) (*storage.ApplyOperation, error) {
+	ops := make([]*storage.ApplyOperation, 0, len(m.ops))
+	for _, op := range m.ops {
+		ops = append(ops, op)
+	}
+	return failedSiblingHaltingIn(ops, applyID, operationID), nil
+}
+
+// failedSiblingHaltingIn mirrors the storage rule for test stores: the
+// earliest failed work row of the same deployment and target halts
+// operationID, unless its own on_failure is continue or pause.
+func failedSiblingHaltingIn(ops []*storage.ApplyOperation, applyID, operationID int64) *storage.ApplyOperation {
+	var halted *storage.ApplyOperation
+	for _, op := range ops {
+		if op != nil && op.ID == operationID {
+			halted = op
+		}
+	}
+	if halted == nil || halted.ApplyID != applyID || halted.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+		return nil
+	}
+	if halted.OnFailure == storage.OnFailureContinue || halted.OnFailure == storage.OnFailurePause {
+		return nil
+	}
+	var earliest *storage.ApplyOperation
+	for _, op := range ops {
+		if op == nil || op.ID == operationID || op.ApplyID != applyID || op.Deployment != halted.Deployment || op.Target != halted.Target {
+			continue
+		}
+		if op.OperationKind == storage.ApplyOperationKindGroupFinalizer || !state.IsState(op.State, state.ApplyOperation.Failed) {
+			continue
+		}
+		if earliest == nil || op.ID < earliest.ID {
+			earliest = op
+		}
+	}
+	return earliest
+}
+
 func (m *mockApplyOperationStore) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyOperation, error) {
 	if m.listErr != nil {
 		return nil, m.listErr

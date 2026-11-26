@@ -16,6 +16,7 @@ CREATE TABLE `checks` (
   `change_summary` varchar(255) DEFAULT NULL,
   `rollout_targets` int NOT NULL DEFAULT '0',
   `rollout_targets_with_work` int NOT NULL DEFAULT '0',
+  `plan_refused` tinyint(1) NOT NULL DEFAULT '0',
   `aggregate_render` json DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,

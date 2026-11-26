@@ -67,6 +67,10 @@ early release.
 - Adding an index to a partitioned table, one partition at a time. Applying
   again after a cancel or failure resumes from the partitions already built.
 - Creating a table together with its indexes.
+- Adding a foreign key to an existing table, or creating a table that has
+  one. See [Foreign keys](#foreign-keys).
+- Dropping a table whose schema file was deleted, after you approve the drop
+  with `--allow-unsafe`. See [Tables with no schema file](#tables-with-no-schema-file).
 - Adding labels to an existing enum type. See [Enum types](#enum-types).
 - Row-level security policies on an existing table.
 - `schemabot init` and `schemabot pull` for an existing database.
@@ -79,12 +83,11 @@ early release.
 | Rewriting a table, such as changing a column's type | Blocked. It needs pg-sprite's copy-and-swap, which is still in preview |
 | `ALTER TABLE` on a table larger than the size limit, unless it only changes the catalog | Blocked, for the same reason |
 | Dropping a foreign key | Blocked. See [Foreign keys](#foreign-keys) for running one yourself |
-| Dropping a table | Blocked. There is no pending-drops quarantine to hold one |
 | Creating an enum type, or removing or reordering its labels | Blocked |
 | `stop`, `start`, `cutover`, deferred cutover, `revert`, `skip-revert` | Not available. Only an index build can be cancelled. See [Unsupported workflow features](#unsupported-workflow-features) |
 | Some changes to a partitioned table's parent | Refused when the apply runs. See [Partitioned tables](#partitioned-tables) |
 | Row-level security on a new table, or mixed with structural changes | Blocked. A namespace with managed RLS cannot be rolled back. See [Row-level security](#row-level-security) |
-| Pulling every table shape | `pull` refuses tables it cannot write completely, rather than writing a partial schema. See [Schema pull](#schema-pull) |
+| Pulling every table shape | `pull` skips a table it cannot write completely and names it, rather than writing a partial file. `onboard` and `init` add it to `ignore_tables`. See [Schema pull](#schema-pull) |
 | Detailed catalog output from the schema intelligence API | Not available |
 
 **A passing plan is not a promise that the apply will succeed.** Some checks
@@ -176,10 +179,22 @@ supply a DSN.
 SchemaBot checks the privileges each statement needs on its own table before
 running it, and a missing grant fails with the `GRANT` that fixes it. A plan
 that adds a foreign key also checks `REFERENCES` on the referenced table, and
-fails with the grant to add when it is missing. If the grant is revoked after
-the plan, the apply fails, says a grant is missing, and retries once you grant it. If your tables belong to a
-dedicated owner role, read [Table ownership](#table-ownership) before the first
-`CREATE TABLE`.
+fails with the grant to add when it is missing.
+
+If a grant is revoked after the plan, the apply fails at the statement that
+needs it, and statements before it may already have run:
+
+- A privilege on the statement's own table is checked again before the
+  statement runs. The failure names the `GRANT` that fixes it. The apply fails:
+  grant the privilege, then plan and apply again. The new plan holds only the
+  statements that did not run.
+- `REFERENCES` on the table a foreign key references is checked only by the
+  server. The failure says a privilege is missing, and the server log names it.
+  SchemaBot retries the apply on its own, so grant the privilege and it carries
+  on. If its retries run out first, plan and apply again.
+
+If your tables belong to a dedicated owner role, read
+[Table ownership](#table-ownership) before the first `CREATE TABLE`.
 
 ## What runs and what is blocked
 
@@ -195,6 +210,7 @@ dedicated owner role, read [Table ownership](#table-ownership) before the first
 | Row-level security policies on an existing table | Run in one transaction, after you explicitly approve them, because they change who can read rows. See [Row-level security](#row-level-security) |
 | Adding a foreign key | Runs in two steps: `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`, which checks existing rows while writes continue. See [Foreign keys](#foreign-keys) |
 | Dropping a foreign key | Shown in the plan, but blocked. See [Foreign keys](#foreign-keys) |
+| Making a column `NOT NULL` | Runs in four steps on a table up to the size limit: a helper `CHECK (column IS NOT NULL) NOT VALID`, `VALIDATE CONSTRAINT`, which checks existing rows while writes continue, `SET NOT NULL`, which uses the validated check instead of scanning, and the helper's drop. If a row holds `NULL`, the validation fails and names the helper. Fix those rows and SchemaBot retries the validation on its own. If its retries run out first, drop the helper outside SchemaBot, then plan and apply again |
 | A table with no schema file, or a deleted file | Runs as `DROP TABLE` after you approve it with `--allow-unsafe`, as on MySQL. Archive tables and `ignore_tables` entries are left alone. See [Tables with no schema file](#tables-with-no-schema-file) |
 
 Once a statement starts, it runs until it commits or its timeout ends it; it
@@ -701,7 +717,8 @@ When a plan is blocked:
   names the clause to remove. A statement pg-sprite refuses gets the reason
   it would take a lock or break running code, and the safe steps that make the
   same change.
-- The plan Check Run fails.
+- The Check Run fails with the title "Plan blocked", and the database's row
+  reads Blocked.
 - An apply is rejected before anything is queued.
 - No flag overrides it. Rewrite the change into a form pg-sprite accepts, or
   make it outside SchemaBot through a separately reviewed process.
@@ -799,11 +816,11 @@ the apply fails and drops nothing. Fix the cause, then apply again.
 The plan lists the tables it exempted, by namespace, in the PR comment and in
 `schemabot plan` and `schemabot apply` output.
 
-**Tables `pull` cannot write.** `pull` refuses the whole pull when any of
-its tables has something the file format cannot represent: triggers, table or
-column comments, table options, inheritance, or a foreign key it cannot write
-(see the table below). Write those files by hand, or drop the tables through a
-reviewed process, before you pull the rest.
+**Tables `pull` cannot write.** `pull` skips a table that has something the
+file format cannot represent, such as a trigger, a table or column comment, or
+a foreign key it cannot write, and names it with the reason. `onboard` and
+`init` add the table to `ignore_tables`, so the next plan leaves it alone
+instead of dropping it. See [Schema pull](#schema-pull).
 
 A hand-written file can use `CREATE UNLOGGED TABLE`, `PARTITION BY`, and an
 `INHERITS` child flattened to its own columns. Each inheritance child and
@@ -859,10 +876,10 @@ out. To keep it, declare it in the file. To remove it, run the
 - A foreign key added `NOT VALID` is written as an enforced one. The next plan
   shows its `VALIDATE CONSTRAINT`, which runs like an added key's second step.
 
-`pull` refuses a foreign key it cannot write. The table it names depends on the
-case:
+`pull` skips the tables a foreign key it cannot write would leave incomplete.
+Which tables depends on the case:
 
-| The foreign key | Tables named | Why |
+| The foreign key | Tables skipped | Why |
 |---|---|---|
 | Crosses namespaces | Both | A file cannot reference a table in another namespace |
 | Sits on a partition | The referenced table, with a reason that names the partition's key | A partition has no file of its own. Declare the key on the partitioned parent |
@@ -999,7 +1016,13 @@ schema file format. These include tables with:
 - Table inheritance, or `UNLOGGED`
 - Explicit collations
 - Sequence defaults it cannot represent safely
-- Triggers, table or column comments, or non-default table options
+- Triggers, or table or column comments. See [Triggers](#triggers)
+
+Storage parameters, such as `fillfactor` or `autovacuum_enabled`, are not on
+this list. `pull` writes them into the table's `WITH (...)` clause. SchemaBot
+does not change them: if the file and the live table differ, the table's plan
+is refused. Change a parameter on the database directly, then update the file
+to match.
 
 | Command | What happens to such a table |
 |---|---|
@@ -1010,6 +1033,44 @@ schema file format. These include tables with:
 An `ignore_tables` entry is a bare table name, so it also withholds a table of
 the same name in every other namespace. A skipped table whose name reads as an
 `ignore_tables` pattern refuses onboarding; rename it first.
+
+### Triggers
+
+SchemaBot does not manage triggers, by design. A schema file declares a
+table's shape: its columns, constraints, and indexes. A trigger runs a
+function, and a function is procedural code. pg-sprite cannot compare it with
+a file, show its effect in a plan, or change it online, so triggers stay
+outside the declarative model.
+
+`onboard` and `init` skip a table with a trigger and list it in
+`ignore_tables`, so SchemaBot never changes or drops it. To manage the table, move the trigger's work
+out of the database and remove the trigger.
+
+| The trigger | Replace it with |
+|---|---|
+| Sets `updated_at` on every update | The application sets `updated_at` in each `UPDATE`. A `DEFAULT now()` still covers inserts |
+| Writes an audit or history row | The application writes the row in the same transaction, or change data capture reads the change from the write-ahead log |
+| Keeps a count, total, or copied column in sync | The application updates both in one transaction, or computes the value when it reads it |
+| Enforces a rule across rows | A `CHECK`, `UNIQUE`, or foreign key constraint when one fits, otherwise the application |
+
+**Steps:**
+
+1. Deploy the application change that does the trigger's work.
+2. Drop the trigger outside SchemaBot, then its function if nothing else
+   calls it:
+   ```sql
+   DROP TRIGGER orders_set_updated_at ON orders;
+   DROP FUNCTION set_updated_at();
+   ```
+3. In one pull request, add the table's file from `schemabot pull -d shop -e
+   staging` and remove the table from `ignore_tables`. Removing the entry
+   without the file makes the plan show a `DROP TABLE`.
+
+The plan for that pull request shows no change to the table.
+
+Table and column comments, and explicit column collations, are skipped the
+same way. Changing a column's collation rewrites the column, so it stays out
+of the files.
 
 The schema intelligence API's detailed catalog output is not available for
 PostgreSQL. A request for it is rejected rather than answered with the basic

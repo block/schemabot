@@ -429,7 +429,8 @@ func TestCommentObserverResolvedDiffReachesShardedComment(t *testing.T) {
 	o := &CommentObserver{stor: &stubPlanStorage{plan: plan}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, o.resolveShardedPlan(apply, ops), "", "", nil, 0, 0)
 
-	assert.Contains(t, body, "### VSchema")
+	assert.Contains(t, body, "#### Keyspace `ks`")
+	assert.Contains(t, body, "**VSchema**: Applying...")
 	assert.Contains(t, body, "```diff\n+ vindex hash\n```",
 		"the stored plan's diff renders in the observer-built comment body")
 }
@@ -535,7 +536,8 @@ func TestFormatApplyStatusComment_MultiKeyspaceRendersKeyspaceSections(t *testin
 	assert.Contains(t, out, "**`entries_lookup`**: 🔄 Row copy in progress")
 	assert.Contains(t, out, "**`entries_index`**: ⏳ Queued")
 	assert.NotContains(t, out, "| Shard | Status |", "healthy uniform keyspaces render no per-shard tables")
-	assert.Contains(t, out, "### VSchema", "the finalizer renders in the VSchema section, not as a shard")
+	assert.Contains(t, out, "**`entries_index`**: ⏳ Queued\n\n**VSchema**: Pending",
+		"the finalizer renders as its keyspace's VSchema line, not as a shard")
 }
 
 // eightShards are the shards of a keyspace split eight ways.
@@ -646,8 +648,8 @@ func TestFormatApplySummaryComment_ShardedVSchemaSection(t *testing.T) {
 	out := formatApplySummaryComment(apply, ops, false, nil, nil, nil, nil, "", "", nil)
 
 	assert.Contains(t, out, "## ✅ Schema Change Applied — Staging")
-	assert.Contains(t, out, "### VSchema")
-	assert.Contains(t, out, "**`cdb_resolute_sharded`**: Applied")
+	assert.Contains(t, out, "#### Keyspace `cdb_resolute_sharded`\n\n**`mutes`**: ✅ Complete (2 shards)\n\n**VSchema**: Applied",
+		"the VSchema update renders inside its keyspace's section")
 	assert.Contains(t, out, "your schema changes are live!", "a table change plus a VSchema update reads as plural")
 	assert.Contains(t, out, "**Shards**: 2 completed", "the finalizer is not counted as a shard")
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -779,5 +780,20 @@ func TestRevertWindowControlsDeclineAsUnsupported(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.reason,
 				"the decline reason reaches operator-facing surfaces and must say why")
 		})
+	}
+}
+
+// A cancel refuses a runner whose cutover has begun, or that has moved past it
+// into the reverse window or teardown, and interrupts one in any earlier phase.
+// ErrCleanup is the teardown of a failed run, which may never have reached its
+// cutover, so it does not count.
+func TestCutoverHasBegun(t *testing.T) {
+	begun := map[status.State]bool{
+		status.CutOver:       true,
+		status.ReverseWindow: true,
+		status.Close:         true,
+	}
+	for s := status.Initial; s <= status.ErrCleanup; s++ {
+		assert.Equal(t, begun[s], cutoverHasBegun(s), "state %s", s)
 	}
 }

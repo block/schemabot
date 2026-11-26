@@ -256,15 +256,25 @@ func TestExecutionVerdictBlocksPartitionedIndexShapeTheBuildRefuses(t *testing.T
 	}, executionVerdict(pgplan.FormatVersion, statement, "events", nil))
 }
 
-// Every execution contract the planner can attach runs; only a contract
-// outside the planner's closed set is blocked, and reported as vocabulary
-// that moved.
+// Every execution contract the planner can attach either runs or is blocked
+// with a sentence written for it; only a contract outside the planner's
+// closed set is reported as vocabulary that moved.
 func TestExecutionContractVerdictCoversEveryExecution(t *testing.T) {
+	blocked := map[planner.Execution]string{
+		planner.ExecutionBlockingIndexDrop: blockingIndexDropReason("users"),
+	}
 	for _, execution := range planner.Executions() {
 		t.Run(string(execution), func(t *testing.T) {
 			verdict, runs := executionContractVerdict(execution, "users")
-			assert.True(t, runs, "a contract the planner names must run")
-			assert.Equal(t, stepVerdict{}, verdict)
+			reason, isBlocked := blocked[execution]
+			if !isBlocked {
+				assert.True(t, runs, "a contract the planner names must run or have its own sentence")
+				assert.Equal(t, stepVerdict{}, verdict)
+				return
+			}
+			assert.False(t, runs)
+			assert.Equal(t, stepVerdict{mode: engine.ExecutionModeBlocked, reason: reason}, verdict)
+			assert.Nil(t, verdict.unrecognized, "a contract the planner names is not vocabulary that moved")
 		})
 	}
 

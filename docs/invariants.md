@@ -1040,9 +1040,11 @@ it. A finalizer whose
 own work has failed can never start, so it holds later members exactly where that failure does and
 no longer, and it holds no target. Once an operator releases a paused rollout it stays released, with no path back to paused. An *unrecognized* `on_failure` value behaves like `halt`, never like `continue`.
 
-Failing closed decides the verdict, not when it is recorded. A fail-closed policy refuses new
-claims and cancels nothing, so a sibling deployment that a driver already started keeps working through
-the failure: the apply stays `running_degraded` until that sibling settles and only then takes
+Under `halt`, a member's failed work also ends the rest of that member's work that a driver already started:
+each driver of that member's work cancels its own work at its next checkpoint, except work whose
+cutover has begun, which finishes. Failing closed decides the verdict, not when it is recorded. A
+fail-closed policy cancels nothing in another member, so a sibling deployment that a driver already
+started keeps working through the failure: the apply stays `running_degraded` until that sibling settles and only then takes
 the `failed` verdict. A sibling that is merely pending, or that a stop caught before it started,
 holds nothing, since the same policy is what stops it from ever starting. Recording the verdict over live work would take `stop` and `cancel`
 away from the operator who still has work to stop. The target reservation survives it, since OW-5
@@ -1063,7 +1065,9 @@ without completing the request would refuse the start the hold exists to preserv
 each gate on earlier members and whose stopped+start arm holds a finalizer, and work that never
 started, to the same gate, with the failure exemption shared by every gate and the table-step
 boundary `rolloutStepGateSQL` and the same-member failure gate `sameMemberFailureGateSQL` in the
-work gate, and `FindNextApplyOperationCutover`, whose start
+work gate, with the same rule reaching started work through `FailedSiblingHaltingOperation` and the
+drive checkpoints that read it (`cancelForFailedSibling` and `cancelRemoteForFailedSibling`,
+`pkg/tern/same_member_halt.go`), and `FindNextApplyOperationCutover`, whose start
 arm gates on the hold rule `earlierSiblingHoldsCutoverSQL` that `CutoverBlocker` shares
 (`pkg/storage/internal/sqlstore/apply_operations.go`), pinned per policy on both dialects by the
 storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a
@@ -1468,6 +1472,7 @@ cancel rejected over a deploy request that failed as a settled-outcome refusal
 refusal over a provider-settled failure its probe reads (`providerSettledChangeAsFailed`,
 `pkg/tern/local_control.go`) as the backstop; the in-process engine's
 settled outcome checks on stop and cancel (`pkg/engine/spirit/control.go`), including a
+cutover that has begun (`cutoverHasBegun`), which the run finishes on its own, and a
 completion its run records after the cancel, and its run's deference to a stop or cancel that
 interrupted it, which no failure the run records afterwards replaces (`setSchemaChangeFailed`,
 `pkg/engine/spirit/execution.go`, `pkg/engine/spirit/direct.go`).
@@ -1538,24 +1543,28 @@ identifier within its own database and environment scope (`resolveControlApply` 
 
 Only Spirit can pause a change. A Spirit stop checkpoints the copy, the apply settles as
 `stopped`, and `start` resumes it from there. A PlanetScale deploy request has no pause: it runs
-or it ends. The tempting shortcut is to honor a stop there by cancelling, since cancelling does
+or it ends. A PostgreSQL statement has none either: it runs until it commits or fails. The tempting shortcut is to honor a stop there by cancelling, since cancelling does
 take the load off the database. SchemaBot does not, because an operator asking to pause has said
 they intend to resume, and a cancel is permanent. The stop is refused instead, with a `400` naming
-`cancel` as the operation that does what the engine can actually do. Nothing durable is recorded,
+`cancel` as the operation that does what the engine can actually do, wherever it can. Nothing durable is recorded,
 so there is no request left pending against an engine that will never service it.
 
-The refusal is decided before any work is attempted, and it is enforced twice: once in the service
-method both the CLI and the PR surface reach, and again in the data plane on the target's database
-type, so a stop arriving by any route meets the same answer.
+The refusal is decided before any work is attempted, in the service method the CLI, the PR
+surface, and a freeze's stop sweep all reach. A stop that arrives by another route still meets a
+refusal that reports no pause, and each engine upholds that its own way. A PlanetScale stop is also
+refused at data-plane intake on the target's database type. A PostgreSQL stop that reaches the
+engine is declined with a typed unsupported-operation error, so the request settles as a command
+that did not take effect while the change runs on.
 
-Where a stop against such an engine does exist in storage, written by an earlier release, settling
-it must still not report a pause. Those records terminalize to `cancelled`, decided in one place
-from the database type rather than inferred wherever a result is rendered, and keyed on the type
+Where a PlanetScale stop does exist in storage, written by an earlier release, settling it must
+still not report a pause. Those records terminalize to `cancelled`, decided in one place from the
+database type rather than inferred wherever a result is rendered, and keyed on the type
 specifically so an apply that never reached a data plane settles the same way with no engine
 instance anywhere to ask. *Breaks if violated:* an operator asks for a pause, is told the change is
-`stopped`, waits to resume, and it is already dead. *Enforced:* the engine refusal
-(`pkg/api/control_handlers.go`, `pkg/tern/local_control.go`) and the single stop-terminality
-decision behind it (`pkg/tern/stop_terminality.go`).
+`stopped`, waits to resume, and it is already dead. *Enforced:* the intake refusal (`stopRefusals`,
+which classifies every engine, in `pkg/api/control_handlers.go`); the data-plane refusal
+(`pkg/tern/local_control.go`) and the stop-terminality decision behind it
+(`pkg/tern/stop_terminality.go`); and the PostgreSQL engine's `Stop` (`pkg/engine/postgres/postgres.go`).
 
 ### CO-9: Control operations are stateless
 
@@ -1793,6 +1802,24 @@ that list complete. Its sharded counterpart (`TestShardedInFlightTableReadsTheSa
 covers a table copying across shards in the CLI, the sharded apply comment, and the apply status
 comment. These tests prove the surfaces read the same facts alike; which facts an engine reports is
 pinned by that engine's own progress tests.
+
+### UX-9: A sharded apply's failed shards read the same on every surface
+
+When shards of a sharded apply fail, the apply has one reading of the failure: which shards failed
+on their own work and how each is named, whether every one of them is still retrying, each distinct
+reason once with the shards it failed, and how far a failed table's failure reaches across its
+shards. That reading is
+derived once and rendered by the CLI and the PR comment alike, so one surface never blames a single
+shard while the other lists several reasons. *Enforced:* the shared derivation (`FailedMember`,
+`QualifyShardNames`, `SummarizeFailures`, and `FailedReach` in `pkg/presentation/failure_reasons.go`),
+each failed shard's reason read once (`ApplyOperation.FailureMessage` in `pkg/storage`, which the PR
+comment and the progress API both serve) and grouped on one redacted reason on both surfaces
+(`InlineError` in `pkg/presentation/error_redaction.go`), and tests that render the same failed shards through both surfaces and fail when they read
+differently (`TestShardFailureReasonsReadTheSameOnEverySurface`,
+`TestShardFailureReasonsGroupAcrossHostsOnEverySurface`, and
+`TestShardFailureNamesQualifyRepeatedShardsOnEverySurface` in `pkg/cmd/internal/templates`), with
+`TestWatchModel_ShardedApplyGroupsFailedShards` in `pkg/cmd/commands` pinning the watch view to the same
+callout.
 
 ## Recovery (RC)
 

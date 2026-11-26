@@ -596,6 +596,37 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="postgres-plan-no-rollback"></a><strong>Postgres Plan (No Rollback)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `PostgreSQL`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+#### Schema Name: `app`
+```sql
+ALTER TABLE app.users ADD COLUMN email text;
+```
+
+📋 **Plan**: **1** table to alter
+
+⚠️ No rollback for namespace `app`: SchemaBot couldn't save the current schema of the tables below, so an apply of this plan can't be rolled back. To undo the change, revert the schema files in a new pull request.
+
+- `orders`: holds a foreign key added NOT VALID, which a schema file cannot declare
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-ignore-tables"></a><strong>MySQL Plan (Ignore Tables)</strong></summary>
 
 
@@ -1537,7 +1568,10 @@ The live database operation was already started and may continue independently o
      ```
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
-     After rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan.
+     After the rollback completes, refresh the checks:
+     ```
+     schemabot plan
+     ```
 <!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
@@ -1573,7 +1607,10 @@ Choose one:
      ```
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
-   - after rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan
+   - after the rollback completes, refresh the checks:
+     ```
+     schemabot plan
+     ```
 <!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
@@ -2104,6 +2141,42 @@ schemabot apply -e staging
 ```
 schemabot plan -e production
 ```
+
+</details>
+
+<details>
+<summary><a name="multienv-plan-refused-statements"></a><strong>Multi-env Plan (Refused Statements)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `PostgreSQL`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+### Staging
+
+❌ **SchemaBot can't plan 3 statements in the schema files:**
+
+**`testapp/accounts.sql`, line 7:** SchemaBot doesn't manage comments. Remove the COMMENT statement from this file and set the comment on the database directly.
+```sql
+COMMENT ON TABLE accounts IS 'People who can place orders'
+```
+
+**`testapp/orders.sql`, line 12:** SchemaBot doesn't manage functions. Create set_updated_at() outside SchemaBot and remove it from this file.
+```sql
+CREATE FUNCTION set_updated_at() RETURNS trigger AS $$ …
+```
+
+**`testapp/orders.sql`, line 19:** SchemaBot doesn't manage triggers. Create orders_updated_at outside SchemaBot and remove it from this file.
+```sql
+CREATE TRIGGER orders_updated_at BEFORE UPDATE ON orders …
+```
+
+---
+
+
+⚠️ **Staging** plans once these statements change. Fix them in the schema files and push a commit.
 
 </details>
 
@@ -4430,6 +4503,22 @@ SchemaBot is holding back its remaining GitHub API quota for check runs, so it d
 |----------|------|--------|--------|
 | `orders` | mysql | 1 alter | Stopped |
 
+</details>
+
+
+## Aggregate Check — Plan Blocked
+
+<details>
+<summary><strong>Aggregate Check — Plan Blocked</strong></summary>
+
+Plan blocked
+
+| Database | Type | Change | Status |
+|----------|------|--------|--------|
+| `orders` | postgres | 1 index drop | Blocked |
+
+
+The plan comment names each blocked change and why. Rewrite the change into a form SchemaBot runs, or take it out of the schema files, and push.
 </details>
 
 
@@ -11598,6 +11687,13 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
   - ○ `80-c0`: queued
   - ○ `c0-`: queued
 
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
+
 _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
@@ -11620,7 +11716,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 #### Keyspace `cdb_resolute_sharded`
 
-**`mutes`**: ❌ Failed
+**`mutes`**: ❌ Failed on 1 of 4 shards
 
 ```sql
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
@@ -11639,6 +11735,132 @@ To retry:
 ```
 schemabot apply -e production
 ```
+
+</details>
+
+<details>
+<summary><a name="apply-failed-many-shards-failed"></a><strong>Apply Failed (Many Shards Failed)</strong></summary>
+
+
+## Schema Change Status — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-03-15 14:30:00 UTC*
+
+**Status**: Failed — 0 of 1 change applied
+
+**Shards**: 6 failed, 10 halted
+
+> ❌ **Failed on 6 of 16 shards:**
+> - shards `-10`, `10-20`, `30-40`, `40-50`, `50-60`: Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again.
+> - shard `20-30`: The schema change ran out of time before it finished; see the server logs for the step that timed out.
+
+#### Keyspace `cdb_resolute_sharded`
+
+**`mutes`**: ❌ Failed on 6 of 16 shards
+
+```sql
+ALTER TABLE `mutes` ADD UNIQUE `uk_target`(`target_id`);
+```
+
+<details>
+<summary>❌ 6 failed</summary>
+
+| Shard | Status |
+| --- | --- |
+| `-10` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `10-20` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `20-30` | ❌ failed — The schema change ran out of time before it finished; see the server logs for the step that timed out. |
+| `30-40` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `40-50` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `50-60` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+
+</details>
+
+<details>
+<summary>⏸️ 10 halted</summary>
+
+```
+60-70  70-80  80-90  90-a0  a0-b0  b0-c0  c0-d0  d0-e0  e0-f0  f0-
+```
+
+</details>
+
+
+---
+
+To retry:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="apply-running-past-a-failed-shard"></a><strong>Apply Running Past A Failed Shard</strong></summary>
+
+
+## Schema Change Status — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-03-15 14:30:00 UTC*
+
+**Status**: In Progress — 0 of 1 change applied
+
+**Shards**: 3 failed, 4 running table copy, 9 halted
+
+> ❌ **Failed on shards `-10`, `10-20`, `20-30`:** Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again.
+
+#### Keyspace `cdb_resolute_sharded`
+
+**`mutes`**: ❌ Failed on 3 of 16 shards
+
+```sql
+ALTER TABLE `mutes` ADD UNIQUE `uk_target`(`target_id`);
+```
+
+<details>
+<summary>❌ 3 failed</summary>
+
+| Shard | Status |
+| --- | --- |
+| `-10` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `10-20` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `20-30` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+
+</details>
+
+<details>
+<summary>🔄 4 running table copy</summary>
+
+```
+30-40  40-50  50-60  60-70
+```
+
+</details>
+
+<details>
+<summary>⏸️ 9 halted</summary>
+
+```
+70-80  80-90  90-a0  a0-b0  b0-c0  c0-d0  d0-e0  e0-f0  f0-
+```
+
+</details>
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
+
+A new apply can retry the failure once this one finishes or is stopped; it reprocesses only the tables that haven't completed.
+
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
 
@@ -11691,6 +11913,13 @@ Shards diverge — grouped by change:
 | --- | --- |
 | `40-80` | ⏳ queued |
 
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
+
 _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
 </details>
@@ -11734,10 +11963,15 @@ ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
-### VSchema
+**VSchema**: Pending
 
-**`cdb_resolute_sharded`**: Pending
 
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
 
 _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
@@ -11767,9 +12001,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
-### VSchema
-
-**`cdb_resolute_sharded`**: Applied
+**VSchema**: Applied
 
 ```diff
 --- current
@@ -11807,7 +12039,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 #### Keyspace `cdb_resolute_sharded`
 
-**`mutes`**: ❌ Failed
+**`mutes`**: ❌ Failed on 1 of 4 shards
 
 ```sql
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
@@ -11820,9 +12052,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 | `80-c0` | ⏸️ halted — -40 failed |
 | `c0-` | ⏸️ halted — -40 failed |
 
-### VSchema
-
-**`cdb_resolute_sharded`**: Cancelled
+**VSchema**: Cancelled
 
 
 ---
@@ -11885,7 +12115,7 @@ schemabot apply -e production
 
 #### Keyspace `shop_sharded`
 
-**`mutes`**: ❌ Failed
+**`mutes`**: ❌ Failed on 1 of 4 shards
 
 ```sql
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
@@ -12393,7 +12623,7 @@ To resume from where it stopped:
 
   ── shop_001 ──
 
-     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+     ~ orders: ❌ Failed on 1 of 4 shards
        ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
 
        • Shards: 4 (1 failed, 3 cancelled)
@@ -12440,7 +12670,7 @@ The new apply will only process tables that haven't completed.
 
   ── shop_001 ──
 
-     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+     ~ orders: ❌ Failed on 1 of 4 shards
        ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
 
        • Shards: 4 (1 failed, 3 stopped)

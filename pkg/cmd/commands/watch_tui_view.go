@@ -62,6 +62,11 @@ func (m WatchModel) progressSections() (string, string) {
 	copy(tables, m.tables)
 	sortTablesByProgress(tables)
 
+	var shardFailureCallout string
+	if m.sharded {
+		shardFailureCallout = templates.ShardFailureCallout(m.state, m.operations, m.tables, m.released)
+	}
+
 	// Check if effectively stopped (any table is stopped means the whole apply is stopped)
 	effectivelyStopped := m.isEffectivelyStopped()
 	if effectivelyStopped {
@@ -136,6 +141,10 @@ func (m WatchModel) progressSections() (string, string) {
 		if note := templates.ShardedStoppedAtCutoverNote(m.state, m.operations, m.tables, m.released); note != "" {
 			fmt.Fprintf(&b, "  ⏹️ %s\n", note)
 		}
+		// The grouped failure callout, as `progress --no-watch` and the PR
+		// comment show it. It stands in for the apply's error, which names
+		// only the first failed shard.
+		b.WriteString(shardFailureCallout)
 	}
 
 	// Keep the PlanetScale deploy request link visible throughout the apply,
@@ -165,7 +174,7 @@ func (m WatchModel) progressSections() (string, string) {
 		f.WriteString("\n")
 	case state.IsState(m.state, state.Apply.Failed):
 		f.WriteString("\n\n")
-		if m.errorMsg != "" {
+		if m.errorMsg != "" && shardFailureCallout == "" {
 			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 			f.WriteString(errStyle.Render("Error: "+m.errorMsg) + "\n\n")
 		}
@@ -196,7 +205,7 @@ func (m WatchModel) progressSections() (string, string) {
 		}
 	case effectivelyStopped:
 		f.WriteString("\n\n")
-		if m.errorMsg != "" {
+		if m.errorMsg != "" && shardFailureCallout == "" {
 			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 			f.WriteString(errStyle.Render("Error: "+m.errorMsg) + "\n\n")
 		}
@@ -266,6 +275,9 @@ func (m WatchModel) progressSections() (string, string) {
 		f.WriteString("\n\n")
 		f.WriteString(m.formatFooter())
 		f.WriteString("\n")
+		if m.sharded && templates.ShardFailedWhileRunning(m.state, m.operations, m.tables, m.released) {
+			f.WriteString(m.wrapToWindow(presentation.RetryOnceSettledNote) + "\n")
+		}
 	case state.IsSetupPhase(m.state):
 		f.WriteString("\n\n")
 		dimStyle := lipgloss.NewStyle().Faint(true)

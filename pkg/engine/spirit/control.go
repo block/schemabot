@@ -16,6 +16,7 @@ import (
 	"github.com/block/mysql"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -295,6 +296,23 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 			"tables", tables,
 		)
 		return nil, engine.NewSettledOutcomeError("cancel rejected: the schema change on database %s failed before the cancel arrived; the failure stands, plan and apply again to retry", database)
+	}
+	if len(rm.runners) > 0 && rm.runners[0] != nil {
+		if runnerState := rm.runners[0].Progress().CurrentState; cutoverHasBegun(runnerState) {
+			// The swap may already have moved the table. Interrupting it, or
+			// recording the change as cancelled, would leave the target
+			// ownership unknown and misstate what landed, so the cancel is
+			// refused and the run finishes on its own.
+			database := rm.database
+			tables := rm.tables
+			e.mu.Unlock()
+			e.schemaChangeLogger(rm).Warn("cancel rejected: the cutover of the schema change has begun; the run finishes on its own",
+				"database", database,
+				"tables", tables,
+				"spirit_state", runnerState.String(),
+			)
+			return nil, engine.NewSettledOutcomeError("cancel rejected: the cutover of the schema change on database %s has begun; it finishes on its own", database)
+		}
 	}
 	database := rm.database
 	tables := rm.tables
@@ -613,4 +631,18 @@ func (e *Engine) Revert(ctx context.Context, req *engine.ControlRequest) (*engin
 // so the decline is deterministic and typed for the same reason as Revert.
 func (e *Engine) SkipRevert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
 	return nil, engine.NewUnsupportedOperationError("skip-revert is not supported for MySQL schema changes: there is no revert window to close, since the change is already permanent once it cuts over")
+}
+
+// cutoverHasBegun reports whether a runner in state s has started its cutover
+// or moved past it into the reverse window or teardown. From that point Spirit
+// itself no longer abandons the run on a fatal error, so a cancel must not
+// interrupt it either. ErrCleanup is excluded: it is the teardown of a run
+// that failed, which may never have reached its cutover.
+func cutoverHasBegun(s status.State) bool {
+	switch s {
+	case status.CutOver, status.ReverseWindow, status.Close:
+		return true
+	default:
+		return false
+	}
 }

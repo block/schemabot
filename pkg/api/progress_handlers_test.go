@@ -364,3 +364,27 @@ func TestProgressEngineNamesChooseTheStorageEnginesStopCommand(t *testing.T) {
 		})
 	}
 }
+
+// A shard that failed remotely records its error on its tasks, not its
+// operation row, so the progress response names the first task error for it,
+// the reason the PR comment names, while a row's own error stands as it is.
+func TestProgressOperationsCarryTheirFirstTaskError(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, OperationKey: "shop/-80/orders", State: state.ApplyOperation.Failed},
+		{ID: 2, OperationKey: "shop/80-/orders", State: state.ApplyOperation.Failed, ErrorMessage: "copy failed on orders"},
+		{ID: 3, OperationKey: "shop/c0-/orders", State: state.ApplyOperation.Completed},
+	}
+	tasks := []*storage.Task{
+		{ApplyOperationID: new(int64(1)), TableName: "orders", ErrorMessage: "dial tcp 10.0.0.11:3306: connect: connection refused"},
+		{ApplyOperationID: new(int64(2)), TableName: "orders", ErrorMessage: "lock wait timeout exceeded"},
+		{ApplyOperationID: new(int64(3)), TableName: "orders"},
+	}
+	responses, _ := progressOperationsFromRows(ops)
+
+	setProgressOperationErrors(responses, ops, tasks)
+
+	assert.Equal(t, "dial tcp 10.0.0.11:3306: connect: connection refused", responses[0].ErrorMessage)
+	assert.Equal(t, deriveErrorCode(state.ApplyOperation.Failed, responses[0].ErrorMessage), responses[0].ErrorCode)
+	assert.Equal(t, "copy failed on orders", responses[1].ErrorMessage, "the row's own error stands")
+	assert.Empty(t, responses[2].ErrorMessage)
+}

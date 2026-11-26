@@ -6,6 +6,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -31,6 +32,26 @@ func (h *Handler) postCommandError(
 	commandName, environment, requestedBy, errorDetail string,
 ) {
 	h.postCommandErrorLanded(repo, pr, installationID, commandName, environment, requestedBy, errorDetail)
+}
+
+// postPlanCommandError posts a failed plan command's error. A plan refused over
+// statements in the schema files lists each one with where it is, as the
+// multi-environment plan comment does, so the author can fix them all in one
+// push.
+func (h *Handler) postPlanCommandError(
+	repo string, pr int, installationID int64,
+	environment, requestedBy string, err error,
+) {
+	problems, omitted := api.PlanRefusalProblems(err)
+	h.postCommentBestEffortID(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
+		RequestedBy:  requestedBy,
+		Timestamp:    templates.NowFunc().UTC().Format("2006-01-02 15:04:05"),
+		Environment:  environment,
+		Environments: h.deploymentEnvironmentScope(environment),
+		CommandName:  action.Plan,
+		ErrorDetail:  userFacingErrorDetail(userFacingError(err)),
+		PlanProblems: templates.RefusedStatements{Problems: problems, Omitted: omitted},
+	}))
 }
 
 // postCommandErrorLanded is postCommandError reporting whether the comment

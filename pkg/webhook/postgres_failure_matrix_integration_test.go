@@ -188,12 +188,15 @@ func TestPostgresConfigFixtureConcurrentIndexBuildSurvivesRestart(t *testing.T) 
 	require.NoError(t, svcB.Close())
 }
 
-// A stop accepted while a PostgreSQL apply is running resolves as a terminal
-// decline once the driver consumes it: the engine's reason is stored for the
-// operator, the request does not remain pending for another claim, and the
-// unsupported stop is never mistaken for a successful stop. The apply remains
-// authoritative and completes its native DDL on the target once its lock clears.
-func TestPostgresConfigFixtureStopDeclineIsTerminalAndApplyCompletes(t *testing.T) {
+// An operator stops a running PostgreSQL apply. The stop is refused before
+// anything is recorded, since PostgreSQL has no stopped phase, and the refusal
+// points at cancel. A stop that reaches storage by another route, as one an
+// earlier release recorded, resolves as a terminal decline once the driver
+// consumes it: the engine's reason is stored for the operator, the request
+// does not remain pending for another claim, and the unsupported stop is never
+// mistaken for a successful stop. The apply remains authoritative and
+// completes its native DDL on the target once its lock clears.
+func TestPostgresConfigFixtureStopIsRefusedAndAStoredStopIsDeclined(t *testing.T) {
 	fixture := loadPostgresConfigFixture(t, "postgres")
 	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
 	createFixtureUsersTable(t, db)
@@ -207,7 +210,7 @@ func TestPostgresConfigFixtureStopDeclineIsTerminalAndApplyCompletes(t *testing.
 	require.False(t, plan.HasBlockedChanges())
 
 	// Hold the target table so the native ALTER remains observably running
-	// while the durable stop traverses the public control path.
+	// while the public stop is refused and a stored stop is settled.
 	lockTx, err := db.BeginTx(t.Context(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = lockTx.Rollback() })
@@ -232,23 +235,25 @@ func TestPostgresConfigFixtureStopDeclineIsTerminalAndApplyCompletes(t *testing.
 		}
 	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
 
-	stopResp, err := svc.ExecuteStop(t.Context(), apitypes.ControlRequest{
+	_, err = svc.ExecuteStop(t.Context(), apitypes.ControlRequest{
 		ApplyID:     running.ApplyIdentifier,
 		Environment: running.Environment,
 		Caller:      "integration-test",
 	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "stop is not supported for PostgreSQL schema changes")
+	assert.Contains(t, err.Error(), "This schema change commits or fails on its own; wait for it to finish")
+	refused, err := svc.Storage().ControlRequests().GetByOperation(t.Context(), running.ID, storage.ControlOperationStop)
 	require.NoError(t, err)
-	require.True(t, stopResp.Accepted)
-	// The driver's progress ticker consumes pending control requests while the
-	// engine change runs, so this read races with that consumption. Durability
-	// is provable without the race: the request row must exist regardless of
-	// status, and its status must be pending (not yet consumed) or the
-	// terminal decline — never a successful stop.
-	stored, err := svc.Storage().ControlRequests().GetByOperation(t.Context(), running.ID, storage.ControlOperationStop)
+	assert.Nil(t, refused, "a refused stop records no control request")
+
+	_, _, err = svc.Storage().ControlRequests().RequestPending(t.Context(), &storage.ApplyControlRequest{
+		ApplyID:     running.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "integration-test",
+	})
 	require.NoError(t, err)
-	require.NotNil(t, stored, "accepted stop must be durably recorded")
-	require.Contains(t, []storage.ControlRequestStatus{storage.ControlRequestPending, storage.ControlRequestFailed},
-		stored.Status, "durable stop must be pending or terminally declined, never completed")
 
 	var declined *storage.ApplyControlRequest
 	require.EventuallyWithT(t, func(c *assert.CollectT) {

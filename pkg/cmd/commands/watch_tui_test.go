@@ -15,6 +15,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
@@ -1151,4 +1152,67 @@ func TestWatchModel_EndsOnEveryTerminalState(t *testing.T) {
 		assert.NotContains(t, view, "Apply complete")
 		assert.ErrorIs(t, model.exitError(), ErrSilent)
 	})
+}
+
+// shardedFailureProgress is a sharded apply adding a column to `orders` on
+// shop_001's four shards, with each shard's operation in the state ops gives.
+func shardedFailureProgress(applyState string, ops ...*apitypes.ProgressOperationResponse) *apitypes.ProgressResponse {
+	names := []string{"-40", "40-80", "80-c0", "c0-"}
+	progress := &apitypes.ProgressResponse{
+		State: applyState, ApplyID: "apply-sharded", Database: "shop", Environment: "staging", Sharded: true,
+		Tables: []*apitypes.TableProgressResponse{{
+			Deployment: "data-plane", Keyspace: "shop_001", TableName: "orders", ChangeType: "alter",
+			DDL: "ALTER TABLE `orders` ADD COLUMN `note` text", Status: state.Task.Running,
+		}},
+	}
+	for i, name := range names {
+		op := &apitypes.ProgressOperationResponse{State: state.ApplyOperation.Running}
+		if i < len(ops) {
+			op = ops[i]
+		}
+		op.Deployment, op.OperationKey, op.OperationKind = "data-plane", "shop_001/"+name+"/orders", storage.ApplyOperationKindWork
+		progress.Operations = append(progress.Operations, op)
+		status := state.Task.Running
+		if state.IsState(op.State, state.ApplyOperation.Failed) {
+			status = state.Task.Failed
+		}
+		progress.Tables[0].Shards = append(progress.Tables[0].Shards, &apitypes.ShardProgressResponse{Shard: name, Status: status})
+	}
+	return progress
+}
+
+func watchView(t *testing.T, progress *apitypes.ProgressResponse) string {
+	t.Helper()
+	m := NewWatchModel("http://localhost:8080", "shop", "staging", false)
+	m.initialized = true
+	updated, _ := m.Update(parseProgressResult(progress))
+	return updated.(WatchModel).View()
+}
+
+// Watching a sharded apply groups its failed shards by reason under the shard
+// counts, as `progress --no-watch` and the PR comment do (UX-9). While other
+// shards still run, the footer says a new apply can retry the failure once
+// this one settles.
+func TestWatchModel_ShardedApplyGroupsFailedShards(t *testing.T) {
+	failed := func(reason string) *apitypes.ProgressOperationResponse {
+		return &apitypes.ProgressOperationResponse{State: state.ApplyOperation.Failed, ErrorMessage: reason}
+	}
+
+	running := watchView(t, shardedFailureProgress(state.Apply.Running, failed("duplicate entry"), failed("lock wait timeout")))
+	assert.Contains(t, running, "    - shard -40: duplicate entry\n")
+	assert.Contains(t, running, "    - shard 40-80: lock wait timeout\n")
+	assert.Contains(t, running, presentation.RetryOnceSettledNote)
+
+	done := watchView(t, shardedFailureProgress(state.Apply.Failed, failed("duplicate entry"), failed("lock wait timeout")))
+	assert.Contains(t, done, "    - shard -40: duplicate entry\n")
+	assert.NotContains(t, done, "Error: ", "the grouped reasons stand in for the apply's error")
+	assert.NotContains(t, done, presentation.RetryOnceSettledNote, "a failed apply can be retried now")
+}
+
+// A shard SchemaBot is still retrying needs no new apply, so the watch footer
+// does not offer one.
+func TestWatchModel_ShardedApplyRetryingShardOffersNoRetry(t *testing.T) {
+	retrying := &apitypes.ProgressOperationResponse{State: state.ApplyOperation.FailedRetryable, ErrorMessage: "lost connection"}
+	view := watchView(t, shardedFailureProgress(state.Apply.Running, retrying))
+	assert.NotContains(t, view, presentation.RetryOnceSettledNote)
 }

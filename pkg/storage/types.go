@@ -375,6 +375,13 @@ type Check struct {
 	RolloutTargets         int
 	RolloutTargetsWithWork int
 
+	// PlanRefused records that the plan behind the change summary completed
+	// and named a change the engine refuses to run, with no plan errors and no
+	// durable block. It is written with ChangeSummary and kept with it, like
+	// the rollout counts. False for rows recorded before this field existed,
+	// which read as a failed plan rather than a refused one.
+	PlanRefused bool
+
 	// AggregateRender is what an aggregate row's Check Run text was rendered
 	// from, so the text can be rendered again with newer rollout counts
 	// without re-reading the PR. The encoding belongs to the caller. Upsert
@@ -853,6 +860,40 @@ func (op *ApplyOperation) KeyedByTarget() bool {
 	return op.OperationKey == TargetOperationKey(op.Target, "")
 }
 
+// TasksByOperation buckets tasks by their owning apply_operation, keeping
+// each operation's tasks in the order given. Tasks with no apply_operation_id
+// (legacy rows predating the per-deployment back-fill) are not attributable
+// to an operation and are omitted; in a genuine multi-deployment apply every
+// task carries the id.
+func TasksByOperation(tasks []*Task) map[int64][]*Task {
+	byOp := make(map[int64][]*Task)
+	for _, t := range tasks {
+		if t.ApplyOperationID == nil {
+			continue
+		}
+		byOp[*t.ApplyOperationID] = append(byOp[*t.ApplyOperationID], t)
+	}
+	return byOp
+}
+
+// FailureMessage is why the operation failed, as every surface reads it: its
+// own error message, or, when the row carries none, the first error among
+// tasks, the operation's own tasks in order. A remote failure records its
+// error on the operation's tasks, and the row may never be stamped with it,
+// so without the fallback a failed shard would show no reason on one surface
+// while another named it.
+func (op *ApplyOperation) FailureMessage(tasks []*Task) string {
+	if op.ErrorMessage != "" {
+		return op.ErrorMessage
+	}
+	for _, t := range tasks {
+		if t.ErrorMessage != "" {
+			return t.ErrorMessage
+		}
+	}
+	return ""
+}
+
 // PlanIDForOperation resolves which plan an operation executes: its own when it
 // has one, and its parent apply's otherwise. Members of one apply share the
 // apply's plan when they are planned together, and carry their own plan when
@@ -1048,6 +1089,13 @@ func (tc TableChange) UnsafeOptInReason() string {
 // question the same way.
 const VSchemaArtifactName = "vschema.json"
 
+// RollbackBlocker is a live table that kept a plan from saving its
+// namespace's current schema, and why.
+type RollbackBlocker struct {
+	Table  string `json:"table"`
+	Reason string `json:"reason"`
+}
+
 // NamespacePlanData contains plan data for a single namespace. OriginalFiles is
 // captured once for the namespace and applies to every table/artifact change in
 // Tables and Artifacts.
@@ -1057,6 +1105,13 @@ type NamespacePlanData struct {
 	OriginalFiles         map[string]string `json:"original_files,omitempty"`
 	OriginalFilesCaptured bool              `json:"original_files_captured,omitempty"`
 	Artifacts             map[string]string `json:"artifacts,omitempty"`
+
+	// RollbackBlockers names the live tables that kept the plan from saving
+	// the namespace's current schema, each with why. It is set exactly when
+	// OriginalFilesCaptured is false for a namespace the engine could have
+	// saved, so a stored plan says why its apply cannot be rolled back, as
+	// the response to the plan request did.
+	RollbackBlockers []RollbackBlocker `json:"rollback_blockers,omitempty"`
 
 	// Metadata is the subset of the engine's plan change-metadata that
 	// apply-time consumers read (see VSchemaPlanMetadata): the safety-gate

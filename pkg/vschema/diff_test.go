@@ -1,8 +1,10 @@
 package vschema
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/pmezard/go-difflib/difflib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -270,4 +272,99 @@ func TestChanged_ProtojsonRoundTrip_Sharded(t *testing.T) {
 	t.Logf("api normalized:  %s", Normalize(apiVSchema))
 	assert.False(t, Changed(apiVSchema, fileVSchema),
 		"protojson round-trip of sharded VSchema should not produce a false positive")
+}
+
+// vschemaWithTables builds a sharded VSchema whose tables all route by vindex
+// hash on id, so every table's body is identical and only its name tells them
+// apart.
+func vschemaWithTables(names ...string) string {
+	var s strings.Builder
+	s.WriteString(`{"sharded":true,"vindexes":{"hash":{"type":"hash"}},"tables":{`)
+	for i, name := range names {
+		if i > 0 {
+			s.WriteString(",")
+		}
+		s.WriteString(`"` + name + `":{"column_vindexes":[{"column":"id","name":"hash"}]}`)
+	}
+	return s.String() + "}}"
+}
+
+// A table added between two tables with the same body shows as one whole
+// added block that opens at the new table's name, not as added lines that
+// start inside the table above it.
+func TestDiff_AddedTableOpensAtItsOwnName(t *testing.T) {
+	diff := Diff(vschemaWithTables("orders", "users"), vschemaWithTables("orders", "orders_archive", "users"))
+
+	assert.Contains(t, diff, `
+     },
++    "orders_archive": {
++      "column_vindexes": [
++        {
++          "column": "id",
++          "name": "hash"
++        }
++      ]
++    },
+     "users": {
+`)
+}
+
+// A table added after the last table closes the one above it with a comma,
+// then opens at its own name. The added lines never start inside the table
+// above it.
+func TestDiff_TableAddedLastOpensAtItsOwnName(t *testing.T) {
+	diff := Diff(vschemaWithTables("orders"), vschemaWithTables("orders", "orders_archive"))
+
+	assert.Contains(t, diff, `
+       ]
++    },
++    "orders_archive": {
++      "column_vindexes": [
++        {
++          "column": "id",
++          "name": "hash"
++        }
++      ]
+     }
+   },
+`)
+}
+
+// A removed table shows as one whole removed block from its own name, the
+// same way an added one does.
+func TestDiff_RemovedTableClosesAtItsOwnName(t *testing.T) {
+	diff := Diff(vschemaWithTables("orders", "orders_archive", "users"), vschemaWithTables("orders", "users"))
+
+	assert.Contains(t, diff, `
+     },
+-    "orders_archive": {
+-      "column_vindexes": [
+-        {
+-          "column": "id",
+-          "name": "hash"
+-        }
+-      ]
+-    },
+     "users": {
+`)
+}
+
+// Changes with nothing to slide render exactly as a standard unified diff
+// does, hunk headers included.
+func TestDiff_MatchesAStandardUnifiedDiffWhenNothingSlides(t *testing.T) {
+	current, desired := vschemaWithTables("a", "b", "c", "d"), vschemaWithTables("a0", "b", "c", "d0")
+	want, err := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
+		A:        difflib.SplitLines(prettyJSON(Normalize(current))),
+		B:        difflib.SplitLines(prettyJSON(Normalize(desired))),
+		FromFile: "current",
+		ToFile:   "new",
+		Context:  3,
+	})
+	require.NoError(t, err)
+
+	diff := Diff(current, desired)
+	assert.Equal(t, want, diff)
+	assert.Equal(t, 2, strings.Count(diff, "\n@@ "), "changes far apart render as separate hunks")
+	assert.Contains(t, diff, "@@ -1,7 +1,7 @@\n")
+	assert.Contains(t, diff, "@@ -25,7 +25,7 @@\n")
 }

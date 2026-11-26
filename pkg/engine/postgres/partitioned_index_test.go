@@ -99,7 +99,7 @@ func TestBuildPartitionedIndexNamesItsOwnDeadline(t *testing.T) {
 	assert.False(t, isCancellation(err), "a build that ran past its bound is not a cancellation")
 	assert.Equal(t, 1, boundErr.partitionsBuilt)
 	assert.Nil(t, classifyRefusal(err, "users"), "a run that finished a partition made progress a retry keeps")
-	failure := classifyApplyFailure(err, "users")
+	failure := classifyApplyFailure(err, "users", nil)
 	assert.True(t, failure.retryable)
 	assert.Equal(t, "the partitioned index build ran past postgres.concurrent_index_max_duration (10ms) before every partition had its index; the retry resumes from the partitions already built", failure.detail)
 

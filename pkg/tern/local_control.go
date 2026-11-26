@@ -1052,7 +1052,8 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		return nil, fmt.Errorf("cancel schema change on database %s: %w", c.config.Database, err)
 	}
 	if applyID > 0 && cancelledCount > 0 {
-		if opLease, operationScoped := operationLeaseOnlyDrive(ctx); operationScoped {
+		opLease, operationScoped := operationLeaseOnlyDrive(ctx)
+		if operationScoped {
 			c.leaveApplyRowToProjection(targetApply, opLease, state.Task.Cancelled)
 		} else if err := c.markApplyCancelled(ctx, applyID); err != nil {
 			return nil, err
@@ -1063,6 +1064,9 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		}
 		c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			eventMsg, "", "")
+		if !operationScoped {
+			c.notifyTerminalAfterCancel(ctx, applyID, targetApply)
+		}
 	}
 	if cancelledCount == 0 && skippedCount == 0 {
 		// No apply was resolved and the database has no targetable tasks: there
@@ -2950,6 +2954,57 @@ func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context,
 	return skippedCount, nil
 }
 
+// notifyTerminalAfterCancel delivers the terminal notification for an apply a
+// cancel just settled. A cancel resolves the apply directly to a terminal state
+// and surfaces through the terminal summary, and the cancel path is the writer
+// that moved it there, so it owes the summary and Check Run refresh, the same
+// as the task-less cancel path and a failed drive do. The drive it woke cannot
+// deliver them: the cancel cancelled the drive's context, so the drive hands
+// the apply back without finalizing it. An observer held by a drive in another
+// process is delivered by that drive's finalization, which finds the apply
+// already terminal; the summary-marker claim keeps the two exactly-once. When
+// the reload fails the apply stays terminal and summary reconciliation posts
+// what this could not.
+func (c *LocalClient) notifyTerminalAfterCancel(ctx context.Context, applyID int64, target *storage.Apply) {
+	if c.getObserver(applyID) == nil {
+		c.logger.Debug("cancel settled an apply this process holds no observer for; the drive that holds it delivers the terminal summary",
+			c.cancelTargetLogAttrs(target)...)
+		return
+	}
+	apply, err := c.storage.Applies().Get(ctx, applyID)
+	if err != nil {
+		c.logger.Warn("cancel settled the apply but could not reload it to post the terminal summary; summary reconciliation posts it",
+			append(c.cancelTargetLogAttrs(target), "error", err)...)
+		return
+	}
+	if apply == nil {
+		c.logger.Warn("cancel settled an apply that could not be found on reload; no terminal summary is posted",
+			c.cancelTargetLogAttrs(target)...)
+		return
+	}
+	if !state.IsState(apply.State, state.Apply.Cancelled) {
+		c.logger.Warn("cancel settled the apply's tasks but the stored apply is not cancelled; no terminal summary is posted from the cancel path",
+			apply.LogAttrs()...)
+		return
+	}
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, applyID)
+	if err != nil {
+		c.logger.Warn("could not load tasks for the terminal summary after cancel; notifying without them",
+			append(apply.LogAttrs(), "error", err)...)
+		tasks = nil
+	}
+	c.notifyTerminalObserver(apply, tasks)
+}
+
+// cancelTargetLogAttrs returns the triage attributes of the apply a cancel
+// resolved, or the database alone when it resolved none.
+func (c *LocalClient) cancelTargetLogAttrs(target *storage.Apply) []any {
+	if target == nil {
+		return []any{"database", c.config.Database}
+	}
+	return target.LogAttrs()
+}
+
 // capitalizeControlVerb upper-cases the first letter of a control verb for use
 // at the start of an operator-facing apply event message.
 func capitalizeControlVerb(operation string) string {
@@ -3017,7 +3072,7 @@ func (c *LocalClient) activeTaskForControlApply(ctx context.Context, applyID, en
 // through the ControlResumeValidator gate below — engines own validation of
 // opaque ResumeState.Metadata before control calls.
 func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Task, creds *engine.Credentials, eng engine.Engine, operation engine.ControlOperation) (*engine.ControlRequest, error) {
-	resumeState, err := c.loadStoredEngineResumeState(ctx, task, string(operation))
+	resumeState, err := c.taskEngineResumeState(ctx, task, string(operation))
 	if err != nil {
 		return nil, fmt.Errorf("load engine resume state for %s of task %s: %w", operation, task.TaskIdentifier, err)
 	}
@@ -3058,6 +3113,99 @@ func (c *LocalClient) loadStoredEngineResumeState(ctx context.Context, task *sto
 		return nil, fmt.Errorf("load persisted engine resume state for apply operation %d: %w", operationID, err)
 	}
 	return stored, nil
+}
+
+// taskEngineResumeState is the resume state a control or progress request for
+// task carries, so the request addresses the work the task's drive started:
+// the state persisted on the task's apply operation, or, when the engine
+// persisted none for a task driven on its own, the identity that drive sent
+// with the task's Apply call. An engine that echoes that identity back
+// persists nothing and keys its in-process tracking on it, so a request
+// without it names no work, and the engine answers that nothing runs while
+// the task's build is still running. A grouped drive sends its own context,
+// so a task it drives keeps whatever was persisted. Whether the drive groups
+// is read from the cutover decision it acts on, which includes a deferral it
+// makes on its own at a cutover barrier, not only the operator's option.
+func (c *LocalClient) taskEngineResumeState(ctx context.Context, task *storage.Task, purpose string) (*engine.ResumeState, error) {
+	stored, err := c.loadStoredEngineResumeState(ctx, task, purpose)
+	if err != nil {
+		return nil, err
+	}
+	if stored != nil {
+		return stored, nil
+	}
+	apply, err := c.storage.Applies().Get(ctx, task.ApplyID)
+	if err != nil {
+		return nil, fmt.Errorf("load the apply of task %s to address its engine work for %s: %w", task.TaskIdentifier, purpose, err)
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("the apply of task %s does not exist; its engine work cannot be addressed for %s", task.TaskIdentifier, purpose)
+	}
+	deferCutover, err := c.taskDriveDefersCutover(ctx, apply, task)
+	if err != nil {
+		return nil, fmt.Errorf("decide how task %s is driven to address its engine work for %s: %w", task.TaskIdentifier, purpose, err)
+	}
+	if storage.GroupsEngineExecution(apply.DatabaseType, deferCutover) {
+		c.logger.Debug("grouped apply persisted no engine resume state; the engine request goes out without one",
+			append(task.LogAttrs(), "purpose", purpose)...)
+		return nil, nil
+	}
+	return sequentialDriveResumeState(task), nil
+}
+
+// taskDriveDefersCutover reports the cutover decision the drive of task acts
+// on: the operator's --defer-cutover, or the deferral an operation makes on
+// its own when it parks at a cutover barrier (see effectiveCopyDriveOptions).
+func (c *LocalClient) taskDriveDefersCutover(ctx context.Context, apply *storage.Apply, task *storage.Task) (bool, error) {
+	if apply.GetOptions().DeferCutover {
+		return true, nil
+	}
+	if !groupingFollowsCutoverDecision(apply.DatabaseType) {
+		// The engine groups, or never groups, whatever the drive decides
+		// about cutover, so the decision needs no read.
+		return false, nil
+	}
+	if task.ApplyOperationID == nil {
+		// Only an operation parks at a cutover barrier, so a task outside
+		// one runs on the operator's option alone.
+		return false, nil
+	}
+	store := c.storage.ApplyOperations()
+	if store == nil {
+		return false, fmt.Errorf("apply operation store is not configured")
+	}
+	operations, err := store.ListByApply(ctx, apply.ID)
+	if err != nil {
+		return false, fmt.Errorf("list apply operations of apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	operation, err := taskOperation(task, operations)
+	if err != nil {
+		return false, fmt.Errorf("apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return effectiveCopyDriveOptions(apply, len(operations) > 1, operation).DeferCutover, nil
+}
+
+// groupingFollowsCutoverDecision reports whether a drive of databaseType
+// groups its tasks only when it defers cutover.
+func groupingFollowsCutoverDecision(databaseType string) bool {
+	return storage.GroupsEngineExecution(databaseType, true) != storage.GroupsEngineExecution(databaseType, false)
+}
+
+// taskOperation returns the apply operation task names among operations. A
+// task naming an operation the apply does not have is an error.
+func taskOperation(task *storage.Task, operations []*storage.ApplyOperation) (*storage.ApplyOperation, error) {
+	for _, operation := range operations {
+		if operation.ID == *task.ApplyOperationID {
+			return operation, nil
+		}
+	}
+	return nil, fmt.Errorf("task %s names apply operation %d, which the apply does not have", task.TaskIdentifier, *task.ApplyOperationID)
+}
+
+// sequentialDriveResumeState is the resume state a sequential drive sends with
+// task's Apply call, and so the identity its engine work is tracked under.
+func sequentialDriveResumeState(task *storage.Task) *engine.ResumeState {
+	return &engine.ResumeState{MigrationContext: task.TaskIdentifier}
 }
 
 // Revert reverts a completed schema change during the revert window.
