@@ -440,7 +440,7 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, stoppedProgressID, edited.CommentID, "the freeze edit lands on the superseded comment")
-		assert.Contains(t, edited.Body, "Progress before the stop — the schema change resumed in")
+		assert.Contains(t, edited.Body, "Progress comment superseded — progress before the stop. The schema change resumed in")
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", newProgressID), "the frozen comment links to its successor")
 		assert.Contains(t, edited.Body, "<details>")
 		assert.Contains(t, edited.Body, "Stopped at 21%", "the pre-stop body is preserved inside the fold")
@@ -1151,7 +1151,7 @@ func TestE2EResumeRotationFreezesAcrossIterations(t *testing.T) {
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, secondProgressID, edited.CommentID, "the freeze edit lands on the second cycle's comment")
-		assert.Contains(t, edited.Body, "Progress before the stop — the schema change resumed in")
+		assert.Contains(t, edited.Body, "Progress comment superseded — progress before the stop. The schema change resumed in")
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", thirdProgressID), "the frozen comment links to its successor")
 		assert.Contains(t, edited.Body, "Stopped at 63%", "the superseded body is preserved inside the fold")
 	case <-time.After(5 * time.Second):
@@ -1378,7 +1378,7 @@ func TestE2ERevertRotatesProgressComment(t *testing.T) {
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, preRevertID, edited.CommentID, "the freeze edit lands on the superseded comment")
-		assert.Contains(t, edited.Body, "Progress before the revert — the revert is tracked in")
+		assert.Contains(t, edited.Body, "Progress comment superseded — progress before the revert. The revert is tracked in")
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", newProgressID), "the frozen comment links to its successor")
 		assert.Contains(t, edited.Body, "<details>")
 		assert.Contains(t, edited.Body, "Revert window open", "the pre-revert body is preserved inside the fold")
@@ -1490,7 +1490,7 @@ func TestE2ESkipRevertRotatesProgressComment(t *testing.T) {
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, preSkipID, edited.CommentID, "the freeze edit lands on the superseded comment")
-		assert.Contains(t, edited.Body, "Progress before the revert was skipped — the schema change is finalizing in")
+		assert.Contains(t, edited.Body, "Progress comment superseded — progress before the revert was skipped. The schema change is finalizing in")
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", newProgressID), "the frozen comment links to its successor")
 		assert.Contains(t, edited.Body, "<details>")
 		assert.Contains(t, edited.Body, "Revert window open", "the revert-window body is preserved inside the fold")
@@ -1719,7 +1719,7 @@ func TestE2EDeferredCutoverRotatesProgressComment(t *testing.T) {
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, cutoverPromptID, edited.CommentID, "the freeze edit lands on the cutover prompt")
-		assert.Contains(t, edited.Body, "Cutover prompt — the cutover completed")
+		assert.Contains(t, edited.Body, "Progress comment superseded — the cutover prompt. The cutover completed")
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", newProgressID), "the frozen prompt links to its successor")
 		assert.Contains(t, edited.Body, "<details>")
 		assert.Contains(t, edited.Body, "Ready for cutover", "the prompt body is preserved inside the fold")
@@ -1816,7 +1816,7 @@ func TestE2EDeferredCutoverSupersedeRetriedUntilItLands(t *testing.T) {
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, cutoverPromptID, edited.CommentID, "the freeze edit lands on the cutover prompt")
-		assert.Contains(t, edited.Body, "Cutover prompt — the cutover completed")
+		assert.Contains(t, edited.Body, "Progress comment superseded — the cutover prompt. The cutover completed")
 	case <-time.After(5 * time.Second):
 		require.FailNow(t, "expected the cutover prompt to be frozen")
 	}
@@ -2042,7 +2042,7 @@ func TestE2EDeferredCutoverCommandRotatesProgressComment(t *testing.T) {
 			case edited := <-capture.edits:
 				assert.Equal(t, gateProgressID, edited.CommentID, "the fold lands on the comment that waited for cutover")
 				assert.True(t, strings.HasPrefix(edited.Body, fmt.Sprintf(
-					"Progress before the cutover — the cutover is tracked in [a new progress comment](https://github.com/%s/pull/156#issuecomment-%d).", repo, freshID)), edited.Body)
+					"⏭️ Progress comment superseded — progress before the cutover. The cutover is tracked in [a new progress comment](https://github.com/%s/pull/156#issuecomment-%d).", repo, freshID)), edited.Body)
 				assert.Contains(t, edited.Body, "<summary>Progress before the cutover</summary>")
 				assert.Contains(t, edited.Body, "Waiting for Cutover — run `schemabot cutover` to proceed", "the waiting rendering is kept inside the fold")
 			case <-time.After(5 * time.Second):
@@ -2116,7 +2116,7 @@ func TestE2EDeferredCutoverFirstObservedSkippingRevertRotates(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, gateProgressID, edited.CommentID, "the fold lands on the comment that waited for cutover")
 		assert.True(t, strings.HasPrefix(edited.Body, fmt.Sprintf(
-			"Progress before the cutover — the cutover is tracked in [a new progress comment](https://github.com/%s/pull/158#issuecomment-%d).", repo, freshID)), edited.Body)
+			"⏭️ Progress comment superseded — progress before the cutover. The cutover is tracked in [a new progress comment](https://github.com/%s/pull/158#issuecomment-%d).", repo, freshID)), edited.Body)
 	case <-time.After(5 * time.Second):
 		require.FailNow(t, "expected the comment that waited for cutover to be folded")
 	}
@@ -2197,7 +2197,7 @@ func TestE2EOrderedDeferredCutoverRotatesForEachMember(t *testing.T) {
 				case edited := <-capture.edits:
 					assert.Equal(t, supersededID, edited.CommentID, "the fold lands on the comment tracking the previous cutover")
 					assert.True(t, strings.HasPrefix(edited.Body, fmt.Sprintf(
-						"Progress before the cutover — the cutover is tracked in [a new progress comment](https://github.com/%s/pull/159#issuecomment-%d).", repo, freshID)), edited.Body)
+						"⏭️ Progress comment superseded — progress before the cutover. The cutover is tracked in [a new progress comment](https://github.com/%s/pull/159#issuecomment-%d).", repo, freshID)), edited.Body)
 				case <-time.After(5 * time.Second):
 					require.FailNow(t, "expected the comment tracking the previous cutover to be folded")
 				}
@@ -2305,7 +2305,7 @@ func TestE2EOrderedDeferredCutoverRotatesPastCommentWithoutMember(t *testing.T) 
 	case edited := <-capture.edits:
 		assert.Equal(t, pastID, edited.CommentID, "the fold lands on the comment that recorded no member")
 		assert.True(t, strings.HasPrefix(edited.Body, fmt.Sprintf(
-			"Progress before the cutover — the cutover is tracked in [a new progress comment](https://github.com/%s/pull/160#issuecomment-%d).", repo, freshID)), edited.Body)
+			"⏭️ Progress comment superseded — progress before the cutover. The cutover is tracked in [a new progress comment](https://github.com/%s/pull/160#issuecomment-%d).", repo, freshID)), edited.Body)
 	case <-time.After(5 * time.Second):
 		require.FailNow(t, "expected the comment that recorded no member to be folded")
 	}
@@ -2638,7 +2638,7 @@ func TestE2EDeferredCutoverUntrackedFreshCommentAdoptedWhenStorageHeals(t *testi
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, cutoverPromptID, edited.CommentID, "the freeze edit lands on the cutover prompt")
-		assert.Contains(t, edited.Body, "Cutover prompt — the cutover completed")
+		assert.Contains(t, edited.Body, "Progress comment superseded — the cutover prompt. The cutover completed")
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshProgressID), "the frozen prompt links to its adopted successor")
 	case created := <-capture.creates:
 		require.FailNow(t, fmt.Sprintf("adoption must not post another comment; got %d", created.ID))
@@ -2906,7 +2906,7 @@ func TestE2ERevertRotationUntrackedFreshCommentAdoptedWhenStorageHeals(t *testin
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, preRevertID, edited.CommentID, "the freeze edit lands on the superseded comment")
-		assert.Contains(t, edited.Body, "Progress before the revert — the revert is tracked in")
+		assert.Contains(t, edited.Body, "Progress comment superseded — progress before the revert. The revert is tracked in")
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshProgressID), "the frozen comment links to its adopted successor")
 	case created := <-capture.creates:
 		require.FailNow(t, fmt.Sprintf("adoption must not post another comment; got %d", created.ID))

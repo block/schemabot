@@ -217,7 +217,7 @@ func TestRenderResumeSupersededProgressComment(t *testing.T) {
 		PreviousBody: "## Schema Change Progress\n\nStopped at 21%",
 	})
 	assert.True(t, strings.HasPrefix(rendered,
-		"Progress before the stop — the schema change resumed in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).\n\n"),
+		"⏭️ Progress comment superseded — progress before the stop. The schema change resumed in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).\n\n"),
 		"the headline names the period the comment covered before the resume that ended it: %s", rendered)
 	assert.Contains(t, rendered, "<details>")
 	assert.Contains(t, rendered, "<summary>Progress before the stop</summary>")
@@ -238,7 +238,7 @@ func TestRenderCutoverCommandSupersededProgressComment(t *testing.T) {
 		PreviousBody: "## Schema Change Status — Production\n\n**Status**: Waiting for Cutover",
 	})
 	assert.True(t, strings.HasPrefix(rendered,
-		"Progress before the cutover — the cutover is tracked in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).\n\n"), rendered)
+		"⏭️ Progress comment superseded — progress before the cutover. The cutover is tracked in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).\n\n"), rendered)
 	assert.Contains(t, rendered, "<details>\n<summary>Progress before the cutover</summary>\n\n## Schema Change Status — Production\n\n**Status**: Waiting for Cutover\n\n</details>\n")
 }
 
@@ -303,6 +303,51 @@ func TestIsSupersededProgressComment(t *testing.T) {
 	for name, body := range live {
 		assert.Falsef(t, IsSupersededProgressComment(body),
 			"a live %s is not frozen", name)
+	}
+}
+
+// TestSupersededHeadlinesStayRecognizableByPreviousRelease verifies every
+// rotation's frozen body is recognized by the frozen-body check the previous
+// release runs. A freeze retry can run on an older pod during a rolling deploy
+// or a rollback; if that pod read a frozen body as live, its retry would fold
+// the body a second time.
+func TestSupersededHeadlinesStayRecognizableByPreviousRelease(t *testing.T) {
+	// The prefixes the previous release's IsSupersededProgressComment accepts.
+	previousRelease := []string{
+		"⏩ Volume changed to",
+		"▶️ Schema change resumed",
+		"Schema change reverting",
+		"Revert skipped",
+		"Cutover complete",
+		"Cutover started",
+		"⏭️ Progress comment superseded",
+	}
+	recognizedByPreviousRelease := func(body string) bool {
+		headline, _, _ := strings.Cut(body, "\n")
+		if !strings.Contains(headline, " [a new progress comment](") {
+			return false
+		}
+		for _, prefix := range previousRelease {
+			if strings.HasPrefix(headline, prefix) {
+				return true
+			}
+		}
+		return false
+	}
+
+	shared := SupersededProgressData{
+		Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
+	}
+	for flavor, body := range map[string]string{
+		"resume":          RenderResumeSupersededProgressComment(shared),
+		"revert":          RenderRevertSupersededProgressComment(shared),
+		"skip-revert":     RenderSkipRevertSupersededProgressComment(shared),
+		"cutover":         RenderCutoverSupersededComment(shared),
+		"cutover command": RenderCutoverCommandSupersededProgressComment(shared),
+		"generic":         RenderSupersededProgressComment(shared),
+	} {
+		assert.Truef(t, recognizedByPreviousRelease(body),
+			"the previous release recognizes a %s-frozen body as frozen: %s", flavor, body)
 	}
 }
 
