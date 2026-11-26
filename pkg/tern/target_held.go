@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // targetHeldEscalationAfter is how long an apply's drives can be refused the
@@ -109,7 +110,7 @@ func (c *LocalClient) observeTargetHeld(ctx context.Context, logger *slog.Logger
 		subject = "Table " + table
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventInfo, storage.LogSourceSchemaBot,
-		fmt.Sprintf("%s has been held by another run of a schema change for %s; the apply keeps waiting for it. Find the run holding it, or stop the apply.", subject, heldFor.Round(time.Second)), "", "")
+		fmt.Sprintf("%s has been held by another run of a schema change for %s; the apply keeps waiting for it. Find the run holding it, or stop the apply.", subject, ui.FormatHumanDuration(heldFor.Round(time.Second))), "", "")
 }
 
 // engineRefusedTheTarget reports a poll whose run failed because another run

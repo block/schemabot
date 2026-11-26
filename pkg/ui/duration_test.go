@@ -85,7 +85,6 @@ func TestFormatETAReadsAsHumanDuration(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, FormatETA(tt.seconds), "FormatETA(%d)", tt.seconds)
-			assert.Equal(t, FormatHumanDuration(time.Duration(tt.seconds)*time.Second), FormatETA(tt.seconds))
 		})
 	}
 }

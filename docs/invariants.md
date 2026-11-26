@@ -1747,9 +1747,12 @@ codepoints are identical in the CLI and in a PR comment, the bar is built from e
 terminal colors so it renders the same in both, and the multi-deployment rollup that decides what
 an apply is called is derived once from the operation rows and rendered by both. Only markup
 differs between surfaces, ANSI color against markdown emphasis, and colored output degrades to the
-same text byte for byte when it is not going to a terminal. *Enforced:* the severity vocabulary
+same text byte for byte when it is not going to a terminal. A duration reads one way on every
+surface too, as its two largest non-zero units, so an apply's run time, a revert window's time
+left, a table's ETA, and the watch view's running timers agree. *Enforced:* the severity vocabulary
 and its rules (`pkg/glyph`), the shared bar and its colors (`pkg/ui`), the shared duration
-formatter (`FormatHumanDuration` in `pkg/ui`, pinned by `TestDurationsReadTheSameOnEverySurface`),
+formatter (`FormatHumanDuration` in `pkg/ui`, pinned by `TestDurationsReadTheSameOnEverySurface`
+and, for the watch view's timers, `TestWatchModel_TimersReadAsHumanDurations`),
 the shared rollup (`pkg/presentation`), and a custom analyzer run by the pre-commit hook that blocks a commit
 introducing a severity glyph as a literal outside its home package
 (`pkg/analyzers/severityglyphs`, `scripts/lint-fix.sh`).

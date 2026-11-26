@@ -28,7 +28,7 @@ func (e *eventEmittingEngine) Name() string { return "event-emitting" }
 
 func (e *eventEmittingEngine) Apply(_ context.Context, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
 	e.insideApply = true
-	req.OnEvent(engine.ApplyEvent{Message: "Waiting for branch schemabot-orders-1 to be ready (1m0s elapsed)"})
+	req.OnEvent(engine.ApplyEvent{Message: "Waiting for branch schemabot-orders-1 to be ready (1m elapsed)"})
 	e.insideApply = false
 	e.cancel()
 	return &engine.ApplyResult{Accepted: true}, nil

@@ -26,6 +26,7 @@ import (
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // noChangesApplyResult builds the result for a converged apply where the deploy
@@ -349,7 +350,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName, emitEvent); err != nil {
 			return nil, fmt.Errorf("wait for schema refresh %s: %w", branchName, err)
 		}
-		elapsed := time.Since(branchStart).Round(time.Second)
+		elapsed := ui.FormatHumanDuration(time.Since(branchStart).Round(time.Second))
 		emitEvent(engine.ApplyEvent{
 			Message:  fmt.Sprintf("Branch %s schema refreshed (%s)", branchName, elapsed),
 			Metadata: map[string]string{"branch": branchName},
@@ -376,7 +377,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName, emitEvent); err != nil {
 			return nil, fmt.Errorf("wait for branch: %w", err)
 		}
-		elapsed := time.Since(branchStart).Round(time.Second)
+		elapsed := ui.FormatHumanDuration(time.Since(branchStart).Round(time.Second))
 		emitEvent(engine.ApplyEvent{
 			Message:  fmt.Sprintf("Branch %s ready (%s)", branchName, elapsed),
 			Metadata: map[string]string{"branch": branchName},
@@ -559,7 +560,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 		emitEvent(rowCopyDeclineEvent(unsafe, unsafeReason))
 	}
 
-	drElapsed := time.Since(drStart).Round(time.Second)
+	drElapsed := ui.FormatHumanDuration(time.Since(drStart).Round(time.Second))
 	readyMsg := fmt.Sprintf("Deploy request #%d ready (%s)", dr.Number, drElapsed)
 	if useInstant {
 		readyMsg += " — instant DDL eligible"
@@ -769,7 +770,7 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 // wedged. The reason is a fixed phrase: the raw error stays in the server log.
 func keyspaceRetryEvent(keyspace, branch string, attempt int, delay time.Duration, reason string) engine.ApplyEvent {
 	return engine.ApplyEvent{
-		Message:  fmt.Sprintf("Retrying keyspace %s on branch %s in %s (attempt %d): %s", keyspace, branch, delay.Round(time.Second), attempt, reason),
+		Message:  fmt.Sprintf("Retrying keyspace %s on branch %s in %s (attempt %d): %s", keyspace, branch, ui.FormatHumanDuration(delay.Round(time.Second)), attempt, reason),
 		Metadata: map[string]string{"keyspace": keyspace, "branch": branch},
 	}
 }
@@ -777,7 +778,7 @@ func keyspaceRetryEvent(keyspace, branch string, attempt int, delay time.Duratio
 // snapshotRetryReason says how much of the snapshot window is left, so a retry
 // late in the window does not read as though the whole window were still ahead.
 func snapshotRetryReason(left time.Duration) string {
-	return fmt.Sprintf("PlanetScale is taking a schema snapshot of the branch, retrying for up to %s more", left.Round(time.Second))
+	return fmt.Sprintf("PlanetScale is taking a schema snapshot of the branch, retrying for up to %s more", ui.FormatHumanDuration(left.Round(time.Second)))
 }
 
 // transientRetryReason says how many more transient failures in a row the
