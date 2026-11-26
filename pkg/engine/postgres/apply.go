@@ -120,13 +120,17 @@ type nativeApply struct {
 	partitionedIndex bool
 	enumValueAdd     bool
 	// dropped is the plan's record of the live object the statement drops,
-	// which the apply checks under the table's lock before dropping it.
+	// which the apply checks before dropping it: under the table's lock, or
+	// for an index drop, right before the concurrent drop.
 	dropped *schemadiff.DroppedObject
+	// indexDrop is set for a DROP INDEX CONCURRENTLY of the index dropped
+	// names, which runs through pg-sprite's concurrent index drop.
+	indexDrop bool
 	// validates is the plan's record of the live NOT VALID constraint the
 	// statement validates, which the apply checks under the validation's
 	// lock before validating it.
 	validates *schemadiff.ConstraintValidation
-	// database names the target for the logs and metrics of a table drop.
+	// database names the target for the logs and metrics of a drop.
 	database string
 	// droppedTable is the definition the plan recorded for a table the
 	// statement drops whole, which pg-sprite checks under the table's lock.
@@ -292,7 +296,7 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if err := plannedSchemaMatchesTarget(statements, req.Changes[0].Namespace); err != nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: %w", tc.Table, err)
 	}
-	change := nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements)}
+	change := nativeApply{database: req.Database, namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements)}
 	if len(statements) == 1 {
 		// The tier derivation above parsed this statement already, so a
 		// parse failure here is an invariant guard; the message stays curated
@@ -304,6 +308,10 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		change.concurrentIndex = build == indexBuildConcurrent
 		change.partitionedIndex = build == indexBuildPartitioned
 		change.dropped, err = reviewedDropForApply(req.Database, tc, statements[0])
+		if err != nil {
+			return nativeApply{}, err
+		}
+		change.indexDrop, err = indexDropForApply(req.Database, change.namespace, tc.Table, statements[0], change.dropped)
 		if err != nil {
 			return nativeApply{}, err
 		}
@@ -1840,6 +1848,9 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	// where greenfieldCreateSet keeps the blocking form on purpose — a
 	// table born in the run has no readers, and CONCURRENTLY cannot run
 	// inside its create sequence.
+	if change.indexDrop {
+		return executeIndexDrop(ctx, pool, change, tracker, logger)
+	}
 	if change.dropped != nil {
 		return executeReviewedDrop(ctx, pool, table, change, statement.SQL(), tracker)
 	}
@@ -1989,6 +2000,11 @@ func provenCatalogOnly(ctx context.Context, pool *pgxpool.Pool, statement pgstat
 
 func applyTablePreflightLimit(change nativeApply, tableSizeLimit int64) int64 {
 	if change.durationBoundedIndexBuild() {
+		return preflight.NoSizeLimit
+	}
+	if change.indexDrop {
+		// A concurrent index drop scans no rows, so the table's size does
+		// not bound it.
 		return preflight.NoSizeLimit
 	}
 	return tableSizeLimit

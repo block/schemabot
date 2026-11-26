@@ -193,6 +193,7 @@ dedicated owner role, read [Table ownership](#table-ownership) before the first
 | `ALTER TABLE` that rewrites the table, such as most column type changes | Blocked. It needs a copy of the table, which SchemaBot does not run on PostgreSQL yet |
 | `CREATE INDEX` on an existing table | Runs as `CREATE INDEX CONCURRENTLY`, bounded by `postgres.concurrent_index_max_duration` (24 hours by default). It can be cancelled |
 | `CREATE INDEX` on a partitioned table | Built one partition at a time, each concurrently, under the same bound. It can be cancelled, and applying again resumes from the partitions already built. See [Partitioned index builds](#partitioned-index-builds) |
+| Dropping an index | Runs as `DROP INDEX CONCURRENTLY` after you approve it with `--allow-unsafe`, on a table of any size. Reads and writes continue while it waits for open transactions, up to 4 minutes. See [Dropping an index](#dropping-an-index) |
 | A new table, with its indexes | Runs together: the table, then its indexes, built without `CONCURRENTLY` because nothing reads the table yet. See [Greenfield tables](#greenfield-tables) |
 | A new label on an existing enum type | Runs as `ALTER TYPE ... ADD VALUE`, one label per step, before the table changes. Creating a type or removing a label fails the plan. See [Enum types](#enum-types) |
 | Row-level security policies on an existing table | Run in one transaction, after you explicitly approve them, because they change who can read rows. See [Row-level security](#row-level-security) |
@@ -709,6 +710,26 @@ When a plan is blocked:
 - An apply is rejected before anything is queued.
 - No flag overrides it. Rewrite the change into a form pg-sprite accepts, or
   make it outside SchemaBot through a separately reviewed process.
+
+### Dropping an index
+
+An index the schema file no longer declares is dropped with
+`DROP INDEX CONCURRENTLY`, after you approve it with `--allow-unsafe`. The
+drop reads no rows and rewrites nothing, so the size limit does not apply. It
+does not block reads or writes. It waits for the transactions already open on
+the table, for up to 4 minutes. A drop that runs out of time fails and can
+leave the index invalid, which queries no longer use. Drop that index outside
+SchemaBot, then plan again.
+
+Right before the drop, the apply checks that the index still has the
+definition the plan recorded. If it changed, for example because the index was
+dropped and created again under the same name, nothing is dropped. Plan again
+and review the new plan. An index that a table's replica identity uses is not
+dropped either: point `REPLICA IDENTITY` elsewhere first.
+
+An index of a partitioned table is blocked, because PostgreSQL cannot drop it
+concurrently. Drop it outside SchemaBot when a lock on every partition is
+acceptable, then plan again.
 
 ### Dropping a column or constraint
 

@@ -1939,13 +1939,14 @@ the re-plan speaks for a shard-tagged task at all. `remainingPlannedChanges` on 
 path of the PlanetScale engine (`pkg/engine/planetscale/apply.go`) runs only reviewed DDL for the
 tables the branch still lacks, refuses a branch that differs outside the reviewed DDL, and
 validates the branch against the declared schema before creating or adopting the deploy request.
-On PostgreSQL, a statement that drops a table, a column, a constraint, or a NOT NULL runs only with the
+On PostgreSQL, a statement that drops a table, a column, a constraint, an index, or a NOT NULL runs only with the
 planner's record of that object, which the plan stores with the change and every apply path passes
 back, matching a task to its change by the statement's canonical form (`planChangeMetadata` in
 `pkg/tern/plan_change_metadata.go`); the apply refuses a drop with no record
 and drops nothing when the object no longer matches it under the table's lock
 (`reviewedDropForApply` and `executeReviewedDrop` in `pkg/engine/postgres/apply.go`;
-`tableDropForApply` and `executeTableDrop` in `pkg/engine/postgres/table_drop.go`).
+`tableDropForApply` and `executeTableDrop` in `pkg/engine/postgres/table_drop.go`;
+`indexDropForApply` and `executeIndexDrop` in `pkg/engine/postgres/index_drop.go`).
 The re-plan an apply runs after a confirmation, or after an automatic apply posts its plan, holds
 each statement the confirmed plan ran to the engine's record of the objects it acts on: a record
 that differs refuses the confirmation, or stops the automatic apply for manual confirmation
