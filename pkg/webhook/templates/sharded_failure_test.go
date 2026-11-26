@@ -51,8 +51,9 @@ func TestRenderShardedApplyComment_GroupsFailuresByReason(t *testing.T) {
 	assert.Contains(t, out, "> ❌ **Failed on 4 of 16 shards:**\n"+
 		"> - shards `s00`, `s02`, `s03`: "+dupes+"\n"+
 		"> - shard `s01`: "+timeout+"\n")
-	assert.Equal(t, 1, strings.Count(out, dupes), "each reason renders once")
+	assert.Equal(t, 1, strings.Count(out, ": "+dupes+"\n"), "each reason renders once in the callout")
 	assert.NotContains(t, out, "First failure")
+	assert.Contains(t, out, "| `s03` | ❌ failed — "+dupes+" |", "each failed shard's reason stays reachable")
 
 	single := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Failed, Environment: "production", Database: "cdb_resolute", ApplyID: "apply-x",
@@ -95,6 +96,9 @@ func TestRenderShardedApplyComment_CapsFailureReasons(t *testing.T) {
 	assert.Contains(t, out, "> - shards `s00`, `s01`: reason 0\n", "the most common reason leads")
 	assert.Equal(t, failureReasonLimit, strings.Count(out, ": reason "))
 	assert.Contains(t, out, "> - …and 2 more reasons on 2 shards\n")
+	for i := 2; i < len(statuses); i++ {
+		assert.Contains(t, out, fmt.Sprintf("| `s%02d` | ❌ failed — reason %d |", i, i), "a reason past the limit stays reachable in the failed shards' table")
+	}
 }
 
 // While every failed shard is still retrying on its own, the callout reads as
@@ -110,7 +114,8 @@ func TestRenderShardedApplyComment_RetryingShardsReadAsAttention(t *testing.T) {
 }
 
 // A keyspace wider than the inline limit lists its shards under one collapsed
-// line per state, failures first, instead of one table row per shard.
+// line per state, failures first, instead of one table row per shard. The
+// failed line expands into a table carrying each failed shard's error.
 func TestRenderShardedApplyComment_WideKeyspaceCollapsesShardsByState(t *testing.T) {
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "production", Database: "cdb_resolute", ApplyID: "apply-x",
@@ -124,7 +129,8 @@ func TestRenderShardedApplyComment_WideKeyspaceCollapsesShardsByState(t *testing
 	assert.Greater(t, running, failed, "failed shards lead")
 	assert.Greater(t, halted, running)
 	assert.Contains(t, out, "s00  s02\n", "the running line expands into its shards")
-	assert.NotContains(t, out, "| Shard | Status |")
+	assert.Contains(t, out, "<summary>❌ 1 failed</summary>\n\n| Shard | Status |\n| --- | --- |\n| `s01` | ❌ failed — dupes |\n\n</details>")
+	assert.Equal(t, 1, strings.Count(out, "| Shard | Status |"), "only the failed line expands into a table")
 
 	narrow := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Failed, Environment: "production", Database: "cdb_resolute", ApplyID: "apply-x",
@@ -148,6 +154,53 @@ func TestRenderShardedApplyComment_FailedTableCountsFailedShards(t *testing.T) {
 	})
 
 	assert.Contains(t, out, "**`mutes`**: ❌ Failed on 1 of 3 shards\n")
+
+	keyspaces[0].Tables[0].PlannedShards = 16
+	planned := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "production", Database: "cdb_resolute", ApplyID: "apply-x",
+		Keyspaces: keyspaces,
+	})
+	assert.Contains(t, planned, "**`mutes`**: ❌ Failed on 1 of 16 shards\n", "shards yet to attach count toward the total")
+
+	keyspaces[0].Tables[0].Shards = keyspaces[0].Tables[0].Shards[:1]
+	onlyAttached := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "production", Database: "cdb_resolute", ApplyID: "apply-x",
+		Keyspaces: keyspaces,
+	})
+	assert.Contains(t, onlyAttached, "**`mutes`**: ❌ Failed on 1 of 16 shards\n", "the only attached shard failing is not every shard failing")
+}
+
+// Keyspaces split on the same key ranges share shard names, so the failure
+// callout names each shard with its keyspace when a name repeats across
+// keyspaces, and leaves names bare when they cannot be confused.
+func TestRenderShardedApplyComment_FailureCalloutQualifiesRepeatedShardNames(t *testing.T) {
+	keyspace := func(name string, shards ...ShardStatus) ShardedKeyspace {
+		return ShardedKeyspace{Keyspace: name, Shards: shards}
+	}
+	failedOn := func(shard, reason string) ShardStatus {
+		s := failedShard(reason)
+		s.Shard = shard
+		return s
+	}
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Failed, Environment: "production", Database: "shop", ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{
+			keyspace("shop_a", failedOn("-80", "dupes"), failedOn("80-", "timeout")),
+			keyspace("shop_b", failedOn("-80", "dupes")),
+		},
+	})
+	assert.Contains(t, out, "> ❌ **Failed on all 3 shards:**\n"+
+		"> - shards `shop_a/-80`, `shop_b/-80`: dupes\n"+
+		"> - shard `shop_a/80-`: timeout\n")
+
+	distinct := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Failed, Environment: "production", Database: "shop", ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{
+			keyspace("shop_a", failedOn("-40", "dupes")),
+			keyspace("shop_b", failedOn("40-", "dupes")),
+		},
+	})
+	assert.Contains(t, distinct, "> ❌ **Failed on shards `-40`, `40-`:** dupes\n")
 }
 
 // A running sharded apply ends with the stop command. While a failed shard

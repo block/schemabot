@@ -11715,9 +11715,14 @@ ALTER TABLE `mutes` ADD UNIQUE `uk_target`(`target_id`);
 <details>
 <summary>❌ 6 failed</summary>
 
-```
--10    10-20  20-30  30-40  40-50  50-60
-```
+| Shard | Status |
+| --- | --- |
+| `-10` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `10-20` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `20-30` | ❌ failed — The schema change ran out of time before it finished; see the server logs for the step that timed out. |
+| `30-40` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `40-50` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `50-60` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
 
 </details>
 
@@ -11767,9 +11772,11 @@ ALTER TABLE `mutes` ADD UNIQUE `uk_target`(`target_id`);
 <details>
 <summary>❌ 3 failed</summary>
 
-```
--10    10-20  20-30
-```
+| Shard | Status |
+| --- | --- |
+| `-10` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `10-20` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `20-30` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
 
 </details>
 

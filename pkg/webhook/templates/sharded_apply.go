@@ -703,10 +703,11 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, budget *dd
 		if status == state.Task.Running && t.CopiesNoRows {
 			phrase = "🔄 Applying"
 		}
-		if failed := failedShardCount(t.Shards); status == state.Task.Failed && failed > 0 && failed < len(t.Shards) {
+		if failed, total := failedShardCount(t.Shards), t.shardTotal(); status == state.Task.Failed && failed > 0 && failed < total {
 			// A failure leads the table's rollup however many shards are
-			// still copying, so the line says how far the failure reaches.
-			phrase += fmt.Sprintf(" on %d of %d shards", failed, len(t.Shards))
+			// still copying, so the line says how far the failure reaches,
+			// against every shard the change spans, attached or not.
+			phrase += fmt.Sprintf(" on %d of %d shards", failed, total)
 		}
 		if landed := landedShardCount(t.Shards); landed > 0 && landed < len(t.Shards) && !presentation.ListsParts(status) {
 			if status == state.Task.Cancelled {
@@ -990,7 +991,7 @@ func isShardFailureState(opState string) bool {
 // failed apply must still name it. Renders nothing when the apply carries no
 // failure to explain.
 func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
-	shards := allShardStatuses(data.Keyspaces)
+	shards := failureCalloutShards(data.Keyspaces)
 	failed := failedShards(shards)
 	switch {
 	case len(failed) == 1:
@@ -1019,6 +1020,40 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 	if msg := SanitizeInlineError(data.ErrorMessage); msg != "" {
 		fmt.Fprintf(sb, "\n> %s **Failure:** %s\n", failureSeverity(state.IsState(data.State, state.Apply.FailedRetryable)), html.EscapeString(msg))
 	}
+}
+
+// failureCalloutShards is every keyspace's shards for the failure callout,
+// which names shards from several keyspaces on one line. Keyspaces split on
+// the same key ranges share shard names, so when a name appears in more than
+// one keyspace every name is qualified as keyspace/shard to say which shard
+// failed.
+func failureCalloutShards(keyspaces []ShardedKeyspace) []ShardStatus {
+	if !shardNamesRepeatAcrossKeyspaces(keyspaces) {
+		return allShardStatuses(keyspaces)
+	}
+	var out []ShardStatus
+	for _, ks := range keyspaces {
+		for _, s := range ks.Shards {
+			s.Shard = ks.Keyspace + "/" + s.Shard
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// shardNamesRepeatAcrossKeyspaces reports whether two keyspaces have a shard
+// of the same name.
+func shardNamesRepeatAcrossKeyspaces(keyspaces []ShardedKeyspace) bool {
+	owner := make(map[string]string)
+	for _, ks := range keyspaces {
+		for _, s := range ks.Shards {
+			if other, ok := owner[s.Shard]; ok && other != ks.Keyspace {
+				return true
+			}
+			owner[s.Shard] = ks.Keyspace
+		}
+	}
+	return false
 }
 
 // failureReasonLimit bounds the reasons the failure callout lists, so shards
@@ -1145,8 +1180,10 @@ func failureSeverity(retrying bool) string {
 // read as a table with one row each, carrying each failed shard's error. More
 // than that would wall the comment with rows that mostly repeat one another,
 // so each state instead gets one collapsed line, such as "❌ 31 failed", that
-// expands into the names of its shards; the failure callout above already
-// carries each distinct reason.
+// expands into the names of its shards. A failed state expands into a table
+// instead, with each shard's own error: the failure callout above lists a
+// bounded number of reasons, so the table is where every failed shard's
+// reason stays reachable.
 func writeShardStatuses(sb *strings.Builder, shards []ShardStatus) {
 	if len(shards) <= shardNamesInlineLimit {
 		writeShardStatusTable(sb, shards)
@@ -1154,11 +1191,17 @@ func writeShardStatuses(sb *strings.Builder, shards []ShardStatus) {
 	}
 	sb.WriteString("\n")
 	for _, g := range shardStateGroups(shards) {
-		summary := fmt.Sprintf("%d %s", len(g.names), html.EscapeString(g.label))
+		summary := fmt.Sprintf("%d %s", len(g.shards), html.EscapeString(g.label))
 		if g.emoji != "" {
 			summary = g.emoji + " " + summary
 		}
-		writeCollapsedNameGrid(sb, "", summary, g.names)
+		if g.failed {
+			fmt.Fprintf(sb, "<details>\n<summary>%s</summary>\n", summary)
+			writeShardStatusTable(sb, g.shards)
+			sb.WriteString("\n</details>\n\n")
+			continue
+		}
+		writeCollapsedNameGrid(sb, "", summary, g.names())
 	}
 }
 
@@ -1166,10 +1209,20 @@ func writeShardStatuses(sb *strings.Builder, shards []ShardStatus) {
 // words of their label without the reason after " — ", as the Shards count
 // line counts them (presentation.ShardCounts).
 type shardStateGroup struct {
-	emoji string
-	label string
-	rank  int
-	names []string
+	emoji  string
+	label  string
+	rank   int
+	failed bool
+	shards []ShardStatus
+}
+
+// names is the group's shard names, in order.
+func (g shardStateGroup) names() []string {
+	names := make([]string, len(g.shards))
+	for i, s := range g.shards {
+		names[i] = s.Shard
+	}
+	return names
 }
 
 // shardStateGroups groups shards by status, the most attention-worthy status
@@ -1186,7 +1239,10 @@ func shardStateGroups(shards []ShardStatus) []shardStateGroup {
 			index[key] = i
 			groups = append(groups, shardStateGroup{emoji: s.Emoji, label: label, rank: presentation.ShardStateRank(s.State)})
 		}
-		groups[i].names = append(groups[i].names, s.Shard)
+		groups[i].shards = append(groups[i].shards, s)
+		if isShardFailureState(s.State) {
+			groups[i].failed = true
+		}
 	}
 	slices.SortStableFunc(groups, func(a, b shardStateGroup) int { return b.rank - a.rank })
 	return groups
