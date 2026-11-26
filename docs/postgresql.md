@@ -1003,7 +1003,7 @@ schema file format. These include tables with:
 
 | Command | What happens to such a table |
 |---|---|
-| `pull` | Left out of the SQL and listed in a `-- Skipped` comment with the reason |
+| `pull` | Left out of the SQL, counted in the summary box, and listed with its reason under a `⚠️ Skipped` warning |
 | `onboard`, `init` | No file is written. `schemabot.yaml` lists it in `ignore_tables`, so SchemaBot never changes or drops it, and the command names it with the reason |
 | `POST /api/pull` | The whole pull is refused, unless the request sets `skip_unrepresentable_tables`. See [Skip tables schema files cannot describe](schema-intelligence.md#skip-tables-schema-files-cannot-describe) |
 
