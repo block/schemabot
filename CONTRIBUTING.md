@@ -32,10 +32,16 @@ Thank you for your interest in contributing to SchemaBot! We welcome bug reports
 ## Development Setup
 
 ```bash
-make setup    # Configure git hooks
+make setup         # Configure git hooks
 make demo-full     # Start local services, apply schema, seed data
-make test     # Run all tests (unit + integration + e2e)
+make demo-vitess   # The same against a local sharded Vitess cluster
+make test          # Run all tests (unit + integration + e2e)
 ```
+
+`make demo-vitess` runs against [LocalScale](./pkg/localscale/README.md), which
+answers the PlanetScale API over an embedded Vitess cluster, so Vitess changes
+can be developed and tested without a PlanetScale account. It builds the
+LocalScale image first; `make build-localscale-image` builds it on its own.
 
 See [docs/architecture.md](./docs/architecture.md) for an overview of how SchemaBot works.
 

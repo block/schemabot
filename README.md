@@ -80,7 +80,7 @@ schemabot init
 
 ![Choose a PostgreSQL sample, edit its schema, review and apply the change, then verify the result](./assets/init-sample-demo.gif)
 
-The wizard connects to your MySQL or PostgreSQL database, imports its schema into declarative `.sql` files, and verifies a no-change plan before it finishes. It reads your application's schema and never changes it. SchemaBot keeps its own plans and progress in a separate database, which can live on the same server. Make your first edit and run `schemabot plan` to preview changes. Run `schemabot apply` when you’re ready to apply them. [docs/init.md](./docs/init.md) walks through each step, including the flag form for agents and scripts.
+The wizard offers a disposable sample database — MySQL, PostgreSQL, or a sharded Vitess cluster — or connects to your own MySQL or PostgreSQL database. It imports the schema into declarative `.sql` files, and verifies a no-change plan before it finishes. It reads your application's schema and never changes it. SchemaBot keeps its own plans and progress in a separate database, which can live on the same server. Make your first edit and run `schemabot plan` to preview changes. Run `schemabot apply` when you’re ready to apply them. [docs/init.md](./docs/init.md) walks through each step, including the flag form for agents and scripts.
 
 For more local examples, see the [examples guide](./examples/README.md).
 
@@ -88,11 +88,13 @@ To run the PR workflow for your team, deploy the server from [Releases](#release
 
 ## Supported databases
 
-| Database | Status | How changes run |
-|---|---|---|
-| MySQL | Generally available | [Spirit](https://github.com/block/spirit), with instant DDL where supported and online copying when needed |
-| Vitess on PlanetScale | Generally available | [Deploy requests](https://planetscale.com/docs/vitess/schema-changes/deploy-requests), with per-shard progress |
-| PostgreSQL | Beta | [pg-sprite](https://github.com/block/pg-sprite); see [what is not GA yet](./docs/postgresql.md#beta-status) |
+| Database | Status | How changes run | Try it locally |
+|---|---|---|---|
+| MySQL | Generally available | [Spirit](https://github.com/block/spirit), with instant DDL where supported and online copying when needed | `schemabot init --sample --type mysql` |
+| Vitess on PlanetScale | Generally available | [Deploy requests](https://planetscale.com/docs/vitess/schema-changes/deploy-requests), with per-shard progress | `schemabot init --sample --type vitess` |
+| PostgreSQL | Beta | [pg-sprite](https://github.com/block/pg-sprite); see [what is not GA yet](./docs/postgresql.md#beta-status) | `schemabot init --sample --type postgres` |
+
+Each sample is a disposable local database that needs nothing but Docker. The Vitess one brings up a sharded cluster, so you can watch a change land shard by shard without a PlanetScale account.
 
 Follow progress, choose cutover timing, and pause, resume, cancel, or roll back where the engine supports it. Execution methods, throttling, and recovery differ by engine; the [capability matrix](./docs/engines.md) explains the choices.
 
@@ -111,7 +113,7 @@ Guides and reference:
 - [Engines](./docs/engines.md): See how changes run on your database engine
 - [MySQL](./docs/mysql.md): Understand online copies, direct execution, and primary key choices
 - [PostgreSQL](./docs/postgresql.md): Find out what’s supported today
-- [Vitess on PlanetScale](./docs/vitess.md): Grant the service token the permissions SchemaBot needs
+- [Vitess on PlanetScale](./docs/vitess.md): Run sharded changes through branches and deploy requests
 - [Configuration](./docs/configuration.md): Set things up for your environment
 - [Storage schema](./docs/storage-schema.md): Keep SchemaBot’s own bookkeeping database converged across deploys
 - [Authentication](./docs/auth.md): Choose who can read and change your databases
