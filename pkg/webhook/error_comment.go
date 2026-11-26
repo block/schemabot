@@ -165,13 +165,20 @@ func userFacingErrorDetail(errorDetail string) string {
 // tried to reach and never the transport error, which carries hostnames and
 // addresses. The caller logs that error with its identifiers.
 func userFacingRemoteUnavailableError(deployment, target string) string {
-	const logsHint = "; if it fails again, the SchemaBot server logs have the cause."
+	service, healthy := remoteServiceName(deployment, target)
+	return "SchemaBot could not reach the " + service + ". Run the command again once " + healthy + " is healthy; if it fails again, the SchemaBot server logs have the cause."
+}
+
+// remoteServiceName names the remote data plane SchemaBot tried to reach, as
+// specifically as the deployment and target allow, and how a sentence asking
+// the reader to wait for it refers back to it.
+func remoteServiceName(deployment, target string) (service, healthy string) {
 	switch {
 	case deployment != "" && target != "":
-		return "SchemaBot could not reach the remote deployment `" + deployment + "` for target `" + target + "`. Run the command again once that deployment is healthy" + logsHint
+		return "remote deployment `" + deployment + "` for target `" + target + "`", "that deployment"
 	case deployment != "":
-		return "SchemaBot could not reach the remote deployment `" + deployment + "`. Run the command again once that deployment is healthy" + logsHint
+		return "remote deployment `" + deployment + "`", "that deployment"
 	default:
-		return "SchemaBot could not reach the remote schema change service. Run the command again once the service is healthy" + logsHint
+		return "remote schema change service", "the service"
 	}
 }
