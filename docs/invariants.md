@@ -1472,6 +1472,7 @@ cancel rejected over a deploy request that failed as a settled-outcome refusal
 refusal over a provider-settled failure its probe reads (`providerSettledChangeAsFailed`,
 `pkg/tern/local_control.go`) as the backstop; the in-process engine's
 settled outcome checks on stop and cancel (`pkg/engine/spirit/control.go`), including a
+cutover that has begun (`cutoverHasBegun`), which the run finishes on its own, and a
 completion its run records after the cancel, and its run's deference to a stop or cancel that
 interrupted it, which no failure the run records afterwards replaces (`setSchemaChangeFailed`,
 `pkg/engine/spirit/execution.go`, `pkg/engine/spirit/direct.go`).

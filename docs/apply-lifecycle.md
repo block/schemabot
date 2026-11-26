@@ -382,7 +382,12 @@ apply spent its retry budget or recovery window.
 
 Under `halt`, the other shards of the failed operation's own target do not
 wait for the steps below. Each one's drive cancels its work at its next
-checkpoint, as it would for an operator's `cancel`.
+checkpoint, as it would for an operator's `cancel`, and its copy is thrown
+away. That holds for a shard still copying and for a shard already waiting at
+the cutover while its drive still holds it. A waiting shard whose drive has
+ended is left to the reaper, and so is one the reaper's stop reaches first:
+it is stopped and keeps its copy. A shard whose cutover has started finishes
+it.
 
 SchemaBot does not leave the other operations waiting at the cutover, holding
 their targets, until the wait times out. The reaper ends the apply in two
@@ -395,15 +400,17 @@ steps:
    Each stopped operation fails and names the operation it failed for, and its
    task stays `stopped`, so its saved copy is kept.
 
-Shard `-40` fails while shards `40-80` and `80-` wait at the cutover:
+Shard `-80` of target `users` fails while shard `80-` of `users` is still
+copying and both shards of target `orders` wait at the cutover:
 
 ```
- -40      copying ──> failed (halt)
- 40-80    copying ──> waiting_for_cutover ──> stopped ──> failed, for -40
- 80-      copying ──> waiting_for_cutover ──> stopped ──> failed, for -40
- apply    running ──> running_degraded ──────────────────> failed
-                            │
-                            └── reaper records a stop as schemabot
+ users/-80    copying ──> failed (halt)
+ users/80-    copying ──> cancelled, its drive halts it for users/-80
+ orders/-80   copying ──> waiting_for_cutover ──> stopped ──> failed, for users/-80
+ orders/80-   copying ──> waiting_for_cutover ──> stopped ──> failed, for users/-80
+ apply        running ──> running_degraded ──────────────────> failed
+                                │
+                                └── reaper records a stop as schemabot
 ```
 
 To try again, fix what made the first operation fail, then plan and apply the

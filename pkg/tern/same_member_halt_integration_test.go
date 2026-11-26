@@ -243,3 +243,27 @@ func TestLocalClient_FailedShardCancelsASequentialSiblingMidCopy(t *testing.T) {
 	}
 	f.requireParentUntouched(t)
 }
+
+// Shard 80- of target testdb fails under on_failure halt while shard -80 of
+// the same target waits at its cutover in an apply that did not defer its
+// cutover. A drive that resumes shard -80 neither resumes its copy nor parks it
+// again: it cancels the parked engine work, records the task cancelled, and
+// leaves the apply row to the rollout projection.
+func TestLocalClient_FailedShardCancelsASiblingWaitingAtItsCutover(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newMultiOpResumeFixture(t, []string{state.Task.WaitingForCutover})
+	f.eng.planChanges = []engine.SchemaChange{{
+		Namespace:    "testdb",
+		TableChanges: []engine.TableChange{{Table: "users", DDL: multiOpResumeDDL}},
+	}}
+	f.client.spiritEngine = &multiOpTargetDrainerEngine{multiOpResumeEngine: f.eng}
+	insertFailedShardSibling(t, f)
+
+	require.NoError(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.opID))
+	assert.Zero(t, f.eng.applyCalls, "a halted shard's copy is not resumed")
+	assert.Equal(t, 1, f.eng.cancelCalls, "the drive cancels the copy parked at the cutover")
+	assert.Equal(t, state.Task.Cancelled, f.taskState(t, f.tasks[0]), "the parked shard ends cancelled, not waiting for its cutover")
+	f.requireParentUntouched(t)
+}
