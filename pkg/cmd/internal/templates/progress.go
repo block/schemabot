@@ -983,6 +983,61 @@ func WriteCancelSuccess(data CancelData) {
 	fmt.Printf("%sThis schema change cannot be resumed.%s\n", ANSIDim, ANSIReset)
 }
 
+// CancelPendingData contains data for rendering a cancel the server recorded
+// but the apply has not acted on yet.
+type CancelPendingData struct {
+	Database       string
+	Environment    string
+	ApplyID        string
+	CancelledCount int
+	// LookupErr is why the CLI could not read the apply's state while waiting,
+	// or nil when the apply was still active at the deadline.
+	LookupErr error
+}
+
+// WriteCancelPending writes the output of a cancel that is recorded but has
+// not ended the schema change yet. The apply keeps running until a driver
+// consumes the request, and a new apply is refused until it does, so the
+// output must not read as done.
+func WriteCancelPending(data CancelPendingData) {
+	fmt.Printf("%s%s⏳ Cancel requested%s\n", ANSIBold, ANSIYellow, ANSIReset)
+	fmt.Println()
+	fmt.Printf("Database:    %s\n", data.Database)
+	fmt.Printf("Environment: %s\n", data.Environment)
+	if data.CancelledCount > 0 {
+		fmt.Printf("Cancelling:  %d table(s)\n", data.CancelledCount)
+	}
+	fmt.Println()
+	if data.LookupErr != nil {
+		fmt.Printf("The cancel is recorded, but its state could not be read: %v\n", data.LookupErr)
+	} else {
+		fmt.Println("The cancel is recorded. The schema change is still running and ends when SchemaBot next picks it up.")
+	}
+	fmt.Println("A new apply is refused until it ends.")
+	fmt.Println()
+	fmt.Print(FormatNextCommand("To watch it end", ControlCommand("progress", data.ApplyID, data.Environment)))
+}
+
+// CancelOvertakenData contains data for rendering a cancel the schema change
+// finished before acting on.
+type CancelOvertakenData struct {
+	Database    string
+	Environment string
+	ApplyID     string
+	State       string
+}
+
+// WriteCancelOvertaken writes the output of a cancel that arrived after the
+// schema change had already reached another terminal state.
+func WriteCancelOvertaken(data CancelOvertakenData) {
+	fmt.Printf("%sSchema change ended as %s before the cancel took effect%s\n", ANSIBold, data.State, ANSIReset)
+	fmt.Println()
+	fmt.Printf("Database:    %s\n", data.Database)
+	fmt.Printf("Environment: %s\n", data.Environment)
+	fmt.Println()
+	fmt.Print(FormatNextCommand("To see how it ended", ControlCommand("progress", data.ApplyID, data.Environment)))
+}
+
 // StartData contains data for rendering start command output.
 type StartData struct {
 	Database     string

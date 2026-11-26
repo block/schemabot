@@ -2005,15 +2005,34 @@ func (s *Service) stopQueuedStart(ctx context.Context, apply *storage.Apply, cal
 	}
 }
 
+// stopRequestCounts counts the tables a stop or cancel acts on and the tables
+// it leaves alone because they already finished. It counts tables, not tasks:
+// one table can carry several tasks, such as the steps of a staged change or
+// one task per shard, and the operator reads the count as tables. A table is
+// acted on while any of its tasks is still active. A task that names no table
+// covers several tables at once and counts as one.
 func stopRequestCounts(tasks []*storage.Task) (int64, int64) {
+	type tableKey struct {
+		namespace string
+		table     string
+		taskID    int64
+	}
+	active := make(map[tableKey]bool)
+	for _, task := range tasks {
+		key := tableKey{namespace: task.Namespace, table: task.TableName}
+		if task.TableName == "" {
+			key.taskID = task.ID
+		}
+		active[key] = active[key] || !state.IsTerminalTaskState(task.State)
+	}
 	var stoppedCount int64
 	var skippedCount int64
-	for _, task := range tasks {
-		if state.IsTerminalTaskState(task.State) {
-			skippedCount++
+	for _, isActive := range active {
+		if isActive {
+			stoppedCount++
 			continue
 		}
-		stoppedCount++
+		skippedCount++
 	}
 	return stoppedCount, skippedCount
 }
