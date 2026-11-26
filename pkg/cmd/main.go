@@ -74,6 +74,14 @@ type CLI struct {
 	FixLint commands.FixLintCmd `cmd:"" name:"fix-lint" hidden:"" help:"Auto-fix lint issues in schema files"`
 }
 
+// helpOptions is how every help page renders: one line per command, with
+// subcommands left to the parent's own --help. The top-level listing is the
+// first thing a newcomer reads; it should fit on a screen and name what
+// SchemaBot does, not enumerate every operation.
+func helpOptions() kong.HelpOptions {
+	return kong.HelpOptions{Compact: true, NoExpandSubcommands: true}
+}
+
 func main() {
 	// Render command hints — and kong's own usage text — with the tool name a
 	// wrapper passes via --cli-name, so wrapper-invoked runs print commands
@@ -86,10 +94,7 @@ func main() {
 		kong.Name(cliname.Name()),
 		kong.Description("Declarative schema GitOps orchestrator"),
 		kong.UsageOnError(),
-		// One line per command, with subcommands left to the parent's own --help.
-		// The top-level listing is the first thing a newcomer reads; it should fit
-		// on a screen and name what SchemaBot does, not enumerate every operation.
-		kong.ConfigureHelp(kong.HelpOptions{Compact: true, NoExpandSubcommands: true}),
+		kong.ConfigureHelp(helpOptions()),
 		// Section order follows the CLI struct, which follows docs/cli.md.
 		kong.Groups{
 			"setup":       "Set up the CLI:",
