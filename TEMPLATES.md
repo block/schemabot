@@ -1625,7 +1625,7 @@ CREATE TABLE `address_seq` (
 
 #### Keyspace: `commerce_sharded`
 #### VSchema
-- adds table `addresses`: vindex `hash` on `customer_id`, `id` from sequence `commerce.address_seq`
+- adds table `addresses`: vindex `hash` on `customer_id`, sequence `commerce.address_seq` for `id`
 
 <details><summary>VSchema diff</summary>
 
@@ -1695,7 +1695,7 @@ schemabot apply -e staging
 
 #### Keyspace: `commerce_sharded`
 #### VSchema
-- changes table `customers`: vindexes `hash` on `id`, `customers_email_lookup` on `email` becomes vindex `hash` on `id`
+- changes table `customers` from vindexes `hash` on `id`, `customers_email_lookup` on `email` to vindex `hash` on `id`
 - removes vindex `customers_email_lookup`
 
 <details><summary>VSchema diff</summary>
@@ -1837,7 +1837,7 @@ CREATE TABLE `address_seq` (
 
 #### Keyspace: `commerce_sharded`
 #### VSchema
-- adds table `addresses`: vindex `hash` on `customer_id`, `id` from sequence `commerce.address_seq`
+- adds table `addresses`: vindex `hash` on `customer_id`, sequence `commerce.address_seq` for `id`
 
 <details><summary>VSchema diff</summary>
 
@@ -4232,7 +4232,7 @@ Options: ⏸️ Defer Cutover
   ── commerce ──
 
      ~ VSchema:
-       - changes table orders: id from sequence orders_seq becomes vindex region_map on region, id from sequence orders_seq
+       - changes table orders from sequence orders_seq for id to vindex region_map on region, sequence orders_seq for id
 
               "auto_increment": {
                 "column": "id",
@@ -5121,7 +5121,7 @@ CREATE TABLE `address_seq` (
 
 #### Keyspace: `commerce_sharded`
 #### VSchema
-- adds table `addresses`: vindex `hash` on `customer_id`, `id` from sequence `commerce.address_seq`
+- adds table `addresses`: vindex `hash` on `customer_id`, sequence `commerce.address_seq` for `id`
 
 <details><summary>VSchema diff</summary>
 
@@ -9897,7 +9897,7 @@ Vitess plan: DDL + VSchema changes in a sharded keyspace
   ── testapp_sharded ──
 
      ~ VSchema:
-       - changes table users: no routing becomes vindex hash on id
+       - changes table users from no vindex to vindex hash on id
        - adds table user_preferences: vindex hash on user_id
 
           },
@@ -11866,7 +11866,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 **VSchema**: Applied
 
-- changes table `mutes`: no routing becomes vindex `hash` on `target_id`
+- changes table `mutes` from no vindex to vindex `hash` on `target_id`
 
 <details><summary>VSchema diff</summary>
 
@@ -12460,7 +12460,7 @@ To resume from where it stopped:
            ○ 80-c0: queued
            ○ c0-: queued
     ~ VSchema (shop_001): Pending
-       - changes table orders: no routing becomes vindex hash on customer_id
+       - changes table orders from no vindex to vindex hash on customer_id
 
           "tables": {
             "orders": {
@@ -12503,7 +12503,7 @@ To resume from where it stopped:
            ○ 80-c0: cancelled
            ○ c0-: cancelled
     ~ VSchema (shop_001): Cancelled
-       - changes table orders: no routing becomes vindex hash on customer_id
+       - changes table orders from no vindex to vindex hash on customer_id
 
           "tables": {
             "orders": {
@@ -12552,7 +12552,7 @@ The new apply will only process tables that haven't completed.
            ○ 80-c0: stopped at 100.00% · 1,402,118 / 1,402,118 rows
            ○ c0-: stopped at 100.00% · 1,389,004 / 1,389,004 rows
     ~ VSchema (shop_001): Cancelled
-       - changes table orders: no routing becomes vindex hash on customer_id
+       - changes table orders from no vindex to vindex hash on customer_id
 
           "tables": {
             "orders": {

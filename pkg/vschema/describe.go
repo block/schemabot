@@ -47,7 +47,7 @@ func describeTables(current, desired map[string]*vschemapb.Table) []string {
 		case !inDesired:
 			lines = append(lines, fmt.Sprintf("removes table %s", code(name)))
 		case !proto.Equal(cur, des):
-			lines = append(lines, fmt.Sprintf("changes table %s: %s", code(name), tableChange(cur, des)))
+			lines = append(lines, "changes table "+code(name)+tableChange(cur, des))
 		}
 	}
 	return lines
@@ -64,7 +64,7 @@ func describeVindexes(current, desired map[string]*vschemapb.Vindex) []string {
 		case !inDesired:
 			lines = append(lines, fmt.Sprintf("removes vindex %s", code(name)))
 		case !proto.Equal(cur, des):
-			lines = append(lines, fmt.Sprintf("changes vindex %s: %s", code(name), vindexChange(cur, des)))
+			lines = append(lines, "changes vindex "+code(name)+vindexChange(cur, des))
 		}
 	}
 	return lines
@@ -114,7 +114,7 @@ func tableRouting(t *vschemapb.Table) string {
 		parts = append(parts, vindexes)
 	}
 	if ai := t.GetAutoIncrement(); ai != nil {
-		parts = append(parts, fmt.Sprintf("%s from sequence %s", code(ai.GetColumn()), code(ai.GetSequence())))
+		parts = append(parts, fmt.Sprintf("sequence %s for %s", code(ai.GetSequence()), code(ai.GetColumn())))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -141,17 +141,17 @@ func columnVindexList(t *vschemapb.Table) string {
 // change already shows their before and after.
 var tableRoutingFields = []string{"type", "source", "pinned", "column_vindexes", "auto_increment"}
 
-// tableChange describes what differs between two definitions of one table.
-// The routing reads as before and after, since that is what a reviewer
-// checks; any other field only says which fields change, after the routing
-// when both do.
+// tableChange describes what differs between two definitions of one table,
+// as the rest of the line after "changes table `name`". The routing reads as
+// "from <before> to <after>", since that is what a reviewer checks; any other
+// field only says which fields change, after the routing when both do.
 func tableChange(current, desired *vschemapb.Table) string {
 	changed := changedFields(current, desired)
 	before, after := tableRouting(current), tableRouting(desired)
 	if before != after {
-		return withOtherChanges(fmt.Sprintf("%s becomes %s", orNone(before), orNone(after)), changed, tableRoutingFields...)
+		return withOtherChanges(fmt.Sprintf(" from %s to %s", orNoVindex(before), orNoVindex(after)), changed, tableRoutingFields...)
 	}
-	return "changes " + codeList(changed)
+	return ": changes " + codeList(changed)
 }
 
 func vindexDefinition(v *vschemapb.Vindex) string {
@@ -168,15 +168,16 @@ func vindexDefinition(v *vschemapb.Vindex) string {
 	return strings.Join(parts, ", ")
 }
 
-// vindexChange describes what differs between two definitions of one vindex:
-// a type change as before and after, followed by any other field that also
+// vindexChange describes what differs between two definitions of one vindex,
+// as the rest of the line after "changes vindex `name`": a type change as
+// "from type <before> to type <after>", followed by any other field that also
 // changes.
 func vindexChange(current, desired *vschemapb.Vindex) string {
 	changed := changedFields(current, desired)
 	if current.GetType() != desired.GetType() {
-		return withOtherChanges(fmt.Sprintf("type %s becomes %s", code(current.GetType()), code(desired.GetType())), changed, "type")
+		return withOtherChanges(fmt.Sprintf(" from type %s to type %s", code(current.GetType()), code(desired.GetType())), changed, "type")
 	}
-	return "changes " + codeList(changed)
+	return ": changes " + codeList(changed)
 }
 
 // withOtherChanges appends to a before-and-after line the changed fields it
@@ -216,9 +217,11 @@ func withDetail(line, detail string) string {
 	return line + ": " + detail
 }
 
-func orNone(routing string) string {
+// orNoVindex names an empty routing description: a table with no type, pin,
+// vindex, or sequence is routed by nothing in the VSchema.
+func orNoVindex(routing string) string {
 	if routing == "" {
-		return "no routing"
+		return "no vindex"
 	}
 	return routing
 }

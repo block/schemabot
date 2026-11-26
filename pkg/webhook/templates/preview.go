@@ -2492,7 +2492,7 @@ func sampleVitessPlanChanges() []KeyspaceChangeData {
 +    }
    }
  }`,
-			VSchemaSummary: []string{"adds table `addresses`: vindex `hash` on `customer_id`, `id` from sequence `commerce.address_seq`"},
+			VSchemaSummary: []string{"adds table `addresses`: vindex `hash` on `customer_id`, sequence `commerce.address_seq` for `id`"},
 		},
 	}
 }
@@ -2582,7 +2582,7 @@ func PreviewCommentVitessPlanVSchemaRemoval() string {
          }
        ]
      }`,
-				VSchemaSummary: []string{"changes table `customers`: vindexes `hash` on `id`, `customers_email_lookup` on `email` becomes vindex `hash` on `id`", "removes vindex `customers_email_lookup`"},
+				VSchemaSummary: []string{"changes table `customers` from vindexes `hash` on `id`, `customers_email_lookup` on `email` to vindex `hash` on `id`", "removes vindex `customers_email_lookup`"},
 			},
 		},
 		HasUnsafeChanges: true,

@@ -162,7 +162,7 @@ func PreviewCommentShardedSummaryCompleted() string {
      }
    }
  }`,
-			Summary: []string{"changes table `mutes`: no routing becomes vindex `hash` on `target_id`"},
+			Summary: []string{"changes table `mutes` from no vindex to vindex `hash` on `target_id`"},
 		}},
 	})
 }
