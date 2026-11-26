@@ -6,13 +6,17 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	grpccodes "google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
 
@@ -190,6 +194,81 @@ func TestApplyCommandCoreChecksGateEvaluationFailureIsRetryable(t *testing.T) {
 	assert.True(t, retry, "an unevaluated checks gate must be retried")
 }
 
+// A storage failure while reading the database's lock stays retryable, and the
+// PR comment names the database and the next step without the storage error,
+// whose host and driver text stay in the server log.
+func TestApplyCommandCoreLockCheckFailureHidesTheCause(t *testing.T) {
+	const rawCause = "dial tcp 10.1.2.3:3306: connect: connection refused"
+	h, mux, comments := newApplyGateContractHandler(t, &lockStoreStorage{locks: &actorAuthLockStore{getErr: errors.New(rawCause)}})
+	registerCheckStatusRESTHandlers(mux, nil)
+
+	retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+
+	require.Error(t, err)
+	assert.True(t, retry, "an unreadable lock is a transient storage failure a durable driver should re-drive")
+	body := requireComment(t, comments, "lock check failure comment")
+	assert.Contains(t, body, "SchemaBot could not check the lock for `orders`, so the apply did not start. Run the command again; if it fails again, the SchemaBot server logs have the cause.")
+	assert.NotContains(t, body, "dial tcp")
+	assert.NotContains(t, body, "connection refused")
+}
+
+// A GitHub failure while reading the PR's changed files stays retryable, and
+// the PR comment carries the fixed line instead of the request URL and status
+// the GitHub client reports.
+func TestApplyCommandCorePRChangesCheckFailureHidesTheCause(t *testing.T) {
+	h, mux, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"head": map[string]any{"sha": "abc123", "ref": "feature-branch"},
+			"base": map[string]any{"sha": "def456", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
+			"user": map[string]any{"login": "testuser"},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+
+	require.Error(t, err)
+	assert.True(t, retry, "an unreadable changed-file list is a transient GitHub failure a durable driver should re-drive")
+	body := requireComment(t, comments, "PR changes check failure comment")
+	assert.Contains(t, body, "SchemaBot could not check the schema changes in this PR for `staging`, so the apply did not start. Run the command again; if it fails again, the SchemaBot server logs have the cause.")
+	assert.NotContains(t, body, "github unavailable")
+	assert.NotContains(t, body, "/repos/octocat/hello-world/pulls/1/files")
+}
+
+// A remote deployment that stays unreachable through the plan retries leaves the
+// apply retryable. The PR comment names the deployment and target the operator
+// configured and carries neither the host nor the transport text.
+func TestApplyCommandCorePlanRemoteUnavailableHidesTheCause(t *testing.T) {
+	const rawCause = "connection error: dial tcp 10.1.2.3:9090: connect: connection refused"
+	cfg := actorAuthTestConfig(false, func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.Environments["staging"] = api.EnvironmentConfig{Deployment: "remote", Target: "orders-target"}
+		cfg.Databases["orders"] = db
+		cfg.TernDeployments = api.TernConfig{"remote": {"staging": "remote:9090"}}
+	})
+	store := &lockStoreStorage{locks: &actorAuthLockStore{}}
+	h, mux, comments := newApplyGateContractHandlerWithConfig(t, cfg, store)
+	registerCheckStatusRESTHandlers(mux, nil)
+	registerCurrentBaseSchema(t, mux)
+	remote := &flakyPlanTernClient{failPlans: 100, planErr: grpcstatus.Error(grpccodes.Unavailable, rawCause)}
+	h.service = api.New(store, cfg, map[string]tern.Client{"remote/staging": remote}, testLogger())
+	h.transientPlanRetryDelay = time.Millisecond
+
+	retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+
+	require.Error(t, err)
+	assert.True(t, retry, "an unreachable remote deployment is transient, so a durable driver should re-drive")
+	assert.Positive(t, remote.calls(), "the apply must have reached the plan request")
+	body := requireComment(t, comments, "remote unavailable plan failure comment")
+	assert.Contains(t, body, "SchemaBot could not reach the remote deployment `remote` for target `orders-target`, so the apply did not start. Run the command again once that deployment is healthy; if it fails again, the SchemaBot server logs have the cause.")
+	assert.NotContains(t, body, "dial tcp")
+	assert.NotContains(t, body, "connection refused")
+	assert.NotContains(t, body, "Raw error")
+}
+
 // A failing required check is a verified gate decision, so the apply is
 // terminal for this command delivery rather than retrying the same block.
 func TestApplyCommandCoreChecksGateMeritBlockIsTerminal(t *testing.T) {
@@ -354,6 +433,14 @@ func promotionOrderedContractConfig() *api.ServerConfig {
 		cfg.EnvironmentOrder = []string{"staging", "production"}
 	})
 }
+
+// lockStoreStorage is empty storage that serves its own lock store.
+type lockStoreStorage struct {
+	emptyStorage
+	locks storage.LockStore
+}
+
+func (s *lockStoreStorage) Locks() storage.LockStore { return s.locks }
 
 func newApplyGateContractHandler(t *testing.T, store storage.Storage) (*Handler, *http.ServeMux, <-chan string) {
 	return newApplyGateContractHandlerWithConfig(t, actorAuthTestConfig(false), store)
