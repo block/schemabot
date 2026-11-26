@@ -752,6 +752,16 @@ func (h *Handler) postDurableCommandTerminalComment(event *storage.WebhookEvent,
 				"Comment the command again after the quota resets at "+quotaResetTime(refusal.ResetAt)+".")
 		return
 	}
+	// A remote data plane that never answered is named by its deployment and
+	// target, which tell an operator which deployment to look at; its
+	// transport error is in the server log with the retry budget exhaustion.
+	if remoteErr, ok := errors.AsType[*api.RemoteDeploymentUnavailableError](processErr); ok {
+		service, healthy := remoteServiceName(remoteErr.Deployment, remoteErr.Target)
+		h.postCommandError(repo, pr, installationID, result.Action, result.Environment, requestedBy,
+			"SchemaBot could not complete this command after retrying, because it could not reach the "+service+". "+
+				"Comment the command again once "+healthy+" is healthy; the SchemaBot server logs have the cause.")
+		return
+	}
 	// The answer carries the wrapped error chain rather than the gates'
 	// curated per-attempt messages. Those messages advise retrying — the
 	// wrong advice once the retry budget is exhausted — while the chain names

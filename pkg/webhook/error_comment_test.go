@@ -91,9 +91,8 @@ func TestPostCommandErrorExplainsRemoteUnavailable(t *testing.T) {
 
 	select {
 	case body := <-bodies:
-		assert.Contains(t, body, "SchemaBot could not reach the remote schema change service")
-		assert.Contains(t, body, "No healthy upstream is available")
-		assert.Contains(t, body, "Raw error: no healthy upstream")
+		assert.Contains(t, body, "SchemaBot could not reach the remote schema change service. Run the command again once the service is healthy; if it fails again, the SchemaBot server logs have the cause.")
+		assert.NotContains(t, body, "no healthy upstream")
 		assert.NotContains(t, body, "rpc error: code =")
 	case <-time.After(2 * time.Second):
 		require.FailNow(t, "timed out waiting for posted comment")
