@@ -82,6 +82,27 @@ func helpOptions() kong.HelpOptions {
 	return kong.HelpOptions{Compact: true, NoExpandSubcommands: true}
 }
 
+// commandGroups titles the sections of a help listing. Sections print in the
+// order the CLI struct declares them, not the order of this map, and the order
+// loosely follows docs/cli.md: that page has no section for managing an
+// environment or for running the server, and it covers freezes under planning
+// and applying a change.
+//
+// Every subcommand carries "commands". A command with no group of its own
+// takes its parent's, so without it a parent's own --help would head the
+// subcommands it lists with whichever top-level section the parent sits in.
+func commandGroups() kong.Groups {
+	return kong.Groups{
+		"setup":       "Set up the CLI:",
+		"explore":     "Explore your databases:",
+		"change":      "Plan and apply a change:",
+		"control":     "Follow and control a change:",
+		"environment": "Manage an environment:",
+		"server":      "Run SchemaBot:",
+		"commands":    "Commands:",
+	}
+}
+
 func main() {
 	// Render command hints — and kong's own usage text — with the tool name a
 	// wrapper passes via --cli-name, so wrapper-invoked runs print commands
@@ -95,15 +116,7 @@ func main() {
 		kong.Description("Declarative schema GitOps orchestrator"),
 		kong.UsageOnError(),
 		kong.ConfigureHelp(helpOptions()),
-		// Section order follows the CLI struct, which follows docs/cli.md.
-		kong.Groups{
-			"setup":       "Set up the CLI:",
-			"explore":     "Explore your databases:",
-			"change":      "Plan and apply a change:",
-			"control":     "Follow and control a change:",
-			"environment": "Manage an environment:",
-			"server":      "Run SchemaBot:",
-		},
+		commandGroups(),
 		kong.Vars{
 			"version":  fmt.Sprintf("%s (commit: %s)", version, commit),
 			"cli_name": cliname.Name(),
