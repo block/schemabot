@@ -69,7 +69,8 @@ func (e *Engine) ReleaseCancelledArtifacts(ctx context.Context, req *engine.Rele
 // releaseNotNullHelpers drops each helper a stopped SET NOT NULL left on
 // schema.table that the cancelled apply added, recording each one as removed
 // or remaining on result. A helper the apply did not add was already on the
-// table, left by an earlier run or put there by another one, and stays.
+// table, left by an earlier run or put there by another one, and stays; it is
+// recorded as preexisting, since it still checks writes.
 func releaseNotNullHelpers(ctx context.Context, pool *pgxpool.Pool, schema, table string, added []string, result *engine.ReleaseArtifactsResult) error {
 	helpers, err := diffplan.LeftoverNotNullHelpers(ctx, pool, schema, table)
 	if err != nil {
@@ -77,15 +78,17 @@ func releaseNotNullHelpers(ctx context.Context, pool *pgxpool.Pool, schema, tabl
 	}
 	var errs []error
 	for _, helper := range helpers {
-		if !slices.Contains(added, helper.Name) {
-			slog.Info("left a SET NOT NULL helper constraint in place: the cancelled schema change did not add it",
-				"schema", schema, "table", table, "constraint", helper.Name)
-			continue
-		}
 		constraint := engine.EngineConstraint{
 			Table:  schema + "." + table,
 			Name:   helper.Name,
 			Effect: "rejects writes that break " + strings.TrimSuffix(helper.Definition, " NOT VALID"),
+		}
+		if !slices.Contains(added, helper.Name) {
+			slog.Info("left a SET NOT NULL helper constraint in place: the cancelled schema change did not add it",
+				"schema", schema, "table", table, "constraint", helper.Name)
+			constraint.Removal = dropConstraintStatement(schema, table, helper.Name)
+			result.PreexistingConstraints = append(result.PreexistingConstraints, constraint)
+			continue
 		}
 		err := dropNotNullHelper(ctx, pool, schema, table, helper)
 		switch {

@@ -179,6 +179,14 @@ func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Ap
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
 			remainingConstraintMessage(constraint), "", "")
 	}
+	for _, constraint := range result.PreexistingConstraints {
+		// The cancel did not add it and does not remove it, but the operator
+		// who cancelled may expect the table back as it was.
+		c.logger.Warn("a constraint the cancelled schema change worked with, but did not add, is still on a live table",
+			append(apply.LogAttrs(), "namespace", namespace, "table", constraint.Table, "constraint", constraint.Name)...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+			preexistingConstraintMessage(constraint), "", "")
+	}
 	reclaimed := len(result.Preserved) > 0 || len(result.Discarded) > 0 || len(result.RemovedConstraints) > 0
 	if len(result.Preserved) > 0 || len(result.Discarded) > 0 {
 		c.logger.Info("reclaimed cancelled schema change artifacts",
@@ -218,6 +226,14 @@ func removedConstraintMessage(constraint engine.EngineConstraint) string {
 // drops it.
 func remainingConstraintMessage(constraint engine.EngineConstraint) string {
 	return fmt.Sprintf("Constraint %s is still on %s. The cancelled schema change added it, and it %s until it is dropped. Drop it with: %s",
+		constraint.Name, constraint.Table, constraint.Effect, constraint.Removal)
+}
+
+// preexistingConstraintMessage describes, for the apply log, a constraint the
+// release left because the schema change did not add it, what it does to
+// writes, and the statement that drops it.
+func preexistingConstraintMessage(constraint engine.EngineConstraint) string {
+	return fmt.Sprintf("Constraint %s is still on %s. It was there before the cancelled schema change, so the cancel left it, and it %s until it is dropped. Drop it with: %s",
 		constraint.Name, constraint.Table, constraint.Effect, constraint.Removal)
 }
 

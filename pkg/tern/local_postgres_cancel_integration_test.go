@@ -344,6 +344,9 @@ func TestLocalClientPostgresCancelLeavesAHelperTheApplyDidNotAdd(t *testing.T) {
 	logs, err := stor.ApplyLogs().GetByApply(t.Context(), apply.ID)
 	require.NoError(t, err)
 	assert.Zero(t, countLogMessagesContaining(logs, "Removed constraint"), "the cancel removed nothing it did not add")
+	assert.Equal(t, 1, countLogMessagesContaining(logs,
+		`Constraint users_name_not_null_check is still on public.users. It was there before the cancelled schema change, so the cancel left it, and it rejects writes that break CHECK ((name IS NOT NULL)) until it is dropped. Drop it with: ALTER TABLE "public"."users" DROP CONSTRAINT "users_name_not_null_check"`),
+		"the apply log says the helper still checks writes and how to drop it")
 }
 
 // checkConstraintCount counts the constraints named name on public.users.

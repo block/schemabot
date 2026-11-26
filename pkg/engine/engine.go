@@ -402,6 +402,11 @@ type ReleaseArtifactsResult struct {
 	// could not drop, with the statement that drops it by hand. It still
 	// checks the application's writes.
 	RemainingConstraints []EngineConstraint
+	// PreexistingConstraints names each constraint of the same kind the
+	// release found and left because the schema change did not add it, with
+	// the statement that drops it by hand. It still checks the application's
+	// writes.
+	PreexistingConstraints []EngineConstraint
 }
 
 // EngineConstraint is a constraint an engine added to a live table as a step
@@ -415,7 +420,7 @@ type EngineConstraint struct {
 	// as `rejects writes that leave "email" NULL`.
 	Effect string
 	// Removal is the statement that drops the constraint by hand. Set only
-	// on a remaining constraint.
+	// on a remaining or preexisting constraint.
 	Removal string
 }
 
