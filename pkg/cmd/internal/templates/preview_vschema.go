@@ -55,7 +55,7 @@ func previewVSchemaPlanOutput() {
    }
  }
 `,
-			Summary: []string{"changes table `users` from no vindex to vindex `hash` on `id`", "adds table `user_preferences`: vindex `hash` on `user_id`"},
+			Summary: []string{"table `users`: adds vindex `hash` on `id`", "adds table `user_preferences`: vindex `hash` on `user_id`"},
 		},
 	}
 

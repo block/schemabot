@@ -1695,7 +1695,7 @@ schemabot apply -e staging
 
 #### Keyspace: `commerce_sharded`
 #### VSchema
-- changes table `customers` from vindexes `hash` on `id`, `customers_email_lookup` on `email` to vindex `hash` on `id`
+- table `customers`: removes vindex `customers_email_lookup` on `email`
 - removes vindex `customers_email_lookup`
 
 <details><summary>VSchema diff</summary>
@@ -4232,7 +4232,7 @@ Options: ⏸️ Defer Cutover
   ── commerce ──
 
      ~ VSchema:
-       - changes table orders from sequence orders_seq for id to vindex region_map on region, sequence orders_seq for id
+       - table orders: adds vindex region_map on region
 
               "auto_increment": {
                 "column": "id",
@@ -9897,7 +9897,7 @@ Vitess plan: DDL + VSchema changes in a sharded keyspace
   ── testapp_sharded ──
 
      ~ VSchema:
-       - changes table users from no vindex to vindex hash on id
+       - table users: adds vindex hash on id
        - adds table user_preferences: vindex hash on user_id
 
           },
@@ -11866,7 +11866,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 **VSchema**: Applied
 
-- changes table `mutes` from no vindex to vindex `hash` on `target_id`
+- table `mutes`: adds vindex `hash` on `target_id`
 
 <details><summary>VSchema diff</summary>
 
@@ -12460,7 +12460,7 @@ To resume from where it stopped:
            ○ 80-c0: queued
            ○ c0-: queued
     ~ VSchema (shop_001): Pending
-       - changes table orders from no vindex to vindex hash on customer_id
+       - table orders: adds vindex hash on customer_id
 
           "tables": {
             "orders": {
@@ -12503,7 +12503,7 @@ To resume from where it stopped:
            ○ 80-c0: cancelled
            ○ c0-: cancelled
     ~ VSchema (shop_001): Cancelled
-       - changes table orders from no vindex to vindex hash on customer_id
+       - table orders: adds vindex hash on customer_id
 
           "tables": {
             "orders": {
@@ -12552,7 +12552,7 @@ The new apply will only process tables that haven't completed.
            ○ 80-c0: stopped at 100.00% · 1,402,118 / 1,402,118 rows
            ○ c0-: stopped at 100.00% · 1,389,004 / 1,389,004 rows
     ~ VSchema (shop_001): Cancelled
-       - changes table orders from no vindex to vindex hash on customer_id
+       - table orders: adds vindex hash on customer_id
 
           "tables": {
             "orders": {

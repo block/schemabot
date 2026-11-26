@@ -2582,7 +2582,7 @@ func PreviewCommentVitessPlanVSchemaRemoval() string {
          }
        ]
      }`,
-				VSchemaSummary: []string{"changes table `customers` from vindexes `hash` on `id`, `customers_email_lookup` on `email` to vindex `hash` on `id`", "removes vindex `customers_email_lookup`"},
+				VSchemaSummary: []string{"table `customers`: removes vindex `customers_email_lookup` on `email`", "removes vindex `customers_email_lookup`"},
 			},
 		},
 		HasUnsafeChanges: true,

@@ -47,7 +47,7 @@ func describeTables(current, desired map[string]*vschemapb.Table) []string {
 		case !inDesired:
 			lines = append(lines, fmt.Sprintf("removes table %s", code(name)))
 		case !proto.Equal(cur, des):
-			lines = append(lines, "changes table "+code(name)+tableChange(cur, des))
+			lines = append(lines, fmt.Sprintf("table %s: %s", code(name), strings.Join(tableChanges(cur, des), "; ")))
 		}
 	}
 	return lines
@@ -64,7 +64,7 @@ func describeVindexes(current, desired map[string]*vschemapb.Vindex) []string {
 		case !inDesired:
 			lines = append(lines, fmt.Sprintf("removes vindex %s", code(name)))
 		case !proto.Equal(cur, des):
-			lines = append(lines, "changes vindex "+code(name)+vindexChange(cur, des))
+			lines = append(lines, fmt.Sprintf("vindex %s: %s", code(name), strings.Join(vindexChanges(cur, des), "; ")))
 		}
 	}
 	return lines
@@ -137,23 +137,6 @@ func columnVindexList(t *vschemapb.Table) string {
 	return "vindexes " + strings.Join(entries, ", ")
 }
 
-// tableRoutingFields are the table fields tableRouting reads, so a routing
-// change already shows their before and after.
-var tableRoutingFields = []string{"type", "source", "pinned", "column_vindexes", "auto_increment"}
-
-// tableChange describes what differs between two definitions of one table,
-// as the rest of the line after "changes table `name`". The routing reads as
-// "from <before> to <after>", since that is what a reviewer checks; any other
-// field only says which fields change, after the routing when both do.
-func tableChange(current, desired *vschemapb.Table) string {
-	changed := changedFields(current, desired)
-	before, after := tableRouting(current), tableRouting(desired)
-	if before != after {
-		return withOtherChanges(fmt.Sprintf(" from %s to %s", orNoVindex(before), orNoVindex(after)), changed, tableRoutingFields...)
-	}
-	return ": changes " + codeList(changed)
-}
-
 func vindexDefinition(v *vschemapb.Vindex) string {
 	var parts []string
 	if v.GetType() != "" {
@@ -166,33 +149,6 @@ func vindexDefinition(v *vschemapb.Vindex) string {
 		parts = append(parts, fmt.Sprintf("backed by %s", code(table)))
 	}
 	return strings.Join(parts, ", ")
-}
-
-// vindexChange describes what differs between two definitions of one vindex,
-// as the rest of the line after "changes vindex `name`": a type change as
-// "from type <before> to type <after>", followed by any other field that also
-// changes.
-func vindexChange(current, desired *vschemapb.Vindex) string {
-	changed := changedFields(current, desired)
-	if current.GetType() != desired.GetType() {
-		return withOtherChanges(fmt.Sprintf(" from type %s to type %s", code(current.GetType()), code(desired.GetType())), changed, "type")
-	}
-	return ": changes " + codeList(changed)
-}
-
-// withOtherChanges appends to a before-and-after line the changed fields it
-// does not already show, so the line names every field that changes.
-func withOtherChanges(line string, changed []string, shown ...string) string {
-	var others []string
-	for _, field := range changed {
-		if !slices.Contains(shown, field) {
-			others = append(others, field)
-		}
-	}
-	if len(others) == 0 {
-		return line
-	}
-	return line + ", and also changes " + codeList(others)
 }
 
 // changedFields names the top-level fields whose values differ between two
@@ -215,15 +171,6 @@ func withDetail(line, detail string) string {
 		return line
 	}
 	return line + ": " + detail
-}
-
-// orNoVindex names an empty routing description: a table with no type, pin,
-// vindex, or sequence is routed by nothing in the VSchema.
-func orNoVindex(routing string) string {
-	if routing == "" {
-		return "no vindex"
-	}
-	return routing
 }
 
 // The table types Vitess defines, as a VSchema document spells them.

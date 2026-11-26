@@ -61,7 +61,7 @@ func TestDescribeNamesEachChangedElement(t *testing.T) {
   }
 }`,
 			want: []string{
-				"changes table `orders` from vindex `hash` on `id` to vindex `xxhash` on `id`",
+				"table `orders`: replaces primary vindex `hash` on `id` with `xxhash` on `id`",
 				"adds vindex `xxhash`: type `xxhash`",
 			},
 		},
@@ -79,7 +79,7 @@ func TestDescribeNamesEachChangedElement(t *testing.T) {
   }
 }`,
 			want: []string{
-				"changes table `orders` from vindex `hash` on `id` to vindexes `hash` on `id`, `orders_email_lookup` on `email`",
+				"table `orders`: adds vindex `orders_email_lookup` on `email`",
 				"adds vindex `orders_email_lookup`: type `consistent_lookup`, owned by `orders`, backed by `orders_email_idx`",
 			},
 		},
@@ -93,7 +93,7 @@ func TestDescribeNamesEachChangedElement(t *testing.T) {
     "orders": {"column_vindexes": [{"column": "id", "name": "hash"}], "auto_increment": {"column": "id", "sequence": "orders_seq"}}
   }
 }`,
-			want: []string{"changes table `orders` from vindex `hash` on `id` to vindex `hash` on `id`, sequence `orders_seq` for `id`"},
+			want: []string{"table `orders`: adds sequence `orders_seq` for `id`"},
 		},
 		{
 			name:    "a table's column list changed",
@@ -105,7 +105,7 @@ func TestDescribeNamesEachChangedElement(t *testing.T) {
     "orders": {"column_vindexes": [{"column": "id", "name": "hash"}], "columns": [{"name": "region", "type": "VARCHAR"}]}
   }
 }`,
-			want: []string{"changes table `orders`: changes `columns`"},
+			want: []string{"table `orders`: adds column `region`"},
 		},
 		{
 			name:    "a vindex's type changed",
@@ -117,7 +117,7 @@ func TestDescribeNamesEachChangedElement(t *testing.T) {
     "orders": {"column_vindexes": [{"column": "id", "name": "hash"}]}
   }
 }`,
-			want: []string{"changes vindex `hash` from type `hash` to type `xxhash`"},
+			want: []string{"vindex `hash`: changes type from `hash` to `xxhash`"},
 		},
 		{
 			name: "a lookup vindex's type and backing table changed together",
@@ -141,7 +141,7 @@ func TestDescribeNamesEachChangedElement(t *testing.T) {
     "orders": {"column_vindexes": [{"column": "id", "name": "hash"}, {"columns": ["email"], "name": "orders_lookup"}]}
   }
 }`,
-			want: []string{"changes vindex `orders_lookup` from type `lookup_hash` to type `consistent_lookup`, and also changes `params`"},
+			want: []string{"vindex `orders_lookup`: changes type from `lookup_hash` to `consistent_lookup`; changes param `table` from `orders_idx` to `orders_idx_v2`"},
 		},
 		{
 			name:    "a table's primary vindex and column list changed together",
@@ -154,9 +154,29 @@ func TestDescribeNamesEachChangedElement(t *testing.T) {
   }
 }`,
 			want: []string{
-				"changes table `orders` from vindex `hash` on `id` to vindex `xxhash` on `id`, and also changes `columns`",
+				"table `orders`: replaces primary vindex `hash` on `id` with `xxhash` on `id`; adds column `region`",
 				"adds vindex `xxhash`: type `xxhash`",
 			},
+		},
+		{
+			name: "a vindex added to a table that had none",
+			current: `{
+  "sharded": true,
+  "vindexes": {"hash": {"type": "hash"}},
+  "tables": {"orders": {}}
+}`,
+			desired: describeBase,
+			want:    []string{"table `orders`: adds vindex `hash` on `id`"},
+		},
+		{
+			name:    "every vindex removed from a table",
+			current: describeBase,
+			desired: `{
+  "sharded": true,
+  "vindexes": {"hash": {"type": "hash"}},
+  "tables": {"orders": {}}
+}`,
+			want: []string{"table `orders`: removes vindex `hash` on `id`"},
 		},
 		{
 			name:    "a sequence table and a plain table added to an unsharded keyspace",

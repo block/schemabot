@@ -60,7 +60,7 @@ func previewVitessPlanOutput() {
        }
      }
    }`,
-			VSchemaSummary: []string{"changes table `orders` from sequence `orders_seq` for `id` to vindex `region_map` on `region`, sequence `orders_seq` for `id`"},
+			VSchemaSummary: []string{"table `orders`: adds vindex `region_map` on `region`"},
 		},
 		{
 			Namespace: "customer",
