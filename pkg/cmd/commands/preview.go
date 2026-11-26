@@ -128,7 +128,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCLIMultiDeployCompleted, templates.PreviewCLIMultiDeployAll,
 		templates.PreviewCommentShardedAll, templates.PreviewAggregateCheckSummary,
 		templates.PreviewAggregateCheckFileCapBlocked, templates.PreviewAggregateCheckQuotaReserved,
-		templates.PreviewAggregateCheckStopped,
+		templates.PreviewAggregateCheckStopped, templates.PreviewAggregateCheckPlanBlocked,
 		templates.PreviewAggregateCheckRollout,
 		templates.PreviewCommentSingleProgress, templates.PreviewCommentSingleComplete,
 		templates.PreviewCommentSingleFailed, templates.PreviewCommentSingleStopped,

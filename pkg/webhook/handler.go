@@ -787,13 +787,73 @@ func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Chec
 	h.logger.Info("re-planning after a terminal apply: the PR head moved while the apply held its check, so no plan result covers the current commit",
 		logFields...)
 	h.goSafe(a.Repository, a.PullRequest, a.InstallationID, "", func() {
-		// System-triggered: no actor to authorize, and no new comment while the
-		// visible plan comment still matches the outcome — the operator asked
-		// for an apply, not for a plan. The stored check state it writes is the
-		// whole point. It re-plans the one database the settled apply held the
-		// check for.
-		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, nil, admission)
+		// System-triggered: no actor to authorize. The stored check state it
+		// writes is the whole point, and the plan comment posts only when the
+		// push changed what the PR plans. It re-plans the one database the
+		// settled apply held the check for.
+		postPlanComment := h.replanPostsPlanComment(context.Background(), a, prInfo.HeadSHA)
+		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, postPlanComment, 0, nil, admission)
 	})
+}
+
+// replanPostsPlanComment reports whether the re-plan after a terminal apply
+// posts its plan comment.
+//
+// It compares the new head with the commit the PR's visible plan comment
+// rendered. That is usually the commit the apply started on, but a push during
+// the apply that changed schema inputs has already posted a comment for its own
+// head, even though the ownership guard kept its result out of the stored
+// check state. A visible comment that already rendered the head, or one whose
+// commit differs from the head only in files that are not schema inputs, stays:
+// the operator asked for an apply, not for a plan. A push that changed schema
+// inputs since that comment leaves the head planning something no comment has
+// shown, such as dropping an index the apply just built, so the re-plan posts.
+// When the visible comment or the range cannot be resolved it posts, so the PR
+// never keeps a comment that may no longer describe what it plans.
+func (h *Handler) replanPostsPlanComment(ctx context.Context, a *storage.Apply, headSHA string) bool {
+	logFields := append(a.LogAttrs(), "head_sha", headSHA)
+	visible, err := h.visiblePlanComment(ctx, a.Repository, a.PullRequest, a.Database, a.DatabaseType)
+	if err != nil {
+		h.logger.Warn("re-plan after terminal apply will post its plan comment because the visible plan comment could not be resolved",
+			append(logFields, "error", err)...)
+		return true
+	}
+	if visible == nil {
+		h.logger.Info("re-plan after terminal apply will post its plan comment because no visible plan comment is tracked",
+			logFields...)
+		return true
+	}
+	if visible.HeadSHA == "" {
+		h.logger.Info("re-plan after terminal apply will post its plan comment because the visible plan comment has no recorded head SHA",
+			logFields...)
+		return true
+	}
+	logFields = append(logFields, "plan_head_sha", visible.HeadSHA)
+	if visible.HeadSHA == headSHA {
+		h.logger.Info("re-plan after terminal apply keeps the visible plan comment while its outcome matches, because that comment already rendered the head",
+			logFields...)
+		return false
+	}
+	client, err := h.clientForRepo(a.Repository, a.InstallationID)
+	if err != nil {
+		h.logger.Warn("re-plan after terminal apply will post its plan comment because no GitHub client could compare the push",
+			append(logFields, "error", err)...)
+		return true
+	}
+	files, err := client.FetchChangedFilesBetween(ctx, a.Repository, visible.HeadSHA, headSHA)
+	if err != nil {
+		h.logger.Warn("re-plan after terminal apply will post its plan comment because the files changed since the visible plan comment could not be compared",
+			append(logFields, "error", err)...)
+		return true
+	}
+	if github.HasSchemaInputFiles(files) {
+		h.logger.Info("re-plan after terminal apply will post its plan comment because schema inputs changed since the visible plan comment",
+			logFields...)
+		return true
+	}
+	h.logger.Info("re-plan after terminal apply keeps the visible plan comment while its outcome matches, because no schema input changed since that comment",
+		logFields...)
+	return false
 }
 
 // replanOwedAfterTerminalApply reports whether a settled apply leaves the PR

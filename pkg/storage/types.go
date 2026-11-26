@@ -375,6 +375,13 @@ type Check struct {
 	RolloutTargets         int
 	RolloutTargetsWithWork int
 
+	// PlanRefused records that the plan behind the change summary completed
+	// and named a change the engine refuses to run, with no plan errors and no
+	// durable block. It is written with ChangeSummary and kept with it, like
+	// the rollout counts. False for rows recorded before this field existed,
+	// which read as a failed plan rather than a refused one.
+	PlanRefused bool
+
 	// AggregateRender is what an aggregate row's Check Run text was rendered
 	// from, so the text can be rendered again with newer rollout counts
 	// without re-reading the PR. The encoding belongs to the caller. Upsert
