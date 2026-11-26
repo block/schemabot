@@ -2024,6 +2024,22 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 			logger.Warn("failed to settle pending control requests for terminal sequential apply",
 				"error", err)
 		}
+		// The writer that settled the apply delivers its own observer. An
+		// observer still registered here belongs to this drive's process,
+		// which that writer may not be, so the drive delivers it with the
+		// task rows that writer stored.
+		storedTasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+		if err != nil {
+			if c.driveCancelled(ctx, apply, "before reloading tasks for the terminal summary of an apply another writer settled") {
+				return nil
+			}
+			// This drive's task copies predate the settling write, so the
+			// summary goes out without task rows rather than with stale ones.
+			logger.Warn("could not reload tasks for the terminal summary of an apply another writer settled; notifying without them",
+				"error", err)
+			storedTasks = nil
+		}
+		c.notifyTerminalObserver(apply, storedTasks)
 		return nil
 	}
 	previousState := apply.State
