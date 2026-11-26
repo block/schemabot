@@ -414,7 +414,8 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			// Only a namespace with changes needs a rollback baseline, so
 			// the render is paid once per changed namespace rather than for
 			// every namespace the schema files declare.
-			schemaChange.OriginalFiles, schemaChange.OriginalFilesCaptured, err = captureOriginalFiles(ctx, pool, req.Database, namespace, desiredTables, ignored)
+			schemaChange.OriginalFiles, schemaChange.RollbackBlockers, err = captureOriginalFiles(ctx, pool, req.Database, namespace, desiredTables, ignored)
+			schemaChange.OriginalFilesCaptured = len(schemaChange.RollbackBlockers) == 0
 			if err != nil {
 				return nil, err
 			}
@@ -459,10 +460,12 @@ func refuseTableDeclaredTwice(namespace string, files map[string]pgstatement.Des
 // differently. A table the engine read but pg-sprite's renderer refuses —
 // each shape it refuses is named by one of its ErrUnrenderable errors,
 // inheritance among them — or that a foreign key on an unmanaged table or
-// in another namespace references, leaves captured false, and RV-7 then refuses rollback for this plan rather than
-// reconstructing the originals; the plan itself still proceeds, because
+// in another namespace references, is returned as a blocker in place of the
+// files, and RV-7 then refuses rollback for this plan rather than
+// reconstructing the originals. The plan itself still proceeds, because
 // rollback capability is not a precondition for reviewing or applying the
-// change. A table the engine could not read — the listing named it and
+// change, and the blockers let the plan say why it cannot be rolled back
+// before anyone applies it. A table the engine could not read — the listing named it and
 // introspection cannot find or resolve it, a catalog query fails, the
 // context is cancelled — is an error that ends the plan, whether it is one
 // table's read or the namespace's: a catalog that could not be read
@@ -473,12 +476,20 @@ func refuseTableDeclaredTwice(namespace string, files map[string]pgstatement.Des
 // not, so its cost grows with the namespace rather than with the change; the
 // introspections run concurrently within the pool's ceiling, so the wall
 // time grows more slowly than the table count does.
-func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables) (files map[string]string, captured bool, err error) {
+func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables) (files map[string]string, blockers []engine.RollbackBlocker, err error) {
 	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, database, namespace, rollbackBaseline(declared, ignored))
 	if err != nil {
-		return nil, false, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
+		return nil, nil, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
 	}
 	if len(renderErrors) > 0 {
+		refused, err := skippedTables(renderErrors)
+		if err != nil {
+			return nil, nil, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
+		}
+		blockers = make([]engine.RollbackBlocker, 0, len(refused))
+		for _, table := range refused {
+			blockers = append(blockers, engine.RollbackBlocker{Table: table.GetTable(), Reason: table.GetReason()})
+		}
 		// One representative cause is enough to start triage; the count says
 		// how far the namespace is from a complete baseline without the log
 		// line growing with the number of unrenderable tables.
@@ -487,13 +498,13 @@ func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, nam
 			"namespace", namespace,
 			"unrenderable_tables", len(renderErrors),
 			"first_error", renderErrors[0])
-		return nil, false, nil
+		return nil, blockers, nil
 	}
 	files = make(map[string]string, len(originalTables))
 	for table, content := range originalTables {
 		files[table+".sql"] = content
 	}
-	return files, true, nil
+	return files, nil, nil
 }
 
 // tierUnderived marks a step whose privilege tier could not be derived: its

@@ -235,6 +235,9 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 			Namespace: sc.Namespace,
 			Metadata:  sc.Metadata,
 		}
+		for _, b := range sc.GetRollbackBlockers() {
+			apiSC.RollbackBlockers = append(apiSC.RollbackBlockers, apitypes.SkippedTable{Table: b.GetTable(), Reason: b.GetReason()})
+		}
 		for _, t := range sc.TableChanges {
 			apiSC.TableChanges = append(apiSC.TableChanges, tableChangeResponseFromProto(t))
 		}
@@ -461,6 +464,9 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[st
 			if nsData.OriginalFiles == nil {
 				nsData.OriginalFiles = map[string]string{}
 			}
+		}
+		for _, b := range sc.GetRollbackBlockers() {
+			nsData.RollbackBlockers = append(nsData.RollbackBlockers, storage.RollbackBlocker{Table: b.GetTable(), Reason: b.GetReason()})
 		}
 		nsData.Metadata = storage.VSchemaPlanMetadata(sc.Metadata)
 		nsData.Finalize = sc.Metadata[engine.MetadataNeedsFinalizer] == "true"

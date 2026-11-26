@@ -130,6 +130,27 @@ func PreviewCommentPlanExemptTables() string {
 	})
 }
 
+// PreviewCommentPlanRollbackBlockers renders a PostgreSQL plan whose namespace
+// holds a table no schema file can describe, so the plan could not save the
+// namespace's current schema and an apply of it cannot be rolled back. The
+// comment says so before anyone applies, names the table and why, and says
+// how to undo the change instead.
+func PreviewCommentPlanRollbackBlockers() string {
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", SchemaName: "app", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		DatabaseType: "postgres",
+		Changes:      []KeyspaceChangeData{{Keyspace: "app", Statements: []string{"ALTER TABLE app.users ADD COLUMN email text;"}}},
+		RollbackBlockers: []RollbackBlockersData{{
+			Namespace: "app",
+			Tables: []RollbackBlockerData{{
+				Table:  "orders",
+				Reason: "holds a foreign key added NOT VALID, which a schema file cannot declare",
+			}},
+		}},
+	})
+}
+
 // PreviewCommentPlanIgnoreTables renders the plan a repository gets once its
 // config withholds a live table nothing declares. The plan is clean, which is
 // where the disclosures carry the most: they are the only evidence on the

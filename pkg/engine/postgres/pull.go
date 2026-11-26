@@ -148,13 +148,22 @@ type baselinePolicy struct {
 	skipUndeclaredArchiveTables bool
 	declaredTables              map[string]bool
 	ignoredTables               engine.IgnoredTables
+	// unwrittenKeyRemedy follows an incoming foreign key on a table in this
+	// schema that has no file of its own, and says what the reader of this
+	// baseline can do about it.
+	unwrittenKeyRemedy string
 }
 
 // pulledBaseline becomes the owner's declared schema, so a table the format
 // would describe incompletely is refused rather than written down without
 // its trigger or comment, and every table the plan would hold a file
 // accountable for is present, archive tables included.
-var pulledBaseline = baselinePolicy{refuseUnmodeledObjects: true, includeRowSecurity: true, includeForeignKeys: true}
+var pulledBaseline = baselinePolicy{
+	refuseUnmodeledObjects: true,
+	includeRowSecurity:     true,
+	includeForeignKeys:     true,
+	unwrittenKeyRemedy:     "on a table the pull cannot write, such as one an extension owns; remove the key",
+}
 
 // rollbackBaseline is read only by a rollback re-plan, which manages the
 // same table set the forward plan did. Objects the differ cannot see are
@@ -173,6 +182,7 @@ func rollbackBaseline(declared map[string]bool, ignored engine.IgnoredTables) ba
 		skipUndeclaredArchiveTables: true,
 		declaredTables:              declared,
 		ignoredTables:               ignored,
+		unwrittenKeyRemedy:          "on a table without a schema file, such as one an extension owns or one the repository ignores; declare that table in a schema file or remove the key",
 	}
 }
 
@@ -338,7 +348,7 @@ func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, database, nam
 			if _, ok := rendered[table]; !ok {
 				continue
 			}
-			unwritten, err := unwrittenIncomingForeignKeys(ctx, pool, namespace, results[i].incoming, written)
+			unwritten, err := unwrittenIncomingForeignKeys(ctx, pool, namespace, results[i].incoming, written, policy.unwrittenKeyRemedy)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -356,16 +366,16 @@ func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, database, nam
 // foreign key lives on a table the pull does not write. The key is declared
 // only in the referencing table's file, so a baseline without that file
 // would not carry the relationship.
-var errUnwrittenReferencingTable = errors.New("referenced by a foreign key on a table this pull does not write")
+var errUnwrittenReferencingTable = errors.New("referenced by a foreign key on a table without a schema file")
 
 // unwrittenIncomingForeignKeys describes every incoming foreign key that lives
 // outside the pulled files, with what the operator can do about it: a key on
 // a table in another schema, which a desired file cannot reference; a key on
 // a partition, which belongs on the partitioned parent; or a key on another
-// table in this schema that has no file of its own, such as one an extension
-// owns. It fails only when the catalog cannot say whether the referencing
-// table is a partition.
-func unwrittenIncomingForeignKeys(ctx context.Context, pool *pgxpool.Pool, namespace string, incoming []schemadiff.IncomingForeignKey, written map[string]bool) ([]string, error) {
+// table in this schema that has no file of its own, followed by the
+// baseline's remedy for it. It fails only when the catalog cannot say
+// whether the referencing table is a partition.
+func unwrittenIncomingForeignKeys(ctx context.Context, pool *pgxpool.Pool, namespace string, incoming []schemadiff.IncomingForeignKey, written map[string]bool, remedy string) ([]string, error) {
 	var unwritten []string
 	for _, fk := range incoming {
 		name := foreignKeyName(namespace, fk)
@@ -382,7 +392,7 @@ func unwrittenIncomingForeignKeys(ctx context.Context, pool *pgxpool.Pool, names
 			if partition {
 				unwritten = append(unwritten, name+" (on a partition; declare the key on the partitioned parent)")
 			} else {
-				unwritten = append(unwritten, name+" (on a table this pull does not write, such as one an extension owns; remove the key)")
+				unwritten = append(unwritten, name+" ("+remedy+")")
 			}
 		}
 	}
@@ -431,7 +441,10 @@ func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, tab
 	}
 	if policy.refuseNotValidForeignKeys {
 		if key, ok := notValidForeignKey(model); ok {
-			return &renderedTable{renderErr: fmt.Errorf("schema %q table %q: %w: %s", namespace, table, errNotValidForeignKey, key)}, nil
+			return &renderedTable{renderErr: &tableRefusal{
+				namespace: namespace, table: table,
+				detail: fmt.Sprintf("%s: %s", errNotValidForeignKey, key), reason: errNotValidForeignKey.Error(), cause: errNotValidForeignKey,
+			}}, nil
 		}
 	}
 	opts := schemadiff.RenderOptions{ForeignKeys: policy.includeForeignKeys}

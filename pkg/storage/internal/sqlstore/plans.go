@@ -389,6 +389,7 @@ func namespacesWithShardPlans(plan *storage.Plan) map[string]*storage.NamespaceP
 			Metadata:              nsData.Metadata,
 			IgnoreTables:          nsData.IgnoreTables,
 			DropTables:            nsData.DropTables,
+			RollbackBlockers:      nsData.RollbackBlockers,
 			Finalize:              nsData.Finalize,
 		}
 	}

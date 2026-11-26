@@ -298,6 +298,9 @@ func PlanContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 			continue
 		}
 		change := &apitypes.SchemaChangeResponse{Namespace: namespace}
+		for _, b := range nsData.RollbackBlockers {
+			change.RollbackBlockers = append(change.RollbackBlockers, apitypes.SkippedTable{Table: b.Table, Reason: b.Reason})
+		}
 		if nsData.ChangesVSchema() {
 			change.Metadata = map[string]string{apitypes.VSchemaChangedMetadataKey: "true"}
 			// The diff recorded at plan time is the one the plan was reviewed

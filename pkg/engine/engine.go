@@ -675,6 +675,22 @@ type SchemaChange struct {
 	Metadata              map[string]string
 	OriginalFiles         map[string]string // Declarative schema files and artifacts for this namespace before applying
 	OriginalFilesCaptured bool              // True when OriginalFiles was captured, including an empty namespace
+	// RollbackBlockers names the tables that kept OriginalFiles from being
+	// captured, each with what it carries that a schema file cannot
+	// describe. The plan still proceeds, but the apply it starts cannot be
+	// rolled back, and the plan says so. Empty when OriginalFilesCaptured.
+	RollbackBlockers []RollbackBlocker
+}
+
+// RollbackBlocker is one table whose live definition no schema file can
+// describe, so the plan could not capture the namespace's original schema
+// as a rollback baseline.
+type RollbackBlocker struct {
+	Table string
+	// Reason says what the table carries that a schema file cannot
+	// describe, such as "holds a foreign key added NOT VALID, which a schema
+	// file cannot declare".
+	Reason string
 }
 
 // MetadataNeedsFinalizer is the plan change-metadata key ("true") an engine

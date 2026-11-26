@@ -596,6 +596,37 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="postgres-plan-no-rollback"></a><strong>Postgres Plan (No Rollback)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `PostgreSQL`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+#### Schema Name: `app`
+```sql
+ALTER TABLE app.users ADD COLUMN email text;
+```
+
+📋 **Plan**: **1** table to alter
+
+⚠️ No rollback for namespace `app`: SchemaBot couldn't save the current schema of the tables below, so an apply of this plan can't be rolled back. To undo the change, revert the schema files in a new pull request.
+
+- `orders`: holds a foreign key added NOT VALID, which a schema file cannot declare
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-ignore-tables"></a><strong>MySQL Plan (Ignore Tables)</strong></summary>
 
 

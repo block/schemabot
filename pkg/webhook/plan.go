@@ -1787,6 +1787,16 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		PlanID:              planResp.PlanID,
 		UnmatchedDropTables: planResp.UnmatchedDropTables,
 	}
+	for _, change := range planResp.Changes {
+		if change == nil || len(change.RollbackBlockers) == 0 {
+			continue
+		}
+		group := templates.RollbackBlockersData{Namespace: change.Namespace}
+		for _, b := range change.RollbackBlockers {
+			group.Tables = append(group.Tables, templates.RollbackBlockerData{Table: b.Table, Reason: b.Reason})
+		}
+		data.RollbackBlockers = append(data.RollbackBlockers, group)
+	}
 	for _, group := range planResp.ExemptTables {
 		if group == nil {
 			continue

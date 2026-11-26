@@ -1048,6 +1048,13 @@ func (tc TableChange) UnsafeOptInReason() string {
 // question the same way.
 const VSchemaArtifactName = "vschema.json"
 
+// RollbackBlocker is a live table that kept a plan from saving its
+// namespace's current schema, and why.
+type RollbackBlocker struct {
+	Table  string `json:"table"`
+	Reason string `json:"reason"`
+}
+
 // NamespacePlanData contains plan data for a single namespace. OriginalFiles is
 // captured once for the namespace and applies to every table/artifact change in
 // Tables and Artifacts.
@@ -1057,6 +1064,13 @@ type NamespacePlanData struct {
 	OriginalFiles         map[string]string `json:"original_files,omitempty"`
 	OriginalFilesCaptured bool              `json:"original_files_captured,omitempty"`
 	Artifacts             map[string]string `json:"artifacts,omitempty"`
+
+	// RollbackBlockers names the live tables that kept the plan from saving
+	// the namespace's current schema, each with why. It is set exactly when
+	// OriginalFilesCaptured is false for a namespace the engine could have
+	// saved, so a stored plan says why its apply cannot be rolled back, as
+	// the response to the plan request did.
+	RollbackBlockers []RollbackBlocker `json:"rollback_blockers,omitempty"`
 
 	// Metadata is the subset of the engine's plan change-metadata that
 	// apply-time consumers read (see VSchemaPlanMetadata): the safety-gate

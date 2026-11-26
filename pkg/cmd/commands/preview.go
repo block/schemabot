@@ -82,6 +82,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	case templates.PreviewCommentPlan, templates.PreviewCommentPlanBlocked,
 		templates.PreviewCommentPlanBlockedPostgres,
 		templates.PreviewCommentPlanIgnoredNamespaces, templates.PreviewCommentPlanExemptTables,
+		templates.PreviewCommentPlanRollbackBlockers,
 		templates.PreviewCommentPlanUnmanagedSchema,
 		templates.PreviewCommentPlanIgnoreTables,
 		templates.PreviewCommentPlanDropTables,
