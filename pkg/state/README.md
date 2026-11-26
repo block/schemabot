@@ -428,7 +428,7 @@ return store.Get(ctx, applyID, state.Comment.Progress)  // progress is active
    - **EDIT** progress comment: "Waiting for Cutover", with the cutover command in the footer
 4. User runs `schemabot cutover -e staging` → `cutting_over`
    - **CREATE** fresh progress comment: "Cutting over..." ← the fresh comment is now active
-   - **EDIT** the earlier progress comment into a fold: "⏭️ Progress comment superseded — progress before the cutover. The cutover is tracked in a new progress comment", with its waiting-for-cutover rendering collapsed
+   - **EDIT** the earlier progress comment into a fold: "Progress before the cutover — the cutover is tracked in a new progress comment", with its waiting-for-cutover rendering collapsed
 5. Cutover completes → `completed`
    - **EDIT** fresh progress comment: "Applied"
    - **CREATE** summary comment: "Schema change completed successfully"
