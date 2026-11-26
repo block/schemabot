@@ -11,10 +11,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -260,6 +262,8 @@ func TestPlanHeadVerificationFailureKeepsErrorOutOfComment(t *testing.T) {
 
 	t.Run("single environment plan", func(t *testing.T) {
 		h, comments := planHeadFixture(t)
+		var logs bytes.Buffer
+		h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 
 		h.handlePlanCommand(httptest.NewRecorder(), "octocat/hello-world", 1, "staging", "orders", "", "", 12345, "", "alice", 0)
 
@@ -267,10 +271,13 @@ func TestPlanHeadVerificationFailureKeepsErrorOutOfComment(t *testing.T) {
 		assert.Contains(t, body, want)
 		assert.NotContains(t, body, "Failed to verify PR HEAD")
 		assert.NotContains(t, body, "502")
+		requireHeadVerificationLog(t, &logs)
 	})
 
 	t.Run("plan across environments", func(t *testing.T) {
 		h, comments := planHeadFixture(t)
+		var logs bytes.Buffer
+		h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 
 		h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "alice", false, 1, true, 0, nil, prSchemaAdmission{})
 
@@ -278,7 +285,81 @@ func TestPlanHeadVerificationFailureKeepsErrorOutOfComment(t *testing.T) {
 		assert.Contains(t, body, want)
 		assert.NotContains(t, body, "Failed to verify PR HEAD")
 		assert.NotContains(t, body, "502")
+		requireHeadVerificationLog(t, &logs)
 	})
+}
+
+// requireHeadVerificationLog finds the log record of the failed head read and
+// checks it carries the cause and the commit the plan loaded its schema files
+// from, which is what an operator compares with the pull request's head.
+func requireHeadVerificationLog(t *testing.T, logs *bytes.Buffer) {
+	t.Helper()
+	for line := range bytes.Lines(logs.Bytes()) {
+		var record map[string]any
+		require.NoError(t, json.Unmarshal(line, &record))
+		if record["msg"] != "failed to fetch PR for stale-schema check" {
+			continue
+		}
+		assert.Equal(t, "abc123", record["head_sha"])
+		assert.Equal(t, "orders", record["database"])
+		assert.Contains(t, record["error"], "502")
+		return
+	}
+	require.Fail(t, "no log record for the failed head read", logs.String())
+}
+
+// A plan whose read of the pull request's files is refused by the quota
+// reserve says when the reserve lifts instead of advising another run, which
+// the same reserve would refuse again.
+func TestPlanRefusedByQuotaReserveNamesTheReset(t *testing.T) {
+	plain, mux := setupGitHubServer(t)
+	reserve := &refuseSchemaReadsOutsidePublication{}
+	client := gh.NewClient(&http.Client{Transport: reserve})
+	client.BaseURL = plain.BaseURL
+	installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
+	h := &Handler{
+		service:   api.New(&foldStorage{checks: &foldCheckStore{}}, planControlServerConfig(), nil, testLogger()),
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:    testLogger(),
+	}
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"state": "open",
+			"user":  map[string]any{"login": "author"},
+			"head":  map[string]any{"sha": "abc123", "ref": "topic"},
+			"base":  map[string]any{"sha": "def456", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		// A one-line file can be a symlink to a schema file. The diff shows
+		// it is one, so listing the changed files reads its target from the
+		// tree, and the reserve refuses that read.
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{{"filename": "docs/current", "status": "added", "additions": 1}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"default_branch":"main"}`)
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"object":{"sha":"def456"}}`)
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Accept"), "diff") {
+			writeCommitFilesDiff(t, w, []*gh.CommitFile{{Filename: new("docs/current"), Status: new("added")}}, "docs/current")
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"merge_base_commit":{"sha":"def456"}}`)
+	})
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	h.handlePlanCommand(httptest.NewRecorder(), "octocat/hello-world", 1, "staging", "", "", "", 12345, "", "alice", 0)
+
+	body := requireComment(t, comments, "quota reserve plan comment")
+	assert.Positive(t, reserve.refused.Load(), "the plan's read of the changed files is refused by the reserve")
+	assert.Contains(t, body, "SchemaBot is holding back its remaining GitHub API quota for check runs, so the plan did not start. "+
+		"Comment the command again after the quota resets at ")
+	assert.NotContains(t, body, planControlRetryLine)
+	assert.NotContains(t, body, "/git/trees/", "the refusal's own text, which names the refused read and the quota figures, stays in the log")
 }
 
 // A plan on a pull request past GitHub's changed-file cap fails the same way on
