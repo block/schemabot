@@ -150,8 +150,8 @@ func TestDurableDriverMarksClaimsItRetriesAtTheQuotaReset(t *testing.T) {
 	}{
 		{name: "first claim", attempts: 0, received: 0, want: true},
 		{name: "last attempt inside the uncharged window", attempts: maxDurableWebhookAttempts - 1, received: 0, want: true},
-		{name: "attempts left past the uncharged window", attempts: 0, received: quotaReserveUnchargedWindow + time.Minute, want: true},
-		{name: "last attempt past the uncharged window", attempts: maxDurableWebhookAttempts - 1, received: quotaReserveUnchargedWindow + time.Minute, want: false},
+		{name: "attempts left past the uncharged window", attempts: 0, received: unchargedRefusalWindow + time.Minute, want: true},
+		{name: "last attempt past the uncharged window", attempts: maxDurableWebhookAttempts - 1, received: unchargedRefusalWindow + time.Minute, want: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			event := durablePullRequestEvent(t)
@@ -181,7 +181,7 @@ func TestDurableDriverMarksClaimsItRetriesAtTheQuotaReset(t *testing.T) {
 func TestDurableDriverKeepsTheRetryPromiseWhenARunCrossesTheUnchargedWindow(t *testing.T) {
 	event := durablePullRequestEvent(t)
 	event.Attempts = maxDurableWebhookAttempts - 1
-	event.ReceivedAt = time.Now().Add(-quotaReserveUnchargedWindow + time.Hour)
+	event.ReceivedAt = time.Now().Add(-unchargedRefusalWindow + time.Hour)
 	store := newScriptedWebhookEventStore(event)
 	h := newDurableDriverHandler(t, store, nil, nil)
 	resetAt := time.Now().Add(40 * time.Minute).Truncate(time.Second)
@@ -296,7 +296,7 @@ func TestCheckReviewGateRetriesEarlierApprovalRefusedByQuotaReserve(t *testing.T
 func TestDurableWebhookDriverAnswersQuotaReserveRefusalAtAttemptCapWithFixedLine(t *testing.T) {
 	event := durableIssueCommentEvent("schemabot apply -e production")
 	event.Attempts = maxDurableWebhookAttempts - 1
-	event.ReceivedAt = time.Now().Add(-quotaReserveUnchargedWindow - time.Minute)
+	event.ReceivedAt = time.Now().Add(-unchargedRefusalWindow - time.Minute)
 	store := newScriptedWebhookEventStore(event)
 	client, mux := setupGitHubServer(t)
 	comments := make(chan string, 1)
