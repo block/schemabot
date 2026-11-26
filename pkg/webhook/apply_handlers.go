@@ -105,7 +105,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Apply, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether apply command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 		if !result.SuppressRetryComments {
-			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, applyPRChangesCheckFailedMessage(environment))
 		}
 		return true, fmt.Errorf("apply command managed-schema check %s#%d: %w", repo, pr, err)
 	} else if handled {
@@ -212,7 +212,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	if err != nil {
 		h.logger.Error("failed to check lock", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
 		if !result.SuppressRetryComments {
-			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to check lock status: "+err.Error())
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, applyLockCheckFailedMessage(database))
 		}
 		return true, fmt.Errorf("apply command check lock %s#%d: %w", repo, pr, err)
 	}
@@ -380,10 +380,10 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	}
 
 	if err != nil {
-		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "error", err)
+		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "database", schemaResult.Database, "database_type", schemaResult.Type, "environment", environment, "error", err)
 		if isTransientRemotePlanError(err) {
 			if !result.SuppressRetryComments {
-				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, applyRemoteUnavailableMessage(err))
 			}
 			return true, fmt.Errorf("apply command plan %s#%d: %w", repo, pr, err)
 		}
@@ -616,8 +616,8 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			// Another owner won the lock between the pre-check above and this
 			// acquire: the same answer the pre-check gives, so it is terminal.
 			h.logger.Info("apply blocked by lock conflict at acquire",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment)
-			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to acquire lock: "+err.Error())
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, applyLockHeldAtAcquireMessage(database))
 			return false, nil
 		}
 		if errors.Is(err, storage.ErrLockIntentChanged) {
@@ -630,9 +630,11 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				applyLockIntentChangedRefusal(action.Apply, database, environment, requestedBy, databaseName, applyCommandOptionsOf(result))))
 			return false, nil
 		}
-		h.logger.Error("failed to acquire lock", "error", err)
+		h.logger.Error("failed to acquire lock",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+			"plan_id", planResp.PlanID, "error", err)
 		if !result.SuppressRetryComments {
-			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to acquire lock: "+err.Error())
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, applyLockAcquireFailedMessage(database))
 		}
 		return true, fmt.Errorf("apply command acquire lock %s#%d: %w", repo, pr, err)
 	}
@@ -911,7 +913,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether apply-confirm command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 		if !result.SuppressRetryComments {
-			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, err.Error())
+			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, applyPRChangesCheckFailedMessage(environment))
 		}
 		return true, fmt.Errorf("apply-confirm command managed-schema check %s#%d: %w", repo, pr, err)
 	} else if handled {
@@ -1006,7 +1008,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	if err != nil {
 		h.logger.Error("failed to check lock", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
 		if !result.SuppressRetryComments {
-			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Failed to check lock status: "+err.Error())
+			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, applyLockCheckFailedMessage(database))
 		}
 		return true, fmt.Errorf("apply-confirm command check lock %s#%d: %w", repo, pr, err)
 	}
@@ -1103,7 +1105,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"pending_plan_id", existingLock.PendingPlanID, "error", planLoadErr)
 		if !result.SuppressRetryComments {
-			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Failed to load confirmation plan: "+planLoadErr.Error())
+			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, applyConfirmPlanLoadFailedMessage(database))
 		}
 		return true, fmt.Errorf("apply-confirm command load confirmation plan %s#%d: %w", repo, pr, planLoadErr)
 	}
@@ -1368,7 +1370,7 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 				return false, fmt.Errorf("unlock command infer database %s#%d: %w", repo, pr, err)
 			}
 			if !result.SuppressRetryComments {
-				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to infer database for force unlock: "+err.Error())
+				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, unlockInferenceFailedMessage)
 			}
 			return true, fmt.Errorf("unlock command infer database %s#%d: %w", repo, pr, err)
 		}
@@ -1383,7 +1385,7 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 			return false, nil
 		}
 		if !result.SuppressRetryComments {
-			h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to look up locks: "+err.Error())
+			h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, unlockLookupFailedMessage(result.Database))
 		}
 		return true, fmt.Errorf("unlock command lock lookup %s#%d: %w", repo, pr, err)
 	}

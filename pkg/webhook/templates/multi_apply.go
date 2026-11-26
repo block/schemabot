@@ -5,6 +5,7 @@ import (
 	"html"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
@@ -66,6 +67,10 @@ type MultiDeploymentApplyData struct {
 	// headline vocabulary from "apply" to "rollback", matching the
 	// single-deployment comment.
 	Rollback bool
+
+	// UpdateCadence is the longest a change waits before it reaches this
+	// comment, shown beside the "Last updated" footer. Zero renders no note.
+	UpdateCadence time.Duration
 }
 
 // RenderMultiDeploymentApplyComment renders the PR comment for an apply that
@@ -126,13 +131,13 @@ func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt
 		writeTargetRolloutBody(&sb, data, g, budget)
 		writeRolloutFooter(&sb, data)
 		if !state.IsTerminalApplyState(data.Model.State) {
-			writeLastUpdatedFooter(&sb, renderedAt)
+			writeLastUpdatedFooter(&sb, renderedAt, data.UpdateCadence)
 		}
 		return sb.String()
 	}
 	writeDeploymentCounts(&sb, data.Model.Counts, groups)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
-	writeStoppedAtCutoverNote(&sb, data.Model.Deployments, rolloutMemberNoun(groups))
+	writeStoppedAtCutoverNote(&sb, data.Model.Deployments, presentation.MemberNoun(groups))
 
 	// Flat per-deployment summary (always visible — survives any later size
 	// trimming of the detail sections).
@@ -142,7 +147,7 @@ func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt
 	writeDeploymentSections(&sb, data, groups, renderedAt, budget)
 	writeRolloutFooter(&sb, data)
 	if !state.IsTerminalApplyState(data.Model.State) {
-		writeLastUpdatedFooter(&sb, renderedAt)
+		writeLastUpdatedFooter(&sb, renderedAt, data.UpdateCadence)
 	}
 
 	return sb.String()
@@ -176,7 +181,7 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 	}
 	writeDeploymentCounts(&sb, data.Model.Counts, groups)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
-	writeStoppedAtCutoverNote(&sb, data.Model.Deployments, rolloutMemberNoun(groups))
+	writeStoppedAtCutoverNote(&sb, data.Model.Deployments, presentation.MemberNoun(groups))
 
 	writeDeploymentSummaryList(&sb, data.Model, groups)
 
@@ -387,15 +392,6 @@ func writeStoppedAtCutoverNote(sb *strings.Builder, deps []presentation.Deployme
 		return
 	}
 	fmt.Fprintf(sb, "\n> ⏹️ %s\n", note)
-}
-
-// rolloutMemberNoun is what the rollout's counts call its members: targets
-// when a deployment addresses several of them, deployments otherwise.
-func rolloutMemberNoun(groups []presentation.Group) presentation.Noun {
-	if hasMultiTargetGroup(groups) {
-		return targetNoun
-	}
-	return deploymentNoun
 }
 
 // writeRolloutFooter writes the rollout's footer at the bottom, where the

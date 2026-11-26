@@ -42,6 +42,11 @@ type aggregateRender struct {
 	// Inputs is the stored per-database check state the fold read, keyed by
 	// row ID, so a refresh can tell whether any of it moved since.
 	Inputs map[int64]renderInput
+
+	// Tenant is the deployment's own tenant, carried by the commands the
+	// summary names. It is not stored: each render reads it from the
+	// deployment's config, so a stored render never names another tenant.
+	Tenant string `json:"-"`
 }
 
 // renderInput is the part of one stored per-database row that the fold's
@@ -119,7 +124,7 @@ func inputsMoved(render aggregateRender, environment string, stored []*storage.C
 
 // text renders the Check Run's title and summary.
 func (r aggregateRender) text() (title, summary string) {
-	title, summary = aggregateSummary(r.Contributions, r.Conclusion, r.Stopped, r.Progress)
+	title, summary = aggregateSummary(r.Contributions, r.Conclusion, r.Stopped, r.Progress, r.Tenant)
 	if r.PrerequisiteNotice != "" {
 		title = "Waiting for prerequisite environments"
 		summary = appendPrerequisiteSummary(summary, r.PrerequisiteNotice)
@@ -229,6 +234,7 @@ func (h *Handler) refreshAggregateRolloutCounts(
 		return rolloutCountsUnchanged, nil
 	}
 	render.Progress = progress
+	render.Tenant = h.deploymentTenant()
 	title, summary := render.text()
 
 	run, _, err := client.FindCheckRunByName(ctx, repo, render.HeadSHA, checkName)

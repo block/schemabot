@@ -52,7 +52,7 @@ func TestAggregateCheckCountsFinishedRolloutTargets(t *testing.T) {
 
 	t.Run("some targets finished", func(t *testing.T) {
 		progress := rolloutProgress{9: {Total: 32, Complete: 5, InProgress: 4, Queued: 23, ProgressCommentID: 777}}
-		title, summary := aggregateSummary(checks, "", nil, progress)
+		title, summary := aggregateSummary(checks, "", nil, progress, "")
 		assert.Equal(t, "Apply in progress on all 32 targets: 5 done", title)
 		assert.Contains(t, summary, "In progress · 5 of 32 done")
 		assert.Contains(t, summary, "- `orders` targets: 32 (4 in progress, 23 queued, 5 complete) · [progress](https://github.com/octocat/shop/pull/12#issuecomment-777)")
@@ -60,21 +60,21 @@ func TestAggregateCheckCountsFinishedRolloutTargets(t *testing.T) {
 
 	t.Run("no target finished yet", func(t *testing.T) {
 		progress := rolloutProgress{9: {Total: 32, InProgress: 4, Queued: 28}}
-		title, summary := aggregateSummary(checks, "", nil, progress)
+		title, summary := aggregateSummary(checks, "", nil, progress, "")
 		assert.Equal(t, "Apply in progress on all 32 targets", title)
 		assert.NotContains(t, summary, " done")
 		assert.Contains(t, summary, "- `orders` targets: 32 (4 in progress, 28 queued)\n", "no progress comment is tracked, so the line has no link")
 	})
 
 	t.Run("progress unavailable", func(t *testing.T) {
-		title, summary := aggregateSummary(checks, "", nil, nil)
+		title, summary := aggregateSummary(checks, "", nil, nil, "")
 		assert.Equal(t, "Apply in progress on all 32 targets", title)
 		assert.NotContains(t, summary, "targets: 32 (")
 	})
 
 	t.Run("stopped apply shows no counts", func(t *testing.T) {
 		progress := rolloutProgress{9: {Total: 32, Complete: 5, Stopped: 27}}
-		_, summary := aggregateSummary(checks, "", stoppedApplyIDs{9: true}, progress)
+		_, summary := aggregateSummary(checks, "", stoppedApplyIDs{9: true}, progress, "")
 		assert.NotContains(t, summary, "targets: 32 (")
 	})
 }
@@ -199,7 +199,7 @@ func TestRolloutProgressLinesStayWithinTheirBudget(t *testing.T) {
 	assert.Contains(t, section, "- `orders_0000` targets: 32 (4 in progress, 23 queued, 5 complete)")
 	assert.Regexp(t, `- … \d+ more rollouts in progress\n$`, section)
 
-	_, summary := aggregateSummary(checks, "", nil, progress)
+	_, summary := aggregateSummary(checks, "", nil, progress, "")
 	assert.LessOrEqual(t, len(summary), maxCheckRunTextLength)
 }
 

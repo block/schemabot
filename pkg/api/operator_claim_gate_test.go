@@ -154,7 +154,7 @@ func TestDriveTickSkipsTheClaimLadderOnceClaimingStopped(t *testing.T) {
 	store := &mockStorageWithApplyStores{applies: applies, operations: ops}
 	svc := New(store, testServerConfig(), nil, slog.New(slog.DiscardHandler))
 
-	svc.driveTick(t.Context(), 1, closedClaimGate())
+	svc.driveTick(t.Context(), 1, closedClaimGate(), passPolled)
 
 	assert.Zero(t, applies.stopProbes, "a tick that starts after claiming stopped must not begin the ladder")
 	assert.Zero(t, ops.claims, "a tick that starts after claiming stopped must not claim")

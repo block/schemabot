@@ -31,6 +31,9 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 		rows = append(rows, BoxRow{Label: "Namespaces", Value: strconv.Itoa(len(resp.Namespaces))})
 	}
 	rows = append(rows, BoxRow{Label: "Tables", Value: strconv.Itoa(int(resp.TableCount))})
+	if skipped := pulledSkippedCount(resp); skipped > 0 {
+		rows = append(rows, BoxRow{Label: "Skipped", Value: fmt.Sprintf("%s %d %s, not in the output", glyph.Attention, skipped, ui.Pluralize("table", skipped))})
+	}
 	WriteBox(rows, "", nil)
 	writeTargetDivergence(resp)
 
@@ -280,13 +283,27 @@ func writePulledLint(violations []*apitypes.LintViolationResponse) {
 	}
 }
 
+// pulledSkippedCount totals the tables the pull left out across namespaces,
+// so the summary box says up front that the output is not the whole schema.
+func pulledSkippedCount(resp *apitypes.PullSchemaResponse) int {
+	total := 0
+	for _, ns := range resp.Namespaces {
+		if ns != nil {
+			total += len(ns.SkippedTables)
+		}
+	}
+	return total
+}
+
 // writePulledSkippedTables lists the tables the pull left out because schema
 // files cannot describe them, as "--" comments so the output stays valid SQL.
+// The header is a warning rather than dimmed scaffolding: a table missing
+// from the output is one the operator has to decide about.
 func writePulledSkippedTables(skipped []apitypes.SkippedTable) {
 	if len(skipped) == 0 {
 		return
 	}
-	fmt.Println(annotation(fmt.Sprintf("-- Skipped %d %s:", len(skipped), ui.Pluralize("table", len(skipped)))))
+	fmt.Println(styled(ANSIYellow, fmt.Sprintf("-- %s Skipped %d %s, not in the output:", glyph.Attention, len(skipped), ui.Pluralize("table", len(skipped)))))
 	for _, table := range skipped {
 		writeCommented("--   ", table.Table+": "+table.Reason)
 	}

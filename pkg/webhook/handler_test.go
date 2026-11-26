@@ -444,6 +444,55 @@ func TestHandleSchemaRequestErrorRendersConfigNotAuthorized(t *testing.T) {
 	}
 }
 
+// A command without -d that matches several configs is answered with the
+// choices the user can name. The choices come from the typed error's fields,
+// so a wrapping prefix, or a database name or path holding ": " or ", ", still
+// renders one safe line per config. The same comment carries no raw error text
+// when the typed error is missing; the raw error stays in the server log.
+func TestHandleSchemaRequestErrorRendersMultipleConfigs(t *testing.T) {
+	newHandler := func(t *testing.T) (*Handler, chan string, *bytes.Buffer) {
+		t.Helper()
+		client, mux := setupGitHubServer(t)
+		comments := make(chan string, 1)
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+		var logBuf bytes.Buffer
+		return &Handler{
+			service:   api.New(nil, &api.ServerConfig{}, nil, testLogger()),
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+			logger:    slog.New(slog.NewTextHandler(&logBuf, nil)),
+		}, comments, &logBuf
+	}
+
+	t.Run("lists every candidate from the typed error", func(t *testing.T) {
+		h, comments, logBuf := newHandler(t)
+		requestErr := fmt.Errorf("resolve config: %w", &ghclient.MultipleConfigsError{Candidates: []ghclient.ConfigCandidate{
+			{Database: "orders", SchemaDir: "services/orders/schema"},
+			{Database: "payments: v2, legacy", SchemaDir: "services/a: b/@acme/team"},
+		}})
+
+		assert.True(t, h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "", "hubot", "plan", requestErr, false))
+
+		body := requireComment(t, comments, "multiple configs comment")
+		assert.Contains(t, body, "Multiple Databases Detected")
+		assert.Contains(t, body, "### Available Databases\n\n- `orders` (`services/orders/schema`)\n- `payments: v2, legacy` (`services/a: b/@acme/team`)\n\n")
+		assert.Contains(t, logBuf.String(), "databases=\"[orders payments: v2, legacy]\"")
+	})
+
+	t.Run("renders a fixed line and never the raw error without the typed error", func(t *testing.T) {
+		h, comments, logBuf := newHandler(t)
+		requestErr := fmt.Errorf("%w: dial tcp 10.1.2.3:3306: refused", ghclient.ErrMultipleConfigs)
+
+		assert.True(t, h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "", "hubot", "plan", requestErr, false))
+
+		body := requireComment(t, comments, "multiple configs comment")
+		assert.Contains(t, body, "### Available Databases\n\n- SchemaBot could not list them here. Each `schemabot.yaml` in this PR names its database under `database`.\n\n")
+		assert.NotContains(t, body, "10.1.2.3")
+		assert.NotContains(t, body, "dial tcp")
+		assert.Contains(t, logBuf.String(), "dial tcp 10.1.2.3:3306: refused")
+		assert.Contains(t, logBuf.String(), "repo=octocat/hello-world")
+	})
+}
+
 func TestCheckRunRerequestIgnoresNonSchemaBotCheck(t *testing.T) {
 	h, _, _ := newTestHandler(t)
 
