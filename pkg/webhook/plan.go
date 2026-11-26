@@ -59,7 +59,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Fix checks stuck at "in_progress" from crashed applies
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
+		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, planNotStartedMessage("reconcile the stale status checks on this pull request"))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "status check reconciliation failed"})
 		return
 	}
@@ -111,7 +111,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	freshPRInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to fetch PR for stale-schema check",
-			"repo", repo, "pr", pr, "environment", environment, "database", schemaResult.Database, "command", action.Plan, "error", err)
+			"repo", repo, "pr", pr, "environment", environment, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "command", action.Plan, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, planHeadVerificationFailedMessage(schemaResult.Database))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "PR fetch failed"})
 		return
@@ -608,7 +608,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// Fix checks stuck at "in_progress" from crashed applies
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
+		h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, planNotStartedMessage("reconcile the stale status checks on this pull request"))
 		return
 	}
 
@@ -836,7 +836,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 				freshPRInfo, prErr := client.FetchPullRequestNoCache(ctx, repo, pr)
 				if prErr != nil {
 					h.logger.Error("failed to fetch PR for stale-schema check",
-						"repo", repo, "pr", pr, "environment", env, "database", schemaResult.Database, "command", action.Plan, "error", prErr)
+						"repo", repo, "pr", pr, "environment", env, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "command", action.Plan, "error", prErr)
 					h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, planHeadVerificationFailedMessage(schemaResult.Database))
 					return
 				}

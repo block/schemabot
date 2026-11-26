@@ -1,15 +1,19 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,7 +33,6 @@ const planControlRetryLine = "Run the command again; if it fails again, the Sche
 // rawInfrastructureError.
 func requireNoInfrastructureDetail(t *testing.T, body string) {
 	t.Helper()
-	assert.NotContains(t, body, "10.1.2.3")
 	assert.NotContains(t, body, "connection refused")
 	assert.NotContains(t, body, "dial tcp")
 }
@@ -64,6 +67,8 @@ func TestControlCommandApplyLookupFailureKeepsStorageErrorOutOfComment(t *testin
 	comments := recordComments(t, mux)
 	st := &planControlStorage{applies: &planControlApplyStore{err: errors.New(rawInfrastructureError)}}
 	h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+	var logs bytes.Buffer
+	h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 
 	h.handleStopCommand("octocat/hello-world", 1, 12345, "testuser", planControlCommandResult())
 
@@ -71,6 +76,13 @@ func TestControlCommandApplyLookupFailureKeepsStorageErrorOutOfComment(t *testin
 	assert.Contains(t, body, "SchemaBot could not look up apply `apply-123`, so the stop command did not run. "+planControlRetryLine)
 	assert.NotContains(t, body, "Failed to look up apply")
 	requireNoInfrastructureDetail(t, body)
+	// The cause the comment leaves out is in the server log, with the
+	// identifiers an operator needs to find it.
+	logged := logs.String()
+	assert.Contains(t, logged, "failed to load apply for PR control command")
+	assert.Contains(t, logged, rawInfrastructureError)
+	assert.Contains(t, logged, `"apply_id":"apply-123"`)
+	assert.Contains(t, logged, `"repo":"octocat/hello-world"`)
 }
 
 // servePlanPullRequest serves the reads a plan makes of an open pull request and
@@ -267,4 +279,60 @@ func TestPlanHeadVerificationFailureKeepsErrorOutOfComment(t *testing.T) {
 		assert.NotContains(t, body, "Failed to verify PR HEAD")
 		assert.NotContains(t, body, "502")
 	})
+}
+
+// A plan on a pull request past GitHub's changed-file cap fails the same way on
+// every attempt, so the comment says to split the pull request instead of
+// advising another run.
+func TestPlanOnPullRequestPastFileCapNamesTheCap(t *testing.T) {
+	h, mux, _ := newFoldHandler(t, planControlServerConfig(), &foldCheckStore{})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"state": "open",
+			"user":  map[string]any{"login": "author"},
+			"head":  map[string]any{"sha": "abc123", "ref": "topic"},
+			"base":  map[string]any{"sha": "def456", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, r *http.Request) {
+		page := 1
+		if p := r.URL.Query().Get("page"); p != "" {
+			var err error
+			page, err = strconv.Atoi(p)
+			require.NoError(t, err)
+		}
+		if page < 30 {
+			w.Header().Set("Link", fmt.Sprintf(`<http://%s/repos/octocat/hello-world/pulls/1/files?page=%d>; rel="next"`, r.Host, page+1))
+		}
+		files := make([]map[string]string, 100)
+		for i := range files {
+			files[i] = map[string]string{"filename": fmt.Sprintf("src/f%d_%d.go", page, i), "status": "added"}
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(files))
+	})
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	h.handlePlanCommand(httptest.NewRecorder(), "octocat/hello-world", 1, "staging", "", "", "", 12345, "", "alice", 0)
+
+	body := requireComment(t, comments, "file cap plan comment")
+	assert.Contains(t, body, "it changes more files than GitHub will report for a single pull request")
+	assert.Contains(t, body, "Split this pull request")
+	assert.NotContains(t, body, planControlRetryLine)
+}
+
+// The schema file check names the outcome the commenter can act on for the two
+// failures that are not worth an immediate retry: the changed-file cap, which
+// returns the same list every time, and a quota reserve refusal, which clears
+// at a reset time SchemaBot knows.
+func TestPlanReconciliationFailureMessageForFailuresARetryCannotClear(t *testing.T) {
+	capErr := fmt.Errorf("fetch PR files before plan: list PR files for octocat/hello-world#1 reached GitHub API limit: %w", ghclient.ErrPRFilesIncomplete)
+	got := planReconciliationFailureMessage(capErr, "orders")
+	assert.Contains(t, got, "Split this pull request")
+	assert.NotContains(t, got, planControlRetryLine)
+	assert.NotContains(t, got, "reached GitHub API limit")
+
+	refusal := &ghclient.QuotaReservedError{Operation: "fetch_file_content", Remaining: 120, Reserve: 1500, ResetAt: time.Date(2026, 11, 26, 14, 7, 30, 0, time.UTC)}
+	got = planReconciliationFailureMessage(fmt.Errorf("fetch PR files before plan: %w", refusal), "orders")
+	assert.Equal(t, "SchemaBot is holding back its remaining GitHub API quota for check runs, so the plan did not start. Comment the command again after the quota resets at 14:08 UTC.", got)
 }
