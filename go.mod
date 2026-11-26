@@ -42,7 +42,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.45.1-0.20261109125418-f31e98d4ee9b // pinned for reaper recovery from a reaper that is being removed; move to the first release that includes it (v0.46.0)
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0
-	github.com/wasilibs/go-pgquery v0.0.0-20261106060434-4301e51f8dbf
+	github.com/wasilibs/go-pgquery v0.0.0-20261124022233-3939604ca45d
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.45.0
