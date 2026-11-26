@@ -17,19 +17,43 @@ const maxRenderedPlanProblems = 25
 // recognize the statement, never its whole body.
 const maxPlanProblemExcerptRunes = 120
 
+// maxPlanProblemsBytes bounds the refused statements one comment lists, every
+// environment's together, well inside GitHub's comment limit. The lists are
+// fixed text with no truncation of their own, so without a shared bound a few
+// environments with long paths and messages could push the comment past the
+// limit and lose every location. The ones beyond it are counted.
+const maxPlanProblemsBytes = 24 * 1024
+
+// planProblemBudget is what remains of maxPlanProblemsBytes as a comment's
+// environments list their refused statements.
+type planProblemBudget struct{ remaining int }
+
+func newPlanProblemBudget() *planProblemBudget {
+	return &planProblemBudget{remaining: maxPlanProblemsBytes}
+}
+
 // writePlanProblems lists every statement an environment's plan refused, so
 // the files' author can fix them all in one push. Each one is its location,
-// what to change, and the statement's opening line in a SQL block.
-func writePlanProblems(sb *strings.Builder, problems []engine.PlanProblem) {
+// what to change, and the statement's opening line in a SQL block. It lists at
+// most maxRenderedPlanProblems, each only while it fits the comment's budget,
+// and counts the rest.
+func writePlanProblems(sb *strings.Builder, problems []engine.PlanProblem, budget *planProblemBudget) {
 	fmt.Fprintf(sb, "%s **SchemaBot can't plan %s in the schema files:**\n\n", glyph.Failed, statementCount(len(problems)))
-	shown := problems
-	if len(shown) > maxRenderedPlanProblems {
-		shown = shown[:maxRenderedPlanProblems]
+	listed := 0
+	for _, problem := range problems {
+		if listed == maxRenderedPlanProblems {
+			break
+		}
+		var entry strings.Builder
+		writePlanProblem(&entry, problem)
+		if entry.Len() > budget.remaining {
+			break
+		}
+		budget.remaining -= entry.Len()
+		sb.WriteString(entry.String())
+		listed++
 	}
-	for _, problem := range shown {
-		writePlanProblem(sb, problem)
-	}
-	if hidden := len(problems) - len(shown); hidden > 0 {
+	if hidden := len(problems) - listed; hidden > 0 {
 		fmt.Fprintf(sb, "…and %s more.\n\n", statementCount(hidden))
 	}
 }

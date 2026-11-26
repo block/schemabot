@@ -77,7 +77,7 @@ func TestRenderPlanProblemsCountsTheOnesItDoesNotList(t *testing.T) {
 		problems = append(problems, engine.PlanProblem{File: "testapp/big.sql", Line: i + 1, Message: "Comments are not managed.", Statement: fmt.Sprintf("COMMENT ON COLUMN t.c%d IS 'x'", i)})
 	}
 	var sb strings.Builder
-	writePlanProblems(&sb, problems)
+	writePlanProblems(&sb, problems, newPlanProblemBudget())
 	out := sb.String()
 
 	assert.Contains(t, out, fmt.Sprintf("SchemaBot can't plan %d statements", maxRenderedPlanProblems+3))
@@ -111,4 +111,46 @@ func TestRenderPlanProblemFencesBackticks(t *testing.T) {
 	var sb strings.Builder
 	writePlanProblem(&sb, engine.PlanProblem{File: "app/t.sql", Line: 1, Message: "Not managed.", Statement: "CREATE TRIGGER ```t``` ON `orders`"})
 	assert.Contains(t, sb.String(), "````sql\nCREATE TRIGGER ```t``` ON `orders`\n````\n")
+}
+
+// Four environments that each refuse a full list of long statements share one
+// budget: the comment stays inside GitHub's limit with every environment's
+// heading and push guidance, and each list counts the statements it had no
+// room to show.
+func TestRenderPlanProblemsShareOneBudgetAcrossEnvironments(t *testing.T) {
+	envs := []string{"dev", "staging", "sandbox", "production"}
+	data := MultiEnvPlanCommentData{
+		Database:     "testapp",
+		DatabaseType: "postgres",
+		Environments: envs,
+		Plans:        map[string]*PlanCommentData{},
+		Errors:       map[string]string{},
+		PlanProblems: map[string][]engine.PlanProblem{},
+	}
+	for _, env := range envs {
+		var problems []engine.PlanProblem
+		for i := range maxRenderedPlanProblems {
+			problems = append(problems, engine.PlanProblem{
+				File:      "schema/" + strings.Repeat("p", 43) + ".sql",
+				Line:      i + 1,
+				Message:   strings.Repeat("m", 500),
+				Statement: "CREATE TRIGGER " + strings.Repeat("s", 200),
+			})
+		}
+		data.Errors[env] = "refused"
+		data.PlanProblems[env] = problems
+	}
+
+	comment := RenderMultiEnvPlanComment(data)
+
+	fitted, replaced := FitGitHubComment(comment, "schemabot", "")
+	assert.False(t, replaced, "the plan renders instead of the oversized-comment notice")
+	assert.Equal(t, comment, fitted)
+	for _, env := range envs {
+		assert.Contains(t, comment, "### "+capitalizeFirst(env))
+		assert.Contains(t, comment, "**"+capitalizeFirst(env)+"** plans once these statements change.")
+	}
+	assert.Equal(t, len(envs), strings.Count(comment, "SchemaBot can't plan 25 statements"))
+	assert.Contains(t, comment, "more.", "the statements left out for space are counted")
+	assert.LessOrEqual(t, strings.Count(comment, "CREATE TRIGGER"), maxPlanProblemsBytes/500)
 }

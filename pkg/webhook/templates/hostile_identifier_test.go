@@ -54,7 +54,7 @@ func TestHostileIdentifierNeverEscapesItsCodeSpan(t *testing.T) {
 	}
 
 	var refusedStatement strings.Builder
-	writePlanProblems(&refusedStatement, []engine.PlanProblem{{File: hostileIdentifier, Line: 3, Message: "Triggers are not managed.", Statement: "CREATE TRIGGER t BEFORE UPDATE ON orders"}})
+	writePlanProblems(&refusedStatement, []engine.PlanProblem{{File: hostileIdentifier, Line: 3, Message: "Triggers are not managed.", Statement: "CREATE TRIGGER t BEFORE UPDATE ON orders"}}, newPlanProblemBudget())
 
 	surfaces := map[string]string{
 		"plan comment":                                 RenderPlanComment(plan),

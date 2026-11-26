@@ -4374,6 +4374,7 @@ func countMultiEnvPlanDDLBlocks(data MultiEnvPlanCommentData) int {
 
 func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
+	problemBudget := newPlanProblemBudget()
 
 	// Header
 	writeEnvironmentTitle(&sb, "Schema Change Plan", singleEnvironmentTitleEnvironment(data.Environments))
@@ -4421,7 +4422,7 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 			fmt.Fprintf(&sb, "### %s\n\n", capitalizeFirst(env))
 
 			if problems := data.PlanProblems[env]; len(problems) > 0 {
-				writePlanProblems(&sb, problems)
+				writePlanProblems(&sb, problems, problemBudget)
 				continue
 			}
 			if errMsg, hasErr := data.Errors[env]; hasErr {

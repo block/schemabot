@@ -59,3 +59,30 @@ func TestE2EMultiEnvPlanListsRemotelyRefusedStatements(t *testing.T) {
 	require.Contains(t, byEnv, "production")
 	assert.Equal(t, checkConclusionFailure, byEnv["production"].Conclusion, "a refused plan still blocks the merge")
 }
+
+// The same refusal answered to a plan scoped to production lists the same
+// statements at their files and lines and asks for a push, and production
+// still stores a failing check row.
+func TestE2ESingleEnvPlanListsRemotelyRefusedStatements(t *testing.T) {
+	production := &statementRefusingTernClient{problems: []engine.PlanProblem{
+		{File: "ns_0/orders.sql", Line: 6, Message: "Comments are not managed. Set the comment on the database directly.", Statement: "COMMENT ON TABLE orders IS 'Orders placed'"},
+		{File: "ns_1/orders.sql", Line: 9, Message: "Triggers are not managed.", Statement: "CREATE TRIGGER orders_touch BEFORE UPDATE ON orders"},
+	}}
+	p := newMultiEnvPlanHarness(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+		{Target: "orders-002", Namespaces: []string{"ns_1"}},
+	}, production, nil)
+
+	comment := p.comment(t, "schemabot plan -e production")
+
+	assert.Contains(t, comment, "SchemaBot can't plan 2 statements in the schema files:")
+	assert.Contains(t, comment, "**`ns_0/orders.sql`, line 6:** Comments are not managed. Set the comment on the database directly.\n```sql\nCOMMENT ON TABLE orders IS 'Orders placed'\n```")
+	assert.Contains(t, comment, "**`ns_1/orders.sql`, line 9:** Triggers are not managed.")
+	assert.Contains(t, comment, "The plan runs once these statements change. Fix them in the schema files and push a commit.")
+	assert.NotContains(t, comment, "### Error")
+	assert.NotContains(t, comment, "rpc error")
+
+	byEnv := p.checksByEnv(t)
+	require.Contains(t, byEnv, "production")
+	assert.Equal(t, checkConclusionFailure, byEnv["production"].Conclusion, "a refused plan still blocks the merge")
+}

@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -582,4 +584,24 @@ func TestRenderGenericErrorDetailLimit(t *testing.T) {
 	clamped := RenderGenericError(SchemaErrorData{CommandName: "apply", ErrorDetail: detail})
 	assert.NotContains(t, clamped, "END")
 	assert.Contains(t, clamped, "…")
+}
+
+// A plan refused over statements in the schema files lists each one in the
+// command's error comment in place of the error text, and asks for a push.
+func TestRenderGenericErrorListsPlanProblems(t *testing.T) {
+	comment := RenderGenericError(SchemaErrorData{
+		RequestedBy: "octocat",
+		Environment: "staging",
+		CommandName: "plan",
+		ErrorDetail: "1 statement in the schema files cannot be planned",
+		PlanProblems: []engine.PlanProblem{
+			{File: "testapp/orders.sql", Line: 3, Message: "Triggers are not managed.", Statement: "CREATE TRIGGER t BEFORE UPDATE ON orders"},
+		},
+	})
+
+	assert.Contains(t, comment, "## "+glyph.Failed+" Plan Failed")
+	assert.Contains(t, comment, "SchemaBot can't plan 1 statement in the schema files:")
+	assert.Contains(t, comment, "**`testapp/orders.sql`, line 3:** Triggers are not managed.\n```sql\nCREATE TRIGGER t BEFORE UPDATE ON orders\n```")
+	assert.Contains(t, comment, "Fix them in the schema files and push a commit.")
+	assert.NotContains(t, comment, "### Error")
 }
