@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"slices"
@@ -262,11 +263,12 @@ const awaitingCurrentCommitTitle = "Awaiting results for the latest commit"
 // placeholder instead of its stored status and conclusion: results computed
 // for another commit say nothing about the current one, so they must hold the
 // aggregate open until the current commit's plan or apply results replace
-// them. Rows for the current commit pass through unchanged.
+// them. Rows for the current commit pass through unchanged, and so does a
+// failed apply's row on any commit (see settledApplyFailure).
 func normalizeStaleContributions(checks []*storage.Check, headSHA string) (contributions []*storage.Check, staleCount int) {
 	contributions = make([]*storage.Check, 0, len(checks))
 	for _, c := range checks {
-		if c.HeadSHA == headSHA {
+		if c.HeadSHA == headSHA || settledApplyFailure(c) {
 			contributions = append(contributions, c)
 			continue
 		}
@@ -277,6 +279,78 @@ func normalizeStaleContributions(checks []*storage.Check, headSHA string) (contr
 		staleCount++
 	}
 	return contributions, staleCount
+}
+
+// settledApplyFailure reports whether c is the outcome of an apply that
+// settled failed. The row keeps naming the commit the apply started on, which
+// is older than the PR head whenever a push landed while the apply ran. Its
+// outcome still describes the target, so it folds as the failure it is rather
+// than as a placeholder awaiting results for the newer commit: the Check Run
+// says the apply failed, and a failure can only block the aggregate, never
+// pass it.
+func settledApplyFailure(c *storage.Check) bool {
+	return c.ApplyID != 0 && c.Status == checkStatusCompleted && c.Conclusion == checkConclusionFailure
+}
+
+// failedApplyRemedyBudget bounds the failed-apply remedy, so a pull request
+// with many failed databases still leaves the table its room under the Check
+// Run text limit.
+const failedApplyRemedyBudget = maxCheckRunTextLength / 8
+
+// failedApplyRemedy names what clears a failed apply's block, or returns ""
+// when no contribution is a failed apply. Each failed database gets its own
+// plan, carrying the deployment's tenant so the pasted command reaches this
+// deployment, and `checks show` names the same command for the same row
+// (checkstate.PlanCommand). When any failed row's change was rolled back or
+// is no longer in the pull request, the remedy does not offer to apply it
+// again. The commands stop at failedApplyRemedyBudget; the rest are counted,
+// and the table above still lists every failed database.
+func failedApplyRemedy(checks []*storage.Check, tenant string) string {
+	type target struct{ environment, database string }
+	var failed []target
+	remedy := checkstate.ReconciliationRemedy
+	for _, c := range checks {
+		if !settledApplyFailure(c) {
+			continue
+		}
+		if checkstate.ReapplyIsNotTheRemedy(c.BlockingReason) {
+			remedy = checkstate.MatchTargetRemedy
+		}
+		t := target{c.Environment, c.DatabaseName}
+		if !slices.Contains(failed, t) {
+			failed = append(failed, t)
+		}
+	}
+	if len(failed) == 0 {
+		return ""
+	}
+	slices.SortFunc(failed, func(a, b target) int {
+		return cmp.Or(cmp.Compare(a.environment, b.environment), cmp.Compare(a.database, b.database))
+	})
+	var commands []string
+	size := 0
+	for _, t := range failed {
+		command := checkstate.PlanCommand(t.environment, t.database, tenant)
+		if len(commands) > 0 && size+len(command) > failedApplyRemedyBudget {
+			break
+		}
+		commands = append(commands, command)
+		size += len(command)
+	}
+	return "\n**To clear this:** " + remedy(commands...) + otherFailedDatabases(len(failed)-len(commands)) + "\n"
+}
+
+// otherFailedDatabases points at the failed databases the remedy had no room
+// to name, or returns "" when it named them all.
+func otherFailedDatabases(omitted int) string {
+	switch {
+	case omitted <= 0:
+		return ""
+	case omitted == 1:
+		return " Plan the other failed database in the table the same way."
+	default:
+		return fmt.Sprintf(" Plan the other %d failed databases in the table the same way.", omitted)
+	}
 }
 
 // anyInProgressOnCommit reports whether any check recorded for headSHA is
@@ -338,7 +412,9 @@ func computeAggregate(checks []*storage.Check, stopped stoppedApplyIDs) (conclus
 }
 
 // aggregateSummary builds a human-readable title and markdown summary for the aggregate check.
-func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppedApplyIDs, progress rolloutProgress) (title, summary string) {
+// tenant is the deployment's own tenant, which the commands the summary names
+// carry; pass "" for an untenanted deployment.
+func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppedApplyIDs, progress rolloutProgress, tenant string) (title, summary string) {
 	switch conclusion {
 	case checkConclusionSuccess:
 		if allChecksAreUpToDate(checks) {
@@ -349,7 +425,8 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		summary = buildAggregateTable(checks, stopped, progress)
 	case checkConclusionFailure:
 		title = "Apply failed"
-		summary = buildAggregateTable(checks, stopped, progress)
+		remedy := failedApplyRemedy(checks, tenant)
+		summary = buildAggregateTableWithin(checks, stopped, progress, len(remedy)) + remedy
 	case checkConclusionActionRequired:
 		pending := 0
 		unresolved := 0
@@ -539,6 +616,12 @@ func isParticipantCheck(c *storage.Check) bool {
 // is never dropped, even when many per-database rows would otherwise fill the
 // Check Run text limit — those rows truncate instead.
 func buildAggregateTable(checks []*storage.Check, stopped stoppedApplyIDs, progress rolloutProgress) string {
+	return buildAggregateTableWithin(checks, stopped, progress, 0)
+}
+
+// buildAggregateTableWithin is buildAggregateTable leaving reserved bytes of
+// the Check Run text limit free for text the summary adds after the table.
+func buildAggregateTableWithin(checks []*storage.Check, stopped stoppedApplyIDs, progress rolloutProgress, reserved int) string {
 	var dbChecks, participantChecks []*storage.Check
 	for _, c := range checks {
 		if isParticipantCheck(c) {
@@ -552,7 +635,7 @@ func buildAggregateTable(checks []*storage.Check, stopped stoppedApplyIDs, progr
 	// The progress lines get a quarter of the text limit, so the Database
 	// table always keeps room for its own rows.
 	progressSection := renderRolloutProgress(dbChecks, progress, stopped, maxCheckRunTextLength/4)
-	dbSection := renderDatabaseSection(dbChecks, maxCheckRunTextLength-1000-len(tenantSection)-len(progressSection), stopped, progress)
+	dbSection := renderDatabaseSection(dbChecks, maxCheckRunTextLength-1000-reserved-len(tenantSection)-len(progressSection), stopped, progress)
 
 	var sb strings.Builder
 	sb.WriteString(dbSection)
