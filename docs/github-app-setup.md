@@ -332,7 +332,7 @@ github:
   previous-webhook-secret: "env:GITHUB_PREVIOUS_WEBHOOK_SECRET"  # the old secret, removed after step 3
 ```
 
-`previous-repo-webhook-secret` does the same for `repo-webhook-secret`. In multi-App mode, each entry under `apps:` accepts its own `previous-webhook-secret`. A previous secret without the matching current secret fails startup.
+`previous-repo-webhook-secret` does the same for `repo-webhook-secret`. In multi-App mode, each entry under `apps:` accepts its own `previous-webhook-secret`; repository webhooks are not served in multi-App mode, so `previous-repo-webhook-secret` there fails startup. Startup also fails when a previous secret is set without the matching current secret, or when either resolves to an empty value, such as an unset environment variable.
 
 ## Repository-level Webhooks (optional)
 
