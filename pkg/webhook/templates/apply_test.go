@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
@@ -1750,7 +1751,7 @@ func TestRenderApplyStatusComment_TableSizeBesideRows(t *testing.T) {
 			name:  "running with ETA",
 			state: state.Apply.Running,
 			table: TableProgressData{TableName: "orders", Status: state.Task.Running, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, ETASeconds: 720, EstimatedBytes: &bytes},
-			want:  "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB · ETA: 12m 0s\n",
+			want:  "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB · ETA: 12m\n",
 		},
 		{
 			name:  "running without ETA",
@@ -1768,7 +1769,7 @@ func TestRenderApplyStatusComment_TableSizeBesideRows(t *testing.T) {
 			name:  "no estimate",
 			state: state.Apply.Running,
 			table: TableProgressData{TableName: "orders", Status: state.Task.Running, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, ETASeconds: 720},
-			want:  "- Rows: 1,234,567 / 48,200,000 · ETA: 12m 0s\n",
+			want:  "- Rows: 1,234,567 / 48,200,000 · ETA: 12m\n",
 		},
 		{
 			// A queued table has reported nothing yet, so it shows the
@@ -1941,6 +1942,10 @@ func TestRenderApplySummaryComment_Duration(t *testing.T) {
 		CompletedAt: "2026-06-16T19:59:00Z",
 	}
 	assert.Contains(t, RenderApplySummaryComment(data), "**Duration**: 17m")
+
+	// An apply that runs past a day reads in its two largest units, as the CLI does.
+	data.CompletedAt = "2026-06-17T20:43:00Z"
+	assert.Contains(t, RenderApplySummaryComment(data), "**Duration**: 1d 1h\n")
 
 	data.CompletedAt = "2026-06-16T19:00:00Z"
 	assert.NotContains(t, RenderApplySummaryComment(data), "**Duration**:")
@@ -2171,6 +2176,29 @@ func TestPreviewCommentSummaryFailed(t *testing.T) {
 	assert.Contains(t, result, "**`users`** — Failed at 30.00%")
 	assert.Contains(t, result, "**`orders`** — Completed", "on a failed apply, the reader must be able to tell which tables made it")
 	assert.Contains(t, result, "**`products`** — Cancelled")
+}
+
+// A table whose copy finished short of its estimate, then halted, reads in
+// the terminal summary as halted at 100.00%, not at a percent of the estimate.
+func TestSummaryEntryReadsAFinishedCopyAsDone(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		want   string
+	}{
+		{status: state.Task.Failed, want: "**`users`** — Failed at 100.00%"},
+		{status: state.Task.Stopped, want: "**`users`** — Stopped at 100.00%"},
+		{status: state.Task.Cancelled, want: "**`users`** — Cancelled at 100.00%"},
+	} {
+		t.Run(tc.status, func(t *testing.T) {
+			var sb strings.Builder
+			writeSummaryTableEntry(&sb, schema.DialectMySQL, TableProgressData{
+				TableName: "users", Status: tc.status,
+				RowsCopied: 3_261_100_506, RowsTotal: 3_291_032_158, PercentComplete: 100,
+			}, true, nil)
+			assert.Contains(t, sb.String(), tc.want)
+			assert.NotContains(t, sb.String(), "99.09%")
+		})
+	}
 }
 
 func TestPreviewCommentSummaryStopped(t *testing.T) {
@@ -2900,6 +2928,14 @@ func TestRenderApplyStatusComment_RevertWindowDeadline(t *testing.T) {
 	pastDue := base
 	pastDue.RevertExpiresAt = time.Now().Add(-1 * time.Minute).UTC().Format(time.RFC3339)
 	assert.NotContains(t, RenderApplyStatusComment(pastDue), "Closes in")
+
+	// A window longer than a day reads in its two largest units, as the CLI does.
+	now := time.Date(2026, 6, 16, 19, 42, 0, 0, time.UTC)
+	NowFunc = func() time.Time { return now }
+	t.Cleanup(func() { NowFunc = time.Now })
+	longWindow := base
+	longWindow.RevertExpiresAt = now.Add(25*time.Hour + time.Minute).Format(time.RFC3339)
+	assert.Contains(t, RenderApplyStatusComment(longWindow), "**Status**: Revert Window | Closes in 1d 1h\n")
 }
 
 // TestRenderApplyStatusComment_Rollback verifies that a rollback apply's
@@ -2997,4 +3033,27 @@ func TestRenderApplyComments_CancelledTableSaysHowFarItGot(t *testing.T) {
 	assert.Contains(t, summary, "**`orders`** — Cancelled at 40.00%\n", "%s", summary)
 	assert.Contains(t, summary, "**`users`** — Cancelled\n", "%s", summary)
 	assert.Contains(t, summary, "**`products`** — Cancelled\n", "%s", summary)
+}
+
+// A sharded table in a single-deployment apply whose shards are in different
+// phases keeps its bar across every shard, as the sharded comment and the CLI
+// show it: one verified shard of four, with the rest queued or not yet
+// attached, reads 25% with its rows line, not the verifying shard's phase.
+func TestRenderApplyStatusComment_ShardedPhaseBarSpansEveryShard(t *testing.T) {
+	out := RenderApplyStatusComment(ApplyStatusFromProgress(&apitypes.ProgressResponse{
+		ApplyID: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Running,
+		Tables: []*apitypes.TableProgressResponse{{
+			TableName: "orders", Keyspace: "shop_001", DDL: "ALTER TABLE orders ADD COLUMN note text", ChangeType: "alter",
+			Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, PlannedShards: 4,
+			Shards: []*apitypes.ShardProgressResponse{
+				{Shard: "-40", Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, PercentComplete: 100, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000},
+				{Shard: "40-80", Status: state.Task.Pending},
+			},
+		}},
+	}, "octocat"))
+
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(25)+" 25%\n", "%s", out)
+	assert.Contains(t, out, "- Rows: 1,000 / 1,000 across 1 of 4 shards\n", "%s", out)
+	assert.Contains(t, out, "  - ◉ `-40`: checksumming 25.00% · 250 / 1,000 rows verified\n", "%s", out)
+	assert.NotContains(t, out, "Checksumming to verify data")
 }

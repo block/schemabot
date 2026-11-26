@@ -451,6 +451,129 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		}
 	})
 
+	// FindNextApplyOperation_FailedShardHoldsItsSiblingShards covers one target
+	// whose change runs on three shards in parallel. The first shard to start
+	// fails. Under halt, and under a pause nobody has released, neither other
+	// shard starts: every shard runs the same change, so starting them repeats
+	// the failure on each. A release lets a paused rollout go on to them, and
+	// continue goes on without one.
+	t.Run("FindNextApplyOperation_FailedShardHoldsItsSiblingShards", func(t *testing.T) {
+		for _, tc := range []struct {
+			name           string
+			onFailure      string
+			release        bool
+			othersAdmitted bool
+		}{
+			{name: "halt", onFailure: storage.OnFailureHalt},
+			{name: "pause", onFailure: storage.OnFailurePause},
+			{name: "pause_released", onFailure: storage.OnFailurePause, release: true, othersAdmitted: true},
+			{name: "continue", onFailure: storage.OnFailureContinue, othersAdmitted: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "operation_shard_failure_"+tc.name, storage.DatabaseTypeMySQL)
+				apply := CreateApply(t, store, lock, "apply_operation_shard_failure_"+tc.name, 912)
+				shardIDs := map[int64]string{}
+				for _, shard := range []string{"-40", "40-80", "80-"} {
+					id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+						ApplyID: apply.ID, Deployment: "payments-a", Target: "payments-001",
+						OperationKey:  storage.TargetOperationKey("payments-001", storage.ShardOperationKey("orders", shard, "orders")),
+						OperationKind: storage.ApplyOperationKindWork,
+						CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: tc.onFailure,
+					})
+					require.NoError(t, err)
+					shardIDs[id] = shard
+				}
+
+				first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+				require.NoError(t, err)
+				require.NotNil(t, first)
+				require.NoError(t, store.ApplyOperations().MarkFailed(ctx, first.ID, "duplicate entry for key 'uk_orders_source'"))
+				if tc.release {
+					requestControl(t, store, apply.ID, storage.ControlOperationRelease)
+				}
+
+				next, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+				require.NoError(t, err)
+				if !tc.othersAdmitted {
+					assert.Nil(t, next, "on_failure %s keeps every other shard from starting after shard %s failed", tc.onFailure, shardIDs[first.ID])
+					return
+				}
+				require.NotNil(t, next, "%s goes on to another shard after shard %s failed", tc.name, shardIDs[first.ID])
+				assert.NotEqual(t, first.ID, next.ID, "the failed shard is never claimed again")
+				assert.Contains(t, shardIDs, next.ID)
+			})
+		}
+	})
+
+	// FailedSiblingHaltingOperation_HaltsTheRestOfTheTarget covers target
+	// payments-001, whose change runs on three shards at once, beside target
+	// payments-002 in the same deployment. Shard -40 of payments-001 fails.
+	// Under halt, and under an on_failure value SchemaBot does not recognize,
+	// the other two shards of payments-001 are halted by that failure and
+	// name it, while payments-002's shard and the failed shard itself are not.
+	// Continue goes on past the failure and pause waits for an operator to
+	// release it, so neither halts work that is already running.
+	t.Run("FailedSiblingHaltingOperation_HaltsTheRestOfTheTarget", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			onFailure string
+			halts     bool
+		}{
+			{name: "halt", onFailure: storage.OnFailureHalt, halts: true},
+			{name: "unrecognized", onFailure: "stop-everything", halts: true},
+			{name: "pause", onFailure: storage.OnFailurePause},
+			{name: "continue", onFailure: storage.OnFailureContinue},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "operation_sibling_halt_"+tc.name, storage.DatabaseTypeMySQL)
+				apply := CreateApply(t, store, lock, "apply_operation_sibling_halt_"+tc.name, 913)
+				insert := func(target, shard string) int64 {
+					id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+						ApplyID: apply.ID, Deployment: "payments-a", Target: target,
+						OperationKey:  storage.TargetOperationKey(target, storage.ShardOperationKey("orders", shard, "orders")),
+						OperationKind: storage.ApplyOperationKindWork,
+						CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: tc.onFailure,
+					})
+					require.NoError(t, err)
+					return id
+				}
+				failed := insert("payments-001", "-40")
+				running := []int64{insert("payments-001", "40-80"), insert("payments-001", "80-")}
+				otherTarget := insert("payments-002", "-40")
+
+				for _, id := range append([]int64{failed, otherTarget}, running...) {
+					halting, err := store.ApplyOperations().FailedSiblingHaltingOperation(ctx, apply.ID, id)
+					require.NoError(t, err)
+					assert.Nil(t, halting, "nothing halts operation %d before any shard fails", id)
+				}
+
+				require.NoError(t, store.ApplyOperations().MarkFailed(ctx, failed, "duplicate entry for key 'uk_orders_source'"))
+
+				for _, id := range running {
+					halting, err := store.ApplyOperations().FailedSiblingHaltingOperation(ctx, apply.ID, id)
+					require.NoError(t, err)
+					if !tc.halts {
+						assert.Nil(t, halting, "on_failure %s halts no running shard after shard -40 failed", tc.onFailure)
+						continue
+					}
+					require.NotNil(t, halting, "on_failure %s halts every other shard of payments-001 after shard -40 failed", tc.onFailure)
+					assert.Equal(t, failed, halting.ID, "the halted shard names the shard that failed")
+					assert.Equal(t, "payments-001", halting.Target)
+					assert.Equal(t, state.ApplyOperation.Failed, halting.State)
+				}
+				for _, id := range []int64{failed, otherTarget} {
+					halting, err := store.ApplyOperations().FailedSiblingHaltingOperation(ctx, apply.ID, id)
+					require.NoError(t, err)
+					assert.Nil(t, halting, "a failed shard halts the rest of its own target only, never itself or another target")
+				}
+			})
+		}
+	})
+
 	// FindNextApplyOperation_ParallelStartsTargetsUpToCapAndCutsOverEachWhenReady
 	// verifies a parallel rollout over the targets of one deployment. Copies
 	// start without waiting on earlier targets, bounded by the per-apply driver
@@ -1298,11 +1421,18 @@ func TestApplyOperations(t *testing.T, h Harness) {
 					"payments-001", "payments-002")
 				failed, survivor := shards["payments-001"][0], shards["payments-001"][1]
 
+				// Both shards of payments-001 start copying before either
+				// finishes, as parallel shards do; a shard that has not started
+				// never starts after its sibling fails under halt or pause.
+				var started []*storage.ApplyOperation
 				for _, want := range shards["payments-001"] {
 					claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
 					require.NoError(t, err)
 					require.NotNil(t, claimed)
 					require.Equal(t, want, claimed.ID)
+					started = append(started, claimed)
+				}
+				for _, claimed := range started {
 					if claimed.ID == failed && !tc.failAtCutover {
 						require.NoError(t, store.ApplyOperations().MarkFailed(ctx, failed, "duplicate key name 'idx_orders_source'"))
 						continue
@@ -1328,7 +1458,17 @@ func TestApplyOperations(t *testing.T, h Harness) {
 				}
 
 				if !tc.laterAdmitted {
-					copyStart, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+					if tc.onFailure == storage.OnFailureHalt {
+						// Under halt, a driver claims payments-001's parked
+						// shard so it can cancel it (ST-10); the claim keeps
+						// the shard parked and starts no copy.
+						halted, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+						require.NoError(t, err)
+						require.NotNil(t, halted, "the parked payments-001 shard is claimed to be cancelled under %s", tc.name)
+						assert.Equal(t, survivor, halted.ID)
+						assert.Equal(t, state.ApplyOperation.WaitingForCutover, halted.State)
+					}
+					copyStart, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
 					require.NoError(t, err)
 					assert.Nil(t, copyStart, "no payments-002 copy starts behind a failed payments-001 under %s", tc.name)
 					cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")

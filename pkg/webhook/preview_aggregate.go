@@ -48,7 +48,7 @@ func PreviewAggregateSummary() string {
 	}
 
 	conclusion, _ := computeAggregate(checks, nil)
-	title, summary := aggregateSummary(checks, conclusion, nil, nil)
+	title, summary := aggregateSummary(checks, conclusion, nil, nil, "")
 	return title + "\n\n" + summary
 }
 
@@ -71,7 +71,29 @@ func PreviewAggregateCheckStopped() string {
 
 	stopped := stoppedApplyIDs{stoppedApplyID: true}
 	conclusion, _ := computeAggregate(checks, stopped)
-	title, summary := aggregateSummary(checks, conclusion, stopped, nil)
+	title, summary := aggregateSummary(checks, conclusion, stopped, nil, "")
+	return title + "\n\n" + summary
+}
+
+// PreviewAggregateCheckPlanBlocked renders the aggregate check of a PR whose
+// plan names a change the engine refuses to run: here, dropping an index the
+// PostgreSQL engine does not execute. Nothing failed and nothing ran, so the
+// title and the row say the plan is blocked and the summary says how to clear
+// it.
+func PreviewAggregateCheckPlanBlocked() string {
+	checks := []*storage.Check{
+		{
+			DatabaseType:  storage.DatabaseTypePostgres,
+			DatabaseName:  "orders",
+			HasChanges:    true,
+			Status:        checkStatusCompleted,
+			Conclusion:    checkConclusionFailure,
+			ChangeSummary: "1 index drop",
+			PlanRefused:   true,
+		},
+	}
+	conclusion, _ := computeAggregate(checks, nil)
+	title, summary := aggregateSummary(checks, conclusion, nil, nil, "")
 	return title + "\n\n" + summary
 }
 
@@ -116,7 +138,7 @@ func PreviewAggregateCheckRollout() string {
 	for _, sc := range scenarios {
 		checks := []*storage.Check{sc.check}
 		conclusion, _ := computeAggregate(checks, nil)
-		title, summary := aggregateSummary(checks, conclusion, nil, sc.progress)
+		title, summary := aggregateSummary(checks, conclusion, nil, sc.progress, "")
 		sections = append(sections, "**"+sc.heading+"**\n\n"+title+"\n\n"+summary)
 	}
 	return strings.Join(sections, "\n\n")

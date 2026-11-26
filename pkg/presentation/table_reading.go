@@ -23,8 +23,11 @@ type TableFacts struct {
 	RowsTotal       int64
 	// RowsTotalPlanned marks a row total taken from the plan's estimate
 	// because some shards or targets have not reported one yet.
-	RowsTotalPlanned    bool
-	ETASeconds          int64
+	RowsTotalPlanned bool
+	ETASeconds       int64
+	// EstimatedRows is the table's row count when it was planned, nil when
+	// the plan could not count it.
+	EstimatedRows       *int64
 	EstimatedBytes      *int64
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
@@ -52,9 +55,11 @@ func (f TableFacts) partialShards() bool {
 // shard count, or the listed shards when more are listed or the plan recorded
 // none. While later shards have not reported, the figures cover the reporting
 // ones alone, so the reading says so rather than passing their fraction off
-// as the table's. A table with one shard or none listed is left as it is.
+// as the table's. A table with one shard or none listed is left as it is, and
+// so is one whose total already counts the plan's estimate for the shards that
+// have not reported, since that total spans the whole table.
 func (f TableFacts) WithShardCoverage(listed, reporting int) TableFacts {
-	if listed < 2 {
+	if listed < 2 || f.RowsTotalPlanned {
 		return f
 	}
 	if total := max(listed, f.PlannedShards); reporting > 0 && reporting < total {
@@ -168,6 +173,15 @@ func readRunning(f TableFacts) TableReading {
 			{Text: fmt.Sprintf("Rows copied: %s so far", ui.FormatNumber(f.RowsCopied))},
 			{Text: ui.EstimateExceededTooltip, Note: true},
 		}}
+	case ui.CopyFinishedShortOfEstimate(f.PercentComplete, f.RowsCopied, f.RowsTotal):
+		// The engine reports the copy done, but it inserted fewer rows than
+		// the estimated total, as when the estimate ran high or the copy
+		// skipped rows. It can insert none at all, when the source emptied
+		// after the estimate or the binlog applier moved every row first, so
+		// this comes before the starting-copy case. A percent of the estimate
+		// would sit beside a full bar, so the table reads as fully copied,
+		// with the rows it copied, as the post-copy phases do.
+		return TableReading{Bar: ui.ProgressBarRowCopy(100), Label: ui.FormatRowCopyPercent(100, f.RowsTotal, f.RowsTotal) + ShardCoverageSuffix(f), Details: rowsCopiedDetail(f)}
 	case f.RowsTotal > 0 && f.RowsCopied == 0:
 		// The row total is known but no rows have moved yet, which can take a
 		// while on a large table. A 0% bar reads as stuck, and a percent the
@@ -184,10 +198,16 @@ func readRunning(f TableFacts) TableReading {
 	case f.BuildWork.IsConcurrentIndexBuild():
 		// The engine's whole-build percent draws the bar. The current phase's
 		// counters sit under the statement and carry no percent of their own,
-		// so the table never shows two.
+		// so the table never shows two. The build reads every row, so the
+		// table's planned rows and size stay under it, as they read while the
+		// build was queued: the phase counters say how far it is, and the size
+		// says how long the rest will take.
 		r := TableReading{Label: ui.IndexBuildProgress(f.PercentComplete, f.BuildWork)}
 		if line := ui.FormatBuildWork(f.BuildWork); line != "" {
-			r.Details = []TableDetail{{Text: line}}
+			r.Details = append(r.Details, TableDetail{Text: line})
+		}
+		if line := PlannedRowsText(f.EstimatedRows, f.EstimatedBytes, ""); line != "" {
+			r.Details = append(r.Details, TableDetail{Text: line})
 		}
 		return r
 	default:
@@ -213,10 +233,21 @@ func applyingLabel(f TableFacts) string {
 
 // rowsCopiedDetail reports the rows a finished copy moved, once it moved any.
 func rowsCopiedDetail(f TableFacts) []TableDetail {
-	if f.RowsCopied <= 0 {
-		return nil
+	if line := FinishedCopyRowsText(f.RowsCopied); line != "" {
+		return []TableDetail{{Text: line}}
 	}
-	return []TableDetail{{Text: "Rows copied: " + ui.FormatNumber(f.RowsCopied)}}
+	return nil
+}
+
+// FinishedCopyRowsText is the rows line of a copy the engine reports finished
+// short of its estimate: the rows it copied, since a line against the
+// estimate would contradict the full bar beside it. It is empty when the copy
+// inserted none.
+func FinishedCopyRowsText(rowsCopied int64) string {
+	if rowsCopied <= 0 {
+		return ""
+	}
+	return "Rows copied: " + ui.FormatNumber(rowsCopied)
 }
 
 // RowsLine is a copy's rows line: rows copied of the total, the shards the

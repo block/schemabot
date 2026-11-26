@@ -1119,6 +1119,24 @@ type mockApplyOperationStore struct {
 	// operation id, standing in for a pod that dies before that id reaches
 	// storage.
 	operationIDWriteErr error
+	// getByKeyErr fails GetByApplyDeploymentAndOperationKey.
+	getByKeyErr error
+	// markTerminalErr fails MarkTerminal.
+	markTerminalErr error
+	// listErr fails ListByApply.
+	listErr error
+}
+
+func (m *mockApplyOperationStore) GetByApplyDeploymentAndOperationKey(_ context.Context, applyID int64, deployment, operationKey string) (*storage.ApplyOperation, error) {
+	if m.getByKeyErr != nil {
+		return nil, m.getByKeyErr
+	}
+	for _, op := range m.ops {
+		if op.ApplyID == applyID && op.Deployment == deployment && op.OperationKey == operationKey {
+			return op, nil
+		}
+	}
+	return nil, nil
 }
 
 func (m *mockApplyOperationStore) Get(_ context.Context, id int64) (*storage.ApplyOperation, error) {
@@ -1129,7 +1147,50 @@ func (m *mockApplyOperationStore) Get(_ context.Context, id int64) (*storage.App
 	return op, nil
 }
 
+// FailedSiblingHaltingOperation mirrors the storage rule over the mock's rows.
+func (m *mockApplyOperationStore) FailedSiblingHaltingOperation(_ context.Context, applyID, operationID int64) (*storage.ApplyOperation, error) {
+	ops := make([]*storage.ApplyOperation, 0, len(m.ops))
+	for _, op := range m.ops {
+		ops = append(ops, op)
+	}
+	return failedSiblingHaltingIn(ops, applyID, operationID), nil
+}
+
+// failedSiblingHaltingIn mirrors the storage rule for test stores: the
+// earliest failed work row of the same deployment and target halts
+// operationID, unless its own on_failure is continue or pause.
+func failedSiblingHaltingIn(ops []*storage.ApplyOperation, applyID, operationID int64) *storage.ApplyOperation {
+	var halted *storage.ApplyOperation
+	for _, op := range ops {
+		if op != nil && op.ID == operationID {
+			halted = op
+		}
+	}
+	if halted == nil || halted.ApplyID != applyID || halted.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+		return nil
+	}
+	if halted.OnFailure == storage.OnFailureContinue || halted.OnFailure == storage.OnFailurePause {
+		return nil
+	}
+	var earliest *storage.ApplyOperation
+	for _, op := range ops {
+		if op == nil || op.ID == operationID || op.ApplyID != applyID || op.Deployment != halted.Deployment || op.Target != halted.Target {
+			continue
+		}
+		if op.OperationKind == storage.ApplyOperationKindGroupFinalizer || !state.IsState(op.State, state.ApplyOperation.Failed) {
+			continue
+		}
+		if earliest == nil || op.ID < earliest.ID {
+			earliest = op
+		}
+	}
+	return earliest
+}
+
 func (m *mockApplyOperationStore) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyOperation, error) {
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
 	var ops []*storage.ApplyOperation
 	for _, op := range m.ops {
 		if op != nil && op.ApplyID == applyID {
@@ -1163,6 +1224,9 @@ func (m *mockApplyOperationStore) UpdateState(_ context.Context, id int64, newSt
 }
 
 func (m *mockApplyOperationStore) MarkTerminal(_ context.Context, id int64, newState string) error {
+	if m.markTerminalErr != nil {
+		return m.markTerminalErr
+	}
 	op, ok := m.ops[id]
 	if !ok {
 		return storage.ErrApplyOperationNotFound
@@ -1393,6 +1457,10 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 	}
 	client, cleanup := testCapturingGRPCClient(t, server)
 	defer cleanup()
+	client.changeEventApp = func(database string) string {
+		assert.Equal(t, "testdb", database)
+		return "managed-app"
+	}
 
 	apply := &storage.Apply{
 		ID:              7,
@@ -1442,6 +1510,7 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 	assert.Equal(t, "testdb", req.Database)
 	assert.Equal(t, "testdb-target", req.Target)
 	assert.Equal(t, "true", req.Options["defer_cutover"])
+	assert.Equal(t, "managed-app", req.Options[changeEventAppOption])
 	require.Len(t, req.DdlChanges, 1)
 	assert.Equal(t, "users", req.DdlChanges[0].TableName)
 	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_ALTER, req.DdlChanges[0].ChangeType)

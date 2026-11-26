@@ -596,6 +596,37 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="postgres-plan-no-rollback"></a><strong>Postgres Plan (No Rollback)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `PostgreSQL`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+#### Schema Name: `app`
+```sql
+ALTER TABLE app.users ADD COLUMN email text;
+```
+
+📋 **Plan**: **1** table to alter
+
+⚠️ No rollback for namespace `app`: SchemaBot couldn't save the current schema of the tables below, so an apply of this plan can't be rolled back. To undo the change, revert the schema files in a new pull request.
+
+- `orders`: holds a foreign key added NOT VALID, which a schema file cannot declare
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-ignore-tables"></a><strong>MySQL Plan (Ignore Tables)</strong></summary>
 
 
@@ -1537,7 +1568,10 @@ The live database operation was already started and may continue independently o
      ```
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
-     After rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan.
+     After the rollback completes, refresh the checks:
+     ```
+     schemabot plan
+     ```
 <!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
@@ -1573,7 +1607,10 @@ Choose one:
      ```
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
-   - after rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan
+   - after the rollback completes, refresh the checks:
+     ```
+     schemabot plan
+     ```
 <!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
@@ -2108,6 +2145,42 @@ schemabot plan -e production
 </details>
 
 <details>
+<summary><a name="multienv-plan-refused-statements"></a><strong>Multi-env Plan (Refused Statements)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `PostgreSQL`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+### Staging
+
+❌ **SchemaBot can't plan 3 statements in the schema files:**
+
+**`testapp/accounts.sql`, line 7:** SchemaBot doesn't manage comments. Remove the COMMENT statement from this file and set the comment on the database directly.
+```sql
+COMMENT ON TABLE accounts IS 'People who can place orders'
+```
+
+**`testapp/orders.sql`, line 12:** SchemaBot doesn't manage functions. Create set_updated_at() outside SchemaBot and remove it from this file.
+```sql
+CREATE FUNCTION set_updated_at() RETURNS trigger AS $$ …
+```
+
+**`testapp/orders.sql`, line 19:** SchemaBot doesn't manage triggers. Create orders_updated_at outside SchemaBot and remove it from this file.
+```sql
+CREATE TRIGGER orders_updated_at BEFORE UPDATE ON orders …
+```
+
+---
+
+
+⚠️ **Staging** plans once these statements change. Fix them in the schema files and push a commit.
+
+</details>
+
+<details>
 <summary><a name="multienv-plan-lint-warnings"></a><strong>Multi-env Plan (Lint Warnings)</strong></summary>
 
 
@@ -2525,6 +2598,245 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 schemabot apply -e staging
 ```
+
+</details>
+
+<details>
+<summary><a name="plan-of-a-frozen-change"></a><strong>Plan Of A Frozen Change</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+❄️ **`staging` is frozen, so applying this plan would be refused now.**
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `freeze-3f9a1c2e7b4d8a06` | until 2026-12-26T00:00:00Z | Holiday code freeze |
+
+Wait for the freeze to end before you apply. If this change can't wait, apply with `--override` and your reason, as the command below does: SchemaBot lets it through and records your reason.
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
+💡 **Lint Warnings**: 2 advisory findings
+1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging --override "<why it can't wait>"
+```
+
+</details>
+
+<details>
+<summary><a name="plan-of-a-change-a-scheduled-freeze-covers"></a><strong>Plan Of A Change A Scheduled Freeze Covers</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+❄️ **A freeze is scheduled in `staging`.** Apply before it starts, and let the change finish: while it holds, the apply is refused, and so is a `start` or `cutover` the change still needs.
+
+| Freeze | Starts | Holds | Reason |
+| :-- | :-- | :-- | :-- |
+| `freeze-8c41d2e9a7f03b56` | 2026-12-19T00:00:00Z | until 2026-12-26T00:00:00Z | Holiday code freeze |
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
+💡 **Lint Warnings**: 2 advisory findings
+1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="plan-of-a-frozen-change-approval-policy"></a><strong>Plan Of A Frozen Change (Approval Policy)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+❄️ **`staging` is frozen, so applying this plan would be refused now.**
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `freeze-3f9a1c2e7b4d8a06` | until lifted | INC-1234: payments latency |
+
+Wait for the freeze to end before you apply. If this change can't wait, apply with `--override` and your reason, as the command below does. A freeze approver other than you and the PR author, a member of `acme/freeze-approvers`, must approve it, and then you run the command again.
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
+💡 **Lint Warnings**: 2 advisory findings
+1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging --override "<why it can't wait>"
+```
+
+</details>
+
+<details>
+<summary><a name="plan-of-a-frozen-change-with-an-unsafe-change"></a><strong>Plan Of A Frozen Change With An Unsafe Change</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+❄️ **`staging` is frozen, so applying this plan would be refused now.**
+
+| Freeze | Holds | Reason |
+| :-- | :-- | :-- |
+| `freeze-3f9a1c2e7b4d8a06` | until 2026-12-26T00:00:00Z | Holiday code freeze |
+
+Wait for the freeze to end before you apply. If this change can't wait, apply with `--override` and your reason, as the command below does: SchemaBot lets it through and records your reason.
+
+```sql
+ALTER TABLE `orders` DROP COLUMN `legacy_ref`;
+```
+
+```sql
+ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `orders`: DROP COLUMN discards the column's data
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply**:
+1. Deploy application code that no longer reads from or writes to the dropped column.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `orders`:
+   ```
+   schemabot apply -e staging --override "<why it can't wait>"
+   ```
 
 </details>
 
@@ -3258,16 +3570,16 @@ That command wasn't recognized. Available commands:
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
-
-```sql
-ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-```
-
 **`products`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
@@ -3402,8 +3714,9 @@ This repository has multiple `schemabot.yaml` configurations.
 
 ### Available Databases
 
-- `testapp` (schema/testapp/schemabot.yaml)
-- `payments` (schema/payments/schemabot.yaml)
+- `testapp` (`schema/testapp`)
+- `payments` (`schema/payments`)
+
 
 ### How to specify a database
 
@@ -4193,6 +4506,22 @@ SchemaBot is holding back its remaining GitHub API quota for check runs, so it d
 </details>
 
 
+## Aggregate Check — Plan Blocked
+
+<details>
+<summary><strong>Aggregate Check — Plan Blocked</strong></summary>
+
+Plan blocked
+
+| Database | Type | Change | Status |
+|----------|------|--------|--------|
+| `orders` | postgres | 1 index drop | Blocked |
+
+
+The plan comment names each blocked change and why. Rewrite the change into a form SchemaBot runs, or take it out of the schema files, and push.
+</details>
+
+
 ## Aggregate Check — Multi-Target Rollout Names Its Targets
 
 <details>
@@ -4404,6 +4733,51 @@ Options:
 
 🔒 Lock for testapp (mysql) is now held by another owner, so it was left in place.
    Nothing was submitted and this command holds no lock. See who holds it: schemabot locks
+
+```
+</details>
+
+<details>
+<summary><a name="lock-kept-an-apply-runs-under-it"></a><strong>Lock Kept (An Apply Runs Under It)</strong></summary>
+
+```
+
+🔒 Lock kept for testapp (mysql): apply apply-b2c3d4e5 (running) runs under it.
+   Watch that apply: schemabot progress apply-b2c3d4e5 -e staging
+
+```
+</details>
+
+<details>
+<summary><a name="lock-left-in-place-taken-again-since"></a><strong>Lock Left In Place (Taken Again Since)</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) was released and taken again since this command took it, so it was left in place.
+   This command released nothing. See who holds it: schemabot locks
+
+```
+</details>
+
+<details>
+<summary><a name="apply-settled-lock-now-held-by-another-owner"></a><strong>Apply Settled, Lock Now Held By Another Owner</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) is now held by another owner, so it was left in place.
+   This command released nothing. See who holds it: schemabot locks
+
+```
+</details>
+
+<details>
+<summary><a name="lock-kept-server-reported-no-lock-id"></a><strong>Lock Kept (Server Reported No Lock ID)</strong></summary>
+
+```
+
+🔒 Lock kept for testapp (mysql): the server did not say which lock this command took, so releasing it could remove a lock another command uses.
+   See who holds it: schemabot locks
+   If no apply of yours runs under it, release it: schemabot unlock -d testapp -t mysql
 
 ```
 </details>
@@ -5843,7 +6217,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
-_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC) · changes show within ~5s_
 
 </details>
 
@@ -6208,7 +6582,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
-- Rows: 87,231 / 523,140 · ~157 MB · ETA: 7m 0s
+- Rows: 87,231 / 523,140 · ~157 MB · ETA: 7m
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -6702,16 +7076,16 @@ schemabot apply -e staging
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
-
-```sql
-ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-```
-
 **`products`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
@@ -6947,16 +7321,16 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 **Schema `testapp`**
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
-
-```sql
-ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-```
-
 **`users`**: 🚫 Cancelled at 72.00%
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
@@ -8843,11 +9217,11 @@ Sequential mode: Middle table failed
      ~ orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-
      ~ products: 🚫 Cancelled (not started)
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -9469,10 +9843,10 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70.00%
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
-       • Rows: 2,800,000 / 4,000,000 · ETA: 2m 0s
+       • Rows: 2,800,000 / 4,000,000 · ETA: 2m
        • Shards: 2 (2 copying)
            ◉ -80: 95.24% · 2,000,000 / 2,100,000 rows · ETA: 10s
-           ◉ 80-: 42.11% · 800,000 / 1,900,000 rows · ETA: 2m 0s
+           ◉ 80-: 42.11% · 800,000 / 1,900,000 rows · ETA: 2m
 
 ```
 </details>
@@ -9693,7 +10067,7 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
 │  Deploy Request:     https://app.planetscale.com/my-org/myapp/deploy-requests/48  │
 │  Started:            Jan 15 14:28:00 UTC                                          │
 │  Duration:           30s                                                          │
-│  Revert expires in:  28m 29s                                                      │
+│  Revert expires in:  28m 30s                                                      │
 └───────────────────────────────────────────────────────────────────────────────────┘
 
 
@@ -9854,7 +10228,7 @@ Resuming from checkpoint...
 
      ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 39.75%
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-       • Rows: 158,000 / 397,453 · ETA: 8m 0s
+       • Rows: 158,000 / 397,453 · ETA: 8m
 
      ~ products: ⏳ Queued
        ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -10222,7 +10596,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 *Applied by @aparajon at 2026-03-15 14:10:00 UTC*
 
-**Targets**: 40 completed, 8 running, 79 queued, 1 failed
+**Targets**: 40 completed, 8 running, 79 queued, 1 failed (8 at a time)
 
 > ❌ **First failure:** <code>us/orders_062</code> — Error 1062: Duplicate entry &#39;12345&#39; for key &#39;orders.idx_user_id&#39;
 
@@ -10232,6 +10606,15 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 <details open>
 <summary>❌ us — 40 completed, 4 running, 19 queued, 1 failed (64 targets)</summary>
 <dl><dd>
+
+**`orders`**: ❌ Failed · 7 queued, 1 failed
+
+**targets `orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`**
+```sql
+ALTER TABLE `orders`
+    ADD INDEX `idx_user_id`(`user_id`),
+    ADD COLUMN `note` text;
+```
 
 **`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜ 75%
 
@@ -10252,15 +10635,6 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   - ◉ `orders_042`: 62.38% · 914,707 / 1,466,232 rows
   - ◉ `orders_043`: 62.38% · 914,707 / 1,466,232 rows
 
-**`orders`**: ❌ Failed · 7 queued, 1 failed
-
-**targets `orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`**
-```sql
-ALTER TABLE `orders`
-    ADD INDEX `idx_user_id`(`user_id`),
-    ADD COLUMN `note` text;
-```
-
 
 | Target | Status |
 | --- | --- |
@@ -10278,7 +10652,7 @@ ALTER TABLE `orders`
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
-- Rows: 732,116 / 5,864,928 across 4 of 64 targets · ETA: ≥ 23m 0s
+- Rows: 732,116 / 5,864,928 across 4 of 64 targets · ETA: ≥ 23m
 - Targets: 64 (4 copying, 60 queued)
   - ◉ `orders_000`: 12.48% · 183,029 / 1,466,232 rows
   - ◉ `orders_001`: 12.48% · 183,029 / 1,466,232 rows
@@ -10552,16 +10926,16 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
-
-```sql
-ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-```
-
 **`products`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
@@ -11081,7 +11455,7 @@ b0-b8  b8-c0  c0-c8  c8-d0  d0-d8  d8-e0  e0-e8  e8-f0  f0-f8  f8-
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
-📋 **Plan**: **1** table to alter
+📋 **Plan**: **1** table to alter · 32 shards, 8 at a time
 
 
 ---
@@ -11140,7 +11514,7 @@ fd-fe  fe-ff  ff-
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
-📋 **Plan**: **1** table to alter
+📋 **Plan**: **1** table to alter · 256 shards, 8 at a time
 
 
 ---
@@ -11297,7 +11671,7 @@ ALTER TABLE `mutes`
 
 **Status**: In Progress — 0 of 1 change applied
 
-**Shards**: 1 running table copy, 3 waiting for -40
+**Shards**: 1 running table copy, 3 queued (1 at a time)
 
 #### Keyspace `cdb_resolute_sharded`
 
@@ -11312,6 +11686,13 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
   - ○ `40-80`: queued
   - ○ `80-c0`: queued
   - ○ `c0-`: queued
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
 
 _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
@@ -11335,7 +11716,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 #### Keyspace `cdb_resolute_sharded`
 
-**`mutes`**: ❌ Failed
+**`mutes`**: ❌ Failed on 1 of 4 shards
 
 ```sql
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
@@ -11358,6 +11739,132 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="apply-failed-many-shards-failed"></a><strong>Apply Failed (Many Shards Failed)</strong></summary>
+
+
+## Schema Change Status — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-03-15 14:30:00 UTC*
+
+**Status**: Failed — 0 of 1 change applied
+
+**Shards**: 6 failed, 10 halted
+
+> ❌ **Failed on 6 of 16 shards:**
+> - shards `-10`, `10-20`, `30-40`, `40-50`, `50-60`: Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again.
+> - shard `20-30`: The schema change ran out of time before it finished; see the server logs for the step that timed out.
+
+#### Keyspace `cdb_resolute_sharded`
+
+**`mutes`**: ❌ Failed on 6 of 16 shards
+
+```sql
+ALTER TABLE `mutes` ADD UNIQUE `uk_target`(`target_id`);
+```
+
+<details>
+<summary>❌ 6 failed</summary>
+
+| Shard | Status |
+| --- | --- |
+| `-10` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `10-20` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `20-30` | ❌ failed — The schema change ran out of time before it finished; see the server logs for the step that timed out. |
+| `30-40` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `40-50` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `50-60` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+
+</details>
+
+<details>
+<summary>⏸️ 10 halted</summary>
+
+```
+60-70  70-80  80-90  90-a0  a0-b0  b0-c0  c0-d0  d0-e0  e0-f0  f0-
+```
+
+</details>
+
+
+---
+
+To retry:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="apply-running-past-a-failed-shard"></a><strong>Apply Running Past A Failed Shard</strong></summary>
+
+
+## Schema Change Status — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-03-15 14:30:00 UTC*
+
+**Status**: In Progress — 0 of 1 change applied
+
+**Shards**: 3 failed, 4 running table copy, 9 halted
+
+> ❌ **Failed on shards `-10`, `10-20`, `20-30`:** Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again.
+
+#### Keyspace `cdb_resolute_sharded`
+
+**`mutes`**: ❌ Failed on 3 of 16 shards
+
+```sql
+ALTER TABLE `mutes` ADD UNIQUE `uk_target`(`target_id`);
+```
+
+<details>
+<summary>❌ 3 failed</summary>
+
+| Shard | Status |
+| --- | --- |
+| `-10` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `10-20` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+| `20-30` | ❌ failed — Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again. |
+
+</details>
+
+<details>
+<summary>🔄 4 running table copy</summary>
+
+```
+30-40  40-50  50-60  60-70
+```
+
+</details>
+
+<details>
+<summary>⏸️ 9 halted</summary>
+
+```
+70-80  80-90  90-a0  a0-b0  b0-c0  c0-d0  d0-e0  e0-f0  f0-
+```
+
+</details>
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
+
+A new apply can retry the failure once this one finishes or is stopped; it reprocesses only the tables that haven't completed.
+
+_Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="apply-with-divergent-shards"></a><strong>Apply With Divergent Shards</strong></summary>
 
 
@@ -11369,7 +11876,7 @@ schemabot apply -e production
 
 **Status**: In Progress — 0 of 1 change applied
 
-**Shards**: 1 running table copy, 2 waiting for -40
+**Shards**: 1 running table copy, 2 queued
 
 #### Keyspace `cdb_resolute_sharded`
 
@@ -11398,13 +11905,20 @@ Shards diverge — grouped by change:
 | Shard | Status |
 | --- | --- |
 | `-40` | 🔄 running table copy |
-| `80-c0` | ⏳ waiting for -40 |
+| `80-c0` | ⏳ queued |
 
 **shard `40-80`**
 
 | Shard | Status |
 | --- | --- |
-| `40-80` | ⏳ waiting for -40 |
+| `40-80` | ⏳ queued |
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
 
 _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
@@ -11422,7 +11936,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 **Status**: In Progress — 1 of 4 changes applied (done on 1 of 6 shards)
 
-**Shards**: 1 completed, 1 running table copy, 4 waiting for cdb_resolute_lookup/-
+**Shards**: 1 completed, 1 running table copy, 4 queued
 
 #### Keyspace `cdb_resolute`
 
@@ -11439,7 +11953,7 @@ ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);
 ```sql
 ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);
 ```
-- Rows: 540,211 / 2,000,780 · ~612 MB · ETA: 8m 0s
+- Rows: 540,211 / 2,000,780 · ~612 MB · ETA: 8m
 
 #### Keyspace `cdb_resolute_sharded`
 
@@ -11449,10 +11963,15 @@ ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
-### VSchema
+**VSchema**: Pending
 
-**`cdb_resolute_sharded`**: Pending
 
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
 
 _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
@@ -11472,6 +11991,8 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 **Shards**: 4 completed
 
+<details><summary>Apply details (1 table, 1 VSchema update)</summary>
+
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: ✅ Complete (4 shards)
@@ -11480,9 +12001,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
-### VSchema
-
-**`cdb_resolute_sharded`**: Applied
+**VSchema**: Applied
 
 ```diff
 --- current
@@ -11500,33 +12019,6 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 
 </details>
-
-<details>
-<summary><a name="summary-keyspace-finalized"></a><strong>Summary: Keyspace Finalized</strong></summary>
-
-
-## ✅ Schema Change Applied — Production
-
-**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
-
-*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
-
-> Applied successfully — your schema change is live!
-
-**Shards**: 2 completed
-
-#### Keyspace `cdb_resolute_sharded`
-
-**`mutes`**: ✅ Complete (2 shards)
-
-```sql
-ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
-```
-
-### Finalize
-
-**`cdb_resolute_sharded`**: Finalized
-
 
 </details>
 
@@ -11547,7 +12039,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 #### Keyspace `cdb_resolute_sharded`
 
-**`mutes`**: ❌ Failed
+**`mutes`**: ❌ Failed on 1 of 4 shards
 
 ```sql
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
@@ -11560,10 +12052,40 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 | `80-c0` | ⏸️ halted — -40 failed |
 | `c0-` | ⏸️ halted — -40 failed |
 
-### VSchema
+**VSchema**: Cancelled
 
-**`cdb_resolute_sharded`**: Cancelled
 
+---
+
+To retry:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="summary-keyspace-finalize-failed"></a><strong>Summary: Keyspace Finalize Failed</strong></summary>
+
+
+## ❌ Schema Change Failed — Production
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `shop` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
+
+*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
+
+**Shards**: 4 completed
+
+> ❌ **Failure:** finalizing keyspace <code>commerce</code> — publish routing rules: target is read-only
+
+#### Keyspace `commerce`
+
+**`mutes`**: ✅ Complete (4 shards)
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
 
 ---
 
@@ -11593,7 +12115,7 @@ schemabot apply -e production
 
 #### Keyspace `shop_sharded`
 
-**`mutes`**: ❌ Failed
+**`mutes`**: ❌ Failed on 1 of 4 shards
 
 ```sql
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
@@ -11715,7 +12237,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-       • Rows: 42,000 / 120,000 · ETA: 4m 0s
+       • Rows: 42,000 / 120,000 · ETA: 4m
 
 
 ⏳ ap-south — waiting for eu-west (orders-ap-south)
@@ -11803,7 +12325,7 @@ To retry once the failure above is resolved — a new apply reprocesses only the
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-       • Rows: 42,000 / 120,000 · ETA: 4m 0s
+       • Rows: 42,000 / 120,000 · ETA: 4m
 
 
 ⏸️ ap-south — halted — us-east failed (orders-ap-south)
@@ -11878,10 +12400,10 @@ A new apply can retry the failure once this one finishes or is stopped; it repro
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜ 79%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-       • Rows: 4,093,000 / 4,720,000 across 59 of 64 targets · ETA: ≥ 10m 0s
+       • Rows: 4,093,000 / 4,720,000 across 59 of 64 targets · ETA: ≥ 10m
        • Targets: 64 (1 failed, 19 copying, 4 queued, 40 complete)
            ✗ payments-041: failed
-           ◉ payments-042: 25.00% · 20,000 / 80,000 rows · ETA: 10m 0s
+           ◉ payments-042: 25.00% · 20,000 / 80,000 rows · ETA: 10m
            ◉ payments-043: 28.75% · 23,000 / 80,000 rows · ETA: 9m 35s
            ◉ payments-044: 32.50% · 26,000 / 80,000 rows · ETA: 9m 10s
            ◉ payments-045: 36.25% · 29,000 / 80,000 rows · ETA: 8m 45s
@@ -11970,9 +12492,9 @@ To run the cutover for prod/payments-001:
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 52%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-       • Rows: 168,000 / 240,000 across 3 of 4 targets · ETA: ≥ 4m 0s
+       • Rows: 168,000 / 240,000 across 3 of 4 targets · ETA: ≥ 4m
        • Targets: 4 (2 copying, 1 queued, 1 complete)
-           ◉ payments-001: 45.00% · 36,000 / 80,000 rows · ETA: 4m 0s
+           ◉ payments-001: 45.00% · 36,000 / 80,000 rows · ETA: 4m
            ◉ payments-002: 65.00% · 52,000 / 80,000 rows · ETA: 2m 30s
            ✓ payments-003: 80,000 rows
            ○ payments-004: queued
@@ -12045,17 +12567,17 @@ To resume from where it stopped:
 
 ```
 
-┌─────────────────────────────────────────────────────────┐
-│  Apply ID:     apply-shard-e5f6a7b8                     │
-│  Database:     shop                                     │
-│  Environment:  production                               │
-│  State:        Running                                  │
-│  Shards:       1 running table copy, 3 waiting for -40  │
-│  Caller:       github:octocat                           │
-│  Source:       https://github.com/acme/shop/pull/412    │
-│  Started:      Jan 15 14:26:00 UTC                      │
-│  Duration:     4m                                       │
-└─────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-e5f6a7b8                   │
+│  Database:     shop                                   │
+│  Environment:  production                             │
+│  State:        Running                                │
+│  Shards:       1 running table copy, 3 queued         │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:26:00 UTC                    │
+│  Duration:     4m                                     │
+└───────────────────────────────────────────────────────┘
 
 
   ── shop_001 ──
@@ -12101,7 +12623,7 @@ To resume from where it stopped:
 
   ── shop_001 ──
 
-     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+     ~ orders: ❌ Failed on 1 of 4 shards
        ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
 
        • Shards: 4 (1 failed, 3 cancelled)
@@ -12148,7 +12670,7 @@ The new apply will only process tables that haven't completed.
 
   ── shop_001 ──
 
-     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+     ~ orders: ❌ Failed on 1 of 4 shards
        ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
 
        • Shards: 4 (1 failed, 3 stopped)
@@ -12359,11 +12881,11 @@ Sequential mode: Middle table failed
      ~ orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-
      ~ products: 🚫 Cancelled (not started)
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -12776,7 +13298,7 @@ ESC detach • s stop
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.42%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-       • Rows: 42,500 / 120,000 · ETA: 4m 0s
+       • Rows: 42,500 / 120,000 · ETA: 4m
 
 
 ⏳ ap-south — waiting for eu-west (orders-ap-south)

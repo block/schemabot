@@ -98,6 +98,8 @@ const (
 	ErrCodeActiveApplyExists       = "active_apply_exists"       // Another active apply already exists for the target
 	ErrCodeSourcePolicyDenied      = "source_policy_denied"      // Source repo/path is not authorized for the database
 	ErrCodeLockNotOwned            = "lock_not_owned"            // Lock release denied because the caller is not the owner
+	ErrCodeLockInUse               = "lock_in_use"               // Lock release pinned to a lock row refused: an apply that can still change records that row as its lock; lock_holder names it
+	ErrCodeLockReplaced            = "lock_replaced"             // Lock release pinned to a lock row refused: a different lock now holds the database; nothing was released
 	ErrCodeRateLimited             = "rate_limited"              // Caller or target exceeded its request budget; retry after the advertised delay
 	ErrCodeUnsafeOptInRequired     = "unsafe_opt_in_required"    // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
 	ErrCodePlanBlocked             = "plan_blocked"              // Plan carries a change the engine refuses; no retry or option can apply it
@@ -155,6 +157,21 @@ type ErrorResponse struct {
 	// change_gate_refused command repeated with --override runs at once. A
 	// server that predates the policy omits it, and always asks an approver.
 	OverrideOnReason bool `json:"override_on_reason,omitempty"`
+
+	// LockHolder is the apply that kept a lock_in_use lock release from
+	// releasing the lock.
+	LockHolder *LockHolder `json:"lock_holder,omitempty"`
+}
+
+// LockHolder is an apply that records a lock row as its lock and can still
+// change, so a release pinned to that row keeps the lock.
+type LockHolder struct {
+	// ApplyID is the apply's identifier, such as "apply-a1b2c3d4".
+	ApplyID string `json:"apply_id"`
+	// State is the apply's state, such as "running" or "stopped".
+	State string `json:"state"`
+	// Environment is the environment the apply runs in.
+	Environment string `json:"environment,omitempty"`
 }
 
 // ChangeGateBlocker is one reason a change gate refused an apply, start or
@@ -661,6 +678,19 @@ type PulledNamespace struct {
 	// with no violations serializes as an explicit empty list so a clean
 	// audit is distinguishable from lint not being requested (omitted).
 	Lint []*LintViolationResponse `json:"lint,omitzero"`
+	// SkippedTables are the live tables the pull left out of Tables because
+	// their schema file cannot describe them in full, in name order. Set only
+	// when the request asked for SkipUnrepresentableTables.
+	SkippedTables []SkippedTable `json:"skipped_tables,omitempty"`
+}
+
+// SkippedTable is a live table a pull, or a plan's rollback capture, left
+// out, and why.
+type SkippedTable struct {
+	Table string `json:"table"`
+	// Reason says what the table carries that its schema file cannot
+	// describe.
+	Reason string `json:"reason"`
 }
 
 // NamespaceCatalog contains structured metadata for a pulled namespace.
@@ -733,6 +763,13 @@ type PullSchemaRequest struct {
 	// violations to each namespace, so a caller can audit a database's lint
 	// debt without planning a change. Off by default.
 	Lint bool `json:"lint,omitempty"`
+	// SkipUnrepresentableTables returns the rest of a namespace when some of
+	// its tables cannot be described by a schema file, naming each one in the
+	// namespace's SkippedTables, instead of refusing the whole pull. Off by
+	// default. A caller that writes schema files from the response must keep
+	// every skipped table out of the plan, such as with ignore_tables,
+	// because a table with no schema file is planned as a drop.
+	SkipUnrepresentableTables bool `json:"skip_unrepresentable_tables,omitempty"`
 }
 
 // PullSchemaResponse is the HTTP response body for POST /api/pull.
@@ -995,6 +1032,14 @@ type PlanResponse struct {
 	// on them. Nil when the environment has a single member. The top-level
 	// Changes and Shards are the primary member's plan.
 	Rollout *PlanRolloutResponse `json:"rollout,omitempty"`
+	// Freezes are the freezes that cover a change to this database in this
+	// environment when it was planned: those in effect, which would refuse
+	// its apply now, then those scheduled, which will once they start. They
+	// only inform: the apply checks the freezes again, and that check
+	// decides. Like ExemptTables they are carried on the response to the plan
+	// request only. Empty when no freeze covers the change, or when SchemaBot
+	// could not read the freezes.
+	Freezes []Freeze `json:"freezes,omitempty"`
 }
 
 // PlanRolloutResponse is the plan of every member of a rollout.
@@ -1715,6 +1760,10 @@ type SchemaChangeResponse struct {
 	Namespace    string                 `json:"namespace"`
 	TableChanges []*TableChangeResponse `json:"table_changes,omitempty"`
 	Metadata     map[string]string      `json:"metadata,omitempty"` // Engine-specific data (e.g., "vschema" → diff)
+	// RollbackBlockers are the live tables that kept the plan from capturing
+	// this namespace's original schema. An apply of the plan still runs, but
+	// it cannot be rolled back.
+	RollbackBlockers []SkippedTable `json:"rollback_blockers,omitempty"`
 }
 
 // TableChangeResponse represents a DDL change in the HTTP response.
@@ -1938,6 +1987,12 @@ type ProgressResponse struct {
 	// VSchema change. Operations still lists every shard and finalizer row,
 	// but a client renders the apply as one change, the way its PR comments do.
 	Sharded bool `json:"sharded,omitempty"`
+	// MaxOperationsAtOnce is how many of the apply's operations the server's
+	// drivers run at once (its max_drivers_per_apply), set when the apply runs
+	// more than one operation. A client states it beside a running rollout's
+	// counts, so the operations queued behind it read as waiting their turn.
+	// Zero when the response does not say.
+	MaxOperationsAtOnce int `json:"max_operations_at_once,omitempty"`
 	// StoppedByFreeze names the freeze that stopped this apply, set only while
 	// the apply is stopped and the stop that stopped it was a freeze's (one
 	// with running "stop"), not an operator's.
@@ -2032,6 +2087,12 @@ type TableProgressResponse struct {
 	RowsTotal       int64  `json:"rows_total"`
 	PercentComplete int32  `json:"percent_complete"`
 	ETASeconds      int64  `json:"eta_seconds,omitempty"`
+	// RowsTotalPlanned marks a sharded table's rows_total that also counts
+	// the plan's estimate for each shard still to copy that has not reported
+	// a total, so rows_total and percent_complete span the whole table. The
+	// total is then approximate. False when rows_total covers only the
+	// shards that reported one.
+	RowsTotalPlanned bool `json:"rows_total_planned,omitempty"`
 	// EstimatedBytes is the plan's approximate on-disk footprint of the table
 	// (data plus indexes), for display beside the row counts. It is the
 	// table's size when planned, not a measure of copy progress. Absent when

@@ -6,7 +6,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"sync"
 	"testing"
@@ -16,6 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/changeevents"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
@@ -26,7 +30,8 @@ import (
 // re-plan result is configurable so a test can choose whether the driven task
 // still has remaining work; Apply can be forced to reject or error so the
 // failure and retry paths are exercised without a real backend; Stop can be
-// forced to report the change already completed; and its progress can be
+// forced to report the change already completed; Cancel can be forced to
+// refuse; and its progress can be
 // declared externally authoritative so terminal-truth reconciliation runs.
 type multiOpResumeEngine struct {
 	engine.Engine
@@ -36,6 +41,7 @@ type multiOpResumeEngine struct {
 	rejectApply           bool
 	applyErr              error
 	stopErr               error
+	cancelErr             error
 	cancelCalls           int
 	authoritativeProgress bool
 	applyCalls            int
@@ -83,6 +89,9 @@ func (e *multiOpResumeEngine) Cancel(context.Context, *engine.ControlRequest) (*
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.cancelCalls++
+	if e.cancelErr != nil {
+		return nil, e.cancelErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
@@ -113,7 +122,7 @@ type multiOpResumeFixture struct {
 // task states scoped to the first operation, stamps that operation's lease, and
 // returns a context carrying the operation lease alone — the shape of an
 // operator's operation-scoped drive claim.
-func newMultiOpResumeFixture(t *testing.T, taskStates []string) *multiOpResumeFixture {
+func newMultiOpResumeFixture(t *testing.T, taskStates []string, opts ...storage.Option) *multiOpResumeFixture {
 	t.Helper()
 	_, dsn := setupMySQLContainer(t)
 	setupStorageSchema(t, dsn)
@@ -121,7 +130,7 @@ func newMultiOpResumeFixture(t *testing.T, taskStates []string) *multiOpResumeFi
 	cleanupTestTables(t, dsn)
 
 	ctx := t.Context()
-	stor := createStorage(t, dsn)
+	stor := createStorage(t, dsn, opts...)
 	t.Cleanup(func() { utils.CloseAndLog(stor) })
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -419,9 +428,27 @@ func TestLocalClient_OperationDrivePendingStartTriggersDeployWithoutParentWrites
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
-	f := newMultiOpResumeFixture(t, []string{state.Task.WaitingForDeploy})
+	delivered := make(chan string, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		delivered <- string(body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	sender, err := changeevents.New([]changeevents.Destination{{
+		URL: server.URL, Environments: []string{localClientTestEnvironment},
+		Events: []string{changeevents.OperationStarted, changeevents.OperationFinished},
+		Body:   `{{json .Description}}`,
+	}}, slog.Default())
+	require.NoError(t, err)
+	t.Cleanup(sender.Close)
+	f := newMultiOpResumeFixture(t, []string{state.Task.WaitingForDeploy}, storage.WithChangeEvents(sender, nil, slog.Default()))
 	ctx := t.Context()
-	_, err := f.leaseDB.ExecContext(ctx, "UPDATE `applies` SET `state` = ? WHERE `id` = ?",
+	_, err = f.leaseDB.ExecContext(ctx, "UPDATE `applies` SET `state` = ? WHERE `id` = ?",
 		state.Apply.WaitingForDeploy, f.apply.ID)
 	require.NoError(t, err)
 	f.apply.State = state.Apply.WaitingForDeploy
@@ -434,7 +461,11 @@ func TestLocalClient_OperationDrivePendingStartTriggersDeployWithoutParentWrites
 	require.NoError(t, err)
 	require.False(t, alreadyPending)
 
-	require.NoError(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.opID),
+	op, err := f.stor.ApplyOperations().Get(ctx, f.opID)
+	require.NoError(t, err)
+	require.NotNil(t, op)
+	drive := storage.WithOperationChangeAttempt(f.opCtx, op)
+	require.NoError(t, f.client.ResumeApplyOperation(drive, f.apply, f.opID),
 		"consuming a pending start under the operation lease must not abort on a parent-write refusal")
 
 	assert.Equal(t, state.Task.Completed, f.taskState(t, f.tasks[0]),
@@ -448,6 +479,16 @@ func TestLocalClient_OperationDrivePendingStartTriggersDeployWithoutParentWrites
 	require.NoError(t, err)
 	assert.NotNil(t, startReq,
 		"the start request must stay pending so sibling operations' deferred-deploy claims can still fire")
+
+	// Commit the operation outcome as the operator does after the drive.
+	require.NoError(t, f.stor.ApplyOperations().MarkCompleted(drive, f.opID))
+	select {
+	case description := <-delivered:
+		want := fmt.Sprintf("operation.finished apply=%s operation=%d deployment=testdb attempt=1 outcome=completed", f.apply.ApplyIdentifier, f.opID)
+		require.JSONEq(t, fmt.Sprintf("%q", want), description)
+	case <-time.After(5 * time.Second):
+		t.Fatal("deferred deploy did not report its committed outcome")
+	}
 }
 
 // A stop that races the engine's own completion on an operation-scoped drive

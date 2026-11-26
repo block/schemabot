@@ -153,3 +153,65 @@ func TestChangeGateRefusedTextNamesTheOverrideCommand(t *testing.T) {
 	assert.Equal(t, `  schemabot cutover apply-`+lineAttackCleaned+` -e production --override "<reason>"`, lines[3])
 	assertNoTerminalControls(t, strings.Join(lines, "\n"))
 }
+
+// A plan names the freezes in effect, then those scheduled with when they
+// start. Their IDs and reasons come from other people, so they print with
+// control runes removed.
+func TestPlanFreezesText(t *testing.T) {
+	starts := time.Date(2026, 11, 26, 8, 0, 0, 0, time.UTC)
+	ends := starts.Add(48 * time.Hour)
+	lines := PlanFreezesText("production", []apitypes.Freeze{
+		{ID: "freeze-abc", Reason: "SEV-1234 " + lineAttack, InEffect: true},
+		{ID: "freeze-def", Reason: "deploy freeze", InEffect: true},
+		{ID: "freeze-ghi", Reason: "launch week", StartsAt: starts, EndsAt: &ends},
+	})
+
+	assert.Equal(t, []string{
+		"❄️ production is frozen, so applying this plan would be refused now.",
+		"   freeze-abc  SEV-1234 " + lineAttackCleaned + "  (until lifted)",
+		"   freeze-def  deploy freeze  (until lifted)",
+		`Wait for the freezes to end before you apply. If this change can't wait, apply with --override "<reason>": as the server's override policy says, SchemaBot lets it through on your reason, or asks a freeze approver to approve it first.`,
+		"",
+		"❄️ A freeze is scheduled in production. Apply before it starts, and let the change finish: while it holds, the apply is refused, and so is a start or cutover the change still needs.",
+		"   freeze-ghi  launch week  (starts 2026-11-26T08:00:00Z, until 2026-11-28T08:00:00Z)",
+	}, lines)
+	assertNoTerminalControls(t, strings.Join(lines, "\n"))
+	assert.Empty(t, PlanFreezesText("production", nil), "no freeze, no notice")
+}
+
+// The CLI plan and the PR plan comment split the same freezes the same way:
+// each freeze in effect under the heading that says the apply would be
+// refused now, each scheduled one under the heading that says to apply before
+// it starts.
+func TestPlanFreezesSurfacesAgree(t *testing.T) {
+	starts := time.Date(2026, 11, 26, 8, 0, 0, 0, time.UTC)
+	ends := starts.Add(48 * time.Hour)
+	freezes := []apitypes.Freeze{
+		{ID: "freeze-aaaaaaaaaaaaaaaa", Reason: "incident 42", InEffect: true},
+		{ID: "freeze-bbbbbbbbbbbbbbbb", Reason: "launch week", StartsAt: starts, EndsAt: &ends},
+	}
+	notice := &webhooktemplates.PlanFreezeNotice{OverrideOnReason: true}
+	for _, f := range freezes {
+		if f.InEffect {
+			notice.InEffect = append(notice.InEffect, webhooktemplates.RefusingFreeze{ID: f.ID, Reason: f.Reason, EndsAt: f.EndsAt})
+		} else {
+			notice.Scheduled = append(notice.Scheduled, webhooktemplates.ScheduledFreeze{ID: f.ID, Reason: f.Reason, StartsAt: f.StartsAt, EndsAt: f.EndsAt})
+		}
+	}
+	comment := webhooktemplates.RenderPlanComment(webhooktemplates.PlanCommentData{
+		Environment: "production", DatabaseType: "mysql", IsMySQL: true,
+		Changes: []webhooktemplates.KeyspaceChangeData{{Keyspace: "app", Statements: []string{"ALTER TABLE orders ADD COLUMN state TEXT"}}},
+		Freezes: notice,
+	})
+	cli := strings.Join(PlanFreezesText("production", freezes), "\n")
+
+	for surface, out := range map[string]string{"CLI": cli, "PR comment": comment} {
+		frozenAt := strings.Index(out, "is frozen, so applying this plan would be refused now.")
+		scheduledAt := strings.Index(out, "Apply before it starts, and let the change finish")
+		inEffectAt := strings.Index(out, "freeze-aaaaaaaaaaaaaaaa")
+		laterAt := strings.Index(out, "freeze-bbbbbbbbbbbbbbbb")
+		require.True(t, frozenAt >= 0 && scheduledAt >= 0, "%s names both kinds:\n%s", surface, out)
+		assert.True(t, frozenAt < inEffectAt && inEffectAt < scheduledAt, "%s lists the freeze in effect under its heading:\n%s", surface, out)
+		assert.Less(t, scheduledAt, laterAt, "%s lists the scheduled freeze under its heading:\n%s", surface, out)
+	}
+}

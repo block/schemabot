@@ -814,7 +814,9 @@ func TestTableChangeTaskEstimatedBytes(t *testing.T) {
 
 // A task carries the plan's row estimate under the same whole-table rule as
 // its size: its own copy when it spans the table, none when scoped to a shard.
-// Only an ALTER copies rows, so a DROP of a sized table carries none.
+// Only a change that works through the rows carries one: an ALTER, or a
+// CREATE INDEX that reads every row to build the index. A DROP of a sized
+// table carries none.
 func TestTableChangeTaskEstimatedRows(t *testing.T) {
 	rows := int64(48_200_000)
 	change := TableChange{Table: "orders", Operation: "alter", EstimatedRows: &rows}
@@ -828,6 +830,33 @@ func TestTableChangeTaskEstimatedRows(t *testing.T) {
 	assert.Nil(t, change.TaskEstimatedRows("-80"), "a shard-scoped task carries no whole-table estimate")
 	assert.Nil(t, TableChange{Table: "users", Operation: "alter"}.TaskEstimatedRows(""), "no estimate at plan time means none on the task")
 
+	createIndex := TableChange{Table: "orders", Operation: "create_index", EstimatedRows: &rows}
+	assert.Equal(t, &rows, createIndex.TaskEstimatedRows(""), "an index build reads every row, so its task carries the estimate")
+
 	drop := TableChange{Table: "orders", Operation: "drop", EstimatedRows: &rows}
 	assert.Nil(t, drop.TaskEstimatedRows(""), "a drop copies no rows, so its task carries no row estimate")
+}
+
+// A shard's copy estimate is the rows the plan read for that shard's own
+// ALTER. A shard that creates the table copies no rows, and a negative
+// estimate is a statistics sentinel rather than a count, so both have none.
+func TestShardCopyEstimatedRows(t *testing.T) {
+	rows := func(n int64) *int64 { return &n }
+	plan := &Plan{Namespaces: map[string]*NamespacePlanData{
+		"shop_sharded": {Shards: []ShardPlan{
+			{Shard: "-80", Changes: []TableChange{{Table: "orders", Operation: "alter", EstimatedRows: rows(1000)}}},
+			{Shard: "80-", Changes: []TableChange{
+				{Table: "orders", Operation: "alter", EstimatedRows: rows(-1)},
+				{Table: "widgets", Operation: "create", EstimatedRows: rows(5)},
+			}},
+		}},
+	}}
+
+	if got := plan.ShardCopyEstimatedRows("shop_sharded", "-80", "orders"); assert.NotNil(t, got) {
+		assert.Equal(t, int64(1000), *got)
+	}
+	assert.Nil(t, plan.ShardCopyEstimatedRows("shop_sharded", "80-", "orders"), "a negative estimate is no estimate")
+	assert.Nil(t, plan.ShardCopyEstimatedRows("shop_sharded", "80-", "widgets"), "a CREATE copies no rows")
+	assert.Nil(t, plan.ShardCopyEstimatedRows("shop_sharded", "c0-", "orders"), "a shard the plan does not change")
+	assert.Nil(t, plan.ShardCopyEstimatedRows("shop", "-80", "orders"), "a namespace the plan does not change")
 }

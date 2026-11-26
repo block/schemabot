@@ -33,6 +33,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/engine/mysqlsize"
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/pendingdrops"
@@ -614,10 +615,8 @@ func newDrainedOutcome(rm *runningSchemaChange) *drainedOutcome {
 			tp.ThrottleReason = ""
 			if rm.state == engine.StateCompleted {
 				tp.Progress = 100
-				// A completed change copied everything, so the copied count is
-				// ground truth: reconcile the estimated total to it the way the
-				// live path does.
-				tp.RowsTotal = tp.RowsCopied
+				// The same total the live path reports for a finished copy.
+				tp.RowsTotal = completedCopyTotal(tp.RowsCopied, tp.RowsTotal)
 			}
 			tables = append(tables, tp)
 		}
@@ -801,27 +800,18 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	for _, namespace := range slices.Sorted(maps.Keys(req.SchemaFiles)) {
 		ns := req.SchemaFiles[namespace]
 		for _, filename := range slices.Sorted(maps.Keys(ns.Files)) {
-			content := ns.Files[filename]
-			stmts, err := ddl.SplitStatements(content)
+			tables, err := parseDesiredTables(namespace, filename, ns.Files[filename])
 			if err != nil {
-				return nil, fmt.Errorf("split statements in %s/%s: %w", namespace, filename, err)
+				return nil, err
 			}
-			for _, stmt := range stmts {
-				ct, err := statement.ParseCreateTable(stmt)
-				if err != nil {
-					return nil, fmt.Errorf("parse desired schema in %s/%s: %w", namespace, filename, err)
-				}
-				// Validate semantic correctness (e.g., index columns exist)
-				if err := ddl.ValidateCreateTable(ct); err != nil {
-					return nil, fmt.Errorf("SQL usage error in %s/%s: %w", namespace, filename, err)
-				}
-				if err := declared.Declare(namespace+"/"+filename, ct.TableName); err != nil {
+			for _, desired := range tables {
+				if err := declared.Declare(namespace+"/"+filename, desired.table); err != nil {
 					return nil, &engine.PlanRefusedError{Err: err}
 				}
 				// The diff names a live table the way it exists, so every
 				// lookup below keys the declaration by that spelling.
-				name := liveName(ct.TableName)
-				desiredSchemas = append(desiredSchemas, table.TableSchema{Name: name, Schema: stmt})
+				name := liveName(desired.table)
+				desiredSchemas = append(desiredSchemas, table.TableSchema{Name: name, Schema: desired.sql})
 				declaredByNamespace[namespace] = append(declaredByNamespace[namespace], name)
 				namespaceByTable[name] = namespace
 			}
@@ -1345,10 +1335,9 @@ func directStatementTableProgress(rm *runningSchemaChange) []engine.TableProgres
 // essentially done).
 //
 // Spirit's per-table RowsTotal is a statistics-based estimate, not a count, so
-// a finished copy can land above or below it. Once the copy is complete the
-// copied count is ground truth: the total is reconciled to it so the table
-// reports a consistent 100% instead of a full bar contradicted by its own rows
-// line (estimate high) or an over-100 ratio (estimate low).
+// a finished copy can land above or below it. A finished table reports 100%
+// and the total completedCopyTotal settles on, which surfaces read as the
+// table's size.
 func buildSpiritTableProgress(prog status.Progress, spiritState status.State, ddlByTable, tableNamespace map[string]string) []engine.TableProgress {
 	stateStr := spiritState.String()
 	var etaSeconds int64
@@ -1366,7 +1355,7 @@ func buildSpiritTableProgress(prog status.Progress, spiritState status.State, dd
 			RowsTotal:  int64(st.RowsTotal),
 		}
 		if st.IsComplete {
-			tp.RowsTotal = tp.RowsCopied
+			tp.RowsTotal = completedCopyTotal(tp.RowsCopied, tp.RowsTotal)
 			tp.Progress = 100
 			// While the runner works through its post-copy phases the table's
 			// interesting state is that phase (applying accumulated changes,
@@ -1402,6 +1391,16 @@ func buildSpiritTableProgress(prog status.Progress, spiritState status.State, dd
 		tableProgress = append(tableProgress, tp)
 	}
 	return tableProgress
+}
+
+// completedCopyTotal is the row total a finished copy reports. Spirit counts
+// the rows its copy inserted, so a copy finishes short of the table's size
+// whenever it skipped rows: the binlog applier wrote them first on a busy
+// table, or a new UNIQUE key dropped duplicates. Only a count above the
+// cardinality estimate proves the estimate low, so the total is raised to
+// the count and never lowered to it.
+func completedCopyTotal(rowsCopied, estimatedTotal int64) int64 {
+	return max(rowsCopied, estimatedTotal)
 }
 
 // tableInPacedPhase reports whether a table is doing work the runner's
@@ -1703,13 +1702,28 @@ func (e *Engine) plannedTableNames(database string, changes []spiritlint.Planned
 	return names
 }
 
-// sizeProbeStatement returns stmt as the size probe sends it: unchanged
-// outside tests, rewritten by the sizeProbeSQL seam inside them.
-func (e *Engine) sizeProbeStatement(ctx context.Context, stmt string) string {
+// sizeProbeConn returns conn as the size probe uses it: unchanged outside
+// tests, and wrapped so the sizeProbeSQL seam rewrites each statement inside
+// them.
+func (e *Engine) sizeProbeConn(conn *sql.Conn) mysqlsize.Conn {
 	if e.sizeProbeSQL == nil {
-		return stmt
+		return conn
 	}
-	return e.sizeProbeSQL(ctx, stmt)
+	return rewritingConn{conn: conn, rewrite: e.sizeProbeSQL}
+}
+
+// rewritingConn sends each statement through rewrite before it reaches conn.
+type rewritingConn struct {
+	conn    *sql.Conn
+	rewrite func(ctx context.Context, stmt string) string
+}
+
+func (c rewritingConn) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return c.conn.ExecContext(ctx, c.rewrite(ctx, query), args...)
+}
+
+func (c rewritingConn) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return c.conn.QueryContext(ctx, c.rewrite(ctx, query), args...)
 }
 
 // fetchTableSizeEstimates reads the approximate row count and on-disk
@@ -1743,79 +1757,19 @@ func (e *Engine) fetchTableSizeEstimates(ctx context.Context, target *lazyTarget
 		return nil, fmt.Errorf("acquire connection for size estimates: %w", err)
 	}
 	defer utils.CloseAndLog(conn)
-	if _, err := conn.ExecContext(ctx, e.sizeProbeStatement(ctx, "SET SESSION information_schema_stats_expiry = 0")); err != nil {
-		return nil, fmt.Errorf("disable cached statistics for size estimates: %w", err)
+	probe := make([]mysqlsize.Table, len(tables))
+	for i, name := range tables {
+		probe[i] = mysqlsize.Table{Schema: database, Name: name}
 	}
-
-	args := make([]any, 0, len(tables)+1)
-	args = append(args, database)
-	for _, name := range tables {
-		args = append(args, name)
-	}
-	query := `
-		SELECT table_name, table_rows, data_length + index_length
-		FROM information_schema.tables
-		WHERE table_schema = ? AND table_type = 'BASE TABLE'
-		  AND table_name IN (?` + strings.Repeat(", ?", len(tables)-1) + `)`
-	requested := requestedTableNames(tables)
-
-	rows, err := conn.QueryContext(ctx, e.sizeProbeStatement(ctx, query), args...)
+	read, err := mysqlsize.Read(ctx, e.sizeProbeConn(conn), e.logger, probe)
 	if err != nil {
-		return nil, fmt.Errorf("query size estimates for tables %v: %w", tables, err)
+		return nil, fmt.Errorf("read size estimates for database %s: %w", database, err)
 	}
-	defer utils.CloseAndLog(rows)
-
-	estimates := make(map[string]tableSizeEstimate)
-	for rows.Next() {
-		var name string
-		var tableRows, tableBytes sql.NullInt64
-		if err := rows.Scan(&name, &tableRows, &tableBytes); err != nil {
-			return nil, fmt.Errorf("scan table size estimate: %w", err)
-		}
-		// information_schema can match a name case-insensitively and return it
-		// in the server's case; the estimate is keyed by the name the plan
-		// asked for, which is the name its changes carry.
-		asked, ok := requested[strings.ToLower(name)]
-		if !ok {
-			e.logger.Warn("size probe returned a table the plan did not ask for; ignoring it",
-				"database", database, "table", name)
-			continue
-		}
-		name = asked
-		est := tableSizeEstimate{
-			rows:  e.validSizeStatistic(database, name, "table_rows", tableRows),
-			bytes: e.validSizeStatistic(database, name, "data_length + index_length", tableBytes),
-		}
-		if est.rows == nil && est.bytes == nil {
-			// validSizeStatistic logged why each one is missing.
-			continue
-		}
-		estimates[name] = est
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate table size estimates: %w", err)
+	estimates := make(map[string]tableSizeEstimate, len(read))
+	for t, est := range read {
+		estimates[t.Name] = tableSizeEstimate{rows: est.Rows, bytes: est.Bytes}
 	}
 	return estimates, nil
-}
-
-// validSizeStatistic returns a base table's statistic as a display estimate,
-// or nil with a warning when statistics could not report it. A NULL value is a
-// base table whose statistics are unreadable (for example a discarded
-// tablespace), and a negative one is a sentinel for "no real estimate", not a
-// count, as it is for the direct execution size gate.
-func (e *Engine) validSizeStatistic(database, table, statistic string, v sql.NullInt64) *int64 {
-	if !v.Valid {
-		e.logger.Warn("table statistics report no value; the plan will omit it from the table's size",
-			"database", database, "table", table, "statistic", statistic)
-		return nil
-	}
-	if v.Int64 < 0 {
-		e.logger.Warn("table statistics report a negative value; the plan will omit it from the table's size",
-			"database", database, "table", table, "statistic", statistic, "value", v.Int64)
-		return nil
-	}
-	n := v.Int64
-	return &n
 }
 
 // logMissingSizeEstimates reports the existing tables a successful probe
@@ -1847,13 +1801,33 @@ func partitionByExistence(tables []string, currentByTable map[string]string) (ex
 	return existing, created
 }
 
-// requestedTableNames indexes the probed table names by their lower-cased
-// form, so a row information_schema returns in a different case maps back to
-// the name the plan asked for.
-func requestedTableNames(tables []string) map[string]string {
-	requested := make(map[string]string, len(tables))
-	for _, name := range tables {
-		requested[strings.ToLower(name)] = name
+// desiredTable is one CREATE TABLE a schema file declares.
+type desiredTable struct {
+	sql   string
+	table string
+}
+
+// parseDesiredTables reads the CREATE TABLE statements of one schema file.
+// It reads only the file's text, so whatever it rejects is fixed by editing
+// the file, and it reports each rejection as a plan refusal: a statement that
+// does not parse, one that is not a CREATE TABLE, or one that names a column
+// it does not declare.
+func parseDesiredTables(namespace, filename, content string) ([]desiredTable, error) {
+	stmts, err := ddl.SplitStatements(content)
+	if err != nil {
+		return nil, &engine.PlanRefusedError{Err: fmt.Errorf("split statements in %s/%s: %w", namespace, filename, err)}
 	}
-	return requested
+	tables := make([]desiredTable, 0, len(stmts))
+	for _, stmt := range stmts {
+		ct, err := statement.ParseCreateTable(stmt)
+		if err != nil {
+			return nil, &engine.PlanRefusedError{Err: fmt.Errorf("parse desired schema in %s/%s: %w", namespace, filename, err)}
+		}
+		// Validate semantic correctness (e.g., index columns exist)
+		if err := ddl.ValidateCreateTable(ct); err != nil {
+			return nil, &engine.PlanRefusedError{Err: fmt.Errorf("SQL usage error in %s/%s: %w", namespace, filename, err)}
+		}
+		tables = append(tables, desiredTable{sql: stmt, table: ct.TableName})
+	}
+	return tables, nil
 }

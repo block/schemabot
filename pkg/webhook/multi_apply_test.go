@@ -25,7 +25,7 @@ func runningApply() *storage.Apply {
 // An apply with no operation rows (legacy, predating apply_operations) renders
 // the single-deployment comment unchanged — no aggregate header.
 func TestFormatApplyStatusComment_NoOperationsRendersSingle(t *testing.T) {
-	out := formatApplyStatusComment(runningApply(), nil, false, nil, nil, nil, nil, "", "", nil)
+	out := formatApplyStatusComment(runningApply(), nil, false, nil, nil, nil, nil, "", "", nil, 0, 0)
 	assert.Contains(t, out, "## Schema Change Status")
 	assert.NotContains(t, out, "**Deployments**:")
 }
@@ -36,7 +36,7 @@ func TestFormatApplyStatusComment_OneOperationRendersSingle(t *testing.T) {
 	ops := []*storage.ApplyOperation{
 		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Running},
 	}
-	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil)
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil, 0, 0)
 	assert.NotContains(t, out, "**Deployments**:")
 	assert.NotContains(t, out, "- 🔄 `eu`")
 }
@@ -48,7 +48,7 @@ func TestFormatApplyStatusComment_MultipleOperationsRendersMulti(t *testing.T) {
 		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyBarrier},
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier},
 	}
-	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil)
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil, 0, 0)
 	assert.Contains(t, out, "## Schema Change Status")
 	assert.Contains(t, out, "**Deployments**: 1 completed, 1 running")
 	assert.Contains(t, out, "- ✅ `eu` — completed")
@@ -65,13 +65,13 @@ func TestFormatApplyStatusComment_CutoverNextActionFollowsDeferCutover(t *testin
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier},
 	}
 
-	automatic := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil)
+	automatic := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil, 0, 0)
 	assert.Contains(t, automatic, "SchemaBot will run the cutover for `eu` next — no action needed.")
 	assert.NotContains(t, automatic, "schemabot cutover")
 
 	deferred := runningApply()
 	deferred.Options = storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true})
-	manual := formatApplyStatusComment(deferred, ops, false, nil, nil, nil, nil, "", "", nil)
+	manual := formatApplyStatusComment(deferred, ops, false, nil, nil, nil, nil, "", "", nil, 0, 0)
 	assert.Contains(t, manual, "To run the cutover for `eu`:")
 	assert.Contains(t, manual, "schemabot cutover apply-1 -e production")
 	assert.NotContains(t, manual, "SchemaBot will run the cutover for")
@@ -87,10 +87,10 @@ func TestFormatApplyStatusComment_ReleasedPauseRendersDegradedNotPaused(t *testi
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Pending, OnFailure: storage.OnFailurePause},
 	}
 
-	paused := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil)
+	paused := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "", nil, 0, 0)
 	assert.Contains(t, paused, "paused — eu failed; release or stop")
 
-	released := formatApplyStatusComment(runningApply(), ops, true, nil, nil, nil, nil, "", "", nil)
+	released := formatApplyStatusComment(runningApply(), ops, true, nil, nil, nil, nil, "", "", nil, 0, 0)
 	assert.NotContains(t, released, "paused — eu failed; release or stop")
 }
 
@@ -159,7 +159,7 @@ func TestFormatApplyStatusComment_ResumingRolloutReadsAsResuming(t *testing.T) {
 				)
 			}
 
-			out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil)
+			out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil, 0, 0)
 			assert.Contains(t, out, "🔄 0 of 2 tables done on 2 targets\n")
 			assert.Contains(t, out, "**`bikes`**: 🔄 Resuming…\n")
 			assert.Contains(t, out, "ADD INDEX `idx_status`", "the table keeps its DDL")
@@ -188,7 +188,7 @@ func TestFormatApplyStatusComment_ResumingRolloutKeepsTargetsThatMovedOn(t *test
 			first,
 			{ApplyOperationID: new(int64(2)), TableName: "bikes", DDL: bikesDDL, State: state.Task.Stopped, RowsCopied: 57, RowsTotal: 100},
 		}
-		return formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil)
+		return formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil, 0, 0)
 	}
 
 	finished := render(&storage.Task{TableName: "bikes", DDL: bikesDDL, State: state.Task.Completed, RowsCopied: 100, RowsTotal: 100})
@@ -217,7 +217,7 @@ func TestFormatApplyStatusComment_ResumingSingleTargetSections(t *testing.T) {
 		)
 	}
 
-	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil)
+	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil, 0, 0)
 	assert.Equal(t, 2, strings.Count(out, "**`bikes`**: 🔄 Resuming…\n"), out)
 	assert.Equal(t, 2, strings.Count(out, "**`docks`**: ⏳ Queued"), out)
 	assert.NotContains(t, out, "**`docks`**: 🔄 Resuming…")
@@ -429,18 +429,6 @@ func TestDeriveApplyPresentation_HeldByARetryingTask(t *testing.T) {
 	assert.Equal(t, "ready for cutover", deriveApplyPresentation(state.Apply.Running, ops, nil, false).Deployments[1].Label)
 }
 
-// Tasks without an apply_operation_id (legacy rows) are not attributable to a
-// deployment and are dropped from the per-operation grouping.
-func TestGroupTasksByOperation_SkipsUnlinkedTasks(t *testing.T) {
-	grouped := groupTasksByOperation([]*storage.Task{
-		{ApplyOperationID: new(int64(1)), TableName: "a"},
-		{ApplyOperationID: nil, TableName: "orphan"},
-		{ApplyOperationID: new(int64(1)), TableName: "b"},
-	})
-	require.Len(t, grouped[1], 2)
-	assert.Len(t, grouped, 1)
-}
-
 // Target orders-001 deferred its cutover across shards -80 and 80-, and 80-
 // failed while -80 waited at the cutover, so SchemaBot stopped -80 and failed
 // it for 80- (ended_by_operation_id). The comment's model reads -80 as stopped
@@ -460,5 +448,28 @@ func TestDeriveApplyPresentation_StoppedAtCutoverNamesTheFailedRow(t *testing.T)
 	assert.Equal(t, []presentation.StateCount{{Label: "failed", Count: 1}, {Label: "stopped at cutover", Count: 1}}, model.Counts)
 	require.NotNil(t, model.FirstFailure)
 	assert.Equal(t, 1, model.FirstFailure.Row)
+	assert.Equal(t, "lock wait timeout exceeded", model.FirstFailure.Error)
+}
+
+// Target orders-001 failed on a remote data plane that recorded the error on
+// its task and never stamped the operation row. The comment's model reads the
+// target's reason from that task, the same reason the progress API serves the
+// CLI, so the failed-target row names it instead of reading blank.
+func TestDeriveApplyPresentation_FailedTargetReasonFromItsTask(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 21, Deployment: "payments-a", Target: "orders-001", State: state.ApplyOperation.Failed},
+		{ID: 22, Deployment: "payments-a", Target: "orders-002", State: state.ApplyOperation.Failed, ErrorMessage: "copy failed on orders"},
+	}
+	tasksByOp := map[int64][]*storage.Task{
+		21: {{TableName: "orders", State: state.Task.Failed, ErrorMessage: "lock wait timeout exceeded"}},
+		22: {{TableName: "orders", State: state.Task.Failed, ErrorMessage: "duplicate entry"}},
+	}
+
+	model := deriveApplyPresentation(state.Apply.Failed, ops, tasksByOp, false)
+
+	require.Len(t, model.Deployments, 2)
+	assert.Equal(t, "lock wait timeout exceeded", model.Deployments[0].Error)
+	assert.Equal(t, "copy failed on orders", model.Deployments[1].Error, "a row's own error wins over its tasks'")
+	require.NotNil(t, model.FirstFailure)
 	assert.Equal(t, "lock wait timeout exceeded", model.FirstFailure.Error)
 }

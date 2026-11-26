@@ -8,6 +8,7 @@ package sqlstore
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/storage"
@@ -15,6 +16,7 @@ import (
 
 // Storage implements the storage.Storage interface over database/sql.
 type Storage struct {
+	changeEvents    *changeEventRecorder
 	db              *rebindDB
 	locks           *lockStore
 	plans           *planStore
@@ -86,7 +88,7 @@ func NewWithDependencies(deps Dependencies) *Storage {
 	if maxDriversPerApply <= 0 {
 		maxDriversPerApply = storage.DefaultMaxDriversPerApply
 	}
-	return &Storage{
+	store := &Storage{
 		db:              rdb,
 		locks:           &lockStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 		plans:           &planStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier},
@@ -104,6 +106,17 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		webhookEvents:   &webhookEventStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 		driverPools:     &driverPoolStore{db: rdb, dialect: deps.Dialect},
 	}
+	if deps.Options.ChangeEvents != nil {
+		logger := deps.Options.ChangeEventLog
+		if logger == nil {
+			logger = slog.Default()
+		}
+		events := &changeEventRecorder{store: store, sender: deps.Options.ChangeEvents, app: deps.Options.ChangeEventApp, logger: logger}
+		store.changeEvents = events
+		store.applies.events = events
+		store.applyOperations.events = events
+	}
+	return store
 }
 
 // Locks returns the lock store.

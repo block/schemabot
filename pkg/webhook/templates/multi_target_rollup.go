@@ -433,9 +433,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	fmt.Fprintf(sb, "**%s**: %s%s\n", name, phrase, coverage)
 	writeDDL()
 	if status == state.Task.Pending && !settled {
-		if rows := targetsPlannedRows(cells); rows != nil {
-			writePlannedRows(sb, rows, targetsTableBytes(cells), presentation.PlannedRowsSpan(len(cells)))
-		}
+		writePlannedRows(sb, targetsPlannedRows(cells), targetsTableBytes(cells), presentation.PlannedRowsSpan(len(cells)))
 	}
 	if lists {
 		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, presentation.RunningCopying, budget)

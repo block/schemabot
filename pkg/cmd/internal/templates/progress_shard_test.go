@@ -8,25 +8,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestFormatDurationSeconds(t *testing.T) {
-	tests := []struct {
-		seconds  int64
-		expected string
-	}{
-		{0, "< 1s"},
-		{-1, "< 1s"},
-		{30, "30s"},
-		{60, "1m 0s"},
-		{90, "1m 30s"},
-		{3600, "1h 0m"},
-		{3661, "1h 1m"},
-		{7200, "2h 0m"},
-	}
-	for _, tt := range tests {
-		assert.Equal(t, tt.expected, FormatDurationSeconds(tt.seconds), "seconds=%d", tt.seconds)
-	}
-}
-
 // A copying shard that hasn't reached 1% shows the true fraction computed
 // from its row counts, so a shard's early progress on a huge table reads as
 // the small fraction it is instead of a rounded-up 1%.
@@ -41,6 +22,21 @@ func TestFormatShardLineShowsSubPercentFraction(t *testing.T) {
 
 	assert.Contains(t, line, "0.19% · 3,000 / 1,604,159 rows")
 	assert.NotContains(t, line, " 0%")
+}
+
+// A shard's copy ETA reads in days past a day, like every other duration, so a
+// slow shard shows "1d 1h".
+func TestFormatShardLineETAPastADay(t *testing.T) {
+	line := formatShardLine(ShardProgress{
+		Shard:           "-80",
+		Status:          state.Task.Running,
+		RowsCopied:      400,
+		RowsTotal:       1_000,
+		PercentComplete: 40,
+		ETASeconds:      90_000,
+	}, "queued", "copying")
+
+	assert.Contains(t, line, "ETA: 1d 1h")
 }
 
 func TestIsPlanetScaleEngine(t *testing.T) {

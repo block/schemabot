@@ -298,8 +298,8 @@ func (h *Handler) storeNamespacePlacementCheck(ctx context.Context, client *ghcl
 }
 
 // planFailedCheckSummary is the stored Change column for a plan that reported
-// errors and no change to summarize, so the aggregate's row for it points at
-// the plan comment that carries the errors instead of showing nothing.
+// errors, so the aggregate's row for it points at the plan comment that carries
+// the errors.
 const planFailedCheckSummary = "plan failed; see the plan comment"
 
 // planFailedUnstoredSummary is the failing aggregate's summary when the failing
@@ -394,15 +394,24 @@ func planCheckConclusion(hasChanges, hasPlanErrors, hasFinalRefusal, driftBlocke
 	}
 }
 
+// planOnlyRefused reports whether a plan's failing check is down to the
+// engine refusing a change and nothing else: no plan error the reader has to
+// investigate and no durable block with its own reason. Only such a plan is
+// stored as refused, so its aggregate says the plan is blocked.
+func planOnlyRefused(refused, hasErrors, driftBlocked bool) bool {
+	return refused && !hasErrors && !driftBlocked
+}
+
 // planRefusalFailsCheck reports whether a plan's engine-blocked changes are
 // final enough to fail the check rather than leave the PR at action-required.
 //
 // A refusal is final when no apply SchemaBot runs can satisfy it, so leaving
 // the PR at action-required would coach an apply that is certain to be
 // refused. PostgreSQL blocks a change it has no authoritative classifier
-// verdict for and a DROP TABLE it never executes — the latter is lifted only
-// by the operator changing the repository or the target and re-planning, never
-// by an apply — and Vitess refuses constructs it cannot execute at all. The
+// verdict for and a DROP TABLE it cannot run, such as one of a partitioned
+// table or one a kept table's foreign key still needs — lifted only by the
+// operator changing the repository or the target and re-planning, never by
+// an apply — and Vitess refuses constructs it cannot execute at all. The
 // MySQL engine also marks a refused statement blocked, but there the verdict
 // previews a direct-execution routing decision that apply time re-resolves
 // against live policy and table size, so a plan blocked at review can still
@@ -497,7 +506,8 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	hasChanges := planResp.HasChanges() || drift.work.pending > 0
 	driftBlocked := drift.blocks()
 
-	conclusion := planCheckConclusion(hasChanges, len(planResp.Errors) > 0, planRefusalFailsCheck(schema.Type, planResp), driftBlocked)
+	refused := planRefusalFailsCheck(schema.Type, planResp)
+	conclusion := planCheckConclusion(hasChanges, len(planResp.Errors) > 0, refused, driftBlocked)
 
 	// Review-time drift is a first-class blocking reason, not an overload of the
 	// plan facts: HasChanges stays "some rollout member has changes", and the
@@ -505,8 +515,12 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	// legible and durable across write paths.
 	changeSummary := drift.changeSummary(summarizePlanChanges(schema, planResp, environment))
 	rolloutTargets, rolloutTargetsWithWork := drift.work.rolloutCounts()
-	if changeSummary == "" && len(planResp.Errors) > 0 {
+	if len(planResp.Errors) > 0 {
+		// The errors are what the reader has to act on, and the plan comment
+		// carries them. A change summary beside them would read as a plan
+		// that only refused a change.
 		changeSummary = planFailedCheckSummary
+		rolloutTargets, rolloutTargetsWithWork = 0, 0
 	}
 	blockingReason := ""
 	if driftBlocked {
@@ -531,6 +545,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 
 		RolloutTargets:         rolloutTargets,
 		RolloutTargetsWithWork: rolloutTargetsWithWork,
+		PlanRefused:            planOnlyRefused(refused, len(planResp.Errors) > 0, driftBlocked),
 	}
 	var stored bool
 	if driftBlocked && len(drift.preserve) > 0 {
@@ -1003,6 +1018,7 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 			// The narrowed apply says nothing about the other targets, so the
 			// row carries no counts of them.
 			check.RolloutTargets, check.RolloutTargetsWithWork = 0, 0
+			check.PlanRefused = false
 		}
 		// MarkActionRequiredForApply releases check ownership, so the plan of
 		// the whole environment that lifts this block can write its result.

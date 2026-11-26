@@ -9,9 +9,10 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.33.16
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.16
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.50.11
+	github.com/aws/aws-sdk-go-v2/service/sqs v1.52.0
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.9
 	github.com/block/mysql v0.0.0-20261122231317-2d9dfd496f60
-	github.com/block/pg-sprite v0.5.6-0.20261124121627-63dac36afedd
+	github.com/block/pg-sprite v0.5.7-0.20261126183603-033f2fd57fc8
 	github.com/block/spirit v0.20.1-0.20261122162747-cc0fa5849d1f
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
@@ -38,11 +39,11 @@ require (
 	github.com/prometheus/common v0.67.5
 	github.com/square/etre v0.15.0
 	github.com/stretchr/testify v1.12.1
-	github.com/testcontainers/testcontainers-go v0.45.0
+	github.com/testcontainers/testcontainers-go v0.45.1-0.20261109125418-f31e98d4ee9b // pinned for reaper recovery from a reaper that is being removed; move to the first release that includes it (v0.46.0)
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0
 	github.com/wasilibs/go-pgquery v0.0.0-20261106060434-4301e51f8dbf
-	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.69.0
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.45.0
@@ -170,6 +171,8 @@ require (
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/hashicorp/serf v0.10.2 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/jackc/pgio v1.0.0 // indirect
+	github.com/jackc/pglogrepl v0.0.0-20261111174325-d50336b09c47 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.3 // indirect

@@ -19,6 +19,7 @@ func TestPreviewPlanDisclosuresSelectIndividually(t *testing.T) {
 	}{
 		{templates.PreviewCommentPlanIgnoredNamespaces, "excluded from this plan by `ignore_namespaces`"},
 		{templates.PreviewCommentPlanExemptTables, "Ignored tables in namespace"},
+		{templates.PreviewCommentPlanRollbackBlockers, "- `orders`: holds a foreign key added NOT VALID, which a schema file cannot declare"},
 		{templates.PreviewCommentPlanUnmanagedSchema, "- `services/inventory/schema` declares database `inventory`"},
 		// The reason is engine prose, so it is escaped like any other. An
 		// underscore inside a word cannot start emphasis, so it is left as written.

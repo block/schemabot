@@ -247,17 +247,24 @@ func TestApplyStore_AttachTargetKeyedFinalizerBesideTargetKeyedWork(t *testing.T
 // Attaching to a terminal apply fails closed with ErrApplyNotActive: the
 // apply's target reservation is released and no drive will claim new work
 // under it, so accepting the operation would strand it as permanently pending.
+// The refusal names the state the store read, not the caller's copy, which
+// still reads running when the apply settled after the caller loaded it.
 func TestApplyStore_AttachOperationWithTasksRefusesTerminalApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 	apply := createAttachFixtureApply(t, store)
-	apply.State = state.Apply.Completed
+	apply.State = state.Apply.Cancelled
 	require.NoError(t, store.Applies().Update(ctx, apply))
+	apply.State = state.Apply.Running
 
 	operation, tasks := attachSiblingOperation("payments/80-/users", "80-")
 	err := store.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
 	require.ErrorIs(t, err, storage.ErrApplyNotActive)
+	var notActive *storage.ApplyNotActiveError
+	require.ErrorAs(t, err, &notActive)
+	assert.Equal(t, state.Apply.Cancelled, notActive.State)
+	assert.Equal(t, apply.ApplyIdentifier, notActive.ApplyID)
 
 	ops, listErr := store.ApplyOperations().ListByApply(ctx, apply.ID)
 	require.NoError(t, listErr)

@@ -179,6 +179,7 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 		operations:   data.Operations,
 		released:     data.Released,
 		sharded:      data.Sharded,
+		atOnce:       data.MaxOperationsAtOnce,
 		deferCutover: data.Options["defer_cutover"] == "true",
 		stoppedBy:    data.StoppedByFreeze,
 		errorMsg:     data.ErrorMessage,

@@ -1092,3 +1092,36 @@ func TestGroups_ResumingTargetHeadsGroupOverStoppedOne(t *testing.T) {
 	assert.Equal(t, StateResuming, groups[0].Lead.Presentation)
 	assert.Equal(t, []StateCount{{"resuming", 1}, {"stopped", 1}}, groups[0].Counts)
 }
+
+// Two work rows of one target start in parallel, so a pending row is not
+// ordered behind its sibling. Once the sibling fails, though, the claim holds
+// the pending row whichever of the two comes first, so it reads as paused for
+// a release under on_failure=pause and as halted otherwise, even when the
+// failure sits after it. Under continue the claim still lets it start.
+func TestDerivePending_HeldBySameTargetFailure(t *testing.T) {
+	work := func(key, opState string, set func(*Operation)) Operation {
+		op := Operation{Deployment: "payments", Target: "payments-001", OperationKey: key, Work: true, State: opState}
+		set(&op)
+		return op
+	}
+	for _, tc := range []struct {
+		name  string
+		set   func(*Operation)
+		want  PresentationState
+		label string
+	}{
+		{name: "pause", set: func(op *Operation) { op.PauseOnFailure = true }, want: StatePaused, label: "paused — payments failed; release or stop"},
+		{name: "halt", set: func(*Operation) {}, want: StateHalted, label: "halted — payments failed"},
+		{name: "continue", set: func(op *Operation) { op.ContinueOnFailure = true }, want: StateQueuedNext, label: "queued — next in order"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := Derive([]Operation{
+				work("orders/-80", so.Pending, tc.set),
+				work("orders/80-", so.Failed, tc.set),
+			}).Deployments
+			require.Len(t, deps, 2)
+			assert.Equal(t, tc.want, deps[0].Presentation)
+			assert.Equal(t, tc.label, deps[0].Label)
+		})
+	}
+}

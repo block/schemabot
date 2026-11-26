@@ -38,6 +38,10 @@ type TableProgressData struct {
 	// the table is queued and before the engine reports RowsTotal. Nil when
 	// the plan had no estimate.
 	EstimatedRows *int64
+	// RowsTotalPlanned marks a sharded table's RowsTotal that counts the
+	// plan's estimate for the shards that have not reported, so it renders
+	// as approximate (apitypes.TableProgressResponse.RowsTotalPlanned).
+	RowsTotalPlanned bool
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -249,6 +253,10 @@ type ApplyStatusCommentData struct {
 	// applied it, and the one command that acts on the whole rollout, so the
 	// section leaves out all three.
 	InRolloutSection bool
+
+	// UpdateCadence is the longest a change waits before it reaches this
+	// comment, shown beside the "Last updated" footer. Zero renders no note.
+	UpdateCadence time.Duration
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -334,7 +342,7 @@ func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdate
 	// Footer with next actions
 	writeApplyFooter(&sb, data)
 	if includeLastUpdated && !state.IsTerminalApplyState(data.State) {
-		writeLastUpdatedFooter(&sb, renderedAt)
+		writeLastUpdatedFooter(&sb, renderedAt, data.UpdateCadence)
 	}
 
 	return sb.String()
@@ -657,7 +665,7 @@ func revertWindowCountdown(revertExpiresAt string) string {
 	if remaining <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("Closes in %s", formatDuration(remaining))
+	return fmt.Sprintf("Closes in %s", ui.FormatHumanDuration(remaining))
 }
 
 // taskSettledBeforeCutover reports whether a row is out of the cutover's way:
@@ -728,7 +736,7 @@ func runningPercentText(running []TableProgressData) string {
 		if t.RowsTotal <= 0 {
 			return ""
 		}
-		copied += ui.ClampRows(t.RowsCopied, t.RowsTotal)
+		copied += ui.CopyCoveredRows(t.PercentComplete, t.RowsCopied, t.RowsTotal)
 		total += t.RowsTotal
 	}
 	if copied == 0 {
@@ -897,19 +905,16 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 // application is not a per-table task. Renders nothing when the apply carries
 // no VSchema change.
 func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
+	writeVSchemaStatusWithin(sb, changes, vschemaDiffBudgetFor(changes))
+}
+
+// writeVSchemaStatusWithin renders the VSchema section for changes, each diff
+// held to budget bytes.
+func writeVSchemaStatusWithin(sb *strings.Builder, changes []apitypes.VSchemaChange, budget int) {
 	if len(changes) == 0 {
 		return
 	}
 	sb.WriteString("\n### VSchema\n\n")
-	// The diff budget is per comment, not per keyspace: split it across the
-	// entries that carry a diff so a multi-keyspace apply stays bounded.
-	diffCount := 0
-	for _, c := range changes {
-		if c.Diff != "" {
-			diffCount++
-		}
-	}
-	budget := vschemaDiffBudget(diffCount)
 	for _, c := range changes {
 		fmt.Fprintf(sb, "**%s**: %s\n\n", inlineCode(c.Namespace), ui.VSchemaStatusLabel(c.Status))
 		if c.Diff != "" {
@@ -918,11 +923,24 @@ func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
 	}
 }
 
+// vschemaDiffBudgetFor returns the byte budget for each VSchema diff in a
+// comment. The budget is per comment, not per keyspace: it is split across the
+// entries that carry a diff so a multi-keyspace apply stays bounded.
+func vschemaDiffBudgetFor(changes []apitypes.VSchemaChange) int {
+	diffCount := 0
+	for _, c := range changes {
+		if c.Diff != "" {
+			diffCount++
+		}
+	}
+	return vschemaDiffBudget(diffCount)
+}
+
 // writeTableProgressSection writes the per-row progress breakdown, grouped by
 // namespace so the operator can see which schema (MySQL) or keyspace
 // (Vitess/PlanetScale, Strata) each table belongs to. Within a namespace, rows
-// are ordered by sortProgressRows: active/running first, then pending, then
-// completed/terminal last, with a table's rows kept together.
+// are ordered by sortProgressRows: failed and halted first, then active/running,
+// then pending, then completed last, with a table's rows kept together.
 func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData, budget *ddlBlockBudget) {
 	// During the resume window the per-table percents are indeterminate (the data
 	// plane has not reported continuation vs fresh copy yet), so the aggregate
@@ -1031,7 +1049,7 @@ func renderResumingTable(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	sb.WriteString("\n")
 }
 
-// tableStatePriority returns a sort key: lower = rendered first (active on top, completed on bottom).
+// tableStatePriority returns a sort key: lower = rendered first (failed and halted on top, completed on bottom).
 func tableStatePriority(tableStatus string) int {
 	return ui.TableStatePriority(state.NormalizeTaskStatus(tableStatus))
 }
@@ -1053,7 +1071,8 @@ func summaryStatePriority(tableStatus string) int {
 }
 
 // sortProgressRows orders one namespace's rows for the progress comment, with
-// active tables on top and terminal ones at the bottom. See sortRowsByTable.
+// failed and halted tables on top, then active ones, and finished ones at the
+// bottom. See sortRowsByTable.
 func sortProgressRows(rows []TableProgressData) []TableProgressData {
 	return sortRowsByTable(rows, tableStatePriority)
 }
@@ -1109,6 +1128,15 @@ func sortRowsByTable(rows []TableProgressData, statePriority func(tableStatus st
 func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table TableProgressData, applyState string, applyAttempt int, applyError string, work apitypes.BuildWork, budget *ddlBlockBudget) {
 	// Normalize to canonical Task state for consistent matching.
 	status := state.NormalizeTaskStatus(table.Status)
+
+	if sharded := shardedTableStatus(table); keepsShardedProgressBar(status, sharded) {
+		// A sharded table whose shards are in different phases keeps its bar
+		// across them, as the sharded comment and the CLI show it (UX-8).
+		writeShardedTablePhaseProgress(sb, sharded, func() { writeDDLLine(sb, dialect, table.DDL, budget) })
+		renderShardSummary(sb, table, presentation.RunningCopying, budget)
+		sb.WriteString("\n")
+		return
+	}
 
 	switch status {
 	case state.Task.Pending:
@@ -1225,6 +1253,29 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	sb.WriteString("\n")
 }
 
+// shardedTableStatus is a table row as the sharded comment reads it, so a
+// sharded table in a single-deployment apply renders the way it does there.
+func shardedTableStatus(table TableProgressData) ShardedTableStatus {
+	reporting := 0
+	for _, sh := range table.Shards {
+		if sh.RowsTotal > 0 {
+			reporting++
+		}
+	}
+	return ShardedTableStatus{
+		Table:            table.TableName,
+		Status:           table.Status,
+		RowsCopied:       table.RowsCopied,
+		RowsTotal:        table.RowsTotal,
+		RowsTotalPlanned: table.RowsTotalPlanned,
+		ETASeconds:       table.ETASeconds,
+		EstimatedBytes:   table.EstimatedBytes,
+		ShardsReporting:  reporting,
+		PlannedShards:    table.PlannedShards,
+		Shards:           table.Shards,
+	}
+}
+
 // renderShardSummary lists a sharded table's shards while it is in flight. A
 // settled table's line already says where it ended, so the listing stays out
 // of the way then. runningWord names the shards working on the change
@@ -1301,7 +1352,9 @@ func tableFacts(table TableProgressData, work apitypes.BuildWork) presentation.T
 		PercentComplete:     table.PercentComplete,
 		RowsCopied:          table.RowsCopied,
 		RowsTotal:           table.RowsTotal,
+		RowsTotalPlanned:    table.RowsTotalPlanned,
 		ETASeconds:          table.ETASeconds,
+		EstimatedRows:       table.EstimatedRows,
 		EstimatedBytes:      table.EstimatedBytes,
 		ChecksumRowsChecked: table.ChecksumRowsChecked,
 		ChecksumRowsTotal:   table.ChecksumRowsTotal,
@@ -1392,8 +1445,13 @@ func renderStoppedTable(sb *strings.Builder, dialect schema.Dialect, table Table
 
 	writeDDLLine(sb, dialect, table.DDL, budget)
 
-	// Show rows (no ETA) for stopped tables with progress
-	if table.RowsTotal > 0 && (table.PercentComplete > 0 || table.RowsCopied > 0) {
+	// Show rows (no ETA) for stopped tables with progress. A copy finished
+	// short of its estimate shows the rows it copied, as a running one does.
+	if ui.CopyFinishedShortOfEstimate(table.PercentComplete, table.RowsCopied, table.RowsTotal) {
+		if line := presentation.FinishedCopyRowsText(table.RowsCopied); line != "" {
+			fmt.Fprintf(sb, "- %s\n", line)
+		}
+	} else if table.RowsTotal > 0 && (table.PercentComplete > 0 || table.RowsCopied > 0) {
 		fmt.Fprintf(sb, "- Rows: %s / %s%s\n",
 			ui.FormatNumber(ui.ClampRows(table.RowsCopied, table.RowsTotal)),
 			ui.FormatNumber(table.RowsTotal),
@@ -1449,8 +1507,9 @@ func countTablesWithDDL(tables []TableProgressData) int {
 
 // writePlannedRows writes the rows line of a table no engine has reported on
 // yet (presentation.PlannedRowsText). span names the targets the estimate
-// covers when it is summed across several. It writes nothing when the plan
-// had no row estimate.
+// covers when it is summed across several. It writes the size alone when the
+// plan sized the table but could not count its rows, and nothing when the plan
+// had neither.
 func writePlannedRows(sb *strings.Builder, estimatedRows, estimatedBytes *int64, span string) {
 	if text := presentation.PlannedRowsText(estimatedRows, estimatedBytes, span); text != "" {
 		fmt.Fprintf(sb, "- %s\n", text)
@@ -1716,52 +1775,7 @@ func durationDisplay(startedAt, completedAt string) string {
 	if endTime.Before(startTime) {
 		return ""
 	}
-	return formatDuration(endTime.Sub(startTime))
-}
-
-// formatDuration formats a time.Duration as a human-readable string.
-func formatDuration(d time.Duration) string {
-	d = d.Truncate(time.Second)
-	if d < time.Minute {
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	}
-	if d < time.Hour {
-		m := int(d.Minutes())
-		s := int(d.Seconds()) % 60
-		if s > 0 {
-			return fmt.Sprintf("%dm %ds", m, s)
-		}
-		return fmt.Sprintf("%dm", m)
-	}
-	totalHours := int(d.Hours())
-	if totalHours < 24 {
-		m := int(d.Minutes()) % 60
-		if m > 0 {
-			return fmt.Sprintf("%dh %dm", totalHours, m)
-		}
-		return fmt.Sprintf("%dh", totalHours)
-	}
-	totalDays := totalHours / 24
-	hours := totalHours % 24
-	m := int(d.Minutes()) % 60
-	var parts []string
-	if totalDays >= 7 {
-		weeks := totalDays / 7
-		days := totalDays % 7
-		parts = append(parts, fmt.Sprintf("%dw", weeks))
-		if days > 0 {
-			parts = append(parts, fmt.Sprintf("%dd", days))
-		}
-	} else {
-		parts = append(parts, fmt.Sprintf("%dd", totalDays))
-	}
-	if hours > 0 {
-		parts = append(parts, fmt.Sprintf("%dh", hours))
-	}
-	if m > 0 {
-		parts = append(parts, fmt.Sprintf("%dm", m))
-	}
-	return strings.Join(parts, " ")
+	return ui.FormatHumanDuration(endTime.Sub(startTime))
 }
 
 func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentData, budget *ddlBlockBudget) {
@@ -1787,12 +1801,20 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 }
 
 func completedSummaryDetailsLabel(data ApplyStatusCommentData) string {
+	return applyDetailsLabel(len(data.Tables), progressUnit(data.Tables), len(data.VSchemaChanges))
+}
+
+// applyDetailsLabel is the summary line of a completed apply's collapsed
+// detail block, shared by every apply shape so a sharded summary and a
+// regular one word it the same way: the changes counted in unit ("table" or
+// "statement"), then the VSchema updates.
+func applyDetailsLabel(changes int, unit string, vschemaUpdates int) string {
 	var parts []string
-	if len(data.Tables) > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s", len(data.Tables), pluralize(progressUnit(data.Tables), len(data.Tables))))
+	if changes > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", changes, pluralize(unit, changes)))
 	}
-	if len(data.VSchemaChanges) > 0 {
-		parts = append(parts, fmt.Sprintf("%d VSchema %s", len(data.VSchemaChanges), pluralize("update", len(data.VSchemaChanges))))
+	if vschemaUpdates > 0 {
+		parts = append(parts, fmt.Sprintf("%d VSchema %s", vschemaUpdates, pluralize("update", vschemaUpdates)))
 	}
 	return fmt.Sprintf("Apply details (%s)", strings.Join(parts, ", "))
 }
@@ -2091,6 +2113,7 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 			EstimatedBytes:  t.EstimatedBytes,
 			EstimatedRows:   t.EstimatedRows,
 
+			RowsTotalPlanned:    t.RowsTotalPlanned,
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
 			Throttled:           t.Throttled,

@@ -29,12 +29,14 @@ type SchemaErrorData struct {
 	// names the concrete environments the failed command covered. Empty means
 	// the deployment is unscoped and the header omits the environment segment
 	// rather than rendering filler.
-	Environments       []string
-	DatabaseName       string
-	SchemaPath         string
-	CommandName        string // "plan" or "apply"
-	ErrorDetail        string
-	AvailableDatabases string
+	Environments []string
+	DatabaseName string
+	SchemaPath   string
+	CommandName  string // "plan" or "apply"
+	ErrorDetail  string
+	// AvailableConfigs lists the configs a command without -d could have
+	// targeted, rendered as the choices in the multiple databases comment.
+	AvailableConfigs []AvailableConfigData
 	// SearchedDirs lists the schema directories a database-scoped search was
 	// limited to when GitHub truncated the repository tree. Empty when the
 	// whole repository was searched.
@@ -53,6 +55,10 @@ type SchemaErrorData struct {
 	// claim about its registry says which environments it covers. Empty for a
 	// deployment serving one environment (Deployment names it) or every one.
 	DeploymentEnvironments []string
+	// PlanProblems lists the statements in the schema files a refused plan
+	// names. When set, the comment lists them with where each one is in
+	// place of the error text.
+	PlanProblems RefusedStatements
 }
 
 // UnregisteredSchemaConfigData identifies one schema config whose database the
@@ -60,6 +66,32 @@ type SchemaErrorData struct {
 type UnregisteredSchemaConfigData struct {
 	Database   string
 	SchemaPath string
+}
+
+// AvailableConfigData identifies one config a command without -d could have
+// targeted.
+type AvailableConfigData struct {
+	Database   string
+	SchemaPath string
+}
+
+// unlistedAvailableConfigsLine is the line shown when no candidate configs are
+// known. It points at where the database names live instead of repeating any
+// error text.
+const unlistedAvailableConfigsLine = "SchemaBot could not list them here. Each `schemabot.yaml` in this PR names its database under `database`."
+
+// AvailableConfigLines renders each available config as its database and the
+// directory holding it, as code spans the PR-supplied values cannot break out
+// of. With no known configs it returns one fixed line.
+func (d SchemaErrorData) AvailableConfigLines() []string {
+	if len(d.AvailableConfigs) == 0 {
+		return []string{unlistedAvailableConfigsLine}
+	}
+	lines := make([]string, 0, len(d.AvailableConfigs))
+	for _, cfg := range d.AvailableConfigs {
+		lines = append(lines, inlineCode(cfg.Database)+" ("+inlineCode(cfg.SchemaPath)+")")
+	}
+	return lines
 }
 
 // MultipleUnregisteredConfigs reports whether the error names more than one
@@ -376,7 +408,8 @@ This repository has multiple ` + "`schemabot.yaml`" + ` configurations.
 
 ### Available Databases
 
-{{.AvailableDatabases}}
+{{range .AvailableConfigLines}}- {{.}}
+{{end}}
 
 ### How to specify a database
 
@@ -386,11 +419,13 @@ Use the ` + "`-d`" + ` flag:
 schemabot {{.CommandName}} -e {{.ExampleEnvironment}} -d <database-name>
 ` + "```" + ``
 
-const genericErrorTemplate = "## " + glyph.Failed + ` {{.CommandName}} Failed
+const commandFailedHeaderTemplate = "## " + glyph.Failed + ` {{.CommandName}} Failed
 
 {{with .EnvironmentHeader}}{{.}}
 
-{{end}}{{.Attribution}}
+{{end}}{{.Attribution}}`
+
+const genericErrorTemplate = commandFailedHeaderTemplate + `
 
 ### Error
 
@@ -410,6 +445,7 @@ var (
 	tmplUnmanagedNotice       = template.Must(template.New("unmanagedSchemaConfigsNotice").Parse(unmanagedSchemaConfigsNoticeTemplate))
 	tmplMultipleConfigs       = template.Must(template.New("multipleConfigs").Parse(multipleConfigsTemplate))
 	tmplGenericError          = template.Must(template.New("genericError").Parse(genericErrorTemplate))
+	tmplCommandFailedHeader   = template.Must(template.New("commandFailedHeader").Parse(commandFailedHeaderTemplate))
 )
 
 // RenderDatabaseNotFound renders the "database not found" error comment. When
@@ -585,12 +621,32 @@ func RenderMultipleConfigs(data SchemaErrorData) string {
 func RenderGenericError(data SchemaErrorData) string {
 	// Capitalize command name for header
 	data.CommandName = capitalizeFirst(data.CommandName)
+	if refusal, ok := renderPlanRefusal(data); ok {
+		return offerSupportChannel(refusal)
+	}
 	// The error detail is untrusted engine or infrastructure error text:
 	// sanitize it, escape HTML, and keep a multi-line message inside the
 	// blockquote so it cannot leak endpoints, inject markup, or escape into
 	// the surrounding comment structure.
 	data.ErrorDetail = quoteBlockLines(html.EscapeString(sanitizeCommentError(data.ErrorDetail)))
 	return offerSupportChannel(renderTemplate(tmplGenericError, data))
+}
+
+// renderPlanRefusal lists the statements a refused plan names, with where each
+// one is, and offers a push rather than a re-run: the plan is refused again
+// until the files change.
+func renderPlanRefusal(data SchemaErrorData) (string, bool) {
+	if len(data.PlanProblems.Problems) == 0 {
+		return "", false
+	}
+	var sb strings.Builder
+	sb.WriteString(renderTemplate(tmplCommandFailedHeader, data))
+	sb.WriteString("\n\n")
+	if !writePlanProblems(&sb, data.PlanProblems, newPlanProblemBudget()) {
+		return "", false
+	}
+	sb.WriteString(glyph.Attention + " The plan runs once these statements change. Fix them in the schema files and push a commit.\n")
+	return sb.String(), true
 }
 
 // RenderInvalidCommand generates an error message for unrecognized commands.
@@ -658,31 +714,6 @@ func renderTemplate(tmpl *template.Template, data SchemaErrorData) string {
 		return fmt.Sprintf("Error rendering template: %v", err)
 	}
 	return sb.String()
-}
-
-// FormatAvailableDatabases formats database names from error message as markdown list.
-func FormatAvailableDatabases(errMsg string) string {
-	// Error message format: "multiple schemabot.yaml configs found...: `db1` (path1), `db2` (path2)"
-	colonIdx := strings.LastIndex(errMsg, ": ")
-	if colonIdx == -1 || colonIdx+2 >= len(errMsg) {
-		return "- (Unable to determine available databases)"
-	}
-
-	databasesPart := errMsg[colonIdx+2:]
-	parts := strings.Split(databasesPart, ", ")
-
-	var result strings.Builder
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			fmt.Fprintf(&result, "- %s\n", part)
-		}
-	}
-
-	if result.Len() == 0 {
-		return "- (Unable to determine available databases)"
-	}
-	return result.String()
 }
 
 // MemberPlanBlockedDetail is the error line for an apply whose creation refused

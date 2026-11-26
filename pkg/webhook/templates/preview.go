@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/presentation"
@@ -125,6 +126,27 @@ func PreviewCommentPlanExemptTables() string {
 			Namespace: "app",
 			Tables:    []string{"events_archive_2025_01", "orders_archive_2024"},
 			Reason:    engine.ExemptReasonArchiveNaming,
+		}},
+	})
+}
+
+// PreviewCommentPlanRollbackBlockers renders a PostgreSQL plan whose namespace
+// holds a table no schema file can describe, so the plan could not save the
+// namespace's current schema and an apply of it cannot be rolled back. The
+// comment says so before anyone applies, names the table and why, and says
+// how to undo the change instead.
+func PreviewCommentPlanRollbackBlockers() string {
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", SchemaName: "app", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		DatabaseType: "postgres",
+		Changes:      []KeyspaceChangeData{{Keyspace: "app", Statements: []string{"ALTER TABLE app.users ADD COLUMN email text;"}}},
+		RollbackBlockers: []RollbackBlockersData{{
+			Namespace: "app",
+			Tables: []RollbackBlockerData{{
+				Table:  "orders",
+				Reason: "holds a foreign key added NOT VALID, which a schema file cannot declare",
+			}},
 		}},
 	})
 }
@@ -467,7 +489,12 @@ func PreviewCommentPlanBlockedPostgres() string {
 // holds until the apply carries --allow-unsafe. The footer states that
 // requirement under the plain command, which never carries the flag itself.
 func PreviewCommentPlanUnsafe() string {
-	return RenderPlanComment(PlanCommentData{
+	return RenderPlanComment(previewUnsafePlanData())
+}
+
+// previewUnsafePlanData is a plan with one unsafe change, a dropped column.
+func previewUnsafePlanData() PlanCommentData {
+	return PlanCommentData{
 		Database:     "testapp",
 		SchemaName:   "testapp",
 		Environment:  "staging",
@@ -489,7 +516,7 @@ func PreviewCommentPlanUnsafe() string {
 		UnsafeChanges: []UnsafeChangeData{
 			{Table: "orders", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `orders` DROP COLUMN `legacy_ref`;"},
 		},
-	})
+	}
 }
 
 // PreviewCommentPlanManyUnsafeChanges renders a sample plan whose unsafe list
@@ -537,8 +564,9 @@ func PreviewCommentPlanManyUnsafeChanges() string {
 
 // PreviewCommentPlanAttributedChange renders a sample plan whose destructive
 // changes target tables another open pull request applied but has not merged
-// yet, so each entry is annotated with its owner. Attribution is table-grained,
-// so a dropped column is named by its table exactly as a dropped table is.
+// yet, so each finding that undoes an owner's work is annotated with that
+// owner: the dropped column is one the owner added, and the dropped table is
+// one the owner created.
 func PreviewCommentPlanAttributedChange() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
@@ -560,12 +588,18 @@ func PreviewCommentPlanAttributedChange() string {
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "orders", Reason: "DROP COLUMN discards the column's data"},
-			{Table: "reconcile_state", Reason: "DROP TABLE removes all data"},
+			{Table: "orders", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `orders` DROP COLUMN `notes`"},
+			{Table: "reconcile_state", Reason: "DROP TABLE removes all data", DDL: "DROP TABLE `reconcile_state`"},
 		},
 		AttributedChanges: []AttributedChangeData{
-			{Table: "orders", Repository: previewRepository, PullRequest: 4820},
-			{Table: "reconcile_state", Repository: previewRepository, PullRequest: 4821},
+			{
+				Table: "orders", Repository: previewRepository, PullRequest: 4820,
+				OwnerChanges: &ddl.ObjectChanges{Added: []ddl.SchemaObject{{Kind: ddl.ObjectColumn, Name: "notes"}}},
+			},
+			{
+				Table: "reconcile_state", Repository: previewRepository, PullRequest: 4821,
+				OwnerChanges: &ddl.ObjectChanges{Added: []ddl.SchemaObject{{Kind: ddl.ObjectTable, Name: "reconcile_state"}}},
+			},
 		},
 	})
 }
@@ -898,6 +932,57 @@ func PreviewCommentPlanBaseSchemaChanged() string {
 func PreviewCommentPlanBaseSchemaUnverified() string {
 	data := previewPlanData()
 	data.BaseSchema = &BaseSchemaData{BaseBranch: "main", Unverified: true}
+	return RenderPlanComment(data)
+}
+
+// previewFreezeEnd is when the preview freezes end.
+var previewFreezeEnd = time.Date(2026, 12, 26, 0, 0, 0, 0, time.UTC)
+
+// PreviewCommentPlanFrozen renders a plan of a change a freeze in effect
+// covers, under the default override policy: the apply would be refused now.
+func PreviewCommentPlanFrozen() string {
+	data := previewPlanData()
+	data.Freezes = &PlanFreezeNotice{
+		InEffect:         []RefusingFreeze{{ID: "freeze-3f9a1c2e7b4d8a06", Reason: "Holiday code freeze", EndsAt: &previewFreezeEnd}},
+		OverrideOnReason: true,
+	}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanFrozenUnsafe renders a plan of a frozen change that also
+// carries an unsafe change: the --allow-unsafe instruction leads into the
+// command that already carries --override, so one apply gives both consents.
+func PreviewCommentPlanFrozenUnsafe() string {
+	data := previewUnsafePlanData()
+	data.Freezes = &PlanFreezeNotice{
+		InEffect:         []RefusingFreeze{{ID: "freeze-3f9a1c2e7b4d8a06", Reason: "Holiday code freeze", EndsAt: &previewFreezeEnd}},
+		OverrideOnReason: true,
+	}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanFreezeScheduled renders a plan of a change a scheduled
+// code freeze will cover once it starts.
+func PreviewCommentPlanFreezeScheduled() string {
+	data := previewPlanData()
+	data.Freezes = &PlanFreezeNotice{
+		Scheduled: []ScheduledFreeze{{
+			ID: "freeze-8c41d2e9a7f03b56", Reason: "Holiday code freeze",
+			StartsAt: time.Date(2026, 12, 19, 0, 0, 0, 0, time.UTC), EndsAt: &previewFreezeEnd,
+		}},
+		OverrideOnReason: true,
+	}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanFrozenApproval renders a plan of a frozen change on a
+// server whose override policy needs a second approver.
+func PreviewCommentPlanFrozenApproval() string {
+	data := previewPlanData()
+	data.Freezes = &PlanFreezeNotice{
+		InEffect:  []RefusingFreeze{{ID: "freeze-3f9a1c2e7b4d8a06", Reason: "INC-1234: payments latency"}},
+		Approvers: []string{"acme/freeze-approvers"},
+	}
 	return RenderPlanComment(data)
 }
 
@@ -1438,11 +1523,14 @@ func PreviewCommentErrorNoConfig() string {
 // PreviewCommentErrorMultiple renders the "multiple databases" error comment.
 func PreviewCommentErrorMultiple() string {
 	return RenderMultipleConfigs(SchemaErrorData{
-		RequestedBy:        previewRequestedBy,
-		Timestamp:          "2026-01-15 14:30:00",
-		Environment:        "staging",
-		CommandName:        action.Plan,
-		AvailableDatabases: "- `testapp` (schema/testapp/schemabot.yaml)\n- `payments` (schema/payments/schemabot.yaml)",
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-01-15 14:30:00",
+		Environment: "staging",
+		CommandName: action.Plan,
+		AvailableConfigs: []AvailableConfigData{
+			{Database: "testapp", SchemaPath: "schema/testapp"},
+			{Database: "payments", SchemaPath: "schema/payments"},
+		},
 	})
 }
 
@@ -2672,6 +2760,48 @@ func PreviewCommentMultiEnvPlanError() string {
 	})
 }
 
+// PreviewCommentMultiEnvPlanRefusedStatements renders a sample
+// multi-environment plan comment where staging's schema files declare
+// statements the engine cannot plan: each one is listed with its file, line,
+// fix and opening line, and the footer asks for a push rather than a re-run.
+func PreviewCommentMultiEnvPlanRefusedStatements() string {
+	refusal := "plan PostgreSQL schema: 3 statements in the schema files cannot be planned"
+	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		IsMySQL:      false,
+		DatabaseType: "postgres",
+		RequestedBy:  previewRequestedBy,
+		Environments: []string{"staging"},
+		Plans:        map[string]*PlanCommentData{},
+		Errors:       map[string]string{"staging": refusal},
+		PlanProblems: map[string]RefusedStatements{
+			"staging": {Problems: []engine.PlanProblem{
+				{
+					File:      "testapp/accounts.sql",
+					Line:      7,
+					Message:   "SchemaBot doesn't manage comments. Remove the COMMENT statement from this file and set the comment on the database directly.",
+					Statement: "COMMENT ON TABLE accounts IS 'People who can place orders'",
+				},
+				{
+					File:      "testapp/orders.sql",
+					Line:      12,
+					Message:   "SchemaBot doesn't manage functions. Create set_updated_at() outside SchemaBot and remove it from this file.",
+					Statement: "CREATE FUNCTION set_updated_at() RETURNS trigger AS $$\nBEGIN\n  NEW.updated_at := now();\n  RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql",
+				},
+				{
+					File:      "testapp/orders.sql",
+					Line:      19,
+					Message:   "SchemaBot doesn't manage triggers. Create orders_updated_at outside SchemaBot and remove it from this file.",
+					Statement: "CREATE TRIGGER orders_updated_at BEFORE UPDATE ON orders\n  FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
+				},
+			}},
+		},
+	})
+}
+
 // PreviewCommentMultiEnvPlanDiff renders a sample multi-environment plan comment
 // where staging and production have different changes (separate sections).
 func PreviewCommentMultiEnvPlanDiff() string {
@@ -2782,7 +2912,9 @@ func PreviewCommentApplyProgress() string {
 	tables[1].PercentComplete = 62
 	tables[1].ETASeconds = 195
 	tables[2].Status = state.Task.Pending
-	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+	data := sampleApplyData(state.Apply.Running, tables)
+	data.UpdateCadence = 5 * time.Second
+	return RenderApplyStatusComment(data)
 }
 
 // PreviewCommentApplySeveralRunning renders an apply comment where two tables
@@ -3399,8 +3531,10 @@ func PreviewCommentMultiTargetApplyInProgress() string {
 		queue("eu", i, addIndex)
 	}
 
+	model := presentation.Derive(ops)
+	model.OperationsAtOnce = 8
 	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
-		Model:       presentation.Derive(ops),
+		Model:       model,
 		ApplyID:     "apply-a1b2c3d4e5f6",
 		Environment: "production",
 		RequestedBy: "aparajon",

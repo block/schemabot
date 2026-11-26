@@ -124,6 +124,64 @@ func TestEnginePullSchemaRejectsUnmodeledTableObjects(t *testing.T) {
 	assert.Contains(t, err.Error(), "comment")
 }
 
+// A pull that asks to skip tables its schema files cannot describe returns
+// every other table and names each skipped one with what it carries, so a
+// caller can keep them out of the plan instead of losing the whole pull.
+func TestEnginePullSchemaSkipsTablesItCannotDescribe(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_skip_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.customers (id bigint PRIMARY KEY);
+		CREATE UNLOGGED TABLE app.audit_log (id bigint PRIMARY KEY, customer_id bigint REFERENCES app.customers (id));
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY);
+		CREATE TABLE app.orders (id bigint PRIMARY KEY, account_id bigint NOT NULL REFERENCES app.accounts (id));
+		CREATE FUNCTION app.touch_account() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+		CREATE TRIGGER touch_account BEFORE INSERT ON app.accounts FOR EACH ROW EXECUTE FUNCTION app.touch_account();
+		COMMENT ON TABLE app.accounts IS 'customer accounts'`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, 0, "pull_skip_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app", SkipUnrepresentableTables: true})
+	require.NoError(t, err)
+
+	pulled := response.Namespaces["app"]
+	require.NotNil(t, pulled)
+	assert.Equal(t, int32(2), response.TableCount)
+	assert.Equal(t, []string{"customers", "orders"}, slices.Sorted(maps.Keys(pulled.Tables)))
+	require.Len(t, pulled.SkippedTables, 2)
+	assert.Equal(t, "accounts", pulled.SkippedTables[0].GetTable())
+	assert.Equal(t, "schema files cannot describe its trigger, comment", pulled.SkippedTables[0].GetReason())
+	assert.Equal(t, "audit_log", pulled.SkippedTables[1].GetTable())
+	assert.Equal(t, schemadiff.ErrUnrenderableUnlogged.Error(), pulled.SkippedTables[1].GetReason())
+
+	// The pulled files plus an ignore_tables entry per skipped table describe
+	// the target exactly: no change, and above all no DROP TABLE, even for the
+	// key on orders that references a skipped table, or the key on the skipped
+	// audit_log that references customers.
+	files := make(map[string]string, len(pulled.Tables))
+	for table, sql := range pulled.Tables {
+		files[table+".sql"] = sql
+	}
+	ignored := make([]string, 0, len(pulled.SkippedTables))
+	for _, skipped := range pulled.SkippedTables {
+		ignored = append(ignored, skipped.GetTable())
+	}
+	plan, err := New().Plan(t.Context(), &engine.PlanRequest{
+		Database:     "pull_skip_test",
+		SchemaFiles:  schema.SchemaFiles{"app": {Files: files}},
+		Credentials:  &engine.Credentials{DSN: dsn},
+		IgnoreTables: ignored,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, plan.Changes, "the pulled files and the skipped tables' ignore_tables entries plan nothing")
+
+	refused, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+	require.Error(t, err, "a pull that does not ask to skip still refuses the namespace")
+	assert.Nil(t, refused)
+	assert.Contains(t, err.Error(), `schema "app" table "accounts"`)
+	assert.Contains(t, err.Error(), `schema "app" table "audit_log"`)
+}
+
 // A child table created with PostgreSQL table inheritance is refused because
 // flattening inherited columns would lose the relationship to its parent.
 func TestEnginePullSchemaRejectsTableInheritance(t *testing.T) {
@@ -580,9 +638,9 @@ func TestRenderPostgresTablesReturnsCancellationAfterFiltering(t *testing.T) {
 			require.NoError(t, err)
 			defer pool.Close()
 
-			files, captured, err := captureOriginalFiles(ctx, pool, tt.database, "public", nil, mustIgnoredTables(t, tt.ignored))
+			files, blockers, err := captureOriginalFiles(ctx, pool, tt.database, "public", nil, mustIgnoredTables(t, tt.ignored))
 			require.ErrorIs(t, err, context.Canceled)
-			assert.False(t, captured)
+			assert.Nil(t, blockers)
 			assert.Nil(t, files)
 		})
 	}
@@ -627,9 +685,9 @@ func TestCaptureOriginalFilesReturnsCancellationInsteadOfIncompleteBaseline(t *t
 	require.NoError(t, err)
 	defer pool.Close()
 
-	files, captured, err := captureOriginalFiles(ctx, pool, "capture_cancel_test", "public", nil, engine.IgnoredTables{})
+	files, blockers, err := captureOriginalFiles(ctx, pool, "capture_cancel_test", "public", nil, engine.IgnoredTables{})
 	require.ErrorIs(t, err, context.Canceled)
-	assert.False(t, captured)
+	assert.Nil(t, blockers)
 	assert.Nil(t, files)
 }
 
@@ -937,7 +995,7 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 		Database: "plan_privilege_test",
 		SchemaFiles: schema.SchemaFiles{
 			"public": {Files: map[string]string{
-				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, created_at timestamptz DEFAULT now())",
 			}},
 		},
 		Credentials: &engine.Credentials{DSN: limitedDSN.String()},
@@ -1012,7 +1070,9 @@ func TestEnginePlanPrivilegeRefusalPerTier(t *testing.T) {
 }
 
 // TestEnginePlanTableSizeRefusal proves the configured native-safe ceiling
-// blocks an otherwise executable plan when the target table exceeds it.
+// blocks an otherwise executable plan when the target table exceeds it. The
+// added column's default is an expression, so the change is not proven to
+// touch only the catalog and the ceiling applies.
 func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_size_limit_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
@@ -1021,7 +1081,7 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 		Database: "plan_size_limit_test",
 		SchemaFiles: schema.SchemaFiles{
 			"public": {Files: map[string]string{
-				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, created_at timestamptz DEFAULT now())",
 			}},
 		},
 		Credentials: &engine.Credentials{DSN: dsn},
@@ -1036,6 +1096,41 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	assert.Contains(t, change.ModeReason, `statement for table "users":`)
 	assert.Contains(t, change.ModeReason, "1-byte threshold")
 	assert.Contains(t, change.ModeReason, "SchemaBot's ceiling for a native-safe apply")
+	// The blocked table still shows the size the ceiling measured. It has
+	// never been analyzed, so the row count is omitted rather than zero.
+	var size int64
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT pg_catalog.pg_total_relation_size('public.users'::regclass)").Scan(&size))
+	assert.Equal(t, &size, change.EstimatedBytes)
+	assert.Nil(t, change.EstimatedRows)
+}
+
+// TestEnginePlanOversizedTableAdmitsCatalogOnlyChange proves the ceiling does
+// not block a change that only writes the catalog. Adding a nullable column
+// with no default rewrites no rows, so its cost does not grow with the table,
+// and the plan keeps it executable on a table far past a one-byte ceiling.
+func TestEnginePlanOversizedTableAdmitsCatalogOnlyChange(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_oversized_catalog_only_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_oversized_catalog_only_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	change := result.Changes[0].TableChanges[0]
+	assert.Empty(t, change.ExecutionMode, "a catalog-only change must stay executable above the ceiling")
+	assert.Empty(t, change.ModeReason)
+	assert.Contains(t, change.DDL, "ADD COLUMN")
+	assert.Contains(t, change.DDL, "email")
 }
 
 // TestEnginePlanTableSizeRefusalKeepsTableNameVerbatim proves the size verdict
@@ -1052,7 +1147,7 @@ func TestEnginePlanTableSizeRefusalKeepsTableNameVerbatim(t *testing.T) {
 		Database: "plan_size_limit_odd_name_test",
 		SchemaFiles: schema.SchemaFiles{
 			"public": {Files: map[string]string{
-				"odd_users.sql": `CREATE TABLE "odd|users" (id bigint PRIMARY KEY, email text)`,
+				"odd_users.sql": `CREATE TABLE "odd|users" (id bigint PRIMARY KEY, created_at timestamptz DEFAULT now())`,
 			}},
 		},
 		Credentials: &engine.Credentials{DSN: dsn},
@@ -1079,7 +1174,7 @@ func TestEnginePlanOversizedTableAdmitsConcurrentIndex(t *testing.T) {
 		Database: "plan_oversized_concurrent_index_test",
 		SchemaFiles: schema.SchemaFiles{
 			"public": {Files: map[string]string{
-				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text); CREATE INDEX users_email_idx ON users (email)",
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, created_at timestamptz DEFAULT now()); CREATE INDEX users_created_at_idx ON users (created_at)",
 			}},
 		},
 		Credentials: &engine.Credentials{DSN: dsn},
@@ -1095,6 +1190,40 @@ func TestEnginePlanOversizedTableAdmitsConcurrentIndex(t *testing.T) {
 	assert.Contains(t, alter.ModeReason, "1-byte threshold")
 	assert.Empty(t, index.ExecutionMode)
 	assert.Contains(t, index.DDL, "CREATE INDEX CONCURRENTLY")
+}
+
+// An index build on a table over the native-safe ceiling stays executable,
+// and its plan carries the size the ceiling measured, so the operator sees how
+// large a table the build has to read. The table has been analyzed, so the
+// plan carries the row estimate the ceiling read in the same lookup.
+func TestEnginePlanOversizedIndexBuildCarriesItsSize(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_oversized_index_size_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY, email text);
+		INSERT INTO public.users SELECT g, 'user' || g || '@example.com' FROM pg_catalog.generate_series(1, 1000) g;
+		ANALYZE public.users;`)
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_oversized_index_size_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text); CREATE INDEX users_email_idx ON users (email)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	index := result.Changes[0].TableChanges[0]
+	assert.Empty(t, index.ExecutionMode, "the ceiling does not block an index build")
+	assert.Contains(t, index.DDL, "CREATE INDEX CONCURRENTLY")
+	var size int64
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT pg_catalog.pg_total_relation_size('public.users'::regclass)").Scan(&size))
+	assert.Equal(t, &size, index.EstimatedBytes)
+	assert.Equal(t, new(int64(1000)), index.EstimatedRows)
 }
 
 // TestEnginePlanOversizedTableIndexOnlyDiffHasNoBlockedChange proves the
@@ -1155,22 +1284,26 @@ func TestEnginePlanCreateTableIgnoresSizeCeiling(t *testing.T) {
 	assert.Empty(t, change.ModeReason)
 }
 
-// TestEnginePlanUndeclaredTableIsBlockedDrop proves a live table that no
+// TestEnginePlanUndeclaredTableIsUnsafeDrop proves a live table that no
 // schema file declares never vanishes from the plan: the declarative diff
-// surfaces it as a DROP TABLE that is both destructive and blocked, so the
-// reviewer sees the divergence and the apply path can never run the drop. The
-// verdict prescribes only remedies the operator can follow — a table that owns
-// a foreign key into another namespace cannot be declared, and any other table
-// with a foreign key on either side cannot be declared by a pulled file, so
-// each reason names the constraint and the side it lives on instead of a file
-// that cannot be written. A declared table that already matches its file contributes nothing,
-// even when foreign keys elsewhere reference it. Tables whose definition lives
-// elsewhere are not reported on their own: a partition belongs to its parent
-// and an extension-owned table to its extension. Archive tables are exempt by
-// naming convention, as they are on MySQL, while an underscore prefix means
-// nothing on PostgreSQL. An inheritance child and an unlogged table are
-// ordinary tables that must carry their own file.
-func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
+// surfaces it as a DROP TABLE behind the unsafe acknowledgment, as a MySQL
+// table drop is, with the table's definition recorded so the apply drops only
+// the table the reviewer saw. Drops run in foreign key order: warehouses
+// references regions, so warehouses is dropped first, and regions' recorded
+// definition leaves that reference out because it is gone by then. A table's
+// foreign key to itself orders nothing.
+//
+// A drop the plan cannot make safely is blocked, after the executable ones: a
+// partitioned table and an inheritance child, whose drops reach rows the plan
+// does not show; a table that a table which stays references, since the drop
+// never cascades; and two tables whose foreign keys form a cycle, which no
+// drop order satisfies. A declared table that already matches its file
+// contributes nothing, even when foreign keys elsewhere reference it. Tables
+// whose definition lives elsewhere are not reported on their own: a partition
+// belongs to its parent and an extension-owned table to its extension.
+// Archive tables are exempt by naming convention, as they are on MySQL, while
+// an underscore prefix means nothing on PostgreSQL.
+func TestEnginePlanUndeclaredTableIsUnsafeDrop(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_undeclared_test")
 	_, err := db.ExecContext(t.Context(), `
 		CREATE TABLE public.users (id bigint PRIMARY KEY, email text NOT NULL);
@@ -1178,13 +1311,18 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint REFERENCES public.users (id));
 		CREATE TABLE public.regions (id bigint PRIMARY KEY);
 		CREATE TABLE public.warehouses (id bigint PRIMARY KEY, region_id bigint REFERENCES public.regions (id));
+		CREATE TABLE public.categories (id bigint PRIMARY KEY, parent_id bigint REFERENCES public.categories (id));
 		CREATE SCHEMA billing;
 		CREATE TABLE billing.accounts (id bigint PRIMARY KEY);
 		CREATE TABLE public.invoices (id bigint PRIMARY KEY, account_id bigint REFERENCES billing.accounts (id));
-		CREATE TABLE public.events (id bigint, day date) PARTITION BY RANGE (day);
+		CREATE TABLE public.tags (id bigint PRIMARY KEY);
+		CREATE TABLE public.events (id bigint, day date, tag_id bigint REFERENCES public.tags (id)) PARTITION BY RANGE (day);
 		CREATE TABLE public.events_2026 PARTITION OF public.events
 			FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
 		CREATE TABLE public.users_history () INHERITS (public.users);
+		CREATE TABLE public.ping (id bigint PRIMARY KEY, pong_id bigint);
+		CREATE TABLE public.pong (id bigint PRIMARY KEY, ping_id bigint REFERENCES public.ping (id));
+		ALTER TABLE public.ping ADD CONSTRAINT ping_pong_id_fkey FOREIGN KEY (pong_id) REFERENCES public.pong (id);
 		CREATE UNLOGGED TABLE public.scratch (id bigint PRIMARY KEY);
 		CREATE TABLE public._settings (id bigint PRIMARY KEY);
 		CREATE TABLE public.audit_log_archive_2019 (id bigint PRIMARY KEY);
@@ -1214,36 +1352,49 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 	assert.Equal(t, "public", result.ExemptTables[0].Namespace)
 	assert.Equal(t, []string{"audit_log_archive_2019"}, result.ExemptTables[0].Tables)
 	assert.Equal(t, "archive naming", result.ExemptTables[0].Reason)
-	assert.NotContains(t, result.ExemptTables[0].Tables, "legacy_users")
-	require.Len(t, result.Changes[0].TableChanges, 9,
-		"every undeclared table with a definition of its own is reported; the declared table, its partition, the extension-owned table and the archive table are not")
 
-	const declarable = "declare the table in a schema file to keep it under management, or drop it through a separately reviewed process"
-	const ownsForeignKey = `it carries foreign key constraint(s) "orders_user_id_fkey", so the schema pull cannot write a file for it — declare the table by hand in a schema file, foreign keys included, to keep it under management, or drop it through a separately reviewed process`
-	const ownsCrossNamespaceForeignKey = `the table cannot be declared while it carries foreign key constraint(s) "invoices_account_id_fkey", which reference another namespace and schema files do not support — drop the table, or remove those foreign keys before declaring it, through a separately reviewed process`
-	const referencedByForeignKey = `foreign key constraint(s) "warehouses_region_id_fkey" on other tables reference it, so the schema pull cannot write a file for it — declare the table by hand in a schema file to keep it under management, or drop it together with the referencing constraints through a separately reviewed process`
-	for i, want := range []struct{ table, ddl, remedy string }{
-		{"_settings", "DROP TABLE public._settings", declarable},
-		{"events", "DROP TABLE public.events", declarable},
-		{"invoices", "DROP TABLE public.invoices", ownsCrossNamespaceForeignKey},
-		{"legacy_users", "DROP TABLE public.legacy_users", declarable},
-		{"orders", "DROP TABLE public.orders", ownsForeignKey},
-		{"regions", "DROP TABLE public.regions", referencedByForeignKey},
-		{"scratch", "DROP TABLE public.scratch", declarable},
-		{"users_history", "DROP TABLE public.users_history", declarable},
-		{"warehouses", "DROP TABLE public.warehouses", `it carries foreign key constraint(s) "warehouses_region_id_fkey", so the schema pull cannot write a file for it`},
-	} {
-		change := result.Changes[0].TableChanges[i]
+	const hierarchy = "SchemaBot does not drop a partitioned table or a table in an inheritance hierarchy"
+	const cycle = "its foreign keys form a cycle with other tables the plan drops"
+	wants := []struct{ table, blockedBecause string }{
+		{"_settings", ""},
+		{"categories", ""},
+		{"invoices", ""},
+		{"legacy_users", ""},
+		{"orders", ""},
+		{"scratch", ""},
+		{"warehouses", ""},
+		{"regions", ""},
+		{"events", hierarchy},
+		{"ping", cycle},
+		{"pong", cycle},
+		{"tags", `foreign key constraint(s) "events.events_tag_id_fkey" of tables that stay reference it`},
+		{"users_history", hierarchy},
+	}
+	changes := result.Changes[0].TableChanges
+	require.Len(t, changes, len(wants),
+		"every undeclared table with a definition of its own is reported; the declared table, its partition, the extension-owned table and the archive table are not")
+	for i, want := range wants {
+		change := changes[i]
 		assert.Equal(t, want.table, change.Table)
 		assert.Equal(t, ddl.StatementDropTable, change.Operation)
-		assert.Equal(t, want.ddl, change.DDL)
+		assert.Equal(t, "DROP TABLE public."+want.table, change.DDL)
 		assert.True(t, change.IsUnsafe, "a drop removes live data and must carry the unsafe flag")
 		assert.Equal(t, `DROP TABLE removes all data from table "`+want.table+`"`, change.UnsafeReason)
-		assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode,
-			"the native-safe path never executes a drop, so the verdict must say so at plan time")
+		if want.blockedBecause == "" {
+			assert.Empty(t, change.ExecutionMode, "%s: %s", want.table, change.ModeReason)
+			assert.Contains(t, change.Metadata[reviewedTableDropMetadataKey], "table "+want.table+"\n",
+				"the plan records the definition of the table it drops")
+			continue
+		}
+		assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode, want.table)
 		assert.Contains(t, change.ModeReason, `table "`+want.table+`" exists on the target but no schema file in namespace "public" declares it`)
-		assert.Contains(t, change.ModeReason, want.remedy)
+		assert.Contains(t, change.ModeReason, want.blockedBecause)
+		assert.Empty(t, change.Metadata[reviewedTableDropMetadataKey], "a blocked drop records nothing to execute")
 	}
+	assert.NotContains(t, changes[7].Metadata[reviewedTableDropMetadataKey], "referenced by",
+		"regions is dropped after warehouses, so no foreign key references it by then")
+	assert.Contains(t, changes[1].Metadata[reviewedTableDropMetadataKey], "constraint categories_parent_id_fkey: FOREIGN KEY (parent_id) REFERENCES categories(id)",
+		"a table's foreign key to itself goes with the table")
 	for _, table := range []string{"legacy_users", "orders", "regions", "warehouses", "invoices", "scratch", "users_history", "_settings", "audit_log_archive_2019", "ext_owned_config"} {
 		assert.True(t, testutil.PostgresTableExists(t, db, "public", table), "planning must never touch the target")
 	}
@@ -1272,7 +1423,8 @@ func TestEnginePlanEmptyNamespaceSurfacesAllLiveTables(t *testing.T) {
 	assert.Equal(t, "users", change.Table)
 	assert.Equal(t, "DROP TABLE public.users", change.DDL)
 	assert.Equal(t, ddl.StatementDropTable, change.Operation)
-	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+	assert.True(t, change.IsUnsafe)
+	assert.Empty(t, change.ExecutionMode, change.ModeReason)
 }
 
 // TestEnginePlanUndeclaredTableInMissingSchema proves a namespace whose
@@ -1329,8 +1481,9 @@ func TestEnginePlanUndeclaredTablesAcrossNamespaces(t *testing.T) {
 	for _, change := range result.Changes {
 		for _, tc := range change.TableChanges {
 			assert.Equal(t, ddl.StatementDropTable, tc.Operation)
-			assert.Equal(t, engine.ExecutionModeBlocked, tc.ExecutionMode)
-			assert.Contains(t, tc.ModeReason, `no schema file in namespace "`+change.Namespace+`" declares it`)
+			assert.Equal(t, "DROP TABLE "+change.Namespace+"."+tc.Table, tc.DDL)
+			assert.True(t, tc.IsUnsafe)
+			assert.Empty(t, tc.ExecutionMode, tc.ModeReason)
 			dropsByNamespace[change.Namespace] = append(dropsByNamespace[change.Namespace], tc.Table)
 		}
 	}
@@ -1341,7 +1494,7 @@ func TestEnginePlanUndeclaredTablesAcrossNamespaces(t *testing.T) {
 }
 
 // TestLiveTablesUnderShadowingSearchPath proves the catalog reads that find
-// undeclared live tables and the schema pull fail closed when the target's
+// undeclared live tables and their foreign keys and the schema pull fail closed when the target's
 // search_path lists a user schema ahead of pg_catalog. Decoy relations named
 // after every catalog table the queries touch, decoy "=", "<>", ">" and ">="
 // operators over every operand type the queries compare, and decoy array_agg
@@ -1404,18 +1557,24 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 	require.NoError(t, pool.QueryRow(t.Context(), "SHOW search_path").Scan(&searchPath))
 	require.Equal(t, "hostile, pg_catalog, public", searchPath, "the pool must see the hostile search_path for the test to prove anything")
 
-	tables, err := liveTables(t.Context(), pool, "public")
+	pulled, err := schemadiff.ListManagedTables(t.Context(), pool, "public")
 	require.NoError(t, err)
-	assert.Equal(t, []liveTable{
+	assert.Equal(t, []string{"events", "invoices", "orders", "users"}, pulled,
+		"every live table must be enumerated, and only the partition and the extension-owned table left out, despite the shadowing search_path")
+
+	keys, err := foreignKeysFor(t.Context(), pool, "public", pulled)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []tableForeignKeys{
 		{name: "events", foreignKeys: []string{}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{}},
 		{name: "invoices", foreignKeys: []string{"invoices_account_id_fkey"}, crossNamespaceForeignKeys: []string{"invoices_account_id_fkey"}, referencedBy: []string{}},
 		{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{}},
 		{name: "users", foreignKeys: []string{}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{"orders_user_id_fkey"}},
-	}, tables, "every live table and its foreign keys must be enumerated, and only the partition and the extension-owned table left out, despite the shadowing search_path")
+	}, keys, "every table's foreign keys must be read from the real catalog")
 
-	pulled, err := schemadiff.ListManagedTables(t.Context(), pool, "public")
+	users, err := schemadiff.Introspect(t.Context(), pool, "public", "users")
 	require.NoError(t, err)
-	assert.Equal(t, []string{"events", "invoices", "orders", "users"}, pulled, "the pull must render the same set the plan holds files accountable for")
+	assert.Equal(t, []string{"orders.orders_user_id_fkey"}, users.ReferencedBy,
+		"the definition a table drop records must name the foreign keys that reference the table")
 
 	namespaces, err := pullNamespaces(t.Context(), pool, "")
 	require.NoError(t, err)
@@ -1683,20 +1842,165 @@ func TestEngineApplyTableNotFoundRefusal(t *testing.T) {
 }
 
 // TestEngineApplyTableSizeRefusal proves the configured native-safe ceiling
-// reaches preflight and permanently refuses an ALTER when the table exceeds it.
+// reaches preflight and permanently refuses an ALTER when the table exceeds it
+// and the ALTER is not proven to touch only the catalog.
 func TestEngineApplyTableSizeRefusal(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "size_limit_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
 	require.NoError(t, err)
 
 	eng := NewWithTableSizeLimit(1)
-	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN email text"))
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN created_at timestamptz DEFAULT now()"))
 	require.NoError(t, err)
 	progress := awaitPostgresProgress(t, eng, "users")
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "a size refusal is permanent until the ceiling or target changes")
 	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+}
+
+// TestEngineApplyOversizedTableRunsCatalogOnlyChange proves apply re-proves a
+// change against the live table before it waives the ceiling: a nullable
+// column with no default changes only the catalog, so it runs to completion
+// on a table past a one-byte ceiling and the column exists afterward.
+func TestEngineApplyOversizedTableRunsCatalogOnlyChange(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "oversized_catalog_only_apply_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+
+	eng := NewWithTableSizeLimit(1)
+	result, err := eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN email text"))
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	progress := awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateCompleted, progress.State, progress.ErrorMessage)
+
+	var dataType string
+	err = db.QueryRowContext(t.Context(),
+		`SELECT data_type FROM information_schema.columns
+		 WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'email'`).Scan(&dataType)
+	require.NoError(t, err)
+	assert.Equal(t, "text", dataType)
+}
+
+// TestEngineApplyOversizedTableRefusesWhenTheLiveProofNoLongerHolds proves
+// apply judges the statement against the table as it is now, not as it was
+// planned. Adding a column of an enum type is catalog-only, so the plan keeps
+// it executable on an oversized table. If the type is then replaced by a
+// domain with a CHECK before the apply runs, the same statement would run
+// that check under the lock, so the apply keeps the size refusal and adds
+// no column.
+func TestEngineApplyOversizedTableRefusesWhenTheLiveProofNoLongerHolds(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "oversized_stale_proof_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TYPE public.tier AS ENUM ('free', 'paid');
+		CREATE TABLE public.users (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	eng := NewWithTableSizeLimit(1)
+	planned, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "oversized_stale_proof_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"tier.sql":  "CREATE TYPE tier AS ENUM ('free', 'paid')",
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, plan tier)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, planned.Changes, 1)
+	require.Len(t, planned.Changes[0].TableChanges, 1)
+	assert.Empty(t, planned.Changes[0].TableChanges[0].ExecutionMode, "an enum column is catalog-only when planned")
+
+	_, err = db.ExecContext(t.Context(), `
+		DROP TYPE public.tier;
+		CREATE DOMAIN public.tier AS text CHECK (VALUE IN ('free', 'paid'))`)
+	require.NoError(t, err)
+
+	_, err = eng.Apply(t.Context(), plannedApplyRequest(dsn, planned.Changes[0].TableChanges[0]))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable)
+	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+	assertColumnAbsent(t, db, "users", "plan")
+}
+
+// TestEngineApplyOversizedTableFailsWhenTheLiveProofFails proves a proof
+// that cannot be made runs nothing. The column's type does not exist, so
+// pg-sprite cannot prove the statement changes only the catalog. A failed
+// proof is not a size verdict, so the apply fails as retryable rather than
+// as a permanent size refusal, and adds no column.
+func TestEngineApplyOversizedTableFailsWhenTheLiveProofFails(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "oversized_failed_proof_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+
+	eng := NewWithTableSizeLimit(1)
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN plan public.missing_type"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "failed", progress.Metadata["phase"])
+	assert.True(t, progress.Retryable, "a failed proof is not a size verdict; a retry may prove the statement")
+	assert.NotContains(t, progress.ErrorMessage, "1-byte threshold")
+	assertColumnAbsent(t, db, "users", "plan")
+
+	// The failure renders only a fixed sentence, so check the failed proof
+	// itself: it must be an error, not a false that looks like a decided
+	// answer.
+	pool, err := pgxpool.New(t.Context(), dsn)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	stmt, err := statement.ParseOne("ALTER TABLE public.users ADD COLUMN plan public.missing_type")
+	require.NoError(t, err)
+	_, err = provenCatalogOnly(t.Context(), pool, stmt)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing_type")
+}
+
+// TestEngineApplyOversizedTableNamesTheMissingTemporaryGrant proves the
+// operator learns which grant lets a catalog-only change run. The table is
+// over the limit and the engine role owns it, but the role cannot create the
+// temporary table the add-column proof needs. The apply refuses with the
+// grant to provision, not with the size threshold, and adds no column.
+func TestEngineApplyOversizedTableNamesTheMissingTemporaryGrant(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "oversized_no_temp_test")
+	_, err := db.ExecContext(t.Context(), `
+		REVOKE TEMPORARY ON DATABASE oversized_no_temp_test FROM PUBLIC;
+		CREATE ROLE no_temp LOGIN PASSWORD 'no_temp';
+		GRANT CONNECT ON DATABASE oversized_no_temp_test TO no_temp;
+		GRANT USAGE ON SCHEMA public TO no_temp;
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		ALTER TABLE public.users OWNER TO no_temp`)
+	require.NoError(t, err)
+	noTemp, err := url.Parse(dsn)
+	require.NoError(t, err)
+	noTemp.User = url.UserPassword("no_temp", "no_temp")
+
+	eng := NewWithTableSizeLimit(1)
+	_, err = eng.Apply(t.Context(), applyRequest(noTemp.String(), "users", "ALTER TABLE public.users ADD COLUMN email text"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "the grant must be provisioned before a retry can succeed")
+	assert.Contains(t, progress.ErrorMessage, "grant TEMPORARY on the database to the engine role")
+	assert.NotContains(t, progress.ErrorMessage, "1-byte threshold")
+	assertColumnAbsent(t, db, "users", "email")
+}
+
+// assertColumnAbsent fails the test when column exists on public.table.
+func assertColumnAbsent(t *testing.T, db *sql.DB, table, column string) {
+	t.Helper()
+	var count int
+	err := db.QueryRowContext(t.Context(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2`, table, column).Scan(&count)
+	require.NoError(t, err)
+	assert.Zero(t, count, "column %q must not exist on %q", column, table)
 }
 
 // TestEngineApplyOversizedTableUsesKindSpecificBounds proves a concurrent
@@ -1721,7 +2025,7 @@ func TestEngineApplyOversizedTableUsesKindSpecificBounds(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, valid)
 
-	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN nickname text"))
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN created_at timestamptz DEFAULT now()"))
 	require.NoError(t, err)
 	progress = awaitPostgresProgress(t, eng, "users")
 	assert.Equal(t, engine.StateFailed, progress.State)
@@ -1794,7 +2098,7 @@ func TestEngineSharedAcrossAppliesKeepsProgressPerApply(t *testing.T) {
 func TestEngineApplyRefusesNonNativeShape(t *testing.T) {
 	dsn, _ := testutil.StartPostgres(t, "shape_test")
 	eng := New()
-	_, err := eng.Apply(t.Context(), applyRequest(dsn, "users", "DROP TABLE public.users"))
+	_, err := eng.Apply(t.Context(), applyRequest(dsn, "users", "TRUNCATE public.users"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not execute this statement shape yet")
 }
@@ -2586,9 +2890,10 @@ func TestCaptureOriginalFilesWithRowSecurity(t *testing.T) {
 	pool, err := pgxpool.New(ctx, dsn)
 	require.NoError(t, err)
 	defer pool.Close()
-	files, captured, err := captureOriginalFiles(ctx, pool, "capture_rls", "public", nil, engine.IgnoredTables{})
+	files, blockers, err := captureOriginalFiles(ctx, pool, "capture_rls", "public", nil, engine.IgnoredTables{})
 	require.NoError(t, err)
-	assert.False(t, captured)
+	assert.Equal(t, []engine.RollbackBlocker{{Table: "documents", Reason: schemadiff.ErrUnrenderableRowSecurity.Error()}}, blockers,
+		"only the table with row security blocks the capture, named with what its schema file cannot carry")
 	assert.Nil(t, files)
 }
 

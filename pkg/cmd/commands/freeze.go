@@ -17,11 +17,11 @@ import (
 // fix (not an approver, no such freeze, already approved), and a wrapper
 // would only bury it.
 type FreezeCmd struct {
-	Create   FreezeCreateCmd   `cmd:"" default:"withargs" help:"Freeze an environment, or some of its deployments and databases"`
-	List     FreezeListCmd     `cmd:"" help:"List freezes in effect, scheduled and recent"`
-	Show     FreezeShowCmd     `cmd:"" help:"Show one freeze"`
-	Approve  FreezeApproveCmd  `cmd:"" help:"Approve a freeze override request"`
-	Override FreezeOverrideCmd `cmd:"" help:"Show a freeze override request"`
+	Create   FreezeCreateCmd   `cmd:"" default:"withargs" help:"Freeze an environment, or some of its deployments and databases" group:"commands"`
+	List     FreezeListCmd     `cmd:"" help:"List freezes in effect, scheduled and recent" group:"commands"`
+	Show     FreezeShowCmd     `cmd:"" help:"Show one freeze" group:"commands"`
+	Approve  FreezeApproveCmd  `cmd:"" help:"Approve a freeze override request" group:"commands"`
+	Override FreezeOverrideCmd `cmd:"" help:"Show a freeze override request" group:"commands"`
 }
 
 // FreezeCreateCmd sets an environment freeze.

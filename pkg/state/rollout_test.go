@@ -487,3 +487,92 @@ func TestDeriveRolloutApplyState_StartedRolloutStaysRunning(t *testing.T) {
 		})
 	}
 }
+
+// TestDeriveRolloutApplyState_PausedShardFailureHoldsItsSiblingShards verifies
+// that a shard failure under an unreleased pause holds the rollout paused while
+// another shard of the same target has not started, wherever that shard sits in
+// deployment order. The claim holds payments-001's unstarted shard once its
+// sibling has failed, so only a release lets it start, and release is accepted
+// only while the rollout is paused. A stopped sibling is held the same way,
+// since start resumes it only through the claim, and work rows stored without
+// a target form one member of their deployment, as the claim groups them. A
+// sibling a driver is already copying is past the claim, so it leaves the
+// rollout running degraded rather than paused with nothing to release. A
+// pending shard of another target that sits before the failure is not held by
+// it, and once payments-001 has nothing left to run the rollout settles.
+func TestDeriveRolloutApplyState_PausedShardFailureHoldsItsSiblingShards(t *testing.T) {
+	shard := func(target, name, opState string) RolloutOperation {
+		op := rolloutShard(target, name, opState)
+		op.Target = target
+		op.PauseOnFailure = true
+		return op
+	}
+
+	for _, tc := range []struct {
+		name string
+		ops  []RolloutOperation
+		want string
+	}{
+		{
+			name: "unstarted sibling shard before the failure",
+			ops: []RolloutOperation{
+				shard("payments-001", "-80", ApplyOperation.Pending),
+				shard("payments-001", "80-", ApplyOperation.Failed),
+			},
+			want: Apply.Paused,
+		},
+		{
+			name: "unstarted sibling shard after the failure",
+			ops: []RolloutOperation{
+				shard("payments-001", "-80", ApplyOperation.Failed),
+				shard("payments-001", "80-", ApplyOperation.Pending),
+			},
+			want: Apply.Paused,
+		},
+		{
+			name: "stopped sibling shard before the failure",
+			ops: []RolloutOperation{
+				shard("payments-001", "-80", ApplyOperation.Stopped),
+				shard("payments-001", "80-", ApplyOperation.Failed),
+			},
+			want: Apply.Paused,
+		},
+		{
+			name: "unstarted sibling of work stored without a target",
+			ops: []RolloutOperation{
+				shard("", "-80", ApplyOperation.Pending),
+				shard("", "80-", ApplyOperation.Failed),
+			},
+			want: Apply.Paused,
+		},
+		{
+			name: "sibling shard already copying before the failure",
+			ops: []RolloutOperation{
+				shard("payments-001", "-80", ApplyOperation.Running),
+				shard("payments-001", "80-", ApplyOperation.Failed),
+			},
+			want: Apply.RunningDegraded,
+		},
+		{
+			name: "earlier target still copying, failed target has nothing left",
+			ops: []RolloutOperation{
+				shard("payments-002", "-80", ApplyOperation.Running),
+				shard("payments-001", "-80", ApplyOperation.Completed),
+				shard("payments-001", "80-", ApplyOperation.Failed),
+			},
+			want: Apply.RunningDegraded,
+		},
+		{
+			name: "every sibling shard settled",
+			ops: []RolloutOperation{
+				shard("payments-001", "-80", ApplyOperation.Completed),
+				shard("payments-001", "80-", ApplyOperation.Failed),
+			},
+			want: Apply.Failed,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, DeriveRolloutApplyState(RolloutChildren(tc.ops)))
+		})
+	}
+}

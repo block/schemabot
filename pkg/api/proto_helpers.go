@@ -41,7 +41,19 @@ func protoPulledNamespacesToAPI(namespaces map[string]*ternv1.PulledNamespace) m
 			Artifacts:        artifacts,
 			NamespaceCatalog: protoNamespaceCatalogToAPI(pulled.NamespaceCatalog),
 			TableCatalog:     protoTableCatalogToAPI(pulled.TableCatalog),
+			SkippedTables:    protoSkippedTablesToAPI(pulled.SkippedTables),
 		}
+	}
+	return result
+}
+
+func protoSkippedTablesToAPI(skipped []*ternv1.SkippedTable) []apitypes.SkippedTable {
+	if len(skipped) == 0 {
+		return nil
+	}
+	result := make([]apitypes.SkippedTable, 0, len(skipped))
+	for _, table := range skipped {
+		result = append(result, apitypes.SkippedTable{Table: table.GetTable(), Reason: table.GetReason()})
 	}
 	return result
 }
@@ -222,6 +234,9 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 		apiSC := &apitypes.SchemaChangeResponse{
 			Namespace: sc.Namespace,
 			Metadata:  sc.Metadata,
+		}
+		for _, b := range sc.GetRollbackBlockers() {
+			apiSC.RollbackBlockers = append(apiSC.RollbackBlockers, apitypes.SkippedTable{Table: b.GetTable(), Reason: b.GetReason()})
 		}
 		for _, t := range sc.TableChanges {
 			apiSC.TableChanges = append(apiSC.TableChanges, tableChangeResponseFromProto(t))
@@ -449,6 +464,9 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[st
 			if nsData.OriginalFiles == nil {
 				nsData.OriginalFiles = map[string]string{}
 			}
+		}
+		for _, b := range sc.GetRollbackBlockers() {
+			nsData.RollbackBlockers = append(nsData.RollbackBlockers, storage.RollbackBlocker{Table: b.GetTable(), Reason: b.GetReason()})
 		}
 		nsData.Metadata = storage.VSchemaPlanMetadata(sc.Metadata)
 		nsData.Finalize = sc.Metadata[engine.MetadataNeedsFinalizer] == "true"

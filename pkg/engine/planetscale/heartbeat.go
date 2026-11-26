@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // waitHeartbeatInterval paces the progress events a long engine wait emits. It
@@ -51,7 +52,7 @@ func (h *waitHeartbeat) beat() {
 	}
 	h.last = now
 	h.emit(engine.ApplyEvent{
-		Message:  fmt.Sprintf("%s (%s elapsed)", h.message, now.Sub(h.start).Round(time.Second)),
+		Message:  fmt.Sprintf("%s (%s elapsed)", h.message, ui.FormatHumanDuration(now.Sub(h.start).Round(time.Second))),
 		Metadata: maps.Clone(h.metadata),
 	})
 }

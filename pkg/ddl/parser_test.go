@@ -44,6 +44,10 @@ func (f fakeStatementParser) DropTargets(string) (DropTargets, error) {
 	return DropTargets{}, nil
 }
 
+func (f fakeStatementParser) ObjectChanges(string) (ObjectChanges, error) {
+	return ObjectChanges{}, nil
+}
+
 func (f fakeStatementParser) CreateTableColumns(string) ([]string, error) {
 	return nil, nil
 }

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -503,7 +504,7 @@ func inlineCode(name string) string {
 // control and format characters are removed and whitespace runs, line breaks
 // included, collapse to one space.
 func flattenIdentifier(name string) string {
-	return strings.Join(strings.Fields(stripControlText(name)), " ")
+	return strings.Join(strings.Fields(presentation.StripControlText(name)), " ")
 }
 
 // inlineCodeCell is inlineCode for a table cell: the cell separator is

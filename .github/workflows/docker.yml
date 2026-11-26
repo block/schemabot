@@ -218,16 +218,26 @@ jobs:
             ~/.cache/go-build
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
-      - name: "Build LocalScale binary"
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/localscale-linux ./cmd/localscale
+      # One binary per published platform. The Dockerfile copies in the one
+      # matching its own leg's TARGETARCH, so both must exist before the build.
+      - name: "Build LocalScale binaries"
+        run: |
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -o "bin/localscale-linux-$arch" ./cmd/localscale
+          done
 
       - name: "Extract LocalScale metadata"
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # docker/metadata-action@v5
         id: localscale-meta
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/localscale
+          # The release tag matters here as well as on the server image: a CLI
+          # that provisions a Vitess sample pins the image to its own release,
+          # so the API the engine speaks moves on both sides at once.
           tags: |
             type=sha,prefix=
+            type=semver,pattern=v{{version}}
+            type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: "Build and push LocalScale image"
@@ -235,7 +245,9 @@ jobs:
         with:
           context: .
           file: deploy/local/Dockerfile.localscale
-          platforms: linux/amd64
+          # The sample runs on contributors' own machines, which are as often
+          # arm64 as amd64, so both are published and both are built on a PR.
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.localscale-meta.outputs.tags }}
           labels: ${{ steps.localscale-meta.outputs.labels }}

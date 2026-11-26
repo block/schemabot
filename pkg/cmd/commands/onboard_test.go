@@ -1209,3 +1209,118 @@ func TestBuildOnboardWritePlanChecksNamespacesSharingADirectory(t *testing.T) {
 		assert.Contains(t, err.Error(), "the pulled schemas of their namespaces differ")
 	})
 }
+
+// A live table schema files cannot describe has no file to write, and a live
+// table with no file plans as DROP TABLE. Onboarding therefore lists each
+// skipped table in ignore_tables beside the files it writes, keeps entries the
+// repository already had without repeating them, and names the skipped tables
+// so the operator knows SchemaBot will leave them alone.
+func TestBuildOnboardWritePlanWithholdsSkippedTables(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database: "app", Type: "postgres", Environment: "development", TableCount: 1,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"public": {
+				Tables: map[string]string{"orders": "CREATE TABLE orders (\n  id bigint PRIMARY KEY\n);\n"},
+				SkippedTables: []apitypes.SkippedTable{
+					{Table: "audit_log", Reason: "unlogged tables cannot be rendered as a desired schema"},
+					{Table: "flyway_schema_history", Reason: "schema files cannot describe its trigger"},
+				},
+			},
+		},
+	}, client.PlanExclusions{Tables: []string{"flyway_schema_history"}})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	config, err := os.ReadFile(filepath.Join(root, "schemabot.yaml"))
+	require.NoError(t, err)
+	assert.Equal(t, "database: app\ntype: postgres\nignore_tables:\n  - flyway_schema_history\n  - audit_log\n", string(config))
+	assert.Equal(t, []string{"flyway_schema_history", "audit_log"}, plan.exclusions.Tables,
+		"verification plans with the skipped tables withheld")
+	assert.FileExists(t, filepath.Join(root, "public", "orders.sql"))
+	assert.NoFileExists(t, filepath.Join(root, "public", "audit_log.sql"))
+
+	out := stripAnsi(captureStdout(plan.printExclusionDisclosure))
+	assert.Contains(t, out, "Not managed in namespace public: 2 tables have no schema file, so schemabot.yaml lists them in ignore_tables:\n")
+	assert.Contains(t, out, "  audit_log: unlogged tables cannot be rendered as a desired schema\n")
+	assert.Contains(t, out, "  flyway_schema_history: schema files cannot describe its trigger\n")
+}
+
+// ignore_tables reads a name wrapped in slashes as a pattern, so listing a
+// skipped table of that name would withhold every table the pattern matches.
+// Onboarding refuses before writing anything rather than write that entry.
+func TestBuildOnboardWritePlanRefusesASkippedTableThatReadsAsAPattern(t *testing.T) {
+	root := t.TempDir()
+	_, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database: "app", Type: "postgres", Environment: "development",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"public": {
+				Tables:        map[string]string{"orders": "CREATE TABLE orders (id bigint PRIMARY KEY);\n"},
+				SkippedTables: []apitypes.SkippedTable{{Table: "/tmp/", Reason: "unlogged tables cannot be rendered as a desired schema"}},
+			},
+		},
+	}, client.PlanExclusions{})
+	require.ErrorContains(t, err, "onboarding refused; no files were written")
+	require.ErrorContains(t, err, `namespace "public" (unlogged tables cannot be rendered as a desired schema)`)
+	require.ErrorContains(t, err, "ignore_tables would read its name as a pattern")
+	assert.NoFileExists(t, filepath.Join(root, "schemabot.yaml"))
+}
+
+// A skipped table whose name ignore_tables does not accept as an entry, such
+// as one with a slash or surrounding whitespace, would leave a config no plan
+// can read. Onboarding refuses before writing anything.
+func TestBuildOnboardWritePlanRefusesASkippedTableIgnoreTablesCannotName(t *testing.T) {
+	for _, name := range []string{"audit/log", " audit_log"} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			_, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+				Database: "app", Type: "postgres", Environment: "development",
+				Namespaces: map[string]*apitypes.PulledNamespace{
+					"public": {
+						Tables:        map[string]string{"orders": "CREATE TABLE orders (id bigint PRIMARY KEY);\n"},
+						SkippedTables: []apitypes.SkippedTable{{Table: name, Reason: "unlogged tables cannot be rendered as a desired schema"}},
+					},
+				},
+			}, client.PlanExclusions{})
+			require.ErrorContains(t, err, "onboarding refused; no files were written")
+			require.ErrorContains(t, err, "ignore_tables cannot name it")
+			assert.NoFileExists(t, filepath.Join(root, "schemabot.yaml"))
+		})
+	}
+}
+
+// A table onboarded earlier that has since gained something schema files
+// cannot describe is skipped and withheld on the next onboard. Its leftover
+// file is reported with the withheld tables, whose remedy is deleting it, not
+// as a missing table to restore.
+func TestOnboardWritePlanSeparatesASkippedTablesLeftoverFile(t *testing.T) {
+	root := t.TempDir()
+	before, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database: "app", Type: "postgres", Environment: "development",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"public": {Tables: map[string]string{
+				"orders":   "CREATE TABLE orders (id bigint PRIMARY KEY);\n",
+				"accounts": "CREATE TABLE accounts (id bigint PRIMARY KEY);\n",
+			}},
+		},
+	}, client.PlanExclusions{})
+	require.NoError(t, err)
+	require.NoError(t, before.write())
+
+	after, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database: "app", Type: "postgres", Environment: "development",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"public": {
+				Tables:        map[string]string{"orders": "CREATE TABLE orders (id bigint PRIMARY KEY);\n"},
+				SkippedTables: []apitypes.SkippedTable{{Table: "accounts", Reason: "schema files cannot describe its trigger"}},
+			},
+		},
+	}, client.PlanExclusions{})
+	require.NoError(t, err)
+	require.NoError(t, after.write())
+
+	strays, withheldStrays, err := after.strayFiles()
+	require.NoError(t, err)
+	assert.Empty(t, strays, "the leftover file is not an absent table to restore")
+	assert.Equal(t, []string{filepath.Join(root, "public", "accounts.sql")}, withheldStrays)
+}

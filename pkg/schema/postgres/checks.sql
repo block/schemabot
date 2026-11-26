@@ -16,6 +16,7 @@ CREATE TABLE checks (
   change_summary varchar(255) DEFAULT NULL,
   rollout_targets integer NOT NULL DEFAULT 0,
   rollout_targets_with_work integer NOT NULL DEFAULT 0,
+  plan_refused boolean NOT NULL DEFAULT FALSE,
   aggregate_render jsonb DEFAULT NULL,
   created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,

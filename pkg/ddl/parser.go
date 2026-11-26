@@ -43,6 +43,12 @@ type StatementParser interface {
 	// stop relying on. Statements that drop nothing report zeros.
 	DropTargets(stmt string) (DropTargets, error)
 
+	// ObjectChanges names the tables, columns, indexes, constraints and
+	// partitions exactly one statement adds, drops or changes in place, so a
+	// finding on one object can be matched against what another statement
+	// did to the same object.
+	ObjectChanges(stmt string) (ObjectChanges, error)
+
 	// CreateTableColumns returns the declared column names from exactly one
 	// CREATE TABLE statement. Table-level constraints are not columns.
 	CreateTableColumns(stmt string) ([]string, error)

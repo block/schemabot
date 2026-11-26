@@ -903,8 +903,11 @@ type ApplyStore interface {
 	// AttachOperationWithTasks stores one additional apply_operations row and
 	// its tasks under an existing apply in a single transaction. The apply's
 	// state is re-read under a row lock inside the transaction and the attach
-	// fails with ErrApplyNotActive when it is terminal — new work must never
-	// land on an apply no drive will pick up again. The (apply_id, deployment,
+	// fails with an *ApplyNotActiveError, which matches ErrApplyNotActive and
+	// carries the state it read, when the apply is terminal. New
+	// work must never land on an apply no drive will pick up again, and the
+	// caller settles the refused work against that stored state rather than
+	// against its own copy of the apply. The (apply_id, deployment,
 	// operation_key) unique index is the idempotency guard: a concurrent attach
 	// of the same operation loses with ErrApplyOperationExists, which the
 	// caller resolves by re-reading the winner's row. Under the same lock, an
@@ -1878,6 +1881,18 @@ type ApplyOperationStore interface {
 	// (apply_id, deployment, operation_key), or nil if not found.
 	GetByApplyDeploymentAndOperationKey(ctx context.Context, applyID int64, deployment, operationKey string) (*ApplyOperation, error)
 
+	// FailedSiblingHaltingOperation returns the failed work row that halts
+	// the work row operationID of apply applyID, or nil when nothing halts
+	// it. A row is halted when another work row of its own rollout member
+	// (the same deployment and target, such as another shard of the same
+	// target) has failed and its own on_failure is halt. An on_failure value
+	// other than continue or pause behaves like halt. Pause holds the
+	// rollout for an operator to release rather than ending it, so it halts
+	// nothing that is already running. An apply a remote dispatch created
+	// leaves its order to the dispatcher, so its rows are never halted here.
+	// When several siblings have failed, the earliest one is returned.
+	FailedSiblingHaltingOperation(ctx context.Context, applyID, operationID int64) (*ApplyOperation, error)
+
 	// ListByApply returns all child rows for an apply in (created_at, id) order.
 	ListByApply(ctx context.Context, applyID int64) ([]*ApplyOperation, error)
 
@@ -2025,7 +2040,10 @@ type ApplyOperationStore interface {
 	// state it was claimed from, which is how the caller tells a claim that
 	// starts an operation from a retry or a recovery.
 	//
-	// opts narrow what the claim may match; see OperationClaimFilter.
+	// opts narrow what the claim may match; see OperationClaimFilter. With
+	// ReportClaimContention, a claim that took nothing while a lock-free
+	// reread found an operation it could take returns
+	// ErrOperationClaimContended instead of nil.
 	FindNextApplyOperation(ctx context.Context, owner string, opts ...OperationClaimOption) (*ApplyOperation, error)
 
 	// FindNextApplyOperationCutover atomically claims the next operation parked

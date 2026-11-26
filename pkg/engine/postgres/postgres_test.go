@@ -167,7 +167,6 @@ var createShapeRefusalSentences = map[executor.CreateShapeCause]string{
 	executor.CreateShapeConcurrently:       `statement for table "users" declares CONCURRENTLY for an index on a new table, which SchemaBot's PostgreSQL create path does not support; remove CONCURRENTLY so the index can be built before the table receives traffic`,
 	executor.CreateShapeDuplicateName:      `statement for table "users" declares the same relation name more than once; give every table, index, constraint, and sequence a unique name`,
 	executor.CreateShapeMultipleOperations: `statement for table "users" contains multiple create operations in one statement; split them into separate CREATE TABLE or CREATE INDEX statements`,
-	executor.CreateShapeForeignKey:         `statement for table "users" declares a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; leave the foreign key out of the schema file to create the table, then add the foreign key outside SchemaBot and back to the file`,
 	executor.CreateShapeUnsupportedKind:    `statement for table "users" uses a statement kind SchemaBot's PostgreSQL create path does not support; use CREATE TABLE or CREATE INDEX, or create the object outside SchemaBot`,
 }
 
@@ -257,15 +256,25 @@ func TestExecutionVerdictBlocksPartitionedIndexShapeTheBuildRefuses(t *testing.T
 	}, executionVerdict(pgplan.FormatVersion, statement, "events", nil))
 }
 
-// Every execution contract the planner can attach runs; only a contract
-// outside the planner's closed set is blocked, and reported as vocabulary
-// that moved.
+// Every execution contract the planner can attach either runs or is blocked
+// with a sentence written for it; only a contract outside the planner's
+// closed set is reported as vocabulary that moved.
 func TestExecutionContractVerdictCoversEveryExecution(t *testing.T) {
+	blocked := map[planner.Execution]string{
+		planner.ExecutionBlockingIndexDrop: blockingIndexDropReason("users"),
+	}
 	for _, execution := range planner.Executions() {
 		t.Run(string(execution), func(t *testing.T) {
 			verdict, runs := executionContractVerdict(execution, "users")
-			assert.True(t, runs, "a contract the planner names must run")
-			assert.Equal(t, stepVerdict{}, verdict)
+			reason, isBlocked := blocked[execution]
+			if !isBlocked {
+				assert.True(t, runs, "a contract the planner names must run or have its own sentence")
+				assert.Equal(t, stepVerdict{}, verdict)
+				return
+			}
+			assert.False(t, runs)
+			assert.Equal(t, stepVerdict{mode: engine.ExecutionModeBlocked, reason: reason}, verdict)
+			assert.Nil(t, verdict.unrecognized, "a contract the planner names is not vocabulary that moved")
 		})
 	}
 
@@ -336,15 +345,13 @@ func TestExecutionVerdictUnknownGuidance(t *testing.T) {
 	}, "users", nil))
 }
 
-// A foreign-key change on a live table is planned so it can be reviewed, but
-// the engine does not run it: the step is blocked with a sentence naming
-// whether the statement adds or drops the foreign key, and nothing is
-// reported as unrecognized vocabulary. An added foreign key's remedy applies
-// the rest of the plan first, since its column may be one the same plan adds.
-// A dropped foreign key's remedy offers declaring it before removing it, so
-// an operator whose file left it out keeps the constraint. Only a table that
-// carries foreign keys into another namespace gets the clause naming them,
-// since those cannot be declared and removal is the only way forward.
+// A foreign-key change the planner refuses is shown for review and the engine
+// does not run it. A dropped foreign key's remedy offers declaring it before
+// removing it, so an operator whose file left it out keeps the constraint.
+// Only a table that carries foreign keys into another namespace gets the
+// clause naming them, since those cannot be declared and removal is the only
+// way forward. Any other foreign-key change the planner refuses gets the
+// general remedy, and nothing is reported as unrecognized vocabulary.
 func TestExecutionVerdictForeignKeyChange(t *testing.T) {
 	const dropReason = `statement for table "users" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan`
 	for _, tt := range []struct {
@@ -353,7 +360,7 @@ func TestExecutionVerdictForeignKeyChange(t *testing.T) {
 		crossNamespace []string
 		want           string
 	}{
-		{"add", schemadiff.ChangeAddForeignKey, nil, `statement for table "users" adds a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; leave the foreign key out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and add the foreign key back to the file`},
+		{"another foreign-key change", schemadiff.ChangeAddForeignKey, nil, `statement for table "users" changes a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; leave the change out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and put the change back in the file`},
 		{"drop", schemadiff.ChangeDropForeignKey, nil, dropReason},
 		{"drop with cross-namespace foreign keys", schemadiff.ChangeDropForeignKey, []string{"users_account_id_fkey", "users_region_id_fkey"},
 			dropReason + `; foreign key constraint(s) "users_account_id_fkey", "users_region_id_fkey" reference another namespace and cannot be declared, so the plan stays blocked until they are removed through a separately reviewed process`},
@@ -385,7 +392,7 @@ func TestExecutionVerdictGeneratedExpressionChange(t *testing.T) {
 
 // A foreign key the planner cannot bind fails the plan with the fix appended:
 // the referenced table must already exist on the target, and the planning
-// role must be able to read it. The remedy matches through wrapping, and any
+// role must be able to read and reference it. The remedy matches through wrapping, and any
 // other failure gets none.
 func TestReferencedTableRemedy(t *testing.T) {
 	for _, tt := range []struct {
@@ -394,9 +401,11 @@ func TestReferencedTableRemedy(t *testing.T) {
 		want string
 	}{
 		{"not found", fmt.Errorf("plan: %w: public.customers", schemadiff.ErrReferencedTableNotFound),
-			"; a foreign key can reference only a table that already exists on the target, so leave the foreign key out of the schema file, apply the referenced table first, then run the ADD CONSTRAINT outside SchemaBot and add the foreign key back to the file"},
+			"; a foreign key can reference only a table that already exists on the target, so apply the referenced table first, then add the foreign key to the file in a later change"},
 		{"not readable", fmt.Errorf("plan: %w: public.customers", schemadiff.ErrReferencedTableNotReadable),
 			"; grant the planning role SELECT on the referenced table, then re-plan"},
+		{"not referenceable", fmt.Errorf("plan: %w: public.customers", schemadiff.ErrReferencedTableNotReferenceable),
+			"; grant the planning role REFERENCES on the referenced table, then re-plan"},
 		{"other failure", errors.New("connection reset"), ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1154,7 +1163,7 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndIndexBuilds(t *testing.T) {
 	}
 	partitionedBuilds := map[string]bool{"CREATE INDEX users_name_idx ON public.users (name)": true}
 
-	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds))
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds, nil))
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
 	assert.Equal(t, []string{"privilege verdict", "size verdict"}, engine.BlockedCauses(changes[0].ModeReason))
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
@@ -1166,7 +1175,7 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndIndexBuilds(t *testing.T) {
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[4].ExecutionMode, "a plain index build the planner did not route to the partitioned build stays under the ceiling")
 	assert.Equal(t, "size verdict", changes[4].ModeReason)
 
-	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds))
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds, nil))
 	assert.Equal(t, []string{"privilege verdict", "size verdict"}, engine.BlockedCauses(changes[0].ModeReason))
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
 }
@@ -1178,7 +1187,7 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndIndexBuilds(t *testing.T) {
 func TestBlockRewriteStepsFailsClosedOnUnparseableStep(t *testing.T) {
 	changes := []engine.TableChange{{Table: "users", DDL: "ALTER TABLE public.users ADD"}}
 
-	err := blockRewriteSteps(changes, "size verdict", nil)
+	err := blockRewriteSteps(changes, "size verdict", nil, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `classify planned statement for table "users"`)
 	assert.Empty(t, changes[0].ExecutionMode)
@@ -1427,6 +1436,62 @@ func TestBlockOversizedTableBlocksExecutableRewrite(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
 	assert.Equal(t, `statement for table "users": table size 2048 bytes exceeds the 1024-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`, changes[0].ModeReason)
+}
+
+// A step whose every planner decision is proven catalog-only stays executable
+// on an oversized table: it rewrites no rows, so its cost does not grow with
+// the table the ceiling measures.
+func TestBlockOversizedTableAdmitsProvenCatalogOnlyStep(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}
+	}
+	const ddl = "ALTER TABLE public.users ADD COLUMN email text"
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	report.Statements = []pgplan.Statement{{
+		ExecSQL:   []string{ddl},
+		Decisions: []planner.Decision{{ProvenCatalogOnly: true}},
+	}}
+	changes := []engine.TableChange{{Table: "users", DDL: ddl}}
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	assert.Empty(t, changes[0].ExecutionMode)
+	assert.Empty(t, changes[0].ModeReason)
+}
+
+// One unproven decision is enough to keep the ceiling on a step, since the
+// exemption holds only when the whole statement writes nothing but the catalog.
+func TestBlockOversizedTableBlocksStepWithAnUnprovenDecision(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}
+	}
+	const ddl = "ALTER TABLE public.users ADD COLUMN email text, ALTER COLUMN id TYPE numeric"
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	report.Statements = []pgplan.Statement{{
+		ExecSQL:   []string{ddl},
+		Decisions: []planner.Decision{{ProvenCatalogOnly: true}, {ProvenCatalogOnly: false}},
+	}}
+	changes := []engine.TableChange{{Table: "users", DDL: ddl}}
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+	assert.Contains(t, changes[0].ModeReason, "1024-byte threshold")
+}
+
+// catalogOnlySteps exempts only statements whose decisions are all proven, and
+// a statement with no decisions proves nothing.
+func TestCatalogOnlyStepsRequiresEveryDecisionProven(t *testing.T) {
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Statements = []pgplan.Statement{
+		{ExecSQL: []string{"ALTER TABLE a ADD COLUMN x text"}, Decisions: []planner.Decision{{ProvenCatalogOnly: true}}},
+		{ExecSQL: []string{"ALTER TABLE b ADD COLUMN y text"}, Decisions: []planner.Decision{{ProvenCatalogOnly: true}, {}}},
+		{ExecSQL: []string{"ALTER TABLE c ADD COLUMN z text"}},
+	}
+
+	assert.Equal(t, map[string]bool{"ALTER TABLE a ADD COLUMN x text": true}, catalogOnlySteps(report))
 }
 
 // An executable step without a named target fails the plan closed because a
@@ -1738,121 +1803,6 @@ func capabilityMappingRows(t *testing.T) map[string]string {
 func TestNewWithTableSizeLimitTreatsZeroAsUnset(t *testing.T) {
 	assert.Equal(t, DefaultNativeSafeTableSizeLimitBytes, NewWithTableSizeLimit(0).TableSizeLimit())
 	assert.Equal(t, int64(42), NewWithTableSizeLimit(42).TableSizeLimit())
-}
-
-// The undeclared-table reason offers only remedies the operator can carry
-// out, and which remedy applies depends on where the table's foreign key
-// constraints live: none, on the table itself, on other tables, or both, and
-// whether one the table owns references another namespace, which no schema
-// file can declare. Every constraint the remedy depends on is named so the
-// operator knows what a drop or a hand-written file has to account for.
-func TestUndeclaredTableReasonNamesRemedyPerForeignKeySide(t *testing.T) {
-	const preamble = `table "orders" exists on the target but no schema file in namespace "public" declares it; converging would drop the table, which SchemaBot's PostgreSQL support never executes`
-	tests := []struct {
-		name string
-		live liveTable
-		want string
-	}{
-		{
-			name: "no foreign keys on either side",
-			live: liveTable{name: "orders"},
-			want: preamble + " — declare the table in a schema file to keep it under management, or drop it through a separately reviewed process",
-		},
-		{
-			name: "owns one foreign key",
-			live: liveTable{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}},
-			want: preamble + `; it carries foreign key constraint(s) "orders_user_id_fkey", so the schema pull cannot write a file for it — declare the table by hand in a schema file, foreign keys included, to keep it under management, or drop it through a separately reviewed process`,
-		},
-		{
-			name: "owns several foreign keys",
-			live: liveTable{name: "orders", foreignKeys: []string{"orders_shop_id_fkey", "orders_user_id_fkey"}},
-			want: preamble + `; it carries foreign key constraint(s) "orders_shop_id_fkey", "orders_user_id_fkey", so the schema pull cannot write a file for it — declare the table by hand in a schema file, foreign keys included, to keep it under management, or drop it through a separately reviewed process`,
-		},
-		{
-			name: "owns a foreign key into another namespace",
-			live: liveTable{name: "orders", foreignKeys: []string{"orders_account_id_fkey", "orders_user_id_fkey"}, crossNamespaceForeignKeys: []string{"orders_account_id_fkey"}},
-			want: preamble + `; the table cannot be declared while it carries foreign key constraint(s) "orders_account_id_fkey", which reference another namespace and schema files do not support — drop the table, or remove those foreign keys before declaring it, through a separately reviewed process`,
-		},
-		{
-			name: "referenced by foreign keys on other tables",
-			live: liveTable{name: "orders", referencedBy: []string{"invoices_order_id_fkey", "shipments_order_id_fkey"}},
-			want: preamble + `; foreign key constraint(s) "invoices_order_id_fkey", "shipments_order_id_fkey" on other tables reference it, so the schema pull cannot write a file for it — declare the table by hand in a schema file to keep it under management, or drop it together with the referencing constraints through a separately reviewed process`,
-		},
-		{
-			name: "owns and is referenced by foreign keys",
-			live: liveTable{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, referencedBy: []string{"invoices_order_id_fkey"}},
-			want: preamble + `; it carries foreign key constraint(s) "orders_user_id_fkey" and foreign key constraint(s) "invoices_order_id_fkey" on other tables reference it, so the schema pull cannot write a file for it — declare the table by hand in a schema file, foreign keys included, to keep it under management, or drop it together with the referencing constraints through a separately reviewed process`,
-		},
-		{
-			name: "owns a foreign key into another namespace and is referenced",
-			live: liveTable{name: "orders", foreignKeys: []string{"orders_account_id_fkey"}, crossNamespaceForeignKeys: []string{"orders_account_id_fkey"}, referencedBy: []string{"invoices_order_id_fkey"}},
-			want: preamble + `; the table cannot be declared while it carries foreign key constraint(s) "orders_account_id_fkey", which reference another namespace and schema files do not support, and foreign key constraint(s) "invoices_order_id_fkey" on other tables reference it — drop the table together with the referencing constraints, or remove those foreign keys and declare it by hand, through a separately reviewed process`,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, undeclaredTableReason("public", tt.live))
-		})
-	}
-}
-
-// The managed table set decides membership and order; the foreign key read
-// only decorates it. The join keeps the set's order whatever order the
-// decoration rows arrive in, and a table with no constraints on either side
-// is one the catalog confirmed, not one the read missed.
-func TestJoinForeignKeysPreservesManagedOrder(t *testing.T) {
-	tables, err := joinForeignKeys("public", []string{"invoices", "orders", "users"}, []tableForeignKeys{
-		{name: "users"},
-		{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, referencedBy: []string{"invoices_order_id_fkey"}},
-		{name: "invoices", foreignKeys: []string{"invoices_order_id_fkey"}},
-	})
-	require.NoError(t, err)
-	assert.Equal(t, []liveTable{
-		{name: "invoices", foreignKeys: []string{"invoices_order_id_fkey"}},
-		{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, referencedBy: []string{"invoices_order_id_fkey"}},
-		{name: "users"},
-	}, tables)
-}
-
-// The two catalog reads run on separate snapshots, so the join is checked in
-// both directions rather than trusted: a managed table with no decoration row
-// left the catalog between the reads, and a decoration row outside the
-// managed set means the read stopped restricting itself to it. Neither is
-// turned into a table with no foreign keys; the plan fails so it can be
-// retried against one catalog state.
-func TestJoinForeignKeysFailsClosedOnSkew(t *testing.T) {
-	tests := []struct {
-		name    string
-		names   []string
-		keys    []tableForeignKeys
-		wantErr string
-	}{
-		{
-			name:    "managed table left the catalog between the reads",
-			names:   []string{"orders", "users"},
-			keys:    []tableForeignKeys{{name: "users"}},
-			wantErr: `table "orders" in namespace "public" left the catalog while the plan was reading it; retry the plan`,
-		},
-		{
-			name:    "decoration row outside the managed set",
-			names:   []string{"orders"},
-			keys:    []tableForeignKeys{{name: "orders"}, {name: "orders_p2024"}},
-			wantErr: `foreign key metadata for table "orders_p2024" in namespace "public" is outside the managed table set`,
-		},
-		{
-			name:    "decoration row returned twice",
-			names:   []string{"orders"},
-			keys:    []tableForeignKeys{{name: "orders"}, {name: "orders", foreignKeys: []string{"orders_user_id_fkey"}}},
-			wantErr: `foreign key metadata for table "orders" in namespace "public" was returned more than once`,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tables, err := joinForeignKeys("public", tt.names, tt.keys)
-			require.EqualError(t, err, tt.wantErr)
-			assert.Nil(t, tables)
-		})
-	}
 }
 
 // A baseline render never runs more introspections than the pool can hold

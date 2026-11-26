@@ -143,12 +143,12 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 		// say so: the operator needs to know the removal has not taken effect
 		// and what completes it.
 		if len(vacated) > 0 {
-			return nil, fmt.Errorf("no schema files found under %s for environment %q: this pull request removes the last schema files under it, so the tables those files declared stay live and the removal does not take effect; drop them through a reviewed schema change before deleting the files", schemaRoot, environment)
+			return nil, &noSchemaFilesError{message: fmt.Sprintf("no schema files found under %s for environment %q: this pull request removes the last schema files under it, so the tables those files declared stay live and the removal does not take effect; drop them through a reviewed schema change before deleting the files", schemaRoot, environment)}
 		}
 		if len(ignoredNamespaces) > 0 {
-			return nil, fmt.Errorf("no schema files found under %s for environment %q after excluding ignored namespaces %v", schemaRoot, environment, ignoredNamespaces)
+			return nil, &noSchemaFilesError{message: fmt.Sprintf("no schema files found under %s for environment %q after excluding ignored namespaces %v", schemaRoot, environment, ignoredNamespaces)}
 		}
-		return nil, fmt.Errorf("no schema files found under %s for environment %q", schemaRoot, environment)
+		return nil, &noSchemaFilesError{message: fmt.Sprintf("no schema files found under %s for environment %q", schemaRoot, environment)}
 	}
 	for _, namespace := range emptiedPRNamespaces(schemaFiles, config.IgnoreNamespaces, vacated, schemaRoot, environment) {
 		schemaFiles[namespace] = &ternv1.SchemaFiles{Files: map[string]string{}}

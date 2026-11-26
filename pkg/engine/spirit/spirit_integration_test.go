@@ -3034,6 +3034,13 @@ func TestEngine_Plan_SlowSizeProbeStatementIsAbandoned(t *testing.T) {
 			}
 			return fmt.Sprintf("SET SESSION information_schema_stats_expiry = (SELECT SLEEP(%d))", int(stall.Seconds()))
 		},
+		// SLEEP returns 0, so the stalled read still reports the server's setting.
+		"name case setting": func(stmt string) string {
+			if !strings.Contains(stmt, "@@lower_case_table_names") {
+				return stmt
+			}
+			return fmt.Sprintf("SELECT @@lower_case_table_names + SLEEP(%d)", int(stall.Seconds()))
+		},
 		"statistics query": func(stmt string) string {
 			if !strings.Contains(stmt, "information_schema.tables") {
 				return stmt

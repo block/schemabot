@@ -628,8 +628,10 @@ type InstallationClient struct {
 
 	// blobs holds schema file content by blob SHA, so a file whose content did
 	// not change is read from GitHub once per installation, however many
-	// environments, plans, and pushes read it.
-	blobs *blobContentCache
+	// environments, plans, and pushes read it. blobReads shares one read
+	// between the callers that miss on the same blob at the same time.
+	blobs     *blobContentCache
+	blobReads singleflight.Group
 }
 
 // InstallationID returns the GitHub App installation this client is scoped
@@ -889,16 +891,18 @@ func (ic *InstallationClient) GetIssueComment(ctx context.Context, repo string, 
 	return comment.GetBody(), nil
 }
 
-// EditIssueComment edits an existing PR/issue comment.
-func (ic *InstallationClient) EditIssueComment(ctx context.Context, repo string, commentID int64, body string) error {
+// EditIssueComment edits an existing PR/issue comment and returns when GitHub
+// created the comment, read from the edit response at no extra request cost.
+// The time is zero when the response omits it.
+func (ic *InstallationClient) EditIssueComment(ctx context.Context, repo string, commentID int64, body string) (time.Time, error) {
 	owner, repoName := splitRepo(repo)
-	_, _, err := ic.client.Issues.EditComment(ctx, owner, repoName, commentID, &gh.IssueComment{
+	edited, _, err := ic.client.Issues.EditComment(ctx, owner, repoName, commentID, &gh.IssueComment{
 		Body: new(body),
 	})
 	if err != nil {
-		return fmt.Errorf("edit issue comment: %w", err)
+		return time.Time{}, fmt.Errorf("edit issue comment: %w", err)
 	}
-	return nil
+	return edited.GetCreatedAt().Time, nil
 }
 
 // DeleteIssueComment removes an existing PR/issue comment from the timeline.
@@ -3862,7 +3866,7 @@ func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, rep
 			if fullObjectSHA.MatchString(headSHA) {
 				blobSHA = loc.blobSHA
 			}
-			content, err := ic.cachedBlobContent(repo, blobSHA, func() (string, error) {
+			content, err := ic.cachedBlobContent(ctx, repo, blobSHA, func(ctx context.Context) (string, error) {
 				return ic.FetchFileContent(ctx, repo, loc.fetchPath, headSHA)
 			})
 			if err != nil {
@@ -3972,7 +3976,7 @@ func (ic *InstallationClient) fetchSchemaFilesFromTree(ctx context.Context, repo
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			content, err := ic.cachedBlobContent(repo, entry.SHA, func() (string, error) {
+			content, err := ic.cachedBlobContent(ctx, repo, entry.SHA, func(ctx context.Context) (string, error) {
 				return ic.FetchBlobContent(ctx, repo, entry.SHA)
 			})
 			if err != nil {

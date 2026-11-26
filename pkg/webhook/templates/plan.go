@@ -46,6 +46,11 @@ type UnsafeChangeData struct {
 	// ChangeType is the engine's change type (e.g. "drop"), rendered when the
 	// change carries no parseable reason so the finding still explains itself.
 	ChangeType string
+	// FindingColumns maps a finding of Reason, as ui.LintReasons lists it, to
+	// the column the engine said the finding concerns. A finding absent from
+	// it names no column, and its attribution is matched against the whole
+	// statement.
+	FindingColumns map[string]string
 	// Shards names the shards this unsafe change applies to, for a sharded plan
 	// where only some shards carry it. Empty for a non-sharded change (applies to
 	// the whole table).
@@ -120,16 +125,121 @@ type DirectChangeData struct {
 // established, which is annotated the same way — the lookup fails toward
 // ownership rather than presenting a change SchemaBot cannot vouch for as one
 // this pull request proposes.
+//
+// OwnerChanges is what the owner's stored statements did to the table's
+// columns, indexes and constraints, merged across them, so each finding can be
+// matched against the owner's work (UndoesAttributedWork). It is nil when that
+// is unknown, and every finding on the table then carries the attribution.
 type AttributedChangeData struct {
-	Table       string
-	Repository  string
-	PullRequest int
-	Unresolved  bool
+	Table        string
+	Repository   string
+	PullRequest  int
+	Unresolved   bool
+	OwnerChanges *ddl.ObjectChanges
+}
+
+// UndoesAttributedWork reports whether a planned change, as ReadPlannedChange
+// read its statement, would undo something the attributed pull request did to its table: drop or
+// change an object the owner added, changed or built an index or constraint
+// on, put back an object the owner dropped, or drop the table itself. A change
+// that touches only objects the owner never did is this pull request's own,
+// so it is not attributed. Anything the match cannot read (an unresolved
+// owner, unknown owner changes, a missing parser, or a statement that does not
+// parse) counts as undoing the owner's work, since over-attributing is the
+// safe direction.
+func UndoesAttributedWork(a AttributedChangeData, planned *ddl.ObjectChanges) bool {
+	return undoesOwnerWork(a, planned, "")
+}
+
+// ReadPlannedChange reads what a planned statement does to its table's
+// objects, or returns nil when it cannot: no statement, no parser, or a
+// statement the parser rejects. A nil result attributes every finding of the
+// statement to each owner (undoesOwnerWork). Callers read each statement
+// once and match the result against every owner, so a failure is logged once.
+func ReadPlannedChange(table, stmt string, parser ddl.StatementParser) *ddl.ObjectChanges {
+	if parser == nil {
+		slog.Debug("planned change is attributed to every owning pull request because no statement parser is known for its database type",
+			"table", table)
+		return nil
+	}
+	if strings.TrimSpace(stmt) == "" {
+		slog.Debug("planned change is attributed to every owning pull request because it carries no statement",
+			"table", table)
+		return nil
+	}
+	change, err := parser.ObjectChanges(stmt)
+	if err != nil {
+		slog.Warn("planned change is attributed to every owning pull request because its statement's objects could not be read",
+			"table", table, "error", err)
+		return nil
+	}
+	return &change
+}
+
+// undoesOwnerWork is UndoesAttributedWork for the one finding of a planned
+// change that concerns column, so a compound ALTER TABLE whose other clauses
+// undo the owner's work does not lend this finding the owner's note. An empty
+// column, or one the statement does not change, matches the whole statement.
+// A nil change is one ReadPlannedChange could not read, and it counts as
+// undoing the owner's work. Objects compare exactly: each parser folds names
+// the way its dialect does before they get here, and only the finding's column
+// name, which comes from the linter, is matched without case.
+func undoesOwnerWork(a AttributedChangeData, planned *ddl.ObjectChanges, column string) bool {
+	if a.Unresolved || a.OwnerChanges == nil || planned == nil {
+		return true
+	}
+	change := *planned
+	if column != "" {
+		if narrowed, ok := narrowToColumn(change, column); ok {
+			change = narrowed
+		}
+	}
+	owner := *a.OwnerChanges
+	destroyed := slices.Concat(change.Dropped, change.Modified)
+	if slices.ContainsFunc(destroyed, isTableObject) {
+		return true
+	}
+	ownerBuilt := slices.Concat(owner.Added, owner.Modified, owner.Referenced)
+	if len(destroyed) > 0 && slices.ContainsFunc(ownerBuilt, isTableObject) {
+		return true
+	}
+	return sharesObject(destroyed, ownerBuilt) || sharesObject(change.Added, owner.Dropped)
+}
+
+// narrowToColumn keeps only what a statement does to one column, and reports
+// whether the statement does anything to it.
+func narrowToColumn(change ddl.ObjectChanges, column string) (ddl.ObjectChanges, bool) {
+	isColumn := func(o ddl.SchemaObject) bool {
+		return o.Kind == ddl.ObjectColumn && strings.EqualFold(o.Name, column)
+	}
+	narrowed := ddl.ObjectChanges{
+		Added:    slices.DeleteFunc(slices.Clone(change.Added), func(o ddl.SchemaObject) bool { return !isColumn(o) }),
+		Dropped:  slices.DeleteFunc(slices.Clone(change.Dropped), func(o ddl.SchemaObject) bool { return !isColumn(o) }),
+		Modified: slices.DeleteFunc(slices.Clone(change.Modified), func(o ddl.SchemaObject) bool { return !isColumn(o) }),
+	}
+	found := len(narrowed.Added)+len(narrowed.Dropped)+len(narrowed.Modified) > 0
+	return narrowed, found
+}
+
+// isTableObject reports whether an object is a whole table, which covers
+// every column, index and constraint on it.
+func isTableObject(o ddl.SchemaObject) bool {
+	return o.Kind == ddl.ObjectTable
+}
+
+// sharesObject reports whether the two lists name a common object.
+func sharesObject(a, b []ddl.SchemaObject) bool {
+	return slices.ContainsFunc(a, func(o ddl.SchemaObject) bool { return slices.Contains(b, o) })
 }
 
 // PlanCommentData contains all data needed to render a plan comment.
 type PlanCommentData struct {
 	Database string
+
+	// Freezes are the freezes covering this environment's change when it was
+	// planned, nil when none does, when they could not be read, or when the
+	// comment offers no apply.
+	Freezes *PlanFreezeNotice
 
 	// ScopedDatabase is the database this comment's copy-paste commands name,
 	// so the follow-up an operator is being asked for is one they can paste in
@@ -199,6 +309,11 @@ type PlanCommentData struct {
 	// drop, so the comment says so rather than reading as if the table were
 	// seen and kept.
 	UnmatchedDropTables []string
+
+	// RollbackBlockers lists, per namespace, the live tables that kept the
+	// plan from saving the namespace's current schema, so an apply of the
+	// plan cannot be rolled back. The comment says so before anyone applies.
+	RollbackBlockers []RollbackBlockersData
 
 	// ApplyAuthorization lists who may run the apply the comment offers. Nil
 	// when PR command authorization is off or the reader may run the apply.
@@ -297,6 +412,12 @@ type PlanCommentData struct {
 	// database (nothing to compare) or when drift was not evaluated.
 	DeploymentDrift *DeploymentDriftData
 
+	// OperationsAtOnce is how many of an apply's operations SchemaBot runs at
+	// once (max_drivers_per_apply). The plan summary states it when the plan
+	// rolls out to more targets or shards than that, so a reviewer knows before
+	// applying that the rest will wait their turn. Zero states nothing.
+	OperationsAtOnce int
+
 	// BaseSchema says whether the PR's base branch changed this environment's
 	// schema after the PR branched off it. Nil when it was not checked.
 	BaseSchema *BaseSchemaData
@@ -318,6 +439,10 @@ type PlanCommentData struct {
 	// count combined across targets never reads as any one target's work. Nil
 	// when the summary is one plan's.
 	summaryRollout *DeploymentDriftData
+	// summaryRolloutOperations is how many operations an apply of the
+	// summarized rollout would run across its targets that have work, counted
+	// from each target's own plan before the summary combines them.
+	summaryRolloutOperations int
 	// applyWithheld is set on an environment's plan whose apply a multi-env
 	// footer does not offer, because an earlier environment's apply is
 	// refused, so its unsafe warning keeps the drop steps no footer carries.
@@ -335,6 +460,20 @@ type ExemptTablesData struct {
 	Namespace string
 	Tables    []string
 	Reason    string
+}
+
+// RollbackBlockersData names the tables that kept a plan from saving one
+// namespace's current schema as its rollback baseline.
+type RollbackBlockersData struct {
+	Namespace string
+	Tables    []RollbackBlockerData
+}
+
+// RollbackBlockerData is one table a plan could not save, with what it
+// carries that a schema file cannot describe.
+type RollbackBlockerData struct {
+	Table  string
+	Reason string
 }
 
 // DeploymentDriftData renders the review-time drift rollup in the PR preview: a
@@ -633,6 +772,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// A branch missing newer base-branch schema changes is shown first, since
 	// it says the plan below may not be the change the PR means to make.
 	writeBaseSchema(&sb, data.BaseSchema)
+	writePlanFreezesIfApplyOffered(&sb, data)
 	// Review-time deployment drift is shown before the change list — and before
 	// the no-changes short-circuit — because a non-primary deployment can drift
 	// even when the primary plan is a clean no-op.
@@ -647,8 +787,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			writePausedApplyCause(&sb, data.PausedApplyCause)
 		}
 		writeTargetPlans(&sb, data, budget, false)
-		summary.Changes = combinedTargetPlanChanges(data)
-		summary.summaryRollout = data.DeploymentDrift
+		summary.summarizeRollout(data)
 	}
 
 	// Count changes
@@ -818,7 +957,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		if data.Tenant != "" {
 			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 		}
-		writeApplyInstruction(&sb, applyCmd, data)
+		writeApplyInstruction(&sb, appendFreezeOverride(applyCmd, data.Freezes), data)
 		writeWhoCanApply(&sb, data.Database, data.ApplyAuthorization)
 	}
 
@@ -1163,23 +1302,39 @@ func attributionStillActionable(data PlanCommentData) bool {
 // operator's call to make; what the comment owes them is the attribution they
 // cannot see from the DDL alone.
 //
-// Attribution is table-grained: stored task history records the table a task
-// changed and nothing finer, so the notice names the table and the pull request
-// that last changed it, never the specific column or index.
+// A table is listed only when one of its planned changes undoes what the owner
+// did to it (UndoesAttributedWork); the notice names the table and the owner,
+// and the plan's own findings say which column or index is at stake.
 func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData) {
-	n := len(changes)
-	fmt.Fprintf(sb, glyph.Attention+" **Check before applying**: %d %s SchemaBot cannot attribute to this PR\n", n, pluralize("destructive change", n))
+	var tables []string
+	byTable := map[string][]AttributedChangeData{}
 	for _, d := range changes {
-		if d.Unresolved {
-			fmt.Fprintf(sb, "- %s: ownership could not be established; see server logs\n", inlineCode(d.Table))
+		if _, seen := byTable[d.Table]; !seen {
+			tables = append(tables, d.Table)
+		}
+		byTable[d.Table] = append(byTable[d.Table], d)
+	}
+	n := len(tables)
+	fmt.Fprintf(sb, glyph.Attention+" **Check before applying**: %d %s SchemaBot cannot attribute to this PR\n", n, pluralize("destructive change", n))
+	for _, table := range tables {
+		owners := byTable[table]
+		if slices.ContainsFunc(owners, func(d AttributedChangeData) bool { return d.Unresolved }) {
+			fmt.Fprintf(sb, "- %s: ownership could not be established; see server logs\n", inlineCode(table))
 			continue
 		}
-		// The owner named is the most recent open pull request that changed the
-		// table, which is not necessarily the last one to change it: a later
-		// change from a pull request that has since closed leaves no open claim
-		// and is passed over.
-		fmt.Fprintf(sb, "- %s: changed by %s, which is still open\n",
-			inlineCode(d.Table), caller.PullRequestMarkdownLink(d.Repository, d.PullRequest))
+		// The owners named are the open pull requests whose work the plan
+		// undoes, which need not include the last one to change the table: a
+		// later change from a pull request that has since closed leaves no
+		// open claim and is passed over.
+		refs := make([]string, len(owners))
+		for i, d := range owners {
+			refs[i] = caller.PullRequestMarkdownLink(d.Repository, d.PullRequest)
+		}
+		if len(refs) == 1 {
+			fmt.Fprintf(sb, "- %s: changed by %s, which is still open\n", inlineCode(table), refs[0])
+			continue
+		}
+		fmt.Fprintf(sb, "- %s: changed by %s, which are still open\n", inlineCode(table), joinWithAnd(refs))
 	}
 	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.\n\n")
 }
@@ -1339,6 +1494,15 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	text := planSummaryText(data.Changes, data.DatabaseType, data.IsMySQL, totalStatements)
 	if data.summaryRollout != nil {
 		text += " · " + rolloutScope(data.summaryRollout)
+		changing := changingTargetCount(data.summaryRollout)
+		if limit := presentation.LimitPhrase(changing, data.summaryRolloutOperations, data.OperationsAtOnce); limit != "" {
+			text += ", " + limit
+		}
+	}
+	if shards, operations := plannedShardWork(data.Changes, data.DatabaseType); shards > 0 {
+		if limit := presentation.LimitPhrase(shards, operations, data.OperationsAtOnce); limit != "" {
+			text += fmt.Sprintf(" · %d %s, %s", shards, pluralize("shard", shards), limit)
+		}
 	}
 	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", text)
 
@@ -1348,6 +1512,126 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 	writeExemptTables(sb, data.ExemptTables)
 	writeUnmatchedDropTables(sb, data.shownUnmatchedDropTables())
+	writeRollbackBlockers(sb, data.shownRollbackBlockers())
+}
+
+// shownRollbackBlockers is the rollback blockers the plan reports. A rollout
+// plan reports none: rollback is refused for an environment with more than
+// one target whatever was saved, so naming tables as the reason would point
+// the reader at the wrong cause. The blockers also describe the primary
+// target alone.
+func (d PlanCommentData) shownRollbackBlockers() []RollbackBlockersData {
+	if d.DeploymentDrift != nil {
+		return nil
+	}
+	return d.RollbackBlockers
+}
+
+// writeRollbackBlockers renders, per namespace, that an apply of the plan
+// cannot be rolled back and which tables are why. No-op when every changed
+// namespace's current schema was saved, which is the ordinary case. The
+// table names come from the target's catalog and the reasons are engine
+// prose, so each is escaped for markdown.
+func writeRollbackBlockers(sb *strings.Builder, groups []RollbackBlockersData) {
+	for _, group := range groups {
+		if len(group.Tables) == 0 {
+			continue
+		}
+		fmt.Fprintf(sb, glyph.Attention+" %s\n\n", presentation.RollbackNotCaptured(inlineCode(group.Namespace)))
+		shown, more := presentation.RollbackBlockersShown(len(group.Tables))
+		for _, table := range group.Tables[:shown] {
+			fmt.Fprintf(sb, "- %s: %s\n", inlineCode(table.Table), exemptReason(table.Reason))
+		}
+		if more > 0 {
+			fmt.Fprintf(sb, "- %s\n", presentation.RollbackBlockersMore(more))
+		}
+		sb.WriteString("\n")
+	}
+}
+
+// summarizeRollout makes s the summary of data's rollout: the union of every
+// target's changes, the rollout it covers, and how many operations its apply
+// would run (plannedRolloutOperations).
+func (s *PlanCommentData) summarizeRollout(data PlanCommentData) {
+	s.Changes = combinedTargetPlanChanges(data)
+	s.summaryRollout = data.DeploymentDrift
+	s.summaryRolloutOperations = plannedRolloutOperations(data)
+}
+
+// plannedRolloutOperations counts the operations an apply of data's rollout
+// would run on its targets that have work. A target runs one operation for its
+// whole plan, and a sharded target one per table on each of its shards with
+// work (plannedShardWork), so a rollout across sharded targets has more
+// operations than targets for the limit to hold back.
+func plannedRolloutOperations(data PlanCommentData) int {
+	if data.DeploymentDrift == nil {
+		return 0
+	}
+	operations := 0
+	for _, g := range data.DeploymentDrift.Plans {
+		if g.Empty() {
+			continue
+		}
+		perTarget := 1
+		if _, shardOperations := plannedShardWork(targetPlanChanges(g, data), data.DatabaseType); shardOperations > 0 {
+			perTarget = shardOperations
+		}
+		operations += perTarget * len(g.Members)
+	}
+	return operations
+}
+
+// plannedShardWork counts a sharded plan's shards that have work and the
+// operations an apply would run on them. The apply runs one operation per
+// table on each shard, however many statements that table's change has, so
+// statements are counted by the distinct table each names. A statement the
+// dialect's parser cannot name a table for counts as an operation of its own,
+// which can only overstate the work the limit holds back. Both are zero for a
+// plan with no sharded keyspace.
+func plannedShardWork(changes []KeyspaceChangeData, databaseType string) (shards, operations int) {
+	parser, parserErr := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
+	if parserErr != nil {
+		slog.Warn("plan summary cannot classify shard statements; it will count one operation per statement for the operation limit",
+			"database_type", databaseType, "error", parserErr)
+	}
+	for _, ks := range changes {
+		for _, sh := range ks.Shards {
+			if sh.Satisfied || len(sh.Statements) == 0 {
+				continue
+			}
+			shards++
+			operations += shardTableCount(parser, ks.Keyspace, sh)
+		}
+	}
+	return shards, operations
+}
+
+// shardTableCount is how many tables one shard's planned statements change,
+// the operations an apply runs on that shard. With no parser, or for a
+// statement the parser names no table for, each statement counts as one.
+func shardTableCount(parser ddl.StatementParser, keyspace string, sh KeyspaceShardChange) int {
+	if parser == nil {
+		return len(sh.Statements)
+	}
+	tables := make(map[string]bool, len(sh.Statements))
+	unnamed := 0
+	for _, stmt := range sh.Statements {
+		_, table, err := parser.Classify(stmt)
+		if err != nil {
+			slog.Debug("plan summary could not classify a shard statement; it counts as one operation for the operation limit",
+				"keyspace", keyspace, "shard", sh.Shard, "error", err)
+			unnamed++
+			continue
+		}
+		if table == "" {
+			slog.Debug("plan summary found no table in a shard statement; it counts as one operation for the operation limit",
+				"keyspace", keyspace, "shard", sh.Shard)
+			unnamed++
+			continue
+		}
+		tables[table] = true
+	}
+	return len(tables) + unnamed
 }
 
 // planSummaryText renders what a plan would do as the plan summary counts it,
@@ -1434,7 +1718,7 @@ func writeExemptTablesGroup(sb *strings.Builder, group ExemptTablesData, env str
 	}
 	fmt.Fprintf(sb, "<details>\n<summary>"+glyph.Info+" %s%d ignored tables in namespace <code>%s</code> (%s)</summary>\n\n%s\n\n</details>\n\n",
 		prefix, len(group.Tables), html.EscapeString(flattenIdentifier(group.Namespace)),
-		html.EscapeString(SanitizeInlineError(group.Reason)), names)
+		html.EscapeString(presentation.InlineError(group.Reason)), names)
 }
 
 // hasExemptTables reports whether writeExemptTables would render anything for
@@ -1450,7 +1734,7 @@ func hasExemptTables(groups []ExemptTablesData) bool {
 }
 
 func exemptReason(reason string) string {
-	return escapeProse(SanitizeInlineError(reason))
+	return escapeProse(presentation.InlineError(reason))
 }
 
 // writeMultiEnvExemptTables renders the exempt-table disclosure for the
@@ -2317,8 +2601,8 @@ func shardGroupSignature(s KeyspaceShardChange) string {
 // comment, for the shards of a keyspace and the targets of a rollout alike.
 // Beyond it, listing every name reads as a wall — a wide group collapses to a
 // count, with the names behind a collapsed block where the rendering has room
-// for one.
-const shardNamesInlineLimit = 8
+// for one. It is the CLI's limit too (presentation.MemberNamesInlineLimit).
+const shardNamesInlineLimit = presentation.MemberNamesInlineLimit
 
 // A plan group's members render through the same group headings whatever
 // they are called, so a rollout whose targets need different work reads the
@@ -3184,7 +3468,7 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 	causes := make([]string, 0)
 	for _, cause := range engine.BlockedCauses(reason) {
-		if cause = SanitizeInlineError(cause); cause != "" {
+		if cause = presentation.InlineError(cause); cause != "" {
 			causes = append(causes, cause)
 		}
 	}
@@ -3198,17 +3482,17 @@ func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 	}
 }
 
-// writeUnsafeWarning lists the unsafe findings. attributionNotes, keyed by
-// table, carries the attribution for tables another pull request changed, so
-// the reader learns where a change came from on the finding itself. When
+// writeUnsafeWarning lists the unsafe findings. attributionNotes carries the
+// attribution for findings that undo another pull request's change, so the
+// reader learns where a change came from on the finding itself. When
 // dropTips is set, a tip on making each destructive drop safe follows the
 // list; it is unset where the comment's apply instruction carries those steps
 // instead, so the reader meets them once, beside the command they precede.
-func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL, dropTips bool) {
+func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes *unsafeAttribution, databaseType string, isMySQL, dropTips bool) {
 	drops, rest := splitDestructiveDrops(changes, databaseType)
 	fmt.Fprintf(sb, "%s **Issues**: %s\n", glyph.Attention, unsafeCountPhrase(drops, rest))
 	writeUnsafeFindingList(sb, drops, rest, attributionNotes)
-	writeUnsafeAttributionDisclosure(sb, attributionNotes)
+	writeUnsafeAttributionDisclosure(sb, changes, attributionNotes)
 	sb.WriteString("\n")
 	if dropTips {
 		writeUnsafeDropTips(sb, drops, databaseType, isMySQL)
@@ -3235,7 +3519,7 @@ func unsafeCountPhrase(drops, rest []UnsafeChangeData) string {
 // header's drop count and each finding's own text say which ones they are.
 // A long list shows its first findings and folds the rest, as
 // unsafeFindingsShown decides; numbering runs on into the fold.
-func writeUnsafeFindingList(sb *strings.Builder, drops, rest []UnsafeChangeData, attributionNotes map[string]string) {
+func writeUnsafeFindingList(sb *strings.Builder, drops, rest []UnsafeChangeData, attributionNotes *unsafeAttribution) {
 	var lines []string
 	for _, c := range drops {
 		lines = append(lines, unsafeFindingLines(c, attributionNotes)...)
@@ -3273,8 +3557,8 @@ func unsafeFindingsShown(total, drops int) int {
 
 // writeUnsafeAttributionDisclosure explains why another pull request's change
 // shows up as one to undo, when any finding carries an attribution note.
-func writeUnsafeAttributionDisclosure(sb *strings.Builder, attributionNotes map[string]string) {
-	if len(attributionNotes) > 0 {
+func writeUnsafeAttributionDisclosure(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes *unsafeAttribution) {
+	if slices.ContainsFunc(changes, attributionNotes.carriesNote) {
 		sb.WriteString("\nA plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.\n")
 	}
 }
@@ -3308,37 +3592,126 @@ func unsafeChangeLabel(c UnsafeChangeData) string {
 	return table
 }
 
-// unsafeAttributionNotes returns, keyed by table, the note each attributed
-// table's unsafe findings carry, and whether the attribution is folded into
-// the unsafe warning. It folds only when that warning is shown and lists every
-// attributed table with a finding that destroys something; otherwise the
-// attribution keeps its own section, so no disclosure is lost. A finding on a
-// change that creates its table never carries the note: such a change
-// destroys nothing, so another target's change to the same table, which the
-// attribution is about, would otherwise read as the creation's.
-func unsafeAttributionNotes(data PlanCommentData, unsafeShown bool) (map[string]string, bool) {
+// unsafeAttribution is the attribution the unsafe findings carry: for each
+// attributed table, every owner whose work a finding on it may undo.
+type unsafeAttribution struct {
+	byTable     map[string][]AttributedChangeData
+	parser      ddl.StatementParser
+	commentRepo string
+	// planned caches each planned statement's objects, so a statement is
+	// parsed once per render however many findings and owners consult it.
+	planned map[string]*ddl.ObjectChanges
+}
+
+// plannedChange is what a change's statement does to its table's objects,
+// read once and then reused (ReadPlannedChange).
+func (n *unsafeAttribution) plannedChange(c UnsafeChangeData) *ddl.ObjectChanges {
+	if change, ok := n.planned[c.DDL]; ok {
+		return change
+	}
+	change := ReadPlannedChange(c.Table, c.DDL, n.parser)
+	n.planned[c.DDL] = change
+	return change
+}
+
+// ownersFor is every owner whose work one finding of a change undoes, in the
+// order the lookup reported them. A change that creates its table names none:
+// such a change destroys nothing, so another target's change to the same
+// table, which the attribution is about, would otherwise read as the
+// creation's. Nor does a finding that touches only objects an owner never did,
+// since that finding is this pull request's own.
+func (n *unsafeAttribution) ownersFor(c UnsafeChangeData, finding string) []AttributedChangeData {
+	if n == nil || createsItsTable(c) {
+		return nil
+	}
+	attributed := n.byTable[c.Table]
+	if len(attributed) == 0 {
+		return nil
+	}
+	column := c.FindingColumns[finding]
+	planned := n.plannedChange(c)
+	var owners []AttributedChangeData
+	for _, a := range attributed {
+		if undoesOwnerWork(a, planned, column) {
+			owners = append(owners, a)
+		}
+	}
+	return owners
+}
+
+// noteFor is the attribution note one finding of a change carries, empty when
+// it carries none.
+func (n *unsafeAttribution) noteFor(c UnsafeChangeData, finding string) string {
+	owners := n.ownersFor(c, finding)
+	if len(owners) == 0 {
+		return ""
+	}
+	if slices.ContainsFunc(owners, func(a AttributedChangeData) bool { return a.Unresolved }) {
+		return "ownership could not be established"
+	}
+	refs := make([]string, len(owners))
+	for i, a := range owners {
+		refs[i] = pullRequestRef(n.commentRepo, a.Repository, a.PullRequest)
+	}
+	if len(refs) == 1 {
+		return "changed by open PR " + refs[0]
+	}
+	return "changed by open PRs " + joinWithAnd(refs)
+}
+
+// carriesNote reports whether any finding of a change carries an attribution
+// note.
+func (n *unsafeAttribution) carriesNote(c UnsafeChangeData) bool {
+	return slices.ContainsFunc(unsafeFindings(c), func(f string) bool { return n.noteFor(c, f) != "" })
+}
+
+// unsafeFindings is the findings of a change's unsafe reason, or one empty
+// finding when the reason lists none, so every change is matched at least
+// once.
+func unsafeFindings(c UnsafeChangeData) []string {
+	if reasons := ui.LintReasons(c.Reason); len(reasons) > 0 {
+		return reasons
+	}
+	return []string{""}
+}
+
+// unsafeAttributionNotes returns the attribution the unsafe findings carry,
+// and whether the attribution is folded into the unsafe warning. It folds only
+// when that warning is shown and every attributed owner is named by a finding
+// that undoes its work; otherwise the attribution keeps its own section, so no
+// disclosure is lost.
+func unsafeAttributionNotes(data PlanCommentData, unsafeShown bool) (*unsafeAttribution, bool) {
 	if !unsafeShown || len(data.AttributedChanges) == 0 {
 		return nil, false
 	}
-	unsafeTables := make(map[string]bool, len(data.UnsafeChanges))
-	for _, c := range data.UnsafeChanges {
-		if createsItsTable(c) {
-			continue
-		}
-		unsafeTables[c.Table] = true
+	notes := &unsafeAttribution{
+		byTable:     make(map[string][]AttributedChangeData, len(data.AttributedChanges)),
+		parser:      dropStatementParser(data.DatabaseType),
+		commentRepo: data.Repository,
+		planned:     make(map[string]*ddl.ObjectChanges, len(data.UnsafeChanges)),
 	}
-	notes := make(map[string]string, len(data.AttributedChanges))
 	for _, a := range data.AttributedChanges {
-		if !unsafeTables[a.Table] {
+		notes.byTable[a.Table] = append(notes.byTable[a.Table], a)
+	}
+	for _, a := range data.AttributedChanges {
+		if !notes.namesOwner(data.UnsafeChanges, a) {
 			return nil, false
 		}
-		if a.Unresolved {
-			notes[a.Table] = "ownership could not be established"
-			continue
-		}
-		notes[a.Table] = "changed by open PR " + pullRequestRef(data.Repository, a.Repository, a.PullRequest)
 	}
 	return notes, true
+}
+
+// namesOwner reports whether some finding among changes carries the note of
+// owner a.
+func (n *unsafeAttribution) namesOwner(changes []UnsafeChangeData, a AttributedChangeData) bool {
+	return slices.ContainsFunc(changes, func(c UnsafeChangeData) bool {
+		if c.Table != a.Table {
+			return false
+		}
+		return slices.ContainsFunc(unsafeFindings(c), func(f string) bool {
+			return slices.Contains(n.ownersFor(c, f), a)
+		})
+	})
 }
 
 // createsItsTable reports whether an unsafe change creates its table, so the
@@ -3357,27 +3730,29 @@ func pullRequestRef(commentRepo, repo string, pr int) string {
 }
 
 // unsafeFindingLines is one unnumbered line per finding in a change's unsafe
-// reason: the table, the finding, and the change's attribution note, which a
-// change that creates its table never carries. A change with no parseable reason
+// reason: the table, the finding, and the change's attribution note when it
+// carries one (unsafeAttribution.noteFor). A change with no parseable reason
 // still gets a line, carrying the engine's change type when one is known so
 // the finding explains itself. The table is already Markdown, as
 // unsafeChangeLabel renders it; each reason is rendered here by markdownReason.
-func unsafeFindingLines(c UnsafeChangeData, attributionNotes map[string]string) []string {
+func unsafeFindingLines(c UnsafeChangeData, attributionNotes *unsafeAttribution) []string {
 	table := unsafeChangeLabel(c)
-	suffix := ""
-	if note := attributionNotes[c.Table]; note != "" && !createsItsTable(c) {
-		suffix = " (" + note + ")"
+	suffix := func(finding string) string {
+		if note := attributionNotes.noteFor(c, finding); note != "" {
+			return " (" + note + ")"
+		}
+		return ""
 	}
 	reasons := ui.LintReasons(c.Reason)
 	if len(reasons) == 0 {
 		if c.ChangeType != "" {
-			return []string{fmt.Sprintf("%s: %s%s", table, c.ChangeType, suffix)}
+			return []string{fmt.Sprintf("%s: %s%s", table, c.ChangeType, suffix(""))}
 		}
-		return []string{table + suffix}
+		return []string{table + suffix("")}
 	}
 	lines := make([]string, 0, len(reasons))
 	for _, r := range reasons {
-		lines = append(lines, fmt.Sprintf("%s: %s%s", table, markdownReason(r), suffix))
+		lines = append(lines, fmt.Sprintf("%s: %s%s", table, markdownReason(r), suffix(r)))
 	}
 	return lines
 }
@@ -3844,7 +4219,7 @@ func groupLintWarningsByTable(warnings []LintViolationData) []lintWarningGroup {
 func writeErrors(sb *strings.Builder, errors []string) {
 	var msgs []string
 	for _, errMsg := range errors {
-		if msg := SanitizeInlineError(errMsg); msg != "" {
+		if msg := presentation.InlineError(errMsg); msg != "" {
 			msgs = append(msgs, msg)
 		}
 	}
@@ -3898,6 +4273,12 @@ type MultiEnvPlanCommentData struct {
 
 	// Errors per environment (if plan execution failed)
 	Errors map[string]string
+
+	// PlanProblems lists, per failed environment, the statements in the schema
+	// files its engine refused to plan. An environment with problems renders
+	// them in place of its error text, and its fix is a change to those files
+	// rather than a re-run.
+	PlanProblems map[string]RefusedStatements
 
 	// UnmanagedSchema lists the schema configs the PR also changes that this
 	// deployment does not manage, and UnmanagedEnvironments the environments
@@ -3993,6 +4374,7 @@ func countMultiEnvPlanDDLBlocks(data MultiEnvPlanCommentData) int {
 
 func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
+	problemBudget := newPlanProblemBudget()
 
 	// Header
 	writeEnvironmentTitle(&sb, "Schema Change Plan", singleEnvironmentTitleEnvironment(data.Environments))
@@ -4039,6 +4421,12 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 		for _, env := range data.Environments {
 			fmt.Fprintf(&sb, "### %s\n\n", capitalizeFirst(env))
 
+			// An environment whose refused statements no longer fit what is
+			// left of the comment's budget shows its refusal text instead, so
+			// every section names something to act on.
+			if problems := data.PlanProblems[env]; len(problems.Problems) > 0 && writePlanProblems(&sb, problems, problemBudget) {
+				continue
+			}
 			if errMsg, hasErr := data.Errors[env]; hasErr {
 				writeErrorBlock(&sb, glyph.Failed, errMsg)
 				sb.WriteString("\n")
@@ -4158,6 +4546,7 @@ func titleDatabaseType(databaseType string) string {
 // writeEnvironmentPlanSection writes the plan body for a single environment within a multi-env comment.
 func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, budget *ddlBlockBudget) {
 	writeBaseSchema(sb, plan.BaseSchema)
+	writePlanFreezesIfApplyOffered(sb, *plan)
 	// Deployment drift is shown before the change list and before the no-changes
 	// short-circuit: a non-primary deployment can drift even when this
 	// environment's primary plan is a clean no-op.
@@ -4166,8 +4555,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	summary := *plan
 	if targetPlans {
 		writeTargetPlans(sb, *plan, budget, true)
-		summary.Changes = combinedTargetPlanChanges(*plan)
-		summary.summaryRollout = plan.DeploymentDrift
+		summary.summarizeRollout(*plan)
 	}
 
 	totalStatements, keyspaceUpdates := countChanges(plan.Changes)
@@ -4326,20 +4714,25 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	command := func(baseCommand, environment string) string {
 		return scopedCommand(baseCommand, environment, data.ScopedDatabase, data.Tenant)
 	}
+	// An environment a freeze holds is applied with --override, so the
+	// command its author copies is the one the freeze lets through.
+	applyCommand := func(environment string) string {
+		return appendFreezeOverride(command("schemabot apply", environment), data.Plans[environment].Freezes)
+	}
 
 	// Apply instructions for environments with changes.
 	switch {
 	case len(envsWithChanges) >= 2:
-		writeEnvApplyCommand(sb, "▶️ **To apply** these changes, start with the first environment", data.Plans[envsWithChanges[0]], command("schemabot apply", envsWithChanges[0]))
+		writeEnvApplyCommand(sb, "▶️ **To apply** these changes, start with the first environment", data.Plans[envsWithChanges[0]], applyCommand(envsWithChanges[0]))
 		for i := 1; i < len(envsWithChanges); i++ {
-			writeEnvApplyCommand(sb, fmt.Sprintf("\nAfter verifying %s, apply to %s", envsWithChanges[i-1], envsWithChanges[i]), data.Plans[envsWithChanges[i]], command("schemabot apply", envsWithChanges[i]))
+			writeEnvApplyCommand(sb, fmt.Sprintf("\nAfter verifying %s, apply to %s", envsWithChanges[i-1], envsWithChanges[i]), data.Plans[envsWithChanges[i]], applyCommand(envsWithChanges[i]))
 		}
 	case len(envsWithChanges) == 1:
 		if consent, ok := planUnsafeConsent(*data.Plans[envsWithChanges[0]]); ok {
-			writeUnsafeConsentCommand(sb, "▶️ **To apply** these changes", consent, command("schemabot apply", envsWithChanges[0]))
+			writeUnsafeConsentCommand(sb, "▶️ **To apply** these changes", consent, applyCommand(envsWithChanges[0]))
 		} else {
 			sb.WriteString("▶️ **To apply** these changes, comment:\n")
-			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
+			fmt.Fprintf(sb, "```\n%s\n```\n", applyCommand(envsWithChanges[0]))
 		}
 	case len(envsWithErrors) == 0 && len(envsRefused) == 0:
 		sb.WriteString("No changes to apply.\n")
@@ -4367,6 +4760,12 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	if len(envsWithErrors) > 0 {
 		sb.WriteString("\n")
 		for _, env := range envsWithErrors {
+			// A plan refused over statements in the files is refused again
+			// until the files change, so it is offered a push, not a re-run.
+			if len(data.PlanProblems[env].Problems) > 0 {
+				fmt.Fprintf(sb, glyph.Attention+" **%s** plans once these statements change. Fix them in the schema files and push a commit.\n", capitalizeFirst(env))
+				continue
+			}
 			fmt.Fprintf(sb, glyph.Attention+" **%s** failed to plan. Resolve the error above and re-run:\n", capitalizeFirst(env))
 			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot plan", env))
 		}

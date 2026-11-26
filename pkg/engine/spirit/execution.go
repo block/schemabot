@@ -657,6 +657,7 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 	// still in flight, and a progress poll must observe the recorded outcome,
 	// never infer one from a runner mid-teardown.
 	if err := runner.Run(ctx); err != nil {
+		err = explainRunnerError(err, parsed)
 		// Whether the error ended the change is Spirit's to say: an error
 		// after the cutover committed comes from cleanup of a change the
 		// target already holds, whether or not anything cancelled the run.
@@ -774,6 +775,43 @@ func (e *Engine) setSchemaChangeFailed(err error) {
 			e.runningSchemaChange.targetHeld = errors.Is(err, engine.ErrTargetHeld)
 		}
 	}
+}
+
+// UniqueKeyDuplicatesReason is what a schema change that adds a UNIQUE key
+// reports when Spirit's checksum keeps finding rows that differ between the
+// table and its copy. Spirit copies with INSERT IGNORE, so rows holding
+// duplicate values for the new key are dropped from the copy rather than
+// refused, and every repair drops them again.
+const UniqueKeyDuplicatesReason = "The checksum kept finding rows that differ between the table and its copy. This change adds a UNIQUE key, and duplicate values under it are the usual cause. Resolve the duplicates, then apply the change again."
+
+// explainRunnerError marks a runner error whose cause SchemaBot can name, so
+// failureReason shows that cause instead of the generic sentence. Only one is
+// named: a checksum that kept finding differences on a batch that adds a
+// UNIQUE key. Spirit reports that cause in its own error text, which also
+// carries text SchemaBot does not publish, so it is matched on Spirit's
+// sentinel and the statements instead. The cause stays wrapped, so retry
+// classification still reads it.
+func explainRunnerError(err error, stmts []*statement.AbstractStatement) error {
+	if errors.Is(err, checksum.ErrDifferencesExhausted) && addsUniqueKey(stmts) {
+		return engine.OperatorErrorf(err, "%s", UniqueKeyDuplicatesReason)
+	}
+	return err
+}
+
+// addsUniqueKey reports whether any statement in the batch adds a UNIQUE key.
+// It mirrors the decision Spirit makes before it names duplicates as the cause
+// of a checksum failure, and only the ErrAlterContainsUnique result counts: an
+// error such as ErrNotAlterTable does not mean the batch adds a key. A typed
+// error from Spirit wrapping its duplicate-key failure would retire this copy.
+// Until then, a batch Spirit treats as adding a unique key and this does not
+// (ADD PRIMARY KEY, a column-level UNIQUE) keeps the generic failure reason.
+func addsUniqueKey(stmts []*statement.AbstractStatement) bool {
+	for _, stmt := range stmts {
+		if errors.Is(stmt.AlterContainsAddUnique(), statement.ErrAlterContainsUnique) {
+			return true
+		}
+	}
+	return false
 }
 
 // failureReason renders why the schema change failed, for a pull request to

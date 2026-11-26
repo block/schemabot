@@ -370,7 +370,7 @@ ifeq ($(FRESH),1)
 endif
 	@echo "Building binaries..."
 	@(CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/schemabot-linux ./pkg/cmd) & \
-		(CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/localscale-linux ./cmd/localscale) & \
+		(CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/localscale-linux-$$(go env GOARCH) ./cmd/localscale) & \
 		wait
 	@cp bin/schemabot-linux deploy/local/schemabot-dev
 	@docker build -f deploy/local/Dockerfile.localscale -t localscale:latest . -q
@@ -694,7 +694,7 @@ test-endpoints:
 # Uses pre-built vttestserver image from GHCR (vtcombo + mysqlctl + MySQL 8.4),
 # only needs to build the localscale binary and layer it on top.
 build-localscale-image: ## Build LocalScale Docker image
-	CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/localscale-linux ./cmd/localscale
+	CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/localscale-linux-$$(go env GOARCH) ./cmd/localscale
 	docker build -f deploy/local/Dockerfile.localscale -t localscale:latest .
 
 # Run LocalScale integration tests

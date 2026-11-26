@@ -29,6 +29,10 @@ type RolloutOperation struct {
 	// Deployment is the operation's deployment. A finalizer and the work it
 	// finalizes share it.
 	Deployment string
+	// Target is the address the operation runs against within its
+	// deployment. Work rows that share a deployment and a target are one
+	// rollout member's work, such as one target's per-shard work.
+	Target string
 	// OperationKey is the operation's key. A finalizer's key names the scope
 	// of the work it finalizes (see FinalizerFinalizesWork).
 	OperationKey string
@@ -72,6 +76,7 @@ func RolloutChildren(ops []RolloutOperation) []RolloutChild {
 	for i, op := range ops {
 		children[i] = RolloutChild{
 			State:             op.State,
+			Member:            workMember(op),
 			ContinueOnFailure: op.ContinueOnFailure,
 			PauseOnFailure:    op.PauseOnFailure,
 			Orphaned:          finalizerOrphanedByFailedWork(op, ops) || stepOrphanedByEarlierStep(op, ops),
@@ -79,6 +84,20 @@ func RolloutChildren(ops []RolloutOperation) []RolloutChild {
 		}
 	}
 	return children
+}
+
+// workMember names the rollout member a work row belongs to, its deployment
+// and target, or returns "" for a row that is not work. The claim's
+// same-member failure gate (sameMemberFailureGateSQL) holds a work row back
+// once another work row of the same deployment and target has failed, so the
+// projection groups the same rows. That includes work rows with no target:
+// the gate compares targets as stored, so a deployment's rows without one
+// form one member there and here.
+func workMember(op RolloutOperation) string {
+	if !op.Work {
+		return ""
+	}
+	return op.Deployment + OperationKeyDelimiter + op.Target
 }
 
 // finalizerOrphanedByFailedWork reports whether op is a group_finalizer that

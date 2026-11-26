@@ -250,21 +250,40 @@ func outputMultiEnvPlanResult(results map[string]*apitypes.PlanResponse, databas
 		// Single environment
 		templates.WriteEnvironmentHeader(envOrder[0])
 		writeEnvPlan(results[envOrder[0]])
+		writePlanFreezes(envOrder[0], results[envOrder[0]])
 	case plansIdentical:
-		// Same plan across all environments
+		// Same plan across all environments. The freezes differ by
+		// environment, so each one's are written under the combined plan.
 		var titled []string
 		for _, env := range envOrder {
 			titled = append(titled, cases.Title(language.English).String(env))
 		}
 		fmt.Printf("  %s%s%s\n\n", templates.ANSIBold, strings.Join(titled, " & "), templates.ANSIReset)
 		writeEnvPlan(stagingResult)
+		for _, env := range envOrder {
+			writePlanFreezes(env, results[env])
+		}
 	default:
 		// Different plans — per-env sections
 		for _, env := range envOrder {
 			templates.WriteEnvironmentHeader(env)
 			writeEnvPlan(results[env])
+			writePlanFreezes(env, results[env])
 		}
 	}
+}
+
+// writePlanFreezes writes the freezes that cover environment's change, so the
+// operator learns before applying that a freeze refuses the apply now, or will
+// once it starts. A plan with no changes, or one apply refuses whatever its
+// flags (planRefusal), offers no apply, so it names none: an override would
+// not get it through. The PR plan comment withholds its notice by the same
+// rule.
+func writePlanFreezes(environment string, result *apitypes.PlanResponse) {
+	if result == nil || !hasResultChanges(result) || planRefusal(result) != "" {
+		return
+	}
+	templates.WritePlanFreezes(environment, result.Freezes)
 }
 
 // withUnmatchedDropTablesInEveryPlan copies results with each one's unmatched
@@ -395,7 +414,10 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 	}
 	templates.WriteExemptTables(result.ExemptTables)
 	// A rollout reports no unmatched drop_tables entries; see
-	// shownUnmatchedDropTables.
+	// shownUnmatchedDropTables. Nor does it report rollback blockers:
+	// rollback is refused for an environment with more than one target
+	// whatever each member saved, so naming tables as the reason would point
+	// the reader at the wrong cause.
 }
 
 // shownUnmatchedDropTables is the unmatched drop_tables entries the plan
@@ -609,6 +631,7 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 	}
 	templates.WriteExemptTables(result.ExemptTables)
 	templates.WriteUnmatchedDropTables(shownUnmatchedDropTables(result))
+	templates.WriteRollbackBlockers(result.Changes)
 }
 
 // writePlanGuidance links the guides for the lint findings the output shows.

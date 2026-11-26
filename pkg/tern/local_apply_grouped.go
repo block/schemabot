@@ -14,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // executeGroupedApply runs all DDLs in one engine operation. For Spirit with
@@ -717,14 +718,13 @@ func (w *acceptedEngineWork) haltUnlessPolled() {
 // its own context to learn why it stopped.
 func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, options map[string]string, releaseAtCutoverBarrier bool) error {
 	eng := c.getEngine()
-	ticker := time.NewTicker(c.taskPollInterval())
-	defer ticker.Stop()
 
 	// Seed revertSkipped from the durable signal so a driver that picks this apply
 	// up after a restart treats skip-revert as already accepted: it won't re-attempt
 	// SkipRevert, and it keeps surfacing skipping_revert while finalization is in
 	// flight rather than falling back to revert_window.
 	ps := &atomicPollState{
+		nextPollWait:    c.progressPollWait(0),
 		lastProgressLog: time.Now(),
 		revertSkipped:   apply.RevertSkippedAt != nil,
 		lostWork:        lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)},
@@ -740,13 +740,15 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 		c.haltEngineWorkLeftByDrive(ctx, c.logger.With(apply.IdentityLogAttrs()...))
 	}()
 
+	tickStart := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			c.logger.Info("drive context cancelled while polling; handing the apply back for another driver to claim",
 				apply.IdentityLogAttrs()...)
 			return nil
-		case <-ticker.C:
+		case <-time.After(max(0, ps.nextPollWait-time.Since(tickStart))):
+			tickStart = time.Now()
 			if !ps.parked.runFullPoll(ctx, c.storage, apply, time.Now(), c.logger.With(apply.IdentityLogAttrs()...)) {
 				continue
 			}
@@ -787,7 +789,7 @@ func applyQuiesceDecision(projectedApplyState string) (quiesce, retryablePause, 
 func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState, options map[string]string, releaseAtCutoverBarrier bool) bool {
 	// Bind identity once for all decisions and state transitions in this progress tick.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
-	// The poll loop's select can pick a ready ticker over an equally ready
+	// The poll loop's select can pick a fired poll timer over an equally ready
 	// ctx.Done(), so a tick can begin after the drive has been cancelled. Every
 	// engine call and storage write it made would fail on that context.
 	if c.driveCancelled(ctx, apply, "before a progress tick") {
@@ -808,6 +810,20 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		} else if standDown {
 			return true
 		}
+	}
+	if standDown, err := c.cancelForFailedSibling(ctx, logger, eng, apply, tasks, firstTaskAtCutover, &ps.loggedSiblingFailureAtCutover); err != nil {
+		if errors.Is(err, ErrTaskVerdictRefused) {
+			// Some tasks recorded cancelled and some did not. The error
+			// keeps the operation row claimable instead of deriving it from
+			// the partly settled tasks.
+			ps.terminalErr = err
+			return true
+		}
+		logger.Warn("halting this operation behind a failed sibling failed; current apply owner will exit for operator retry",
+			"error", err)
+		return true
+	} else if standDown {
+		return true
 	}
 
 	result, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
@@ -830,8 +846,9 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			return true
 		}
 		ps.consecutiveErrors++
+		ps.nextPollWait = c.progressPollWait(ps.consecutiveErrors)
 		logger.Warn("progress check failed",
-			append(apply.MutableLogAttrs(), "error", err, "consecutive_errors", ps.consecutiveErrors)...)
+			append(apply.MutableLogAttrs(), "error", err, "consecutive_errors", ps.consecutiveErrors, "next_poll_in", ps.nextPollWait)...)
 		if ps.consecutiveErrors >= maxConsecutiveProgressPollErrors {
 			if c.shouldPauseAcceptedWork(apply, tasks, err) {
 				logger.Warn("progress polling failed repeatedly, pausing apply for operator retry",
@@ -901,8 +918,9 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 				// the healthy poll that carried the pending report cannot
 				// clear the count.
 				ps.consecutiveErrors++
+				ps.nextPollWait = c.progressPollWait(ps.consecutiveErrors)
 				logger.Warn("engine reports no active schema change for an in-flight apply and target verification failed; the drive re-verifies at the next poll",
-					append(apply.MutableLogAttrs(), "engine_state", result.State, "consecutive_errors", ps.consecutiveErrors, "error", settleErr)...)
+					append(apply.MutableLogAttrs(), "engine_state", result.State, "consecutive_errors", ps.consecutiveErrors, "next_poll_in", ps.nextPollWait, "error", settleErr)...)
 				if ps.consecutiveErrors >= maxConsecutiveProgressPollErrors {
 					ps.terminalErr = c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("engine reports no active schema change for an in-flight apply and the target could not be verified; %d consecutive errors across progress polls and target verification; see server logs", ps.consecutiveErrors))
 					return true
@@ -925,6 +943,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	}
 
 	ps.consecutiveErrors = 0
+	ps.nextPollWait = c.progressPollWait(0)
 	c.logEngineResumeOnce(ctx, logger, apply, result.ResumedFromCheckpoint, &ps.resumeEventLogged)
 
 	// Update resumeState if the engine returned a newer one (e.g., with
@@ -1595,7 +1614,7 @@ func (c *LocalClient) autoTriggerCutover(ctx context.Context, eng engine.Engine,
 		}
 		if !ps.cutoverNotReadyEscalated {
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
-				fmt.Sprintf("Cutover has not been accepted by the engine backend for %s; SchemaBot keeps retrying every progress tick", notReadyFor.Round(time.Second)), "", "")
+				fmt.Sprintf("Cutover has not been accepted by the engine backend for %s; SchemaBot keeps retrying every progress tick", ui.FormatHumanDuration(notReadyFor.Round(time.Second))), "", "")
 			ps.cutoverNotReadyEscalated = true
 		}
 		logger.Error("auto-cutover has been rejected as not-ready beyond the staging window; the engine backend is not staging the cutover and the drive keeps retrying",
@@ -1769,7 +1788,7 @@ func (c *LocalClient) reportAutoSkipRevertFailure(ctx context.Context, logger *s
 	}
 	if !ps.autoSkipRevertEscalated {
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
-			fmt.Sprintf("The engine has not accepted the skip-revert for %s; the revert window stays open and SchemaBot keeps retrying every progress tick", failingFor.Round(time.Second)), "", "")
+			fmt.Sprintf("The engine has not accepted the skip-revert for %s; the revert window stays open and SchemaBot keeps retrying every progress tick", ui.FormatHumanDuration(failingFor.Round(time.Second))), "", "")
 		ps.autoSkipRevertEscalated = true
 	}
 	logger.Error("auto-skip revert has been failing beyond the escalation window; the revert window stays open and the drive keeps retrying",

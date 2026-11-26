@@ -221,6 +221,7 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	writePlanMetadata(&sb, data)
 	writePlanAttribution(&sb, data)
 	sb.WriteString("\n")
+	writePlanFreezes(&sb, data.Environment, data.Freezes)
 
 	// Count and show changes, every target's when the apply runs them.
 	summary := data
@@ -232,8 +233,7 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 		groups.HasUnsafeChanges, groups.UnsafeChanges = false, nil
 		groups.DiscardedCopies, groups.AdoptedCopies, groups.RunningCopies = nil, nil, nil
 		writeTargetPlans(&sb, groups, budget, false)
-		summary.Changes = combinedTargetPlanChanges(data)
-		summary.summaryRollout = data.DeploymentDrift
+		summary.summarizeRollout(data)
 	} else if statements, keyspaceUpdates := countChanges(data.Changes); statements+keyspaceUpdates > 0 {
 		writeKeyspaceChanges(&sb, data, budget)
 	}
@@ -283,6 +283,10 @@ func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, reje
 	if includeFlag {
 		command += " --allow-unsafe"
 	}
+	// A freeze refuses the retry too unless it carries an override. The
+	// author types the reason again, as they type --allow-unsafe again: a
+	// consent is given against the comment they read, never pasted back.
+	command = appendFreezeOverride(command, data.Freezes)
 	lead := fmt.Sprintf("**%s To proceed with these destructive changes**", glyph.Escalation)
 	writeConsentCommand(sb, lead, consent.dropSteps, consent.instruction(includeFlag), command)
 }

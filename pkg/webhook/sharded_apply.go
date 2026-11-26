@@ -52,13 +52,15 @@ type shardWorkGroup struct {
 // display status from the operation state, and its diff from the stored plan
 // (the view, see resolveShardedPlanView) — rendered in the comment's
 // VSchema section. A keyspace the stored plan finalizes without a VSchema
-// change renders in the Finalize section instead, so the comment does not
-// claim a VSchema change the plan never carried. A
+// change has nothing of its own for the operator to review, so its finalizer
+// is not listed, the same as in the plan: the finalize is an engine step, not
+// a change the operator made. Its outcome still reaches the comment through
+// the apply's state and failure callout. A
 // failed finalizer's error also stands in for the apply-level failure cause
 // when the apply row carries none, since a finalizer failure is
 // operation-scoped and leaves no failed shard row to name it.
 func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, view *shardedPlanView, tenant string) templates.ShardedApplyData {
-	tasksByOp := groupTasksByOperation(tasks)
+	tasksByOp := storage.TasksByOperation(tasks)
 	// Sort each operation's tasks by id so the joined DDL (and the change
 	// signature derived from it) is deterministic without depending on the
 	// loader's ordering. In practice a (shard, table) operation has a single
@@ -77,8 +79,8 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 	type keyspaceShard struct{ namespace, shard string }
 	groupIndex := make(map[keyspaceShard]int)
 	var vschemaChanges []apitypes.VSchemaChange
-	var finalizes []templates.ShardedFinalize
 	finalizerError := ""
+	var failedFinalizer *templates.FinalizerFailure
 	for _, op := range ops {
 		ns, shard, table, ok := state.ShardWorkKey(op.OperationKey)
 		if !ok {
@@ -89,9 +91,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 				continue
 			}
 			status := presentation.FinalizerVSchemaStatus(apply.State, op.State)
-			if view.finalizesOnly(finalizerNS) {
-				finalizes = append(finalizes, templates.ShardedFinalize{Keyspace: finalizerNS, Status: status})
-			} else {
+			if !view.finalizesOnly(finalizerNS) {
 				vschemaChanges = append(vschemaChanges, apitypes.VSchemaChange{
 					Namespace: finalizerNS,
 					Status:    status,
@@ -100,6 +100,9 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 			}
 			if finalizerError == "" && isOperationFailureState(op.State) && op.ErrorMessage != "" {
 				finalizerError = op.ErrorMessage
+			}
+			if failedFinalizer == nil && isOperationFailureState(op.State) {
+				failedFinalizer = &templates.FinalizerFailure{Keyspace: finalizerNS, State: op.State, Error: op.ErrorMessage}
 			}
 			continue
 		}
@@ -149,17 +152,17 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 	}
 
 	data := templates.ShardedApplyData{
-		State:          apply.State,
-		Environment:    apply.Environment,
-		Database:       apply.Database,
-		ApplyID:        apply.ApplyIdentifier,
-		RequestedBy:    actorFromCaller(apply.Caller),
-		ErrorMessage:   errorMessage,
-		Keyspaces:      keyspaces,
-		VSchemaChanges: vschemaChanges,
-		Finalizes:      finalizes,
-		Tenant:         tenant,
-		Rollback:       apply.IsRollback(),
+		State:           apply.State,
+		Environment:     apply.Environment,
+		Database:        apply.Database,
+		ApplyID:         apply.ApplyIdentifier,
+		RequestedBy:     actorFromCaller(apply.Caller),
+		ErrorMessage:    errorMessage,
+		FailedFinalizer: failedFinalizer,
+		Keyspaces:       keyspaces,
+		VSchemaChanges:  vschemaChanges,
+		Tenant:          tenant,
+		Rollback:        apply.IsRollback(),
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)
@@ -186,10 +189,19 @@ type shardedPlanView struct {
 	// plannedChanges is each table's change in the stored plan, which a
 	// table reads its copy label from until a shard records its own change.
 	plannedChanges map[shardedTableKey]presentation.TableChange
+	// shardCounts is how many shards each table's change spans per the plan.
+	shardCounts map[shardedTableKey]int
+	// shardCopyRows is the plan's row estimate for each shard's copy of a
+	// table (storage.Plan.ShardCopyEstimatedRows), which stands in for the
+	// shard's row total until it reports one.
+	shardCopyRows map[shardedShardTableKey]int64
 }
 
 // shardedTableKey names one table of a sharded apply.
 type shardedTableKey struct{ namespace, table string }
+
+// shardedShardTableKey names one shard's copy of a table of a sharded apply.
+type shardedShardTableKey struct{ namespace, shard, table string }
 
 // plannedTableSize is one table's planned size and the shards it spans. The
 // shard count comes from the plan rather than from the apply's operations,
@@ -225,6 +237,28 @@ func (p *shardedPlanView) plannedChange(namespace, table string) *presentation.T
 		return nil
 	}
 	return &change
+}
+
+// plannedShardCount returns how many shards the table's change spans per the
+// stored plan, or zero when the plan records no count.
+func (p *shardedPlanView) plannedShardCount(namespace, table string) int {
+	if p == nil {
+		return 0
+	}
+	return p.shardCounts[shardedTableKey{namespace, table}]
+}
+
+// shardCopyEstimate returns the plan's row estimate for one shard's copy of
+// the table, or nil when the plan has none.
+func (p *shardedPlanView) shardCopyEstimate(namespace, shard, table string) *int64 {
+	if p == nil {
+		return nil
+	}
+	rows, ok := p.shardCopyRows[shardedShardTableKey{namespace, shard, table}]
+	if !ok {
+		return nil
+	}
+	return &rows
 }
 
 // vschemaDiff returns the namespace's rendered VSchema diff, or "" when the
@@ -275,6 +309,8 @@ func resolveShardedPlanView(ctx context.Context, stor storage.Storage, apply *st
 		finalizeOnly:   map[string]bool{},
 		tableSizes:     map[shardedTableKey]plannedTableSize{},
 		plannedChanges: map[shardedTableKey]presentation.TableChange{},
+		shardCounts:    map[shardedTableKey]int{},
+		shardCopyRows:  map[shardedShardTableKey]int64{},
 	}
 	for namespace, nsData := range plan.Namespaces {
 		if nsData == nil {
@@ -284,6 +320,16 @@ func resolveShardedPlanView(ctx context.Context, stor storage.Storage, apply *st
 			view.plannedChanges[shardedTableKey{namespace, tc.Table}] = presentation.TableChange{DDLAction: tc.Operation}
 			if tc.EstimatedBytes != nil {
 				view.tableSizes[shardedTableKey{namespace, tc.Table}] = plannedTableSize{bytes: *tc.EstimatedBytes, shards: tc.ShardCount}
+			}
+			if tc.ShardCount > 0 {
+				view.shardCounts[shardedTableKey{namespace, tc.Table}] = tc.ShardCount
+			}
+		}
+		for _, sp := range nsData.Shards {
+			for _, tc := range sp.Changes {
+				if rows := plan.ShardCopyEstimatedRows(namespace, sp.Shard, tc.Table); rows != nil {
+					view.shardCopyRows[shardedShardTableKey{namespace, sp.Shard, tc.Table}] = *rows
+				}
 			}
 		}
 		if d := nsData.Metadata[storage.PlanMetadataVSchemaDiff]; d != "" {
@@ -412,6 +458,7 @@ func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, release
 		for _, op := range g.ops {
 			sw.Operations = append(sw.Operations, presentation.Operation{
 				Deployment:        op.Deployment,
+				Target:            op.Target,
 				OperationKey:      op.OperationKey,
 				EndedBy:           endedBy[op.ID],
 				State:             op.State,
@@ -421,7 +468,7 @@ func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, release
 				PauseOnFailure:    op.OnFailure == storage.OnFailurePause,
 				Released:          released,
 				CopiesNoRows:      presentation.TasksCopyNoRows(tasksByOp[op.ID]),
-				Error:             shardOperationError(op, tasksByOp[op.ID]),
+				Error:             op.FailureMessage(tasksByOp[op.ID]),
 			})
 		}
 		work = append(work, sw)
@@ -437,6 +484,7 @@ func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, release
 			StoppedAtCutover: s.Presentation == presentation.StateStoppedAtCutover,
 			EndedBy:          s.EndedBy,
 			Landed:           s.Landed,
+			CompetesForSlot:  s.Presentation.CompetesForSlot(),
 		})
 	}
 	return out
@@ -467,6 +515,8 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 		}
 		changesByTable[key] = append(changesByTable[key], presentation.TaskTableChanges(tasksByOp[op.ID]))
 		sp := shardOperationCopy(op, tasksByOp[op.ID])
+		sp.PlannedRows = view.shardCopyEstimate(ns, shard, table)
+		sp.CopiesNoRows = presentation.TasksCopyNoRows(tasksByOp[op.ID])
 		copiesByTable[key] = append(copiesByTable[key], sp)
 		shardsByTable[key] = append(shardsByTable[key], templates.ShardProgressData{
 			Shard:               shard,
@@ -480,19 +530,22 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 	}
 	out := make(map[string][]templates.ShardedTableStatus, len(order))
 	for _, key := range order {
-		rollup := presentation.RollUpShardedTable(copiesByTable[key])
+		rollup := presentation.RollUpShardedTable(copiesByTable[key], view.plannedShardCount(key.namespace, key.table))
 		estimatedBytes, plannedShards := view.plannedSize(key.namespace, key.table)
 		out[key.namespace] = append(out[key.namespace], templates.ShardedTableStatus{
-			Table:           key.table,
-			Status:          rollup.Status,
-			RowsCopied:      rollup.RowsCopied,
-			RowsTotal:       rollup.RowsTotal,
-			ETASeconds:      rollup.ETASeconds,
-			ShardsReporting: rollup.ShardsReporting,
-			EstimatedBytes:  estimatedBytes,
-			PlannedShards:   plannedShards,
-			CopiesNoRows:    presentation.ShardedTableCopiesNoRows(changesByTable[key], view.plannedChange(key.namespace, key.table)),
-			Shards:          shardsByTable[key],
+			Table:            key.table,
+			Status:           rollup.Status,
+			RowsCopied:       rollup.RowsCopied,
+			RowsTotal:        rollup.RowsTotal,
+			ETASeconds:       rollup.ETASeconds,
+			ShardsReporting:  rollup.ShardsReporting,
+			RowsTotalPlanned: rollup.RowsTotalPlanned,
+			Throttled:        rollup.Throttled,
+			ThrottleReason:   rollup.ThrottleReason,
+			EstimatedBytes:   estimatedBytes,
+			PlannedShards:    plannedShards,
+			CopiesNoRows:     presentation.ShardedTableCopiesNoRows(changesByTable[key], view.plannedChange(key.namespace, key.table)),
+			Shards:           shardsByTable[key],
 		})
 	}
 	return out
@@ -512,31 +565,11 @@ func shardOperationCopy(op *storage.ApplyOperation, tasks []*storage.Task) prese
 
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
+			Throttled:           t.Throttled,
+			ThrottleReason:      t.ThrottleReason,
 		})
 	}
 	return presentation.ShardOperationCopy(op.State, copies)
-}
-
-// shardOperationError is a shard operation's error. When the row carries no
-// error message (a remote failure records the error on the operation's tasks,
-// and the operator may not have stamped the row), it falls back to the first
-// task error so a failed shard always shows why; otherwise the comment is
-// silent and the operator has to dig through logs.
-func shardOperationError(op *storage.ApplyOperation, tasks []*storage.Task) string {
-	if op.ErrorMessage != "" {
-		return op.ErrorMessage
-	}
-	return firstTaskError(tasks)
-}
-
-// firstTaskError returns the first non-empty task error for an operation.
-func firstTaskError(tasks []*storage.Task) string {
-	for _, t := range tasks {
-		if t.ErrorMessage != "" {
-			return t.ErrorMessage
-		}
-	}
-	return ""
 }
 
 // rendersAsSingleShard reports whether a sharded apply reads as one change on
@@ -586,7 +619,7 @@ func rendersAsSingleShard(apply *storage.Apply, ops []*storage.ApplyOperation, v
 // left out, since each keyspace has only one shard. That shard covers the
 // whole table, so each table's planned size from the stored plan is its own.
 func buildSingleShardApplyCommentData(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, displayByOp map[int64]operationDisplay, view *shardedPlanView, tenant string) templates.ApplyStatusCommentData {
-	tasksByOp := groupTasksByOperation(tasks)
+	tasksByOp := storage.TasksByOperation(tasks)
 	var workTasks []*storage.Task
 	var workOps []*storage.ApplyOperation
 	for _, op := range ops {
@@ -627,7 +660,7 @@ func mostSignificantFailure(ops []*storage.ApplyOperation, tasksByOp map[int64][
 	if best == nil || !isOperationFailureState(best.State) {
 		return ""
 	}
-	return shardOperationError(best, tasksByOp[best.ID])
+	return best.FailureMessage(tasksByOp[best.ID])
 }
 
 // tablesStoppedAtCutover counts the table operations of a single-shard layout

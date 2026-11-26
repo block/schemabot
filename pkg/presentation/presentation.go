@@ -90,6 +90,17 @@ type Operation struct {
 	// are mutually exclusive: the caller derives each from the same stored policy.
 	Parallel bool
 
+	// CopyMember names the rollout member a shard row belongs to, empty when
+	// the row is a member of its own. The claim gate starts the copies of one
+	// member's shards in parallel and holds them back only at the apply's
+	// driver cap, so an earlier row of the same member never orders this
+	// row's copy start: a pending row reads as waiting for or halted behind
+	// only rows of other members, and as queued when none of those come
+	// before it. A failed shard of the same member is the exception, since
+	// the claim holds the member's unstarted shards behind it
+	// (sameMemberFailure). Cutover ordering is unchanged.
+	CopyMember string
+
 	// ContinueOnFailure is true only when the operation's on_failure policy is
 	// exactly "continue". A terminal-failed earlier sibling no longer blocks
 	// later deployments and the aggregate is held running_degraded past the
@@ -353,6 +364,12 @@ type Apply struct {
 	// order (the order the caller supplies, which mirrors the rollout order).
 	Deployments []Deployment
 
+	// OperationsAtOnce is how many of the apply's operations SchemaBot runs
+	// at once (max_drivers_per_apply), which the surface rendering the model
+	// supplies; Derive leaves it zero. A running rollout states it beside its
+	// counts (Apply.LimitPhrase), and zero leaves it unstated.
+	OperationsAtOnce int
+
 	// rows are the operations the model was derived from, which
 	// Deployment.Rows index.
 	rows []Operation
@@ -485,6 +502,7 @@ func Derive(ops []Operation) Apply {
 	for i, op := range ops {
 		rolloutOps[i] = state.RolloutOperation{
 			Deployment:        op.Deployment,
+			Target:            op.Target,
 			OperationKey:      op.OperationKey,
 			Work:              op.Work,
 			Finalizer:         op.Finalizer,
@@ -686,6 +704,18 @@ func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 		deriveFinalizerPending(d, ops, names, i)
 		return
 	}
+	if h := sameMemberFailure(ops, i); h >= 0 {
+		setHeldByFailure(d, op, names[h])
+		return
+	}
+	if op.CopyMember != "" {
+		ops, names, i = otherMembersBefore(ops, names, i)
+		if i == 0 {
+			d.set(StateQueuedNext, PendingQueued, "⏳", false)
+			return
+		}
+		op = ops[i]
+	}
 	// Under parallel the copy phase has no earlier-sibling ordering, so a
 	// pending operation never waits for an earlier sibling and a cancelled or
 	// reverted one does not hold it. Failure admission still applies: a
@@ -701,6 +731,58 @@ func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 		return
 	}
 	deriveOrderedPending(d, ops, names, i)
+}
+
+// sameMemberFailure returns the index of a terminal-failed row of row i's own
+// member, wherever it sits, or -1 when there is none or row i's policy
+// continues past a failure. It mirrors the claim's same-member failure gate
+// (sameMemberFailureGateSQL in FindNextApplyOperation), which holds a member's
+// unstarted work once any of its work has failed, so a pending shard of a
+// failed shard's target reads as held rather than as queued.
+func sameMemberFailure(ops []Operation, i int) int {
+	member := failureMember(ops[i])
+	if member == "" || ops[i].continuesPastFailure() {
+		return -1
+	}
+	for j, o := range ops {
+		if j != i && o.State == state.ApplyOperation.Failed && failureMember(o) == member {
+			return j
+		}
+	}
+	return -1
+}
+
+// failureMember names the member the same-member failure gate groups a row
+// under: its CopyMember on a shard row, its deployment and target on a work
+// row, or "" for a row the gate does not hold. Work rows with no target in
+// one deployment form one member, as the gate compares targets as stored.
+func failureMember(o Operation) string {
+	if o.CopyMember != "" {
+		return o.CopyMember
+	}
+	if o.Work {
+		return o.Deployment + "\x00" + o.Target
+	}
+	return ""
+}
+
+// otherMembersBefore returns the rows before row i that belong to another
+// member than its copy's (Operation.CopyMember), followed by row i, with their
+// names, and row i's index among them. Rows of the same member never order
+// its copy start, so its pending label reads only the rest.
+func otherMembersBefore(ops []Operation, names []string, i int) ([]Operation, []string, int) {
+	kept := make([]Operation, 0, i+1)
+	keptNames := make([]string, 0, i+1)
+	for j := range i {
+		if ops[j].CopyMember == ops[i].CopyMember {
+			continue
+		}
+		kept = append(kept, ops[j])
+		keptNames = append(keptNames, names[j])
+	}
+	kept = append(kept, ops[i])
+	keptNames = append(keptNames, names[i])
+	return kept, keptNames, len(kept) - 1
 }
 
 // deriveOrderedPending labels a pending row under an ordered policy: halted

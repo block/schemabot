@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +41,10 @@ type CommentObserver struct {
 	// ran an apply, for the engine-logs fold on a failed apply's summary.
 	// Nil where no reader was wired; see EngineLogReader.
 	engineLogs EngineLogReader
+	// operationsAtOnce is how many of an apply's operations this server's
+	// drivers run at once, stated on a running rollout's counts. Zero leaves
+	// it unstated.
+	operationsAtOnce int
 	// plans remembers the plan rows this apply's members run, so the progress
 	// comment reads each once for the observer's life, not once per render.
 	plans planIdentities
@@ -143,6 +148,26 @@ type CommentObserver struct {
 	// with the known comment ID) instead of posting a duplicate.
 	pendingRotation *pendingProgressRotation
 
+	// progressCommentCreatedAt is when the tracked progress comment was
+	// created: the age progressEditInterval decays the edit spacing by. It is
+	// read off each confirmed edit's GitHub response, so a restarted or handed
+	// over drive resumes at the spacing the comment's real age earns rather than
+	// at the fastest one. Until an edit reports it, it holds an estimate: the
+	// first progress tick, or the moment a rotation posted a fresh comment.
+	progressCommentCreatedAt time.Time
+
+	// progressEditRetryAt holds back the retry of a progress edit that failed,
+	// so a pending state change is retried at the fastest cadence instead of on
+	// every tick while GitHub keeps failing. Zero when the last edit succeeded.
+	progressEditRetryAt time.Time
+
+	// progressShownCadence is the spacing the progress comment's footer
+	// currently promises ("changes show within ~X"). When the comment's age
+	// earns a longer spacing, the next tick publishes the new footer before the
+	// longer spacing applies, so the comment never promises a shorter wait than
+	// a change will get. Zero until this observer has shown an edit.
+	progressShownCadence time.Duration
+
 	// authorityMu guards the per-callback memo of the durable progress-comment
 	// authority decision below. It is separate from mu because OnProgress holds
 	// mu for its entire tick while OnTerminal runs without it, and the gate is
@@ -154,6 +179,30 @@ type CommentObserver struct {
 	// re-writing the claim row. Each callback starts with a fresh decision.
 	authorityDecided bool
 	authorityHeld    bool
+
+	// lastWritten remembers, per GitHub comment ID, the content key
+	// (templates.CommentContentKey) of the body this observer last wrote and
+	// when it was confirmed written, so an edit whose visible content is
+	// unchanged is skipped instead of PATCHing an identical comment — until
+	// unchangedCommentHeartbeat elapses, when a refresh edit goes through so
+	// the "Last updated" footer keeps proving liveness. Guarded by its own
+	// mutex rather than o.mu: every caller already holds o.mu, and o.mu is not
+	// re-entrant, so taking it again here would deadlock.
+	lastWrittenMu sync.Mutex
+	lastWritten   map[int64]writtenContent
+}
+
+// writtenContent records what an observer last wrote to a GitHub comment and
+// when, so unchanged re-renders can be skipped until the liveness heartbeat
+// elapses. firstWrittenAt is when this observer first wrote the comment, not
+// when the comment was created; it anchors the grace window and carries
+// forward across edits. A rotation to a fresh comment ID starts a new grace
+// window, and so does a new observer taking over an existing comment after a
+// restart or a lease handover.
+type writtenContent struct {
+	contentKey     string
+	writtenAt      time.Time
+	firstWrittenAt time.Time
 }
 
 // pendingProgressRotation identifies a rotation progress comment that was
@@ -182,7 +231,71 @@ const (
 	activeInterval   = 5 * time.Second
 	stagnantInterval = 30 * time.Second
 	stagnantThresh   = 3 // consecutive unchanged ticks before slowing down
+
+	// unchangedCommentHeartbeat bounds how long an unchanged tracked comment
+	// may go without a re-edit. Content-identical edits are normally skipped
+	// to save GitHub write budget, but the "Last updated" footer doubles as a
+	// liveness signal: a periodic refresh keeps a stalled apply's comment from
+	// reading as abandoned. Content changes always edit immediately.
+	unchangedCommentHeartbeat = 10 * time.Minute
+
+	// unchangedCommentGraceWindow is how long a freshly written comment keeps
+	// refreshing on every tick even when its content is unchanged. A young
+	// comment is the one being actively watched — the requester just started
+	// or resumed the apply — and an early stall (setup, throttling) must not
+	// read as SchemaBot going silent, so unchanged-edit skipping only begins
+	// once the comment ages past this window. The window is measured from
+	// when this observer first wrote the comment, so its cost recurs once per
+	// observer that drives the comment, including a new driver after a restart
+	// or a lease handover.
+	unchangedCommentGraceWindow = 10 * time.Minute
+
+	// progressEditDecayMaxInterval is the edit spacing once the progress
+	// comment is older than the last progressEditDecaySchedule step. It
+	// matches unchangedCommentHeartbeat, so the oldest comments refresh at the
+	// same pace whether or not their progress moves.
+	progressEditDecayMaxInterval = unchangedCommentHeartbeat
 )
+
+// progressEditDecayStep is one rung of the age-decayed edit cadence: while the
+// progress comment is younger than age, edits are spaced at least interval
+// apart.
+type progressEditDecayStep struct {
+	age      time.Duration
+	interval time.Duration
+}
+
+// progressEditDecaySchedule spaces progress comment edits further apart as the
+// comment ages. A young comment is the one the requester is watching, so it
+// updates every few seconds; a copy that has run for hours is checked now and
+// then, and every edit spends the installation's shared GitHub request budget.
+// The CLI stays the high-resolution view of progress. A change of apply,
+// rollout member, or table state skips the spacing (progressChangeIsUrgent),
+// so the decay never delays a state change reaching the PR.
+var progressEditDecaySchedule = []progressEditDecayStep{
+	{age: 10 * time.Minute, interval: activeInterval},
+	{age: time.Hour, interval: 30 * time.Second},
+	{age: 2 * time.Hour, interval: time.Minute},
+	{age: 4 * time.Hour, interval: 2 * time.Minute},
+	{age: 6 * time.Hour, interval: 5 * time.Minute},
+}
+
+// progressEditInterval returns the minimum spacing between edits of a progress
+// comment of the given age.
+func progressEditInterval(age time.Duration) time.Duration {
+	for _, step := range progressEditDecaySchedule {
+		if age < step.age {
+			return step.interval
+		}
+	}
+	return progressEditDecayMaxInterval
+}
+
+// freshProgressCommentCadence is the edit spacing a newly posted progress
+// comment starts on: the first rung of the decay schedule.
+func freshProgressCommentCadence() time.Duration {
+	return progressEditDecaySchedule[0].interval
+}
 
 // CommentObserverConfig holds the parameters for creating a CommentObserver.
 type CommentObserverConfig struct {
@@ -211,6 +324,11 @@ type CommentObserverConfig struct {
 	// account of the failure alongside SchemaBot's. Optional — nil leaves the
 	// engine-logs fold off the summary.
 	EngineLogs EngineLogReader
+
+	// OperationsAtOnce is how many of an apply's operations the server's
+	// drivers run at once (max_drivers_per_apply), which a running sharded or
+	// multi-target comment states beside its counts. Zero leaves it unstated.
+	OperationsAtOnce int
 
 	// shardedPlans is the sharded plan cache shared with every other
 	// comment render in the process. Nil gives the observer a cache of its own.
@@ -322,12 +440,14 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		cliName:           cfg.CLIName,
 		tenant:            cfg.Tenant,
 		engineLogs:        cfg.EngineLogs,
+		operationsAtOnce:  cfg.OperationsAtOnce,
 		shardedPlans:      shardedPlans,
 		logger:            cfg.Logger,
 		OnTerminalHook:    cfg.OnTerminalHook,
 		onTargetsFinished: cfg.OnTargetsFinishedHook,
 		clock:             clk,
 		authorityOwner:    storage.LeaseOwnerProcess() + "/comment-observer",
+		lastWritten:       map[int64]writtenContent{},
 	}
 }
 
@@ -423,6 +543,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 			o.lastRendered.state = currentState
 			o.lastProgressPost = now
 			o.stagnantTicks = 0
+			o.restartProgressCommentAge(now)
 		}
 		return
 	}
@@ -437,6 +558,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 			o.lastRendered.state = currentState
 			o.lastProgressPost = now
 			o.stagnantTicks = 0
+			o.restartProgressCommentAge(now)
 			return
 		}
 
@@ -448,6 +570,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 			o.lastRendered.state = currentState
 			o.lastProgressPost = now
 			o.stagnantTicks = 0
+			o.restartProgressCommentAge(now)
 			return
 		}
 	}
@@ -465,12 +588,21 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 		o.logger.Debug("observer: failed to load apply operations for the comment freshness check; the statement position will not count as movement this tick",
 			"apply_id", o.applyID, "error", opsErr)
 	}
-	if !o.progressCommentDue(now, progressSnapshotOf(currentState, tasks, ops)) {
+	snapshot := progressSnapshotOf(currentState, tasks, ops)
+	cadence, due := o.progressCommentDue(now, snapshot)
+	if !due {
 		return
 	}
 
-	body := o.statusCommentFromOps(apply, ops, opsErr, tasks, o.shardsByTable(ctx, apply, ops))
-	o.editTrackedComment(apply, state.Comment.Progress, body)
+	// The footer says how soon a change reaches the comment, which is the
+	// cadence: a stalled apply edits less often than that, but any change still
+	// lands within it.
+	body := o.statusCommentFromOps(apply, ops, opsErr, tasks, o.shardsByTable(ctx, apply, ops), cadence)
+	edit := o.editTrackedComment(apply, state.Comment.Progress, body)
+	o.recordProgressEdit(now, snapshot, cadence, edit)
+	// The Check Run refresh does not depend on the comment edit landing: a
+	// deleted or unreachable progress comment must not keep a finished target
+	// off the Check Run.
 	if opsErr == nil {
 		o.reportFinishedTargets(apply, ops)
 	}
@@ -505,8 +637,13 @@ func (o *CommentObserver) reportFinishedTargets(apply *storage.Apply, ops []*sto
 // progressSnapshot is the freshness signal for the tracked progress comment:
 // the figures whose movement between polls means the comment is out of date.
 type progressSnapshot struct {
-	state      string
-	rowsCopied int64
+	state string
+	// memberStates fingerprints the state of every rollout member and table.
+	// A change there (a member failing and pausing the rest, a table finishing)
+	// is news to whoever watches the PR, so like an apply state change it
+	// skips the edit spacing.
+	memberStates string
+	rowsCopied   int64
 	// steps fingerprints every operation's statement position and the server's
 	// work on the running statement. It is what moves for an engine that
 	// executes a statement sequence and reports no row counts, so without it
@@ -517,18 +654,33 @@ type progressSnapshot struct {
 
 func progressSnapshotOf(applyState string, tasks []*storage.Task, ops []*storage.ApplyOperation) progressSnapshot {
 	snapshot := progressSnapshot{state: applyState, steps: progressFingerprint(ops)}
+	var members strings.Builder
+	for _, op := range ops {
+		fmt.Fprintf(&members, "o%d=%s;", op.ID, op.State)
+	}
 	for _, t := range tasks {
 		snapshot.rowsCopied += t.RowsCopied
+		fmt.Fprintf(&members, "t%d=%s;", t.ID, t.State)
 	}
+	snapshot.memberStates = members.String()
 	return snapshot
 }
 
-// progressCommentDue applies the adaptive rate limit — ported from
-// watchApplyProgress — and reports whether the tracked progress comment is due
-// an edit on this tick, recording the snapshot as rendered when it is. Edits
-// land every activeInterval while the snapshot keeps moving and slow to
-// stagnantInterval once it has held still for stagnantThresh consecutive ticks;
-// a state change is rendered at once.
+// progressChangeIsUrgent reports whether the change from the rendered snapshot
+// to the current one is a change of state (the apply's, a rollout member's, or
+// a table's) rather than of progress figures. A state change is rendered at
+// once, whatever the edit spacing.
+func progressChangeIsUrgent(rendered, current progressSnapshot) bool {
+	return current.state != rendered.state || current.memberStates != rendered.memberStates
+}
+
+// progressCommentDue applies the adaptive rate limit and reports the edit
+// spacing for the progress comment's age (progressEditInterval) and whether the
+// comment is due an edit on this tick. Edits land at that spacing while the
+// snapshot keeps moving and slow to at least stagnantInterval once it has held
+// still for stagnantThresh consecutive ticks; a state change is rendered at
+// once. Only a shown edit records the snapshot as rendered (recordProgressEdit),
+// so a failed edit leaves the change pending for the next due tick.
 //
 // Movement is judged against the snapshot the comment last rendered, not the
 // last one observed. A change that arrives inside the interval therefore stays
@@ -536,31 +688,77 @@ func progressSnapshotOf(applyState string, tasks []*storage.Task, ops []*storage
 // is rendered on the first due tick. Comparing against the last observed
 // snapshot instead would count the ticks after the change as stagnant and, for
 // a figure that moves rarely, defer rendering it to the slow interval.
-func (o *CommentObserver) progressCommentDue(now time.Time, current progressSnapshot) bool {
-	interval := activeInterval
-	if o.stagnantTicks >= stagnantThresh {
-		interval = stagnantInterval
+func (o *CommentObserver) progressCommentDue(now time.Time, current progressSnapshot) (time.Duration, bool) {
+	cadence := progressEditInterval(o.progressCommentAge(now))
+	if now.Before(o.progressEditRetryAt) {
+		return cadence, false // a failed edit is waiting out its retry spacing
+	}
+	if o.footerPromisesShorterWait(cadence) {
+		return cadence, true // publish the longer spacing before enforcing it
 	}
 	sinceLastPost := now.Sub(o.lastProgressPost)
 
 	if current == o.lastRendered {
 		o.stagnantTicks++
-		if o.stagnantTicks >= stagnantThresh && sinceLastPost < stagnantInterval {
-			return false // stagnant — skip edit
+		interval := cadence
+		if o.stagnantTicks >= stagnantThresh {
+			interval = max(cadence, stagnantInterval)
 		}
-		if sinceLastPost < interval {
-			return false // not time yet
-		}
-	} else {
-		o.stagnantTicks = 0
-		if sinceLastPost < activeInterval && current.state == o.lastRendered.state {
-			return false // moving but not time yet (unless state changed)
-		}
+		return cadence, sinceLastPost >= interval
 	}
+	o.stagnantTicks = 0
+	if progressChangeIsUrgent(o.lastRendered, current) {
+		return cadence, true
+	}
+	return cadence, sinceLastPost >= cadence
+}
 
+// footerPromisesShorterWait reports whether the comment's footer promises a
+// change will show sooner than the spacing the comment's age now earns. That
+// happens when the age crosses into a slower step, and after a restart once the
+// first edit learns the comment's real age from GitHub.
+func (o *CommentObserver) footerPromisesShorterWait(cadence time.Duration) bool {
+	return o.progressShownCadence > 0 && cadence > o.progressShownCadence
+}
+
+// recordProgressEdit settles a due progress tick. A shown edit (written, or
+// skipped because GitHub already shows that content) records the snapshot as
+// rendered and, when GitHub reported it, the comment's creation time. A failed
+// edit records nothing, so the change stays pending, and holds the retry back
+// by the fastest cadence. A shown edit also records the cadence its footer
+// promised.
+func (o *CommentObserver) recordProgressEdit(now time.Time, current progressSnapshot, cadence time.Duration, edit trackedCommentEdit) {
+	if !edit.shown {
+		o.progressEditRetryAt = now.Add(freshProgressCommentCadence())
+		return
+	}
+	o.progressEditRetryAt = time.Time{}
 	o.lastRendered = current
 	o.lastProgressPost = now
-	return true
+	o.progressShownCadence = cadence
+	if !edit.commentCreatedAt.IsZero() {
+		o.progressCommentCreatedAt = edit.commentCreatedAt
+	}
+}
+
+// progressCommentAge returns how old the tracked progress comment is. Until an
+// edit has reported the comment's creation time, the first call anchors an
+// estimate at its own tick, so a drive with nothing confirmed yet starts at the
+// fastest cadence and its first edit learns the real age.
+func (o *CommentObserver) progressCommentAge(now time.Time) time.Duration {
+	if o.progressCommentCreatedAt.IsZero() {
+		o.progressCommentCreatedAt = now
+	}
+	return max(now.Sub(o.progressCommentCreatedAt), 0)
+}
+
+// restartProgressCommentAge marks the tracked progress comment as new: a
+// rotation just posted it, because someone acted on the apply and is watching
+// the PR again, so it starts back at the fastest cadence.
+func (o *CommentObserver) restartProgressCommentAge(now time.Time) {
+	o.progressCommentCreatedAt = now
+	o.progressEditRetryAt = time.Time{}
+	o.progressShownCadence = freshProgressCommentCadence()
 }
 
 // OnTerminal is called when the apply reaches a terminal state.
@@ -663,7 +861,7 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		// This is the per-operation status freeze, not the apply-level summary, so
 		// it always runs; the aggregate publisher re-edits it with the full task
 		// set for multi-operation applies.
-		finalBody := o.statusCommentFromOps(apply, ops, opsErr, tasks, shardsByTable)
+		finalBody := o.statusCommentFromOps(apply, ops, opsErr, tasks, shardsByTable, 0)
 		o.editTrackedComment(apply, activeCommentState, finalBody)
 
 		// Post a separate summary comment. A new comment is more reliable than
@@ -751,7 +949,7 @@ func (o *CommentObserver) finalizeTrackedProgressCommentAtTerminal(apply *storag
 		o.logInfo(apply, "observer: tracked progress comment is the cutover prompt; the terminal summary already covers it")
 		return
 	}
-	finalBody := o.statusCommentFromOps(apply, ops, opsErr, tasks, shardsByTable)
+	finalBody := o.statusCommentFromOps(apply, ops, opsErr, tasks, shardsByTable, 0)
 	o.editTrackedComment(apply, state.Comment.Progress, finalBody)
 }
 
@@ -763,11 +961,11 @@ func (o *CommentObserver) finalizeTrackedProgressCommentAtTerminal(apply *storag
 // single-deployment layout byte-for-byte. A load failure falls back to the
 // single-deployment layout so a transient storage error never blocks a comment
 // update.
-func (o *CommentObserver) formatStatusComment(apply *storage.Apply, tasks []*storage.Task) string {
+func (o *CommentObserver) formatStatusComment(apply *storage.Apply, tasks []*storage.Task, updateCadence time.Duration) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	ops, err := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
-	return o.statusCommentFromOps(apply, ops, err, tasks, o.shardsByTable(ctx, apply, ops))
+	return o.statusCommentFromOps(apply, ops, err, tasks, o.shardsByTable(ctx, apply, ops), updateCadence)
 }
 
 // shardsByTable loads an apply's per-shard detail rows and groups them by table
@@ -803,15 +1001,17 @@ func (o *CommentObserver) shardsByTable(ctx context.Context, apply *storage.Appl
 // statusCommentFromOps renders the status comment from already-loaded operation
 // rows, applying the same single-deployment fallback as formatStatusComment when
 // the load failed. Callers that already hold the operation set (e.g. OnTerminal)
-// use this to avoid re-reading apply_operations.
-func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
+// use this to avoid re-reading apply_operations. updateCadence is how soon a
+// change reaches the comment, rendered beside the "Last updated" footer; zero
+// renders no note (terminal and cutover renders, which no longer refresh).
+func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task, updateCadence time.Duration) string {
 	var body string
 	if opsErr != nil {
 		o.logger.Error("observer: failed to load apply operations for comment dispatch; rendering single-deployment layout",
 			"apply_id", o.applyID, "error", opsErr)
-		body = formatProgressComment(apply, tasks, shardsByTable, o.tenant)
+		body = formatProgressComment(apply, tasks, shardsByTable, o.tenant, updateCadence)
 	} else {
-		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveShardedPlan(apply, ops), o.tenant, o.cliName, o.resolveStoppedByFreeze(apply))
+		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveShardedPlan(apply, ops), o.tenant, o.cliName, o.resolveStoppedByFreeze(apply), o.operationsAtOnce, updateCadence)
 	}
 	return body + controlRejectionSection(context.Background(), o.stor, o.logger, apply, body)
 }
@@ -1222,10 +1422,21 @@ func (o *CommentObserver) contextWithApplyLease(ctx context.Context, apply *stor
 	return storage.WithApplyLease(ctx, lease)
 }
 
+// trackedCommentEdit is the outcome of editTrackedComment.
+type trackedCommentEdit struct {
+	// shown reports that the comment now shows the body: the edit went
+	// through, or it was skipped because the comment already shows that
+	// content. False when no comment is tracked or the edit failed.
+	shown bool
+	// commentCreatedAt is when GitHub created the comment, from the edit
+	// response. Zero when no edit was sent or GitHub did not report it.
+	commentCreatedAt time.Time
+}
+
 // editTrackedComment looks up a stored comment ID and edits it.
-func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState string, body string) {
+func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState string, body string) trackedCommentEdit {
 	if !o.leaseStillOwnsObserver(apply, "lookup comment before edit") {
-		return
+		return trackedCommentEdit{}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1233,39 +1444,102 @@ func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState 
 	comment, err := o.stor.ApplyComments().Get(ctx, o.applyID, commentState)
 	if err != nil {
 		o.logError(apply, "observer: failed to look up comment for edit", "error", err, "comment_state", commentState)
-		return
+		return trackedCommentEdit{}
 	}
 	if comment == nil {
 		// No tracked comment for this state — nothing to edit.
 		// This is expected when the progress comment hasn't been posted yet
 		// (e.g., first OnProgress tick before the handler posts it).
-		return
+		return trackedCommentEdit{}
+	}
+
+	// Skip the edit when nothing the reader can see has changed. Renders of an
+	// unchanged status differ only in their rendered timestamps ("Last updated"
+	// footer, attribution line), so re-PATCHing spends GitHub write budget
+	// without changing the comment — a stagnant long-running apply would
+	// otherwise re-edit an identical comment forever. Young comments (inside
+	// their grace window) always edit so an early stall never reads as
+	// SchemaBot going silent, and skips lapse after unchangedCommentHeartbeat
+	// so the footer still refreshes periodically as a liveness signal.
+	// Expected and frequent, so no log; the edit count is not incremented
+	// because no edit happens.
+	rendered := o.renderPRComment(apply, body)
+	contentKey := templates.CommentContentKey(rendered)
+	if o.skipUnchangedEdit(comment.GitHubCommentID, contentKey) {
+		return trackedCommentEdit{shown: true}
 	}
 	if !o.leaseStillOwnsObserver(apply, "create GitHub client before edit") {
-		return
+		return trackedCommentEdit{}
 	}
 
 	client, err := o.ghClient.ForInstallation(o.installationID)
 	if err != nil {
 		o.logError(apply, "observer: failed to create GitHub client", "error", err)
-		return
+		return trackedCommentEdit{}
 	}
 	if !o.leaseStillOwnsObserver(apply, "edit GitHub comment") {
-		return
+		return trackedCommentEdit{}
 	}
 
-	if err := client.EditIssueComment(ctx, o.repo, comment.GitHubCommentID, o.renderPRComment(apply, body)); err != nil {
+	createdAt, err := client.EditIssueComment(ctx, o.repo, comment.GitHubCommentID, rendered)
+	if err != nil {
 		o.logError(apply, "observer: failed to edit comment", "error", err, "comment_state", commentState)
-		return
+		return trackedCommentEdit{}
 	}
+	o.recordLastWritten(comment.GitHubCommentID, contentKey)
+	edited := trackedCommentEdit{shown: true, commentCreatedAt: createdAt}
 	if !o.leaseStillOwnsObserver(apply, "record edited GitHub comment") {
-		return
+		return edited
 	}
 
 	// Track the edit for audit/debugging
 	if err := o.stor.ApplyComments().IncrementEditCount(o.contextWithApplyLease(ctx, apply), o.applyID, commentState); err != nil {
 		o.logError(apply, "observer: failed to increment edit count", "error", err, "comment_state", commentState)
 	}
+	return edited
+}
+
+// skipUnchangedEdit reports whether an edit may be skipped because its visible
+// content matches what this observer last wrote to the given GitHub comment
+// and that write is recent enough that the "Last updated" footer still proves
+// the observer is alive. A comment still inside its grace window always edits,
+// unchanged or not — young comments are the actively watched ones. A cache
+// miss — including a comment this observer never wrote, such as the
+// handler-posted initial progress comment — means the edit must proceed; only
+// a confirmed match may skip it, so uncertainty degrades to an extra edit.
+// The cache records what this observer wrote, not what is on GitHub: if
+// another writer edits the same comment between two ticks, a render that
+// matches this observer's last write is skipped, and the comment keeps the
+// other writer's body until the heartbeat refresh.
+func (o *CommentObserver) skipUnchangedEdit(commentID int64, contentKey string) bool {
+	o.lastWrittenMu.Lock()
+	defer o.lastWrittenMu.Unlock()
+	last, ok := o.lastWritten[commentID]
+	if !ok {
+		return false
+	}
+	now := o.clock.Now()
+	if now.Sub(last.firstWrittenAt) < unchangedCommentGraceWindow {
+		return false
+	}
+	return last.contentKey == contentKey &&
+		now.Sub(last.writtenAt) < unchangedCommentHeartbeat
+}
+
+// recordLastWritten remembers the content key of a body confirmed written to a
+// GitHub comment (posted or edited) and when, keyed by the GitHub comment ID
+// so a rotation to a fresh comment never matches its predecessor's content.
+// The first record for a comment ID anchors its grace window; later records
+// carry the anchor forward.
+func (o *CommentObserver) recordLastWritten(commentID int64, contentKey string) {
+	o.lastWrittenMu.Lock()
+	defer o.lastWrittenMu.Unlock()
+	now := o.clock.Now()
+	firstWrittenAt := now
+	if prev, ok := o.lastWritten[commentID]; ok {
+		firstWrittenAt = prev.firstWrittenAt
+	}
+	o.lastWritten[commentID] = writtenContent{contentKey: contentKey, writtenAt: now, firstWrittenAt: firstWrittenAt}
 }
 
 // rotateProgressCommentForResume posts a fresh progress comment when a resumed
@@ -1343,7 +1617,7 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 		o.logError(apply, "observer: failed to load the cutover request before resume rotation", "error", err)
 		return false
 	}
-	body := o.formatStatusComment(apply, tasks)
+	body := o.formatStatusComment(apply, tasks, freshProgressCommentCadence())
 	newCommentID, posted, trackedNew := o.postAndTrackComment(apply, state.Comment.Progress, body, pendingFreeze, cutoverOperationID)
 	if !posted {
 		// postAndTrackComment logged the failure. The summary marker is left in
@@ -1712,7 +1986,7 @@ func (o *CommentObserver) rotateProgressCommentForControlPhase(apply *storage.Ap
 		return false
 	}
 
-	body := o.formatStatusComment(apply, tasks)
+	body := o.formatStatusComment(apply, tasks, freshProgressCommentCadence())
 	newCommentID, posted, trackedNew := o.postAndTrackComment(apply, state.Comment.Progress, body, &tracked.GitHubCommentID, rotations.key.cutoverOperationID)
 	if !posted {
 		// postAndTrackComment logged the failure. The tracked comment still
@@ -1844,7 +2118,7 @@ func (o *CommentObserver) rotateProgressCommentAfterCutover(apply *storage.Apply
 		o.logError(apply, "observer: failed to load the cutover request before post-cutover rotation", "error", err)
 		return false
 	}
-	body := o.formatStatusComment(apply, tasks)
+	body := o.formatStatusComment(apply, tasks, freshProgressCommentCadence())
 	newCommentID, posted, trackedNew := o.postAndTrackComment(apply, state.Comment.Progress, body, &cutover.GitHubCommentID, cutoverOperationID)
 	if !posted {
 		// postAndTrackComment logged the failure. The live cutover row is left
@@ -2011,11 +2285,12 @@ func (o *CommentObserver) freezeSupersededProgressComment(apply *storage.Apply, 
 			return
 		}
 		frozen := o.frozenSupersededProgressBody(reason, newCommentID, oldBody)
-		if err := client.EditIssueComment(ctx, o.repo, oldCommentID, frozen); err != nil {
+		if _, err := client.EditIssueComment(ctx, o.repo, oldCommentID, frozen); err != nil {
 			o.logError(apply, "observer: failed to freeze superseded progress comment; the pending-freeze marker stays set and the next observer pass that reads the tracked row retries",
 				"error", err, "github_comment_id", oldCommentID)
 			return
 		}
+		o.recordLastWritten(oldCommentID, templates.CommentContentKey(frozen))
 	}
 	if err := o.stor.ApplyComments().ClearPendingFreeze(o.contextWithApplyLease(ctx, apply), o.applyID, state.Comment.Progress); err != nil {
 		o.logError(apply, "observer: failed to clear pending-freeze marker after freezing superseded progress comment; a later retry finds the comment already frozen and clears the marker",
@@ -2048,11 +2323,13 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 		return 0, false, false
 	}
 
-	commentID, _, err = client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(apply, body))
+	rendered := o.renderPRComment(apply, body)
+	commentID, _, err = client.CreateIssueComment(ctx, o.repo, o.pr, rendered)
 	if err != nil {
 		o.logError(apply, "observer: failed to post comment", "error", err, "comment_state", commentState)
 		return 0, false, false
 	}
+	o.recordLastWritten(commentID, templates.CommentContentKey(rendered))
 	if !o.leaseStillOwnsObserver(apply, "record posted GitHub comment") {
 		// The comment is live on the PR; only the tracking write is being
 		// skipped. Report it posted-but-untracked — the contract callers use to

@@ -26,6 +26,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -1544,6 +1546,225 @@ func TestE2EAggregateBlockedStateSurvivesRecompute(t *testing.T) {
 	assert.Equal(t, managedDirMissingConfigBlock.message, stored.ErrorMessage)
 	assert.Equal(t, checkConclusionFailure, stored.Conclusion)
 	assert.Equal(t, "abc123", stored.HeadSHA)
+}
+
+// A push lands while an apply is running, and the apply then fails. The
+// failure is stored on the commit the apply started on, which is now older
+// than the PR head. The aggregate on the head reports the failure and names
+// the plan that clears it, rather than reading "Awaiting results for the
+// latest commit" as if results were still on their way. The failure blocks the
+// merge gate either way, so the older commit never passes the newer head.
+func TestE2EAggregateReportsFailedApplyFromEarlierCommit(t *testing.T) {
+	dbName := "webhook_agg_failed_apply_sha"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-failed-earlier-commit",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		Environment:     "staging",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+	}
+	applyID, err := svc.Storage().Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   100,
+		ApplyID:      applyID,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	checkRuns := setupFakeGitHubHeadAndCheckRuns(t, mux, "newsha222")
+
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+
+	apply.State = state.Apply.Failed
+	updated, err := h.updateCheckRecordForApplyResult(ctx, "octocat/hello-world", 1, apply)
+	require.NoError(t, err)
+	require.True(t, updated)
+
+	failed, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, failed)
+	assert.Equal(t, "oldsha111", failed.HeadSHA, "the terminal write keeps the row on the apply's commit")
+	assert.Equal(t, applyID, failed.ApplyID)
+	assert.Equal(t, checkConclusionFailure, failed.Conclusion)
+
+	h.updateAggregateCheck(ctx, installClient, "octocat/hello-world", 1, "newsha222")
+
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, "newsha222", cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionFailure, cr.Conclusion)
+		require.NotNil(t, cr.Output)
+		assert.Equal(t, "Apply failed", cr.Output.Title)
+		assert.Contains(t, cr.Output.Summary, "| `"+dbName+"` | mysql |")
+		assert.Contains(t, cr.Output.Summary, "| Failed |")
+		assert.Contains(t, cr.Output.Summary, "**To clear this:** "+checkstate.ReconciliationRemedy(checkstate.PlanCommand("staging", dbName, "")))
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		require.FailNow(t, "timed out waiting for the failed aggregate check run on the new commit")
+	}
+
+	stored, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1,
+		aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, "newsha222", stored.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, stored.Status)
+	assert.Equal(t, checkConclusionFailure, stored.Conclusion)
+}
+
+// An apply fails, leaving a settled failure on the commit it started on, and
+// the PR head has since moved on. SchemaBot never re-plans that environment on
+// its own (MG-10). Once a person has reconciled the target and comments the
+// plan the check names, that plan replaces the failed row on the new head:
+// it passes only when the plan finds nothing left to do, and otherwise
+// records the work that still differs, which keeps the PR blocked.
+func TestE2EManualPlanReplacesSettledFailedApplyOnlyWhenTargetMatches(t *testing.T) {
+	dbName := "webhook_manual_plan_after_failed_apply"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	setupFakeGitHubHeadAndCheckRuns(t, mux, "newsha222")
+
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+	schema := &ghclient.SchemaRequestResult{
+		Repository:  "octocat/hello-world",
+		PullRequest: 1,
+		Database:    dbName,
+		Type:        "mysql",
+		HeadSHA:     "newsha222",
+	}
+
+	seedSettledFailure := func(t *testing.T) int64 {
+		t.Helper()
+		ctx := t.Context()
+		applyID, err := svc.Storage().Applies().Create(ctx, &storage.Apply{
+			ApplyIdentifier: "apply-failed-" + t.Name(),
+			Database:        dbName,
+			DatabaseType:    "mysql",
+			Repository:      "octocat/hello-world",
+			PullRequest:     1,
+			Environment:     "staging",
+			Engine:          storage.EngineSpirit,
+			State:           state.Apply.Failed,
+		})
+		require.NoError(t, err)
+		require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+			Repository:   "octocat/hello-world",
+			PullRequest:  1,
+			HeadSHA:      "oldsha111",
+			Environment:  "staging",
+			DatabaseType: "mysql",
+			DatabaseName: dbName,
+			CheckRunID:   100,
+			ApplyID:      applyID,
+			HasChanges:   true,
+			Status:       checkStatusCompleted,
+			Conclusion:   checkConclusionFailure,
+		}))
+		return applyID
+	}
+
+	t.Run("a plan that still finds work keeps the PR blocked", func(t *testing.T) {
+		seedSettledFailure(t)
+		planResp := &apitypes.PlanResponse{
+			Changes: []*apitypes.SchemaChangeResponse{{
+				Namespace: dbName,
+				TableChanges: []*apitypes.TableChangeResponse{{
+					TableName:  "orders",
+					DDL:        "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)",
+					ChangeType: "alter",
+				}},
+			}},
+		}
+
+		_, check, err := h.upsertPlanCheckRecord(t.Context(), installClient, "octocat/hello-world", 1, schema, planResp, "staging", reviewDriftOutcome{})
+		require.NoError(t, err)
+		require.NotNil(t, check)
+
+		stored, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "newsha222", stored.HeadSHA)
+		assert.True(t, stored.HasChanges)
+		assert.Equal(t, checkConclusionActionRequired, stored.Conclusion, "the target still differs from the PR, so the merge stays blocked")
+	})
+
+	t.Run("a plan that finds nothing left to do clears the block", func(t *testing.T) {
+		seedSettledFailure(t)
+		planResp := &apitypes.PlanResponse{
+			Changes: []*apitypes.SchemaChangeResponse{{Namespace: dbName}},
+		}
+
+		_, check, err := h.upsertPlanCheckRecord(t.Context(), installClient, "octocat/hello-world", 1, schema, planResp, "staging", reviewDriftOutcome{})
+		require.NoError(t, err)
+		require.NotNil(t, check)
+
+		stored, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "newsha222", stored.HeadSHA)
+		assert.False(t, stored.HasChanges)
+		assert.Equal(t, checkConclusionSuccess, stored.Conclusion, "the target matches the PR, so the reconciled environment passes")
+	})
+
+	// A plan that reported errors beside a change stores the failed-plan
+	// summary rather than the change's, so its row and the aggregate title
+	// say the plan failed instead of reading as a plan that only refused a
+	// change.
+	t.Run("a plan with errors beside a change reads as a failed plan", func(t *testing.T) {
+		seedSettledFailure(t)
+		planResp := &apitypes.PlanResponse{
+			Changes: []*apitypes.SchemaChangeResponse{{
+				Namespace: dbName,
+				TableChanges: []*apitypes.TableChangeResponse{{
+					TableName:  "orders",
+					DDL:        "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)",
+					ChangeType: "alter",
+				}},
+			}},
+			Errors: []string{"lint failed for table payments"},
+		}
+
+		_, check, err := h.upsertPlanCheckRecord(t.Context(), installClient, "octocat/hello-world", 1, schema, planResp, "staging", reviewDriftOutcome{})
+		require.NoError(t, err)
+		require.NotNil(t, check)
+
+		stored, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.True(t, stored.HasChanges)
+		assert.Equal(t, checkConclusionFailure, stored.Conclusion)
+		assert.Equal(t, planFailedCheckSummary, stored.ChangeSummary)
+		assert.False(t, stored.PlanRefused, "a plan with errors is never stored as refused")
+		assert.Equal(t, planFailedCheckText, failedAggregateTitle([]*storage.Check{stored}))
+	})
 }
 
 // Stored per-database results are keyed to the commit they were computed for.

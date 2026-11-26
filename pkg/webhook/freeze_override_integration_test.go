@@ -158,6 +158,46 @@ func TestE2EApplyOverrideFromAPullRequestOnReason(t *testing.T) {
 	assert.Equal(t, "fix the index", request.Reason)
 }
 
+// A frozen change that is also unsafe needs both consents. The plan comment
+// offers one command that carries both, and that command is admitted: the
+// unsafe consent lets the apply run without a confirmation step, and the
+// freeze lets it through on its reason. Without --allow-unsafe nothing runs.
+func TestE2EApplyOverrideOfAnUnsafeChange(t *testing.T) {
+	dbName := "webhook_override_unsafe"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "us", liveSchema: usersWithEmailSchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	freezeID := freezeForOverride(t, svc.Storage(), driftEnv, dbName)
+	dropEmail := map[string]string{"users.sql": usersBaseSchema}
+
+	planned := runRolloutWebhookWithFiles(t, svc, dbName, commentRequest(t, "carol", `schemabot plan -e `+driftEnv), dropEmail)
+	plan := awaitCommentContaining(t, planned, "| `"+freezeID+"` | until lifted |")
+	assert.Contains(t, plan, "Add `--allow-unsafe` to confirm 1 unsafe change on `users`")
+	assert.Contains(t, plan, "schemabot apply -e "+driftEnv+` --override "<why it can't wait>"`)
+
+	withoutConsent := runRolloutWebhookWithFiles(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv+` --override "fix the index"`), dropEmail)
+	refusal := awaitCommentContaining(t, withoutConsent, "Apply rejected")
+	assert.Contains(t, refusal, "| `"+freezeID+"` | until lifted |", "the refusal names the freeze the retry meets next")
+	assert.Contains(t, refusal, "schemabot apply -e "+driftEnv+` --allow-unsafe --override "<why it can't wait>"`, "the retry carries the override")
+	requireNoApplies(t, svc, dbName)
+
+	// The retry pasted unedited still carries the placeholder, which is no
+	// reason: it is answered, and nothing runs.
+	pasted := runRolloutWebhookWithFiles(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv+` --allow-unsafe --override "<why it can't wait>"`), dropEmail)
+	assert.Contains(t, awaitCommentContaining(t, pasted, "placeholder"), "replace it with why this change can't wait")
+	requireNoApplies(t, svc, dbName)
+
+	admitted := runRolloutWebhookWithFiles(t, svc, dbName, commentRequest(t, "carol", `schemabot apply -e `+driftEnv+` --allow-unsafe --override "fix the index"`), dropEmail)
+	created := awaitRolloutApply(t, svc, dbName, admitted)
+	require.NotEmpty(t, created.GetOptions().FreezeOverride, "the freeze let the apply through on its reason")
+	request, err := svc.Storage().FreezeOverrides().Get(t.Context(), created.GetOptions().FreezeOverride)
+	require.NoError(t, err)
+	assert.Equal(t, "fix the index", request.Reason)
+}
+
 // approveTeam is the one freeze approver team the approval tests configure.
 const approveTeam = "acme/freeze-approvers"
 

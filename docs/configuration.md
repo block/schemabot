@@ -12,6 +12,7 @@
 - [Hybrid Mode](#hybrid-mode)
 - [Drivers](#drivers)
 - [Metrics](#metrics)
+- [Change Events](#change-events)
 - [Rate Limits](#rate-limits)
 - [Pending Drops](#pending-drops)
 - [Direct Execution](#direct-execution)
@@ -776,7 +777,7 @@ Rules:
 - An environment-level `targets` list is mutually exclusive with an environment-level `deployments` map, the same way an environment-level `target` is. A `targets` list inside a `deployments` entry is how the two combine.
 - The list MUST contain at least one entry, and no entry may be empty.
 - A rollout across the listed targets runs table by table: each table lands on every target before any target starts the next. Tables run in the order the reviewed plan lists them, then any table only another target's plan changes, sorted by name. A target whose plan does not change a table has nothing to run for it, and two statements on one table run together. The exception is a rollout where a target's plan changes a VSchema, which applies with that target's tables, so each target then runs its whole change in one go.
-- `cutover_policy` and `on_failure` order the listed targets' copies within each table the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. Cutover is where targets differ from deployments. The default here is `parallel`: it starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and cuts each target over as soon as its copy is ready: a target never waits for an earlier target's copy or cutover to finish, and an earlier target holds a later target's cutover only while it is failed, retrying a failure, stopped, cancelled, or reverted. The [multi-target apply animation](#multi-target-environment) shows this default with four targets. A deployment with a `targets` list therefore refuses `--defer-cutover`; apply one target at a time with `--target` to hold a target's cutover. Under the default `on_failure: halt` a failed target stops every queued target from starting, and holds the cutover of every later target already copying: each of those finishes its copy and waits at the cutover barrier until an operator stops or cancels it. `max_drivers_per_apply` is therefore what bounds how many targets copy at once, and how many a failure can leave holding a finished copy, so raising it widens both; size it for the targets that share a host's disk and network as well as for throughput. An environment that relies on an unset `cutover_policy` running one target at a time needs `cutover_policy: rolling` to keep doing so: a failed target then stops every later one before it starts copying. Whatever `on_failure` says, a table that failed on any target ends the rollout at that table: `continue` or a released `pause` still runs it on the remaining targets, but no target starts the next table.
+- `cutover_policy` and `on_failure` order the listed targets' copies within each table the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. Cutover is where targets differ from deployments. The default here is `parallel`: it starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and cuts each target over as soon as its copy is ready: a target never waits for an earlier target's copy or cutover to finish, and an earlier target holds a later target's cutover only while it is failed, retrying a failure, stopped, cancelled, or reverted. The [multi-target apply animation](#multi-target-environment) shows this default with four targets. A deployment with a `targets` list therefore refuses `--defer-cutover`; apply one target at a time with `--target` to hold a target's cutover. Under the default `on_failure: halt` a failed target stops every queued target from starting, and holds the cutover of every later target already copying: each of those finishes its copy and waits at the cutover barrier until an operator stops or cancels it. The failed target's own other shards do not wait: each one whose cutover has not begun is cancelled. `max_drivers_per_apply` is therefore what bounds how many targets copy at once, and how many a failure can leave holding a finished copy, so raising it widens both; size it for the targets that share a host's disk and network as well as for throughput. An environment that relies on an unset `cutover_policy` running one target at a time needs `cutover_policy: rolling` to keep doing so: a failed target then stops every later one before it starts copying. Whatever `on_failure` says, a table that failed on any target ends the rollout at that table: `continue` or a released `pause` still runs it on the remaining targets, but no target starts the next table.
 - No entry may contain `/`. A deployment addressing several targets names each one in its members' operation keys, and `/` separates a key's components.
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.
@@ -1018,6 +1019,102 @@ The cap applies only to *starting* new operations — a first start, a resume af
 
 A multi-shard apply started with a manual `--defer-cutover` keeps its drivers while it waits: unlike the automatic barrier park, a manually deferred operation holds its claim and keeps heartbeating, so it stays counted. Its cutover is accepted only once every operation waits, which takes a cap no smaller than the apply's width, so a deferred apply that would hold more operations at once than `max_drivers_per_apply` is [refused at the start](#deferred-cutover-capacity). Run it without `--defer-cutover`, or raise `max_drivers_per_apply` to at least its width.
 
+## Change Events
+
+Use `change_events` to send JSON lifecycle events to HTTP destinations. Each
+destination selects its environments and events. A server with no destinations
+configured sends no events.
+
+```yaml
+change_events:
+  - url: https://events.example.com/schema
+    environments: [production]
+    events: [operation.started, operation.finished, apply.finished]
+    body: |
+      {"app":{{json .App}},"environment":{{json .Environment}},
+       "timestamp":{{.OccurredAtNanos}},"description":{{json .Description}}}
+```
+
+Templates receive `.Type`, `.App`, `.Environment`, `.OccurredAtNanos`, and
+`.Description`. Use the `json` function to encode string values. `.App` comes
+from the database registration's `app` field and falls back to the logical
+database name when no application is registered.
+
+- The executing worker reports `operation.started` when a fresh attempt reaches
+  the engine. It reports `operation.finished` when a drive that called the engine
+  commits the attempt outcome. After a takeover, the finish can be omitted if
+  the drive cannot establish a new outcome for the attempt. An automatic retry opens a
+  new attempt even when its outcome is again `failed_retryable`.
+- The control plane reports `apply.finished` when a state transition records
+  the settled rollout outcome. If the rollout settles while the apply already
+  has that outcome, the event is omitted. The description includes the apply
+  ID and deployment outcomes for pull request and CLI applies.
+
+Each server configures its own destinations. For a remote apply, configure the
+worker to report operation events and the control plane to report the aggregate
+outcome. Worker events use the executing deployment's apply and operation IDs.
+The worker receives the managed app label in the existing dispatch options.
+
+### Amazon SQS destinations
+
+Use `sqs_change_events` to publish structured JSON to an existing standard SQS
+queue. Each queue selects its own events and environments. It works on its own
+or alongside the HTTP destinations above.
+
+```yaml
+sqs_change_events:
+  - queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/schema-events
+    region: us-east-1
+    environments: [production]
+    events: [apply.finished]
+```
+
+Grant the server role `sqs:SendMessage` on that queue. The publisher uses the AWS
+SDK credential chain. Set `region` to the queue's region or supply it through
+the AWS SDK configuration. Omitting `sqs_change_events` disables SQS delivery.
+
+An `apply.finished` message for a successful apply looks like this:
+
+```json
+{
+  "event_id": "103dfb3a-5cb6-4b2c-b36a-6bc0d75ce5c7",
+  "type": "apply.finished",
+  "id": "apply_example",
+  "app": "checkout",
+  "database": "orders",
+  "database_type": "mysql",
+  "environment": "production",
+  "repository": "example/schemas",
+  "pull_request": 42,
+  "outcome": "completed",
+  "completed_at": "2026-11-20T00:00:00Z",
+  "occurred_at_nanos": 1795132800000000000
+}
+```
+
+Use `event_id` to deduplicate deliveries. With a local worker, operation events
+and the control plane’s `apply.finished` event share the same apply `id`. With a
+remote worker, operation events carry the worker’s apply ID and `apply.finished`
+carries the control plane’s apply ID. Joining on `id` only correlates events
+within the same apply record.
+
+Apply
+outcomes include `completed`, `failed`, `cancelled`, and `reverted`. Consumers
+that react only to successful schema changes should select `outcome == "completed"`.
+`occurred_at_nanos` is when the hook observed the event. `completed_at` is the
+stored apply completion time, falling back to the stored update time. Operation
+events include `operation_id`, `deployment`, and `attempt`. Only finish events
+carry an outcome, and only aggregate finish events carry `completed_at`.
+Repository and pull request fields are omitted when absent.
+
+Delivery is best effort for both transports. Each destination uses a bounded
+in-memory queue and a three-second send deadline. A full queue, a failed send,
+or shutdown can lose events. The SQS publisher makes one send attempt. Once
+SQS accepts a message, the queue's retention and delivery policies apply.
+Delivery failures are logged. SchemaBot writes no outbox rows. When a reaper
+settles an apply, delivery workers load the event details in the background
+so the reaper can update GitHub without waiting.
+
 ## Rate Limits
 
 `POST /api/pull` reads a database's live schema. Per namespace, that opens a
@@ -1181,6 +1278,20 @@ one of the event's five attempts, so an event the quota keeps refusing at every
 hourly reset stops being retried about eight hours after it arrived, and its
 check stays failing until the next push or check re-run. A read refused while one database is being
 planned still fails that plan until the next push or check re-run.
+
+GitHub's own primary rate limit is handled the same way, whether or not
+`quota-reserve` is set. When GitHub refuses a request because the
+installation's quota is spent, SchemaBot retries the event at the reset time
+GitHub reports, plus up to 30 seconds. For three hours after the event arrived
+that wait does not use up its retry attempts, and after that each refusal uses
+one of the five. A secondary rate limit, or a refusal that carries no readable
+reset time, is retried on the usual schedule.
+
+Because each wait lasts until a reset, a PR command such as `apply` that the
+limit keeps refusing can run hours after it was typed, and about 13 hours after
+it in the worst case before its final comment says it failed. It posts nothing
+while it waits, since GitHub would refuse that comment too. When it does run,
+it checks the PR, its reviews, its head and the database lock again first.
 
 ```yaml
 github:
@@ -1729,7 +1840,12 @@ target is safe for a bounded attempt. Every apply still runs under short
 `lock_timeout` and `statement_timeout` budgets, so above the ceiling it is the
 statement timeout, not the ceiling, that stops a runaway rewrite. A greenfield
 `CREATE TABLE` does not consult the ceiling: the gate bounds rewrites of
-existing data, and a table that does not exist yet has none.
+existing data, and a table that does not exist yet has none. Neither does an
+`ALTER TABLE` that pg-sprite proves changes only the catalog, such as adding a
+nullable column: it reads no rows, so its cost does not grow with the table.
+The apply proves it again against the live table and applies the ceiling if
+the change is no longer catalog-only. [Catalog-only changes](postgresql.md#catalog-only-changes)
+lists which changes qualify.
 
 Every engine gate still runs when an earlier gate has already blocked all of a
 table's steps. A missing grant is appended to each blocked step whose statement
@@ -2880,7 +2996,7 @@ Rules:
 - When `apps:` is NOT configured, repositories must not set `github_app:` — it would be silently ignored, so it is rejected at config load to surface misconfiguration early.
 - The legacy single-App `github:` shape continues to work unchanged.
 
-The map key under `apps:` is the App's stable logical name and the value that flows into log lines and metrics. Each entry MUST provide a non-empty `app-id`, `private-key`, and `webhook-secret`; all three accept the same secret-resolution prefixes as the legacy `github:` block (see [Secret Resolution](#secret-resolution)). `check-name` is optional and defaults to `SchemaBot`.
+The map key under `apps:` is the App's stable logical name and the value that flows into log lines and metrics. Each entry MUST provide a non-empty `app-id`, `private-key`, and `webhook-secret`; all three accept the same secret-resolution prefixes as the legacy `github:` block (see [Secret Resolution](#secret-resolution)). `check-name` is optional and defaults to `SchemaBot`. `previous-webhook-secret` is optional and holds the App's old webhook secret while it is rotated out; see [Rotating the webhook secret](github-app-setup.md#rotating-the-webhook-secret).
 
 ### How dispatch works
 

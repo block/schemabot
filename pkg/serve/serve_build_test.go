@@ -2,6 +2,9 @@ package serve
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"log/slog"
 	"net"
 	"net/http"
@@ -464,6 +467,105 @@ func TestBuildWebhookRuntimeRefusesEmptyWebhookSecret(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "webhook secret resolved to empty value")
 	})
+
+	t.Run("single App rotating to an empty repo-webhook secret", func(t *testing.T) {
+		t.Setenv("SCHEMABOT_TEST_REPO_WEBHOOK_SECRET", "")
+		cfg := &api.ServerConfig{GitHub: api.GitHubConfig{
+			AppID: "123", PrivateKey: "some-key", WebhookSecret: "secret",
+			RepoWebhookSecret: "env:SCHEMABOT_TEST_REPO_WEBHOOK_SECRET", PreviousRepoWebhookSecret: "old-repo-secret",
+		}}
+		_, err := buildWebhookRuntime(cfg, api.New(mysqlstore.New(nil), cfg, nil, logger), logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "github.repo-webhook-secret resolved to an empty value")
+	})
+
+	t.Run("single App with a previous webhook secret that resolves to empty", func(t *testing.T) {
+		t.Setenv("SCHEMABOT_TEST_OLD_WEBHOOK_SECRET", "")
+		cfg := &api.ServerConfig{GitHub: api.GitHubConfig{
+			AppID: "123", PrivateKey: "some-key", WebhookSecret: "secret",
+			PreviousWebhookSecret: "env:SCHEMABOT_TEST_OLD_WEBHOOK_SECRET",
+		}}
+		_, err := buildWebhookRuntime(cfg, api.New(mysqlstore.New(nil), cfg, nil, logger), logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "previous-webhook-secret is set but resolved to an empty value")
+	})
+
+	t.Run("multi App with a previous repo-webhook secret", func(t *testing.T) {
+		cfg := &api.ServerConfig{Apps: map[string]api.GitHubAppConfig{"a": {
+			AppID: "1001", PrivateKey: "k", WebhookSecret: "s", PreviousRepoWebhookSecret: "old-repo-secret",
+		}}}
+		_, err := buildWebhookRuntime(cfg, api.New(mysqlstore.New(nil), cfg, nil, logger), logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "repository webhooks are not served when apps: is configured")
+	})
+}
+
+// A server configured mid-rotation accepts a delivery signed with the secret
+// being rotated out, in single-App mode for App and repository webhooks and in
+// multi-App mode, and still refuses one signed with any other secret. The
+// delivery goes through the handler the runtime builds, so the test covers the
+// startup wiring from config to handler and not only the handler options.
+func TestBuildWebhookRuntimeAcceptsTheSecretBeingRotatedOut(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	// A ping is authenticated and then ignored, so it needs no storage.
+	body := []byte(`{"zen":"Keep it logically awesome."}`)
+	sign := func(secret string) string {
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write(body)
+		return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	}
+
+	tests := []struct {
+		name    string
+		cfg     *api.ServerConfig
+		headers map[string]string
+	}{
+		{
+			name: "single App",
+			cfg: &api.ServerConfig{GitHub: api.GitHubConfig{
+				AppID: "123", PrivateKey: "some-key", WebhookSecret: "new-secret", PreviousWebhookSecret: "old-secret",
+			}},
+		},
+		{
+			name: "single App repository webhook",
+			cfg: &api.ServerConfig{GitHub: api.GitHubConfig{
+				AppID: "123", PrivateKey: "some-key", WebhookSecret: "app-secret",
+				RepoWebhookSecret: "new-secret", PreviousRepoWebhookSecret: "old-secret",
+			}},
+			headers: map[string]string{"X-GitHub-Hook-Installation-Target-Type": "repository"},
+		},
+		{
+			name: "multi App",
+			cfg: &api.ServerConfig{Apps: map[string]api.GitHubAppConfig{"a": {
+				AppID: "1001", PrivateKey: "k", WebhookSecret: "new-secret", PreviousWebhookSecret: "old-secret",
+			}}},
+			headers: map[string]string{
+				"X-GitHub-Hook-Installation-Target-Type": "integration",
+				"X-GitHub-Hook-Installation-Target-ID":   "1001",
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rt, err := buildWebhookRuntime(tc.cfg, api.New(mysqlstore.New(nil), tc.cfg, nil, logger), logger)
+			require.NoError(t, err)
+			for signWith, wantCode := range map[string]int{
+				"new-secret":   http.StatusOK,
+				"old-secret":   http.StatusOK,
+				"other-secret": http.StatusUnauthorized,
+			} {
+				req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(string(body)))
+				req.Header.Set("X-GitHub-Event", "ping")
+				req.Header.Set("X-Hub-Signature-256", sign(signWith))
+				for k, v := range tc.headers {
+					req.Header.Set(k, v)
+				}
+				rec := httptest.NewRecorder()
+				rt.handler.ServeHTTP(rec, req)
+				assert.Equal(t, wantCode, rec.Code, "delivery signed with %s", signWith)
+			}
+		})
+	}
 }
 
 // staticStorageSchemaService stands in for the adapter bound to an instance's

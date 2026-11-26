@@ -90,6 +90,67 @@ func TestTableChangesRecordsTheReviewedDrop(t *testing.T) {
 	assert.NotEqual(t, engine.ExecutionModeBlocked, unrecorded[1].ExecutionMode)
 }
 
+// A SET NOT NULL runs as its helper sequence, whose last step drops the
+// helper the first step added. The plan records that helper on the drop step,
+// so the apply checks it drops the plan's own helper, and the statement stays
+// safe because it drops no live structure. A sequence whose helper drop the
+// planner did not record is blocked at plan time, as the apply would refuse
+// it.
+func TestTableChangesRecordsTheNotNullHelperDrop(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	steps := []string{
+		`ALTER TABLE "public"."users" ADD CONSTRAINT "users_email_not_null_check" CHECK ("email" IS NOT NULL) NOT VALID`,
+		`ALTER TABLE "public"."users" VALIDATE CONSTRAINT "users_email_not_null_check"`,
+		`ALTER TABLE "public"."users" ALTER COLUMN "email" SET NOT NULL`,
+		`ALTER TABLE "public"."users" DROP CONSTRAINT "users_email_not_null_check"`,
+	}
+	helper := schemadiff.DroppedObject{
+		Kind:       schemadiff.DroppedConstraint,
+		Name:       "users_email_not_null_check",
+		Definition: "CHECK ((email IS NOT NULL))",
+	}
+	plan := func(dropsHelper *schemadiff.DroppedObject) []engine.TableChange {
+		report := pgplan.NewReport(pgplan.SourceDiff)
+		report.Table = "users"
+		report.Statements = []pgplan.Statement{{
+			SQL:         "ALTER TABLE public.users ALTER COLUMN email SET NOT NULL",
+			Route:       planner.RouteNative,
+			Backend:     router.BackendNative,
+			Disposition: router.DispositionExecute,
+			ExecSQL:     steps,
+			Validates: &schemadiff.ConstraintValidation{
+				Constraint: "users_email_not_null_check",
+				Def:        "CHECK ((email IS NOT NULL)) NOT VALID",
+			},
+			DropsHelper: dropsHelper,
+		}}
+		changes, _, _, err := tableChanges(report, nil, parser)
+		require.NoError(t, err)
+		require.Len(t, changes, len(steps))
+		return changes
+	}
+
+	recorded := plan(&helper)
+	for _, tc := range recorded {
+		assert.NotEqual(t, engine.ExecutionModeBlocked, tc.ExecutionMode, "%s: %s", tc.DDL, tc.ModeReason)
+		assert.False(t, tc.IsUnsafe, "%s drops only the plan's own helper", tc.DDL)
+	}
+	got, err := reviewedDropFromMetadata(recorded[3].Metadata)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, helper, *got)
+	for _, tc := range recorded[:3] {
+		dropped, err := reviewedDropFromMetadata(tc.Metadata)
+		require.NoError(t, err)
+		assert.Nil(t, dropped, "%s drops nothing, so it carries no drop record", tc.DDL)
+	}
+
+	unrecorded := plan(nil)
+	assert.Equal(t, engine.ExecutionModeBlocked, unrecorded[3].ExecutionMode)
+	assert.Contains(t, unrecorded[3].ModeReason, `drops an object the planner did not record`)
+}
+
 // An apply admits a statement that drops a live object only when the plan
 // recorded that object, so the drop can be checked against what was reviewed.
 func TestValidateOptimisticApplyRequiresTheReviewedDrop(t *testing.T) {

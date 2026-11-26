@@ -24,6 +24,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
@@ -764,6 +765,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp.Rollout = rollout
+	resp.Freezes = s.planResponseFreezes(r.Context(), req.Database, req.Environment, req.Repository, resp)
 
 	s.writeJSON(w, http.StatusOK, resp)
 }
@@ -4101,6 +4103,24 @@ func PlanFailureLog(logger *slog.Logger, err error) func(msg string, args ...any
 		return logger.Warn
 	}
 	return logger.Error
+}
+
+// PlanRefusalProblems returns the statements in the schema files a refused
+// plan names, from a local engine's refusal or from the detail a remote data
+// plane attaches to its FailedPrecondition answer, and how many more a remote
+// data plane refused without listing them to keep its answer bounded. It
+// returns nil and 0 for a failure that is not a refusal, for a refusal about
+// the target rather than the files, and for a remote data plane that predates
+// the detail, whose refusal text still describes every problem.
+func PlanRefusalProblems(err error) ([]engine.PlanProblem, int) {
+	if refusal, ok := errors.AsType[*engine.PlanRefusedError](err); ok {
+		return refusal.Problems, 0
+	}
+	var remote interface{ GRPCStatus() *grpcstatus.Status }
+	if errors.As(err, &remote) {
+		return ternconv.PlanProblemsFromStatus(remote.GRPCStatus())
+	}
+	return nil, 0
 }
 
 // planRefusalReason is a refusal's own text, without the gRPC status prefix a

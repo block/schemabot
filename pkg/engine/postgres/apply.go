@@ -18,6 +18,8 @@ import (
 
 	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/executor"
+	"github.com/block/pg-sprite/pkg/migrate"
+	"github.com/block/pg-sprite/pkg/planner"
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/progress"
 	"github.com/block/pg-sprite/pkg/schemadiff"
@@ -119,7 +121,16 @@ type nativeApply struct {
 	enumValueAdd     bool
 	// dropped is the plan's record of the live object the statement drops,
 	// which the apply checks under the table's lock before dropping it.
-	dropped                    *schemadiff.DroppedObject
+	dropped *schemadiff.DroppedObject
+	// validates is the plan's record of the live NOT VALID constraint the
+	// statement validates, which the apply checks under the validation's
+	// lock before validating it.
+	validates *schemadiff.ConstraintValidation
+	// database names the target for the logs and metrics of a table drop.
+	database string
+	// droppedTable is the definition the plan recorded for a table the
+	// statement drops whole, which pg-sprite checks under the table's lock.
+	droppedTable               string
 	concurrentIndexMaxDuration time.Duration
 	cancelRequested            func() bool
 }
@@ -255,6 +266,15 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned DDL is not one statement or a valid greenfield create set", tc.Table)
 	}
+	// A table drop is not a shape pg-sprite's migrate path executes, so it is
+	// admitted on its own terms, against the definition the plan recorded.
+	drop, isTableDrop, err := tableDropForApply(req.Database, req.Changes[0].Namespace, tc, statements)
+	if err != nil {
+		return nativeApply{}, err
+	}
+	if isTableDrop {
+		return drop, nil
+	}
 	// A label addition to an enum type is the one shape that names a type
 	// rather than a table, so it is admitted on its own terms before the
 	// table privilege tiers, which have no rung for it.
@@ -287,8 +307,39 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		if err != nil {
 			return nativeApply{}, err
 		}
+		change.validates, err = reviewedValidationForApply(req.Database, tc, statements[0])
+		if err != nil {
+			return nativeApply{}, err
+		}
 	}
 	return change, nil
+}
+
+// reviewedValidationForApply returns the plan's record of the constraint a
+// VALIDATE CONSTRAINT statement validates, and nil for any other statement.
+// A validation is admitted only with that record: without it the apply could
+// not tell the reviewed constraint from one that took its name after the
+// plan, so a missing or unreadable record refuses the apply before any work
+// is queued and the operator re-plans.
+func reviewedValidationForApply(database string, tc engine.TableChange, statement string) (*schemadiff.ConstraintValidation, error) {
+	validates, err := validatesConstraint(statement)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission could not classify a planned validation", "database", database, "table", tc.Table, "error", err)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
+	}
+	if !validates {
+		return nil, nil
+	}
+	reviewed, err := reviewedValidationFromMetadata(tc.Metadata)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission rejected the reviewed validation record", "database", database, "table", tc.Table, "error", err)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: the plan's record of the constraint this statement validates is unreadable; re-plan and apply again", tc.Table)
+	}
+	if reviewed == nil {
+		slog.Warn("PostgreSQL apply admission refused a validation the plan did not record", "database", database, "table", tc.Table)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: the plan has no record of the constraint this statement validates; re-plan and apply again", tc.Table)
+	}
+	return reviewed, nil
 }
 
 // reviewedDropForApply returns the plan's record of the object a statement
@@ -496,7 +547,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		return
 	}
 
-	failure := classifyApplyFailure(err, change.table)
+	failure := classifyApplyFailure(err, change.table, change.validates)
 	failure.detail = recoveryContextDetail(err, failure.detail)
 	switch {
 	case failure.committedPrefix:
@@ -530,8 +581,10 @@ type applyFailure struct {
 // collide. classifyRefusal already consumed the statement-budget cause, so a
 // budget exceeded here is the lock budget: the statement is native-safe and
 // merely lost a bounded race with concurrent lock holders, and marking it
-// blocked would falsely tell the operator retrying cannot succeed.
-func classifyApplyFailure(err error, table string) applyFailure {
+// blocked would falsely tell the operator retrying cannot succeed. validates
+// is the plan's record of the constraint the failed step validates, or nil
+// when the step validates none.
+func classifyApplyFailure(err error, table string, validates *schemadiff.ConstraintValidation) applyFailure {
 	if detail, committed := committedCreatePrefixDetail(err, table); committed {
 		return applyFailure{detail: detail, committedPrefix: true}
 	}
@@ -551,7 +604,79 @@ func classifyApplyFailure(err error, table string) applyFailure {
 			lockBudget: true,
 		}
 	}
+	if detail, ok := brokenForeignKeyDetail(err, table); ok {
+		return applyFailure{detail: detail, retryable: true}
+	}
+	if detail, ok := brokenCheckDetail(err, table, validates); ok {
+		return applyFailure{detail: detail, retryable: true}
+	}
+	if detail, ok := missingGrantDetail(err, table); ok {
+		return applyFailure{detail: detail, retryable: true}
+	}
 	return applyFailure{detail: "PostgreSQL schema change failed; see server logs", retryable: true}
+}
+
+// missingGrantDetail names a statement the server refused because the engine
+// role lacks a privilege. The privilege check before the apply covers the
+// target table; a foreign key also needs REFERENCES on the table it
+// references, which only the server checks. The detail leaves out the
+// server's message, which names objects the plan did not, and the server log
+// keeps it.
+func missingGrantDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateInsufficientPrivilege {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"the engine role lacks a privilege the statement on %q needs, such as REFERENCES on the table a foreign key references; the server log names it; grant it, then retry",
+		table)), true
+}
+
+// sqlstateForeignKeyViolation is the SQLSTATE the server raises when a row
+// breaks a foreign key, which for a schema change means validating a key
+// that existing rows do not satisfy.
+const sqlstateForeignKeyViolation = "23503"
+
+// brokenForeignKeyDetail names the foreign key whose validation failed on
+// existing rows. The key was added NOT VALID in an earlier step, so it stays
+// in place and checks new writes; the apply can finish once the owner fixes
+// the rows. The detail is built from the server's typed fields, never its
+// message, because the message quotes the offending row's values.
+func brokenForeignKeyDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateForeignKeyViolation {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"existing rows in %q break foreign key %q; the key is in place and checks new writes; fix those rows, then retry",
+		table, pgErr.ConstraintName)), true
+}
+
+// sqlstateCheckViolation is the SQLSTATE the server raises when a row breaks
+// a check constraint, which for a validation step means existing rows do not
+// satisfy the constraint the plan added NOT VALID.
+const sqlstateCheckViolation = "23514"
+
+// brokenCheckDetail names the check constraint whose validation failed on
+// existing rows. It applies only when the failed step validates the
+// constraint the server names. That constraint is NOT VALID on the table,
+// whether the plan added it in an earlier step or found it live, so it stays
+// in place and checks new writes, and the apply can finish once the owner
+// fixes the rows. For the helper check a SET NOT NULL validates, those are
+// the rows that hold NULL in the column. The detail is built from the
+// server's typed fields, never its message, because the message can quote
+// row values.
+func brokenCheckDetail(err error, table string, validates *schemadiff.ConstraintValidation) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateCheckViolation {
+		return "", false
+	}
+	if validates == nil || pgErr.ConstraintName != validates.Constraint {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"existing rows in %q break check constraint %q; the constraint is in place and checks new writes; fix those rows, then retry",
+		table, pgErr.ConstraintName)), true
 }
 
 // invalidIndexAdvice renders the operator-facing cause and next step for an
@@ -930,6 +1055,10 @@ func refusalForCause(err error, table string) *refusal {
 		// property — so rendering it verbatim is safe by construction.
 		return &refusal{reason: "unsupported-partitioned-parent", cause: partitionErr.Error()}
 	}
+	var proofErr *catalogOnlyProofError
+	if errors.As(err, &proofErr) {
+		return catalogOnlyProofRefusal(proofErr, table)
+	}
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
 		// Name whose limit this is: read cold, the size text sounds like a
@@ -1047,7 +1176,8 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 	case executor.CodeEmptySequence, executor.CodeUnsupportedSequenceStep,
 		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
 		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable,
-		executor.CodeUnsupportedAcceptedBlocking, executor.CodeNotCreateIndex:
+		executor.CodeUnsupportedAcceptedBlocking, executor.CodeNotCreateIndex,
+		executor.CodeNotAddKeyConstraint:
 		// Shape refusals: the executor refused the statement's form at
 		// admission, so retrying the identical plan refails the same way.
 		return &refusal{reason: "unsupported-statement-shape",
@@ -1136,6 +1266,42 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "partition-detach-pending",
 			cause:  fmt.Sprintf("a partition of %s has an unfinished concurrent detach", quotedTable(table)),
 			remedy: "finish the detach with ALTER TABLE ... DETACH PARTITION ... FINALIZE, then re-run"}, true
+	case executor.CodeDetachDefaultPartition:
+		// PostgreSQL never detaches a partition concurrently from a table
+		// that has a DEFAULT partition; nothing ran, and a retry meets the
+		// same DEFAULT partition.
+		return &refusal{reason: "detach-default-partition",
+			cause:  fmt.Sprintf("%s has a DEFAULT partition, so PostgreSQL will not detach a partition from it concurrently; nothing ran", quotedTable(table)),
+			remedy: "detach the partition outside SchemaBot, then " + replanRemedy}, true
+	case executor.CodePartitionedKeyNameTaken:
+		// The build left the occupant alone, so only an operator freeing the
+		// name, or the schema file choosing another, changes the outcome.
+		return &refusal{reason: "partitioned-key-name-taken",
+			cause:  fmt.Sprintf("a name the key constraint on partitioned table %s needs on a partition is held by something else", quotedTable(table)),
+			remedy: "rename the constraint in the schema file and re-plan, or drop or rename what holds the name"}, true
+	case executor.CodePartitionedKeyConflict:
+		return &refusal{reason: "partitioned-key-conflict",
+			cause:  fmt.Sprintf("a partition of %s already has a key constraint that conflicts with the planned one; nothing was added", quotedTable(table)),
+			remedy: "drop or change the partition's key, or change the key in the schema file, then " + replanRemedy}, true
+	case executor.CodePartitionedKeyNullableColumn:
+		return &refusal{reason: "partitioned-key-nullable-column",
+			cause:  fmt.Sprintf("the planned primary key on %s covers a column a partition allows to be NULL; nothing was built", quotedTable(table)),
+			remedy: "make the column NOT NULL on every partition, then " + replanRemedy}, true
+	case executor.CodePartitionedKeyUnsupportedShape:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("the key on partitioned table %s has no name or a clause its partitions cannot carry", quotedTable(table)),
+			remedy: "name the key and drop that clause in the schema file, then " + replanRemedy}, true
+	case executor.CodePartitionedKeyParentConflict:
+		// Nothing was created, and the parent's own constraint or the
+		// relation holding the index name stays until an operator or the
+		// schema file changes it.
+		return &refusal{reason: "partitioned-key-parent-conflict",
+			cause:  fmt.Sprintf("partitioned table %s already has the key's name in use, or a primary key", quotedTable(table)),
+			remedy: "rename the key in the schema file, or free the name, then " + replanRemedy}, true
+	case executor.CodePartitionedKeySubPartitioned:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("a partition of %s is itself partitioned, which the key build does not run", quotedTable(table)),
+			remedy: "add the key to that partition by hand, then " + replanRemedy}, true
 	case executor.CodePartitionedIndexTablespace:
 		return &refusal{reason: "unsupported-statement-shape",
 			cause:  fmt.Sprintf("the index on %s names a TABLESPACE, which the partitions' indexes would not use", quotedTable(table)),
@@ -1158,6 +1324,31 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "dropped-object-has-descendants",
 			cause:  fmt.Sprintf("the planned drop on %s would also reach unreviewed partitions or child tables", quotedTable(table)),
 			remedy: "make the drop outside SchemaBot on the whole table tree, then " + replanRemedy}, true
+	case executor.CodeDroppedColumnPartitionKey:
+		// PostgreSQL never drops a column in a partition key, read under the
+		// table's lock; nothing was dropped.
+		return &refusal{reason: "dropped-column-partition-key",
+			cause:  fmt.Sprintf("the planned column drop on %s names a column in a partition key, which PostgreSQL cannot drop", quotedTable(table)),
+			remedy: "declare the column again in the schema file, then " + replanRemedy}, true
+	case executor.CodeDroppedColumnPartitionDependent:
+		// A partition has an object of its own on the column, which the
+		// drop would remove without review; nothing was dropped.
+		return &refusal{reason: "dropped-column-partition-dependent",
+			cause:  fmt.Sprintf("the planned column drop on %s would also remove an index, constraint, or other object a partition has on that column", quotedTable(table)),
+			remedy: "drop or change that object on the partition, then " + replanRemedy}, true
+	case executor.CodeDroppedTableHasParent:
+		// The table the plan drops became a partition or an inheritance
+		// child after planning, read under its lock; nothing was dropped.
+		// Dropping it would remove rows of the table above it.
+		return &refusal{reason: "dropped-table-has-parent",
+			cause:  fmt.Sprintf("table %s is now a partition or inheritance child", quotedTable(table)),
+			remedy: "make the drop outside SchemaBot on the whole table tree, then " + replanRemedy}, true
+	case executor.CodeDroppedTableHasDependents:
+		// A view or another object depends on the table, and the drop never
+		// cascades, so PostgreSQL refused it; nothing was dropped.
+		return &refusal{reason: "dropped-table-has-dependents",
+			cause:  fmt.Sprintf("a view or other object depends on table %s", quotedTable(table)),
+			remedy: "drop or change the objects that depend on the table, then apply again"}, true
 	case executor.CodeAdoptedIndexDrift, executor.CodeValidatedConstraintDrift,
 		executor.CodeRenamedIndexDrift, executor.CodeDroppedIndexDrift:
 		// The index or constraint the planned statement names changed after
@@ -1168,8 +1359,8 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 			cause:  fmt.Sprintf("the index or constraint the planned statement for %s names changed after planning", quotedTable(table)),
 			remedy: replanRemedy}, true
 	case executor.CodeDroppedObjectDrift:
-		// The column, constraint, or NOT NULL the planned drop removes no
-		// longer has the definition the plan recorded, read again under the
+		// The table, column, constraint, or NOT NULL the planned drop removes
+		// no longer has the definition the plan recorded, read again under the
 		// table's lock; nothing was dropped. The plan is stale, so only a
 		// re-plan changes the outcome.
 		return &refusal{reason: "planned-object-drift",
@@ -1235,12 +1426,13 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeCancelledExternally, executor.CodeInvalidIndexOwnLeftover,
 		executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuildInFlight,
 		executor.CodeInvalidIndexBuilderUnobservable, executor.CodeInvalidIndexUnproven,
-		executor.CodePartitionedIndexUnsettled, executor.CodeExecutionFailed:
+		executor.CodePartitionedIndexUnsettled, executor.CodePartitionedKeyUnsettled,
+		executor.CodeDetachInterrupted, executor.CodeExecutionFailed:
 		// Operational outcomes: a bounded lock race, the caller's own
 		// context ending or an external stop, an invalid-index state a retry
 		// recovers or an operator clears or waits out, a partitioned index
-		// build that a rerun resumes, or a failure outside
-		// the typed set. A retry can succeed once conditions change, so
+		// or key build that a rerun resumes, a concurrent detach that running the
+		// same statement again finishes, or a failure outside the typed set. A retry can succeed once conditions change, so
 		// none is a permanent refusal.
 		return nil, true
 	}
@@ -1571,6 +1763,9 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	if change.enumValueAdd {
 		return executeEnumValueAdd(ctx, pool, change)
 	}
+	if change.droppedTable != "" {
+		return executeTableDrop(ctx, pool, change, tracker, logger)
+	}
 	statements, err := postgresCreateSetStatements(change.sql)
 	if err != nil {
 		return fmt.Errorf("parse planned PostgreSQL DDL for table %q: %w", change.table, err)
@@ -1599,9 +1794,9 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	// envelope rather than the rewrite ceiling. NoSizeLimit still proves the
 	// target exists and is an ordinary or partitioned table.
 	preflightLimit := applyTablePreflightLimit(change, tableSizeLimit)
-	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, preflightLimit)
+	table, err := checkTableUnlessCatalogOnly(ctx, pool, change, statement, preflightLimit, logger)
 	if err != nil {
-		return fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
+		return err
 	}
 	if change.partitionedIndex {
 		// The build refuses a table that is no longer partitioned before it
@@ -1649,6 +1844,17 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	if change.dropped != nil {
 		return executeReviewedDrop(ctx, pool, table, change, statement.SQL(), tracker)
 	}
+	if change.validates != nil {
+		// pg-sprite reads the constraint again under the validation's lock
+		// and refuses with ErrValidatedConstraintDrift, validating nothing,
+		// when it no longer has the definition the plan recorded.
+		if err := executor.ExecuteNativeValidatingWithProgress(ctx, pool, table, statement, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		}, executor.DefaultRetryPolicy(), *change.validates, tracker); err != nil {
+			return fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", change.validates.Constraint, change.table, err)
+		}
+		return nil
+	}
 	if err := executor.ExecuteNativeWithProgress(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	}, executor.DefaultRetryPolicy(), tracker); err != nil {
@@ -1681,6 +1887,105 @@ func executeReviewedDrop(ctx context.Context, pool *pgxpool.Pool, table prefligh
 		return fmt.Errorf("drop reviewed %s %q on PostgreSQL table %q: %w", change.dropped.Kind, change.dropped.Name, change.table, err)
 	}
 	return nil
+}
+
+// checkTableUnlessCatalogOnly runs the table preflight under limit. When the
+// table is over the limit, the statement still runs if pg-sprite proves,
+// against the live table now, that every operation in it changes only the
+// catalog: such a statement reads and writes no rows, so its cost under the
+// lock does not grow with the table. The proof is made here rather than
+// read from the plan, because the table, its column types, and the
+// functions a default calls can all change between plan and apply. A proof
+// that cannot be made leaves the size refusal standing.
+func checkTableUnlessCatalogOnly(ctx context.Context, pool *pgxpool.Pool, change nativeApply, statement pgstatement.Statement, limit int64, logger *slog.Logger) (preflight.PreflightedTable, error) {
+	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, limit)
+	var sizeErr *preflight.SizeError
+	if !errors.As(err, &sizeErr) {
+		if err != nil {
+			return preflight.PreflightedTable{}, fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
+		}
+		return table, nil
+	}
+	catalogOnly, proofErr := provenCatalogOnly(ctx, pool, statement)
+	if proofErr != nil {
+		logger.Warn("PostgreSQL table is over the size limit and the statement could not be proven to change only the catalog; the apply will be refused on size",
+			"namespace", change.namespace,
+			"table", change.table,
+			"size_limit_bytes", limit,
+			"error", proofErr)
+		return preflight.PreflightedTable{}, fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, &catalogOnlyProofError{size: sizeErr, proof: proofErr})
+	}
+	if !catalogOnly {
+		return preflight.PreflightedTable{}, fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
+	}
+	logger.Info("PostgreSQL table is over the size limit; running the statement because it changes only the catalog",
+		"namespace", change.namespace,
+		"table", change.table,
+		"size_limit_bytes", limit)
+	table, err = preflight.CheckTable(ctx, pool, change.namespace, change.table, preflight.NoSizeLimit)
+	if err != nil {
+		return preflight.PreflightedTable{}, fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
+	}
+	return table, nil
+}
+
+// sqlstateInsufficientPrivilege is the SQLSTATE the server returns when a
+// role lacks a privilege the statement needs.
+const sqlstateInsufficientPrivilege = "42501"
+
+// catalogOnlyProofError reports a table over the size limit whose statement
+// went unproven because the proof itself failed, not because the statement
+// rewrites or scans rows. It is not a size verdict: a retry, or a grant the
+// proof needs, can let the statement run. So it unwraps to the proof's
+// failure and never to the size error, and the size refusal cannot claim it.
+type catalogOnlyProofError struct {
+	size  *preflight.SizeError
+	proof error
+}
+
+func (e *catalogOnlyProofError) Error() string {
+	return fmt.Sprintf("%s; proving the statement changes only the catalog failed: %s", e.size, e.proof)
+}
+
+func (e *catalogOnlyProofError) Unwrap() error { return e.proof }
+
+// catalogOnlyProofRefusal decides the outcome of a failed catalog-only
+// proof. A role that cannot create the proof's temporary table needs a
+// grant, so that refusal names it. Any other failure, such as a dropped
+// connection or a server that briefly accepts no writes during a failover,
+// is operational, and a retry may prove the statement.
+func catalogOnlyProofRefusal(err *catalogOnlyProofError, table string) *refusal {
+	if probeLacksTemporaryGrant(err.proof) {
+		return &refusal{reason: "insufficient-privileges",
+			cause:         fmt.Sprintf("table %s is over the size limit, and proving the statement changes only the catalog needs a temporary table the engine role cannot create", quotedTable(table)),
+			remedy:        "grant TEMPORARY on the database to the engine role, then retry the apply",
+			provisionable: true}
+	}
+	return nil
+}
+
+// probeLacksTemporaryGrant reports whether the add-column proof could not
+// create its temporary table because the engine role lacks the privilege.
+func probeLacksTemporaryGrant(err error) bool {
+	if !errors.Is(err, preflight.ErrAddColumnProbeUnavailable) {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == sqlstateInsufficientPrivilege
+}
+
+// provenCatalogOnly classifies statement against the live table and reports
+// whether pg-sprite proved every operation in it changes only the catalog.
+func provenCatalogOnly(ctx context.Context, pool *pgxpool.Pool, statement pgstatement.Statement) (bool, error) {
+	facts, err := migrate.LiveFacts(ctx, pool, statement)
+	if err != nil {
+		return false, fmt.Errorf("read live facts: %w", err)
+	}
+	plan, err := planner.Classify(statement.SQL(), facts.Classifier)
+	if err != nil {
+		return false, fmt.Errorf("classify the statement: %w", err)
+	}
+	return planner.ProvenCatalogOnly(plan.Decisions), nil
 }
 
 func applyTablePreflightLimit(change nativeApply, tableSizeLimit int64) int64 {
@@ -2204,6 +2509,12 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	if req != nil {
 		key = progressIdentity(req.ResumeState)
 	}
+	if key == "" {
+		// The idle sentinel below means this engine tracks no such apply, which
+		// a caller may act on as "nothing runs". A request that names no apply
+		// has not asked about one, so it gets an error, never that answer.
+		return nil, errMissingApplyIdentity("progress")
+	}
 	e.mu.Lock()
 	tracked := e.progress[key]
 	if tracked == nil {
@@ -2462,6 +2773,14 @@ func setRunningPercent(result *engine.ProgressResult, percent float64) {
 		result.Metadata = make(map[string]string)
 	}
 	result.Metadata[runningPercentMetadataKey] = strconv.FormatFloat(percent, 'f', 2, 64)
+}
+
+// errMissingApplyIdentity is the error for a request that does not name the
+// apply it is about. The engine tracks each apply under its identity, so it
+// cannot answer for work the request does not name, and answering "nothing
+// runs" could let a caller record a schema change as ended while it runs.
+func errMissingApplyIdentity(operation string) error {
+	return fmt.Errorf("PostgreSQL %s request names no apply: ResumeState.MigrationContext is empty, so the engine cannot tell whether a schema change is running", operation)
 }
 
 // progressIdentity extracts the apply identity that keys engine progress.

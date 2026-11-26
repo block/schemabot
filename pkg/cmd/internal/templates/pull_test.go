@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -454,4 +455,40 @@ func TestWritePullSchema_FilteredDifferenceKeepsItsNonPrimaryBaseline(t *testing
 	assert.Contains(t, out, "-- Target `shop-003` — 1 table differs from the schema below\n")
 	assert.Contains(t, out, "--   shop_0.orders: extra\n")
 	assert.NotContains(t, out, "from the primary target", "the difference is from shop-002's shop_0, not the primary")
+}
+
+// Skipped tables render as SQL comments under the namespace header, so the
+// output stays executable and still says which tables it left out and why.
+func TestWritePullSchema_SkippedTablesRenderAsComments(t *testing.T) {
+	setColors(t, false)
+	out := captureStdout(t, func() {
+		WritePullSchema(&apitypes.PullSchemaResponse{
+			Database: "app", Type: "postgres", Environment: "development", TableCount: 1,
+			Namespaces: map[string]*apitypes.PulledNamespace{
+				"public": {
+					Tables: map[string]string{"orders": "CREATE TABLE orders (id bigint)\n"},
+					SkippedTables: []apitypes.SkippedTable{
+						{Table: "audit_log", Reason: "unlogged tables cannot be rendered as a desired schema"},
+						{Table: "sessions", Reason: "schema files cannot describe its trigger"},
+					},
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, out, "Skipped")
+	assert.Contains(t, out, glyph.Attention+" 2 tables, not in the output")
+	assert.Contains(t, out, "-- Namespace `public` — 1 table\n-- "+glyph.Attention+" Skipped 2 tables, not in the output:\n--   audit_log: unlogged tables cannot be rendered as a desired schema\n--   sessions: schema files cannot describe its trigger\n")
+	assert.Contains(t, out, "CREATE TABLE orders (id bigint);\n")
+}
+
+// Onboarding names the tables it listed in ignore_tables instead of writing,
+// with the reason for each.
+func TestWriteOnboardSkippedTables(t *testing.T) {
+	out := captureStdout(t, func() {
+		WriteOnboardSkippedTables("public", []apitypes.SkippedTable{{Table: "audit_log", Reason: "unlogged tables cannot be rendered as a desired schema"}})
+	})
+	assert.Contains(t, out, "Not managed in namespace public: 1 table has no schema file, so schemabot.yaml lists it in ignore_tables:\n  audit_log: unlogged tables cannot be rendered as a desired schema\n")
+
+	assert.Empty(t, captureStdout(t, func() { WriteOnboardSkippedTables("public", nil) }))
 }

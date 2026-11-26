@@ -178,6 +178,10 @@ type PullSchemaOptions struct {
 	Namespaces    []string
 	CatalogDetail string
 	Lint          bool
+	// SkipUnrepresentableTables asks for every table schema files can describe
+	// and a list of the rest, instead of a refusal. A caller that writes the
+	// files must add every skipped table to ignore_tables.
+	SkipUnrepresentableTables bool
 }
 
 // CallPullSchemaAPI fetches live schema files for a database/environment pair.
@@ -199,6 +203,8 @@ func CallPullSchemaAPIWithContext(ctx context.Context, endpoint, database, dbTyp
 		Namespaces:    opts.Namespaces,
 		CatalogDetail: opts.CatalogDetail,
 		Lint:          opts.Lint,
+
+		SkipUnrepresentableTables: opts.SkipUnrepresentableTables,
 	}
 	var result apitypes.PullSchemaResponse
 	if err := doPostIntoWithClient(ctx, httpClient, endpoint, "/api/pull", req, &result); err != nil {
@@ -466,23 +472,21 @@ func CheckActiveSchemaChangeOnDeployment(endpoint, database, environment, deploy
 	})
 }
 
-func findActiveSchemaChange(endpoint, database, environment, deployment string, holds func(*apitypes.ActiveApplyResponse) bool) (*ActiveSchemaChange, error) {
-	var result apitypes.StatusResponse
-	query := url.Values{}
-	query.Set("environment", environment)
-	if deployment != "" {
-		query.Set("deployment", deployment)
-	}
-	query.Set("limit", "1000")
-	// Ask only for applies still holding a target. This runs on every apply and
-	// rollback preflight, and the answer never depends on settled history, so
-	// scanning it would make every schema change pay for the environment's whole
-	// past to learn whether one database is busy.
-	query.Set("active", "true")
-	if err := doGetInto(endpoint, "/api/status?"+query.Encode(), &result); err != nil {
-		return nil, err
-	}
+// activeSchemaChangePageSize is how many active applies one preflight request
+// asks for.
+const activeSchemaChangePageSize = 1000
 
+// maxActiveSchemaChangePages bounds how many pages the preflight reads. The list
+// holds every active apply in the environment, across databases, so one page is
+// already far more than any deployment has; reaching the bound means something
+// is wrong, and the preflight says so rather than reporting the database idle.
+const maxActiveSchemaChangePages = 20
+
+// findActiveSchemaChange reads the environment's active applies a page at a
+// time and returns the first that holds the database. It returns nil only when
+// it has read every active apply; when it cannot, it returns an error, since
+// "no active schema change" must never mean "not all of them were seen".
+func findActiveSchemaChange(endpoint, database, environment, deployment string, holds func(*apitypes.ActiveApplyResponse) bool) (*ActiveSchemaChange, error) {
 	// The operator's flags arrive in whatever case they were typed, and on
 	// MySQL a stored row written before storage folded its keys is still
 	// matched by the case-insensitive collation and returned in its original
@@ -493,22 +497,70 @@ func findActiveSchemaChange(endpoint, database, environment, deployment string, 
 	// back into the preflight.
 	database = storage.CanonicalKey(database)
 	environment = storage.CanonicalKey(environment)
-	for _, apply := range result.Applies {
-		if storage.CanonicalKey(apply.Database) != database || storage.CanonicalKey(apply.Environment) != environment {
-			continue
+
+	after := ""
+	for range maxActiveSchemaChangePages {
+		var result apitypes.StatusResponse
+		query := url.Values{}
+		query.Set("environment", environment)
+		// The server canonicalizes the database filter the same way, so this
+		// narrows every page to the one database; the comparison below stays
+		// for a server that ignores the filter.
+		query.Set("database", database)
+		if deployment != "" {
+			query.Set("deployment", deployment)
 		}
-		// The server already excluded terminal states; re-checking here keeps the
-		// answer correct if this ever reads a response that was not filtered.
-		activeState, active := activeStateOf(apply)
-		if !active {
-			continue
+		query.Set("limit", strconv.Itoa(activeSchemaChangePageSize))
+		// Ask only for applies still holding a target. This runs on every apply and
+		// rollback preflight, and the answer never depends on settled history, so
+		// scanning it would make every schema change pay for the environment's whole
+		// past to learn whether one database is busy.
+		query.Set("active", "true")
+		if after != "" {
+			query.Set("starting_after", after)
 		}
-		if !holds(apply) {
-			continue
+		if err := doGetInto(endpoint, "/api/status?"+query.Encode(), &result); err != nil {
+			if after != "" {
+				return nil, fmt.Errorf("fetch the active schema changes after apply %s: %w", after, err)
+			}
+			return nil, err
 		}
-		return &ActiveSchemaChange{State: activeState, ApplyID: apply.ApplyID}, nil
+		// A server that predates paging ignores starting_after and serves its
+		// first page again, so a page that does not echo the anchor is not the
+		// page after it.
+		if after != "" && result.StartingAfter != after {
+			return nil, fmt.Errorf("the server did not continue after apply %s; it predates paging, so the active schema changes cannot all be listed", after)
+		}
+
+		for _, apply := range result.Applies {
+			if storage.CanonicalKey(apply.Database) != database || storage.CanonicalKey(apply.Environment) != environment {
+				continue
+			}
+			// The server already excluded terminal states; re-checking here keeps the
+			// answer correct if this ever reads a response that was not filtered.
+			activeState, active := activeStateOf(apply)
+			if !active {
+				continue
+			}
+			if !holds(apply) {
+				continue
+			}
+			return &ActiveSchemaChange{State: activeState, ApplyID: apply.ApplyID}, nil
+		}
+
+		if !result.HasMore {
+			return nil, nil
+		}
+		if len(result.Applies) == 0 {
+			return nil, fmt.Errorf("the server reports more active schema changes in %s but listed none to continue from", environment)
+		}
+		next := result.Applies[len(result.Applies)-1].ApplyID
+		if next == after {
+			return nil, fmt.Errorf("the server reports more active schema changes in %s but served the page ending at apply %s again", environment, after)
+		}
+		after = next
 	}
-	return nil, nil
+	return nil, fmt.Errorf("there are more than %d active schema changes in %s, so the check for one on %s stopped without reading them all", maxActiveSchemaChangePages*activeSchemaChangePageSize, environment, database)
 }
 
 // activeStateOf reports whether a listed apply still holds its targets, and
@@ -718,6 +770,9 @@ func ExitWithJSON(code, message string) error {
 
 // LockInfo represents lock information returned from the API.
 type LockInfo struct {
+	// ID identifies the lock row. It is zero from a server that does not
+	// report it.
+	ID           int64     `json:"id"`
 	Database     string    `json:"database"`
 	DatabaseType string    `json:"database_type"`
 	Owner        string    `json:"owner"`
@@ -854,6 +909,55 @@ func ReleaseLock(endpoint, database, dbType, owner string) error {
 	return err
 }
 
+// ReleaseLockIfUnused releases the lock row id, the row a lock acquire
+// reported, under owner, only while no apply that can still change runs under
+// it. It returns ErrLockNotFound when no lock is held, ErrLockReplaced when a
+// different lock now holds the database, ErrLockNotOwned when the row is held
+// under another owner, and a *LockInUseError naming the apply that kept the
+// lock. Every refusal leaves the lock held now as it is.
+func ReleaseLockIfUnused(endpoint, database, dbType, owner string, id int64) error {
+	err := doSendBody(endpoint, http.MethodDelete, "/api/locks", map[string]any{
+		"database":      database,
+		"database_type": dbType,
+		"owner":         owner,
+		"id":            id,
+	})
+	apiErr, ok := errors.AsType[*APIError](err)
+	if !ok {
+		return err
+	}
+	switch {
+	case apiErr.Status == http.StatusForbidden && apiErr.ErrorCode == apitypes.ErrCodeLockNotOwned:
+		return ErrLockNotOwned
+	case apiErr.Status == http.StatusNotFound:
+		return ErrLockNotFound
+	case apiErr.Status == http.StatusConflict && apiErr.ErrorCode == apitypes.ErrCodeLockReplaced:
+		return ErrLockReplaced
+	case apiErr.Status == http.StatusConflict && apiErr.ErrorCode == apitypes.ErrCodeLockInUse:
+		inUse := &LockInUseError{}
+		if apiErr.LockHolder != nil {
+			inUse.Holder = *apiErr.LockHolder
+		}
+		return inUse
+	default:
+		return err
+	}
+}
+
+// LockInUseError is a release that kept the lock because an apply that can
+// still change runs under it. Holder names that apply; it is empty when the
+// server did not name it.
+type LockInUseError struct {
+	Holder apitypes.LockHolder
+}
+
+func (e *LockInUseError) Error() string {
+	if e.Holder.ApplyID == "" {
+		return "lock is in use by an apply"
+	}
+	return fmt.Sprintf("lock is in use by apply %s (%s)", e.Holder.ApplyID, e.Holder.State)
+}
+
 // ForceReleaseLock releases a lock regardless of owner (admin override).
 func ForceReleaseLock(endpoint, database, dbType string) error {
 	err := doSendBody(endpoint, http.MethodDelete, "/api/locks", map[string]any{
@@ -899,6 +1003,7 @@ var (
 	ErrLockHeld     = fmt.Errorf("lock is already held by another owner")
 	ErrLockNotOwned = fmt.Errorf("lock is not owned by you")
 	ErrLockNotFound = fmt.Errorf("lock not found")
+	ErrLockReplaced = fmt.Errorf("lock was released and taken again since")
 )
 
 // StatusOptions controls the status list request.

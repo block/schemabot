@@ -135,6 +135,23 @@ comment says the change was not applied. The comment lists up to ten freezes
 and counts the rest. The API answers `409`; see
 [read a refusal](#read-a-refusal).
 
+A pull request warns you sooner. When a freeze covers the change, the plan
+comment names it above the DDL, before anyone comments an apply, and its apply
+command already carries `--override "<why it can't wait>"`. Replace the
+placeholder with your reason: SchemaBot refuses a reason still in angle
+brackets, so a command pasted unedited never overrides a freeze. A freeze that
+is scheduled but has not started is named with when it starts, so you can
+apply, and let the change finish, before it does. The notice only informs: the
+apply checks the freezes again, and that check decides. If an apply is refused
+for an unsafe change first, the retry command it offers carries `--override`
+too.
+
+`schemabot plan` warns you the same way. Under the plan, it names the freezes
+in effect and those scheduled, and says to apply with `--override "<reason>"`
+if the change can't wait. A plan that apply refuses whatever its flags, such
+as one with a blocked change, names no freeze, as the plan comment does not. The response to `POST /api/plan` carries them in
+`freezes`, in effect first, each with `in_effect`.
+
 You have two choices:
 
 1. **Wait for the freeze to end**, then run the same command again. This is the right choice for almost every change. `schemabot freeze show <freeze-id>` says when it ends.
@@ -461,7 +478,7 @@ Every error has the standard body, `{"error": "...", "error_code": "..."}`.
 
 | Status | When |
 |---|---|
-| `400` (`invalid_request`) | A missing `environment` or `reason`, an unknown field, a bad time, a planned freeze with no end, an end in the past, or an override reason over 500 characters. |
+| `400` (`invalid_request`) | A missing `environment` or `reason`, an unknown field, a bad time, a planned freeze with no end, an end in the past, or an override reason that is over 500 characters or still a `<…>` placeholder. |
 | `403` | Setting or lifting a freeze without freeze write access; approving an override without being a freeze approver (`write_groups` alone is not enough); asking for or approving an override as an unverified caller; or approving your own request. |
 | `404` (`not_found`) | No freeze or override request with that ID. |
 | `409` | `change_gate_refused`, or a lift of a freeze already lifted or ended, or an approval of a request already approved, expired, or asked for on a pull request. |
@@ -563,6 +580,10 @@ When a freeze refuses a change, the agent:
 1. Stops. It does not retry in a loop, rewrite the change, or try another environment, deployment or credential to get past the freeze.
 2. Tells the user which freeze holds the change, its reason, and when it ends.
 3. Hands over the exact `--override` command if the user says the change can't wait. The override reason is recorded as the user's, so the user writes it and runs it.
+
+A plan comment's `❄️ <environment> is frozen` notice is a warning, not a
+refusal, and the same rules hold: the agent tells the user, and the apply
+command with `--override` in that comment is the user's to post.
 
 `change_gate_unavailable` is different: it is a retryable storage problem.
 Retry it with backoff, like any other `503`.

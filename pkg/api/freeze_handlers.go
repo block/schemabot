@@ -347,12 +347,20 @@ func (s *Service) overrideReasonFromRequest(w http.ResponseWriter, r *http.Reque
 }
 
 // ValidateOverrideReason trims the reason a caller gave for a freeze override
-// and refuses one that is blank or longer than storage keeps. The pull request
-// commands share it, so the rule lives here.
+// and refuses one that is blank, still a placeholder, or longer than storage
+// keeps. The pull request commands share it, so the rule lives here.
+//
+// A placeholder is a reason wholly in angle brackets, as the commands that
+// SchemaBot offers write it (`--override "<why it can't wait>"`). Pasting such
+// a command unedited must not get a change through a freeze: the override
+// stays a deliberate step, with a reason the caller wrote (AZ-10).
 func ValidateOverrideReason(raw string) (string, error) {
 	reason := strings.TrimSpace(raw)
 	if reason == "" {
 		return "", errors.New("override reason is empty")
+	}
+	if strings.HasPrefix(reason, "<") && strings.HasSuffix(reason, ">") {
+		return "", errors.New("override reason is still the placeholder; replace it with why this change can't wait")
 	}
 	if n := len([]rune(reason)); n > storage.FreezeOverrideReasonMax {
 		return "", fmt.Errorf("override reason is %d characters; the limit is %d", n, storage.FreezeOverrideReasonMax)

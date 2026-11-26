@@ -104,7 +104,7 @@ func WriteProgress(data ProgressData) {
 	}
 	rows = append(rows, BoxRow{"State", displayState})
 	if data.Sharded {
-		if counts := ShardCounts(data.State, data.Operations, data.Tables, data.Released); counts != "" {
+		if counts := ShardCounts(data.State, data.Operations, data.Tables, data.Released, data.MaxOperationsAtOnce); counts != "" {
 			rows = append(rows, BoxRow{"Shards", counts})
 		}
 	}
@@ -143,9 +143,9 @@ func WriteProgress(data ProgressData) {
 	if state.IsState(data.State, state.Apply.RevertWindow) {
 		if expiresStr := data.Metadata["revert_expires_at"]; expiresStr != "" {
 			if expires, err := time.Parse(time.RFC3339, expiresStr); err == nil {
-				remaining := time.Until(expires)
+				remaining := expires.Sub(nowFunc())
 				if remaining > 0 {
-					rows = append(rows, BoxRow{"Revert expires in", FormatDurationSeconds(int64(remaining.Seconds()))})
+					rows = append(rows, BoxRow{"Revert expires in", ui.FormatHumanDuration(remaining)})
 				}
 			}
 		}
@@ -154,8 +154,14 @@ func WriteProgress(data ProgressData) {
 	WriteBox(rows, "State", colorFn)
 	writeProgressStep(data)
 
-	// Error below the box
-	if data.State == state.Apply.Failed && data.ErrorMessage != "" {
+	// Error below the box. A sharded apply shows it in every state, as the PR
+	// comment's failure callout does: a shard or a keyspace finalize can fail
+	// while other shards keep running, and nothing else on screen names it.
+	// When several shards failed, their reasons grouped stand in for the one
+	// error, which names only the first.
+	if callout := shardFailureCallout(data); callout != "" {
+		fmt.Printf("\n%s", callout)
+	} else if (data.State == state.Apply.Failed || data.Sharded) && data.ErrorMessage != "" {
 		fmt.Printf("\n  %s%s%s\n", ANSIRed, data.ErrorMessage, ANSIReset)
 	}
 	writeStoppedByFreeze(data)
@@ -175,7 +181,7 @@ func WriteProgress(data ProgressData) {
 		}
 	}
 
-	// Table progress (sorted: active first, sharded before unsharded, terminal last)
+	// Table progress (sorted: failed and halted first, then active, sharded before unsharded, finished last)
 	// Hide tables during branch setup phases (all tables are Queued, not meaningful)
 	if len(activeTables) > 0 && !state.IsSetupPhase(data.State) {
 		sort.SliceStable(activeTables, func(i, j int) bool {
@@ -239,6 +245,20 @@ func WriteProgress(data ProgressData) {
 	if data.State == state.Apply.Failed {
 		writeFailureGuidance()
 	}
+	// A shard that failed while others still run can be retried once they
+	// settle. Watch offers the stop key, so no stop command is printed here.
+	if data.Sharded && ShardFailedWhileRunning(data.State, data.Operations, data.Tables, data.Released) {
+		fmt.Printf("\n%s\n", presentation.RetryOnceSettledNote)
+	}
+}
+
+// shardFailureCallout is the grouped failure callout for a sharded apply, or
+// "" when the apply is not sharded (ShardFailureCallout).
+func shardFailureCallout(data ProgressData) string {
+	if !data.Sharded {
+		return ""
+	}
+	return ShardFailureCallout(data.State, data.Operations, data.Tables, data.Released)
 }
 
 func writeProgressStep(data ProgressData) {
@@ -640,8 +660,15 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.Failed:
-		bar := ui.ProgressBarFailed(ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
-		writeTableLine(&b, t, "%s "+glyph.Failed+" Failed", bar)
+		if isShardedRollup(t) {
+			// The shards under the line show how far each got, so the
+			// table's line says how far the failure reaches instead of a
+			// bar, as the PR comment's does.
+			writeTableLine(&b, t, glyph.Failed+" Failed%s", presentation.FailedReach(shardTaskStatuses(t), shardTotal(t)))
+		} else {
+			bar := ui.ProgressBarFailed(ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
+			writeTableLine(&b, t, "%s "+glyph.Failed+" Failed", bar)
+		}
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
 		}
@@ -733,7 +760,13 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
 		}
-		if t.RowsTotal > 0 && (t.PercentComplete > 0 || t.RowsCopied > 0) {
+		if ui.CopyFinishedShortOfEstimate(t.PercentComplete, t.RowsCopied, t.RowsTotal) {
+			// A copy finished short of its estimate shows the rows it copied,
+			// as a running one does.
+			if line := presentation.FinishedCopyRowsText(t.RowsCopied); line != "" {
+				b.WriteString(indentDetail + line + "\n")
+			}
+		} else if t.RowsTotal > 0 && (t.PercentComplete > 0 || t.RowsCopied > 0) {
 			// A stopped copy is not advancing, so its rows line carries no ETA.
 			f := tableFacts(t)
 			f.ETASeconds = 0
@@ -811,6 +844,7 @@ func tableFacts(t TableProgress) presentation.TableFacts {
 		RowsTotal:           t.RowsTotal,
 		RowsTotalPlanned:    t.RowsTotalPlanned,
 		ETASeconds:          t.ETASeconds,
+		EstimatedRows:       t.EstimatedRows,
 		EstimatedBytes:      t.EstimatedBytes,
 		ChecksumRowsChecked: t.ChecksumRowsChecked,
 		ChecksumRowsTotal:   t.ChecksumRowsTotal,
@@ -851,8 +885,9 @@ func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
 
 // writePlannedRows writes the rows line of a queued table
 // (presentation.PlannedRowsText). A table rolled up across targets names them,
-// since its estimate is their sum. It writes nothing when the plan had no row
-// estimate, which a table rolled up across targets lacks while some of its
+// since its estimate is their sum. It writes the size alone when the plan
+// sized the table but could not count its rows, and nothing when the plan had
+// neither. A table rolled up across targets has neither while some of its
 // targets have reported nothing at all: their estimates are not known, so a
 // sum of the rest would understate the table (tableAcrossTargets).
 func writePlannedRows(b *strings.Builder, t TableProgress) {

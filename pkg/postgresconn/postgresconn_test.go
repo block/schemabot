@@ -924,3 +924,55 @@ func TestWithStatementTimeoutHookBoundIsTheConfiguredConnectTimeout(t *testing.T
 	assert.Greater(t, gotWithin, 2*time.Second, "the bound must track the configured connect budget")
 	assert.LessOrEqual(t, gotWithin, 3*time.Second, "the bound must not exceed the configured connect budget")
 }
+
+// Only a cancellation the server made while the caller still wants the
+// connection is sent again. Any other error is a property of the statement or
+// the session, such as a budget above what the server accepts, and fails the
+// dial on the first attempt. A cancellation the caller's context caused means
+// the caller has given up, and a budget that cancels every attempt fails with
+// the server's own error rather than retrying until the connect budget ends.
+func TestArmStatementTimeoutRetriesOnlyAServerCancellation(t *testing.T) {
+	cancelled := &pgconn.PgError{Code: sqlstateQueryCanceled, Message: "canceling statement due to statement timeout"}
+	invalid := &pgconn.PgError{Code: "22023", Message: "invalid value for parameter"}
+
+	tests := []struct {
+		name         string
+		results      []error
+		cancelCtx    bool
+		wantAttempts int
+		wantErr      error
+	}{
+		{name: "accepted at once", results: []error{nil}, wantAttempts: 1},
+		{name: "accepted after a cancellation", results: []error{cancelled, nil}, wantAttempts: 2},
+		{name: "another error is returned at once", results: []error{invalid}, wantAttempts: 1, wantErr: invalid},
+		{name: "the caller's own cancellation is returned at once", results: []error{cancelled}, cancelCtx: true, wantAttempts: 1, wantErr: cancelled},
+		{name: "a budget that cancels every attempt fails", results: []error{cancelled}, wantAttempts: armStatementTimeoutAttempts, wantErr: cancelled},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var attempts int
+			original := execStatementTimeout
+			t.Cleanup(func() { execStatementTimeout = original })
+			execStatementTimeout = func(context.Context, *pgconn.PgConn, string) error {
+				result := tc.results[min(attempts, len(tc.results)-1)]
+				attempts++
+				return result
+			}
+
+			ctx := t.Context()
+			if tc.cancelCtx {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+
+			err := armStatementTimeout(ctx, nil, "SET statement_timeout = 0", "localhost", "db")
+			assert.Equal(t, tc.wantAttempts, attempts)
+			if tc.wantErr == nil {
+				assert.NoError(t, err)
+				return
+			}
+			assert.ErrorIs(t, err, tc.wantErr)
+		})
+	}
+}

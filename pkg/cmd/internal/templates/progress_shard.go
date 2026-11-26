@@ -52,14 +52,14 @@ func keepsShardedBar(t TableProgress) bool {
 
 // formatShardedPhaseProgress renders a sharded table that keeps its bar
 // (keepsShardedBar): the bar across every shard the table spans
-// (presentation.PercentAcrossTargets), counting a shard that has not reported
-// as nothing, then the rows line and each shard's line.
+// (presentation.ShardedPhasePercent), then the rows line and each shard's
+// line.
 func formatShardedPhaseProgress(t TableProgress) string {
 	parts := make([]presentation.Part, len(t.Shards))
 	for i, s := range t.Shards {
 		parts[i] = shardPart(s)
 	}
-	pct := presentation.PercentAcrossTargets(parts, shardTotal(t)-len(t.Shards))
+	pct := presentation.ShardedPhasePercent(parts, shardTotal(t)-len(t.Shards), t.RowsCopied, t.RowsTotal, t.RowsTotalPlanned)
 	var b strings.Builder
 	writeTableLine(&b, t, "%s %d%%%s", ui.ProgressBarRowCopy(pct), pct, ui.ThrottledSuffix(t.Throttled))
 	if t.DDL != "" {
@@ -140,7 +140,7 @@ func formatShardLine(s ShardProgress, pendingWord, runningWord string) string {
 		return fmt.Sprintf(indentShardLine+"%s%s %s%s: %s\n", ANSIGreen, glyph, s.Shard, ANSIReset, detail)
 	case state.Task.Running:
 		if s.ETASeconds > 0 {
-			detail += " · ETA: " + FormatDurationSeconds(s.ETASeconds)
+			detail += " · ETA: " + ui.FormatETA(s.ETASeconds)
 		}
 		return fmt.Sprintf(indentShardLine+"%s%s %s%s: %s\n", ANSICyan, glyph, s.Shard, ANSIReset, detail)
 	case state.Task.WaitingForCutover, state.Task.CuttingOver:
@@ -155,18 +155,4 @@ func formatShardLine(s ShardProgress, pendingWord, runningWord string) string {
 	default:
 		return fmt.Sprintf(indentShardLine+"%s%s %s: %s%s\n", ANSIDim, glyph, s.Shard, detail, ANSIReset)
 	}
-}
-
-// FormatDurationSeconds formats seconds into a human-readable duration.
-func FormatDurationSeconds(seconds int64) string {
-	if seconds <= 0 {
-		return "< 1s"
-	}
-	if seconds < 60 {
-		return fmt.Sprintf("%ds", seconds)
-	}
-	if seconds < 3600 {
-		return fmt.Sprintf("%dm %ds", seconds/60, seconds%60)
-	}
-	return fmt.Sprintf("%dh %dm", seconds/3600, (seconds%3600)/60)
 }

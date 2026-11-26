@@ -3463,6 +3463,58 @@ func TestApplyOperationStore_FindNextApplyOperation_HaltsOnFailedSibling(t *test
 	assert.Nil(t, claimed, "later siblings must not be claimed once an earlier deployment failed")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_DispatchedApplyLeavesShardFailuresToTheDispatcher
+// covers one target whose change runs on two shards, one failed and one
+// pending, under the halt default. On an apply ordered here the pending shard
+// never starts. On an apply a dispatcher created, the pending shard arrived as
+// its own dispatch once the dispatcher decided it may start, so it starts.
+// The storage parity suite covers the same-member failure gate per policy.
+func TestApplyOperationStore_FindNextApplyOperation_DispatchedApplyLeavesShardFailuresToTheDispatcher(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		idempotencyKey string
+		wantClaimed    bool
+	}{
+		{name: "apply ordered here", wantClaimed: false},
+		{name: "dispatched apply", idempotencyKey: "schemabot:v1:dispatched", wantClaimed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
+
+			lock := createTestLock(t, store, "testdb", "mysql")
+			apply := createTestApply(t, store, lock, "apply_op_failed_shard", 1)
+			if tc.idempotencyKey != "" {
+				_, err := testDB.ExecContext(ctx, `UPDATE applies SET idempotency_key = ? WHERE id = ?`, tc.idempotencyKey, apply.ID)
+				require.NoError(t, err)
+			}
+
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "orders-001",
+				OperationKey: "commerce/-80/orders", OperationKind: storage.ApplyOperationKindWork,
+				State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureHalt,
+			})
+			require.NoError(t, err)
+			pendingID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "orders-001",
+				OperationKey: "commerce/80-/orders", OperationKind: storage.ApplyOperationKindWork,
+				OnFailure: storage.OnFailureHalt,
+			})
+			require.NoError(t, err)
+
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+			require.NoError(t, err)
+			if !tc.wantClaimed {
+				assert.Nil(t, claimed, "a shard of an apply ordered here never starts after its sibling shard failed")
+				return
+			}
+			require.NotNil(t, claimed, "a dispatched shard starts when it arrives; the dispatcher already admitted it")
+			assert.Equal(t, pendingID, claimed.ID)
+		})
+	}
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_OnFailureContinueClaimsPastFailedSibling
 // verifies that when an apply's on_failure policy is "continue", a
 // terminal-failed earlier deployment no longer blocks later siblings: the

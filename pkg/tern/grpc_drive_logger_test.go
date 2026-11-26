@@ -231,7 +231,7 @@ func TestTerminalizeUndispatchedApplyOperation_LogsCarryBothDeployments(t *testi
 	require.NoError(t, client.terminalizeUndispatchedApplyOperation(t.Context(), apply, "alice", scope, cancelUndispatchedTerminalization()))
 
 	for _, msg := range []string{
-		"leaving terminal gRPC task unchanged while settling an undispatched operation's control request",
+		"leaving terminal gRPC task unchanged while settling an undispatched operation",
 		"settled undispatched multi-operation gRPC apply operation; apply-level control request remains pending for siblings",
 	} {
 		line := requireCapturedLog(t, records, msg)
@@ -242,7 +242,7 @@ func TestTerminalizeUndispatchedApplyOperation_LogsCarryBothDeployments(t *testi
 		assert.Equal(t, opID, line.attrs["apply_operation_id"], msg)
 		assert.Equal(t, storage.ControlOperationCancel, line.attrs["control_operation"], msg)
 	}
-	skip := requireCapturedLog(t, records, "leaving terminal gRPC task unchanged while settling an undispatched operation's control request")
+	skip := requireCapturedLog(t, records, "leaving terminal gRPC task unchanged while settling an undispatched operation")
 	assert.Equal(t, "task-done", skip.attrs["task_id"])
 	settled := requireCapturedLog(t, records, "settled undispatched multi-operation gRPC apply operation; apply-level control request remains pending for siblings")
 	assert.Equal(t, "alice", settled.attrs["requested_by"])

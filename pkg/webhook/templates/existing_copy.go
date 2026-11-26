@@ -6,6 +6,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -249,7 +250,7 @@ const maxExistingCopyStatementLen = 200
 // so the code span's delimiter grows around whatever identifier quoting the
 // clamped text still carries.
 func existingCopyStatement(statement string) string {
-	s := strings.Join(strings.Fields(stripControlText(statement)), " ")
+	s := strings.Join(strings.Fields(presentation.StripControlText(statement)), " ")
 	if s == "" {
 		return ""
 	}

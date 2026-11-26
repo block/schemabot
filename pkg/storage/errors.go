@@ -137,6 +137,15 @@ var (
 	// matches the apply lease token stored by the latest operator claimant.
 	ErrApplyLeaseLost = errors.New("apply lease lost")
 
+	// ErrOperationClaimContended is returned by an operation claim that asked
+	// to report contention (ReportClaimContention) when it took nothing, but a
+	// lock-free reread of the same eligibility found an operation it could
+	// take. Usually another transaction held that row, since the claim skips
+	// locked rows rather than wait on them. The reread is a fresh snapshot, so
+	// it can also find a row that became claimable after the claim ran. Either
+	// way this is not a failure: the caller retries shortly.
+	ErrOperationClaimContended = errors.New("the claim took no apply_operation but a lock-free reread found one claimable")
+
 	// ErrOperationLeaseActive is returned when a repair write requires an
 	// operation to remain unleased but a live drive owns it.
 	ErrOperationLeaseActive = errors.New("operation lease is active")
@@ -218,6 +227,26 @@ func (e *ActiveApplyError) Error() string {
 
 func (e *ActiveApplyError) Unwrap() error {
 	return ErrActiveApplyExists
+}
+
+// ApplyNotActiveError reports an apply that a write needed to be active but
+// that the store found terminal. It matches ErrApplyNotActive, and carries the
+// state the store read under the apply's row lock, which a caller's copy of the
+// apply can lag: the apply may have settled after the caller read it.
+type ApplyNotActiveError struct {
+	ApplyID string
+	// State is the apply's state as the store read it.
+	State string
+	// Detail is the store's full account of the refused write, for the log line.
+	Detail string
+}
+
+func (e *ApplyNotActiveError) Error() string {
+	return e.Detail + ": " + ErrApplyNotActive.Error()
+}
+
+func (e *ApplyNotActiveError) Unwrap() error {
+	return ErrApplyNotActive
 }
 
 // LockInUseError reports the apply that kept a lock row from being released.

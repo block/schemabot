@@ -116,3 +116,28 @@ func TestRefuseDeclaredTablesAcceptsUndeclaredEntries(t *testing.T) {
 
 	require.NoError(t, refuseDeclaredTables("app", []string{"orders"}, mustIgnoredTables(t, []string{"flyway_schema_history"}), drops, &liveSchema{}))
 }
+
+// A schema file the MySQL parser rejects is the file's to fix, so it is a
+// plan refusal that names the file, as on every engine, and never an engine
+// failure.
+func TestParseDesiredTablesRefusesWhatTheFileGetsWrong(t *testing.T) {
+	for name, tc := range map[string]struct {
+		content string
+		wantErr string
+	}{
+		"a syntax error":                         {"CREATE TABLE `orders` (`id` bigint NOT NULL PRIMARY KEY", "app/orders.sql"},
+		"a statement that is not a CREATE TABLE": {"ALTER TABLE `orders` ADD COLUMN `note` varchar(255);", "parse desired schema in app/orders.sql"},
+		"an index on a missing column":           {"CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`), KEY `k` (`missing`));", "SQL usage error in app/orders.sql"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseDesiredTables("app", "orders.sql", tc.content)
+			require.Error(t, err)
+			assert.True(t, engine.IsPlanRefused(err), "the refusal must be typed")
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+	tables, err := parseDesiredTables("app", "orders.sql", "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`));")
+	require.NoError(t, err)
+	require.Len(t, tables, 1)
+	assert.Equal(t, "orders", tables[0].table)
+}

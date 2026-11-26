@@ -30,6 +30,8 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/changeevents"
+	"github.com/block/schemabot/pkg/changeevents/sqspublisher"
 	"github.com/block/schemabot/pkg/drain"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
@@ -572,6 +574,7 @@ func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os
 // the embedding seam: a data plane consuming SchemaBot as a module configures it
 // entirely through ServerConfig rather than reimplementing this wiring.
 type Server struct {
+	changeEvents    *changeevents.Sender
 	cfg             *api.ServerConfig
 	svc             *api.Service
 	storage         storage.Storage
@@ -677,6 +680,21 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 	logger.Info("building server", "version", version, "commit", o.commit, "built", o.date)
 
+	queues, err := sqspublisher.NewDestinations(ctx, cfg.SQSChangeEvents)
+	if err != nil {
+		return nil, err
+	}
+	events, err := changeevents.NewWithPublishers(cfg.ChangeEvents, queues, logger)
+	if err != nil {
+		return nil, err
+	}
+	keepEvents := false
+	defer func() {
+		if !keepEvents {
+			events.Close()
+		}
+	}()
+
 	// Register PlanetScale mTLS before anything else so a worker with
 	// missing or unreadable certificate material fails startup immediately
 	// instead of failing every Vitess connection it later opens.
@@ -760,7 +778,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 
 	// Create service with dependencies
-	store, err := newStore(dialect, db, storage.WithMaxDriversPerApply(cfg.MaxDriversPerApply))
+	store, err := newStore(dialect, db, storage.WithMaxDriversPerApply(cfg.MaxDriversPerApply), storage.WithChangeEvents(events, cfg.DatabaseApp, logger))
 	if err != nil {
 		return nil, err
 	}
@@ -830,6 +848,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		targetResolver = router.Resolver()
 	}
 	srv := &Server{
+		changeEvents:    events,
 		cfg:             cfg,
 		svc:             svc,
 		storage:         store,
@@ -851,6 +870,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 
 	success = true
+	keepEvents = true
 	return srv, nil
 }
 
@@ -1136,8 +1156,7 @@ func (s *Server) RegisterGRPC(ctx context.Context, gs *grpc.Server) error {
 	// The driver capacity is that of the operators sharing this instance's
 	// storage, since those are the operators that run what a control plane
 	// sends here, and they share this instance's per-apply cap.
-	maxDriversPerApply := storage.BuildOptions(storage.WithMaxDriversPerApply(s.cfg.MaxDriversPerApply)).MaxDriversPerApply
-	opts := []tern.ServerOption{tern.WithDriverCapacity(s.storage.DriverPools(), maxDriversPerApply)}
+	opts := []tern.ServerOption{tern.WithDriverCapacity(s.storage.DriverPools(), s.cfg.OperationsAtOnce())}
 	// The storage-schema service answers for this instance's own storage
 	// database, which is the only way a control plane can read it: a data
 	// plane's storage is reachable from the data plane, and the gRPC endpoint
@@ -1314,6 +1333,7 @@ func (s *Server) Close() error {
 	// shutdown-window drive a closed client. StopOperator waits for in-flight
 	// drivers and is idempotent, so svc.Close repeating it is a no-op.
 	s.svc.StopOperator()
+	s.changeEvents.Close()
 
 	var errs []error
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1539,6 +1559,19 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	if err != nil {
 		return webhookRuntime{}, fmt.Errorf("resolve GitHub repo-webhook secret: %w", err)
 	}
+	previousWebhookSecret, err := serverConfig.GitHub.ResolvePreviousWebhookSecret()
+	if err != nil {
+		return webhookRuntime{}, fmt.Errorf("resolve GitHub previous webhook secret: %w", err)
+	}
+	previousRepoWebhookSecret, err := serverConfig.GitHub.ResolvePreviousRepoWebhookSecret()
+	if err != nil {
+		return webhookRuntime{}, fmt.Errorf("resolve GitHub previous repo-webhook secret: %w", err)
+	}
+	if previousRepoWebhookSecret != "" && repoWebhookSecret == "" {
+		// Rotating to an empty secret would turn repository webhook dispatch
+		// off and refuse every delivery still signed with the old secret.
+		return webhookRuntime{}, fmt.Errorf("github.previous-repo-webhook-secret is set but github.repo-webhook-secret resolved to an empty value; set repo-webhook-secret to the new secret")
+	}
 
 	ghClient := ghclient.NewClient(creds.AppID, []byte(creds.PrivateKey), logger,
 		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs),
@@ -1547,6 +1580,8 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		ghclient.WithQuotaReserve(serverConfig.GitHub.QuotaReserve))
 	handlerOpts := append([]webhook.HandlerOption{
 		webhook.WithRepoWebhookSecret([]byte(repoWebhookSecret)),
+		webhook.WithPreviousWebhookSecret([]byte(previousWebhookSecret)),
+		webhook.WithPreviousRepoWebhookSecret([]byte(previousRepoWebhookSecret)),
 		webhook.WithDurableWebhookDispatch(),
 		webhook.WithWebhookReconciler(),
 	}, webhookReconcileSynthesisOptions(logger)...)
@@ -1558,7 +1593,9 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	logger.Info("GitHub webhook endpoint registered",
 		"app_id", creds.AppID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs,
 		"quota_reserve", serverConfig.GitHub.QuotaReserve,
-		"repo_webhook_dispatch", repoWebhookSecret != "")
+		"repo_webhook_dispatch", repoWebhookSecret != "",
+		"previous_webhook_secret_accepted", previousWebhookSecret != "",
+		"previous_repo_webhook_secret_accepted", previousRepoWebhookSecret != "")
 	return webhookRuntime{
 		startDurableWebhookDispatch:    handler.StartDurableWebhookDispatch,
 		stopDurableWebhookDispatch:     handler.StopDurableWebhookDispatch,
@@ -1614,6 +1651,7 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 	clients := make(map[string]ghclient.GitHubClientFactory, len(appsByID))
 	quotaProbes := make([]*ghclient.QuotaProbe, 0, len(appsByID))
 	secretsByApp := make(map[string][]byte, len(appsByID))
+	previousSecretsByApp := make(map[string][]byte, len(appsByID))
 	appByID := make(map[int64]string, len(appsByID))
 
 	// Iterate App names in sorted order so startup log output is
@@ -1629,7 +1667,16 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
 
+	// Repository webhooks are served only in single-App mode, so a repository
+	// secret being rotated out has nothing to verify here. Refuse it rather
+	// than accept a rotation that does nothing.
+	if serverConfig.GitHub.PreviousRepoWebhookSecret != "" {
+		return webhookRuntime{}, fmt.Errorf("github.previous-repo-webhook-secret is set, but repository webhooks are not served when apps: is configured; remove it")
+	}
 	for _, e := range entries {
+		if e.cfg.PreviousRepoWebhookSecret != "" {
+			return webhookRuntime{}, fmt.Errorf("app %q sets previous-repo-webhook-secret, but repository webhooks are not served when apps: is configured; remove it", e.name)
+		}
 		privateKey, err := e.cfg.ResolvePrivateKey()
 		if err != nil {
 			return webhookRuntime{}, fmt.Errorf("resolve private key for app %q: %w", e.name, err)
@@ -1656,12 +1703,20 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 		secretsByApp[e.name] = []byte(secret)
 		appByID[e.id] = e.name
 
+		previousSecret, err := e.cfg.ResolvePreviousWebhookSecret()
+		if err != nil {
+			return webhookRuntime{}, fmt.Errorf("resolve previous webhook secret for app %q: %w", e.name, err)
+		}
+		previousSecretsByApp[e.name] = []byte(previousSecret)
+
 		logger.Info("registered GitHub App",
 			"app_name", e.name, "app_id", e.id, "trusted_check_app_slugs", e.cfg.TrustedCheckAppSlugs,
-			"quota_reserve", e.cfg.QuotaReserve)
+			"quota_reserve", e.cfg.QuotaReserve,
+			"previous_webhook_secret_accepted", previousSecret != "")
 	}
 
 	handlerOpts := append([]webhook.HandlerOption{
+		webhook.WithPreviousWebhookSecrets(previousSecretsByApp),
 		webhook.WithDurableWebhookDispatch(),
 		webhook.WithWebhookReconciler(),
 	}, webhookReconcileSynthesisOptions(logger)...)

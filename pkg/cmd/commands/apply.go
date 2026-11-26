@@ -73,7 +73,7 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 	// deployment alone: members of a targets list share one deployment, and one
 	// running on another deployment does not conflict with it.
 	if cmd.Target == "" {
-		if err := cmd.refuseActiveSchemaChange(cfg.Database, func() (*client.ActiveSchemaChange, error) {
+		if err := refuseActiveSchemaChange(cfg.Database, cmd.Environment, cmd.Output != OutputFormatJSON, func() (*client.ActiveSchemaChange, error) {
 			return client.CheckActiveSchemaChange(ep, cfg.Database, cmd.Environment)
 		}); err != nil {
 			return err
@@ -169,7 +169,7 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 	// A targeted apply's preflight: the plan has resolved its member, and has
 	// work that would conflict with a schema change on that deployment.
 	if cmd.Target != "" {
-		if err := cmd.refuseActiveSchemaChange(cfg.Database, func() (*client.ActiveSchemaChange, error) {
+		if err := refuseActiveSchemaChange(cfg.Database, cmd.Environment, cmd.Output != OutputFormatJSON, func() (*client.ActiveSchemaChange, error) {
 			return client.CheckActiveSchemaChangeOnDeployment(ep, cfg.Database, cmd.Environment, planResult.Deployment)
 		}); err != nil {
 			return err
@@ -274,6 +274,11 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 	// finding it already held under this owner, so only a lock this command
 	// took is released when its apply is never submitted.
 	var lockCreated bool
+	// lockID is the lock row the acquire reported, which every release this
+	// command sends names, so it never removes a lock it did not take or one
+	// an apply still runs under. It is zero from a server that does not
+	// report it.
+	var lockID int64
 	if !cmd.NoLock {
 		// If --force, break any existing lock first
 		if cmd.Force {
@@ -298,8 +303,8 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 
 		// Acquire the lock
 		err = withLoading("Acquiring database lock...", cmd.Output != OutputFormatJSON, func() error {
-			var lockErr error
-			_, lockCreated, lockErr = client.AcquireLock(ep, cfg.Database, cfg.Type, owner, cmd.Repository, cmd.PullRequest)
+			acquired, created, lockErr := client.AcquireLock(ep, cfg.Database, cfg.Type, owner, cmd.Repository, cmd.PullRequest)
+			lockCreated, lockID = created, acquiredLockID(acquired)
 			return lockErr
 		})
 		if errors.Is(err, client.ErrLockHeld) {
@@ -342,16 +347,16 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 	applyID, err := applyAndWatch(ctx, ep, planResult, true, cfg.Database, cmd.Environment, owner, cmd.Override, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
 	if err != nil {
 		if lockCreated && neverSubmitted(err) {
-			return releaseUnsubmittedLock(ep, cfg.Database, cfg.Type, owner, err)
+			return releaseUnsubmittedLock(ep, cfg.Database, cfg.Type, owner, lockID, err)
 		}
 		if cmd.Yield && !cmd.NoLock && applyID != "" {
-			return errors.Join(err, yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID))
+			return errors.Join(err, yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID, lockID))
 		}
 		return err
 	}
 
 	if cmd.Yield && !cmd.NoLock {
-		return yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID)
+		return yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID, lockID)
 	}
 
 	return nil
@@ -395,7 +400,14 @@ func childWorkSettled(progress *apitypes.ProgressResponse) bool {
 // command got here: an unwatched apply, a stopped one, and a watch the operator
 // left all return without the apply having finished. Anything that is not a
 // settled state keeps the lock and says how to release it later.
-func yieldLock(ep, database, dbType, owner, environment, applyID string) error {
+//
+// The release names the lock row the acquire reported (lockID), and the
+// server releases it only while no apply that can still change runs under it.
+// This command's own apply has settled by then, so the condition keeps the
+// lock only for an apply another command of the same owner started under the
+// same row, and a row taken again since is left alone. A server that reported
+// no row ID leaves no safe release, so the lock is kept.
+func yieldLock(ep, database, dbType, owner, environment, applyID string, lockID int64) error {
 	if applyID == "" {
 		templates.WriteLockKept(database, dbType, "the server returned no apply ID to check")
 		return fmt.Errorf("release lock for %s: the server returned no apply ID", database)
@@ -409,12 +421,45 @@ func yieldLock(ep, database, dbType, owner, environment, applyID string) error {
 		templates.WriteLockKept(database, dbType, lockKeptReason(applyID, environment, progress))
 		return nil
 	}
-	if err := client.ReleaseLock(ep, database, dbType, owner); err != nil {
+	if lockID == 0 {
+		templates.WriteLockKeptWithoutID(database, dbType)
+		return nil
+	}
+	err = client.ReleaseLockIfUnused(ep, database, dbType, owner, lockID)
+	if inUse, ok := errors.AsType[*client.LockInUseError](err); ok {
+		templates.WriteLockInUse(database, dbType, inUse.Holder.ApplyID, inUse.Holder.State, inUse.Holder.Environment)
+		return nil
+	}
+	if errors.Is(err, client.ErrLockReplaced) {
+		templates.WriteLockReplaced(database, dbType)
+		return nil
+	}
+	// Someone else released the lock, or it is held under another owner now:
+	// either way this command has nothing to release, and the apply it ran
+	// settled, so this is not a failure.
+	if errors.Is(err, client.ErrLockNotFound) {
+		templates.WriteUnsubmittedLockAlreadyReleased(database, dbType)
+		return nil
+	}
+	if errors.Is(err, client.ErrLockNotOwned) {
+		templates.WriteLockHeldByAnotherOwner(database, dbType)
+		return nil
+	}
+	if err != nil {
 		templates.WriteLockKept(database, dbType, fmt.Sprintf("the server did not release it (%v)", err))
 		return fmt.Errorf("release lock for %s: %w", database, err)
 	}
 	templates.WriteLockReleased(database, dbType)
 	return nil
+}
+
+// acquiredLockID returns the lock row ID a lock acquire reported, or zero
+// when it reported no lock or a server too old to report the ID answered.
+func acquiredLockID(lock *client.LockInfo) int64 {
+	if lock == nil {
+		return 0
+	}
+	return lock.ID
 }
 
 // lockKeptReason says why --yield kept the lock for an apply that
@@ -567,51 +612,6 @@ func finishAfterCutover(result *apitypes.ProgressResponse, tables []*apitypes.Ta
 	default:
 		return fmt.Errorf("schema change ended in state %s after cutover", curState)
 	}
-}
-
-// refuseActiveSchemaChange runs the active schema change preflight and
-// refuses the apply, with guidance for the schema change already in progress,
-// when check reports one. A preflight that fails is not a refusal: the apply is
-// still guarded server-side.
-func (cmd *ApplyCmd) refuseActiveSchemaChange(database string, check func() (*client.ActiveSchemaChange, error)) error {
-	var active *client.ActiveSchemaChange
-	err := withLoading("Checking active schema changes...", cmd.Output != OutputFormatJSON, func() error {
-		var checkErr error
-		active, checkErr = check()
-		return checkErr
-	})
-	if err != nil || active == nil || active.State == "" {
-		return nil
-	}
-	var stateMsg string
-	switch {
-	case state.IsState(active.State, state.Apply.Pending):
-		stateMsg = "A schema change is queued and has not started yet."
-	case state.IsState(active.State, state.Apply.WaitingForDeploy):
-		stateMsg = "A schema change is waiting for deploy."
-	case state.IsState(active.State, state.Apply.WaitingForCutover):
-		stateMsg = "A schema change is waiting for cutover."
-	case state.IsRunningApplyState(active.State):
-		stateMsg = "A schema change is already running."
-	case state.IsState(active.State, state.Apply.CuttingOver):
-		stateMsg = "A schema change is currently cutting over."
-	}
-	if stateMsg == "" {
-		return nil
-	}
-	fmt.Println()
-	fmt.Println("⏳ Schema Change In Progress")
-	fmt.Println()
-	fmt.Printf("Database: %s\n", database)
-	fmt.Printf("Environment: %s\n", cmd.Environment)
-	fmt.Println()
-	fmt.Println(stateMsg)
-	fmt.Println()
-	if state.IsState(active.State, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) {
-		fmt.Printf("To trigger cutover:  %s\n", templates.ControlCommand("cutover", active.ApplyID, cmd.Environment))
-	}
-	fmt.Printf("To watch and manage: %s\n", cliname.Command("status", active.ApplyID))
-	return fmt.Errorf("schema change already in progress")
 }
 
 // blockUnsafeApply displays the plan and an error when unsafe changes are detected without --allow-unsafe.

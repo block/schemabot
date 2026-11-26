@@ -37,14 +37,20 @@ func PlannedRowsSpan(targets int) string {
 // PlannedRowsText is the rows line of a table no engine has reported on yet:
 // "Rows: ~1.2M · ~3.0 GB", the plan's row estimate and size, both approximate,
 // so the work ahead is visible before the copy starts. span names the targets
-// the estimate is summed across (PlannedRowsSpan), or is empty for one. It is
-// empty when the plan had no row estimate. The CLI and the PR comment each add
-// their own line prefix and newline.
+// the estimate is summed across (PlannedRowsSpan), or is empty for one. When
+// the plan sized the table but could not count its rows, as for a PostgreSQL
+// table that has never been analyzed, the line gives the size alone, "Size:
+// ~3.0 GB", rather than reporting a row count it does not have. It is empty
+// when the plan had neither. The CLI and the PR comment each add their own
+// line prefix and newline.
 func PlannedRowsText(estimatedRows, estimatedBytes *int64, span string) string {
-	if estimatedRows == nil {
-		return ""
+	if estimatedRows != nil {
+		return fmt.Sprintf("Rows: %s%s%s", ui.FormatApproxRows(*estimatedRows), span, ui.FormatTableSizeClause(estimatedBytes))
 	}
-	return fmt.Sprintf("Rows: %s%s%s", ui.FormatApproxRows(*estimatedRows), span, ui.FormatTableSizeClause(estimatedBytes))
+	if estimatedBytes != nil {
+		return fmt.Sprintf("Size: %s%s", ui.FormatApproxBytes(*estimatedBytes), span)
+	}
+	return ""
 }
 
 // TargetsTableSizeClause is a table's planned size on the rows line of a

@@ -40,13 +40,14 @@ source "$REPO_ROOT/e2e/k8s/pin-minikube-kubeconfig.sh"
 
 echo "Building schemabot + etre + localscale images for minikube..."
 CGO_ENABLED=0 GOOS=linux go build -o "$REPO_ROOT/bin/schemabot-linux" ./pkg/cmd
-CGO_ENABLED=0 GOOS=linux go build -o "$REPO_ROOT/bin/localscale-linux" ./cmd/localscale
+CGO_ENABLED=0 GOOS=linux go build -o "$REPO_ROOT/bin/localscale-linux-$(go env GOARCH)" ./cmd/localscale
 cp "$REPO_ROOT/bin/schemabot-linux" "$REPO_ROOT/deploy/local/schemabot-dev"
 eval "$(minikube docker-env)"
 docker build -t schemabot:test -f "$REPO_ROOT/deploy/local/Dockerfile.dev" "$REPO_ROOT/deploy/local/"
 rm -f "$REPO_ROOT/deploy/local/schemabot-dev"
 docker build -t etre:test "$REPO_ROOT/e2e/k8s/etre/"
-# LocalScale's Dockerfile COPYs bin/localscale-linux relative to the repo root.
+# LocalScale's Dockerfile COPYs the binary built for the build's architecture
+# out of bin/, relative to the repo root.
 docker build -t localscale:test -f "$REPO_ROOT/deploy/local/Dockerfile.localscale" "$REPO_ROOT"
 
 PIDS=()

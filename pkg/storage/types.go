@@ -375,6 +375,13 @@ type Check struct {
 	RolloutTargets         int
 	RolloutTargetsWithWork int
 
+	// PlanRefused records that the plan behind the change summary completed
+	// and named a change the engine refuses to run, with no plan errors and no
+	// durable block. It is written with ChangeSummary and kept with it, like
+	// the rollout counts. False for rows recorded before this field existed,
+	// which read as a failed plan rather than a refused one.
+	PlanRefused bool
+
 	// AggregateRender is what an aggregate row's Check Run text was rendered
 	// from, so the text can be rendered again with newer rollout counts
 	// without re-reading the PR. The encoding belongs to the caller. Upsert
@@ -717,6 +724,19 @@ type Setting struct {
 // shares the settings table, not configuration an operator chooses.
 const WebhookReconcileScanCursorSettingKeyPrefix = "webhook_reconcile_scan_cursor:"
 
+// MaxSettingKeyBytes is the longest settings key storage keeps whole. It is
+// the width of the setting_key column (varchar(255)) in pkg/schema/mysql and
+// pkg/schema/postgres. A key that passes IsPrintableASCIISettingKey takes one
+// byte per character, so the byte count and the column's character count agree.
+const MaxSettingKeyBytes = 255
+
+// MaxSettingValueBytes is the largest settings value storage keeps whole. It
+// is the size of a MySQL TEXT column, which holds 65,535 bytes and is what
+// setting_value is in pkg/schema/mysql. The PostgreSQL column is unbounded
+// text, but the limit is the same on every dialect so a value accepted on one
+// is accepted on the other.
+const MaxSettingValueBytes = 65535
+
 // IsComponentStateSettingKey reports whether key names a row a component
 // keeps for its own state rather than an operator setting. The settings
 // listing leaves such rows out so it shows only what an operator can act on;
@@ -838,6 +858,40 @@ func (op *ApplyOperation) KeyedByTarget() bool {
 		return false
 	}
 	return op.OperationKey == TargetOperationKey(op.Target, "")
+}
+
+// TasksByOperation buckets tasks by their owning apply_operation, keeping
+// each operation's tasks in the order given. Tasks with no apply_operation_id
+// (legacy rows predating the per-deployment back-fill) are not attributable
+// to an operation and are omitted; in a genuine multi-deployment apply every
+// task carries the id.
+func TasksByOperation(tasks []*Task) map[int64][]*Task {
+	byOp := make(map[int64][]*Task)
+	for _, t := range tasks {
+		if t.ApplyOperationID == nil {
+			continue
+		}
+		byOp[*t.ApplyOperationID] = append(byOp[*t.ApplyOperationID], t)
+	}
+	return byOp
+}
+
+// FailureMessage is why the operation failed, as every surface reads it: its
+// own error message, or, when the row carries none, the first error among
+// tasks, the operation's own tasks in order. A remote failure records its
+// error on the operation's tasks, and the row may never be stamped with it,
+// so without the fallback a failed shard would show no reason on one surface
+// while another named it.
+func (op *ApplyOperation) FailureMessage(tasks []*Task) string {
+	if op.ErrorMessage != "" {
+		return op.ErrorMessage
+	}
+	for _, t := range tasks {
+		if t.ErrorMessage != "" {
+			return t.ErrorMessage
+		}
+	}
+	return ""
 }
 
 // PlanIDForOperation resolves which plan an operation executes: its own when it
@@ -981,13 +1035,15 @@ func (tc TableChange) TaskEstimatedBytes(shard string) *int64 {
 // TaskEstimatedRows returns the row estimate a task created from this change
 // carries, under the same whole-table rule as TaskEstimatedBytes: a task
 // scoped to one shard carries none rather than the whole table's count. Only
-// an ALTER copies rows, so a task for any other change carries none either:
-// the plan sizes a table it drops, but that is not work the task will copy.
+// a change that works through the table's rows carries one: an ALTER copies
+// them, and a separate CREATE INDEX statement, which is how PostgreSQL adds an
+// index, reads them all to build it. A task for any other change carries none:
+// the plan sizes a table it drops, but that is not work the task will do.
 func (tc TableChange) TaskEstimatedRows(shard string) *int64 {
 	if shard != "" || tc.EstimatedRows == nil {
 		return nil
 	}
-	if !strings.EqualFold(tc.Operation, "alter") {
+	if !strings.EqualFold(tc.Operation, "alter") && !strings.EqualFold(tc.Operation, "create_index") {
 		return nil
 	}
 	rows := *tc.EstimatedRows
@@ -1033,6 +1089,13 @@ func (tc TableChange) UnsafeOptInReason() string {
 // question the same way.
 const VSchemaArtifactName = "vschema.json"
 
+// RollbackBlocker is a live table that kept a plan from saving its
+// namespace's current schema, and why.
+type RollbackBlocker struct {
+	Table  string `json:"table"`
+	Reason string `json:"reason"`
+}
+
 // NamespacePlanData contains plan data for a single namespace. OriginalFiles is
 // captured once for the namespace and applies to every table/artifact change in
 // Tables and Artifacts.
@@ -1042,6 +1105,13 @@ type NamespacePlanData struct {
 	OriginalFiles         map[string]string `json:"original_files,omitempty"`
 	OriginalFilesCaptured bool              `json:"original_files_captured,omitempty"`
 	Artifacts             map[string]string `json:"artifacts,omitempty"`
+
+	// RollbackBlockers names the live tables that kept the plan from saving
+	// the namespace's current schema, each with why. It is set exactly when
+	// OriginalFilesCaptured is false for a namespace the engine could have
+	// saved, so a stored plan says why its apply cannot be rolled back, as
+	// the response to the plan request did.
+	RollbackBlockers []RollbackBlocker `json:"rollback_blockers,omitempty"`
 
 	// Metadata is the subset of the engine's plan change-metadata that
 	// apply-time consumers read (see VSchemaPlanMetadata): the safety-gate
@@ -1301,6 +1371,35 @@ func (p *Plan) AllChangesDirect() bool {
 		}
 	}
 	return total > 0
+}
+
+// ShardCopyEstimatedRows returns the plan's row estimate for the copy one
+// shard runs for a table: the estimate on the shard's own change, when that
+// change is an ALTER, the only change that copies rows. It is nil when the
+// plan records no change for the table on that shard, the change copies no
+// rows, or the planner had no estimate. A negative estimate is a statistics
+// sentinel rather than a count, so it reads as no estimate. It never falls
+// back to the keyspace's estimate, which covers every shard.
+func (p *Plan) ShardCopyEstimatedRows(namespace, shard, table string) *int64 {
+	if p == nil || p.Namespaces[namespace] == nil {
+		return nil
+	}
+	for _, sp := range p.Namespaces[namespace].Shards {
+		if sp.Shard != shard {
+			continue
+		}
+		for _, tc := range sp.Changes {
+			if tc.Table != table || tc.EstimatedRows == nil || !strings.EqualFold(tc.Operation, "alter") {
+				continue
+			}
+			if *tc.EstimatedRows < 0 {
+				return nil
+			}
+			rows := *tc.EstimatedRows
+			return &rows
+		}
+	}
+	return nil
 }
 
 // FlatDDLChanges returns all DDL changes across namespaces, sorted by namespace key.
@@ -1821,6 +1920,9 @@ type DriverPool struct {
 // user-facing handle for the whole rollout. applies.state is derived from
 // the child rows' states via the existing state.DeriveApplyState().
 type ApplyOperation struct {
+	// StartsAttempt is set only on the snapshot returned by a fresh work claim.
+	StartsAttempt bool
+
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
 	ID int64
 
@@ -2046,6 +2148,11 @@ func (op *ApplyOperation) Lease() OperationLease {
 // ApplyOptions contains durable user and engine options for an apply.
 // Stored as JSON in the database for flexibility across engine types.
 type ApplyOptions struct {
+	// ChangeEventApp is the managed app label forwarded to a remote worker for
+	// change events. It is stored on the worker's apply and kept out of engine
+	// options.
+	ChangeEventApp string `json:"change_event_app,omitempty"`
+
 	// AllowUnsafe permits destructive changes (DROP TABLE, DROP COLUMN).
 	AllowUnsafe bool `json:"allow_unsafe,omitempty"`
 
@@ -2183,17 +2290,26 @@ const (
 	ControlOperationRelease ControlOperation = "release"
 )
 
+// controlOperations are the operations this release implements. It is the
+// registry the operator surfaces are checked against: every operation here is
+// a command on the PR comment, the CLI, and the HTTP API, and every one of
+// them is refused without the apply ID it acts on (CO-11).
+var controlOperations = []ControlOperation{
+	ControlOperationStart, ControlOperationStop, ControlOperationCancel,
+	ControlOperationCutover, ControlOperationRevert, ControlOperationSkipRevert,
+	ControlOperationRelease,
+}
+
+// ControlOperations returns every operation this release implements.
+func ControlOperations() []ControlOperation {
+	return slices.Clone(controlOperations)
+}
+
 // Valid reports whether the operation is one SchemaBot recognizes. Control
 // operations cross the control-plane / data-plane boundary as strings, so a
 // value read off the wire is checked here before it reaches storage.
 func (o ControlOperation) Valid() bool {
-	switch o {
-	case ControlOperationStart, ControlOperationStop, ControlOperationCancel,
-		ControlOperationCutover, ControlOperationRevert, ControlOperationSkipRevert,
-		ControlOperationRelease:
-		return true
-	}
-	return false
+	return slices.Contains(controlOperations, o)
 }
 
 // Command returns the operation spelled as the command an operator types

@@ -47,6 +47,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 
 	var failedTask *storage.Task
 	var stoppedByUser bool
+	var haltedBySibling, loggedSiblingFailureAtCutover bool
 	planMetadata := c.newPlanMetadataCache(apply)
 
 	for i, task := range tasks {
@@ -56,6 +57,20 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 			return nil
 		} else if standDown {
 			stoppedByUser = true
+			break
+		}
+		if standDown, err := c.cancelForFailedSibling(ctx, logger, c.getEngine(), apply, tasks, firstTaskMidCutover, &loggedSiblingFailureAtCutover); err != nil {
+			if errors.Is(err, ErrTaskVerdictRefused) {
+				// Some tasks recorded cancelled and some did not. The error
+				// keeps the operation row claimable instead of deriving it
+				// from the partly settled tasks.
+				return err
+			}
+			logger.Warn("halting this operation behind a failed sibling failed; current apply owner will exit for operator retry",
+				"error", err)
+			return nil
+		} else if standDown {
+			haltedBySibling = true
 			break
 		}
 
@@ -108,6 +123,27 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 			stoppedByUser = true
 			break
 		}
+		if action == taskHaltedBySibling {
+			if err := c.cancelTasksQueuedBehindSiblingFailure(ctx, apply, tasks); err != nil {
+				if errors.Is(err, ErrTaskVerdictRefused) {
+					return err
+				}
+				logger.Warn("cancelling the tasks queued behind a failed sibling failed; current apply owner will exit for operator retry",
+					"error", err)
+				return nil
+			}
+			haltedBySibling = true
+			break
+		}
+	}
+
+	if haltedBySibling {
+		// Only an operation-scoped drive is halted by a sibling, and its
+		// outcome is its tasks: the rollout projection derives the operation
+		// row and the apply from them, so there is nothing here to finalize.
+		logger.Info("sequential operation drive cancelled its work behind a failed sibling; the rollout projection settles the apply",
+			"task_count", len(tasks))
+		return nil
 	}
 
 	// Update apply state based on task outcomes
@@ -135,16 +171,17 @@ type taskAction int
 // the apply still active, to be reclaimed and resumed. Recording a handover as an
 // operator stop would park every apply a shutdown interrupts.
 const (
-	taskContinue      taskAction = iota // Task completed successfully, proceed to next
-	taskFailed                          // Task failed, stop processing
-	taskStopped                         // Task/apply was stopped by user, stop processing
-	taskSkip                            // Task is already terminal in storage; move on to the next
-	taskAlreadyFailed                   // A previous drive failed the task permanently; it owns the apply's verdict, stop processing
-	taskAbort                           // Current owner should exit without changing final state
-	taskHandover                        // This drive's context was cancelled; the apply stays active for another driver to claim
-	taskMissing                         // The task's row is gone; the drive exits without a verdict and reports the apply undriveable
-	taskTargetHeld                      // The engine was refused the target because another run holds it; the drive waits and starts the task again
-	taskStartAgain                      // A held table's wait found the task still needed; runEngineTask starts it again and never returns this
+	taskContinue        taskAction = iota // Task completed successfully, proceed to next
+	taskFailed                            // Task failed, stop processing
+	taskStopped                           // Task/apply was stopped by user, stop processing
+	taskSkip                              // Task is already terminal in storage; move on to the next
+	taskAlreadyFailed                     // A previous drive failed the task permanently; it owns the apply's verdict, stop processing
+	taskAbort                             // Current owner should exit without changing final state
+	taskHandover                          // This drive's context was cancelled; the apply stays active for another driver to claim
+	taskMissing                           // The task's row is gone; the drive exits without a verdict and reports the apply undriveable
+	taskTargetHeld                        // The engine was refused the target because another run holds it; the drive waits and starts the task again
+	taskStartAgain                        // A held table's wait found the task still needed; runEngineTask starts it again and never returns this
+	taskHaltedBySibling                   // Another work row of this rollout member failed under on_failure halt; the task was cancelled, and the drive cancels the rest of its work
 )
 
 const (
@@ -247,7 +284,7 @@ func sequentialEngineApplyRequest(applyIdentifier string, task *storage.Task, op
 		Database:        task.Database,
 		Changes:         []engine.SchemaChange{change},
 		Options:         options,
-		ResumeState:     &engine.ResumeState{MigrationContext: task.TaskIdentifier},
+		ResumeState:     sequentialDriveResumeState(task),
 		Credentials:     creds,
 		Logger:          logger,
 	}
@@ -698,7 +735,7 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 	// carry what Apply returned. An engine that echoes the request's resume state
 	// polls with the same state the drive sent.
 	pollAction := c.pollTaskToCompletion(ctx, apply, task, taskCreds, result.ResumeState)
-	if pollAction == taskAbort || pollAction == taskStopped || pollAction == taskHandover || pollAction == taskTargetHeld {
+	if pollAction == taskAbort || pollAction == taskStopped || pollAction == taskHandover || pollAction == taskTargetHeld || pollAction == taskHaltedBySibling {
 		return pollAction
 	}
 
@@ -836,6 +873,11 @@ type atomicPollState struct {
 	// parked paces the poll while the drive holds at a deferred cutover.
 	parked parkedPoll
 
+	// loggedSiblingFailureAtCutover is set once the drive has logged that a
+	// failed sibling halts its rollout member while its own change is already
+	// cutting over, so the line is not repeated on every tick.
+	loggedSiblingFailureAtCutover bool
+
 	// progressWriteFailures counts consecutive ticks whose task progress
 	// writes did not all land; see pollTaskToCompletion's counterpart.
 	progressWriteFailures int
@@ -903,8 +945,13 @@ type atomicPollState struct {
 	consecutiveCutoverFailures int
 
 	// consecutiveErrors tracks progress poll failures to fail fast when the
-	// engine is unreachable (e.g., branch deleted mid-apply).
+	// engine is unreachable (e.g., branch deleted mid-apply), and paces the
+	// next poll while they last (progressPollWait).
 	consecutiveErrors int
+	// nextPollWait is how long after the last tick began the next poll is
+	// due: the plain interval, or the backed-off wait drawn once for the
+	// latest failure.
+	nextPollWait time.Duration
 
 	// lostWork measures how long the engine has been reporting no active
 	// schema change while stored tasks say the work is in flight, so the drive
@@ -1152,10 +1199,10 @@ func (c *LocalClient) lostEngineWorkPendingBudget(eng engine.Engine) time.Durati
 // inside that window.
 func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.Apply, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState) taskAction {
 	eng := c.getEngine()
-	ticker := time.NewTicker(c.taskPollInterval())
-	defer ticker.Stop()
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 
+	// consecutiveErrors counts failed polls in a row; it bounds the drive and
+	// paces its next poll (progressPollWait).
 	var consecutiveErrors int
 	// terminalWriteFailures counts consecutive failed writes of the task's
 	// terminal state. It is separate from consecutiveErrors because every
@@ -1181,6 +1228,11 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	lostWork := lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)}
 	watchdog := taskStallWatchdog{interval: c.taskStallWarnInterval()}
 	parked := newParkedPoll()
+	var loggedSiblingFailureAtCutover bool
+	// nextPollWait is how long after the last tick began the next poll is
+	// due, so the time a tick takes is not added to the interval.
+	nextPollWait := c.progressPollWait(0)
+	tickStart := time.Now()
 
 	for {
 		select {
@@ -1188,7 +1240,8 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			logger.Info("drive context cancelled while polling; handing the apply back for another driver to claim",
 				"task_id", task.TaskIdentifier, "table", task.TableName)
 			return taskHandover
-		case <-ticker.C:
+		case <-time.After(max(0, nextPollWait-time.Since(tickStart))):
+			tickStart = time.Now()
 			if !parked.runFullPoll(ctx, c.storage, apply, time.Now(), logger) {
 				continue
 			}
@@ -1208,6 +1261,23 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					task.State = state.Task.Stopped
 					return taskStopped
 				}
+			}
+			standDown, err := c.cancelForFailedSibling(ctx, logger, eng, apply, []*storage.Task{task}, firstTaskMidCutover, &loggedSiblingFailureAtCutover)
+			if standDown {
+				if err != nil {
+					// The engine work is cancelled but this task's row did not
+					// record it. The caller records every task of the operation
+					// cancelled next, this one included, and returns the error
+					// if that write is refused too.
+					logger.Warn("halted task's cancelled verdict was not recorded; the drive records it again with the tasks queued behind it",
+						"task_id", task.TaskIdentifier, "error", err)
+				}
+				return taskHaltedBySibling
+			}
+			if err != nil {
+				logger.Warn("halting this operation behind a failed sibling failed; current apply owner will exit for operator retry",
+					"task_id", task.TaskIdentifier, "error", err)
+				return taskAbort
 			}
 			if pending.has(storage.ControlOperationCutover) {
 				if err := c.processPendingCutoverControlRequest(ctx, apply, []*storage.Task{task}); err != nil {
@@ -1246,8 +1316,9 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				// database's active-apply slot and blocks every later apply. Fail
 				// after a bounded run of errors, matching the grouped poll.
 				consecutiveErrors++
+				nextPollWait = c.progressPollWait(consecutiveErrors)
 				logger.Warn("progress check failed",
-					"task_id", task.TaskIdentifier, "table", task.TableName, "error", err, "consecutive_errors", consecutiveErrors)
+					"task_id", task.TaskIdentifier, "table", task.TableName, "error", err, "consecutive_errors", consecutiveErrors, "next_poll_in", nextPollWait)
 				if consecutiveErrors >= maxConsecutiveProgressPollErrors {
 					if c.shouldRetryEngineError(err) {
 						return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskRetryable(ctx, task, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", consecutiveErrors, err)))
@@ -1300,8 +1371,9 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					// against the same bounded error budget as a failed poll —
 					// this must never become an unbounded loop.
 					consecutiveErrors++
+					nextPollWait = c.progressPollWait(consecutiveErrors)
 					c.logger.Warn("engine reports no active schema change for an in-flight task and target verification failed; the drive re-verifies at the next poll",
-						append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", result.State, "consecutive_errors", consecutiveErrors, "error", settleErr)...)
+						append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", result.State, "consecutive_errors", consecutiveErrors, "next_poll_in", nextPollWait, "error", settleErr)...)
 					if consecutiveErrors >= maxConsecutiveProgressPollErrors {
 						return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskRetryable(ctx, task, fmt.Sprintf("engine reports no active schema change for an in-flight task and the target could not be verified; %d consecutive errors across progress polls and target verification; see server logs", consecutiveErrors)))
 					}
@@ -1317,6 +1389,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			}
 
 			consecutiveErrors = 0
+			nextPollWait = c.progressPollWait(0)
 			c.logEngineResumeOnce(ctx, logger, apply, result.ResumedFromCheckpoint, &resumeEventLogged)
 			var saveErr error
 			lastProgressMetadata, saveErr = c.persistProgressMetadataIfChanged(lastProgressMetadata, result.Metadata, &progressMetadataLeaseLost, func(metadata map[string]string) error {
@@ -1885,6 +1958,22 @@ func (c *LocalClient) cancelTasksQueuedBehindFailure(ctx context.Context, apply 
 	return false, nil
 }
 
+// cancelTasksQueuedBehindSiblingFailure cancels the tasks of this drive's
+// operation that a failed sibling halted before they started. The task that
+// was running has already been cancelled with its engine work.
+func (c *LocalClient) cancelTasksQueuedBehindSiblingFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
+	opLease, ok := operationLeaseOnlyDrive(ctx)
+	if !ok {
+		return fmt.Errorf("cancel tasks of apply %s queued behind a failed sibling: the drive holds no operation lease", apply.ApplyIdentifier)
+	}
+	if _, _, _, err := c.markTasksWithState(ctx, tasksForOperation(tasks, opLease.OperationID), apply.ID, StatementIndex[engine.TableProgress]{}, state.Task.Cancelled); err != nil {
+		// A refused write leaves the operation's tasks partly settled; the
+		// error keeps the operation row claimable so the next drive finishes.
+		return fmt.Errorf("%w: cancel tasks of apply %s operation %d queued behind a failed sibling: %w", ErrTaskVerdictRefused, apply.ApplyIdentifier, opLease.OperationID, err)
+	}
+	return nil
+}
+
 // finalizeSequentialApply updates the apply state based on sequential task outcomes.
 // Permanent failures cancel remaining pending tasks; retryable failures leave
 // pending tasks queued for operator recovery.
@@ -1935,6 +2024,22 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 			logger.Warn("failed to settle pending control requests for terminal sequential apply",
 				"error", err)
 		}
+		// The writer that settled the apply delivers its own observer. An
+		// observer still registered here belongs to this drive's process,
+		// which that writer may not be, so the drive delivers it with the
+		// task rows that writer stored.
+		storedTasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+		if err != nil {
+			if c.driveCancelled(ctx, apply, "before reloading tasks for the terminal summary of an apply another writer settled") {
+				return nil
+			}
+			// This drive's task copies predate the settling write, so the
+			// summary goes out without task rows rather than with stale ones.
+			logger.Warn("could not reload tasks for the terminal summary of an apply another writer settled; notifying without them",
+				"error", err)
+			storedTasks = nil
+		}
+		c.notifyTerminalObserver(apply, storedTasks)
 		return nil
 	}
 	previousState := apply.State

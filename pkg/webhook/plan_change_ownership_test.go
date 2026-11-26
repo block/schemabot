@@ -1,11 +1,17 @@
 package webhook
 
 import (
+	"maps"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/lint"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -28,7 +34,7 @@ func TestPlannedDestructiveTables_CollectsFromBothViews(t *testing.T) {
 		}},
 	}
 
-	assert.Equal(t, []string{"audit_log", "orders"}, plannedDestructiveTables(planResp))
+	assert.Equal(t, []string{"audit_log", "orders"}, destructiveTables(plannedDestructiveStatements(planResp)))
 }
 
 // An ALTER that destroys something a table keeps — a dropped column, a dropped
@@ -46,7 +52,7 @@ func TestPlannedDestructiveTables_CollectsUnsafeAlters(t *testing.T) {
 		}},
 	}
 
-	assert.Equal(t, []string{"customers", "orders"}, plannedDestructiveTables(planResp),
+	assert.Equal(t, []string{"customers", "orders"}, destructiveTables(plannedDestructiveStatements(planResp)),
 		"an additive alter stays out; a destructive one is attributed by its table")
 }
 
@@ -79,10 +85,10 @@ func TestUnsafeGateCoversEveryAttributedTable(t *testing.T) {
 		gated = append(gated, unsafe.Table)
 	}
 
-	assert.Subset(t, gated, plannedDestructiveTables(planResp), "every attributed table is gated")
+	assert.Subset(t, gated, destructiveTables(plannedDestructiveStatements(planResp)), "every attributed table is gated")
 	assert.ElementsMatch(t, []string{"audit_log", "orders", "stations"}, gated,
 		"a shard-only drop solicits consent, an additive alter is not gated at all")
-	assert.Equal(t, []string{"audit_log", "orders"}, plannedDestructiveTables(planResp),
+	assert.Equal(t, []string{"audit_log", "orders"}, destructiveTables(plannedDestructiveStatements(planResp)),
 		"the created table's lint error is gated but not attributed")
 }
 
@@ -108,7 +114,7 @@ func TestPlannedDestructiveTables_LeavesOutCreatedTables(t *testing.T) {
 		}},
 	}
 
-	assert.Equal(t, []string{"docks"}, plannedDestructiveTables(planResp))
+	assert.Equal(t, []string{"docks"}, destructiveTables(plannedDestructiveStatements(planResp)))
 }
 
 func TestPlannedDestructiveTables_NoDestructiveChanges(t *testing.T) {
@@ -119,8 +125,8 @@ func TestPlannedDestructiveTables_NoDestructiveChanges(t *testing.T) {
 		}},
 	}
 
-	assert.Empty(t, plannedDestructiveTables(planResp))
-	assert.Empty(t, plannedDestructiveTables(nil))
+	assert.Empty(t, destructiveTables(plannedDestructiveStatements(planResp)))
+	assert.Empty(t, destructiveTables(plannedDestructiveStatements(nil)))
 }
 
 func TestRenderPlanComment_AttributedChangeNamesOwnerAndStillOffersApply(t *testing.T) {
@@ -336,9 +342,90 @@ func TestTargetPlanDestructiveTables(t *testing.T) {
 				}},
 		},
 	}
-	assert.Equal(t, []string{"reconcile_state", "users"}, targetPlanDestructiveTables(drift))
+	assert.Equal(t, []string{"reconcile_state", "users"}, destructiveTables(targetPlanDestructiveStatements(drift)))
 
 	drift.Clean = false
-	assert.Empty(t, targetPlanDestructiveTables(drift), "a blocked rollup renders no target plans")
-	assert.Empty(t, targetPlanDestructiveTables(nil))
+	assert.Empty(t, destructiveTables(targetPlanDestructiveStatements(drift)), "a blocked rollup renders no target plans")
+	assert.Empty(t, destructiveTables(targetPlanDestructiveStatements(nil)))
+}
+
+// destructiveTables lists the tables of a statements-by-table map in order.
+func destructiveTables(statements map[string][]string) []string {
+	return slices.Sorted(maps.Keys(statements))
+}
+
+// The engine names the column an unsafe finding concerns. The plan comment
+// keys that column by the finding as the change's unsafe reason lists it, so
+// each finding of a compound ALTER TABLE is attributed by its own clause. A
+// finding that names no column, and a warning, add nothing, and a message that
+// carries the reason separator still keys the one finding it became.
+func TestPlanUnsafeChanges_KeysEachFindingToItsColumn(t *testing.T) {
+	dropEmail := `Unsafe operation detected: "DROP COLUMN ` + "`email`" + `"`
+	dropNickname := `Unsafe operation detected: "DROP COLUMN ` + "`nickname`" + `"; data is lost`
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "keyspace",
+			TableChanges: []*apitypes.TableChangeResponse{{
+				TableName: "users", ChangeType: "alter", IsUnsafe: true,
+				DDL:          "ALTER TABLE `users` DROP COLUMN `email`, DROP COLUMN `nickname`, DROP PRIMARY KEY",
+				UnsafeReason: lintReasonOf(dropEmail, dropNickname, "Unsafe operation detected: DROP PRIMARY KEY"),
+			}},
+		}},
+		LintResults: []*apitypes.LintViolationResponse{
+			{Severity: "error", Table: "users", Column: "email", Message: dropEmail},
+			{Severity: "error", Table: "users", Column: "nickname", Message: dropNickname},
+			{Severity: "error", Table: "users", Message: "Unsafe operation detected: DROP PRIMARY KEY"},
+			{Severity: "warning", Table: "users", Column: "name", Message: "column `name` has no default"},
+		},
+	}
+
+	unsafe := planUnsafeChanges(planResp)
+	require.Len(t, unsafe, 1)
+	assert.Equal(t, map[string]string{
+		ui.LintReasons(lint.UnsafeFindingText(dropEmail))[0]:    "email",
+		ui.LintReasons(lint.UnsafeFindingText(dropNickname))[0]: "nickname",
+	}, unsafe[0].FindingColumns)
+	for finding := range unsafe[0].FindingColumns {
+		assert.Contains(t, ui.LintReasons(unsafe[0].Reason), finding, "each key is a finding the reason lists")
+	}
+}
+
+// Two clauses of one ALTER TABLE drop different columns with the same finding
+// text. The reason lists both findings, but the text alone cannot say which
+// line is which column, so that text is keyed to no column and both lines are
+// matched against the whole statement. A finding with its own text still keys
+// its column.
+func TestPlanUnsafeChanges_LeavesFindingTextSharedByTwoColumnsUnkeyed(t *testing.T) {
+	dropsData := "Unsafe operation detected: dropping a column discards its data"
+	dropNickname := `Unsafe operation detected: "DROP COLUMN ` + "`nickname`" + `"`
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "keyspace",
+			TableChanges: []*apitypes.TableChangeResponse{{
+				TableName: "users", ChangeType: "alter", IsUnsafe: true,
+				DDL:          "ALTER TABLE `users` DROP COLUMN `email`, DROP COLUMN `phone`, DROP COLUMN `nickname`",
+				UnsafeReason: lintReasonOf(dropsData, dropsData, dropNickname),
+			}},
+		}},
+		LintResults: []*apitypes.LintViolationResponse{
+			{Severity: "error", Table: "users", Column: "email", Message: dropsData},
+			{Severity: "error", Table: "users", Column: "phone", Message: dropsData},
+			{Severity: "error", Table: "users", Column: "nickname", Message: dropNickname},
+		},
+	}
+
+	unsafe := planUnsafeChanges(planResp)
+	require.Len(t, unsafe, 1)
+	assert.Equal(t, map[string]string{
+		ui.LintReasons(lint.UnsafeFindingText(dropNickname))[0]: "nickname",
+	}, unsafe[0].FindingColumns)
+}
+
+// lintReasonOf joins error messages the way the engine's unsafe reason does.
+func lintReasonOf(messages ...string) string {
+	findings := make([]string, len(messages))
+	for i, m := range messages {
+		findings[i] = lint.UnsafeFindingText(m)
+	}
+	return strings.Join(findings, "; ")
 }

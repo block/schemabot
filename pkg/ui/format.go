@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -177,25 +178,11 @@ func VSchemaStatusLabel(status string) string {
 	}
 }
 
-// FormatETA formats a duration in seconds as a human-readable string, using the
-// two largest non-zero units so a long copy stays readable.
-// Examples: 45 → "45s", 195 → "3m 15s", 3700 → "1h 1m", 180000 → "2d 2h"
+// FormatETA formats a number of seconds, such as an ETA or the time left in a
+// window, the same way as FormatHumanDuration, so every duration reads alike.
+// Examples: 45 → "45s", 195 → "3m 15s", 1800 → "30m", 90060 → "1d 1h"
 func FormatETA(seconds int64) string {
-	const (
-		minute = 60
-		hour   = 60 * minute
-		day    = 24 * hour
-	)
-	switch {
-	case seconds < minute:
-		return fmt.Sprintf("%ds", seconds)
-	case seconds < hour:
-		return fmt.Sprintf("%dm %ds", seconds/minute, seconds%minute)
-	case seconds < day:
-		return fmt.Sprintf("%dh %dm", seconds/hour, (seconds%hour)/minute)
-	default:
-		return fmt.Sprintf("%dd %dh", seconds/day, (seconds%day)/hour)
-	}
+	return FormatHumanDuration(time.Duration(seconds) * time.Second)
 }
 
 // MaxStatementRunes bounds an engine-reported statement rendered as a
@@ -229,6 +216,28 @@ func ClampRows(copied, total int64) int64 {
 		return total
 	}
 	return copied
+}
+
+// CopyFinishedShortOfEstimate reports whether the engine says a table's copy
+// is done while the rows it copied fall short of the estimated total, as when
+// the estimate ran high or the copy skipped rows. An engine's percent reaches
+// 100 short of the total only when the engine itself declares the copy
+// finished, since a percent read from the rows stays below 100 until the rows
+// reach the total.
+func CopyFinishedShortOfEstimate(pct int, copied, total int64) bool {
+	return pct >= 100 && copied >= 0 && copied < total
+}
+
+// CopyCoveredRows is how many rows of its total a copy accounts for: the
+// rows it copied, clamped to the total, or the whole total once the engine
+// reports the copy finished short of it. Percents and sums across tables,
+// shards and targets read a copy through this, so a finished copy never
+// counts as a fraction of its estimate.
+func CopyCoveredRows(pct int, copied, total int64) int64 {
+	if CopyFinishedShortOfEstimate(pct, copied, total) {
+		return total
+	}
+	return ClampRows(copied, total)
 }
 
 // EstimateExceeded reports whether the row copy has exceeded its estimated total.
@@ -290,6 +299,7 @@ func ChecksumDisplayPercent(rowsChecked, rowsTotal int64) int {
 // percent. Renderers comparing tables or shards by progress should compare
 // this value so the selection agrees with what FormatRowCopyPercent displays.
 func RowCopyFraction(pct int, rowsCopied, rowsTotal int64) float64 {
+	rowsCopied = CopyCoveredRows(pct, rowsCopied, rowsTotal)
 	if rowsCopied > 0 && rowsTotal > 0 {
 		return math.Min(float64(rowsCopied)/float64(rowsTotal)*100, 100)
 	}
@@ -304,10 +314,12 @@ func RowCopyFraction(pct int, rowsCopied, rowsTotal int64) float64 {
 // floored at 0.01% so an in-flight copy never reads as 0.00%, and capped at
 // 99.99% while copied rows still trail the total, so a copy never reads as
 // finished before it is — an operator deciding whether to keep waiting takes
-// "100.00%" as done. Without row counts it falls back to the engine's
+// "100.00%" as done. A copy the engine reports finished short of its total
+// reads 100.00%, since its rows can no longer measure it. Without row counts it falls back to the engine's
 // whole-number percent, or "<1%" when copying has begun but there is no
 // total to compute a fraction from.
 func FormatRowCopyPercent(pct int, rowsCopied, rowsTotal int64) string {
+	rowsCopied = CopyCoveredRows(pct, rowsCopied, rowsTotal)
 	if rowsCopied > 0 && rowsTotal > 0 {
 		frac := math.Max(RowCopyFraction(pct, rowsCopied, rowsTotal), 0.01)
 		if rowsCopied < rowsTotal {
@@ -352,45 +364,40 @@ func FormatTimeAgo(t time.Time) string {
 	return fmt.Sprintf("%d days ago", days)
 }
 
-// FormatHumanDuration formats a duration in a human-readable way.
-// Examples: 500ms → "< 1s", 45s → "45s", 90s → "1m 30s", 2h → "2h"
+// FormatHumanDuration formats a duration the one way SchemaBot shows every
+// duration, in the CLI, the watch view, and the PR comment: the two largest
+// non-zero units, with a zero unit left out. A duration under a second, zero,
+// or negative reads "< 1s".
+// Examples: 500ms → "< 1s", 45s → "45s", 90s → "1m 30s", 30m → "30m",
+// 25h1m → "1d 1h", 24h30m → "1d 30m", 8d3h → "1w 1d", 7d3h → "1w 3h"
 func FormatHumanDuration(d time.Duration) string {
 	if d < time.Second {
 		return "< 1s"
 	}
-	if d < time.Minute {
-		return fmt.Sprintf("%ds", int(d.Seconds()))
+	seconds := int64(d / time.Second)
+	units := []struct {
+		suffix  string
+		seconds int64
+	}{
+		{"w", 7 * 24 * 3600},
+		{"d", 24 * 3600},
+		{"h", 3600},
+		{"m", 60},
+		{"s", 1},
 	}
-	if d < time.Hour {
-		mins := int(d.Minutes())
-		secs := int(d.Seconds()) % 60
-		if secs == 0 {
-			return fmt.Sprintf("%dm", mins)
+	var parts []string
+	for _, unit := range units {
+		count := seconds / unit.seconds
+		seconds %= unit.seconds
+		if count == 0 {
+			continue
 		}
-		return fmt.Sprintf("%dm %ds", mins, secs)
-	}
-	totalHours := int(d.Hours())
-	if totalHours < 24 {
-		mins := int(d.Minutes()) % 60
-		if mins == 0 {
-			return fmt.Sprintf("%dh", totalHours)
+		parts = append(parts, fmt.Sprintf("%d%s", count, unit.suffix))
+		if len(parts) == 2 {
+			break
 		}
-		return fmt.Sprintf("%dh %dm", totalHours, mins)
 	}
-	days := totalHours / 24
-	remainHours := totalHours % 24
-	if days < 7 {
-		if remainHours == 0 {
-			return fmt.Sprintf("%dd", days)
-		}
-		return fmt.Sprintf("%dd %dh", days, remainHours)
-	}
-	weeks := days / 7
-	remainDays := days % 7
-	if remainDays == 0 {
-		return fmt.Sprintf("%dw", weeks)
-	}
-	return fmt.Sprintf("%dw %dd", weeks, remainDays)
+	return strings.Join(parts, " ")
 }
 
 // CapitalizeFirst capitalizes the first letter of a string.
@@ -417,24 +424,37 @@ func PluralizeLabel(singular, plural string, count int) string {
 	return plural
 }
 
+// haltedTaskStates is the order a listing leads with the tables that stopped
+// short of completing. It is the same precedence a table's status is rolled up
+// across targets by (presentation.RollupTaskStatus), so the two cannot name a
+// different state first.
+var haltedTaskStates = state.HaltedTaskStates()
+
 // TableStatePriority returns a sort key for table display ordering.
-// Lower values sort first: active/running on top, terminal on bottom.
+// Lower values sort first: a failure or halt leads, so an operator scanning a
+// long list sees it before any queued table, then work in progress, then
+// queued tables, and settled tables last. The halted states lead in the order
+// of state.HaltedTaskStates. Sorts that use the key must be stable, so tables
+// of one rank keep their order.
 // Uses Task states (not Apply states) since tables are per-table tasks.
 // Used by both CLI (watch TUI) and PR comment rendering for consistent ordering.
 func TableStatePriority(taskState string) int {
+	if rank := slices.Index(haltedTaskStates, taskState); rank >= 0 {
+		return rank
+	}
+	// The ranks below follow the halted ones, however many there are.
+	after := len(haltedTaskStates)
 	switch taskState {
 	case state.Task.Running, state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum, state.Task.CuttingOver:
-		return 0 // active — top
-	case state.Task.WaitingForCutover, state.Task.Recovering, state.Task.FailedRetryable:
-		return 1
+		return after // active
+	case state.Task.WaitingForCutover, state.Task.Recovering:
+		return after + 1
 	case state.Task.Pending:
-		return 2
-	case state.Task.Failed, state.Task.Stopped:
-		return 3
-	case state.Task.Completed, state.Task.Cancelled, state.Task.Reverted:
-		return 4 // terminal — bottom
+		return after + 2
+	case state.Task.Completed, state.Task.Reverted:
+		return after + 3 // settled — bottom
 	default:
-		return 2
+		return after + 2
 	}
 }
 

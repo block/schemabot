@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -30,6 +31,9 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 		rows = append(rows, BoxRow{Label: "Namespaces", Value: strconv.Itoa(len(resp.Namespaces))})
 	}
 	rows = append(rows, BoxRow{Label: "Tables", Value: strconv.Itoa(int(resp.TableCount))})
+	if skipped := pulledSkippedCount(resp); skipped > 0 {
+		rows = append(rows, BoxRow{Label: "Skipped", Value: fmt.Sprintf("%s %d %s, not in the output", glyph.Attention, skipped, ui.Pluralize("table", skipped))})
+	}
 	WriteBox(rows, "", nil)
 	writeTargetDivergence(resp)
 
@@ -39,6 +43,7 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 		fmt.Println(annotation(fmt.Sprintf("-- Namespace %s — %d %s",
 			emphasis("`"+name+"`"), len(ns.Tables), ui.Pluralize("table", len(ns.Tables)))))
 		writePulledLint(ns.Lint)
+		writePulledSkippedTables(ns.SkippedTables)
 
 		for _, table := range sortedKeys(ns.Tables) {
 			fmt.Println()
@@ -275,6 +280,47 @@ func writePulledLint(violations []*apitypes.LintViolationResponse) {
 			line += v.Table + ": "
 		}
 		writeCommented("--   ", line+v.Message)
+	}
+}
+
+// pulledSkippedCount totals the tables the pull left out across namespaces,
+// so the summary box says up front that the output is not the whole schema.
+func pulledSkippedCount(resp *apitypes.PullSchemaResponse) int {
+	total := 0
+	for _, ns := range resp.Namespaces {
+		if ns != nil {
+			total += len(ns.SkippedTables)
+		}
+	}
+	return total
+}
+
+// writePulledSkippedTables lists the tables the pull left out because schema
+// files cannot describe them, as "--" comments so the output stays valid SQL.
+// The header is a warning rather than dimmed scaffolding: a table missing
+// from the output is one the operator has to decide about.
+func writePulledSkippedTables(skipped []apitypes.SkippedTable) {
+	if len(skipped) == 0 {
+		return
+	}
+	fmt.Println(styled(ANSIYellow, fmt.Sprintf("-- %s Skipped %d %s, not in the output:", glyph.Attention, len(skipped), ui.Pluralize("table", len(skipped)))))
+	for _, table := range skipped {
+		writeCommented("--   ", table.Table+": "+table.Reason)
+	}
+}
+
+// WriteOnboardSkippedTables tells the operator which tables onboarding left
+// out of the schema files and listed in ignore_tables instead, so SchemaBot
+// will neither change nor drop them.
+func WriteOnboardSkippedTables(namespace string, skipped []apitypes.SkippedTable) {
+	if len(skipped) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Printf("%s  Not managed in namespace %s: %d %s no schema file, so schemabot.yaml lists %s in ignore_tables:\n",
+		glyph.Attention, namespace, len(skipped), ui.PluralizeLabel("table has", "tables have", len(skipped)), ui.PluralizeLabel("it", "them", len(skipped)))
+	for _, table := range skipped {
+		fmt.Printf("  %s: %s\n", table.Table, table.Reason)
 	}
 }
 

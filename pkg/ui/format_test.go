@@ -73,31 +73,32 @@ func TestFormatTableSizeClause(t *testing.T) {
 }
 
 // Every task state has a pinned place in the table listing, so a state added
-// to pkg/state fails here until the listing says where it goes. States the
-// priority does not name, and statuses it does not recognize, list with
-// pending.
+// to pkg/state fails here until the listing says where it goes. A failure or
+// halt leads, then work in progress, then queued tables, then settled ones.
+// States the priority does not name, and statuses it does not recognize, list
+// with pending.
 func TestTableStatePriority(t *testing.T) {
 	task := state.Task
 	statetest.AssertRanks(t, statetest.Every(t, state.Task), map[string]int{
-		task.Running:           0,
-		task.CatchingUp:        0,
-		task.Checksumming:      0,
-		task.PostChecksum:      0,
-		task.CuttingOver:       0,
-		task.WaitingForCutover: 1,
-		task.Recovering:        1,
+		task.Failed:            0,
 		task.FailedRetryable:   1,
-		task.Pending:           2,
-		task.WaitingForDeploy:  2,
-		task.RevertWindow:      2,
-		task.Reverting:         2,
-		task.Failed:            3,
-		task.Stopped:           3,
-		task.Completed:         4,
-		task.Cancelled:         4,
-		task.Reverted:          4,
+		task.Stopped:           2,
+		task.Cancelled:         3,
+		task.Running:           4,
+		task.CatchingUp:        4,
+		task.Checksumming:      4,
+		task.PostChecksum:      4,
+		task.CuttingOver:       4,
+		task.WaitingForCutover: 5,
+		task.Recovering:        5,
+		task.Pending:           6,
+		task.WaitingForDeploy:  6,
+		task.RevertWindow:      6,
+		task.Reverting:         6,
+		task.Completed:         7,
+		task.Reverted:          7,
 	}, TableStatePriority)
-	assert.Equal(t, 2, TableStatePriority("unknown_state"))
+	assert.Equal(t, 6, TableStatePriority("unknown_state"))
 }
 
 func TestVSchemaStatusLabel(t *testing.T) {
@@ -120,31 +121,6 @@ func TestProgressBarActivity(t *testing.T) {
 	// one surface and a full row-copy bar in another; the two must stay
 	// byte-identical so the same phase never shows two different bars.
 	assert.Equal(t, ProgressBarRowCopy(100), bar)
-}
-
-func TestFormatETA(t *testing.T) {
-	tests := []struct {
-		name    string
-		seconds int64
-		want    string
-	}{
-		{"zero", 0, "0s"},
-		{"sub-minute", 45, "45s"},
-		{"exactly a minute", 60, "1m 0s"},
-		{"minutes and seconds", 195, "3m 15s"},
-		{"exactly an hour", 3600, "1h 0m"},
-		{"hours and minutes", 3700, "1h 1m"},
-		{"just under a day", 86399, "23h 59m"},
-		{"exactly a day", 86400, "1d 0h"},
-		{"days and hours", 180000, "2d 2h"},
-		{"multi-week copy", 1814400, "21d 0h"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, FormatETA(tt.seconds))
-		})
-	}
 }
 
 func TestRowCopyDisplayPercent(t *testing.T) {
@@ -187,6 +163,18 @@ func TestRowCopyFraction(t *testing.T) {
 	assert.InDelta(t, 100, RowCopyFraction(99, 1_100_000, 1_000_000), 0.0001)
 	assert.InDelta(t, 45, RowCopyFraction(45, 0, 0), 0.0001)
 	assert.InDelta(t, 100, RowCopyFraction(145, 0, 0), 0.0001)
+	assert.InDelta(t, 100, RowCopyFraction(100, 1, 200_000), 0.0001, "a copy the engine finished short of its total is done")
+}
+
+// A copy covers the rows it copied, clamped to its total, or the whole total
+// once the engine reports it finished short of the total.
+func TestCopyCoveredRows(t *testing.T) {
+	assert.Equal(t, int64(50_000), CopyCoveredRows(25, 50_000, 200_000))
+	assert.Equal(t, int64(200_000), CopyCoveredRows(100, 1, 200_000))
+	assert.Equal(t, int64(200_000), CopyCoveredRows(100, 0, 200_000))
+	assert.Equal(t, int64(200_000), CopyCoveredRows(100, 250_000, 200_000))
+	assert.Equal(t, int64(0), CopyCoveredRows(0, 0, 200_000))
+	assert.Equal(t, int64(0), CopyCoveredRows(100, 0, 0))
 }
 
 func TestFormatRowCopyPercent(t *testing.T) {
@@ -206,8 +194,14 @@ func TestFormatRowCopyPercent(t *testing.T) {
 	// Capped at 99.99% while copied rows still trail the total: "100.00%"
 	// reads as done, and a copy in its final stretch is not.
 	assert.Equal(t, "99.99%", FormatRowCopyPercent(99, 999_999_999, 1_000_000_000))
-	assert.Equal(t, "99.99%", FormatRowCopyPercent(100, 43_234_523_344, 43_234_523_345))
+	assert.Equal(t, "99.99%", FormatRowCopyPercent(99, 43_234_523_344, 43_234_523_345))
 	assert.Equal(t, "99.99%", FormatRowCopyPercent(99, 99_999, 100_000))
+
+	// An engine reports 100 short of the total only when it declares the copy
+	// finished, as when the copy skipped rows, so the copy reads as done.
+	assert.Equal(t, "100.00%", FormatRowCopyPercent(100, 43_234_523_344, 43_234_523_345))
+	assert.Equal(t, "100.00%", FormatRowCopyPercent(100, 1, 200_000))
+	assert.Equal(t, "100.00%", FormatRowCopyPercent(100, 0, 200_000))
 
 	// Without row counts, the engine's whole-number percent renders clamped;
 	// a copy that has begun with no total falls back to "<1%".

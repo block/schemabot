@@ -4,7 +4,6 @@ package api
 
 import (
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,7 +46,7 @@ func TestOperator_UnclaimableParentReleasesOperationLease(t *testing.T) {
 	require.NotNil(t, peerApply, "the peer must hold the parent apply lease for the scenario")
 
 	svc := newMatrixService(t, stor, map[string]tern.Client{})
-	svc.recoverApplyOperation(ctx, 1, "blocked-driver")
+	svc.recoverApplyOperation(ctx, 1, "blocked-driver", passPolled)
 
 	opID := seed.opID("region-a")
 	op, err := stor.ApplyOperations().Get(ctx, opID)
@@ -55,13 +54,13 @@ func TestOperator_UnclaimableParentReleasesOperationLease(t *testing.T) {
 	require.NotNil(t, op)
 	assert.Empty(t, op.LeaseOwner, "the blocked driver must release the operation lease it cannot use")
 	assert.Empty(t, op.LeaseToken, "the released operation must carry no lease token")
-	assert.Equal(t, state.ApplyOperation.Running, op.State,
-		"the claimed operation keeps its state; the release only surrenders the lease")
-	assert.True(t, op.UpdatedAt.Before(time.Now().Add(-storage.ApplyLeaseStaleAfter/2)),
-		"the released operation's heartbeat must be backdated past the staleness window")
+	assert.Equal(t, state.ApplyOperation.Pending, op.State,
+		"handback restores a first claim the driver never dispatched")
+	assert.Nil(t, op.StartedAt)
 
 	reclaimed, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "retry-driver")
 	require.NoError(t, err)
 	require.NotNil(t, reclaimed, "the released operation must be re-claimable on the next poll")
 	assert.Equal(t, opID, reclaimed.ID)
+	assert.True(t, reclaimed.StartsAttempt, "the first dispatch can still emit operation.started")
 }

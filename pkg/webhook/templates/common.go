@@ -6,9 +6,9 @@ import (
 	"regexp"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -71,6 +71,25 @@ type SupportChannelData struct {
 // currentTimestamp returns the current UTC time formatted for PR comments.
 func currentTimestamp() string {
 	return TimestampFunc()
+}
+
+// renderedTimestampPattern matches the timestamps templates stamp into comment
+// bodies at render time: the "2006-01-02 15:04:05 UTC" display form (TimestampFunc,
+// startedAtDisplay) and the RFC3339 form inside <relative-time> datetime
+// attributes. CommentContentKey collapses both so renders that differ only in
+// when they happened compare equal.
+var renderedTimestampPattern = regexp.MustCompile(`\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?: UTC|Z)`)
+
+// CommentContentKey returns a comparison key for a rendered comment body: the
+// body with every rendered timestamp collapsed to a placeholder. The "Last
+// updated" footer and attribution lines re-stamp the render time on every
+// render, so byte comparison of raw bodies always differs; equal content keys
+// mean an edit would change nothing else the reader can see. Values that must
+// keep updating between otherwise-identical renders — such as the revert-window
+// countdown — are durations, not timestamps, so they stay in the key and their
+// comments keep being edited.
+func CommentContentKey(body string) string {
+	return renderedTimestampPattern.ReplaceAllString(body, "<timestamp>")
 }
 
 // supportChannelOfferMarker flags a rendered comment as reporting a problem
@@ -184,7 +203,7 @@ func inlineCodeStatement(text string) string {
 // pathological engine error cannot flood the comment. Genuine engine errors,
 // such as a Spirit preflight check reason, are a few hundred characters and
 // render intact; anything longer is clamped with a truncation marker.
-const maxCommentErrorLen = 500
+const maxCommentErrorLen = presentation.MaxErrorLen
 
 // maxCommentVSchemaDiffLen bounds the VSchema diffs rendered into one comment
 // — a budget shared across every keyspace's diff, not granted per diff — so
@@ -223,72 +242,6 @@ func writeVSchemaDiffFence(sb *strings.Builder, diff string, budget int) {
 	}
 }
 
-var (
-	// dsnFragmentRe matches Go MySQL driver DSN fragments such as
-	// user:pass@tcp(host:3306)/db, which leak credentials and endpoints.
-	dsnFragmentRe = regexp.MustCompile(`\S*@tcp\([^)]*\)\S*`)
-	// absolutePathRe deliberately matches only absolute paths with at least
-	// two components. Relative paths and Go import paths remain useful in
-	// errors and do not reveal host filesystem layout.
-	absolutePathRe = regexp.MustCompile("(^|[[:space:]\\(\\\"'`=,:\\[])/[A-Za-z0-9._~+-]+(?:/[A-Za-z0-9._~+-]+)+")
-	// lookupHostRe matches the hostname in net.DNSError text. The "on"
-	// alternative is anchored on the resolver endpoint that follows the
-	// hostname — an IP or host:port, which later passes redact — so prose
-	// uses of "lookup … on …" are never matched.
-	lookupHostRe = regexp.MustCompile(`\b(lookup[[:space:]]+)[A-Za-z0-9][A-Za-z0-9.-]*([[:space:]]+on[[:space:]]+(?:\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z0-9][A-Za-z0-9.-]*):[0-9]{1,5}\b|:[[:space:]]+no such host)`)
-	// libpqPasswordRe matches a password value in keyword/value connection
-	// fragments. Unlike the other parameters, the value is bounded only by
-	// whitespace (and a backtick, so backtick-quoted connection fragments
-	// stay balanced): a secret may legally contain the delimiters the
-	// parameter pattern stops at, and a credential must be over-redacted
-	// rather than leave part of the secret behind.
-	libpqPasswordRe = regexp.MustCompile("\\bpassword=[^[:space:]`]*")
-	// libpqParameterRe matches identifying values in keyword/value connection
-	// fragments while preserving the parameter name for diagnostic context.
-	libpqParameterRe = regexp.MustCompile("\\b(user|database|dbname|host)=([^[:space:],;:`]+)(?::[0-9]+)?")
-	// mysqlUserHostRe matches the MySQL account form 'user'@'host', which
-	// names both a role and its origin host; the quoting is distinctive
-	// enough to redact wherever it appears.
-	mysqlUserHostRe = regexp.MustCompile(`'[^']*'@'[^']*'`)
-	// mysqlErrorLineRe scopes quoted-identity redaction to MySQL server
-	// error lines, mirroring the SQLSTATE scoping on the PostgreSQL side so
-	// ordinary application errors can still quote a database name.
-	mysqlErrorLineRe = regexp.MustCompile(`[^\n]*\bError [0-9]+ \([0-9A-Z]{5}\)[^\n]*`)
-	mysqlIdentityRe  = regexp.MustCompile(`\b(database|user)[[:space:]]+'[^']*'`)
-	// urlUserinfoRe matches credentials between a URL scheme and endpoint.
-	urlUserinfoRe = regexp.MustCompile(`\b([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]]+@`)
-	// postgresSQLSTATELineRe scopes quoted identity redaction to PostgreSQL
-	// server errors, so ordinary application errors can still name a database.
-	postgresSQLSTATELineRe = regexp.MustCompile(`[^\n]*\(SQLSTATE[[:space:]]+[0-9A-Z]{5}\)`)
-	postgresIdentityRe     = regexp.MustCompile(`\b(user|database|dbname|host)[[:space:]]+"[^"]*"`)
-	// hostPortRe matches hostnames carrying an explicit port: dotted names
-	// such as db.internal.example.com:3306 and single-label service names
-	// such as mysql-primary:3306, which are common in dial errors. Requiring
-	// the port avoids matching schema-qualified identifiers like db.table;
-	// the single-label form additionally requires a leading letter and a
-	// multi-digit port so line:column references and similar numeric pairs
-	// are not redacted.
-	hostPortRe = regexp.MustCompile(`\b(?:(?:[A-Za-z0-9][A-Za-z0-9-]*\.)+[A-Za-z0-9][A-Za-z0-9-]*:\d{1,5}|[A-Za-z][A-Za-z0-9-]*:\d{2,5})\b`)
-	// contextualHostnameRe matches any dotted hostname after connection words,
-	// where the surrounding text disambiguates it from a Go symbol or prose.
-	contextualHostnameRe = regexp.MustCompile(`\b((?:connect(?:ion)? to|dial(?: tcp)?)[[:space:]]+)(?:[A-Za-z0-9][A-Za-z0-9-]*\.)+[A-Za-z0-9][A-Za-z0-9-]*\b`)
-	// infrastructureHostnameRe matches port-less names carrying suffixes used
-	// by private DNS and managed database endpoints. Restricting the suffixes
-	// avoids treating ordinary dotted words and Go symbols as hostnames.
-	infrastructureHostnameRe = regexp.MustCompile(`\b(?:[A-Za-z0-9][A-Za-z0-9-]*\.)+(?:internal|rds\.amazonaws\.com)\b`)
-	// ipEndpointRe matches IPv4 addresses with an optional port.
-	ipEndpointRe = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b`)
-	// ansiEscapeRe matches ANSI terminal escape sequences (colors, cursor
-	// movement) that some tools embed in their error output.
-	ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
-)
-
-// grpcStatusPrefixRe matches the "rpc error: code = X desc = " text a gRPC
-// status adds to an error from a remote data plane. The code is transport
-// detail for operators, not something a PR author acts on, and the message
-// after it is the engine's own.
-var grpcStatusPrefixRe = regexp.MustCompile(`rpc error: code = [A-Za-z]+ desc = `)
-
 // sanitizeCommentError makes an untrusted engine or task error safe to render
 // in a public PR comment: it normalizes line endings, strips control and
 // format characters (including bidi overrides usable for visual spoofing),
@@ -297,21 +250,7 @@ var grpcStatusPrefixRe = regexp.MustCompile(`rpc error: code = [A-Za-z]+ desc = 
 // whitespace, and clamps the length by rune count. The raw error remains
 // available server-side in the apply logs, so nothing is lost for triage.
 func sanitizeCommentError(msg string) string {
-	return sanitizeCommentErrorWithin(msg, maxCommentErrorLen)
-}
-
-// sanitizeCommentErrorWithin is sanitizeCommentError with its own rune bound.
-func sanitizeCommentErrorWithin(msg string, limit int) string {
-	msg = strings.ReplaceAll(msg, "\r\n", "\n")
-	msg = strings.ReplaceAll(msg, "\r", "\n")
-	msg = stripControlText(msg)
-	msg = grpcStatusPrefixRe.ReplaceAllString(msg, "")
-	msg = redactConnectionDetails(msg)
-	msg = strings.TrimSpace(msg)
-	if runes := []rune(msg); len(runes) > limit {
-		msg = trimPartialRedactionMarker(string(runes[:limit-1])) + "…"
-	}
-	return msg
+	return presentation.RedactError(msg, maxCommentErrorLen)
 }
 
 // RedactedReason redacts a person's reason, such as a freeze's, as an error
@@ -320,75 +259,11 @@ func sanitizeCommentErrorWithin(msg string, limit int) string {
 // redacts each reason before it counts it; the sanitizer the whole detail goes
 // through then has nothing left to lengthen.
 func RedactedReason(reason string, limit int) string {
-	reason = strings.TrimSpace(redactConnectionDetails(stripControlText(reason)))
+	reason = strings.TrimSpace(presentation.RedactConnectionDetails(presentation.StripControlText(reason)))
 	if runes := []rune(reason); len(runes) > limit {
-		reason = strings.TrimSpace(trimPartialRedactionMarker(string(runes[:limit-1]))) + "…"
+		reason = strings.TrimSpace(presentation.TrimPartialRedactionMarker(string(runes[:limit-1]))) + "…"
 	}
 	return reason
-}
-
-// redactionMarker is the placeholder every redaction pass substitutes for
-// sensitive text.
-const redactionMarker = "[endpoint redacted]"
-
-// trimPartialRedactionMarker removes an incomplete redaction marker left
-// dangling at the end of a clamped message, so truncation can never turn a
-// redaction back into text that looks like a partially leaked value.
-func trimPartialRedactionMarker(msg string) string {
-	i := strings.LastIndexByte(msg, '[')
-	if i < 0 {
-		return msg
-	}
-	tail := msg[i:]
-	if len(tail) < len(redactionMarker) && strings.HasPrefix(redactionMarker, tail) {
-		return msg[:i]
-	}
-	return msg
-}
-
-func redactConnectionDetails(msg string) string {
-	msg = dsnFragmentRe.ReplaceAllString(msg, "[endpoint redacted]")
-	msg = urlUserinfoRe.ReplaceAllString(msg, "${1}[endpoint redacted]@")
-	msg = absolutePathRe.ReplaceAllString(msg, "${1}[endpoint redacted]")
-	msg = lookupHostRe.ReplaceAllString(msg, "${1}[endpoint redacted]${2}")
-	msg = libpqPasswordRe.ReplaceAllString(msg, "password=[endpoint redacted]")
-	msg = libpqParameterRe.ReplaceAllString(msg, "${1}=[endpoint redacted]")
-	msg = postgresSQLSTATELineRe.ReplaceAllStringFunc(msg, func(line string) string {
-		return postgresIdentityRe.ReplaceAllString(line, `${1} "[endpoint redacted]"`)
-	})
-	msg = mysqlUserHostRe.ReplaceAllString(msg, "[endpoint redacted]")
-	msg = mysqlErrorLineRe.ReplaceAllStringFunc(msg, func(line string) string {
-		return mysqlIdentityRe.ReplaceAllString(line, "${1} '[endpoint redacted]'")
-	})
-	msg = hostPortRe.ReplaceAllString(msg, "[endpoint redacted]")
-	msg = contextualHostnameRe.ReplaceAllString(msg, "${1}[endpoint redacted]")
-	msg = infrastructureHostnameRe.ReplaceAllString(msg, "[endpoint redacted]")
-	msg = ipEndpointRe.ReplaceAllString(msg, "[endpoint redacted]")
-	return msg
-}
-
-// stripControlText removes ANSI escape sequences and control and format
-// characters (including bidi overrides usable for visual spoofing) from
-// untrusted text, keeping newlines and tabs.
-func stripControlText(msg string) string {
-	msg = ansiEscapeRe.ReplaceAllString(msg, "")
-	return strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\t' {
-			return r
-		}
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-			return -1
-		}
-		return r
-	}, msg)
-}
-
-// SanitizeInlineError makes an untrusted error safe for a single-line Markdown
-// context — a list item or an inline "— …" suffix: full comment sanitization
-// plus collapsing whitespace runs (including line breaks) so the message
-// cannot escape the enclosing Markdown line.
-func SanitizeInlineError(msg string) string {
-	return strings.Join(strings.Fields(sanitizeCommentError(msg)), " ")
 }
 
 // maxCellErrorLen clamps an error rendered inside a Markdown table cell so a
@@ -402,7 +277,7 @@ const maxCellErrorLen = 255
 // before the call site's HTML escaping, so entity expansion can render wider
 // than the clamp; the clamp is a layout mitigation, not a hard boundary.
 func sanitizeCellError(msg string) string {
-	msg = strings.ReplaceAll(SanitizeInlineError(msg), "|", "/")
+	msg = strings.ReplaceAll(presentation.InlineError(msg), "|", "/")
 	if runes := []rune(msg); len(runes) > maxCellErrorLen {
 		msg = string(runes[:maxCellErrorLen-1]) + "…"
 	}
@@ -488,15 +363,26 @@ func writeAttributionLineAt(sb *strings.Builder, verb, user, timestamp, suffix s
 	}
 }
 
-func writeLastUpdatedFooter(sb *strings.Builder, timestamp string) {
+// writeLastUpdatedFooter writes the "Last updated" footer. A positive
+// updateCadence adds how soon a change reaches the comment, so a reader of a
+// long apply whose comment refreshes less often reads an old timestamp as "no
+// change since then" rather than as SchemaBot going quiet. The note promises
+// latency, not a refresh rate: a comment whose content has not changed is not
+// re-edited on every interval.
+func writeLastUpdatedFooter(sb *strings.Builder, timestamp string, updateCadence time.Duration) {
 	if !strings.HasSuffix(sb.String(), "\n") {
 		sb.WriteString("\n")
 	}
+	cadenceNote := ""
+	if updateCadence > 0 {
+		cadenceNote = " · changes show within ~" + ui.FormatHumanDuration(updateCadence)
+	}
 	escapedTimestamp := html.EscapeString(timestamp)
-	fmt.Fprintf(sb, "\n_Last updated: <relative-time datetime=\"%s\">%s</relative-time> (%s)_\n",
+	fmt.Fprintf(sb, "\n_Last updated: <relative-time datetime=\"%s\">%s</relative-time> (%s)%s_\n",
 		escapeRelativeTimeDatetime(timestamp),
 		escapedTimestamp,
-		escapedTimestamp)
+		escapedTimestamp,
+		cadenceNote)
 }
 
 func escapeRelativeTimeDatetime(timestamp string) string {

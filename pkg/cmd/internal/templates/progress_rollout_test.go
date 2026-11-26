@@ -149,10 +149,10 @@ func TestWriteProgress_ThreeTargetRolloutIsOneSection(t *testing.T) {
 	assert.NotContains(t, out, "(3 targets)", "the header already counts the targets, so the section does not repeat them:\n%s", out)
 	assert.Equal(t, 1, strings.Count(out, "ADD COLUMN `region`"), "the shared change's DDL is shown once:\n%s", out)
 	assert.Contains(t, out, "46%", "the bar is the table's progress across all three targets")
-	assert.Contains(t, out, "Rows: 1,400 / 2,000 across 2 of 3 targets · ETA: ≥ 2m 0s")
+	assert.Contains(t, out, "Rows: 1,400 / 2,000 across 2 of 3 targets · ETA: ≥ 2m")
 	assert.Contains(t, out, "• Targets: 3 (1 copying, 1 queued, 1 complete)\n"+
 		"           ✓ payments-001: 1,000 rows\n"+
-		"           ◉ payments-002: 40.00% · 400 / 1,000 rows · ETA: 2m 0s\n"+
+		"           ◉ payments-002: 40.00% · 400 / 1,000 rows · ETA: 2m\n"+
 		"           ○ payments-003: queued\n")
 	assert.NotContains(t, out, "have not reported progress yet", "the queued target is listed rather than counted apart")
 	assert.NotContains(t, out, "prod/payments-001 —", "a rolled-up target has no section of its own")
@@ -176,7 +176,7 @@ func TestWriteProgress_TargetRollupRowsCarryTheTableSize(t *testing.T) {
 
 	total := int64(4_000_000_000)
 	assert.Contains(t, out, "orders: "+ui.ProgressBarRowCopy(85)+" 85.50%\n", "%s", out)
-	assert.Contains(t, out, "Rows: 3,420 / 4,000"+ui.FormatTableSizeClause(&total)+" · ETA: 2m 0s\n", "%s", out)
+	assert.Contains(t, out, "Rows: 3,420 / 4,000"+ui.FormatTableSizeClause(&total)+" · ETA: 2m\n", "%s", out)
 }
 
 // A rollout no target has reported progress for yet has no table block to
@@ -346,10 +346,10 @@ func TestWriteProgress_SixtyFourTargetRolloutStaysOneScreen(t *testing.T) {
 	assert.NotContains(t, out, "❌ Failed", "a table still copying on 19 targets does not read as failed")
 	assert.Contains(t, out, "• Targets: 64 (1 failed, 19 copying, 4 queued, 40 complete)\n"+
 		"           ✗ payments-041: failed\n"+
-		"           ◉ payments-042: 51.00% · 510 / 1,000 rows · ETA: 2m 0s\n"+
-		"           ◉ payments-043: 52.00% · 520 / 1,000 rows · ETA: 2m 0s\n"+
-		"           ◉ payments-044: 53.00% · 530 / 1,000 rows · ETA: 2m 0s\n"+
-		"           ◉ payments-045: 54.00% · 540 / 1,000 rows · ETA: 2m 0s\n"+
+		"           ◉ payments-042: 51.00% · 510 / 1,000 rows · ETA: 2m\n"+
+		"           ◉ payments-043: 52.00% · 520 / 1,000 rows · ETA: 2m\n"+
+		"           ◉ payments-044: 53.00% · 530 / 1,000 rows · ETA: 2m\n"+
+		"           ◉ payments-045: 54.00% · 540 / 1,000 rows · ETA: 2m\n"+
 		"           ... 15 more copying targets\n",
 		"the failure and the four slowest copiers are named; the rest are counted")
 	assertLess(t, out, "Targets needing attention:", "❌ payments-041 — failed: Error 1062: Duplicate entry 'x' for key 'orders.idx'")
@@ -474,10 +474,10 @@ func TestWriteProgress_TargetRollupSumsTargetsPastRowCopy(t *testing.T) {
 
 	out := renderRollout(t, targetRolloutData([]rolloutTarget{waiting, copyingTarget(200)}))
 	assert.Contains(t, out, "60.00%", "the bar sums every target past the start of its copy:\n%s", out)
-	assert.Contains(t, out, "Rows: 1,200 / 2,000 · ETA: 2m 0s")
+	assert.Contains(t, out, "Rows: 1,200 / 2,000 · ETA: 2m")
 	assert.Contains(t, out, "• Targets: 2 (1 copying, 1 waiting for cutover)\n"+
 		"           ● payments-001: waiting for cutover\n"+
-		"           ◉ payments-002: 20.00% · 200 / 1,000 rows · ETA: 2m 0s\n")
+		"           ◉ payments-002: 20.00% · 200 / 1,000 rows · ETA: 2m\n")
 }
 
 // A four-target rollout part-way through: payments-001 is checksumming,
@@ -499,7 +499,7 @@ func TestWriteProgress_TargetRollupListsTargetsInRolloutOrder(t *testing.T) {
 	assert.Contains(t, out, "• Targets: 4 (1 copying, 1 waiting for cutover, 1 checksumming, 1 queued)\n"+
 		"           ◉ payments-001: checksumming 40.00% · 400 / 1,000 rows verified\n"+
 		"           ● payments-002: waiting for cutover\n"+
-		"           ◉ payments-003: 50.00% · 500 / 1,000 rows · ETA: 2m 0s\n"+
+		"           ◉ payments-003: 50.00% · 500 / 1,000 rows · ETA: 2m\n"+
 		"           ○ payments-004: queued\n", "%s", out)
 }
 
@@ -770,12 +770,12 @@ func TestFormatTargetRollup_TableCountsItsTargets(t *testing.T) {
 		"one of 64 started": {
 			targets: append([]rolloutTarget{copyingTarget(500)}, repeat(queuedWithRow, 63)...),
 			line:    "~ orders: " + ui.ProgressBarRowCopy(1) + " 1%\n",
-			counts:  "• Rows: 500 / 1,000 across 1 of 64 targets · ETA: ≥ 2m 0s\n       • Targets: 64 (1 copying, 63 queued)\n",
+			counts:  "• Rows: 500 / 1,000 across 1 of 64 targets · ETA: ≥ 2m\n       • Targets: 64 (1 copying, 63 queued)\n",
 		},
 		"one copying beside 63 failed": {
 			targets: append([]rolloutTarget{copyingTarget(500)}, repeat(failed, 63)...),
 			line:    "~ orders: " + ui.ProgressBarRowCopy(1) + " 1%\n",
-			counts:  "• Rows: 500 / 1,000 across 1 of 64 targets · ETA: 2m 0s\n       • Targets: 64 (63 failed, 1 copying)\n",
+			counts:  "• Rows: 500 / 1,000 across 1 of 64 targets · ETA: 2m\n       • Targets: 64 (63 failed, 1 copying)\n",
 		},
 		"63 complete and one queued": {
 			targets: append(repeat(completedTarget(), 63), queuedWithRow),

@@ -554,7 +554,13 @@ older server refuses a request from a newer CLI as an unknown field.
 
 A targeted apply checks for a schema change already in progress on its
 target's deployment, which every target of a `targets:` list shares, and
-refuses to start while one is queued or running there.
+refuses to start while one that has not finished holds it, whether it is
+queued, running, paused, retrying or in its revert window.
+
+`rollback` runs the same check on its database and environment, before it asks
+for confirmation or takes a lock, and gives the same refusal. If the check
+itself cannot run, `apply` and `rollback` both go on, since the server refuses
+a conflicting apply when it is created, and log that the check did not run.
 
 A rollback of a rollout-wide apply is made against the first target the apply
 ran from. If the rollout order changed since, the rollback is refused rather
@@ -602,7 +608,17 @@ work before releasing it. `apply` and `rollback` release a lock they took
 themselves when the schema change was never submitted: the server refused it,
 or you pressed Ctrl-C before it was sent. A server error or a lost connection
 leaves it unknown whether the apply started, so the lock stays held. A lock
-you already held before the command started also stays held. Locks span the
+you already held before the command started also stays held. The release, and
+the one `apply --yield` sends once its apply settles, names the lock the
+command took, so a lock another of your commands started an apply under stays
+held for that apply, and a lock released and taken again since stays with
+whoever holds it now; the command says which happened. Only a started apply
+counts: another of your commands that has found the lock but not yet started
+its apply does not keep it, so wait for that command before you release. A
+server too old to
+name the lock gets no release at all: the command keeps the lock and tells you
+to check `schemabot locks` and run `schemabot unlock` if nothing of yours runs
+under it. Locks span the
 database's environments; forcing one away from its owner is an administrative
 action, not a routine retry.
 See [locks](schema-intelligence.md#check-locks) for the inspection request and
@@ -708,7 +724,7 @@ $ schemabot progress apply-example-73
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
-       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s
+       • Rows: 6,000,000 / 10,000,000 · ETA: 8m
        • ℹ️ Throttled: commit-latency 120ms >= 100ms · backing off while database writes commit slowly
 
   📖 Docs: https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling
@@ -833,7 +849,7 @@ $ schemabot progress apply-example-84
        • Rows: 2,900,000 / 4,000,000 · ETA: 2m 45s
        • Shards: 4 (3 copying, 1 complete)
            ✓ -40: 1,000,000 rows
-           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
+           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m
            ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
            ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
 
@@ -1112,7 +1128,7 @@ Waiting on an operator:
   staging/inventory: A terminal outcome left this check blocking, and the target may not match the pull request.
     apply: apply-example-68 (rolled_back)
     blocking reason: rollback_completed
-    do: Reconcile the target environment. No plan and no new commit clears this on its own.
+    do: Once the apply has settled, change the pull request to match the target. Then comment `schemabot plan -e staging -d inventory` on the pull request. The plan clears this block once the two match, and otherwise lists what still differs.
   staging/shipments: The apply holding this check is stopped, so the gate stays closed.
     apply: apply-example-81 (stopped)
     do: Start the apply or cancel it. It does not settle on its own, and no plan replaces a stopped apply's result.

@@ -47,12 +47,19 @@ Each database in the config gets its own `vttest.LocalCluster` (the same code pa
 
 ### Docker Image
 
-Self-contained all-in-one container (~5s startup):
+Self-contained all-in-one container (~5s startup). The image layers a Linux
+binary onto the pre-built vttestserver image rather than compiling in a build
+stage, so build the binary first: the Dockerfile copies
+`bin/localscale-linux-${TARGETARCH}` and fails on a missing file without it.
 
 ```bash
+CGO_ENABLED=0 GOOS=linux go build -o bin/localscale-linux-$(go env GOARCH) ./cmd/localscale
 docker build -f deploy/local/Dockerfile.localscale -t localscale:latest .
 docker run -p 8080:8080 -v ./config.json:/etc/localscale/config.json localscale:latest
 ```
+
+`make build-localscale-image` runs both build steps for the host's own
+architecture.
 
 Config:
 ```json
@@ -69,16 +76,34 @@ Config:
       }
     }
   },
-  "listen_addr": ":8080"
+  "listen_addr": ":8080",
+  "schema_dir": "/etc/localscale/schema"
 }
+```
+
+`schema_dir` is optional and seeds the clusters at startup. It holds one
+directory per keyspace, in the [layout below](#schema-directory-layout), and
+each keyspace is seeded into every configured database that declares it — a
+directory naming a keyspace no database declares is logged and seeds nothing.
+Seeding runs before the server reports healthy, and any failure exits the
+binary rather than leave a half-seeded cluster behind.
+
+Mount it alongside the config:
+
+```bash
+docker run -p 8080:8080 \
+  -v ./config.json:/etc/localscale/config.json \
+  -v ./schema:/etc/localscale/schema \
+  localscale:latest
 ```
 
 ### Testcontainers (Go)
 
 #### Schema directory layout
 
-Create a `testdata/schema/` directory with one subdirectory per keyspace. Each keyspace
-can contain `.sql` files (DDL) and an optional `vschema.json`:
+The same layout serves the container's `schema_dir` and the testcontainers
+`SchemaDir` below. One subdirectory per keyspace, each holding any number of
+`.sql` files and an optional `vschema.json`:
 
 ```
 testdata/schema/
@@ -89,6 +114,12 @@ testdata/schema/
     products.sql        # CREATE TABLE products (...)
     vschema.json        # {"sharded": true, "vindexes": {...}, "tables": {...}}
 ```
+
+Each `.sql` file is submitted as a single statement. A file holding two of them
+fails the seed rather than being split on semicolons, which is what the
+real-parser rule exists to prevent — give each table its own file. Files are
+read in name order, so a schema whose statements depend on each other can fix
+their order by naming them.
 
 #### TestMain setup
 

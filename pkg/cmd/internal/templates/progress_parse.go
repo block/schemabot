@@ -39,6 +39,10 @@ type ProgressData struct {
 	// renders as one change, the way its PR comments do, however many shard
 	// and finalizer rows it has.
 	Sharded bool
+	// MaxOperationsAtOnce is how many of the apply's operations the server
+	// runs at once, stated beside a running rollout's counts. Zero when the
+	// server does not say.
+	MaxOperationsAtOnce int
 	// StoppedByFreeze names the freeze that stopped the apply, nil when an
 	// operator stopped it or it is not stopped.
 	StoppedByFreeze *apitypes.FreezeStopRef
@@ -105,9 +109,9 @@ type TableProgress struct {
 	// the table is queued and before the engine reports RowsTotal. Nil when
 	// the plan had no estimate.
 	EstimatedRows *int64
-	// RowsTotalPlanned marks a RowsTotal rolled up across targets that
-	// includes the plan's estimate for targets that have not reported their
-	// copy yet, so the total renders as approximate.
+	// RowsTotalPlanned marks a RowsTotal that includes the plan's estimate
+	// for the targets, or a sharded table's shards, that have not reported
+	// their copy yet, so the total renders as approximate.
 	RowsTotalPlanned bool
 	// PlannedShards is how many shards a sharded table's change spans per its
 	// plan, the shards EstimatedBytes covers. Zero when the plan recorded none.
@@ -193,6 +197,8 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		Released:       result.Released,
 		Sharded:        result.Sharded,
 
+		MaxOperationsAtOnce: result.MaxOperationsAtOnce,
+
 		StoppedByFreeze: result.StoppedByFreeze,
 	}
 	if step, err := apitypes.ParseProgressStep(result.Metadata); err != nil {
@@ -254,6 +260,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			Status:              state.NormalizeTaskStatus(tbl.Status),
 			RowsCopied:          tbl.RowsCopied,
 			RowsTotal:           tbl.RowsTotal,
+			RowsTotalPlanned:    tbl.RowsTotalPlanned,
 			EstimatedBytes:      tbl.EstimatedBytes,
 			EstimatedRows:       tbl.EstimatedRows,
 			PlannedShards:       int(tbl.PlannedShards),
@@ -265,6 +272,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			ThrottleReason:      ui.TerminalSafe(tbl.ThrottleReason),
 			IsInstant:           tbl.IsInstant,
 		}
+		copies := make([]presentation.ShardCopy, 0, len(tbl.Shards))
 		for _, sh := range tbl.Shards {
 			pct := int(sh.PercentComplete)
 			if pct == 0 && sh.RowsTotal > 0 {
@@ -287,11 +295,16 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 				ChecksumRowsTotal:   sh.ChecksumRowsTotal,
 				CopiesNoRows:        sh.CopiesNoRows,
 			})
-			// Table-level ETA: the table's own estimate (MySQL/Spirit), or
-			// the slowest shard's for a sharded (Vitess) table.
-			if sh.ETASeconds > tp.ETASeconds {
-				tp.ETASeconds = sh.ETASeconds
-			}
+			copies = append(copies, presentation.ShardCopy{RowsCopied: sh.RowsCopied, RowsTotal: sh.RowsTotal, ETASeconds: sh.ETASeconds})
+		}
+		if tp.ETASeconds == 0 {
+			// The server reports a sharded table's ETA when it has one, which
+			// the PR comment shows too. Without it, the table's ETA is the
+			// slowest shard's, as the server reads it. The response carries
+			// no per-shard throttle, but the server reports an ETA whenever a
+			// shard does, so this reading never has a throttled shard to
+			// leave out.
+			tp.ETASeconds = presentation.ShardedTableETA(copies)
 		}
 		tp.BuildWork = tableBuildWork(data.BuildWork, workByOperation, len(result.Operations), tbl)
 		data.Tables = append(data.Tables, tp)
@@ -311,21 +324,49 @@ func tableBuildWork(applyWork apitypes.BuildWork, byOperation map[presentation.O
 	return byOperation[presentation.OperationRef{Deployment: tbl.Deployment, OperationKey: tbl.OperationKey}]
 }
 
-// firstOperationError returns the error of the first operation, in resolved
-// order, that failed with one, or "" when none did. A shard's error names the
-// shard, as the PR comment's first-failure line does, since the apply shows
-// no section per shard to say where it failed.
+// firstOperationError names the first failure among a sharded apply's
+// operations, or returns "" when none failed: a failed shard first, then a
+// failed keyspace finalize, then any other failed operation's error. It names
+// the shard or keyspace, as the PR comment's failure callout does, since the
+// apply shows no section per operation to say where it failed.
 func firstOperationError(ops []ProgressOperation) string {
+	// Shard failures come first and a finalizer's after them, the order the
+	// PR comment's failure callout names them in.
 	for _, op := range ops {
-		if !state.IsState(op.State, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable) || op.ErrorMessage == "" {
+		if !isOperationFailure(op) {
 			continue
 		}
 		if _, shard, _, ok := state.ShardWorkKey(op.OperationKey); ok {
+			if op.ErrorMessage == "" {
+				return "shard " + shard + " failed"
+			}
 			return "shard " + shard + ": " + op.ErrorMessage
 		}
-		return op.ErrorMessage
+	}
+	for _, op := range ops {
+		if !isOperationFailure(op) {
+			continue
+		}
+		if keyspace, ok := state.NamespaceFinalizerKey(op.OperationKey); ok {
+			// The finalize error need not name its keyspace, so the line does.
+			if op.ErrorMessage == "" {
+				return "finalizing keyspace " + keyspace + " failed"
+			}
+			return "finalizing keyspace " + keyspace + ": " + op.ErrorMessage
+		}
+	}
+	for _, op := range ops {
+		if isOperationFailure(op) && op.ErrorMessage != "" {
+			return op.ErrorMessage
+		}
 	}
 	return ""
+}
+
+// isOperationFailure reports whether an operation failed or is retrying a
+// failure.
+func isOperationFailure(op ProgressOperation) bool {
+	return state.IsState(op.State, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable)
 }
 
 // progressOperationRef maps the API's reference to an operation of the apply

@@ -182,7 +182,7 @@ func TestLogEmitter_EmitTableStateChange(t *testing.T) {
 			status:     state.Apply.Recovering,
 			pct:        42,
 			wantMsg:    "Row copy in progress during restart recovery",
-			wantFields: []string{"table=users", "progress=42.00%", "rows=420/1,000", "eta=\"2m 0s\""},
+			wantFields: []string{"table=users", "progress=42.00%", "rows=420/1,000", "eta=2m"},
 		},
 		{
 			name:       "cutting over",
@@ -282,12 +282,12 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 		assert.Contains(t, plain, "eta=")
 	})
 
-	t.Run("rows override an overshooting whole-number percent", func(t *testing.T) {
+	t.Run("rows set the percent below the engine's whole-number percent", func(t *testing.T) {
 		e := &logEmitter{}
 		ts := &tableLogState{}
 		tbl := &apitypes.TableProgressResponse{
 			TableName:       "orders",
-			PercentComplete: 105,
+			PercentComplete: 96,
 			RowsCopied:      221000,
 			RowsTotal:       230000,
 		}

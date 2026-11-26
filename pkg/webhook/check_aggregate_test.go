@@ -1,6 +1,8 @@
 package webhook
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/checkstate"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -145,7 +148,7 @@ func TestAggregateSummary(t *testing.T) {
 		{DatabaseName: "users", DatabaseType: "vitess", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, ChangeSummary: "1 drop · 2 vschema updates"},
 	}
 
-	title, summary := aggregateSummary(checks, checkConclusionActionRequired, nil, nil)
+	title, summary := aggregateSummary(checks, checkConclusionActionRequired, nil, nil, "")
 
 	assert.Contains(t, title, "1 apply pending")
 	// The rows span staging and production, so the global aggregate table adds an
@@ -199,7 +202,7 @@ func TestAggregateSummary_WithParticipants(t *testing.T) {
 		{DatabaseType: aggregateSentinel, DatabaseName: "tenant-c", Environment: "production", Status: checkStatusInProgress},
 	}
 
-	_, summary := aggregateSummary(checks, checkConclusionActionRequired, nil, nil)
+	_, summary := aggregateSummary(checks, checkConclusionActionRequired, nil, nil, "")
 
 	dbSection, tenantSection, found := strings.Cut(summary, "**Tenant deployments**")
 	require.True(t, found, "summary has a Tenant deployments section")
@@ -239,7 +242,7 @@ func TestAggregateSummary_TenantApplyTitles(t *testing.T) {
 			tenantPending("tenant-b"),
 			tenantPending("tenant-c"),
 		}
-		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil, nil)
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil, nil, "")
 		assert.Equal(t, "3 tenant applies pending", title)
 	})
 
@@ -248,7 +251,7 @@ func TestAggregateSummary_TenantApplyTitles(t *testing.T) {
 			tenantPending("tenant-a"),
 			{DatabaseType: aggregateSentinel, DatabaseName: "tenant-b", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
 		}
-		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil, nil)
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil, nil, "")
 		assert.Equal(t, "1 tenant apply pending", title)
 	})
 
@@ -257,7 +260,7 @@ func TestAggregateSummary_TenantApplyTitles(t *testing.T) {
 			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, ChangeSummary: "1 alter"},
 			tenantPending("tenant-a"),
 		}
-		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil, nil)
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil, nil, "")
 		assert.Equal(t, "2 applies pending (1 tenant)", title)
 	})
 
@@ -271,7 +274,7 @@ func TestAggregateSummary_TenantApplyTitles(t *testing.T) {
 			tenantPending("tenant-a"),
 			unresolvedRow,
 		}
-		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil, nil)
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil, nil, "")
 		assert.Equal(t, "1 apply pending, 1 participant has not reported", title)
 	})
 
@@ -286,7 +289,7 @@ func TestAggregateSummary_TenantApplyTitles(t *testing.T) {
 			unresolvedB,
 			unresolvedC,
 		}
-		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil, nil)
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil, nil, "")
 		assert.Equal(t, "2 applies pending, 2 participants have not reported", title)
 	})
 }
@@ -316,13 +319,13 @@ func TestAggregateFold_StoppedApplies(t *testing.T) {
 	}
 	failedUsers := &storage.Check{
 		DatabaseName: "users", DatabaseType: "mysql", Environment: "production",
-		Status: checkStatusCompleted, Conclusion: checkConclusionFailure, HasChanges: true,
+		ApplyID: 34, Status: checkStatusCompleted, Conclusion: checkConclusionFailure, HasChanges: true,
 	}
 	stopped := stoppedApplyIDs{22: true, 33: true}
 
 	fold := func(checks ...*storage.Check) (conclusion, status, title, summary string) {
 		conclusion, status = computeAggregate(checks, stopped)
-		title, summary = aggregateSummary(checks, conclusion, stopped, nil)
+		title, summary = aggregateSummary(checks, conclusion, stopped, nil, "")
 		return conclusion, status, title, summary
 	}
 
@@ -354,6 +357,21 @@ func TestAggregateFold_StoppedApplies(t *testing.T) {
 		assert.Equal(t, "Apply failed", title)
 	})
 
+	// The stopped row is waiting on an operator, not failed, so the only
+	// failure is the plan: the title names it and the table still lists the
+	// stopped apply.
+	t.Run("a failed plan beside a stopped apply", func(t *testing.T) {
+		failedPlan := &storage.Check{
+			DatabaseName: "users", DatabaseType: "mysql", Environment: "production",
+			Status: checkStatusCompleted, Conclusion: checkConclusionFailure,
+		}
+		conclusion, status, title, summary := fold(stoppedLedger, failedPlan)
+		assert.Equal(t, checkStatusCompleted, status)
+		assert.Equal(t, checkConclusionFailure, conclusion)
+		assert.Equal(t, "Plan failed", title)
+		assert.Contains(t, summary, "ledger", "the table still lists the stopped apply")
+	})
+
 	t.Run("a stopped apply alongside one still running", func(t *testing.T) {
 		conclusion, status, title, _ := fold(running, stoppedLedger)
 		assert.Equal(t, checkStatusInProgress, status)
@@ -379,7 +397,7 @@ func TestAggregateFold_StoppedApplies(t *testing.T) {
 	t.Run("unknown apply states keep the aggregate in progress", func(t *testing.T) {
 		checks := []*storage.Check{stoppedOrders, stoppedLedger}
 		conclusion, status := computeAggregate(checks, nil)
-		title, _ := aggregateSummary(checks, conclusion, nil, nil)
+		title, _ := aggregateSummary(checks, conclusion, nil, nil, "")
 		assert.Equal(t, checkStatusInProgress, status)
 		assert.Empty(t, conclusion)
 		assert.Equal(t, "Apply in progress", title)
@@ -432,12 +450,39 @@ func TestAggregateSummary_TenantSectionSurvivesDatabaseTruncation(t *testing.T) 
 		Status: checkStatusInProgress,
 	})
 
-	_, summary := aggregateSummary(checks, checkStatusInProgress, nil, nil)
+	_, summary := aggregateSummary(checks, checkStatusInProgress, nil, nil, "")
 
 	assert.Less(t, len(summary), maxCheckRunTextLength, "summary stays under the Check Run limit")
 	assert.Contains(t, summary, "more check(s)", "the Database section truncates")
 	assert.Contains(t, summary, "**Tenant deployments**", "the tenant section is not dropped")
 	assert.Contains(t, summary, "`tenant-b`", "the participant still appears despite database truncation")
+}
+
+// A failed rollout across thousands of databases still fits the Check Run:
+// the remedy is bounded and the table makes room for it, so GitHub accepts the
+// publish and the failure is shown rather than the older blocking run.
+func TestAggregateSummary_FailedApplyRemedySurvivesDatabaseTruncation(t *testing.T) {
+	var checks []*storage.Check
+	for i := range 6000 {
+		checks = append(checks, &storage.Check{
+			DatabaseType: "mysql", DatabaseName: fmt.Sprintf("orders_%04d", i), Environment: "production",
+			ApplyID: int64(i + 1), Status: checkStatusCompleted, Conclusion: checkConclusionFailure,
+		})
+	}
+
+	_, summary := aggregateSummary(checks, checkConclusionFailure, nil, nil, "payments")
+
+	assert.Less(t, len(summary), maxCheckRunTextLength, "summary stays under the Check Run limit")
+	assert.Contains(t, summary, "more check(s)", "the Database section truncates")
+	assert.Contains(t, summary, "**To clear this:** Once the apply has settled", "the remedy is not dropped")
+	assert.Contains(t, summary, "`schemabot plan -e production -d orders_0000 --tenant payments`")
+	assert.Regexp(t, `Plan the other \d+ failed databases in the table the same way\.\n$`, summary)
+}
+
+func TestOtherFailedDatabasesCountsWhatTheRemedyLeftOut(t *testing.T) {
+	assert.Empty(t, otherFailedDatabases(0))
+	assert.Equal(t, " Plan the other failed database in the table the same way.", otherFailedDatabases(1))
+	assert.Equal(t, " Plan the other 2 failed databases in the table the same way.", otherFailedDatabases(2))
 }
 
 func TestAggregateSummary_AllSuccess(t *testing.T) {
@@ -446,7 +491,7 @@ func TestAggregateSummary_AllSuccess(t *testing.T) {
 		{DatabaseName: "orders", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true},
 	}
 
-	title, _ := aggregateSummary(checks, checkConclusionSuccess, nil, nil)
+	title, _ := aggregateSummary(checks, checkConclusionSuccess, nil, nil, "")
 	assert.Equal(t, "All applies complete", title)
 }
 
@@ -456,7 +501,7 @@ func TestAggregateSummary_AllUpToDate(t *testing.T) {
 		{DatabaseName: "users", DatabaseType: "mysql", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
 	}
 
-	title, summary := aggregateSummary(checks, checkConclusionSuccess, nil, nil)
+	title, summary := aggregateSummary(checks, checkConclusionSuccess, nil, nil, "")
 
 	assert.Equal(t, "Schema up to date", title)
 	assert.Contains(t, summary, "| Database | Type | Change | Status |")
@@ -558,6 +603,31 @@ func TestNormalizeStaleContributions(t *testing.T) {
 		assert.Equal(t, checkStatusInProgress, status)
 	})
 
+	t.Run("a failed apply's row on another commit folds as the failure", func(t *testing.T) {
+		checks := []*storage.Check{
+			{HeadSHA: "previous", Environment: "staging", DatabaseName: "orders", ApplyID: 7, Status: checkStatusCompleted, Conclusion: checkConclusionFailure},
+		}
+		contributions, staleCount := normalizeStaleContributions(checks, "current")
+		require.Len(t, contributions, 1)
+		assert.Zero(t, staleCount)
+		assert.Equal(t, checkStatusCompleted, contributions[0].Status)
+		assert.Equal(t, checkConclusionFailure, contributions[0].Conclusion)
+		conclusion, status := computeAggregate(contributions, nil)
+		assert.Equal(t, checkConclusionFailure, conclusion)
+		assert.Equal(t, checkStatusCompleted, status)
+	})
+
+	t.Run("a successful apply's row on another commit stays a placeholder", func(t *testing.T) {
+		checks := []*storage.Check{
+			{HeadSHA: "previous", Environment: "staging", DatabaseName: "orders", ApplyID: 7, Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+		}
+		contributions, staleCount := normalizeStaleContributions(checks, "current")
+		require.Len(t, contributions, 1)
+		assert.Equal(t, 1, staleCount)
+		assert.Equal(t, checkStatusInProgress, contributions[0].Status)
+		assert.Empty(t, contributions[0].Conclusion)
+	})
+
 	t.Run("normalization copies rows so stored state is untouched", func(t *testing.T) {
 		original := &storage.Check{HeadSHA: "previous", DatabaseName: "orders", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess}
 		contributions, staleCount := normalizeStaleContributions([]*storage.Check{original}, "current")
@@ -565,6 +635,71 @@ func TestNormalizeStaleContributions(t *testing.T) {
 		assert.Equal(t, 1, staleCount)
 		assert.Equal(t, checkStatusCompleted, original.Status)
 		assert.Equal(t, checkConclusionSuccess, original.Conclusion)
+	})
+}
+
+func TestAggregateSummary_FailedApplyNamesThePlanThatClearsIt(t *testing.T) {
+	checks := []*storage.Check{
+		{Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders", ApplyID: 7, Status: checkStatusCompleted, Conclusion: checkConclusionFailure},
+		{Environment: "production", DatabaseType: "mysql", DatabaseName: "orders", ApplyID: 8, Status: checkStatusCompleted, Conclusion: checkConclusionFailure},
+		{Environment: "staging", DatabaseType: "mysql", DatabaseName: "users", ApplyID: 9, Status: checkStatusCompleted, Conclusion: checkConclusionFailure},
+	}
+	title, summary := aggregateSummary(checks, checkConclusionFailure, nil, nil, "")
+	assert.Equal(t, "Apply failed", title)
+	assert.True(t, strings.HasSuffix(summary, "\n**To clear this:** Once the apply has settled, make the pull request and the target agree: "+
+		"apply the change again, or change the pull request to match the target. "+
+		"Then comment `schemabot plan -e production -d orders` and `schemabot plan -e staging -d orders` and `schemabot plan -e staging -d users` on the pull request. "+
+		"The plan clears this block once the two match, and otherwise lists what still differs.\n"), summary)
+
+	t.Run("each database's plan is named once", func(t *testing.T) {
+		repeated := []*storage.Check{
+			{Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders", ApplyID: 7, Status: checkStatusCompleted, Conclusion: checkConclusionFailure},
+			{Environment: "staging", DatabaseType: "vitess", DatabaseName: "orders", ApplyID: 8, Status: checkStatusCompleted, Conclusion: checkConclusionFailure},
+		}
+		_, summary := aggregateSummary(repeated, checkConclusionFailure, nil, nil, "")
+		assert.Contains(t, summary, "Then comment `schemabot plan -e staging -d orders` on the pull request.")
+	})
+
+	t.Run("a tenanted deployment's plan carries its tenant", func(t *testing.T) {
+		_, summary := aggregateSummary(checks[:1], checkConclusionFailure, nil, nil, "payments")
+		assert.Contains(t, summary, "Then comment `schemabot plan -e staging -d orders --tenant payments` on the pull request.")
+	})
+
+	t.Run("the Check Run and checks show name the same plan", func(t *testing.T) {
+		row := checks[0]
+		_, summary := aggregateSummary([]*storage.Check{row}, checkConclusionFailure, nil, nil, "payments")
+		shown := checkstate.Diagnose(row, "", nil, "", "payments")
+		assert.Contains(t, summary, "**To clear this:** "+shown.Remedy+"\n")
+	})
+
+	t.Run("a database the pull request no longer changes is not offered a reapply", func(t *testing.T) {
+		removed := []*storage.Check{
+			{Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders", ApplyID: 7, Status: checkStatusCompleted, Conclusion: checkConclusionFailure,
+				BlockingReason: storage.SchemaRemovedAfterApplyStartedBlockingReason},
+		}
+		_, summary := aggregateSummary(removed, checkConclusionFailure, nil, nil, "")
+		assert.Contains(t, summary, "**To clear this:** "+checkstate.MatchTargetRemedy("schemabot plan -e staging -d orders")+"\n")
+		assert.NotContains(t, summary, "apply the change again")
+		assert.NotContains(t, summary, "rollback")
+	})
+
+	t.Run("one rolled-back database keeps the rollup from offering a reapply", func(t *testing.T) {
+		mixed := []*storage.Check{
+			checks[0],
+			{Environment: "staging", DatabaseType: "mysql", DatabaseName: "users", ApplyID: 9, Status: checkStatusCompleted, Conclusion: checkConclusionFailure,
+				BlockingReason: checkstate.BlockRollbackCompleted},
+		}
+		_, summary := aggregateSummary(mixed, checkConclusionFailure, nil, nil, "")
+		assert.Contains(t, summary, "**To clear this:** "+checkstate.MatchTargetRemedy("schemabot plan -e staging -d orders", "schemabot plan -e staging -d users")+"\n")
+		assert.NotContains(t, summary, "apply the change again")
+	})
+
+	t.Run("a failed plan names no remedy", func(t *testing.T) {
+		planFailed := []*storage.Check{
+			{Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders", Status: checkStatusCompleted, Conclusion: checkConclusionFailure},
+		}
+		_, summary := aggregateSummary(planFailed, checkConclusionFailure, nil, nil, "")
+		assert.NotContains(t, summary, "To clear this")
 	})
 }
 
@@ -589,5 +724,60 @@ func TestAggregateRequiresRecognizedTerminalSuccess(t *testing.T) {
 	} {
 		conclusion, _ := computeAggregate([]*storage.Check{check}, nil)
 		assert.NotEqual(t, checkConclusionSuccess, conclusion)
+	}
+}
+
+// A failing aggregate names what failed. A plan that failed before any apply
+// ran must not read "Apply failed": the reader would take it to mean their
+// database was changed and broken, when nothing ran against it. Whenever a
+// failed apply is present it names the Check Run, since that is the outcome
+// that touched a database.
+func TestAggregateSummary_FailureTitleNamesWhatFailed(t *testing.T) {
+	failedPlanRow := func(db string) *storage.Check {
+		return &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: db, Status: checkStatusCompleted, Conclusion: checkConclusionFailure}
+	}
+	failedApplyRow := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "ledger", ApplyID: 7, Status: checkStatusCompleted, Conclusion: checkConclusionFailure}
+	pendingRow := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "users", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, HasChanges: true}
+	gatedRow := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "users", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, BlockingReason: "prerequisite"}
+	failedParticipant := &storage.Check{Environment: "staging", DatabaseType: aggregateSentinel, DatabaseName: "tenant-b", Status: checkStatusCompleted, Conclusion: checkConclusionFailure}
+	blockedPlanRow := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "orders", Status: checkStatusCompleted, Conclusion: checkConclusionFailure, HasChanges: true, ChangeSummary: "1 index drop", PlanRefused: true}
+	unmarkedPlanWithChanges := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "billing", Status: checkStatusCompleted, Conclusion: checkConclusionFailure, HasChanges: true, ChangeSummary: "1 column add"}
+	erroredPlanWithChanges := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "payments", Status: checkStatusCompleted, Conclusion: checkConclusionFailure, HasChanges: true, ChangeSummary: planFailedCheckSummary}
+
+	cases := []struct {
+		name   string
+		checks []*storage.Check
+		want   string
+	}{
+		{"one failed plan", []*storage.Check{failedPlanRow("orders")}, "Plan failed"},
+		{"failed plans beside a pending change", []*storage.Check{failedPlanRow("orders"), failedPlanRow("payments"), pendingRow}, "Plan failed"},
+		{"a failed apply", []*storage.Check{failedApplyRow}, "Apply failed"},
+		{"a failed apply outranks a failed plan", []*storage.Check{failedPlanRow("orders"), failedApplyRow}, "Apply failed"},
+		{"a gated change beside a failed plan", []*storage.Check{failedPlanRow("orders"), gatedRow}, "Apply failed"},
+		{"a failed participant beside a failed plan", []*storage.Check{failedPlanRow("orders"), failedParticipant}, "Apply failed"},
+		{"a plan that names a change it refuses to run", []*storage.Check{blockedPlanRow}, "Plan blocked"},
+		{"a blocked plan beside a pending change", []*storage.Check{blockedPlanRow, pendingRow}, "Plan blocked"},
+		{"a plan error outranks a blocked plan", []*storage.Check{blockedPlanRow, failedPlanRow("payments")}, "Plan failed"},
+		{"a plan with errors and changes is a failed plan", []*storage.Check{erroredPlanWithChanges}, "Plan failed"},
+		{"a failing plan not stored as refused is a failed plan", []*storage.Check{unmarkedPlanWithChanges}, "Plan failed"},
+		{"a failed apply outranks a blocked plan", []*storage.Check{blockedPlanRow, failedApplyRow}, "Apply failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conclusion, status := computeAggregate(tc.checks, nil)
+			require.Equal(t, checkStatusCompleted, status)
+			require.Equal(t, checkConclusionFailure, conclusion)
+			title, summary := aggregateSummary(tc.checks, conclusion, nil, nil, "")
+			assert.Equal(t, tc.want, title)
+			if tc.want == "Plan failed" || tc.want == "Plan blocked" {
+				assert.NotContains(t, summary, "To clear this", "a plan that did not run names no apply remedy")
+			}
+			if slices.Contains(tc.checks, blockedPlanRow) {
+				assert.Contains(t, summary, "| `orders` | postgres | 1 index drop | Blocked |", "the row says the plan is blocked, as the title does")
+				assert.Contains(t, summary, blockedPlanRemedyText, "a blocked plan says how to clear it")
+			} else {
+				assert.NotContains(t, summary, blockedPlanRemedyText)
+			}
+		})
 	}
 }

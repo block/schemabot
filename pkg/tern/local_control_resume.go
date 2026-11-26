@@ -160,7 +160,7 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 		return nil, 0, 0, fmt.Errorf("schema change is not stopped (current state: %s)", apply.State)
 	}
 
-	var startedCount, skippedCount int64
+	var startedCount, skippedCount, queuedCount int64
 	var unresumable []string
 	for _, task := range tasks {
 		if task.ApplyID != apply.ID {
@@ -170,6 +170,16 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 			// Settled by an earlier drive: the table needs no resuming, and the
 			// count is what tells the operator how much of the change is done.
 			skippedCount++
+			continue
+		}
+		if state.IsState(task.State, state.Task.Pending) {
+			// Queued behind the apply's concurrency limit when the stop landed.
+			// It was never started, so there is nothing to resume, and the
+			// resumed drive starts it in turn. That is the expected shape of a
+			// stopped apply with more work than it runs at once, so it is
+			// counted and logged once below rather than warned about per task.
+			unresumable = append(unresumable, task.State)
+			queuedCount++
 			continue
 		}
 		if !state.IsState(task.State, state.Task.Stopped) {
@@ -188,7 +198,8 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 		return nil, 0, 0, c.noResumableWorkError(apply, len(tasks), skippedCount, unresumable)
 	}
 	c.logger.Info("Start: resolved resumable work",
-		append(apply.LogAttrs(), "started_count", startedCount, "skipped_count", skippedCount)...)
+		append(apply.LogAttrs(), "started_count", startedCount, "skipped_count", skippedCount,
+			"queued_count", queuedCount)...)
 	return apply, startedCount, skippedCount, nil
 }
 
@@ -321,6 +332,7 @@ func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Ap
 	if err != nil {
 		return nil, fmt.Errorf("build deferred deploy request for task %s: %w", applyTasks[0].TaskIdentifier, err)
 	}
+	c.observeOperationDispatch(ctx)
 	result, err := eng.Start(withDriveWorkOwner(ctx), controlReq)
 	if err != nil {
 		return nil, fmt.Errorf("start deferred deploy: %w", err)
@@ -454,6 +466,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 
 	var failedTask *storage.Task
 	var stoppedByUser bool
+	var haltedBySibling, loggedSiblingFailureAtCutover bool
 	planMetadata := c.newPlanMetadataCache(apply)
 
 	for i, task := range tasks {
@@ -463,6 +476,20 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			return nil
 		} else if standDown {
 			stoppedByUser = true
+			break
+		}
+		if standDown, err := c.cancelForFailedSibling(ctx, logger, c.getEngine(), apply, tasks, firstTaskMidCutover, &loggedSiblingFailureAtCutover); err != nil {
+			if errors.Is(err, ErrTaskVerdictRefused) {
+				// Some tasks recorded cancelled and some did not. The error
+				// keeps the operation row claimable instead of deriving it
+				// from the partly settled tasks.
+				return err
+			}
+			logger.Warn("halting this operation behind a failed sibling failed; current apply owner will exit for operator retry",
+				"error", err)
+			return nil
+		} else if standDown {
+			haltedBySibling = true
 			break
 		}
 
@@ -596,6 +623,27 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			stoppedByUser = true
 			break
 		}
+		if action == taskHaltedBySibling {
+			if err := c.cancelTasksQueuedBehindSiblingFailure(ctx, apply, tasks); err != nil {
+				if errors.Is(err, ErrTaskVerdictRefused) {
+					return err
+				}
+				logger.Warn("cancelling the tasks queued behind a failed sibling failed; current apply owner will exit for operator retry",
+					"error", err)
+				return nil
+			}
+			haltedBySibling = true
+			break
+		}
+	}
+
+	if haltedBySibling {
+		// Only an operation-scoped drive is halted by a sibling, and its
+		// outcome is its tasks: the rollout projection derives the operation
+		// row and the apply from them, so there is nothing here to finalize.
+		logger.Info("sequential operation resume cancelled its work behind a failed sibling; the rollout projection settles the apply",
+			"task_count", len(tasks))
+		return nil
 	}
 
 	// Update apply state based on task outcomes
@@ -1957,6 +2005,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 // are loaded scoped to the operation rather than the whole apply, so a driver
 // can advance one deployment independently of its siblings.
 func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	ctx = withChangeDispatchApply(ctx, apply)
 	if err := c.guardDriveScope(apply); err != nil {
 		return err
 	}
@@ -2031,6 +2080,7 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 // operation, so an empty result fails closed the same way ResumeApplyOperation
 // does rather than failing the whole parent apply.
 func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	ctx = withChangeDispatchApply(ctx, apply)
 	if apply == nil {
 		return fmt.Errorf("stored apply is required to drive apply_operation %d cutover", applyOperationID)
 	}
@@ -2657,12 +2707,14 @@ func finalizerVSchemaApplied(s engine.State) bool {
 // returns the last one, which is not a permanent error: the caller pauses the
 // finalizer for a retry instead of polling an engine that does not answer.
 // The operator does not watch a finalizer for a stalled drive, since it has no
-// task rows to mirror, so this budget is what bounds the drive.
+// task rows to mirror, so this budget is what bounds the drive. The wait
+// between polls grows while they fail (progressPollWait), so a provider that
+// throttles the drive is not polled through the budget in a few seconds.
 func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.Engine, apply *storage.Apply, creds *engine.Credentials, resumeState *engine.ResumeState, persistResume func(*engine.ResumeState)) (engine.State, error) {
-	ticker := time.NewTicker(c.taskPollInterval())
-	defer ticker.Stop()
 	consecutiveErrors := 0
+	var nextPollWait time.Duration
 	for {
+		tickStart := time.Now()
 		res, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 			Database:    apply.Database,
 			Credentials: creds,
@@ -2674,13 +2726,15 @@ func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.E
 				return "", fmt.Errorf("group_finalizer progress poll failed permanently: %w", err)
 			}
 			consecutiveErrors++
+			nextPollWait = c.progressPollWait(consecutiveErrors)
 			c.logger.Warn("group_finalizer: transient progress error",
-				append(apply.LogAttrs(), "error", err, "consecutive_errors", consecutiveErrors)...)
+				append(apply.LogAttrs(), "error", err, "consecutive_errors", consecutiveErrors, "next_poll_in", nextPollWait)...)
 			if consecutiveErrors >= maxConsecutiveProgressPollErrors {
 				return "", fmt.Errorf("group_finalizer progress poll failed after %d consecutive errors: %w", consecutiveErrors, err)
 			}
 		} else {
 			consecutiveErrors = 0
+			nextPollWait = c.progressPollWait(0)
 			if res.ResumeState != nil {
 				persistResume(res.ResumeState)
 				resumeState = res.ResumeState
@@ -2692,7 +2746,7 @@ func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.E
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-ticker.C:
+		case <-time.After(max(0, nextPollWait-time.Since(tickStart))):
 		}
 	}
 }
@@ -3296,6 +3350,10 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 	}
 	if suppressParentApplyWrites(ctx) {
 		return nil
+	}
+	if _, operationDrive := storage.OperationLeaseFromContext(ctx); operationDrive &&
+		ctx.Err() == nil && state.IsState(apply.State, state.Apply.Failed) {
+		return fmt.Errorf("%w: %w", ErrGroupedResumeFailureCommitted, err)
 	}
 	return err
 }

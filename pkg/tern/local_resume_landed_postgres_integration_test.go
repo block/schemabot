@@ -24,7 +24,8 @@ import (
 
 // This scenario plans and applies through LocalClient while the target schema
 // has a quoted physical name. The engine receives that physical name, while
-// the durable task keeps the canonical namespace used by the repository.
+// the durable task keeps the canonical namespace used by the repository, along
+// with the table's plan-time row count and size.
 func TestLocalClientPostgresSchemaOverridePlanAndApply(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -41,8 +42,15 @@ func TestLocalClientPostgresSchemaOverridePlanAndApply(t *testing.T) {
 	targetDSN, targetDB := testutil.StartPostgres(t, database)
 	_, err := targetDB.ExecContext(t.Context(), "CREATE SCHEMA "+pgx.Identifier{physical}.Sanitize())
 	require.NoError(t, err)
-	_, err = targetDB.ExecContext(t.Context(), "CREATE TABLE "+pgx.Identifier{physical, "users"}.Sanitize()+" (id bigint PRIMARY KEY)")
+	users := pgx.Identifier{physical, "users"}.Sanitize()
+	_, err = targetDB.ExecContext(t.Context(), "CREATE TABLE "+users+" (id bigint PRIMARY KEY)")
 	require.NoError(t, err)
+	_, err = targetDB.ExecContext(t.Context(), "INSERT INTO "+users+" SELECT pg_catalog.generate_series(1, 1000)")
+	require.NoError(t, err)
+	_, err = targetDB.ExecContext(t.Context(), "ANALYZE "+users)
+	require.NoError(t, err)
+	var usersBytes int64
+	require.NoError(t, targetDB.QueryRowContext(t.Context(), "SELECT pg_catalog.pg_total_relation_size($1::regclass)", users).Scan(&usersBytes))
 
 	stor := createStorage(t, storageDSN)
 	defer utils.CloseAndLog(stor)
@@ -66,6 +74,10 @@ func TestLocalClientPostgresSchemaOverridePlanAndApply(t *testing.T) {
 	require.Len(t, plan.Changes, 1)
 	assert.Equal(t, canonical, plan.Changes[0].Namespace)
 	require.Len(t, plan.Changes[0].TableChanges, 1)
+	// The engine sizes the table under its physical schema name, and the
+	// plan carries that size under the canonical namespace.
+	assert.Equal(t, new(int64(1000)), plan.Changes[0].TableChanges[0].EstimatedRows)
+	assert.Equal(t, &usersBytes, plan.Changes[0].TableChanges[0].EstimatedBytes)
 
 	applyResponse, err := client.Apply(t.Context(), &ternv1.ApplyRequest{
 		PlanId:      plan.PlanId,
@@ -82,6 +94,10 @@ func TestLocalClientPostgresSchemaOverridePlanAndApply(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, tasks, 1)
 	assert.Equal(t, canonical, tasks[0].Namespace)
+	// The stored task is what the CLI and the PR comment render the table's
+	// size from, so both surfaces show it for this PostgreSQL apply.
+	assert.Equal(t, new(int64(1000)), tasks[0].EstimatedRows)
+	assert.Equal(t, &usersBytes, tasks[0].EstimatedBytes)
 	assert.True(t, postgresColumnExists(t, targetDB, physical, "users", "email"))
 }
 
