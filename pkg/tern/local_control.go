@@ -3068,7 +3068,9 @@ func (c *LocalClient) loadStoredEngineResumeState(ctx context.Context, task *sto
 // persists nothing and keys its in-process tracking on it, so a request
 // without it names no work, and the engine answers that nothing runs while
 // the task's build is still running. A grouped drive sends its own context,
-// so a task it drives keeps whatever was persisted.
+// so a task it drives keeps whatever was persisted. Whether the drive groups
+// is read from the cutover decision it acts on, which includes a deferral it
+// makes on its own at a cutover barrier, not only the operator's option.
 func (c *LocalClient) taskEngineResumeState(ctx context.Context, task *storage.Task, purpose string) (*engine.ResumeState, error) {
 	stored, err := c.loadStoredEngineResumeState(ctx, task, purpose)
 	if err != nil {
@@ -3084,12 +3086,65 @@ func (c *LocalClient) taskEngineResumeState(ctx context.Context, task *storage.T
 	if apply == nil {
 		return nil, fmt.Errorf("the apply of task %s does not exist; its engine work cannot be addressed for %s", task.TaskIdentifier, purpose)
 	}
-	if storage.GroupsEngineExecution(apply.DatabaseType, apply.GetOptions().DeferCutover) {
+	deferCutover, err := c.taskDriveDefersCutover(ctx, apply, task)
+	if err != nil {
+		return nil, fmt.Errorf("decide how task %s is driven to address its engine work for %s: %w", task.TaskIdentifier, purpose, err)
+	}
+	if storage.GroupsEngineExecution(apply.DatabaseType, deferCutover) {
 		c.logger.Debug("grouped apply persisted no engine resume state; the engine request goes out without one",
 			append(task.LogAttrs(), "purpose", purpose)...)
 		return nil, nil
 	}
 	return sequentialDriveResumeState(task), nil
+}
+
+// taskDriveDefersCutover reports the cutover decision the drive of task acts
+// on: the operator's --defer-cutover, or the deferral an operation makes on
+// its own when it parks at a cutover barrier (see effectiveCopyDriveOptions).
+func (c *LocalClient) taskDriveDefersCutover(ctx context.Context, apply *storage.Apply, task *storage.Task) (bool, error) {
+	if apply.GetOptions().DeferCutover {
+		return true, nil
+	}
+	if !groupingFollowsCutoverDecision(apply.DatabaseType) {
+		// The engine groups, or never groups, whatever the drive decides
+		// about cutover, so the decision needs no read.
+		return false, nil
+	}
+	if task.ApplyOperationID == nil {
+		// Only an operation parks at a cutover barrier, so a task outside
+		// one runs on the operator's option alone.
+		return false, nil
+	}
+	store := c.storage.ApplyOperations()
+	if store == nil {
+		return false, fmt.Errorf("apply operation store is not configured")
+	}
+	operations, err := store.ListByApply(ctx, apply.ID)
+	if err != nil {
+		return false, fmt.Errorf("list apply operations of apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	operation, err := taskOperation(task, operations)
+	if err != nil {
+		return false, fmt.Errorf("apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return effectiveCopyDriveOptions(apply, len(operations) > 1, operation).DeferCutover, nil
+}
+
+// groupingFollowsCutoverDecision reports whether a drive of databaseType
+// groups its tasks only when it defers cutover.
+func groupingFollowsCutoverDecision(databaseType string) bool {
+	return storage.GroupsEngineExecution(databaseType, true) != storage.GroupsEngineExecution(databaseType, false)
+}
+
+// taskOperation returns the apply operation task names among operations. A
+// task naming an operation the apply does not have is an error.
+func taskOperation(task *storage.Task, operations []*storage.ApplyOperation) (*storage.ApplyOperation, error) {
+	for _, operation := range operations {
+		if operation.ID == *task.ApplyOperationID {
+			return operation, nil
+		}
+	}
+	return nil, fmt.Errorf("task %s names apply operation %d, which the apply does not have", task.TaskIdentifier, *task.ApplyOperationID)
 }
 
 // sequentialDriveResumeState is the resume state a sequential drive sends with

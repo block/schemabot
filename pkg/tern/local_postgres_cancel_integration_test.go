@@ -176,6 +176,12 @@ func TestLocalClientPostgresCancelOfPlainDDLIsDeclined(t *testing.T) {
 		return req != nil && req.Status != storage.ControlRequestPending
 	}, postgresCancelDeadline, 50*time.Millisecond, "the cancel request never settled")
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestFailed)
+	declined, err := stor.ControlRequests().GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, declined)
+	// The request settles through the engine's typed decline, so the operator
+	// is told why the cancel did nothing rather than shown a generic failure.
+	assert.Contains(t, declined.ErrorMessage, "this schema change runs as plain DDL that commits or fails on its own")
 	apply = resolveDispatchedApply(t, stor, result.ApplyId)
 	assert.NotEqual(t, state.Apply.Cancelled, apply.State, "a declined cancel must not record the apply cancelled")
 
