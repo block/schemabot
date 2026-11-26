@@ -358,9 +358,10 @@ func tableChangeSignature(tables []TableProgress) string {
 // matches on DDL as well as table, so a table changed by two statements rolls
 // up once per statement. The change reads as instant only when every target
 // that ran it reports it instant: an engine decides that per target, so one
-// target's instant ALTER says nothing about how another applied it. Once no
-// target is working on the change and one has halted, those rows no longer
-// speak for the table, which renders as its halt (formatHaltedAcrossTargets).
+// target's instant ALTER says nothing about how another applied it. Once a
+// target has halted, its status speaks for the table even while another
+// target is still working on the change, and the table renders as that halt
+// (formatHaltedAcrossTargets) whenever no bar is drawn for it.
 func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProgress, members []int, table TableProgress) TableProgress {
 	rolled := TableProgress{
 		TableName:     table.TableName,
@@ -579,9 +580,10 @@ func stoppedRowsAcrossTargets(targets []ShardProgress) (copied, total int64) {
 }
 
 // isHaltedAcrossTargets reports whether a table rolled up across targets has
-// halted: no target is still working on the change, and one failed, is
-// retrying, was stopped or was cancelled. Its rolled-up rows cover only the
-// targets that finished, so no one bar or percentage speaks for the table.
+// halted: a target failed, is retrying, was stopped or was cancelled, even
+// while another target is still working on the change. Its rolled-up rows
+// cover only the targets that reported them, so no one bar or percentage
+// speaks for the table.
 func isHaltedAcrossTargets(t TableProgress) bool {
 	return t.AcrossTargets && state.IsState(t.Status,
 		state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled)

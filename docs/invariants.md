@@ -1751,9 +1751,10 @@ While a rollout is copying a table on several targets, the table has one reading
 the percent beside its bar, the rows copied of the rows to copy, how many targets those rows cover,
 its planned size, and whether its ETA is a floor. That reading is derived once from the targets'
 progress and rendered by the CLI and the PR comment alike, so the two never disagree about how far
-one rollout has got. The table's state across its targets is likewise derived once, failure first
-(`RollupTaskStatus`), so a table that failed on one target never reads as in flight on one surface
-and failed on the other. *Enforced:* the shared derivation (`SumTargetRows`, `PercentAcrossTargets`,
+one rollout has got. The table's state across its targets is likewise derived once, failure first and otherwise the
+least finished state any target is in (`RollupTaskStatus`), so a table that failed on one target
+never reads as in flight on one surface and failed on the other, and a table never reads further
+along than its slowest target. *Enforced:* the shared derivation (`SumTargetRows`, `PercentAcrossTargets`,
 `AcrossTargetsPercent`, `TargetsTableSizeClause`, and `RollupTaskStatus` in `pkg/presentation`), and
 tests that render the same rollouts through both surfaces and fail when they read differently
 (`TestRolledUpTableReadsTheSameInTheCLIAndThePRComment` and

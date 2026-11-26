@@ -96,13 +96,18 @@ func TestRolledUpTableReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
 // way, failure first: `orders` failed on one target reads as failed on both
 // surfaces however far another target has got, until a target is copying rows
 // whose progress the table's bar shows instead. A table with every other target
-// copying, queued or complete reads as its bar on both (UX-7).
+// copying, queued or complete reads as its bar on both (UX-7). A table still
+// reverting on one target reads as reverting on both, whichever target is
+// listed first.
 func TestRolledUpTableStatusReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
 	const bar = "🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 20%"
 	cases := []struct {
 		name     string
 		targets  []parityTarget
 		headline string
+		// prHeadline is the PR comment's reading where its wording for the
+		// same rolled-up state is not yet the CLI's; empty means it is.
+		prHeadline string
 	}{
 		{
 			name: "running on one target and failed on another, before any rows are known",
@@ -119,6 +124,46 @@ func TestRolledUpTableStatusReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
 				{opState: state.ApplyOperation.Failed, status: state.Task.Failed, copied: 100, total: 1000},
 			},
 			headline: "❌ Failed",
+		},
+		{
+			name: "reverted on one target and still reverting on another",
+			targets: []parityTarget{
+				{opState: state.ApplyOperation.Reverted, status: state.Task.Reverted},
+				{opState: state.ApplyOperation.Reverting, status: state.Task.Reverting},
+			},
+			headline: "🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ↩️ Reverting", prHeadline: "↩️ Reverting",
+		},
+		{
+			name: "still reverting on one target and reverted on another",
+			targets: []parityTarget{
+				{opState: state.ApplyOperation.Reverting, status: state.Task.Reverting},
+				{opState: state.ApplyOperation.Reverted, status: state.Task.Reverted},
+			},
+			headline: "🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ↩️ Reverting", prHeadline: "↩️ Reverting",
+		},
+		{
+			name: "running on one target and stopped on another",
+			targets: []parityTarget{
+				{opState: state.ApplyOperation.Running, status: state.Task.Running},
+				{opState: state.ApplyOperation.Stopped, status: state.Task.Stopped},
+			},
+			headline: "⏹️ Stopped (not started)", prHeadline: "⏹️ Stopped",
+		},
+		{
+			name: "running on one target and cancelled on another",
+			targets: []parityTarget{
+				{opState: state.ApplyOperation.Running, status: state.Task.Running},
+				{opState: state.ApplyOperation.Cancelled, status: state.Task.Cancelled},
+			},
+			headline: "🚫 Cancelled (not started)", prHeadline: "⊘ Cancelled (not started)",
+		},
+		{
+			name: "running on one target and retrying on another",
+			targets: []parityTarget{
+				{opState: state.ApplyOperation.Running, status: state.Task.Running},
+				{opState: state.ApplyOperation.Running, status: state.Task.FailedRetryable},
+			},
+			headline: "Retrying", prHeadline: "🔄 Interrupted — retrying automatically",
 		},
 		{
 			name: "copying on one target and failed on another",
@@ -155,8 +200,12 @@ func TestRolledUpTableStatusReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
 			}
 			cli := tableHeadline(t, renderRollout(t, targetRolloutData(rollout)), cliTableHeadline)
 			pr := tableHeadline(t, renderPRRollout(tc.targets), prTableHeadline)
+			wantPR := tc.headline
+			if tc.prHeadline != "" {
+				wantPR = tc.prHeadline
+			}
 			assert.Equal(t, tc.headline, cli, "CLI table line")
-			assert.Equal(t, tc.headline, pr, "PR comment table line")
+			assert.Equal(t, wantPR, pr, "PR comment table line")
 		})
 	}
 }
