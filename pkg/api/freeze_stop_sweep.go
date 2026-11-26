@@ -141,7 +141,7 @@ func (s *Service) stopApplyForFreeze(ctx context.Context, freeze *storage.Enviro
 	client, current, ternApplyID, err := s.controlTarget(ctx, "stop", apply.ApplyIdentifier, apply.Environment)
 	if err == nil {
 		var resp *apitypes.StopResponse
-		resp, _, err = s.stopApply(ctx, client, current, ternApplyID, current.Environment, caller)
+		resp, _, err = s.stopApply(ctx, client, current, ternApplyID, caller)
 		if err == nil && !resp.Accepted {
 			s.logger.Warn("freeze's stop was not accepted; the apply keeps running", append(attrs, "error_message", resp.ErrorMessage)...)
 			return resp.ErrorMessage, freezeStopNotRecorded

@@ -45,7 +45,9 @@ func releasedForApply(ctx context.Context, stor storage.Storage, apply *storage.
 // api.StoppedByFreeze), nil when none did. operationsAtOnce is how many of the
 // apply's operations the server's drivers run at once, stated beside a
 // sharded or multi-deployment apply's counts; zero leaves it unstated.
-func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, view *shardedPlanView, tenant, cliName string, stoppedByFreeze *apitypes.FreezeStopRef, operationsAtOnce int) string {
+// updateCadence is how soon a change reaches the comment, rendered beside
+// the "Last updated" footer; zero renders no note.
+func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, view *shardedPlanView, tenant, cliName string, stoppedByFreeze *apitypes.FreezeStopRef, operationsAtOnce int, updateCadence time.Duration) string {
 	// A sharded apply fans out across the shards of one or more keyspaces within
 	// a single deployment, so it gets the shard-unit layout rather than the
 	// deployment-unit one — its operations differ by shard, not deployment. One
@@ -55,21 +57,25 @@ func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperatio
 		if rendersAsSingleShard(apply, ops, view) {
 			data := buildSingleShardApplyCommentData(apply, ops, tasks, displayByOp, view, tenant)
 			data.StoppedByFreeze = stoppedByFreeze
+			data.UpdateCadence = updateCadence
 			return templates.RenderApplyStatusComment(data)
 		}
 		data := buildShardedApplyData(apply, ops, released, tasks, view, tenant)
 		data.StoppedByFreeze = stoppedByFreeze
 		data.MaxOperationsAtOnce = operationsAtOnce
+		data.UpdateCadence = updateCadence
 		return templates.RenderShardedApplyComment(data)
 	}
 	if len(ops) <= 1 {
 		data := buildApplyCommentData(apply, tasks, singleOpDisplay(ops, displayByOp), shardsByTable, tenant)
 		data.StoppedByFreeze = stoppedByFreeze
+		data.UpdateCadence = updateCadence
 		return templates.RenderApplyStatusComment(data)
 	}
 	data := buildMultiApplyData(apply, ops, released, tasks, displayByOp, shardsByTable, tenant, cliName)
 	data.StoppedByFreeze = stoppedByFreeze
 	data.Model.OperationsAtOnce = operationsAtOnce
+	data.UpdateCadence = updateCadence
 	return templates.RenderMultiDeploymentApplyComment(data)
 }
 

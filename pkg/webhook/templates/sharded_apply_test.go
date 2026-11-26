@@ -766,6 +766,33 @@ func TestRenderShardedApplyComment_TableCopyProgressBar(t *testing.T) {
 	assert.NotContains(t, out, "62% (", "full coverage carries no headline qualifier")
 }
 
+// A copying table with one shard held back by the throttler keeps the ETA of
+// its slowest unthrottled shard (presentation.ShardedTableETA), and reads as
+// throttled with the engine's reason, the way the CLI reads it, so the
+// operator still sees the held-back shard.
+func TestRenderShardedApplyComment_TableCopyThrottledShard(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "commerce",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "commerce_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "orders", Status: state.Task.Running,
+				RowsCopied: 914707, RowsTotal: 1466232, ETASeconds: 195,
+				ShardsReporting: 2, Throttled: true, ThrottleReason: "replica-lag 5s >= 2s",
+				Shards: []ShardProgressData{
+					{Shard: "-40", Status: state.Task.Running, PercentComplete: 71},
+					{Shard: "80-", Status: state.Task.Running, PercentComplete: 54},
+				},
+			}},
+		}},
+	})
+
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(62)+" 62.38% (throttled)")
+	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s")
+	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s\n- ℹ️ _Throttled: replica-lag 5s >= 2s_\n")
+}
+
 // While later dispatch waves have yet to start, the summed figures cover only
 // the reporting shards; the headline and rows line both name that coverage
 // and the ETA renders as a floor, so a wave's fraction is never passed off as

@@ -1502,11 +1502,14 @@ func PreviewCommentErrorNoConfig() string {
 // PreviewCommentErrorMultiple renders the "multiple databases" error comment.
 func PreviewCommentErrorMultiple() string {
 	return RenderMultipleConfigs(SchemaErrorData{
-		RequestedBy:        previewRequestedBy,
-		Timestamp:          "2026-01-15 14:30:00",
-		Environment:        "staging",
-		CommandName:        action.Plan,
-		AvailableDatabases: "- `testapp` (schema/testapp/schemabot.yaml)\n- `payments` (schema/payments/schemabot.yaml)",
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-01-15 14:30:00",
+		Environment: "staging",
+		CommandName: action.Plan,
+		AvailableConfigs: []AvailableConfigData{
+			{Database: "testapp", SchemaPath: "schema/testapp"},
+			{Database: "payments", SchemaPath: "schema/payments"},
+		},
 	})
 }
 
@@ -2846,7 +2849,9 @@ func PreviewCommentApplyProgress() string {
 	tables[1].PercentComplete = 62
 	tables[1].ETASeconds = 195
 	tables[2].Status = state.Task.Pending
-	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+	data := sampleApplyData(state.Apply.Running, tables)
+	data.UpdateCadence = 5 * time.Second
+	return RenderApplyStatusComment(data)
 }
 
 // PreviewCommentApplySeveralRunning renders an apply comment where two tables

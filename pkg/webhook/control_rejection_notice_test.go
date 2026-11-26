@@ -36,7 +36,7 @@ func TestStatusCommentSurfacesRejectedControlCommands(t *testing.T) {
 			Status:       storage.ControlRequestFailed,
 			RequestedBy:  "octocat",
 			ErrorMessage: "deploy request is outside its revert window",
-		}).formatStatusComment(apply, nil)
+		}).formatStatusComment(apply, nil, 0)
 
 		assert.Contains(t, body, "Command not applied")
 		assert.Contains(t, body, "`revert` was accepted but did not take effect")
@@ -52,7 +52,7 @@ func TestStatusCommentSurfacesRejectedControlCommands(t *testing.T) {
 			Status:       storage.ControlRequestFailed,
 			RequestedBy:  "octocat",
 			ErrorMessage: "the schema change reached Reverted before the skip-revert could take effect",
-		}).formatStatusComment(apply, nil)
+		}).formatStatusComment(apply, nil, 0)
 
 		assert.Contains(t, body, "`skip-revert` was accepted but did not take effect (requested by `octocat`): the schema change reached Reverted before the skip-revert could take effect")
 		assert.NotContains(t, body, "skip_revert")
@@ -67,7 +67,7 @@ func TestStatusCommentSurfacesRejectedControlCommands(t *testing.T) {
 			Status:       storage.ControlRequestFailed,
 			RequestedBy:  "octocat",
 			ErrorMessage: "the engine rejected the volume change",
-		}).formatStatusComment(apply, nil)
+		}).formatStatusComment(apply, nil, 0)
 
 		assert.NotContains(t, body, "Command not applied")
 	})
@@ -76,13 +76,13 @@ func TestStatusCommentSurfacesRejectedControlCommands(t *testing.T) {
 		body := observer(&storage.ApplyControlRequest{
 			Operation: storage.ControlOperationCutover,
 			Status:    storage.ControlRequestCompleted,
-		}).formatStatusComment(apply, nil)
+		}).formatStatusComment(apply, nil, 0)
 
 		assert.NotContains(t, body, "Command not applied")
 	})
 
 	t.Run("no control commands leaves the comment unchanged", func(t *testing.T) {
-		assert.NotContains(t, observer().formatStatusComment(apply, nil), "Command not applied")
+		assert.NotContains(t, observer().formatStatusComment(apply, nil, 0), "Command not applied")
 	})
 
 	// A command that reached this plane without an operator identity — an
@@ -95,7 +95,7 @@ func TestStatusCommentSurfacesRejectedControlCommands(t *testing.T) {
 			Status:       storage.ControlRequestFailed,
 			RequestedBy:  storage.ForwardingControlRequestCaller,
 			ErrorMessage: "no stopped schema change to resume",
-		}).formatStatusComment(apply, nil)
+		}).formatStatusComment(apply, nil, 0)
 
 		assert.Contains(t, body, "`start` was accepted but did not take effect")
 		assert.Contains(t, body, "no stopped schema change to resume")

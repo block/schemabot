@@ -272,6 +272,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			ThrottleReason:      ui.TerminalSafe(tbl.ThrottleReason),
 			IsInstant:           tbl.IsInstant,
 		}
+		copies := make([]presentation.ShardCopy, 0, len(tbl.Shards))
 		for _, sh := range tbl.Shards {
 			pct := int(sh.PercentComplete)
 			if pct == 0 && sh.RowsTotal > 0 {
@@ -294,11 +295,16 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 				ChecksumRowsTotal:   sh.ChecksumRowsTotal,
 				CopiesNoRows:        sh.CopiesNoRows,
 			})
-			// Table-level ETA: the table's own estimate (MySQL/Spirit), or
-			// the slowest shard's for a sharded (Vitess) table.
-			if sh.ETASeconds > tp.ETASeconds {
-				tp.ETASeconds = sh.ETASeconds
-			}
+			copies = append(copies, presentation.ShardCopy{RowsCopied: sh.RowsCopied, RowsTotal: sh.RowsTotal, ETASeconds: sh.ETASeconds})
+		}
+		if tp.ETASeconds == 0 {
+			// The server reports a sharded table's ETA when it has one, which
+			// the PR comment shows too. Without it, the table's ETA is the
+			// slowest shard's, as the server reads it. The response carries
+			// no per-shard throttle, but the server reports an ETA whenever a
+			// shard does, so this reading never has a throttled shard to
+			// leave out.
+			tp.ETASeconds = presentation.ShardedTableETA(copies)
 		}
 		tp.BuildWork = tableBuildWork(data.BuildWork, workByOperation, len(result.Operations), tbl)
 		data.Tables = append(data.Tables, tp)

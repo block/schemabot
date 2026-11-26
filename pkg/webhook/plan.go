@@ -59,14 +59,14 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Fix checks stuck at "in_progress" from crashed applies
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
+		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, planNotStartedMessage("reconcile the stale status checks on this pull request"))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "status check reconciliation failed"})
 		return
 	}
 
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Plan, environment, databaseName, requestedBy); err != nil {
-		h.logger.Error("failed to check whether plan command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, err.Error())
+		h.logger.Error("failed to check whether plan command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "command", action.Plan, "error", err)
+		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, planReconciliationFailureMessage(err, databaseName))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema reconciliation check failed"})
 		return
 	} else if handled {
@@ -110,8 +110,9 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// discovery would return the discovery-time HeadSHA, masking the race.
 	freshPRInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
-		h.logger.Error("failed to fetch PR for stale-schema check", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, "Failed to verify PR HEAD: "+err.Error())
+		h.logger.Error("failed to fetch PR for stale-schema check",
+			"repo", repo, "pr", pr, "environment", environment, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "command", action.Plan, "error", err)
+		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, planHeadVerificationFailedMessage(schemaResult.Database))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "PR fetch failed"})
 		return
 	}
@@ -607,7 +608,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// Fix checks stuck at "in_progress" from crashed applies
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
+		h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, planNotStartedMessage("reconcile the stale status checks on this pull request"))
 		return
 	}
 
@@ -617,8 +618,8 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// configs already discovered from the PR's changed files.
 	if !isAutoPlan {
 		if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Plan, "", databaseName, requestedBy); err != nil {
-			h.logger.Error("failed to check whether plan command needs schema change reconciliation", "repo", repo, "pr", pr, "database", databaseName, "error", err)
-			h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, err.Error())
+			h.logger.Error("failed to check whether plan command needs schema change reconciliation", "repo", repo, "pr", pr, "database", databaseName, "command", action.Plan, "error", err)
+			h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, planReconciliationFailureMessage(err, databaseName))
 			return
 		} else if handled {
 			return
@@ -835,8 +836,8 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 				freshPRInfo, prErr := client.FetchPullRequestNoCache(ctx, repo, pr)
 				if prErr != nil {
 					h.logger.Error("failed to fetch PR for stale-schema check",
-						"repo", repo, "pr", pr, "error", prErr)
-					h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, "Failed to verify PR HEAD: "+prErr.Error())
+						"repo", repo, "pr", pr, "environment", env, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "command", action.Plan, "error", prErr)
+					h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, planHeadVerificationFailedMessage(schemaResult.Database))
 					return
 				}
 				if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, freshPRInfo.HeadSHA, env, requestedBy, action.Plan); rejected {
@@ -1217,9 +1218,20 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 	}
 
 	if errors.Is(err, ghclient.ErrMultipleConfigs) {
-		h.logger.Warn("schema request: multiple configs found", logFields...)
+		var multipleConfigsErr *ghclient.MultipleConfigsError
+		if errors.As(err, &multipleConfigsErr) {
+			for _, candidate := range multipleConfigsErr.Candidates {
+				data.AvailableConfigs = append(data.AvailableConfigs, templates.AvailableConfigData{
+					Database:   candidate.Database,
+					SchemaPath: candidate.SchemaDir,
+				})
+			}
+			h.logger.Warn("schema request: multiple configs found",
+				append(logFields, "databases", multipleConfigsErr.Databases())...)
+		} else {
+			h.logger.Warn("schema request: multiple configs found without candidate details; the comment lists no databases", logFields...)
+		}
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "multiple_configs")
-		data.AvailableDatabases = templates.FormatAvailableDatabases(err.Error())
 		h.postComment(repo, pr, installationID, templates.RenderMultipleConfigs(data))
 		return true
 	}

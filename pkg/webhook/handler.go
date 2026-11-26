@@ -134,6 +134,15 @@ type Handler struct {
 	// (single- and multi-App) unchanged.
 	repoWebhookSecret []byte
 
+	// previousWebhookSecretsByApp and previousRepoWebhookSecret hold the
+	// secrets being rotated out, keyed like webhookSecretsByApp. A delivery
+	// that fails verification against the current secret is accepted when it
+	// verifies against the previous one, so a rotation does not refuse the
+	// deliveries GitHub still signs with the old secret. Empty when no
+	// rotation is in progress.
+	previousWebhookSecretsByApp map[string][]byte
+	previousRepoWebhookSecret   []byte
+
 	// insecureSkipSignatureVerification is the explicit opt-in to accept
 	// unsigned deliveries in single-App mode when no webhook secret is
 	// configured. Set by WithInsecureSkipSignatureVerification.
@@ -229,6 +238,41 @@ func WithRepoWebhookSecret(secret []byte) HandlerOption {
 	return func(h *Handler) {
 		if len(secret) > 0 {
 			h.repoWebhookSecret = secret
+		}
+	}
+}
+
+// WithPreviousWebhookSecrets sets the App webhook secrets being rotated out,
+// keyed by App logical name like the current secrets (defaultAppName in
+// single-App mode). A delivery signed with one of them is accepted alongside
+// one signed with the current secret. Empty entries are ignored.
+func WithPreviousWebhookSecrets(secretsByApp map[string][]byte) HandlerOption {
+	return func(h *Handler) {
+		for name, secret := range secretsByApp {
+			if len(secret) == 0 {
+				continue
+			}
+			if h.previousWebhookSecretsByApp == nil {
+				h.previousWebhookSecretsByApp = make(map[string][]byte, len(secretsByApp))
+			}
+			h.previousWebhookSecretsByApp[name] = secret
+		}
+	}
+}
+
+// WithPreviousWebhookSecret sets the App webhook secret being rotated out in
+// single-App mode. Empty is a no-op.
+func WithPreviousWebhookSecret(secret []byte) HandlerOption {
+	return WithPreviousWebhookSecrets(map[string][]byte{defaultAppName: secret})
+}
+
+// WithPreviousRepoWebhookSecret sets the repo-webhook secret being rotated
+// out. A repository-targeted delivery signed with it is accepted alongside one
+// signed with the current repo-webhook secret. Empty is a no-op.
+func WithPreviousRepoWebhookSecret(secret []byte) HandlerOption {
+	return func(h *Handler) {
+		if len(secret) > 0 {
+			h.previousRepoWebhookSecret = secret
 		}
 	}
 }
@@ -385,6 +429,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 	for _, opt := range opts {
 		opt(h)
 	}
+	h.warnIgnoredPreviousSecrets()
 
 	// Register recovery callback so the operator can attach comment observers
 	// before resuming recovered applies.
@@ -1272,7 +1317,7 @@ func (h *Handler) authenticateWebhook(r *http.Request, body []byte) (appName str
 	// webhook. Falls through to App-webhook handling for "integration"
 	// deliveries so a deployment can run both during the cutover.
 	if h.repoWebhookTargeted(r) {
-		if !verifyHMAC(signature, body, h.repoWebhookSecret) {
+		if !h.verifyRotatingSecret(r, defaultAppName, "previous-repo-webhook-secret", signature, body, h.repoWebhookSecret, h.previousRepoWebhookSecret) {
 			return defaultAppName, 0, "invalid_signature", false
 		}
 		return defaultAppName, 0, "", true
@@ -1301,7 +1346,7 @@ func (h *Handler) authenticateWebhook(r *http.Request, body []byte) (appName str
 		if len(secret) == 0 {
 			return name, parsedID, "missing_webhook_secret", false
 		}
-		if !verifyHMAC(signature, body, secret) {
+		if !h.verifyRotatingSecret(r, name, "previous-webhook-secret", signature, body, secret, h.previousWebhookSecretsByApp[name]) {
 			return name, parsedID, "invalid_signature", false
 		}
 		return name, parsedID, "", true
@@ -1325,10 +1370,48 @@ func (h *Handler) authenticateWebhook(r *http.Request, body []byte) (appName str
 		}
 		return defaultAppName, 0, "", true
 	}
-	if !verifyHMAC(signature, body, secret) {
+	if !h.verifyRotatingSecret(r, defaultAppName, "previous-webhook-secret", signature, body, secret, h.previousWebhookSecretsByApp[defaultAppName]) {
 		return defaultAppName, 0, "invalid_signature", false
 	}
 	return defaultAppName, 0, "", true
+}
+
+// warnIgnoredPreviousSecrets logs each secret being rotated out that the
+// handler will never check, because the current secret it pairs with is not
+// set: verification is then skipped or refused without consulting it, so the
+// rotation setting does nothing. The server refuses to start in that state;
+// this covers a host that builds the handler directly.
+func (h *Handler) warnIgnoredPreviousSecrets() {
+	for name := range h.previousWebhookSecretsByApp {
+		if len(h.webhookSecretsByApp[name]) == 0 {
+			h.logger.Warn("previous webhook secret is ignored because its App has no current webhook secret; set the current webhook secret or remove the previous one",
+				"app_name", name,
+				"config_key", "previous-webhook-secret")
+		}
+	}
+	if len(h.previousRepoWebhookSecret) > 0 && len(h.repoWebhookSecret) == 0 {
+		h.logger.Warn("previous webhook secret is ignored because no current repo-webhook secret is set; set the current repo-webhook secret or remove the previous one",
+			"config_key", "previous-repo-webhook-secret")
+	}
+}
+
+// verifyRotatingSecret verifies a delivery against the current secret and,
+// when a rotation is in progress, against the secret being rotated out. A
+// match on the previous secret is logged, so the operator can see GitHub still
+// signs with it and knows the previous secret cannot be removed yet.
+func (h *Handler) verifyRotatingSecret(r *http.Request, appName, previousKey, signature string, body, current, previous []byte) bool {
+	if verifyHMAC(signature, body, current) {
+		return true
+	}
+	if len(previous) == 0 || !verifyHMAC(signature, body, previous) {
+		return false
+	}
+	h.logger.Info("webhook delivery verified with the secret being rotated out; GitHub still signs with it, so keep it configured until deliveries verify with the new secret",
+		"app_name", appName,
+		"config_key", previousKey,
+		"delivery_id", r.Header.Get(headerDeliveryID),
+		"event", r.Header.Get("X-GitHub-Event"))
+	return true
 }
 
 // verifySignedAppOwnsRepo returns an error when the App that signed the

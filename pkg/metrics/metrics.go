@@ -1329,6 +1329,7 @@ var knownOperatorClaimFailureReasons = map[string]bool{
 	"branch_reconcile_error":                   true,
 	"missing_lease_token":                      true,
 	"operation_storage_error":                  true,
+	"operation_claim_contention_exhausted":     true,
 	"missing_operation_lease_token":            true,
 	"operation_set_list_error":                 true,
 	"operation_set_missing":                    true,
@@ -2248,6 +2249,11 @@ func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo
 //     refused a read the processing needed; the row waits for the quota to
 //     reset and the claim's attempt was refunded. A sustained rate means
 //     plans are outrunning the installation's quota.
+//   - "rate_limit_deferred": GitHub's primary rate limit refused a request
+//     the processing needed, so the installation's hourly budget is spent
+//     (the quota reserve did not keep it back); the row waits for the limit
+//     to reset and the claim's attempt was refunded. Any sustained rate means
+//     the installation is exhausting its quota and check runs are at risk.
 //   - "superseded": the claimed auto-plan delivery was discarded without
 //     processing because a newer covering delivery exists for the same pull
 //     request; the successor performs the work.
@@ -2264,6 +2270,7 @@ var knownWebhookDispatchOutcomes = map[string]bool{
 	"failed_permanent":       true,
 	"retrying":               true,
 	"quota_reserve_deferred": true,
+	"rate_limit_deferred":    true,
 	"superseded":             true,
 	"released":               true,
 	"lease_lost":             true,

@@ -466,23 +466,21 @@ func CheckActiveSchemaChangeOnDeployment(endpoint, database, environment, deploy
 	})
 }
 
-func findActiveSchemaChange(endpoint, database, environment, deployment string, holds func(*apitypes.ActiveApplyResponse) bool) (*ActiveSchemaChange, error) {
-	var result apitypes.StatusResponse
-	query := url.Values{}
-	query.Set("environment", environment)
-	if deployment != "" {
-		query.Set("deployment", deployment)
-	}
-	query.Set("limit", "1000")
-	// Ask only for applies still holding a target. This runs on every apply and
-	// rollback preflight, and the answer never depends on settled history, so
-	// scanning it would make every schema change pay for the environment's whole
-	// past to learn whether one database is busy.
-	query.Set("active", "true")
-	if err := doGetInto(endpoint, "/api/status?"+query.Encode(), &result); err != nil {
-		return nil, err
-	}
+// activeSchemaChangePageSize is how many active applies one preflight request
+// asks for.
+const activeSchemaChangePageSize = 1000
 
+// maxActiveSchemaChangePages bounds how many pages the preflight reads. The list
+// holds every active apply in the environment, across databases, so one page is
+// already far more than any deployment has; reaching the bound means something
+// is wrong, and the preflight says so rather than reporting the database idle.
+const maxActiveSchemaChangePages = 20
+
+// findActiveSchemaChange reads the environment's active applies a page at a
+// time and returns the first that holds the database. It returns nil only when
+// it has read every active apply; when it cannot, it returns an error, since
+// "no active schema change" must never mean "not all of them were seen".
+func findActiveSchemaChange(endpoint, database, environment, deployment string, holds func(*apitypes.ActiveApplyResponse) bool) (*ActiveSchemaChange, error) {
 	// The operator's flags arrive in whatever case they were typed, and on
 	// MySQL a stored row written before storage folded its keys is still
 	// matched by the case-insensitive collation and returned in its original
@@ -493,22 +491,70 @@ func findActiveSchemaChange(endpoint, database, environment, deployment string, 
 	// back into the preflight.
 	database = storage.CanonicalKey(database)
 	environment = storage.CanonicalKey(environment)
-	for _, apply := range result.Applies {
-		if storage.CanonicalKey(apply.Database) != database || storage.CanonicalKey(apply.Environment) != environment {
-			continue
+
+	after := ""
+	for range maxActiveSchemaChangePages {
+		var result apitypes.StatusResponse
+		query := url.Values{}
+		query.Set("environment", environment)
+		// The server canonicalizes the database filter the same way, so this
+		// narrows every page to the one database; the comparison below stays
+		// for a server that ignores the filter.
+		query.Set("database", database)
+		if deployment != "" {
+			query.Set("deployment", deployment)
 		}
-		// The server already excluded terminal states; re-checking here keeps the
-		// answer correct if this ever reads a response that was not filtered.
-		activeState, active := activeStateOf(apply)
-		if !active {
-			continue
+		query.Set("limit", strconv.Itoa(activeSchemaChangePageSize))
+		// Ask only for applies still holding a target. This runs on every apply and
+		// rollback preflight, and the answer never depends on settled history, so
+		// scanning it would make every schema change pay for the environment's whole
+		// past to learn whether one database is busy.
+		query.Set("active", "true")
+		if after != "" {
+			query.Set("starting_after", after)
 		}
-		if !holds(apply) {
-			continue
+		if err := doGetInto(endpoint, "/api/status?"+query.Encode(), &result); err != nil {
+			if after != "" {
+				return nil, fmt.Errorf("fetch the active schema changes after apply %s: %w", after, err)
+			}
+			return nil, err
 		}
-		return &ActiveSchemaChange{State: activeState, ApplyID: apply.ApplyID}, nil
+		// A server that predates paging ignores starting_after and serves its
+		// first page again, so a page that does not echo the anchor is not the
+		// page after it.
+		if after != "" && result.StartingAfter != after {
+			return nil, fmt.Errorf("the server did not continue after apply %s; it predates paging, so the active schema changes cannot all be listed", after)
+		}
+
+		for _, apply := range result.Applies {
+			if storage.CanonicalKey(apply.Database) != database || storage.CanonicalKey(apply.Environment) != environment {
+				continue
+			}
+			// The server already excluded terminal states; re-checking here keeps the
+			// answer correct if this ever reads a response that was not filtered.
+			activeState, active := activeStateOf(apply)
+			if !active {
+				continue
+			}
+			if !holds(apply) {
+				continue
+			}
+			return &ActiveSchemaChange{State: activeState, ApplyID: apply.ApplyID}, nil
+		}
+
+		if !result.HasMore {
+			return nil, nil
+		}
+		if len(result.Applies) == 0 {
+			return nil, fmt.Errorf("the server reports more active schema changes in %s but listed none to continue from", environment)
+		}
+		next := result.Applies[len(result.Applies)-1].ApplyID
+		if next == after {
+			return nil, fmt.Errorf("the server reports more active schema changes in %s but served the page ending at apply %s again", environment, after)
+		}
+		after = next
 	}
-	return nil, nil
+	return nil, fmt.Errorf("there are more than %d active schema changes in %s, so the check for one on %s stopped without reading them all", maxActiveSchemaChangePages*activeSchemaChangePageSize, environment, database)
 }
 
 // activeStateOf reports whether a listed apply still holds its targets, and
