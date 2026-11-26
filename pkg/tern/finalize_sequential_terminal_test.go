@@ -1,6 +1,8 @@
 package tern
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"testing"
 
@@ -60,4 +62,58 @@ func TestFinalizeSequentialApplyDeliversAnApplyAnotherWriterSettled(t *testing.T
 	again := failureLogTestApply(state.Apply.Running, 0)
 	require.NoError(t, client.finalizeSequentialApply(t.Context(), again, []*storage.Task{staleTask}, nil, false))
 	assert.Len(t, observer.deliveries, 1, "a second finalization must not deliver the terminal summary again")
+}
+
+// failingTaskReloadStore fails every task reload.
+type failingTaskReloadStore struct {
+	storage.TaskStore
+}
+
+func (failingTaskReloadStore) GetByApplyID(context.Context, int64) ([]*storage.Task, error) {
+	return nil, errors.New("connection reset by peer")
+}
+
+// The settling writer stored the apply cancelled, but the drive cannot reload
+// the task rows it stored. The drive's own task copies predate that write, so
+// the terminal summary goes out with the stored apply state and no task rows
+// rather than showing a task still running under a cancelled apply. A drive
+// whose own context ended by then hands the apply back and delivers nothing.
+func TestFinalizeSequentialApplyNeverDeliversStaleTaskCopies(t *testing.T) {
+	newClient := func(stored *storage.Apply) *LocalClient {
+		return &LocalClient{
+			config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypePostgres},
+			storage: &controlTestStorage{
+				applies:         &controlTestApplyStore{apply: stored},
+				tasks:           failingTaskReloadStore{},
+				applyLogs:       &capturingApplyLogStore{},
+				controlRequests: &testControlRequestStore{},
+			},
+			logger: slog.Default(),
+		}
+	}
+	staleTask := &storage.Task{ID: 1, TaskIdentifier: "task-1", TableName: "orders", State: state.Task.Running}
+
+	t.Run("a live drive delivers the stored state without task rows", func(t *testing.T) {
+		stored := failureLogTestApply(state.Apply.Cancelled, 0)
+		client := newClient(stored)
+		observer := &terminalDeliveryObserver{}
+		client.SetObserver(stored.ID, observer)
+
+		require.NoError(t, client.finalizeSequentialApply(t.Context(), failureLogTestApply(state.Apply.Running, 0),
+			[]*storage.Task{staleTask}, nil, false))
+		assert.Equal(t, [][]string{{state.Apply.Cancelled}}, observer.deliveries)
+	})
+
+	t.Run("a cancelled drive hands the apply back", func(t *testing.T) {
+		stored := failureLogTestApply(state.Apply.Cancelled, 0)
+		client := newClient(stored)
+		observer := &terminalDeliveryObserver{}
+		client.SetObserver(stored.ID, observer)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		require.NoError(t, client.finalizeSequentialApply(ctx, failureLogTestApply(state.Apply.Running, 0),
+			[]*storage.Task{staleTask}, nil, false))
+		assert.Empty(t, observer.deliveries)
+	})
 }

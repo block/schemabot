@@ -1052,7 +1052,8 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		return nil, fmt.Errorf("cancel schema change on database %s: %w", c.config.Database, err)
 	}
 	if applyID > 0 && cancelledCount > 0 {
-		if opLease, operationScoped := operationLeaseOnlyDrive(ctx); operationScoped {
+		opLease, operationScoped := operationLeaseOnlyDrive(ctx)
+		if operationScoped {
 			c.leaveApplyRowToProjection(targetApply, opLease, state.Task.Cancelled)
 		} else if err := c.markApplyCancelled(ctx, applyID); err != nil {
 			return nil, err
@@ -1063,8 +1064,8 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		}
 		c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			eventMsg, "", "")
-		if _, operationScoped := operationLeaseOnlyDrive(ctx); !operationScoped {
-			c.notifyTerminalAfterCancel(ctx, applyID)
+		if !operationScoped {
+			c.notifyTerminalAfterCancel(ctx, applyID, targetApply)
 		}
 	}
 	if cancelledCount == 0 && skippedCount == 0 {
@@ -2964,21 +2965,21 @@ func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context,
 // already terminal; the summary-marker claim keeps the two exactly-once. When
 // the reload fails the apply stays terminal and summary reconciliation posts
 // what this could not.
-func (c *LocalClient) notifyTerminalAfterCancel(ctx context.Context, applyID int64) {
+func (c *LocalClient) notifyTerminalAfterCancel(ctx context.Context, applyID int64, target *storage.Apply) {
 	if c.getObserver(applyID) == nil {
 		c.logger.Debug("cancel settled an apply this process holds no observer for; the drive that holds it delivers the terminal summary",
-			"database", c.config.Database)
+			c.cancelTargetLogAttrs(target)...)
 		return
 	}
 	apply, err := c.storage.Applies().Get(ctx, applyID)
 	if err != nil {
 		c.logger.Warn("cancel settled the apply but could not reload it to post the terminal summary; summary reconciliation posts it",
-			"database", c.config.Database, "error", err)
+			append(c.cancelTargetLogAttrs(target), "error", err)...)
 		return
 	}
 	if apply == nil {
 		c.logger.Warn("cancel settled an apply that could not be found on reload; no terminal summary is posted",
-			"database", c.config.Database)
+			c.cancelTargetLogAttrs(target)...)
 		return
 	}
 	if !state.IsState(apply.State, state.Apply.Cancelled) {
@@ -2993,6 +2994,15 @@ func (c *LocalClient) notifyTerminalAfterCancel(ctx context.Context, applyID int
 		tasks = nil
 	}
 	c.notifyTerminalObserver(apply, tasks)
+}
+
+// cancelTargetLogAttrs returns the triage attributes of the apply a cancel
+// resolved, or the database alone when it resolved none.
+func (c *LocalClient) cancelTargetLogAttrs(target *storage.Apply) []any {
+	if target == nil {
+		return []any{"database", c.config.Database}
+	}
+	return target.LogAttrs()
 }
 
 // capitalizeControlVerb upper-cases the first letter of a control verb for use

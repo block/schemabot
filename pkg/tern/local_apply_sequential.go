@@ -2030,9 +2030,14 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		// task rows that writer stored.
 		storedTasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
 		if err != nil {
-			logger.Warn("could not reload tasks for the terminal summary of an apply another writer settled; notifying with this drive's copies",
+			if c.driveCancelled(ctx, apply, "before reloading tasks for the terminal summary of an apply another writer settled") {
+				return nil
+			}
+			// This drive's task copies predate the settling write, so the
+			// summary goes out without task rows rather than with stale ones.
+			logger.Warn("could not reload tasks for the terminal summary of an apply another writer settled; notifying without them",
 				"error", err)
-			storedTasks = tasks
+			storedTasks = nil
 		}
 		c.notifyTerminalObserver(apply, storedTasks)
 		return nil
