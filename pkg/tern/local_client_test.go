@@ -924,6 +924,13 @@ func (s *exactProgressApplyOperationStore) ListByApply(context.Context, int64) (
 	return s.ops, nil
 }
 
+func (s *exactProgressApplyOperationStore) FailedSiblingHaltingOperation(_ context.Context, applyID, operationID int64) (*storage.ApplyOperation, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return failedSiblingHaltingIn(s.ops, applyID, operationID), nil
+}
+
 func (s *exactProgressApplyOperationStore) SaveEngineResumeState(_ context.Context, operationID int64, resumeState *storage.EngineResumeState) error {
 	if s.saveErr != nil {
 		return s.saveErr

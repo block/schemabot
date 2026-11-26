@@ -455,6 +455,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 
 	var failedTask *storage.Task
 	var stoppedByUser bool
+	var haltedBySibling, loggedSiblingFailureAtCutover bool
 	planMetadata := c.newPlanMetadataCache(apply)
 
 	for i, task := range tasks {
@@ -464,6 +465,20 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			return nil
 		} else if standDown {
 			stoppedByUser = true
+			break
+		}
+		if standDown, err := c.cancelForFailedSibling(ctx, logger, c.getEngine(), apply, tasks, firstTaskMidCutover, &loggedSiblingFailureAtCutover); err != nil {
+			if errors.Is(err, ErrTaskVerdictRefused) {
+				// Some tasks recorded cancelled and some did not. The error
+				// keeps the operation row claimable instead of deriving it
+				// from the partly settled tasks.
+				return err
+			}
+			logger.Warn("halting this operation behind a failed sibling failed; current apply owner will exit for operator retry",
+				"error", err)
+			return nil
+		} else if standDown {
+			haltedBySibling = true
 			break
 		}
 
@@ -597,6 +612,27 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			stoppedByUser = true
 			break
 		}
+		if action == taskHaltedBySibling {
+			if err := c.cancelTasksQueuedBehindSiblingFailure(ctx, apply, tasks); err != nil {
+				if errors.Is(err, ErrTaskVerdictRefused) {
+					return err
+				}
+				logger.Warn("cancelling the tasks queued behind a failed sibling failed; current apply owner will exit for operator retry",
+					"error", err)
+				return nil
+			}
+			haltedBySibling = true
+			break
+		}
+	}
+
+	if haltedBySibling {
+		// Only an operation-scoped drive is halted by a sibling, and its
+		// outcome is its tasks: the rollout projection derives the operation
+		// row and the apply from them, so there is nothing here to finalize.
+		logger.Info("sequential operation resume cancelled its work behind a failed sibling; the rollout projection settles the apply",
+			"task_count", len(tasks))
+		return nil
 	}
 
 	// Update apply state based on task outcomes
