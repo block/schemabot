@@ -55,7 +55,7 @@ type CLI struct {
 	Logs       commands.LogsCmd       `cmd:"" help:"View apply logs"`
 	Status     commands.StatusCmd     `cmd:"" help:"Show schema change status"`
 	Plans      commands.PlansCmd      `cmd:"" name:"list-plans" help:"List recently generated schema change plans"`
-	Preview    commands.PreviewCmd    `cmd:"" help:"Preview CLI output templates (for development)"`
+	Preview    commands.PreviewCmd    `cmd:"" hidden:"" help:"Preview CLI output templates (for development)"`
 	FixLint    commands.FixLintCmd    `cmd:"" name:"fix-lint" help:"Auto-fix lint issues in schema files"`
 	Configure  commands.ConfigureCmd  `cmd:"" help:"Configure CLI settings (endpoint, profiles)"`
 	Login      commands.LoginCmd      `cmd:"" help:"Log in via OIDC and cache a token for the active profile"`
