@@ -1040,9 +1040,11 @@ it. A finalizer whose
 own work has failed can never start, so it holds later members exactly where that failure does and
 no longer, and it holds no target. Once an operator releases a paused rollout it stays released, with no path back to paused. An *unrecognized* `on_failure` value behaves like `halt`, never like `continue`.
 
-Failing closed decides the verdict, not when it is recorded. A fail-closed policy refuses new
-claims and cancels nothing, so a sibling deployment that a driver already started keeps working through
-the failure: the apply stays `running_degraded` until that sibling settles and only then takes
+Under `halt`, a member's failed work also ends the rest of that member's work that a driver already started:
+each driver of that member's work cancels its own work at its next checkpoint, except work whose
+cutover has begun, which finishes. Failing closed decides the verdict, not when it is recorded. A
+fail-closed policy cancels nothing in another member, so a sibling deployment that a driver already
+started keeps working through the failure: the apply stays `running_degraded` until that sibling settles and only then takes
 the `failed` verdict. A sibling that is merely pending, or that a stop caught before it started,
 holds nothing, since the same policy is what stops it from ever starting. Recording the verdict over live work would take `stop` and `cancel`
 away from the operator who still has work to stop. The target reservation survives it, since OW-5
@@ -1063,7 +1065,9 @@ without completing the request would refuse the start the hold exists to preserv
 each gate on earlier members and whose stopped+start arm holds a finalizer, and work that never
 started, to the same gate, with the failure exemption shared by every gate and the table-step
 boundary `rolloutStepGateSQL` and the same-member failure gate `sameMemberFailureGateSQL` in the
-work gate, and `FindNextApplyOperationCutover`, whose start
+work gate, with the same rule reaching started work through `FailedSiblingHaltingOperation` and the
+drive checkpoints that read it (`cancelForFailedSibling` and `cancelRemoteForFailedSibling`,
+`pkg/tern/same_member_halt.go`), and `FindNextApplyOperationCutover`, whose start
 arm gates on the hold rule `earlierSiblingHoldsCutoverSQL` that `CutoverBlocker` shares
 (`pkg/storage/internal/sqlstore/apply_operations.go`), pinned per policy on both dialects by the
 storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a
@@ -1468,6 +1472,7 @@ cancel rejected over a deploy request that failed as a settled-outcome refusal
 refusal over a provider-settled failure its probe reads (`providerSettledChangeAsFailed`,
 `pkg/tern/local_control.go`) as the backstop; the in-process engine's
 settled outcome checks on stop and cancel (`pkg/engine/spirit/control.go`), including a
+cutover that has begun (`cutoverHasBegun`), which the run finishes on its own, and a
 completion its run records after the cancel, and its run's deference to a stop or cancel that
 interrupted it, which no failure the run records afterwards replaces (`setSchemaChangeFailed`,
 `pkg/engine/spirit/execution.go`, `pkg/engine/spirit/direct.go`).

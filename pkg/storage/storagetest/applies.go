@@ -1655,6 +1655,62 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Nil(t, cutover, "the parked operation still does not cut over behind the failure")
 	})
 
+	// Shard 80- of target orders-001 fails under on_failure halt after shard
+	// -80 has parked at the cutover barrier. Nothing drives the parked shard,
+	// and the cutover claim will not start it behind the failure, so the halt
+	// makes it claimable once, for the drive that cancels its finished copy.
+	// The claim leaves it parked and is not repeated while that drive holds
+	// the lease. A parked shard of target orders-002 is another rollout member
+	// and stays parked, and under on_failure continue the failure halts
+	// nothing.
+	t.Run("FindNextApplyOperation_SameMemberFailureClaimsShardParkedAtBarrier", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_rollout_parked_halt_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_parked_halt", 9337, state.Apply.Pending, "production", "orders")
+		insert := func(target, shard, onFailure, operationState string) int64 {
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: rollout.ID, Deployment: "orders", Target: target,
+				OperationKey:  storage.TargetOperationKey(target, storage.ShardOperationKey("orders", shard, "orders")),
+				OperationKind: storage.ApplyOperationKindWork, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: onFailure,
+				State: operationState,
+			})
+			require.NoError(t, err)
+			return id
+		}
+		parkedID := insert("orders-001", "-80", storage.OnFailureHalt, state.ApplyOperation.WaitingForCutover)
+		otherMemberID := insert("orders-002", "-80", storage.OnFailureContinue, state.ApplyOperation.WaitingForCutover)
+		insert("orders-002", "80-", storage.OnFailureContinue, state.ApplyOperation.Failed)
+		rollout.State = state.Apply.RunningDegraded
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		idle, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		assert.Nil(t, idle, "a failure the policy continues past halts no parked shard")
+
+		insert("orders-001", "80-", storage.OnFailureHalt, state.ApplyOperation.Failed)
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "the failed shard makes its parked sibling claimable")
+		assert.Equal(t, parkedID, claimed.ID)
+		assert.Equal(t, state.ApplyOperation.WaitingForCutover, claimed.State)
+		held, err := store.ApplyOperations().Get(ctx, parkedID)
+		require.NoError(t, err)
+		require.NotNil(t, held)
+		assert.Equal(t, state.ApplyOperation.WaitingForCutover, held.State, "the claim leaves the shard parked")
+		assert.Equal(t, claimed.LeaseToken, held.LeaseToken)
+
+		again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, again, "the halt is delivered by the drive that holds the lease, not re-claimed")
+
+		cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, cutover, "orders-002 is its own rollout member, and its policy continues past its own failure")
+		assert.Equal(t, otherMemberID, cutover.ID, "the halted orders-001 shard does not cut over behind its sibling's failure")
+	})
+
 	// A cancel reaches a rollout between members: region-a has completed and
 	// region-b has not started. While the cancel pends, region-b is not
 	// claimed, so no engine work begins on a rollout the operator has asked to

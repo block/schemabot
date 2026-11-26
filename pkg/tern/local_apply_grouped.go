@@ -810,6 +810,20 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			return true
 		}
 	}
+	if standDown, err := c.cancelForFailedSibling(ctx, logger, eng, apply, tasks, firstTaskAtCutover, &ps.loggedSiblingFailureAtCutover); err != nil {
+		if errors.Is(err, ErrTaskVerdictRefused) {
+			// Some tasks recorded cancelled and some did not. The error
+			// keeps the operation row claimable instead of deriving it from
+			// the partly settled tasks.
+			ps.terminalErr = err
+			return true
+		}
+		logger.Warn("halting this operation behind a failed sibling failed; current apply owner will exit for operator retry",
+			"error", err)
+		return true
+	} else if standDown {
+		return true
+	}
 
 	result, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 		Database:    apply.Database,
