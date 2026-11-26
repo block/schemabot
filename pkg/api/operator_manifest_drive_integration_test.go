@@ -197,7 +197,7 @@ func TestOperatorRemoteManifestConvergedMemberSettlesAndAcceptsNextApply(t *test
 
 	driveDone := make(chan struct{})
 	go func() {
-		cpService.recoverApplyOperation(ctx, 1, "remote-manifest-driver")
+		cpService.recoverApplyOperation(ctx, 1, "remote-manifest-driver", passPolled)
 		close(driveDone)
 	}()
 	t.Cleanup(func() {

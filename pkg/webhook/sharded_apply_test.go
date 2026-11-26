@@ -904,9 +904,9 @@ func TestBuildSingleShardApplyCommentData_StoppedAtCutoverNamesTheFailedTable(t 
 }
 
 // A shard reporting copied rows without a row total has no denominator to
-// aggregate against, so none of its figures count: the table's fraction stays
-// consistent (numerator, denominator, ETA, and coverage all describe the same
-// reporting shards) instead of copied rows inflating the numerator alone.
+// aggregate against, so its rows stay out of the table's fraction instead of
+// inflating the numerator alone. Its ETA still counts: the table finishes when
+// its slowest shard does, whether or not that shard has reported a total.
 func TestBuildShardedApplyData_CopiedRowsWithoutTotalNotAggregated(t *testing.T) {
 	mk := func(id int64, key, opState string) *storage.ApplyOperation {
 		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
@@ -931,7 +931,7 @@ func TestBuildShardedApplyData_CopiedRowsWithoutTotalNotAggregated(t *testing.T)
 	table := data.Keyspaces[0].Tables[0]
 	assert.Equal(t, int64(185000), table.RowsCopied, "copied rows without a total stay out of the numerator")
 	assert.Equal(t, int64(500000), table.RowsTotal)
-	assert.Equal(t, int64(240), table.ETASeconds, "an ETA without a total does not set the table's floor")
+	assert.Equal(t, int64(900), table.ETASeconds, "the slowest shard's ETA counts even without a row total")
 	assert.Equal(t, 1, table.ShardsReporting, "a shard without a row total is not reporting")
 }
 

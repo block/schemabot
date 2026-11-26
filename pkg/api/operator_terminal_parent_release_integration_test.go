@@ -74,7 +74,7 @@ func TestOperator_StaleOperationUnderFailedParentReleasesTheRolloutTargets(t *te
 		"the rollout it keeps live still holds region-a")
 
 	svc := newMatrixService(t, stor, map[string]tern.Client{})
-	svc.recoverApplyOperation(ctx, 1, "recovering-driver")
+	svc.recoverApplyOperation(ctx, 1, "recovering-driver", passPolled)
 
 	op, err := stor.ApplyOperations().Get(ctx, staleID)
 	require.NoError(t, err)
