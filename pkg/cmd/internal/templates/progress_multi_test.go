@@ -54,6 +54,32 @@ func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
 	assert.Contains(t, output, "users_c")
 }
 
+// A deployment's own section of a multi-deployment apply lists its failed
+// table ahead of the one still copying and the one not started, the same order
+// a single-deployment apply uses.
+func TestWriteProgressMultiDeploymentSectionLeadsWithAFailedTable(t *testing.T) {
+	alter := func(table string) string { return "ALTER TABLE `" + table + "` ADD COLUMN `region` varchar(20)" }
+	output := captureStdout(t, func() {
+		WriteProgress(ProgressData{
+			ApplyID: "apply-test", Environment: "staging", State: state.Apply.Running,
+			Operations: []ProgressOperation{
+				{Deployment: "region-a", Target: "orders-a", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureContinue},
+				{Deployment: "region-b", Target: "orders-b", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureContinue},
+			},
+			Tables: []TableProgress{
+				{Deployment: "region-a", Target: "orders-a", TableName: "invoices", ChangeType: "alter", DDL: alter("invoices"), Status: state.Task.Pending},
+				{Deployment: "region-a", Target: "orders-a", TableName: "sessions", ChangeType: "alter", DDL: alter("sessions"), Status: state.Task.Running},
+				{Deployment: "region-a", Target: "orders-a", TableName: "payments", ChangeType: "alter", DDL: alter("payments"), Status: state.Task.Failed},
+				{Deployment: "region-b", Target: "orders-b", TableName: "refunds", ChangeType: "alter", DDL: alter("refunds"), Status: state.Task.Running},
+			},
+		})
+	})
+
+	assertLess(t, output, "payments", "sessions")
+	assertLess(t, output, "sessions", "invoices")
+	assertLess(t, output, "invoices", "region-b")
+}
+
 // A resuming rollout's progress output reads as the start under way, even
 // while its targets still report stopped: the state and target counts say
 // resuming, a stopped table reads as resuming, a table that never started

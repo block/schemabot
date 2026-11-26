@@ -131,11 +131,11 @@ func TestTableRolloutRankRanksEveryTaskStateOnOneTarget(t *testing.T) {
 		task.WaitingForCutover: tableRankWaiting,
 		task.WaitingForDeploy:  tableRankWaiting,
 		task.Recovering:        tableRankWaiting,
-		task.FailedRetryable:   tableRankWaiting,
-		task.Failed:            tableRankHalted,
-		task.Stopped:           tableRankHalted,
-		task.Cancelled:         tableRankHalted,
-		task.Reverted:          tableRankHalted,
+		task.FailedRetryable:   tableRankHalted(task.FailedRetryable),
+		task.Failed:            tableRankHalted(task.Failed),
+		task.Stopped:           tableRankHalted(task.Stopped),
+		task.Cancelled:         tableRankHalted(task.Cancelled),
+		task.Reverted:          tableRankFinished,
 		task.Pending:           tableRankNotStarted,
 		task.Completed:         tableRankFinished,
 		task.RevertWindow:      tableRankFinished,
@@ -143,7 +143,7 @@ func TestTableRolloutRankRanksEveryTaskStateOnOneTarget(t *testing.T) {
 }
 
 // A table that two targets run sorts by whichever target's state lists
-// earlier, so a waiting target leads a halted one and both lead a target that
+// earlier, so a halted target leads a working one and both lead a target that
 // has not started. The one exception is a table finished on one target and
 // not started on the other, which is partly done. The order the targets
 // report in makes no difference.
@@ -229,5 +229,23 @@ func TestTaskRankingsRankAStateTheSameHoweverItIsSpelled(t *testing.T) {
 		}
 		assert.Equalf(t, rank(state.Task.Running), rank(state.ApplyOperation.RunningDegraded),
 			"%s of an operation state that stands in for running", name)
+	}
+}
+
+// A rollout and a single-target listing lead with the same halted state: of
+// any two task states, the one a single-target listing puts first because it
+// halted also leads when it is the state of a table on one target of a
+// rollout (UX-5).
+func TestTableRolloutRankLeadsWithTheSameHaltedStatesAsAListing(t *testing.T) {
+	halted := state.HaltedTaskStates()
+	for _, h := range halted {
+		for _, s := range statetest.Every(t, state.Task) {
+			if s == h {
+				continue
+			}
+			if ui.TableStatePriority(h) < ui.TableStatePriority(s) {
+				assert.Lessf(t, rolloutRankOnOneTarget(h), rolloutRankOnOneTarget(s), "%q leads %q in a rollout as in a listing", h, s)
+			}
+		}
 	}
 }

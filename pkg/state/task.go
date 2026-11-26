@@ -58,11 +58,15 @@ var TerminalTaskStates = []string{
 
 // HaltedTaskStates lists the task states in which a table has stopped short of
 // completing, most urgent first: a failure, a failure the scheduler will
-// retry, a stop an operator can resume, then a cancellation. It is the one
-// precedence for which of a table's states leads: a table's status rolled up
-// across targets (presentation.RollupTaskStatus) and the order a listing puts
-// its tables in (ui.TableStatePriority) both read it, so neither can name a
-// different state first. The result is a fresh slice the caller may keep.
+// retry, a stop an operator can resume, then a cancellation. It is the
+// precedence for which of a table's states leads while an apply is in
+// progress: a table's status rolled up across targets
+// (presentation.RollupTaskStatus), the order a progress listing puts its
+// tables in (ui.TableStatePriority), and the order a rollout lists its
+// rolled-up tables in (presentation.TableRolloutRank) all read it, so none can
+// name a different state first. The terminal summary keeps its own order,
+// which lists what went wrong, then what landed, then what never ran. The
+// result is a fresh slice the caller may keep.
 func HaltedTaskStates() []string {
 	return []string{Task.Failed, Task.FailedRetryable, Task.Stopped, Task.Cancelled}
 }

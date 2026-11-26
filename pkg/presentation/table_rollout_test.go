@@ -17,16 +17,18 @@ func TestTableRolloutRank(t *testing.T) {
 	}{
 		{"one target copying among queued ones", []string{task.Completed, task.Running, task.Pending}, tableRankWorking},
 		{"checksumming is working", []string{task.Checksumming, task.Pending}, tableRankWorking},
-		{"working outranks a failure beside it", []string{task.Failed, task.CuttingOver}, tableRankWorking},
+		{"a failure leads work beside it", []string{task.Failed, task.CuttingOver}, tableRankHalted(task.Failed)},
+		{"failed and retrying on two targets reads as failed", []string{task.FailedRetryable, task.Failed}, tableRankHalted(task.Failed)},
 		{"waiting for cutover", []string{task.WaitingForCutover, task.Pending}, tableRankWaiting},
-		{"retrying", []string{task.FailedRetryable, task.Completed}, tableRankWaiting},
+		{"retrying", []string{task.FailedRetryable, task.Completed}, tableRankHalted(task.FailedRetryable)},
 		{"finished on some targets, queued on the rest", []string{task.Completed, task.Pending, task.Pending}, tableRankPartlyDone},
 		{"in its revert window on some targets, queued on the rest", []string{task.RevertWindow, task.Pending}, tableRankPartlyDone},
 		{"no target has started", []string{task.Pending, task.Pending}, tableRankNotStarted},
 		{"no target has reported", nil, tableRankNotStarted},
 		{"finished everywhere", []string{task.Completed, task.Completed}, tableRankFinished},
-		{"halted on one target", []string{task.Completed, task.Failed, task.Pending}, tableRankHalted},
-		{"stopped", []string{task.Stopped, task.Pending}, tableRankHalted},
+		{"halted on one target", []string{task.Completed, task.Failed, task.Pending}, tableRankHalted(task.Failed)},
+		{"stopped", []string{task.Stopped, task.Pending}, tableRankHalted(task.Stopped)},
+		{"reverted everywhere is finished", []string{task.Reverted, task.Completed}, tableRankFinished},
 		{"proto-prefixed status", []string{"STATE_RUNNING"}, tableRankWorking},
 	}
 	for _, tt := range tests {
@@ -36,15 +38,19 @@ func TestTableRolloutRank(t *testing.T) {
 	}
 }
 
-// The ranks list the live tables first: a table some target is copying leads a
-// table a target is waiting on, which leads a table that failed on a target and
-// stopped the rollout, which leads a table finished on one target and queued on
-// three, which leads a table no target has started, which leads one finished
-// everywhere.
+// The ranks list a halted table first, a failure ahead of a retry, a stop and a
+// cancellation, since that is where the rollout stopped. Then a table some
+// target is copying leads a table a target is waiting on, which leads a table
+// finished on one target and queued on three, which leads a table no target
+// has started, which leads one finished everywhere.
 func TestTableRolloutRankOrder(t *testing.T) {
+	task := state.Task
+	assert.Less(t, tableRankHalted(task.Failed), tableRankHalted(task.FailedRetryable))
+	assert.Less(t, tableRankHalted(task.FailedRetryable), tableRankHalted(task.Stopped))
+	assert.Less(t, tableRankHalted(task.Stopped), tableRankHalted(task.Cancelled))
+	assert.Less(t, tableRankHalted(task.Cancelled), tableRankWorking)
 	assert.Less(t, tableRankWorking, tableRankWaiting)
-	assert.Less(t, tableRankWaiting, tableRankHalted)
-	assert.Less(t, tableRankHalted, tableRankPartlyDone)
+	assert.Less(t, tableRankWaiting, tableRankPartlyDone)
 	assert.Less(t, tableRankPartlyDone, tableRankNotStarted)
 	assert.Less(t, tableRankNotStarted, tableRankFinished)
 }

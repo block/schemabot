@@ -7,38 +7,56 @@ import (
 	"github.com/block/schemabot/pkg/state"
 )
 
-// The ranks TableRolloutRank returns, in the order a rollout's tables are
-// listed.
+// The ranks TableRolloutRank returns for a table no target has halted, in the
+// order a rollout's tables are listed. A halted table ranks below all of them
+// (see TableRolloutRank).
 const (
 	tableRankWorking = iota
 	tableRankWaiting
-	tableRankHalted
 	tableRankPartlyDone
 	tableRankNotStarted
 	tableRankFinished
 )
 
+// rolloutHaltedStates is the order a rollout leads with the tables that
+// stopped short of completing on some target.
+var rolloutHaltedStates = state.HaltedTaskStates()
+
+// tableRankHalted is the rank of a table whose most urgent halted state on any
+// target is s. It is below every other rank, and the halted states rank in the
+// order of state.HaltedTaskStates.
+func tableRankHalted(s string) int {
+	return slices.Index(rolloutHaltedStates, s) - len(rolloutHaltedStates)
+}
+
 // TableRolloutRank is where a table rolled up across the targets that run it
 // sorts in a rollout's progress, lower first, given the table's status on each
-// of those targets. A table some target is working on leads, then one a target
-// is waiting on or retrying, then one that failed or halted on a target, since
-// that is where the rollout stopped, then one finished on some targets and
-// queued on the rest, then one no target has started, and last one finished
-// everywhere it ran. The PR comment and the CLI both order their target rollups
-// by it, so the two list a rollout's tables the same way.
+// of those targets. A table that failed or halted on any target leads, in the
+// order of state.HaltedTaskStates, since that is where the rollout stopped and
+// what the operator has to act on; single-target listings lead the same way
+// (ui.TableStatePriority). Then comes a table some target is working on, then
+// one a target is waiting on, then one finished on some targets and queued on
+// the rest, then one no target has started, and last one finished everywhere
+// it ran. The PR comment and the CLI both order their target rollups by it, so
+// the two list a rollout's tables the same way.
 func TableRolloutRank(statuses []string) int {
-	var waiting, halted, done, queued bool
+	halted := -1
+	var working, waiting, done, queued bool
 	for _, s := range statuses {
-		switch state.NormalizeTaskStatus(s) {
+		normalized := state.NormalizeTaskStatus(s)
+		if i := slices.Index(rolloutHaltedStates, normalized); i >= 0 {
+			if halted < 0 || i < halted {
+				halted = i
+			}
+			continue
+		}
+		switch normalized {
 		case state.Task.Running, state.Task.CatchingUp, state.Task.Checksumming,
 			state.Task.PostChecksum, state.Task.CuttingOver, state.Task.Reverting:
-			return tableRankWorking
-		case state.Task.WaitingForCutover, state.Task.WaitingForDeploy,
-			state.Task.Recovering, state.Task.FailedRetryable:
+			working = true
+		case state.Task.WaitingForCutover, state.Task.WaitingForDeploy, state.Task.Recovering:
 			waiting = true
-		case state.Task.Failed, state.Task.Stopped, state.Task.Cancelled, state.Task.Reverted:
-			halted = true
-		case state.Task.Completed, state.Task.RevertWindow:
+		case state.Task.Completed, state.Task.RevertWindow, state.Task.Reverted:
 			done = true
 		default:
 			// Pending: not started. NormalizeTaskStatus maps a state this build
@@ -47,10 +65,12 @@ func TableRolloutRank(statuses []string) int {
 		}
 	}
 	switch {
+	case halted >= 0:
+		return tableRankHalted(rolloutHaltedStates[halted])
+	case working:
+		return tableRankWorking
 	case waiting:
 		return tableRankWaiting
-	case halted:
-		return tableRankHalted
 	case done && queued:
 		return tableRankPartlyDone
 	case queued || len(statuses) == 0:
