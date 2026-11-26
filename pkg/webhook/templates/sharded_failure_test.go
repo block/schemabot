@@ -241,3 +241,35 @@ func TestRenderShardedApplyComment_RunningFinalizerFailureRendersOnce(t *testing
 	assert.Equal(t, 1, strings.Count(out, finalizeErr), out)
 	assert.Contains(t, out, "> ❌ **Failure:** finalizing keyspace <code>commerce</code> — "+finalizeErr+"\n")
 }
+
+// A failed table that already landed on some shards counts both against the
+// same total, so the two clauses never disagree about how many shards exist.
+func TestRenderShardedApplyComment_FailedTableCountsLandedShardsAgainstPlannedTotal(t *testing.T) {
+	keyspaces := wideShards(16, failedShard("dupes"))
+	keyspaces[0].Tables = []ShardedTableStatus{{Table: "mutes", Status: state.Task.Failed, PlannedShards: 16, Shards: []ShardProgressData{
+		{Shard: "s00", Status: state.Task.Failed},
+		{Shard: "s01", Status: state.Task.Completed},
+		{Shard: "s02", Status: state.Task.Completed},
+		{Shard: "s03", Status: state.Task.Completed},
+	}}}
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Failed, Environment: "production", Database: "cdb_resolute", ApplyID: "apply-x",
+		Keyspaces: keyspaces,
+	})
+
+	assert.Contains(t, out, "**`mutes`**: ❌ Failed on 1 of 16 shards — applied on 3 of 16 shards\n")
+}
+
+// A shard SchemaBot is still retrying has not failed for good, so a running
+// apply whose only problem shard is retrying does not tell the operator to
+// retry with a new apply.
+func TestRenderShardedApplyComment_FooterOmitsRetryNoteWhileShardRetries(t *testing.T) {
+	retrying := ShardStatus{Emoji: "⚠️", Label: "retrying", State: state.ApplyOperation.FailedRetryable, Error: "lost connection"}
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "production", Database: "cdb_resolute", ApplyID: "apply-x", Tenant: "acme",
+		Keyspaces: wideShards(4, retrying, runningShard(), runningShard(), runningShard()),
+	})
+
+	assert.Contains(t, out, "schemabot stop apply-x -e production --tenant acme")
+	assert.NotContains(t, out, "A new apply can retry")
+}
