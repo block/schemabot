@@ -799,6 +799,12 @@ func explainRunnerError(err error, stmts []*statement.AbstractStatement) error {
 }
 
 // addsUniqueKey reports whether any statement in the batch adds a UNIQUE key.
+// It mirrors the decision Spirit makes before it names duplicates as the cause
+// of a checksum failure, and only the ErrAlterContainsUnique result counts: an
+// error such as ErrNotAlterTable does not mean the batch adds a key. A typed
+// error from Spirit wrapping its duplicate-key failure would retire this copy.
+// Until then, a batch Spirit treats as adding a unique key and this does not
+// (ADD PRIMARY KEY, a column-level UNIQUE) keeps the generic failure reason.
 func addsUniqueKey(stmts []*statement.AbstractStatement) bool {
 	for _, stmt := range stmts {
 		if errors.Is(stmt.AlterContainsAddUnique(), statement.ErrAlterContainsUnique) {
