@@ -1160,6 +1160,53 @@ func TestCatalogAndRowRefusalsNameTheirRemedies(t *testing.T) {
 	}
 }
 
+// A partitioned key constraint or a concurrent detach that the target's
+// partition tree rules out changes nothing, and an unchanged retry meets the
+// same tree. Each is a permanent refusal whose remedy names what has to
+// change first. A concurrent detach that stopped after its first transaction
+// is the exception: running the same statement again finishes it, so it stays
+// retryable.
+func TestPartitionedKeyAndDetachOutcomesNameTheirRemedies(t *testing.T) {
+	tests := []struct {
+		code   executor.Code
+		reason string
+		cause  string
+		remedy string
+	}{
+		{code: executor.CodeDetachDefaultPartition, reason: "detach-default-partition",
+			cause:  `"users" has a DEFAULT partition, so PostgreSQL will not detach a partition from it concurrently; nothing ran`,
+			remedy: "detach the partition outside SchemaBot, then re-plan against the current schema"},
+		{code: executor.CodePartitionedKeyNameTaken, reason: "partitioned-key-name-taken",
+			cause:  `a name the key constraint on partitioned table "users" needs on a partition is held by something else`,
+			remedy: "rename the constraint in the schema file and re-plan, or drop or rename what holds the name"},
+		{code: executor.CodePartitionedKeyConflict, reason: "partitioned-key-conflict",
+			cause:  `a partition of "users" already has a key constraint that conflicts with the planned one; nothing was added`,
+			remedy: "drop or change the partition's key, or change the key in the schema file, then re-plan against the current schema"},
+		{code: executor.CodePartitionedKeyNullableColumn, reason: "partitioned-key-nullable-column",
+			cause:  `the planned primary key on "users" covers a column a partition allows to be NULL; nothing was built`,
+			remedy: "make the column NOT NULL on every partition, then re-plan against the current schema"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.code), func(t *testing.T) {
+			r, known := refusalForOutcome(tt.code, "users")
+			require.True(t, known)
+			require.NotNil(t, r, "outcome %q must not fall into the retryable tail", tt.code)
+			assert.True(t, tt.code.Permanent(), "the engine marks %q permanent", tt.code)
+			assert.Equal(t, tt.reason, r.reason)
+			assert.Equal(t, tt.cause, r.cause)
+			assert.Equal(t, tt.remedy, r.remedy)
+			assert.False(t, r.provisionable, "nothing to provision answers %q", tt.code)
+		})
+	}
+
+	t.Run(string(executor.CodeDetachInterrupted), func(t *testing.T) {
+		r, known := refusalForOutcome(executor.CodeDetachInterrupted, "users")
+		require.True(t, known)
+		assert.Nil(t, r, "a rerun finishes an interrupted detach, so it is retried")
+		assert.False(t, executor.CodeDetachInterrupted.Permanent())
+	})
+}
+
 // An index build on a partitioned table that the target's partition tree or
 // configuration rules out creates nothing, and an unchanged retry meets the
 // same tree. Each is a permanent refusal whose remedy names what has to

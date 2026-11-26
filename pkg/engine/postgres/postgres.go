@@ -1467,13 +1467,20 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 // statement's steps one at a time, each in its own transaction, and it runs a
 // partitioned index build's one step through pg-sprite's partition-by-partition
 // build, so either contract, or no steps at all, leaves the verdict to the
-// disposition and reports ok. A contract this build does not know is a blocked
-// verdict reported as vocabulary that moved, so the caller logs it: running
-// its steps one at a time may not be what the contract asks for.
+// disposition and reports ok. A blocking index drop runs only when the operator
+// accepts a lock on the whole partition tree, which SchemaBot has no way to
+// accept, so it is blocked with its remedy. A contract this build does not know
+// is a blocked verdict reported as vocabulary that moved, so the caller logs
+// it: running its steps one at a time may not be what the contract asks for.
 func executionContractVerdict(execution planner.Execution, table string) (stepVerdict, bool) {
 	switch execution {
 	case "", planner.ExecutionAutocommit, planner.ExecutionPartitionedIndexBuild:
 		return stepVerdict{}, true
+	case planner.ExecutionBlockingIndexDrop:
+		return stepVerdict{
+			mode:   engine.ExecutionModeBlocked,
+			reason: blockingIndexDropReason(table),
+		}, false
 	default:
 		return stepVerdict{
 			mode:         engine.ExecutionModeBlocked,
@@ -1481,6 +1488,14 @@ func executionContractVerdict(execution planner.Execution, table string) (stepVe
 			unrecognized: &unrecognizedPlannerVocabulary{kind: "execution", value: string(execution)},
 		}, false
 	}
+}
+
+// blockingIndexDropReason is the sentence for dropping an index of a
+// partitioned table. PostgreSQL cannot drop that index concurrently, so the
+// drop blocks reads and writes on the table and every partition until it
+// finishes.
+func blockingIndexDropReason(table string) string {
+	return fmt.Sprintf("statement for table %q drops an index of a partitioned table, which PostgreSQL cannot do without blocking reads and writes on the table and every partition until it finishes; drop the index outside SchemaBot when that lock is acceptable, then re-plan", table)
 }
 
 // partitionedIndexShapeVerdict runs the partitioned index build's own shape
