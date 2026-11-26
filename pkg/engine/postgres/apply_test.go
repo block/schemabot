@@ -1644,7 +1644,7 @@ func TestCommittedCreatePrefixDetail(t *testing.T) {
 func TestClassifyApplyFailureCommittedCreatePrefix(t *testing.T) {
 	err := &executor.SequenceStepError{Step: 2, Total: 3, Err: errors.New("server failure")}
 
-	failure := classifyApplyFailure(err, "users")
+	failure := classifyApplyFailure(err, "users", nil)
 
 	assert.False(t, failure.retryable)
 	assert.True(t, failure.committedPrefix)
@@ -1663,7 +1663,7 @@ func TestClassifyApplyFailureBrokenForeignKey(t *testing.T) {
 		ConstraintName: "orders_user_id_fkey",
 	})
 
-	failure := classifyApplyFailure(err, "orders")
+	failure := classifyApplyFailure(err, "orders", nil)
 
 	assert.True(t, failure.retryable)
 	assert.Equal(t, `existing rows in "orders" break foreign key "orders_user_id_fkey"; the key is in place and checks new writes; fix those rows, then retry`, failure.detail)
@@ -1676,7 +1676,7 @@ func TestClassifyApplyFailureBrokenForeignKey(t *testing.T) {
 func TestClassifyApplyFailureMissingGrant(t *testing.T) {
 	err := fmt.Errorf("add foreign key: %w", &pgconn.PgError{Code: "42501", Message: "permission denied for table users"})
 
-	failure := classifyApplyFailure(err, "orders")
+	failure := classifyApplyFailure(err, "orders", nil)
 
 	assert.True(t, failure.retryable)
 	assert.Equal(t, `the engine role lacks a privilege the statement on "orders" needs, such as REFERENCES on the table a foreign key references; the server log names it; grant it, then retry`, failure.detail)
@@ -3671,7 +3671,7 @@ func TestRecoveryFailureDetailNamesTheAbandonedIndex(t *testing.T) {
 	t.Run("lost proof lock stays retryable and names the index before the lock remedy", func(t *testing.T) {
 		err := wrap(&executor.BudgetError{Cause: executor.CauseLock, Budget: 5 * time.Second})
 		require.Nil(t, classifyRefusal(err, "orders"), "a lock budget lost during recovery is operational")
-		failure := classifyApplyFailure(err, "orders")
+		failure := classifyApplyFailure(err, "orders", nil)
 		assert.True(t, failure.retryable)
 		assert.True(t, failure.lockBudget)
 		detail := recoveryContextDetail(err, failure.detail)

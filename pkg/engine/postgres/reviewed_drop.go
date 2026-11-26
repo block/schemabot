@@ -65,15 +65,12 @@ func reviewedDropFromMetadata(metadata map[string]string) (*schemadiff.DroppedOb
 }
 
 // stepDropMetadata returns the metadata one rendered step of a planned
-// statement carries. A step that drops a live object carries the planner's
+// statement carries. A step that drops an object carries the planner's
 // record of that object, and only that step does: a statement the planner
 // rendered as several steps drops in one of them, and pg-sprite refuses a
 // record on a step that drops nothing. unrecorded reports a dropping step
 // the planner left without a record, which the apply would refuse.
 func stepDropMetadata(statement pgplan.Statement, sql string) (metadata map[string]string, unrecorded bool, err error) {
-	if !statement.Destructive {
-		return nil, false, nil
-	}
 	drops, err := dropsLiveObject(sql)
 	if err != nil {
 		return nil, false, err
@@ -81,12 +78,26 @@ func stepDropMetadata(statement pgplan.Statement, sql string) (metadata map[stri
 	if !drops {
 		return nil, false, nil
 	}
-	if statement.Drops == nil {
+	record := plannedDropRecord(statement)
+	if record == nil {
 		return nil, true, nil
 	}
-	metadata, err = reviewedDropMetadata(*statement.Drops)
+	metadata, err = reviewedDropMetadata(*record)
 	if err != nil {
 		return nil, false, err
 	}
 	return metadata, false, nil
+}
+
+// plannedDropRecord returns the planner's record of what a statement drops.
+// A destructive statement drops live structure the operator reviews. A SET
+// NOT NULL that runs as its helper sequence drops only the helper constraint
+// its first step added, which leaves the statement non-destructive, and the
+// planner records that helper so the drop step still checks it removes the
+// plan's own helper and not whatever took its name between the steps.
+func plannedDropRecord(statement pgplan.Statement) *schemadiff.DroppedObject {
+	if statement.Destructive {
+		return statement.Drops
+	}
+	return statement.DropsHelper
 }
