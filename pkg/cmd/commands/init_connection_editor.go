@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/block/mysql"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -262,16 +264,28 @@ func initConnectionLabel(ref string) string {
 	return initTerminalText(ref)
 }
 
-// Keep the immediate recovery action visible without repeating driver details.
+// initConnectionFailure renders a connection check's error as sentences. The
+// check names the cause and its fix in one line joined by "; ", and never
+// includes driver details.
 func initConnectionFailure(message string) string {
-	switch {
-	case strings.Contains(message, "connection refused"):
-		return "Couldn’t connect. Check that the database is running and the host and port are correct."
-	case strings.Contains(message, "hostname could not be resolved"):
-		return "Couldn’t find that host. Check the address and your network connection."
-	case strings.Contains(message, "timed out"):
-		return "The connection timed out. Check the address and network access, then retry."
-	default:
-		return message
+	cause, fix, hasFix := strings.Cut(message, "; ")
+	line := initSentence(cause)
+	if hasFix {
+		line += " " + initSentence(fix)
 	}
+	return line
+}
+
+// initSentence capitalizes a clause and ends it with a full stop.
+func initSentence(clause string) string {
+	clause = strings.TrimSpace(clause)
+	if clause == "" {
+		return clause
+	}
+	first, size := utf8.DecodeRuneInString(clause)
+	clause = string(unicode.ToUpper(first)) + clause[size:]
+	if !strings.ContainsAny(clause[len(clause)-1:], ".!?") {
+		clause += "."
+	}
+	return clause
 }

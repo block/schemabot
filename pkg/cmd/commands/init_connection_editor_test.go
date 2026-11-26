@@ -1,7 +1,7 @@
 package commands
 
 import (
-	"fmt"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -115,17 +115,17 @@ func TestInitConnectionScreenStates(t *testing.T) {
 	require.Contains(t, checking, "Checking connection")
 	require.NotContains(t, checking, "enter continue")
 	require.NotContains(t, checking, "unencrypted")
-	m.Update(initConnectionMsg{generation: m.generation, err: fmt.Errorf("could not connect: connection refused")})
+	m.Update(initConnectionMsg{generation: m.generation, err: errors.New("the server refused the connection; check that the database is running and that the host and port are right")})
 	failed := stripANSI(m.View())
-	require.Contains(t, failed, "Couldn’t connect.")
+	require.Contains(t, failed, "The server refused the connection. Check that the database is running")
 	require.Contains(t, failed, "enter retry")
 	require.NotContains(t, failed, "VPN")
 	require.NotContains(t, failed, "enter continue")
-	require.Less(t, strings.Index(failed, "Couldn’t connect"), strings.Index(failed, "enter retry"))
+	require.Less(t, strings.Index(failed, "The server refused the connection"), strings.Index(failed, "enter retry"))
 	wizardKey(m, tea.KeyEnter)
 	require.Empty(t, m.err)
 	require.True(t, m.checkingConnection)
-	require.NotContains(t, stripANSI(m.View()), "Couldn’t connect")
+	require.NotContains(t, stripANSI(m.View()), "The server refused the connection")
 	m.Update(initConnectionMsg{generation: m.generation})
 	connected := stripANSI(m.View())
 	require.Contains(t, connected, "✓ Connected")
