@@ -509,6 +509,8 @@ func previewCommentShardedAllOutput() {
 		{"PLAN: UNSAFE CHANGE ON ONE SHARD", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanUnsafe()) }},
 		{"APPLY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyInProgress()) }},
 		{"APPLY FAILED (ONE SHARD FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyFailed()) }},
+		{"APPLY FAILED (MANY SHARDS FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyFailedManyShards()) }},
+		{"APPLY RUNNING PAST A FAILED SHARD", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyRunningPastFailure()) }},
 		{"APPLY WITH DIVERGENT SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyDivergent()) }},
 		{"APPLY ACROSS MULTIPLE KEYSPACES", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyMultiKeyspace()) }},
 		{"SUMMARY: ALL SHARDS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCompleted()) }},
