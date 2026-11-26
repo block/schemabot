@@ -27,7 +27,8 @@ import (
 )
 
 // ReleaseCancelledArtifacts drops the SET NOT NULL helper constraints a
-// cancelled schema change left on the named tables of one schema, connecting
+// cancelled schema change added and left on the named tables of one schema,
+// as req.AddedConstraints names them, connecting
 // from the request's credentials rather than from in-process state, since the
 // cancel may land on an instance that never drove the apply.
 //
@@ -58,7 +59,7 @@ func (e *Engine) ReleaseCancelledArtifacts(ctx context.Context, req *engine.Rele
 	result := &engine.ReleaseArtifactsResult{}
 	var errs []error
 	for _, table := range slices.Sorted(slices.Values(req.Tables)) {
-		if err := releaseNotNullHelpers(ctx, pool, req.Database, table, result); err != nil {
+		if err := releaseNotNullHelpers(ctx, pool, req.Database, table, req.AddedConstraints[table], result); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -66,14 +67,21 @@ func (e *Engine) ReleaseCancelledArtifacts(ctx context.Context, req *engine.Rele
 }
 
 // releaseNotNullHelpers drops each helper a stopped SET NOT NULL left on
-// schema.table, recording each one as removed or remaining on result.
-func releaseNotNullHelpers(ctx context.Context, pool *pgxpool.Pool, schema, table string, result *engine.ReleaseArtifactsResult) error {
+// schema.table that the cancelled apply added, recording each one as removed
+// or remaining on result. A helper the apply did not add was already on the
+// table, left by an earlier run or put there by another one, and stays.
+func releaseNotNullHelpers(ctx context.Context, pool *pgxpool.Pool, schema, table string, added []string, result *engine.ReleaseArtifactsResult) error {
 	helpers, err := diffplan.LeftoverNotNullHelpers(ctx, pool, schema, table)
 	if err != nil {
 		return fmt.Errorf("find SET NOT NULL helper constraints on %s.%s: %w", schema, table, err)
 	}
 	var errs []error
 	for _, helper := range helpers {
+		if !slices.Contains(added, helper.Name) {
+			slog.Info("left a SET NOT NULL helper constraint in place: the cancelled schema change did not add it",
+				"schema", schema, "table", table, "constraint", helper.Name)
+			continue
+		}
 		constraint := engine.EngineConstraint{
 			Table:  schema + "." + table,
 			Name:   helper.Name,

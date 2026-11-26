@@ -364,6 +364,12 @@ type ReleaseArtifactsRequest struct {
 	Database    string
 	Tables      []string
 	Credentials *Credentials
+	// AddedConstraints names, per table, the constraints the cancelled
+	// apply's own statements added: those of its tasks that ran. An engine
+	// removes a constraint a stopped change left only when the apply added
+	// it, since a constraint of the same name that was already on the table
+	// belongs to whatever put it there.
+	AddedConstraints map[string][]string
 }
 
 // ReleaseArtifactsResult reports what a release reclaimed and what it left

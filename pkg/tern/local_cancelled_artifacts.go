@@ -22,7 +22,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -41,6 +43,9 @@ const cancelledArtifactReleaseTimeout = 10 * time.Minute
 type namespaceArtifacts struct {
 	task   *storage.Task
 	tables []string
+	// addedConstraints names, per table, the constraints the apply's tasks
+	// that ran added.
+	addedConstraints map[string][]string
 }
 
 // releaseCancelledArtifacts reclaims the artifacts the cancelled apply left on
@@ -128,9 +133,10 @@ func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.
 		return false, fmt.Errorf("resolve the schema to reclaim artifacts in %s: %w", namespace, err)
 	}
 	supported, result, err := engine.ReleaseCancelledArtifacts(ctx, eng, &engine.ReleaseArtifactsRequest{
-		Database:    physical,
-		Tables:      artifacts.tables,
-		Credentials: creds,
+		Database:         physical,
+		Tables:           artifacts.tables,
+		Credentials:      creds,
+		AddedConstraints: artifacts.addedConstraints,
 	})
 	if !supported {
 		// The engine's unfinished work lives in the service it drives, which
@@ -278,8 +284,44 @@ func (c *LocalClient) cancelledArtifactTables(apply *storage.Apply, tasks []*sto
 		if !slices.Contains(entry.tables, task.TableName) {
 			entry.tables = append(entry.tables, task.TableName)
 		}
+		for _, constraint := range c.constraintsTaskAdded(apply, task) {
+			if entry.addedConstraints == nil {
+				entry.addedConstraints = map[string][]string{}
+			}
+			entry.addedConstraints[task.TableName] = append(entry.addedConstraints[task.TableName], constraint)
+		}
 	}
 	return byNamespace
+}
+
+// constraintsTaskAdded names the constraints a task's statement adds, when
+// the task ran. A task that never left pending added nothing, so a
+// constraint of the same name on its table is not the apply's to remove. A
+// statement that cannot be read attributes nothing, which leaves any
+// constraint in place rather than risk removing one the apply did not add.
+func (c *LocalClient) constraintsTaskAdded(apply *storage.Apply, task *storage.Task) []string {
+	if state.IsState(task.State, state.Task.Pending) {
+		return nil
+	}
+	parser, err := c.statementParser()
+	if err != nil {
+		c.logger.Warn("a cancel cannot read which constraints the task added, so it removes none of them",
+			append(task.LogAttrs(), "database", apply.Database, "error", err)...)
+		return nil
+	}
+	changes, err := parser.ObjectChanges(task.DDL)
+	if err != nil {
+		c.logger.Warn("a cancel cannot read which constraints the task added, so it removes none of them",
+			append(task.LogAttrs(), "database", apply.Database, "error", err)...)
+		return nil
+	}
+	var added []string
+	for _, object := range changes.Added {
+		if object.Kind == ddl.ObjectConstraint {
+			added = append(added, object.Name)
+		}
+	}
+	return added
 }
 
 // logSkippedArtifactRelease records that a cancel left artifacts on the target,
