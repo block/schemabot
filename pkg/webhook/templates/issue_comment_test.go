@@ -276,6 +276,12 @@ func TestIsFrozenByEarlierRelease(t *testing.T) {
 			"a body an earlier release froze under %q is recognized as frozen", prefix)
 	}
 
+	generic := RenderSupersededProgressComment(SupersededProgressData{
+		Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
+	})
+	assert.True(t, IsFrozenByEarlierRelease(generic),
+		"the generic fold the current release still writes is recognized as frozen")
+
 	live := map[string]string{
 		"progress body":            "## Schema Change Status — Staging",
 		"cutover-complete wording": "Cutover complete — the schema change is finalizing.",

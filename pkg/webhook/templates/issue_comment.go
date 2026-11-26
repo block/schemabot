@@ -354,8 +354,9 @@ func renderSupersededFold(headline, foldLabel, repo string, pr int, newCommentID
 // and names the event that ended it only after the dash. The frozen comment
 // sits above the operator command that caused the rotation, so a headline that
 // led with the event would announce the effect before its cause. Nothing parses
-// these headlines: the observer stores the frozen body before it edits GitHub,
-// and a retry sends the stored body again rather than reading the comment.
+// these rotation headlines: the observer stores the frozen body before it edits
+// GitHub, and a retry sends the stored body again rather than reading the
+// comment. The generic headline below is the exception.
 
 // RenderResumeSupersededProgressComment renders the frozen body written over a
 // progress comment once a resumed apply rotates in a fresh one. The old
@@ -412,14 +413,21 @@ func RenderCutoverCommandSupersededProgressComment(data SupersededProgressData) 
 // so is no longer known. The old comment's final progress stays on the PR as
 // a record, collapsed into a details block, with a pointer to the comment
 // where progress continues.
+//
+// This headline is still recognized by text, so it must not change. The
+// current release writes it when it finishes an earlier release's freeze, and
+// a retry of that finish recognizes it through IsFrozenByEarlierRelease, as do
+// pods on earlier releases.
 func RenderSupersededProgressComment(data SupersededProgressData) string {
 	return renderSupersededFold("⏭️ Progress comment superseded — progress continues in", "Earlier progress",
 		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
 }
 
 // earlierReleaseFrozenPrefixes open every frozen body a release before stored
-// frozen bodies could write. The list is closed: no current renderer adds to
-// it, because current freezes are tracked in storage, not recognized by text.
+// frozen bodies could write. The list is closed. Its last entry is also the
+// generic headline the current release still writes, so it stays recognized;
+// the rotation headlines are never added, because their freezes are tracked
+// in storage rather than recognized by text.
 var earlierReleaseFrozenPrefixes = []string{
 	"⏩ Volume changed to",
 	"▶️ Schema change resumed",

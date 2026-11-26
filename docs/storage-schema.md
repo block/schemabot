@@ -765,8 +765,8 @@ may count on an operator having run the release before it.
    `pkg/schema/mysql/` and `pkg/schema/postgres/` together. Anything an earlier
    release left in the column is abandoned, so the column's entry below says
    what that costs and how to check for it first.
-3. **Drop it.** This is an operator action, not a release. Startup never drops
-   the column on its own: MySQL refuses the drop under the default policy, and
+3. **Drop it.** This is an operator action, not a release. Under the default
+   policy, startup never drops the column: MySQL refuses the drop, and
    PostgreSQL convergence is additive only.
 
 Drop the column only once every running pod is on a release from step 2 or
@@ -776,6 +776,12 @@ destructive statement until then; opt in with `storage apply --allow-unsafe`
 (see [What is never automatic](#what-is-never-automatic)). On PostgreSQL, run
 the `ALTER TABLE ... DROP COLUMN` by hand. Rolling back afterwards to a release
 that still declares a nullable column adds it back empty, which is harmless.
+
+A MySQL deployment that sets
+[`allow_destructive_schema_changes`](configuration.md#allow_destructive_schema_changes)
+is the exception: the first pod on the step 2 release drops the column at
+startup, while pods on the earlier release still query it. Turn the setting off
+before rolling out the step 2 release, and drop the column afterwards as above.
 
 **Every column being retired has an entry below.** Add it in the PR that takes
 step 1, update it in the PR that takes step 2, and delete it once the drop is
