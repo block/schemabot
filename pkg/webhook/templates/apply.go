@@ -905,25 +905,35 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 // application is not a per-table task. Renders nothing when the apply carries
 // no VSchema change.
 func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
+	writeVSchemaStatusWithin(sb, changes, vschemaDiffBudgetFor(changes))
+}
+
+// writeVSchemaStatusWithin renders the VSchema section for changes, each diff
+// held to budget bytes.
+func writeVSchemaStatusWithin(sb *strings.Builder, changes []apitypes.VSchemaChange, budget int) {
 	if len(changes) == 0 {
 		return
 	}
 	sb.WriteString("\n### VSchema\n\n")
-	// The diff budget is per comment, not per keyspace: split it across the
-	// entries that carry a diff so a multi-keyspace apply stays bounded.
-	diffCount := 0
-	for _, c := range changes {
-		if c.Diff != "" {
-			diffCount++
-		}
-	}
-	budget := vschemaDiffBudget(diffCount)
 	for _, c := range changes {
 		fmt.Fprintf(sb, "**%s**: %s\n\n", inlineCode(c.Namespace), ui.VSchemaStatusLabel(c.Status))
 		if c.Diff != "" {
 			writeVSchemaDiffFence(sb, c.Diff, budget)
 		}
 	}
+}
+
+// vschemaDiffBudgetFor returns the byte budget for each VSchema diff in a
+// comment. The budget is per comment, not per keyspace: it is split across the
+// entries that carry a diff so a multi-keyspace apply stays bounded.
+func vschemaDiffBudgetFor(changes []apitypes.VSchemaChange) int {
+	diffCount := 0
+	for _, c := range changes {
+		if c.Diff != "" {
+			diffCount++
+		}
+	}
+	return vschemaDiffBudget(diffCount)
 }
 
 // writeTableProgressSection writes the per-row progress breakdown, grouped by

@@ -462,8 +462,8 @@ func TestRenderShardedApplySummaryComment_CompletedCollapsesDetail(t *testing.T)
 	open := strings.Index(out, label)
 	assert.Less(t, strings.Index(out, "**Shards**: 2 completed"), open, "shard counts stay above the collapsed detail")
 	assert.Greater(t, strings.Index(out, "#### Keyspace `cdb_resolute_sharded`"), open, "the keyspace section is inside the block")
-	assert.Greater(t, strings.Index(out, "### VSchema"), open, "the VSchema section is inside the block")
-	assert.Greater(t, strings.LastIndex(out, "</details>"), strings.Index(out, "### VSchema"), "the block closes after the VSchema section")
+	assert.Greater(t, strings.Index(out, "**VSchema**: Applied"), open, "the VSchema line is inside the block")
+	assert.Greater(t, strings.LastIndex(out, "</details>"), strings.Index(out, "**VSchema**: Applied"), "the block closes after the VSchema line")
 	assert.Equal(t, label, "<details><summary>"+completedSummaryDetailsLabel(ApplyStatusCommentData{
 		Tables:         []TableProgressData{{Namespace: "cdb_resolute_sharded", TableName: "mutes"}},
 		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded"}},
@@ -623,8 +623,9 @@ func TestRenderShardedApplyComment_VSchemaSection(t *testing.T) {
 		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "applying", Diff: "--- current\n+++ new\n+ vindex hash"}},
 	})
 
-	assert.Contains(t, out, "### VSchema")
-	assert.Contains(t, out, "**`cdb_resolute_sharded`**: Applying...")
+	assert.Contains(t, out, "**VSchema**: Applying...")
+	assert.Greater(t, strings.Index(out, "**VSchema**: Applying..."), strings.Index(out, "#### Keyspace `cdb_resolute_sharded`"),
+		"the VSchema change renders inside its keyspace's section")
 	assert.Contains(t, out, "```diff\n--- current\n+++ new\n+ vindex hash\n```",
 		"the stored plan's diff renders as a diff block under the keyspace entry")
 }
@@ -645,8 +646,7 @@ func TestRenderShardedApplySummaryComment_VSchemaSectionAndPluralGrammar(t *test
 
 	assert.Contains(t, out, "Applied successfully — your schema changes are live!",
 		"a table change plus a VSchema update reads as plural")
-	assert.Contains(t, out, "### VSchema")
-	assert.Contains(t, out, "**`cdb_resolute_sharded`**: Applied")
+	assert.Contains(t, out, "**VSchema**: Applied")
 }
 
 // The outcome line's grammar counts distinct (keyspace, table) pairs and

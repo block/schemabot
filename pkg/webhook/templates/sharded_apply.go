@@ -255,7 +255,6 @@ func renderShardedApplyComment(data ShardedApplyData, renderedAt string, formatt
 	writeShardedFailure(&sb, data)
 	writeShardsStoppedAtCutover(&sb, data)
 	writeShardKeyspaceSections(&sb, data, formatter, budget)
-	writeVSchemaStatus(&sb, data.VSchemaChanges)
 
 	writeShardedFooter(&sb, data)
 	if !state.IsTerminalApplyState(data.State) {
@@ -307,7 +306,6 @@ func writeShardedSummaryDetails(sb *strings.Builder, data ShardedApplyData, form
 		fmt.Fprintf(sb, "\n<details><summary>%s</summary>\n", applyDetailsLabel(tables, "table", len(data.VSchemaChanges)))
 	}
 	writeShardKeyspaceSections(sb, data, formatter, budget)
-	writeVSchemaStatus(sb, data.VSchemaChanges)
 	if collapse {
 		sb.WriteString("\n</details>\n")
 	}
@@ -479,6 +477,8 @@ func writeShardedSummaryMetadata(sb *strings.Builder, data ShardedApplyData) {
 // signature (which shards moved together is invisible at the table level),
 // divergent shard outcomes (the split the operator reconciles shard by shard),
 // or a keyspace carrying no table rollup to stand in for them.
+// Each keyspace's VSchema change follows its tables; a VSchema change for a
+// keyspace with no section renders after the last keyspace.
 func writeShardKeyspaceSections(sb *strings.Builder, data ShardedApplyData, formatter *shardedDDLFormatter, budget *ddlBlockBudget) {
 	keyspaces := data.Keyspaces
 	applyHasShardFailure := false
@@ -488,27 +488,60 @@ func writeShardKeyspaceSections(sb *strings.Builder, data ShardedApplyData, form
 			break
 		}
 	}
+	vschemaChanges := make(map[string]apitypes.VSchemaChange, len(data.VSchemaChanges))
+	for _, c := range data.VSchemaChanges {
+		vschemaChanges[c.Namespace] = c
+	}
+	vschemaBudget := vschemaDiffBudgetFor(data.VSchemaChanges)
+	placed := make(map[string]bool, len(keyspaces))
 	for _, ks := range keyspaces {
+		placed[ks.Keyspace] = true
 		fmt.Fprintf(sb, "\n#### Keyspace %s\n\n", inlineCode(ks.Keyspace))
 		for _, t := range ks.Tables {
 			writeShardedTableLine(sb, t, budget, func() {
 				writeShardedTableDDL(sb, shardedTableDDLGroups(ks, t.Table), len(ks.Shards), formatter, budget)
 			})
 		}
-		needsShardDetail := applyHasShardFailure || keyspaceHasDivergentOutcome(ks.Shards)
-		groups := groupShardsBySignature(ks.Shards, ks.Cells)
-		if len(ks.Tables) > 0 && len(groups) <= 1 && !needsShardDetail {
-			continue
+		writeShardDetail(sb, ks, applyHasShardFailure)
+		if c, ok := vschemaChanges[ks.Keyspace]; ok {
+			writeKeyspaceVSchema(sb, c, vschemaBudget)
 		}
-		if len(groups) <= 1 {
-			writeShardStatusTable(sb, ks.Shards)
-			continue
+	}
+	var unplaced []apitypes.VSchemaChange
+	for _, c := range data.VSchemaChanges {
+		if !placed[c.Namespace] {
+			unplaced = append(unplaced, c)
 		}
-		sb.WriteString("\nShards diverge — grouped by change:\n")
-		for _, g := range groups {
-			fmt.Fprintf(sb, "\n**%s**\n", shardList(g.Shards, len(ks.Shards)))
-			writeShardStatusTable(sb, g.Shards)
-		}
+	}
+	writeVSchemaStatusWithin(sb, unplaced, vschemaBudget)
+}
+
+// writeShardDetail writes a keyspace's per-shard status tables when the
+// keyspace needs them (see writeShardKeyspaceSections).
+func writeShardDetail(sb *strings.Builder, ks ShardedKeyspace, applyHasShardFailure bool) {
+	needsShardDetail := applyHasShardFailure || keyspaceHasDivergentOutcome(ks.Shards)
+	groups := groupShardsBySignature(ks.Shards, ks.Cells)
+	if len(ks.Tables) > 0 && len(groups) <= 1 && !needsShardDetail {
+		return
+	}
+	if len(groups) <= 1 {
+		writeShardStatusTable(sb, ks.Shards)
+		return
+	}
+	sb.WriteString("\nShards diverge — grouped by change:\n")
+	for _, g := range groups {
+		fmt.Fprintf(sb, "\n**%s**\n", shardList(g.Shards, len(ks.Shards)))
+		writeShardStatusTable(sb, g.Shards)
+	}
+}
+
+// writeKeyspaceVSchema writes a keyspace's VSchema change inside that
+// keyspace's section, as a Vitess plan does, so a reader sees the routing
+// change next to the tables it routes.
+func writeKeyspaceVSchema(sb *strings.Builder, c apitypes.VSchemaChange, budget int) {
+	fmt.Fprintf(sb, "\n**VSchema**: %s\n\n", ui.VSchemaStatusLabel(c.Status))
+	if c.Diff != "" {
+		writeVSchemaDiffFence(sb, c.Diff, budget)
 	}
 }
 

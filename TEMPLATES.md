@@ -11740,9 +11740,7 @@ ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
-### VSchema
-
-**`cdb_resolute_sharded`**: Pending
+**VSchema**: Pending
 
 
 _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
@@ -11773,9 +11771,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
-### VSchema
-
-**`cdb_resolute_sharded`**: Applied
+**VSchema**: Applied
 
 ```diff
 --- current
@@ -11826,9 +11822,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 | `80-c0` | ⏸️ halted — -40 failed |
 | `c0-` | ⏸️ halted — -40 failed |
 
-### VSchema
-
-**`cdb_resolute_sharded`**: Cancelled
+**VSchema**: Cancelled
 
 
 ---
