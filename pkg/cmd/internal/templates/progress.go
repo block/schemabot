@@ -162,7 +162,7 @@ func WriteProgress(data ProgressData) {
 	if callout := shardFailureCallout(data); callout != "" {
 		fmt.Printf("\n%s", callout)
 	} else if (data.State == state.Apply.Failed || data.Sharded) && data.ErrorMessage != "" {
-		fmt.Printf("\n  %s%s%s\n", ANSIRed, ui.TerminalSafe(data.ErrorMessage), ANSIReset)
+		fmt.Printf("\n  %s%s%s\n", ANSIRed, data.ErrorMessage, ANSIReset)
 	}
 	writeStoppedByFreeze(data)
 	if data.Sharded {
