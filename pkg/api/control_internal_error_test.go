@@ -223,20 +223,65 @@ func TestStopRefusalsClassifyEveryEngine(t *testing.T) {
 }
 
 // A stop of a PostgreSQL schema change is refused up front: the engine has no
-// stopped phase, so the request is never recorded and the operator is pointed
-// at cancel.
+// stopped phase, so the request is never recorded. The refusal gives the
+// engine's own reason and the remedy the PR comment offers for this apply:
+// cancel for a concurrent index build that is its only statement, waiting for
+// anything else, and both when its stored progress cannot be read.
 func TestStopOfPostgresApplyIsRefusedBeforeItIsRecorded(t *testing.T) {
-	apply := activeTestApply("apply-postgres-stop")
-	apply.Engine = storage.EnginePostgres
-	apply.DatabaseType = storage.DatabaseTypePostgres
-	requests := &memoryControlRequestStore{}
-	svc := newControlInternalErrorService(&staticApplyStore{apply: apply}, requests, slog.New(slog.DiscardHandler))
+	const reason = "stop rejected: stop is not supported for PostgreSQL schema changes: concurrent index builds have no resumable midpoint, and other statements commit or fail on their own. "
+	operation := func(metadata string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: 11, ApplyID: 1, ProgressMetadata: metadata}
+	}
+	tests := []struct {
+		name       string
+		operations *staticApplyOperationStore
+		want       string
+	}{
+		{
+			name: "a lone concurrent index build is pointed at cancel",
+			operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
+				operation(`{"executor_operation":"concurrent-index-build","step":"1","steps_total":"1"}`),
+			}},
+			want: reason + "Use cancel to end this concurrent index build",
+		},
+		{
+			name: "plain DDL is left to finish",
+			operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
+				operation(`{"step":"1","steps_total":"1","statement":"ALTER TABLE users ADD COLUMN email text"}`),
+			}},
+			want: reason + "This schema change commits or fails on its own; wait for it to finish",
+		},
+		{
+			name: "an index build among other statements is left to finish",
+			operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
+				operation(`{"executor_operation":"concurrent-index-build","step":"2","steps_total":"3"}`),
+			}},
+			want: reason + "This schema change commits or fails on its own; wait for it to finish",
+		},
+		{
+			name:       "unreadable progress names the remedy for each kind of statement",
+			operations: &staticApplyOperationStore{err: errors.New(sensitiveControlFailure)},
+			want:       reason + "Use cancel if this schema change is a single concurrent index build; otherwise wait for it to finish",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apply := activeTestApply("apply-postgres-stop")
+			apply.ID = 1
+			apply.Engine = storage.EnginePostgres
+			apply.DatabaseType = storage.DatabaseTypePostgres
+			requests := &memoryControlRequestStore{}
+			svc := newControlInternalErrorService(&staticApplyStore{apply: apply}, requests, slog.New(slog.DiscardHandler))
+			svc.storage.(*mockStorageWithApplyStores).operations = tt.operations
 
-	w, resp := postControlRoute(t, svc, "/api/stop")
+			w, resp := postControlRoute(t, svc, "/api/stop")
 
-	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
-	assert.Equal(t, "stop rejected: stop is not supported for PostgreSQL schema changes: each statement runs until it commits or fails. Use cancel to end a concurrent index build that is still running", resp.Error)
-	assert.Empty(t, requests.requests, "a refused stop records no control request")
+			require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			assert.Equal(t, tt.want, resp.Error)
+			assert.NotContains(t, w.Body.String(), "10.0.0.5")
+			assert.Empty(t, requests.requests, "a refused stop records no control request")
+		})
+	}
 }
 
 // A refusal the requester caused or must act on keeps its own text and its 4xx

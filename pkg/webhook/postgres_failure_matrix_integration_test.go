@@ -210,7 +210,7 @@ func TestPostgresConfigFixtureStopIsRefusedAndAStoredStopIsDeclined(t *testing.T
 	require.False(t, plan.HasBlockedChanges())
 
 	// Hold the target table so the native ALTER remains observably running
-	// while the durable stop traverses the public control path.
+	// while the public stop is refused and a stored stop is settled.
 	lockTx, err := db.BeginTx(t.Context(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = lockTx.Rollback() })
@@ -242,7 +242,7 @@ func TestPostgresConfigFixtureStopIsRefusedAndAStoredStopIsDeclined(t *testing.T
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "stop is not supported for PostgreSQL schema changes")
-	assert.Contains(t, err.Error(), "Use cancel to end a concurrent index build that is still running")
+	assert.Contains(t, err.Error(), "This schema change commits or fails on its own; wait for it to finish")
 	refused, err := svc.Storage().ControlRequests().GetByOperation(t.Context(), running.ID, storage.ControlOperationStop)
 	require.NoError(t, err)
 	assert.Nil(t, refused, "a refused stop records no control request")
