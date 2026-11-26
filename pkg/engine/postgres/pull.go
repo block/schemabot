@@ -35,7 +35,6 @@ SELECT
           WHERE tgrelid OPERATOR(pg_catalog.=) c.oid AND NOT tgisinternal),
   EXISTS (SELECT 1 FROM pg_catalog.pg_description
           WHERE objoid OPERATOR(pg_catalog.=) c.oid AND objsubid OPERATOR(pg_catalog.>=) 0),
-  COALESCE(pg_catalog.cardinality(c.reloptions), 0) OPERATOR(pg_catalog.>) 0,
   EXISTS (SELECT 1 FROM pg_catalog.pg_inherits WHERE inhrelid OPERATOR(pg_catalog.=) c.oid)
     AND NOT c.relispartition
 FROM pg_catalog.pg_class AS c
@@ -45,15 +44,14 @@ WHERE n.nspname OPERATOR(pg_catalog.=) $1 AND c.relname OPERATOR(pg_catalog.=) $
 type unmodeledTableObjects struct {
 	trigger     bool
 	comment     bool
-	reloptions  bool
 	inheritance bool
 }
 
 // PullSchema exports tables that the PostgreSQL declarative format can
-// represent. A table's own foreign keys are written into its file. It refuses
-// tables carrying user triggers, table or column comments, non-default
-// relation options, or table inheritance, a table referenced by a foreign key
-// that the pull does not write, as well as shapes rejected by the renderer.
+// represent. A table's own foreign keys and storage parameters are written
+// into its file. It refuses tables carrying user triggers, table or column
+// comments, or table inheritance, a table referenced by a foreign key that the
+// pull does not write, as well as shapes rejected by the renderer.
 // By default one refused table refuses the whole pull, so a caller never
 // mistakes a partial baseline for the namespace. A request that sets
 // skip_unrepresentable_tables gets the rest of the namespace instead, with
@@ -508,7 +506,6 @@ func pullUnmodeledTableObjects(ctx context.Context, pool *pgxpool.Pool, namespac
 	err := pool.QueryRow(ctx, inspectUnmodeledPostgresTableObjects, namespace, table).Scan(
 		&objects.trigger,
 		&objects.comment,
-		&objects.reloptions,
 		&objects.inheritance,
 	)
 	if err != nil {
@@ -528,7 +525,6 @@ func unmodeledTableObjectsRefusal(namespace, table string, objects unmodeledTabl
 	}{
 		{"trigger", objects.trigger},
 		{"comment", objects.comment},
-		{"relation options", objects.reloptions},
 		{"table inheritance", objects.inheritance},
 	}
 	var kinds []string
