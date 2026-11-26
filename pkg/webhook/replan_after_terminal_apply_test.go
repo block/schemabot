@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -138,18 +139,43 @@ func TestAggregatePublishSHA(t *testing.T) {
 	})
 }
 
+// slotPlanCommentStore serves a fixed set of tracked plan comments for every
+// slot.
+type slotPlanCommentStore struct {
+	storage.PlanCommentStore
+	comments []*storage.PlanComment
+}
+
+func (s *slotPlanCommentStore) ListUnretiredForSlot(context.Context, string, int, string, string) ([]*storage.PlanComment, error) {
+	return s.comments, nil
+}
+
+// planCommentStorage is a storage whose only populated store is the plan
+// comments.
+type planCommentStorage struct {
+	emptyStorage
+	planComments storage.PlanCommentStore
+}
+
+func (s *planCommentStorage) PlanComments() storage.PlanCommentStore {
+	return s.planComments
+}
+
 // A push lands while an apply runs, and the re-plan after the apply settles
-// decides whether the PR gets a new plan comment. A push that changed schema
-// inputs plans something the visible comment never showed, such as dropping
-// the index the apply just built, so the re-plan posts. A push that touched
-// only other files keeps the visible comment. A range GitHub cannot compare,
-// or one whose history is not linear, posts too, so the PR never keeps a
-// comment that may no longer describe its plan.
+// decides whether the PR gets a new plan comment. It compares the head with
+// the commit the visible plan comment rendered. A push that changed schema
+// inputs since that comment plans something no comment showed, such as
+// dropping the index the apply just built, so the re-plan posts. A push that
+// touched only other files keeps the visible comment, and so does a comment
+// the push's own auto-plan already posted for the head. A range GitHub cannot
+// compare, one whose history is not linear, or a PR with no visible comment
+// posts, so the PR never keeps a comment that may no longer describe its plan.
 func TestReplanPostsPlanComment(t *testing.T) {
 	const (
 		repo     = "octocat/hello-world"
 		applySHA = "applysha1"
-		headSHA  = "headsha2"
+		pushSHA  = "pushsha2"
+		headSHA  = "headsha3"
 	)
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-replan-comment",
@@ -160,43 +186,58 @@ func TestReplanPostsPlanComment(t *testing.T) {
 		Environment:     "staging",
 		InstallationID:  4242,
 	}
+	cfg := &api.ServerConfig{Databases: map[string]api.DatabaseConfig{
+		"orders": {Type: storage.DatabaseTypePostgres, Environments: map[string]api.EnvironmentConfig{"staging": {}}},
+	}}
+	visibleAt := func(sha, scope string) []*storage.PlanComment {
+		return []*storage.PlanComment{{HeadSHA: sha, EnvironmentScope: scope}}
+	}
 	tests := []struct {
-		name   string
-		status int
-		state  string
-		files  []string
-		want   bool
+		name     string
+		comments []*storage.PlanComment
+		base     string
+		status   int
+		state    string
+		files    []string
+		want     bool
 	}{
-		{name: "a push that changed a schema file posts", status: http.StatusOK, state: "ahead", files: []string{"schema/orders/orders.sql"}, want: true},
-		{name: "a push that changed the config posts", status: http.StatusOK, state: "ahead", files: []string{"schema/orders/schemabot.yaml"}, want: true},
-		{name: "a push that changed only other files keeps the visible comment", status: http.StatusOK, state: "ahead", files: []string{"README.md"}, want: false},
-		{name: "a range GitHub cannot compare posts", status: http.StatusUnprocessableEntity, want: true},
-		{name: "a range whose history is not linear posts", status: http.StatusOK, state: "diverged", files: []string{"README.md"}, want: true},
+		{name: "a push that changed a schema file since the apply's comment posts", comments: visibleAt(applySHA, "staging"), base: applySHA, status: http.StatusOK, state: "ahead", files: []string{"schema/orders/orders.sql"}, want: true},
+		{name: "a push that changed the config posts", comments: visibleAt(applySHA, "staging"), base: applySHA, status: http.StatusOK, state: "ahead", files: []string{"schema/orders/schemabot.yaml"}, want: true},
+		{name: "a push that changed only other files keeps the visible comment", comments: visibleAt(applySHA, "staging"), base: applySHA, status: http.StatusOK, state: "ahead", files: []string{"README.md"}, want: false},
+		{name: "a comment the push already posted for the head stays", comments: visibleAt(headSHA, "staging"), want: false},
+		{name: "a later push of other files after the push's comment keeps it", comments: visibleAt(pushSHA, "staging"), base: pushSHA, status: http.StatusOK, state: "ahead", files: []string{"README.md"}, want: false},
+		{name: "a range GitHub cannot compare posts", comments: visibleAt(applySHA, "staging"), base: applySHA, status: http.StatusUnprocessableEntity, want: true},
+		{name: "a range whose history is not linear posts", comments: visibleAt(applySHA, "staging"), base: applySHA, status: http.StatusOK, state: "diverged", files: []string{"README.md"}, want: true},
+		{name: "a PR with no visible comment posts", want: true},
+		{name: "a comment for another environment scope is not the visible one", comments: visibleAt(headSHA, "production"), want: true},
+		{name: "a visible comment with no recorded head posts", comments: visibleAt("", "staging"), want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client, mux := setupGitHubServer(t)
-			mux.HandleFunc("GET /repos/"+repo+"/compare/"+applySHA+"..."+headSHA, func(w http.ResponseWriter, r *http.Request) {
-				if strings.Contains(r.Header.Get("Accept"), "diff") {
-					writeRegularFilesDiff(t, w, tt.files)
-					return
-				}
-				if tt.status != http.StatusOK {
-					w.WriteHeader(tt.status)
-					return
-				}
-				files := make([]map[string]string, 0, len(tt.files))
-				for _, f := range tt.files {
-					files = append(files, map[string]string{"filename": f, "status": "modified"})
-				}
-				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"status": tt.state, "files": files}))
-			})
+			if tt.base != "" {
+				mux.HandleFunc("GET /repos/"+repo+"/compare/"+tt.base+"..."+headSHA, func(w http.ResponseWriter, r *http.Request) {
+					if strings.Contains(r.Header.Get("Accept"), "diff") {
+						writeRegularFilesDiff(t, w, tt.files)
+						return
+					}
+					if tt.status != http.StatusOK {
+						w.WriteHeader(tt.status)
+						return
+					}
+					files := make([]map[string]string, 0, len(tt.files))
+					for _, f := range tt.files {
+						files = append(files, map[string]string{"filename": f, "status": "modified"})
+					}
+					require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"status": tt.state, "files": files}))
+				})
+			}
 			h := &Handler{
-				service:   api.New(&foldStorage{}, &api.ServerConfig{}, nil, testLogger()),
+				service:   api.New(&planCommentStorage{planComments: &slotPlanCommentStore{comments: tt.comments}}, cfg, nil, testLogger()),
 				ghClients: github.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: github.NewInstallationClient(client, testLogger())}),
 				logger:    testLogger(),
 			}
-			assert.Equal(t, tt.want, h.replanPostsPlanComment(t.Context(), apply, applySHA, headSHA))
+			assert.Equal(t, tt.want, h.replanPostsPlanComment(t.Context(), apply, headSHA))
 		})
 	}
 }
