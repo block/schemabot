@@ -38,7 +38,7 @@ func TestTableChangesRecordsTheReviewedAdoption(t *testing.T) {
 			ExecSQL:     []string{reviewedAdoptionSQL},
 			Adopts:      adopts,
 		}}
-		changes, _, _, err := tableChanges(report, nil, parser)
+		changes, _, _, err := tableChanges(report, parser)
 		require.NoError(t, err)
 		require.Len(t, changes, 1)
 		return changes[0]

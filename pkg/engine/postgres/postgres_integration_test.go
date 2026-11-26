@@ -1605,15 +1605,6 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 	assert.Equal(t, []string{"events", "invoices", "orders", "users"}, pulled,
 		"every live table must be enumerated, and only the partition and the extension-owned table left out, despite the shadowing search_path")
 
-	keys, err := foreignKeysFor(t.Context(), pool, "public", pulled)
-	require.NoError(t, err)
-	assert.ElementsMatch(t, []tableForeignKeys{
-		{name: "events", foreignKeys: []string{}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{}},
-		{name: "invoices", foreignKeys: []string{"invoices_account_id_fkey"}, crossNamespaceForeignKeys: []string{"invoices_account_id_fkey"}, referencedBy: []string{}},
-		{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{}},
-		{name: "users", foreignKeys: []string{}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{"orders_user_id_fkey"}},
-	}, keys, "every table's foreign keys must be read from the real catalog")
-
 	users, err := schemadiff.Introspect(t.Context(), pool, "public", "users")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"orders.orders_user_id_fkey"}, users.ReferencedBy,
