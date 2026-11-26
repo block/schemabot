@@ -42,8 +42,20 @@ func (cmd *FixLintCmd) Run(g *Globals) error {
 		return fmt.Errorf("fix files: %w", err)
 	}
 
+	// Split what the files still carry by severity. Errors gate, warnings are
+	// advisory and never do, which is how lint findings are routed everywhere
+	// else in SchemaBot.
+	var remainingErrors, remainingWarnings []lint.Result
+	for _, issue := range result.RemainingIssues {
+		if issue.Severity == "error" {
+			remainingErrors = append(remainingErrors, issue)
+		} else {
+			remainingWarnings = append(remainingWarnings, issue)
+		}
+	}
+
 	// Report results
-	if result.TotalFixed == 0 && len(result.UnfixableIssues) == 0 {
+	if result.TotalFixed == 0 && len(result.RemainingIssues) == 0 {
 		fmt.Println("✓ No lint issues found.")
 		return nil
 	}
@@ -74,17 +86,16 @@ func (cmd *FixLintCmd) Run(g *Globals) error {
 		fmt.Println()
 	}
 
-	// Show unfixable issues
-	if len(result.UnfixableIssues) > 0 {
-		fmt.Printf(glyph.Failed+" %d issue(s) require manual fix:\n", len(result.UnfixableIssues))
-		for _, issue := range result.UnfixableIssues {
-			loc := issue.Table
-			if issue.Column != "" {
-				loc = issue.Table + "." + issue.Column
-			}
-			fmt.Printf("  - [%s] %s\n", loc, issue.Message)
-		}
-		fmt.Println()
+	// Show what the files still carry. A finding the fixer has no fix for is
+	// still the operator's to act on, so it is listed whatever its severity:
+	// saying nothing would leave them believing the file came out clean.
+	if len(remainingErrors) > 0 {
+		fmt.Printf(glyph.Failed+" %d issue(s) require manual fix:\n", len(remainingErrors))
+		printIssues(remainingErrors)
+	}
+	if len(remainingWarnings) > 0 {
+		fmt.Printf(glyph.Tip+" %d lint warning(s) with no automatic fix:\n", len(remainingWarnings))
+		printIssues(remainingWarnings)
 	}
 
 	if cmd.DryRun && result.TotalFixed > 0 {
@@ -93,12 +104,25 @@ func (cmd *FixLintCmd) Run(g *Globals) error {
 		fmt.Printf("Run '%s plan' to see full validation results.\n", cliname.Name())
 	}
 
-	// Exit with error if there are unfixable issues (for CI)
-	if len(result.UnfixableIssues) > 0 {
-		return fmt.Errorf("%d unfixable issue(s) found", len(result.UnfixableIssues))
+	// Exit with error if an issue needs a manual fix (for CI). Warnings are
+	// advisory and do not fail the command.
+	if len(remainingErrors) > 0 {
+		return fmt.Errorf("%d issue(s) require a manual fix", len(remainingErrors))
 	}
 
 	return nil
+}
+
+// printIssues lists lint findings as "[table.column] message".
+func printIssues(issues []lint.Result) {
+	for _, issue := range issues {
+		loc := issue.Table
+		if issue.Column != "" {
+			loc = issue.Table + "." + issue.Column
+		}
+		fmt.Printf("  - [%s] %s\n", loc, issue.Message)
+	}
+	fmt.Println()
 }
 
 // readSchemaFiles reads the .sql files under dir that plan would read, keyed

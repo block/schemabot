@@ -57,9 +57,14 @@ type FixResult struct {
 
 // FixFilesResult contains the result of fixing multiple files.
 type FixFilesResult struct {
-	Files           []FixResult // Results for each file
-	TotalFixed      int         // Number of issues fixed
-	UnfixableIssues []Result    // Issues that couldn't be auto-fixed
+	Files      []FixResult // Results for each file
+	TotalFixed int         // Number of issues fixed
+	// RemainingIssues are the findings the files still carry once the fixes
+	// have been applied, at whatever severity the linter reports them. Most
+	// of what the fixer leaves behind is a warning rather than an error, so
+	// reporting only errors would let the command claim a file is clean when
+	// the linter still has something to say about it.
+	RemainingIssues []Result
 }
 
 // FixFiles applies auto-fixes to a set of SQL schema files.
@@ -83,7 +88,7 @@ func (f *Fixer) FixFiles(files map[string]string) (*FixFilesResult, error) {
 		// Parse and fix using AST manipulation. A file counts as changed only
 		// when a fix was applied to it, never because its restored spelling
 		// differs from what was written.
-		fixed, fixes, err := f.fixCreateTable(content)
+		fixed, fixes, err := f.fixFile(content)
 		if err != nil {
 			return nil, fmt.Errorf("fix %s: %w", filename, err)
 		}
@@ -98,7 +103,7 @@ func (f *Fixer) FixFiles(files map[string]string) (*FixFilesResult, error) {
 		result.Files = append(result.Files, fileResult)
 	}
 
-	// Run lint after fixes to report any remaining unfixable issues
+	// Lint after fixing to report whatever the files still carry.
 	linter := New()
 	for _, filename := range filenames {
 		// Lint the fixed content where a fix was applied.
@@ -110,30 +115,101 @@ func (f *Fixer) FixFiles(files map[string]string) (*FixFilesResult, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to lint %s: %w", filename, err)
 		}
-		for _, lr := range lintResults {
-			// Report non-style issues that we couldn't auto-fix
-			if lr.Severity == "error" {
-				result.UnfixableIssues = append(result.UnfixableIssues, lr)
-			}
-		}
+		result.RemainingIssues = append(result.RemainingIssues, lintResults...)
 	}
 
 	return result, nil
 }
 
-// fixCreateTable parses a CREATE TABLE statement, applies all fixes via AST
-// manipulation, and returns the canonical fixed SQL with the fixes applied. It
-// returns the input unchanged and no fixes when there was nothing to fix. A
-// fixed table that cannot be rendered back to SQL is an error: reporting it as
-// unfixed would tell the operator the file is clean.
-func (f *Fixer) fixCreateTable(sql string) (string, []string, error) {
-	ct, err := statement.ParseCreateTable(sql)
+// fixFile applies the fixes to every CREATE TABLE in a schema file and
+// returns the file with those tables rewritten. A file is read one statement
+// at a time, the way the lint pass reads it, so a file that declares several
+// tables has every one of them fixed rather than being skipped for holding
+// more than one statement.
+//
+// Only the tables a fix changed are rewritten. Every other statement, and the
+// text between statements, is copied through exactly as written, so a comment
+// above an untouched table survives and a file with nothing to fix keeps its
+// bytes. A rewritten table is replaced by the parser's canonical rendering of
+// it, which is one line and carries no comments of its own.
+//
+// A file the parser rejects is returned unchanged and without fixes. The lint
+// pass that follows parses it again and reports the parse failure, so refusing
+// here would only report it twice.
+func (f *Fixer) fixFile(sql string) (string, []string, error) {
+	stmts, err := statement.NewWithOptions(sql, statement.Options{AllowMixedStatementTypes: true})
 	if err != nil {
-		// Not a CREATE TABLE this fixer handles. The lint pass that follows
-		// parses the file again and reports a file that does not parse.
 		return sql, nil, nil
 	}
 
+	var (
+		fixes []string
+		out   strings.Builder
+		// cursor is how far through sql the rewritten output has consumed, so
+		// the gaps between statements are copied rather than regenerated.
+		cursor int
+	)
+
+	for _, stmt := range stmts {
+		original := (*stmt.StmtNode).OriginalText()
+		offset := strings.Index(sql[cursor:], original)
+		if offset < 0 {
+			// The statement's source text could not be located in the file, so
+			// its bounds are unknown and no part of the file can be rewritten
+			// without risking the loss of another statement.
+			return sql, nil, nil
+		}
+		out.WriteString(sql[cursor : cursor+offset])
+		cursor += offset + len(original)
+
+		replacement, stmtFixes, err := f.fixStatement(stmt, original)
+		if err != nil {
+			return "", nil, err
+		}
+		fixes = append(fixes, stmtFixes...)
+		out.WriteString(replacement)
+	}
+	out.WriteString(sql[cursor:])
+
+	if len(fixes) == 0 {
+		return sql, nil, nil
+	}
+	return out.String(), fixes, nil
+}
+
+// fixStatement applies the fixes to one statement and returns the text that
+// replaces it. A statement that is not a CREATE TABLE, and a table with
+// nothing to fix, is returned as written. A fixed table that cannot be
+// rendered back to SQL is an error: reporting it as unfixed would tell the
+// operator the file is clean.
+func (f *Fixer) fixStatement(stmt *statement.AbstractStatement, original string) (string, []string, error) {
+	if !stmt.IsCreateTable() {
+		return original, nil, nil
+	}
+	ct, err := stmt.ParseCreateTable()
+	if err != nil {
+		return original, nil, nil
+	}
+
+	fixes := f.fixTable(ct)
+	if len(fixes) == 0 {
+		return original, nil, nil
+	}
+
+	var sb strings.Builder
+	rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
+	if err := ct.Raw.Restore(rCtx); err != nil {
+		return "", nil, fmt.Errorf("render table %s after applying %s: %w", ct.TableName, strings.Join(fixes, ", "), err)
+	}
+	// The rendering carries no terminator of its own, and a file that declares
+	// more than one table needs one between them.
+	return sb.String() + ";", fixes, nil
+}
+
+// fixTable applies every fix to a parsed CREATE TABLE in place and returns one
+// description per kind of fix applied. Each fix visits every column, so a
+// table with three columns of the same problem has all three fixed.
+func (f *Fixer) fixTable(ct *statement.CreateTable) []string {
 	var fixes []string
 
 	// Fix 1: INT AUTO_INCREMENT -> BIGINT AUTO_INCREMENT
@@ -149,30 +225,30 @@ func (f *Fixer) fixCreateTable(sql string) (string, []string, error) {
 	}
 
 	// Fix 3: FLOAT/DOUBLE -> DECIMAL
-	if slices.ContainsFunc(ct.Raw.Cols, f.fixColumnFloatType) {
+	if applyToColumns(ct.Raw.Cols, f.fixColumnFloatType) {
 		fixes = append(fixes, "FLOAT/DOUBLE → DECIMAL") // Only report once
 	}
 
 	// Fix 4: TIMESTAMP/DATETIME without DEFAULT
-	if slices.ContainsFunc(ct.Raw.Cols, f.fixColumnZeroDate) {
+	if applyToColumns(ct.Raw.Cols, f.fixColumnMissingDateDefault) {
 		fixes = append(fixes, "Added DEFAULT for TIMESTAMP/DATETIME") // Only report once
 	}
 
-	// A file with nothing to fix is left exactly as written. Restoring it
-	// would only respell it (one backtick-quoted line, uppercase types) and
-	// turn every clean file into a diff.
-	if len(fixes) == 0 {
-		return sql, nil, nil
-	}
+	return fixes
+}
 
-	// Restore to canonical form
-	var sb strings.Builder
-	rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
-	if err := ct.Raw.Restore(rCtx); err != nil {
-		return "", nil, fmt.Errorf("render table %s after applying %s: %w", ct.TableName, strings.Join(fixes, ", "), err)
+// applyToColumns applies fix to every column and reports whether any column
+// changed. It visits them all: a predicate helper that stops at the first
+// match would leave the rest of a table's columns unfixed while the fix was
+// still reported as applied.
+func applyToColumns(cols []*ast.ColumnDef, fix func(*ast.ColumnDef) bool) bool {
+	fixed := false
+	for _, col := range cols {
+		if fix(col) {
+			fixed = true
+		}
 	}
-
-	return sb.String(), fixes, nil
+	return fixed
 }
 
 // fixColumnPrimaryKeyType changes INT to BIGINT for AUTO_INCREMENT columns.
@@ -249,15 +325,22 @@ func (f *Fixer) fixColumnFloatType(col *ast.ColumnDef) bool {
 	return true
 }
 
-// fixColumnZeroDate adds DEFAULT for TIMESTAMP/DATETIME columns without one.
-// Returns true if a fix was applied.
-func (f *Fixer) fixColumnZeroDate(col *ast.ColumnDef) bool {
+// fixColumnMissingDateDefault gives a TIMESTAMP/DATETIME column that declares
+// no DEFAULT one: CURRENT_TIMESTAMP when the column is NOT NULL, NULL
+// otherwise. Returns true if a fix was applied.
+//
+// A column that already declares a DEFAULT is left alone, including one whose
+// default is a zero date. Replacing a zero date changes what new rows get,
+// which is the schema owner's decision and not a mechanical fix, so the
+// zero_date finding is reported rather than resolved here.
+func (f *Fixer) fixColumnMissingDateDefault(col *ast.ColumnDef) bool {
 	tp := col.Tp.GetType()
 	if tp != mysql.TypeTimestamp && tp != mysql.TypeDatetime {
 		return false
 	}
 
-	// Check if DEFAULT already exists
+	// A column that already declares a DEFAULT, zero date or not, is the
+	// owner's to change.
 	hasDefault := false
 	isNotNull := false
 	for _, opt := range col.Options {

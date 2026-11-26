@@ -247,11 +247,70 @@ func TestFixLint_OnlyFileNeedingFixRewritten(t *testing.T) {
 	})
 	require.NoError(t, runErr)
 
-	assert.Equal(t, "CREATE TABLE `orders` (`id` BIGINT NOT NULL AUTO_INCREMENT,`user_id` BIGINT UNSIGNED NOT NULL,PRIMARY KEY(`id`)) ENGINE = InnoDB DEFAULT CHARACTER SET = UTF8MB4 DEFAULT COLLATE = UTF8MB4_0900_AI_CI", readFile(t, ordersPath))
+	assert.Equal(t, "CREATE TABLE `orders` (`id` BIGINT NOT NULL AUTO_INCREMENT,`user_id` BIGINT UNSIGNED NOT NULL,PRIMARY KEY(`id`)) ENGINE = InnoDB DEFAULT CHARACTER SET = UTF8MB4 DEFAULT COLLATE = UTF8MB4_0900_AI_CI;\n", readFile(t, ordersPath))
 	assert.Equal(t, cleanTable, readFile(t, usersPath))
 	assert.Equal(t, cleanTable, readFile(t, billingPath))
 	assert.Equal(t, "✅ Fixed 1 issue(s):\n"+
 		"  - [testapp/orders.sql] INT → BIGINT for primary key\n"+
 		"\n"+
 		"Run '"+cliname.Name()+" plan' to see full validation results.\n", out)
+}
+
+// A finding with no mechanical fix is listed even though it is only a
+// warning, so an operator is never told a file is clean when the linter
+// still has something to say about it. Warnings are advisory and do not
+// fail the command.
+func TestFixLint_RemainingWarningsListedAndDoNotGate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "app")
+	writeSchemaFile(t, filepath.Join(dir, "sessions.sql"),
+		"CREATE TABLE `sessions` (\n  `id` varchar(36) NOT NULL,\n  `body` text CHARACTER SET latin1 NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n")
+
+	var runErr error
+	out := captureStdout(func() {
+		runErr = (&FixLintCmd{SchemaDir: dir}).Run(&Globals{})
+	})
+
+	require.NoError(t, runErr, "warnings are advisory and never gate")
+	assert.NotContains(t, out, "No lint issues found")
+	assert.Contains(t, out, "2 lint warning(s) with no automatic fix")
+	assert.Contains(t, out, `Primary key column "id" has type "varchar"`)
+	assert.Contains(t, out, `Column "body" has unsupported character set: "latin1"`)
+}
+
+// A finding that is an error still fails the command, so CI keeps gating on
+// the issues that need a human.
+func TestFixLint_RemainingErrorGatesTheCommand(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "app")
+	writeSchemaFile(t, filepath.Join(dir, "payments.sql"),
+		"CREATE TABLE `payments` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci AUTO_INCREMENT=9000000000000000000;\n")
+
+	var runErr error
+	out := captureStdout(func() {
+		runErr = (&FixLintCmd{SchemaDir: dir}).Run(&Globals{})
+	})
+
+	require.Error(t, runErr)
+	assert.Contains(t, runErr.Error(), "require a manual fix")
+	assert.Contains(t, out, "1 issue(s) require manual fix")
+	assert.Contains(t, out, "auto-inc column")
+}
+
+// Fixing one table in a file that declares several leaves the others exactly
+// as written, so a schema file is not reformatted wholesale to fix one column.
+func TestFixLint_MultipleTablesInOneFile(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "app")
+	const untouched = "-- line items\nCREATE TABLE `order_lines` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n"
+	path := filepath.Join(dir, "orders.sql")
+	writeSchemaFile(t, path, fixableTable+"\n"+untouched)
+
+	var runErr error
+	out := captureStdout(func() {
+		runErr = (&FixLintCmd{SchemaDir: dir}).Run(&Globals{})
+	})
+	require.NoError(t, runErr)
+	assert.Contains(t, out, "Fixed 1 issue(s)")
+
+	written := readFile(t, path)
+	assert.Contains(t, written, "`id` BIGINT NOT NULL AUTO_INCREMENT", "the fixable table is rewritten")
+	assert.Contains(t, written, untouched, "the other table keeps its formatting and its comment")
 }

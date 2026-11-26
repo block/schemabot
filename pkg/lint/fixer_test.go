@@ -495,7 +495,7 @@ func TestTier2_ZeroDate_Variants(t *testing.T) {
 // Tier 3 Error Tests - Unfixable issues requiring human judgment
 // =============================================================================
 
-func TestTier3_UnfixableIssues(t *testing.T) {
+func TestTier3_RemainingIssues(t *testing.T) {
 	// These should be reported but NOT auto-fixed
 	fixer := NewFixer()
 
@@ -636,8 +636,9 @@ func TestFixFiles_CleanFileLeftAsWritten(t *testing.T) {
 // A file that needs a fix is written back as the restored DDL with the fix
 // applied, and the fix is the only one reported for it.
 func TestFixFiles_FixedFileRestoredWithFix(t *testing.T) {
-	// The comment, the trailing semicolon, and the final newline are not
-	// kept: the fixed file is the parser's rendering of the table alone.
+	// The rewritten table is the parser's rendering of it, so the comment
+	// above it does not survive. The text around the statement does: the
+	// terminator closes the rendering, and the file keeps its final newline.
 	input := "-- orders placed through checkout\nCREATE TABLE `orders` (\n  `id` int NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n"
 
 	result, err := NewFixer().FixFiles(map[string]string{"orders.sql": input})
@@ -648,7 +649,7 @@ func TestFixFiles_FixedFileRestoredWithFix(t *testing.T) {
 	assert.Equal(t, 1, result.TotalFixed)
 	assert.True(t, fr.Changed)
 	assert.Equal(t, []string{"INT → BIGINT for primary key"}, fr.Fixes)
-	assert.Equal(t, "CREATE TABLE `orders` (`id` BIGINT NOT NULL AUTO_INCREMENT,`user_id` BIGINT UNSIGNED NOT NULL,PRIMARY KEY(`id`)) ENGINE = InnoDB DEFAULT CHARACTER SET = UTF8MB4 DEFAULT COLLATE = UTF8MB4_0900_AI_CI", fr.FixedSQL)
+	assert.Equal(t, "CREATE TABLE `orders` (`id` BIGINT NOT NULL AUTO_INCREMENT,`user_id` BIGINT UNSIGNED NOT NULL,PRIMARY KEY(`id`)) ENGINE = InnoDB DEFAULT CHARACTER SET = UTF8MB4 DEFAULT COLLATE = UTF8MB4_0900_AI_CI;\n", fr.FixedSQL)
 }
 
 func TestFixFiles_InvalidSQL(t *testing.T) {
@@ -706,10 +707,10 @@ func TestFixFiles_ErrorNamesTheFirstFileByName(t *testing.T) {
 	}
 }
 
-// fix-lint lists the issues that need a manual fix in the order FixFiles
+// fix-lint lists the issues a file still carries in the order FixFiles
 // returns them, so files with such issues are listed in filename order on
 // every run.
-func TestFixFiles_UnfixableIssuesAreInFilenameOrder(t *testing.T) {
+func TestFixFiles_RemainingIssuesAreInFilenameOrder(t *testing.T) {
 	// A counter this close to the end of BIGINT is an error no fix resolves.
 	const nearlyExhausted = " (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY) AUTO_INCREMENT=9000000000000000000"
 	files := map[string]string{
@@ -724,16 +725,16 @@ func TestFixFiles_UnfixableIssuesAreInFilenameOrder(t *testing.T) {
 		require.NoError(t, err)
 
 		var tables []string
-		for _, issue := range result.UnfixableIssues {
+		for _, issue := range result.RemainingIssues {
 			tables = append(tables, issue.Table)
 		}
 		require.Equal(t, []string{"accounts", "ledger", "orders", "payments"}, tables)
 	}
 }
 
-// An issue a fix resolves is not also reported as needing a manual fix: the
-// counter is past the end of INT, and widening the key to BIGINT gives it room.
-func TestFixFiles_ResolvedIssueIsNotReportedAsUnfixable(t *testing.T) {
+// An issue a fix resolves is not also reported as remaining: the counter is
+// past the end of INT, and widening the key to BIGINT gives it room.
+func TestFixFiles_ResolvedIssueIsNotReportedAsRemaining(t *testing.T) {
 	const orders = "CREATE TABLE orders (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY) AUTO_INCREMENT=3000000000"
 
 	unfixed, err := New().LintSchema(map[string]string{"orders.sql": orders})
@@ -749,5 +750,104 @@ func TestFixFiles_ResolvedIssueIsNotReportedAsUnfixable(t *testing.T) {
 	result, err := NewFixer().FixFiles(map[string]string{"orders.sql": orders})
 	require.NoError(t, err)
 	assert.Equal(t, 1, result.TotalFixed)
-	assert.Empty(t, result.UnfixableIssues)
+	assert.Empty(t, result.RemainingIssues)
+}
+
+// A schema file may declare more than one table. Every table in it is fixed,
+// and the tables a fix did not touch keep the bytes they were written with,
+// comments included, so fixing one table does not reformat its neighbours.
+func TestFixFiles_MultipleTablesInOneFile(t *testing.T) {
+	const untouched = "-- line items\nCREATE TABLE `order_lines` (\n  `id` BIGINT UNSIGNED AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n"
+	input := "CREATE TABLE `orders` (\n  `id` INT AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n\n" + untouched
+
+	result, err := NewFixer().FixFiles(map[string]string{"orders.sql": input})
+	require.NoError(t, err)
+	require.Len(t, result.Files, 1)
+	fr := result.Files[0]
+
+	require.True(t, fr.Changed, "the INT primary key in the first table is fixed")
+	assert.Equal(t, []string{"INT → BIGINT for primary key"}, fr.Fixes)
+	assert.Contains(t, fr.FixedSQL, "`id` BIGINT AUTO_INCREMENT")
+	assert.Contains(t, fr.FixedSQL, untouched, "the second table keeps its formatting and its comment")
+	assert.Empty(t, result.RemainingIssues, "both tables are clean once the first is fixed")
+}
+
+// A fix visits every column of a table, not only the first one that matches.
+func TestFixFiles_FixesEveryMatchingColumn(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "float columns",
+			input: "CREATE TABLE `t` (`id` BIGINT UNSIGNED AUTO_INCREMENT, `a` DOUBLE NOT NULL, `b` DOUBLE NOT NULL, `c` DOUBLE NOT NULL, PRIMARY KEY (`id`))",
+			want:  []string{"`a` DECIMAL(10,2)", "`b` DECIMAL(10,2)", "`c` DECIMAL(10,2)"},
+		},
+		{
+			name:  "date columns with no default",
+			input: "CREATE TABLE `t` (`id` BIGINT UNSIGNED AUTO_INCREMENT, `a` DATETIME NOT NULL, `b` DATETIME NOT NULL, PRIMARY KEY (`id`))",
+			want:  []string{"`a` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP()", "`b` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP()"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := NewFixer().FixFiles(map[string]string{"t.sql": tt.input})
+			require.NoError(t, err)
+			require.Len(t, result.Files, 1)
+			require.True(t, result.Files[0].Changed)
+			for _, want := range tt.want {
+				assert.Contains(t, result.Files[0].FixedSQL, want)
+			}
+		})
+	}
+}
+
+// A finding the fixer has no fix for is reported whatever its severity. Most
+// schema-shape findings are warnings, so reporting only errors would let the
+// command claim a file with a varchar primary key came out clean.
+func TestFixFiles_RemainingWarningsAreReported(t *testing.T) {
+	const input = "CREATE TABLE `t` (`id` VARCHAR(36) NOT NULL, `body` TEXT CHARACTER SET latin1 NOT NULL, PRIMARY KEY (`id`))"
+
+	result, err := NewFixer().FixFiles(map[string]string{"t.sql": input})
+	require.NoError(t, err)
+	assert.Equal(t, 0, result.TotalFixed, "neither finding has a mechanical fix")
+	assert.False(t, result.Files[0].Changed)
+
+	var linters []string
+	for _, issue := range result.RemainingIssues {
+		assert.Equal(t, "warning", issue.Severity)
+		linters = append(linters, issue.Linter)
+	}
+	assert.ElementsMatch(t, []string{"allow_charset", "primary_key"}, linters)
+}
+
+// A zero date is a default the schema's owner chose, so the fixer leaves it
+// and reports it rather than deciding what new rows should get instead. A
+// date column with no default at all is still given one.
+func TestFixFiles_ZeroDateIsReportedNotRewritten(t *testing.T) {
+	const input = "CREATE TABLE `t` (`id` BIGINT UNSIGNED AUTO_INCREMENT, `placed_at` DATETIME NOT NULL DEFAULT '0000-00-00 00:00:00', `seen_at` DATETIME NOT NULL, PRIMARY KEY (`id`))"
+
+	result, err := NewFixer().FixFiles(map[string]string{"t.sql": input})
+	require.NoError(t, err)
+	require.True(t, result.Files[0].Changed)
+	assert.Contains(t, result.Files[0].FixedSQL, "'0000-00-00 00:00:00'", "the zero date is left as written")
+	assert.Contains(t, result.Files[0].FixedSQL, "`seen_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP()")
+
+	require.Len(t, result.RemainingIssues, 1)
+	assert.Equal(t, "zero_date", result.RemainingIssues[0].Linter)
+	assert.Equal(t, "placed_at", result.RemainingIssues[0].Column)
+}
+
+// A statement the fixer has no fix for is copied through as written, so
+// fixing a table never drops what sits beside it in the file.
+func TestFixFiles_StatementWithNoFixPreserved(t *testing.T) {
+	const other = "ALTER TABLE `orders` ADD INDEX `idx_user` (`user_id`);\n"
+	input := "CREATE TABLE `orders` (\n  `id` INT AUTO_INCREMENT,\n  `user_id` BIGINT UNSIGNED NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n\n" + other
+
+	result, err := NewFixer().FixFiles(map[string]string{"orders.sql": input})
+	require.NoError(t, err)
+	require.True(t, result.Files[0].Changed)
+	assert.Contains(t, result.Files[0].FixedSQL, "`id` BIGINT AUTO_INCREMENT")
+	assert.Contains(t, result.Files[0].FixedSQL, other, "the other statement is copied through as written")
 }

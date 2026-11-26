@@ -70,17 +70,31 @@ storage, insert-order, and online-copy tradeoffs.
 ## Auto-fixing lint issues (`fix-lint`)
 
 `schemabot fix-lint -s <schema-dir>` rewrites the schema files in place to
-resolve the findings that have a mechanical fix, and lists the ones that need a
-human decision. `--dry-run` previews the fixes without writing anything. Run it
+resolve the findings that have a mechanical fix, and lists every finding it
+leaves behind. `--dry-run` previews the fixes without writing anything. Run it
 locally when a plan comes back with lint warnings you agree with — it edits
 your declarative files, so the fixes land in the same PR as the change.
 
-Only files that need a fix are rewritten, and only those are listed. A file
-with nothing to fix keeps its exact bytes, so a file in the
-`SHOW CREATE TABLE` form `onboard` writes stays in that form. A fixed file is
-written back as the parser's canonical rendering of the fixed table: one line,
-backtick-quoted identifiers, uppercase types. SQL comments in the file, the
-trailing semicolon, and the final newline are not kept.
+What it leaves behind is listed whatever its severity. Most schema-shape
+findings are warnings rather than errors, so a command that reported only
+errors would call a file clean while the linter still had something to say
+about it. Errors are listed as needing a manual fix and fail the command;
+warnings are advisory and do not, matching how lint findings are routed
+everywhere else.
+
+Only the tables a fix changed are rewritten. Everything else in the file is
+copied through as written, so a file with nothing to fix keeps its exact
+bytes — a file in the `SHOW CREATE TABLE` form `onboard` writes stays in that
+form — and fixing one table in a file that declares several leaves the others
+alone, comments included. A rewritten table is replaced by the parser's
+canonical rendering of it: one line, backtick-quoted identifiers, uppercase
+types, closed with a semicolon. Comments attached to that table are not kept.
+
+A fix visits every column of a table, so three columns with the same problem
+are all fixed. A zero date is the exception the fixer reports rather than
+resolves: the default a column already declares is the schema owner's choice,
+and replacing it changes what new rows get. A `TIMESTAMP` or `DATETIME` column
+that declares no default at all is still given one.
 
 It reads the same files `plan` does: `.sql` files directly in the schema
 directory, or one level of namespace subdirectories (`<schema-dir>/<namespace>/*.sql`),
@@ -88,8 +102,8 @@ and writes each fix back to the file it came from. Namespaces listed in
 `schemabot.yaml` `ignore_namespaces` are left alone, as is the empty-namespace
 marker `onboard` writes. Like `plan`, it rejects a directory that mixes the two
 layouts without changing any file. It exits non-zero when the directory holds
-no `.sql` files, since that almost always means a wrong path, and when any
-finding needs a manual fix.
+no `.sql` files, since that almost always means a wrong path, and when a
+finding that is an error is left unresolved.
 
 The fixer parses and rewrites with the MySQL grammar, so `fix-lint` is for
 MySQL-family databases (`mysql`, `vitess`, `strata`). A schema directory whose
