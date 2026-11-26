@@ -216,8 +216,9 @@ func TestRenderResumeSupersededProgressComment(t *testing.T) {
 		NewCommentID: 2222222222,
 		PreviousBody: "## Schema Change Progress\n\nStopped at 21%",
 	})
-	assert.Contains(t, rendered, "Schema change resumed")
-	assert.Contains(t, rendered, "https://github.com/acme/testapp/pull/42#issuecomment-2222222222")
+	assert.True(t, strings.HasPrefix(rendered,
+		"Progress before the stop — the schema change resumed in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).\n\n"),
+		"the headline names the period the comment covered before the resume that ended it: %s", rendered)
 	assert.Contains(t, rendered, "<details>")
 	assert.Contains(t, rendered, "<summary>Progress before the stop</summary>")
 	assert.Contains(t, rendered, "Stopped at 21%",
@@ -237,7 +238,7 @@ func TestRenderCutoverCommandSupersededProgressComment(t *testing.T) {
 		PreviousBody: "## Schema Change Status — Production\n\n**Status**: Waiting for Cutover",
 	})
 	assert.True(t, strings.HasPrefix(rendered,
-		"Cutover started — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).\n\n"), rendered)
+		"Progress before the cutover — the cutover is tracked in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).\n\n"), rendered)
 	assert.Contains(t, rendered, "<details>\n<summary>Progress before the cutover</summary>\n\n## Schema Change Status — Production\n\n**Status**: Waiting for Cutover\n\n</details>\n")
 }
 
@@ -278,11 +279,12 @@ func TestIsSupersededProgressComment(t *testing.T) {
 		"cutover":         RenderCutoverSupersededComment(shared),
 		"cutover command": RenderCutoverCommandSupersededProgressComment(shared),
 		"generic":         RenderSupersededProgressComment(shared),
-		// A volume-frozen body has no renderer anymore, but bodies written by a
-		// release that had one are still on GitHub and must stay recognizable.
-		"volume": renderSupersededFold(volumeSupersededPrefix+" **8/11** — progress continues in",
-			"Progress before the volume change",
-			shared.Repo, shared.PR, shared.NewCommentID, shared.PreviousBody),
+	}
+	// Bodies frozen by earlier server versions have no renderer anymore, but
+	// they are still on GitHub and must stay recognizable.
+	for _, prefix := range earlierSupersededPrefixes {
+		frozen["earlier "+prefix] = renderSupersededFold(prefix+" — progress continues in", "Earlier progress",
+			shared.Repo, shared.PR, shared.NewCommentID, shared.PreviousBody)
 	}
 	for flavor, body := range frozen {
 		assert.Truef(t, IsSupersededProgressComment(body),
@@ -295,6 +297,8 @@ func TestIsSupersededProgressComment(t *testing.T) {
 		"cutover-started wording":  "Cutover started by the operator.",
 		"reverting wording":        "Schema change reverting — see the table below.",
 		"skip-revert wording":      "Revert skipped by the operator.",
+		"stop wording":             "Progress before the stop was steady.",
+		"cutover prompt wording":   "Cutover prompt: comment to run the cutover.",
 	}
 	for name, body := range live {
 		assert.Falsef(t, IsSupersededProgressComment(body),
