@@ -1,13 +1,16 @@
 package presentation
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/state/statetest"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // The tests in this file pin, for every state, where each ranking over the
@@ -128,11 +131,11 @@ func TestTableRolloutRankRanksEveryTaskStateOnOneTarget(t *testing.T) {
 		task.WaitingForCutover: tableRankWaiting,
 		task.WaitingForDeploy:  tableRankWaiting,
 		task.Recovering:        tableRankWaiting,
-		task.FailedRetryable:   tableRankWaiting,
-		task.Failed:            tableRankHalted,
-		task.Stopped:           tableRankHalted,
-		task.Cancelled:         tableRankHalted,
-		task.Reverted:          tableRankHalted,
+		task.FailedRetryable:   tableRankHalted(task.FailedRetryable),
+		task.Failed:            tableRankHalted(task.Failed),
+		task.Stopped:           tableRankHalted(task.Stopped),
+		task.Cancelled:         tableRankHalted(task.Cancelled),
+		task.Reverted:          tableRankFinished,
 		task.Pending:           tableRankNotStarted,
 		task.Completed:         tableRankFinished,
 		task.RevertWindow:      tableRankFinished,
@@ -140,7 +143,7 @@ func TestTableRolloutRankRanksEveryTaskStateOnOneTarget(t *testing.T) {
 }
 
 // A table that two targets run sorts by whichever target's state lists
-// earlier, so a waiting target leads a halted one and both lead a target that
+// earlier, so a halted target leads a working one and both lead a target that
 // has not started. The one exception is a table finished on one target and
 // not started on the other, which is partly done. The order the targets
 // report in makes no difference.
@@ -180,6 +183,37 @@ func TestRollupTaskStatusPrecedenceCoversEveryTaskState(t *testing.T) {
 	assert.Equal(t, task.Failed, RollupTaskStatus([]string{"STATE_RUNNING", "STATE_FAILED"}))
 }
 
+// A listing leads with the table state the rollup would name first. Every
+// failure or halt lists ahead of every other state, and of two halted states
+// the one the rollup names lists first, so a table's status across targets and
+// its place in a listing cannot disagree about what leads.
+func TestTableListingLeadsWithWhatTheRollupNamesFirst(t *testing.T) {
+	halted := state.HaltedTaskStates()
+	require.NotEmpty(t, halted)
+	for _, s := range statetest.Every(t, state.Task) {
+		if slices.Contains(halted, s) {
+			continue
+		}
+		for _, h := range halted {
+			assert.Lessf(t, ui.TableStatePriority(h), ui.TableStatePriority(s), "%q lists ahead of %q", h, s)
+		}
+	}
+	for _, a := range halted {
+		for _, b := range halted {
+			if a == b {
+				continue
+			}
+			led := RollupTaskStatus([]string{a, b})
+			other := a
+			if led == a {
+				other = b
+			}
+			assert.Lessf(t, ui.TableStatePriority(led), ui.TableStatePriority(other),
+				"the rollup names %q over %q, so the listing leads with it", led, other)
+		}
+	}
+}
+
 // A task ranking gives a state the same rank however it is spelled: the
 // proto-prefixed form ranks as the canonical state, and an operation state
 // that is not a task state ranks as running, the state it stands in for.
@@ -195,5 +229,23 @@ func TestTaskRankingsRankAStateTheSameHoweverItIsSpelled(t *testing.T) {
 		}
 		assert.Equalf(t, rank(state.Task.Running), rank(state.ApplyOperation.RunningDegraded),
 			"%s of an operation state that stands in for running", name)
+	}
+}
+
+// A rollout and a single-target listing lead with the same halted state: of
+// any two task states, the one a single-target listing puts first because it
+// halted also leads when it is the state of a table on one target of a
+// rollout (UX-5).
+func TestTableRolloutRankLeadsWithTheSameHaltedStatesAsAListing(t *testing.T) {
+	halted := state.HaltedTaskStates()
+	for _, h := range halted {
+		for _, s := range statetest.Every(t, state.Task) {
+			if s == h {
+				continue
+			}
+			if ui.TableStatePriority(h) < ui.TableStatePriority(s) {
+				assert.Lessf(t, rolloutRankOnOneTarget(h), rolloutRankOnOneTarget(s), "%q leads %q in a rollout as in a listing", h, s)
+			}
+		}
 	}
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -1221,16 +1222,19 @@ func TestE2EReconcileStaleInProgressCheckFailure(t *testing.T) {
 	assert.Equal(t, checkConclusionFailure, check.Conclusion)
 	assert.Equal(t, applyID, check.ApplyID)
 
-	// The reconciled failure belongs to the previous commit; the aggregate on
-	// the current HEAD holds it as a blocking placeholder. Merge stays blocked
-	// either way, and the current commit's own plan results decide the real
-	// conclusion.
+	// The reconciled failure belongs to the previous commit, but it still
+	// describes the target, so the aggregate on the current HEAD reports the
+	// failure and names the plan that clears it rather than waiting on results
+	// for the newer commit.
 	select {
 	case checkRun := <-result.checkRuns:
 		assert.Equal(t, aggregateCheckName, checkRun.Name)
 		assert.Equal(t, "abc123", checkRun.HeadSHA)
-		assert.Equal(t, checkStatusInProgress, checkRun.Status)
-		assert.Empty(t, checkRun.Conclusion)
+		assert.Equal(t, checkStatusCompleted, checkRun.Status)
+		assert.Equal(t, checkConclusionFailure, checkRun.Conclusion)
+		require.NotNil(t, checkRun.Output)
+		assert.Equal(t, "Apply failed", checkRun.Output.Title)
+		assert.Contains(t, checkRun.Output.Summary, "**To clear this:** "+checkstate.ReconciliationRemedy(checkstate.PlanCommand("staging", dbName, "")))
 	case <-time.After(webhookIntegrationPollDeadline):
 		require.FailNow(t, "timed out waiting for blocking aggregate check run")
 	}
