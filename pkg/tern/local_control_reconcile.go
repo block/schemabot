@@ -184,7 +184,7 @@ func (c *LocalClient) readEngineProgressForTask(ctx context.Context, eng engine.
 	if err != nil {
 		return nil, fmt.Errorf("resolve credentials for task %s: %w", task.TaskIdentifier, err)
 	}
-	resumeState, err := c.loadStoredEngineResumeState(ctx, task, "progress")
+	resumeState, err := c.taskEngineResumeState(ctx, task, "progress")
 	if err != nil {
 		return nil, fmt.Errorf("load engine resume state for task %s: %w", task.TaskIdentifier, err)
 	}

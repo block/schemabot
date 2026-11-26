@@ -3017,7 +3017,7 @@ func (c *LocalClient) activeTaskForControlApply(ctx context.Context, applyID, en
 // through the ControlResumeValidator gate below — engines own validation of
 // opaque ResumeState.Metadata before control calls.
 func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Task, creds *engine.Credentials, eng engine.Engine, operation engine.ControlOperation) (*engine.ControlRequest, error) {
-	resumeState, err := c.loadStoredEngineResumeState(ctx, task, string(operation))
+	resumeState, err := c.taskEngineResumeState(ctx, task, string(operation))
 	if err != nil {
 		return nil, fmt.Errorf("load engine resume state for %s of task %s: %w", operation, task.TaskIdentifier, err)
 	}
@@ -3058,6 +3058,44 @@ func (c *LocalClient) loadStoredEngineResumeState(ctx context.Context, task *sto
 		return nil, fmt.Errorf("load persisted engine resume state for apply operation %d: %w", operationID, err)
 	}
 	return stored, nil
+}
+
+// taskEngineResumeState is the resume state a control or progress request for
+// task carries, so the request addresses the work the task's drive started:
+// the state persisted on the task's apply operation, or, when the engine
+// persisted none for a task driven on its own, the identity that drive sent
+// with the task's Apply call. An engine that echoes that identity back
+// persists nothing and keys its in-process tracking on it, so a request
+// without it names no work, and the engine answers that nothing runs while
+// the task's build is still running. A grouped drive sends its own context,
+// so a task it drives keeps whatever was persisted.
+func (c *LocalClient) taskEngineResumeState(ctx context.Context, task *storage.Task, purpose string) (*engine.ResumeState, error) {
+	stored, err := c.loadStoredEngineResumeState(ctx, task, purpose)
+	if err != nil {
+		return nil, err
+	}
+	if stored != nil {
+		return stored, nil
+	}
+	apply, err := c.storage.Applies().Get(ctx, task.ApplyID)
+	if err != nil {
+		return nil, fmt.Errorf("load the apply of task %s to address its engine work for %s: %w", task.TaskIdentifier, purpose, err)
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("the apply of task %s does not exist; its engine work cannot be addressed for %s", task.TaskIdentifier, purpose)
+	}
+	if storage.GroupsEngineExecution(apply.DatabaseType, apply.GetOptions().DeferCutover) {
+		c.logger.Debug("grouped apply persisted no engine resume state; the engine request goes out without one",
+			append(task.LogAttrs(), "purpose", purpose)...)
+		return nil, nil
+	}
+	return sequentialDriveResumeState(task), nil
+}
+
+// sequentialDriveResumeState is the resume state a sequential drive sends with
+// task's Apply call, and so the identity its engine work is tracked under.
+func sequentialDriveResumeState(task *storage.Task) *engine.ResumeState {
+	return &engine.ResumeState{MigrationContext: task.TaskIdentifier}
 }
 
 // Revert reverts a completed schema change during the revert window.

@@ -2461,6 +2461,12 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	if req != nil {
 		key = progressIdentity(req.ResumeState)
 	}
+	if key == "" {
+		// The idle sentinel below means this engine tracks no such apply, which
+		// a caller may act on as "nothing runs". A request that names no apply
+		// has not asked about one, so it gets an error, never that answer.
+		return nil, errMissingApplyIdentity("progress")
+	}
 	e.mu.Lock()
 	tracked := e.progress[key]
 	if tracked == nil {
@@ -2719,6 +2725,14 @@ func setRunningPercent(result *engine.ProgressResult, percent float64) {
 		result.Metadata = make(map[string]string)
 	}
 	result.Metadata[runningPercentMetadataKey] = strconv.FormatFloat(percent, 'f', 2, 64)
+}
+
+// errMissingApplyIdentity is the error for a request that does not name the
+// apply it is about. The engine tracks each apply under its identity, so it
+// cannot answer for work the request does not name, and answering "nothing
+// runs" could let a caller record a schema change as ended while it runs.
+func errMissingApplyIdentity(operation string) error {
+	return fmt.Errorf("PostgreSQL %s request names no apply: ResumeState.MigrationContext is empty, so the engine cannot tell whether a schema change is running", operation)
 }
 
 // progressIdentity extracts the apply identity that keys engine progress.

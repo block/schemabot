@@ -284,7 +284,7 @@ func sequentialEngineApplyRequest(applyIdentifier string, task *storage.Task, op
 		Database:        task.Database,
 		Changes:         []engine.SchemaChange{change},
 		Options:         options,
-		ResumeState:     &engine.ResumeState{MigrationContext: task.TaskIdentifier},
+		ResumeState:     sequentialDriveResumeState(task),
 		Credentials:     creds,
 		Logger:          logger,
 	}
