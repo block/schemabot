@@ -1963,6 +1963,12 @@ type ProgressResponse struct {
 	// VSchema change. Operations still lists every shard and finalizer row,
 	// but a client renders the apply as one change, the way its PR comments do.
 	Sharded bool `json:"sharded,omitempty"`
+	// MaxOperationsAtOnce is how many of the apply's operations the server's
+	// drivers run at once (its max_drivers_per_apply), set when the apply runs
+	// more than one operation. A client states it beside a running rollout's
+	// counts, so the operations queued behind it read as waiting their turn.
+	// Zero when the response does not say.
+	MaxOperationsAtOnce int `json:"max_operations_at_once,omitempty"`
 	// StoppedByFreeze names the freeze that stopped this apply, set only while
 	// the apply is stopped and the stop that stopped it was a freeze's (one
 	// with running "stop"), not an operator's.

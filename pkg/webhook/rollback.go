@@ -411,16 +411,17 @@ func (h *Handler) rollbackPlanCommentData(apply *storage.Apply, planResp *apityp
 // operator consents to with --allow-unsafe is one the comment showed.
 func (h *Handler) rollbackCommentData(database, dbType, environment, sourceApplyID string, planResp *apitypes.PlanResponse, requestedBy string) templates.PlanCommentData {
 	commentData := templates.PlanCommentData{
-		Database:     database,
-		Environment:  environment,
-		RequestedBy:  requestedBy,
-		DatabaseType: dbType,
-		IsMySQL:      dbType == "mysql",
-		ApplyID:      sourceApplyID,
-		PlanID:       planResp.PlanID,
-		Tenant:       h.deploymentTenant(),
-		AgentHint:    h.agentHint(),
-		CLIName:      h.cliName(),
+		Database:         database,
+		Environment:      environment,
+		RequestedBy:      requestedBy,
+		OperationsAtOnce: h.operationsAtOnce(),
+		DatabaseType:     dbType,
+		IsMySQL:          dbType == "mysql",
+		ApplyID:          sourceApplyID,
+		PlanID:           planResp.PlanID,
+		Tenant:           h.deploymentTenant(),
+		AgentHint:        h.agentHint(),
+		CLIName:          h.cliName(),
 	}
 
 	commentData.Changes = rollbackKeyspaceChanges(planResp.Changes)

@@ -1421,6 +1421,11 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	stored := s.bestEffortProgressOperations(ctx, apply)
 	httpResp.Operations = stored.responses
 	httpResp.Released = stored.released
+	if isMultiOperationApply(apply, stored.rows) {
+		// This server's drivers, and its peers' sharing its config, are the
+		// ones that run the apply's operations.
+		httpResp.MaxOperationsAtOnce = s.config.OperationsAtOnce()
+	}
 	overlayStoredDisplayMetadata(httpResp, apply, stored.rows)
 	httpResp.StoppedByFreeze = s.StoppedByFreeze(ctx, apply)
 
