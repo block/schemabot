@@ -547,7 +547,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		return
 	}
 
-	failure := classifyApplyFailure(err, change.table)
+	failure := classifyApplyFailure(err, change.table, change.validates)
 	failure.detail = recoveryContextDetail(err, failure.detail)
 	switch {
 	case failure.committedPrefix:
@@ -581,8 +581,10 @@ type applyFailure struct {
 // collide. classifyRefusal already consumed the statement-budget cause, so a
 // budget exceeded here is the lock budget: the statement is native-safe and
 // merely lost a bounded race with concurrent lock holders, and marking it
-// blocked would falsely tell the operator retrying cannot succeed.
-func classifyApplyFailure(err error, table string) applyFailure {
+// blocked would falsely tell the operator retrying cannot succeed. validates
+// is the plan's record of the constraint the failed step validates, or nil
+// when the step validates none.
+func classifyApplyFailure(err error, table string, validates *schemadiff.ConstraintValidation) applyFailure {
 	if detail, committed := committedCreatePrefixDetail(err, table); committed {
 		return applyFailure{detail: detail, committedPrefix: true}
 	}
@@ -603,6 +605,9 @@ func classifyApplyFailure(err error, table string) applyFailure {
 		}
 	}
 	if detail, ok := brokenForeignKeyDetail(err, table); ok {
+		return applyFailure{detail: detail, retryable: true}
+	}
+	if detail, ok := brokenCheckDetail(err, table, validates); ok {
 		return applyFailure{detail: detail, retryable: true}
 	}
 	if detail, ok := missingGrantDetail(err, table); ok {
@@ -644,6 +649,33 @@ func brokenForeignKeyDetail(err error, table string) (string, bool) {
 	}
 	return sanitizeReasonText(fmt.Sprintf(
 		"existing rows in %q break foreign key %q; the key is in place and checks new writes; fix those rows, then retry",
+		table, pgErr.ConstraintName)), true
+}
+
+// sqlstateCheckViolation is the SQLSTATE the server raises when a row breaks
+// a check constraint, which for a validation step means existing rows do not
+// satisfy the constraint the plan added NOT VALID.
+const sqlstateCheckViolation = "23514"
+
+// brokenCheckDetail names the check constraint whose validation failed on
+// existing rows. It applies only when the failed step validates the
+// constraint the server names. That constraint is NOT VALID on the table,
+// whether the plan added it in an earlier step or found it live, so it stays
+// in place and checks new writes, and the apply can finish once the owner
+// fixes the rows. For the helper check a SET NOT NULL validates, those are
+// the rows that hold NULL in the column. The detail is built from the
+// server's typed fields, never its message, because the message can quote
+// row values.
+func brokenCheckDetail(err error, table string, validates *schemadiff.ConstraintValidation) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateCheckViolation {
+		return "", false
+	}
+	if validates == nil || pgErr.ConstraintName != validates.Constraint {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"existing rows in %q break check constraint %q; the constraint is in place and checks new writes; fix those rows, then retry",
 		table, pgErr.ConstraintName)), true
 }
 
@@ -1144,7 +1176,8 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 	case executor.CodeEmptySequence, executor.CodeUnsupportedSequenceStep,
 		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
 		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable,
-		executor.CodeUnsupportedAcceptedBlocking, executor.CodeNotCreateIndex:
+		executor.CodeUnsupportedAcceptedBlocking, executor.CodeNotCreateIndex,
+		executor.CodeNotAddKeyConstraint:
 		// Shape refusals: the executor refused the statement's form at
 		// admission, so retrying the identical plan refails the same way.
 		return &refusal{reason: "unsupported-statement-shape",
@@ -1254,6 +1287,21 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "partitioned-key-nullable-column",
 			cause:  fmt.Sprintf("the planned primary key on %s covers a column a partition allows to be NULL; nothing was built", quotedTable(table)),
 			remedy: "make the column NOT NULL on every partition, then " + replanRemedy}, true
+	case executor.CodePartitionedKeyUnsupportedShape:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("the key on partitioned table %s has no name or a clause its partitions cannot carry", quotedTable(table)),
+			remedy: "name the key and drop that clause in the schema file, then " + replanRemedy}, true
+	case executor.CodePartitionedKeyParentConflict:
+		// Nothing was created, and the parent's own constraint or the
+		// relation holding the index name stays until an operator or the
+		// schema file changes it.
+		return &refusal{reason: "partitioned-key-parent-conflict",
+			cause:  fmt.Sprintf("partitioned table %s already has the key's name in use, or a primary key", quotedTable(table)),
+			remedy: "rename the key in the schema file, or free the name, then " + replanRemedy}, true
+	case executor.CodePartitionedKeySubPartitioned:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("a partition of %s is itself partitioned, which the key build does not run", quotedTable(table)),
+			remedy: "add the key to that partition by hand, then " + replanRemedy}, true
 	case executor.CodePartitionedIndexTablespace:
 		return &refusal{reason: "unsupported-statement-shape",
 			cause:  fmt.Sprintf("the index on %s names a TABLESPACE, which the partitions' indexes would not use", quotedTable(table)),
@@ -1378,12 +1426,12 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeCancelledExternally, executor.CodeInvalidIndexOwnLeftover,
 		executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuildInFlight,
 		executor.CodeInvalidIndexBuilderUnobservable, executor.CodeInvalidIndexUnproven,
-		executor.CodePartitionedIndexUnsettled, executor.CodeDetachInterrupted,
-		executor.CodeExecutionFailed:
+		executor.CodePartitionedIndexUnsettled, executor.CodePartitionedKeyUnsettled,
+		executor.CodeDetachInterrupted, executor.CodeExecutionFailed:
 		// Operational outcomes: a bounded lock race, the caller's own
 		// context ending or an external stop, an invalid-index state a retry
 		// recovers or an operator clears or waits out, a partitioned index
-		// build that a rerun resumes, a concurrent detach that running the
+		// or key build that a rerun resumes, a concurrent detach that running the
 		// same statement again finishes, or a failure outside the typed set. A retry can succeed once conditions change, so
 		// none is a permanent refusal.
 		return nil, true
