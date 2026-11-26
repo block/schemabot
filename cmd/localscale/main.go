@@ -9,11 +9,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -117,16 +119,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Apply VSchema files from schema_dir if set
+	// Seed VSchema and tables from schema_dir if set
 	if cf.SchemaDir != "" {
-		logger.Info("seeding VSchema from schema_dir", "schema_dir", cf.SchemaDir)
-		if err := applyVSchemas(ctx, server.URL(), orgs, cf.SchemaDir, logger); err != nil {
-			logger.Error("failed to apply vschemas", "schema_dir", cf.SchemaDir, "error", err)
+		logger.Info("seeding schema from schema_dir", "schema_dir", cf.SchemaDir)
+		if err := seedSchemaDir(ctx, server.URL(), orgs, cf.SchemaDir, logger); err != nil {
+			logger.Error("failed to seed schema", "schema_dir", cf.SchemaDir, "error", err)
 			os.Exit(1)
 		}
-		logger.Info("VSchema seeding complete")
+		logger.Info("schema seeding complete")
 	} else {
-		logger.Info("no schema_dir configured, skipping VSchema seeding")
+		logger.Info("no schema_dir configured, skipping schema seeding")
 	}
 
 	logger.Info("localscale running", "url", server.URL(), "orgs", len(orgs))
@@ -140,28 +142,37 @@ func main() {
 	server.Close()
 }
 
-// applyVSchemas walks schemaDir looking for keyspace subdirectories containing
-// vschema.json files and applies them to all orgs/databases via the admin HTTP endpoint.
-func applyVSchemas(ctx context.Context, baseURL string, orgs map[string]localscale.OrgConfig, schemaDir string, logger *slog.Logger) error {
+// seedSchemaDir walks schemaDir, treating each subdirectory as a keyspace that
+// holds an optional vschema.json and any number of .sql files, and seeds both
+// into every org and database the server was configured with.
+//
+// VSchema goes first for every keyspace, then the tables: vtgate has to know
+// how to route a keyspace's queries before anything creates tables in it, and a
+// keyspace's vindexes can reference a table in another keyspace.
+func seedSchemaDir(ctx context.Context, baseURL string, orgs map[string]localscale.OrgConfig, schemaDir string, logger *slog.Logger) error {
 	entries, err := os.ReadDir(schemaDir)
 	if err != nil {
 		return fmt.Errorf("read schema dir %s: %w", schemaDir, err)
 	}
-
+	var keyspaces []string
 	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
+		if entry.IsDir() {
+			keyspaces = append(keyspaces, entry.Name())
+		} else {
+			logger.Debug("skipping non-keyspace entry in schema_dir", "schema_dir", schemaDir, "entry", entry.Name())
 		}
-		keyspace := entry.Name()
+	}
+
+	for _, keyspace := range keyspaces {
 		vschemaPath := filepath.Join(schemaDir, keyspace, "vschema.json")
 		data, err := os.ReadFile(vschemaPath)
 		if err != nil {
 			if os.IsNotExist(err) {
+				logger.Debug("keyspace has no vschema.json", "keyspace", keyspace)
 				continue
 			}
 			return fmt.Errorf("read vschema for %s: %w", keyspace, err)
 		}
-
 		for orgName, orgCfg := range orgs {
 			for dbName := range orgCfg.Databases {
 				body := map[string]any{
@@ -170,25 +181,84 @@ func applyVSchemas(ctx context.Context, baseURL string, orgs map[string]localsca
 					"keyspace": keyspace,
 					"vschema":  json.RawMessage(data),
 				}
-				bodyJSON, _ := json.Marshal(body)
-				req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/admin/seed-vschema", bytes.NewReader(bodyJSON))
-				if err != nil {
-					return fmt.Errorf("create request for %s (%s/%s): %w", keyspace, orgName, dbName, err)
-				}
-				req.Header.Set("Content-Type", "application/json")
-				resp, err := http.DefaultClient.Do(req)
-				if err != nil {
+				if err := postAdmin(ctx, baseURL, "/admin/seed-vschema", body); err != nil {
 					return fmt.Errorf("apply vschema for %s (%s/%s): %w", keyspace, orgName, dbName, err)
-				}
-				_ = resp.Body.Close()
-				if resp.StatusCode != http.StatusOK {
-					return fmt.Errorf("apply vschema for %s (%s/%s): HTTP %d", keyspace, orgName, dbName, resp.StatusCode)
 				}
 				logger.Info("applied vschema", "org", orgName, "database", dbName, "keyspace", keyspace)
 			}
 		}
 	}
 
+	for _, keyspace := range keyspaces {
+		stmts, err := keyspaceDDL(filepath.Join(schemaDir, keyspace))
+		if err != nil {
+			return fmt.Errorf("read DDL for %s: %w", keyspace, err)
+		}
+		if len(stmts) == 0 {
+			logger.Debug("keyspace has no .sql files", "keyspace", keyspace)
+			continue
+		}
+		for orgName, orgCfg := range orgs {
+			for dbName := range orgCfg.Databases {
+				body := map[string]any{
+					"org":        orgName,
+					"database":   dbName,
+					"keyspace":   keyspace,
+					"statements": stmts,
+				}
+				if err := postAdmin(ctx, baseURL, "/admin/seed-ddl", body); err != nil {
+					return fmt.Errorf("seed DDL for %s (%s/%s): %w", keyspace, orgName, dbName, err)
+				}
+				logger.Info("seeded tables", "org", orgName, "database", dbName, "keyspace", keyspace, "statements", len(stmts))
+			}
+		}
+	}
+
+	return nil
+}
+
+// keyspaceDDL reads a keyspace directory's .sql files in name order, so a
+// schema whose statements depend on each other can fix their order by naming.
+func keyspaceDDL(dir string) ([]string, error) {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var stmts []string
+	for _, f := range files {
+		if f.IsDir() || filepath.Ext(f.Name()) != ".sql" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, f.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", f.Name(), err)
+		}
+		if stmt := strings.TrimSpace(string(data)); stmt != "" {
+			stmts = append(stmts, stmt)
+		}
+	}
+	return stmts, nil
+}
+
+func postAdmin(ctx context.Context, baseURL, path string, body map[string]any) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("encode %s request: %w", path, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+path, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("create %s request: %w", path, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("%s returned HTTP %d: %s", path, resp.StatusCode, strings.TrimSpace(string(detail)))
+	}
 	return nil
 }
 
