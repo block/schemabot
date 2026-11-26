@@ -2145,6 +2145,42 @@ schemabot plan -e production
 </details>
 
 <details>
+<summary><a name="multienv-plan-refused-statements"></a><strong>Multi-env Plan (Refused Statements)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `PostgreSQL`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+### Staging
+
+❌ **SchemaBot can't plan 3 statements in the schema files:**
+
+**`testapp/accounts.sql`, line 7:** SchemaBot doesn't manage comments. Remove the COMMENT statement from this file and set the comment on the database directly.
+```sql
+COMMENT ON TABLE accounts IS 'People who can place orders'
+```
+
+**`testapp/orders.sql`, line 12:** SchemaBot doesn't manage functions. Create set_updated_at() outside SchemaBot and remove it from this file.
+```sql
+CREATE FUNCTION set_updated_at() RETURNS trigger AS $$ …
+```
+
+**`testapp/orders.sql`, line 19:** SchemaBot doesn't manage triggers. Create orders_updated_at outside SchemaBot and remove it from this file.
+```sql
+CREATE TRIGGER orders_updated_at BEFORE UPDATE ON orders …
+```
+
+---
+
+
+⚠️ **Staging** plans once these statements change. Fix them in the schema files and push a commit.
+
+</details>
+
+<details>
 <summary><a name="multienv-plan-lint-warnings"></a><strong>Multi-env Plan (Lint Warnings)</strong></summary>
 
 

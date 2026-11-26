@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -52,8 +53,12 @@ func TestHostileIdentifierNeverEscapesItsCodeSpan(t *testing.T) {
 		return RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{Items: []SchemaChangeReconciliationItem{item}})
 	}
 
+	var refusedStatement strings.Builder
+	writePlanProblems(&refusedStatement, []engine.PlanProblem{{File: hostileIdentifier, Line: 3, Message: "Triggers are not managed.", Statement: "CREATE TRIGGER t BEFORE UPDATE ON orders"}})
+
 	surfaces := map[string]string{
 		"plan comment":                                 RenderPlanComment(plan),
+		"refused statement's schema file":              refusedStatement.String(),
 		"unmatched drop_tables entry":                  RenderPlanComment(PlanCommentData{Database: "testapp", Environment: "staging", IsMySQL: true, UnmatchedDropTables: []string{hostileIdentifier}}),
 		"unsafe changes rejection":                     RenderUnsafeChangesBlocked(plan),
 		"blocked changes rejection":                    RenderBlockedChangesApplyRejected(plan),

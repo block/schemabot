@@ -4274,6 +4274,12 @@ type MultiEnvPlanCommentData struct {
 	// Errors per environment (if plan execution failed)
 	Errors map[string]string
 
+	// PlanProblems lists, per failed environment, the statements in the schema
+	// files its engine refused to plan. An environment with problems renders
+	// them in place of its error text, and its fix is a change to those files
+	// rather than a re-run.
+	PlanProblems map[string][]engine.PlanProblem
+
 	// UnmanagedSchema lists the schema configs the PR also changes that this
 	// deployment does not manage, and UnmanagedEnvironments the environments
 	// it serves. Set only by an environment-scoped deployment, which posts no
@@ -4414,6 +4420,10 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 		for _, env := range data.Environments {
 			fmt.Fprintf(&sb, "### %s\n\n", capitalizeFirst(env))
 
+			if problems := data.PlanProblems[env]; len(problems) > 0 {
+				writePlanProblems(&sb, problems)
+				continue
+			}
 			if errMsg, hasErr := data.Errors[env]; hasErr {
 				writeErrorBlock(&sb, glyph.Failed, errMsg)
 				sb.WriteString("\n")
@@ -4747,6 +4757,12 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	if len(envsWithErrors) > 0 {
 		sb.WriteString("\n")
 		for _, env := range envsWithErrors {
+			// A plan refused over statements in the files is refused again
+			// until the files change, so it is offered a push, not a re-run.
+			if len(data.PlanProblems[env]) > 0 {
+				fmt.Fprintf(sb, glyph.Attention+" **%s** plans once these statements change. Fix them in the schema files and push a commit.\n", capitalizeFirst(env))
+				continue
+			}
 			fmt.Fprintf(sb, glyph.Attention+" **%s** failed to plan. Resolve the error above and re-run:\n", capitalizeFirst(env))
 			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot plan", env))
 		}

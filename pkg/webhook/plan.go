@@ -784,6 +784,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		Environments:   environments,
 		Plans:          make(map[string]*templates.PlanCommentData),
 		Errors:         make(map[string]string),
+		PlanProblems:   make(map[string][]engine.PlanProblem),
 	}
 	if len(unmanagedSchema) > 0 {
 		multiEnvData.UnmanagedSchema = unmanagedSchema
@@ -795,6 +796,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// also reaching the gate.
 	planFailed := func(env string, err error) {
 		multiEnvData.Errors[env] = userFacingError(err)
+		if problems := api.PlanRefusalProblems(err); len(problems) > 0 {
+			multiEnvData.PlanProblems[env] = problems
+		}
 		planFailedEnvironments = append(planFailedEnvironments, env)
 		if planRefusedBySourcePolicy(err) {
 			sourcePolicyRefused[env] = true
