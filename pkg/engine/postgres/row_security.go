@@ -44,11 +44,29 @@ func parseDesiredFiles(namespace string, files map[string]string) (map[string]st
 			// fixed by editing the file: a statement the file may not hold, a
 			// schema-qualified name, or a syntax error, which pg-sprite
 			// locates at its line and column.
-			return nil, &engine.PlanRefusedError{Err: fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)}
+			return nil, desiredFileRefusal(namespace, filename, err)
 		}
 		parsed[filename] = desired
 	}
 	return parsed, nil
+}
+
+// desiredFileRefusal is the refusal for a schema file the parser does not
+// admit. A syntax error is about one line of the file, so the refusal also
+// lists it as a problem located at that line, for a renderer that points the
+// file's author at it.
+func desiredFileRefusal(namespace, filename string, err error) error {
+	refusal := &engine.PlanRefusedError{Err: fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)}
+	var syntaxErr *statement.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		refusal.Problems = []engine.PlanProblem{{
+			File:      namespace + "/" + filename,
+			Line:      syntaxErr.Line,
+			Message:   fmt.Sprintf("The statement has a syntax error at column %d: %s. Correct it in this file.", syntaxErr.Column, syntaxErr.Message),
+			Statement: syntaxErr.SourceLine,
+		}}
+	}
+	return refusal
 }
 
 // plannerRefusal reports a planner's decline of the declared schema as a plan

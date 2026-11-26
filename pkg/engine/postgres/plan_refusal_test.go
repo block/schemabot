@@ -172,3 +172,28 @@ func TestPlanRefusesFileThePlannerDoesNotAdmit(t *testing.T) {
 		})
 	}
 }
+
+// A syntax error is about one line of one file, so the refusal locates it
+// there for a renderer to point at, with the parser's own words and the line
+// it stopped on.
+func TestPlanRefusalLocatesASyntaxError(t *testing.T) {
+	sql := "CREATE TABLE a (\n  id bigint PRIMARY KEY,\n  name text text\n)"
+	_, err := planSchemas(t.Context(), nil, planRequestWithFiles(map[string]string{"a.sql": sql}), DefaultNativeSafeTableSizeLimitBytes, "")
+	require.Error(t, err)
+	var refusal *engine.PlanRefusedError
+	require.ErrorAs(t, err, &refusal)
+	require.Len(t, refusal.Problems, 1)
+	problem := refusal.Problems[0]
+	assert.Equal(t, "public/a.sql", problem.File)
+	assert.Equal(t, 3, problem.Line)
+	assert.Equal(t, `The statement has a syntax error at column 13: syntax error at or near "text". Correct it in this file.`, problem.Message)
+	assert.Equal(t, "  name text text", problem.Statement)
+}
+
+// A refusal that is not a syntax error names no line, so it lists no problem.
+func TestPlanRefusalOfAQualifiedNameListsNoProblem(t *testing.T) {
+	_, err := planSchemas(t.Context(), nil, planRequestWithFiles(map[string]string{"a.sql": "CREATE TABLE public.a (id bigint PRIMARY KEY)"}), DefaultNativeSafeTableSizeLimitBytes, "")
+	var refusal *engine.PlanRefusedError
+	require.ErrorAs(t, err, &refusal)
+	assert.Empty(t, refusal.Problems)
+}
