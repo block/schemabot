@@ -44,7 +44,9 @@ func TestConnectionErrorRetainsCause(t *testing.T) {
 // and the fix, with no generic prefix and no driver text. Any other failure
 // keeps the caller's generic line with its category or server code.
 func TestConnectionFailureCategories(t *testing.T) {
-	refusedTLS := fmt.Errorf("tls error: %w", errors.New(pgxRefusedTLS))
+	refusedTLS := connectErrorFor(t, "require", fmt.Errorf("tls error: %w", errors.New(pgxRefusedTLS)))
+	refusedTLSOnOneAddress := connectErrorFor(t, "require", errors.Join(syscall.ECONNREFUSED, errors.New(pgxRefusedTLS)))
+	refusedTLSWithPlaintextAllowed := connectErrorFor(t, "prefer", errors.New(pgxRefusedTLS))
 	for _, tc := range []struct {
 		name  string
 		cause error
@@ -61,7 +63,8 @@ func TestConnectionFailureCategories(t *testing.T) {
 		{"refused", syscall.ECONNREFUSED, "the server refused the connection; check that the database is running and that the host and port are right"},
 		{"unresolvable host", &net.DNSError{Name: "private-host", Err: "private-detail"}, "the database hostname could not be resolved; check the host in the connection string and your network connection"},
 		{"no TLS", refusedTLS, "the server does not offer TLS, which the connection's sslmode requires; connect to an endpoint that offers TLS, or change sslmode in the connection string"},
-		{"no TLS on one of several addresses", errors.Join(syscall.ECONNREFUSED, refusedTLS), "the server does not offer TLS"},
+		{"no TLS on one of several addresses", refusedTLSOnOneAddress, "the server does not offer TLS"},
+		{"no TLS when sslmode allows plaintext", refusedTLSWithPlaintextAllowed, "Check connection: connection could not be verified"},
 		{"server answer beats a refused address", errors.Join(syscall.ECONNREFUSED, &pgconn.PgError{Code: "28P01"}), "the server rejected the password"},
 		{"mysql access denied", &mysql.MySQLError{Number: 1045, Message: "private-password"}, "the server denied access for that user and password; check them in the connection string"},
 		{"mysql missing database", &mysql.MySQLError{Number: 1049, Message: "private-detail"}, "that database does not exist on the server; check the database name in the connection string"},
@@ -75,4 +78,20 @@ func TestConnectionFailureCategories(t *testing.T) {
 			require.NotContains(t, err.Error(), "private")
 		})
 	}
+}
+
+// connectErrorFor returns the connect error pgx gives for a connection with
+// the given sslmode whose every attempt fails with cause, without a network:
+// the dial itself returns cause.
+func connectErrorFor(t *testing.T, sslmode string, cause error) error {
+	t.Helper()
+	config, err := pgconn.ParseConfig("postgres://app@127.0.0.1:5432/shop?sslmode=" + sslmode)
+	require.NoError(t, err)
+	config.DialFunc = func(context.Context, string, string) (net.Conn, error) {
+		return nil, cause
+	}
+	_, err = pgconn.ConnectConfig(t.Context(), config)
+	var connectError *pgconn.ConnectError
+	require.ErrorAs(t, err, &connectError)
+	return err
 }

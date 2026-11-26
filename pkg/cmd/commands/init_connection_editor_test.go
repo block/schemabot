@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/jackc/pgx/v5"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -195,6 +196,37 @@ func TestInitConnectionAutoAdvance(t *testing.T) {
 			} else {
 				require.Equal(t, 3, m.step)
 			}
+		})
+	}
+}
+
+// The setup wizard shows a connection failure as two sentences, the cause and
+// its fix. A quoted name in the cause keeps its exact spelling, even when it
+// holds the "; " that joins the two.
+func TestInitConnectionFailureKeepsAQuotedName(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		message string
+		want    string
+	}{
+		{
+			name:    "a plain name",
+			message: `database "shop" does not exist on the server; check the database name in the connection string`,
+			want:    `Database "shop" does not exist on the server. Check the database name in the connection string.`,
+		},
+		{
+			name:    "a name holding the delimiter",
+			message: `database "shop; live" does not exist on the server; check the database name in the connection string`,
+			want:    `Database "shop; live" does not exist on the server. Check the database name in the connection string.`,
+		},
+		{
+			name:    "a line without a fix",
+			message: "the connection check was cancelled",
+			want:    "The connection check was cancelled.",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, initConnectionFailure(tc.message))
 		})
 	}
 }

@@ -70,7 +70,7 @@ func identifiedConnectionFailure(err error) (string, bool) {
 		}
 		return "", false
 	}
-	if serverRefusedTLS(err) {
+	if requiresTLS(err) && serverRefusedTLS(err) {
 		return "the server does not offer TLS, which the connection's sslmode requires; connect to an endpoint that offers TLS, or change sslmode in the connection string", true
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
@@ -122,6 +122,24 @@ func quotedSetting(kind, value, fallback string) string {
 // it, so serverRefusedTLS matches this exact text on the innermost error, and
 // TestCheckConnectionNamesEachPostgresFailure pins it against a real server.
 const pgxRefusedTLS = "server refused TLS connection"
+
+// requiresTLS reports whether the connection settings pgx attached to its
+// connect error allow no attempt without TLS. With sslmode=prefer or allow,
+// pgx tries the server both ways, so a TLS refusal on one attempt is not why
+// the connection failed, and the attempt without TLS holds the cause. Without
+// the settings, nothing says TLS was required.
+func requiresTLS(err error) bool {
+	var connectError *pgconn.ConnectError
+	if !errors.As(err, &connectError) || connectError.Config == nil {
+		return false
+	}
+	if connectError.Config.TLSConfig == nil {
+		return false
+	}
+	return !slices.ContainsFunc(connectError.Config.Fallbacks, func(fallback *pgconn.FallbackConfig) bool {
+		return fallback.TLSConfig == nil
+	})
+}
 
 // serverRefusedTLS reports whether a connection failed because the server
 // does not offer TLS, on any of the addresses tried.

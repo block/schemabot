@@ -266,14 +266,15 @@ func initConnectionLabel(ref string) string {
 
 // initConnectionFailure renders a connection check's error as sentences. The
 // check names the cause and its fix in one line joined by "; ", and never
-// includes driver details.
+// includes driver details. The cause can quote a user or database name, which
+// may itself hold "; ", while a fix never names one, so the line splits at
+// its last "; ".
 func initConnectionFailure(message string) string {
-	cause, fix, hasFix := strings.Cut(message, "; ")
-	line := initSentence(cause)
-	if hasFix {
-		line += " " + initSentence(fix)
+	at := strings.LastIndex(message, "; ")
+	if at < 0 {
+		return initSentence(message)
 	}
-	return line
+	return initSentence(message[:at]) + " " + initSentence(message[at+len("; "):])
 }
 
 // initSentence capitalizes a clause and ends it with a full stop.
