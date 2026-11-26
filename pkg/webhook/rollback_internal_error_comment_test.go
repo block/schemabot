@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -129,7 +131,9 @@ func TestRollbackCommentsKeepInternalFailuresOutOfThePR(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, retry)
 		body := requireComment(t, comments, "engine failure comment")
-		assert.Contains(t, body, "SchemaBot could not create the rollback plan for `orders` in `staging`, so the rollback did not start. "+rollbackRetryAdvice)
+		assert.Contains(t, body, "SchemaBot could not create the rollback plan for `orders` in `staging`, so the rollback did not start. "+
+			"Running the command again fails the same way until the cause is fixed; the SchemaBot server logs have the cause.")
+		assert.NotContains(t, body, "Run the command again")
 		assertNoInternalFailureText(t, body)
 	})
 }
@@ -226,6 +230,64 @@ func TestRollbackLockFailureMessage(t *testing.T) {
 		rollbackLockFailureMessage(storage.ErrLockHeld, "orders", step))
 }
 
+// pinLockTakenStore takes the command's lock on the first Acquire and reports
+// the lock held by someone else on the second, which pins the rollback plan.
+type pinLockTakenStore struct {
+	*rollbackTestLockStore
+}
+
+func (s *pinLockTakenStore) Acquire(ctx context.Context, lock *storage.Lock) error {
+	if err := s.rollbackTestLockStore.Acquire(ctx, lock); err != nil {
+		return err
+	}
+	if s.acquireCalls > 1 {
+		return storage.ErrLockHeld
+	}
+	return nil
+}
+
+// planStoringPlanStore accepts the rollback plan the engine generated.
+type planStoringPlanStore struct {
+	*rollbackTestPlanStore
+}
+
+func (s *planStoringPlanStore) Create(context.Context, *storage.Plan) (int64, error) {
+	return 11, nil
+}
+
+// Someone else taking the lock between the rollback plan and its pin is the
+// command's answer: the command releases the lock it took, the comment names
+// the refusal, and the command is not re-driven.
+func TestRollbackPlanPinLockTakenIsTerminal(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := recordComments(t, mux)
+	lockStore := &pinLockTakenStore{rollbackTestLockStore: &rollbackTestLockStore{}}
+	st := remotePlanRollbackStorage(lockStore)
+	st.plans = &planStoringPlanStore{rollbackTestPlanStore: st.plans.(*rollbackTestPlanStore)}
+	h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+	h.service.RegisterTernClient("tenant-a", "staging", &rollbackPlanTernClient{planResp: &ternv1.PlanResponse{
+		PlanId: "plan-rollback",
+		Changes: []*ternv1.SchemaChange{{
+			Namespace: "default",
+			TableChanges: []*ternv1.TableChange{{
+				Namespace:  "default",
+				TableName:  "users",
+				Ddl:        "ALTER TABLE `users` DROP INDEX `idx_email`",
+				ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+			}},
+		}},
+	}})
+
+	retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+	require.NoError(t, err)
+	assert.False(t, retry, "a lock someone else took is the command's answer")
+	assert.Equal(t, 2, lockStore.acquireCalls, "the command takes the lock, then pins the plan on it")
+	assert.Equal(t, 1, lockStore.releaseCalls, "the command releases the lock it took")
+	body := requireComment(t, comments, "pin lock taken comment")
+	assert.Contains(t, body, "Someone else took the lock for `orders` while this command ran, so the rollback did not start.")
+}
+
 // A storage failure taking the lock is an internal error: the comment names the
 // step and the rerun advice, and the command stays retryable.
 func TestRollbackLockAcquireStorageFailureMessage(t *testing.T) {
@@ -274,8 +336,8 @@ func TestRollbackCheckUpdateFailedMessage(t *testing.T) {
 	other := rollbackCheckUpdateFailedMessage(errors.New(rollbackInternalFailureText), "orders", "staging")
 	assert.Equal(t,
 		"The rollback for `orders` in `staging` was accepted, but SchemaBot could not update the required status check, so the check does not show it yet. "+
-			"The rollback itself is not affected. When the rollback completes, SchemaBot updates the check; "+
-			"if it ends any other way and the check still does not match, the SchemaBot server logs have the cause.",
+			"The rollback itself is not affected. Once the rollback finishes, run plan again to refresh the check; "+
+			"if it still does not match, the SchemaBot server logs have the cause.",
 		other)
 	assert.NotContains(t, other, rollbackInternalFailureText)
 

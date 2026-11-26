@@ -12,6 +12,11 @@ import (
 // attempt.
 const rollbackRetryAdvice = "Run the command again; if it fails again, the SchemaBot server logs have the cause."
 
+// rollbackTerminalAdvice ends a failure line whose cause is the same on every
+// attempt, such as an engine rejection or a deployment the server
+// configuration gets wrong, so running the command again cannot help.
+const rollbackTerminalAdvice = "Running the command again fails the same way until the cause is fixed; the SchemaBot server logs have the cause."
+
 // rollbackNotStartedMessage is the PR comment line for an internal failure that
 // stopped a rollback before it started. failedStep finishes the sentence
 // "SchemaBot could not ...". The failure's own text goes to the server log, so
@@ -20,16 +25,25 @@ func rollbackNotStartedMessage(failedStep string) string {
 	return fmt.Sprintf("SchemaBot could not %s, so the rollback did not start. %s", failedStep, rollbackRetryAdvice)
 }
 
+// rollbackStepFailureMessage is rollbackNotStartedMessage for a failure the
+// control core classified. A terminal failure fails the same way on the next
+// attempt, so its line does not ask for one.
+func rollbackStepFailureMessage(err error, failedStep string) string {
+	if api.IsTerminalControlError(err) {
+		return fmt.Sprintf("SchemaBot could not %s, so the rollback did not start. %s", failedStep, rollbackTerminalAdvice)
+	}
+	return rollbackNotStartedMessage(failedStep)
+}
+
 // rollbackSourceFailureMessage is the PR comment detail for a failed check of
 // the apply a rollback would reverse. A guardrail rejection or an invariant
 // violation named by its identifiers carries text SchemaBot wrote, which is
-// shown as it stands. Any other failure is a storage read whose text stays in
-// the server log.
+// shown as it stands. Any other failure's text stays in the server log.
 func rollbackSourceFailureMessage(err error) string {
 	if message, ok := api.AuthoredControlFailureMessage(err); ok {
 		return message
 	}
-	return rollbackNotStartedMessage("check that the apply can be rolled back")
+	return rollbackStepFailureMessage(err, "check that the apply can be rolled back")
 }
 
 // rollbackPlanFailureMessage is the PR comment detail for a rollback plan that
@@ -44,7 +58,7 @@ func rollbackPlanFailureMessage(err error, database, environment string) string 
 	if unavailable, ok := errors.AsType[*api.RemoteDeploymentUnavailableError](err); ok {
 		return remoteDeploymentUnavailableForRollbackMessage(unavailable)
 	}
-	return rollbackNotStartedMessage(fmt.Sprintf("create the rollback plan for `%s` in `%s`", database, environment))
+	return rollbackStepFailureMessage(err, fmt.Sprintf("create the rollback plan for `%s` in `%s`", database, environment))
 }
 
 // remoteDeploymentUnavailableForRollbackMessage names the deployment and target
@@ -96,9 +110,10 @@ func rollbackConfirmPlanFailureMessage(err error, environment string) string {
 // rollback whose required status check could not be marked in progress. A
 // refusal to clear a block the check holds is deterministic, so it is named in
 // SchemaBot's own words with the step that clears it. Any other failure is a
-// storage or GitHub error whose text stays in the server log. The rollback is stored and
-// unaffected either way, and a completed rollback moves the check to
-// action_required whether or not this update took ownership of the row.
+// storage or GitHub error whose text stays in the server log. The rollback is
+// stored and unaffected either way. The line promises no later refresh: when
+// the check row was never created, the rollback's completion has no row to
+// update, so it names the step that refreshes the check instead.
 func rollbackCheckUpdateFailedMessage(err error, database, environment string) string {
 	rollback := fmt.Sprintf("The rollback for `%s` in `%s` was accepted", database, environment)
 	switch {
@@ -110,6 +125,5 @@ func rollbackCheckUpdateFailedMessage(err error, database, environment string) s
 			"The rollback itself is not affected. Fix the namespace placement, then run plan again."
 	}
 	return rollback + ", but SchemaBot could not update the required status check, so the check does not show it yet. The rollback itself is not affected. " +
-		"When the rollback completes, SchemaBot updates the check; if it ends any other way and the check still does not match, " +
-		"the SchemaBot server logs have the cause."
+		"Once the rollback finishes, run plan again to refresh the check; if it still does not match, the SchemaBot server logs have the cause."
 }

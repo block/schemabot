@@ -227,8 +227,8 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 			h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy,
 				rollbackLockFailureMessage(err, database, "take the lock for `"+database+"`"))
 			if errors.Is(err, storage.ErrLockHeld) {
-				// Another command holds the lock now, so a re-drive would only
-				// post a second comment for the same answer.
+				// Another command holds the lock now. The refusal is the
+				// command's answer, so a durable driver must not re-drive it.
 				return false, nil
 			}
 			return true, fmt.Errorf("rollback command acquire lock %s#%d database %s: %w", repo, pr, database, err)
@@ -336,8 +336,8 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy,
 			rollbackLockFailureMessage(err, database, "save the rollback plan on the lock for `"+database+"`"))
 		if errors.Is(err, storage.ErrLockHeld) {
-			// Another command holds the lock now, so a re-drive would only
-			// post a second comment for the same answer.
+			// Another command holds the lock now. The refusal is the
+			// command's answer, so a durable driver must not re-drive it.
 			h.logRollbackLockReleaseFailure(repo, pr, database, dbType, lockOwner, releaseErr)
 			return false, nil
 		}

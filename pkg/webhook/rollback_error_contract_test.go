@@ -274,11 +274,12 @@ func rollbackCommand() CommandResult {
 // for the remote engine's answer during rollback plan generation.
 type rollbackPlanTernClient struct {
 	tern.Client
-	planErr error
+	planErr  error
+	planResp *ternv1.PlanResponse
 }
 
 func (c *rollbackPlanTernClient) Plan(context.Context, *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
-	return nil, c.planErr
+	return c.planResp, c.planErr
 }
 
 func (c *rollbackPlanTernClient) IsRemote() bool { return true }
@@ -844,7 +845,9 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		assert.False(t, retry, "a deterministic engine rejection is the command's answer; re-driving would re-send the same doomed RPC")
 		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the failed plan")
 		body := requireComment(t, comments, "engine rejection comment")
-		assert.Contains(t, body, "SchemaBot could not create the rollback plan for `orders` in `staging`, so the rollback did not start. "+rollbackRetryAdvice)
+		assert.Contains(t, body, "SchemaBot could not create the rollback plan for `orders` in `staging`, so the rollback did not start. "+
+			"Running the command again fails the same way until the cause is fixed; the SchemaBot server logs have the cause.")
+		assert.NotContains(t, body, "Run the command again")
 		assert.NotContains(t, body, "rollback DDL rejected by engine")
 	})
 
