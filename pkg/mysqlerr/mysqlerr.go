@@ -55,6 +55,22 @@ func PointToRenderedLogs(reason string) string {
 	return GenericRenderedLogs + strings.TrimPrefix(reason, Generic)
 }
 
+// GenericOnShard is Generic for one shard of a sharded apply. A sharded apply
+// runs the same change on every shard of a keyspace, so the part that failed
+// is a shard, and "the target" would read as a rollout target instead.
+const GenericOnShard = "The schema change failed on the shard; see the server logs for the reason."
+
+// OnShard rewrites a reason for a shard of a sharded apply. Only the generic
+// sentence is rewritten, and only its noun, so any code it carries stays. A
+// reason this package did not write, or a sentence chosen by code, is
+// returned unchanged.
+func OnShard(reason string) string {
+	if !strings.HasPrefix(reason, Generic) {
+		return reason
+	}
+	return GenericOnShard + strings.TrimPrefix(reason, Generic)
+}
+
 // Unreachable is what a failure to reach the target at all reports. It is kept
 // apart from Generic because the two send an operator to different places: one
 // is a schema change that ran and stopped, the other never got to run.
@@ -256,6 +272,7 @@ func Authored() map[string]bool {
 	all := map[string]bool{
 		Generic:             true,
 		GenericRenderedLogs: true,
+		GenericOnShard:      true,
 		Unreachable:         true,
 		ConnectionLost:      true,
 		Timeout:             true,
