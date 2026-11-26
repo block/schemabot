@@ -332,7 +332,7 @@ func renderBlockedChangesApplyRejected(data PlanCommentData, budget *ddlBlockBud
 		}
 		writeEngineReasonItem(&sb, table, c.Reason)
 	}
-	sb.WriteString("\nFix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n")
+	sb.WriteString("\nEach reason says what to change. Contact your SchemaBot operators if you need help.\n")
 
 	return appendAgentHint(sb.String(), data.AgentHint)
 }

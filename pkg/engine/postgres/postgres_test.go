@@ -147,7 +147,7 @@ func TestExecutionVerdict(t *testing.T) {
 				mode:         tt.wantMode,
 				reason:       tt.wantReason,
 				unrecognized: tt.wantUnrecognized,
-			}, executionVerdict(version, tt.statement, "users", nil))
+			}, executionVerdict(version, tt.statement, "users"))
 		})
 	}
 }
@@ -189,7 +189,7 @@ func TestCreateShapeRefusalReasonCoversEveryCause(t *testing.T) {
 				executionVerdict(pgplan.FormatVersion, pgplan.Statement{
 					Disposition: router.DispositionRefuse,
 					Cause:       cause,
-				}, "users", nil))
+				}, "users"))
 		})
 	}
 }
@@ -204,7 +204,7 @@ func TestExecutionVerdictUnknownCreateShapeCause(t *testing.T) {
 	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
 		Disposition: router.DispositionRefuse,
 		Cause:       executor.CreateShapeCause("unknown"),
-	}, "users", nil))
+	}, "users"))
 }
 
 // A refusal with no cause comes from outside the create path; the generic
@@ -215,7 +215,7 @@ func TestExecutionVerdictEmptyCreateShapeCause(t *testing.T) {
 		reason: `statement for table "users" is refused: it cannot be executed safely as written`,
 	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
 		Disposition: router.DispositionRefuse,
-	}, "users", nil))
+	}, "users"))
 }
 
 // TestExecutionVerdictRunsPartitionedIndexBuild pins that the planner's
@@ -228,7 +228,7 @@ func TestExecutionVerdictRunsPartitionedIndexBuild(t *testing.T) {
 		Backend:     router.BackendNative,
 		Execution:   planner.ExecutionPartitionedIndexBuild,
 		ExecSQL:     []string{"CREATE INDEX events_created_at_idx ON public.events (created_at)"},
-	}, "events", nil))
+	}, "events"))
 }
 
 // TestExecutionVerdictBlocksPartitionedIndexShapeTheBuildRefuses pins that a
@@ -246,14 +246,14 @@ func TestExecutionVerdictBlocksPartitionedIndexShapeTheBuildRefuses(t *testing.T
 	assert.Equal(t, stepVerdict{
 		mode:   engine.ExecutionModeBlocked,
 		reason: `statement for table "events": the index on "events" names a TABLESPACE, which the partitions' indexes would not use; remove the TABLESPACE clause from the schema file, then re-plan against the current schema`,
-	}, executionVerdict(pgplan.FormatVersion, statement, "events", nil))
+	}, executionVerdict(pgplan.FormatVersion, statement, "events"))
 
 	statement.ExecSQL = []string{"CREATE INDEX a_idx ON public.events (a)", "CREATE INDEX b_idx ON public.events (b)"}
 	assert.Equal(t, stepVerdict{
 		mode:         engine.ExecutionModeBlocked,
 		reason:       `statement for table "events" has an unrecognized planner verdict`,
 		unrecognized: &unrecognizedPlannerVocabulary{kind: "partitioned_index_build_steps", value: "2"},
-	}, executionVerdict(pgplan.FormatVersion, statement, "events", nil))
+	}, executionVerdict(pgplan.FormatVersion, statement, "events"))
 }
 
 // Every execution contract the planner can attach either runs or is blocked
@@ -326,7 +326,7 @@ func TestRewriteRequiredReasonCoversEveryGuidance(t *testing.T) {
 				executionVerdict(pgplan.FormatVersion, pgplan.Statement{
 					Disposition: router.DispositionRewriteRequired,
 					Guidance:    guidance,
-				}, "users", nil))
+				}, "users"))
 		})
 	}
 }
@@ -342,36 +342,32 @@ func TestExecutionVerdictUnknownGuidance(t *testing.T) {
 	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
 		Disposition: router.DispositionRewriteRequired,
 		Guidance:    suggest.Guidance("unknown"),
-	}, "users", nil))
+	}, "users"))
 }
 
-// A foreign-key change the planner refuses is shown for review and the engine
-// does not run it. A dropped foreign key's remedy offers declaring it before
-// removing it, so an operator whose file left it out keeps the constraint.
-// Only a table that carries foreign keys into another namespace gets the
-// clause naming them, since those cannot be declared and removal is the only
-// way forward. Any other foreign-key change the planner refuses gets the
-// general remedy, and nothing is reported as unrecognized vocabulary.
-func TestExecutionVerdictForeignKeyChange(t *testing.T) {
-	const dropReason = `statement for table "users" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan`
+// The planner refuses only the drop of a foreign key into another namespace,
+// which a schema file cannot declare, and the reason names the key and says
+// it is removed outside SchemaBot. A refusal without the planner's record of
+// the key still names what it drops.
+func TestExecutionVerdictForeignKeyDropIntoAnotherNamespace(t *testing.T) {
 	for _, tt := range []struct {
-		name           string
-		kind           schemadiff.ChangeKind
-		crossNamespace []string
-		want           string
+		name  string
+		drops *schemadiff.DroppedObject
+		want  string
 	}{
-		{"another foreign-key change", schemadiff.ChangeAddForeignKey, nil, `statement for table "users" changes a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; leave the change out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and put the change back in the file`},
-		{"drop", schemadiff.ChangeDropForeignKey, nil, dropReason},
-		{"drop with cross-namespace foreign keys", schemadiff.ChangeDropForeignKey, []string{"users_account_id_fkey", "users_region_id_fkey"},
-			dropReason + `; foreign key constraint(s) "users_account_id_fkey", "users_region_id_fkey" reference another namespace and cannot be declared, so the plan stays blocked until they are removed through a separately reviewed process`},
+		{"recorded key", &schemadiff.DroppedObject{Kind: schemadiff.DroppedConstraint, Name: "users_region_id_fkey", Definition: "FOREIGN KEY (region_id) REFERENCES geo.regions(id)"},
+			`statement for table "users" drops foreign key "users_region_id_fkey" into another namespace, which a schema file cannot declare, so SchemaBot does not apply the drop; remove the key outside SchemaBot through a separately reviewed process, then re-plan`},
+		{"unrecorded key", nil,
+			`statement for table "users" drops a foreign key into another namespace, which a schema file cannot declare, so SchemaBot does not apply the drop; remove the key outside SchemaBot through a separately reviewed process, then re-plan`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, stepVerdict{mode: engine.ExecutionModeBlocked, reason: tt.want},
 				executionVerdict(pgplan.FormatVersion, pgplan.Statement{
-					Kind:        tt.kind,
+					Kind:        schemadiff.ChangeDropForeignKey,
 					Disposition: router.DispositionRefuse,
 					Reason:      verdict.ReasonDeclarativeForeignKey,
-				}, "users", tt.crossNamespace))
+					Drops:       tt.drops,
+				}, "users"))
 		})
 	}
 }
@@ -387,7 +383,7 @@ func TestExecutionVerdictGeneratedExpressionChange(t *testing.T) {
 		Kind:        schemadiff.ChangeSetGeneratedExpression,
 		Disposition: router.DispositionRefuse,
 		Reason:      verdict.ReasonUnsupportedStatement,
-	}, "events", nil))
+	}, "events"))
 }
 
 // A foreign key the planner cannot bind fails the plan with the fix appended:
@@ -437,7 +433,7 @@ func TestTableChangesMapsDestructiveSafety(t *testing.T) {
 		},
 	}
 
-	changes, _, _, err := tableChanges(report, nil, parser)
+	changes, _, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 2)
 	assert.True(t, changes[0].IsUnsafe)
@@ -464,7 +460,7 @@ func TestTableChangesRendersOrderedExecutionSteps(t *testing.T) {
 		},
 	}}
 
-	changes, tiers, _, err := tableChanges(report, nil, parser)
+	changes, tiers, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 2)
 	assert.Equal(t, "ALTER TABLE public.users ADD COLUMN email text", changes[0].DDL)
@@ -492,7 +488,7 @@ func TestTableChangesCollapsesGreenfieldCreateSet(t *testing.T) {
 		{SQL: "CREATE INDEX widgets_id_idx ON public.widgets (id)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE INDEX CONCURRENTLY widgets_id_idx ON public.widgets (id)"}},
 	}
 
-	changes, tiers, _, err := tableChanges(report, nil, parser)
+	changes, tiers, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 1)
 	assert.Equal(t, "CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text);\nCREATE UNIQUE INDEX widgets_name_key ON public.widgets (name);\nCREATE INDEX widgets_id_idx ON public.widgets (id)", changes[0].DDL)
@@ -516,7 +512,7 @@ func TestTableChangesKeepsGreenfieldVerdictsPerStatement(t *testing.T) {
 		{SQL: "CREATE INDEX widgets_id_idx ON public.widgets (id)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE INDEX CONCURRENTLY widgets_id_idx ON public.widgets (id)"}},
 	}
 
-	changes, tiers, _, err := tableChanges(report, nil, parser)
+	changes, tiers, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 3)
 	blockAbsentTableDependents(changes, tiers, report.Table)
@@ -590,7 +586,7 @@ func TestTableChangesMixedVerdictsFailClosedPerStatement(t *testing.T) {
 			Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
 	}
 
-	changes, _, _, err := tableChanges(report, nil, parser)
+	changes, _, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 2)
 	assert.Empty(t, changes[0].ExecutionMode)
@@ -621,7 +617,7 @@ func TestTableChangesReportsUnrecognizedPlannerVocabularyOncePerStatement(t *tes
 			}},
 	}
 
-	changes, _, unrecognized, err := tableChanges(report, nil, parser)
+	changes, _, unrecognized, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 4)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
@@ -641,7 +637,7 @@ func TestTableChangesRejectsUnparseablePlanSQL(t *testing.T) {
 	report.Table = "users"
 	report.Statements = []pgplan.Statement{{SQL: "not ddl", Disposition: router.DispositionRefuse}}
 
-	_, _, _, err = tableChanges(report, nil, parser)
+	_, _, _, err = tableChanges(report, parser)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `classify planned statement for table "users"`)
 }
@@ -760,7 +756,7 @@ func TestTableChangesDerivesTiersForBlockedSteps(t *testing.T) {
 		{SQL: "REINDEX INDEX CONCURRENTLY public.users_legacy_idx", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionUnavailable},
 	}
 
-	changes, tiers, _, err := tableChanges(report, nil, parser)
+	changes, tiers, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 3)
 	for _, change := range changes {
@@ -788,7 +784,7 @@ func TestTableChangesCarriesGuidancePerStatement(t *testing.T) {
 		{SQL: "ALTER TABLE public.users RENAME COLUMN name TO full_name", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRewriteRequired, Guidance: suggest.GuidanceExpandContractColumn},
 	}
 
-	changes, _, unrecognized, err := tableChanges(report, nil, parser)
+	changes, _, unrecognized, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 2)
 	assert.Empty(t, unrecognized)
@@ -815,7 +811,7 @@ func TestBlockMissingPrivilegesNamesGrantOnPlannerBlockedPlan(t *testing.T) {
 		{SQL: "ALTER TABLE public.users ADD CONSTRAINT users_email_key UNIQUE (email)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRewriteRequired},
 		{SQL: "REINDEX INDEX CONCURRENTLY public.users_legacy_idx", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionUnavailable},
 	}
-	changes, tiers, _, err := tableChanges(report, nil, parser)
+	changes, tiers, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	plannerReasons := []string{changes[0].ModeReason, changes[1].ModeReason, changes[2].ModeReason}
 
@@ -885,7 +881,7 @@ func plannerBlockedGreenfieldPlan(t *testing.T, indexExecutable bool) (pgplan.Re
 		{SQL: "CREATE TABLE public.widgets PARTITION OF public.gadgets FOR VALUES IN (1)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRefuse, Cause: executor.CreateShapePartitionOf},
 		index,
 	}
-	changes, tiers, _, err := tableChanges(report, nil, parser)
+	changes, tiers, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Equal(t, []preflight.Tier{preflight.TierCreateTable, preflight.TierIndexBuild}, tiers)
 	return report, changes, tiers
@@ -1229,7 +1225,7 @@ func TestTableChangesRendersAnIndexDropAsUnsafe(t *testing.T) {
 		Drops:       &dropped,
 	}}
 
-	changes, tiers, _, err := tableChanges(report, nil, parser)
+	changes, tiers, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 1)
 	assert.Empty(t, changes[0].ExecutionMode, changes[0].ModeReason)
@@ -1328,7 +1324,7 @@ func TestTableChangesNeutralizesCauseSeparatorInTableName(t *testing.T) {
 			Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
 	}
 
-	changes, _, _, err := tableChanges(report, nil, parser)
+	changes, _, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 1)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)

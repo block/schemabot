@@ -69,6 +69,8 @@ early release.
 - Creating a table together with its indexes.
 - Adding a foreign key to an existing table, or creating a table that has
   one. See [Foreign keys](#foreign-keys).
+- Dropping or changing a foreign key, after you approve the drop with
+  `--allow-unsafe`. See [Foreign keys](#foreign-keys).
 - Dropping a table whose schema file was deleted, after you approve the drop
   with `--allow-unsafe`. See [Tables with no schema file](#tables-with-no-schema-file).
 - Adding labels to an existing enum type. See [Enum types](#enum-types).
@@ -82,7 +84,7 @@ early release.
 |---|---|
 | Rewriting a table, such as changing a column's type | Blocked. It needs pg-sprite's copy-and-swap, which is still in preview |
 | `ALTER TABLE` on a table larger than the size limit, unless it only changes the catalog | Blocked, for the same reason |
-| Dropping a foreign key | Blocked. See [Foreign keys](#foreign-keys) for running one yourself |
+| Dropping a foreign key into another namespace | Blocked. A schema file cannot declare it. See [Foreign keys](#foreign-keys) |
 | Creating an enum type, or removing or reordering its labels | Blocked |
 | `stop`, `start`, `cutover`, deferred cutover, `revert`, `skip-revert` | Not available. Only an index build can be cancelled. See [Unsupported workflow features](#unsupported-workflow-features) |
 | Some changes to a partitioned table's parent | Refused when the apply runs. See [Partitioned tables](#partitioned-tables) |
@@ -210,7 +212,7 @@ If your tables belong to a dedicated owner role, read
 | A new label on an existing enum type | Runs as `ALTER TYPE ... ADD VALUE`, one label per step, before the table changes. Creating a type or removing a label fails the plan. See [Enum types](#enum-types) |
 | Row-level security policies on an existing table | Run in one transaction, after you explicitly approve them, because they change who can read rows. See [Row-level security](#row-level-security) |
 | Adding a foreign key | Runs in two steps: `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`, which checks existing rows while writes continue. See [Foreign keys](#foreign-keys) |
-| Dropping a foreign key | Shown in the plan, but blocked. See [Foreign keys](#foreign-keys) |
+| Dropping a foreign key | Runs as `DROP CONSTRAINT` after you approve it with `--allow-unsafe`. It takes a brief `ACCESS EXCLUSIVE` lock on both tables. A changed key runs as the drop, then the two steps that add it. See [Foreign keys](#foreign-keys) |
 | Making a column `NOT NULL` | Runs in four steps on a table up to the size limit: a helper `CHECK (column IS NOT NULL) NOT VALID`, `VALIDATE CONSTRAINT`, which checks existing rows while writes continue, `SET NOT NULL`, which uses the validated check instead of scanning, and the helper's drop. If a row holds `NULL`, the validation fails and names the helper. Fix those rows and SchemaBot retries the validation on its own. If its retries run out first, drop the helper outside SchemaBot, then plan and apply again |
 | A table with no schema file, or a deleted file | Runs as `DROP TABLE` after you approve it with `--allow-unsafe`, as on MySQL. Archive tables and `ignore_tables` entries are left alone. See [Tables with no schema file](#tables-with-no-schema-file) |
 
@@ -860,16 +862,17 @@ SchemaBot's catalog reads name every catalog object with `pg_catalog.`, so a
 
 ### Foreign keys
 
-SchemaBot adds the foreign keys a schema file declares. It does not drop one
-yet.
+SchemaBot adds the foreign keys a schema file declares, and drops the live
+ones it leaves out.
 
 | The file | Plan |
 |---|---|
 | Declares a foreign key that matches the live one | No change |
 | Adds a foreign key to an existing table | `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`. Both run |
 | Creates a table that has a foreign key | The `CREATE TABLE`, with the key. It runs |
-| Leaves out a live foreign key | `DROP CONSTRAINT`, blocked |
-| Has a foreign key into another namespace | Cannot be declared. The plan stays blocked until the foreign key is removed from the database |
+| Leaves out a live foreign key | `DROP CONSTRAINT`. It runs after you approve it with `--allow-unsafe` |
+| Changes a live foreign key, such as adding `ON DELETE CASCADE` | The `DROP CONSTRAINT`, then `ADD CONSTRAINT ... NOT VALID` and `VALIDATE CONSTRAINT`. All three run after you approve the drop |
+| Leaves out a live foreign key into another namespace | Cannot be declared. The `DROP CONSTRAINT` is blocked, and so is the plan, until the key is removed from the database |
 
 A file can declare a foreign key only when the referenced table already exists
 in the same namespace and the reference is unqualified. A table the same plan
@@ -891,9 +894,21 @@ The key stays in place, not yet validated, and keeps checking new writes. Fix
 the rows that reference missing keys, then retry. The next plan shows only the
 `VALIDATE CONSTRAINT`.
 
-**To remove a foreign key.** A dropped foreign key is usually one the file left
-out. To keep it, declare it in the file. To remove it, run the
-`DROP CONSTRAINT` outside SchemaBot, then plan again.
+**How a dropped key runs.** `DROP CONSTRAINT` changes only the catalog, but
+it takes `ACCESS EXCLUSIVE` on the table and on the referenced table, so it
+runs under the 3-second `lock_timeout` and retries on a busy table. Right
+before the drop, the apply reads the key again under the lock. If another
+session replaced it under the same name after the plan, nothing is dropped
+and the apply tells you to plan again. Reverting the pull request that added
+a key plans this drop.
+
+**When a dropped key is a surprise.** A planned drop is usually a key the file
+left out. To keep it, declare it in the file and plan again.
+
+**A changed key.** Between the drop and the add, writes are not checked
+against the key. A row written then that breaks the new key fails the
+validation, which leaves the key `NOT VALID` and still checking new writes.
+Fix the row, and the next plan is only the validation.
 
 **Declaring tables that have foreign keys.** `pull` writes them:
 

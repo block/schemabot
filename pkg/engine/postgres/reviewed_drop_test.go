@@ -68,7 +68,7 @@ func TestTableChangesRecordsTheReviewedDrop(t *testing.T) {
 			Disposition: router.DispositionExecute,
 			ExecSQL:     []string{"ALTER TABLE public.users ADD COLUMN email text"},
 		}}
-		changes, _, _, err := tableChanges(report, nil, parser)
+		changes, _, _, err := tableChanges(report, parser)
 		require.NoError(t, err)
 		require.Len(t, changes, 2)
 		return changes
@@ -125,7 +125,7 @@ func TestTableChangesRecordsTheNotNullHelperDrop(t *testing.T) {
 			},
 			DropsHelper: dropsHelper,
 		}}
-		changes, _, _, err := tableChanges(report, nil, parser)
+		changes, _, _, err := tableChanges(report, parser)
 		require.NoError(t, err)
 		require.Len(t, changes, len(steps))
 		return changes

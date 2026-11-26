@@ -77,7 +77,7 @@ func enumTypeChanges(database, namespace string, report pgplan.Report, parser dd
 			return nil, fmt.Errorf("planned statement for enum type %q adds no label", report.Type)
 		}
 		mode, reason := "", ""
-		verdict := executionVerdict(report.FormatVersion, statement, report.Type, nil)
+		verdict := executionVerdict(report.FormatVersion, statement, report.Type)
 		if verdict.mode != "" {
 			// The table mapping words its reasons for a table, so the
 			// blocked step gets a sentence of its own that names the type

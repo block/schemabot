@@ -1335,7 +1335,7 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 			continue
 		}
 		for _, t := range sp.Changes {
-			unsafeChange, ok := t.UnsafeChange()
+			unsafeChange, ok := t.DisclosedUnsafeChange()
 			if !ok {
 				continue
 			}
@@ -1365,7 +1365,7 @@ func namespacesWithUnsafeShardChanges(shards []*apitypes.ShardPlanResponse) map[
 			continue
 		}
 		for _, t := range sp.Changes {
-			if _, ok := t.UnsafeChange(); ok {
+			if _, ok := t.DisclosedUnsafeChange(); ok {
 				namespaces[sp.Namespace] = true
 				break
 			}
@@ -1374,7 +1374,9 @@ func namespacesWithUnsafeShardChanges(shards []*apitypes.ShardPlanResponse) map[
 	return namespaces
 }
 
-// planUnsafeChanges lists a plan's unsafe changes for a comment. The view is
+// planUnsafeChanges lists a plan's unsafe changes for a comment, leaving out
+// any the engine refuses: the comment lists a refused change once, under the
+// refusal, since no consent lets it run. The view is
 // chosen per namespace. In a namespace with an unsafe per-shard change, the
 // table-level entries come from the per-shard changes, so an unsafe change
 // confined to one shard (e.g. a column drop on a single drifted shard) is still
@@ -1394,7 +1396,7 @@ func planUnsafeChanges(planResp *apitypes.PlanResponse) []templates.UnsafeChange
 			continue
 		}
 		for _, t := range sc.TableChanges {
-			if uc, ok := t.UnsafeChange(); ok {
+			if uc, ok := t.DisclosedUnsafeChange(); ok {
 				unsafe = append(unsafe, templates.UnsafeChangeData{
 					Table:      uc.Table,
 					Reason:     uc.Reason,

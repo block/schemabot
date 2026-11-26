@@ -681,8 +681,9 @@ func writeChangeDetail(result *apitypes.PlanResponse, w planWork, isApply bool) 
 	templates.WriteChangeNotice(glyph.Attention, "Direct execution: runs as native MySQL DDL, not through Spirit, and blocks writes to the table while it runs:", directChangeNotices(result))
 
 	// Check for unsafe changes and show with ⚠️ (attention — the changes await consent)
-	// Skip in apply context — apply shows its own 🚨 warning via WriteUnsafeWarningAllowed
-	unsafeChanges := result.UnsafeChanges()
+	// Skip in apply context — apply shows its own 🚨 warning via WriteUnsafeWarningAllowed.
+	// A refused change is listed once, as refused, so it is left out here.
+	unsafeChanges := result.DisclosedUnsafeChanges()
 	if len(unsafeChanges) > 0 && !isApply {
 		templates.WriteUnsafeChangesWarning(unsafeChanges)
 	}

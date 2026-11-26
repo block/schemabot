@@ -18,11 +18,10 @@ import (
 
 // A schema whose files declare foreign keys plans: an added foreign key, on
 // an existing column or one the same plan adds, is planned to run, and so is a
-// new table that declares one. A live foreign key the file leaves out is shown
-// for review and blocked, since SchemaBot does not drop foreign keys on
-// PostgreSQL yet. A dropped foreign key's remedy names the table's foreign
-// keys into another namespace only when it has some, since a schema file
-// cannot declare those.
+// new table that declares one. A live foreign key the file leaves out is
+// planned to run as an unsafe drop. A live foreign key into another namespace
+// is blocked instead, since a schema file cannot declare it and every plan
+// would drop it whatever the file says; the reason names the key.
 func TestEnginePlanForeignKeys(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_foreign_keys_test")
 	_, err := db.ExecContext(t.Context(), `
@@ -73,15 +72,18 @@ func TestEnginePlanForeignKeys(t *testing.T) {
 		`ALTER TABLE "public"."refunds" VALIDATE CONSTRAINT "refunds_order_id_fkey"`,
 	}, executableDDL(t, result, "refunds"), "the foreign key on a new column runs after the column is added")
 
-	dropFK, ok := byDDL["ALTER TABLE public.payments DROP CONSTRAINT payments_order_id_fkey"]
-	require.True(t, ok, "the undeclared live foreign key is planned as a drop")
-	assert.Equal(t, engine.ExecutionModeBlocked, dropFK.ExecutionMode)
-	assert.Equal(t, `statement for table "payments" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan`, dropFK.ModeReason)
+	assert.Equal(t, []string{
+		"ALTER TABLE public.payments DROP CONSTRAINT payments_order_id_fkey",
+	}, executableDDL(t, result, "payments"), "the undeclared live foreign key is planned to run as a drop")
+	dropFK := byDDL["ALTER TABLE public.payments DROP CONSTRAINT payments_order_id_fkey"]
+	assert.True(t, dropFK.IsUnsafe, "a foreign-key drop needs --allow-unsafe")
+	assert.Equal(t, `statement removes live structure from table "payments"`, dropFK.UnsafeReason)
+	assert.Contains(t, dropFK.Metadata, reviewedDropMetadataKey, "the plan records the key it reviewed, so the apply can check it")
 
 	dropCrossNamespaceFK, ok := byDDL["ALTER TABLE public.invoices DROP CONSTRAINT invoices_account_id_fkey"]
 	require.True(t, ok, "the undeclared foreign key into another namespace is planned as a drop")
 	assert.Equal(t, engine.ExecutionModeBlocked, dropCrossNamespaceFK.ExecutionMode)
-	assert.Equal(t, `statement for table "invoices" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan; foreign key constraint(s) "invoices_account_id_fkey" reference another namespace and cannot be declared, so the plan stays blocked until they are removed through a separately reviewed process`, dropCrossNamespaceFK.ModeReason)
+	assert.Equal(t, `statement for table "invoices" drops foreign key "invoices_account_id_fkey" into another namespace, which a schema file cannot declare, so SchemaBot does not apply the drop; remove the key outside SchemaBot through a separately reviewed process, then re-plan`, dropCrossNamespaceFK.ModeReason)
 
 	assert.Equal(t, []string{
 		"CREATE TABLE public.shipments (id bigint PRIMARY KEY, order_id bigint NOT NULL REFERENCES public.orders (id))",
@@ -370,10 +372,11 @@ func TestEngineRollbackKeepsForeignKeys(t *testing.T) {
 	assert.True(t, foreignKeyValidated(t, db, "orders_user_id_fkey"))
 }
 
-// An owner adds a foreign key and the apply runs it. Rolling back plans the
-// key's drop, shows it for review, and blocks it, since SchemaBot does not
-// drop foreign keys on PostgreSQL yet. The remedy names how to remove the key.
-func TestEngineRollbackOfAnAddedForeignKeyIsBlocked(t *testing.T) {
+// An owner adds a foreign key and the apply runs it, and then the change is
+// reverted, the way a revert of the pull request does: rolling back plans the
+// key's drop as an unsafe change, and the apply drops it. A row the key
+// rejected now lands, and a fresh plan of the originals is empty.
+func TestEngineRollbackOfAnAddedForeignKeyDropsIt(t *testing.T) {
 	const database = "rollback_added_foreign_key_test"
 	dsn, db := testutil.StartPostgres(t, database)
 	_, err := db.ExecContext(t.Context(), `
@@ -396,14 +399,99 @@ func TestEngineRollbackOfAnAddedForeignKeyIsBlocked(t *testing.T) {
 		assert.Equal(t, engine.StateCompleted, progress.State, progress.ErrorMessage)
 	}
 
-	rollback := planForeignKeyFiles(t, eng, database, dsn, forward.Changes[0].OriginalFiles)
+	originals := forward.Changes[0].OriginalFiles
+	rollback := planForeignKeyFiles(t, eng, database, dsn, originals)
+	assert.Equal(t, []string{"ALTER TABLE public.orders DROP CONSTRAINT orders_user_id_fkey"}, executableDDL(t, rollback, "orders"))
 	require.Len(t, rollback.Changes, 1)
 	require.Len(t, rollback.Changes[0].TableChanges, 1)
-	drop := rollback.Changes[0].TableChanges[0]
-	assert.Equal(t, "ALTER TABLE public.orders DROP CONSTRAINT orders_user_id_fkey", drop.DDL)
-	assert.Equal(t, engine.ExecutionModeBlocked, drop.ExecutionMode)
-	assert.Equal(t, `statement for table "orders" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan`, drop.ModeReason)
-	assert.True(t, foreignKeyValidated(t, db, "orders_user_id_fkey"), "nothing ran, so the key is still in place")
+	assert.True(t, rollback.Changes[0].TableChanges[0].IsUnsafe)
+
+	outcomes = applyPlannedSteps(t, eng, dsn, rollback)
+	require.Len(t, outcomes, 1)
+	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
+	_, err = db.ExecContext(t.Context(), `INSERT INTO public.orders VALUES (11, 2)`)
+	require.NoError(t, err, "the dropped key no longer rejects the row")
+
+	converged := planForeignKeyFiles(t, eng, database, dsn, originals)
+	assert.True(t, converged.NoChanges, "the rollback converged, got %+v", converged.Changes)
+}
+
+// An owner changes a live foreign key to cascade deletes. The plan drops the
+// key and adds the new one without checking existing rows, then validates it;
+// the apply runs all three, and the key cascades afterward.
+func TestEngineApplyChangedForeignKey(t *testing.T) {
+	const database = "apply_changed_foreign_key_test"
+	dsn, db := testutil.StartPostgres(t, database)
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES public.users (id));
+		INSERT INTO public.users VALUES (1);
+		INSERT INTO public.orders VALUES (10, 1)`)
+	require.NoError(t, err)
+	files := map[string]string{
+		"users.sql":  "CREATE TABLE users (id bigint PRIMARY KEY)",
+		"orders.sql": "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES users (id) ON DELETE CASCADE)",
+	}
+	eng := New()
+
+	plan := planForeignKeyFiles(t, eng, database, dsn, files)
+	assert.Equal(t, []string{
+		"ALTER TABLE public.orders DROP CONSTRAINT orders_user_id_fkey",
+		"ALTER TABLE public.orders ADD CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users (id) ON DELETE CASCADE NOT VALID",
+		`ALTER TABLE "public"."orders" VALIDATE CONSTRAINT "orders_user_id_fkey"`,
+	}, executableDDL(t, plan, "orders"))
+	outcomes := applyPlannedSteps(t, eng, dsn, plan)
+	require.Len(t, outcomes, 3)
+	for _, progress := range outcomes {
+		assert.Equal(t, engine.StateCompleted, progress.State, progress.ErrorMessage)
+	}
+
+	assert.True(t, foreignKeyValidated(t, db, "orders_user_id_fkey"))
+	_, err = db.ExecContext(t.Context(), `DELETE FROM public.users WHERE id = 1`)
+	require.NoError(t, err)
+	var orders int
+	require.NoError(t, db.QueryRowContext(t.Context(), `SELECT count(*) FROM public.orders`).Scan(&orders))
+	assert.Zero(t, orders, "the changed key cascades the delete")
+	replan := planForeignKeyFiles(t, eng, database, dsn, files)
+	assert.True(t, replan.NoChanges, "the changed key matches the file, got %+v", replan.Changes)
+}
+
+// A plan drops a live foreign key the file left out. Before the apply runs,
+// another session replaces the key with a different one under the same name.
+// The apply reads the key again under the drop's lock, finds it is not the key
+// the plan reviewed, and drops nothing.
+func TestEngineApplyRefusesToDropAReplacedForeignKey(t *testing.T) {
+	const database = "apply_foreign_key_drop_replaced_test"
+	dsn, db := testutil.StartPostgres(t, database)
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.accounts (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES public.users (id));
+		INSERT INTO public.users VALUES (1);
+		INSERT INTO public.accounts VALUES (1);
+		INSERT INTO public.orders VALUES (10, 1)`)
+	require.NoError(t, err)
+	eng := New()
+	planned := planForeignKeyFiles(t, eng, database, dsn, map[string]string{
+		"users.sql":    "CREATE TABLE users (id bigint PRIMARY KEY)",
+		"accounts.sql": "CREATE TABLE accounts (id bigint PRIMARY KEY)",
+		"orders.sql":   "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL)",
+	})
+	assert.Equal(t, []string{"ALTER TABLE public.orders DROP CONSTRAINT orders_user_id_fkey"}, executableDDL(t, planned, "orders"))
+
+	_, err = db.ExecContext(t.Context(), `
+		ALTER TABLE public.orders DROP CONSTRAINT orders_user_id_fkey;
+		ALTER TABLE public.orders ADD CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.accounts (id)`)
+	require.NoError(t, err)
+
+	outcomes := applyPlannedSteps(t, eng, dsn, planned)
+	require.Len(t, outcomes, 1)
+	assert.Equal(t, engine.StateFailed, outcomes[0].State)
+	assert.Equal(t, `the object the planned drop on "orders" removes changed after planning; re-plan against the current schema`, outcomes[0].ErrorMessage)
+	var references string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT confrelid::regclass::text FROM pg_constraint WHERE conname = 'orders_user_id_fkey'`).Scan(&references))
+	assert.Equal(t, "accounts", references, "the replacement key stays")
 }
 
 // A schema file cannot declare a foreign key into another namespace, so the

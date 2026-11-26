@@ -3380,7 +3380,7 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 		}
 		writeEngineReasonItem(sb, table, c.Reason)
 	}
-	sb.WriteString("\nAn apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n\n")
+	sb.WriteString("\nAn apply will fail on these statements. Each reason says what to change. Contact your SchemaBot operators if you need help.\n\n")
 }
 
 // directMySQLConsequence is the MySQL consequence sentence of the
