@@ -800,27 +800,18 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	for _, namespace := range slices.Sorted(maps.Keys(req.SchemaFiles)) {
 		ns := req.SchemaFiles[namespace]
 		for _, filename := range slices.Sorted(maps.Keys(ns.Files)) {
-			content := ns.Files[filename]
-			stmts, err := ddl.SplitStatements(content)
+			tables, err := parseDesiredTables(namespace, filename, ns.Files[filename])
 			if err != nil {
-				return nil, fmt.Errorf("split statements in %s/%s: %w", namespace, filename, err)
+				return nil, err
 			}
-			for _, stmt := range stmts {
-				ct, err := statement.ParseCreateTable(stmt)
-				if err != nil {
-					return nil, fmt.Errorf("parse desired schema in %s/%s: %w", namespace, filename, err)
-				}
-				// Validate semantic correctness (e.g., index columns exist)
-				if err := ddl.ValidateCreateTable(ct); err != nil {
-					return nil, fmt.Errorf("SQL usage error in %s/%s: %w", namespace, filename, err)
-				}
-				if err := declared.Declare(namespace+"/"+filename, ct.TableName); err != nil {
+			for _, desired := range tables {
+				if err := declared.Declare(namespace+"/"+filename, desired.table); err != nil {
 					return nil, &engine.PlanRefusedError{Err: err}
 				}
 				// The diff names a live table the way it exists, so every
 				// lookup below keys the declaration by that spelling.
-				name := liveName(ct.TableName)
-				desiredSchemas = append(desiredSchemas, table.TableSchema{Name: name, Schema: stmt})
+				name := liveName(desired.table)
+				desiredSchemas = append(desiredSchemas, table.TableSchema{Name: name, Schema: desired.sql})
 				declaredByNamespace[namespace] = append(declaredByNamespace[namespace], name)
 				namespaceByTable[name] = namespace
 			}
@@ -1808,4 +1799,35 @@ func partitionByExistence(tables []string, currentByTable map[string]string) (ex
 		}
 	}
 	return existing, created
+}
+
+// desiredTable is one CREATE TABLE a schema file declares.
+type desiredTable struct {
+	sql   string
+	table string
+}
+
+// parseDesiredTables reads the CREATE TABLE statements of one schema file.
+// It reads only the file's text, so whatever it rejects is fixed by editing
+// the file, and it reports each rejection as a plan refusal: a statement that
+// does not parse, one that is not a CREATE TABLE, or one that names a column
+// it does not declare.
+func parseDesiredTables(namespace, filename, content string) ([]desiredTable, error) {
+	stmts, err := ddl.SplitStatements(content)
+	if err != nil {
+		return nil, &engine.PlanRefusedError{Err: fmt.Errorf("split statements in %s/%s: %w", namespace, filename, err)}
+	}
+	tables := make([]desiredTable, 0, len(stmts))
+	for _, stmt := range stmts {
+		ct, err := statement.ParseCreateTable(stmt)
+		if err != nil {
+			return nil, &engine.PlanRefusedError{Err: fmt.Errorf("parse desired schema in %s/%s: %w", namespace, filename, err)}
+		}
+		// Validate semantic correctness (e.g., index columns exist)
+		if err := ddl.ValidateCreateTable(ct); err != nil {
+			return nil, &engine.PlanRefusedError{Err: fmt.Errorf("SQL usage error in %s/%s: %w", namespace, filename, err)}
+		}
+		tables = append(tables, desiredTable{sql: stmt, table: ct.TableName})
+	}
+	return tables, nil
 }
