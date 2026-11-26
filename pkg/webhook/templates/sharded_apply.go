@@ -3,6 +3,7 @@ package templates
 import (
 	"fmt"
 	"html"
+	"slices"
 	"strings"
 	"time"
 
@@ -451,6 +452,17 @@ func landedShardCount(shards []ShardProgressData) int {
 	return n
 }
 
+// failedShardCount counts the shards where the table's change failed.
+func failedShardCount(shards []ShardProgressData) int {
+	n := 0
+	for _, sh := range shards {
+		if state.NormalizeTaskStatus(sh.Status) == state.Task.Failed {
+			n++
+		}
+	}
+	return n
+}
+
 // writeShardedSummaryMetadata writes the terminal metadata line — database,
 // engine type, apply ID, and duration when both timestamps are known — followed
 // by the attribution line: the sharded analogue of writeSummaryMetadata.
@@ -525,13 +537,13 @@ func writeShardDetail(sb *strings.Builder, ks ShardedKeyspace, applyHasShardFail
 		return
 	}
 	if len(groups) <= 1 {
-		writeShardStatusTable(sb, ks.Shards)
+		writeShardStatuses(sb, ks.Shards)
 		return
 	}
 	sb.WriteString("\nShards diverge — grouped by change:\n")
 	for _, g := range groups {
 		fmt.Fprintf(sb, "\n**%s**\n", shardList(g.Shards, len(ks.Shards)))
-		writeShardStatusTable(sb, g.Shards)
+		writeShardStatuses(sb, g.Shards)
 	}
 }
 
@@ -690,6 +702,11 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, budget *dd
 		phrase := shardedTableStatusPhrase(status)
 		if status == state.Task.Running && t.CopiesNoRows {
 			phrase = "🔄 Applying"
+		}
+		if failed := failedShardCount(t.Shards); status == state.Task.Failed && failed > 0 && failed < len(t.Shards) {
+			// A failure leads the table's rollup however many shards are
+			// still copying, so the line says how far the failure reaches.
+			phrase += fmt.Sprintf(" on %d of %d shards", failed, len(t.Shards))
 		}
 		if landed := landedShardCount(t.Shards); landed > 0 && landed < len(t.Shards) && !presentation.ListsParts(status) {
 			if status == state.Task.Cancelled {
@@ -973,10 +990,11 @@ func isShardFailureState(opState string) bool {
 // failed apply must still name it. Renders nothing when the apply carries no
 // failure to explain.
 func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
-	for _, s := range allShardStatuses(data.Keyspaces) {
-		if !isShardFailureState(s.State) || s.StoppedAtCutover {
-			continue
-		}
+	shards := allShardStatuses(data.Keyspaces)
+	failed := failedShards(shards)
+	switch {
+	case len(failed) == 1:
+		s := failed[0]
 		severity := failureSeverity(s.State == state.ApplyOperation.FailedRetryable)
 		shard := html.EscapeString(s.Shard)
 		if msg := SanitizeInlineError(s.Error); msg == "" {
@@ -984,6 +1002,9 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 		} else {
 			fmt.Fprintf(sb, "\n> %s **First failure:** shard <code>%s</code> — %s\n", severity, shard, html.EscapeString(msg))
 		}
+		return
+	case len(failed) > 1:
+		writeShardFailureReasons(sb, failed, len(shards))
 		return
 	}
 	writeFinalizerFailure(sb, data.FailedFinalizer)
@@ -997,6 +1018,77 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 	}
 	if msg := SanitizeInlineError(data.ErrorMessage); msg != "" {
 		fmt.Fprintf(sb, "\n> %s **Failure:** %s\n", failureSeverity(state.IsState(data.State, state.Apply.FailedRetryable)), html.EscapeString(msg))
+	}
+}
+
+// failureReasonLimit bounds the reasons the failure callout lists, so shards
+// that each fail for their own reason cannot wall the comment.
+const failureReasonLimit = 5
+
+var reasonNoun = presentation.Noun{Singular: "reason", Plural: "reasons"}
+
+// failedShards is the shards whose own work failed or is retrying after a
+// failure, in resolved order. A shard stopped at the cutover reads failed, but
+// the failure it names is another shard's, so it is left out.
+func failedShards(shards []ShardStatus) []ShardStatus {
+	var out []ShardStatus
+	for _, s := range shards {
+		if isShardFailureState(s.State) && !s.StoppedAtCutover {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// writeShardFailureReasons writes the callout for several failed shards: how
+// many failed, then each distinct reason once with the shards it failed
+// (presentation.GroupFailureReasons), so a change that fails the same way on
+// every shard reads as one line instead of the same error on each shard. A
+// single reason rides on the headline. The glyph reads failed once any shard
+// has stopped on its error, and attention while every one is still retrying.
+func writeShardFailureReasons(sb *strings.Builder, failed []ShardStatus, totalShards int) {
+	retrying := true
+	failures := make([]presentation.Failure, len(failed))
+	names := make([]string, len(failed))
+	for i, s := range failed {
+		if s.State != state.ApplyOperation.FailedRetryable {
+			retrying = false
+		}
+		failures[i] = presentation.Failure{Name: s.Shard, Reason: SanitizeInlineError(s.Error)}
+		names[i] = s.Shard
+	}
+	verb := "Failed on"
+	if retrying {
+		verb = "Retrying after a failure on"
+	}
+	glyph := failureSeverity(retrying)
+	reasons := presentation.GroupFailureReasons(failures)
+	if len(reasons) == 1 {
+		subject := verb + " " + planShardList(names, totalShards)
+		if reasons[0].Reason == "" {
+			fmt.Fprintf(sb, "\n> %s **%s**\n", glyph, subject)
+			return
+		}
+		fmt.Fprintf(sb, "\n> %s **%s:** %s\n", glyph, subject, html.EscapeString(reasons[0].Reason))
+		return
+	}
+	// Each reason's line names its shards, so the headline only counts them.
+	headline := fmt.Sprintf("%s **%s %s:**", glyph, verb, presentation.CoveragePhrase(shardNoun, len(failed), totalShards))
+	fmt.Fprintf(sb, "\n> %s\n", headline)
+	for _, r := range reasons[:min(len(reasons), failureReasonLimit)] {
+		list := planShardList(r.Names, totalShards)
+		if r.Reason == "" {
+			fmt.Fprintf(sb, "> - %s: no reason recorded\n", list)
+			continue
+		}
+		fmt.Fprintf(sb, "> - %s: %s\n", list, html.EscapeString(r.Reason))
+	}
+	if rest := reasons[min(len(reasons), failureReasonLimit):]; len(rest) > 0 {
+		more := 0
+		for _, r := range rest {
+			more += len(r.Names)
+		}
+		fmt.Fprintf(sb, "> - …and %d more %s on %s\n", len(rest), reasonNoun.Label(len(rest)), shardNoun.Count(more))
 	}
 }
 
@@ -1049,6 +1141,57 @@ func failureSeverity(retrying bool) string {
 	return glyph.Failed
 }
 
+// writeShardStatuses writes where each of a set of shards stands. A few shards
+// read as a table with one row each, carrying each failed shard's error. More
+// than that would wall the comment with rows that mostly repeat one another,
+// so each state instead gets one collapsed line, such as "❌ 31 failed", that
+// expands into the names of its shards; the failure callout above already
+// carries each distinct reason.
+func writeShardStatuses(sb *strings.Builder, shards []ShardStatus) {
+	if len(shards) <= shardNamesInlineLimit {
+		writeShardStatusTable(sb, shards)
+		return
+	}
+	sb.WriteString("\n")
+	for _, g := range shardStateGroups(shards) {
+		summary := fmt.Sprintf("%d %s", len(g.names), html.EscapeString(g.label))
+		if g.emoji != "" {
+			summary = g.emoji + " " + summary
+		}
+		writeCollapsedNameGrid(sb, "", summary, g.names)
+	}
+}
+
+// shardStateGroup is the shards that share one status, named by the state
+// words of their label without the reason after " — ", as the Shards count
+// line counts them (presentation.ShardCounts).
+type shardStateGroup struct {
+	emoji string
+	label string
+	rank  int
+	names []string
+}
+
+// shardStateGroups groups shards by status, the most attention-worthy status
+// first (presentation.ShardStateRank), so the failed shards lead.
+func shardStateGroups(shards []ShardStatus) []shardStateGroup {
+	var groups []shardStateGroup
+	index := make(map[string]int)
+	for _, s := range shards {
+		label, _, _ := strings.Cut(s.Label, " — ")
+		key := s.Emoji + " " + label
+		i, ok := index[key]
+		if !ok {
+			i = len(groups)
+			index[key] = i
+			groups = append(groups, shardStateGroup{emoji: s.Emoji, label: label, rank: presentation.ShardStateRank(s.State)})
+		}
+		groups[i].names = append(groups[i].names, s.Shard)
+	}
+	slices.SortStableFunc(groups, func(a, b shardStateGroup) int { return b.rank - a.rank })
+	return groups
+}
+
 // writeShardStatusTable renders the per-shard status table for a set of shards.
 func writeShardStatusTable(sb *strings.Builder, shards []ShardStatus) {
 	if len(shards) == 0 {
@@ -1076,12 +1219,21 @@ func shardStatusCell(s ShardStatus) string {
 }
 
 // writeShardedFooter renders the single next operator action, matching the
-// single-deployment footer vocabulary: a failed apply is retried, an
+// single-deployment footer vocabulary: a running apply is stopped, and while
+// a failed shard waits on the rest to settle the footer says when a retry
+// opens up, as a rollout's does; a failed apply is retried, an
 // auto-retrying (failed_retryable) apply offers the stop-retrying command, a
 // stopped apply is resumed, and a cancelled apply — permanent, unlike stopped —
 // directs the operator to open a new schema change.
 func writeShardedFooter(sb *strings.Builder, data ShardedApplyData) {
 	switch {
+	case state.IsRunningApplyState(data.State):
+		// Every shard runs on the same engine, and every engine a sharded
+		// apply runs on stops (presentation.StopCommand).
+		writeFooterAction(sb, "To stop this schema change:", AppendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", presentation.StopCommandStop, data.ApplyID, data.Environment), data.Tenant))
+		if len(failedShards(allShardStatuses(data.Keyspaces))) > 0 {
+			fmt.Fprintf(sb, "\n%s\n", presentation.RetryOnceSettledNote)
+		}
 	case state.IsState(data.State, state.Apply.Failed):
 		writeFooterAction(sb, "To retry:", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case state.IsState(data.State, state.Apply.FailedRetryable):

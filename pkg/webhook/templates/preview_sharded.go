@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -116,6 +117,97 @@ func PreviewCommentShardedApplyFailed() string {
 			}),
 			Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
 		}},
+	})
+}
+
+// previewKeyRanges is n shard key ranges splitting the keyspace evenly, in
+// order: "-10", "10-20", … "f0-" for 16.
+func previewKeyRanges(n int) []string {
+	step := 256 / n
+	out := make([]string, n)
+	for i := range n {
+		lo, hi := "", ""
+		if i > 0 {
+			lo = fmt.Sprintf("%02x", i*step)
+		}
+		if i < n-1 {
+			hi = fmt.Sprintf("%02x", (i+1)*step)
+		}
+		out[i] = lo + "-" + hi
+	}
+	return out
+}
+
+// previewUniqueKeyDuplicates is the reason a shard reports when a new unique
+// key meets rows that already share a value.
+const previewUniqueKeyDuplicates = "Rows on the shard already share a value in the new unique key, so the key cannot be added. Remove the duplicates or drop the key from the schema, then apply again."
+
+// previewManyShards renders a 16-shard keyspace adding a unique key to mutes,
+// with each shard's state and error from states, in key-range order: shards
+// past the end of states are pending.
+func previewManyShards(applyState string, states []presentation.Operation) ShardedKeyspace {
+	const uniqueKey = "ALTER TABLE `mutes` ADD UNIQUE KEY `uk_target`(`target_id`);"
+	ranges := previewKeyRanges(16)
+	ops := make([]presentation.Operation, len(ranges))
+	progress := make([]ShardProgressData, len(ranges))
+	cells := make([]ShardCell, len(ranges))
+	tableStatus := state.Task.Pending
+	for i, shard := range ranges {
+		op := presentation.Operation{Deployment: shard, State: state.ApplyOperation.Pending}
+		if i < len(states) {
+			op.State, op.Error = states[i].State, states[i].Error
+		}
+		ops[i] = op
+		task := state.Task.Pending
+		switch op.State {
+		case state.ApplyOperation.Failed:
+			task, tableStatus = state.Task.Failed, state.Task.Failed
+		case state.ApplyOperation.Running:
+			task = state.Task.Running
+			if tableStatus == state.Task.Pending {
+				tableStatus = state.Task.Running
+			}
+		}
+		progress[i] = ShardProgressData{Shard: shard, Status: task}
+		cells[i] = ShardCell{Shard: shard, Table: "mutes", Statements: []string{uniqueKey}}
+	}
+	return ShardedKeyspace{
+		Keyspace: "cdb_resolute_sharded",
+		Tables:   []ShardedTableStatus{{Table: "mutes", Status: tableStatus, Shards: progress}},
+		Shards:   previewShardStatuses(applyState, ops),
+		Cells:    cells,
+	}
+}
+
+// PreviewCommentShardedApplyFailedManyShards renders a 16-shard apply that
+// failed on six shards for two reasons and started none of the rest: one
+// callout with each reason and the shards it failed, then one collapsed line
+// per state instead of a row per shard.
+func PreviewCommentShardedApplyFailedManyShards() string {
+	failed := presentation.Operation{State: state.ApplyOperation.Failed, Error: previewUniqueKeyDuplicates}
+	timedOut := presentation.Operation{State: state.ApplyOperation.Failed, Error: mysqlerr.Timeout}
+	return RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Failed, Environment: "production", Database: "cdb_resolute",
+		ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
+		Keyspaces: []ShardedKeyspace{previewManyShards(state.Apply.Failed, []presentation.Operation{
+			failed, failed, timedOut, failed, failed, failed,
+		})},
+	})
+}
+
+// PreviewCommentShardedApplyRunningPastFailure renders a 16-shard apply where
+// three shards failed while four others still copy: the callout names the
+// failure, and the footer offers stop and says a retry waits for the apply to
+// settle.
+func PreviewCommentShardedApplyRunningPastFailure() string {
+	failed := presentation.Operation{State: state.ApplyOperation.Failed, Error: previewUniqueKeyDuplicates}
+	running := presentation.Operation{State: state.ApplyOperation.Running}
+	return RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "production", Database: "cdb_resolute",
+		ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
+		Keyspaces: []ShardedKeyspace{previewManyShards(state.Apply.Running, []presentation.Operation{
+			failed, failed, failed, running, running, running, running,
+		})},
 	})
 }
 

@@ -263,7 +263,10 @@ func TestRenderShardedApplyComment_DivergentWideGroupStatesCoverage(t *testing.T
 	assert.Contains(t, out, "**15 of 16 shards**", "the wide group states coverage, not names")
 	assert.NotContains(t, out, "all 16 shards", "a divergent subset never reads as full coverage")
 	assert.Contains(t, out, "**shard `s15`**", "the small group still names its shard inline")
-	assert.Contains(t, out, "| `s00` |", "the group's status table still names every shard")
+	assert.Contains(t, out, "<summary>⏳ 15 queued</summary>", "the wide group's shards collapse under one line per state")
+	assert.Contains(t, out, "s00  s01  s02", "the collapsed line expands into every shard's name")
+	assert.NotContains(t, out, "| `s00` |", "a wide group writes no row per shard")
+	assert.Contains(t, out, "| `s15` |", "the small group keeps its status table")
 }
 
 // A uniform multi-table change set is one group (no spurious "grouped by change"
