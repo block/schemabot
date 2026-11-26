@@ -463,6 +463,12 @@ func TestAggregateSummary_FailedApplyRemedySurvivesDatabaseTruncation(t *testing
 	assert.Regexp(t, `Plan the other \d+ failed databases in the table the same way\.\n$`, summary)
 }
 
+func TestOtherFailedDatabasesCountsWhatTheRemedyLeftOut(t *testing.T) {
+	assert.Empty(t, otherFailedDatabases(0))
+	assert.Equal(t, " Plan the other failed database in the table the same way.", otherFailedDatabases(1))
+	assert.Equal(t, " Plan the other 2 failed databases in the table the same way.", otherFailedDatabases(2))
+}
+
 func TestAggregateSummary_AllSuccess(t *testing.T) {
 	checks := []*storage.Check{
 		{DatabaseName: "orders", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true},
@@ -650,14 +656,26 @@ func TestAggregateSummary_FailedApplyNamesThePlanThatClearsIt(t *testing.T) {
 		assert.Contains(t, summary, "**To clear this:** "+shown.Remedy+"\n")
 	})
 
-	t.Run("a database the pull request no longer changes owes the same reconciliation", func(t *testing.T) {
+	t.Run("a database the pull request no longer changes is not offered a reapply", func(t *testing.T) {
 		removed := []*storage.Check{
 			{Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders", ApplyID: 7, Status: checkStatusCompleted, Conclusion: checkConclusionFailure,
 				BlockingReason: storage.SchemaRemovedAfterApplyStartedBlockingReason},
 		}
 		_, summary := aggregateSummary(removed, checkConclusionFailure, nil, nil, "")
-		assert.Contains(t, summary, "**To clear this:** "+checkstate.ReconciliationRemedy("schemabot plan -e staging -d orders")+"\n")
+		assert.Contains(t, summary, "**To clear this:** "+checkstate.MatchTargetRemedy("schemabot plan -e staging -d orders")+"\n")
+		assert.NotContains(t, summary, "apply the change again")
 		assert.NotContains(t, summary, "rollback")
+	})
+
+	t.Run("one rolled-back database keeps the rollup from offering a reapply", func(t *testing.T) {
+		mixed := []*storage.Check{
+			checks[0],
+			{Environment: "staging", DatabaseType: "mysql", DatabaseName: "users", ApplyID: 9, Status: checkStatusCompleted, Conclusion: checkConclusionFailure,
+				BlockingReason: checkstate.BlockRollbackCompleted},
+		}
+		_, summary := aggregateSummary(mixed, checkConclusionFailure, nil, nil, "")
+		assert.Contains(t, summary, "**To clear this:** "+checkstate.MatchTargetRemedy("schemabot plan -e staging -d orders", "schemabot plan -e staging -d users")+"\n")
+		assert.NotContains(t, summary, "apply the change again")
 	})
 
 	t.Run("a failed plan names no remedy", func(t *testing.T) {

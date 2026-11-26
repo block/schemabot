@@ -301,14 +301,20 @@ const failedApplyRemedyBudget = maxCheckRunTextLength / 8
 // when no contribution is a failed apply. Each failed database gets its own
 // plan, carrying the deployment's tenant so the pasted command reaches this
 // deployment, and `checks show` names the same command for the same row
-// (checkstate.PlanCommand). The commands stop at failedApplyRemedyBudget; the
-// rest are counted, and the table above still lists every failed database.
+// (checkstate.PlanCommand). When any failed row's change was rolled back or
+// is no longer in the pull request, the remedy does not offer to apply it
+// again. The commands stop at failedApplyRemedyBudget; the rest are counted,
+// and the table above still lists every failed database.
 func failedApplyRemedy(checks []*storage.Check, tenant string) string {
 	type target struct{ environment, database string }
 	var failed []target
+	remedy := checkstate.ReconciliationRemedy
 	for _, c := range checks {
 		if !settledApplyFailure(c) {
 			continue
+		}
+		if checkstate.ReapplyIsNotTheRemedy(c.BlockingReason) {
+			remedy = checkstate.MatchTargetRemedy
 		}
 		t := target{c.Environment, c.DatabaseName}
 		if !slices.Contains(failed, t) {
@@ -331,11 +337,20 @@ func failedApplyRemedy(checks []*storage.Check, tenant string) string {
 		commands = append(commands, command)
 		size += len(command)
 	}
-	remedy := "\n**To clear this:** " + checkstate.ReconciliationRemedy(commands...)
-	if omitted := len(failed) - len(commands); omitted > 0 {
-		remedy += fmt.Sprintf(" Plan the other %d failed databases in the table the same way.", omitted)
+	return "\n**To clear this:** " + remedy(commands...) + otherFailedDatabases(len(failed)-len(commands)) + "\n"
+}
+
+// otherFailedDatabases points at the failed databases the remedy had no room
+// to name, or returns "" when it named them all.
+func otherFailedDatabases(omitted int) string {
+	switch {
+	case omitted <= 0:
+		return ""
+	case omitted == 1:
+		return " Plan the other failed database in the table the same way."
+	default:
+		return fmt.Sprintf(" Plan the other %d failed databases in the table the same way.", omitted)
 	}
-	return remedy + "\n"
 }
 
 // anyInProgressOnCommit reports whether any check recorded for headSHA is

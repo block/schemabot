@@ -366,22 +366,47 @@ func PlanCommand(environment, database, tenant string) string {
 // the apply left behind. A person first makes the pull request and the target
 // agree, and their plan then records that the two match.
 func ReconciliationRemedy(planCommands ...string) string {
+	return reconciliationRemedy("make the pull request and the target agree: apply the change again, or change the pull request to match the target", planCommands)
+}
+
+// MatchTargetRemedy is ReconciliationRemedy for a row whose change should not
+// simply be applied again: a rollback undid it on purpose, or the pull request
+// no longer carries it, so no apply from this pull request can reach it. The
+// pull request is what changes to match the target.
+func MatchTargetRemedy(planCommands ...string) string {
+	return reconciliationRemedy("change the pull request to match the target", planCommands)
+}
+
+func reconciliationRemedy(firstStep string, planCommands []string) string {
 	quoted := make([]string, len(planCommands))
 	for i, command := range planCommands {
 		quoted[i] = "`" + command + "`"
 	}
-	return "Once the apply has settled, make the pull request and the target agree: apply the change again, or change the pull request to match the target. " +
+	return "Once the apply has settled, " + firstStep + ". " +
 		"Then comment " + strings.Join(quoted, " and ") + " on the pull request. The plan clears this block once the two match, and otherwise lists what still differs."
 }
 
-// checkReconciliationRemedy is ReconciliationRemedy for check's own database
-// and environment, or for the placeholder plan when the row does not record
-// them, as a rollup does not.
+// checkReconciliationRemedy is the remedy for check's own database and
+// environment, or for the placeholder plan when the row does not record them,
+// as a rollup does not. A row whose change was rolled back, or that the pull
+// request no longer changes, gets MatchTargetRemedy; every other row gets
+// ReconciliationRemedy.
 func checkReconciliationRemedy(check *storage.Check, tenant string) string {
-	if IsAggregate(check) || check.Environment == "" || check.DatabaseName == "" {
-		return ReconciliationRemedy(withTenant("schemabot plan -e <environment>", tenant))
+	remedy := ReconciliationRemedy
+	if ReapplyIsNotTheRemedy(check.BlockingReason) {
+		remedy = MatchTargetRemedy
 	}
-	return ReconciliationRemedy(PlanCommand(check.Environment, check.DatabaseName, tenant))
+	if IsAggregate(check) || check.Environment == "" || check.DatabaseName == "" {
+		return remedy(withTenant("schemabot plan -e <environment>", tenant))
+	}
+	return remedy(PlanCommand(check.Environment, check.DatabaseName, tenant))
+}
+
+// ReapplyIsNotTheRemedy reports whether a blocking reason rules out applying
+// the change again: a rollback that completed undid it on purpose, and a pull
+// request that stopped changing the database no longer carries it.
+func ReapplyIsNotTheRemedy(reason string) bool {
+	return reason == BlockRollbackCompleted || reason == BlockSchemaRemovedAfterApplyStarted
 }
 
 // withTenant appends the --tenant flag to a command when tenant is set.

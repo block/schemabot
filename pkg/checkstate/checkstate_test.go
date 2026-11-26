@@ -433,9 +433,10 @@ func TestDiagnoseNamesTheBlockedDatabasesPlan(t *testing.T) {
 	assert.Contains(t, terminal.Remedy, "comment `schemabot plan -e production -d orders` on the pull request")
 }
 
-// A database the pull request stopped changing after its apply started owes
-// the same reconciliation as any other settled apply: the person makes the pull
-// request and the target agree, then plans it. The plan command carries the
+// A database the pull request stopped changing after its apply started owes a
+// reconciliation, but no apply from this pull request can reach it, so the
+// remedy has the person change the pull request to match the target rather
+// than apply the change again, then plan it. The plan command carries the
 // deployment's tenant, as the Check Run's does.
 func TestDiagnoseSchemaRemovedNamesTheTenantsPlan(t *testing.T) {
 	t.Parallel()
@@ -448,7 +449,44 @@ func TestDiagnoseSchemaRemovedNamesTheTenantsPlan(t *testing.T) {
 	assert.Equal(t, ReasonReconciliationOwed, got.Reason)
 	assert.True(t, got.Blocking)
 	assert.False(t, got.SelfConverging)
-	assert.Equal(t, ReconciliationRemedy(PlanCommand("staging", "orders", "tenant-a")), got.Remedy)
+	assert.Equal(t, MatchTargetRemedy(PlanCommand("staging", "orders", "tenant-a")), got.Remedy)
 	assert.Contains(t, got.Remedy, "`schemabot plan -e staging -d orders --tenant tenant-a`")
-	assert.Contains(t, got.Remedy, "make the pull request and the target agree")
+	assert.Contains(t, got.Remedy, "change the pull request to match the target")
+	assert.NotContains(t, got.Remedy, "apply the change again")
+}
+
+// Each reconciliation reason gets the remedy that fits it: a change a rollback
+// undid on purpose, or one the pull request no longer carries, is never offered
+// as something to apply again, while a failed or cancelled apply may be.
+func TestReconciliationRemedyFitsTheBlockingReason(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		reason      string
+		offersRerun bool
+	}{
+		{"rolled back on purpose", BlockRollbackCompleted, false},
+		{"no longer in the pull request", BlockSchemaRemovedAfterApplyStarted, false},
+		{"cancelled after a task completed", BlockApplyCancelledAfterTaskCompleted, true},
+		{"terminal apply with no recorded reason", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := Diagnose(&storage.Check{
+				HeadSHA: headSHA, Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders",
+				ApplyID: 42, Status: StatusCompleted, Conclusion: ConclusionFailure, BlockingReason: tc.reason,
+			}, headSHA, nil, "", "")
+			require.Equal(t, ReasonReconciliationOwed, got.Reason)
+			plan := PlanCommand("staging", "orders", "")
+			if tc.offersRerun {
+				assert.Equal(t, ReconciliationRemedy(plan), got.Remedy)
+				assert.Contains(t, got.Remedy, "apply the change again")
+				return
+			}
+			assert.Equal(t, MatchTargetRemedy(plan), got.Remedy)
+			assert.NotContains(t, got.Remedy, "apply the change again")
+		})
+	}
 }
