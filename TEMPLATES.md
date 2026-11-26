@@ -4800,7 +4800,7 @@ Options:
 
 ```
 
-🔓 Lock for testapp (mysql) is not held, so the failed acquire took nothing.
+🔓 Lock for testapp (mysql) is not held now, though the acquire request failed.
    Nothing was submitted. It is safe to run the command again.
 
 ```

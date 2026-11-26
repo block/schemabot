@@ -106,10 +106,13 @@ func WriteAcquireUnknownLockHeldByAnotherOwner(database, dbType, holder string) 
 
 // WriteAcquireUnknownLockFree writes the message when a command's request to
 // take the lock failed after the server may have received it, and a lookup
-// found no lock held. Nothing was taken or submitted, so running the command
+// found no lock held. The lookup shows only what the server held when it
+// answered, since the server may still be finishing the acquire, so the
+// message claims no more than that. Nothing was submitted, and an acquire
+// under the same owner takes a lock it already holds, so running the command
 // again is safe.
 func WriteAcquireUnknownLockFree(database, dbType string) {
-	fmt.Printf("🔓 Lock for %s (%s) is not held, so the failed acquire took nothing.\n", database, dbType)
+	fmt.Printf("🔓 Lock for %s (%s) is not held now, though the acquire request failed.\n", database, dbType)
 	fmt.Println("   Nothing was submitted. It is safe to run the command again.")
 }
 

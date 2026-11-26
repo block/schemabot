@@ -33,6 +33,7 @@ import (
 type unsubmittedLockServer struct {
 	planWithoutID   bool
 	acquireBody     string
+	acquireStatus   int
 	dropAcquire     bool
 	lockBefore      string
 	lockAfter       string
@@ -101,6 +102,9 @@ func (s unsubmittedLockServer) start(t *testing.T) (*httptest.Server, *atomic.In
 				}
 				utils.CloseAndLog(conn)
 				return
+			}
+			if s.acquireStatus != 0 {
+				status = s.acquireStatus
 			}
 			body = []byte(s.acquireBody)
 		case "POST /api/apply":

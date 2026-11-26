@@ -713,6 +713,9 @@ func reportUnansweredLockAcquire(ep, database, dbType, owner string, before *cli
 		templates.WriteAcquireUnknownLockUnchecked(database, dbType)
 		return errors.Join(cause, fmt.Errorf("look up lock for %s after the acquire failed: %w", database, err))
 	}
+	// The lookup answered and the message below says what it found, so the
+	// error does not repeat the request's advice to go and check.
+	cause = client.WithoutCheckAdvice(cause)
 	switch {
 	case lock == nil:
 		templates.WriteAcquireUnknownLockFree(database, dbType)

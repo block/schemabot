@@ -31,7 +31,7 @@ var acquireNoAnswerHeadlines = []string{
 	"is held under your owner, but the server did not say which lock it is, so it was left in place.",
 	"is the one you already held, so the failed acquire took nothing.",
 	"so the failed acquire took nothing.\n   Nothing was submitted. Run the command again once that lock is released.",
-	"is not held, so the failed acquire took nothing.",
+	"is not held now, though the acquire request failed.",
 	"may have been taken: the acquire request failed, and the lock could not be checked.",
 }
 
@@ -123,18 +123,20 @@ func TestLockAcquireWithNoAnswerSaysWhatItLeftBehind(t *testing.T) {
 		},
 		{
 			// Another owner took the lock, so the operator is told who holds
-			// it and is not sent to unlock it.
+			// it and is not sent to unlock it. The owner is whatever that
+			// caller named itself, so a line break in it cannot start a
+			// line of its own in the message.
 			name:      "lock held by another owner",
-			lockAfter: lockBody(t, acquiredLockRowID, "cli:alice@build-host"),
-			want: "🔒 Lock for testdb (mysql) is held by cli:alice@build-host, so the failed acquire took nothing.\n" +
+			lockAfter: lockBody(t, acquiredLockRowID, "cli:alice@build-host\n🔓 Lock released"),
+			want: "🔒 Lock for testdb (mysql) is held by cli:alice@build-host🔓 Lock released, so the failed acquire took nothing.\n" +
 				"   Nothing was submitted. Run the command again once that lock is released.\n",
 			wantNoUnlock: true,
 		},
 		{
-			// No lock is held, so the acquire took nothing and the command
-			// can be run again.
+			// No lock is held when the lookup answers, so nothing is left
+			// to release and the command can be run again.
 			name: "lock free",
-			want: "🔓 Lock for testdb (mysql) is not held, so the failed acquire took nothing.\n" +
+			want: "🔓 Lock for testdb (mysql) is not held now, though the acquire request failed.\n" +
 				"   Nothing was submitted. It is safe to run the command again.\n",
 			wantNoUnlock: true,
 		},
@@ -173,8 +175,10 @@ func TestLockAcquireWithNoAnswerSaysWhatItLeftBehind(t *testing.T) {
 				assert.True(t, strings.HasPrefix(err.Error(), "acquire lock: "), err.Error())
 				if tc.wantLookupErr {
 					assert.Contains(t, err.Error(), "look up lock for testdb after the acquire failed")
+					assert.Contains(t, err.Error(), "may already have acted", "a lookup that failed leaves the advice to check")
 				} else {
 					assert.NotContains(t, err.Error(), "look up lock")
+					assert.NotContains(t, err.Error(), "may already have acted", "the error does not ask for the check the output answered")
 				}
 				assert.NotContains(t, err.Error(), "release lock for testdb", "a release that answered is not a failure")
 				assert.Contains(t, out, "\n"+tc.want)
@@ -193,4 +197,59 @@ func TestLockAcquireWithNoAnswerSaysWhatItLeftBehind(t *testing.T) {
 			})
 		}
 	}
+}
+
+// The server answers the lock acquire of an apply or a rollback with an error
+// of its own. That is an answer, so the command fails with it as it always
+// has: it does not look the lock up and tell the operator the lock is free,
+// since a server that failed after taking the lock may still hold it.
+func TestLockAcquireThatGotAnAnswerIsNotLookedUp(t *testing.T) {
+	owner := client.GenerateCLIOwner()
+	commands := []struct {
+		name string
+		run  func(t *testing.T, server *httptest.Server) (string, error)
+	}{
+		{"apply", func(t *testing.T, server *httptest.Server) (string, error) {
+			return runUnsubmittedApply(t.Context(), writeTestSchemaDir(t), server)
+		}},
+		{"rollback", runUnsubmittedRollback},
+	}
+	for _, command := range commands {
+		t.Run(command.name, func(t *testing.T) {
+			t.Setenv("SCHEMABOT_TOKEN", "fictional-unsubmitted-lock-test")
+			server, releases := unsubmittedLockServer{acquireStatus: http.StatusInternalServerError, acquireBody: `{"error":"storage unavailable"}`,
+				lockAfter: lockBody(t, acquiredLockRowID, owner), applyStatus: http.StatusOK, applyBody: `{"accepted":true,"apply_id":"apply-never"}`}.start(t)
+
+			out, err := command.run(t, server)
+
+			require.Error(t, err)
+			assert.True(t, strings.HasPrefix(err.Error(), "acquire lock: "), err.Error())
+			assert.False(t, client.ServerMayHaveActed(err), "the server answered: %v", err)
+			for _, headline := range acquireNoAnswerHeadlines {
+				assert.NotContains(t, out, headline)
+			}
+			assert.NotContains(t, out, "Applying")
+			assert.Equal(t, int32(0), releases.Load(), out)
+		})
+	}
+}
+
+// An apply run with --force breaks only a lock another owner holds. When this
+// command's owner already holds the lock and the acquire then gets no answer,
+// the lookup finds that same row, so the command leaves it in place rather
+// than releasing a lock an earlier apply may run under.
+func TestForcedApplyWithNoAnswerKeepsTheLockItAlreadyHeld(t *testing.T) {
+	t.Setenv("SCHEMABOT_TOKEN", "fictional-unsubmitted-lock-test")
+	held := lockBody(t, acquiredLockRowID, client.GenerateCLIOwner())
+	server, releases := unsubmittedLockServer{dropAcquire: true, lockBefore: held, lockAfter: held,
+		applyStatus: http.StatusOK, applyBody: `{"accepted":true,"apply_id":"apply-never"}`}.start(t)
+	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "staging", AutoApprove: true, Force: true, Output: OutputFormatLog}
+
+	var err error
+	out := stripAnsi(captureStdout(func() { err = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
+
+	require.Error(t, err)
+	assert.Contains(t, out, "\n🔒 Lock for testdb (mysql) is the one you already held, so the failed acquire took nothing.\n")
+	assert.NotContains(t, out, "Force released")
+	assert.Equal(t, int32(0), releases.Load(), out)
 }
