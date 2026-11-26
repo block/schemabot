@@ -758,8 +758,8 @@ The pull request is named however you already have it: by URL, by
 
 Each row carries a stable `reason` code, and the two that decide what to do
 next are `awaiting_replan_after_apply`, which SchemaBot converges on its own,
-and `reconciliation_owed`, which it never will. The command separates them
-under "Waiting on SchemaBot" and "Waiting on an operator" so the distinction
+and `reconciliation_owed`, which needs a person to act. The command separates
+them under "Waiting on SchemaBot" and "Waiting on an operator" so the distinction
 does not have to be inferred from a status and a conclusion. The full set of
 codes is defined in `pkg/checkstate`, and `--json` emits them alongside the
 `blocking` and `self_converging` flags for a script or an agent to branch on.
@@ -799,8 +799,13 @@ namespace counts once per shard, and a deployment whose plan could not be
 computed or compared shows no count rather than one read from an unusable plan.
 
 It reads state and never writes: recreating a missing Check Run is
-`checks backfill` below, and clearing a `reconciliation_owed` row means
-reconciling the target environment, not running a command.
+`checks backfill` below. SchemaBot never clears a `reconciliation_owed` row
+on its own (MG-10). Once the apply has settled, a person makes the pull
+request and the target agree, by applying the change again or changing the
+pull request to match the target. A change a rollback undid, or one the pull
+request no longer carries, is not applied again: the pull request changes to
+match the target. Then they comment the plan the row's `do:` line names. That plan clears the block once the two match, and otherwise
+lists what still differs.
 
 ### Backfilling missing Check Runs
 
@@ -1154,6 +1159,16 @@ that failed together do not all retry at the same moment. A GitHub outage
 that lasts longer, a suspended or removed App installation, or a deleted
 repository uses up those attempts. The lock then stays held and blocks other
 PRs on that database until an operator runs `schemabot unlock`.
+
+A retry that GitHub's primary rate limit refuses is the exception to that schedule.
+Retrying sooner is refused the same way, so SchemaBot retries at the reset
+time GitHub reports, plus up to 30 seconds, and for three hours after the
+event arrived that wait does not use up an attempt. After that each refusal
+uses one of the five attempts, so a delivery that GitHub keeps refusing still
+ends. While a delivery waits for the reset, its head can carry no SchemaBot
+check, or the check it already had, because the same limit refuses the check
+write. Make the SchemaBot check a required status check so that a head with no
+check cannot be merged in the meantime.
 
 The read is made once, before cleanup starts. A PR that reopens while cleanup
 is already running is not seen by that cleanup, which finishes as if the PR

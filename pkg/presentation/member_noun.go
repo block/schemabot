@@ -41,3 +41,14 @@ func CoveragePhrase(noun Noun, count, total int) string {
 	}
 	return noun.Count(count)
 }
+
+// MemberNoun is what a rollout's counts call its members: targets when a
+// deployment addresses several of them, deployments otherwise.
+func MemberNoun(groups []Group) Noun {
+	for _, g := range groups {
+		if len(g.Members) > 1 {
+			return TargetNoun
+		}
+	}
+	return DeploymentNoun
+}

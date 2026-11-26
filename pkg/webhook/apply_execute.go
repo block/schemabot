@@ -744,7 +744,7 @@ func (h *Handler) executeApply(
 		h.rolloutApplyChangeSummary(schemaResult, planResp, environment, rollout.work)); err != nil {
 		h.logger.Error("failed to mark check in_progress for apply",
 			append(apply.LogAttrs(), "error", err)...)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, applyCheckUpdateFailedMessage(database, environment, err))
 		return
 	}
 }
@@ -1705,7 +1705,7 @@ func (h *Handler) markAutoApplyCommentRefused(
 	defer cancel()
 	// The post wrapped the body with an empty environment, so the edit does too.
 	body := h.renderPRComment(repo, pr, "", templates.RenderPlanComment(data))
-	if err := client.EditIssueComment(editCtx, repo, comment.ID, body); err != nil {
+	if _, err := client.EditIssueComment(editCtx, repo, comment.ID, body); err != nil {
 		h.logger.Error("failed to edit the automatic apply comment after a change gate refused the apply; it still says the apply is running",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 			"environment", environment, "comment_id", comment.ID, "error", err)
