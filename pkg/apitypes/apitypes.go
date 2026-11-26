@@ -684,7 +684,8 @@ type PulledNamespace struct {
 	SkippedTables []SkippedTable `json:"skipped_tables,omitempty"`
 }
 
-// SkippedTable is a live table a pull left out, and why.
+// SkippedTable is a live table a pull, or a plan's rollback capture, left
+// out, and why.
 type SkippedTable struct {
 	Table string `json:"table"`
 	// Reason says what the table carries that its schema file cannot
@@ -1759,6 +1760,10 @@ type SchemaChangeResponse struct {
 	Namespace    string                 `json:"namespace"`
 	TableChanges []*TableChangeResponse `json:"table_changes,omitempty"`
 	Metadata     map[string]string      `json:"metadata,omitempty"` // Engine-specific data (e.g., "vschema" → diff)
+	// RollbackBlockers are the live tables that kept the plan from capturing
+	// this namespace's original schema. An apply of the plan still runs, but
+	// it cannot be rolled back.
+	RollbackBlockers []SkippedTable `json:"rollback_blockers,omitempty"`
 }
 
 // TableChangeResponse represents a DDL change in the HTTP response.

@@ -538,6 +538,27 @@ func WriteUnmatchedDropTables(entries []string) {
 	}
 }
 
+// WriteRollbackBlockers writes, per namespace, that an apply of the plan
+// cannot be rolled back and which tables are why, as the PR comment does.
+// No-op when every changed namespace's current schema was saved, which is the
+// ordinary case.
+func WriteRollbackBlockers(changes []*apitypes.SchemaChangeResponse) {
+	for _, change := range changes {
+		if change == nil || len(change.RollbackBlockers) == 0 {
+			continue
+		}
+		fmt.Println(glyph.Attention + "  " + presentation.RollbackNotCaptured(change.Namespace))
+		shown, more := presentation.RollbackBlockersShown(len(change.RollbackBlockers))
+		for _, table := range change.RollbackBlockers[:shown] {
+			fmt.Printf("     - %s: %s\n", table.Table, table.Reason)
+		}
+		if more > 0 {
+			fmt.Printf("     - %s\n", presentation.RollbackBlockersMore(more))
+		}
+		fmt.Println()
+	}
+}
+
 // UnsafeChange is a type alias for the shared unsafe change type.
 type UnsafeChange = apitypes.UnsafeChange
 

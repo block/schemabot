@@ -628,6 +628,7 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 	}
 	templates.WriteExemptTables(result.ExemptTables)
 	templates.WriteUnmatchedDropTables(shownUnmatchedDropTables(result))
+	templates.WriteRollbackBlockers(result.Changes)
 }
 
 // writePlanGuidance links the guides for the lint findings the output shows.

@@ -235,6 +235,9 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 			Namespace: sc.Namespace,
 			Metadata:  sc.Metadata,
 		}
+		for _, b := range sc.GetRollbackBlockers() {
+			apiSC.RollbackBlockers = append(apiSC.RollbackBlockers, apitypes.SkippedTable{Table: b.GetTable(), Reason: b.GetReason()})
+		}
 		for _, t := range sc.TableChanges {
 			apiSC.TableChanges = append(apiSC.TableChanges, tableChangeResponseFromProto(t))
 		}

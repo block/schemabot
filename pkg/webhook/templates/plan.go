@@ -310,6 +310,11 @@ type PlanCommentData struct {
 	// seen and kept.
 	UnmatchedDropTables []string
 
+	// RollbackBlockers lists, per namespace, the live tables that kept the
+	// plan from saving the namespace's current schema, so an apply of the
+	// plan cannot be rolled back. The comment says so before anyone applies.
+	RollbackBlockers []RollbackBlockersData
+
 	// ApplyAuthorization lists who may run the apply the comment offers. Nil
 	// when PR command authorization is off or the reader may run the apply.
 	ApplyAuthorization *ApplyAuthorizationData
@@ -455,6 +460,20 @@ type ExemptTablesData struct {
 	Namespace string
 	Tables    []string
 	Reason    string
+}
+
+// RollbackBlockersData names the tables that kept a plan from saving one
+// namespace's current schema as its rollback baseline.
+type RollbackBlockersData struct {
+	Namespace string
+	Tables    []RollbackBlockerData
+}
+
+// RollbackBlockerData is one table a plan could not save, with what it
+// carries that a schema file cannot describe.
+type RollbackBlockerData struct {
+	Table  string
+	Reason string
 }
 
 // DeploymentDriftData renders the review-time drift rollup in the PR preview: a
@@ -1493,6 +1512,29 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 	writeExemptTables(sb, data.ExemptTables)
 	writeUnmatchedDropTables(sb, data.shownUnmatchedDropTables())
+	writeRollbackBlockers(sb, data.RollbackBlockers)
+}
+
+// writeRollbackBlockers renders, per namespace, that an apply of the plan
+// cannot be rolled back and which tables are why. No-op when every changed
+// namespace's current schema was saved, which is the ordinary case. The
+// table names come from the target's catalog and the reasons are engine
+// prose, so each is escaped for markdown.
+func writeRollbackBlockers(sb *strings.Builder, groups []RollbackBlockersData) {
+	for _, group := range groups {
+		if len(group.Tables) == 0 {
+			continue
+		}
+		fmt.Fprintf(sb, glyph.Attention+" %s\n\n", presentation.RollbackNotCaptured(inlineCode(group.Namespace)))
+		shown, more := presentation.RollbackBlockersShown(len(group.Tables))
+		for _, table := range group.Tables[:shown] {
+			fmt.Fprintf(sb, "- %s: %s\n", inlineCode(table.Table), exemptReason(table.Reason))
+		}
+		if more > 0 {
+			fmt.Fprintf(sb, "- %s\n", presentation.RollbackBlockersMore(more))
+		}
+		sb.WriteString("\n")
+	}
 }
 
 // summarizeRollout makes s the summary of data's rollout: the union of every

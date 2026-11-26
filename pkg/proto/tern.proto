@@ -501,7 +501,8 @@ message PulledNamespace {
   repeated SkippedTable skipped_tables = 5;
 }
 
-// SkippedTable is a live table a pull left out, and why.
+// SkippedTable is a live table a pull, or a plan's rollback capture, left
+// out, and why.
 message SkippedTable {
   string table = 1;
   // What the table carries that the schema file format cannot describe, such
@@ -769,6 +770,10 @@ message SchemaChange {
   map<string, string> original_files = 4;
   // True when original_files was captured, including an intentionally empty namespace.
   bool original_files_captured = 5;
+  // The tables that kept original_files from being captured, each with what
+  // it carries that a schema file cannot describe. The plan proceeds, but an
+  // apply of it cannot be rolled back. Empty when original_files_captured.
+  repeated SkippedTable rollback_blockers = 6;
 }
 
 // LintViolation represents a schema linting violation.

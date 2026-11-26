@@ -115,7 +115,7 @@ func TestEnginePullSchemaRefusesForeignKeysOutsideThePull(t *testing.T) {
 		require.ErrorIs(t, err, errUnwrittenReferencingTable)
 		assert.Nil(t, response)
 		assert.Contains(t, err.Error(), `schema "app" table "users"`)
-		assert.Contains(t, err.Error(), "ext_settings.ext_settings_user_id_fkey (on a table this pull does not write, such as one an extension owns; remove the key)")
+		assert.Contains(t, err.Error(), "ext_settings.ext_settings_user_id_fkey (such as a table an extension owns or one the repository ignores)")
 	})
 
 	t.Run("another schema", func(t *testing.T) {
@@ -213,7 +213,7 @@ func TestCaptureOriginalFilesCarriesForeignKeys(t *testing.T) {
 		database     string
 		setup        string
 		ignored      []string
-		wantCaptured bool
+		wantBlockers []engine.RollbackBlocker
 		wantFiles    map[string]string
 	}{
 		{
@@ -222,8 +222,7 @@ func TestCaptureOriginalFilesCarriesForeignKeys(t *testing.T) {
 			setup: `CREATE SCHEMA app;
 				CREATE TABLE app.users (id bigint PRIMARY KEY);
 				CREATE TABLE app.orders (id bigint PRIMARY KEY, user_id bigint REFERENCES app.users (id))`,
-			wantCaptured: true,
-			wantFiles:    map[string]string{"orders.sql": originalOrders, "users.sql": originalUsers},
+			wantFiles: map[string]string{"orders.sql": originalOrders, "users.sql": originalUsers},
 		},
 		{
 			name:     "referenced by an ignored table",
@@ -232,6 +231,10 @@ func TestCaptureOriginalFilesCarriesForeignKeys(t *testing.T) {
 				CREATE TABLE app.users (id bigint PRIMARY KEY);
 				CREATE TABLE app.audit_events (id bigint PRIMARY KEY, user_id bigint REFERENCES app.users (id))`,
 			ignored: []string{"audit_events"},
+			wantBlockers: []engine.RollbackBlocker{{
+				Table:  "users",
+				Reason: "referenced by a foreign key on a table without a schema file: audit_events.audit_events_user_id_fkey (such as a table an extension owns or one the repository ignores)",
+			}},
 		},
 	}
 	for _, tt := range tests {
@@ -243,10 +246,10 @@ func TestCaptureOriginalFilesCarriesForeignKeys(t *testing.T) {
 			require.NoError(t, err)
 			defer pool.Close()
 
-			files, captured, err := captureOriginalFiles(t.Context(), pool, tt.database, "app", nil, mustIgnoredTables(t, tt.ignored))
+			files, blockers, err := captureOriginalFiles(t.Context(), pool, tt.database, "app", nil, mustIgnoredTables(t, tt.ignored))
 
 			require.NoError(t, err)
-			assert.Equal(t, tt.wantCaptured, captured)
+			assert.Equal(t, tt.wantBlockers, blockers)
 			assert.Equal(t, tt.wantFiles, files)
 		})
 	}

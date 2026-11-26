@@ -356,7 +356,7 @@ func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, database, nam
 // foreign key lives on a table the pull does not write. The key is declared
 // only in the referencing table's file, so a baseline without that file
 // would not carry the relationship.
-var errUnwrittenReferencingTable = errors.New("referenced by a foreign key on a table this pull does not write")
+var errUnwrittenReferencingTable = errors.New("referenced by a foreign key on a table without a schema file")
 
 // unwrittenIncomingForeignKeys describes every incoming foreign key that lives
 // outside the pulled files, with what the operator can do about it: a key on
@@ -382,7 +382,7 @@ func unwrittenIncomingForeignKeys(ctx context.Context, pool *pgxpool.Pool, names
 			if partition {
 				unwritten = append(unwritten, name+" (on a partition; declare the key on the partitioned parent)")
 			} else {
-				unwritten = append(unwritten, name+" (on a table this pull does not write, such as one an extension owns; remove the key)")
+				unwritten = append(unwritten, name+" (such as a table an extension owns or one the repository ignores)")
 			}
 		}
 	}
@@ -431,7 +431,10 @@ func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, tab
 	}
 	if policy.refuseNotValidForeignKeys {
 		if key, ok := notValidForeignKey(model); ok {
-			return &renderedTable{renderErr: fmt.Errorf("schema %q table %q: %w: %s", namespace, table, errNotValidForeignKey, key)}, nil
+			return &renderedTable{renderErr: &tableRefusal{
+				namespace: namespace, table: table,
+				detail: fmt.Sprintf("%s: %s", errNotValidForeignKey, key), reason: errNotValidForeignKey.Error(), cause: errNotValidForeignKey,
+			}}, nil
 		}
 	}
 	opts := schemadiff.RenderOptions{ForeignKeys: policy.includeForeignKeys}

@@ -1935,6 +1935,7 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 				Metadata:              maps.Clone(sc.Metadata),
 				OriginalFiles:         sc.OriginalFiles,
 				OriginalFilesCaptured: sc.OriginalFilesCaptured,
+				RollbackBlockers:      protoRollbackBlockers(sc.RollbackBlockers),
 			}
 			protoByNS[ns] = protoSC
 			protoTableSeen[ns] = make(map[string]bool)

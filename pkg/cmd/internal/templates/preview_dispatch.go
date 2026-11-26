@@ -142,6 +142,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentPlanUnmanagedSchema())
 	case PreviewCommentPlanExemptTables:
 		fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables())
+	case PreviewCommentPlanRollbackBlockers:
+		fmt.Print(webhooktemplates.PreviewCommentPlanRollbackBlockers())
 	case PreviewCommentPlanIgnoreTables:
 		fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables())
 	case PreviewCommentPlanDropTables:

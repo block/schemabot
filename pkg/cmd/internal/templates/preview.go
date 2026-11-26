@@ -121,6 +121,7 @@ const (
 	PreviewCommentPlanIgnoredNamespaces        PreviewType = "comment_plan_ignored_namespaces"         // Plan with namespaces withheld by ignore_namespaces
 	PreviewCommentPlanUnmanagedSchema          PreviewType = "comment_plan_unmanaged_schema"           // Environment-scoped plan naming schema directories it does not manage
 	PreviewCommentPlanExemptTables             PreviewType = "comment_plan_exempt_tables"              // Plan with ignored live tables disclosed
+	PreviewCommentPlanRollbackBlockers         PreviewType = "comment_plan_rollback_blockers"          // PostgreSQL plan whose apply cannot be rolled back, and why
 	PreviewCommentPlanIgnoreTables             PreviewType = "comment_plan_ignore_tables"              // Clean plan with a live table withheld by ignore_tables
 	PreviewCommentPlanDropTables               PreviewType = "comment_plan_drop_tables"                // Plan dropping a leftover "_" table named by drop_tables
 	PreviewCommentPlanDropTablesUnmatched      PreviewType = "comment_plan_drop_tables_unmatched"      // Clean plan whose drop_tables entry names no table
