@@ -298,8 +298,8 @@ func (h *Handler) storeNamespacePlacementCheck(ctx context.Context, client *ghcl
 }
 
 // planFailedCheckSummary is the stored Change column for a plan that reported
-// errors and no change to summarize, so the aggregate's row for it points at
-// the plan comment that carries the errors instead of showing nothing.
+// errors, so the aggregate's row for it points at the plan comment that carries
+// the errors.
 const planFailedCheckSummary = "plan failed; see the plan comment"
 
 // planFailedUnstoredSummary is the failing aggregate's summary when the failing
@@ -506,8 +506,12 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	// legible and durable across write paths.
 	changeSummary := drift.changeSummary(summarizePlanChanges(schema, planResp, environment))
 	rolloutTargets, rolloutTargetsWithWork := drift.work.rolloutCounts()
-	if changeSummary == "" && len(planResp.Errors) > 0 {
+	if len(planResp.Errors) > 0 {
+		// The errors are what the reader has to act on, and the plan comment
+		// carries them. A change summary beside them would read as a plan
+		// that only refused a change.
 		changeSummary = planFailedCheckSummary
+		rolloutTargets, rolloutTargetsWithWork = 0, 0
 	}
 	blockingReason := ""
 	if driftBlocked {

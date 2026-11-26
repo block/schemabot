@@ -1505,6 +1505,10 @@ func (h *Handler) postFailingAggregateTargetsWithBlock(ctx context.Context, clie
 // aggregate Check Run shows when no more specific error text is available.
 const planFailedCheckText = "Plan failed"
 
+// planBlockedCheckText is the aggregate title when every failing database's
+// plan named a change the engine refuses to run.
+const planBlockedCheckText = "Plan blocked"
+
 // checkRunSummaryEscaper neutralizes the markup that renders in a Check Run
 // summary: HTML tags, plus the Markdown constructs that can carry a payload —
 // links and images (brackets), which would let error text phish or fire an

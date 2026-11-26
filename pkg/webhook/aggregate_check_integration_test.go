@@ -1733,6 +1733,37 @@ func TestE2EManualPlanReplacesSettledFailedApplyOnlyWhenTargetMatches(t *testing
 		assert.False(t, stored.HasChanges)
 		assert.Equal(t, checkConclusionSuccess, stored.Conclusion, "the target matches the PR, so the reconciled environment passes")
 	})
+
+	// A plan that reported errors beside a change stores the failed-plan
+	// summary rather than the change's, so its row and the aggregate title
+	// say the plan failed instead of reading as a plan that only refused a
+	// change.
+	t.Run("a plan with errors beside a change reads as a failed plan", func(t *testing.T) {
+		seedSettledFailure(t)
+		planResp := &apitypes.PlanResponse{
+			Changes: []*apitypes.SchemaChangeResponse{{
+				Namespace: dbName,
+				TableChanges: []*apitypes.TableChangeResponse{{
+					TableName:  "orders",
+					DDL:        "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)",
+					ChangeType: "alter",
+				}},
+			}},
+			Errors: []string{"lint failed for table payments"},
+		}
+
+		_, check, err := h.upsertPlanCheckRecord(t.Context(), installClient, "octocat/hello-world", 1, schema, planResp, "staging", reviewDriftOutcome{})
+		require.NoError(t, err)
+		require.NotNil(t, check)
+
+		stored, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.True(t, stored.HasChanges)
+		assert.Equal(t, checkConclusionFailure, stored.Conclusion)
+		assert.Equal(t, planFailedCheckSummary, stored.ChangeSummary)
+		assert.Equal(t, planFailedCheckText, failedAggregateTitle([]*storage.Check{stored}))
+	})
 }
 
 // Stored per-database results are keyed to the commit they were computed for.

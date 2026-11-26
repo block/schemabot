@@ -1,10 +1,15 @@
 package webhook
 
 import (
+	"encoding/json"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -131,4 +136,67 @@ func TestAggregatePublishSHA(t *testing.T) {
 		closed := &github.PullRequestInfo{HeadSHA: "newer-sha", State: "closed", Merged: true}
 		assert.Equal(t, "newer-sha", aggregatePublishSHA(check, closed))
 	})
+}
+
+// A push lands while an apply runs, and the re-plan after the apply settles
+// decides whether the PR gets a new plan comment. A push that changed schema
+// inputs plans something the visible comment never showed, such as dropping
+// the index the apply just built, so the re-plan posts. A push that touched
+// only other files keeps the visible comment. A range GitHub cannot compare,
+// or one whose history is not linear, posts too, so the PR never keeps a
+// comment that may no longer describe its plan.
+func TestReplanPostsPlanComment(t *testing.T) {
+	const (
+		repo     = "octocat/hello-world"
+		applySHA = "applysha1"
+		headSHA  = "headsha2"
+	)
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-replan-comment",
+		Database:        "orders",
+		DatabaseType:    storage.DatabaseTypePostgres,
+		Repository:      repo,
+		PullRequest:     1,
+		Environment:     "staging",
+		InstallationID:  4242,
+	}
+	tests := []struct {
+		name   string
+		status int
+		state  string
+		files  []string
+		want   bool
+	}{
+		{name: "a push that changed a schema file posts", status: http.StatusOK, state: "ahead", files: []string{"schema/orders/orders.sql"}, want: true},
+		{name: "a push that changed the config posts", status: http.StatusOK, state: "ahead", files: []string{"schema/orders/schemabot.yaml"}, want: true},
+		{name: "a push that changed only other files keeps the visible comment", status: http.StatusOK, state: "ahead", files: []string{"README.md"}, want: false},
+		{name: "a range GitHub cannot compare posts", status: http.StatusUnprocessableEntity, want: true},
+		{name: "a range whose history is not linear posts", status: http.StatusOK, state: "diverged", files: []string{"README.md"}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			mux.HandleFunc("GET /repos/"+repo+"/compare/"+applySHA+"..."+headSHA, func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.Header.Get("Accept"), "diff") {
+					writeRegularFilesDiff(t, w, tt.files)
+					return
+				}
+				if tt.status != http.StatusOK {
+					w.WriteHeader(tt.status)
+					return
+				}
+				files := make([]map[string]string, 0, len(tt.files))
+				for _, f := range tt.files {
+					files = append(files, map[string]string{"filename": f, "status": "modified"})
+				}
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"status": tt.state, "files": files}))
+			})
+			h := &Handler{
+				service:   api.New(&foldStorage{}, &api.ServerConfig{}, nil, testLogger()),
+				ghClients: github.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: github.NewInstallationClient(client, testLogger())}),
+				logger:    testLogger(),
+			}
+			assert.Equal(t, tt.want, h.replanPostsPlanComment(t.Context(), apply, applySHA, headSHA))
+		})
+	}
 }

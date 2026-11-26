@@ -185,6 +185,7 @@ render_markdown_section "Aggregate Check — Details summary" "aggregate_check_s
 render_markdown_section "Aggregate Check — Blocked: PR File Cap Exceeded" "aggregate_check_file_cap_blocked"
 render_markdown_section "Aggregate Check — Blocked: GitHub Quota Held in Reserve" "aggregate_check_quota_reserved"
 render_markdown_section "Aggregate Check — Stopped Apply Holds the PR" "aggregate_check_stopped"
+render_markdown_section "Aggregate Check — Plan Blocked" "aggregate_check_plan_blocked"
 render_markdown_section "Aggregate Check — Multi-Target Rollout Names Its Targets" "aggregate_check_rollout"
 render_paired_section "Locking"        "comment_locking_all"    "cli_locking_all"
 render_paired_section "Apply Flow"     "comment_apply_flow_all" "cli_apply_all"

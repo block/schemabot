@@ -75,6 +75,27 @@ func PreviewAggregateCheckStopped() string {
 	return title + "\n\n" + summary
 }
 
+// PreviewAggregateCheckPlanBlocked renders the aggregate check of a PR whose
+// plan names a change the engine refuses to run: here, dropping an index the
+// PostgreSQL engine does not execute. Nothing failed and nothing ran, so the
+// title and the row say the plan is blocked and the summary says how to clear
+// it.
+func PreviewAggregateCheckPlanBlocked() string {
+	checks := []*storage.Check{
+		{
+			DatabaseType:  storage.DatabaseTypePostgres,
+			DatabaseName:  "orders",
+			HasChanges:    true,
+			Status:        checkStatusCompleted,
+			Conclusion:    checkConclusionFailure,
+			ChangeSummary: "1 index drop",
+		},
+	}
+	conclusion, _ := computeAggregate(checks, nil)
+	title, summary := aggregateSummary(checks, conclusion, nil, nil, "")
+	return title + "\n\n" + summary
+}
+
 // PreviewAggregateCheckRollout renders the aggregate check of a production
 // environment rolled out to four targets, at three points of one rollout: an
 // apply narrowed to shop-002 has completed, a plan of the whole environment

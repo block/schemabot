@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -739,6 +740,8 @@ func TestAggregateSummary_FailureTitleNamesWhatFailed(t *testing.T) {
 	pendingRow := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "users", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, HasChanges: true}
 	gatedRow := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "users", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, BlockingReason: "prerequisite"}
 	failedParticipant := &storage.Check{Environment: "staging", DatabaseType: aggregateSentinel, DatabaseName: "tenant-b", Status: checkStatusCompleted, Conclusion: checkConclusionFailure}
+	blockedPlanRow := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "orders", Status: checkStatusCompleted, Conclusion: checkConclusionFailure, HasChanges: true, ChangeSummary: "1 index drop"}
+	erroredPlanWithChanges := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "payments", Status: checkStatusCompleted, Conclusion: checkConclusionFailure, HasChanges: true, ChangeSummary: planFailedCheckSummary}
 
 	cases := []struct {
 		name   string
@@ -751,6 +754,11 @@ func TestAggregateSummary_FailureTitleNamesWhatFailed(t *testing.T) {
 		{"a failed apply outranks a failed plan", []*storage.Check{failedPlanRow("orders"), failedApplyRow}, "Apply failed"},
 		{"a gated change beside a failed plan", []*storage.Check{failedPlanRow("orders"), gatedRow}, "Apply failed"},
 		{"a failed participant beside a failed plan", []*storage.Check{failedPlanRow("orders"), failedParticipant}, "Apply failed"},
+		{"a plan that names a change it refuses to run", []*storage.Check{blockedPlanRow}, "Plan blocked"},
+		{"a blocked plan beside a pending change", []*storage.Check{blockedPlanRow, pendingRow}, "Plan blocked"},
+		{"a plan error outranks a blocked plan", []*storage.Check{blockedPlanRow, failedPlanRow("payments")}, "Plan failed"},
+		{"a plan with errors and changes is a failed plan", []*storage.Check{erroredPlanWithChanges}, "Plan failed"},
+		{"a failed apply outranks a blocked plan", []*storage.Check{blockedPlanRow, failedApplyRow}, "Apply failed"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -759,8 +767,14 @@ func TestAggregateSummary_FailureTitleNamesWhatFailed(t *testing.T) {
 			require.Equal(t, checkConclusionFailure, conclusion)
 			title, summary := aggregateSummary(tc.checks, conclusion, nil, nil, "")
 			assert.Equal(t, tc.want, title)
-			if tc.want == "Plan failed" {
-				assert.NotContains(t, summary, "To clear this", "a failed plan names no apply remedy")
+			if tc.want == "Plan failed" || tc.want == "Plan blocked" {
+				assert.NotContains(t, summary, "To clear this", "a plan that did not run names no apply remedy")
+			}
+			if slices.Contains(tc.checks, blockedPlanRow) {
+				assert.Contains(t, summary, "| `orders` | postgres | 1 index drop | Blocked |", "the row says the plan is blocked, as the title does")
+				assert.Contains(t, summary, blockedPlanRemedyText, "a blocked plan says how to clear it")
+			} else {
+				assert.NotContains(t, summary, blockedPlanRemedyText)
 			}
 		})
 	}

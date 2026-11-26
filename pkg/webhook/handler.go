@@ -787,13 +787,48 @@ func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Chec
 	h.logger.Info("re-planning after a terminal apply: the PR head moved while the apply held its check, so no plan result covers the current commit",
 		logFields...)
 	h.goSafe(a.Repository, a.PullRequest, a.InstallationID, "", func() {
-		// System-triggered: no actor to authorize, and no new comment while the
-		// visible plan comment still matches the outcome — the operator asked
-		// for an apply, not for a plan. The stored check state it writes is the
-		// whole point. It re-plans the one database the settled apply held the
-		// check for.
-		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, nil, admission)
+		// System-triggered: no actor to authorize. The stored check state it
+		// writes is the whole point, and the plan comment posts only when the
+		// push changed what the PR plans. It re-plans the one database the
+		// settled apply held the check for.
+		postPlanComment := h.replanPostsPlanComment(context.Background(), a, check.HeadSHA, prInfo.HeadSHA)
+		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, postPlanComment, 0, nil, admission)
 	})
+}
+
+// replanPostsPlanComment reports whether the re-plan after a terminal apply
+// posts its plan comment.
+//
+// The visible plan comment rendered the commit the apply started on. A push
+// during the apply that changed schema inputs leaves the new head planning
+// something that comment never showed, such as dropping an index the apply
+// just built, and this head's plan comment is the only place the PR says so. A
+// push that left the schema inputs alone keeps the visible comment while its
+// outcome still matches: the operator asked for an apply, not for a plan. A
+// range that cannot be compared posts, so the PR never keeps a comment that
+// may no longer describe what it plans.
+func (h *Handler) replanPostsPlanComment(ctx context.Context, a *storage.Apply, applySHA, headSHA string) bool {
+	logFields := append(a.LogAttrs(), "apply_head_sha", applySHA, "head_sha", headSHA)
+	client, err := h.clientForRepo(a.Repository, a.InstallationID)
+	if err != nil {
+		h.logger.Warn("re-plan after terminal apply will post its plan comment because no GitHub client could compare the push",
+			append(logFields, "error", err)...)
+		return true
+	}
+	files, err := client.FetchChangedFilesBetween(ctx, a.Repository, applySHA, headSHA)
+	if err != nil {
+		h.logger.Warn("re-plan after terminal apply will post its plan comment because the files changed since the apply's commit could not be compared",
+			append(logFields, "error", err)...)
+		return true
+	}
+	if github.HasSchemaInputFiles(files) {
+		h.logger.Info("re-plan after terminal apply will post its plan comment because the push during the apply changed schema inputs",
+			logFields...)
+		return true
+	}
+	h.logger.Info("re-plan after terminal apply keeps the visible plan comment while its outcome matches, because the push during the apply left the schema inputs unchanged",
+		logFields...)
+	return false
 }
 
 // replanOwedAfterTerminalApply reports whether a settled apply leaves the PR

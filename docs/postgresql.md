@@ -704,7 +704,8 @@ When a plan is blocked:
   names the clause to remove. A statement pg-sprite refuses gets the reason
   it would take a lock or break running code, and the safe steps that make the
   same change.
-- The plan Check Run fails.
+- The Check Run fails with the title "Plan blocked", and the database's row
+  reads Blocked.
 - An apply is rejected before anything is queued.
 - No flag overrides it. Rewrite the change into a form pg-sprite accepts, or
   make it outside SchemaBot through a separately reviewed process.
