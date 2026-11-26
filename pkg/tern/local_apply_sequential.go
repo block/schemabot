@@ -903,8 +903,13 @@ type atomicPollState struct {
 	consecutiveCutoverFailures int
 
 	// consecutiveErrors tracks progress poll failures to fail fast when the
-	// engine is unreachable (e.g., branch deleted mid-apply).
+	// engine is unreachable (e.g., branch deleted mid-apply), and paces the
+	// next poll while they last (progressPollWait).
 	consecutiveErrors int
+	// nextPollWait is how long after the last tick began the next poll is
+	// due: the plain interval, or the backed-off wait drawn once for the
+	// latest failure.
+	nextPollWait time.Duration
 
 	// lostWork measures how long the engine has been reporting no active
 	// schema change while stored tasks say the work is in flight, so the drive
@@ -1152,10 +1157,10 @@ func (c *LocalClient) lostEngineWorkPendingBudget(eng engine.Engine) time.Durati
 // inside that window.
 func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.Apply, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState) taskAction {
 	eng := c.getEngine()
-	ticker := time.NewTicker(c.taskPollInterval())
-	defer ticker.Stop()
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 
+	// consecutiveErrors counts failed polls in a row; it bounds the drive and
+	// paces its next poll (progressPollWait).
 	var consecutiveErrors int
 	// terminalWriteFailures counts consecutive failed writes of the task's
 	// terminal state. It is separate from consecutiveErrors because every
@@ -1181,6 +1186,10 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	lostWork := lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)}
 	watchdog := taskStallWatchdog{interval: c.taskStallWarnInterval()}
 	parked := newParkedPoll()
+	// nextPollWait is how long after the last tick began the next poll is
+	// due, so the time a tick takes is not added to the interval.
+	nextPollWait := c.progressPollWait(0)
+	tickStart := time.Now()
 
 	for {
 		select {
@@ -1188,7 +1197,8 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			logger.Info("drive context cancelled while polling; handing the apply back for another driver to claim",
 				"task_id", task.TaskIdentifier, "table", task.TableName)
 			return taskHandover
-		case <-ticker.C:
+		case <-time.After(max(0, nextPollWait-time.Since(tickStart))):
+			tickStart = time.Now()
 			if !parked.runFullPoll(ctx, c.storage, apply, time.Now(), logger) {
 				continue
 			}
@@ -1246,8 +1256,9 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				// database's active-apply slot and blocks every later apply. Fail
 				// after a bounded run of errors, matching the grouped poll.
 				consecutiveErrors++
+				nextPollWait = c.progressPollWait(consecutiveErrors)
 				logger.Warn("progress check failed",
-					"task_id", task.TaskIdentifier, "table", task.TableName, "error", err, "consecutive_errors", consecutiveErrors)
+					"task_id", task.TaskIdentifier, "table", task.TableName, "error", err, "consecutive_errors", consecutiveErrors, "next_poll_in", nextPollWait)
 				if consecutiveErrors >= maxConsecutiveProgressPollErrors {
 					if c.shouldRetryEngineError(err) {
 						return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskRetryable(ctx, task, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", consecutiveErrors, err)))
@@ -1300,8 +1311,9 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					// against the same bounded error budget as a failed poll —
 					// this must never become an unbounded loop.
 					consecutiveErrors++
+					nextPollWait = c.progressPollWait(consecutiveErrors)
 					c.logger.Warn("engine reports no active schema change for an in-flight task and target verification failed; the drive re-verifies at the next poll",
-						append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", result.State, "consecutive_errors", consecutiveErrors, "error", settleErr)...)
+						append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", result.State, "consecutive_errors", consecutiveErrors, "next_poll_in", nextPollWait, "error", settleErr)...)
 					if consecutiveErrors >= maxConsecutiveProgressPollErrors {
 						return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskRetryable(ctx, task, fmt.Sprintf("engine reports no active schema change for an in-flight task and the target could not be verified; %d consecutive errors across progress polls and target verification; see server logs", consecutiveErrors)))
 					}
@@ -1317,6 +1329,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			}
 
 			consecutiveErrors = 0
+			nextPollWait = c.progressPollWait(0)
 			c.logEngineResumeOnce(ctx, logger, apply, result.ResumedFromCheckpoint, &resumeEventLogged)
 			var saveErr error
 			lastProgressMetadata, saveErr = c.persistProgressMetadataIfChanged(lastProgressMetadata, result.Metadata, &progressMetadataLeaseLost, func(metadata map[string]string) error {

@@ -960,8 +960,8 @@ Task fields updated during polling (`storage.Task` in `pkg/storage/types.go`):
 
 | Trigger | What writes | Frequency | Fields updated |
 |---------|-------------|-----------|----------------|
-| `pollForCompletionAtomic` (atomic mode) | Poller goroutine | Every 500ms; every 5s while held at a deferred cutover with no cutover, stop, or cancel pending | `State`, `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`, `Throttled`, `ThrottleReason`, `UpdatedAt`, `CompletedAt` (on terminal) |
-| `pollTaskToCompletion` (sequential mode) | Poller goroutine | Every 500ms; every 5s while held at a deferred cutover with no cutover, stop, or cancel pending | Same as above, plus `IsInstant` |
+| `pollForCompletionAtomic` (atomic mode) | Poller goroutine | Every 500ms, backing off to at most 8s while progress polls fail; every 5s while held at a deferred cutover with no cutover, stop, or cancel pending | `State`, `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`, `Throttled`, `ThrottleReason`, `UpdatedAt`, `CompletedAt` (on terminal) |
+| `pollTaskToCompletion` (sequential mode) | Poller goroutine | Every 500ms, backing off to at most 8s while progress polls fail; every 5s while held at a deferred cutover with no cutover, stop, or cancel pending | Same as above, plus `IsInstant` |
 | Durable stop request | Lease-held drive | Once, after the engine stops | `State` → STOPPED for non-terminal tasks, `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`, `CompletedAt` |
 | `executeGroupedApply` / `executeApplySequential` | Apply launcher | Once at start | `State` → RUNNING, `StartedAt` |
 
@@ -973,14 +973,14 @@ copy alone does not complete a task: cutover may still be outstanding.
 
 ###### Atomic mode (`--defer-cutover`)
 
-One Spirit runner handles all DDLs together. `pollForCompletionAtomic` polls every 500ms, slowing to a 5s refresh while it holds at a deferred cutover with no cutover, stop, or cancel pending:
+One Spirit runner handles all DDLs together. `pollForCompletionAtomic` polls every 500ms, backing off to at most 8s while progress polls fail, and slowing to a 5s refresh while it holds at a deferred cutover with no cutover, stop, or cancel pending:
 - Updates ALL tasks with the shared engine state and per-table row counts.
 - Maintains a heartbeat (bumps `apply.updated_at` every 10s) so the recovery loop knows it's alive.
 - Auto-triggers cutover if `defer_cutover` is NOT set (shouldn't happen in this mode, but defensive).
 
 ###### Sequential mode (default)
 
-One Spirit runner per table, processed in order. `pollTaskToCompletion` polls every 500ms, with the same slower refresh while it holds at a deferred cutover:
+One Spirit runner per table, processed in order. `pollTaskToCompletion` polls every 500ms, with the same backoff while progress polls fail and the same slower refresh while it holds at a deferred cutover:
 - Updates the single active task with engine progress, refining a running task
   into its engine-reported post-copy phase the same way the atomic sync does.
 - Re-fetches task state from storage each tick to detect external Stop signals.
