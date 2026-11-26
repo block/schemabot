@@ -1,13 +1,16 @@
 package presentation
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/state/statetest"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // The tests in this file pin, for every state, where each ranking over the
@@ -178,6 +181,37 @@ func TestRollupTaskStatusPrecedenceCoversEveryTaskState(t *testing.T) {
 	})
 	assert.Equal(t, task.Completed, RollupTaskStatus(nil), "a table no target reports reads as complete")
 	assert.Equal(t, task.Failed, RollupTaskStatus([]string{"STATE_RUNNING", "STATE_FAILED"}))
+}
+
+// A listing leads with the table state the rollup would name first. Every
+// failure or halt lists ahead of every other state, and of two halted states
+// the one the rollup names lists first, so a table's status across targets and
+// its place in a listing cannot disagree about what leads.
+func TestTableListingLeadsWithWhatTheRollupNamesFirst(t *testing.T) {
+	halted := state.HaltedTaskStates()
+	require.NotEmpty(t, halted)
+	for _, s := range statetest.Every(t, state.Task) {
+		if slices.Contains(halted, s) {
+			continue
+		}
+		for _, h := range halted {
+			assert.Lessf(t, ui.TableStatePriority(h), ui.TableStatePriority(s), "%q lists ahead of %q", h, s)
+		}
+	}
+	for _, a := range halted {
+		for _, b := range halted {
+			if a == b {
+				continue
+			}
+			led := RollupTaskStatus([]string{a, b})
+			other := a
+			if led == a {
+				other = b
+			}
+			assert.Lessf(t, ui.TableStatePriority(led), ui.TableStatePriority(other),
+				"the rollup names %q over %q, so the listing leads with it", led, other)
+		}
+	}
 }
 
 // A task ranking gives a state the same rank however it is spelled: the
