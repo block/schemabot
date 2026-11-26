@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -224,4 +225,25 @@ func TestDeriveShardsLandsAShardOnlyWhenEveryChangeHasLanded(t *testing.T) {
 	assert.Equal(t, state.ApplyOperation.RevertWindow, shards[1].State,
 		"the shard reads as its revert window operation")
 	assert.False(t, shards[1].Landed, "80- still has a queued change")
+}
+
+// A sharded apply runs the same change on every shard of a keyspace, so a
+// failed shard's generic reason names the shard, on the PR comment and in the
+// CLI alike, since both read a shard through DeriveShards. A reason chosen by
+// its code already says what to do, so it reads the same as on any target.
+func TestDeriveShardsNamesTheShardInTheGenericReason(t *testing.T) {
+	duplicates := mysqlerr.ReasonFromText("Error 1062 (23000): Duplicate entry 'x' for key 'uk_token'")
+	work := []ShardWork{
+		{Keyspace: "commerce", Shard: "-80", Operations: []Operation{
+			{Deployment: "default", State: state.ApplyOperation.Failed, Error: mysqlerr.Generic},
+		}},
+		{Keyspace: "commerce", Shard: "80-", Operations: []Operation{
+			{Deployment: "default", State: state.ApplyOperation.Failed, Error: duplicates},
+		}},
+	}
+
+	shards := DeriveShards(state.Apply.Failed, work)
+	require.Len(t, shards, 2)
+	assert.Equal(t, mysqlerr.GenericOnShard, shards[0].Error)
+	assert.Equal(t, duplicates, shards[1].Error)
 }
