@@ -465,6 +465,9 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[st
 				nsData.OriginalFiles = map[string]string{}
 			}
 		}
+		for _, b := range sc.GetRollbackBlockers() {
+			nsData.RollbackBlockers = append(nsData.RollbackBlockers, storage.RollbackBlocker{Table: b.GetTable(), Reason: b.GetReason()})
+		}
 		nsData.Metadata = storage.VSchemaPlanMetadata(sc.Metadata)
 		nsData.Finalize = sc.Metadata[engine.MetadataNeedsFinalizer] == "true"
 		if sc.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {

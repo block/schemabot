@@ -1512,7 +1512,19 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 	writeExemptTables(sb, data.ExemptTables)
 	writeUnmatchedDropTables(sb, data.shownUnmatchedDropTables())
-	writeRollbackBlockers(sb, data.RollbackBlockers)
+	writeRollbackBlockers(sb, data.shownRollbackBlockers())
+}
+
+// shownRollbackBlockers is the rollback blockers the plan reports. A rollout
+// plan reports none: rollback is refused for an environment with more than
+// one target whatever was saved, so naming tables as the reason would point
+// the reader at the wrong cause. The blockers also describe the primary
+// target alone.
+func (d PlanCommentData) shownRollbackBlockers() []RollbackBlockersData {
+	if d.DeploymentDrift != nil {
+		return nil
+	}
+	return d.RollbackBlockers
 }
 
 // writeRollbackBlockers renders, per namespace, that an apply of the plan
