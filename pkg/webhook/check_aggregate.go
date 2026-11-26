@@ -305,15 +305,12 @@ func failedPlan(c *storage.Check) bool {
 // blockedPlan reports whether c is a plan that completed and named a change
 // the engine refuses to run. It fails the aggregate as a plan error does, but
 // nothing failed: the plan worked, and the change it found is one no apply can
-// carry out. A plan that also reported errors stores planFailedCheckSummary in
-// place of its change summary, and a durable block carries a reason of its
-// own, so neither reads as blocked.
+// carry out. Only the plan write marks a row refused (planOnlyRefused), never
+// one that also reported errors or carries a durable block, so a row without
+// the mark, including one stored before the mark existed, reads as a failed
+// plan.
 func blockedPlan(c *storage.Check) bool {
-	return failedPlan(c) &&
-		c.HasChanges &&
-		c.BlockingReason == "" &&
-		c.ChangeSummary != "" &&
-		c.ChangeSummary != planFailedCheckSummary
+	return failedPlan(c) && c.PlanRefused && c.BlockingReason == ""
 }
 
 // failedAggregateTitle names what failed in a failing aggregate. A failed

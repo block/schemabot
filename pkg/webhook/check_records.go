@@ -394,6 +394,14 @@ func planCheckConclusion(hasChanges, hasPlanErrors, hasFinalRefusal, driftBlocke
 	}
 }
 
+// planOnlyRefused reports whether a plan's failing check is down to the
+// engine refusing a change and nothing else: no plan error the reader has to
+// investigate and no durable block with its own reason. Only such a plan is
+// stored as refused, so its aggregate says the plan is blocked.
+func planOnlyRefused(refused, hasErrors, driftBlocked bool) bool {
+	return refused && !hasErrors && !driftBlocked
+}
+
 // planRefusalFailsCheck reports whether a plan's engine-blocked changes are
 // final enough to fail the check rather than leave the PR at action-required.
 //
@@ -498,7 +506,8 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	hasChanges := planResp.HasChanges() || drift.work.pending > 0
 	driftBlocked := drift.blocks()
 
-	conclusion := planCheckConclusion(hasChanges, len(planResp.Errors) > 0, planRefusalFailsCheck(schema.Type, planResp), driftBlocked)
+	refused := planRefusalFailsCheck(schema.Type, planResp)
+	conclusion := planCheckConclusion(hasChanges, len(planResp.Errors) > 0, refused, driftBlocked)
 
 	// Review-time drift is a first-class blocking reason, not an overload of the
 	// plan facts: HasChanges stays "some rollout member has changes", and the
@@ -536,6 +545,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 
 		RolloutTargets:         rolloutTargets,
 		RolloutTargetsWithWork: rolloutTargetsWithWork,
+		PlanRefused:            planOnlyRefused(refused, len(planResp.Errors) > 0, driftBlocked),
 	}
 	var stored bool
 	if driftBlocked && len(drift.preserve) > 0 {
@@ -1008,6 +1018,7 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 			// The narrowed apply says nothing about the other targets, so the
 			// row carries no counts of them.
 			check.RolloutTargets, check.RolloutTargetsWithWork = 0, 0
+			check.PlanRefused = false
 		}
 		// MarkActionRequiredForApply releases check ownership, so the plan of
 		// the whole environment that lifts this block can write its result.

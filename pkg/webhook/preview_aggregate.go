@@ -89,6 +89,7 @@ func PreviewAggregateCheckPlanBlocked() string {
 			Status:        checkStatusCompleted,
 			Conclusion:    checkConclusionFailure,
 			ChangeSummary: "1 index drop",
+			PlanRefused:   true,
 		},
 	}
 	conclusion, _ := computeAggregate(checks, nil)

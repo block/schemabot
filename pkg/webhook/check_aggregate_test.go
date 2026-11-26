@@ -740,7 +740,8 @@ func TestAggregateSummary_FailureTitleNamesWhatFailed(t *testing.T) {
 	pendingRow := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "users", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, HasChanges: true}
 	gatedRow := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "users", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, BlockingReason: "prerequisite"}
 	failedParticipant := &storage.Check{Environment: "staging", DatabaseType: aggregateSentinel, DatabaseName: "tenant-b", Status: checkStatusCompleted, Conclusion: checkConclusionFailure}
-	blockedPlanRow := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "orders", Status: checkStatusCompleted, Conclusion: checkConclusionFailure, HasChanges: true, ChangeSummary: "1 index drop"}
+	blockedPlanRow := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "orders", Status: checkStatusCompleted, Conclusion: checkConclusionFailure, HasChanges: true, ChangeSummary: "1 index drop", PlanRefused: true}
+	unmarkedPlanWithChanges := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "billing", Status: checkStatusCompleted, Conclusion: checkConclusionFailure, HasChanges: true, ChangeSummary: "1 column add"}
 	erroredPlanWithChanges := &storage.Check{Environment: "staging", DatabaseType: "postgres", DatabaseName: "payments", Status: checkStatusCompleted, Conclusion: checkConclusionFailure, HasChanges: true, ChangeSummary: planFailedCheckSummary}
 
 	cases := []struct {
@@ -758,6 +759,7 @@ func TestAggregateSummary_FailureTitleNamesWhatFailed(t *testing.T) {
 		{"a blocked plan beside a pending change", []*storage.Check{blockedPlanRow, pendingRow}, "Plan blocked"},
 		{"a plan error outranks a blocked plan", []*storage.Check{blockedPlanRow, failedPlanRow("payments")}, "Plan failed"},
 		{"a plan with errors and changes is a failed plan", []*storage.Check{erroredPlanWithChanges}, "Plan failed"},
+		{"a failing plan not stored as refused is a failed plan", []*storage.Check{unmarkedPlanWithChanges}, "Plan failed"},
 		{"a failed apply outranks a blocked plan", []*storage.Check{blockedPlanRow, failedApplyRow}, "Apply failed"},
 	}
 	for _, tc := range cases {

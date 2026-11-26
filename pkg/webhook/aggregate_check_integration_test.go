@@ -1762,6 +1762,7 @@ func TestE2EManualPlanReplacesSettledFailedApplyOnlyWhenTargetMatches(t *testing
 		assert.True(t, stored.HasChanges)
 		assert.Equal(t, checkConclusionFailure, stored.Conclusion)
 		assert.Equal(t, planFailedCheckSummary, stored.ChangeSummary)
+		assert.False(t, stored.PlanRefused, "a plan with errors is never stored as refused")
 		assert.Equal(t, planFailedCheckText, failedAggregateTitle([]*storage.Check{stored}))
 	})
 }
