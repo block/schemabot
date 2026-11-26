@@ -12571,7 +12571,7 @@ To resume from where it stopped:
 
   ── shop_001 ──
 
-     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+     ~ orders: ❌ Failed on 1 of 4 shards
        ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
 
        • Shards: 4 (1 failed, 3 cancelled)
@@ -12618,7 +12618,7 @@ The new apply will only process tables that haven't completed.
 
   ── shop_001 ──
 
-     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+     ~ orders: ❌ Failed on 1 of 4 shards
        ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
 
        • Shards: 4 (1 failed, 3 stopped)
