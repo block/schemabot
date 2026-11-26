@@ -109,3 +109,36 @@ func TestPlanRecordsTheSameDropOnlyForTheSameObject(t *testing.T) {
 	assert.Equal(t, reviewed.DDL, replanned.DDL, "the statement reads the same")
 	assert.NotEqual(t, reviewed.Metadata, replanned.Metadata, "a replaced column is a different object")
 }
+
+// An operator removes users.legacy from a table past the size limit.
+// Dropping a column changes only the catalog, so the plan keeps the drop
+// executable and the apply runs it through the reviewed-drop path despite
+// the limit: the column is gone afterward.
+func TestEngineApplyOversizedTableRunsReviewedColumnDrop(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "oversized_reviewed_drop_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, legacy text)")
+	require.NoError(t, err)
+
+	eng := NewWithTableSizeLimit(1)
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "oversized_reviewed_drop_test",
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY)",
+		}}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	change := result.Changes[0].TableChanges[0]
+	require.Equal(t, "ALTER TABLE public.users DROP legacy", change.DDL)
+	assert.Empty(t, change.ExecutionMode, "a column drop is catalog-only, so it stays executable above the limit")
+	assert.Empty(t, change.ModeReason)
+
+	accepted, err := eng.Apply(t.Context(), plannedApplyRequest(dsn, change))
+	require.NoError(t, err)
+	require.True(t, accepted.Accepted)
+	progress := awaitPostgresProgress(t, eng, change.Table)
+	assert.Equal(t, engine.StateCompleted, progress.State, progress.ErrorMessage)
+	assert.False(t, legacyColumnExists(t, db))
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -432,24 +433,37 @@ func PluralizeLabel(singular, plural string, count int) string {
 	return plural
 }
 
+// haltedTaskStates is the order a listing leads with the tables that stopped
+// short of completing. It is the same precedence a table's status is rolled up
+// across targets by (presentation.RollupTaskStatus), so the two cannot name a
+// different state first.
+var haltedTaskStates = state.HaltedTaskStates()
+
 // TableStatePriority returns a sort key for table display ordering.
-// Lower values sort first: active/running on top, terminal on bottom.
+// Lower values sort first: a failure or halt leads, so an operator scanning a
+// long list sees it before any queued table, then work in progress, then
+// queued tables, and settled tables last. The halted states lead in the order
+// of state.HaltedTaskStates. Sorts that use the key must be stable, so tables
+// of one rank keep their order.
 // Uses Task states (not Apply states) since tables are per-table tasks.
 // Used by both CLI (watch TUI) and PR comment rendering for consistent ordering.
 func TableStatePriority(taskState string) int {
+	if rank := slices.Index(haltedTaskStates, taskState); rank >= 0 {
+		return rank
+	}
+	// The ranks below follow the halted ones, however many there are.
+	after := len(haltedTaskStates)
 	switch taskState {
 	case state.Task.Running, state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum, state.Task.CuttingOver:
-		return 0 // active — top
-	case state.Task.WaitingForCutover, state.Task.Recovering, state.Task.FailedRetryable:
-		return 1
+		return after // active
+	case state.Task.WaitingForCutover, state.Task.Recovering:
+		return after + 1
 	case state.Task.Pending:
-		return 2
-	case state.Task.Failed, state.Task.Stopped:
-		return 3
-	case state.Task.Completed, state.Task.Cancelled, state.Task.Reverted:
-		return 4 // terminal — bottom
+		return after + 2
+	case state.Task.Completed, state.Task.Reverted:
+		return after + 3 // settled — bottom
 	default:
-		return 2
+		return after + 2
 	}
 }
 

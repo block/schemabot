@@ -2849,7 +2849,9 @@ func PreviewCommentApplyProgress() string {
 	tables[1].PercentComplete = 62
 	tables[1].ETASeconds = 195
 	tables[2].Status = state.Task.Pending
-	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+	data := sampleApplyData(state.Apply.Running, tables)
+	data.UpdateCadence = 5 * time.Second
+	return RenderApplyStatusComment(data)
 }
 
 // PreviewCommentApplySeveralRunning renders an apply comment where two tables

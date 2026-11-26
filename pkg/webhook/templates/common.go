@@ -507,15 +507,26 @@ func writeAttributionLineAt(sb *strings.Builder, verb, user, timestamp, suffix s
 	}
 }
 
-func writeLastUpdatedFooter(sb *strings.Builder, timestamp string) {
+// writeLastUpdatedFooter writes the "Last updated" footer. A positive
+// updateCadence adds how soon a change reaches the comment, so a reader of a
+// long apply whose comment refreshes less often reads an old timestamp as "no
+// change since then" rather than as SchemaBot going quiet. The note promises
+// latency, not a refresh rate: a comment whose content has not changed is not
+// re-edited on every interval.
+func writeLastUpdatedFooter(sb *strings.Builder, timestamp string, updateCadence time.Duration) {
 	if !strings.HasSuffix(sb.String(), "\n") {
 		sb.WriteString("\n")
 	}
+	cadenceNote := ""
+	if updateCadence > 0 {
+		cadenceNote = " · changes show within ~" + ui.FormatHumanDuration(updateCadence)
+	}
 	escapedTimestamp := html.EscapeString(timestamp)
-	fmt.Fprintf(sb, "\n_Last updated: <relative-time datetime=\"%s\">%s</relative-time> (%s)_\n",
+	fmt.Fprintf(sb, "\n_Last updated: <relative-time datetime=\"%s\">%s</relative-time> (%s)%s_\n",
 		escapeRelativeTimeDatetime(timestamp),
 		escapedTimestamp,
-		escapedTimestamp)
+		escapedTimestamp,
+		cadenceNote)
 }
 
 func escapeRelativeTimeDatetime(timestamp string) string {

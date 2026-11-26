@@ -458,8 +458,8 @@ func refuseTableDeclaredTwice(namespace string, files map[string]pgstatement.Des
 // complete or it is nothing, and the two ways it can fall short end
 // differently. A table the engine read but pg-sprite's renderer refuses —
 // each shape it refuses is named by one of its ErrUnrenderable errors,
-// foreign keys on either side and inheritance among them — leaves captured
-// false, and RV-7 then refuses rollback for this plan rather than
+// inheritance among them — or that a foreign key on an unmanaged table or
+// in another namespace references, leaves captured false, and RV-7 then refuses rollback for this plan rather than
 // reconstructing the originals; the plan itself still proceeds, because
 // rollback capability is not a precondition for reviewing or applying the
 // change. A table the engine could not read — the listing named it and
@@ -591,9 +591,24 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("record the reviewed drop for table %q: %w", report.Table, err)
 			}
+			validationMetadata, unrecordedValidation, err := stepValidationMetadata(statement, sql)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("record the reviewed validation for table %q: %w", report.Table, err)
+			}
+			if validationMetadata != nil {
+				if metadata == nil {
+					metadata = validationMetadata
+				} else {
+					maps.Copy(metadata, validationMetadata)
+				}
+			}
 			if unrecordedDrop && stepMode == "" {
 				stepMode = engine.ExecutionModeBlocked
 				stepReason = fmt.Sprintf("statement for table %q drops an object the planner did not record, so the apply cannot check that it is still the object this plan reviewed; make the change outside SchemaBot", table)
+			}
+			if unrecordedValidation && stepMode == "" {
+				stepMode = engine.ExecutionModeBlocked
+				stepReason = fmt.Sprintf("statement for table %q validates a constraint the planner did not record, so the apply cannot check that it is still the constraint this plan reviewed; make the change outside SchemaBot", table)
 			}
 			// Verdict reasons quote the table name, a planner-sourced
 			// identifier, so the reserved cause separator is neutralized
@@ -920,7 +935,7 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 	reason := engine.SanitizeBlockedCause(singleLine(fmt.Sprintf("statement for table %q: %s", report.Table, r.detail)))
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
-		if err := blockRewriteSteps(changes, reason, partitionedIndexBuildSteps(report)); err != nil {
+		if err := blockRewriteSteps(changes, reason, partitionedIndexBuildSteps(report), catalogOnlySteps(report)); err != nil {
 			if fullyBlocked {
 				slog.Warn("PostgreSQL table size check could not classify a blocked step; existing blocked plan verdicts remain unchanged",
 					"database", database,
@@ -958,16 +973,19 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 // each is bounded by the concurrent index duration envelope rather than the
 // table size ceiling: a concurrent index build, and a step the planner routed
 // to the partitioned index build, named by partitionedBuilds, which builds one
-// partition at a time under that envelope per partition. An earlier blocked
-// verdict retains its reason and gains the independent size cause so the
-// operator can resolve both without another planning round trip.
+// partition at a time under that envelope per partition. A step pg-sprite
+// proved changes only the catalog, named by catalogOnly, keeps its verdict
+// too: it reads and writes no rows, so its cost does not grow with the
+// table. An earlier blocked verdict retains its reason and gains the
+// independent size cause so the operator can resolve both without another
+// planning round trip.
 // parser.Classify in tableChanges parsed every rendered statement, including
 // blocked steps, with the same single-statement requirements used here. A
 // statement that now fails to classify is therefore an invariant violation.
 // Every step is classified before any verdict is written, so a caller that
 // keeps the plan on that error keeps it exactly as it was rather than with
 // the size cause on some steps and not others.
-func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedBuilds map[string]bool) error {
+func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedBuilds, catalogOnly map[string]bool) error {
 	durationBounded := make([]bool, len(changes))
 	for i := range changes {
 		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
@@ -984,6 +1002,9 @@ func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedB
 			continue
 		}
 		if durationBounded[i] {
+			continue
+		}
+		if catalogOnly[changes[i].DDL] {
 			continue
 		}
 		if changes[i].ExecutionMode == engine.ExecutionModeBlocked {
@@ -1005,6 +1026,24 @@ func partitionedIndexBuildSteps(report pgplan.Report) map[string]bool {
 	steps := make(map[string]bool)
 	for _, statement := range report.Statements {
 		if statement.Execution != planner.ExecutionPartitionedIndexBuild {
+			continue
+		}
+		for _, sql := range statement.ExecSQL {
+			steps[sql] = true
+		}
+	}
+	return steps
+}
+
+// catalogOnlySteps returns the planned steps of every statement pg-sprite
+// proved changes only the catalog, keyed by the DDL tableChanges renders for
+// them. A statement is proven only when every operation in it is
+// (planner.ProvenCatalogOnly); one unproven operation leaves all of its steps
+// under the size ceiling.
+func catalogOnlySteps(report pgplan.Report) map[string]bool {
+	steps := make(map[string]bool)
+	for _, statement := range report.Statements {
+		if !planner.ProvenCatalogOnly(statement.Decisions) {
 			continue
 		}
 		for _, sql := range statement.ExecSQL {
@@ -1486,8 +1525,6 @@ func createShapeRefusalReason(cause executor.CreateShapeCause, table string) (st
 		reason = "declares the same relation name more than once; give every table, index, constraint, and sequence a unique name"
 	case executor.CreateShapeMultipleOperations:
 		reason = "contains multiple create operations in one statement; split them into separate CREATE TABLE or CREATE INDEX statements"
-	case executor.CreateShapeForeignKey:
-		reason = "declares a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; leave the foreign key out of the schema file to create the table, then add the foreign key outside SchemaBot and back to the file"
 	case executor.CreateShapeUnsupportedKind:
 		reason = "uses a statement kind SchemaBot's PostgreSQL create path does not support; use CREATE TABLE or CREATE INDEX, or create the object outside SchemaBot"
 	default:
@@ -1557,30 +1594,25 @@ func rewriteRequiredReason(guidance suggest.Guidance, table string) (string, boo
 }
 
 // foreignKeyChangeRefusalReason renders the planner's refusal of a
-// foreign-key change on a live table. The plan shows the change so it can be
-// reviewed, but the engine does not run it, so the operator runs it
-// themselves. A blocked step blocks the whole plan, so an added foreign key
-// whose column the same plan adds cannot be run on its own: the remedy has
-// the rest of the plan applied first, without the foreign key. A dropped
+// foreign-key drop. The plan shows the drop so it can be reviewed, but the
+// engine does not run it, so the operator runs it themselves. A dropped
 // foreign key is usually one the file left out rather than one the operator
-// means to remove, so its remedy offers declaring it first, which plans no
-// change and keeps the constraint. A foreign key into another namespace
+// means to remove, so the remedy offers declaring it first, which plans no
+// change and keeps the constraint. A changed foreign key plans as a drop and
+// an add, so it is refused here too. A foreign key into another namespace
 // cannot be declared, so when the table carries any, the remedy names them
 // and says removal is the only way forward for those.
 func foreignKeyChangeRefusalReason(kind schemadiff.ChangeKind, table string, crossNamespaceForeignKeys []string) string {
 	const unsupported = "which SchemaBot plans but does not apply on PostgreSQL yet"
-	switch kind {
-	case schemadiff.ChangeAddForeignKey:
-		return fmt.Sprintf("statement for table %q adds a foreign key, %s; leave the foreign key out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and add the foreign key back to the file", table, unsupported)
-	case schemadiff.ChangeDropForeignKey:
-		reason := fmt.Sprintf("statement for table %q drops a foreign key, %s; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan", table, unsupported)
-		if len(crossNamespaceForeignKeys) > 0 {
-			reason += fmt.Sprintf("; foreign key constraint(s) %s reference another namespace and cannot be declared, so the plan stays blocked until they are removed through a separately reviewed process",
-				strings.Join(quoteAll(crossNamespaceForeignKeys), ", "))
-		}
-		return reason
+	if kind != schemadiff.ChangeDropForeignKey {
+		return fmt.Sprintf("statement for table %q changes a foreign key, %s; leave the change out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and put the change back in the file", table, unsupported)
 	}
-	return fmt.Sprintf("statement for table %q changes a foreign key, %s; leave the change out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and put the change back in the file", table, unsupported)
+	reason := fmt.Sprintf("statement for table %q drops a foreign key, %s; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan", table, unsupported)
+	if len(crossNamespaceForeignKeys) > 0 {
+		reason += fmt.Sprintf("; foreign key constraint(s) %s reference another namespace and cannot be declared, so the plan stays blocked until they are removed through a separately reviewed process",
+			strings.Join(quoteAll(crossNamespaceForeignKeys), ", "))
+	}
+	return reason
 }
 
 // generatedExpressionRefusalReason renders the planner's refusal of a changed

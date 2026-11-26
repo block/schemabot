@@ -451,13 +451,15 @@ func controlMissingDeploymentMessage(operation, applyIdentifier string) string {
 		strings.ReplaceAll(operation, "_", "-"), applyIdentifier)
 }
 
-// authoredControlFailureMessage returns the text a 5xx control error shows the
+// AuthoredControlFailureMessage returns the text a control error shows the
 // requester, which SchemaBot wrote and which carries the next step. A typed
 // HTTP failure, such as the engine-unavailable 503, shows the message it was
 // built with, and a terminal control error shows its shown text. It reads the
 // text from the typed error itself, so anything an outer wrap added stays out
-// of it.
-func authoredControlFailureMessage(err error) (string, bool) {
+// of it. It reports false for an error with no such text, whose own text can
+// carry storage, driver, or engine detail and belongs in the server log, so a
+// PR comment names the failure in words of its own instead.
+func AuthoredControlFailureMessage(err error) (string, bool) {
 	if httpErr, ok := errors.AsType[*controlOperationHTTPError](err); ok {
 		return httpErr.err.Error(), true
 	}
@@ -487,7 +489,7 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply 
 		// The code is what tells a client that an engine-unavailable 503 is
 		// worth retrying.
 		code := controlOperationErrorCode(err)
-		if authored, ok := authoredControlFailureMessage(err); ok {
+		if authored, ok := AuthoredControlFailureMessage(err); ok {
 			s.writeErrorCode(w, status, code, opName+" failed: "+authored)
 			return
 		}

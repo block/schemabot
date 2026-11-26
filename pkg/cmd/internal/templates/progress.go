@@ -177,7 +177,7 @@ func WriteProgress(data ProgressData) {
 		}
 	}
 
-	// Table progress (sorted: active first, sharded before unsharded, terminal last)
+	// Table progress (sorted: failed and halted first, then active, sharded before unsharded, finished last)
 	// Hide tables during branch setup phases (all tables are Queued, not meaningful)
 	if len(activeTables) > 0 && !state.IsSetupPhase(data.State) {
 		sort.SliceStable(activeTables, func(i, j int) bool {

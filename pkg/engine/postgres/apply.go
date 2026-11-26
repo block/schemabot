@@ -18,6 +18,8 @@ import (
 
 	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/executor"
+	"github.com/block/pg-sprite/pkg/migrate"
+	"github.com/block/pg-sprite/pkg/planner"
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/progress"
 	"github.com/block/pg-sprite/pkg/schemadiff"
@@ -120,6 +122,10 @@ type nativeApply struct {
 	// dropped is the plan's record of the live object the statement drops,
 	// which the apply checks under the table's lock before dropping it.
 	dropped *schemadiff.DroppedObject
+	// validates is the plan's record of the live NOT VALID constraint the
+	// statement validates, which the apply checks under the validation's
+	// lock before validating it.
+	validates *schemadiff.ConstraintValidation
 	// database names the target for the logs and metrics of a table drop.
 	database string
 	// droppedTable is the definition the plan recorded for a table the
@@ -301,8 +307,39 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		if err != nil {
 			return nativeApply{}, err
 		}
+		change.validates, err = reviewedValidationForApply(req.Database, tc, statements[0])
+		if err != nil {
+			return nativeApply{}, err
+		}
 	}
 	return change, nil
+}
+
+// reviewedValidationForApply returns the plan's record of the constraint a
+// VALIDATE CONSTRAINT statement validates, and nil for any other statement.
+// A validation is admitted only with that record: without it the apply could
+// not tell the reviewed constraint from one that took its name after the
+// plan, so a missing or unreadable record refuses the apply before any work
+// is queued and the operator re-plans.
+func reviewedValidationForApply(database string, tc engine.TableChange, statement string) (*schemadiff.ConstraintValidation, error) {
+	validates, err := validatesConstraint(statement)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission could not classify a planned validation", "database", database, "table", tc.Table, "error", err)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
+	}
+	if !validates {
+		return nil, nil
+	}
+	reviewed, err := reviewedValidationFromMetadata(tc.Metadata)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission rejected the reviewed validation record", "database", database, "table", tc.Table, "error", err)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: the plan's record of the constraint this statement validates is unreadable; re-plan and apply again", tc.Table)
+	}
+	if reviewed == nil {
+		slog.Warn("PostgreSQL apply admission refused a validation the plan did not record", "database", database, "table", tc.Table)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: the plan has no record of the constraint this statement validates; re-plan and apply again", tc.Table)
+	}
+	return reviewed, nil
 }
 
 // reviewedDropForApply returns the plan's record of the object a statement
@@ -565,7 +602,49 @@ func classifyApplyFailure(err error, table string) applyFailure {
 			lockBudget: true,
 		}
 	}
+	if detail, ok := brokenForeignKeyDetail(err, table); ok {
+		return applyFailure{detail: detail, retryable: true}
+	}
+	if detail, ok := missingGrantDetail(err, table); ok {
+		return applyFailure{detail: detail, retryable: true}
+	}
 	return applyFailure{detail: "PostgreSQL schema change failed; see server logs", retryable: true}
+}
+
+// missingGrantDetail names a statement the server refused because the engine
+// role lacks a privilege. The privilege check before the apply covers the
+// target table; a foreign key also needs REFERENCES on the table it
+// references, which only the server checks. The detail leaves out the
+// server's message, which names objects the plan did not, and the server log
+// keeps it.
+func missingGrantDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateInsufficientPrivilege {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"the engine role lacks a privilege the statement on %q needs, such as REFERENCES on the table a foreign key references; the server log names it; grant it, then retry",
+		table)), true
+}
+
+// sqlstateForeignKeyViolation is the SQLSTATE the server raises when a row
+// breaks a foreign key, which for a schema change means validating a key
+// that existing rows do not satisfy.
+const sqlstateForeignKeyViolation = "23503"
+
+// brokenForeignKeyDetail names the foreign key whose validation failed on
+// existing rows. The key was added NOT VALID in an earlier step, so it stays
+// in place and checks new writes; the apply can finish once the owner fixes
+// the rows. The detail is built from the server's typed fields, never its
+// message, because the message quotes the offending row's values.
+func brokenForeignKeyDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateForeignKeyViolation {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"existing rows in %q break foreign key %q; the key is in place and checks new writes; fix those rows, then retry",
+		table, pgErr.ConstraintName)), true
 }
 
 // invalidIndexAdvice renders the operator-facing cause and next step for an
@@ -943,6 +1022,10 @@ func refusalForCause(err error, table string) *refusal {
 		// interpolated identifiers or server text — a deliberate pg-sprite
 		// property — so rendering it verbatim is safe by construction.
 		return &refusal{reason: "unsupported-partitioned-parent", cause: partitionErr.Error()}
+	}
+	var proofErr *catalogOnlyProofError
+	if errors.As(err, &proofErr) {
+		return catalogOnlyProofRefusal(proofErr, table)
 	}
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
@@ -1641,9 +1724,9 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	// envelope rather than the rewrite ceiling. NoSizeLimit still proves the
 	// target exists and is an ordinary or partitioned table.
 	preflightLimit := applyTablePreflightLimit(change, tableSizeLimit)
-	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, preflightLimit)
+	table, err := checkTableUnlessCatalogOnly(ctx, pool, change, statement, preflightLimit, logger)
 	if err != nil {
-		return fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
+		return err
 	}
 	if change.partitionedIndex {
 		// The build refuses a table that is no longer partitioned before it
@@ -1691,6 +1774,17 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	if change.dropped != nil {
 		return executeReviewedDrop(ctx, pool, table, change, statement.SQL(), tracker)
 	}
+	if change.validates != nil {
+		// pg-sprite reads the constraint again under the validation's lock
+		// and refuses with ErrValidatedConstraintDrift, validating nothing,
+		// when it no longer has the definition the plan recorded.
+		if err := executor.ExecuteNativeValidatingWithProgress(ctx, pool, table, statement, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		}, executor.DefaultRetryPolicy(), *change.validates, tracker); err != nil {
+			return fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", change.validates.Constraint, change.table, err)
+		}
+		return nil
+	}
 	if err := executor.ExecuteNativeWithProgress(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	}, executor.DefaultRetryPolicy(), tracker); err != nil {
@@ -1723,6 +1817,105 @@ func executeReviewedDrop(ctx context.Context, pool *pgxpool.Pool, table prefligh
 		return fmt.Errorf("drop reviewed %s %q on PostgreSQL table %q: %w", change.dropped.Kind, change.dropped.Name, change.table, err)
 	}
 	return nil
+}
+
+// checkTableUnlessCatalogOnly runs the table preflight under limit. When the
+// table is over the limit, the statement still runs if pg-sprite proves,
+// against the live table now, that every operation in it changes only the
+// catalog: such a statement reads and writes no rows, so its cost under the
+// lock does not grow with the table. The proof is made here rather than
+// read from the plan, because the table, its column types, and the
+// functions a default calls can all change between plan and apply. A proof
+// that cannot be made leaves the size refusal standing.
+func checkTableUnlessCatalogOnly(ctx context.Context, pool *pgxpool.Pool, change nativeApply, statement pgstatement.Statement, limit int64, logger *slog.Logger) (preflight.PreflightedTable, error) {
+	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, limit)
+	var sizeErr *preflight.SizeError
+	if !errors.As(err, &sizeErr) {
+		if err != nil {
+			return preflight.PreflightedTable{}, fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
+		}
+		return table, nil
+	}
+	catalogOnly, proofErr := provenCatalogOnly(ctx, pool, statement)
+	if proofErr != nil {
+		logger.Warn("PostgreSQL table is over the size limit and the statement could not be proven to change only the catalog; the apply will be refused on size",
+			"namespace", change.namespace,
+			"table", change.table,
+			"size_limit_bytes", limit,
+			"error", proofErr)
+		return preflight.PreflightedTable{}, fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, &catalogOnlyProofError{size: sizeErr, proof: proofErr})
+	}
+	if !catalogOnly {
+		return preflight.PreflightedTable{}, fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
+	}
+	logger.Info("PostgreSQL table is over the size limit; running the statement because it changes only the catalog",
+		"namespace", change.namespace,
+		"table", change.table,
+		"size_limit_bytes", limit)
+	table, err = preflight.CheckTable(ctx, pool, change.namespace, change.table, preflight.NoSizeLimit)
+	if err != nil {
+		return preflight.PreflightedTable{}, fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
+	}
+	return table, nil
+}
+
+// sqlstateInsufficientPrivilege is the SQLSTATE the server returns when a
+// role lacks a privilege the statement needs.
+const sqlstateInsufficientPrivilege = "42501"
+
+// catalogOnlyProofError reports a table over the size limit whose statement
+// went unproven because the proof itself failed, not because the statement
+// rewrites or scans rows. It is not a size verdict: a retry, or a grant the
+// proof needs, can let the statement run. So it unwraps to the proof's
+// failure and never to the size error, and the size refusal cannot claim it.
+type catalogOnlyProofError struct {
+	size  *preflight.SizeError
+	proof error
+}
+
+func (e *catalogOnlyProofError) Error() string {
+	return fmt.Sprintf("%s; proving the statement changes only the catalog failed: %s", e.size, e.proof)
+}
+
+func (e *catalogOnlyProofError) Unwrap() error { return e.proof }
+
+// catalogOnlyProofRefusal decides the outcome of a failed catalog-only
+// proof. A role that cannot create the proof's temporary table needs a
+// grant, so that refusal names it. Any other failure, such as a dropped
+// connection or a server that briefly accepts no writes during a failover,
+// is operational, and a retry may prove the statement.
+func catalogOnlyProofRefusal(err *catalogOnlyProofError, table string) *refusal {
+	if probeLacksTemporaryGrant(err.proof) {
+		return &refusal{reason: "insufficient-privileges",
+			cause:         fmt.Sprintf("table %s is over the size limit, and proving the statement changes only the catalog needs a temporary table the engine role cannot create", quotedTable(table)),
+			remedy:        "grant TEMPORARY on the database to the engine role, then retry the apply",
+			provisionable: true}
+	}
+	return nil
+}
+
+// probeLacksTemporaryGrant reports whether the add-column proof could not
+// create its temporary table because the engine role lacks the privilege.
+func probeLacksTemporaryGrant(err error) bool {
+	if !errors.Is(err, preflight.ErrAddColumnProbeUnavailable) {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == sqlstateInsufficientPrivilege
+}
+
+// provenCatalogOnly classifies statement against the live table and reports
+// whether pg-sprite proved every operation in it changes only the catalog.
+func provenCatalogOnly(ctx context.Context, pool *pgxpool.Pool, statement pgstatement.Statement) (bool, error) {
+	facts, err := migrate.LiveFacts(ctx, pool, statement)
+	if err != nil {
+		return false, fmt.Errorf("read live facts: %w", err)
+	}
+	plan, err := planner.Classify(statement.SQL(), facts.Classifier)
+	if err != nil {
+		return false, fmt.Errorf("classify the statement: %w", err)
+	}
+	return planner.ProvenCatalogOnly(plan.Decisions), nil
 }
 
 func applyTablePreflightLimit(change nativeApply, tableSizeLimit int64) int64 {

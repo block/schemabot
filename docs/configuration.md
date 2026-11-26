@@ -1840,7 +1840,12 @@ target is safe for a bounded attempt. Every apply still runs under short
 `lock_timeout` and `statement_timeout` budgets, so above the ceiling it is the
 statement timeout, not the ceiling, that stops a runaway rewrite. A greenfield
 `CREATE TABLE` does not consult the ceiling: the gate bounds rewrites of
-existing data, and a table that does not exist yet has none.
+existing data, and a table that does not exist yet has none. Neither does an
+`ALTER TABLE` that pg-sprite proves changes only the catalog, such as adding a
+nullable column: it reads no rows, so its cost does not grow with the table.
+The apply proves it again against the live table and applies the ceiling if
+the change is no longer catalog-only. [Catalog-only changes](postgresql.md#catalog-only-changes)
+lists which changes qualify.
 
 Every engine gate still runs when an earlier gate has already blocked all of a
 table's steps. A missing grant is appended to each blocked step whose statement

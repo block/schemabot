@@ -12,7 +12,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.52.0
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.9
 	github.com/block/mysql v0.0.0-20261122231317-2d9dfd496f60
-	github.com/block/pg-sprite v0.5.6-0.20261125153037-91a3c66ebd12
+	github.com/block/pg-sprite v0.5.6-0.20261125194448-f93ff345f8b6
 	github.com/block/spirit v0.20.1-0.20261122162747-cc0fa5849d1f
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
@@ -171,6 +171,8 @@ require (
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/hashicorp/serf v0.10.2 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/jackc/pgio v1.0.0 // indirect
+	github.com/jackc/pglogrepl v0.0.0-20261111174325-d50336b09c47 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.3 // indirect
