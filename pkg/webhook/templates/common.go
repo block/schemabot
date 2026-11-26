@@ -375,7 +375,7 @@ func writeLastUpdatedFooter(sb *strings.Builder, timestamp string, updateCadence
 	}
 	cadenceNote := ""
 	if updateCadence > 0 {
-		cadenceNote = " · changes show within ~" + ui.FormatExactDuration(updateCadence)
+		cadenceNote = " · changes show within ~" + ui.FormatHumanDuration(updateCadence)
 	}
 	escapedTimestamp := html.EscapeString(timestamp)
 	fmt.Fprintf(sb, "\n_Last updated: <relative-time datetime=\"%s\">%s</relative-time> (%s)%s_\n",

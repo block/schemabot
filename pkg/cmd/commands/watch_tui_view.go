@@ -196,7 +196,7 @@ func (m WatchModel) progressSections() (string, string) {
 		if state.IsState(m.state, state.Apply.SkippingRevert) || m.skipRevertTriggered || (m.metadata != nil && m.metadata["revert_skipped"] == "true") {
 			elapsed := ""
 			if !m.skipRevertAt.IsZero() {
-				elapsed = fmt.Sprintf(" (%ds)", int(time.Since(m.skipRevertAt).Seconds()))
+				elapsed = " (" + ui.FormatHumanDuration(time.Since(m.skipRevertAt)) + ")"
 			}
 			f.WriteString(m.spinner.View() + "Finalizing — closing revert window..." + elapsed + "\n")
 		} else {
@@ -420,7 +420,7 @@ func (m WatchModel) elapsed() string {
 	if d < 3*time.Second {
 		return ""
 	}
-	return fmt.Sprintf(" (%s)", d)
+	return " (" + ui.FormatHumanDuration(d) + ")"
 }
 
 // detachedView returns the message shown when user detaches.

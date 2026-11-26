@@ -140,7 +140,7 @@ func formatShardLine(s ShardProgress, pendingWord, runningWord string) string {
 		return fmt.Sprintf(indentShardLine+"%s%s %s%s: %s\n", ANSIGreen, glyph, s.Shard, ANSIReset, detail)
 	case state.Task.Running:
 		if s.ETASeconds > 0 {
-			detail += " · ETA: " + ui.FormatDurationSeconds(s.ETASeconds)
+			detail += " · ETA: " + ui.FormatETA(s.ETASeconds)
 		}
 		return fmt.Sprintf(indentShardLine+"%s%s %s%s: %s\n", ANSICyan, glyph, s.Shard, ANSIReset, detail)
 	case state.Task.WaitingForCutover, state.Task.CuttingOver:

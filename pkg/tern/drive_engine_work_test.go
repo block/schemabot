@@ -324,6 +324,6 @@ func TestObserveTargetHeldEscalatesToTheTimeline(t *testing.T) {
 
 	client.observeTargetHeld(t.Context(), slog.Default(), apply, "orders")
 
-	assertApplyLogContains(t, client, "Table orders has been held by another run of a schema change for 2m0s")
+	assertApplyLogContains(t, client, "Table orders has been held by another run of a schema change for 2m")
 	assertApplyLogContains(t, client, "Find the run holding it, or stop the apply.")
 }

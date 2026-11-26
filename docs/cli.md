@@ -724,7 +724,7 @@ $ schemabot progress apply-example-73
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
-       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s
+       • Rows: 6,000,000 / 10,000,000 · ETA: 8m
        • ℹ️ Throttled: commit-latency 120ms >= 100ms · backing off while database writes commit slowly
 
   📖 Docs: https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling
@@ -849,7 +849,7 @@ $ schemabot progress apply-example-84
        • Rows: 2,900,000 / 4,000,000 · ETA: 2m 45s
        • Shards: 4 (3 copying, 1 complete)
            ✓ -40: 1,000,000 rows
-           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
+           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m
            ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
            ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
 
