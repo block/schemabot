@@ -709,13 +709,13 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, budget *dd
 			// against every shard the change spans, attached or not.
 			phrase += fmt.Sprintf(" on %d of %d shards", failed, total)
 		}
-		if landed := landedShardCount(t.Shards); landed > 0 && landed < len(t.Shards) && !presentation.ListsParts(status) {
+		if landed, total := landedShardCount(t.Shards), t.shardTotal(); landed > 0 && landed < total && !presentation.ListsParts(status) {
 			if status == state.Task.Cancelled {
 				// The pure-cancelled parenthetical ("not started") would be false
 				// here: the change is live on the landed shards.
 				phrase = "⊘ Cancelled"
 			}
-			phrase += fmt.Sprintf(" — applied on %d of %d shards", landed, len(t.Shards))
+			phrase += fmt.Sprintf(" — applied on %d of %d shards", landed, total)
 		}
 		line := fmt.Sprintf("**%s**: %s", inlineCode(t.Table), phrase)
 		if status == state.Task.Completed && len(t.Shards) > 1 {
@@ -1010,7 +1010,6 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 	}
 	writeFinalizerFailure(sb, data.FailedFinalizer)
 	if !state.IsState(data.State, state.Apply.Failed, state.Apply.FailedRetryable) {
-		writeFinalizerFailure(sb, data.FailedFinalizer)
 		return
 	}
 	if data.FailedFinalizer != nil && data.ErrorMessage == data.FailedFinalizer.Error {
@@ -1073,6 +1072,18 @@ func failedShards(shards []ShardStatus) []ShardStatus {
 		}
 	}
 	return out
+}
+
+// hasSettledShardFailure reports whether a shard failed for good. A shard in
+// failed_retryable is still being retried by SchemaBot, so only a terminal
+// failure leaves work that a new apply has to retry.
+func hasSettledShardFailure(shards []ShardStatus) bool {
+	for _, s := range failedShards(shards) {
+		if s.State == state.ApplyOperation.Failed {
+			return true
+		}
+	}
+	return false
 }
 
 // writeShardFailureReasons writes the callout for several failed shards: how
@@ -1287,7 +1298,7 @@ func writeShardedFooter(sb *strings.Builder, data ShardedApplyData) {
 		// Every shard runs on the same engine, and every engine a sharded
 		// apply runs on stops (presentation.StopCommand).
 		writeFooterAction(sb, "To stop this schema change:", AppendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", presentation.StopCommandStop, data.ApplyID, data.Environment), data.Tenant))
-		if len(failedShards(allShardStatuses(data.Keyspaces))) > 0 {
+		if hasSettledShardFailure(allShardStatuses(data.Keyspaces)) {
 			fmt.Fprintf(sb, "\n%s\n", presentation.RetryOnceSettledNote)
 		}
 	case state.IsState(data.State, state.Apply.Failed):
