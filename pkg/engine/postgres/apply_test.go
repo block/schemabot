@@ -1606,6 +1606,35 @@ func TestClassifyApplyFailureCommittedCreatePrefix(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(failure.detail, "re-plan"))
 }
 
+// A validation that existing rows fail names the key and the fix, and leaves
+// the row values the server quotes in its message out of the detail.
+func TestClassifyApplyFailureBrokenForeignKey(t *testing.T) {
+	err := fmt.Errorf("validate: %w", &pgconn.PgError{
+		Code:           "23503",
+		Message:        `insert or update on table "orders" violates foreign key constraint "orders_user_id_fkey"`,
+		Detail:         `Key (user_id)=(99) is not present in table "users".`,
+		ConstraintName: "orders_user_id_fkey",
+	})
+
+	failure := classifyApplyFailure(err, "orders")
+
+	assert.True(t, failure.retryable)
+	assert.Equal(t, `existing rows in "orders" break foreign key "orders_user_id_fkey"; the key is in place and checks new writes; fix those rows, then retry`, failure.detail)
+	assert.NotContains(t, failure.detail, "99")
+}
+
+// A statement the server refuses for a missing grant, such as a foreign key
+// whose referenced table the engine role cannot reference, says a grant is
+// missing instead of reporting a generic failure.
+func TestClassifyApplyFailureMissingGrant(t *testing.T) {
+	err := fmt.Errorf("add foreign key: %w", &pgconn.PgError{Code: "42501", Message: "permission denied for table users"})
+
+	failure := classifyApplyFailure(err, "orders")
+
+	assert.True(t, failure.retryable)
+	assert.Equal(t, `the engine role lacks a privilege the statement on "orders" needs, such as REFERENCES on the table a foreign key references; the server log names it; grant it, then retry`, failure.detail)
+}
+
 func TestProgressResultReportsCreateSequenceLength(t *testing.T) {
 	result := progressResult(engine.StateRunning, "running", time.Now(), nativeApply{
 		namespace: "public",

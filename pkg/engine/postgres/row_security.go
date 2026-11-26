@@ -83,14 +83,17 @@ func plannerRefusal(err error) error {
 // referencedTableRemedy names the fix for a foreign key the planner cannot
 // bind. The planner copies each referenced table's shape from the live
 // database, so the referenced table must already exist on the target: a
-// schema file that creates it in the same plan does not help. It returns an
-// empty string for every other failure.
+// schema file that creates it in the same plan does not help. The planning
+// role must also hold SELECT and REFERENCES on it. It returns an empty
+// string for every other failure.
 func referencedTableRemedy(err error) string {
 	switch {
 	case errors.Is(err, schemadiff.ErrReferencedTableNotFound):
-		return "; a foreign key can reference only a table that already exists on the target, so leave the foreign key out of the schema file, apply the referenced table first, then run the ADD CONSTRAINT outside SchemaBot and add the foreign key back to the file"
+		return "; a foreign key can reference only a table that already exists on the target, so apply the referenced table first, then add the foreign key to the file in a later change"
 	case errors.Is(err, schemadiff.ErrReferencedTableNotReadable):
 		return "; grant the planning role SELECT on the referenced table, then re-plan"
+	case errors.Is(err, schemadiff.ErrReferencedTableNotReferenceable):
+		return "; grant the planning role REFERENCES on the referenced table, then re-plan"
 	}
 	return ""
 }

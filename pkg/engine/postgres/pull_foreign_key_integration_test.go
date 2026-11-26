@@ -156,8 +156,8 @@ func TestEnginePullSchemaRefusesCrossSchemaForeignKeys(t *testing.T) {
 // A foreign key added NOT VALID is pulled as an enforced one, because a
 // schema file declares what the table should be and cannot declare that
 // existing rows are unchecked. Planning the pulled files therefore plans the
-// key's validation, which is blocked for review like any foreign key change,
-// rather than leaving the key unchecked silently.
+// key's validation, which runs while writes keep flowing, rather than leaving
+// the key unchecked silently.
 func TestEnginePullSchemaPlansValidationOfANotValidForeignKey(t *testing.T) {
 	eng, credentials := pullForeignKeyTarget(t, "pull_not_valid_fk_test", `
 		CREATE SCHEMA app;
@@ -180,8 +180,7 @@ func TestEnginePullSchemaPlansValidationOfANotValidForeignKey(t *testing.T) {
 	require.Len(t, result.Changes[0].TableChanges, 1)
 	validate := result.Changes[0].TableChanges[0]
 	assert.Equal(t, "ALTER TABLE app.orders VALIDATE CONSTRAINT orders_user_id_fkey", validate.DDL)
-	assert.Equal(t, engine.ExecutionModeBlocked, validate.ExecutionMode,
-		"SchemaBot does not run foreign key changes on PostgreSQL yet, so the validation is shown for review")
+	assert.Empty(t, validate.ExecutionMode, "the validation runs as planned: %s", validate.ModeReason)
 }
 
 // A schema file cannot declare row-level security and a foreign key together
@@ -202,23 +201,53 @@ func TestEnginePullSchemaRefusesRowSecurityWithAForeignKey(t *testing.T) {
 	assert.NotContains(t, err.Error(), `table "users"`, "only the referencing table is refused")
 }
 
-// A plan's rollback baseline cannot carry foreign keys yet, so a namespace
-// whose only unusual shape is an ordinary foreign key pair plans
-// rollback-incapable rather than advertising originals it could not restore.
-func TestCaptureOriginalFilesRefusesForeignKeys(t *testing.T) {
-	dsn, db := testutil.StartPostgres(t, "capture_fk_test")
-	_, err := db.ExecContext(t.Context(), `
-		CREATE SCHEMA app;
-		CREATE TABLE app.users (id bigint PRIMARY KEY);
-		CREATE TABLE app.orders (id bigint PRIMARY KEY, user_id bigint REFERENCES app.users (id))`)
-	require.NoError(t, err)
-	pool, err := pgxpool.New(t.Context(), dsn)
-	require.NoError(t, err)
-	defer pool.Close()
+// A plan's rollback baseline carries each table's foreign keys, so a
+// namespace with an ordinary foreign key pair captures both tables. A managed
+// table referenced by a foreign key on an ignored table is refused, since no
+// captured file would hold that key, and the plan is rollback-incapable.
+func TestCaptureOriginalFilesCarriesForeignKeys(t *testing.T) {
+	const originalOrders = "CREATE TABLE \"orders\" (\n    \"id\" bigint NOT NULL,\n    \"user_id\" bigint,\n    CONSTRAINT \"orders_pkey\" PRIMARY KEY (id),\n    CONSTRAINT \"orders_user_id_fkey\" FOREIGN KEY (user_id) REFERENCES users(id)\n);\n"
+	const originalUsers = "CREATE TABLE \"users\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"users_pkey\" PRIMARY KEY (id)\n);\n"
+	tests := []struct {
+		name         string
+		database     string
+		setup        string
+		ignored      []string
+		wantCaptured bool
+		wantFiles    map[string]string
+	}{
+		{
+			name:     "foreign key pair",
+			database: "capture_fk_test",
+			setup: `CREATE SCHEMA app;
+				CREATE TABLE app.users (id bigint PRIMARY KEY);
+				CREATE TABLE app.orders (id bigint PRIMARY KEY, user_id bigint REFERENCES app.users (id))`,
+			wantCaptured: true,
+			wantFiles:    map[string]string{"orders.sql": originalOrders, "users.sql": originalUsers},
+		},
+		{
+			name:     "referenced by an ignored table",
+			database: "capture_fk_ignored_test",
+			setup: `CREATE SCHEMA app;
+				CREATE TABLE app.users (id bigint PRIMARY KEY);
+				CREATE TABLE app.audit_events (id bigint PRIMARY KEY, user_id bigint REFERENCES app.users (id))`,
+			ignored: []string{"audit_events"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, db := testutil.StartPostgres(t, tt.database)
+			_, err := db.ExecContext(t.Context(), tt.setup)
+			require.NoError(t, err)
+			pool, err := pgxpool.New(t.Context(), dsn)
+			require.NoError(t, err)
+			defer pool.Close()
 
-	files, captured, err := captureOriginalFiles(t.Context(), pool, "capture_fk_test", "app", nil, engine.IgnoredTables{})
+			files, captured, err := captureOriginalFiles(t.Context(), pool, tt.database, "app", nil, mustIgnoredTables(t, tt.ignored))
 
-	require.NoError(t, err)
-	assert.False(t, captured, "a foreign key the rollback baseline cannot write leaves the plan rollback-incapable")
-	assert.Nil(t, files)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantCaptured, captured)
+			assert.Equal(t, tt.wantFiles, files)
+		})
+	}
 }
