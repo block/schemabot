@@ -57,9 +57,11 @@ early release.
 - Plans on every pull request and in the CLI, showing the exact SQL. Make the
   Check Run a [required check](check-runs.md#branch-protection-setup), so a
   pull request cannot merge until the live schema matches it.
-- `ALTER TABLE` changes that don't rewrite the table, such as adding a
-  nullable column or a check constraint, on tables up to the size limit
-  (1 GiB by default).
+- `ALTER TABLE` changes that only change the catalog, such as adding a
+  nullable column, on a table of any size. See
+  [Catalog-only changes](#catalog-only-changes).
+- Other `ALTER TABLE` changes that don't rewrite the table, such as adding a
+  check constraint, on tables up to the size limit (1 GiB by default).
 - Adding an index to an existing table with `CREATE INDEX CONCURRENTLY`. You
   can cancel a running build.
 - Adding an index to a partitioned table, one partition at a time. Applying
@@ -75,7 +77,7 @@ early release.
 | Change | Status |
 |---|---|
 | Rewriting a table, such as changing a column's type | Blocked. It needs pg-sprite's copy-and-swap, which is still in preview |
-| `ALTER TABLE` on a table larger than the size limit | Blocked, for the same reason |
+| `ALTER TABLE` on a table larger than the size limit, unless it only changes the catalog | Blocked, for the same reason |
 | Adding or dropping a foreign key | Blocked. See [Foreign keys](#foreign-keys) for running one yourself |
 | Dropping a table | Blocked. There is no pending-drops quarantine to hold one |
 | Creating an enum type, or removing or reordering its labels | Blocked |
@@ -90,7 +92,8 @@ can only run against the live table when the apply starts:
 
 - A statement the planner expected to be quick that turns out to rewrite the
   table is cancelled by its time budget, and nothing is changed.
-- A table that grew past the size limit after the plan is refused.
+- A table that grew past the size limit after the plan is refused, unless
+  the statement only changes the catalog.
 - A plan with several statements is not atomic. They run in order, so if one
   fails, the ones before it stay applied. Keep a change to one statement when
   a half-applied plan would be unsafe to leave in place.
@@ -178,8 +181,8 @@ dedicated owner role, read [Table ownership](#table-ownership) before the first
 
 | Change | What happens |
 |---|---|
-| Add a nullable column, or another `ALTER TABLE` that only changes the catalog | Runs, with a 3-second `lock_timeout` and a 30-second `statement_timeout` |
-| `ALTER TABLE` on a table larger than 1 GiB | Blocked. The limit is `postgres.native_safe_table_size_limit_bytes` |
+| Add a nullable column, or another `ALTER TABLE` that only changes the catalog | Runs on a table of any size, with a 3-second `lock_timeout` and a 30-second `statement_timeout`. See [Catalog-only changes](#catalog-only-changes) |
+| Any other `ALTER TABLE` on a table larger than 1 GiB | Blocked. The limit is `postgres.native_safe_table_size_limit_bytes` |
 | `ALTER TABLE` that rewrites the table, such as most column type changes | Blocked. It needs a copy of the table, which SchemaBot does not run on PostgreSQL yet |
 | `CREATE INDEX` on an existing table | Runs as `CREATE INDEX CONCURRENTLY`, bounded by `postgres.concurrent_index_max_duration` (24 hours by default). It can be cancelled |
 | `CREATE INDEX` on a partitioned table | Built one partition at a time, each concurrently, under the same bound. It can be cancelled, and applying again resumes from the partitions already built. See [Partitioned index builds](#partitioned-index-builds) |
@@ -196,6 +199,37 @@ lists the SchemaBot controls that do not apply to PostgreSQL.
 
 The [reference](#supported-changes) below covers every rule behind this
 table.
+
+### Catalog-only changes
+
+Some `ALTER TABLE` changes write only PostgreSQL's catalog and never read or
+rewrite the table's rows. They take the same few milliseconds on a table of
+any size, so the size limit does not apply to them.
+
+| Change | Catalog-only when |
+|---|---|
+| `ADD COLUMN` | pg-sprite proves against the live table that it neither rewrites nor scans the rows, its default is absent or a constant, and its type is built in or an enum |
+| `DROP COLUMN`, `DROP DEFAULT`, `DROP NOT NULL`, `DROP CONSTRAINT` | Always |
+
+A `NOT NULL` column with no default still counts against the size limit,
+because PostgreSQL scans the rows to check it. So does a default such as
+`now()`, any user-defined type other than an enum (a domain, composite, or
+range type), and a statement that mixes a catalog-only change with any other
+change.
+
+`SET DEFAULT` counts against the size limit too. PostgreSQL converts the new
+default to the column's type while it holds the table lock, and for a
+user-defined type that runs the type's own code, which can read any table.
+
+pg-sprite proves the change against the live table when SchemaBot plans it,
+and again when the apply starts. What happens at the second proof:
+
+| Second proof | Apply |
+|---|---|
+| Still catalog-only | Runs |
+| No longer catalog-only | Refused on size |
+| The engine role cannot create the proof's temporary table | Refused until you grant `TEMPORARY` on the database to that role |
+| Fails for another reason, such as a dropped connection | Fails without running anything; retry it |
 
 ## Example: add a column and an index
 
@@ -361,7 +395,7 @@ unsafe to leave in place.
 
 | Statement | Limit | Setting |
 |---|---|---|
-| `ALTER TABLE` | Table size, including every partition of a partitioned table. 1 GiB by default | `postgres.native_safe_table_size_limit_bytes` |
+| `ALTER TABLE` | Table size, including every partition of a partitioned table. 1 GiB by default. A catalog-only change has no size limit | `postgres.native_safe_table_size_limit_bytes` |
 | `ALTER TABLE` | Each attempt gets a 3-second lock budget, retried on contention, and a 30-second statement budget | Fixed |
 | `CREATE INDEX CONCURRENTLY` | Build duration, enforced as the server-side `statement_timeout`. 24 hours by default | `postgres.concurrent_index_max_duration` |
 | Index on a partitioned table | The same duration, for each partition and for the whole build | `postgres.concurrent_index_max_duration` |
@@ -761,11 +795,11 @@ the apply fails and drops nothing. Fix the cause, then apply again.
 The plan lists the tables it exempted, by namespace, in the PR comment and in
 `schemabot plan` and `schemabot apply` output.
 
-**Tables `pull` cannot write.** `pull` refuses a whole namespace when any of
+**Tables `pull` cannot write.** `pull` refuses the whole pull when any of
 its tables has something the file format cannot represent: triggers, table or
-column comments, table options, inheritance, or a foreign key on either side.
-Write those files by hand, or drop the tables through a reviewed process,
-before you pull the rest.
+column comments, table options, inheritance, or a foreign key it cannot write
+(see the table below). Write those files by hand, or drop the tables through a
+reviewed process, before you pull the rest.
 
 A hand-written file can use `CREATE UNLOGGED TABLE`, `PARTITION BY`, and an
 `INHERITS` child flattened to its own columns. Each inheritance child and
@@ -804,14 +838,27 @@ creates does not count.
 out. To keep it, declare it in the file. To remove it, run the
 `DROP CONSTRAINT` outside SchemaBot, then plan again.
 
-**Declaring tables that have foreign keys.** `pull` refuses these tables, so
-write their files by hand:
+**Declaring tables that have foreign keys.** `pull` writes them:
 
 - A table that owns foreign keys is declared with them.
 - A table that other tables reference is declared without them, since the
   constraints belong to the referencing tables.
-- A table with a foreign key into another namespace cannot be declared.
-  Remove the foreign key, or drop the table through a reviewed process.
+- A foreign key added `NOT VALID` is written as an enforced one. The next plan
+  shows its `VALIDATE CONSTRAINT`, blocked like any foreign key change.
+
+`pull` refuses a foreign key it cannot write. The table it names depends on the
+case:
+
+| The foreign key | Tables named | Why |
+|---|---|---|
+| Crosses namespaces | Both | A file cannot reference a table in another namespace |
+| Sits on a partition | The referenced table, with a reason that names the partition's key | A partition has no file of its own. Declare the key on the partitioned parent |
+| Sits on a table with no file of its own, such as one an extension owns | The referenced table | The key would be lost from the baseline |
+| References its own table through a standalone unique index | The referencing table | The file would declare the key before the index exists. Make the index an immediate `UNIQUE` constraint to pull it. A deferrable one does not count |
+| Sits on a table with row-level security | The referencing table | A file cannot declare row-level security and a foreign key together yet |
+
+Remove the foreign key, or drop the table through a reviewed process, then
+pull again.
 
 Dropping a referenced table must drop the constraints that reference it too.
 The plan names the constraints on both sides.
@@ -830,7 +877,7 @@ applying the same plan again meets the same refusal.
 
 | What SchemaBot finds | Result |
 |---|---|
-| The table grew past the size limit, for an `ALTER TABLE` or a non-concurrent `CREATE INDEX` | Refused. The limit is `postgres.native_safe_table_size_limit_bytes`; see [configuration](configuration.md) |
+| The table grew past the size limit, for an `ALTER TABLE` that is not catalog-only or a non-concurrent `CREATE INDEX` | Refused. The limit is `postgres.native_safe_table_size_limit_bytes`; see [configuration](configuration.md) |
 | The table is gone, or is no longer an ordinary or partitioned table | Refused |
 | The role lacks a privilege the statement needs | Refused before any DDL runs. The failure includes the `GRANT` that fixes it |
 | A statement waited past its 3-second lock budget | Retryable once the lock contention clears |
@@ -934,7 +981,9 @@ you select JSON output. Each PostgreSQL schema is a SchemaBot namespace.
 schema file format, the whole pull is refused and nothing is written. That
 covers tables with:
 
-- A foreign key, on either side
+- A foreign key `pull` cannot write: into another namespace, on a partition,
+  on a table with row-level security, or referencing its own table through a
+  standalone unique index. See [Foreign keys](#foreign-keys)
 - Table inheritance, or `UNLOGGED`
 - Explicit collations
 - Sequence defaults it cannot represent safely

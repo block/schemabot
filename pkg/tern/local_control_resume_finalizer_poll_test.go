@@ -77,15 +77,16 @@ func TestDriveFinalizerToTerminal_TransientErrorsSpendABudgetAndReturnRetryable(
 	assert.NotErrorIs(t, err, context.DeadlineExceeded)
 }
 
-// The drive waits the client's poll interval between polls, the cadence the
-// task drives share, instead of a cadence of its own. The first poll does not
-// wait, so a run of failures that spends the budget takes one interval less
-// than the budget.
-func TestDriveFinalizerToTerminal_WaitsTheClientsPollIntervalBetweenPolls(t *testing.T) {
+// The drive paces its polls from the client's poll interval, as the task
+// drives do, instead of on a cadence of its own: the first poll does not wait,
+// and a run of failures that spends the budget backs off from that interval
+// up to its cap. TestProgressDrives_FailingPollsBackOffToTheCap pins each wait.
+func TestDriveFinalizerToTerminal_PacesPollsFromTheClientsPollInterval(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const pollInterval = 7 * time.Second
 		eng := &finalizerPollEngine{steps: []finalizerPollStep{{err: errors.New("get deploy request: rate limited")}}}
 		client := finalizerPollClient(discardLogger(), pollInterval)
+		client.progressPollJitter = noProgressPollJitter
 		apply := &storage.Apply{ApplyIdentifier: "apply-finalizer-poll", Database: "appdb"}
 
 		start := time.Now()
@@ -93,7 +94,8 @@ func TestDriveFinalizerToTerminal_WaitsTheClientsPollIntervalBetweenPolls(t *tes
 
 		require.Error(t, err)
 		require.Equal(t, maxConsecutiveProgressPollErrors, eng.calls)
-		assert.Equal(t, time.Duration(maxConsecutiveProgressPollErrors-1)*pollInterval, time.Since(start))
+		// Waits of 1, 2, 4, 8, then 16 intervals for each remaining failure.
+		assert.Equal(t, (1+2+4+8+16*5)*pollInterval, time.Since(start))
 	})
 }
 

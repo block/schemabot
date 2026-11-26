@@ -61,6 +61,14 @@ func TestAuthoredErrorsReturnTheirWordsThroughWraps(t *testing.T) {
 			err:  &ambiguousDatabaseConfigError{Database: "orders", Paths: []string{"a/orders", "b/orders"}},
 			want: "ambiguous: database 'orders' matches multiple configs at: a/orders, b/orders",
 		},
+		{
+			name: "command without -d matching two configs",
+			err: &MultipleConfigsError{Candidates: []ConfigCandidate{
+				{Database: "orders", SchemaDir: "schema/orders"},
+				{Database: "users", SchemaDir: "schema/users"},
+			}},
+			want: ErrMultipleConfigs.Error() + ": `orders` (schema/orders), `users` (schema/users)",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

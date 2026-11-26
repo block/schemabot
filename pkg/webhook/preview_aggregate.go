@@ -48,7 +48,7 @@ func PreviewAggregateSummary() string {
 	}
 
 	conclusion, _ := computeAggregate(checks, nil)
-	title, summary := aggregateSummary(checks, conclusion, nil, nil)
+	title, summary := aggregateSummary(checks, conclusion, nil, nil, "")
 	return title + "\n\n" + summary
 }
 
@@ -71,7 +71,7 @@ func PreviewAggregateCheckStopped() string {
 
 	stopped := stoppedApplyIDs{stoppedApplyID: true}
 	conclusion, _ := computeAggregate(checks, stopped)
-	title, summary := aggregateSummary(checks, conclusion, stopped, nil)
+	title, summary := aggregateSummary(checks, conclusion, stopped, nil, "")
 	return title + "\n\n" + summary
 }
 
@@ -116,7 +116,7 @@ func PreviewAggregateCheckRollout() string {
 	for _, sc := range scenarios {
 		checks := []*storage.Check{sc.check}
 		conclusion, _ := computeAggregate(checks, nil)
-		title, summary := aggregateSummary(checks, conclusion, nil, sc.progress)
+		title, summary := aggregateSummary(checks, conclusion, nil, sc.progress, "")
 		sections = append(sections, "**"+sc.heading+"**\n\n"+title+"\n\n"+summary)
 	}
 	return strings.Join(sections, "\n\n")

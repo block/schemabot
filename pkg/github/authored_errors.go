@@ -67,3 +67,8 @@ func (e *ambiguousDatabaseConfigError) Error() string {
 func (e *ambiguousDatabaseConfigError) AuthoredText() (string, bool) {
 	return e.Error(), false
 }
+
+// AuthoredText returns the whole message: it carries no cause.
+func (e *MultipleConfigsError) AuthoredText() (string, bool) {
+	return e.Error(), false
+}

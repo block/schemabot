@@ -27,3 +27,8 @@ func (e *schemaConfigOutsideAllowedDirsError) AuthoredText() (string, bool) {
 func (e *databaseNotRegisteredError) AuthoredText() (string, bool) {
 	return e.Error(), false
 }
+
+// AuthoredText returns the whole message: it carries no cause.
+func (e *closedPRRefreshError) AuthoredText() (string, bool) {
+	return e.Error(), false
+}

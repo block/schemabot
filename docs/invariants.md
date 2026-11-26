@@ -749,8 +749,8 @@ waiting for a lucky comment or push. The exception is a block that no retry can 
 App, misconfigured check name), which blocks immediately and permanently.
 
 A block an operator owes a target a reconciliation for is not an exception to this. It converges
-too, by the operator reconciling the target — what it must not do is converge on its own, since
-that would clear the block without the divergence behind it being addressed.
+too, by a person reconciling the target and then planning it — what it must not do is converge on
+its own, since that would clear the block without the divergence behind it being addressed.
 
 *Enforced:* stale-check reconciliation (`pkg/webhook/check_records.go`), aggregate re-evaluation
 (`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), the re-plan a settled

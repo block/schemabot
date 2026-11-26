@@ -49,6 +49,11 @@ func TestAuthoredErrorsReturnTheirWordsThroughWraps(t *testing.T) {
 			}},
 			want: `schema config for database "orders" at "schema/orders", database "users" at "schema/users": database not registered on this deployment, and schema directory under no expected participant's paths`,
 		},
+		{
+			name: "plan refused because the pull request is closed",
+			err:  &closedPRRefreshError{repo: "octocat/hello-world", pr: 7},
+			want: "PR #7 in octocat/hello-world is closed; SchemaBot refreshes check state only for open PRs",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

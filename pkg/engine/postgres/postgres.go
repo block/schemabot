@@ -920,7 +920,7 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 	reason := engine.SanitizeBlockedCause(singleLine(fmt.Sprintf("statement for table %q: %s", report.Table, r.detail)))
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
-		if err := blockRewriteSteps(changes, reason, partitionedIndexBuildSteps(report)); err != nil {
+		if err := blockRewriteSteps(changes, reason, partitionedIndexBuildSteps(report), catalogOnlySteps(report)); err != nil {
 			if fullyBlocked {
 				slog.Warn("PostgreSQL table size check could not classify a blocked step; existing blocked plan verdicts remain unchanged",
 					"database", database,
@@ -958,16 +958,19 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 // each is bounded by the concurrent index duration envelope rather than the
 // table size ceiling: a concurrent index build, and a step the planner routed
 // to the partitioned index build, named by partitionedBuilds, which builds one
-// partition at a time under that envelope per partition. An earlier blocked
-// verdict retains its reason and gains the independent size cause so the
-// operator can resolve both without another planning round trip.
+// partition at a time under that envelope per partition. A step pg-sprite
+// proved changes only the catalog, named by catalogOnly, keeps its verdict
+// too: it reads and writes no rows, so its cost does not grow with the
+// table. An earlier blocked verdict retains its reason and gains the
+// independent size cause so the operator can resolve both without another
+// planning round trip.
 // parser.Classify in tableChanges parsed every rendered statement, including
 // blocked steps, with the same single-statement requirements used here. A
 // statement that now fails to classify is therefore an invariant violation.
 // Every step is classified before any verdict is written, so a caller that
 // keeps the plan on that error keeps it exactly as it was rather than with
 // the size cause on some steps and not others.
-func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedBuilds map[string]bool) error {
+func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedBuilds, catalogOnly map[string]bool) error {
 	durationBounded := make([]bool, len(changes))
 	for i := range changes {
 		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
@@ -984,6 +987,9 @@ func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedB
 			continue
 		}
 		if durationBounded[i] {
+			continue
+		}
+		if catalogOnly[changes[i].DDL] {
 			continue
 		}
 		if changes[i].ExecutionMode == engine.ExecutionModeBlocked {
@@ -1005,6 +1011,24 @@ func partitionedIndexBuildSteps(report pgplan.Report) map[string]bool {
 	steps := make(map[string]bool)
 	for _, statement := range report.Statements {
 		if statement.Execution != planner.ExecutionPartitionedIndexBuild {
+			continue
+		}
+		for _, sql := range statement.ExecSQL {
+			steps[sql] = true
+		}
+	}
+	return steps
+}
+
+// catalogOnlySteps returns the planned steps of every statement pg-sprite
+// proved changes only the catalog, keyed by the DDL tableChanges renders for
+// them. A statement is proven only when every operation in it is
+// (planner.ProvenCatalogOnly); one unproven operation leaves all of its steps
+// under the size ceiling.
+func catalogOnlySteps(report pgplan.Report) map[string]bool {
+	steps := make(map[string]bool)
+	for _, statement := range report.Statements {
+		if !planner.ProvenCatalogOnly(statement.Decisions) {
 			continue
 		}
 		for _, sql := range statement.ExecSQL {
