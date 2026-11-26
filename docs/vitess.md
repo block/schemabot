@@ -32,6 +32,8 @@ branch first, so a statement Vitess will not accept fails against a throwaway
 branch instead of a live table. And the deploy request, not SchemaBot, drives
 the change, so the cluster reports progress and any instance can read it.
 
+![A Vitess pull request adds a column to a sharded table: SchemaBot plans the ALTER, the apply copies rows on all four shards at once, the cutover swaps them in, the revert window opens, then the apply completes, the check passes and the PR merges](../assets/pr-vitess-workflow-demo.gif)
+
 See [Engines](engines.md) for how this engine compares with the others.
 
 ## Quick start

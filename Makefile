@@ -191,6 +191,7 @@ check-docs-toc: ## Fail if a Table of Contents behind TOC markers is stale
 docs-assets: templates ## Re-render the PR mock-ups and animations the docs embed (needs gh, Chrome, ImageMagick, Node.js/Playwright)
 	@python3 scripts/prepare-pr-demo.py
 	@python3 scripts/prepare-pr-postgres-demo.py
+	@python3 scripts/prepare-pr-vitess-demo.py
 	@python3 scripts/prepare-pr-multi-target-demo.py
 	@python3 scripts/render-pr-mockups.py --prepared
 	@bash scripts/render-pr-demo.sh
