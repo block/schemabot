@@ -322,12 +322,14 @@ versions continue to fail closed as required by pg-sprite's progress-report
 contract.
 
 SchemaBot's `executorProgressMetadata` will pass the bounded partition fields
-through alongside its existing fields. The PR comment remains one apply row and
-shows, for example:
+through alongside its existing fields. The PR comment remains one apply row. It
+shows the partition position above the table, and the build counters as a
+detail line under the table's statement, for example:
 
 ```text
 Building index on partition 3 of 12 (events_2026_03)
-building index: 25% of blocks (2,500/10,000)
+…
+- Building index: 2,500 of 10,000 blocks
 ```
 
 The table and partition text is sanitized and clamped before reaching GitHub.

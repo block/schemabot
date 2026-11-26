@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/presentation"
@@ -187,6 +188,31 @@ func PreviewCommentPlanDropTables() string {
 			Tables:    []string{"_orders_old"},
 			Reason:    engine.ExemptReasonLeadingUnderscore,
 		}},
+	})
+}
+
+// PreviewCommentPlanDropTablesUnmatched renders the plan a repository gets
+// when its drop_tables entry has a typo. The entry names no table, so the
+// plan drops nothing and is otherwise clean, with the leftover the entry
+// meant still disclosed as skipped by its leading underscore; the comment
+// names the entry so the clean plan does not read as if the leftover was
+// seen and kept.
+func PreviewCommentPlanDropTablesUnmatched() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		ExemptTables: []ExemptTablesData{{
+			Namespace: "testapp",
+			Tables:    []string{"_events_old"},
+			Reason:    engine.ExemptReasonLeadingUnderscore,
+		}},
+		UnmatchedDropTables: []string{"_events_olds"},
 	})
 }
 
@@ -424,14 +450,14 @@ func PreviewCommentPlanBlockedPostgres() string {
 			{
 				Keyspace: "testapp",
 				Statements: []string{
-					"ALTER TABLE users ALTER COLUMN email TYPE bigint",
+					"ALTER TABLE users ADD COLUMN order_ref text UNIQUE",
 					"ALTER TABLE orders ADD COLUMN notes text",
 				},
 			},
 		},
 		BlockedChanges: []BlockedChangeData{
 			{Table: "users", Reason: engine.JoinBlockedCauses([]string{
-				`statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned`,
+				`statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change`,
 				`statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`,
 			})},
 		},
@@ -442,7 +468,12 @@ func PreviewCommentPlanBlockedPostgres() string {
 // holds until the apply carries --allow-unsafe. The footer states that
 // requirement under the plain command, which never carries the flag itself.
 func PreviewCommentPlanUnsafe() string {
-	return RenderPlanComment(PlanCommentData{
+	return RenderPlanComment(previewUnsafePlanData())
+}
+
+// previewUnsafePlanData is a plan with one unsafe change, a dropped column.
+func previewUnsafePlanData() PlanCommentData {
+	return PlanCommentData{
 		Database:     "testapp",
 		SchemaName:   "testapp",
 		Environment:  "staging",
@@ -464,7 +495,7 @@ func PreviewCommentPlanUnsafe() string {
 		UnsafeChanges: []UnsafeChangeData{
 			{Table: "orders", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `orders` DROP COLUMN `legacy_ref`;"},
 		},
-	})
+	}
 }
 
 // PreviewCommentPlanManyUnsafeChanges renders a sample plan whose unsafe list
@@ -512,8 +543,9 @@ func PreviewCommentPlanManyUnsafeChanges() string {
 
 // PreviewCommentPlanAttributedChange renders a sample plan whose destructive
 // changes target tables another open pull request applied but has not merged
-// yet, so each entry is annotated with its owner. Attribution is table-grained,
-// so a dropped column is named by its table exactly as a dropped table is.
+// yet, so each finding that undoes an owner's work is annotated with that
+// owner: the dropped column is one the owner added, and the dropped table is
+// one the owner created.
 func PreviewCommentPlanAttributedChange() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
@@ -535,12 +567,18 @@ func PreviewCommentPlanAttributedChange() string {
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "orders", Reason: "DROP COLUMN discards the column's data"},
-			{Table: "reconcile_state", Reason: "DROP TABLE removes all data"},
+			{Table: "orders", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `orders` DROP COLUMN `notes`"},
+			{Table: "reconcile_state", Reason: "DROP TABLE removes all data", DDL: "DROP TABLE `reconcile_state`"},
 		},
 		AttributedChanges: []AttributedChangeData{
-			{Table: "orders", Repository: previewRepository, PullRequest: 4820},
-			{Table: "reconcile_state", Repository: previewRepository, PullRequest: 4821},
+			{
+				Table: "orders", Repository: previewRepository, PullRequest: 4820,
+				OwnerChanges: &ddl.ObjectChanges{Added: []ddl.SchemaObject{{Kind: ddl.ObjectColumn, Name: "notes"}}},
+			},
+			{
+				Table: "reconcile_state", Repository: previewRepository, PullRequest: 4821,
+				OwnerChanges: &ddl.ObjectChanges{Added: []ddl.SchemaObject{{Kind: ddl.ObjectTable, Name: "reconcile_state"}}},
+			},
 		},
 	})
 }
@@ -815,14 +853,14 @@ func PreviewCommentApplyBlockedRejected() string {
 			{
 				Keyspace: "testapp",
 				Statements: []string{
-					"ALTER TABLE users ALTER COLUMN email TYPE bigint",
+					"ALTER TABLE users ADD COLUMN order_ref text UNIQUE",
 					"ALTER TABLE orders ADD COLUMN notes text",
 				},
 			},
 		},
 		BlockedChanges: []BlockedChangeData{
 			{Table: "users", Reason: engine.JoinBlockedCauses([]string{
-				`statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned`,
+				`statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change`,
 				`statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`,
 			})},
 		},
@@ -873,6 +911,57 @@ func PreviewCommentPlanBaseSchemaChanged() string {
 func PreviewCommentPlanBaseSchemaUnverified() string {
 	data := previewPlanData()
 	data.BaseSchema = &BaseSchemaData{BaseBranch: "main", Unverified: true}
+	return RenderPlanComment(data)
+}
+
+// previewFreezeEnd is when the preview freezes end.
+var previewFreezeEnd = time.Date(2026, 12, 26, 0, 0, 0, 0, time.UTC)
+
+// PreviewCommentPlanFrozen renders a plan of a change a freeze in effect
+// covers, under the default override policy: the apply would be refused now.
+func PreviewCommentPlanFrozen() string {
+	data := previewPlanData()
+	data.Freezes = &PlanFreezeNotice{
+		InEffect:         []RefusingFreeze{{ID: "freeze-3f9a1c2e7b4d8a06", Reason: "Holiday code freeze", EndsAt: &previewFreezeEnd}},
+		OverrideOnReason: true,
+	}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanFrozenUnsafe renders a plan of a frozen change that also
+// carries an unsafe change: the --allow-unsafe instruction leads into the
+// command that already carries --override, so one apply gives both consents.
+func PreviewCommentPlanFrozenUnsafe() string {
+	data := previewUnsafePlanData()
+	data.Freezes = &PlanFreezeNotice{
+		InEffect:         []RefusingFreeze{{ID: "freeze-3f9a1c2e7b4d8a06", Reason: "Holiday code freeze", EndsAt: &previewFreezeEnd}},
+		OverrideOnReason: true,
+	}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanFreezeScheduled renders a plan of a change a scheduled
+// code freeze will cover once it starts.
+func PreviewCommentPlanFreezeScheduled() string {
+	data := previewPlanData()
+	data.Freezes = &PlanFreezeNotice{
+		Scheduled: []ScheduledFreeze{{
+			ID: "freeze-8c41d2e9a7f03b56", Reason: "Holiday code freeze",
+			StartsAt: time.Date(2026, 12, 19, 0, 0, 0, 0, time.UTC), EndsAt: &previewFreezeEnd,
+		}},
+		OverrideOnReason: true,
+	}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanFrozenApproval renders a plan of a frozen change on a
+// server whose override policy needs a second approver.
+func PreviewCommentPlanFrozenApproval() string {
+	data := previewPlanData()
+	data.Freezes = &PlanFreezeNotice{
+		InEffect:  []RefusingFreeze{{ID: "freeze-3f9a1c2e7b4d8a06", Reason: "INC-1234: payments latency"}},
+		Approvers: []string{"acme/freeze-approvers"},
+	}
 	return RenderPlanComment(data)
 }
 
@@ -1413,11 +1502,14 @@ func PreviewCommentErrorNoConfig() string {
 // PreviewCommentErrorMultiple renders the "multiple databases" error comment.
 func PreviewCommentErrorMultiple() string {
 	return RenderMultipleConfigs(SchemaErrorData{
-		RequestedBy:        previewRequestedBy,
-		Timestamp:          "2026-01-15 14:30:00",
-		Environment:        "staging",
-		CommandName:        action.Plan,
-		AvailableDatabases: "- `testapp` (schema/testapp/schemabot.yaml)\n- `payments` (schema/payments/schemabot.yaml)",
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-01-15 14:30:00",
+		Environment: "staging",
+		CommandName: action.Plan,
+		AvailableConfigs: []AvailableConfigData{
+			{Database: "testapp", SchemaPath: "schema/testapp"},
+			{Database: "payments", SchemaPath: "schema/payments"},
+		},
 	})
 }
 
@@ -2303,6 +2395,50 @@ func PreviewCommentApplyPlanDowngraded() string {
 				"`shipments` (create) is no longer planned",
 			},
 		},
+	})
+}
+
+// PreviewCommentApplyPlanChangeGateRefused renders the locked apply-plan of an
+// automatic apply after a change gate refused it, as the comment reads once its
+// footer is edited. The refusal itself posts as the comment below.
+func PreviewCommentApplyPlanChangeGateRefused() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:            "testapp",
+		SchemaName:          "testapp",
+		Environment:         "staging",
+		HeadSHA:             previewHeadSHA,
+		Repository:          previewRepository,
+		RequestedBy:         previewRequestedBy,
+		IsMySQL:             true,
+		DatabaseType:        "mysql",
+		Changes:             samplePlanChanges(),
+		IsLocked:            true,
+		LockOwner:           "acme/myapp#42",
+		LockAcquired:        "2026-03-14 10:30:00 UTC",
+		RefusedByChangeGate: true,
+		LockReleased:        true,
+		RefusalPosted:       true,
+	})
+}
+
+// PreviewCommentApplyPlanRefusalUnposted renders the same edited
+// comment when the refusal comment did not post and the lock was not released:
+// no lock claim, and a footer that carries the reason to look and the next step.
+func PreviewCommentApplyPlanRefusalUnposted() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:            "testapp",
+		SchemaName:          "testapp",
+		Environment:         "staging",
+		HeadSHA:             previewHeadSHA,
+		Repository:          previewRepository,
+		RequestedBy:         previewRequestedBy,
+		IsMySQL:             true,
+		DatabaseType:        "mysql",
+		Changes:             samplePlanChanges(),
+		IsLocked:            true,
+		LockOwner:           "acme/myapp#42",
+		LockAcquired:        "2026-03-14 10:30:00 UTC",
+		RefusedByChangeGate: true,
 	})
 }
 

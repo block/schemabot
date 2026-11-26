@@ -2,9 +2,9 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net/http"
 	"slices"
@@ -181,9 +181,7 @@ func (e *RemoteDeploymentUnavailableError) Unwrap() error {
 // handlePullSchema handles POST /api/pull requests.
 func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 	var req apitypes.PullSchemaRequest
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
@@ -282,11 +280,16 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 				"deployment", unavailableErr.Deployment,
 				"target", unavailableErr.Target,
 				"error", err)
-			s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable, "pull schema failed: "+err.Error())
+			s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable, pullUnavailableMessage(req.Database, req.Environment))
+			return
+		}
+		if text, ok := authoredMessage(err); ok {
+			s.logger.Warn("pull schema rejected", "database", req.Database, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "pull schema failed: "+text)
 			return
 		}
 		s.logger.Error("pull schema failed", "database", req.Database, "environment", req.Environment, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "pull schema failed: "+err.Error())
+		s.writeError(w, http.StatusInternalServerError, pullFailureMessage(req.Database, req.Environment))
 		return
 	}
 
@@ -524,19 +527,19 @@ func pullNamespaces(dialect schema.Dialect, namespaces []string) ([]string, erro
 	seenOutput := make(map[string]struct{}, len(namespaces))
 	for _, namespace := range namespaces {
 		if strings.TrimSpace(namespace) != namespace || namespace == "" {
-			return nil, fmt.Errorf("pull namespace %q must be non-empty and contain no leading or trailing whitespace", namespace)
+			return nil, operatorMessagef("pull namespace %q must be non-empty and contain no leading or trailing whitespace", namespace)
 		}
 		if strings.Contains(namespace, "..") || strings.ContainsAny(namespace, `/\`) {
-			return nil, fmt.Errorf("pull namespace %q must be a single path component", namespace)
+			return nil, operatorMessagef("pull namespace %q must be a single path component", namespace)
 		}
 		if schema.HasNamespaceEnvironmentPlaceholder(namespace) {
-			return nil, fmt.Errorf("pull namespace %q must be a concrete live namespace; resolve {env} or $ENV before calling pull", namespace)
+			return nil, operatorMessagef("pull namespace %q must be a concrete live namespace; resolve {env} or $ENV before calling pull", namespace)
 		}
 		if schema.IsReservedPullNamespaceForDialect(dialect, namespace) {
-			return nil, fmt.Errorf("pull namespace %q is reserved and cannot be pulled", namespace)
+			return nil, operatorMessagef("pull namespace %q is reserved and cannot be pulled", namespace)
 		}
 		if _, ok := seenOutput[namespace]; ok {
-			return nil, fmt.Errorf("duplicate pull namespace %q", namespace)
+			return nil, operatorMessagef("duplicate pull namespace %q", namespace)
 		}
 		seenOutput[namespace] = struct{}{}
 		result = append(result, namespace)
@@ -604,7 +607,7 @@ type ApplyRequest struct {
 	Override string `json:"override,omitempty"`
 	// freezeOverride is the approved override request that admitted this
 	// apply, set by the server after the change gates and never by a caller.
-	freezeOverride string
+	freezeOverride *storage.FreezeOverrideRequest
 	// viaHTTP is set by POST /api/apply, the one entry point whose caller has
 	// to say it rendered the rollout. The webhook and the trusted enqueue path
 	// call the service in process and leave it unset.
@@ -627,9 +630,7 @@ type ApplyRequest struct {
 // handlePlan handles POST /api/plan requests.
 func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 	var req PlanRequest
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
@@ -696,7 +697,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		}
 		s.logger.Error("plan failed: the environment's rollout members did not resolve, so the rollout rendering check refuses the plan",
 			"database", req.Database, "environment", req.Environment, "repository", req.Repository, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
+		s.writeError(w, http.StatusInternalServerError, planFailureMessage(req.Database, req.Environment, err))
 		return
 	}
 
@@ -746,8 +747,8 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "plan rejected: "+err.Error())
 			return
 		}
-		s.logger.Error("plan failed", "database", req.Database, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
+		PlanFailureLog(s.logger, err)("plan failed", "database", req.Database, "environment", req.Environment, "repository", req.Repository, "error", err)
+		s.writeError(w, http.StatusInternalServerError, planFailureMessage(req.Database, req.Environment, err))
 		return
 	}
 
@@ -758,11 +759,12 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 	// error says which step failed.
 	rollout, err := s.planRollout(r.Context(), req, primaryPlan, resp)
 	if err != nil {
-		s.logger.Error("plan failed: the rollout's member plans could not be completed", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
+		PlanFailureLog(s.logger, err)("plan failed: the rollout's member plans could not be completed", "database", req.Database, "environment", req.Environment, "repository", req.Repository, "plan_id", resp.PlanID, "error", err)
+		s.writeError(w, http.StatusInternalServerError, planRolloutFailureMessage(req.Database, req.Environment, err))
 		return
 	}
 	resp.Rollout = rollout
+	resp.Freezes = s.planResponseFreezes(r.Context(), req.Database, req.Environment, req.Repository, resp)
 
 	s.writeJSON(w, http.StatusOK, resp)
 }
@@ -1026,7 +1028,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			"error", err,
 		}
 		if isPlanRefusal(err) {
-			s.logger.Warn("ExecutePlan: engine refused the plan; the PR's schema files must change before it can plan", planFailureAttrs...)
+			s.logger.Warn("ExecutePlan: engine refused the plan; it plans once the change the refusal names is made to the schema files or the target", planFailureAttrs...)
 		} else {
 			s.logger.Error("ExecutePlan: client.Plan failed", planFailureAttrs...)
 		}
@@ -1308,11 +1310,11 @@ func (s *Service) refuseWithheldDrops(req PlanRequest, ignored engine.IgnoredTab
 		upgrade = "Upgrade that deployment to a build that supports ignore_tables patterns"
 	}
 	if len(dropped) == 1 {
-		return fmt.Errorf(
+		return operatorMessagef(
 			"the plan from deployment %q proposes dropping %q, which ignore_tables withholds. That deployment's planner did not apply the exclusion, so the plan is refused rather than reviewed as a drop. %s",
 			deployment, dropped[0], upgrade)
 	}
-	return fmt.Errorf(
+	return operatorMessagef(
 		"the plan from deployment %q proposes dropping %s, which ignore_tables withholds. That deployment's planner did not apply the exclusion, so the plan is refused rather than reviewed as drops. %s",
 		deployment, quotedTableList(dropped), upgrade)
 }
@@ -1532,9 +1534,7 @@ func storedNarrowingConflicts(stored, planned string) bool {
 // which the CLI reads as an unknown outcome and keeps its lock for.
 func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 	var req ApplyRequest
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
@@ -1596,6 +1596,12 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, ok := errors.AsType[*DropTablesInUseError](err); ok {
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "apply rejected: "+err.Error())
+			return
+		}
+		if released, ok := errors.AsType[*applyLockReleasedError](err); ok {
+			s.logger.Warn("apply rejected: the database lock it would record was released or acquired again while it was being queued; no apply was created",
+				"plan_id", req.PlanID, "database", released.Database, "environment", req.Environment, "error", released.Err)
+			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeLockChanged, "apply rejected: "+err.Error())
 			return
 		}
 		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
@@ -1664,8 +1670,8 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, applyStorageFailedMessage(req.PlanID))
 			return
 		}
-		s.logger.Error("apply failed", "plan_id", req.PlanID, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "apply failed: "+err.Error())
+		s.logger.Error("apply failed", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
+		s.writeError(w, http.StatusInternalServerError, applyFailureMessage(req.PlanID, err))
 		return
 	}
 
@@ -1681,6 +1687,11 @@ const applyMetricStatusRejected = "rejected"
 
 func applyMetricStatusForError(err error) string {
 	if errors.Is(err, storage.ErrActiveApplyExists) {
+		return "conflict"
+	}
+	// A lock released while the apply was being queued is a race with the
+	// operator who released it, not a server failure.
+	if _, ok := errors.AsType[*applyLockReleasedError](err); ok {
 		return "conflict"
 	}
 	if isPlanAdmissionRefusal(err) {
@@ -1810,6 +1821,121 @@ func applyStorageFailedMessage(planID string) string {
 	return fmt.Sprintf("apply failed: storage error while queueing plan %s; see server logs and check for a stored apply before retrying", planID)
 }
 
+// operatorMessageError is text SchemaBot wrote for the person reading the
+// response. It wraps no storage, driver, engine, or RPC error, and it says what
+// to change or do next, so a 500 answer carries it as written. It has no
+// Unwrap on purpose: whatever an outer wrap added stays out of the response.
+type operatorMessageError struct {
+	message string
+}
+
+func (e *operatorMessageError) Error() string { return e.message }
+
+// operatorMessagef builds an operatorMessageError. Use it only for a message
+// that wraps no cause and names the next step; any error that wraps a cause
+// belongs in the server log instead. Naming a configured deployment, target,
+// or rollout member is fine: the plan response and the apply refusals show
+// those names already. What stays out is anything a cause carries, such as an
+// address, a DSN, or a driver's text.
+func operatorMessagef(format string, args ...any) error {
+	return &operatorMessageError{message: fmt.Sprintf(format, args...)}
+}
+
+// authoredMessage returns the text of the operatorMessageError in err's chain.
+func authoredMessage(err error) (string, bool) {
+	authored, ok := errors.AsType[*operatorMessageError](err)
+	if !ok {
+		return "", false
+	}
+	return authored.message, true
+}
+
+// authoredPlanFailureText returns the text of a plan failure that is meant for
+// the reader, and only that text, without any wrap an outer caller added:
+//   - a SchemaBot-written message;
+//   - the engine declining the declared schema as written, which describes the
+//     change to make to the schema files, from a local engine (its own text) or a
+//     remote data plane that answered FailedPrecondition (the status message,
+//     without the "rpc error" framing);
+//   - a schema file the drop check could not parse.
+func authoredPlanFailureText(err error) (string, bool) {
+	if text, ok := authoredMessage(err); ok {
+		return text, true
+	}
+	if refusal, ok := errors.AsType[*engine.PlanRefusedError](err); ok {
+		return refusal.Error(), true
+	}
+	if grpcstatus.Code(err) == grpccodes.FailedPrecondition {
+		// Convert(err).Message() would carry the whole wrap chain for a wrapped
+		// status error, so read the message from the status itself.
+		var carrier interface{ GRPCStatus() *grpcstatus.Status }
+		if errors.As(err, &carrier) {
+			return carrier.GRPCStatus().Message(), true
+		}
+	}
+	if check, ok := errors.AsType[*UnselectedTableDropCheckError](err); ok {
+		if _, parse := errors.AsType[*schemaFileParseError](check.Err); parse {
+			return check.Error(), true
+		}
+	}
+	return "", false
+}
+
+// The closing sentences of the fixed 500 messages. The cause is in the server
+// log, which only a SchemaBot operator can read.
+const (
+	internalFailureTail = "A SchemaBot operator can find the cause in the server log."
+	retryFailureTail    = "If it keeps failing, a SchemaBot operator can find the cause in the server log."
+)
+
+// pullFailureMessage is the 500 body of a failed pull. The cause can be a
+// storage, driver, or engine error carrying addresses or credentials, so it
+// stays in the server log. A pull changes nothing, so it can be repeated.
+func pullFailureMessage(database, environment string) string {
+	return fmt.Sprintf("pull schema failed for database %q in environment %q: SchemaBot hit an internal error while reading the live schema. "+
+		"Retry in a moment. %s", database, environment, retryFailureTail)
+}
+
+// pullUnavailableMessage is the 503 body of a pull whose remote deployment
+// could not be reached. The connection error names the address it dialed, so
+// it stays in the server log with the deployment and target.
+func pullUnavailableMessage(database, environment string) string {
+	return fmt.Sprintf("pull schema failed for database %q in environment %q: SchemaBot could not reach the deployment that serves it. "+
+		"Retry in a moment. %s", database, environment, retryFailureTail)
+}
+
+// planFailureMessage is the 500 body of a failed plan. The cause stays in the
+// server log unless it is text written for the reader.
+func planFailureMessage(database, environment string, err error) string {
+	if text, ok := authoredPlanFailureText(err); ok {
+		return "plan failed: " + text
+	}
+	return fmt.Sprintf("plan failed for database %q in environment %q: SchemaBot hit an internal error. "+
+		"Plan again in a moment. %s", database, environment, retryFailureTail)
+}
+
+// planRolloutFailureMessage is the 500 body of a plan whose rollout members
+// could not all be planned. It does not say whether any member plan was
+// recorded, because that depends on how far planning got.
+func planRolloutFailureMessage(database, environment string, err error) string {
+	if text, ok := authoredPlanFailureText(err); ok {
+		return "plan failed: " + text
+	}
+	return fmt.Sprintf("plan failed for database %q in environment %q: SchemaBot could not finish planning every rollout member. "+
+		"Plan again in a moment. %s", database, environment, retryFailureTail)
+}
+
+// applyFailureMessage is the 500 body of an apply that failed inside SchemaBot.
+// The apply may already be recorded when the failure happens, so the message
+// tells the caller to check the schema change before applying again.
+func applyFailureMessage(planID string, err error) string {
+	if text, ok := authoredMessage(err); ok {
+		return "apply failed: " + text
+	}
+	return fmt.Sprintf("apply failed for plan %s: SchemaBot hit an internal error. "+
+		"The apply may already be recorded, so check the schema change's status before applying again. %s", planID, internalFailureTail)
+}
+
 // activeApplyConflictMessage tells the operator which apply holds the target
 // and what to do before applying again. Each state names only the controls
 // that state accepts. The store's own account names internal deployments, so
@@ -1857,6 +1983,38 @@ func isApplyCreationStorageRefusal(err error) bool {
 	}
 	return errors.Is(err, storage.ErrLockIntentChanged)
 }
+
+// isRecordedLockGone reports whether storing an apply failed because the lock
+// row it would record was released, or released and acquired again, after
+// apply creation read it. Storage locks that row in the transaction that
+// creates the apply, so a release that checks for applies before it deletes
+// the row cannot interleave with the create; the create refuses instead.
+func isRecordedLockGone(err error) bool {
+	if errors.Is(err, storage.ErrLockNotFound) {
+		return true
+	}
+	return errors.Is(err, storage.ErrLockReplaced)
+}
+
+// applyLockReleasedError refuses an apply whose database lock was released,
+// or released and acquired again, while the apply was being queued. No apply
+// was created.
+type applyLockReleasedError struct {
+	Database string
+	Err      error
+}
+
+// Error names which of the two happened, since they need different next steps:
+// a released lock has to be taken again, and a lock taken again may now be
+// someone else's.
+func (e *applyLockReleasedError) Error() string {
+	if errors.Is(e.Err, storage.ErrLockReplaced) {
+		return fmt.Sprintf("the lock on database %q was released and taken again while this apply was being queued, so nothing was queued; check who holds it with `schemabot locks`, then apply again", e.Database)
+	}
+	return fmt.Sprintf("the lock on database %q was released while this apply was being queued, so nothing was queued; take the lock again, then apply again", e.Database)
+}
+
+func (e *applyLockReleasedError) Unwrap() error { return e.Err }
 
 // PlanNotFoundError identifies an apply that names a plan SchemaBot has no
 // record of. It matches storage.ErrPlanNotFound, and carries the plan
@@ -2184,7 +2342,7 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		}
 		admitCtx = gatedCtx
 		if override != nil {
-			req.freezeOverride = override.Identifier
+			req.freezeOverride = override
 		}
 	}
 	applyIdentifier, storedApplyID, err := s.enqueueApply(admitCtx, plan, req, options, attachObserver)
@@ -2305,7 +2463,9 @@ func (s *Service) createStoredApply(
 	// change gates as its creation did.
 	applyOpts.PinnedRollback = isPinnedRollback(plan, req)
 	// Only the server records the override that admitted the apply.
-	applyOpts.FreezeOverride = req.freezeOverride
+	if req.freezeOverride != nil {
+		applyOpts.FreezeOverride = req.freezeOverride.Identifier
+	}
 
 	// Attribute the apply to the authenticated caller when the request carried a
 	// real identity (API auth enabled); see resolveCaller.
@@ -2443,6 +2603,9 @@ func (s *Service) createStoredApply(
 	// apply exists, and handleApply's callers treat a 4xx as proof it does not.
 	storedApplyID, err := s.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)
 	if err != nil {
+		if isRecordedLockGone(err) {
+			return nil, 0, &applyLockReleasedError{Database: plan.Database, Err: err}
+		}
 		if isApplyCreationStorageRefusal(err) {
 			return nil, 0, fmt.Errorf("store apply and tasks: %w", err)
 		}
@@ -2469,6 +2632,7 @@ func (s *Service) createStoredApply(
 			s.logger.Warn("failed to log queued apply", "apply_id", applyIdentifier, "error", err)
 		}
 	}
+	s.logFreezeOverrideForApply(ctx, apply, caller, storage.LogEventInfo, req.freezeOverride)
 
 	return apply, storedApplyID, nil
 }
@@ -3078,7 +3242,7 @@ func buildApplyOperationGroups(
 	// plan rather than complete an apply that skipped it.
 	for _, member := range members {
 		if namespaces := member.Plan.EngineFinalizedNamespaces(); len(namespaces) > 0 {
-			return nil, false, fmt.Errorf("plan %s asks to finalize namespaces %v after their DDL, but its changes carry no per-shard plan to schedule a group finalizer behind; re-plan, and report this if it repeats",
+			return nil, false, operatorMessagef("plan %s asks to finalize namespaces %v after their DDL, but its changes carry no per-shard plan to schedule a group finalizer behind; re-plan, and report this if it repeats",
 				member.Plan.PlanIdentifier, namespaces)
 		}
 	}
@@ -3610,12 +3774,12 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	}
 	schemaFiles, err := rollbackSchemaFiles(plan)
 	if err != nil {
-		return nil, terminalControlf("rollback source plan is invalid: %w", err)
+		return nil, authoredTerminalControlf("rollback source plan is invalid: %w", err)
 	}
 
 	deployment, err := storedDeploymentForApply(apply)
 	if err != nil {
-		return nil, terminalControlf("rollback source apply is invalid: %w", err)
+		return nil, authoredTerminalControlf("rollback source apply is invalid: %w", err)
 	}
 	if plan.Target == "" {
 		return nil, terminalControlf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
@@ -3688,11 +3852,19 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 				Err:        err,
 			}
 		}
-		return nil, terminalControlf("rollback plan for database %q (%s): %w%s",
-			apply.Database, apply.Environment, err, recordedIgnoreTablesNote(req.IgnoreTables))
+		failure := &terminalControlError{err: fmt.Errorf("rollback plan for database %q (%s): %w%s",
+			apply.Database, apply.Environment, err, recordedIgnoreTablesNote(req.IgnoreTables))}
+		// A refusal is the engine's answer for whoever edits the schema
+		// files, so the requester sees it. Any other Plan failure can carry
+		// driver or transport text and stays in the server log.
+		if isPlanRefusal(err) {
+			failure.shown = fmt.Sprintf("rollback plan for database %q (%s): %s%s",
+				apply.Database, apply.Environment, planRefusalReason(err), recordedIgnoreTablesNote(req.IgnoreTables))
+		}
+		return nil, failure
 	}
 	if err := s.refuseDropsOfWithheldTables(req, resp, deployment); err != nil {
-		return nil, terminalControlf("rollback plan for database %q (%s): %w", apply.Database, apply.Environment, err)
+		return nil, authoredTerminalControlf("rollback plan for database %q (%s): %w", apply.Database, apply.Environment, err)
 	}
 	s.normalizeExecutionVerdicts(resp, apply.Database, deployment)
 	route := storedPlanRoute{
@@ -3912,11 +4084,35 @@ func validateSchemaFiles(schemaFiles map[string]*ternv1.SchemaFiles) (warning st
 
 // isPlanRefusal reports whether a Plan failure is the engine declining the
 // declared schema as written, from a local engine or from a remote data plane
-// that answered FailedPrecondition. The PR author fixes it by changing the
-// schema files, so it is not a SchemaBot fault and is not logged as an error.
+// that answered FailedPrecondition. The operator resolves it with the change
+// the refusal names, to the schema files or the target, so it is not a
+// SchemaBot fault and is not logged as an error.
 func isPlanRefusal(err error) bool {
 	if engine.IsPlanRefused(err) {
 		return true
 	}
 	return grpcstatus.Code(err) == grpccodes.FailedPrecondition
+}
+
+// PlanFailureLog returns the log call for a failed plan: Warn for a plan the
+// engine refused, which the operator acts on and SchemaBot did not cause, and
+// Error for every other failure.
+func PlanFailureLog(logger *slog.Logger, err error) func(msg string, args ...any) {
+	if isPlanRefusal(err) {
+		return logger.Warn
+	}
+	return logger.Error
+}
+
+// planRefusalReason is a refusal's own text, without the gRPC status prefix a
+// remote data plane's answer carries. It reads the status itself, since
+// grpcstatus.FromError puts the whole wrapped text back into the message.
+func planRefusalReason(err error) string {
+	var remote interface{ GRPCStatus() *grpcstatus.Status }
+	if errors.As(err, &remote) {
+		if st := remote.GRPCStatus(); st != nil {
+			return st.Message()
+		}
+	}
+	return err.Error()
 }

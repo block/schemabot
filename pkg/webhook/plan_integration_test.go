@@ -59,7 +59,7 @@ func TestE2EPlanWithChanges(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -544,7 +544,7 @@ func TestE2EPlanNoChanges(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -622,7 +622,7 @@ func TestE2EPlanConfigNotFound(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -712,7 +712,7 @@ func TestE2EPlanCommentShowsTableSizes(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -797,7 +797,7 @@ func TestE2EPlanCommentShowsCollationChanges(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -860,7 +860,7 @@ func TestE2EPlanCleansStalePlanOnlyChecksBeforeConvergingAggregates(t *testing.T
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -938,7 +938,7 @@ func TestE2EPlanScopedToOneEnvironmentBlocksOnOtherEnvironmentApply(t *testing.T
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -981,7 +981,7 @@ func TestE2EMultiEnvPlan(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	// "schemabot plan" without -e → multi-env plan
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -1058,7 +1058,7 @@ func TestE2EMultiEnvPlanDifferentChanges(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan",
@@ -1176,7 +1176,7 @@ func TestE2EPlanUsesServerSideTarget(t *testing.T) {
 
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -1237,7 +1237,7 @@ func TestE2EPlanExcludesIgnoredNamespaces(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
@@ -1311,7 +1311,7 @@ func TestE2EPlanIgnoringEveryNamespaceFails(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
 
-	h := NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger, WithInsecureSkipSignatureVerification())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",

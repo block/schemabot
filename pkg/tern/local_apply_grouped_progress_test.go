@@ -616,3 +616,132 @@ func TestPollForCompletionAtomic_VitessProgressOutageInRevertWindowDoesNotPause(
 		assert.NotEqual(t, state.Task.Completed, task.State, "task %s", task.TaskIdentifier)
 	}
 }
+
+// An apply is waiting for its deploy and the engine refuses the automatic
+// start with a permanent error. The refusal can never succeed on a retry, so
+// the drive fails the apply with the engine's message, which names the next
+// step, and does not ask the engine to start again. The failure is visible:
+// the pending start is answered with it and the PR's observer is told the
+// apply reached a terminal state.
+func TestPollForCompletionAtomic_AutoDeployPermanentRefusalFailsApply(t *testing.T) {
+	eng := &fakeControlEngine{
+		progressResult: &engine.ProgressResult{State: engine.StateWaitingForDeploy},
+		startErr:       engine.NewPermanentError("deploy request #9 needs approval; turn off approvals, then run a new plan and apply."),
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+	startReq := &storage.ApplyControlRequest{ApplyID: apply.ID, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"}
+	client.storage.(*exactProgressStorage).controlRequests.(*testControlRequestStore).requests = []*storage.ApplyControlRequest{startReq}
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+	// The bound only matters if the drive wrongly keeps polling, which would
+	// otherwise never return.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, client.pollForCompletionAtomic(ctx, apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, 1, eng.startCount, "a permanent refusal is never retried")
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Equal(t, "deploy could not start: deploy request #9 needs approval; turn off approvals, then run a new plan and apply.", apply.ErrorMessage)
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.Failed, task.State, "task %s", task.TaskIdentifier)
+	}
+	assert.Equal(t, storage.ControlRequestFailed, startReq.Status, "the pending start is answered with the failure")
+	require.Len(t, observer.terminal, 1, "the observer posts the terminal summary")
+	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
+}
+
+// startedThenRefusedEngine starts the deploy and then answers Start with a
+// permanent refusal, standing in for an engine that breaks the Start contract.
+type startedThenRefusedEngine struct{ *fakeControlEngine }
+
+func (e *startedThenRefusedEngine) Start(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	e.startCount++
+	e.progressResult = &engine.ProgressResult{State: engine.StateRunning}
+	return nil, engine.NewPermanentError("deploy request #9 could not be deployed")
+}
+
+// The drive never fails an apply whose deploy the engine reports running, even
+// when Start answered with a permanent refusal: failing it would leave the
+// deploy with nothing tracking it. The apply keeps going and the drive follows
+// the engine's state.
+func TestHandleAtomicProgressTick_AutoDeployPermanentRefusalWhileDeployRunsKeepsApply(t *testing.T) {
+	eng := &startedThenRefusedEngine{&fakeControlEngine{progressResult: &engine.ProgressResult{State: engine.StateWaitingForDeploy}}}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+	ps := &atomicPollState{lastProgressLog: time.Now()}
+
+	done := client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, map[string]string{}, false)
+
+	assert.False(t, done, "the drive keeps polling")
+	assert.Equal(t, 2, eng.progressCalls, "the drive re-reads progress before failing")
+	assert.False(t, state.IsTerminalApplyState(apply.State), "the apply is not settled, got %q", apply.State)
+	assert.NoError(t, ps.terminalErr)
+}
+
+// failingUpdateApplyStore refuses every apply write while reads still succeed.
+type failingUpdateApplyStore struct{ *snapshotApplyStore }
+
+func (s *failingUpdateApplyStore) Update(context.Context, *storage.Apply) error {
+	return errors.New("storage unavailable")
+}
+
+// When the failure of a permanently refused deploy cannot be recorded, the
+// drive stops and returns that write error, so its owner exits for operator
+// retry rather than reporting the drive finished.
+func TestHandleAtomicProgressTick_AutoDeployPermanentRefusalUnrecordedFailureStopsDrive(t *testing.T) {
+	eng := &fakeControlEngine{
+		progressResult: &engine.ProgressResult{State: engine.StateWaitingForDeploy},
+		startErr:       engine.NewPermanentError("deploy request #9 could not be deployed"),
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+	store := client.storage.(*exactProgressStorage)
+	store.applies = &failingUpdateApplyStore{store.applies.(*snapshotApplyStore)}
+	ps := &atomicPollState{lastProgressLog: time.Now()}
+
+	done := client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, map[string]string{}, false)
+
+	assert.True(t, done, "the drive stops")
+	require.Error(t, ps.terminalErr)
+	assert.Contains(t, ps.terminalErr.Error(), "storage unavailable")
+}
+
+// An apply deferring its deploy waits for the operator, so the drive never
+// asks the engine to start it, whatever the engine would answer.
+func TestHandleAtomicProgressTick_DeferDeployNeverAutoStarts(t *testing.T) {
+	eng := &fakeControlEngine{
+		progressResult: &engine.ProgressResult{State: engine.StateWaitingForDeploy},
+		startErr:       engine.NewPermanentError("deploy request #9 could not be deployed"),
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+	ps := &atomicPollState{lastProgressLog: time.Now()}
+
+	done := client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, map[string]string{"defer_deploy": "true"}, false)
+
+	assert.False(t, done, "the drive keeps waiting for the operator")
+	assert.Zero(t, eng.startCount, "the engine is never asked to start")
+	assert.False(t, state.IsTerminalApplyState(apply.State), "the apply is not settled, got %q", apply.State)
+}
+
+// Any other Start error may clear on its own, so the drive logs it and asks the
+// engine to start again on the next poll while the apply keeps waiting for its
+// deploy.
+func TestHandleAtomicProgressTick_AutoDeployTransientErrorRetriesNextPoll(t *testing.T) {
+	eng := &fakeControlEngine{
+		progressResult: &engine.ProgressResult{State: engine.StateWaitingForDeploy},
+		startErr:       errors.New("start deploy request: connection reset"),
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+	ps := &atomicPollState{lastProgressLog: time.Now()}
+
+	for tick := 1; tick <= 2; tick++ {
+		done := client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, map[string]string{}, false)
+		assert.False(t, done, "tick %d: the drive keeps polling", tick)
+		assert.Equal(t, tick, eng.startCount, "tick %d: the engine is asked to start again", tick)
+	}
+
+	assert.False(t, state.IsTerminalApplyState(apply.State), "the apply is not settled, got %q", apply.State)
+	assert.NoError(t, ps.terminalErr)
+	for _, task := range tasks {
+		assert.False(t, state.IsTerminalTaskState(task.State), "task %s is not settled, got %q", task.TaskIdentifier, task.State)
+	}
+}

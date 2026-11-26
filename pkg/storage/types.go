@@ -378,9 +378,10 @@ type Check struct {
 	// AggregateRender is what an aggregate row's Check Run text was rendered
 	// from, so the text can be rendered again with newer rollout counts
 	// without re-reading the PR. The encoding belongs to the caller. Upsert
-	// writes it, so an Upsert that leaves it empty clears it; other reads do
-	// not load it, and GetAggregateRender returns it. Empty on per-database
-	// rows.
+	// writes it, so an Upsert that leaves it empty clears it. GetAggregateRender
+	// returns it, and ListRemovableOnPRClose loads it so close cleanup can tell
+	// a render-only rewrite from an untouched row; other reads do not load it.
+	// Empty on per-database rows.
 	AggregateRender []byte `json:"-"`
 
 	// CreatedAt is when the check was created.
@@ -573,9 +574,11 @@ const FreezeOverrideReasonMax = 500
 const FreezeOverrideMaxLifetime = 24 * time.Hour
 
 // FreezeOverrideRequest asks to let one change through the freezes that hold
-// it. Nobody overrides alone: a second person approves the request, and the
-// change goes ahead only while every blocker it meets is one the request
-// names.
+// it. Under the approval override policy nobody overrides alone: a second
+// person approves the request. Under the reason policy, the default, the
+// request is stored approved by its requester, on their reason, and admits
+// only the command that gave it. Either way the change goes
+// ahead only while every blocker it meets is one the request names.
 type FreezeOverrideRequest struct {
 	ID          int64
 	Identifier  string
@@ -682,6 +685,13 @@ func (r *FreezeOverrideRequest) IsPersonOf(who string) bool {
 	return who == CanonicalKey(r.RequestedBy) || (r.PRAuthor != "" && who == CanonicalKey(r.PRAuthor))
 }
 
+// OnReason reports whether the request was admitted on its requester's own
+// reason, under the reason override policy, rather than approved by someone
+// else. Approve refuses the requester, so only CreateOnReason stores one.
+func (r *FreezeOverrideRequest) OnReason() bool {
+	return r.ApprovedAt != nil && CanonicalKey(r.ApprovedBy) == CanonicalKey(r.RequestedBy)
+}
+
 // Setting represents an admin-level SchemaBot setting.
 // Examples: feature flags, default options, maintenance mode.
 type Setting struct {
@@ -706,6 +716,19 @@ type Setting struct {
 // reconciler owns and derives those rows; they are component state that
 // shares the settings table, not configuration an operator chooses.
 const WebhookReconcileScanCursorSettingKeyPrefix = "webhook_reconcile_scan_cursor:"
+
+// MaxSettingKeyBytes is the longest settings key storage keeps whole. It is
+// the width of the setting_key column (varchar(255)) in pkg/schema/mysql and
+// pkg/schema/postgres. A key that passes IsPrintableASCIISettingKey takes one
+// byte per character, so the byte count and the column's character count agree.
+const MaxSettingKeyBytes = 255
+
+// MaxSettingValueBytes is the largest settings value storage keeps whole. It
+// is the size of a MySQL TEXT column, which holds 65,535 bytes and is what
+// setting_value is in pkg/schema/mysql. The PostgreSQL column is unbounded
+// text, but the limit is the same on every dialect so a value accepted on one
+// is accepted on the other.
+const MaxSettingValueBytes = 65535
 
 // IsComponentStateSettingKey reports whether key names a row a component
 // keeps for its own state rather than an operator setting. The settings
@@ -760,6 +783,10 @@ const (
 	EngineStrata      = "strata"
 	EnginePostgres    = "postgres"
 )
+
+// Engines lists every engine constant above, for checks that must hold on
+// every engine. TestEnginesListsEveryEngineConstant keeps it complete.
+var Engines = []string{EngineSpirit, EnginePlanetScale, EngineStrata, EnginePostgres}
 
 // ApplyOperationKind constants classify operation rows by scheduling role.
 const (
@@ -918,6 +945,12 @@ type TableChange struct {
 	// moves, with how each move changes the way values compare. Empty when
 	// the change re-collates no column, or the engine does not report it.
 	CollationChanges []CollationChange `json:"collation_changes,omitempty"`
+
+	// Metadata is what the engine recorded about this change at plan time
+	// and needs back at apply time (engine.TableChange.Metadata). It is
+	// stored with the reviewed plan so the apply runs against what was
+	// reviewed rather than against a fresh read of the target.
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // CollationChange is one existing column a planned change moves onto another
@@ -961,13 +994,15 @@ func (tc TableChange) TaskEstimatedBytes(shard string) *int64 {
 // TaskEstimatedRows returns the row estimate a task created from this change
 // carries, under the same whole-table rule as TaskEstimatedBytes: a task
 // scoped to one shard carries none rather than the whole table's count. Only
-// an ALTER copies rows, so a task for any other change carries none either:
-// the plan sizes a table it drops, but that is not work the task will copy.
+// a change that works through the table's rows carries one: an ALTER copies
+// them, and a separate CREATE INDEX statement, which is how PostgreSQL adds an
+// index, reads them all to build it. A task for any other change carries none:
+// the plan sizes a table it drops, but that is not work the task will do.
 func (tc TableChange) TaskEstimatedRows(shard string) *int64 {
 	if shard != "" || tc.EstimatedRows == nil {
 		return nil
 	}
-	if !strings.EqualFold(tc.Operation, "alter") {
+	if !strings.EqualFold(tc.Operation, "alter") && !strings.EqualFold(tc.Operation, "create_index") {
 		return nil
 	}
 	rows := *tc.EstimatedRows
@@ -1281,6 +1316,35 @@ func (p *Plan) AllChangesDirect() bool {
 		}
 	}
 	return total > 0
+}
+
+// ShardCopyEstimatedRows returns the plan's row estimate for the copy one
+// shard runs for a table: the estimate on the shard's own change, when that
+// change is an ALTER, the only change that copies rows. It is nil when the
+// plan records no change for the table on that shard, the change copies no
+// rows, or the planner had no estimate. A negative estimate is a statistics
+// sentinel rather than a count, so it reads as no estimate. It never falls
+// back to the keyspace's estimate, which covers every shard.
+func (p *Plan) ShardCopyEstimatedRows(namespace, shard, table string) *int64 {
+	if p == nil || p.Namespaces[namespace] == nil {
+		return nil
+	}
+	for _, sp := range p.Namespaces[namespace].Shards {
+		if sp.Shard != shard {
+			continue
+		}
+		for _, tc := range sp.Changes {
+			if tc.Table != table || tc.EstimatedRows == nil || !strings.EqualFold(tc.Operation, "alter") {
+				continue
+			}
+			if *tc.EstimatedRows < 0 {
+				return nil
+			}
+			rows := *tc.EstimatedRows
+			return &rows
+		}
+	}
+	return nil
 }
 
 // FlatDDLChanges returns all DDL changes across namespaces, sorted by namespace key.
@@ -1801,6 +1865,9 @@ type DriverPool struct {
 // user-facing handle for the whole rollout. applies.state is derived from
 // the child rows' states via the existing state.DeriveApplyState().
 type ApplyOperation struct {
+	// StartsAttempt is set only on the snapshot returned by a fresh work claim.
+	StartsAttempt bool
+
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
 	ID int64
 
@@ -2026,6 +2093,11 @@ func (op *ApplyOperation) Lease() OperationLease {
 // ApplyOptions contains durable user and engine options for an apply.
 // Stored as JSON in the database for flexibility across engine types.
 type ApplyOptions struct {
+	// ChangeEventApp is the managed app label forwarded to a remote worker for
+	// change events. It is stored on the worker's apply and kept out of engine
+	// options.
+	ChangeEventApp string `json:"change_event_app,omitempty"`
+
 	// AllowUnsafe permits destructive changes (DROP TABLE, DROP COLUMN).
 	AllowUnsafe bool `json:"allow_unsafe,omitempty"`
 
@@ -2163,17 +2235,26 @@ const (
 	ControlOperationRelease ControlOperation = "release"
 )
 
+// controlOperations are the operations this release implements. It is the
+// registry the operator surfaces are checked against: every operation here is
+// a command on the PR comment, the CLI, and the HTTP API, and every one of
+// them is refused without the apply ID it acts on (CO-11).
+var controlOperations = []ControlOperation{
+	ControlOperationStart, ControlOperationStop, ControlOperationCancel,
+	ControlOperationCutover, ControlOperationRevert, ControlOperationSkipRevert,
+	ControlOperationRelease,
+}
+
+// ControlOperations returns every operation this release implements.
+func ControlOperations() []ControlOperation {
+	return slices.Clone(controlOperations)
+}
+
 // Valid reports whether the operation is one SchemaBot recognizes. Control
 // operations cross the control-plane / data-plane boundary as strings, so a
 // value read off the wire is checked here before it reaches storage.
 func (o ControlOperation) Valid() bool {
-	switch o {
-	case ControlOperationStart, ControlOperationStop, ControlOperationCancel,
-		ControlOperationCutover, ControlOperationRevert, ControlOperationSkipRevert,
-		ControlOperationRelease:
-		return true
-	}
-	return false
+	return slices.Contains(controlOperations, o)
 }
 
 // Command returns the operation spelled as the command an operator types

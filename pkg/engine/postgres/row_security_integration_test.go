@@ -283,6 +283,7 @@ func TestEngineRowSecurityMissingTableRefuses(t *testing.T) {
   `}}},
 	})
 	require.ErrorIs(t, err, schemadiff.ErrUnsupportedChange)
+	assert.True(t, engine.IsPlanRefused(err))
 	require.ErrorContains(t, err, "creating table")
 	assert.Nil(t, result)
 	var absent bool

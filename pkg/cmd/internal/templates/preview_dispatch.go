@@ -146,6 +146,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables())
 	case PreviewCommentPlanDropTables:
 		fmt.Print(webhooktemplates.PreviewCommentPlanDropTables())
+	case PreviewCommentPlanDropTablesUnmatched:
+		fmt.Print(webhooktemplates.PreviewCommentPlanDropTablesUnmatched())
 	case PreviewCommentPlanColumnOnlyAlter:
 		fmt.Print(webhooktemplates.PreviewCommentPlanColumnOnlyAlter())
 	case PreviewCommentPlanManyTables:
@@ -224,6 +226,10 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentApplyPlanUnsafe())
 	case PreviewCommentApplyPlanDowngraded:
 		fmt.Print(webhooktemplates.PreviewCommentApplyPlanDowngraded())
+	case PreviewCommentApplyPlanChangeGateRefused:
+		fmt.Print(webhooktemplates.PreviewCommentApplyPlanChangeGateRefused())
+	case PreviewCommentApplyPlanRefusalUnposted:
+		fmt.Print(webhooktemplates.PreviewCommentApplyPlanRefusalUnposted())
 	case PreviewCommentApplyProgress:
 		fmt.Print(webhooktemplates.PreviewCommentApplyProgress())
 	case PreviewCommentApplyEstimateExceeded:
@@ -262,6 +268,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhook.PreviewAggregateSummary())
 	case PreviewAggregateCheckFileCapBlocked:
 		fmt.Print(webhook.PreviewAggregateCheckFileCapBlocked())
+	case PreviewAggregateCheckQuotaReserved:
+		fmt.Print(webhook.PreviewAggregateCheckQuotaReserved())
 	case PreviewAggregateCheckStopped:
 		fmt.Print(webhook.PreviewAggregateCheckStopped())
 	case PreviewAggregateCheckRollout:

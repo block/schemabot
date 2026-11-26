@@ -51,11 +51,6 @@ func TestCanonicalizePostgresIdentityKeys_FoldsMixedCaseRows(t *testing.T) {
 		`SELECT updated_at FROM locks WHERE database_name = 'otherdb'`).Scan(&canonicalUpdatedAt))
 
 	_, err := db.ExecContext(t.Context(),
-		`INSERT INTO apply_target_locks (database_name, database_type, environment, deployment)
-		 VALUES ('MyDB', 'MySQL', 'Production', 'Default')`)
-	require.NoError(t, err)
-
-	_, err = db.ExecContext(t.Context(),
 		`INSERT INTO checks (repository, pull_request, head_sha, environment, database_type, database_name, status)
 		 VALUES ('Org/Repo', 7, 'AbCd1234', 'Staging', 'MySQL', 'MyDB', 'queued')`)
 	require.NoError(t, err)
@@ -88,16 +83,7 @@ func TestCanonicalizePostgresIdentityKeys_FoldsMixedCaseRows(t *testing.T) {
 	assert.True(t, untouchedUpdatedAt.Equal(canonicalUpdatedAt),
 		"an already-canonical row must not be rewritten: updated_at moved from %s to %s", canonicalUpdatedAt, untouchedUpdatedAt)
 
-	var environment, deployment string
-	require.NoError(t, db.QueryRowContext(t.Context(),
-		`SELECT database_name, database_type, environment, deployment FROM apply_target_locks`).
-		Scan(&databaseName, &databaseType, &environment, &deployment))
-	assert.Equal(t, "mydb", databaseName)
-	assert.Equal(t, "mysql", databaseType)
-	assert.Equal(t, "production", environment)
-	assert.Equal(t, "default", deployment)
-
-	var headSHA string
+	var environment, deployment, headSHA string
 	require.NoError(t, db.QueryRowContext(t.Context(),
 		`SELECT repository, environment, database_type, database_name, head_sha FROM checks WHERE pull_request = 7`).
 		Scan(&repository, &environment, &databaseType, &databaseName, &headSHA))
@@ -144,24 +130,23 @@ func TestCanonicalizePostgresIdentityKeys_CollisionNamesConstraint(t *testing.T)
 	assert.ErrorContains(t, err, "differ only by case")
 }
 
-// The same collision refusal on a table whose unique keys span several
-// folded columns: two apply-target locks whose database spelling differs
-// only by case must fail the fold naming a violated unique index rather
-// than collapse into one target.
-func TestCanonicalizePostgresIdentityKeys_ApplyTargetLockCollision(t *testing.T) {
+// The same collision refusal on a unique key that spans several folded
+// columns: two check rows for one PR whose repository, environment, database
+// type and database spellings differ only by case must fail the fold naming
+// the violated index rather than collapse into one row.
+func TestCanonicalizePostgresIdentityKeys_MultiColumnKeyCollision(t *testing.T) {
 	db := startCanonicalizeStorage(t)
 
 	_, err := db.ExecContext(t.Context(),
-		`INSERT INTO apply_target_locks (database_name, database_type, environment, deployment)
-		 VALUES ('Shared', 'mysql', 'production', ''), ('shared', 'mysql', 'production', '')`)
+		`INSERT INTO checks (repository, pull_request, head_sha, environment, database_type, database_name, status)
+		 VALUES ('Org/Repo', 7, 'abc123', 'Staging', 'MySQL', 'Shared', 'queued'),
+		        ('org/repo', 7, 'abc123', 'staging', 'mysql', 'shared', 'queued')`)
 	require.NoError(t, err)
 
 	err = CanonicalizePostgresIdentityKeys(t.Context(), db, slog.New(slog.DiscardHandler))
 	require.Error(t, err)
-	assert.ErrorContains(t, err, `storage table "apply_target_locks"`)
-	// Both idx_apply_target_locks_target and its _v2 variant are violated;
-	// PostgreSQL names whichever it checks first, so pin the shared prefix.
-	assert.ErrorContains(t, err, `unique index "idx_apply_target_locks_target`)
+	assert.ErrorContains(t, err, `storage table "checks"`)
+	assert.ErrorContains(t, err, `unique index "idx_checks_check_key"`)
 	assert.ErrorContains(t, err, "differ only by case")
 }
 

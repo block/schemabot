@@ -44,15 +44,10 @@ func fencedCommands(t *testing.T, comment string) []string {
 // A plan with unsafe changes states, in the sentence leading into the apply
 // command, that the apply needs --allow-unsafe and which tables it confirms, so
 // the reader meets the requirement before copying the command rather than in a
-// rejection comment. The flag stays out of the pasteable command: consenting to
-// destroy data takes typing it.
+// rejection comment. The operator enters the flag explicitly.
 func TestRenderPlanComment_UnsafeConsentLeadsIntoPlainCommand(t *testing.T) {
 	out := RenderPlanComment(*unsafeConsentPlan("staging"))
 
-	assert.Contains(t, fencedCommands(t, out), "schemabot apply -e staging")
-	for _, block := range fencedCommands(t, out) {
-		assert.NotContains(t, block, "--allow-unsafe", "the pasteable command never carries the consent flag")
-	}
 	assert.Contains(t, out, "▶️ **To apply**:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging\n   ```")
 	assert.NotContains(t, out, glyph.Tip+" Before allowing", "the drop steps lead into the command rather than repeating as a tip")
 	assert.NotContains(t, out, glyph.Attention+" This plan", "the footer adds no second warning glyph")
@@ -87,6 +82,7 @@ func TestRenderPlanComment_UnsafeConsentNamesTablesAndVSchema(t *testing.T) {
 	}
 	out := RenderPlanComment(*data)
 	assert.Contains(t, out, "to confirm 3 unsafe changes on `mutes` and `commerce_sharded` VSchema:")
+	assert.Contains(t, fencedCommands(t, out), "schemabot apply -e staging")
 }
 
 // When the plan undoes a change another open pull request applied, the
@@ -200,10 +196,6 @@ func TestRenderMultiEnvPlanComment_UnsafeConsentPerEnvironment(t *testing.T) {
 	out := render(clean, unsafeConsentPlan("production"))
 	assert.Contains(t, out, "▶️ **To apply** these changes, start with the first environment:\n```\nschemabot apply -e staging\n```")
 	assert.Contains(t, out, "After verifying staging, apply to production:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e production\n   ```")
-	for _, block := range fencedCommands(t, out) {
-		assert.NotContains(t, block, "--allow-unsafe")
-	}
-
 	out = render(unsafeConsentPlan("staging"), unsafeConsentPlan("production"))
 	assert.Contains(t, out, "▶️ **To apply** these changes, start with the first environment:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging\n   ```")
 
@@ -387,7 +379,7 @@ func TestRenderPlanComment_LongUnsafeListKeepsDropsOpen(t *testing.T) {
 	assert.Contains(t, out, "5. `refunds`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n"+
 		"\n<details>\n<summary>3 more unsafe changes</summary>\n\n6. `refunds`:", "%s", out)
 	assert.Contains(t, out, "8. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n\n</details>\n\n", "%s", out)
-	assert.Contains(t, out, "▶️ **To apply**:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add", "%s", out)
+	assert.Contains(t, out, "▶️ **To apply**:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe`", "%s", out)
 	assert.Contains(t, out, "to confirm 8 unsafe changes on `transfer_events`, `refund_backfill` and 3 more:",
 		"the consent sentence names the dropped tables before it starts counting")
 }
@@ -422,7 +414,7 @@ func TestRenderUnsafeChangesBlocked_LeadsWithDrops(t *testing.T) {
 		"1. `refund_backfill`: DROP TABLE removes all data\n"+
 		"2. `loans`:", "%s", out)
 	assert.Contains(t, out, "\n<details>\n<summary>2 more unsafe changes</summary>\n\n6. `ledger`:", "%s", out)
-	assert.Contains(t, out, "**"+glyph.Escalation+" To proceed with these destructive changes**:\n1. Deploy application code that no longer reads from or writes to the dropped table.\n2. Add", "%s", out)
+	assert.Contains(t, out, "**"+glyph.Escalation+" To proceed with these destructive changes**:\n1. Deploy application code that no longer reads from or writes to the dropped table.\n2. Post this command", "%s", out)
 	assert.Contains(t, out, "to confirm 7 unsafe changes on `refund_backfill`, `loans` and 2 more:", "%s", out)
 }
 

@@ -6,7 +6,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -69,6 +71,91 @@ func RunningWord(copiesRows bool) string {
 		return RunningCopying
 	}
 	return RunningApplying
+}
+
+// ChangeCopiesRows reports whether a table change copies the table's rows,
+// given its DDL action ("create", "alter" or "drop") and whether its engine
+// runs it as instant DDL. A CREATE TABLE, a DROP TABLE and an instant ALTER
+// copy none. An action it does not recognize reads as copying, the label a
+// change that may copy has always carried.
+func ChangeCopiesRows(ddlAction string, instant bool) bool {
+	switch ddl.OpToStatementType(ddlAction) {
+	case ddl.StatementCreateTable, ddl.StatementDropTable:
+		return false
+	case ddl.StatementAlterTable:
+		return !instant
+	}
+	return true
+}
+
+// TableChange is what decides whether one table change copies rows: its DDL
+// action ("create", "alter" or "drop") and whether its engine runs it as
+// instant DDL.
+type TableChange struct {
+	DDLAction string
+	Instant   bool
+}
+
+// ChangesCopyNoRows reports whether none of a shard operation's table
+// changes copies rows (ChangeCopiesRows), so the shard reads as applying
+// rather than running a table copy. An operation with no changes recorded yet
+// reads as copying, since nothing says otherwise.
+func ChangesCopyNoRows(changes []TableChange) bool {
+	if len(changes) == 0 {
+		return false
+	}
+	for _, c := range changes {
+		if ChangeCopiesRows(c.DDLAction, c.Instant) {
+			return false
+		}
+	}
+	return true
+}
+
+// TasksCopyNoRows reports whether a shard operation's stored tasks are all
+// table changes that copy no rows (ChangesCopyNoRows). The progress API and
+// the PR comment both read a shard's tasks through it.
+func TasksCopyNoRows(tasks []*storage.Task) bool {
+	return ChangesCopyNoRows(TaskTableChanges(tasks))
+}
+
+// TaskTableChanges is the table change each of a shard operation's stored
+// tasks runs.
+func TaskTableChanges(tasks []*storage.Task) []TableChange {
+	changes := make([]TableChange, 0, len(tasks))
+	for _, t := range tasks {
+		changes = append(changes, TableChange{DDLAction: t.DDLAction, Instant: t.IsInstant})
+	}
+	return changes
+}
+
+// ShardedTableCopiesNoRows reports whether a table rolled up across shards
+// copies no rows, so it reads as applying rather than copying. The CLI and
+// the PR comment both read a sharded table by this rule. shardChanges holds
+// each shard's recorded changes to the table. The shards that have recorded
+// any decide: the table copies no rows when at least one has and none of
+// those changes copies rows. A shard that has recorded nothing yet does not
+// decide. When no shard has recorded a change, the table reads from planned,
+// its change in the stored plan, which carries no instant flag. With no
+// planned change either, it reads as copying, since nothing says otherwise.
+func ShardedTableCopiesNoRows(shardChanges [][]TableChange, planned *TableChange) bool {
+	recorded := false
+	for _, changes := range shardChanges {
+		if len(changes) == 0 {
+			continue
+		}
+		recorded = true
+		if !ChangesCopyNoRows(changes) {
+			return false
+		}
+	}
+	if recorded {
+		return true
+	}
+	if planned == nil {
+		return false
+	}
+	return !ChangeCopiesRows(planned.DDLAction, planned.Instant)
 }
 
 // PendingWord names the parts still to run of a rollout that has or has not
@@ -417,6 +504,11 @@ func partProgress(p Part) string {
 	if p.RowsTotal <= 0 {
 		return pct
 	}
+	if ui.CopyFinishedShortOfEstimate(p.PercentComplete, p.RowsCopied, p.RowsTotal) {
+		// The part's copy is done short of its estimate, so its rows read as
+		// the rows it copied rather than a fraction of the estimate.
+		return fmt.Sprintf("%s · %s %s copied", pct, ui.FormatNumber(p.RowsCopied), ui.Pluralize("row", int(min(p.RowsCopied, 2))))
+	}
 	return fmt.Sprintf("%s · %s / %s rows", pct, ui.FormatNumber(ui.ClampRows(p.RowsCopied, p.RowsTotal)), ui.FormatNumber(p.RowsTotal))
 }
 
@@ -634,7 +726,7 @@ func SumTargetRows(parts []Part) TargetRows {
 			switch {
 			case p.RowsTotal > 0:
 				r.Counted++
-				r.Copied += ui.ClampRows(p.RowsCopied, p.RowsTotal)
+				r.Copied += ui.CopyCoveredRows(p.PercentComplete, p.RowsCopied, p.RowsTotal)
 				r.Total += p.RowsTotal
 			case p.PlannedRows != nil:
 				r.Counted++
@@ -709,6 +801,54 @@ func AcrossTargetsPercent(pct int, exact bool, copied, total int64) string {
 	return ui.FormatRowCopyPercent(pct, copied, total)
 }
 
+// IndexBuildPercentAcrossTargets is how far a concurrent index build is across
+// every target that runs it. A build has no rows to count, and each target
+// reports its own whole-build percent instead, so the table's percent is their
+// mean: a completed target counts in full, a running target by its percent,
+// and every other target as nothing yet. Like PercentAcrossTargets, it stops
+// short of complete until every target has completed. Once any target has
+// made progress it reads at least 1%, the way a row copy that has moved rows
+// does (ui.RowCopyDisplayPercent): across many targets the mean can round
+// down to 0, which would read as a build that has not started.
+func IndexBuildPercentAcrossTargets(parts []Part) int {
+	if len(parts) == 0 {
+		return 0
+	}
+	sum, done := 0, 0
+	for _, p := range parts {
+		switch state.NormalizeTaskStatus(p.Status) {
+		case state.Task.Completed, state.Task.RevertWindow:
+			sum += 100
+			done++
+		case state.Task.Running:
+			sum += ui.ClampPercent(p.PercentComplete)
+		}
+	}
+	percent := sum / len(parts)
+	if percent == 0 && sum > 0 {
+		percent = 1
+	}
+	if done < len(parts) {
+		percent = min(percent, 99)
+	}
+	return percent
+}
+
+// ShardedPhasePercent is the bar of a sharded table that keeps its bar past
+// its row copy (ShardsKeepTableBar). When the table's row total counts the
+// plan's estimate for the shards still to copy (RollUpShardedTable), the bar
+// is the rows copied over that total, the same fraction its rows line and its
+// copy bar show, so it does not jump when a shard moves from copying to
+// verifying. It stops short of complete, since the table is still in flight.
+// Otherwise it is the table's share across its shards
+// (PercentAcrossTargets).
+func ShardedPhasePercent(parts []Part, silent int, rowsCopied, rowsTotal int64, rowsTotalPlanned bool) int {
+	if rowsTotalPlanned && rowsTotal > 0 {
+		return min(int(ui.ClampRows(rowsCopied, rowsTotal)*100/rowsTotal), 99)
+	}
+	return PercentAcrossTargets(parts, silent)
+}
+
 // PercentAcrossTargets is how far a table is across every target that runs it,
 // for the bar that leads its line until every target completes. While every
 // target's rows are known, it is the rows copied over the rows to copy across
@@ -770,7 +910,7 @@ func PercentAcrossTargets(parts []Part, silent int) int {
 				}
 				continue
 			}
-			rows := ui.ClampRows(p.RowsCopied, p.RowsTotal)
+			rows := ui.CopyCoveredRows(p.PercentComplete, p.RowsCopied, p.RowsTotal)
 			share += float64(rows) / float64(p.RowsTotal)
 			copied += rows
 			total += p.RowsTotal

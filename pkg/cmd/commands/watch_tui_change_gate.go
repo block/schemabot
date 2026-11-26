@@ -17,6 +17,11 @@ import (
 // next request, so Enter needs no reason of its own.
 const changeGateRetryHint = "Once a freeze approver other than you approves it, press Enter to try again."
 
+// changeGateOnReasonHint is the hint under the reason override policy. The
+// command above runs at once with no approver, and Enter, which sends no
+// reason, is refused for as long as the freeze holds.
+const changeGateOnReasonHint = "Run that in another terminal: it starts the change at once, and this watch follows it."
+
 // changeGateLines is what the watcher shows when the freeze gate answers a
 // start or cutover it sent, and whether err was such an answer. The watcher's
 // keys carry no override reason, so a refusal names the exact CLI command that
@@ -36,6 +41,9 @@ func (m WatchModel) changeGateLines(operation string, err error) ([]string, bool
 			Message:         apiErr.Message,
 			OverrideCommand: templates.ControlCommand(operation, m.applyID, m.environment),
 		})
+		if apiErr.OverrideOnReason {
+			return append(lines, changeGateOnReasonHint), true
+		}
 		return append(lines, changeGateRetryHint), true
 	case apiErr.ErrorCode == apitypes.ErrCodeChangeGateUnavailable:
 		return []string{"✗ SchemaBot could not check the freezes, so nothing started. Press Enter to try again in a moment."}, true

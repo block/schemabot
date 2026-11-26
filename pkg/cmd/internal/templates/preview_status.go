@@ -233,4 +233,13 @@ func previewStatusHistoryOutput() {
 		Database: "new-db",
 		Applies:  nil,
 	})
+
+	fmt.Println()
+	fmt.Println("Empty database, filtered to one environment:")
+	fmt.Println()
+	WriteDatabaseHistory(DatabaseHistoryData{
+		Database:    "new-db",
+		Environment: "staging",
+		Applies:     nil,
+	})
 }

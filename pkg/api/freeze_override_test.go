@@ -58,6 +58,20 @@ func (m *memoryFreezeOverrideStore) Create(_ context.Context, request *storage.F
 	return &copied, nil
 }
 
+func (m *memoryFreezeOverrideStore) CreateOnReason(ctx context.Context, request *storage.FreezeOverrideRequest) (*storage.FreezeOverrideRequest, error) {
+	created, err := m.Create(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	stored := m.requests[len(m.requests)-1]
+	approvedAt := stored.CreatedAt
+	stored.ApprovedBy, stored.ApprovedAt = stored.RequestedBy, &approvedAt
+	created.ApprovedBy, created.ApprovedAt = stored.ApprovedBy, &approvedAt
+	return created, nil
+}
+
 func (m *memoryFreezeOverrideStore) Get(_ context.Context, identifier string) (*storage.FreezeOverrideRequest, error) {
 	if m.getErr != nil {
 		return nil, m.getErr
@@ -133,8 +147,11 @@ var (
 	overrideApprover  = "ida"
 )
 
-// withOverrides gives svc an override store sharing its freeze store's clock.
+// withOverrides gives svc an override store sharing its freeze store's clock,
+// under the approval override policy, which most override tests exercise. A
+// test of the reason policy sets it after this.
 func withOverrides(svc *Service) *memoryFreezeOverrideStore {
+	svc.config.Freeze.OverridePolicy = FreezeOverridePolicyApproval
 	mock := svc.storage.(*mockStorageWithApplyStores)
 	store := &memoryFreezeOverrideStore{clock: mock.freezes.(*memoryFreezeStore).clock}
 	mock.overrides = store
@@ -341,6 +358,80 @@ func TestFreezeOverrideLetsAStartAndACutoverThrough(t *testing.T) {
 				"Freeze override "+request.ID+" admitted this change: requested by rita, approved by ida, covering freeze freeze-incident"))
 		})
 	}
+}
+
+// Under the reason policy a start or cutover goes ahead on its own reason, with
+// no approver. Without a reason it is refused and the refusal says a reason
+// would let it through. The admitted command records its override, and a
+// start's override is the one the claim checkpoint honors.
+func TestFreezeOverrideOnReasonLetsAStartAndACutoverThrough(t *testing.T) {
+	for _, tc := range overrideControlCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			client, apply, tasks := tc.build()
+			svc := newControlTestServiceWithTasks(client, apply, tasks)
+			mock := svc.storage.(*mockStorageWithApplyStores)
+			mock.freezes = newGateFreezeStore(t, gateTestFreeze("freeze-incident"))
+			logs := &capturingApplyLogStore{}
+			mock.applyLogs = logs
+			store := withOverrides(svc)
+			svc.config.Freeze.OverridePolicy = "" // the default
+			mux := serveRoutes(svc)
+			noReason := strings.Replace(overrideControl, `,"override":"fix for incident 42"`, "", 1)
+
+			rec := postAs(t, mux, overrideRequester, tc.path, noReason)
+			require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+			refusal := decodeGateError(t, rec)
+			assert.True(t, refusal.OverrideOnReason, "the refusal says a reason would let it through")
+			assert.Nil(t, refusal.OverrideRequest)
+			assert.Zero(t, store.count())
+
+			rec = postAs(t, mux, overrideRequester, tc.path, overrideControl)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			require.Equal(t, 1, store.count())
+			stored := store.requests[0]
+			assert.True(t, stored.OnReason())
+			assert.Equal(t, strings.TrimPrefix(tc.path, "/api/"), stored.Action)
+			assert.Equal(t, "apply-stopped", stored.TargetID)
+			pending, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, tc.operation)
+			require.NoError(t, err)
+			require.NotNil(t, pending)
+			assert.True(t, hasApplyLogMessageContaining(logs.logs,
+				"Freeze override "+stored.Identifier+" admitted this change on the requester's reason: requested by rita"))
+			if tc.operation == storage.ControlOperationStart {
+				honored, err := svc.approvedOverridesForApply(t.Context(), apply)
+				require.NoError(t, err)
+				require.Len(t, honored, 1, "the claim checkpoint honors the start's override")
+				assert.Equal(t, stored.Identifier, honored[0].Identifier)
+			}
+
+		})
+	}
+}
+
+// An apply admitted on a reason does not carry that reason to its cutover:
+// the override is keyed by action and target, so a cutover with no reason is
+// refused although the apply's own override names the same freeze.
+func TestFreezeOverrideOnReasonOfAnApplyDoesNotAdmitItsCutover(t *testing.T) {
+	apply := activeTestApply("apply-stopped")
+	apply.State = state.Apply.WaitingForCutover
+	svc := newControlTestServiceWithTasks(&mockTernClient{}, apply, nil)
+	mock := svc.storage.(*mockStorageWithApplyStores)
+	mock.freezes = newGateFreezeStore(t, gateTestFreeze("freeze-incident"))
+	store := withOverrides(svc)
+	svc.config.Freeze.OverridePolicy = FreezeOverridePolicyReason
+	own, err := store.CreateOnReason(t.Context(), &storage.FreezeOverrideRequest{
+		Identifier: "ovr-apply", Environment: "staging", Action: storage.FreezeOverrideActionApply, TargetID: "testdb/@schema",
+		Database: "testdb", Blockers: []string{"freeze freeze-incident"}, Reason: "fix for incident 42", RequestedBy: "rita",
+		ExpiresAt: freezeTestNow.Add(time.Hour),
+	})
+	require.NoError(t, err)
+	apply.SetOptions(storage.ApplyOptions{FreezeOverride: own.Identifier})
+
+	rec := postAs(t, serveRoutes(svc), overrideRequester, "/api/cutover",
+		strings.Replace(overrideControl, `,"override":"fix for incident 42"`, "", 1))
+
+	require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+	assert.Equal(t, 1, store.count(), "nothing new is recorded without a reason")
 }
 
 // A gate that cannot read the approved requests, or record a new one, fails
@@ -622,5 +713,135 @@ func TestFreezeOverrideNeedsAVerifiedRequester(t *testing.T) {
 	assert.Nil(t, refused.OverrideRequest)
 	assert.Contains(t, refused.Error(), "asking for one needs a verified caller")
 	assert.Zero(t, store.count())
+	assert.Nil(t, applies.apply)
+}
+
+// Under the reason override policy, the default, an operator's own reason
+// admits the change at once, like an audited deploy override. The request is stored approved by
+// its requester, with the reason, the apply records it, and the override is
+// counted. Without a reason the change is still refused, and the reason does
+// not carry over: a retry gives its own, like a deploy override.
+func TestFreezeOverrideOnReasonLetsAnApplyThrough(t *testing.T) {
+	reader := newFreezeMetricsReader(t)
+	svc, applies := newGateApplyTestService(t, gateTestFreeze("freeze-incident"))
+	store := withOverrides(svc)
+	svc.config.Freeze.OverridePolicy = "" // the default
+	logs := &capturingApplyLogStore{}
+	svc.storage.(*mockStorageWithApplyStores).applyLogs = logs
+	mux := serveRoutes(svc)
+
+	rec := postAs(t, mux, overrideRequester, "/api/apply", `{"plan_id":"plan-1","environment":"staging"}`)
+	require.Equal(t, http.StatusConflict, rec.Code, "a freeze still refuses a change with no reason")
+	assert.Nil(t, decodeGateError(t, rec).OverrideRequest)
+	assert.Zero(t, store.count())
+
+	rec = postAs(t, mux, overrideRequester, "/api/apply", overrideApplyBody)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.NotNil(t, applies.apply)
+	require.Equal(t, 1, store.count())
+	id := applies.apply.GetOptions().FreezeOverride
+	stored, err := store.Get(t.Context(), id)
+	require.NoError(t, err)
+	assert.True(t, stored.OnReason())
+	assert.Equal(t, "rita", stored.RequestedBy)
+	assert.Equal(t, "rita", stored.ApprovedBy)
+	assert.Equal(t, "fix for incident 42", stored.Reason)
+	assert.Equal(t, []string{"freeze freeze-incident"}, stored.Blockers)
+	assert.Equal(t, freezeTestNow.Add(storage.FreezeOverrideMaxLifetime), stored.ExpiresAt)
+	assert.True(t, hasApplyLogMessageContaining(logs.logs,
+		"Freeze override "+id+` admitted this change on the requester's reason: requested by rita, covering freeze freeze-incident, reason "fix for incident 42"`),
+		"the apply log records the reason that admitted it")
+
+	applies.apply = nil
+	rec = postAs(t, mux, overrideRequester, "/api/apply", `{"plan_id":"plan-1","environment":"staging"}`)
+	require.Equal(t, http.StatusConflict, rec.Code, "a reason covers only the command that gave it, not a retry")
+	assert.Nil(t, applies.apply)
+
+	rec = postAs(t, mux, overrideRequester, "/api/apply", overrideApplyBody)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Equal(t, 2, store.count(), "a retry with its own reason records its own override")
+	assert.NotEqual(t, id, applies.apply.GetOptions().FreezeOverride)
+
+	other := &auth.User{Subject: "sam", Groups: []string{"schema-admins"}}
+	rec = postAs(t, mux, other, "/api/apply", `{"plan_id":"plan-1","environment":"staging"}`)
+	require.Equal(t, http.StatusConflict, rec.Code, "another person's override never admits sam")
+
+	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 3}, changeGateCounters(t, reader, "schemabot.change_gate.refusals"))
+	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 2}, changeGateCounters(t, reader, "schemabot.change_gate.overrides"))
+}
+
+// Under the reason policy an unverified caller has no one to record the
+// reason against, so the change is refused and nothing is stored.
+func TestFreezeOverrideOnReasonNeedsAVerifiedRequester(t *testing.T) {
+	svc, applies := newGateApplyTestService(t, gateTestFreeze("freeze-incident"))
+	store := withOverrides(svc)
+	svc.config.Freeze.OverridePolicy = FreezeOverridePolicyReason
+
+	_, _, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging", Override: "fix"})
+
+	refused, ok := errors.AsType[*ChangeGateRefusedError](err)
+	require.True(t, ok, "got %v", err)
+	assert.Nil(t, refused.OverrideRequest)
+	assert.True(t, refused.OverrideUnrecorded)
+	assert.Zero(t, store.count())
+	assert.Nil(t, applies.apply)
+}
+
+// A storage failure while recording the override fails closed.
+func TestFreezeOverrideOnReasonFailsClosedOnStorageErrors(t *testing.T) {
+	svc, applies := newGateApplyTestService(t, gateTestFreeze("freeze-incident"))
+	store := withOverrides(svc)
+	svc.config.Freeze.OverridePolicy = FreezeOverridePolicyReason
+	store.createErr = errors.New("connection refused")
+
+	_, _, err := svc.ExecuteApply(auth.WithVerifiedUser(t.Context(), overrideRequester), ApplyRequest{PlanID: "plan-1", Environment: "staging", Override: "fix"})
+
+	unavailable, ok := errors.AsType[*ChangeGateUnavailableError](err)
+	require.True(t, ok, "got %v", err)
+	assert.Equal(t, "override", unavailable.Gate)
+	assert.Nil(t, applies.apply)
+}
+
+func TestFreezeOverridePolicyIsValidated(t *testing.T) {
+	for _, policy := range []string{"", FreezeOverridePolicyApproval, FreezeOverridePolicyReason} {
+		config := testServerConfig()
+		config.Freeze.OverridePolicy = policy
+		require.NoError(t, config.Validate(), policy)
+	}
+	config := testServerConfig()
+	config.Freeze.OverridePolicy = "self"
+	require.ErrorContains(t, config.Validate(), "freeze.override_policy")
+	assert.True(t, FreezeConfig{}.OverrideOnReason(), "the default admits on a reason")
+	assert.False(t, FreezeConfig{OverridePolicy: FreezeOverridePolicyApproval}.OverrideOnReason())
+	assert.True(t, FreezeConfig{OverridePolicy: FreezeOverridePolicyReason}.OverrideOnReason())
+	for _, unknown := range []string{"self", "Approval", "Reason", "approvel"} {
+		assert.False(t, FreezeConfig{OverridePolicy: unknown}.OverrideOnReason(),
+			"an unvalidated value %q falls back to approval", unknown)
+	}
+}
+
+// A server switched from reason back to approval honors only overrides a
+// second person approved. An override admitted on its reason before the
+// switch admits no new command, and asking again records a request for an
+// approver.
+func TestFreezeOverrideOnReasonDoesNotOutliveTheApprovalPolicy(t *testing.T) {
+	svc, applies := newGateApplyTestService(t, gateTestFreeze("freeze-incident"))
+	store := withOverrides(svc)
+	svc.config.Freeze.OverridePolicy = FreezeOverridePolicyReason
+	mux := serveRoutes(svc)
+	require.Equal(t, http.StatusOK, postAs(t, mux, overrideRequester, "/api/apply", overrideApplyBody).Code)
+	require.Equal(t, 1, store.count())
+	applies.apply = nil
+
+	svc.config.Freeze.OverridePolicy = FreezeOverridePolicyApproval
+
+	rec := postAs(t, mux, overrideRequester, "/api/apply", `{"plan_id":"plan-1","environment":"staging"}`)
+	require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+	rec = postAs(t, mux, overrideRequester, "/api/apply", overrideApplyBody)
+	require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+	requested := decodeGateError(t, rec).OverrideRequest
+	require.NotNil(t, requested, "asking again records a request for an approver")
+	assert.Equal(t, 2, store.count())
 	assert.Nil(t, applies.apply)
 }

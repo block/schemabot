@@ -36,8 +36,10 @@ type rolloutTarget struct {
 	// estimatedBytes is the plan's size estimate for the target's table.
 	estimatedBytes *int64
 	eta            int64
-	err            string
-	externalID     string
+	// throttled marks a target the engine's throttler is holding back.
+	throttled  bool
+	err        string
+	externalID string
 	// externalOperationID is the target's own data-plane operation.
 	externalOperationID string
 	isInstant           bool
@@ -91,6 +93,7 @@ func targetRolloutData(targets []rolloutTarget) ProgressData {
 			ChangeType: "alter", DDL: ddl, Status: target.status,
 			RowsCopied: target.rowsCopied, RowsTotal: target.rowsTotal, ETASeconds: target.eta, PercentComplete: percent,
 			IsInstant: target.isInstant, EstimatedRows: target.estimatedRows, EstimatedBytes: target.estimatedBytes,
+			Throttled:           target.throttled,
 			ChecksumRowsChecked: target.checksumChecked, ChecksumRowsTotal: target.checksumTotal,
 		})
 	}

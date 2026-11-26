@@ -156,10 +156,15 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 	}
 	var ddls []string
 	copies := make([]presentation.ShardCopy, 0, len(tableOps))
+	shardChanges := make([][]presentation.TableChange, 0, len(tableOps))
+	var reportedRows []*apitypes.TableProgressResponse
+	var standIn *apitypes.TableProgressResponse
 	for _, op := range tableOps {
 		_, shard, _, _ := state.ShardWorkKey(op.OperationKey)
 		sc := presentation.ShardOperationCopy(op.State, taskCopies(tasksByOp[op.ID]))
 		copies = append(copies, sc)
+		copies[len(copies)-1].PlannedRows = plan.ShardCopyEstimatedRows(namespace, shard, table)
+		copies[len(copies)-1].CopiesNoRows = presentation.TasksCopyNoRows(tasksByOp[op.ID])
 		row.Shards = append(row.Shards, &apitypes.ShardProgressResponse{
 			Shard:           shard,
 			Status:          sc.Status,
@@ -170,33 +175,45 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 
 			ChecksumRowsChecked: sc.ChecksumRowsChecked,
 			ChecksumRowsTotal:   sc.ChecksumRowsTotal,
+			CopiesNoRows:        presentation.TasksCopyNoRows(tasksByOp[op.ID]),
 		})
+		shardChanges = append(shardChanges, presentation.TaskTableChanges(tasksByOp[op.ID]))
 		shardRows := rowsByOp[op.ID]
+		reportedRows = append(reportedRows, shardRows...)
 		if len(shardRows) == 0 {
 			if planned := plannedShardChange(plan, namespace, shard, table); planned != nil {
 				shardRows = []*apitypes.TableProgressResponse{{ChangeType: planned.Operation, DDL: planned.DDL}}
+				if standIn == nil {
+					standIn = shardRows[0]
+				}
 			}
 		}
 		for _, r := range shardRows {
-			if row.ChangeType == "" {
-				row.ChangeType = r.ChangeType
-			}
 			if r.DDL != "" && !slices.Contains(ddls, r.DDL) {
 				ddls = append(ddls, r.DDL)
-			}
-			if r.Throttled && !row.Throttled {
-				row.Throttled = true
-				row.ThrottleReason = r.ThrottleReason
 			}
 		}
 	}
 	row.DDL = strings.Join(ddls, "\n")
+	var planned *presentation.TableChange
+	if pt := plannedTable(plan, namespace, table); pt != nil {
+		planned = &presentation.TableChange{DDLAction: pt.Operation}
+	}
+	row.ChangeType, row.IsInstant = shardedTableChange(reportedRows, standIn,
+		presentation.ShardedTableCopiesNoRows(shardChanges, planned))
 
-	rollup := presentation.RollUpShardedTable(copies)
+	plannedShards := 0
+	if planned := plannedTable(plan, namespace, table); planned != nil {
+		plannedShards = planned.ShardCount
+	}
+	rollup := presentation.RollUpShardedTable(copies, plannedShards)
 	row.Status = rollup.Status
 	row.RowsCopied = rollup.RowsCopied
 	row.RowsTotal = rollup.RowsTotal
+	row.RowsTotalPlanned = rollup.RowsTotalPlanned
 	row.ETASeconds = rollup.ETASeconds
+	row.Throttled = rollup.Throttled
+	row.ThrottleReason = rollup.ThrottleReason
 	if rollup.RowsTotal > 0 {
 		row.PercentComplete = int32(min(100, rollup.RowsCopied*100/rollup.RowsTotal))
 	}
@@ -249,6 +266,8 @@ func taskCopies(tasks []*storage.Task) []presentation.ShardCopy {
 			RowsCopied:      t.RowsCopied,
 			RowsTotal:       t.RowsTotal,
 			ETASeconds:      int64(t.ETASeconds),
+			Throttled:       t.Throttled,
+			ThrottleReason:  t.ThrottleReason,
 
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
@@ -321,4 +340,26 @@ func (s *Service) storedPlanForShardedProgress(ctx context.Context, apply *stora
 		return nil
 	}
 	return plan
+}
+
+// shardedTableChange is the change a rolled-up table row names. The CLI reads
+// the table's running word from it (presentation.ChangeCopiesRows), so it is
+// a change that reads as copying exactly when the table does by
+// presentation.ShardedTableCopiesNoRows, the rule the PR comment reads it by:
+// the first reported change that agrees with copiesNoRows. A stand-in from the
+// plan is used only when no shard has reported, and its instant flag is
+// unknown, so it never decides that a reported table copies no rows.
+func shardedTableChange(reported []*apitypes.TableProgressResponse, standIn *apitypes.TableProgressResponse, copiesNoRows bool) (changeType string, isInstant bool) {
+	for _, r := range reported {
+		if presentation.ChangeCopiesRows(r.ChangeType, r.IsInstant) != copiesNoRows {
+			return r.ChangeType, r.IsInstant
+		}
+	}
+	if len(reported) > 0 {
+		return reported[0].ChangeType, reported[0].IsInstant
+	}
+	if standIn != nil {
+		return standIn.ChangeType, false
+	}
+	return "", false
 }

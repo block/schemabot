@@ -20,6 +20,9 @@ import (
 	"unicode/utf8"
 
 	gomysql "github.com/block/mysql"
+	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/changeevents"
+	"github.com/block/schemabot/pkg/changeevents/sqspublisher"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
@@ -44,6 +47,10 @@ var configIdentifierPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 // ServerConfig holds the server-side SchemaBot configuration.
 // This is loaded from a YAML file specified by SCHEMABOT_CONFIG_FILE.
 type ServerConfig struct {
+	// ChangeEvents asynchronously reports selected operation and apply lifecycle events.
+	ChangeEvents    []changeevents.Destination `yaml:"change_events,omitempty"`
+	SQSChangeEvents []sqspublisher.Destination `yaml:"sqs_change_events,omitempty"`
+
 	liveDatabases *liveDatabaseRegistry
 
 	// ExperimentalStrataEnabled permits experimental Strata registrations and
@@ -863,15 +870,31 @@ func (g *GitHubConfig) ResolveRepoWebhookSecret() (string, error) {
 }
 
 // ResolvePreviousWebhookSecret resolves the webhook secret being rotated out.
-// Empty when no rotation is in progress.
+// Empty only when no rotation is configured; a configured reference that
+// resolves to nothing, such as an unset environment variable, is an error, so
+// a rotation deploy never starts without the old secret it promised to accept.
 func (g *GitHubConfig) ResolvePreviousWebhookSecret() (string, error) {
-	return secrets.Resolve(g.PreviousWebhookSecret, "")
+	return resolveConfiguredPreviousSecret("previous-webhook-secret", g.PreviousWebhookSecret)
 }
 
 // ResolvePreviousRepoWebhookSecret resolves the repo-webhook secret being
-// rotated out. Empty when no rotation is in progress.
+// rotated out, with the same rule as ResolvePreviousWebhookSecret.
 func (g *GitHubConfig) ResolvePreviousRepoWebhookSecret() (string, error) {
-	return secrets.Resolve(g.PreviousRepoWebhookSecret, "")
+	return resolveConfiguredPreviousSecret("previous-repo-webhook-secret", g.PreviousRepoWebhookSecret)
+}
+
+func resolveConfiguredPreviousSecret(key, ref string) (string, error) {
+	if ref == "" {
+		return "", nil
+	}
+	secret, err := secrets.Resolve(ref, "")
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", key, err)
+	}
+	if secret == "" {
+		return "", fmt.Errorf("%s is set but resolved to an empty value; set it to the secret being rotated out, or remove it", key)
+	}
+	return secret, nil
 }
 
 // validatePreviousWebhookSecrets refuses a previous secret configured without
@@ -2860,6 +2883,13 @@ type ForwardAuthSettings struct {
 	// through a trusted gateway. Service callers never get the write tier.
 	ReadServiceSPIFFE []string `yaml:"read_service_spiffe,omitempty"`
 
+	// TrustedMeshLoopbackSources lists loopback addresses a service-mesh
+	// sidecar delivers requests from, such as Istio's 127.0.0.6. A
+	// request from one that passed the SPIFFE check has its identity verified;
+	// any other loopback source, such as a kubectl port-forward, stays
+	// break-glass. Requires TrustedProxySPIFFE, and refuses 127.0.0.1 and ::1.
+	TrustedMeshLoopbackSources []string `yaml:"trusted_mesh_loopback_sources,omitempty"`
+
 	// OperatorEnvironments lists the environments in which per-database
 	// operator grants (databases.*.operator_groups) may mutate. The policy is
 	// instance-wide: which environments accept scoped direct writes is a
@@ -2971,7 +3001,19 @@ func (f *ForwardAuthSettings) validate() error {
 	if len(trimmedGateways) > 0 && len(trimmedSPIFFE) == 0 {
 		return fmt.Errorf("forward_auth trusted_gateway_spiffe requires SPIFFE-anchored proxy trust (trusted_proxy_spiffe): with CIDR-only trust the service-caller lane is unreachable")
 	}
-	return nil
+	meshSources, err := auth.ParseTrustedMeshLoopbackSources(f.TrustedMeshLoopbackSources)
+	if err != nil {
+		return err
+	}
+	if len(meshSources) > 0 && len(trimmedSPIFFE) == 0 {
+		return auth.ErrMeshSourcesNeedSPIFFE
+	}
+	nets := make([]*net.IPNet, 0, len(trimmedCIDRs))
+	for _, c := range trimmedCIDRs {
+		_, network, _ := net.ParseCIDR(c) // validated above
+		nets = append(nets, network)
+	}
+	return auth.CheckMeshSourcesInTrustedNetworks(meshSources, nets)
 }
 
 // Comment renderers reserve a fixed amount of headroom under GitHub's comment
@@ -3142,7 +3184,7 @@ func (c *ServerConfig) validateNoLocalRemoteRouteCollision() error {
 //   - If apps: is NOT set, repos must not declare github_app (it would be a
 //     silently ignored field, which we want to fail closed on).
 func (c *ServerConfig) validateGitHubAppsConfig() error {
-	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != "" || c.GitHub.PreviousWebhookSecret != "" || c.GitHub.CheckName != "" || len(c.GitHub.TrustedCheckAppSlugs) > 0 || c.GitHub.PromotionCheckName != "" || c.GitHub.QuotaReserve != 0
+	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != "" || c.GitHub.PreviousWebhookSecret != "" || c.GitHub.PreviousRepoWebhookSecret != "" || c.GitHub.CheckName != "" || len(c.GitHub.TrustedCheckAppSlugs) > 0 || c.GitHub.PromotionCheckName != "" || c.GitHub.QuotaReserve != 0
 	hasApps := c.Apps != nil
 
 	if hasGitHub && hasApps {
@@ -3159,12 +3201,9 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 		if err := c.GitHub.validateQuotaReserve("github"); err != nil {
 			return err
 		}
-	}
-	// Checked outside hasGitHub: a lone previous-repo-webhook-secret does not
-	// count as configuring github:, and it must still be refused rather than
-	// ignored.
-	if err := c.GitHub.validatePreviousWebhookSecrets("github"); err != nil {
-		return err
+		if err := c.GitHub.validatePreviousWebhookSecrets("github"); err != nil {
+			return err
+		}
 	}
 
 	if hasApps {
@@ -3183,6 +3222,9 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 			}
 			if app.WebhookSecret == "" {
 				return fmt.Errorf("app %q missing webhook-secret", name)
+			}
+			if app.PreviousRepoWebhookSecret != "" {
+				return fmt.Errorf("app %q sets previous-repo-webhook-secret, but repository webhooks are not served when apps: is configured; remove it", name)
 			}
 			if err := validateUniqueNames(fmt.Sprintf("app %q trusted-check-app-slugs", name), app.TrustedCheckAppSlugs); err != nil {
 				return err
@@ -3354,6 +3396,14 @@ func (c *ServerConfig) Database(name string) *DatabaseConfig {
 		return &db
 	}
 	return nil
+}
+
+// DatabaseApp returns the registered application for a logical database.
+func (c *ServerConfig) DatabaseApp(database string) string {
+	if db, ok := c.DatabaseConfigs()[database]; ok {
+		return db.App
+	}
+	return ""
 }
 
 // DatabaseEnvironment returns the environment configuration for a database.

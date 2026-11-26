@@ -70,6 +70,8 @@ func TestPartDetail(t *testing.T) {
 		{Part{Status: task.Checksumming, ChecksumRowsChecked: 450, ChecksumRowsTotal: 1000}, "checksumming 45.00% · 450 / 1,000 rows verified"},
 		{Part{Status: task.Failed}, "failed"},
 		{Part{Status: task.Cancelled, RowsCopied: 800000, RowsTotal: 2100000}, "cancelled at 38.10% · 800,000 / 2,100,000 rows"},
+		{Part{Status: task.Running, PercentComplete: 100, RowsCopied: 1, RowsTotal: 200_000}, "100.00% · 1 row copied"},
+		{Part{Status: task.Running, PercentComplete: 100, RowsCopied: 3, RowsTotal: 200_000}, "100.00% · 3 rows copied"},
 		{Part{Status: task.Stopped}, "stopped"},
 	}
 	for _, tt := range tests {
@@ -258,6 +260,12 @@ func TestPercentAcrossTargets(t *testing.T) {
 		{Status: task.Running, RowsCopied: 900, RowsTotal: 1000},
 		{Status: task.Checksumming, RowsCopied: 100, RowsTotal: 1000},
 	}, 0))
+	// A target whose copy finished short of its estimate and is now verifying
+	// counts in full: 1,000 + 500 of 2,000.
+	assert.Equal(t, 75, PercentAcrossTargets([]Part{
+		{Status: task.Checksumming, PercentComplete: 100, RowsCopied: 1, RowsTotal: 1000},
+		{Status: task.Running, RowsCopied: 500, RowsTotal: 1000},
+	}, 0))
 	// A failed target has not landed the change, so the table reads its share
 	// across all three rather than the rows of the two still in play.
 	assert.Equal(t, 50, PercentAcrossTargets([]Part{
@@ -364,6 +372,11 @@ func TestSumTargetRows(t *testing.T) {
 	rows = SumTargetRows([]Part{copying, {Status: task.Failed, RowsCopied: 300, RowsTotal: 1000}})
 	assert.Equal(t, TargetRows{Copied: 420, Total: 1000, Counted: 1, ETASeconds: 120}, rows)
 
+	// A target whose copy finished short of its estimate counts its whole
+	// total, so it does not pull the rows across targets down.
+	rows = SumTargetRows([]Part{copying, {Status: task.Running, PercentComplete: 100, RowsCopied: 1, RowsTotal: 1000}})
+	assert.Equal(t, TargetRows{Copied: 1420, Total: 2000, Counted: 2, ETASeconds: 120}, rows)
+
 	// A target past its copy with no rows had none to copy.
 	rows = SumTargetRows([]Part{copying, {Status: task.WaitingForCutover}})
 	assert.Equal(t, TargetRows{Copied: 420, Total: 1000, Counted: 2, ETASeconds: 120}, rows)
@@ -395,4 +408,76 @@ func TestAcrossTargetsPercent(t *testing.T) {
 	assert.Equal(t, "85%", AcrossTargetsPercent(85, false, 3420, 4000))
 	assert.Equal(t, "99.99%", AcrossTargetsPercent(99, true, 4000, 4000))
 	assert.Equal(t, "0%", AcrossTargetsPercent(0, true, 0, 0))
+}
+
+// A CREATE TABLE, a DROP TABLE and an instant ALTER copy no rows; any other
+// ALTER does, and an action the rule does not recognize reads as copying.
+func TestChangeCopiesRows(t *testing.T) {
+	assert.False(t, ChangeCopiesRows("create", false))
+	assert.False(t, ChangeCopiesRows("drop", false))
+	assert.False(t, ChangeCopiesRows("alter", true))
+	assert.True(t, ChangeCopiesRows("alter", false))
+	assert.True(t, ChangeCopiesRows("", false))
+	assert.True(t, ChangeCopiesRows("", true))
+}
+
+// A table rolled up across shards reads as applying only when the shards that
+// have recorded their changes all copy no rows. A shard with nothing recorded
+// yet does not decide, and the plan's change decides only when no shard has
+// recorded one.
+func TestShardedTableCopiesNoRows(t *testing.T) {
+	instant := []TableChange{{DDLAction: "alter", Instant: true}}
+	copying := []TableChange{{DDLAction: "alter"}}
+	plannedAlter := &TableChange{DDLAction: "alter"}
+	plannedCreate := &TableChange{DDLAction: "create"}
+
+	assert.True(t, ShardedTableCopiesNoRows([][]TableChange{nil, instant}, plannedAlter),
+		"a shard with nothing recorded does not outvote one running an instant ALTER")
+	assert.False(t, ShardedTableCopiesNoRows([][]TableChange{instant, copying}, nil),
+		"one shard copying rows makes the table a table copy")
+	assert.True(t, ShardedTableCopiesNoRows([][]TableChange{nil, nil}, plannedCreate),
+		"with nothing recorded, a planned CREATE TABLE copies no rows")
+	assert.False(t, ShardedTableCopiesNoRows([][]TableChange{nil, nil}, plannedAlter),
+		"a planned ALTER carries no instant flag, so it reads as a table copy")
+	assert.False(t, ShardedTableCopiesNoRows([][]TableChange{nil}, nil),
+		"with nothing recorded or planned, the table reads as copying")
+}
+
+// An index build across targets reads as the mean of each target's whole-build
+// percent. A completed target counts in full, a target that is queued or
+// halted counts as nothing, and the table never reads complete until every
+// target has completed.
+func TestIndexBuildPercentAcrossTargets(t *testing.T) {
+	running := func(pct int) Part { return Part{Status: state.Task.Running, PercentComplete: pct} }
+	tests := []struct {
+		name  string
+		parts []Part
+		want  int
+	}{
+		{name: "no targets", want: 0},
+		{name: "two builds at a quarter", parts: []Part{running(25), running(25)}, want: 25},
+		{name: "one done, one halfway", parts: []Part{{Status: state.Task.Completed}, running(50)}, want: 75},
+		{name: "a queued target counts as nothing", parts: []Part{running(60), {Status: state.Task.Pending}}, want: 30},
+		{name: "a failed target counts as nothing", parts: []Part{running(80), {Status: state.Task.Failed, PercentComplete: 90}}, want: 40},
+		{name: "a percent past complete is clamped", parts: []Part{running(140)}, want: 99},
+		{name: "every target done", parts: []Part{{Status: state.Task.Completed}, {Status: state.Task.RevertWindow}}, want: 100},
+		{name: "progress on a few of many targets reads as begun", parts: manyTargets(300, Part{Status: state.Task.Completed}, Part{Status: state.Task.Completed}, running(10)), want: 1},
+		{name: "many targets, none started", parts: manyTargets(300), want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, IndexBuildPercentAcrossTargets(tt.parts))
+		})
+	}
+}
+
+// manyTargets is a rollout of n targets: the given ones first, then queued
+// targets for the rest.
+func manyTargets(n int, first ...Part) []Part {
+	parts := make([]Part, n)
+	for i := range parts {
+		parts[i] = Part{Status: state.Task.Pending}
+	}
+	copy(parts, first)
+	return parts
 }

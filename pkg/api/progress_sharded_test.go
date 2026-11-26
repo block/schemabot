@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -115,6 +116,175 @@ func TestProgressByApplyIDRollsAShardedApplyUpByTable(t *testing.T) {
 	changes, err := apitypes.ParseVSchemaChanges(resp.Metadata)
 	require.NoError(t, err)
 	assert.Equal(t, []apitypes.VSchemaChange{{Namespace: "shop_001", Status: "", Diff: "+ orders"}}, changes)
+}
+
+// A table copying on one shard while the next waits its turn counts the
+// plan's estimate for the waiting shard in its total, so its percent is of
+// the whole table and the total reads as approximate. The estimate is each
+// shard's own, never the keyspace's figure for every shard.
+func TestProgressByApplyIDCountsThePlannedRowsOfShardsStillToCopy(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		shardOp(1, "shop_001/-80/orders", state.ApplyOperation.Running),
+		shardOp(2, "shop_001/80-/orders", state.ApplyOperation.Pending),
+	}
+	shardChange := func(rows int64) []storage.TableChange {
+		return []storage.TableChange{{Table: "orders", Operation: "alter", DDL: shardedTestDDL, EstimatedRows: new(rows)}}
+	}
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {
+		Tables: []storage.TableChange{{Table: "orders", Operation: "alter", EstimatedRows: new(int64(2_000)), ShardCount: 2}},
+		Shards: []storage.ShardPlan{
+			{Shard: "-80", Namespace: "shop_001", Changes: shardChange(1_000)},
+			{Shard: "80-", Namespace: "shop_001", Changes: shardChange(1_200)},
+		},
+	}}}
+
+	resp := shardedProgress(t, ops, []*storage.Task{shardTask(1, state.Task.Running, 620, 1000)}, &staticPlanStore{plan: plan})
+
+	require.Len(t, resp.Tables, 1)
+	table := resp.Tables[0]
+	assert.Equal(t, int64(620), table.RowsCopied)
+	assert.Equal(t, int64(2_200), table.RowsTotal, "the reported shard's total plus the waiting shard's estimate")
+	assert.True(t, table.RowsTotalPlanned)
+	assert.Equal(t, int32(28), table.PercentComplete)
+}
+
+// The plan's shard count decides whether its estimates can stand in for the
+// shards still to copy. A plan that recorded no shard count, or one that
+// spans more shards than have operations attached so far, leaves the total
+// at what the reporting shard says, never marked planned.
+func TestProgressByApplyIDCountsNoPlannedRowsUnlessEveryPlannedShardIsListed(t *testing.T) {
+	shardChange := func(rows int64) []storage.TableChange {
+		return []storage.TableChange{{Table: "orders", Operation: "alter", DDL: shardedTestDDL, EstimatedRows: new(rows)}}
+	}
+	for _, tc := range []struct {
+		name       string
+		shardCount int
+	}{
+		{name: "no shard count", shardCount: 0},
+		{name: "more planned shards than operations", shardCount: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := []*storage.ApplyOperation{
+				shardOp(1, "shop_001/-80/orders", state.ApplyOperation.Running),
+				shardOp(2, "shop_001/80-/orders", state.ApplyOperation.Pending),
+			}
+			plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {
+				Tables: []storage.TableChange{{Table: "orders", Operation: "alter", EstimatedRows: new(int64(2_000)), ShardCount: tc.shardCount}},
+				Shards: []storage.ShardPlan{
+					{Shard: "-80", Namespace: "shop_001", Changes: shardChange(1_000)},
+					{Shard: "80-", Namespace: "shop_001", Changes: shardChange(1_200)},
+				},
+			}}}
+
+			resp := shardedProgress(t, ops, []*storage.Task{shardTask(1, state.Task.Running, 620, 1000)}, &staticPlanStore{plan: plan})
+
+			require.Len(t, resp.Tables, 1)
+			table := resp.Tables[0]
+			assert.Equal(t, int64(620), table.RowsCopied)
+			assert.Equal(t, int64(1000), table.RowsTotal, "only the reported shard's total")
+			assert.False(t, table.RowsTotalPlanned)
+		})
+	}
+}
+
+// A table copying on -80 while 80- has no copy ahead of it keeps the
+// reported shard's exact total: 80- adds no estimate when its change copies no
+// rows, when its estimate is negative, or when it failed before reporting a
+// total, so the total is never marked planned.
+func TestProgressByApplyIDCountsNoPlannedRowsForAShardWithNoCopyAhead(t *testing.T) {
+	shardChange := func(rows int64) []storage.TableChange {
+		return []storage.TableChange{{Table: "orders", Operation: "alter", DDL: shardedTestDDL, EstimatedRows: new(rows)}}
+	}
+	planWith := func(secondShardRows int64) *storage.Plan {
+		return &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {
+			Tables: []storage.TableChange{{Table: "orders", Operation: "alter", ShardCount: 2}},
+			Shards: []storage.ShardPlan{
+				{Shard: "-80", Namespace: "shop_001", Changes: shardChange(1_000)},
+				{Shard: "80-", Namespace: "shop_001", Changes: shardChange(secondShardRows)},
+			},
+		}}}
+	}
+	instant := shardTask(2, state.Task.Pending, 0, 0)
+	instant.TaskIdentifier = "task-2"
+	instant.IsInstant = true
+
+	for _, tc := range []struct {
+		name        string
+		secondState string
+		secondTasks []*storage.Task
+		secondRows  int64
+	}{
+		{name: "copies no rows", secondState: state.ApplyOperation.Pending, secondTasks: []*storage.Task{instant}, secondRows: 1_200},
+		{name: "negative estimate", secondState: state.ApplyOperation.Pending, secondRows: -1},
+		{name: "failed before reporting", secondState: state.ApplyOperation.Failed, secondRows: 1_200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := []*storage.ApplyOperation{
+				shardOp(1, "shop_001/-80/orders", state.ApplyOperation.Running),
+				shardOp(2, "shop_001/80-/orders", tc.secondState),
+			}
+			tasks := append([]*storage.Task{shardTask(1, state.Task.Running, 620, 1000)}, tc.secondTasks...)
+
+			resp := shardedProgress(t, ops, tasks, &staticPlanStore{plan: planWith(tc.secondRows)})
+
+			require.Len(t, resp.Tables, 1)
+			table := resp.Tables[0]
+			assert.Equal(t, int64(620), table.RowsCopied)
+			assert.Equal(t, int64(1000), table.RowsTotal, "only the reported shard's total")
+			assert.False(t, table.RowsTotalPlanned)
+			assert.Equal(t, int32(62), table.PercentComplete)
+		})
+	}
+}
+
+// Each shard says whether its own change copies rows, from its own tasks, so
+// a shard running an instant ALTER reads as applying while a sibling running a
+// table copy does not. The table reads as a table copy whenever any of its
+// shards runs one, whichever shard is listed first.
+func TestProgressByApplyIDSaysWhichShardsCopyNoRows(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		shardOp(1, "shop_001/-80/orders", state.ApplyOperation.Running),
+		shardOp(2, "shop_001/80-/orders", state.ApplyOperation.Running),
+	}
+	instant := shardTask(1, state.Task.Running, 0, 0)
+	instant.IsInstant = true
+	copying := shardTask(2, state.Task.Running, 400, 1000)
+	copying.TaskIdentifier = "task-2"
+
+	resp := shardedProgress(t, ops, []*storage.Task{instant, copying}, &staticPlanStore{})
+
+	require.Len(t, resp.Tables, 1)
+	table := resp.Tables[0]
+	require.Len(t, table.Shards, 2)
+	assert.True(t, table.Shards[0].CopiesNoRows, "-80 runs an instant ALTER")
+	assert.False(t, table.Shards[1].CopiesNoRows, "80- runs a table copy")
+	assert.Equal(t, "alter", table.ChangeType)
+	assert.False(t, table.IsInstant, "a table with a shard copying rows is not instant")
+}
+
+// A table whose first listed shard has no tasks yet reads from the shards
+// that have reported, not from the plan's stand-in for the first shard, which
+// carries no instant flag. -80 is still pending and 80- runs an instant ALTER,
+// so the table names the instant ALTER and the CLI reads it as applying, as
+// the PR comment does.
+func TestProgressByApplyIDReadsAShardedTableFromItsReportedShards(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		shardOp(1, "shop_001/-80/orders", state.ApplyOperation.Pending),
+		shardOp(2, "shop_001/80-/orders", state.ApplyOperation.Running),
+	}
+	instant := shardTask(2, state.Task.Running, 0, 0)
+	instant.IsInstant = true
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {
+		Tables: []storage.TableChange{{Table: "orders", Operation: "alter", DDL: shardedTestDDL}},
+	}}}
+
+	resp := shardedProgress(t, ops, []*storage.Task{instant}, &staticPlanStore{plan: plan})
+
+	require.Len(t, resp.Tables, 1)
+	table := resp.Tables[0]
+	assert.Equal(t, "alter", table.ChangeType)
+	assert.True(t, table.IsInstant, "the one shard that reported runs an instant ALTER")
+	assert.False(t, presentation.ChangeCopiesRows(table.ChangeType, table.IsInstant))
 }
 
 // While a sharded apply's operations attach one dispatch at a time, it reads

@@ -18,9 +18,13 @@ type PreviewCmd struct {
 
 // Run executes the preview command.
 func (cmd *PreviewCmd) Run(g *Globals) error {
-	// Use fixed timestamps so TEMPLATES.md doesn't change on every regeneration.
-	webhooktemplates.TimestampFunc = func() string { return "2026-01-01 00:00:00 UTC" }
-	webhooktemplates.NowFunc = func() time.Time { return time.Date(2026, 3, 15, 14, 30, 0, 0, time.UTC) }
+	// Pin the render clock so TEMPLATES.md doesn't change on every regeneration.
+	// The rendered timestamps and the clock that durations are measured
+	// against read the same instant, so a preview never shows a comment
+	// updated before the apply it describes started.
+	previewNow := time.Date(2026, 3, 15, 14, 30, 0, 0, time.UTC)
+	webhooktemplates.TimestampFunc = func() string { return previewNow.Format("2006-01-02 15:04:05 UTC") }
+	webhooktemplates.NowFunc = func() time.Time { return previewNow }
 	templates.SetPreviewMode()
 
 	if cmd.Type == "" {
@@ -81,6 +85,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentPlanUnmanagedSchema,
 		templates.PreviewCommentPlanIgnoreTables,
 		templates.PreviewCommentPlanDropTables,
+		templates.PreviewCommentPlanDropTablesUnmatched,
 		templates.PreviewCommentPlanWhoCanApply,
 		templates.PreviewCommentPlanDirect,
 		templates.PreviewCommentPlanCopyDiscarded, templates.PreviewCommentPlanCopyDiscardedApplying,
@@ -104,7 +109,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentDropColumnBlocked, templates.PreviewCommentDropIndexBlocked,
 		templates.PreviewCommentLintErrorsBlocked,
 		templates.PreviewCommentApplyPlan, templates.PreviewCommentApplyPlanOptions,
-		templates.PreviewCommentApplyPlanUnsafe,
+		templates.PreviewCommentApplyPlanUnsafe, templates.PreviewCommentApplyPlanChangeGateRefused,
+		templates.PreviewCommentApplyPlanRefusalUnposted,
 		templates.PreviewCommentApplyProgress, templates.PreviewCommentApplyCompleted,
 		templates.PreviewCommentApplyEstimateExceeded,
 		templates.PreviewCommentApplyFailed,
@@ -120,7 +126,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCLIMultiDeployHalted,
 		templates.PreviewCLIMultiDeployCompleted, templates.PreviewCLIMultiDeployAll,
 		templates.PreviewCommentShardedAll, templates.PreviewAggregateCheckSummary,
-		templates.PreviewAggregateCheckFileCapBlocked, templates.PreviewAggregateCheckStopped,
+		templates.PreviewAggregateCheckFileCapBlocked, templates.PreviewAggregateCheckQuotaReserved,
+		templates.PreviewAggregateCheckStopped,
 		templates.PreviewAggregateCheckRollout,
 		templates.PreviewCommentSingleProgress, templates.PreviewCommentSingleComplete,
 		templates.PreviewCommentSingleFailed, templates.PreviewCommentSingleStopped,

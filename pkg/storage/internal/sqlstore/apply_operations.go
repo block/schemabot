@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/block/schemabot/pkg/changeevents"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -29,6 +31,7 @@ const applyOperationColumns = `id, apply_id, plan_id, deployment, operation_key,
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
 type applyOperationStore struct {
+	events     *changeEventRecorder
 	db         *rebindDB
 	dialect    Dialect
 	identity   identityInserter
@@ -284,11 +287,64 @@ func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, err
 	args = append(args, setArgs...)
 	args = append(args, id)
 	args = append(args, guardArgs...)
-	result, err := s.db.ExecContext(ctx, guard.updateStatement(s.dialect, assignments), args...)
+	statement := guard.updateStatement(s.dialect, assignments)
+
+	var newState string
+	if len(setArgs) > 0 && assignments[0].Column == "state" {
+		newState, _ = setArgs[0].(string)
+	}
+	attempt := storage.OperationChangeAttemptFromContext(ctx)
+	if s.events != nil && s.events.sender.Selects(changeevents.OperationFinished) &&
+		guard.kind == operationGuardOperation && guard.opLease.OperationID == id &&
+		attempt != nil && attempt.OperationID == id && attempt.ObservedDispatch() &&
+		state.IsState(newState, operationFinishStates...) {
+		written, err := s.writeOperationFinish(ctx, statement, args, guard.opLease, attempt, newState)
+		if err != nil {
+			return fmt.Errorf("%s (id=%d): %w", errContext, id, err)
+		}
+		if written {
+			s.events.finishOperation(ctx, guard.opLease.ApplyID, attempt, newState)
+			return nil
+		}
+	}
+
+	result, err := s.db.ExecContext(ctx, statement, args...)
 	if err != nil {
 		return fmt.Errorf("%s (id=%d): %w", errContext, id, err)
 	}
 	return s.checkUpdatedOrExists(ctx, result, id, guard, false)
+}
+
+var operationFinishStates = append(slices.Clone(state.SettledApplyStates), state.ApplyOperation.FailedRetryable)
+
+// writeOperationFinish ties the event to a lease-fenced outcome write from an
+// open attempt. A newly admitted retry can still carry the previous attempt's
+// failed_retryable state, so its own outcome write may keep that state.
+func (s *applyOperationStore) writeOperationFinish(ctx context.Context, statement string, args []any, lease storage.OperationLease, attempt *storage.OperationChangeAttempt, outcome string) (bool, error) {
+	excluded := operationFinishStates
+	if attempt.Retry {
+		excluded = state.SettledApplyStates
+	}
+	statement += " AND ao.apply_id = ? AND ao.attempt = ? AND ao.state NOT IN (" + placeholders(len(excluded)) + ")"
+	result, err := s.db.ExecContext(ctx, statement, append(append(args, lease.ApplyID, attempt.Number-1), stringArgs(excluded)...)...)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil || rows > 0 || !attempt.Retry || !state.IsState(outcome, state.ApplyOperation.FailedRetryable) {
+		return rows > 0, err
+	}
+
+	// MySQL can return zero changed rows for a same-state retry write. Confirm
+	// the fresh claim still owns that outcome under the same attempt identity.
+	var owned bool
+	readCtx, cancel := context.WithTimeout(ctx, changeEventStorageTimeout)
+	defer cancel()
+	err = s.db.QueryRowContext(readCtx, `
+		SELECT EXISTS(SELECT 1 FROM apply_operations
+			WHERE id = ? AND apply_id = ? AND lease_token = ? AND attempt = ? AND state = ?)
+	`, lease.OperationID, lease.ApplyID, lease.Token, attempt.Number-1, outcome).Scan(&owned)
+	return err == nil && owned, nil
 }
 
 // UpdateState transitions a child row to the given state.
@@ -1369,8 +1425,45 @@ NOT EXISTS (
 		)
 		AND ` + releasedFailureExemptionSQL(d) + `
 )
+AND ` + sameMemberFailureGateSQL(d) + `
 AND ` + rolloutStepGateSQL + `
 )`
+}
+
+// sameMemberFailureGateSQL holds a work row back once another work row of its
+// own rollout member has failed, under the same on_failure exemption that lets
+// a later member past an earlier one's failure. One member's work rows, such
+// as a target's per-shard work, start in parallel rather than in order, so the
+// member gate above never compares them. The gate holds every work row of
+// the member, whatever change it runs. Most of them are the member's shards,
+// which run the same change on the same schema, so a failure on one usually
+// repeats on the rest; holding the member's other work too is the fail-safe
+// side of the same rule. The
+// failed row takes the earlier alias only so the exemption can be shared with
+// the member gate; it is a sibling of the same member, not an earlier one. As
+// with the member gate, an apply a remote dispatch created leaves this to its
+// dispatcher (rolloutMembersOrderedHereSQL). The fragment references the
+// apply_operations alias; see sameMemberFailureGateArgs for its placeholders.
+func sameMemberFailureGateSQL(d Dialect) string {
+	return `NOT EXISTS (
+	SELECT 1
+	FROM apply_operations AS earlier
+	WHERE earlier.apply_id = apply_operations.apply_id
+		AND earlier.deployment = apply_operations.deployment
+		AND earlier.target = apply_operations.target
+		AND earlier.id <> apply_operations.id
+		AND earlier.operation_kind = ?
+		AND earlier.state = ?
+		AND ` + rolloutMembersOrderedHereSQL + `
+		AND ` + releasedFailureExemptionSQL(d) + `
+)`
+}
+
+// sameMemberFailureGateArgs returns the positional arguments for
+// sameMemberFailureGateSQL, in placeholder order.
+func sameMemberFailureGateArgs() []any {
+	args := []any{storage.ApplyOperationKindWork, state.ApplyOperation.Failed}
+	return append(args, releasedFailureExemptionArgs()...)
 }
 
 // rolloutStepGateSQL is the table-step boundary of a rollout that runs table by
@@ -1414,6 +1507,7 @@ func workStartGateArgs() []any {
 		state.ApplyOperation.Completed,
 	)
 	args = append(args, releasedFailureExemptionArgs()...)
+	args = append(args, sameMemberFailureGateArgs()...)
 	return append(args, state.ApplyOperation.Completed)
 }
 
@@ -2179,7 +2273,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	deferredDeployGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
 	stoppedCancelGuard := requestRematchGuardSQL("apply_operations", rematchAtOrAfterLease, staleClaimCutoff)
 	parkedControlGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
-	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
+	claimQuery := fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
 		WHERE (
@@ -2311,12 +2405,16 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		)
 		ORDER BY created_at, id
 		LIMIT 1
-		FOR UPDATE SKIP LOCKED
 	`, applyOperationColumns, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders,
-		redispatchParentPlaceholders, crashRecoveryParentPlaceholders, staleClaimCutoff, staleClaimCutoff), queryArgs...)
+		redispatchParentPlaceholders, crashRecoveryParentPlaceholders, staleClaimCutoff, staleClaimCutoff)
+	row := tx.QueryRowContext(ctx, claimQuery+`
+		FOR UPDATE SKIP LOCKED`, queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
+		if claimFilter.ReportContention {
+			return nil, claimContention(ctx, tx, claimQuery, queryArgs)
+		}
 		return nil, nil // nothing to claim
 	}
 	if err != nil {
@@ -2360,6 +2458,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		if rows == 0 {
 			return nil, nil
 		}
+		ad.StartsAttempt = true
 	case state.ApplyOperation.Stopped:
 		// Stopped → resuming: a stopped operation whose parent apply has a
 		// pending start or cancel request is claimable, mirroring the
@@ -2394,6 +2493,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		if rows == 0 {
 			return nil, nil
 		}
+		ad.StartsAttempt = ad.StartedAt == nil
 	default:
 		// Re-leasing a row that already started with a stale active heartbeat:
 		// crash recovery. The row keeps its current (active) state and is driven
@@ -2462,6 +2562,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			}
 			if bumped > 0 {
 				ad.Attempt++
+				ad.StartsAttempt = true
 			}
 
 			underOperationLease, err := redispatchDrivesUnderOperationLease(ctx, tx, ad)
@@ -2816,6 +2917,32 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	ad.LeaseAcquiredAt = &leaseAcquiredAt
 
 	return ad, nil
+}
+
+// claimContention tells a claim that took nothing whether that was because
+// nothing is claimable or because the row it would take was locked. The claim
+// skips locked rows rather than wait on them, and a row is locked for an
+// instant far more often than it is claimed: a peer claim's scan locks each
+// row it reads before its gates turn the row down, and a write such as
+// SaveExternalID locks every operation of an apply. A driver woken for that
+// row would otherwise conclude there is nothing to do and wait out a poll
+// interval while the work sits claimable.
+//
+// It reruns the claim's own read, gates and order unchanged, without taking
+// row locks, in a fresh snapshot. A row found there was usually eligible but
+// held, and can also be one that became claimable after the claim ran; either
+// way it returns ErrOperationClaimContended. No row means nothing is
+// claimable, and it returns nil.
+func claimContention(ctx context.Context, tx *rebindTx, claimQuery string, args []any) error {
+	held, err := scanApplyOperationInto(tx.QueryRowContext(ctx, claimQuery, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reread claimable apply_operations without row locks after the claim took none: %w", err)
+	}
+	return fmt.Errorf("apply_operation %d of apply %d is claimable but the claim took none: %w",
+		held.ID, held.ApplyID, storage.ErrOperationClaimContended)
 }
 
 // admitCutoverUnderCap makes the cutover cap a hard bound per apply. The
@@ -3600,9 +3727,11 @@ func (s *applyOperationStore) reapStranded(ctx context.Context, limit int) ([]*s
 	for _, op := range stranded {
 		parent, ok := parents[op.ApplyID]
 		if !ok {
-			// The parent was deleted between the two reads (PR cleanup races the
-			// reaper). Its rows go with it, so there is nothing left to settle.
-			slog.WarnContext(ctx, "parent apply disappeared while reaping a stranded apply_operation; the row is being deleted with it",
+			// The scan selects only rows whose settled parent exists, so the
+			// parent was removed between the scan and the parent read. SchemaBot
+			// never deletes an apply, so this was a delete from outside SchemaBot.
+			// There is no apply to settle against, so the row stays as it is.
+			slog.WarnContext(ctx, "parent apply disappeared between the stranded apply_operation scan and the parent read; the operation is left unchanged",
 				op.LogAttrs()...)
 			continue
 		}

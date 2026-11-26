@@ -59,7 +59,7 @@ func (s *Service) resolveApplyMembers(ctx context.Context, plan *storage.Plan, e
 		// primary's DDL against a target nothing planned, which is the failure
 		// the per-member pairing below exists to prevent.
 		if targets[0].Deployment != plan.Deployment || targets[0].Target != plan.Target {
-			return nil, fmt.Errorf("apply for %s/%s resolves to the single rollout member %s, but its plan %s was produced for %s; re-plan the environment so the apply runs the plan its target was planned for",
+			return nil, operatorMessagef("apply for %s/%s resolves to the single rollout member %s, but its plan %s was produced for %s; re-plan the environment so the apply runs the plan its target was planned for",
 				plan.Database, environment, targets[0].MemberID(),
 				plan.PlanIdentifier, routing.ExecutionTarget{Deployment: plan.Deployment, Target: plan.Target}.MemberID())
 		}
@@ -99,7 +99,7 @@ func (s *Service) resolveApplyMembers(ctx context.Context, plan *storage.Plan, e
 		}
 		memberPlan, ok := memberPlans[target.MemberID()]
 		if !ok {
-			return nil, fmt.Errorf("apply for %s/%s has no stored plan for rollout member %s in the plan round (plan %s); plan the environment again so every target is planned before applying",
+			return nil, operatorMessagef("apply for %s/%s has no stored plan for rollout member %s in the plan round (plan %s); plan the environment again so every target is planned before applying",
 				plan.Database, environment, target.MemberID(), plan.PlanIdentifier)
 		}
 		members = append(members, applyMember{Target: target, Plan: memberPlan})

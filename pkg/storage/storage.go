@@ -369,16 +369,16 @@ type CheckStore interface {
 	// after the call.
 	DeleteStalePlanOnly(ctx context.Context, check *Check, readHeadSHA string) (bool, error)
 
-	// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a
-	// closed PR, retaining apply-owned rows the close must not unblock. Once
+	// ListRemovableOnPRClose returns the stored check state a close of the PR
+	// removes, retaining apply-owned rows the close must not unblock. Once
 	// an apply has started, its stored check state stays authoritative across
 	// a close and reopen until an operator reconciles the target environment.
-	// Plan-only rows (no apply_id) are always deleted. Apply-owned rows are
+	// Plan-only rows (no apply_id) are always listed. Apply-owned rows are
 	// handled by close kind:
 	//
 	//   - merged close: rows that are in_progress or whose conclusion is
 	//     anything but success are retained; rows that concluded successfully
-	//     are deleted, because the merged PR carries the applied schema and
+	//     are listed, because the merged PR carries the applied schema and
 	//     nothing remains for the row to block.
 	//   - unmerged close: every apply-owned row is retained, including rows
 	//     whose conclusion is success. A stored success only proves the
@@ -388,7 +388,16 @@ type CheckStore interface {
 	//     Reopen-time stale cleanup converges the retained row: it converts
 	//     it to action_required when the schema change is gone from the PR,
 	//     or a fresh plan result replaces it when the change is still present.
-	DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int, merged bool) error
+	ListRemovableOnPRClose(ctx context.Context, repo string, pr int, merged bool) ([]*Check, error)
+
+	// DeleteListedIfUnchanged deletes each row ListRemovableOnPRClose listed
+	// only while every column it was listed with, updated_at included, is
+	// unchanged, and returns the rows it kept because they were written since
+	// the listing. A row is compared and deleted under its row lock, so a
+	// write after the comparison cannot be deleted. A listed row already gone
+	// is neither deleted nor kept, and a row inserted since the listing is
+	// never touched.
+	DeleteListedIfUnchanged(ctx context.Context, listed []*Check) (kept []*Check, err error)
 }
 
 // FreezeStore records environment freezes. While a freeze is in effect,
@@ -443,6 +452,13 @@ type FreezeStore interface {
 type FreezeOverrideStore interface {
 	// Create records a request and returns it as stored.
 	Create(ctx context.Context, request *FreezeOverrideRequest) (*FreezeOverrideRequest, error)
+
+	// CreateOnReason records a request that its requester's reason admits,
+	// for a server whose override policy needs no second approver. It is
+	// stored approved by its requester at creation, by the database clock,
+	// so every later check finds it as an approved override. Its other
+	// rules are Create's.
+	CreateOnReason(ctx context.Context, request *FreezeOverrideRequest) (*FreezeOverrideRequest, error)
 
 	// Get returns the request with this identifier, or
 	// ErrFreezeOverrideNotFound.
@@ -887,8 +903,11 @@ type ApplyStore interface {
 	// AttachOperationWithTasks stores one additional apply_operations row and
 	// its tasks under an existing apply in a single transaction. The apply's
 	// state is re-read under a row lock inside the transaction and the attach
-	// fails with ErrApplyNotActive when it is terminal — new work must never
-	// land on an apply no drive will pick up again. The (apply_id, deployment,
+	// fails with an *ApplyNotActiveError, which matches ErrApplyNotActive and
+	// carries the state it read, when the apply is terminal. New
+	// work must never land on an apply no drive will pick up again, and the
+	// caller settles the refused work against that stored state rather than
+	// against its own copy of the apply. The (apply_id, deployment,
 	// operation_key) unique index is the idempotency guard: a concurrent attach
 	// of the same operation loses with ErrApplyOperationExists, which the
 	// caller resolves by re-reading the winner's row. Under the same lock, an
@@ -1346,12 +1365,6 @@ type ApplyStore interface {
 	// came from, so callers deciding whether a record is safe to retire must
 	// treat it as owning.
 	ExistsForDatabaseHead(ctx context.Context, repo string, pr int, database, databaseType, headSHA string) (bool, error)
-
-	// Delete removes an apply by ID.
-	Delete(ctx context.Context, id int64) error
-
-	// DeleteByPR removes all applies for a PR (cleanup on PR close/merge).
-	DeleteByPR(ctx context.Context, repo string, pr int) error
 }
 
 // ApplyOperationWithTasks groups one apply_operations row with the task rows it owns.
@@ -2015,7 +2028,10 @@ type ApplyOperationStore interface {
 	// state it was claimed from, which is how the caller tells a claim that
 	// starts an operation from a retry or a recovery.
 	//
-	// opts narrow what the claim may match; see OperationClaimFilter.
+	// opts narrow what the claim may match; see OperationClaimFilter. With
+	// ReportClaimContention, a claim that took nothing while a lock-free
+	// reread found an operation it could take returns
+	// ErrOperationClaimContended instead of nil.
 	FindNextApplyOperation(ctx context.Context, owner string, opts ...OperationClaimOption) (*ApplyOperation, error)
 
 	// FindNextApplyOperationCutover atomically claims the next operation parked

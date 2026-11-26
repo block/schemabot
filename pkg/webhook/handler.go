@@ -143,6 +143,15 @@ type Handler struct {
 	previousWebhookSecretsByApp map[string][]byte
 	previousRepoWebhookSecret   []byte
 
+	// insecureSkipSignatureVerification is the explicit opt-in to accept
+	// unsigned deliveries in single-App mode when no webhook secret is
+	// configured. Set by WithInsecureSkipSignatureVerification.
+	insecureSkipSignatureVerification bool
+
+	// unsignedDeliveryWarnOnce limits the "signature verification skipped"
+	// warning to one log line per Handler rather than one per delivery.
+	unsignedDeliveryWarnOnce sync.Once
+
 	durableWebhookDispatch      bool
 	durableWebhookDriverCount   int
 	durableWebhookPollInterval  time.Duration
@@ -164,6 +173,10 @@ type Handler struct {
 	// refusing to complete a delivery after lease loss) can be exercised
 	// deterministically. Production code never sets it.
 	durableWebhookProcessOverride func(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error)
+	// durableWebhookRetryJitterOverride is a test seam that replaces
+	// durableWebhookRetryJitter so the random spread on a retry wait is
+	// deterministic. Production code never sets it.
+	durableWebhookRetryJitterOverride func(limit time.Duration) time.Duration
 
 	// inProcessWebhookCount tracks the detached goSafe goroutines that
 	// non-durable event paths (issue_comment, participant_nudge, check_run,
@@ -261,6 +274,18 @@ func WithPreviousRepoWebhookSecret(secret []byte) HandlerOption {
 		if len(secret) > 0 {
 			h.previousRepoWebhookSecret = secret
 		}
+	}
+}
+
+// WithInsecureSkipSignatureVerification states that this handler is meant to
+// accept unsigned deliveries when no webhook secret is configured. It is for
+// tests and local harnesses only; a deployment that receives deliveries from
+// GitHub must configure a webhook secret instead. Without a secret and without
+// this option, the handler still accepts unsigned deliveries today and logs a
+// warning, and a future release will refuse them.
+func WithInsecureSkipSignatureVerification() HandlerOption {
+	return func(h *Handler) {
+		h.insecureSkipSignatureVerification = true
 	}
 }
 
@@ -1329,8 +1354,18 @@ func (h *Handler) authenticateWebhook(r *http.Request, body []byte) (appName str
 	secret := h.webhookSecretsByApp[defaultAppName]
 	if len(secret) == 0 {
 		// No secret configured — preserve historical behaviour and skip
-		// signature verification entirely. Operators are nudged toward
-		// configuring a secret by serve.go's startup validation.
+		// signature verification entirely. The explicit opt-in skips silently;
+		// without it the handler warns once, since an embedder that built the
+		// handler with an unset secret is accepting forged deliveries.
+		if !h.insecureSkipSignatureVerification {
+			h.unsignedDeliveryWarnOnce.Do(func() {
+				h.logger.Warn("webhook signature verification is skipped because no webhook secret is configured; "+
+					"set the webhook secret or pass WithInsecureSkipSignatureVerification to the webhook handler, "+
+					"as a future release will refuse unsigned deliveries",
+					"delivery_id", r.Header.Get(headerDeliveryID),
+					"event", r.Header.Get("X-GitHub-Event"))
+			})
+		}
 		return defaultAppName, 0, "", true
 	}
 	if !h.verifyRotatingSecret(r, defaultAppName, "previous-webhook-secret", signature, body, secret, h.previousWebhookSecretsByApp[defaultAppName]) {

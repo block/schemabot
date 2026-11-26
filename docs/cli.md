@@ -554,7 +554,13 @@ older server refuses a request from a newer CLI as an unknown field.
 
 A targeted apply checks for a schema change already in progress on its
 target's deployment, which every target of a `targets:` list shares, and
-refuses to start while one is queued or running there.
+refuses to start while one that has not finished holds it, whether it is
+queued, running, paused, retrying or in its revert window.
+
+`rollback` runs the same check on its database and environment, before it asks
+for confirmation or takes a lock, and gives the same refusal. If the check
+itself cannot run, `apply` and `rollback` both go on, since the server refuses
+a conflicting apply when it is created, and log that the check did not run.
 
 A rollback of a rollout-wide apply is made against the first target the apply
 ran from. If the rollout order changed since, the rollback is refused rather
@@ -602,7 +608,17 @@ work before releasing it. `apply` and `rollback` release a lock they took
 themselves when the schema change was never submitted: the server refused it,
 or you pressed Ctrl-C before it was sent. A server error or a lost connection
 leaves it unknown whether the apply started, so the lock stays held. A lock
-you already held before the command started also stays held. Locks span the
+you already held before the command started also stays held. The release, and
+the one `apply --yield` sends once its apply settles, names the lock the
+command took, so a lock another of your commands started an apply under stays
+held for that apply, and a lock released and taken again since stays with
+whoever holds it now; the command says which happened. Only a started apply
+counts: another of your commands that has found the lock but not yet started
+its apply does not keep it, so wait for that command before you release. A
+server too old to
+name the lock gets no release at all: the command keeps the lock and tells you
+to check `schemabot locks` and run `schemabot unlock` if nothing of yours runs
+under it. Locks span the
 database's environments; forcing one away from its owner is an administrative
 action, not a routine retry.
 See [locks](schema-intelligence.md#check-locks) for the inspection request and
@@ -616,17 +632,21 @@ it does not create a PR review trail.
 ### Freeze an environment
 
 An environment freeze holds new schema changes in its scope until it ends or
-someone lifts it. Setting or lifting one is a write, and
+someone lifts it. The [freeze guide](freeze.md) explains how freezes work, the
+pull request and API forms, and what an agent may do. Setting or lifting one is
+a write, and
 [`freeze.groups`](configuration.md#freeze-groups-forward-auth) members may do
 so without any other write access.
 
+![Freeze production, an apply the freeze refuses with nothing started, then lift the freeze](../assets/cli-freeze.gif)
+
 ```console
-$ schemabot freeze -e production --reason "SEV-1234 payments latency"
+$ schemabot freeze -e production --reason "Holiday code freeze"
 $ schemabot freeze -e production --reason "holiday freeze" --planned \
     --start 2026-12-20T00:00:00Z --end 2027-01-03T00:00:00Z
 $ schemabot freeze list -e production
 $ schemabot freeze show freeze-abc123
-$ schemabot unfreeze freeze-abc123 --reason "SEV resolved"
+$ schemabot unfreeze freeze-abc123 --reason "Holidays are over"
 ```
 
 `--deployment` and `--database` narrow a freeze and repeat; without them it
@@ -652,33 +672,37 @@ a plain start resumes it. A stopped apply resumes with
 override. Times are RFC3339 and print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
 and the recent ones.
 
-A second person approves a request to let one change through a freeze. Read it
-with `freeze override <ovr-id>` and approve it with `freeze approve <ovr-id>`.
+On a server whose `freeze.override_policy` is `approval`, a second person
+approves a request to let one change through a freeze. Read it with
+`freeze override <ovr-id>` and approve it with `freeze approve <ovr-id>`.
 Only a verified member of `freeze.groups` other than the requester may approve.
 A request asked for on a pull request is approved there instead, by a
 `freeze.github_teams` member commenting `schemabot freeze approve <ovr-id>`.
 Each command prints the server's reason when it refuses.
 
 A freeze refuses every `apply`, `start` and `cutover` it covers unless an
-approved override for you covers that change. Asking for one with `--override`
-is not enough on its own: until it is approved, the command exits 1 with
+override for you covers that change. Without one, the command exits 1 with
 nothing started:
 
 ```console
 $ schemabot apply -s schema -e production
 ❄️ production is frozen. This change did not start.
-   freeze-abc  SEV-1234 payments latency  (until lifted)
-To ask for an override, run the same command with --override "<reason>".
+   freeze-abc  Holiday code freeze  (until lifted)
+If this change can't wait, run the same command with --override "<reason>".
 ```
 
-`--override "<reason>"` on `apply`, `start` and `cutover` asks a freeze
-approver to let that one change through. It needs a verified caller, and the
-reason is at most 500 characters. The refusal then names the request:
+`--override "<reason>"` on `apply`, `start` and `cutover` overrides the freeze
+for that one change. It needs a verified caller, and the reason is at most 500
+characters. Under the default `freeze.override_policy`, `reason`, the command
+runs at once and SchemaBot records the reason. The reason covers that command
+only: run it again during the freeze and give `--override` again. On a server
+set to `approval`,
+it asks a freeze approver instead, and the refusal names the request:
 
 ```console
-$ schemabot apply -s schema -e production --override "SEV-1234 fix the index"
+$ schemabot apply -s schema -e production --override "Hotfix: checkout needs the gift_note column"
 ❄️ production is frozen. This change did not start.
-   freeze-abc  SEV-1234 payments latency  (until lifted)
+   freeze-abc  Holiday code freeze  (until lifted)
 Override requested: ovr-123. A freeze approver other than you must run 'schemabot freeze approve ovr-123', then run this command again.
 ```
 
@@ -775,16 +799,18 @@ one and stays on screen while the watch keeps following the apply:
 Press Enter to proceed with cutover (or ESC to detach)
 
 ❄️ production is frozen. This cutover did not start.
-   freeze-abc  SEV-1234 payments latency  (until lifted)
-To ask for an override, run:
+   freeze-abc  Holiday code freeze  (until lifted)
+If this change can't wait, override the freeze with a reason:
   schemabot cutover apply-example-73 -e production --override "<reason>"
-Once a freeze approver other than you approves it, press Enter to try again.
+Run that in another terminal: it starts the change at once, and this watch follows it.
 ```
 
-Run that command from another terminal. Once an approver approves the
-request, press **Enter** in the watch again; the approval admits it with no
-reason attached. **Enter** on a waiting deploy works the same way and names
-`schemabot start`.
+Run that command from another terminal. Under the default override policy it
+starts the change at once, and the watch follows it. On a server set to
+`approval` it records a request instead, and the last line says so: once an
+approver approves it, press **Enter** in the watch again, and the approval
+admits it with no reason attached. **Enter** on a waiting deploy works the same
+way and names `schemabot start`.
 
 ![CLI progress shows copying, deferred cutover, and completion](../assets/cli-cutover.gif)
 
@@ -1001,9 +1027,9 @@ before running it. Recreating a dropped column cannot recover its old data.
 
 ```console
 $ schemabot logs apply-example-73
-11:47:07 [INF] Apply queued: apply-example-73
-11:47:07 [INF] [orders] Starting spirit migration
-11:47:07 [INF] [orders] acquired advisory lock
+2026-03-15 11:47:07 UTC [INF] Apply queued: apply-example-73
+2026-03-15 11:47:07 UTC [INF] [orders] Starting spirit migration
+2026-03-15 11:47:07 UTC [INF] [orders] acquired advisory lock
 ...
 ```
 
@@ -1036,9 +1062,9 @@ a whole, such as state changes.
 
 ```console
 $ schemabot logs apply-example-73 --target shop-002
-11:47:07 [INF] Apply queued: apply-example-73
-11:48:12 [INF] [orders] acquired advisory lock
-11:52:40 [INF] [orders] Table complete
+2026-03-15 11:47:07 UTC [INF] Apply queued: apply-example-73
+2026-03-15 11:48:12 UTC [INF] [orders] acquired advisory lock
+2026-03-15 11:52:40 UTC [INF] [orders] Table complete
 ...
 ```
 

@@ -49,6 +49,16 @@ func TestIsInternalControlError(t *testing.T) {
 	})
 }
 
+// A failed control is counted as "rejected" when the requester can act on the
+// error and as "error" when SchemaBot failed, so the error status alerts only
+// on SchemaBot's own failures.
+func TestControlMetricStatusSeparatesRejectionFromFailure(t *testing.T) {
+	assert.Equal(t, "rejected", controlMetricStatus(controlConflictf("schema change is not in its revert window (current state: %s)", "running")))
+	assert.Equal(t, "rejected", controlMetricStatus(fmt.Errorf("execute stop: %w", controlHTTPErrorf(http.StatusNotFound, "apply not found: %s", "apply-123"))))
+	assert.Equal(t, "error", controlMetricStatus(errors.New("control request store is not available")))
+	assert.Equal(t, "error", controlMetricStatus(controlHTTPErrorf(http.StatusBadGateway, "tern unavailable")))
+}
+
 // TestIsTerminalControlError verifies the retry disposition durable command
 // processing hinges on: typed terminal errors and operator-actionable
 // rejections must never be re-driven, while untyped internal failures and

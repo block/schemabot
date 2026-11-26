@@ -1329,6 +1329,7 @@ var knownOperatorClaimFailureReasons = map[string]bool{
 	"branch_reconcile_error":                   true,
 	"missing_lease_token":                      true,
 	"operation_storage_error":                  true,
+	"operation_claim_contention_exhausted":     true,
 	"missing_operation_lease_token":            true,
 	"operation_set_list_error":                 true,
 	"operation_set_missing":                    true,

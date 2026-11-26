@@ -2,6 +2,7 @@ package storagetest
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -692,6 +693,59 @@ func TestLocks(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, stillHeld)
 		assert.Equal(t, current.ID, stillHeld.ID)
+	})
+
+	// An apply that records a lock row is created only while that row still
+	// holds the lock. Once the row is released the create refuses with
+	// ErrLockNotFound, and once a new row holds the lock it refuses with
+	// ErrLockReplaced; neither stores an apply. An apply that records no lock
+	// is not tied to any row.
+	t.Run("ApplyCreate_RefusedOnceRecordedLockRowIsGone", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		checked := CreateLock(t, store, "pinned_lock_db", storage.DatabaseTypeMySQL)
+		CreateApplyWithStateAndEnv(t, store, checked, "apply_on_held_lock", 1, state.Apply.Completed, "staging")
+
+		require.NoError(t, store.Locks().ForceRelease(ctx, "pinned_lock_db", storage.DatabaseTypeMySQL))
+		_, err := store.Applies().Create(ctx, &storage.Apply{
+			ApplyIdentifier: "apply_on_released_lock",
+			LockID:          checked.ID,
+			PlanID:          2,
+			Database:        "pinned_lock_db",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Environment:     "staging",
+			Engine:          storage.EngineForType(storage.DatabaseTypeMySQL),
+			State:           state.Apply.Pending,
+		})
+		require.ErrorIs(t, err, storage.ErrLockNotFound)
+		stored, err := store.Applies().GetByApplyIdentifier(ctx, "apply_on_released_lock")
+		require.NoError(t, err)
+		assert.Nil(t, stored, "an apply refused for a released lock must not be stored")
+
+		current := CreateLock(t, store, "pinned_lock_db", storage.DatabaseTypeMySQL)
+		require.NotEqual(t, checked.ID, current.ID)
+		replacedApply := &storage.Apply{
+			ApplyIdentifier: "apply_on_replaced_lock",
+			LockID:          checked.ID,
+			PlanID:          3,
+			Database:        "pinned_lock_db",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Environment:     "staging",
+			Deployment:      "default",
+			Engine:          storage.EngineForType(storage.DatabaseTypeMySQL),
+			State:           state.Apply.Pending,
+		}
+		_, err = store.Applies().CreateWithTasksAndOperations(ctx, replacedApply,
+			[]*storage.Task{newTask(replacedApply, "task_apply_on_replaced_lock", "users", time.Now())},
+			[]*storage.ApplyOperation{{Deployment: "default", OperationKey: "default", State: state.ApplyOperation.Pending}})
+		require.ErrorIs(t, err, storage.ErrLockReplaced)
+		stored, err = store.Applies().GetByApplyIdentifier(ctx, "apply_on_replaced_lock")
+		require.NoError(t, err)
+		assert.Nil(t, stored, "an apply refused for a replaced lock must not be stored")
+
+		CreateApplyWithStateAndEnv(t, store, current, "apply_on_current_lock", 4, state.Apply.Pending, "staging")
+		CreateApplyWithStateAndEnv(t, store, &storage.Lock{DatabaseName: "pinned_lock_db", DatabaseType: storage.DatabaseTypeMySQL},
+			"apply_without_lock", 5, state.Apply.Pending, "production")
 	})
 
 	t.Run("ReleaseIfPendingPlanID", func(t *testing.T) {

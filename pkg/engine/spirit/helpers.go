@@ -128,13 +128,13 @@ func namespaceForTable(table string, declaredIn map[string]string, sf schema.Sch
 		// SchemaBot's own callers reject a request with no schema files before
 		// it plans, so only a direct Tern Plan call with an empty map lands
 		// here. Every live table would be a drop, so refuse with the way out.
-		return "", fmt.Errorf("DROP TABLE %q cannot be placed: the request carries no schema files for database %q. Restore this database's schema files, or remove the database from the SchemaBot config", table, database)
+		return "", &engine.PlanRefusedError{Err: fmt.Errorf("DROP TABLE %q cannot be placed: the request carries no schema files for database %q. Restore this database's schema files, or remove the database from the SchemaBot config", table, database)}
 	case 1:
 		for nsName := range sf {
 			return nsName, nil
 		}
 	}
-	return "", fmt.Errorf("DROP TABLE %q cannot be placed: namespaces %v all diff against database %q. Keep this database's schema files in one namespace directory, or ask a SchemaBot operator to use a target with no database in its DSN", table, namespaceNames(sf), database)
+	return "", &engine.PlanRefusedError{Err: fmt.Errorf("DROP TABLE %q cannot be placed: namespaces %v all diff against database %q. Keep this database's schema files in one namespace directory, or ask a SchemaBot operator to use a target with no database in its DSN", table, namespaceNames(sf), database)}
 }
 
 // namespaceNames returns the sorted namespace keys for inclusion in error

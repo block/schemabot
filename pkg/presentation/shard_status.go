@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -22,14 +23,23 @@ type ShardWork struct {
 type ShardStatus struct {
 	Keyspace string
 	Shard    string
+	// Landed is true once every table change the shard runs has landed. The
+	// shard's State names its most attention-worthy operation, which can be a
+	// landed one while a sibling operation on the same shard is still queued,
+	// so State alone cannot say the shard is done.
+	Landed bool
 	Deployment
 }
 
 // DeriveShards projects each keyspace shard of a sharded apply to one status,
 // the way the PR comment and the CLI both read a shard: its operations
 // aggregate to the most attention-worthy one's state and error, then every
-// shard, across all keyspaces, is derived in one pass so ordering labels
-// ("waiting for -40", "halted — -40 failed") name sibling shards. A shard's
+// shard, across all keyspaces, is derived in one pass. The shards of one
+// rollout member never order one another's copies (the claim gate starts them
+// in parallel up to the apply's driver cap), so a pending shard with no shard
+// of another member before it reads as queued, or not started once the apply
+// has settled. Ordering labels ("waiting for -40", "halted — -40 failed") name
+// only a shard of another member. A shard's
 // identity is its name, qualified by keyspace ("keyspace/shard") when the
 // apply spans more than one keyspace, since shard names repeat across
 // keyspaces and a label naming a bare duplicate would be ambiguous. The
@@ -62,12 +72,21 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 			ContinueOnFailure: first.ContinueOnFailure,
 			PauseOnFailure:    first.PauseOnFailure,
 			Released:          first.Released,
+			CopyMember:        shardMember(sw.Operations),
+			CopiesNoRows:      shardCopiesNoRows(sw.Operations, sw.Operations[best].State),
 			Error:             sw.Operations[best].Error,
 			EndedBy:           shardEndedBy(sw.Operations, best, shardOf),
 		})
 	}
+	settled := state.IsState(applyState, state.SettledApplyStates...)
 	byIdentity := make(map[string]Deployment, len(inputs))
 	for _, d := range Derive(ResumeClaimed(applyState, inputs)).Deployments {
+		if settled && d.Presentation == StateQueuedNext && d.Label == PendingQueued {
+			// The apply has settled, so nothing will start this shard: it
+			// reads as not started, as a part a settled rollout never ran
+			// does (PendingWord).
+			d.set(StateHalted, PendingWord(true), "⏸️", false)
+		}
 		byIdentity[d.Deployment] = d
 	}
 	out := make([]ShardStatus, 0, len(inputs))
@@ -82,9 +101,63 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 				"identity", identity, "keyspace", sw.Keyspace, "shard", sw.Shard)
 			continue
 		}
-		out = append(out, ShardStatus{Keyspace: sw.Keyspace, Shard: sw.Shard, Deployment: d})
+		out = append(out, ShardStatus{Keyspace: sw.Keyspace, Shard: sw.Shard, Landed: shardLanded(sw.Operations), Deployment: d})
 	}
 	return out
+}
+
+// shardMember is the rollout member, a (deployment, target) pair, that runs
+// a shard's operations, or "" when they span members and the shard keeps the
+// ordering of a member of its own. Operations with no target share the empty
+// target, so a single-target apply's shards all belong to one member, as the
+// claim gate reads them.
+func shardMember(ops []Operation) string {
+	if len(ops) == 0 {
+		return ""
+	}
+	first := ops[0]
+	for _, op := range ops[1:] {
+		if op.Deployment != first.Deployment || op.Target != first.Target {
+			return ""
+		}
+	}
+	return routing.ExecutionTarget{Deployment: first.Deployment, Target: first.Target}.MemberID()
+}
+
+// shardCopiesNoRows reports whether the shard's operations in the state its
+// status names (shardState) all copy no rows, so a running shard reads as
+// applying only when every change it is running does. Operations in another
+// state, such as a table still queued or one whose copy already finished, do
+// not decide, so the shard's label matches the lines of the tables it is
+// running.
+func shardCopiesNoRows(ops []Operation, shardState string) bool {
+	for _, op := range ops {
+		if op.State == shardState && !op.CopiesNoRows {
+			return false
+		}
+	}
+	return true
+}
+
+// shardLanded reports whether every table change a shard runs has landed:
+// completed, or applied and waiting out its revert window.
+func shardLanded(ops []Operation) bool {
+	if len(ops) == 0 {
+		return false
+	}
+	for _, op := range ops {
+		if !OperationLanded(op.State) {
+			return false
+		}
+	}
+	return true
+}
+
+// OperationLanded reports whether an operation in this state has landed its
+// change: completed, or applied and waiting out its revert window.
+func OperationLanded(operationState string) bool {
+	return state.IsState(operationState, state.ApplyOperation.Completed) ||
+		state.IsState(operationState, state.ApplyOperation.RevertWindow)
 }
 
 // shardIdentity is the name a shard's status goes by: the shard, qualified by
@@ -127,7 +200,7 @@ func shardEndedBy(ops []Operation, best int, shardOf map[OperationRef]string) *O
 
 // ShardCounts is the per-status count of a sharded apply's shards, given each
 // shard's status label, in the order each status first appears ("1 running
-// table copy, 3 waiting for -40"): the shard-unit analogue of a rollout's
+// table copy, 3 queued"): the shard-unit analogue of a rollout's
 // deployment counts. A label counts by its leading state words, without the
 // reason after " — ", so shards halted by the same failure count together.
 func ShardCounts(labels []string) string {

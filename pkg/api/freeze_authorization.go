@@ -26,6 +26,36 @@ type FreezeConfig struct {
 	// They govern only that approval and need no forward_auth. Empty means
 	// nobody approves from a pull request.
 	GitHubTeams []string `yaml:"github_teams,omitempty"`
+
+	// OverridePolicy decides what an `--override "<reason>"` does when a
+	// freeze refuses a change. FreezeOverridePolicyReason, the default, lets
+	// the change through on the requester's own reason, like an audited
+	// deploy override: the request is stored approved by its requester, and
+	// the reason stays on it for audit. FreezeOverridePolicyApproval records
+	// a request that someone other than the requester and the pull request's
+	// author must approve. Under either policy the reason is required, an
+	// override covers only the change it was given for, and it lasts at most
+	// storage.FreezeOverrideMaxLifetime.
+	OverridePolicy string `yaml:"override_policy,omitempty"`
+}
+
+// FreezeOverridePolicyApproval requires a second person to approve an
+// override.
+const FreezeOverridePolicyApproval = "approval"
+
+// FreezeOverridePolicyReason lets the requester's own reason admit an
+// override, with no second approver. An empty policy means this one.
+const FreezeOverridePolicyReason = "reason"
+
+// OverrideOnReason reports whether an override reason admits a change on its
+// own, with no second approver: true for the default and
+// FreezeOverridePolicyReason, false for anything else.
+func (c FreezeConfig) OverrideOnReason() bool {
+	// Only the default and reason admit on a reason. Validate refuses any
+	// other value, and one that reaches here unvalidated, a typo included,
+	// falls back to approval rather than opening self-service overrides.
+	policy := strings.TrimSpace(c.OverridePolicy)
+	return policy == "" || policy == FreezeOverridePolicyReason
 }
 
 // DirectWriteReasonNotFreezeAdmin denies a freeze write to a caller in
@@ -43,11 +73,16 @@ const DirectWriteReasonNotFreezeApprover = "not_freeze_approver"
 // caller whose subject is in the pull request identity domain.
 const DirectWriteReasonPullRequestIdentity = "pull_request_identity"
 
-// validateFreeze rejects freeze groups that could never take effect, and
-// malformed or repeated approver teams.
+// validateFreeze rejects freeze groups that could never take effect,
+// malformed or repeated approver teams, and an unknown override policy.
 func (c *ServerConfig) validateFreeze() error {
 	if err := validateGitHubTeamPrincipals("freeze.github_teams", c.Freeze.GitHubTeams); err != nil {
 		return err
+	}
+	switch policy := strings.TrimSpace(c.Freeze.OverridePolicy); policy {
+	case "", FreezeOverridePolicyApproval, FreezeOverridePolicyReason:
+	default:
+		return fmt.Errorf("freeze.override_policy %q is not %q or %q", policy, FreezeOverridePolicyApproval, FreezeOverridePolicyReason)
 	}
 	groups := trimmedNonEmpty(c.Freeze.Groups)
 	if len(groups) == 0 {

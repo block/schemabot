@@ -164,8 +164,9 @@ func reviewGateErrorDetail(err error) string {
 // approval counts only for the schema change it reviewed: it must have been
 // given on HeadSHA, or on an earlier commit at which the PR's change to the
 // database's schema inputs is the same as at HeadSHA (see approvalCoversHead).
-// When GitHub is unavailable while proving that, the approval state is
-// undetermined and the gate returns an evaluation error rather than a block.
+// When GitHub is unavailable while proving that, or the quota reserve refuses
+// a read it needs, the approval state is undetermined and the gate returns an
+// evaluation error rather than a block.
 // An approval on an earlier commit that cannot be compared with HeadSHA at all
 // does not count; it is recorded in UncomparedApprovers so the comment can say
 // why it was not counted.
@@ -432,8 +433,9 @@ func (h *Handler) statementComparerFor(repo string, pr int, database, environmen
 // schemaChangeUnchangedSince). Anything that prevents that comparison (no
 // recorded commit, an unknown commit, a tree GitHub cannot list completely)
 // is returned as an errApprovalNotComparable error. A comparison GitHub could
-// not answer — it was unavailable, or the evaluation was cancelled — is
-// returned as an error too, and never cached as a verdict.
+// not answer — it was unavailable, the quota reserve refused a read, or the
+// evaluation was cancelled — is returned as an error too, and never cached as
+// a verdict.
 func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (approvalVerdict, error) {
 	approvedSHA := approval.CommitID
 	if approvedSHA == "" {
@@ -465,12 +467,19 @@ func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.Insta
 // are not this PR's change, and they reached the base branch through their
 // own PR and its own review. A change the PR itself makes differently at the
 // head does. A comparison that cannot be completed is recorded as
-// errApprovalNotComparable, and a GitHub outage is returned as a retryable
-// error.
+// errApprovalNotComparable, and a GitHub outage or a read the quota reserve
+// refused is returned as a retryable error.
 func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (approvalVerdict, error) {
 	comparison, err := client.PRSchemaChangeUnchangedSince(ctx, c.repo, c.baseRef, c.defaultBranch, approval.CommitID, c.headSHA, c.inputPaths, c.compareStatements)
 	if err != nil {
 		if ghclient.IsUnavailableError(err) {
+			return approvalVerdict{}, fmt.Errorf("compare schema change for %s#%d database %q at approved commit %s and head %s: %w",
+				c.repo, c.pr, c.database, approval.CommitID, c.headSHA, err)
+		}
+		// A read the quota reserve refused was never sent, so GitHub gave no
+		// answer about the approval, and asking again after the reset can
+		// prove it still covers the head.
+		if errors.Is(err, ghclient.ErrGitHubQuotaReserved) {
 			return approvalVerdict{}, fmt.Errorf("compare schema change for %s#%d database %q at approved commit %s and head %s: %w",
 				c.repo, c.pr, c.database, approval.CommitID, c.headSHA, err)
 		}

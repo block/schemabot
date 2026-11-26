@@ -30,7 +30,7 @@ func TestEnvironmentPrerequisiteFoldWithStorage(t *testing.T) {
 	seedCheck(t, svc, "orders", "sandbox", checkConclusionActionRequired)
 	client, mux := setupGitHubServer(t)
 	install := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
-	h := NewHandler(svc, &fakeClientFactory{client: install}, nil, testLogger())
+	h := NewHandler(svc, &fakeClientFactory{client: install}, nil, testLogger(), WithInsecureSkipSignatureVerification())
 	serveHeadSHA(t, mux, "abc123")
 	serveAggregateScopeInputs(t, mux, []string{"schemabot.yaml"}, "database: orders\ntype: mysql\n")
 	// The fixture has no live Check Runs: the publisher must safely create them

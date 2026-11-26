@@ -216,8 +216,10 @@ func TestServeKeepsBackgroundWorkRunningUntilCloseAfterShutdownSignal(t *testing
 	started := make(chan context.Context, 1)
 	liveWhenCloseStoppedIt := make(chan bool, 1)
 	var backgroundCtx context.Context
+	held, metricsPort := holdPorts(t, 1)
 	srv := &Server{
-		cfg:       &api.ServerConfig{MetricsPort: freeTCPPort(t)},
+		cfg:       &api.ServerConfig{MetricsPort: metricsPort[0]},
+		listen:    held.listen,
 		svc:       api.New(mysqlstore.New(db), &api.ServerConfig{}, nil, logger),
 		logger:    logger,
 		authz:     authorizer,
@@ -309,8 +311,10 @@ func TestServeStopsClaimingNewWorkOnShutdownSignal(t *testing.T) {
 
 	started := make(chan struct{}, 1)
 	claimsAcrossDrain := make(chan [2]int, 1)
+	held, metricsPort := holdPorts(t, 1)
 	srv := &Server{
-		cfg:       &api.ServerConfig{MetricsPort: freeTCPPort(t)},
+		cfg:       &api.ServerConfig{MetricsPort: metricsPort[0]},
+		listen:    held.listen,
 		svc:       svc,
 		logger:    logger,
 		authz:     authorizer,
@@ -378,20 +382,6 @@ func settledClaimAttempts(claimAttempts func() int, pollInterval time.Duration) 
 		}
 	}
 	return count
-}
-
-// freeTCPPort returns a loopback port that was free a moment ago, for a listener
-// whose address is fixed by configuration rather than chosen at bind time.
-func freeTCPPort(t *testing.T) int {
-	t.Helper()
-
-	var config net.ListenConfig
-	listener, err := config.Listen(t.Context(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	addr, ok := listener.Addr().(*net.TCPAddr)
-	require.True(t, ok, "a TCP listener reports a TCP address")
-	require.NoError(t, listener.Close())
-	return addr.Port
 }
 
 // lockedWriter serializes writes from the reconciliation goroutine and the test

@@ -293,6 +293,16 @@ func TestValidateOverrideReason(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "empty")
 
+	// A command SchemaBot offers carries a placeholder; pasted unedited, it
+	// gives no reason.
+	for _, placeholder := range []string{"<why it can't wait>", " <reason> "} {
+		_, err = ValidateOverrideReason(placeholder)
+		require.Error(t, err, placeholder)
+		assert.Contains(t, err.Error(), "placeholder")
+	}
+	_, err = ValidateOverrideReason("<INC-42> checkout is down")
+	require.NoError(t, err, "a reason that only starts with a bracket is a reason")
+
 	_, err = ValidateOverrideReason(strings.Repeat("é", storage.FreezeOverrideReasonMax))
 	require.NoError(t, err, "the limit counts characters, not bytes")
 	_, err = ValidateOverrideReason(strings.Repeat("é", storage.FreezeOverrideReasonMax+1))

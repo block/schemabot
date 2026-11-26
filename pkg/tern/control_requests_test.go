@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"testing"
+	"time"
+
+	"github.com/block/schemabot/pkg/presentation"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -578,6 +581,204 @@ func TestSettlePendingRequestsForCancelledApplyCompletesTheCancel(t *testing.T) 
 	assert.Equal(t, "Pending cancel request completed for cancelled apply (caller: armand)", logs.logs[0].Message)
 }
 
+// failedRolloutWithPendingCancel is a failed apply whose operations ended in
+// opStates, keyed by shard when sharded, with a cancel still pending from
+// alice.
+func failedRolloutWithPendingCancel(sharded bool, opStates ...string) (*storage.Apply, *testControlRequestStore, *mockApplyLogStore, *mockStorage) {
+	ops := make([]*storage.ApplyOperation, 0, len(opStates))
+	for i, opState := range opStates {
+		if sharded {
+			ops = append(ops, shardWorkOperation(fmt.Sprintf("commerce/%d0-/orders", i), opState))
+			continue
+		}
+		ops = append(ops, targetStepOperation(fmt.Sprintf("target-%03d", i+1), 1, opState, true))
+	}
+	return failedRolloutWithOperations(ops...)
+}
+
+// shardWorkOperation is one shard's table change in a failed sharded apply's
+// fixture: every shard of the commerce deployment, keyed namespace/shard/table.
+// Each one started, since the fixture's cancel stopped running work.
+func shardWorkOperation(key, opState string) *storage.ApplyOperation {
+	started := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	return &storage.ApplyOperation{
+		Deployment:    "commerce",
+		OperationKey:  key,
+		OperationKind: storage.ApplyOperationKindWork,
+		State:         opState,
+		StartedAt:     &started,
+	}
+}
+
+// targetStepOperation is one table step of one target in a failed multi-target
+// rollout's fixture: the orders deployment runs table by table across its
+// targets. started says whether a driver ever claimed the step.
+func targetStepOperation(target string, step int, opState string, started bool) *storage.ApplyOperation {
+	op := &storage.ApplyOperation{
+		Deployment:    "orders",
+		Target:        target,
+		OperationKey:  storage.TargetOperationKey(target, storage.RolloutStepOperationKey(step)),
+		OperationKind: storage.ApplyOperationKindWork,
+		State:         opState,
+		RolloutStep:   step,
+	}
+	if started {
+		startedAt := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+		op.StartedAt = &startedAt
+	}
+	return op
+}
+
+// failedRolloutWithOperations returns a failed apply made of ops, with a cancel
+// from alice still pending on it.
+func failedRolloutWithOperations(operations ...*storage.ApplyOperation) (*storage.Apply, *testControlRequestStore, *mockApplyLogStore, *mockStorage) {
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-cancel-on-failed-rollout",
+		Database:        "testdb",
+		Environment:     "staging",
+		State:           state.Apply.Failed,
+	}
+	ops := make(map[int64]*storage.ApplyOperation, len(operations))
+	for i, op := range operations {
+		op.ID = int64(i + 1)
+		op.ApplyID = apply.ID
+		ops[op.ID] = op
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ApplyID: apply.ID, Operation: storage.ControlOperationCancel, Status: storage.ControlRequestPending, RequestedBy: "alice"},
+	}}
+	logs := &mockApplyLogStore{}
+	store := &mockStorage{controlRequests: controlRequests, logs: logs, operations: &mockApplyOperationStore{ops: ops}}
+	return apply, controlRequests, logs, store
+}
+
+// An operator cancels a sharded apply after one shard has already failed. The
+// cancel stops the two shards that had not finished, and the rollout settles
+// failed because failed outranks cancelled. The cancel did what the operator
+// asked, so the request completes, the PR comment carries no "Command not
+// applied" notice, and the apply history says how many shards it cancelled and
+// how many failed.
+func TestCancelThatLandsOnAFailedShardedRolloutCompletes(t *testing.T) {
+	apply, controlRequests, logs, store := failedRolloutWithPendingCancel(true,
+		state.ApplyOperation.Failed, state.ApplyOperation.Cancelled, state.ApplyOperation.Cancelled)
+
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestCompleted, settled.Status)
+	assert.Empty(t, settled.ErrorMessage)
+	require.Len(t, logs.logs, 1)
+	assert.Equal(t, storage.LogLevelInfo, logs.logs[0].Level)
+	assert.Equal(t, storage.LogEventCancelRequested, logs.logs[0].EventType)
+	assert.Equal(t, "Cancel took effect: 2 shards that had not finished were cancelled. The apply ended failed because 1 shard failed (caller: alice)",
+		logs.logs[0].Message)
+}
+
+// A multi-target apply names its members as targets, and a failure no member
+// carries leaves the history naming no failed count it cannot back.
+func TestCancelThatLandsOnAFailedRolloutWithNoFailedMemberNamesNoFailureCount(t *testing.T) {
+	apply, controlRequests, logs, store := failedRolloutWithPendingCancel(false,
+		state.ApplyOperation.Completed, state.ApplyOperation.Cancelled)
+
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestCompleted, settled.Status)
+	require.Len(t, logs.logs, 1)
+	assert.Equal(t, "Cancel took effect: 1 target that had not finished was cancelled. The apply ended failed (caller: alice)",
+		logs.logs[0].Message)
+}
+
+// A sharded apply changes two tables on each of three shards. Shard -80
+// failed copying orders, and the cancel stopped users behind it. The cancel
+// stopped both tables on 80-c0 and users on c0-. The history counts shards
+// rather than table steps: one failed and two cancelled, matching the rows the
+// PR comment lists.
+func TestCancelOnAFailedShardedRolloutCountsShardsNotTableSteps(t *testing.T) {
+	apply, controlRequests, logs, store := failedRolloutWithOperations(
+		shardWorkOperation("commerce/-80/orders", state.ApplyOperation.Failed),
+		shardWorkOperation("commerce/-80/users", state.ApplyOperation.Cancelled),
+		shardWorkOperation("commerce/80-c0/orders", state.ApplyOperation.Cancelled),
+		shardWorkOperation("commerce/80-c0/users", state.ApplyOperation.Cancelled),
+		shardWorkOperation("commerce/c0-/orders", state.ApplyOperation.Completed),
+		shardWorkOperation("commerce/c0-/users", state.ApplyOperation.Cancelled),
+	)
+
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestCompleted, settled.Status)
+	require.Len(t, logs.logs, 1)
+	assert.Equal(t, "Cancel took effect: 2 shards that had not finished were cancelled. The apply ended failed because 1 shard failed (caller: alice)",
+		logs.logs[0].Message)
+}
+
+// A multi-target rollout runs two table steps on each of two targets. Target
+// us failed its first step, and eu finished its first step. Neither target's
+// second step could ever start, since a step starts only once every earlier
+// step has completed, and the pending cancel's sweep ended both cancelled. The
+// cancel stopped nothing that could have run, so the request fails with the
+// outrun reason rather than claiming it cancelled eu.
+func TestCancelOnAFailedRolloutWhoseCancelledStepsCouldNeverStartStillFails(t *testing.T) {
+	apply, controlRequests, _, store := failedRolloutWithOperations(
+		targetStepOperation("us", 1, state.ApplyOperation.Failed, true),
+		targetStepOperation("us", 2, state.ApplyOperation.Cancelled, false),
+		targetStepOperation("eu", 1, state.ApplyOperation.Completed, true),
+		targetStepOperation("eu", 2, state.ApplyOperation.Cancelled, false),
+	)
+
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestFailed, settled.Status)
+	assert.Equal(t, "the schema change reached Failed before the cancel could take effect", settled.ErrorMessage)
+}
+
+// When every member of a failed apply had already finished, the cancel reached
+// nothing, so the request still fails with the outrun reason and the PR comment
+// keeps its "Command not applied" notice.
+func TestCancelOnAFailedRolloutWithNoCancelledMemberStillFails(t *testing.T) {
+	apply, controlRequests, logs, store := failedRolloutWithPendingCancel(true,
+		state.ApplyOperation.Failed, state.ApplyOperation.Completed)
+
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestFailed, settled.Status)
+	assert.Equal(t, "the schema change reached Failed before the cancel could take effect", settled.ErrorMessage)
+	require.Len(t, logs.logs, 1)
+	assert.Equal(t, storage.LogLevelWarn, logs.logs[0].Level)
+}
+
+// A failed apply whose operations cannot be read leaves the cancel pending and
+// returns the error, so a later settle decides the outcome from what it can
+// read rather than guessing that the cancel was outrun.
+func TestCancelOnAFailedRolloutStaysPendingWhenOperationsCannotBeRead(t *testing.T) {
+	apply, controlRequests, logs, store := failedRolloutWithPendingCancel(true, state.ApplyOperation.Cancelled)
+	store.operations.listErr = fmt.Errorf("storage unavailable")
+
+	err := SettlePendingCancelForResolvedApply(t.Context(), store, discardLogger(), apply)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "apply-cancel-on-failed-rollout")
+	assert.Contains(t, err.Error(), "storage unavailable")
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, pending, "an unread outcome must not settle the cancel")
+	assert.Empty(t, logs.logs)
+}
+
 // A cancel outrun by a terminal state other than completed names that state
 // without claiming the whole change is live: only a completed apply is known to
 // have landed every table, so the reason sends the operator to look at the
@@ -691,4 +892,45 @@ func TestFailPendingControlRequestsRecordsTheOperatorApplyID(t *testing.T) {
 				"the stored rejection must name the apply the operator asked about")
 		})
 	}
+}
+
+// A rollout of the orders deployment runs one schema change across two
+// sharded targets, keyed target/namespace/shard/table. Shard -80 of orders-001
+// failed, and the cancel stopped the other three shards before they finished.
+// The history counts the members the PR comment's rollup counts, by the same
+// noun, so the two never disagree about what the cancel did.
+func TestCancelOnAFailedRolloutCountsTheMembersThePRCommentLists(t *testing.T) {
+	shardOf := func(target, shard, opState string) *storage.ApplyOperation {
+		started := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+		return &storage.ApplyOperation{
+			Deployment:    "orders",
+			Target:        target,
+			OperationKey:  storage.TargetOperationKey(target, storage.ShardOperationKey("main", shard, "orders")),
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         opState,
+			StartedAt:     &started,
+		}
+	}
+	operations := []*storage.ApplyOperation{
+		shardOf("orders-001", "-80", state.ApplyOperation.Failed),
+		shardOf("orders-001", "80-", state.ApplyOperation.Cancelled),
+		shardOf("orders-002", "-80", state.ApplyOperation.Cancelled),
+		shardOf("orders-002", "80-", state.ApplyOperation.Cancelled),
+	}
+	apply, controlRequests, logs, store := failedRolloutWithOperations(operations...)
+
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestCompleted, settled.Status)
+
+	rows := workRowsForMemberOutcomes(operations)
+	comment := presentation.Derive(rows)
+	noun := presentation.MemberNoun(comment.Groups())
+	assert.Equal(t, []presentation.StateCount{{Label: "failed", Count: 1}, {Label: "cancelled", Count: 3}}, comment.Counts)
+	require.Len(t, logs.logs, 1)
+	assert.Equal(t, fmt.Sprintf("Cancel took effect: %s that had not finished were cancelled. The apply ended failed because %s failed (caller: alice)",
+		noun.Count(3), noun.Count(1)), logs.logs[0].Message)
 }

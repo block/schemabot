@@ -59,7 +59,7 @@ func gateApplyServer(t *testing.T, status int, body any) (*httptest.Server, *[]a
 		case "POST /api/plan":
 			assert.NoError(t, json.NewEncoder(w).Encode(plan))
 		case "POST /api/locks/acquire":
-			_, _ = w.Write([]byte(`{"lock":{"database":"testdb","database_type":"mysql"},"created":true}`))
+			_, _ = w.Write([]byte(acquireCreatedLock))
 		case "POST /api/apply":
 			var req apitypes.ApplyRequest
 			assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
@@ -109,10 +109,10 @@ func TestApplyPrintsTheFreezeRefusal(t *testing.T) {
 		"override recorded": {
 			recorded: true, override: "SEV-1234 fix the index",
 			want:    []string{"Override requested: ovr-123. A freeze approver other than you must run 'schemabot freeze approve ovr-123', then run this command again."},
-			notWant: []string{"To ask for an override"},
+			notWant: []string{"If this change can't wait"},
 		},
 		"no override asked": {
-			want:    []string{`To ask for an override, run the same command with --override "<reason>".`},
+			want:    []string{`If this change can't wait, run the same command with --override "<reason>".`},
 			notWant: []string{"Override requested"},
 		},
 	}
@@ -218,7 +218,7 @@ func TestStartAndCutoverFreezeRefusal(t *testing.T) {
 			assertSentOnce(t, *requests)
 			assert.Empty(t, (*requests)[0].Override)
 			assert.Contains(t, out, tc.outcome+"\n")
-			assert.Contains(t, out, `To ask for an override, run the same command with --override "<reason>".`)
+			assert.Contains(t, out, `If this change can't wait, run the same command with --override "<reason>".`)
 		})
 		t.Run(name+" when the gate cannot check", func(t *testing.T) {
 			server, _ := serveControlTestStub(t, controlTestStub{

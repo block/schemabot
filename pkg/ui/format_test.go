@@ -155,6 +155,13 @@ func TestRowCopyDisplayPercent(t *testing.T) {
 	assert.Equal(t, 100, RowCopyDisplayPercent(145, 42))
 }
 
+func TestRecoveringCopyingRows(t *testing.T) {
+	assert.True(t, RecoveringCopyingRows(1_000, 0))
+	assert.True(t, RecoveringCopyingRows(1_000, 99))
+	assert.False(t, RecoveringCopyingRows(1_000, 100), "a finished copy is not still copying")
+	assert.False(t, RecoveringCopyingRows(0, 40), "no row total yet, so no copy to report")
+}
+
 func TestChecksumDisplayPercent(t *testing.T) {
 	// No total yet, or nothing verified: an empty bar.
 	assert.Equal(t, 0, ChecksumDisplayPercent(0, 0))
@@ -180,6 +187,18 @@ func TestRowCopyFraction(t *testing.T) {
 	assert.InDelta(t, 100, RowCopyFraction(99, 1_100_000, 1_000_000), 0.0001)
 	assert.InDelta(t, 45, RowCopyFraction(45, 0, 0), 0.0001)
 	assert.InDelta(t, 100, RowCopyFraction(145, 0, 0), 0.0001)
+	assert.InDelta(t, 100, RowCopyFraction(100, 1, 200_000), 0.0001, "a copy the engine finished short of its total is done")
+}
+
+// A copy covers the rows it copied, clamped to its total, or the whole total
+// once the engine reports it finished short of the total.
+func TestCopyCoveredRows(t *testing.T) {
+	assert.Equal(t, int64(50_000), CopyCoveredRows(25, 50_000, 200_000))
+	assert.Equal(t, int64(200_000), CopyCoveredRows(100, 1, 200_000))
+	assert.Equal(t, int64(200_000), CopyCoveredRows(100, 0, 200_000))
+	assert.Equal(t, int64(200_000), CopyCoveredRows(100, 250_000, 200_000))
+	assert.Equal(t, int64(0), CopyCoveredRows(0, 0, 200_000))
+	assert.Equal(t, int64(0), CopyCoveredRows(100, 0, 0))
 }
 
 func TestFormatRowCopyPercent(t *testing.T) {
@@ -199,8 +218,14 @@ func TestFormatRowCopyPercent(t *testing.T) {
 	// Capped at 99.99% while copied rows still trail the total: "100.00%"
 	// reads as done, and a copy in its final stretch is not.
 	assert.Equal(t, "99.99%", FormatRowCopyPercent(99, 999_999_999, 1_000_000_000))
-	assert.Equal(t, "99.99%", FormatRowCopyPercent(100, 43_234_523_344, 43_234_523_345))
+	assert.Equal(t, "99.99%", FormatRowCopyPercent(99, 43_234_523_344, 43_234_523_345))
 	assert.Equal(t, "99.99%", FormatRowCopyPercent(99, 99_999, 100_000))
+
+	// An engine reports 100 short of the total only when it declares the copy
+	// finished, as when the copy skipped rows, so the copy reads as done.
+	assert.Equal(t, "100.00%", FormatRowCopyPercent(100, 43_234_523_344, 43_234_523_345))
+	assert.Equal(t, "100.00%", FormatRowCopyPercent(100, 1, 200_000))
+	assert.Equal(t, "100.00%", FormatRowCopyPercent(100, 0, 200_000))
 
 	// Without row counts, the engine's whole-number percent renders clamped;
 	// a copy that has begun with no total falls back to "<1%".

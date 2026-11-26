@@ -100,6 +100,49 @@ var (
 	ErrConfigDiscoveryTruncated = fmt.Errorf("%w; the configured schema directories do not bound where schemabot.yaml may live", ErrGitTreeTruncated)
 )
 
+// ConfigCandidate identifies one schemabot.yaml config an ambiguous command
+// could target: the database it declares and the directory that holds it.
+type ConfigCandidate struct {
+	Database  string
+	SchemaDir string
+}
+
+// MultipleConfigsError reports that a command without -d matched more than one
+// config, so the user must name the database. It carries every candidate so
+// callers render the choices from fields instead of parsing the message. It
+// matches ErrMultipleConfigs under errors.Is.
+type MultipleConfigsError struct {
+	Candidates []ConfigCandidate
+}
+
+func newMultipleConfigsError(configs []DiscoveredConfig) *MultipleConfigsError {
+	candidates := make([]ConfigCandidate, 0, len(configs))
+	for _, dc := range configs {
+		candidates = append(candidates, ConfigCandidate{Database: dc.Config.Database, SchemaDir: dc.SchemaDir})
+	}
+	return &MultipleConfigsError{Candidates: candidates}
+}
+
+func (e *MultipleConfigsError) Error() string {
+	described := make([]string, 0, len(e.Candidates))
+	for _, candidate := range e.Candidates {
+		described = append(described, fmt.Sprintf("`%s` (%s)", candidate.Database, candidate.SchemaDir))
+	}
+	return fmt.Sprintf("%s: %s", ErrMultipleConfigs, strings.Join(described, ", "))
+}
+
+// Unwrap makes the error match ErrMultipleConfigs under errors.Is.
+func (e *MultipleConfigsError) Unwrap() error { return ErrMultipleConfigs }
+
+// Databases lists the database each candidate declares, in discovery order.
+func (e *MultipleConfigsError) Databases() []string {
+	databases := make([]string, 0, len(e.Candidates))
+	for _, candidate := range e.Candidates {
+		databases = append(databases, candidate.Database)
+	}
+	return databases
+}
+
 // DatabaseNotFoundError indicates the specified database was not found in any config.
 type DatabaseNotFoundError struct {
 	DatabaseName       string
@@ -249,7 +292,10 @@ func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref stri
 		return result, nil
 	}
 
-	result := ic.collectConfigsFromTree(ctx, repo, ref, entries)
+	result, err := ic.collectConfigsFromTree(ctx, repo, ref, entries)
+	if err != nil {
+		return nil, err
+	}
 
 	ic.logger.Debug("config discovery complete",
 		"valid", len(result.ValidConfigs),
@@ -261,14 +307,18 @@ func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref stri
 
 // collectConfigsFromTree fetches and parses every schemabot.yaml among the
 // given tree entries. Unparseable configs are reported as invalid rather than
-// failing the whole discovery.
-func (ic *InstallationClient) collectConfigsFromTree(ctx context.Context, repo, ref string, entries []TreeEntry) *FindAllConfigsResult {
+// failing the whole discovery. A read the quota reserve refused says nothing
+// about the config, so it fails the walk instead of being reported as invalid.
+func (ic *InstallationClient) collectConfigsFromTree(ctx context.Context, repo, ref string, entries []TreeEntry) (*FindAllConfigsResult, error) {
 	result := &FindAllConfigsResult{}
 	for _, entry := range entries {
 		if entry.Type != "blob" || !isConfigFile(entry.Path) {
 			continue
 		}
 		config, err := ic.FetchConfig(ctx, repo, entry.Path, ref)
+		if errors.Is(err, ErrGitHubQuotaReserved) {
+			return nil, fmt.Errorf("read schemabot config %s in repo %s ref %s: %w", entry.Path, repo, ref, err)
+		}
 		if err != nil {
 			ic.logger.Warn("failed to parse config", "path", entry.Path, "error", err)
 			result.InvalidConfigs = append(result.InvalidConfigs, InvalidConfigInfo{
@@ -284,7 +334,7 @@ func (ic *InstallationClient) collectConfigsFromTree(ctx context.Context, repo, 
 			SchemaDir: path.Dir(entry.Path),
 		})
 	}
-	return result
+	return result, nil
 }
 
 // findAllConfigsForDatabase discovers configs for a database-scoped lookup.
@@ -300,7 +350,11 @@ func (ic *InstallationClient) findAllConfigsForDatabase(ctx context.Context, rep
 		return nil, nil, false, fmt.Errorf("fetch git tree: %w", err)
 	}
 	if !truncated {
-		return ic.collectConfigsFromTree(ctx, repo, ref, entries), nil, false, nil
+		result, err := ic.collectConfigsFromTree(ctx, repo, ref, entries)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		return result, nil, false, nil
 	}
 	result, searchedDirs, ok, hintErr := ic.findConfigsInDatabaseHintDirs(ctx, repo, ref, databaseName)
 	if hintErr != nil {
@@ -420,6 +474,9 @@ func (ic *InstallationClient) scanHintDirsForConfigs(ctx context.Context, repo, 
 			seen[configPath] = struct{}{}
 
 			config, err := ic.FetchConfig(ctx, repo, configPath, ref)
+			if errors.Is(err, ErrGitHubQuotaReserved) {
+				return nil, fmt.Errorf("read schemabot config %s in repo %s ref %s: %w", configPath, repo, ref, err)
+			}
 			if err != nil {
 				ic.logger.Warn("failed to parse config", "path", configPath, "error", err)
 				result.InvalidConfigs = append(result.InvalidConfigs, InvalidConfigInfo{
@@ -620,11 +677,7 @@ func SingleDiscoveredConfig(configs []DiscoveredConfig) (*SchemabotConfig, strin
 	case 1:
 		return configs[0].Config, configs[0].SchemaDir, nil
 	}
-	var databases []string
-	for _, dc := range configs {
-		databases = append(databases, fmt.Sprintf("`%s` (%s)", dc.Config.Database, dc.SchemaDir))
-	}
-	return nil, "", fmt.Errorf("%w: %s", ErrMultipleConfigs, strings.Join(databases, ", "))
+	return nil, "", newMultipleConfigsError(configs)
 }
 
 // FindAllConfigsForPR finds ALL schemabot.yaml configs that apply to the changed files in a PR.
@@ -717,11 +770,7 @@ func (ic *InstallationClient) FindConfigInRepo(ctx context.Context, repo string,
 		return dc.Config, dc.SchemaDir, result.InvalidConfigs, nil
 	}
 
-	var databases []string
-	for _, dc := range result.ValidConfigs {
-		databases = append(databases, fmt.Sprintf("`%s` (%s)", dc.Config.Database, dc.SchemaDir))
-	}
-	return nil, "", result.InvalidConfigs, fmt.Errorf("%w: %s", ErrMultipleConfigs, strings.Join(databases, ", "))
+	return nil, "", result.InvalidConfigs, newMultipleConfigsError(result.ValidConfigs)
 }
 
 // IsSchemaFile reports whether filename is a SchemaBot-managed schema file

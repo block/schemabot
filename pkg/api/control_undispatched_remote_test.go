@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
@@ -194,6 +195,114 @@ func TestImmediateControlSkippedForUndispatchedRemoteApply(t *testing.T) {
 		require.NotNil(t, mock.cancelReq)
 		assert.Equal(t, "remote-apply-cancel", mock.cancelReq.ApplyId)
 	})
+}
+
+// Revert and skip-revert share one control path, and each reports itself under
+// its own metric operation and in its own words. An accepted control records
+// "success", a control refused before it is recorded records "rejected", and a
+// failed data-plane call records "error", all under the operation the operator
+// sent. An accepted control completes its own durable request and logs its
+// own event, and only skip-revert marks the apply's revert as skipped.
+func TestRevertWindowControlsReportUnderTheirOwnOperation(t *testing.T) {
+	cases := []struct {
+		name            string
+		path            string
+		metricOperation string
+		operation       storage.ControlOperation
+		logEvent        string
+		marksSkipped    bool
+		triggeredLog    string
+		unsupportedText string
+		accepting       *mockTernClient
+		failing         *mockTernClient
+	}{
+		{
+			name:            "revert",
+			path:            "/api/revert",
+			metricOperation: "revert",
+			operation:       storage.ControlOperationRevert,
+			logEvent:        storage.LogEventRevertTriggered,
+			triggeredLog:    "Revert triggered by user",
+			unsupportedText: "revert is only supported for PlanetScale schema changes",
+			accepting:       &mockTernClient{revertResp: &ternv1.RevertResponse{Accepted: true}},
+			failing:         &mockTernClient{revertErr: errors.New("data plane unavailable")},
+		},
+		{
+			name:            "skip-revert",
+			path:            "/api/skip-revert",
+			metricOperation: "skip_revert",
+			operation:       storage.ControlOperationSkipRevert,
+			logEvent:        storage.LogEventSkipRevertTriggered,
+			marksSkipped:    true,
+			triggeredLog:    "Skip-revert triggered by user",
+			unsupportedText: "skip-revert is only supported for PlanetScale schema changes",
+			accepting:       &mockTernClient{skipRevertResp: &ternv1.SkipRevertResponse{Accepted: true}},
+			failing:         &mockTernClient{skipRevertErr: errors.New("data plane unavailable")},
+		},
+	}
+
+	revertWindowApply := func(applyID string, engine string) *storage.Apply {
+		apply := activeTestApply(applyID)
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = engine
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		return apply
+	}
+	body := `{"environment": "staging", "apply_id": "apply-revert-window-metric"}`
+	requireOneMetricPoint := func(t *testing.T, reader *sdkmetric.ManualReader, wantOperation, wantStatus string) {
+		t.Helper()
+		points := collectCounterPoints(t, reader, "schemabot.control_operations_total")
+		require.Len(t, points, 1, "one control operation is recorded")
+		assert.Equal(t, wantOperation, attributeValue(t, points[0], "operation"))
+		assert.Equal(t, wantStatus, attributeValue(t, points[0], "status"))
+		assert.Equal(t, int64(1), points[0].Value)
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name+" accepted by the data plane", func(t *testing.T) {
+			reader := installManualMetricReader(t)
+			apply := revertWindowApply("apply-revert-window-metric", storage.EnginePlanetScale)
+			svc, stores := newControlTestServiceWithStores(tc.accepting, apply, nil)
+
+			w := sendControlRequest(t, svc, tc.path, body)
+
+			assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			requireOneMetricPoint(t, reader, tc.metricOperation, "success")
+			assert.True(t, hasApplyLogMessageContaining(stores.applyLogs.logs, tc.triggeredLog), "the apply log records %q", tc.triggeredLog)
+			require.NotEmpty(t, stores.applyLogs.logs)
+			assert.Equal(t, tc.logEvent, stores.applyLogs.logs[0].EventType)
+			stored, err := stores.controls.GetByOperation(t.Context(), apply.ID, tc.operation)
+			require.NoError(t, err)
+			require.NotNil(t, stored, "the %s request is recorded under its own operation", tc.name)
+			assert.Equal(t, storage.ControlRequestCompleted, stored.Status)
+			if tc.marksSkipped {
+				assert.Equal(t, []int64{apply.ID}, stores.applies.revertSkipped, "skip-revert records that the revert was skipped")
+			} else {
+				assert.Empty(t, stores.applies.revertSkipped, "revert does not mark the revert as skipped")
+			}
+		})
+
+		t.Run(tc.name+" refused for a non-PlanetScale apply", func(t *testing.T) {
+			reader := installManualMetricReader(t)
+			svc := newControlTestService(tc.accepting, revertWindowApply("apply-revert-window-metric", storage.EngineSpirit))
+
+			w := sendControlRequest(t, svc, tc.path, body)
+
+			assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+			assert.Contains(t, w.Body.String(), tc.unsupportedText)
+			requireOneMetricPoint(t, reader, tc.metricOperation, "rejected")
+		})
+
+		t.Run(tc.name+" failed on the data plane", func(t *testing.T) {
+			reader := installManualMetricReader(t)
+			svc := newControlTestService(tc.failing, revertWindowApply("apply-revert-window-metric", storage.EnginePlanetScale))
+
+			w := sendControlRequest(t, svc, tc.path, body)
+
+			assert.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
+			requireOneMetricPoint(t, reader, tc.metricOperation, "error")
+		})
+	}
 }
 
 // A data-plane client that answers a revert or skip-revert with neither a

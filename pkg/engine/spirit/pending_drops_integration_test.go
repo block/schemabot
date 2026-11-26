@@ -416,16 +416,9 @@ func resumeStoppedDropPhase(t *testing.T, eng *Engine, dsn string, attempted, pl
 	require.NoError(t, err, "resume the stopped schema change")
 	require.True(t, result.Accepted, "resume must be accepted: %s", result.Message)
 
-	done := make(chan struct{})
-	go func() {
-		rm.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(resumeDeadline):
-		require.FailNow(t, "resumed schema change did not finish", "deadline %s", resumeDeadline)
-	}
+	waitCtx, cancel := context.WithTimeout(t.Context(), resumeDeadline)
+	defer cancel()
+	require.NoError(t, currentRunExit(eng, rm).wait(waitCtx), "resumed schema change did not finish within %s", resumeDeadline)
 
 	eng.mu.Lock()
 	defer eng.mu.Unlock()

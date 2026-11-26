@@ -1119,6 +1119,24 @@ type mockApplyOperationStore struct {
 	// operation id, standing in for a pod that dies before that id reaches
 	// storage.
 	operationIDWriteErr error
+	// getByKeyErr fails GetByApplyDeploymentAndOperationKey.
+	getByKeyErr error
+	// markTerminalErr fails MarkTerminal.
+	markTerminalErr error
+	// listErr fails ListByApply.
+	listErr error
+}
+
+func (m *mockApplyOperationStore) GetByApplyDeploymentAndOperationKey(_ context.Context, applyID int64, deployment, operationKey string) (*storage.ApplyOperation, error) {
+	if m.getByKeyErr != nil {
+		return nil, m.getByKeyErr
+	}
+	for _, op := range m.ops {
+		if op.ApplyID == applyID && op.Deployment == deployment && op.OperationKey == operationKey {
+			return op, nil
+		}
+	}
+	return nil, nil
 }
 
 func (m *mockApplyOperationStore) Get(_ context.Context, id int64) (*storage.ApplyOperation, error) {
@@ -1130,6 +1148,9 @@ func (m *mockApplyOperationStore) Get(_ context.Context, id int64) (*storage.App
 }
 
 func (m *mockApplyOperationStore) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyOperation, error) {
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
 	var ops []*storage.ApplyOperation
 	for _, op := range m.ops {
 		if op != nil && op.ApplyID == applyID {
@@ -1163,6 +1184,9 @@ func (m *mockApplyOperationStore) UpdateState(_ context.Context, id int64, newSt
 }
 
 func (m *mockApplyOperationStore) MarkTerminal(_ context.Context, id int64, newState string) error {
+	if m.markTerminalErr != nil {
+		return m.markTerminalErr
+	}
 	op, ok := m.ops[id]
 	if !ok {
 		return storage.ErrApplyOperationNotFound
@@ -1393,6 +1417,10 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 	}
 	client, cleanup := testCapturingGRPCClient(t, server)
 	defer cleanup()
+	client.changeEventApp = func(database string) string {
+		assert.Equal(t, "testdb", database)
+		return "managed-app"
+	}
 
 	apply := &storage.Apply{
 		ID:              7,
@@ -1442,6 +1470,7 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 	assert.Equal(t, "testdb", req.Database)
 	assert.Equal(t, "testdb-target", req.Target)
 	assert.Equal(t, "true", req.Options["defer_cutover"])
+	assert.Equal(t, "managed-app", req.Options[changeEventAppOption])
 	require.Len(t, req.DdlChanges, 1)
 	assert.Equal(t, "users", req.DdlChanges[0].TableName)
 	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_ALTER, req.DdlChanges[0].ChangeType)
@@ -5007,7 +5036,8 @@ func TestGRPCClient_ResumeApplyLogsRemoteLifecycle(t *testing.T) {
 		messages = append(messages, log.Message)
 	}
 	assert.Contains(t, messages, "Apply dispatched to remote Tern: target=testdb-target deployment=us-west remote_apply_id=remote-lifecycle-123")
-	assert.Contains(t, messages, "Remote task users changed state: pending -> completed")
+	assert.True(t, hasStateTransitionLog(logs.logs, "Remote task users changed state", state.Task.Pending, state.Task.Completed),
+		"expected the remote task transition in logs: %v", messages)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Remote apply reached terminal state: completed"),
 		"expected final remote apply state in logs: %v", messages)
 	assert.Equal(t, state.Task.Completed, task.State)
@@ -5718,7 +5748,7 @@ func TestGRPCClient_SyncStoredTasksFromRemoteTasksUsesRemoteTaskState(t *testing
 			assert.Equal(t, tc.wantStoredTaskState, storedTask.State)
 			assert.Equal(t, tc.wantProgress, storedTask.ProgressPercent)
 			assert.Equal(t, tc.wantCompletedAt, storedTask.CompletedAt != nil)
-			assert.True(t, hasLogMessageContaining(logs.logs, "Remote task users changed state: running -> "+tc.wantStoredTaskState))
+			assert.True(t, hasStateTransitionLog(logs.logs, "Remote task users changed state", state.Task.Running, tc.wantStoredTaskState))
 		})
 	}
 }
@@ -6074,9 +6104,9 @@ func TestGRPCClient_RemoteRetryablePauseKeepsDrivePollingToCompletion(t *testing
 		assert.False(t, state.IsState(update.State, state.Apply.Failed, state.Apply.FailedRetryable),
 			"a retryable pause must never persist a failed or failed_retryable apply row while the drive polls, got %s", update.State)
 	}
-	assert.True(t, hasLogMessageContaining(logs.logs, "Remote task users changed state: pending -> failed_retryable"),
+	assert.True(t, hasStateTransitionLog(logs.logs, "Remote task users changed state", state.Task.Pending, state.Task.FailedRetryable),
 		"the task row must mirror the data-plane pause")
-	assert.True(t, hasLogMessageContaining(logs.logs, "Remote task users changed state: failed_retryable -> running"),
+	assert.True(t, hasStateTransitionLog(logs.logs, "Remote task users changed state", state.Task.FailedRetryable, state.Task.Running),
 		"the task row must follow the data plane's next recovery attempt")
 }
 
@@ -6156,9 +6186,9 @@ func TestGRPCClient_FailedRetryableWireStateKeepsDrivePollingToCompletion(t *tes
 		assert.False(t, state.IsState(update.State, state.Apply.Failed, state.Apply.FailedRetryable),
 			"a retryable pause must never persist a failed or failed_retryable apply row while the drive polls, got %s", update.State)
 	}
-	assert.True(t, hasLogMessageContaining(logs.logs, "Remote task users changed state: pending -> failed_retryable"),
+	assert.True(t, hasStateTransitionLog(logs.logs, "Remote task users changed state", state.Task.Pending, state.Task.FailedRetryable),
 		"the task row must mirror the data-plane pause")
-	assert.True(t, hasLogMessageContaining(logs.logs, "Remote task users changed state: failed_retryable -> running"),
+	assert.True(t, hasStateTransitionLog(logs.logs, "Remote task users changed state", state.Task.FailedRetryable, state.Task.Running),
 		"the task row must follow the data plane's next recovery attempt")
 }
 
@@ -7629,6 +7659,17 @@ func TestTerminalTaskStateForApply(t *testing.T) {
 func hasLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 	for _, log := range logs {
 		if strings.Contains(log.Message, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasStateTransitionLog reports whether logs hold an entry with exactly this
+// message whose old and new states are the given ones.
+func hasStateTransitionLog(logs []*storage.ApplyLog, message, oldState, newState string) bool {
+	for _, log := range logs {
+		if log.Message == message && log.OldState == oldState && log.NewState == newState {
 			return true
 		}
 	}
@@ -11055,4 +11096,14 @@ func TestObserverPollTreatsAReattachedObserverAsTheSameRegistration(t *testing.T
 		5*time.Second, 10*time.Millisecond, "the observer is cleared after its terminal update")
 	waitForTicks(t, applies, 0)
 	assert.Equal(t, int32(1), stopped.terminal.Load())
+}
+
+// A remote task's state change names the shard on a sharded target, so an
+// operator reading the apply's log can find a slow or failed shard, and never
+// repeats the states the log entry already carries.
+func TestRemoteTaskStateChangeMessageNamesTheShard(t *testing.T) {
+	assert.Equal(t, "Remote task users changed state",
+		remoteTaskStateChangeMessage(&storage.Task{TableName: "users"}))
+	assert.Equal(t, "Remote task users on shard 80-c0 changed state",
+		remoteTaskStateChangeMessage(&storage.Task{TableName: "users", Shard: "80-c0"}))
 }

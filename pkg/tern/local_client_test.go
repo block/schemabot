@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/inventory"
+	"github.com/block/schemabot/pkg/presentation"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
@@ -703,6 +704,7 @@ type fakeControlEngine struct {
 	cancelCount             int
 	cancelErr               error
 	startCount              int
+	startErr                error
 	cutoverCount            int
 	cutoverResult           *engine.ControlResult
 	cutoverErr              error
@@ -779,6 +781,9 @@ func (e *fakeControlEngine) Cancel(context.Context, *engine.ControlRequest) (*en
 
 func (e *fakeControlEngine) Start(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.startCount++
+	if e.startErr != nil {
+		return nil, e.startErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
@@ -1288,6 +1293,7 @@ func TestPlanWithEngine_RefusesIgnoredNamespacesOnDatabaseScopedMySQLDSN(t *test
 		IgnoredNamespaces: []string{"local_fixtures"},
 	}, "testdb", schema.SchemaFiles{"testdb": {Files: map[string]string{"users.sql": "CREATE TABLE users (id INT)"}}})
 	require.Error(t, err)
+	assert.True(t, engine.IsPlanRefused(err))
 	assert.Contains(t, err.Error(), "ignore_namespaces is not supported for MySQL targets whose DSN names a database")
 	assert.Contains(t, err.Error(), "local_fixtures")
 }
@@ -1309,6 +1315,7 @@ func TestPlanWithEngine_RefusesUnselectedNamespacesOnDatabaseScopedMySQLDSN(t *t
 		UnselectedNamespaces: []string{"ns_1"},
 	}, "orders", schema.SchemaFiles{"ns_0": {Files: map[string]string{"orders.sql": "CREATE TABLE orders (id INT)"}}})
 	require.Error(t, err)
+	assert.True(t, engine.IsPlanRefused(err))
 	assert.Contains(t, err.Error(), "a targets entry that selects namespaces is not supported for MySQL targets whose DSN names a database")
 	assert.Contains(t, err.Error(), "unselected namespaces [ns_1] would have their live tables planned as DROP TABLE")
 }
@@ -2020,7 +2027,8 @@ func TestGroupedResumeChangesGroupsTasksByNamespace(t *testing.T) {
 		{Namespace: "billing", TableName: "invoices", DDL: "ALTER TABLE `invoices` ADD COLUMN `due_at` datetime", DDLAction: "alter"},
 	}
 
-	changes := groupedResumeChanges(tasks, nil)
+	changes, err := groupedResumeChanges(tasks, nil, nil)
+	require.NoError(t, err)
 
 	require.Len(t, changes, 2)
 	assert.Equal(t, "commerce", changes[0].Namespace)
@@ -2046,7 +2054,8 @@ func TestGroupedResumeChangesPreservesDDL(t *testing.T) {
 		{Namespace: "commerce", TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter"},
 	}
 
-	changes := groupedResumeChanges(tasks, nil)
+	changes, err := groupedResumeChanges(tasks, nil, nil)
+	require.NoError(t, err)
 
 	require.Len(t, changes, 1)
 	assert.Equal(t, "commerce", changes[0].Namespace)
@@ -2065,7 +2074,8 @@ func TestGroupedResumeChangesPreservesMultiNamespaceScopedTasks(t *testing.T) {
 		{Namespace: "routing", TableName: "lookup", DDL: "ALTER TABLE `lookup` ADD COLUMN `region` varchar(32)", DDLAction: "alter"},
 	}
 
-	changes := groupedResumeChanges(tasks, nil)
+	changes, err := groupedResumeChanges(tasks, nil, nil)
+	require.NoError(t, err)
 
 	require.Len(t, changes, 2)
 	byNamespace := make(map[string]engine.SchemaChange)
@@ -6439,6 +6449,24 @@ func TestShardProgressProto(t *testing.T) {
 	assert.Nil(t, shardProgressProto(nil))
 }
 
+// One shard has a row total and no ETA yet, and the other reports 45s left
+// before it reports a row total. The data plane's table ETA and the PR
+// comment's rollup read the same shards, so both say 45s.
+func TestStoredShardETAMatchesTheCommentRollup(t *testing.T) {
+	stored := []*storage.Task{
+		{Shard: "-80", State: state.Task.Running, RowsCopied: 400, RowsTotal: 1000},
+		{Shard: "80-", State: state.Task.Running, RowsCopied: 50, ETASeconds: 45},
+	}
+	copies := make([]presentation.ShardCopy, 0, len(stored))
+	for _, sh := range stored {
+		copies = append(copies, presentation.ShardCopy{Status: sh.State, RowsCopied: sh.RowsCopied, RowsTotal: sh.RowsTotal, ETASeconds: int64(sh.ETASeconds)})
+	}
+
+	_, _, eta, _ := aggregateStoredShards(stored)
+	assert.Equal(t, int64(45), eta)
+	assert.Equal(t, int64(45), presentation.RollUpShardedTable(copies, 2).ETASeconds)
+}
+
 // Progress renders each table's per-shard breakdown only from the persisted
 // shard rows the operator drive wrote, grouped by (namespace, table). The live
 // engine result is never the read surface, so a live-only shard the engine
@@ -6486,6 +6514,9 @@ func TestLocalClient_VitessProgressRendersShardsFromStored(t *testing.T) {
 	assert.Equal(t, int64(100), progress.Tables[0].RowsCopied)
 	assert.Equal(t, int64(200), progress.Tables[0].RowsTotal)
 	assert.Equal(t, int32(50), progress.Tables[0].PercentComplete, "aggregate is computed from stored shards, not the live result")
+	// The two shards report 7s and 3s left. Shards cannot share work, so the
+	// table finishes with the slower one.
+	assert.Equal(t, int64(7), progress.Tables[0].EtaSeconds, "the table ETA is the slowest shard's")
 
 	shards := progress.Tables[0].Shards
 	require.Len(t, shards, 2, "renders the two persisted shards, not the single live one")

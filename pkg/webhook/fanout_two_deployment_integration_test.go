@@ -126,7 +126,7 @@ func TestE2EFanOutRollbackOwnerActsSiblingSilent(t *testing.T) {
 	}, schemabotConfig, dbName)
 
 	installClient := ghclient.NewInstallationClient(client, testLogger())
-	owner := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, testLogger())
+	owner := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, testLogger(), WithInsecureSkipSignatureVerification())
 	sibling, siblingComments := siblingFanOutHandler(t)
 
 	storedApply, err := svc.Storage().Applies().Get(ctx, applyID)

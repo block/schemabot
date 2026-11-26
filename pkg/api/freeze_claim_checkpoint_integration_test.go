@@ -76,7 +76,7 @@ func TestClaimCheckpointStopsAnUnstartedRolloutUnderAStopFreeze(t *testing.T) {
 			assert.Empty(t, op.LeaseToken, "%s: the claim was handed back", deployment)
 		}
 
-		svc.recoverApplies(ctx, 1, openClaimGate())
+		svc.recoverApplies(ctx, 1, openClaimGate(), passPolled)
 
 		assert.Empty(t, rec.resumeOrder(), "stop reconciliation stops the rollout without starting it")
 		for _, deployment := range []string{"eu", "us"} {

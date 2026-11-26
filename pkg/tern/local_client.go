@@ -115,6 +115,7 @@ import (
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
@@ -634,6 +635,7 @@ func (c *LocalClient) applyWithEngine(ctx context.Context, eng engine.Engine, re
 	ctx = withDriveWorkOwner(ctx)
 	req = applyRequestWithStatedDirectExecution(req)
 	if !c.remapsPostgresNamespaces() {
+		c.observeOperationDispatch(ctx)
 		return eng.Apply(ctx, req)
 	}
 	// Remapping rewrites the caller's request, so it is done on a copy: the
@@ -656,6 +658,7 @@ func (c *LocalClient) applyWithEngine(ctx context.Context, eng engine.Engine, re
 		return nil, fmt.Errorf("prepare PostgreSQL apply schema files: %w", err)
 	}
 	requestCopy.SchemaFiles = physicalFiles
+	c.observeOperationDispatch(ctx)
 	return eng.Apply(ctx, &requestCopy)
 }
 
@@ -1624,6 +1627,9 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 			PlanId:       result.PlanID,
 			Engine:       c.protoEngine(),
 			ExemptTables: protoExemptTables(result.ExemptTables),
+			// An entry that names no table drops nothing, so a clean plan
+			// is also where it has to be reported.
+			UnmatchedDropTables: result.UnmatchedDropTables,
 		}, nil
 	}
 
@@ -1666,13 +1672,14 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 
 	changes, violations, protoShards := c.planResultToProtoChanges(result)
 	return &ternv1.PlanResponse{
-		PlanId:         result.PlanID,
-		Engine:         c.protoEngine(),
-		Changes:        changes,
-		LintViolations: violations,
-		Shards:         protoShards,
-		ExistingCopies: c.protoExistingCopies(result, c.runningCopiesForPlan(ctx, result, req.Environment, localPlanTarget(req, c.config.Database))),
-		ExemptTables:   protoExemptTables(result.ExemptTables),
+		PlanId:              result.PlanID,
+		Engine:              c.protoEngine(),
+		Changes:             changes,
+		LintViolations:      violations,
+		Shards:              protoShards,
+		ExistingCopies:      c.protoExistingCopies(result, c.runningCopiesForPlan(ctx, result, req.Environment, localPlanTarget(req, c.config.Database))),
+		ExemptTables:        protoExemptTables(result.ExemptTables),
+		UnmatchedDropTables: result.UnmatchedDropTables,
 	}, nil
 }
 
@@ -2040,17 +2047,17 @@ func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanReques
 		// shape, so refuse rather than emit a plan that proposes dropping the
 		// namespace the config says to leave alone.
 		if len(req.GetIgnoredNamespaces()) > 0 {
-			return nil, fmt.Errorf(
+			return nil, &engine.PlanRefusedError{Err: fmt.Errorf(
 				"ignore_namespaces is not supported for MySQL targets whose DSN names a database: the whole database is diffed as one unit, so ignored namespaces %v would have their live tables planned as DROP TABLE; use a namespace-free target DSN or remove ignore_namespaces",
-				req.GetIgnoredNamespaces())
+				req.GetIgnoredNamespaces())}
 		}
 		// A namespace the target's entry does not select is withheld the same
 		// way, so its live tables, still on this database until moved, would be
 		// planned as drops too.
 		if len(req.GetUnselectedNamespaces()) > 0 {
-			return nil, fmt.Errorf(
+			return nil, &engine.PlanRefusedError{Err: fmt.Errorf(
 				"a targets entry that selects namespaces is not supported for MySQL targets whose DSN names a database: the whole database is diffed as one unit, so unselected namespaces %v would have their live tables planned as DROP TABLE; use a namespace-free target DSN or remove the entry's namespaces list",
-				req.GetUnselectedNamespaces())
+				req.GetUnselectedNamespaces())}
 		}
 		return c.planNamespaceWithEngine(ctx, eng, req, database, schemaFiles, c.credentials())
 	}
@@ -2106,7 +2113,7 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 
 	// Copies are checked only when every namespace's plan checked its own.
 	result := &engine.PlanResult{PlanID: engine.NewPlanID(), NoChanges: true, ExistingCopiesChecked: true}
-	for _, namespace := range namespaces {
+	for i, namespace := range namespaces {
 		creds, err := c.credentialsForMySQLNamespace(namespace)
 		if err != nil {
 			return nil, err
@@ -2120,6 +2127,16 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 		result.ExistingCopies = append(result.ExistingCopies, nsResult.ExistingCopies...)
 		result.ExistingCopiesChecked = result.ExistingCopiesChecked && nsResult.ExistingCopiesChecked
 		result.ExemptTables = append(result.ExemptTables, nsResult.ExemptTables...)
+		// Every namespace is planned with the whole drop_tables list, so an
+		// entry is unmatched only when no namespace's database has the table:
+		// one that names a table in any of them plans a drop there.
+		if i == 0 {
+			result.UnmatchedDropTables = slices.Clone(nsResult.UnmatchedDropTables)
+		} else {
+			result.UnmatchedDropTables = slices.DeleteFunc(result.UnmatchedDropTables, func(entry string) bool {
+				return !slices.Contains(nsResult.UnmatchedDropTables, entry)
+			})
+		}
 		if !nsResult.NoChanges || len(nsResult.Changes) > 0 {
 			result.NoChanges = false
 		}
@@ -3173,18 +3190,43 @@ func normalizedManifest(keys []string) []string {
 // refuseAttachToTerminalApply is the fail-closed rejection for an attach
 // against an apply that is (or just became) terminal: its target reservation
 // is released and no drive will pick new work up, so accepting the operation
-// would strand it. The deployment's remaining operations cannot dispatch until
-// an operator reconciles the apply.
-func (c *LocalClient) refuseAttachToTerminalApply(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string) *ternv1.ApplyResponse {
+// would strand it.
+//
+// storedState is the apply's state as the store last read it. The attach
+// re-reads it under the apply's row lock, so a refusal from there names the
+// state the apply actually ended in, which the copy loaded before the attach
+// can lag. The response carries it as a field so the caller settles the
+// refused work to match the apply rather than parsing this message.
+func (c *LocalClient) refuseAttachToTerminalApply(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, storedState, operationKey string) *ternv1.ApplyResponse {
 	c.logger.Warn("Apply: refusing to attach operation to terminal keyed apply; dispatch is rejected",
 		append(apply.LogAttrs(),
+			"stored_state", storedState,
 			"operation_key", operationKey,
 			"idempotency_key", req.IdempotencyKey)...)
 	metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "terminal_refused")
-	return &ternv1.ApplyResponse{
-		Accepted:     false,
-		ErrorMessage: fmt.Sprintf("apply %s for this idempotency key is terminal (%s); operation %s cannot attach", apply.ApplyIdentifier, apply.State, operationKey),
+	if storedState == "" {
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: fmt.Sprintf("apply %s for this idempotency key is no longer active; operation %s cannot attach", apply.ApplyIdentifier, operationKey),
+		}
 	}
+	return &ternv1.ApplyResponse{
+		Accepted:         false,
+		ErrorMessage:     fmt.Sprintf("apply %s for this idempotency key is terminal (%s); operation %s cannot attach", apply.ApplyIdentifier, storedState, operationKey),
+		ClosedApplyState: storedState,
+	}
+}
+
+// storedStateOfInactiveApply returns the state the store read for an apply it
+// refused to attach to, or "" when the refusal does not carry one. Without a
+// state the refusal still holds, but names none: the copy loaded before the
+// attach may read active, and a caller must not settle the work against it.
+func storedStateOfInactiveApply(err error) string {
+	var notActive *storage.ApplyNotActiveError
+	if !errors.As(err, &notActive) {
+		return ""
+	}
+	return notActive.State
 }
 
 // refuseAttachToTakenOverApply refuses an operation arriving for an apply whose
@@ -3210,7 +3252,7 @@ func (c *LocalClient) refuseAttachToTakenOverApply(req *ternv1.ApplyRequest, app
 // would have refused, and it fails closed on a terminal apply.
 func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, plan *storage.Plan, scope dispatchScope, operationKey, operationKind string) (*ternv1.ApplyResponse, error) {
 	if state.IsTerminalApplyState(apply.State) {
-		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
+		return c.refuseAttachToTerminalApply(ctx, req, apply, apply.State, operationKey), nil
 	}
 	if refusal := c.validateDispatchAgainstManifest(ctx, req, apply, operationKey); refusal != nil {
 		return refusal, nil
@@ -3254,7 +3296,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	// This runs before the blocked and unsafe-change gates so they judge the
 	// verdicts this shard's re-plan set.
 	if scope.shard != "" {
-		if err := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope, append(apply.LogAttrs(), "operation_key", operationKey)); err != nil {
+		if err := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope); err != nil {
 			return c.replayConcurrentAttachOrFail(ctx, req, apply, operationKey,
 				fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err))
 		}
@@ -3335,7 +3377,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		}
 		return c.replayConcurrentAttachWinner(ctx, req, apply, winner, operationKey, "operation insert"), nil
 	case errors.Is(err, storage.ErrApplyNotActive):
-		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
+		return c.resolveAttachToClosedApply(ctx, req, apply, operationKey, err)
 	case errors.Is(err, storage.ErrApplyOperationKeyingMismatch):
 		return c.refuseAttachKeyingMismatch(req, apply, plan, scope, operationKey, err), nil
 	case errors.Is(err, storage.ErrApplyTakenOver):
@@ -3360,6 +3402,26 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	c.wakeOperatorForQueuedApply(apply)
 
 	return dispatchApplyResponse(apply, operation.ID, operationKey), nil
+}
+
+// resolveAttachToClosedApply answers a dispatch whose attach the store
+// refused because the apply had already closed. A concurrent attach of the
+// same operation can land, and the apply close behind it, between this
+// dispatch's operation lookup and its insert. The refusal tells the control
+// plane the work never started, so it is sent only once a re-read shows no
+// winner. A winner's row is this dispatch's replay target, as for a lost
+// insert, so the control plane adopts the outcome of work that did run. A
+// re-read that fails returns an error, which keeps the dispatch recoverable
+// rather than settling it on a guess.
+func (c *LocalClient) resolveAttachToClosedApply(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string, attachErr error) (*ternv1.ApplyResponse, error) {
+	winner, err := c.findApplyOperationByKey(ctx, apply, operationKey)
+	if err != nil {
+		return nil, fmt.Errorf("check for a concurrent attach of operation %s before refusing it on closed apply %s: %w", operationKey, apply.ApplyIdentifier, err)
+	}
+	if winner != nil {
+		return c.replayConcurrentAttachWinner(ctx, req, apply, winner, operationKey, "closed apply"), nil
+	}
+	return c.refuseAttachToTerminalApply(ctx, req, apply, storedStateOfInactiveApply(attachErr), operationKey), nil
 }
 
 // replayConcurrentAttachWinner resolves a dispatch that lost a race to a
@@ -3388,7 +3450,7 @@ func (c *LocalClient) replayConcurrentAttachOrFail(ctx context.Context, req *ter
 		return nil, errors.Join(verifyErr, fmt.Errorf("re-read operation %s after its drift check failed: %w", operationKey, err))
 	}
 	if winner == nil {
-		c.logger.Warn("Apply: refusing shard dispatch whose drift check failed; dispatch is rejected",
+		c.logger.Warn("Apply: refusing shard dispatch that failed its check against the live schema; dispatch is rejected",
 			append(apply.LogAttrs(),
 				"operation_key", operationKey,
 				"idempotency_key", req.IdempotencyKey,
@@ -3570,7 +3632,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			"environment", req.Environment,
 			"idempotency_key", req.IdempotencyKey,
 		}
-		if verifyErr := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope, dispatchAttrs); verifyErr != nil {
+		if verifyErr := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope); verifyErr != nil {
 			// A same-key dispatch that created the apply while this one was
 			// between its key lookup and its re-plan may already have run the
 			// change, and then the re-plan no longer lists it and reads as
@@ -3590,7 +3652,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 					append(existing.LogAttrs(), "idempotency_key", req.IdempotencyKey, "shard", scope.shard)...)
 				return c.dispatchIntoExistingApply(ctx, req, existing, plan, scope, "create_race")
 			}
-			c.logger.Warn("Apply: refusing shard dispatch whose drift check failed; dispatch is rejected",
+			c.logger.Warn("Apply: refusing shard dispatch that failed its check against the live schema; dispatch is rejected",
 				append(dispatchAttrs, "plan_id", req.PlanId, "shard", scope.shard, "error", verifyErr)...)
 			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, verifyErr)
 		}
@@ -3677,6 +3739,10 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		ExpectedOperationKeys: normalizedManifest(req.GenerationOperationKeys),
 		CreatedAt:             now,
 		UpdatedAt:             now,
+	}
+	if app := req.GetOptions()[changeEventAppOption]; app != "" {
+		applyOpts.ChangeEventApp = app
+		apply.SetOptions(applyOpts)
 	}
 
 	// The stopped applies whose resting copies this dispatch meets are stamped
@@ -4466,9 +4532,11 @@ func (c *LocalClient) loadStoredProgressMetadata(ctx context.Context, reads *pro
 // aggregateStoredShards computes a table's headline figures from its persisted
 // per-shard rows — the per-table number is computed at read time, never stored.
 // Rows are summed (a completed shard's copied count is clamped up to its total,
-// since row counts can lag concurrent inserts), ETA is the slowest shard, and
+// since row counts can lag concurrent inserts), ETA is when the slowest shard
+// finishes (presentation.ShardedTableETA), as the PR comment reads it, and
 // percent is derived from the summed rows.
 func aggregateStoredShards(shards []*storage.Task) (rowsCopied, rowsTotal, etaSeconds int64, percent int32) {
+	copies := make([]presentation.ShardCopy, 0, len(shards))
 	for _, sh := range shards {
 		rowsTotal += sh.RowsTotal
 		copied := sh.RowsCopied
@@ -4476,14 +4544,12 @@ func aggregateStoredShards(shards []*storage.Task) (rowsCopied, rowsTotal, etaSe
 			copied = sh.RowsTotal
 		}
 		rowsCopied += copied
-		if int64(sh.ETASeconds) > etaSeconds {
-			etaSeconds = int64(sh.ETASeconds)
-		}
+		copies = append(copies, presentation.ShardCopy{RowsCopied: sh.RowsCopied, RowsTotal: sh.RowsTotal, ETASeconds: int64(sh.ETASeconds), Throttled: sh.Throttled})
 	}
 	if rowsTotal > 0 {
 		percent = int32(min(rowsCopied*100/rowsTotal, 100))
 	}
-	return rowsCopied, rowsTotal, etaSeconds, percent
+	return rowsCopied, rowsTotal, presentation.ShardedTableETA(copies), percent
 }
 
 // shardProgressProto renders a table's per-shard breakdown from the persisted

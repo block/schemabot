@@ -224,3 +224,21 @@ func TestWatchModel_FreezeRefusalSurvivesAnotherSpellingOfTheState(t *testing.T)
 	m = updated.(WatchModel)
 	assert.NotEmpty(t, m.changeGateAnswer)
 }
+
+// Under the reason override policy the refusal says the command it names runs
+// at once, and does not send the watcher to wait for an approver.
+func TestWatchModel_FreezeRefusedStartUnderTheReasonPolicy(t *testing.T) {
+	original := callStartAPI
+	t.Cleanup(func() { callStartAPI = original })
+	callStartAPI = func(_, _, _ string) (*apitypes.StartResponse, error) {
+		apiErr := freezeRefusedAPIError()
+		apiErr.OverrideOnReason = true
+		return nil, apiErr
+	}
+
+	view := pressEnter(t, waitingWatchModel(state.Apply.WaitingForDeploy)).View()
+
+	assert.Contains(t, view, `start apply-abc123 -e staging --override "<reason>"`)
+	assert.Contains(t, view, changeGateOnReasonHint)
+	assert.NotContains(t, view, "approver")
+}

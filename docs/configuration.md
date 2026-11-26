@@ -12,6 +12,7 @@
 - [Hybrid Mode](#hybrid-mode)
 - [Drivers](#drivers)
 - [Metrics](#metrics)
+- [Change Events](#change-events)
 - [Rate Limits](#rate-limits)
 - [Pending Drops](#pending-drops)
 - [Direct Execution](#direct-execution)
@@ -260,9 +261,8 @@ blocks the create step at plan time with the grant or correction it needs.
 [Table ownership](postgresql.md#table-ownership) explains what the owner
 controls and shows the full set of grants.
 
-`table_owner` is one role per target, deliberately scalar. A per-namespace
-map mirroring `schema_overrides` is a later extension for a target whose
-schemas have different owners; no such target exists today.
+`table_owner` names one role for the whole target. A target whose schemas
+belong to different owner roles cannot set an owner per schema yet.
 
 The referenced config document is JSON with top-level `host`, `port`, and
 `dbname` fields by default; set `config_paths` to read other keys:
@@ -1018,6 +1018,102 @@ The cap applies only to *starting* new operations — a first start, a resume af
 **The cap is a steady-state bound, not a hard admission limit.** Each claim evaluates the count independently, so drivers polling in the same instant can all read the same pre-claim value and admit together — a pod restart or rolling deploy, where every driver's first poll lands at once, is the shape that produces it. The transient ceiling is the number of drivers claiming in that window; once those leases commit, the next claim counts them and the cap binds again. Size against the steady-state number, and do not treat the cap as a guarantee that an apply can never briefly exceed it.
 
 A multi-shard apply started with a manual `--defer-cutover` keeps its drivers while it waits: unlike the automatic barrier park, a manually deferred operation holds its claim and keeps heartbeating, so it stays counted. Its cutover is accepted only once every operation waits, which takes a cap no smaller than the apply's width, so a deferred apply that would hold more operations at once than `max_drivers_per_apply` is [refused at the start](#deferred-cutover-capacity). Run it without `--defer-cutover`, or raise `max_drivers_per_apply` to at least its width.
+
+## Change Events
+
+Use `change_events` to send JSON lifecycle events to HTTP destinations. Each
+destination selects its environments and events. A server with no destinations
+configured sends no events.
+
+```yaml
+change_events:
+  - url: https://events.example.com/schema
+    environments: [production]
+    events: [operation.started, operation.finished, apply.finished]
+    body: |
+      {"app":{{json .App}},"environment":{{json .Environment}},
+       "timestamp":{{.OccurredAtNanos}},"description":{{json .Description}}}
+```
+
+Templates receive `.Type`, `.App`, `.Environment`, `.OccurredAtNanos`, and
+`.Description`. Use the `json` function to encode string values. `.App` comes
+from the database registration's `app` field and falls back to the logical
+database name when no application is registered.
+
+- The executing worker reports `operation.started` when a fresh attempt reaches
+  the engine. It reports `operation.finished` when a drive that called the engine
+  commits the attempt outcome. After a takeover, the finish can be omitted if
+  the drive cannot establish a new outcome for the attempt. An automatic retry opens a
+  new attempt even when its outcome is again `failed_retryable`.
+- The control plane reports `apply.finished` when a state transition records
+  the settled rollout outcome. If the rollout settles while the apply already
+  has that outcome, the event is omitted. The description includes the apply
+  ID and deployment outcomes for pull request and CLI applies.
+
+Each server configures its own destinations. For a remote apply, configure the
+worker to report operation events and the control plane to report the aggregate
+outcome. Worker events use the executing deployment's apply and operation IDs.
+The worker receives the managed app label in the existing dispatch options.
+
+### Amazon SQS destinations
+
+Use `sqs_change_events` to publish structured JSON to an existing standard SQS
+queue. Each queue selects its own events and environments. It works on its own
+or alongside the HTTP destinations above.
+
+```yaml
+sqs_change_events:
+  - queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/schema-events
+    region: us-east-1
+    environments: [production]
+    events: [apply.finished]
+```
+
+Grant the server role `sqs:SendMessage` on that queue. The publisher uses the AWS
+SDK credential chain. Set `region` to the queue's region or supply it through
+the AWS SDK configuration. Omitting `sqs_change_events` disables SQS delivery.
+
+An `apply.finished` message for a successful apply looks like this:
+
+```json
+{
+  "event_id": "103dfb3a-5cb6-4b2c-b36a-6bc0d75ce5c7",
+  "type": "apply.finished",
+  "id": "apply_example",
+  "app": "checkout",
+  "database": "orders",
+  "database_type": "mysql",
+  "environment": "production",
+  "repository": "example/schemas",
+  "pull_request": 42,
+  "outcome": "completed",
+  "completed_at": "2026-11-20T00:00:00Z",
+  "occurred_at_nanos": 1795132800000000000
+}
+```
+
+Use `event_id` to deduplicate deliveries. With a local worker, operation events
+and the control plane’s `apply.finished` event share the same apply `id`. With a
+remote worker, operation events carry the worker’s apply ID and `apply.finished`
+carries the control plane’s apply ID. Joining on `id` only correlates events
+within the same apply record.
+
+Apply
+outcomes include `completed`, `failed`, `cancelled`, and `reverted`. Consumers
+that react only to successful schema changes should select `outcome == "completed"`.
+`occurred_at_nanos` is when the hook observed the event. `completed_at` is the
+stored apply completion time, falling back to the stored update time. Operation
+events include `operation_id`, `deployment`, and `attempt`. Only finish events
+carry an outcome, and only aggregate finish events carry `completed_at`.
+Repository and pull request fields are omitted when absent.
+
+Delivery is best effort for both transports. Each destination uses a bounded
+in-memory queue and a three-second send deadline. A full queue, a failed send,
+or shutdown can lose events. The SQS publisher makes one send attempt. Once
+SQS accepts a message, the queue's retention and delivery policies apply.
+Delivery failures are logged. SchemaBot writes no outbox rows. When a reaper
+settles an apply, delivery workers load the event details in the background
+so the reaper can update GitHub without waiting.
 
 ## Rate Limits
 
@@ -2399,7 +2495,8 @@ auth:
     trusted_proxy_spiffe:                 # proxy SPIFFE IDs, read from the Envoy XFCC header
       - spiffe://example.org/ns/ingress/sa/proxy
     trusted_proxy_cidrs:                  # and/or source networks allowed to be the proxy
-      - 127.0.0.1/32
+      - 127.0.0.1/32                      # port-forward break-glass
+      - 127.0.0.6/32                      # the mesh source below
     read_groups: [readers]                # groups granted read (empty = any authenticated caller)
     write_groups: [operators]             # groups granted write (empty = no writes)
     # Optional service-caller lane — read-only access for services calling as
@@ -2409,11 +2506,16 @@ auth:
     read_service_spiffe:                  # caller SPIFFE IDs granted read-tier access
       - spiffe://example.org/ns/reporting/sa/reporting
     caller_spiffe_header: X-Forwarded-Caller-Spiffe-Id   # optional (default)
+    # Optional: loopback addresses a mesh sidecar delivers proxied requests
+    # from. Requires trusted_proxy_spiffe; refuses 127.0.0.1 and ::1. With
+    # trusted_proxy_cidrs set, each entry must be inside one of its networks.
+    trusted_mesh_loopback_sources: [127.0.0.6]
 ```
 
 The authorizer proves the request came from the trusted proxy, then reads the forwarded identity:
 
 - **Trust anchor (required, fail-closed).** With neither `trusted_proxy_cidrs` nor `trusted_proxy_spiffe` set, the server refuses to start. There are three modes: **CIDR only** (trust any request whose source IP is in a trusted network), **SPIFFE only** (trust any request whose XFCC carries a trusted SPIFFE ID), or **both** (require the source CIDR *and* a matching XFCC SPIFFE ID — defense in depth). `X-Forwarded-Client-Cert` (XFCC) is a spoofable HTTP header, so SPIFFE-only is safe only when the proxy sanitizes inbound XFCC and the server is not directly reachable (a service mesh) — the server logs a startup warning in that mode.
+- **Loopback sources.** On the identity-header lane, a request from a loopback address is the break-glass lane by default. A kubectl port-forward arrives that way, so its identity headers are typed by the person running it. Such a request is admitted, but its identity is not verified: features that record who acted, such as freeze attribution and override approval, treat it as unverified, and writes log a warning with reason `loopback_source`. `trusted_mesh_loopback_sources` names the loopback addresses a mesh sidecar delivers proxied requests from, such as Istio's `127.0.0.6` when the sidecar delivers to the pod IP. A request from one of them that passed the SPIFFE check is verified like any other proxied request, while a port-forward from `127.0.0.1` stays break-glass. Listing an address trusts every process in the pod's network namespace like the proxy: any of them can connect from `127.0.0.6` and send an XFCC header that names the proxy, just as it already can from the pod IP under SPIFFE-only trust. List one only when nothing else in the pod sends requests to SchemaBot. Each entry must be one loopback IP. `127.0.0.1` and `::1` are refused, including in IPv4-mapped form, and the setting requires `trusted_proxy_spiffe`: the source address does not identify the sender, so the SPIFFE check is the only check of who sent the request. With `trusted_proxy_cidrs` also set, the CIDR check runs first, so each listed address must be inside one of those networks (`127.0.0.6/32`), or the server refuses to start. Istio's IPv6 source, `::6`, is not a loopback address, so it never needs listing. The service-caller gateway lane verifies its caller whatever the source address; there, the setting changes only whether a request from a listed address is counted with reason `loopback_source`.
 - **Tiers.** Reads are open to any authenticated caller unless `read_groups` is set; writes require membership in `write_groups`, or in a database's `operator_groups` (see [Per-database write scoping](#per-database-write-scoping-forward-auth)). Only the canonical header is read, so a smuggled underscore variant (`X_Forwarded_User`) is ignored.
 - **Service callers (read-only).** `trusted_gateway_spiffe` + `read_service_spiffe` open a second lane for services calling as themselves: a caller-forwarding gateway terminates the caller's mTLS, verifies the client certificate, and forwards the caller's SPIFFE ID in `caller_spiffe_header`. The header is honored only when the XFCC-verified peer is a listed gateway, the forwarded caller must appear in `read_service_spiffe`, and service callers never get the write tier (denied with reason `service_caller_write`). The user and groups headers are never read on this lane, and the identity-header proxy always wins — the gateway lane is consulted only when the request did not arrive through the trusted proxy. `trusted_proxy_cidrs`, when set, gate this lane like everything else: a gateway SVID claimed from outside the trusted networks is never honored. **List a gateway only if it strips inbound copies of the caller header before setting it from the verified certificate** — otherwise any caller could forge an identity through it. The lane fails closed: gateways without callers (or callers without a gateway) refuse to start, the lane requires SPIFFE-anchored proxy trust (`trusted_proxy_spiffe`) — under CIDR-only trust an in-CIDR gateway request would be mistaken for the identity-header proxy, leaving the lane unreachable, so that combination refuses to start too — and an empty config disables the lane entirely.
 
@@ -2652,10 +2754,17 @@ freeze:
 
 The middleware admits `freeze.groups` members to write-tier endpoints, and the freeze handlers (`POST /api/freezes`, `POST /api/freezes/{id}/lift`) allow them. Approving an override (`POST /api/freezes/overrides/{id}/approve`) is for `freeze.groups` members only, not `write_groups`: the caller must be verified and must not be the requester. Every other mutating handler still requires `write_groups` or a database's `operator_groups`, and database operator grants do not cover freezes, which reach past any one database. Members also get the read tier, deployment-wide. `freeze.groups` requires `auth.type: forward_auth`, and its entries must be unique; either mistake is a startup error. Under other auth types, freezes follow the plain admin write gate.
 
-The CLI sets, lists, shows and lifts freezes and approves override requests, and asks for an override with `--override` on `apply`, `start` and `cutover`: see [Freeze an environment](cli.md#freeze-an-environment).
-A PR author can ask for an override of a freeze from the pull request: `schemabot apply -e production --override "reason"`, and the same flag on `schemabot apply-confirm`, `schemabot start` and `schemabot cutover`. When a freeze refuses the command, SchemaBot records an override request for the commenter and the PR author, and the comment names the request and how it is approved. The request is recorded as `github:<login>`, and an approval has to come from the same identity domain: the API route (`POST /api/freezes/overrides/{id}/approve`) refuses a request asked for on a pull request, and refuses an approver whose forwarded subject starts with `github:`. The identity rule holds both ways: a request asked for through the API or CLI is approved only there, and a request asked for on a pull request only on that pull request.
+The CLI sets, lists, shows and lifts freezes and approves override requests, and asks for an override with `--override` on `apply`, `start` and `cutover`: see [Freeze an environment](cli.md#freeze-an-environment), and the [freeze guide](freeze.md) for the whole workflow.
+A PR author can ask for an override of a freeze from the pull request: `schemabot apply -e production --override "reason"`, and the same flag on `schemabot apply-confirm`, `schemabot start` and `schemabot cutover`. When a freeze refuses the command, the default policy lets it through on that reason. Under `approval`, SchemaBot records an override request for the commenter and the PR author, and the comment names the request and how it is approved. The request is recorded as `github:<login>`, and an approval has to come from the same identity domain: the API route (`POST /api/freezes/overrides/{id}/approve`) refuses a request asked for on a pull request, and refuses an approver whose forwarded subject starts with `github:`. The identity rule holds both ways: a request asked for through the API or CLI is approved only there, and a request asked for on a pull request only on that pull request.
 
-A freeze approver approves from the pull request by commenting `schemabot freeze approve ovr-...` on the pull request where the request was made. Who may is set by `freeze.github_teams`, a list of GitHub teams as `org/team-slug`:
+`freeze.override_policy` decides what an override reason does. `reason`, the default, admits the change on the requester's own reason, with no approver: SchemaBot stores the override already approved by its requester, keeps the reason for audit, and the refusal comment on a pull request says to go ahead with a reason. `approval` records a request that a freeze approver must approve, as described below. Under either policy the reason is required and the caller must be verified. Under `reason` the reason admits only the command that gave it, so a retry gives its own. Under `approval` an approval covers one change for one person for at most 24 hours. Any other value is a startup error. See [choose the override policy](freeze.md#choose-the-override-policy).
+
+```yaml
+freeze:
+  override_policy: approval
+```
+
+Under `approval`, a freeze approver approves from the pull request by commenting `schemabot freeze approve ovr-...` on the pull request where the request was made. Who may is set by `freeze.github_teams`, a list of GitHub teams as `org/team-slug`:
 
 ```yaml
 freeze:

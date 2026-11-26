@@ -1719,8 +1719,11 @@ type TableChange struct {
 	// deterministically refuses the statement and the apply will fail.
 	ExecutionMode string `protobuf:"bytes,7,opt,name=execution_mode,json=executionMode,proto3" json:"execution_mode,omitempty"`
 	ModeReason    string `protobuf:"bytes,8,opt,name=mode_reason,json=modeReason,proto3" json:"mode_reason,omitempty"`
-	// Engine-agnostic annotations about this change. A VSchema change carries
-	// the namespace's persisted VSchema change-metadata here so a deployment
+	// Engine-agnostic annotations about this change, keyed by names the engine
+	// owns. A table change carries the engine's plan-time record of the objects
+	// its statement depends on, such as the definition of a column it drops,
+	// which the engine checks at apply time. A VSchema change carries the
+	// namespace's persisted VSchema change-metadata. Either way, a deployment
 	// that materializes the plan from a dispatch request runs the same
 	// apply-time safety gates as one reading its own stored plan.
 	Metadata map[string]string `protobuf:"bytes,9,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
@@ -2424,9 +2427,13 @@ type PlanResponse struct {
 	// continue or destroy. Empty when nothing is at stake.
 	ExistingCopies []*ExistingCopy `protobuf:"bytes,7,rep,name=existing_copies,json=existingCopies,proto3" json:"existing_copies,omitempty"`
 	// Live tables intentionally excluded from a plan verdict, grouped by namespace.
-	ExemptTables  []*ExemptTables `protobuf:"bytes,8,rep,name=exempt_tables,json=exemptTables,proto3" json:"exempt_tables,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ExemptTables []*ExemptTables `protobuf:"bytes,8,rep,name=exempt_tables,json=exemptTables,proto3" json:"exempt_tables,omitempty"`
+	// The drop_tables entries that name no live table on the target, in the
+	// order the config lists them. Such an entry plans no drop, so the plan
+	// names it rather than reading as if the table were seen and kept.
+	UnmatchedDropTables []string `protobuf:"bytes,9,rep,name=unmatched_drop_tables,json=unmatchedDropTables,proto3" json:"unmatched_drop_tables,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *PlanResponse) Reset() {
@@ -2511,6 +2518,13 @@ func (x *PlanResponse) GetExistingCopies() []*ExistingCopy {
 func (x *PlanResponse) GetExemptTables() []*ExemptTables {
 	if x != nil {
 		return x.ExemptTables
+	}
+	return nil
+}
+
+func (x *PlanResponse) GetUnmatchedDropTables() []string {
+	if x != nil {
+		return x.UnmatchedDropTables
 	}
 	return nil
 }
@@ -2971,9 +2985,15 @@ type ApplyResponse struct {
 	// Set when the apply was refused because other work already holds the
 	// database, so the caller can render the refusal instead of the engine's
 	// unsafe error text. Absent for every other rejection.
-	Conflict      *ApplyConflict `protobuf:"bytes,6,opt,name=conflict,proto3" json:"conflict,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Conflict *ApplyConflict `protobuf:"bytes,6,opt,name=conflict,proto3" json:"conflict,omitempty"`
+	// Set when the dispatch was refused because the apply it would have joined
+	// had already ended, to that apply's state as the data plane's store read
+	// it. The refused work never started, so the caller can settle it to match
+	// the apply, cancelled with a cancelled apply and stopped with a stopped one,
+	// instead of recording it as failed. Absent for every other rejection.
+	ClosedApplyState string `protobuf:"bytes,7,opt,name=closed_apply_state,json=closedApplyState,proto3" json:"closed_apply_state,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ApplyResponse) Reset() {
@@ -3046,6 +3066,13 @@ func (x *ApplyResponse) GetConflict() *ApplyConflict {
 		return x.Conflict
 	}
 	return nil
+}
+
+func (x *ApplyResponse) GetClosedApplyState() string {
+	if x != nil {
+		return x.ClosedApplyState
+	}
+	return ""
 }
 
 // ProgressRequest requests detailed progress for an active schema change.
@@ -5903,7 +5930,7 @@ const file_tern_proto_rawDesc = "" +
 	"\tShardPlan\x12\x14\n" +
 	"\x05shard\x18\x01 \x01(\tR\x05shard\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12.\n" +
-	"\achanges\x18\x03 \x03(\v2\x14.tern.v1.TableChangeR\achanges\"\x82\x03\n" +
+	"\achanges\x18\x03 \x03(\v2\x14.tern.v1.TableChangeR\achanges\"\xb6\x03\n" +
 	"\fPlanResponse\x12\x17\n" +
 	"\aplan_id\x18\x01 \x01(\tR\x06planId\x12'\n" +
 	"\x06engine\x18\x02 \x01(\x0e2\x0f.tern.v1.EngineR\x06engine\x12/\n" +
@@ -5912,7 +5939,8 @@ const file_tern_proto_rawDesc = "" +
 	"\x06errors\x18\x05 \x03(\tR\x06errors\x12*\n" +
 	"\x06shards\x18\x06 \x03(\v2\x12.tern.v1.ShardPlanR\x06shards\x12>\n" +
 	"\x0fexisting_copies\x18\a \x03(\v2\x15.tern.v1.ExistingCopyR\x0eexistingCopies\x12:\n" +
-	"\rexempt_tables\x18\b \x03(\v2\x15.tern.v1.ExemptTablesR\fexemptTables\"\xeb\x02\n" +
+	"\rexempt_tables\x18\b \x03(\v2\x15.tern.v1.ExemptTablesR\fexemptTables\x122\n" +
+	"\x15unmatched_drop_tables\x18\t \x03(\tR\x13unmatchedDropTables\"\xeb\x02\n" +
 	"\x10PlanDiffResponse\x12'\n" +
 	"\x06engine\x18\x01 \x01(\x0e2\x0f.tern.v1.EngineR\x06engine\x12/\n" +
 	"\achanges\x18\x02 \x03(\v2\x15.tern.v1.SchemaChangeR\achanges\x12?\n" +
@@ -5956,14 +5984,15 @@ const file_tern_proto_rawDesc = "" +
 	"repository\x12!\n" +
 	"\fpull_request\x18\x05 \x01(\x05R\vpullRequest\x12\x16\n" +
 	"\x06caller\x18\x06 \x01(\tR\x06caller\x12,\n" +
-	"\x12holder_external_id\x18\a \x01(\tR\x10holderExternalId\"\xf2\x01\n" +
+	"\x12holder_external_id\x18\a \x01(\tR\x10holderExternalId\"\xa0\x02\n" +
 	"\rApplyResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12\x19\n" +
 	"\bapply_id\x18\x03 \x01(\tR\aapplyId\x12,\n" +
 	"\x12apply_operation_id\x18\x04 \x01(\tR\x10applyOperationId\x12#\n" +
 	"\roperation_key\x18\x05 \x01(\tR\foperationKey\x122\n" +
-	"\bconflict\x18\x06 \x01(\v2\x16.tern.v1.ApplyConflictR\bconflict\"|\n" +
+	"\bconflict\x18\x06 \x01(\v2\x16.tern.v1.ApplyConflictR\bconflict\x12,\n" +
+	"\x12closed_apply_state\x18\a \x01(\tR\x10closedApplyState\"|\n" +
 	"\x0fProgressRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
 	"\venvironment\x18\x02 \x01(\tR\venvironment\x12,\n" +

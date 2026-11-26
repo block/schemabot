@@ -445,6 +445,58 @@ func TestBuildWebhookRuntimeGitHubAppID(t *testing.T) {
 	})
 }
 
+// A server with GitHub App credentials but an empty webhook secret could never
+// prove a delivery came from GitHub, so it refuses to start in single-App and
+// in multi-App mode rather than serving the webhook endpoint unverified.
+func TestBuildWebhookRuntimeRefusesEmptyWebhookSecret(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+
+	t.Run("single App", func(t *testing.T) {
+		cfg := &api.ServerConfig{GitHub: api.GitHubConfig{AppID: "123", PrivateKey: "some-key", WebhookSecret: ""}}
+		_, err := buildWebhookRuntime(cfg, api.New(mysqlstore.New(nil), cfg, nil, logger), logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "webhook secret is empty")
+	})
+
+	t.Run("multi App", func(t *testing.T) {
+		cfg := &api.ServerConfig{Apps: map[string]api.GitHubAppConfig{"a": {AppID: "1001", PrivateKey: "k", WebhookSecret: ""}}}
+		_, err := buildWebhookRuntime(cfg, api.New(mysqlstore.New(nil), cfg, nil, logger), logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "webhook secret resolved to empty value")
+	})
+
+	t.Run("single App rotating to an empty repo-webhook secret", func(t *testing.T) {
+		t.Setenv("SCHEMABOT_TEST_REPO_WEBHOOK_SECRET", "")
+		cfg := &api.ServerConfig{GitHub: api.GitHubConfig{
+			AppID: "123", PrivateKey: "some-key", WebhookSecret: "secret",
+			RepoWebhookSecret: "env:SCHEMABOT_TEST_REPO_WEBHOOK_SECRET", PreviousRepoWebhookSecret: "old-repo-secret",
+		}}
+		_, err := buildWebhookRuntime(cfg, api.New(mysqlstore.New(nil), cfg, nil, logger), logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "github.repo-webhook-secret resolved to an empty value")
+	})
+
+	t.Run("single App with a previous webhook secret that resolves to empty", func(t *testing.T) {
+		t.Setenv("SCHEMABOT_TEST_OLD_WEBHOOK_SECRET", "")
+		cfg := &api.ServerConfig{GitHub: api.GitHubConfig{
+			AppID: "123", PrivateKey: "some-key", WebhookSecret: "secret",
+			PreviousWebhookSecret: "env:SCHEMABOT_TEST_OLD_WEBHOOK_SECRET",
+		}}
+		_, err := buildWebhookRuntime(cfg, api.New(mysqlstore.New(nil), cfg, nil, logger), logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "previous-webhook-secret is set but resolved to an empty value")
+	})
+
+	t.Run("multi App with a previous repo-webhook secret", func(t *testing.T) {
+		cfg := &api.ServerConfig{Apps: map[string]api.GitHubAppConfig{"a": {
+			AppID: "1001", PrivateKey: "k", WebhookSecret: "s", PreviousRepoWebhookSecret: "old-repo-secret",
+		}}}
+		_, err := buildWebhookRuntime(cfg, api.New(mysqlstore.New(nil), cfg, nil, logger), logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "repository webhooks are not served when apps: is configured")
+	})
+}
+
 // staticStorageSchemaService stands in for the adapter bound to an instance's
 // own storage, answering with a report no other source could have produced.
 type staticStorageSchemaService struct{ database string }

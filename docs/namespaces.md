@@ -149,10 +149,11 @@ unsafe change and requires the same
 Deleting every schema file in a namespace, or moving them all out of it, does
 not remove the namespace from the plan while another namespace still declares
 files under the schema root. Every table the emptied namespace still holds is
-planned as a `DROP TABLE` change: on MySQL and Vitess an unsafe change that
-needs the explicit drop approval before it can run, on PostgreSQL a blocked
-change that fails the check until the tables are declared again or dropped
-through a reviewed schema change. Only the files the pull request itself
+planned as a `DROP TABLE` change: an unsafe change that needs the explicit
+drop approval before it can run. On PostgreSQL some of these drops are blocked
+instead, such as a table that a view reads; see
+[Tables with no schema file](./postgresql.md#tables-with-no-schema-file). Only
+the files the pull request itself
 removes count — a deletion it inherited from history its base branch has not
 caught up with is not one it proposes.
 
@@ -543,6 +544,26 @@ consent as any other drop (`--allow-unsafe`). On a deployment with
 [pending drops](pending-drops.md) enabled, the apply moves the table into
 `_pending_drops` rather than dropping it outright, so it can be recovered until
 the retention period ends.
+
+An entry that names no table on the target plans nothing, and the PR plan
+comment and `plan` and `apply` output say so, one line per entry:
+
+> ⚠️ `drop_tables` entry `_events_olds` names no table on the target, so this plan drops nothing for it. Fix the name, or remove the entry if the table is already gone.
+
+That is usually a typo, a name wrapped in backticks, the wrong case, or a table
+already dropped. Without the line, the table you meant would still be listed
+under its naming convention and the plan would look clean.
+
+When a plan covers several environments, an entry is listed only when no
+environment's plan has the table. Once the drop has landed in staging and not
+yet in production, staging's plan is clean and production's still drops the
+table, so the entry is not listed: it is still needed for production. The
+first 20 entries get a line each, and one more line counts the rest.
+
+A plan of an environment that rolls out to several targets lists no such
+entries, and neither does a plan of several environments that includes one.
+The planner reports them for the primary target alone, and another
+target may still have the table and plan its drop.
 
 ### Rules
 

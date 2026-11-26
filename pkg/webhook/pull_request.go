@@ -456,6 +456,15 @@ type autoPlanDispatch struct {
 // dispatchAutoPlanForPR is runAutoPlanForPR with options; see its comment.
 func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string, opts autoPlanOptions) (autoPlanDispatch, error) {
 	repo = storage.CanonicalKey(repo)
+	// Every discovery failure below posts through this one call, so whether
+	// the check says SchemaBot retries at the quota reset is decided in one
+	// place. A schema exception delivery's retry stops before it clears the
+	// aggregate block when the PR is within the database limit, so its retry
+	// does not lift the block and the check asks for a re-run instead.
+	retriedAtReset := durableRetryAtQuotaReset(ctx) && !opts.schemaExceptionEvent
+	postDiscoveryFailure := func(err error) {
+		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err, retriedAtReset)
+	}
 	// Snapshot the base ref before anything is read, so the publish-time check
 	// below covers the whole of discovery. A base that moves mid-discovery
 	// changes which databases the PR touches, which is the case that check
@@ -465,7 +474,7 @@ func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.In
 	if err != nil {
 		h.logger.Error("failed to read the PR for auto-plan; its base branch cannot be re-verified before publishing",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
-		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+		postDiscoveryFailure(err)
 		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return autoPlanDispatch{message: "config discovery failed"}, fmt.Errorf("read %s#%d for auto-plan: %w", repo, pr, err)
 	}
@@ -494,12 +503,12 @@ func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.In
 		cacheKey = h.prPlanDiscoveryKey(repo, pr, prInfo)
 		if !cacheKey.revision.valid() {
 			err := fmt.Errorf("GitHub did not supply the PR head and base revision")
-			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			postDiscoveryFailure(err)
 			return autoPlanDispatch{message: "config discovery failed"}, err
 		}
 		discovery, err = h.cachedPRPlanDiscovery(ctx, client, cacheKey)
 		if err != nil {
-			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			postDiscoveryFailure(err)
 			return autoPlanDispatch{message: "config discovery failed"}, err
 		}
 	}
@@ -508,7 +517,7 @@ func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.In
 		discovery, err = h.readPRPlanDiscovery(ctx, client, repo, pr, prInfo, source, deliveryID)
 		if err != nil {
 			h.logConfigDiscoveryFailure("discover PR planning inputs", repo, pr, headSHA, source, deliveryID, err)
-			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			postDiscoveryFailure(err)
 			h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 			return autoPlanDispatch{message: "config discovery failed"}, err
 		}
@@ -1016,13 +1025,19 @@ func (h *Handler) logConfigDiscoveryFailure(step, repo string, pr int, headSHA, 
 	h.logger.Error("auto-plan config discovery failed", attrs...)
 }
 
-func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, discoveryErr error) {
+// postConfigDiscoveryFailure fails the aggregate closed for a discovery that
+// could not finish. retriedAtReset reports whether the caller's durable
+// delivery re-runs this discovery when a quota reserve refusal lifts, which
+// decides whether the check says SchemaBot retries or asks for a re-run.
+func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, discoveryErr error, retriedAtReset bool) {
 	// The causes stay apart because operators triage them differently: GitHub
-	// being unavailable is an outage to wait out, a PR past GitHub's per-PR
-	// changed-file cap is a property of the PR that no retry can change, and
-	// anything else is a configuration problem to investigate.
+	// being unavailable is an outage to wait out, the quota reserve lifts at a
+	// known reset time, a PR past GitHub's per-PR changed-file cap is a
+	// property of the PR that no retry can change, and anything else is a
+	// configuration problem to investigate.
 	block := configDiscoveryFailedBlock
 	discoveryStatus := "error"
+	var refusal *ghclient.QuotaReservedError
 	switch {
 	case errors.Is(discoveryErr, ghclient.ErrPRFilesIncomplete):
 		// A deterministic cap is a block, not an error: reporting it as one
@@ -1031,6 +1046,11 @@ func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclie
 		discoveryStatus = "blocked"
 	case ghclient.IsUnavailableError(discoveryErr):
 		block = githubConfigDiscoveryUnavailableBlock
+	case errors.As(discoveryErr, &refusal):
+		// The refusal is a deliberate hold on SchemaBot's own reads, not a
+		// discovery error; the quota reserve already counts and logs it.
+		block = githubQuotaReservedBlockFor(refusal.ResetAt, retriedAtReset)
+		discoveryStatus = "blocked"
 	}
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 		Operation:  "schema_config_discovery",
@@ -1038,9 +1058,15 @@ func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclie
 		Status:     discoveryStatus,
 	})
 
-	h.logger.Info("posting failing aggregate for config discovery failure",
-		"repo", repo, "pr", pr, "head_sha", headSHA,
-		"blocking_reason", block.blockingReason)
+	logAttrs := []any{"repo", repo, "pr", pr, "head_sha", headSHA, "blocking_reason", block.blockingReason}
+	if refusal != nil {
+		// The check text promises either a retry at the reset or a re-run by
+		// the author. Logging which one, and the reset it names, lets a PR
+		// that says "It will retry" be matched to the durable retry, or to
+		// its absence.
+		logAttrs = append(logAttrs, "retried_at_reset", retriedAtReset, "reset_time", refusal.ResetAt.UTC())
+	}
+	h.logger.Info("posting failing aggregate for config discovery failure", logAttrs...)
 	h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA,
 		h.aggregateMessagesForAllEnvironments(block.message), block)
 }
@@ -1118,7 +1144,13 @@ func (h *Handler) aggregateMessagesForAllEnvironments(message string) map[string
 //
 // The live state is read once, before anything is released or deleted. A
 // reopen that lands after that read, while cleanup is still running, is not
-// seen by this pass.
+// seen by this pass, so the pass acts only on what it listed. The PR's
+// removable stored check state is listed before any lock is released, and the
+// delete removes a listed row only while it is still exactly as listed. A row
+// an apply or plan wrote again after the listing, such as one a reopened PR's
+// `apply` stored with its new lock, is kept, and the pass returns an error the
+// same way it does for a lock held again, so a retry starts from a fresh live
+// read.
 //
 // The returned bool reports whether cleanup ran. It is false, with a nil
 // error, when the PR is open again and nothing was touched.
@@ -1162,26 +1194,44 @@ func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, in
 
 	inFlight := h.inFlightAppliesForClosedPR(ctx, repo, pr, applies)
 
-	if err := h.releaseLocksForClosedPR(ctx, repo, pr, inFlight); err != nil {
+	// List the stored check state this close removes before releasing any
+	// lock: once a lock is released, a reopened PR can take it again and
+	// store its new plan's check state under the same keys, and the delete
+	// below must not remove that.
+	removable, err := h.service.Storage().Checks().ListRemovableOnPRClose(ctx, repo, pr, merged)
+	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "pr_close_cleanup",
+			Repository: repo,
+			Status:     "error",
+		})
+		h.logger.Error("PR close cleanup skipped: cannot list the PR's stored check state; all locks and check state are retained",
+			"repo", repo, "pr", pr, "merged", merged, "error", err)
+		return false, fmt.Errorf("list removable checks for closed PR %s#%d (merged=%t): %w", repo, pr, merged, err)
+	}
+
+	keptForApply, err := h.releaseLocksForClosedPR(ctx, repo, pr, inFlight)
+	if err != nil {
 		return false, fmt.Errorf("release locks for closed PR %s#%d: %w", repo, pr, err)
 	}
 
-	if len(inFlight) > 0 {
-		h.logger.Info("check state retained for closed PR until all applies reach a terminal state",
-			"repo", repo, "pr", pr, "in_flight_databases", len(inFlight))
+	if len(inFlight) > 0 || keptForApply > 0 {
+		h.logger.Info("check state retained for closed PR until all of its applies settle",
+			"repo", repo, "pr", pr, "in_flight_databases", len(inFlight), "locks_kept_for_applies", keptForApply)
 		return true, nil
 	}
 
-	// Delete stored check state for this PR. Apply-owned rows that still block
-	// survive the delete at the storage layer: in-flight rows (even if the
-	// applies table missed the in-flight work above) and terminal rows whose
-	// conclusion is not success, such as a schema change removed from the PR
-	// after its apply started. Those blocks require operator reconciliation
-	// and must persist across a close and reopen. On an unmerged close,
-	// apply-owned rows that concluded successfully survive too: the stored
-	// success may predate a commit that removed the applied change, so
-	// reopen-time cleanup must re-verify it before the row can stop blocking.
-	if err := h.service.Storage().Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, repo, pr, merged); err != nil {
+	// Delete the stored check state listed above. Apply-owned rows that still
+	// block were never listed: in-flight rows (even if the applies table missed
+	// the in-flight work above) and terminal rows whose conclusion is not
+	// success, such as a schema change removed from the PR after its apply
+	// started. Those blocks require operator reconciliation and must persist
+	// across a close and reopen. On an unmerged close, apply-owned rows that
+	// concluded successfully are not listed either: the stored success may
+	// predate a commit that removed the applied change, so reopen-time cleanup
+	// must re-verify it before the row can stop blocking.
+	kept, err := h.service.Storage().Checks().DeleteListedIfUnchanged(ctx, removable)
+	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "pr_close_cleanup",
 			Repository: repo,
@@ -1189,6 +1239,21 @@ func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, in
 		})
 		h.logger.Error("failed to delete checks for closed PR", "repo", repo, "pr", pr, "merged", merged, "error", err)
 		return false, fmt.Errorf("delete checks for closed PR %s#%d (merged=%t): %w", repo, pr, merged, err)
+	}
+	if len(kept) > 0 {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "pr_close_cleanup",
+			Repository: repo,
+			Status:     "error",
+		})
+		for _, check := range kept {
+			h.logger.Warn("stored check state written again since PR close cleanup listed it is kept; this cleanup pass returns an error so a retry re-reads the live PR",
+				"repo", repo, "pr", pr, "merged", merged,
+				"environment", check.Environment, "database_type", check.DatabaseType, "database", check.DatabaseName,
+				"check_id", check.ID, "check_run_id", check.CheckRunID, "head_sha", check.HeadSHA,
+				"apply_id", check.ApplyID, "check_status", check.Status, "conclusion", check.Conclusion)
+		}
+		return false, fmt.Errorf("%d stored check rows for closed PR %s#%d were written again after close cleanup listed them and are kept", len(kept), repo, pr)
 	}
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 		Operation:  "pr_close_cleanup",
@@ -1296,15 +1361,24 @@ func (h *Handler) inFlightAppliesForClosedPR(ctx context.Context, repo string, p
 // again, so it releases a lock only if the PR is still closed and still holds
 // it.
 //
+// The in-flight map comes from an applies read made before the release, so it
+// cannot see an apply that records a listed lock and becomes durable after that
+// read. Each release therefore re-checks under the lock row's lock and keeps
+// the lock while an apply recording it has not settled, a stopped apply
+// included. Such a lock is in flight exactly as one the read found, so it is
+// counted in the returned keptForApply rather than reported as an error: the
+// caller keeps the PR's check state and completes, and a retry would only find
+// the same apply again.
+//
 // Every release is attempted even if an earlier one fails, and the failures
 // are joined and returned so a caller with a retry mechanism re-attempts the
 // still-held locks. Each attempt re-lists the PR's locks first, and a released
 // lock's row is deleted, so a retry converges.
-func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr int, inFlight map[closedPRDatabase]bool) error {
+func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr int, inFlight map[closedPRDatabase]bool) (keptForApply int, err error) {
 	locks, err := h.service.Storage().Locks().GetByPR(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to look up locks for closed PR; no locks released", "repo", repo, "pr", pr, "error", err)
-		return fmt.Errorf("look up locks for closed PR %s#%d: %w", repo, pr, err)
+		return 0, fmt.Errorf("look up locks for closed PR %s#%d: %w", repo, pr, err)
 	}
 	var releaseErrs []error
 	for _, lock := range locks {
@@ -1313,11 +1387,21 @@ func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr i
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType)
 			continue
 		}
-		err := h.service.Storage().Locks().ReleaseByID(ctx, lock.ID, lock.DatabaseName, lock.DatabaseType, lock.Owner, lock.PendingPlanID)
+		err := h.service.Storage().Locks().ReleaseByIDIfUnused(ctx, lock.ID, lock.DatabaseName, lock.DatabaseType, lock.Owner, lock.PendingPlanID)
+		var inUse *storage.LockInUseError
 		switch {
 		case err == nil:
 			h.logger.Info("released lock on PR close",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName)
+		case errors.As(err, &inUse):
+			// An apply recording the listed lock row became durable after
+			// cleanup read the PR's applies, or is stopped and has not
+			// settled. Either way it is in flight for this lock.
+			keptForApply++
+			h.logger.Warn("lock retained on PR close because an apply recording it has not settled; this cleanup pass deletes no check state",
+				append(inUse.Apply.LogAttrs(),
+					"closed_repo", repo, "closed_pr", pr, "lock_owner", lock.Owner,
+					"listed_pending_plan_id", lock.PendingPlanID, "error", err)...)
 		case isVettedLockGone(err):
 			h.logger.Info("lock already released before PR close cleanup reached it",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
@@ -1340,7 +1424,7 @@ func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr i
 			releaseErrs = append(releaseErrs, fmt.Errorf("release lock on %s (%s): %w", lock.DatabaseName, lock.DatabaseType, err))
 		}
 	}
-	return errors.Join(releaseErrs...)
+	return keptForApply, errors.Join(releaseErrs...)
 }
 
 // checkDatabaseKey identifies the database a per-database stored check row

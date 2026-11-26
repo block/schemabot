@@ -176,7 +176,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **operation** (locks): `acquire`, `release`
 
-**status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `no_acquirer` (a scoped acquire refused because there is no verified acquirer to record; the log line carries the reason), `error`
+**status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `no_acquirer` (a scoped acquire refused because there is no verified acquirer to record; the log line carries the reason), `in_use` (a release that named a lock row kept it because an apply that can still change runs under it; the log line names the apply), `error`
 
 **event_type** (webhooks): `create`, `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `pull_request_review_comment`, `check_run`, `check_suite`, `ping`, `push`
 
@@ -196,7 +196,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (GitHub API): `success`, `error`, `not_found` (a 404 answer to a read operation — an expected "no" from probes like schemabot.yaml lookups; 404s on auth and write operations stay `error`), `not_modified` (a 304 answer to a conditional pull request read — the pull request is unchanged, SchemaBot reuses its stored copy, and GitHub does not count the request against the primary rate limit), `transport_error` (no HTTP response: dial/TLS failure or deadline — the signature of GitHub being unreachable), `cancelled` (SchemaBot cancelled the request itself, e.g. during shutdown), `suppressed` (a write SchemaBot refused to send because the repository is `listen_only`; it never reached GitHub), `unknown`
 
-**reason** (operator claim failures): `expire_retryable_error`, `expire_degraded_retry_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_parent_release_error`, `operation_lease_release_error`, `operation_lease_recheck_error`, `operation_lease_recheck_missing`, `operation_lease_rotated`, `operation_lease_released_by_peer`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `stranded_task_reaper_error`, `stranded_active_task_reaper_error`, `stranded_control_request_reaper_error`, `branch_reconcile_error`, `unknown`
+**reason** (operator claim failures): `expire_retryable_error`, `expire_degraded_retry_error`, `missing_lease_token`, `operation_storage_error`, `operation_claim_contention_exhausted`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_parent_release_error`, `operation_lease_release_error`, `operation_lease_recheck_error`, `operation_lease_recheck_missing`, `operation_lease_rotated`, `operation_lease_released_by_peer`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `stranded_task_reaper_error`, `stranded_active_task_reaper_error`, `stranded_control_request_reaper_error`, `branch_reconcile_error`, `unknown`
 
 **reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `lease_presumed_lost`, `retry_budget_exhausted`, `recovery_window_expired`, `drive_panic`, `drive_stalled`, `operation_no_tasks`, `apply_tasks_not_loaded`, `apply_task_row_missing`, `task_requeue_refused` (storage refused the write putting a task back to `pending` for a retry or a start; the task row stays at rest and the next claim retries the requeue), `task_verdict_refused` (storage refused the write recording a task's terminal outcome; the apply stays active, an operation drive's row is left claimable, and the next claim settles the apply from the stored task rows), `remote_operation_never_starts` (the data plane settled the remote apply a rollout member belongs to before that member started, so it will never run there; the drive settled the member's tasks the way the remote apply settled and the rollout derives its verdict from them), `remote_dispatch_unresolved` (a drive re-sent the dispatch of active work whose remote apply id never reached storage, and the data plane gave no verdict; the apply stays active with its attempt unchanged and the next claim, about once per lease staleness window, re-sends the same idempotency key, so a sustained rate means a data plane that is not answering), `post_terminal_reconcile` (the drive stored the apply's terminal outcome but an answer owed after it, such as completing the pending start, did not land; the operator's post-drive settlement retries it, and the reaper's stranded control-request sweep answers what that settlement could not once the apply is quiescent)
 
@@ -327,8 +327,15 @@ should be investigated before relying on branch-protection state.
 reports the latest trustworthy installation budget, without a repository label.
 Group by `github_app`, `installation_id`, and `resource`, taking the minimum
 across replicas. Snapshots require a named App, positive installation ID, valid
-remaining/limit headers, and a future reset time. They disappear from collection
-when older than 120 seconds or when their reset time passes. Repeated scrapes,
+remaining/limit headers, and a reset time after the response was received.
+They disappear from collection when older than 120 seconds, and not before:
+a snapshot whose window resets stays exported until a newer reading replaces
+it or it ages out, so a routine hourly reset never turns an installation that
+is being read into an unknown budget. A snapshot is a reading of bounded age,
+not a lower bound on the budget: requests made since it was read, by this
+replica or any other consumer of the installation, are not in it, across a
+reset or not. A headroom threshold should leave room for what the
+installation can spend within the export age. Repeated scrapes,
 local quota refusals and secondary cooldown waits do not refresh observation age.
 Within one window the lowest allowance seen is kept, in any receipt order, even
 when GitHub later reports more; a later response with more remaining still
@@ -365,7 +372,8 @@ repositories may serve any repository, so its probe reads every active
 installation of the App instead (`operation="list_app_installations"`).
 
 `schemabot.github.rate_limit.unobserved_installations` makes a missing budget
-visible. It counts the probe's installations with no exportable snapshot, plus
+visible. It counts the probe's installations with no snapshot read within the
+export age (a reset does not count: see above), plus
 each configured owner whose installation the probe could not resolve on its
 last pass, plus one when the last pass could not list the App's installations
 at all, plus one when the probe has not reported its targets within the

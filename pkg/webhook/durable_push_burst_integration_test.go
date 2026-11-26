@@ -76,7 +76,7 @@ func newPushBurstFixture(t *testing.T, dbName, liveHead string) *pushBurstFixtur
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
 	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger,
-		WithDurableWebhookDispatch(), WithSynchronizeQuietPeriod(pushBurstQuietPeriod))
+		WithDurableWebhookDispatch(), WithSynchronizeQuietPeriod(pushBurstQuietPeriod), WithInsecureSkipSignatureVerification())
 	return &pushBurstFixture{h: h, store: svc.Storage().WebhookEvents(), requests: requests, result: result}
 }
 

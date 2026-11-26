@@ -54,7 +54,7 @@ func TestPlanCheckWriteRefusedByInFlightApply(t *testing.T) {
 	st := mysqlstore.New(db)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := api.New(st, &api.ServerConfig{}, nil, logger)
-	h := NewHandler(svc, &fakeClientFactory{}, nil, logger)
+	h := NewHandler(svc, &fakeClientFactory{}, nil, logger, WithInsecureSkipSignatureVerification())
 
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-refused-plan",
@@ -153,7 +153,7 @@ func TestCheckConvergesAfterSuccessfulApplyOnMovedHead(t *testing.T) {
 	st := mysqlstore.New(db)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := api.New(st, &api.ServerConfig{}, nil, logger)
-	h := NewHandler(svc, &fakeClientFactory{}, nil, logger)
+	h := NewHandler(svc, &fakeClientFactory{}, nil, logger, WithInsecureSkipSignatureVerification())
 
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-converge-after-apply",
