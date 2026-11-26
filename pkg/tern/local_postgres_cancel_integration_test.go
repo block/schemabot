@@ -205,3 +205,85 @@ func alterWaitingOnLock(t *testing.T, db *sql.DB) bool {
 		WHERE wait_event_type = 'Lock' AND query ILIKE 'ALTER TABLE%'`).Scan(&n))
 	return n > 0
 }
+
+// An operator cancels a PostgreSQL SET NOT NULL whose validation keeps
+// failing on a NULL row. The sequence's first step added a helper CHECK NOT
+// VALID, which rejects every NULL write the application makes. The cancel
+// drops that helper, so the application's writes behave as they did before
+// the apply, and the apply log names the constraint it removed.
+func TestLocalClientPostgresCancelRemovesTheSetNotNullHelper(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	const (
+		database = "cancel_not_null"
+		helper   = "users_name_not_null_check"
+	)
+	_, storageDSN := setupMySQLContainer(t)
+	setupStorageSchema(t, storageDSN)
+	cleanupTasks(t, storageDSN)
+	targetDSN, targetDB := testutil.StartPostgres(t, database)
+	_, err := targetDB.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY, name text);
+		INSERT INTO public.users VALUES (1, 'ada'), (2, NULL)`)
+	require.NoError(t, err)
+
+	stor := createStorage(t, storageDSN)
+	t.Cleanup(func() { utils.CloseAndLog(stor) })
+	client, err := NewLocalClient(LocalConfig{Database: database, Type: storage.DatabaseTypePostgres, TargetDSN: targetDSN,
+		SchemaOverrides: map[string]string{"logical": "public"}}, stor, slog.Default())
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(client) })
+
+	plan, err := client.Plan(t.Context(), &ternv1.PlanRequest{Database: database, Type: storage.DatabaseTypePostgres,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{"logical": {Files: map[string]string{
+			"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, name text NOT NULL);",
+		}}}})
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+
+	result, err := client.Apply(t.Context(), &ternv1.ApplyRequest{PlanId: plan.PlanId, Environment: localClientTestEnvironment,
+		DdlChanges: plan.Changes[0].TableChanges})
+	require.NoError(t, err)
+	require.True(t, result.Accepted, result.ErrorMessage)
+	startTestOperator(t, stor, client, result.ApplyId)
+
+	apply := resolveDispatchedApply(t, stor, result.ApplyId)
+	require.Eventually(t, func() bool {
+		apply = resolveDispatchedApply(t, stor, result.ApplyId)
+		return state.IsState(apply.State, state.Apply.FailedRetryable)
+	}, postgresCancelDeadline, 50*time.Millisecond, "the validation never failed on the NULL row")
+	require.Equal(t, 1, checkConstraintCount(t, targetDB, helper), "the sequence's first step added the helper")
+	_, err = targetDB.ExecContext(t.Context(), `INSERT INTO public.users VALUES (3, NULL)`)
+	require.Error(t, err, "the helper rejects a NULL write while it stays")
+
+	cancelResp, err := client.Cancel(t.Context(), &ternv1.CancelRequest{ApplyId: result.ApplyId, Environment: localClientTestEnvironment})
+	require.NoError(t, err)
+	require.True(t, cancelResp.Accepted, cancelResp.ErrorMessage)
+
+	require.Eventually(t, func() bool {
+		apply = resolveDispatchedApply(t, stor, result.ApplyId)
+		return state.IsTerminalApplyState(apply.State)
+	}, postgresCancelDeadline, 50*time.Millisecond, "the cancelled apply never settled")
+	assert.Equal(t, state.Apply.Cancelled, apply.State, apply.ErrorMessage)
+
+	assert.Zero(t, checkConstraintCount(t, targetDB, helper), "the cancel drops the helper")
+	_, err = targetDB.ExecContext(t.Context(), `INSERT INTO public.users VALUES (3, NULL)`)
+	require.NoError(t, err, "a NULL write lands again, as it did before the apply")
+
+	logs, err := stor.ApplyLogs().GetByApply(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, countLogMessagesContaining(logs,
+		`Removed constraint users_name_not_null_check from public.users. The cancelled schema change added it, and it rejects writes that break CHECK ((name IS NOT NULL))`),
+		"the apply log names the constraint the cancel removed")
+}
+
+// checkConstraintCount counts the constraints named name on public.users.
+func checkConstraintCount(t *testing.T, db *sql.DB, name string) int {
+	t.Helper()
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT count(*) FROM pg_catalog.pg_constraint WHERE conrelid = 'public.users'::regclass AND conname = $1`, name).Scan(&count))
+	return count
+}
