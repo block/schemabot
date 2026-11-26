@@ -140,7 +140,7 @@ func TestSampleVtgateDSNTranslatesToThePublishedPort(t *testing.T) {
 			require.NoError(t, json.NewDecoder(r.Body).Decode(&posted))
 			_, err := w.Write([]byte(`{"ok":true}`))
 			require.NoError(t, err)
-		case "/admin/edge-addrs":
+		case "/admin/edges":
 			_, err := fmt.Fprintf(w, `{%q:"0.0.0.0:%d"}`, sampleOrganization+"/"+sampleVitessDatabase, sampleProxyPortStart+2)
 			require.NoError(t, err)
 		default:

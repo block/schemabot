@@ -240,7 +240,7 @@ func postSampleProxyPortMap(ctx context.Context, apiURL string, ports map[int]in
 func sampleVtgateDSN(ctx context.Context, apiURL string, ports map[int]int) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL+"/admin/edge-addrs", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL+"/admin/edges", nil)
 	if err != nil {
 		return "", err
 	}
