@@ -6,11 +6,15 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
+	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -68,6 +72,117 @@ func TestAuthoredErrorsReturnTheirWordsThroughWraps(t *testing.T) {
 			text, quotesRepository := authored.AuthoredText()
 			assert.Equal(t, tt.want, text)
 			assert.False(t, quotesRepository, "SchemaBot wrote these words; no library composed them from repository input")
+		})
+	}
+}
+
+// A miss that found configs it could not read is not a definite miss, so its
+// words say how many configs could not be read, without naming their paths.
+func TestDatabaseNotFoundWithUnreadableConfigsSaysTheMissIsInconclusive(t *testing.T) {
+	err := &DatabaseNotFoundError{
+		DatabaseName:       "orders",
+		AvailableDatabases: []string{"users"},
+		UnreadableConfigs:  []string{"schema/a/schemabot.yaml", "schema/b/schemabot.yaml"},
+	}
+	authored, ok := errors.AsType[authoredError](fmt.Errorf("find config: %w", err))
+	require.True(t, ok)
+	text, quotesRepository := authored.AuthoredText()
+	assert.Equal(t, "database 'orders' not found. Available databases: users; "+
+		"SchemaBot could not read 2 schemabot.yaml configs, so the database may be declared in one of them", text)
+	assert.NotContains(t, text, "schema/a")
+	assert.False(t, quotesRepository)
+
+	err.UnreadableConfigs = err.UnreadableConfigs[:1]
+	text, _ = err.AuthoredText()
+	assert.Contains(t, text, "could not read 1 schemabot.yaml config, so")
+}
+
+// A database name that matches two configs reaches the caller as a marked error
+// naming both, however the caller wraps it.
+func TestAmbiguousDatabaseConfigReachesCallersMarked(t *testing.T) {
+	configs := []DiscoveredConfig{
+		{Config: &SchemabotConfig{Database: "orders"}, SchemaDir: "a/orders"},
+		{Config: &SchemabotConfig{Database: "orders"}, SchemaDir: "b/orders"},
+	}
+	_, _, _, err := selectConfigByDatabaseName("orders", configs)
+	require.Error(t, err)
+
+	authored, ok := errors.AsType[authoredError](fmt.Errorf("find config: %w", err))
+	require.True(t, ok, "the ambiguity must reach callers as a marked error")
+	text, quotesRepository := authored.AuthoredText()
+	assert.Equal(t, "ambiguous: database 'orders' matches multiple configs at: a/orders, b/orders", text)
+	assert.False(t, quotesRepository)
+}
+
+// Each reason a schema request finds no schema files under its root reaches the
+// caller as a marked error with that reason: the pull request removed the last
+// files, every namespace is ignored, or the root holds none.
+func TestNoSchemaFilesReachesCallersMarked(t *testing.T) {
+	tests := []struct {
+		name     string
+		changed  *gh.CommitFile
+		config   string
+		listing  []*gh.RepositoryContent
+		serve    func(t *testing.T, mux *http.ServeMux)
+		repo     proposedFilesRepo
+		wantText string
+	}{
+		{
+			name:     "pull request removes the last schema files",
+			changed:  &gh.CommitFile{Filename: new("schema/removed/orders.sql"), Status: new("removed")},
+			config:   "database: orders\ntype: mysql\n",
+			listing:  []*gh.RepositoryContent{{Type: new("file"), Name: new("schemabot.yaml"), Path: new("schema/schemabot.yaml")}},
+			repo:     proposedFilesRepo{head: map[string]string{}, defaultTip: map[string]string{"schema/removed/orders.sql": "blob-orders"}},
+			wantText: "this pull request removes the last schema files under it",
+		},
+		{
+			name:    "every namespace is ignored",
+			changed: &gh.CommitFile{Filename: new("schema/schemabot.yaml"), Status: new("modified")},
+			config:  "database: orders\ntype: mysql\nignore_namespaces: [legacy]\n",
+			listing: []*gh.RepositoryContent{
+				{Type: new("file"), Name: new("schemabot.yaml"), Path: new("schema/schemabot.yaml")},
+				{Type: new("dir"), Name: new("legacy"), Path: new("schema/legacy")},
+			},
+			serve: func(t *testing.T, mux *http.ServeMux) {
+				registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/schema/legacy", []*gh.RepositoryContent{
+					{Type: new("file"), Name: new("orders.sql"), Path: new("schema/legacy/orders.sql")},
+				})
+				registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/legacy/orders.sql", "CREATE TABLE orders (id bigint primary key);\n")
+			},
+			repo:     proposedFilesRepo{head: map[string]string{}, defaultTip: map[string]string{}},
+			wantText: "after excluding ignored namespaces [legacy]",
+		},
+		{
+			name:     "schema root holds no schema files",
+			changed:  &gh.CommitFile{Filename: new("schema/schemabot.yaml"), Status: new("modified")},
+			config:   "database: orders\ntype: mysql\n",
+			listing:  []*gh.RepositoryContent{{Type: new("file"), Name: new("schemabot.yaml"), Path: new("schema/schemabot.yaml")}},
+			repo:     proposedFilesRepo{head: map[string]string{}, defaultTip: map[string]string{}},
+			wantText: `no schema files found under schema for environment ""`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, mux := setupConfigTestGitHubServer(t)
+			registerPullRequest(t, mux, "head-sha")
+			registerPullRequestFiles(t, mux, []*gh.CommitFile{tt.changed})
+			tt.repo.serve(t, mux)
+			registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/schemabot.yaml", tt.config)
+			registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/schema", tt.listing)
+			if tt.serve != nil {
+				tt.serve(t, mux)
+			}
+
+			ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			_, err := ic.CreateSchemaRequestFromPR(t.Context(), "octocat/hello-world", 1, "", "", nil)
+			require.Error(t, err)
+
+			authored, ok := errors.AsType[authoredError](err)
+			require.True(t, ok, "the empty schema root must reach callers as a marked error: %v", err)
+			text, quotesRepository := authored.AuthoredText()
+			assert.Contains(t, text, tt.wantText)
+			assert.True(t, strings.HasPrefix(text, "no schema files found under schema"), text)
+			assert.False(t, quotesRepository)
 		})
 	}
 }

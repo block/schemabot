@@ -18,9 +18,20 @@ import (
 // Types that are deliberately unmarked are listed with a reason in the
 // completeness test, so a new error type has to choose.
 
-// AuthoredText returns the whole message: it carries no cause.
+// AuthoredText returns the whole message: it carries no cause. A miss with
+// configs it could not read does not establish that the database is absent, so
+// the words say how many configs could not be read rather than stating a
+// definite miss. The count, not the paths, keeps repository input out of them.
 func (e *DatabaseNotFoundError) AuthoredText() (string, bool) {
-	return e.Error(), false
+	if e.Conclusive() {
+		return e.Error(), false
+	}
+	noun := "configs"
+	if len(e.UnreadableConfigs) == 1 {
+		noun = "config"
+	}
+	return fmt.Sprintf("%s; SchemaBot could not read %d schemabot.yaml %s, so the database may be declared in one of them",
+		e.Error(), len(e.UnreadableConfigs), noun), false
 }
 
 // noSchemaFilesError reports that the schema root for an environment holds no
