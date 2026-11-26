@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"html"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
@@ -74,6 +75,10 @@ type ShardedApplyData struct {
 	// vocabulary from "apply" to "rollback", matching the single-deployment
 	// comment.
 	Rollback bool
+
+	// UpdateCadence is the longest a change waits before it reaches this
+	// comment, shown beside the "Last updated" footer. Zero renders no note.
+	UpdateCadence time.Duration
 }
 
 // ShardedKeyspace is one keyspace's slice of a sharded apply: its tables in
@@ -109,8 +114,9 @@ type ShardedTableStatus struct {
 	Status string
 
 	// RowsCopied/RowsTotal/ETASeconds aggregate the shards' live copy figures:
-	// rows summed across the shards that have reported, ETA from the slowest
-	// shard. They drive the progress bar and rows line while the table copies;
+	// rows summed across the shards that have reported, ETA when the slowest
+	// of them finishes (presentation.ShardedTableETA). They drive the
+	// progress bar and rows line while the table copies;
 	// zero totals fall back to the state-word rendering. The totals grow as
 	// dispatch waves start their shards' copies, so ShardsReporting says how
 	// many shards the figures cover and both the headline and the rows line
@@ -132,6 +138,13 @@ type ShardedTableStatus struct {
 	// (presentation.RollUpShardedTable), so the bar and rows line span the
 	// whole table and read the total as approximate.
 	RowsTotalPlanned bool
+
+	// Throttled reports that the engine's throttler is pausing at least one
+	// of the table's shards still at work, and ThrottleReason names the
+	// signal (presentation.RollUpShardedTable). The copying table then reads
+	// as throttled, as it does in the CLI.
+	Throttled      bool
+	ThrottleReason string
 
 	// EstimatedBytes is the table's on-disk size when it was planned, summed
 	// across its shards, shown beside the copy progress so the operator sees
@@ -233,7 +246,7 @@ func renderShardedApplyComment(data ShardedApplyData, renderedAt string, formatt
 
 	writeShardedFooter(&sb, data)
 	if !state.IsTerminalApplyState(data.State) {
-		writeLastUpdatedFooter(&sb, renderedAt)
+		writeLastUpdatedFooter(&sb, renderedAt, data.UpdateCadence)
 	}
 	return sb.String()
 }
@@ -741,6 +754,8 @@ func shardedTableFacts(t ShardedTableStatus) presentation.TableFacts {
 		ETASeconds:     t.ETASeconds,
 		EstimatedBytes: t.EstimatedBytes,
 		PlannedShards:  t.PlannedShards,
+		Throttled:      t.Throttled,
+		ThrottleReason: t.ThrottleReason,
 
 		RowsTotalPlanned: t.RowsTotalPlanned,
 	}

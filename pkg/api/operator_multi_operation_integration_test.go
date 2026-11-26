@@ -373,7 +373,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		})
 		svc := newMatrixService(t, stor, clients)
 
-		svc.recoverApplies(ctx, 1, openClaimGate())
+		svc.recoverApplies(ctx, 1, openClaimGate(), passPolled)
 
 		assert.Empty(t, rec.resumeOrder(), "stop reconciliation must not drive any operation")
 		for deployment, client := range clients {
@@ -439,7 +439,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 			"region-b": {taskState: state.Task.Pending},
 		}))
 
-		svc.recoverApplies(ctx, 1, openClaimGate())
+		svc.recoverApplies(ctx, 1, openClaimGate(), passPolled)
 
 		assert.Empty(t, rec.resumeOrder(), "stop reconciliation must not drive any operation")
 		assert.Equal(t, state.ApplyOperation.Cancelled, opState(t, ctx, stor, seed.opID("region-b")),
@@ -466,7 +466,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		require.Equal(t, state.ApplyOperation.Pending, opState(t, ctx, stor, seed.finalizerID))
 		requestPendingStop(t, ctx, stor, seed.applyID)
 
-		svc.recoverApplies(ctx, 3, openClaimGate())
+		svc.recoverApplies(ctx, 3, openClaimGate(), passPolled)
 
 		require.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.finalizerID),
 			"the stop caught the finalizer before it began")
@@ -520,7 +520,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		})
 		svc := newMatrixService(t, stor, clients)
 
-		svc.recoverApplies(ctx, 1, openClaimGate())
+		svc.recoverApplies(ctx, 1, openClaimGate(), passPolled)
 
 		assert.Empty(t, rec.resumeOrder(), "a pending cancel must not start the next member")
 		for deployment, client := range clients {
@@ -573,7 +573,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		}
 		svc := newMatrixService(t, stor, clients)
 
-		svc.recoverApplies(ctx, 1, openClaimGate())
+		svc.recoverApplies(ctx, 1, openClaimGate(), passPolled)
 
 		assert.Empty(t, rec.resumeOrder(), "stop reconciliation must not drive any operation")
 		assert.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.opID("region-b")),
@@ -613,7 +613,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		clients["region-a/staging"] = delivering
 		svc := newMatrixService(t, stor, clients)
 
-		svc.recoverApplies(ctx, 1, openClaimGate())
+		svc.recoverApplies(ctx, 1, openClaimGate(), passPolled)
 
 		assert.Empty(t, rec.resumeOrder(), "a pending cancel must not start the operation")
 		assert.NotNil(t, delivering.resumeApply,
@@ -647,7 +647,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		})
 		svc := newMatrixService(t, stor, clients)
 
-		svc.recoverApplies(ctx, 1, openClaimGate())
+		svc.recoverApplies(ctx, 1, openClaimGate(), passPolled)
 
 		assert.NotNil(t, clients["region-a/staging"].(*matrixTernClient).resumeApply)
 		assert.Equal(t, state.ApplyOperation.Pending, opState(t, ctx, stor, seed.opID("region-a")),
@@ -681,7 +681,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		clients["region-a/staging"] = &refuseCancelDuringDriveClient{matrixTernClient: clients["region-a/staging"].(*matrixTernClient)}
 		svc := newMatrixService(t, stor, clients)
 
-		svc.recoverApplies(ctx, 1, openClaimGate())
+		svc.recoverApplies(ctx, 1, openClaimGate(), passPolled)
 
 		assert.Equal(t, state.ApplyOperation.Pending, opState(t, ctx, stor, seed.opID("region-a")),
 			"a refused cancel must not settle the operation cancelled")
@@ -794,7 +794,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 			"region-a": {taskState: state.Task.Pending},
 		}))
 
-		svc.recoverApplies(ctx, 1, openClaimGate())
+		svc.recoverApplies(ctx, 1, openClaimGate(), passPolled)
 
 		assert.Empty(t, rec.resumeOrder(), "stop reconciliation must not drive any shard work")
 		assert.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.workAID),
@@ -1216,7 +1216,7 @@ type matrixService struct {
 
 func driveNextOperation(t *testing.T, ctx context.Context, svc *matrixService, driverID int) {
 	t.Helper()
-	svc.recoverApplyOperation(ctx, driverID, fmt.Sprintf("matrix-driver-%d", driverID))
+	svc.recoverApplyOperation(ctx, driverID, fmt.Sprintf("matrix-driver-%d", driverID), passPolled)
 }
 
 // driveOneOperation polls like a real operator driver until this driver actually
@@ -1228,7 +1228,7 @@ func driveOneOperation(t *testing.T, ctx context.Context, svc *matrixService, re
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		before := rec.resumeCount()
-		svc.recoverApplyOperation(ctx, driverID, owner)
+		svc.recoverApplyOperation(ctx, driverID, owner, passPolled)
 		if rec.resumeCount() > before {
 			return // this driver (or a peer it unblocked) drove an operation
 		}

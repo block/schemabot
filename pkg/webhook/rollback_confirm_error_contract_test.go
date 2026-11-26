@@ -191,7 +191,9 @@ func TestRollbackConfirmCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		require.Error(t, err)
 		assert.True(t, retry, "a transient lock list read failure must stay retryable for a durable driver")
 		body := requireComment(t, comments, "lock list failure comment")
-		assert.Contains(t, body, "list locks")
+		assert.Contains(t, body, "SchemaBot could not read the pending rollback for this pull request in `staging`, so nothing was confirmed and nothing ran. "+rollbackRetryAdvice)
+		assert.NotContains(t, body, "list locks")
+		assert.NotContains(t, body, "storage read failed")
 	})
 
 	t.Run("pinned plan read failure is retryable", func(t *testing.T) {
@@ -208,7 +210,9 @@ func TestRollbackConfirmCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		require.Error(t, err)
 		assert.True(t, retry, "a transient pinned-plan read failure must stay retryable, not become the command's answer")
 		body := requireComment(t, comments, "pinned plan read failure comment")
-		assert.Contains(t, body, "load rollback plan")
+		assert.Contains(t, body, "SchemaBot could not read the pending rollback for this pull request in `staging`, so nothing was confirmed and nothing ran. "+rollbackRetryAdvice)
+		assert.NotContains(t, body, "load rollback plan")
+		assert.NotContains(t, body, "storage read failed")
 	})
 
 	// A gate that could not evaluate its inputs fails closed for this delivery

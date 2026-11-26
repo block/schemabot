@@ -38,7 +38,7 @@ func TestFormatApplyStatusComment_ShardedAttributionFromCaller(t *testing.T) {
 		tasks = append(tasks, &storage.Task{ID: oid, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: shard, DDL: "ALTER TABLE `mutes` ADD INDEX a"})
 	}
 
-	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil)
+	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil, 0)
 
 	assert.Contains(t, out, "by @morgo at", "attribution shows the clean username")
 	assert.NotContains(t, out, "github:", "the raw structured caller is not rendered")
@@ -99,7 +99,7 @@ func TestFormatApplyStatusComment_ShardedFailedSurfacesError(t *testing.T) {
 	}
 	tasks := []*storage.Task{task(1, 1, "-40"), task(2, 2, "40-80"), task(3, 3, "80-c0"), task(4, 4, "c0-")}
 
-	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil)
+	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil, 0)
 
 	assert.Contains(t, out, "## Schema Change Status", "uses the stable in-place status headline")
 	assert.Contains(t, out, "**Shards**:", "counts shards, not deployments")
@@ -126,7 +126,7 @@ func TestFormatApplyStatusComment_ShardedFailureFallsBackToTaskError(t *testing.
 	oid := int64(1)
 	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: "-40", DDL: "ALTER ...", ErrorMessage: gotZero}}
 
-	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil, nil, "", "", nil)
+	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil, nil, "", "", nil, 0)
 
 	assert.Contains(t, out, gotZero, "the task error is surfaced when the operation row has none")
 }
@@ -427,7 +427,7 @@ func TestCommentObserverResolvedDiffReachesShardedComment(t *testing.T) {
 	}}
 
 	o := &CommentObserver{stor: &stubPlanStorage{plan: plan}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, o.resolveShardedPlan(apply, ops), "", "", nil)
+	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, o.resolveShardedPlan(apply, ops), "", "", nil, 0)
 
 	assert.Contains(t, body, "#### Keyspace `ks`")
 	assert.Contains(t, body, "**VSchema**: Applying...")
@@ -523,7 +523,7 @@ func TestFormatApplyStatusComment_MultiKeyspaceRendersKeyspaceSections(t *testin
 		mk(5, "contacts_sharded/group_finalizer", state.ApplyOperation.Pending),
 	}
 
-	out := formatApplyStatusComment(apply, ops, false, nil, nil, nil, nil, "", "", nil)
+	out := formatApplyStatusComment(apply, ops, false, nil, nil, nil, nil, "", "", nil, 0)
 
 	assert.NotContains(t, out, "**Deployments**:", "must not fall back to the deployment-unit layout")
 	assert.Contains(t, out, "#### Keyspace `contacts`")
@@ -906,9 +906,9 @@ func TestBuildSingleShardApplyCommentData_StoppedAtCutoverNamesTheFailedTable(t 
 }
 
 // A shard reporting copied rows without a row total has no denominator to
-// aggregate against, so none of its figures count: the table's fraction stays
-// consistent (numerator, denominator, ETA, and coverage all describe the same
-// reporting shards) instead of copied rows inflating the numerator alone.
+// aggregate against, so its rows stay out of the table's fraction instead of
+// inflating the numerator alone. Its ETA still counts: the table finishes when
+// its slowest shard does, whether or not that shard has reported a total.
 func TestBuildShardedApplyData_CopiedRowsWithoutTotalNotAggregated(t *testing.T) {
 	mk := func(id int64, key, opState string) *storage.ApplyOperation {
 		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
@@ -933,7 +933,7 @@ func TestBuildShardedApplyData_CopiedRowsWithoutTotalNotAggregated(t *testing.T)
 	table := data.Keyspaces[0].Tables[0]
 	assert.Equal(t, int64(185000), table.RowsCopied, "copied rows without a total stay out of the numerator")
 	assert.Equal(t, int64(500000), table.RowsTotal)
-	assert.Equal(t, int64(240), table.ETASeconds, "an ETA without a total does not set the table's floor")
+	assert.Equal(t, int64(900), table.ETASeconds, "the slowest shard's ETA counts even without a row total")
 	assert.Equal(t, 1, table.ShardsReporting, "a shard without a row total is not reporting")
 }
 
@@ -1010,7 +1010,7 @@ func TestShardedCommentShowsGeneratedVSchemaChangeAsFinalize(t *testing.T) {
 	require.NotNil(t, view)
 	assert.Equal(t, map[string]bool{"ks": true}, view.finalizeOnly)
 
-	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, view, "", "", nil)
+	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, view, "", "", nil, 0)
 	assert.NotContains(t, body, "VSchema")
 }
 
@@ -1051,7 +1051,7 @@ func finalizesOnly(keyspace string) *shardedPlanView {
 // counts and no finalize section.
 func TestFormatApplyComment_SingleShardStrataReadsLikeMySQL(t *testing.T) {
 	apply, ops, tasks := singleShardStrataApply(state.Apply.Running, state.ApplyOperation.Running, state.ApplyOperation.Pending)
-	status := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "", "", nil)
+	status := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "", "", nil, 0)
 	assert.Contains(t, status, "**Keyspace `shop_001`**")
 	assert.Contains(t, status, "CREATE TABLE `orders`")
 	assert.NotContains(t, status, "**Shards**:")
