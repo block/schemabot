@@ -429,6 +429,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 	for _, opt := range opts {
 		opt(h)
 	}
+	h.warnIgnoredPreviousSecrets()
 
 	// Register recovery callback so the operator can attach comment observers
 	// before resuming recovered applies.
@@ -1372,6 +1373,25 @@ func (h *Handler) authenticateWebhook(r *http.Request, body []byte) (appName str
 		return defaultAppName, 0, "invalid_signature", false
 	}
 	return defaultAppName, 0, "", true
+}
+
+// warnIgnoredPreviousSecrets logs each secret being rotated out that the
+// handler will never check, because the current secret it pairs with is not
+// set: verification is then skipped or refused without consulting it, so the
+// rotation setting does nothing. The server refuses to start in that state;
+// this covers a host that builds the handler directly.
+func (h *Handler) warnIgnoredPreviousSecrets() {
+	for name := range h.previousWebhookSecretsByApp {
+		if len(h.webhookSecretsByApp[name]) == 0 {
+			h.logger.Warn("previous webhook secret is ignored because its App has no current webhook secret; set the current webhook secret or remove the previous one",
+				"app_name", name,
+				"config_key", "previous-webhook-secret")
+		}
+	}
+	if len(h.previousRepoWebhookSecret) > 0 && len(h.repoWebhookSecret) == 0 {
+		h.logger.Warn("previous webhook secret is ignored because no current repo-webhook secret is set; set the current repo-webhook secret or remove the previous one",
+			"config_key", "previous-repo-webhook-secret")
+	}
 }
 
 // verifyRotatingSecret verifies a delivery against the current secret and,

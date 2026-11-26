@@ -1,12 +1,15 @@
 package webhook
 
 import (
+	"bytes"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // During a webhook secret rotation the server holds both the new secret and
@@ -85,6 +88,13 @@ func TestAuthenticateWebhook_AcceptsSecretBeingRotatedOut(t *testing.T) {
 		{"repo-webhook unknown secret", repoWebhook(WithPreviousRepoWebhookSecret(previous)), repoRequest, []byte("other"), false},
 		// The App webhook's previous secret does not authenticate repo-webhook deliveries.
 		{"repo-webhook signed with the App's previous secret", repoWebhook(WithPreviousWebhookSecret(previous)), repoRequest, previous, false},
+
+		// With no rotation configured, a delivery signed with an empty key,
+		// which anyone can compute, is refused: an unset previous secret never
+		// stands in as a secret that verifies.
+		{"single-App empty key with no rotation", singleApp(), appRequest, []byte{}, false},
+		{"multi-App empty key with no rotation", multiApp(), multiAppRequest, []byte{}, false},
+		{"repo-webhook empty key with no rotation", repoWebhook(), repoRequest, []byte{}, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -97,4 +107,62 @@ func TestAuthenticateWebhook_AcceptsSecretBeingRotatedOut(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A delivery verified with the secret being rotated out is logged, since that
+// line is how an operator knows GitHub still signs with the old secret and the
+// rotation cannot end yet. The line names the App, the config key to remove
+// and the delivery, and carries no secret material. A delivery verified with
+// the current secret logs nothing.
+func TestAuthenticateWebhook_LogsDeliveriesVerifiedWithThePreviousSecret(t *testing.T) {
+	body := []byte(`{"action":"opened","repository":{"full_name":"org-a/repo-x"}}`)
+	current := []byte("new-secret")
+	previous := []byte("old-secret")
+
+	deliver := func(t *testing.T, signWith []byte) string {
+		var logs bytes.Buffer
+		h := &Handler{
+			webhookSecretsByApp: map[string][]byte{defaultAppName: current},
+			logger:              slog.New(slog.NewJSONHandler(&logs, nil)),
+		}
+		WithPreviousWebhookSecret(previous)(h)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(string(body)))
+		req.Header.Set(headerSignature256, signWebhookBody(signWith, body))
+		req.Header.Set(headerDeliveryID, "delivery-7f3c")
+		_, _, _, ok := h.authenticateWebhook(req, body)
+		require.True(t, ok)
+		return logs.String()
+	}
+
+	logged := deliver(t, previous)
+	assert.Contains(t, logged, "webhook delivery verified with the secret being rotated out")
+	assert.Contains(t, logged, `"app_name":"default"`)
+	assert.Contains(t, logged, `"config_key":"previous-webhook-secret"`)
+	assert.Contains(t, logged, `"delivery_id":"delivery-7f3c"`)
+	assert.NotContains(t, logged, string(previous))
+	assert.NotContains(t, logged, string(current))
+
+	assert.Empty(t, deliver(t, current))
+}
+
+// A handler built with a secret being rotated out but no current secret to
+// pair it with can never check the previous secret, so it warns at
+// construction instead of carrying a rotation setting that does nothing.
+func TestNewHandlerWarnsWhenAPreviousSecretHasNoCurrentSecret(t *testing.T) {
+	newHandler := func(webhookSecret []byte, opts ...HandlerOption) string {
+		var logs bytes.Buffer
+		NewHandler(nil, nil, webhookSecret, slog.New(slog.NewJSONHandler(&logs, nil)), opts...)
+		return logs.String()
+	}
+
+	logged := newHandler(nil, WithPreviousWebhookSecret([]byte("old-secret")))
+	assert.Contains(t, logged, "previous webhook secret is ignored")
+	assert.Contains(t, logged, `"config_key":"previous-webhook-secret"`)
+	assert.NotContains(t, logged, "old-secret")
+
+	logged = newHandler([]byte("app-secret"), WithPreviousRepoWebhookSecret([]byte("old-repo-secret")))
+	assert.Contains(t, logged, "previous webhook secret is ignored")
+	assert.Contains(t, logged, `"config_key":"previous-repo-webhook-secret"`)
+
+	assert.Empty(t, newHandler([]byte("new-secret"), WithPreviousWebhookSecret([]byte("old-secret"))))
 }

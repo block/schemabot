@@ -322,9 +322,9 @@ If the secret is not set, signature validation is skipped (useful for local deve
 
 GitHub signs each delivery with one secret, and changing it on GitHub takes effect immediately. To rotate without refusing deliveries, keep the old secret in the config as `previous-webhook-secret` while the change rolls out. SchemaBot accepts a delivery signed with either secret.
 
-1. Deploy the new secret as `webhook-secret` and the old one as `previous-webhook-secret`.
-2. Change the webhook secret in the GitHub App settings to the new secret.
-3. Once SchemaBot stops logging `webhook delivery verified with the secret being rotated out`, remove `previous-webhook-secret` and deploy again.
+1. Deploy the new secret as `webhook-secret` and the old one as `previous-webhook-secret`. SchemaBot reads secrets once at startup, so when the config points at a `secretsmanager:` or `file:` reference, changing the value behind it also needs a restart.
+2. Wait until every pod runs the new config, then change the webhook secret in the GitHub App settings to the new secret. A pod still on the old config refuses deliveries signed with the new secret, and a rolling deploy reaches pods at different times.
+3. Wait until deliveries have arrived since step 2 and none of them logged `webhook delivery verified with the secret being rotated out`, then remove `previous-webhook-secret` and deploy again. A quiet log on its own can also mean no deliveries arrived.
 
 ```yaml
 github:
