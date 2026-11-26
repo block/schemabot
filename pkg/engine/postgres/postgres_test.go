@@ -1154,7 +1154,7 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndIndexBuilds(t *testing.T) {
 	}
 	partitionedBuilds := map[string]bool{"CREATE INDEX users_name_idx ON public.users (name)": true}
 
-	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds))
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds, nil))
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
 	assert.Equal(t, []string{"privilege verdict", "size verdict"}, engine.BlockedCauses(changes[0].ModeReason))
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
@@ -1166,7 +1166,7 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndIndexBuilds(t *testing.T) {
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[4].ExecutionMode, "a plain index build the planner did not route to the partitioned build stays under the ceiling")
 	assert.Equal(t, "size verdict", changes[4].ModeReason)
 
-	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds))
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds, nil))
 	assert.Equal(t, []string{"privilege verdict", "size verdict"}, engine.BlockedCauses(changes[0].ModeReason))
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
 }
@@ -1178,7 +1178,7 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndIndexBuilds(t *testing.T) {
 func TestBlockRewriteStepsFailsClosedOnUnparseableStep(t *testing.T) {
 	changes := []engine.TableChange{{Table: "users", DDL: "ALTER TABLE public.users ADD"}}
 
-	err := blockRewriteSteps(changes, "size verdict", nil)
+	err := blockRewriteSteps(changes, "size verdict", nil, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `classify planned statement for table "users"`)
 	assert.Empty(t, changes[0].ExecutionMode)
@@ -1427,6 +1427,62 @@ func TestBlockOversizedTableBlocksExecutableRewrite(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
 	assert.Equal(t, `statement for table "users": table size 2048 bytes exceeds the 1024-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`, changes[0].ModeReason)
+}
+
+// A step whose every planner decision is proven catalog-only stays executable
+// on an oversized table: it rewrites no rows, so its cost does not grow with
+// the table the ceiling measures.
+func TestBlockOversizedTableAdmitsProvenCatalogOnlyStep(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}
+	}
+	const ddl = "ALTER TABLE public.users ADD COLUMN email text"
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	report.Statements = []pgplan.Statement{{
+		ExecSQL:   []string{ddl},
+		Decisions: []planner.Decision{{ProvenCatalogOnly: true}},
+	}}
+	changes := []engine.TableChange{{Table: "users", DDL: ddl}}
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	assert.Empty(t, changes[0].ExecutionMode)
+	assert.Empty(t, changes[0].ModeReason)
+}
+
+// One unproven decision is enough to keep the ceiling on a step, since the
+// exemption holds only when the whole statement writes nothing but the catalog.
+func TestBlockOversizedTableBlocksStepWithAnUnprovenDecision(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}
+	}
+	const ddl = "ALTER TABLE public.users ADD COLUMN email text, ALTER COLUMN id TYPE numeric"
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	report.Statements = []pgplan.Statement{{
+		ExecSQL:   []string{ddl},
+		Decisions: []planner.Decision{{ProvenCatalogOnly: true}, {ProvenCatalogOnly: false}},
+	}}
+	changes := []engine.TableChange{{Table: "users", DDL: ddl}}
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+	assert.Contains(t, changes[0].ModeReason, "1024-byte threshold")
+}
+
+// catalogOnlySteps exempts only statements whose decisions are all proven, and
+// a statement with no decisions proves nothing.
+func TestCatalogOnlyStepsRequiresEveryDecisionProven(t *testing.T) {
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Statements = []pgplan.Statement{
+		{ExecSQL: []string{"ALTER TABLE a ADD COLUMN x text"}, Decisions: []planner.Decision{{ProvenCatalogOnly: true}}},
+		{ExecSQL: []string{"ALTER TABLE b ADD COLUMN y text"}, Decisions: []planner.Decision{{ProvenCatalogOnly: true}, {}}},
+		{ExecSQL: []string{"ALTER TABLE c ADD COLUMN z text"}},
+	}
+
+	assert.Equal(t, map[string]bool{"ALTER TABLE a ADD COLUMN x text": true}, catalogOnlySteps(report))
 }
 
 // An executable step without a named target fails the plan closed because a

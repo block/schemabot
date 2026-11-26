@@ -4944,6 +4944,44 @@ func TestServerConfig_AppsValidation(t *testing.T) {
 			wantErrSub: "github quota-reserve must not be negative, got -1",
 		},
 		{
+			name: "single-app github: rotating both webhook secrets is accepted",
+			github: GitHubConfig{
+				AppID: "42", PrivateKey: "env:PK", WebhookSecret: "env:WS", PreviousWebhookSecret: "env:OLD_WS",
+				RepoWebhookSecret: "env:RWS", PreviousRepoWebhookSecret: "env:OLD_RWS",
+			},
+			repos: map[string]RepoConfig{"org/repo": {}},
+		},
+		{
+			name: "single-app github: previous webhook secret without the new one is rejected",
+			github: GitHubConfig{
+				AppID: "42", PrivateKey: "env:PK", PreviousWebhookSecret: "env:OLD_WS",
+			},
+			repos:      map[string]RepoConfig{"org/repo": {}},
+			wantErrSub: "github: previous-webhook-secret is set but webhook-secret is not",
+		},
+		{
+			name:       "previous repo-webhook secret without the new one is rejected even with nothing else under github:",
+			github:     GitHubConfig{PreviousRepoWebhookSecret: "env:OLD_RWS"},
+			repos:      map[string]RepoConfig{"org/repo": {}},
+			wantErrSub: "github: previous-repo-webhook-secret is set but repo-webhook-secret is not",
+		},
+		{
+			name: "a previous repo-webhook secret on an apps: entry is rejected, since apps: serves no repository webhooks",
+			apps: map[string]GitHubAppConfig{"a": {
+				AppID: "1", PrivateKey: "env:PK", WebhookSecret: "env:WS",
+				RepoWebhookSecret: "env:RWS", PreviousRepoWebhookSecret: "env:OLD_RWS",
+			}},
+			repos:      map[string]RepoConfig{"org/repo": {GitHubApp: "a"}},
+			wantErrSub: "app \"a\" sets previous-repo-webhook-secret, but repository webhooks are not served when apps: is configured",
+		},
+		{
+			name:       "rotating repo-webhook secrets under github: alongside apps: is rejected",
+			github:     GitHubConfig{RepoWebhookSecret: "env:RWS", PreviousRepoWebhookSecret: "env:OLD_RWS"},
+			apps:       map[string]GitHubAppConfig{"a": validApp},
+			repos:      map[string]RepoConfig{"org/repo": {GitHubApp: "a"}},
+			wantErrSub: "github: and apps: are mutually exclusive",
+		},
+		{
 			name: "app with a negative quota reserve is rejected",
 			apps: map[string]GitHubAppConfig{
 				"app-a": {
@@ -6869,4 +6907,34 @@ func TestReposServedByGitHubApp(t *testing.T) {
 	repos, restricted = (&ServerConfig{}).ReposServedByGitHubApp("default")
 	assert.False(t, restricted)
 	assert.Nil(t, repos)
+}
+
+// A previous webhook secret is optional, but once it is configured it must
+// resolve to a value. A reference to an unset environment variable is refused,
+// so a rotation deploy never starts without the old secret it promised to
+// accept, while an omitted setting still means no rotation.
+func TestResolvePreviousWebhookSecretsRefuseAnEmptyConfiguredValue(t *testing.T) {
+	t.Setenv("SCHEMABOT_TEST_OLD_WEBHOOK_SECRET", "")
+	t.Setenv("SCHEMABOT_TEST_OLD_REPO_WEBHOOK_SECRET", "old-repo")
+
+	empty := GitHubConfig{
+		PreviousWebhookSecret:     "env:SCHEMABOT_TEST_OLD_WEBHOOK_SECRET",
+		PreviousRepoWebhookSecret: "env:SCHEMABOT_TEST_OLD_WEBHOOK_SECRET",
+	}
+	_, err := empty.ResolvePreviousWebhookSecret()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "previous-webhook-secret is set but resolved to an empty value")
+	_, err = empty.ResolvePreviousRepoWebhookSecret()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "previous-repo-webhook-secret is set but resolved to an empty value")
+
+	omitted := GitHubConfig{}
+	secret, err := omitted.ResolvePreviousWebhookSecret()
+	require.NoError(t, err)
+	assert.Empty(t, secret)
+
+	set := GitHubConfig{PreviousRepoWebhookSecret: "env:SCHEMABOT_TEST_OLD_REPO_WEBHOOK_SECRET"}
+	secret, err = set.ResolvePreviousRepoWebhookSecret()
+	require.NoError(t, err)
+	assert.Equal(t, "old-repo", secret)
 }

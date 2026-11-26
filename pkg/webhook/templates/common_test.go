@@ -3,11 +3,13 @@ package templates
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/state"
 )
 
 func TestSanitizeCommentError(t *testing.T) {
@@ -406,4 +408,45 @@ func TestVSchemaDiffBudget_SharedAcrossKeyspaces(t *testing.T) {
 	assert.Less(t, sb.Len(), maxCommentVSchemaDiffLen+4*200,
 		"four oversized keyspace diffs render one budget's worth of diff, not four")
 	assert.Equal(t, 4, strings.Count(sb.String(), "Diff truncated to fit GitHub's comment size limit"))
+}
+
+// A progress comment says how soon a change reaches it, beside the "Last
+// updated" footer, so a reader of a long apply reads an old timestamp as "no
+// change since then" rather than as SchemaBot going quiet. Zero cadence
+// (terminal finalizations and one-shot renders) omits the note.
+func TestLastUpdatedFooterShowsUpdateCadence(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 19:42:00 UTC")
+	data := ApplyStatusCommentData{
+		Database:      "testapp",
+		Environment:   "staging",
+		RequestedBy:   "octocat",
+		State:         state.Apply.Running,
+		UpdateCadence: 2 * time.Minute,
+	}
+
+	out := RenderApplyStatusComment(data)
+	assert.Contains(t, out, "(2026-06-16 19:42:00 UTC) · changes show within ~2m_")
+
+	data.UpdateCadence = 0
+	out = RenderApplyStatusComment(data)
+	assert.Contains(t, out, "(2026-06-16 19:42:00 UTC)_")
+	assert.NotContains(t, out, "changes show within")
+}
+
+// The cadence note is part of the visible content, so a cadence change alone
+// changes the content key: when the decay schedule moves to a slower rung, the
+// comment is edited once and its note stays true.
+func TestCommentContentKeyChangesWithUpdateCadence(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 19:42:00 UTC")
+	render := func(cadence time.Duration) string {
+		return RenderApplyStatusComment(ApplyStatusCommentData{
+			Database:      "testapp",
+			Environment:   "staging",
+			RequestedBy:   "octocat",
+			State:         state.Apply.Running,
+			UpdateCadence: cadence,
+		})
+	}
+
+	assert.NotEqual(t, CommentContentKey(render(30*time.Second)), CommentContentKey(render(time.Minute)))
 }

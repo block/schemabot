@@ -43,6 +43,29 @@ type commentCapture struct {
 
 	mu     sync.Mutex
 	bodies map[int64]string
+	// createdAt, when set, is returned as every edited comment's created_at,
+	// the way GitHub reports when the comment was first posted.
+	createdAt time.Time
+	// failEdits makes every PATCH fail with a server error.
+	failEdits bool
+}
+
+func (c *commentCapture) setCreatedAt(at time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.createdAt = at
+}
+
+func (c *commentCapture) setFailEdits(fail bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.failEdits = fail
+}
+
+func (c *commentCapture) editBehavior() (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.createdAt, c.failEdits
 }
 
 func (c *commentCapture) setBody(commentID int64, body string) {
@@ -128,10 +151,19 @@ func setupFakeGitHubForComments(t *testing.T) (*ghclient.InstallationClient, *co
 			Body string `json:"body"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		createdAt, failEdits := capture.editBehavior()
+		if failEdits {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		capture.setBody(commentID, body.Body)
 		capture.edits <- commentEdit{CommentID: commentID, Body: body.Body}
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": commentID})
+		resp := map[string]any{"id": commentID}
+		if !createdAt.IsZero() {
+			resp["created_at"] = createdAt.UTC().Format(time.RFC3339)
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 
 	client := gh.NewClient(nil)
@@ -3863,7 +3895,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		pending := *apply
 		pending.State = state.Apply.Pending
 		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply,
-			formatProgressComment(&pending, nil, nil, ""))
+			formatProgressComment(&pending, nil, nil, "", 0))
 
 		var created commentCreate
 		select {
@@ -3901,7 +3933,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		require.NoError(t, st.ApplyComments().IncrementEditCount(ctx, apply.ID, state.Comment.Progress))
 
 		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply,
-			formatProgressComment(apply, nil, nil, ""))
+			formatProgressComment(apply, nil, nil, "", 0))
 
 		select {
 		case <-capture.creates:
@@ -3922,7 +3954,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		h, capture := newHandler(t)
 
 		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply,
-			formatProgressComment(apply, nil, nil, ""))
+			formatProgressComment(apply, nil, nil, "", 0))
 
 		select {
 		case <-capture.creates:
@@ -4163,4 +4195,304 @@ func drainCommentEdits(capture *commentCapture) {
 	for range len(capture.edits) {
 		<-capture.edits
 	}
+}
+
+// requireProgressEdit waits for the observer's next edit and returns it.
+func requireProgressEdit(t *testing.T, capture *commentCapture, why string) commentEdit {
+	t.Helper()
+	select {
+	case edited := <-capture.edits:
+		return edited
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, why)
+		return commentEdit{}
+	}
+}
+
+// requireNoProgressEdit asserts the last tick left the comment untouched.
+func requireNoProgressEdit(t *testing.T, capture *commentCapture, why string) {
+	t.Helper()
+	select {
+	case edited := <-capture.edits:
+		require.FailNowf(t, why, "got %q", edited.Body)
+	default:
+	}
+}
+
+// A progress comment that has been live for hours no longer needs
+// second-resolution updates: nobody watches a PR comment continuously for a
+// day, every edit spends the installation's shared GitHub write budget, and
+// the CLI is the high-resolution progress surface. The edit spacing therefore
+// grows with the comment's age, and the footer tells the reader the longest a
+// change waits before it shows. A state change always publishes at once,
+// whatever the comment's age.
+func TestE2EProgressEditCadenceDecaysWithCommentAge(t *testing.T) {
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-decay",
+		pr:         148,
+		database:   "e2e_decay_db",
+		applyState: state.Apply.Running,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(t.Context(), "org/repo-decay", 148, 12345, apply, state.Comment.Progress, "initial progress")
+	progressID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	capture.setCreatedAt(fake.Now())
+	obs := f.newObserver(st, fake)
+
+	obs.OnProgress(apply, []*storage.Task{task})
+	edited := requireProgressEdit(t, capture, "expected the first tick to edit the progress comment")
+	assert.Equal(t, progressID, edited.CommentID)
+	assert.Contains(t, edited.Body, "changes show within ~5s")
+
+	// Over an hour in, row progress no longer reaches GitHub every few
+	// seconds, and the footer names the wider spacing.
+	fake.Advance(61 * time.Minute)
+	task.RowsCopied, task.ProgressPercent = 600, 60
+	obs.OnProgress(apply, []*storage.Task{task})
+	edited = requireProgressEdit(t, capture, "expected an edit after a long-overdue interval")
+	assert.Contains(t, edited.Body, "60.00%")
+	assert.Contains(t, edited.Body, "changes show within ~1m")
+
+	fake.Advance(31 * time.Second)
+	task.RowsCopied, task.ProgressPercent = 650, 65
+	obs.OnProgress(apply, []*storage.Task{task})
+	requireNoProgressEdit(t, capture, "an hour-old comment must not edit again after 31s")
+
+	fake.Advance(time.Minute)
+	task.RowsCopied, task.ProgressPercent = 700, 70
+	obs.OnProgress(apply, []*storage.Task{task})
+	edited = requireProgressEdit(t, capture, "expected an edit once the decayed interval elapsed")
+	assert.Contains(t, edited.Body, "70.00%")
+
+	// Hours deeper in, the spacing grows again.
+	fake.Advance(4 * time.Hour)
+	task.RowsCopied, task.ProgressPercent = 750, 75
+	obs.OnProgress(apply, []*storage.Task{task})
+	edited = requireProgressEdit(t, capture, "expected an edit after hours without one")
+	assert.Contains(t, edited.Body, "75.00%")
+	assert.Contains(t, edited.Body, "changes show within ~5m")
+
+	fake.Advance(2 * time.Minute)
+	task.RowsCopied, task.ProgressPercent = 800, 80
+	obs.OnProgress(apply, []*storage.Task{task})
+	requireNoProgressEdit(t, capture, "a comment hours old must space edits further apart than minutes")
+
+	fake.Advance(5 * time.Minute)
+	task.RowsCopied, task.ProgressPercent = 850, 85
+	obs.OnProgress(apply, []*storage.Task{task})
+	edited = requireProgressEdit(t, capture, "expected an edit once the deeper interval elapsed")
+	assert.Contains(t, edited.Body, "85.00%")
+
+	// A table's state change publishes one second after the previous edit,
+	// even though the apply's own state has not moved.
+	fake.Advance(time.Second)
+	task.State = state.Task.CatchingUp
+	obs.OnProgress(apply, []*storage.Task{task})
+	edited = requireProgressEdit(t, capture, "expected a table state change to edit at once")
+	assert.Equal(t, progressID, edited.CommentID)
+
+	// So does the apply's.
+	fake.Advance(time.Second)
+	apply.State = state.Apply.WaitingForCutover
+	obs.OnProgress(apply, []*storage.Task{task})
+	edited = requireProgressEdit(t, capture, "expected an apply state change to edit at once")
+	assert.Contains(t, edited.Body, "Waiting for Cutover")
+}
+
+// A pod restart or lease handover builds a fresh observer, but the comment it
+// takes over is as old as GitHub says it is: the first edit learns the
+// comment's real age from GitHub, the next tick publishes that age's spacing in
+// the footer, and the observer resumes at that spacing rather than at the
+// fastest one.
+func TestE2EProgressCadenceResumesAtCommentAgeAfterRestart(t *testing.T) {
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-decay-restart",
+		pr:         149,
+		database:   "e2e_decay_restart_db",
+		applyState: state.Apply.Running,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(t.Context(), "org/repo-decay-restart", 149, 12345, apply, state.Comment.Progress, "initial progress")
+	requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt.Add(3 * time.Hour))
+	capture.setCreatedAt(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	obs.OnProgress(apply, []*storage.Task{task})
+	edited := requireProgressEdit(t, capture, "expected the first tick after a restart to edit")
+	assert.Contains(t, edited.Body, "changes show within ~5s", "the first edit has not learned the comment's age yet")
+
+	// That edit learned the comment is three hours old. The next tick
+	// publishes the longer spacing before applying it, even though nothing
+	// moved, so the footer never promises a shorter wait than a change gets.
+	fake.Advance(time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	edited = requireProgressEdit(t, capture, "expected the learned spacing to be published at once")
+	assert.Contains(t, edited.Body, "changes show within ~2m")
+
+	fake.Advance(31 * time.Second)
+	task.RowsCopied, task.ProgressPercent = 600, 60
+	obs.OnProgress(apply, []*storage.Task{task})
+	requireNoProgressEdit(t, capture, "a three-hour-old comment must keep its slow spacing after a restart")
+
+	fake.Advance(2 * time.Minute)
+	task.RowsCopied, task.ProgressPercent = 650, 65
+	obs.OnProgress(apply, []*storage.Task{task})
+	edited = requireProgressEdit(t, capture, "expected an edit once the comment's spacing elapsed")
+	assert.Contains(t, edited.Body, "65.00%")
+	assert.Contains(t, edited.Body, "changes show within ~2m")
+}
+
+// A rotation posts a fresh progress comment because someone just acted on the
+// apply (a start after a stop, a volume change) and is watching the PR again,
+// so the fresh comment starts back at the fastest spacing even when the apply
+// itself has been running for hours. The follow-up tick moves only row
+// figures, so it proves the fast spacing rather than the state-change bypass.
+func TestE2EProgressRotationRestoresFastCadence(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-decay-rotate",
+		pr:         150,
+		database:   "e2e_decay_rotate_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	// Seed the comments the stop left: the progress comment frozen at
+	// "Stopped" and the stopped summary marker.
+	h.postAndTrackComment(ctx, "org/repo-decay-rotate", 150, 12345, apply, state.Comment.Progress, "Stopped at 21%")
+	requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-decay-rotate", 150, 12345, apply, state.Comment.Summary, "Schema Change Stopped")
+	requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The old comment has been live long enough for the spacing to decay fully.
+	obs.progressCommentCreatedAt = task.CreatedAt
+	fake.Advance(7 * time.Hour)
+
+	// The start tick rotates: a fresh progress comment is posted and the old
+	// one is frozen.
+	obs.OnProgress(apply, []*storage.Task{task})
+	newProgressID := requireCommentCreate(t, capture)
+	requireProgressEdit(t, capture, "expected the superseded progress comment to be frozen")
+
+	// The state moves to running: rendered at once on the fresh comment.
+	apply.State = state.Apply.Running
+	fake.Advance(time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	edited := requireProgressEdit(t, capture, "expected the running state to edit the fresh comment")
+	assert.Equal(t, newProgressID, edited.CommentID)
+	assert.Contains(t, edited.Body, "changes show within ~5s",
+		"the fresh comment names the fastest spacing again")
+
+	// Six seconds later, row progress alone publishes at the fastest spacing:
+	// the pre-rotation age no longer applies.
+	fake.Advance(6 * time.Second)
+	task.RowsCopied, task.ProgressPercent = 700, 70
+	obs.OnProgress(apply, []*storage.Task{task})
+	edited = requireProgressEdit(t, capture, "expected row progress on the fresh comment at the fastest spacing")
+	assert.Equal(t, newProgressID, edited.CommentID)
+	assert.Contains(t, edited.Body, "70.00%")
+}
+
+// An edit GitHub rejects does not count as rendered. A state change whose edit
+// failed is still pending on the next tick, without waiting out the comment's
+// decayed spacing, and the retry is held back by the fastest spacing so a
+// GitHub outage does not turn every tick into a request.
+func TestE2EFailedProgressEditRetriesPendingStateChange(t *testing.T) {
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-decay-retry",
+		pr:         151,
+		database:   "e2e_decay_retry_db",
+		applyState: state.Apply.Running,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(t.Context(), "org/repo-decay-retry", 151, 12345, apply, state.Comment.Progress, "initial progress")
+	requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt.Add(3 * time.Hour))
+	capture.setCreatedAt(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	obs.OnProgress(apply, []*storage.Task{task})
+	requireProgressEdit(t, capture, "expected the first tick to edit")
+
+	// The apply reaches its cutover while GitHub rejects edits.
+	capture.setFailEdits(true)
+	fake.Advance(time.Second)
+	apply.State = state.Apply.WaitingForCutover
+	obs.OnProgress(apply, []*storage.Task{task})
+	requireNoProgressEdit(t, capture, "a rejected edit must not reach the comment")
+
+	// GitHub recovers. A tick inside the retry hold-back does not edit.
+	capture.setFailEdits(false)
+	fake.Advance(2 * time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	requireNoProgressEdit(t, capture, "a retry inside the hold-back must wait")
+
+	// Once the hold-back passes, the pending state change publishes, well
+	// inside the three-hour-old comment's spacing.
+	fake.Advance(4 * time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	edited := requireProgressEdit(t, capture, "expected the pending state change to publish after the hold-back")
+	assert.Contains(t, edited.Body, "Waiting for Cutover")
+}
+
+// A rollout target finishes while GitHub rejects every edit of the progress
+// comment, as it does once the comment is deleted. The Check Run refresh for
+// the finished target is offered anyway: it does not wait on a different
+// comment's edit landing.
+func TestE2EFinishedTargetReportedWhenProgressEditFails(t *testing.T) {
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-decay-target-report",
+		pr:         152,
+		database:   "e2e_decay_target_report_db",
+		applyState: state.Apply.Running,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+	ctx := t.Context()
+
+	insertTarget := func(target, opState string) {
+		t.Helper()
+		_, err := st.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "default", Target: target, OperationKey: target, State: opState,
+			CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt,
+		})
+		require.NoError(t, err)
+	}
+	insertTarget("region-a", state.ApplyOperation.Completed)
+	insertTarget("region-b", state.ApplyOperation.Running)
+
+	h.postAndTrackComment(ctx, "org/repo-decay-target-report", 152, 12345, apply, state.Comment.Progress, "initial progress")
+	requireCommentCreate(t, capture)
+	capture.setFailEdits(true)
+
+	var offered atomic.Int32
+	obs := NewCommentObserver(CommentObserverConfig{
+		GHClient:       f.factory,
+		Storage:        st,
+		Repo:           apply.Repository,
+		PR:             apply.PullRequest,
+		InstallationID: apply.InstallationID,
+		ApplyID:        apply.ID,
+		Logger:         f.logger,
+		Clock:          clock.NewFake(task.CreatedAt),
+		OnTargetsFinishedHook: func(*storage.Apply) bool {
+			offered.Add(1)
+			return true
+		},
+	})
+
+	obs.OnProgress(apply, []*storage.Task{task})
+	requireNoProgressEdit(t, capture, "a rejected edit must not reach the comment")
+	assert.Equal(t, int32(1), offered.Load(), "the finished target must be offered to the Check Run even though the comment edit failed")
 }

@@ -93,7 +93,7 @@ func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int
 			"environment", result.Environment,
 			"requested_by", requestedBy,
 			"error", err)
-		h.postCommandError(repo, pr, installationID, command, result.Environment, requestedBy, "Failed to look up apply: "+err.Error())
+		h.postCommandError(repo, pr, installationID, command, result.Environment, requestedBy, controlApplyLookupFailedMessage(command, result.ApplyID))
 		return nil, false
 	}
 	if apply == nil {
