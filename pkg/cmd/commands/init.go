@@ -52,6 +52,27 @@ type initResult struct {
 	PlanID      string `json:"plan_id"`
 	Tables      int32  `json:"tables"`
 	Verified    bool   `json:"verified"`
+	// SkippedTables are live tables schema files cannot describe. The
+	// written schemabot.yaml lists each in ignore_tables, so SchemaBot leaves
+	// them alone.
+	SkippedTables []initSkippedTable `json:"skipped_tables,omitempty"`
+}
+
+// initSkippedTable is one table the import skipped, and why.
+type initSkippedTable struct {
+	Namespace string `json:"namespace"`
+	Table     string `json:"table"`
+	Reason    string `json:"reason"`
+}
+
+func initSkippedTables(groups []skippedTableGroup) []initSkippedTable {
+	var out []initSkippedTable
+	for _, group := range groups {
+		for _, table := range group.Tables {
+			out = append(out, initSkippedTable{Namespace: group.Namespace, Table: table.Table, Reason: table.Reason})
+		}
+	}
+	return out
 }
 
 func (cmd *InitCmd) Run(ctx context.Context, g *Globals) error {
@@ -226,8 +247,9 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 		return nil, err
 	}
 	client.SetLocalAuth(connection.Token, connection.Endpoint)
+	var skipped []skippedTableGroup
 	cmd.reportProgress("Reading your live schema...")
-	pulled, err := client.CallPullSchemaAPIWithContext(ctx, connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, client.PullSchemaOptions{Namespaces: namespaces})
+	pulled, err := client.CallPullSchemaAPIWithContext(ctx, connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, client.PullSchemaOptions{Namespaces: namespaces, SkipUnrepresentableTables: true})
 	if err != nil {
 		return nil, fmt.Errorf("import live schema: %w", err)
 	}
@@ -237,6 +259,23 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 			return nil, err
 		}
 		if err := plan.write(); err != nil {
+			return nil, err
+		}
+		// The written config lists the tables the pull skipped in
+		// ignore_tables, so the baseline is verified with them withheld.
+		exclusions = plan.exclusions
+		skipped = plan.skipped
+	} else {
+		// The reused config keeps its own ignore_tables, so each table the
+		// pull skipped must already be withheld by it. A skipped table the
+		// config still manages would be read as dropped by the next plan.
+		// The tables are disclosed either way, so a rerun reports them as
+		// the first run did.
+		skipped, err = pulledSkippedTables(sortedPulledNamespaces(pulled), pulled.Namespaces)
+		if err != nil {
+			return nil, err
+		}
+		if err := requireReusedConfigWithholdsSkipped(exclusions, skipped); err != nil {
 			return nil, err
 		}
 	}
@@ -267,7 +306,7 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 	if _, err := client.RegisterLocalProfile(profile, cmd.Runtime); err != nil {
 		return nil, fmt.Errorf("verified schema is available at %s, but the profile could not be saved; rerun with the same inputs: %w", root, err)
 	}
-	return &initResult{Database: cmd.Database, Environment: cmd.Environment, Profile: profile, SchemaDir: root, PlanID: baseline.PlanID, Tables: pulled.TableCount, Verified: true}, nil
+	return &initResult{Database: cmd.Database, Environment: cmd.Environment, Profile: profile, SchemaDir: root, PlanID: baseline.PlanID, Tables: pulled.TableCount, Verified: true, SkippedTables: initSkippedTables(skipped)}, nil
 }
 
 // Only a stored, unchanged baseline authorizes publication of imported files.

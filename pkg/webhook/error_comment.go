@@ -11,8 +11,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const remoteSchemaServiceUnavailableMessage = "SchemaBot could not reach the remote schema change service for this environment."
-
 // postCommandError posts a generic command-failure comment to the PR with a
 // consistent UTC timestamp.
 //
@@ -116,10 +114,10 @@ func userFacingError(err error) string {
 	}
 	var remoteErr *api.RemoteDeploymentUnavailableError
 	if errors.As(err, &remoteErr) {
-		return userFacingRemoteUnavailableError(remoteErr.Deployment, remoteErr.Target, err.Error())
+		return userFacingRemoteUnavailableError(remoteErr.Deployment, remoteErr.Target)
 	}
 	if status.Code(err) == codes.Unavailable {
-		return userFacingRemoteUnavailableError("", "", err.Error())
+		return userFacingRemoteUnavailableError("", "")
 	}
 	return err.Error()
 }
@@ -152,33 +150,35 @@ func userFacingConfigNotAuthorizedError(err error) (string, bool) {
 	return templates.RenderConfigNotAuthorizedLine(configErr.Database, configErr.SchemaPath), true
 }
 
+// userFacingErrorDetail replaces a command error that is a gRPC unavailable
+// status, passed along as text by a caller that has no typed error, with the
+// fixed unreachable line. Any other detail is returned as given.
 func userFacingErrorDetail(errorDetail string) string {
-	lowerDetail := strings.ToLower(errorDetail)
-	if isUserFacingRemoteUnavailableError(lowerDetail) {
-		return errorDetail
-	}
-	if strings.Contains(lowerDetail, strings.ToLower(remoteSchemaServiceUnavailableMessage)) {
-		return errorDetail
-	}
-	if strings.Contains(lowerDetail, "rpc error: code = unavailable") {
-		return userFacingRemoteUnavailableError("", "", errorDetail)
+	if strings.Contains(strings.ToLower(errorDetail), "rpc error: code = unavailable") {
+		return userFacingRemoteUnavailableError("", "")
 	}
 	return errorDetail
 }
 
-func isUserFacingRemoteUnavailableError(lowerDetail string) bool {
-	return strings.Contains(lowerDetail, "schemabot could not reach the remote ") && strings.Contains(lowerDetail, "raw error:")
+// userFacingRemoteUnavailableError is the PR comment line for a remote data
+// plane that did not answer. It names the deployment and target SchemaBot
+// tried to reach and never the transport error, which carries hostnames and
+// addresses. The caller logs that error with its identifiers.
+func userFacingRemoteUnavailableError(deployment, target string) string {
+	service, healthy := remoteServiceName(deployment, target)
+	return "SchemaBot could not reach the " + service + ". Run the command again once " + healthy + " is healthy; if it fails again, the SchemaBot server logs have the cause."
 }
 
-func userFacingRemoteUnavailableError(deployment, target, rawError string) string {
-	service := "remote schema change service"
-	if deployment != "" && target != "" {
-		service = "remote deployment `" + deployment + "` for target `" + target + "`"
-	} else if deployment != "" {
-		service = "remote deployment `" + deployment + "`"
+// remoteServiceName names the remote data plane SchemaBot tried to reach, as
+// specifically as the deployment and target allow, and how a sentence asking
+// the reader to wait for it refers back to it.
+func remoteServiceName(deployment, target string) (service, healthy string) {
+	switch {
+	case deployment != "" && target != "":
+		return "remote deployment `" + deployment + "` for target `" + target + "`", "that deployment"
+	case deployment != "":
+		return "remote deployment `" + deployment + "`", "that deployment"
+	default:
+		return "remote schema change service", "the service"
 	}
-	if strings.Contains(strings.ToLower(rawError), "no healthy upstream") {
-		return "SchemaBot could not reach the " + service + ". No healthy upstream is available. The service or network path is unavailable; retry after the upstream is healthy. Raw error: " + rawError
-	}
-	return "SchemaBot could not reach the " + service + ". Retry after the service is healthy. Raw error: " + rawError
 }

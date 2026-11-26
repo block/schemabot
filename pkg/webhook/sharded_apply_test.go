@@ -38,7 +38,7 @@ func TestFormatApplyStatusComment_ShardedAttributionFromCaller(t *testing.T) {
 		tasks = append(tasks, &storage.Task{ID: oid, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: shard, DDL: "ALTER TABLE `mutes` ADD INDEX a"})
 	}
 
-	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil, 0)
+	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil, 0, 0)
 
 	assert.Contains(t, out, "by @morgo at", "attribution shows the clean username")
 	assert.NotContains(t, out, "github:", "the raw structured caller is not rendered")
@@ -99,7 +99,7 @@ func TestFormatApplyStatusComment_ShardedFailedSurfacesError(t *testing.T) {
 	}
 	tasks := []*storage.Task{task(1, 1, "-40"), task(2, 2, "40-80"), task(3, 3, "80-c0"), task(4, 4, "c0-")}
 
-	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil, 0)
+	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "", nil, 0, 0)
 
 	assert.Contains(t, out, "## Schema Change Status", "uses the stable in-place status headline")
 	assert.Contains(t, out, "**Shards**:", "counts shards, not deployments")
@@ -126,7 +126,7 @@ func TestFormatApplyStatusComment_ShardedFailureFallsBackToTaskError(t *testing.
 	oid := int64(1)
 	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: "-40", DDL: "ALTER ...", ErrorMessage: gotZero}}
 
-	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil, nil, "", "", nil, 0)
+	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil, nil, "", "", nil, 0, 0)
 
 	assert.Contains(t, out, gotZero, "the task error is surfaced when the operation row has none")
 }
@@ -427,7 +427,7 @@ func TestCommentObserverResolvedDiffReachesShardedComment(t *testing.T) {
 	}}
 
 	o := &CommentObserver{stor: &stubPlanStorage{plan: plan}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, o.resolveShardedPlan(apply, ops), "", "", nil, 0)
+	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, o.resolveShardedPlan(apply, ops), "", "", nil, 0, 0)
 
 	assert.Contains(t, body, "#### Keyspace `ks`")
 	assert.Contains(t, body, "**VSchema**: Applying...")
@@ -523,7 +523,7 @@ func TestFormatApplyStatusComment_MultiKeyspaceRendersKeyspaceSections(t *testin
 		mk(5, "contacts_sharded/group_finalizer", state.ApplyOperation.Pending),
 	}
 
-	out := formatApplyStatusComment(apply, ops, false, nil, nil, nil, nil, "", "", nil, 0)
+	out := formatApplyStatusComment(apply, ops, false, nil, nil, nil, nil, "", "", nil, 0, 0)
 
 	assert.NotContains(t, out, "**Deployments**:", "must not fall back to the deployment-unit layout")
 	assert.Contains(t, out, "#### Keyspace `contacts`")
@@ -1010,7 +1010,7 @@ func TestShardedCommentShowsGeneratedVSchemaChangeAsFinalize(t *testing.T) {
 	require.NotNil(t, view)
 	assert.Equal(t, map[string]bool{"ks": true}, view.finalizeOnly)
 
-	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, view, "", "", nil, 0)
+	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, view, "", "", nil, 0, 0)
 	assert.NotContains(t, body, "VSchema")
 }
 
@@ -1051,7 +1051,7 @@ func finalizesOnly(keyspace string) *shardedPlanView {
 // counts and no finalize section.
 func TestFormatApplyComment_SingleShardStrataReadsLikeMySQL(t *testing.T) {
 	apply, ops, tasks := singleShardStrataApply(state.Apply.Running, state.ApplyOperation.Running, state.ApplyOperation.Pending)
-	status := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "", "", nil, 0)
+	status := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "", "", nil, 0, 0)
 	assert.Contains(t, status, "**Keyspace `shop_001`**")
 	assert.Contains(t, status, "CREATE TABLE `orders`")
 	assert.NotContains(t, status, "**Shards**:")

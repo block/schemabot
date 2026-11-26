@@ -231,7 +231,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	}
 
 	// Build plan comment data
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData := h.planCommentData(schemaResult, planResp, environment, tenant, requestedBy)
 	commentData.BaseSchema = h.planBaseSchema(ctx, client, repo, pr, schemaResult, environment)
 	commentData.ScopedDatabase = databaseName
 	commentData.DeploymentDrift = driftPreview
@@ -293,7 +293,7 @@ func (h *Handler) postNarrowedPlan(ctx context.Context, client *ghclient.Install
 	h.logger.Info("plan narrowed to one target; stored check state and the aggregate check are left unchanged",
 		"repo", repo, "pr", pr, "database", schemaResult.Database, "environment", environment,
 		"target", target, "narrowed_to", planResp.NarrowedTo, "plan_id", planResp.PlanID, "head_sha", schemaResult.HeadSHA)
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData := h.planCommentData(schemaResult, planResp, environment, tenant, requestedBy)
 	commentData.BaseSchema = h.planBaseSchema(ctx, client, repo, pr, schemaResult, environment)
 	commentData.ScopedDatabase = databaseName
 	commentData.Target = target
@@ -928,7 +928,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			headSHA = sha
 		}
 
-		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy, h.agentHint(), h.cliName())
+		commentData := h.planCommentData(schemaResult, planResp, env, tenant, requestedBy)
 		plannedSchemas[env] = schemaResult
 		commentData.ScopedDatabase = planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan, commandScopeDatabases)
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, driftPreview, repo, pr, env)
@@ -1748,9 +1748,27 @@ func planTableSizes(schema *ghclient.SchemaRequestResult, sc *apitypes.SchemaCha
 // the time the command was posted. Its "Requested by" line then reads when the
 // operator asked, however long planning took, rather than when it rendered.
 func (h *Handler) commandPlanCommentData(schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, requestedBy string, result CommandResult) templates.PlanCommentData {
-	data := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+	data := h.planCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
 	data.RequestedAt = result.RequestedAt
 	return data
+}
+
+// planCommentData builds the plan comment this server posts, stating how many
+// of the apply's operations its drivers run at once.
+func (h *Handler) planCommentData(schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy string) templates.PlanCommentData {
+	data := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
+	data.OperationsAtOnce = h.operationsAtOnce()
+	return data
+}
+
+// operationsAtOnce is how many of an apply's operations this server's drivers
+// run at once. The drivers that run an apply are this server's and its peers',
+// which share its config and so its per-apply limit.
+func (h *Handler) operationsAtOnce() int {
+	if h.service == nil {
+		return 0
+	}
+	return h.service.Config().OperationsAtOnce()
 }
 
 // buildPlanCommentData converts plan results into template data.

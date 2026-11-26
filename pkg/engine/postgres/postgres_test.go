@@ -167,7 +167,6 @@ var createShapeRefusalSentences = map[executor.CreateShapeCause]string{
 	executor.CreateShapeConcurrently:       `statement for table "users" declares CONCURRENTLY for an index on a new table, which SchemaBot's PostgreSQL create path does not support; remove CONCURRENTLY so the index can be built before the table receives traffic`,
 	executor.CreateShapeDuplicateName:      `statement for table "users" declares the same relation name more than once; give every table, index, constraint, and sequence a unique name`,
 	executor.CreateShapeMultipleOperations: `statement for table "users" contains multiple create operations in one statement; split them into separate CREATE TABLE or CREATE INDEX statements`,
-	executor.CreateShapeForeignKey:         `statement for table "users" declares a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; leave the foreign key out of the schema file to create the table, then add the foreign key outside SchemaBot and back to the file`,
 	executor.CreateShapeUnsupportedKind:    `statement for table "users" uses a statement kind SchemaBot's PostgreSQL create path does not support; use CREATE TABLE or CREATE INDEX, or create the object outside SchemaBot`,
 }
 
@@ -336,15 +335,13 @@ func TestExecutionVerdictUnknownGuidance(t *testing.T) {
 	}, "users", nil))
 }
 
-// A foreign-key change on a live table is planned so it can be reviewed, but
-// the engine does not run it: the step is blocked with a sentence naming
-// whether the statement adds or drops the foreign key, and nothing is
-// reported as unrecognized vocabulary. An added foreign key's remedy applies
-// the rest of the plan first, since its column may be one the same plan adds.
-// A dropped foreign key's remedy offers declaring it before removing it, so
-// an operator whose file left it out keeps the constraint. Only a table that
-// carries foreign keys into another namespace gets the clause naming them,
-// since those cannot be declared and removal is the only way forward.
+// A foreign-key change the planner refuses is shown for review and the engine
+// does not run it. A dropped foreign key's remedy offers declaring it before
+// removing it, so an operator whose file left it out keeps the constraint.
+// Only a table that carries foreign keys into another namespace gets the
+// clause naming them, since those cannot be declared and removal is the only
+// way forward. Any other foreign-key change the planner refuses gets the
+// general remedy, and nothing is reported as unrecognized vocabulary.
 func TestExecutionVerdictForeignKeyChange(t *testing.T) {
 	const dropReason = `statement for table "users" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan`
 	for _, tt := range []struct {
@@ -353,7 +350,7 @@ func TestExecutionVerdictForeignKeyChange(t *testing.T) {
 		crossNamespace []string
 		want           string
 	}{
-		{"add", schemadiff.ChangeAddForeignKey, nil, `statement for table "users" adds a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; leave the foreign key out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and add the foreign key back to the file`},
+		{"another foreign-key change", schemadiff.ChangeAddForeignKey, nil, `statement for table "users" changes a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; leave the change out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and put the change back in the file`},
 		{"drop", schemadiff.ChangeDropForeignKey, nil, dropReason},
 		{"drop with cross-namespace foreign keys", schemadiff.ChangeDropForeignKey, []string{"users_account_id_fkey", "users_region_id_fkey"},
 			dropReason + `; foreign key constraint(s) "users_account_id_fkey", "users_region_id_fkey" reference another namespace and cannot be declared, so the plan stays blocked until they are removed through a separately reviewed process`},
@@ -385,7 +382,7 @@ func TestExecutionVerdictGeneratedExpressionChange(t *testing.T) {
 
 // A foreign key the planner cannot bind fails the plan with the fix appended:
 // the referenced table must already exist on the target, and the planning
-// role must be able to read it. The remedy matches through wrapping, and any
+// role must be able to read and reference it. The remedy matches through wrapping, and any
 // other failure gets none.
 func TestReferencedTableRemedy(t *testing.T) {
 	for _, tt := range []struct {
@@ -394,9 +391,11 @@ func TestReferencedTableRemedy(t *testing.T) {
 		want string
 	}{
 		{"not found", fmt.Errorf("plan: %w: public.customers", schemadiff.ErrReferencedTableNotFound),
-			"; a foreign key can reference only a table that already exists on the target, so leave the foreign key out of the schema file, apply the referenced table first, then run the ADD CONSTRAINT outside SchemaBot and add the foreign key back to the file"},
+			"; a foreign key can reference only a table that already exists on the target, so apply the referenced table first, then add the foreign key to the file in a later change"},
 		{"not readable", fmt.Errorf("plan: %w: public.customers", schemadiff.ErrReferencedTableNotReadable),
 			"; grant the planning role SELECT on the referenced table, then re-plan"},
+		{"not referenceable", fmt.Errorf("plan: %w: public.customers", schemadiff.ErrReferencedTableNotReferenceable),
+			"; grant the planning role REFERENCES on the referenced table, then re-plan"},
 		{"other failure", errors.New("connection reset"), ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

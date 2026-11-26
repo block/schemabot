@@ -821,8 +821,9 @@ func replanOwedAfterTerminalApply(check *storage.Check, prInfo *github.PullReque
 // apply whose completed task history keeps the row claimed, a failed apply, an
 // apply whose commit removed the schema it had already applied. A plan run
 // against those targets could come back clean while the divergence it is
-// blocking on is still there, so the block outlives the head it was recorded
-// for and is cleared by reconciliation rather than by a newer commit.
+// blocking on is still there, so SchemaBot never plans them on its own. The
+// block outlives the head it was recorded for until a person makes the pull
+// request and the target agree and then plans that environment (MG-10).
 func checkOpenToPlanForNewerCommit(check *storage.Check) bool {
 	if check.ApplyID == 0 {
 		return true
@@ -897,17 +898,18 @@ func (h *Handler) deploymentTenant() string {
 // deferral, and the terminal hook.
 func (h *Handler) commentObserverConfig(factory github.GitHubClientFactory, repo string, pr int, installationID int64) CommentObserverConfig {
 	return CommentObserverConfig{
-		GHClient:       factory,
-		Storage:        h.service.Storage(),
-		Repo:           repo,
-		PR:             pr,
-		InstallationID: installationID,
-		SupportChannel: h.supportChannel(),
-		CLIName:        h.cliName(),
-		Tenant:         h.deploymentTenant(),
-		EngineLogs:     h.engineLogReader(),
-		shardedPlans:   h.shardedPlans,
-		Logger:         h.logger,
+		GHClient:         factory,
+		Storage:          h.service.Storage(),
+		Repo:             repo,
+		PR:               pr,
+		InstallationID:   installationID,
+		SupportChannel:   h.supportChannel(),
+		CLIName:          h.cliName(),
+		Tenant:           h.deploymentTenant(),
+		EngineLogs:       h.engineLogReader(),
+		OperationsAtOnce: h.operationsAtOnce(),
+		shardedPlans:     h.shardedPlans,
+		Logger:           h.logger,
 
 		OnTargetsFinishedHook: h.rolloutTargetsFinishedHook(),
 	}

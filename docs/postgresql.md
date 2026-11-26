@@ -78,7 +78,7 @@ early release.
 |---|---|
 | Rewriting a table, such as changing a column's type | Blocked. It needs pg-sprite's copy-and-swap, which is still in preview |
 | `ALTER TABLE` on a table larger than the size limit, unless it only changes the catalog | Blocked, for the same reason |
-| Adding or dropping a foreign key | Blocked. See [Foreign keys](#foreign-keys) for running one yourself |
+| Dropping a foreign key | Blocked. See [Foreign keys](#foreign-keys) for running one yourself |
 | Dropping a table | Blocked. There is no pending-drops quarantine to hold one |
 | Creating an enum type, or removing or reordering its labels | Blocked |
 | `stop`, `start`, `cutover`, deferred cutover, `revert`, `skip-revert` | Not available. Only an index build can be cancelled. See [Unsupported workflow features](#unsupported-workflow-features) |
@@ -170,10 +170,14 @@ supply a DSN.
 | Alter a table | To own the table, or to be a member that inherits the owner role |
 | Add an index to an existing table | The same, plus `CREATE` on the schema. Grant it to the owner role, and the connected role inherits it |
 | Create a table | `CREATE` on the schema. With `table_owner` set, the connected role needs membership in that owner role instead, and the owner role needs `USAGE` and `CREATE` on the schema |
+| Add a foreign key | The same as altering the table, plus `REFERENCES` on the referenced table. An owner role that owns both tables has it |
 | Cancel an index build | Nothing more. Membership in `pg_signal_backend` lets the cancel reach the build's backend directly |
 
-SchemaBot checks the privileges each statement needs before running it, and a
-missing grant fails with the `GRANT` that fixes it. If your tables belong to a
+SchemaBot checks the privileges each statement needs on its own table before
+running it, and a missing grant fails with the `GRANT` that fixes it. A plan
+that adds a foreign key also checks `REFERENCES` on the referenced table, and
+fails with the grant to add when it is missing. If the grant is revoked after
+the plan, the apply fails, says a grant is missing, and retries once you grant it. If your tables belong to a
 dedicated owner role, read [Table ownership](#table-ownership) before the first
 `CREATE TABLE`.
 
@@ -189,7 +193,8 @@ dedicated owner role, read [Table ownership](#table-ownership) before the first
 | A new table, with its indexes | Runs together: the table, then its indexes, built without `CONCURRENTLY` because nothing reads the table yet. See [Greenfield tables](#greenfield-tables) |
 | A new label on an existing enum type | Runs as `ALTER TYPE ... ADD VALUE`, one label per step, before the table changes. Creating a type or removing a label fails the plan. See [Enum types](#enum-types) |
 | Row-level security policies on an existing table | Run in one transaction, after you explicitly approve them, because they change who can read rows. See [Row-level security](#row-level-security) |
-| Adding or dropping a foreign key | Shown in the plan, but blocked. See [Blocked plans](#blocked-plans) |
+| Adding a foreign key | Runs in two steps: `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`, which checks existing rows while writes continue. See [Foreign keys](#foreign-keys) |
+| Dropping a foreign key | Shown in the plan, but blocked. See [Foreign keys](#foreign-keys) |
 | A table with no schema file, or a deleted file | Runs as `DROP TABLE` after you approve it with `--allow-unsafe`, as on MySQL. Archive tables and `ignore_tables` entries are left alone. See [Tables with no schema file](#tables-with-no-schema-file) |
 
 Once a statement starts, it runs until it commits or its timeout ends it; it
@@ -615,7 +620,6 @@ A schema that does not exist on the target is also refused.
 - `LIKE` copying a live table
 - `OF` a composite type
 - `CREATE INDEX CONCURRENTLY` on the new table
-- A foreign key
 - More than one create in a statement, or the same name claimed twice
 
 **Name check after the create.** Once the table commits, pg-sprite reads back
@@ -795,11 +799,11 @@ the apply fails and drops nothing. Fix the cause, then apply again.
 The plan lists the tables it exempted, by namespace, in the PR comment and in
 `schemabot plan` and `schemabot apply` output.
 
-**Tables `pull` cannot write.** `pull` refuses a whole namespace when any of
+**Tables `pull` cannot write.** `pull` refuses the whole pull when any of
 its tables has something the file format cannot represent: triggers, table or
-column comments, table options, inheritance, or a foreign key on either side.
-Write those files by hand, or drop the tables through a reviewed process,
-before you pull the rest.
+column comments, inheritance, or a foreign key it cannot write
+(see the table below). Write those files by hand, or drop the tables through a
+reviewed process, before you pull the rest.
 
 A hand-written file can use `CREATE UNLOGGED TABLE`, `PARTITION BY`, and an
 `INHERITS` child flattened to its own columns. Each inheritance child and
@@ -812,40 +816,62 @@ SchemaBot's catalog reads name every catalog object with `pg_catalog.`, so a
 
 ### Foreign keys
 
-The plan shows foreign key changes, but SchemaBot does not apply them on
-PostgreSQL yet. Any foreign key change blocks the whole plan.
+SchemaBot adds the foreign keys a schema file declares. It does not drop one
+yet.
 
 | The file | Plan |
 |---|---|
 | Declares a foreign key that matches the live one | No change |
-| Adds a foreign key | `ADD CONSTRAINT`, blocked |
+| Adds a foreign key to an existing table | `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`. Both run |
+| Creates a table that has a foreign key | The `CREATE TABLE`, with the key. It runs |
 | Leaves out a live foreign key | `DROP CONSTRAINT`, blocked |
-| Creates a table that has a foreign key | The whole `CREATE TABLE`, blocked |
 | Has a foreign key into another namespace | Cannot be declared. The plan stays blocked until the foreign key is removed from the database |
 
 A file can declare a foreign key only when the referenced table already exists
 in the same namespace and the reference is unqualified. A table the same plan
-creates does not count.
+creates does not count: create the referenced table first, then add the key.
 
-**To add a foreign key:**
+**How an added key runs.** Each step commits on its own:
 
-1. Leave it out of the file. Apply the rest of the change, including any table
-   or column the foreign key needs.
-2. Run the `ADD CONSTRAINT` outside SchemaBot.
-3. Add the foreign key to the file. The plan now shows no change.
+| Step | Locks | Takes |
+|---|---|---|
+| `ADD CONSTRAINT ... NOT VALID` | `SHARE ROW EXCLUSIVE` on both tables, under the 3-second `lock_timeout` | Milliseconds. From here on, new writes are checked |
+| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` on the table and `ROW SHARE` on the referenced table. Reads and writes continue on both | Up to the 30-second statement budget. A longer scan is refused, and the key stays `NOT VALID` |
 
-**To keep or remove one.** A dropped foreign key is usually one the file left
+A new table's `REFERENCES` takes the same brief `SHARE ROW EXCLUSIVE` on each
+referenced table. On a busy referenced table, the step times out and the apply
+retries.
+
+**When existing rows break the key.** The validation fails and names the key.
+The key stays in place, not yet validated, and keeps checking new writes. Fix
+the rows that reference missing keys, then retry. The next plan shows only the
+`VALIDATE CONSTRAINT`.
+
+**To remove a foreign key.** A dropped foreign key is usually one the file left
 out. To keep it, declare it in the file. To remove it, run the
 `DROP CONSTRAINT` outside SchemaBot, then plan again.
 
-**Declaring tables that have foreign keys.** `pull` refuses these tables, so
-write their files by hand:
+**Declaring tables that have foreign keys.** `pull` writes them:
 
 - A table that owns foreign keys is declared with them.
 - A table that other tables reference is declared without them, since the
   constraints belong to the referencing tables.
-- A table with a foreign key into another namespace cannot be declared.
-  Remove the foreign key, or drop the table through a reviewed process.
+- A foreign key added `NOT VALID` is written as an enforced one. The next plan
+  shows its `VALIDATE CONSTRAINT`, which runs like an added key's second step.
+
+`pull` refuses a foreign key it cannot write. The table it names depends on the
+case:
+
+| The foreign key | Tables named | Why |
+|---|---|---|
+| Crosses namespaces | Both | A file cannot reference a table in another namespace |
+| Sits on a partition | The referenced table, with a reason that names the partition's key | A partition has no file of its own. Declare the key on the partitioned parent |
+| Sits on a table with no file of its own, such as one an extension owns | The referenced table | The key would be lost from the baseline |
+| References its own table through a standalone unique index | The referencing table | The file would declare the key before the index exists. Make the index an immediate `UNIQUE` constraint to pull it. A deferrable one does not count |
+| Sits on a table with row-level security | The referencing table | A file cannot declare row-level security and a foreign key together yet |
+
+Remove the foreign key, or drop the table through a reviewed process, then
+pull again.
 
 Dropping a referenced table must drop the constraints that reference it too.
 The plan names the constraints on both sides.
@@ -964,15 +990,32 @@ you select JSON output. Each PostgreSQL schema is a SchemaBot namespace.
   with its `PARTITION BY` clause, without its partitions.
 - Not views, materialized views, or foreign tables.
 
-**What it refuses.** If any selected table cannot round-trip through the
-schema file format, the whole pull is refused and nothing is written. That
-covers tables with:
+**Tables it cannot describe.** Some tables cannot round-trip through the
+schema file format. These include tables with:
 
-- A foreign key, on either side
+- A foreign key `pull` cannot write: into another namespace, on a partition,
+  on a table with row-level security, or referencing its own table through a
+  standalone unique index. See [Foreign keys](#foreign-keys)
 - Table inheritance, or `UNLOGGED`
 - Explicit collations
 - Sequence defaults it cannot represent safely
-- Triggers, table or column comments, or non-default table options
+- Triggers, or table or column comments
+
+Storage parameters, such as `fillfactor` or `autovacuum_enabled`, are not on
+this list. `pull` writes them into the table's `WITH (...)` clause. SchemaBot
+does not change them: if the file and the live table differ, the table's plan
+is refused. Change a parameter on the database directly, then update the file
+to match.
+
+| Command | What happens to such a table |
+|---|---|
+| `pull` | Left out of the SQL, counted in the summary box, and listed with its reason under a `⚠️ Skipped` warning |
+| `onboard`, `init` | No file is written. `schemabot.yaml` lists it in `ignore_tables`, so SchemaBot never changes or drops it, and the command names it with the reason |
+| `POST /api/pull` | The whole pull is refused, unless the request sets `skip_unrepresentable_tables`. See [Skip tables schema files cannot describe](schema-intelligence.md#skip-tables-schema-files-cannot-describe) |
+
+An `ignore_tables` entry is a bare table name, so it also withholds a table of
+the same name in every other namespace. A skipped table whose name reads as an
+`ignore_tables` pattern refuses onboarding; rename it first.
 
 The schema intelligence API's detailed catalog output is not available for
 PostgreSQL. A request for it is rejected rather than answered with the basic
@@ -1256,6 +1299,16 @@ leaves. See [Index builds](#index-builds).
 - A plan can be rolled back only when SchemaBot captured the original of every
   table it manages. A namespace with managed RLS tables cannot be rolled back
   yet.
+- The originals carry foreign keys. Rolling back a plan that added a foreign
+  key shows the key's drop as a blocked step, since SchemaBot does not drop
+  foreign keys yet.
+- A namespace cannot be rolled back when one of its managed tables has a
+  foreign key to or from another namespace, or is referenced by a table the
+  plan does not manage.
+- A namespace cannot be rolled back when one of its managed tables holds a
+  foreign key added `NOT VALID`. A schema file declares every key as
+  validated, so rolling back would run a `VALIDATE` the forward apply never
+  ran.
 - Rollback never removes an enum label, since PostgreSQL cannot drop one. The
   plan's table changes are reversed, and the label stays.
 - [RV-7](invariants.md#rv-7-rollback-needs-the-originals) requires complete

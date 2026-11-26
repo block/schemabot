@@ -51,6 +51,79 @@ func TestRenderShardedApplyComment_UniformSingleTable(t *testing.T) {
 	assert.NotContains(t, out, "grouped by change", "a uniform apply is not grouped")
 }
 
+// A sharded apply alters mutes on eight shards and runs two operations at a
+// time: two shards copy and six wait their turn. The Shards line states the
+// limit, so the queued shards read as waiting on it rather than stalled. When
+// each shard changes two tables, the limit counts table changes, since two
+// operations at a time is then one shard's worth. Once the apply is done
+// nothing waits its turn and the limit is gone.
+func TestRenderShardedApplyComment_StatesHowManyRunAtOnce(t *testing.T) {
+	shardNames := []string{"-20", "20-40", "40-60", "60-80", "80-a0", "a0-c0", "c0-e0", "e0-"}
+	render := func(applyState string, tablesPerShard int) string {
+		var shards []ShardStatus
+		var cells []ShardCell
+		for i, shard := range shardNames {
+			status := ShardStatus{Shard: shard, Emoji: "⏳", Label: "queued", State: state.ApplyOperation.Pending, CompetesForSlot: true}
+			if i < 2 {
+				status = ShardStatus{Shard: shard, Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running, CompetesForSlot: true}
+			}
+			shards = append(shards, status)
+			cells = append(cells, mutesCell(shard))
+			if tablesPerShard == 2 {
+				cells = append(cells, ShardCell{Shard: shard, Table: "follows", Statements: []string{"ALTER TABLE `follows` ADD COLUMN `muted` tinyint;"}})
+			}
+		}
+		return RenderShardedApplyComment(ShardedApplyData{
+			State: applyState, Environment: "staging", Database: "cdb_resolute",
+			ApplyID: "apply-x", RequestedBy: "morgo", MaxOperationsAtOnce: 2,
+			Keyspaces: oneKeyspace(shards, cells),
+		})
+	}
+
+	assert.Contains(t, render(state.Apply.Running, 1), "**Shards**: 2 running table copy, 6 queued (2 at a time)\n")
+	assert.Contains(t, render(state.Apply.Running, 2), "**Shards**: 2 running table copy, 6 queued (2 table changes at a time)\n")
+	assert.NotContains(t, render(state.Apply.Failed, 1), "at a time", "a finished apply has nothing waiting its turn")
+}
+
+// A sharded apply alters mutes on eight shards and runs two operations at a
+// time. Six shards have landed the change and the last two are copying, so
+// nothing waits on the limit any more and the Shards line no longer states it.
+// With one more shard still queued, the limit is holding it back and the line
+// states it again.
+func TestRenderShardedApplyComment_StatesHowManyRunAtOnceOnlyWhileWorkIsQueued(t *testing.T) {
+	shardNames := []string{"-20", "20-40", "40-60", "60-80", "80-a0", "a0-c0", "c0-e0", "e0-"}
+	render := func(landed int) string {
+		var shards []ShardStatus
+		var cells []ShardCell
+		var progress []ShardProgressData
+		for i, shard := range shardNames {
+			status := ShardStatus{Shard: shard, Emoji: "⏳", Label: "queued", State: state.ApplyOperation.Pending, CompetesForSlot: true}
+			taskState := state.Task.Pending
+			switch {
+			case i < landed:
+				status = ShardStatus{Shard: shard, Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed}
+				taskState = state.Task.Completed
+			case i < landed+2:
+				status = ShardStatus{Shard: shard, Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running, CompetesForSlot: true}
+				taskState = state.Task.Running
+			}
+			shards = append(shards, status)
+			cells = append(cells, mutesCell(shard))
+			progress = append(progress, ShardProgressData{Shard: shard, Status: taskState})
+		}
+		keyspaces := oneKeyspace(shards, cells)
+		keyspaces[0].Tables = []ShardedTableStatus{{Table: "mutes", Status: state.Task.Running, Shards: progress}}
+		return RenderShardedApplyComment(ShardedApplyData{
+			State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+			ApplyID: "apply-x", RequestedBy: "morgo", MaxOperationsAtOnce: 2,
+			Keyspaces: keyspaces,
+		})
+	}
+
+	assert.Contains(t, render(6), "**Shards**: 6 completed, 2 running table copy\n")
+	assert.Contains(t, render(5), "**Shards**: 5 completed, 2 running table copy, 1 queued (2 at a time)\n")
+}
+
 // A sharded apply that has not started yet reads as queued and says it starts on
 // its own, as a single-database apply does. Once it is running the explanation
 // is gone, since the status line and shard counts then carry the progress.

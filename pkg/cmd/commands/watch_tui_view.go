@@ -57,7 +57,7 @@ func (m WatchModel) View() string {
 func (m WatchModel) progressSections() (string, string) {
 	var b strings.Builder
 
-	// Sort tables by status priority (running first, then pending, then completed)
+	// Sort tables by status priority (failed and halted first, then running, then pending, then completed)
 	tables := make([]templates.TableProgress, len(m.tables))
 	copy(tables, m.tables)
 	sortTablesByProgress(tables)
@@ -130,7 +130,7 @@ func (m WatchModel) progressSections() (string, string) {
 	}
 
 	if m.sharded {
-		if counts := templates.ShardCounts(m.state, m.operations, m.tables, m.released); counts != "" {
+		if counts := templates.ShardCounts(m.state, m.operations, m.tables, m.released, m.maxOperationsAtOnce); counts != "" {
 			fmt.Fprintf(&b, "  Shards:  %s\n", counts)
 		}
 		if note := templates.ShardedStoppedAtCutoverNote(m.state, m.operations, m.tables, m.released); note != "" {

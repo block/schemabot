@@ -500,6 +500,7 @@ func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, release
 			StoppedAtCutover: s.Presentation == presentation.StateStoppedAtCutover,
 			EndedBy:          s.EndedBy,
 			Landed:           s.Landed,
+			CompetesForSlot:  s.Presentation.CompetesForSlot(),
 		})
 	}
 	return out

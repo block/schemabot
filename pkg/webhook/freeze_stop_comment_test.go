@@ -40,7 +40,7 @@ func TestStoppedComments_NameTheFreezeThatStoppedTheApply(t *testing.T) {
 	freeze := &apitypes.FreezeStopRef{ID: "freeze-1", Reason: "SEV-1234 ask @alice"}
 	render := map[string]func(*storage.Apply, []*storage.ApplyOperation, *apitypes.FreezeStopRef) string{
 		"Status": func(apply *storage.Apply, ops []*storage.ApplyOperation, freeze *apitypes.FreezeStopRef) string {
-			return formatApplyStatusComment(apply, ops, false, nil, nil, nil, nil, "", "", freeze, 0)
+			return formatApplyStatusComment(apply, ops, false, nil, nil, nil, nil, "", "", freeze, 0, 0)
 		},
 		"Summary": func(apply *storage.Apply, ops []*storage.ApplyOperation, freeze *apitypes.FreezeStopRef) string {
 			return formatApplySummaryComment(apply, ops, false, nil, nil, nil, nil, "", "", freeze)

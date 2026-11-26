@@ -122,6 +122,10 @@ type nativeApply struct {
 	// dropped is the plan's record of the live object the statement drops,
 	// which the apply checks under the table's lock before dropping it.
 	dropped *schemadiff.DroppedObject
+	// validates is the plan's record of the live NOT VALID constraint the
+	// statement validates, which the apply checks under the validation's
+	// lock before validating it.
+	validates *schemadiff.ConstraintValidation
 	// database names the target for the logs and metrics of a table drop.
 	database string
 	// droppedTable is the definition the plan recorded for a table the
@@ -303,8 +307,39 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		if err != nil {
 			return nativeApply{}, err
 		}
+		change.validates, err = reviewedValidationForApply(req.Database, tc, statements[0])
+		if err != nil {
+			return nativeApply{}, err
+		}
 	}
 	return change, nil
+}
+
+// reviewedValidationForApply returns the plan's record of the constraint a
+// VALIDATE CONSTRAINT statement validates, and nil for any other statement.
+// A validation is admitted only with that record: without it the apply could
+// not tell the reviewed constraint from one that took its name after the
+// plan, so a missing or unreadable record refuses the apply before any work
+// is queued and the operator re-plans.
+func reviewedValidationForApply(database string, tc engine.TableChange, statement string) (*schemadiff.ConstraintValidation, error) {
+	validates, err := validatesConstraint(statement)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission could not classify a planned validation", "database", database, "table", tc.Table, "error", err)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
+	}
+	if !validates {
+		return nil, nil
+	}
+	reviewed, err := reviewedValidationFromMetadata(tc.Metadata)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission rejected the reviewed validation record", "database", database, "table", tc.Table, "error", err)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: the plan's record of the constraint this statement validates is unreadable; re-plan and apply again", tc.Table)
+	}
+	if reviewed == nil {
+		slog.Warn("PostgreSQL apply admission refused a validation the plan did not record", "database", database, "table", tc.Table)
+		return nil, fmt.Errorf("apply PostgreSQL table %q: the plan has no record of the constraint this statement validates; re-plan and apply again", tc.Table)
+	}
+	return reviewed, nil
 }
 
 // reviewedDropForApply returns the plan's record of the object a statement
@@ -567,7 +602,49 @@ func classifyApplyFailure(err error, table string) applyFailure {
 			lockBudget: true,
 		}
 	}
+	if detail, ok := brokenForeignKeyDetail(err, table); ok {
+		return applyFailure{detail: detail, retryable: true}
+	}
+	if detail, ok := missingGrantDetail(err, table); ok {
+		return applyFailure{detail: detail, retryable: true}
+	}
 	return applyFailure{detail: "PostgreSQL schema change failed; see server logs", retryable: true}
+}
+
+// missingGrantDetail names a statement the server refused because the engine
+// role lacks a privilege. The privilege check before the apply covers the
+// target table; a foreign key also needs REFERENCES on the table it
+// references, which only the server checks. The detail leaves out the
+// server's message, which names objects the plan did not, and the server log
+// keeps it.
+func missingGrantDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateInsufficientPrivilege {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"the engine role lacks a privilege the statement on %q needs, such as REFERENCES on the table a foreign key references; the server log names it; grant it, then retry",
+		table)), true
+}
+
+// sqlstateForeignKeyViolation is the SQLSTATE the server raises when a row
+// breaks a foreign key, which for a schema change means validating a key
+// that existing rows do not satisfy.
+const sqlstateForeignKeyViolation = "23503"
+
+// brokenForeignKeyDetail names the foreign key whose validation failed on
+// existing rows. The key was added NOT VALID in an earlier step, so it stays
+// in place and checks new writes; the apply can finish once the owner fixes
+// the rows. The detail is built from the server's typed fields, never its
+// message, because the message quotes the offending row's values.
+func brokenForeignKeyDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateForeignKeyViolation {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"existing rows in %q break foreign key %q; the key is in place and checks new writes; fix those rows, then retry",
+		table, pgErr.ConstraintName)), true
 }
 
 // invalidIndexAdvice renders the operator-facing cause and next step for an
@@ -1696,6 +1773,17 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	// inside its create sequence.
 	if change.dropped != nil {
 		return executeReviewedDrop(ctx, pool, table, change, statement.SQL(), tracker)
+	}
+	if change.validates != nil {
+		// pg-sprite reads the constraint again under the validation's lock
+		// and refuses with ErrValidatedConstraintDrift, validating nothing,
+		// when it no longer has the definition the plan recorded.
+		if err := executor.ExecuteNativeValidatingWithProgress(ctx, pool, table, statement, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		}, executor.DefaultRetryPolicy(), *change.validates, tracker); err != nil {
+			return fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", change.validates.Constraint, change.table, err)
+		}
+		return nil
 	}
 	if err := executor.ExecuteNativeWithProgress(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,

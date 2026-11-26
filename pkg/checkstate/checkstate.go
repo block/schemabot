@@ -16,6 +16,7 @@ package checkstate
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -99,8 +100,10 @@ const (
 	// person controls has to change before a re-plan can lift it.
 	blockGuard blockClass = iota
 	// blockReconciliation: work may have reached the target, so the target and
-	// the pull request may no longer describe the same schema. No plan and no
-	// new commit settles that question.
+	// the pull request may no longer describe the same schema. SchemaBot does
+	// not settle that question on its own: once the apply has settled, a person
+	// makes the two agree and then plans the environment, and that plan
+	// replaces the block, passing only if the target matches the pull request.
 	blockReconciliation
 	// blockAwaitingReport: another deployment owes a result. SchemaBot lifts
 	// the block when that result arrives.
@@ -218,7 +221,7 @@ const (
 	// row is folded from.
 	ReasonAwaitingParticipantResult = "awaiting_participant_result"
 	// ReasonReconciliationOwed: a terminal outcome left the target diverged
-	// from the PR. No plan clears this one.
+	// from the PR. A person makes the two agree, and their plan then clears it.
 	ReasonReconciliationOwed = "reconciliation_owed"
 	// ReasonAggregateRollup: the row is the aggregate. It says nothing of its
 	// own; it reports what the per-database rows add up to.
@@ -274,14 +277,17 @@ func CoversHead(check *storage.Check, headSHA string) bool {
 // is configured, when that is not known, or when the database has no
 // environment left to plan: the row then keeps the reading it would have in a
 // configured environment rather than naming a plan that cannot run.
-func Diagnose(check *storage.Check, headSHA string, apply *storage.Apply, planEnvironment string) Disposition {
+//
+// tenant is the deployment's own tenant, which the plan commands a remedy
+// names carry; pass "" for an untenanted deployment.
+func Diagnose(check *storage.Check, headSHA string, apply *storage.Apply, planEnvironment, tenant string) Disposition {
 	coversHead := CoversHead(check, headSHA)
 
 	// A durable blocking reason outranks everything below it. The writer set it
 	// so the block would survive writes that did not re-evaluate the condition,
 	// and the publisher honors it the same way, refusing to recompute over it.
 	if check.BlockingReason != "" {
-		return blockingReasonDisposition(check)
+		return blockingReasonDisposition(check, tenant)
 	}
 	// The aggregate carries no finding of its own, so reading it as a plan
 	// result would attribute a per-database answer to a rollup.
@@ -317,7 +323,7 @@ func Diagnose(check *storage.Check, headSHA string, apply *storage.Apply, planEn
 		return runningDisposition(check, apply, coversHead)
 	}
 	if !terminalOutcomeIsSuccess(check) {
-		return terminalBlockDisposition(check, coversHead)
+		return terminalBlockDisposition(check, coversHead, tenant)
 	}
 	if coversHead {
 		return Disposition{
@@ -345,17 +351,91 @@ func Diagnose(check *storage.Check, headSHA string, apply *storage.Apply, planEn
 	}
 }
 
+// PlanCommand is the plan of one database in one environment. It carries the
+// deployment's tenant when there is one, since a tenanted deployment ignores a
+// command that names no tenant. The Check Run and `checks show` both name this
+// command, so both build it here.
+func PlanCommand(environment, database, tenant string) string {
+	return withTenant(fmt.Sprintf("schemabot plan -e %s -d %s", environment, database), tenant)
+}
+
+// ReconciliationRemedy says what clears the block a settled apply left on the
+// databases the given plan commands cover. SchemaBot never runs that plan on
+// its own (MG-10): a plan reads the target's schema, not everything an apply
+// can leave on it, so one run before anyone has looked could pass over what
+// the apply left behind. A person first makes the pull request and the target
+// agree, and their plan then records that the two match.
+func ReconciliationRemedy(planCommands ...string) string {
+	return reconciliationRemedy("make the pull request and the target agree: apply the change again, or change the pull request to match the target", planCommands)
+}
+
+// MatchTargetRemedy is ReconciliationRemedy for a row whose change should not
+// simply be applied again: a rollback undid it on purpose, or the pull request
+// no longer carries it, so no apply from this pull request can reach it. The
+// pull request is what changes to match the target.
+func MatchTargetRemedy(planCommands ...string) string {
+	return reconciliationRemedy("change the pull request to match the target", planCommands)
+}
+
+func reconciliationRemedy(firstStep string, planCommands []string) string {
+	quoted := make([]string, len(planCommands))
+	for i, command := range planCommands {
+		quoted[i] = "`" + command + "`"
+	}
+	return "Once the apply has settled, " + firstStep + ". " +
+		"Then comment " + strings.Join(quoted, " and ") + " on the pull request. The plan clears this block once the two match, and otherwise lists what still differs."
+}
+
+// checkReconciliationRemedy is the remedy for check's own database and
+// environment, or for the placeholder plan when the row does not record them,
+// as a rollup does not. A row whose change was rolled back, or that the pull
+// request no longer changes, gets MatchTargetRemedy; every other row gets
+// ReconciliationRemedy.
+func checkReconciliationRemedy(check *storage.Check, tenant string) string {
+	remedy := ReconciliationRemedy
+	if ReapplyIsNotTheRemedy(check.BlockingReason) {
+		remedy = MatchTargetRemedy
+	}
+	if IsAggregate(check) || check.Environment == "" || check.DatabaseName == "" {
+		return remedy(withTenant("schemabot plan -e <environment>", tenant))
+	}
+	return remedy(PlanCommand(check.Environment, check.DatabaseName, tenant))
+}
+
+// ReapplyIsNotTheRemedy reports whether a blocking reason rules out applying
+// the change again: a rollback that completed undid it on purpose, and a pull
+// request that stopped changing the database no longer carries it.
+func ReapplyIsNotTheRemedy(reason string) bool {
+	return reason == BlockRollbackCompleted || reason == BlockSchemaRemovedAfterApplyStarted
+}
+
+// withTenant appends the --tenant flag to a command when tenant is set.
+func withTenant(command, tenant string) string {
+	if tenant == "" {
+		return command
+	}
+	return command + " --tenant " + tenant
+}
+
 // blockingReasonDisposition reads a row a durable guard failed closed. The
 // stored reason, not the row's status or ownership, is what says who has to
 // move: a rollback clears its apply ownership on the way out, so ownership
 // alone would read a reconciliation as an ordinary plan verdict.
-func blockingReasonDisposition(check *storage.Check) Disposition {
+func blockingReasonDisposition(check *storage.Check, tenant string) Disposition {
 	switch blockClasses[check.BlockingReason] {
 	case blockReconciliation:
+		if check.BlockingReason == BlockSchemaRemovedAfterApplyStarted {
+			return Disposition{
+				Reason:   ReasonReconciliationOwed,
+				Summary:  "An apply started before the pull request stopped changing this database, and the target may not match the pull request.",
+				Remedy:   checkReconciliationRemedy(check, tenant),
+				Blocking: true,
+			}
+		}
 		return Disposition{
 			Reason:   ReasonReconciliationOwed,
 			Summary:  "A terminal outcome left this check blocking, and the target may not match the pull request.",
-			Remedy:   "Reconcile the target environment. No plan and no new commit clears this on its own.",
+			Remedy:   checkReconciliationRemedy(check, tenant),
 			Blocking: true,
 		}
 	case blockAwaitingReport:
@@ -474,12 +554,12 @@ func runningDisposition(check *storage.Check, apply *storage.Apply, coversHead b
 // terminalBlockDisposition reads a row a terminal write left blocking without
 // recording a durable reason for it, which makes it a plan verdict rather than
 // a guard: the Check Run's own summary states the finding.
-func terminalBlockDisposition(check *storage.Check, coversHead bool) Disposition {
+func terminalBlockDisposition(check *storage.Check, coversHead bool, tenant string) Disposition {
 	if check.ApplyID != 0 {
 		return Disposition{
 			Reason:   ReasonReconciliationOwed,
 			Summary:  "A terminal apply left this check blocking, and the target may not match the pull request.",
-			Remedy:   "Reconcile the target environment. No plan and no new commit clears this on its own.",
+			Remedy:   checkReconciliationRemedy(check, tenant),
 			Blocking: true,
 		}
 	}

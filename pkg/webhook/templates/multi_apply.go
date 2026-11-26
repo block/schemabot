@@ -135,7 +135,7 @@ func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt
 		}
 		return sb.String()
 	}
-	writeDeploymentCounts(&sb, data.Model.Counts, groups)
+	writeDeploymentCounts(&sb, data, groups)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
 	writeStoppedAtCutoverNote(&sb, data.Model.Deployments, presentation.MemberNoun(groups))
 
@@ -179,7 +179,7 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 		writeRolloutFooter(&sb, data)
 		return sb.String()
 	}
-	writeDeploymentCounts(&sb, data.Model.Counts, groups)
+	writeDeploymentCounts(&sb, data, groups)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
 	writeStoppedAtCutoverNote(&sb, data.Model.Deployments, presentation.MemberNoun(groups))
 
@@ -260,6 +260,7 @@ func writeTargetRolloutStatus(sb *strings.Builder, data MultiDeploymentApplyData
 	if steps, ok := data.Model.TableSteps(g); ok && progress.Total > progress.AlreadyHad {
 		status = presentation.TableStepsHeadline(steps, progress, settled, data.Rollback)
 	}
+	status = data.Model.CountsWithLimit(status)
 	fmt.Fprintf(sb, "\n%s\n", glyphTag(g.Lead.Emoji, status))
 	writeAggregateFirstFailure(sb, data.Model.FirstFailure)
 	writeStoppedAtCutoverNote(sb, data.Model.Deployments, targetNoun)
@@ -324,8 +325,11 @@ func writeAggregateMetadata(sb *strings.Builder, data MultiDeploymentApplyData, 
 // rollout health at a glance without expanding anything. The histogram counts
 // members, so once a deployment addresses several targets it counts targets.
 // Members that already had the change are left out, unless every member
-// already had it: then the count is how the reader learns nothing ran.
-func writeDeploymentCounts(sb *strings.Builder, counts []presentation.StateCount, groups []presentation.Group) {
+// already had it: then the count is how the reader learns nothing ran. While
+// the apply runs, the counts end with how many members run at once
+// (presentation.Apply.CountsWithLimit).
+func writeDeploymentCounts(sb *strings.Builder, data MultiDeploymentApplyData, groups []presentation.Group) {
+	counts := data.Model.Counts
 	if changed := countsWithChanges(counts); len(changed) > 0 {
 		counts = changed
 	}
@@ -336,7 +340,7 @@ func writeDeploymentCounts(sb *strings.Builder, counts []presentation.StateCount
 	if hasMultiTargetGroup(groups) {
 		unit = "Targets"
 	}
-	fmt.Fprintf(sb, "\n**%s**: %s\n", unit, countsPhrase(counts))
+	fmt.Fprintf(sb, "\n**%s**: %s\n", unit, data.Model.CountsWithLimit(countsPhrase(counts)))
 }
 
 // countsPhrase joins a histogram into "3 completed, 1 running".

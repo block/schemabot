@@ -107,12 +107,14 @@ func TestPlannerRefusalTypesOnlyPlannerDeclines(t *testing.T) {
 		})
 	}
 
-	t.Run("a missing privilege is not a refusal", func(t *testing.T) {
-		wrapped := fmt.Errorf("plan PostgreSQL table %q: %w", "users", schemadiff.ErrReferencedTableNotReadable)
-		err := plannerRefusal(wrapped)
-		assert.False(t, engine.IsPlanRefused(err))
-		assert.Equal(t, wrapped, err)
-	})
+	for _, missing := range []error{schemadiff.ErrReferencedTableNotReadable, schemadiff.ErrReferencedTableNotReferenceable} {
+		t.Run("a missing privilege is not a refusal: "+missing.Error(), func(t *testing.T) {
+			wrapped := fmt.Errorf("plan PostgreSQL table %q: %w", "users", missing)
+			err := plannerRefusal(wrapped)
+			assert.False(t, engine.IsPlanRefused(err))
+			assert.Equal(t, wrapped, err)
+		})
+	}
 
 	t.Run("a lost connection is not a refusal", func(t *testing.T) {
 		lost := errors.New("write tcp 127.0.0.1:5432: connection reset by peer")

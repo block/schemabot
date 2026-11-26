@@ -76,6 +76,12 @@ type ShardedApplyData struct {
 	// comment.
 	Rollback bool
 
+	// MaxOperationsAtOnce is how many of the apply's operations SchemaBot runs
+	// at once (max_drivers_per_apply). While the apply runs, the Shards line
+	// states it whenever more unfinished operations compete for a slot than
+	// that, so shards queued behind it read as waiting their turn. Zero leaves
+	// it unstated.
+	MaxOperationsAtOnce int
 	// UpdateCadence is the longest a change waits before it reaches this
 	// comment, shown beside the "Last updated" footer. Zero renders no note.
 	UpdateCadence time.Duration
@@ -187,6 +193,12 @@ type ShardStatus struct {
 	// can be a landed one while another table's change on the shard is
 	// still queued.
 	Landed bool
+	// CompetesForSlot is true while the shard holds one of the apply's
+	// operation slots or is queued for one
+	// (presentation.PresentationState.CompetesForSlot). A shard waiting on
+	// another member, halted, or paused is not held back by the limit, so its
+	// operations do not count toward it.
+	CompetesForSlot bool
 }
 
 // ShardCell is one (shard, table) operation: the statements that table runs
@@ -239,7 +251,7 @@ func renderShardedApplyComment(data ShardedApplyData, renderedAt string, formatt
 		sb.WriteString("\n" + queuedApplyExplanation + "\n")
 	}
 
-	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
+	writeShardCounts(&sb, data)
 	writeShardedFailure(&sb, data)
 	writeShardsStoppedAtCutover(&sb, data)
 	writeShardKeyspaceSections(&sb, data, formatter, budget)
@@ -274,7 +286,7 @@ func renderShardedApplySummaryComment(data ShardedApplyData, formatter *shardedD
 	if state.IsState(data.State, state.Apply.Completed) {
 		writeSuccessBlock(&sb, completedOutcomeMessage(shardedChangeIsSingular(data), data.Rollback))
 	}
-	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
+	writeShardCounts(&sb, data)
 	writeShardedFailure(&sb, data)
 	writeShardsStoppedAtCutover(&sb, data)
 	writeShardedSummaryDetails(&sb, data, formatter, budget)
@@ -897,8 +909,10 @@ func shardList(shards []ShardStatus, totalShards int) string {
 }
 
 // writeShardCounts writes the per-status histogram across shards so rollout
-// health is visible at a glance (presentation.ShardCounts).
-func writeShardCounts(sb *strings.Builder, shards []ShardStatus) {
+// health is visible at a glance (presentation.ShardCounts), ending with how
+// many operations run at once while the apply runs (presentation.WithLimit).
+func writeShardCounts(sb *strings.Builder, data ShardedApplyData) {
+	shards := allShardStatuses(data.Keyspaces)
 	if len(shards) == 0 {
 		return
 	}
@@ -906,7 +920,40 @@ func writeShardCounts(sb *strings.Builder, shards []ShardStatus) {
 	for _, s := range shards {
 		labels = append(labels, s.Label)
 	}
-	fmt.Fprintf(sb, "\n**Shards**: %s\n", presentation.ShardCounts(labels))
+	counts := presentation.ShardCounts(labels)
+	if !state.IsTerminalApplyState(data.State) {
+		operations, competing := shardedOperationCounts(data)
+		counts = presentation.WithLimit(counts, len(shards), operations, competing, data.MaxOperationsAtOnce)
+	}
+	fmt.Fprintf(sb, "\n**Shards**: %s\n", counts)
+}
+
+// shardedOperationCounts counts a sharded apply's (shard, table) operations
+// and how many unfinished ones compete for a slot: those of the shards that
+// hold a slot or are queued for one. An operation the progress does not list
+// yet, because dispatch has not attached its shard, has not finished either.
+func shardedOperationCounts(data ShardedApplyData) (operations, competing int) {
+	for _, ks := range data.Keyspaces {
+		operations += len(ks.Cells)
+		opsByShard := make(map[string]int)
+		for _, cell := range ks.Cells {
+			opsByShard[cell.Shard]++
+		}
+		finishedByShard := make(map[string]int)
+		for _, table := range ks.Tables {
+			for _, shard := range table.Shards {
+				if !presentation.OperationUnfinished(shard.Status) {
+					finishedByShard[shard.Shard]++
+				}
+			}
+		}
+		for _, shard := range ks.Shards {
+			if shard.CompetesForSlot {
+				competing += max(opsByShard[shard.Shard]-finishedByShard[shard.Shard], 0)
+			}
+		}
+	}
+	return operations, competing
 }
 
 // isShardFailureState reports whether a shard's state carries an operator-facing

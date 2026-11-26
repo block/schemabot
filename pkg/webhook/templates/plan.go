@@ -407,6 +407,12 @@ type PlanCommentData struct {
 	// database (nothing to compare) or when drift was not evaluated.
 	DeploymentDrift *DeploymentDriftData
 
+	// OperationsAtOnce is how many of an apply's operations SchemaBot runs at
+	// once (max_drivers_per_apply). The plan summary states it when the plan
+	// rolls out to more targets or shards than that, so a reviewer knows before
+	// applying that the rest will wait their turn. Zero states nothing.
+	OperationsAtOnce int
+
 	// BaseSchema says whether the PR's base branch changed this environment's
 	// schema after the PR branched off it. Nil when it was not checked.
 	BaseSchema *BaseSchemaData
@@ -428,6 +434,10 @@ type PlanCommentData struct {
 	// count combined across targets never reads as any one target's work. Nil
 	// when the summary is one plan's.
 	summaryRollout *DeploymentDriftData
+	// summaryRolloutOperations is how many operations an apply of the
+	// summarized rollout would run across its targets that have work, counted
+	// from each target's own plan before the summary combines them.
+	summaryRolloutOperations int
 	// applyWithheld is set on an environment's plan whose apply a multi-env
 	// footer does not offer, because an earlier environment's apply is
 	// refused, so its unsafe warning keeps the drop steps no footer carries.
@@ -761,8 +771,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			writePausedApplyCause(&sb, data.PausedApplyCause)
 		}
 		writeTargetPlans(&sb, data, budget, false)
-		summary.Changes = combinedTargetPlanChanges(data)
-		summary.summaryRollout = data.DeploymentDrift
+		summary.summarizeRollout(data)
 	}
 
 	// Count changes
@@ -1469,6 +1478,15 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	text := planSummaryText(data.Changes, data.DatabaseType, data.IsMySQL, totalStatements)
 	if data.summaryRollout != nil {
 		text += " · " + rolloutScope(data.summaryRollout)
+		changing := changingTargetCount(data.summaryRollout)
+		if limit := presentation.LimitPhrase(changing, data.summaryRolloutOperations, data.OperationsAtOnce); limit != "" {
+			text += ", " + limit
+		}
+	}
+	if shards, operations := plannedShardWork(data.Changes, data.DatabaseType); shards > 0 {
+		if limit := presentation.LimitPhrase(shards, operations, data.OperationsAtOnce); limit != "" {
+			text += fmt.Sprintf(" · %d %s, %s", shards, pluralize("shard", shards), limit)
+		}
 	}
 	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", text)
 
@@ -1478,6 +1496,91 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 	writeExemptTables(sb, data.ExemptTables)
 	writeUnmatchedDropTables(sb, data.shownUnmatchedDropTables())
+}
+
+// summarizeRollout makes s the summary of data's rollout: the union of every
+// target's changes, the rollout it covers, and how many operations its apply
+// would run (plannedRolloutOperations).
+func (s *PlanCommentData) summarizeRollout(data PlanCommentData) {
+	s.Changes = combinedTargetPlanChanges(data)
+	s.summaryRollout = data.DeploymentDrift
+	s.summaryRolloutOperations = plannedRolloutOperations(data)
+}
+
+// plannedRolloutOperations counts the operations an apply of data's rollout
+// would run on its targets that have work. A target runs one operation for its
+// whole plan, and a sharded target one per table on each of its shards with
+// work (plannedShardWork), so a rollout across sharded targets has more
+// operations than targets for the limit to hold back.
+func plannedRolloutOperations(data PlanCommentData) int {
+	if data.DeploymentDrift == nil {
+		return 0
+	}
+	operations := 0
+	for _, g := range data.DeploymentDrift.Plans {
+		if g.Empty() {
+			continue
+		}
+		perTarget := 1
+		if _, shardOperations := plannedShardWork(targetPlanChanges(g, data), data.DatabaseType); shardOperations > 0 {
+			perTarget = shardOperations
+		}
+		operations += perTarget * len(g.Members)
+	}
+	return operations
+}
+
+// plannedShardWork counts a sharded plan's shards that have work and the
+// operations an apply would run on them. The apply runs one operation per
+// table on each shard, however many statements that table's change has, so
+// statements are counted by the distinct table each names. A statement the
+// dialect's parser cannot name a table for counts as an operation of its own,
+// which can only overstate the work the limit holds back. Both are zero for a
+// plan with no sharded keyspace.
+func plannedShardWork(changes []KeyspaceChangeData, databaseType string) (shards, operations int) {
+	parser, parserErr := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
+	if parserErr != nil {
+		slog.Warn("plan summary cannot classify shard statements; it will count one operation per statement for the operation limit",
+			"database_type", databaseType, "error", parserErr)
+	}
+	for _, ks := range changes {
+		for _, sh := range ks.Shards {
+			if sh.Satisfied || len(sh.Statements) == 0 {
+				continue
+			}
+			shards++
+			operations += shardTableCount(parser, ks.Keyspace, sh)
+		}
+	}
+	return shards, operations
+}
+
+// shardTableCount is how many tables one shard's planned statements change,
+// the operations an apply runs on that shard. With no parser, or for a
+// statement the parser names no table for, each statement counts as one.
+func shardTableCount(parser ddl.StatementParser, keyspace string, sh KeyspaceShardChange) int {
+	if parser == nil {
+		return len(sh.Statements)
+	}
+	tables := make(map[string]bool, len(sh.Statements))
+	unnamed := 0
+	for _, stmt := range sh.Statements {
+		_, table, err := parser.Classify(stmt)
+		if err != nil {
+			slog.Debug("plan summary could not classify a shard statement; it counts as one operation for the operation limit",
+				"keyspace", keyspace, "shard", sh.Shard, "error", err)
+			unnamed++
+			continue
+		}
+		if table == "" {
+			slog.Debug("plan summary found no table in a shard statement; it counts as one operation for the operation limit",
+				"keyspace", keyspace, "shard", sh.Shard)
+			unnamed++
+			continue
+		}
+		tables[table] = true
+	}
+	return len(tables) + unnamed
 }
 
 // planSummaryText renders what a plan would do as the plan summary counts it,
@@ -4389,8 +4492,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	summary := *plan
 	if targetPlans {
 		writeTargetPlans(sb, *plan, budget, true)
-		summary.Changes = combinedTargetPlanChanges(*plan)
-		summary.summaryRollout = plan.DeploymentDrift
+		summary.summarizeRollout(*plan)
 	}
 
 	totalStatements, keyspaceUpdates := countChanges(plan.Changes)

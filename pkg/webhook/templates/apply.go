@@ -938,8 +938,8 @@ func vschemaDiffCount(changes []apitypes.VSchemaChange) int {
 // writeTableProgressSection writes the per-row progress breakdown, grouped by
 // namespace so the operator can see which schema (MySQL) or keyspace
 // (Vitess/PlanetScale, Strata) each table belongs to. Within a namespace, rows
-// are ordered by sortProgressRows: active/running first, then pending, then
-// completed/terminal last, with a table's rows kept together.
+// are ordered by sortProgressRows: failed and halted first, then active/running,
+// then pending, then completed last, with a table's rows kept together.
 func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData, budget *ddlBlockBudget) {
 	// During the resume window the per-table percents are indeterminate (the data
 	// plane has not reported continuation vs fresh copy yet), so the aggregate
@@ -1048,7 +1048,7 @@ func renderResumingTable(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	sb.WriteString("\n")
 }
 
-// tableStatePriority returns a sort key: lower = rendered first (active on top, completed on bottom).
+// tableStatePriority returns a sort key: lower = rendered first (failed and halted on top, completed on bottom).
 func tableStatePriority(tableStatus string) int {
 	return ui.TableStatePriority(state.NormalizeTaskStatus(tableStatus))
 }
@@ -1070,7 +1070,8 @@ func summaryStatePriority(tableStatus string) int {
 }
 
 // sortProgressRows orders one namespace's rows for the progress comment, with
-// active tables on top and terminal ones at the bottom. See sortRowsByTable.
+// failed and halted tables on top, then active ones, and finished ones at the
+// bottom. See sortRowsByTable.
 func sortProgressRows(rows []TableProgressData) []TableProgressData {
 	return sortRowsByTable(rows, tableStatePriority)
 }

@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/apitypes"
 )
 
 func TestStageExistingInitSchemaPreservesAndChecksScope(t *testing.T) {
@@ -50,4 +52,33 @@ func TestInitDestinationPreflight(t *testing.T) {
 	require.FileExists(t, filepath.Join(root, ".gitkeep"))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: app\ntype: mysql\n"), 0600))
 	require.NoError(t, validateInitSchemaDestination(root))
+}
+
+// Setup reuses a schema directory whose config already declares `orders`, and
+// someone has since added a trigger to it, so the pull skips it. The reused
+// ignore_tables does not withhold `orders`, so setup refuses and names the
+// table rather than accepting a baseline the next plan would read as dropping
+// it. A table the config withholds, by name or by pattern, passes.
+func TestInitReuseRefusesSkippedTableTheConfigStillManages(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(root, "public"), 0700))
+	config := "database: app\ntype: postgres\nignore_tables:\n  - audit_log\n  - /^tmp_.*$/\n"
+	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte(config), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "public", "tables.sql"), []byte("CREATE TABLE orders (id bigint PRIMARY KEY);\n"), 0600))
+	exclusions, err := stageExistingInitSchema(root, t.TempDir(), "app", "postgres", "development", []string{"public"})
+	require.NoError(t, err)
+
+	withheld := []skippedTableGroup{{Namespace: "public", Tables: []apitypes.SkippedTable{
+		{Table: "audit_log", Reason: "schema files cannot describe its trigger"},
+		{Table: "tmp_import", Reason: "schema files cannot describe its trigger"},
+	}}}
+	require.NoError(t, requireReusedConfigWithholdsSkipped(exclusions, withheld))
+
+	triggered := []skippedTableGroup{{Namespace: "public", Tables: append(withheld[0].Tables,
+		apitypes.SkippedTable{Table: "orders", Reason: "schema files cannot describe its trigger"})}}
+	err = requireReusedConfigWithholdsSkipped(exclusions, triggered)
+	require.ErrorContains(t, err, "Add each table to ignore_tables")
+	require.ErrorContains(t, err, "public.orders (schema files cannot describe its trigger)")
+	require.NotContains(t, err.Error(), "audit_log")
+	require.NotContains(t, err.Error(), "tmp_import")
 }

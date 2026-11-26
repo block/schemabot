@@ -146,7 +146,7 @@ func (s *Service) StartOperator(ctx context.Context) {
 		"deferred_cutover_drivers", storage.DeferredCutoverDrivers(driverCount),
 		"server_id", server.ServerID,
 		"heartbeat_interval", heartbeatEvery,
-		"max_drivers_per_apply", storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply,
+		"max_drivers_per_apply", s.config.OperationsAtOnce(),
 		"interval", s.operatorPollInterval,
 		"stranded_reaper_interval", reaperEvery,
 		"retryable_expiry_interval", expiryEvery)

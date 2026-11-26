@@ -42,10 +42,12 @@ func releasedForApply(ctx context.Context, stor storage.Storage, apply *storage.
 // view is what the stored plan says about the apply's finalizers and table
 // sizes (see resolveShardedPlanView), consumed only by sharded applies.
 // stoppedByFreeze names the freeze that stopped the apply (see
-// api.StoppedByFreeze), nil when none did. updateCadence is how soon a change
-// reaches the comment, rendered beside the "Last updated" footer; zero renders
-// no note.
-func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, view *shardedPlanView, tenant, cliName string, stoppedByFreeze *apitypes.FreezeStopRef, updateCadence time.Duration) string {
+// api.StoppedByFreeze), nil when none did. operationsAtOnce is how many of the
+// apply's operations the server's drivers run at once, stated beside a
+// sharded or multi-deployment apply's counts; zero leaves it unstated.
+// updateCadence is how soon a change reaches the comment, rendered beside
+// the "Last updated" footer; zero renders no note.
+func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, view *shardedPlanView, tenant, cliName string, stoppedByFreeze *apitypes.FreezeStopRef, operationsAtOnce int, updateCadence time.Duration) string {
 	// A sharded apply fans out across the shards of one or more keyspaces within
 	// a single deployment, so it gets the shard-unit layout rather than the
 	// deployment-unit one — its operations differ by shard, not deployment. One
@@ -60,6 +62,7 @@ func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperatio
 		}
 		data := buildShardedApplyData(apply, ops, released, tasks, view, tenant)
 		data.StoppedByFreeze = stoppedByFreeze
+		data.MaxOperationsAtOnce = operationsAtOnce
 		data.UpdateCadence = updateCadence
 		return templates.RenderShardedApplyComment(data)
 	}
@@ -71,6 +74,7 @@ func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperatio
 	}
 	data := buildMultiApplyData(apply, ops, released, tasks, displayByOp, shardsByTable, tenant, cliName)
 	data.StoppedByFreeze = stoppedByFreeze
+	data.Model.OperationsAtOnce = operationsAtOnce
 	data.UpdateCadence = updateCadence
 	return templates.RenderMultiDeploymentApplyComment(data)
 }

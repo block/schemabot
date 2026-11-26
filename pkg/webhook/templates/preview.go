@@ -3471,8 +3471,10 @@ func PreviewCommentMultiTargetApplyInProgress() string {
 		queue("eu", i, addIndex)
 	}
 
+	model := presentation.Derive(ops)
+	model.OperationsAtOnce = 8
 	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
-		Model:       presentation.Derive(ops),
+		Model:       model,
 		ApplyID:     "apply-a1b2c3d4e5f6",
 		Environment: "production",
 		RequestedBy: "aparajon",

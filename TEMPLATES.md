@@ -1537,7 +1537,10 @@ The live database operation was already started and may continue independently o
      ```
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
-     After rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan.
+     After the rollback completes, refresh the checks:
+     ```
+     schemabot plan
+     ```
 <!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
@@ -1573,7 +1576,10 @@ Choose one:
      ```
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
-   - after rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan
+   - after the rollback completes, refresh the checks:
+     ```
+     schemabot plan
+     ```
 <!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
@@ -3528,16 +3534,16 @@ That command wasn't recognized. Available commands:
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
-
-```sql
-ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-```
-
 **`products`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
@@ -7056,16 +7062,16 @@ schemabot apply -e staging
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
-
-```sql
-ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-```
-
 **`products`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
@@ -7301,16 +7307,16 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 **Schema `testapp`**
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
-
-```sql
-ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-```
-
 **`users`**: 🚫 Cancelled at 72.00%
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
@@ -9209,11 +9215,11 @@ Sequential mode: Middle table failed
      ~ orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-
      ~ products: 🚫 Cancelled (not started)
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -10607,7 +10613,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 *Applied by @aparajon at 2026-03-15 14:10:00 UTC*
 
-**Targets**: 40 completed, 8 running, 79 queued, 1 failed
+**Targets**: 40 completed, 8 running, 79 queued, 1 failed (8 at a time)
 
 > ❌ **First failure:** <code>us/orders_062</code> — Error 1062: Duplicate entry &#39;12345&#39; for key &#39;orders.idx_user_id&#39;
 
@@ -10617,6 +10623,15 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 <details open>
 <summary>❌ us — 40 completed, 4 running, 19 queued, 1 failed (64 targets)</summary>
 <dl><dd>
+
+**`orders`**: ❌ Failed · 7 queued, 1 failed
+
+**targets `orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`**
+```sql
+ALTER TABLE `orders`
+    ADD INDEX `idx_user_id`(`user_id`),
+    ADD COLUMN `note` text;
+```
 
 **`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜ 75%
 
@@ -10636,15 +10651,6 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   - ◉ `orders_041`: 62.38% · 914,707 / 1,466,232 rows
   - ◉ `orders_042`: 62.38% · 914,707 / 1,466,232 rows
   - ◉ `orders_043`: 62.38% · 914,707 / 1,466,232 rows
-
-**`orders`**: ❌ Failed · 7 queued, 1 failed
-
-**targets `orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`**
-```sql
-ALTER TABLE `orders`
-    ADD INDEX `idx_user_id`(`user_id`),
-    ADD COLUMN `note` text;
-```
 
 
 | Target | Status |
@@ -10937,16 +10943,16 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
-
-```sql
-ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-```
-
 **`products`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
@@ -11466,7 +11472,7 @@ b0-b8  b8-c0  c0-c8  c8-d0  d0-d8  d8-e0  e0-e8  e8-f0  f0-f8  f8-
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
-📋 **Plan**: **1** table to alter
+📋 **Plan**: **1** table to alter · 32 shards, 8 at a time
 
 
 ---
@@ -11525,7 +11531,7 @@ fd-fe  fe-ff  ff-
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
-📋 **Plan**: **1** table to alter
+📋 **Plan**: **1** table to alter · 256 shards, 8 at a time
 
 
 ---
@@ -11682,7 +11688,7 @@ ALTER TABLE `mutes`
 
 **Status**: In Progress — 0 of 1 change applied
 
-**Shards**: 1 running table copy, 3 queued
+**Shards**: 1 running table copy, 3 queued (1 at a time)
 
 #### Keyspace `cdb_resolute_sharded`
 
@@ -12757,11 +12763,11 @@ Sequential mode: Middle table failed
      ~ orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-
      ~ products: 🚫 Cancelled (not started)
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
 To recover: Fix the issue above, then run a new apply.

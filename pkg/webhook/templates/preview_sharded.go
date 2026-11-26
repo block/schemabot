@@ -36,7 +36,7 @@ func previewShardStatuses(applyState string, ops []presentation.Operation) []Sha
 		out = append(out, ShardStatus{
 			Shard: d.Shard, Emoji: d.Emoji, Label: d.Label, State: d.State, Error: d.Error,
 			StoppedAtCutover: d.Presentation == presentation.StateStoppedAtCutover, EndedBy: d.EndedBy,
-			Landed: d.Landed,
+			Landed: d.Landed, CompetesForSlot: d.Presentation.CompetesForSlot(),
 		})
 	}
 	return out
@@ -58,12 +58,13 @@ func previewMutesCell(shard string) ShardCell {
 	return ShardCell{Shard: shard, Table: "mutes", Statements: []string{previewMutesIndex}}
 }
 
-// PreviewCommentShardedApplyInProgress renders a sharded apply mid-rollout: the
-// first shard copying, the rest queued until a driver is free.
+// PreviewCommentShardedApplyInProgress renders a sharded apply mid-rollout
+// under a limit of one operation at a time: the first shard copying, the rest
+// queued until a driver is free.
 func PreviewCommentShardedApplyInProgress() string {
 	return RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "production", Database: "cdb_resolute",
-		ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
+		ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy, MaxOperationsAtOnce: 1,
 		Keyspaces: []ShardedKeyspace{{
 			Keyspace: "cdb_resolute_sharded",
 			Tables: []ShardedTableStatus{{
@@ -479,7 +480,8 @@ func PreviewCommentShardedPlanHugeShards() string {
 }
 
 // previewShardedPlanUniform renders a plan that runs the same DDL on every
-// shard of an evenly split keyspace of n shards.
+// shard of an evenly split keyspace of n shards, under a limit of eight
+// operations at a time, which the summary states once the shards outnumber it.
 func previewShardedPlanUniform(n int) string {
 	idx := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
 	shards := make([]KeyspaceShardChange, 0, n)
@@ -489,6 +491,7 @@ func previewShardedPlanUniform(n int) string {
 	return RenderPlanComment(PlanCommentData{
 		Database: "cdb_resolute", Environment: "production", DatabaseType: "strata",
 		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		OperationsAtOnce: 8,
 		Changes: []KeyspaceChangeData{{
 			Keyspace:   "cdb_resolute_sharded",
 			Statements: []string{idx},

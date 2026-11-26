@@ -12,7 +12,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.52.0
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.9
 	github.com/block/mysql v0.0.0-20261122231317-2d9dfd496f60
-	github.com/block/pg-sprite v0.5.6-0.20261125193148-0f221b115266
+	github.com/block/pg-sprite v0.5.6-0.20261125194448-f93ff345f8b6
 	github.com/block/spirit v0.20.1-0.20261122162747-cc0fa5849d1f
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
@@ -39,7 +39,7 @@ require (
 	github.com/prometheus/common v0.67.5
 	github.com/square/etre v0.15.0
 	github.com/stretchr/testify v1.12.1
-	github.com/testcontainers/testcontainers-go v0.45.0
+	github.com/testcontainers/testcontainers-go v0.45.1-0.20261109125418-f31e98d4ee9b // pinned for reaper recovery from a reaper that is being removed; move to the first release that includes it (v0.46.0)
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0
 	github.com/wasilibs/go-pgquery v0.0.0-20261106060434-4301e51f8dbf

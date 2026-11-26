@@ -678,6 +678,18 @@ type PulledNamespace struct {
 	// with no violations serializes as an explicit empty list so a clean
 	// audit is distinguishable from lint not being requested (omitted).
 	Lint []*LintViolationResponse `json:"lint,omitzero"`
+	// SkippedTables are the live tables the pull left out of Tables because
+	// their schema file cannot describe them in full, in name order. Set only
+	// when the request asked for SkipUnrepresentableTables.
+	SkippedTables []SkippedTable `json:"skipped_tables,omitempty"`
+}
+
+// SkippedTable is a live table a pull left out, and why.
+type SkippedTable struct {
+	Table string `json:"table"`
+	// Reason says what the table carries that its schema file cannot
+	// describe.
+	Reason string `json:"reason"`
 }
 
 // NamespaceCatalog contains structured metadata for a pulled namespace.
@@ -750,6 +762,13 @@ type PullSchemaRequest struct {
 	// violations to each namespace, so a caller can audit a database's lint
 	// debt without planning a change. Off by default.
 	Lint bool `json:"lint,omitempty"`
+	// SkipUnrepresentableTables returns the rest of a namespace when some of
+	// its tables cannot be described by a schema file, naming each one in the
+	// namespace's SkippedTables, instead of refusing the whole pull. Off by
+	// default. A caller that writes schema files from the response must keep
+	// every skipped table out of the plan, such as with ignore_tables,
+	// because a table with no schema file is planned as a drop.
+	SkipUnrepresentableTables bool `json:"skip_unrepresentable_tables,omitempty"`
 }
 
 // PullSchemaResponse is the HTTP response body for POST /api/pull.
@@ -1963,6 +1982,12 @@ type ProgressResponse struct {
 	// VSchema change. Operations still lists every shard and finalizer row,
 	// but a client renders the apply as one change, the way its PR comments do.
 	Sharded bool `json:"sharded,omitempty"`
+	// MaxOperationsAtOnce is how many of the apply's operations the server's
+	// drivers run at once (its max_drivers_per_apply), set when the apply runs
+	// more than one operation. A client states it beside a running rollout's
+	// counts, so the operations queued behind it read as waiting their turn.
+	// Zero when the response does not say.
+	MaxOperationsAtOnce int `json:"max_operations_at_once,omitempty"`
 	// StoppedByFreeze names the freeze that stopped this apply, set only while
 	// the apply is stopped and the stop that stopped it was a freeze's (one
 	// with running "stop"), not an operator's.
