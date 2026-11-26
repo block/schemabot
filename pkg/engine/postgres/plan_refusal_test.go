@@ -126,20 +126,39 @@ func TestPlannerRefusalTypesOnlyPlannerDeclines(t *testing.T) {
 
 // A schema file the desired-file parser does not admit is refused before any
 // database is read, and the refusal is typed like a planner decline, because
-// the remedy is the same: change the file. A file that does not parse at all
-// is an input error, not a refusal, and stays an ordinary error.
+// the remedy is the same: change the file. That holds for every error the
+// parse returns, a schema-qualified name and a syntax error included, so none
+// of them reads as an engine failure to plan again.
 func TestPlanRefusesFileThePlannerDoesNotAdmit(t *testing.T) {
 	refused := map[string]struct {
-		sql     string
-		wantErr string
+		sql      string
+		sentinel error
+		wantErr  string
 	}{
 		"two tables in one file": {
-			sql:     "CREATE TABLE a (id bigint PRIMARY KEY); CREATE TABLE b (id bigint PRIMARY KEY)",
-			wantErr: "desired schema must contain exactly one CREATE TABLE",
+			sql:      "CREATE TABLE a (id bigint PRIMARY KEY); CREATE TABLE b (id bigint PRIMARY KEY)",
+			sentinel: statement.ErrMultipleCreateTables,
+			wantErr:  "desired schema must contain exactly one CREATE TABLE",
 		},
 		"a change statement in it": {
-			sql:     "DROP TABLE a",
-			wantErr: "statement kind not allowed in a desired schema: DROP TABLE a",
+			sql:      "DROP TABLE a",
+			sentinel: statement.ErrDisallowedStatement,
+			wantErr:  "statement kind not allowed in a desired schema: DROP TABLE a",
+		},
+		"a schema-qualified table name": {
+			sql:      `CREATE TABLE "public"."a" (id bigint PRIMARY KEY)`,
+			sentinel: statement.ErrQualifiedName,
+			wantErr:  "desired schema statements must use unqualified names: public.a",
+		},
+		"a foreign key to a schema-qualified table": {
+			sql:      `CREATE TABLE a (id bigint PRIMARY KEY, b_id bigint REFERENCES "public"."b"("id"))`,
+			sentinel: statement.ErrQualifiedName,
+			wantErr:  "desired schema statements must use unqualified names",
+		},
+		"a syntax error": {
+			sql:      "CREATE TABLE a (id bigint PRIMARY KEY",
+			sentinel: statement.ErrParseDesired,
+			wantErr:  "syntax error at end of input",
 		},
 	}
 	for name, tc := range refused {
@@ -147,13 +166,9 @@ func TestPlanRefusesFileThePlannerDoesNotAdmit(t *testing.T) {
 			_, err := planSchemas(t.Context(), nil, planRequestWithFiles(map[string]string{"a.sql": tc.sql}), DefaultNativeSafeTableSizeLimitBytes, "")
 			require.Error(t, err)
 			assert.True(t, engine.IsPlanRefused(err), "the refusal must be typed")
+			assert.ErrorIs(t, err, tc.sentinel)
+			assert.Contains(t, err.Error(), `plan PostgreSQL schema in "public"/"a.sql": `)
 			assert.Contains(t, err.Error(), tc.wantErr)
 		})
 	}
-
-	t.Run("a syntax error is not a refusal", func(t *testing.T) {
-		_, err := planSchemas(t.Context(), nil, planRequestWithFiles(map[string]string{"a.sql": "CREATE TABLE a (id bigint PRIMARY KEY"}), DefaultNativeSafeTableSizeLimitBytes, "")
-		require.Error(t, err)
-		assert.False(t, engine.IsPlanRefused(err))
-	})
 }
