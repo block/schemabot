@@ -192,7 +192,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		api.PlanFailureLog(h.logger, err)("plan narrowed to one target failed; leaving the environment's check unchanged",
 			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
 			"deployment", deployment, "environment", environment, "target", target, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, userFacingError(err))
+		h.postPlanCommandError(repo, pr, installationID, environment, requestedBy, err)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan failed"})
 		return
 	}
@@ -212,7 +212,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		} else {
 			h.recordPlanFailuresAndFold(ctx, client, repo, pr, schemaResult.HeadSHA, schemaResult, []string{environment})
 		}
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, userError)
+		h.postPlanCommandError(repo, pr, installationID, environment, requestedBy, err)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan failed"})
 		return
 	}
@@ -784,6 +784,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		Environments:   environments,
 		Plans:          make(map[string]*templates.PlanCommentData),
 		Errors:         make(map[string]string),
+		PlanProblems:   make(map[string]templates.RefusedStatements),
 	}
 	if len(unmanagedSchema) > 0 {
 		multiEnvData.UnmanagedSchema = unmanagedSchema
@@ -795,6 +796,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// also reaching the gate.
 	planFailed := func(env string, err error) {
 		multiEnvData.Errors[env] = userFacingError(err)
+		if problems, omitted := api.PlanRefusalProblems(err); len(problems) > 0 {
+			multiEnvData.PlanProblems[env] = templates.RefusedStatements{Problems: problems, Omitted: omitted}
+		}
 		planFailedEnvironments = append(planFailedEnvironments, env)
 		if planRefusedBySourcePolicy(err) {
 			sourcePolicyRefused[env] = true

@@ -1575,3 +1575,32 @@ message StorageSchemaApplyResponse {
   // steady state during a rollback rather than a failure.
   StorageSchemaReport remaining = 2;
 }
+
+// PlanRefusal is the detail a Plan or PlanDiff refusal carries on its
+// FAILED_PRECONDITION status when the refusal is about statements in the schema
+// files: it lists every statement the engine cannot plan as written, so the
+// caller can point the files' author at each one. A refusal about the target
+// rather than the files carries no detail, and its status message is the
+// whole answer.
+//
+// The detail travels in a response trailer, which proxies bound, so a sender
+// lists a bounded number of problems, each cut to what a caller renders, and
+// counts the rest in omitted.
+message PlanRefusal {
+  repeated PlanProblem problems = 1;
+  // How many more statements the engine refused than problems lists.
+  int32 omitted = 2;
+}
+
+// PlanProblem is one statement in the schema files that the engine cannot plan
+// as written.
+message PlanProblem {
+  // The schema file's path under the schema root, such as "app/orders.sql".
+  string file = 1;
+  // The 1-based line the statement starts on, or 0 when it is not known.
+  int32 line = 2;
+  // What is wrong with the statement and what to change, for the file's author.
+  string message = 3;
+  // The statement's SQL as the file declares it.
+  string statement = 4;
+}
