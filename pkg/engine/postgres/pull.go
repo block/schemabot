@@ -49,10 +49,11 @@ type unmodeledTableObjects struct {
 }
 
 // PullSchema exports tables that the PostgreSQL declarative format can
-// represent. It refuses tables carrying user triggers,
-// table or column comments, non-default relation options, or table inheritance, as
-// well as shapes rejected by the renderer. PostgreSQL currently supports only
-// basic catalog detail.
+// represent. A table's own foreign keys are written into its file. It refuses
+// tables carrying user triggers, table or column comments, non-default
+// relation options, or table inheritance, a table referenced by a foreign key
+// that the pull does not write, as well as shapes rejected by the renderer.
+// PostgreSQL currently supports only basic catalog detail.
 func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
 	if req == nil {
 		return nil, fmt.Errorf("pull PostgreSQL schema: request is required")
@@ -109,6 +110,11 @@ type baselinePolicy struct {
 	// includeRowSecurity exports access rules for pull. Rollback cannot yet
 	// execute these definitions and must not advertise a recoverable baseline.
 	includeRowSecurity bool
+	// includeForeignKeys writes each table's own foreign keys for pull, and
+	// refuses a referenced table whose incoming foreign key lives on a table
+	// the pull does not write. Rollback cannot yet execute a foreign key
+	// change and must not advertise a recoverable baseline.
+	includeForeignKeys bool
 	// refuseUnmodeledObjects refuses a table that carries objects the
 	// declarative format does not represent — a trigger or a table/column comment
 	// — even though the renderer would happily render its columns and
@@ -125,7 +131,7 @@ type baselinePolicy struct {
 // would describe incompletely is refused rather than written down without
 // its trigger or comment, and every table the plan would hold a file
 // accountable for is present, archive tables included.
-var pulledBaseline = baselinePolicy{refuseUnmodeledObjects: true, includeRowSecurity: true}
+var pulledBaseline = baselinePolicy{refuseUnmodeledObjects: true, includeRowSecurity: true, includeForeignKeys: true}
 
 // rollbackBaseline is read only by a rollback re-plan, which manages the
 // same table set the forward plan did. Objects the differ cannot see are
@@ -177,6 +183,10 @@ func baselineIntrospectionLimit(pool *pgxpool.Pool) int {
 type renderedTable struct {
 	content   string
 	renderErr error
+	// incoming are the foreign keys on other tables that reference this
+	// one. Each lives in its referencing table's file, so a baseline that
+	// writes this table must write those tables too.
+	incoming []schemadiff.IncomingForeignKey
 }
 
 // renderPostgresTables uses pg-sprite's managed-table enumeration and
@@ -242,7 +252,78 @@ func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, database, nam
 			rendered[table] = result.content
 		}
 	}
+	if policy.includeForeignKeys {
+		written := make(map[string]bool, len(managedTables))
+		for _, table := range managedTables {
+			written[table] = true
+		}
+		for i, table := range managedTables {
+			if _, ok := rendered[table]; !ok {
+				continue
+			}
+			unwritten, err := unwrittenIncomingForeignKeys(ctx, pool, namespace, results[i].incoming, written)
+			if err != nil {
+				return nil, nil, err
+			}
+			if len(unwritten) > 0 {
+				delete(rendered, table)
+				renderErrors = append(renderErrors, fmt.Errorf("schema %q table %q: %w: %s", namespace, table, errUnwrittenReferencingTable, strings.Join(unwritten, ", ")))
+			}
+		}
+	}
 	return rendered, renderErrors, nil
+}
+
+// errUnwrittenReferencingTable refuses a referenced table whose incoming
+// foreign key lives on a table the pull does not write. The key is declared
+// only in the referencing table's file, so a baseline without that file
+// would not carry the relationship.
+var errUnwrittenReferencingTable = errors.New("referenced by a foreign key on a table this pull does not write")
+
+// unwrittenIncomingForeignKeys describes every incoming foreign key that lives
+// outside the pulled files, with what the operator can do about it: a key on
+// a table in another schema, which a desired file cannot reference; a key on
+// a partition, which belongs on the partitioned parent; or a key on another
+// table in this schema that has no file of its own, such as one an extension
+// owns. It fails only when the catalog cannot say whether the referencing
+// table is a partition.
+func unwrittenIncomingForeignKeys(ctx context.Context, pool *pgxpool.Pool, namespace string, incoming []schemadiff.IncomingForeignKey, written map[string]bool) ([]string, error) {
+	var unwritten []string
+	for _, fk := range incoming {
+		name := foreignKeyName(namespace, fk)
+		switch {
+		case fk.Schema != namespace:
+			unwritten = append(unwritten, name+" (in another schema; a schema file cannot reference it)")
+		case written[fk.Table]:
+			// The key is declared in its referencing table's file, which this pull writes.
+		default:
+			partition, err := isPostgresPartition(ctx, pool, fk.Schema, fk.Table)
+			if err != nil {
+				return nil, err
+			}
+			if partition {
+				unwritten = append(unwritten, name+" (on a partition; declare the key on the partitioned parent)")
+			} else {
+				unwritten = append(unwritten, name+" (on a table this pull does not write, such as one an extension owns; remove the key)")
+			}
+		}
+	}
+	return unwritten, nil
+}
+
+const postgresTableIsPartition = `
+SELECT c.relispartition
+FROM pg_catalog.pg_class AS c
+JOIN pg_catalog.pg_namespace AS n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+WHERE n.nspname OPERATOR(pg_catalog.=) $1 AND c.relname OPERATOR(pg_catalog.=) $2`
+
+// isPostgresPartition reports whether the table is a partition of another.
+func isPostgresPartition(ctx context.Context, pool *pgxpool.Pool, schema, table string) (bool, error) {
+	var partition bool
+	if err := pool.QueryRow(ctx, postgresTableIsPartition, schema, table).Scan(&partition); err != nil {
+		return false, fmt.Errorf("check whether PostgreSQL table %q in schema %q is a partition: %w", table, schema, err)
+	}
+	return partition, nil
 }
 
 // renderPostgresTable renders one table for a baseline. A refusal the
@@ -270,14 +351,16 @@ func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, tab
 	if err != nil {
 		return nil, fmt.Errorf("introspect schema %q table %q: %w", namespace, table, err)
 	}
-	content, err := schemadiff.Render(model)
+	opts := schemadiff.RenderOptions{ForeignKeys: policy.includeForeignKeys}
+	content, err := schemadiff.RenderWith(model, opts)
 	if policy.includeRowSecurity && errors.Is(err, schemadiff.ErrUnrenderableRowSecurity) {
-		content, err = schemadiff.RenderWithRowSecurity(model)
+		opts.RowSecurity = true
+		content, err = schemadiff.RenderWith(model, opts)
 	}
 	if err != nil {
 		return &renderedTable{renderErr: fmt.Errorf("schema %q table %q: render: %w", namespace, table, err)}, nil
 	}
-	return &renderedTable{content: content}, nil
+	return &renderedTable{content: content, incoming: model.IncomingForeignKeys}, nil
 }
 
 // pullNamespaces discovers every non-reserved schema by default. Callers use

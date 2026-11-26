@@ -795,11 +795,11 @@ the apply fails and drops nothing. Fix the cause, then apply again.
 The plan lists the tables it exempted, by namespace, in the PR comment and in
 `schemabot plan` and `schemabot apply` output.
 
-**Tables `pull` cannot write.** `pull` refuses a whole namespace when any of
+**Tables `pull` cannot write.** `pull` refuses the whole pull when any of
 its tables has something the file format cannot represent: triggers, table or
-column comments, table options, inheritance, or a foreign key on either side.
-Write those files by hand, or drop the tables through a reviewed process,
-before you pull the rest.
+column comments, table options, inheritance, or a foreign key it cannot write
+(see the table below). Write those files by hand, or drop the tables through a
+reviewed process, before you pull the rest.
 
 A hand-written file can use `CREATE UNLOGGED TABLE`, `PARTITION BY`, and an
 `INHERITS` child flattened to its own columns. Each inheritance child and
@@ -838,14 +838,27 @@ creates does not count.
 out. To keep it, declare it in the file. To remove it, run the
 `DROP CONSTRAINT` outside SchemaBot, then plan again.
 
-**Declaring tables that have foreign keys.** `pull` refuses these tables, so
-write their files by hand:
+**Declaring tables that have foreign keys.** `pull` writes them:
 
 - A table that owns foreign keys is declared with them.
 - A table that other tables reference is declared without them, since the
   constraints belong to the referencing tables.
-- A table with a foreign key into another namespace cannot be declared.
-  Remove the foreign key, or drop the table through a reviewed process.
+- A foreign key added `NOT VALID` is written as an enforced one. The next plan
+  shows its `VALIDATE CONSTRAINT`, blocked like any foreign key change.
+
+`pull` refuses a foreign key it cannot write. The table it names depends on the
+case:
+
+| The foreign key | Tables named | Why |
+|---|---|---|
+| Crosses namespaces | Both | A file cannot reference a table in another namespace |
+| Sits on a partition | The referenced table, with a reason that names the partition's key | A partition has no file of its own. Declare the key on the partitioned parent |
+| Sits on a table with no file of its own, such as one an extension owns | The referenced table | The key would be lost from the baseline |
+| References its own table through a standalone unique index | The referencing table | The file would declare the key before the index exists. Make the index an immediate `UNIQUE` constraint to pull it. A deferrable one does not count |
+| Sits on a table with row-level security | The referencing table | A file cannot declare row-level security and a foreign key together yet |
+
+Remove the foreign key, or drop the table through a reviewed process, then
+pull again.
 
 Dropping a referenced table must drop the constraints that reference it too.
 The plan names the constraints on both sides.
@@ -968,7 +981,9 @@ you select JSON output. Each PostgreSQL schema is a SchemaBot namespace.
 schema file format, the whole pull is refused and nothing is written. That
 covers tables with:
 
-- A foreign key, on either side
+- A foreign key `pull` cannot write: into another namespace, on a partition,
+  on a table with row-level security, or referencing its own table through a
+  standalone unique index. See [Foreign keys](#foreign-keys)
 - Table inheritance, or `UNLOGGED`
 - Explicit collations
 - Sequence defaults it cannot represent safely
