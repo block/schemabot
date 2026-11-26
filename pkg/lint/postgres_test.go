@@ -229,8 +229,8 @@ CREATE UNIQUE INDEX t_email_uidx ON t (email);`,
 				`Index "t_email_uidx" on column "email" is a duplicate of index "t_email_key"`,
 			},
 			wantSuggestions: []string{
-				`Drop index "t_email_key" as it is an exact duplicate of "t_email_uidx". Duplicate indexes waste space and slow down writes with no benefit.`,
-				`Drop index "t_email_uidx" as it is an exact duplicate of "t_email_key". Duplicate indexes waste space and slow down writes with no benefit.`,
+				`Drop the constraint that owns "t_email_key" rather than the index, as PostgreSQL refuses DROP INDEX on a constraint-owned index. "t_email_uidx" continues to enforce uniqueness.`,
+				`Drop either "t_email_uidx" or "t_email_key", not both, as the one that remains is what enforces uniqueness on column "email".`,
 			},
 		},
 		{

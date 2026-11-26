@@ -399,9 +399,19 @@ func (t postgresColumnType) isFloat() bool {
 // postgresIndex is one btree key the redundancy rule compares: the primary
 // key, a UNIQUE constraint, or a CREATE INDEX statement from the entry.
 type postgresIndex struct {
-	Name  string
-	Type  string // "PRIMARY KEY", "UNIQUE", or "INDEX"
-	Parts []postgresIndexPart
+	Name string
+	Type string // "PRIMARY KEY", "UNIQUE", or "INDEX"
+	// ConstraintOwned records that a table constraint owns this index rather
+	// than a CREATE INDEX statement. PostgreSQL refuses DROP INDEX on one, so
+	// advice that names it has to say to drop the constraint instead.
+	ConstraintOwned bool
+	Parts           []postgresIndexPart
+}
+
+// enforcesUniqueness reports whether dropping this index would give up a
+// uniqueness guarantee.
+func (i postgresIndex) enforcesUniqueness() bool {
+	return i.Type == "PRIMARY KEY" || i.Type == "UNIQUE"
 }
 
 // postgresIndexPart is one plain column key part with its sort direction.
@@ -504,6 +514,7 @@ func postgresConstraintIndex(c *pgproto.Constraint, columns []string) (postgresI
 	if len(columns) == 0 || len(c.GetIncluding()) > 0 || c.GetNullsNotDistinct() {
 		return postgresIndex{}, false
 	}
+	index.ConstraintOwned = true
 	index.Name = c.GetConname()
 	if index.Name == "" {
 		// An inline constraint carries no name until the server assigns one;
@@ -581,8 +592,6 @@ func postgresIndexPartsPrefix(a, b []postgresIndexPart) bool {
 	return true
 }
 
-// postgresRedundancyMessage words a finding the way Spirit does so the two
-// audits read alike.
 // quotedTypeList renders a type allow-list the way a suggestion names it:
 // each type quoted, comma separated, so the advice reads the same on every
 // engine.
@@ -595,35 +604,64 @@ func quotedTypeList(types []string) string {
 }
 
 // postgresRedundancySuggestion is the advice beside a redundancy finding:
-// drop the covered index, naming what covers it. It branches the same four
-// ways the message does, so the advice always names the same pair the message
-// does, and it carries the same wording Spirit uses for the MySQL rule — with
-// one departure. Spirit explains a primary-key prefix by way of InnoDB's
-// clustered index, which PostgreSQL has no equivalent of, so that case states
-// the reason that is true here instead of repeating one that is not.
+// drop the covered index, naming what covers it. A prefix finding carries
+// Spirit's wording for the MySQL rule, except that Spirit explains a
+// primary-key prefix by way of InnoDB's clustered index, which PostgreSQL has
+// no equivalent of, so that case states the reason that is true here.
+// Duplicates are delegated, because what an operator can safely drop there
+// depends on what else enforces the same guarantee.
 func postgresRedundancySuggestion(redundant, covering postgresIndex) string {
-	isDuplicate := len(redundant.Parts) == len(covering.Parts)
-	toPK := covering.Type == "PRIMARY KEY"
-	switch {
-	case isDuplicate && toPK:
-		return fmt.Sprintf("Drop index %q as it duplicates the PRIMARY KEY. "+
-			"The PRIMARY KEY already provides all the functionality of this index.",
-			redundant.Name)
-	case isDuplicate:
-		return fmt.Sprintf("Drop index %q as it is an exact duplicate of %q. "+
-			"Duplicate indexes waste space and slow down writes with no benefit.",
-			redundant.Name, covering.Name)
-	case toPK:
+	if len(redundant.Parts) == len(covering.Parts) {
+		return postgresDuplicateSuggestion(redundant, covering)
+	}
+	if covering.Type == "PRIMARY KEY" {
 		return fmt.Sprintf("Consider dropping index %q as it is fully covered by the PRIMARY KEY. "+
 			"The index backing the PRIMARY KEY already serves lookups on its leading columns.",
 			redundant.Name)
-	default:
-		return fmt.Sprintf("Consider dropping index %q as it is fully covered by %q. "+
-			"The longer index can satisfy all queries that would use the shorter index.",
-			redundant.Name, covering.Name)
 	}
+	return fmt.Sprintf("Consider dropping index %q as it is fully covered by %q. "+
+		"The longer index can satisfy all queries that would use the shorter index.",
+		redundant.Name, covering.Name)
 }
 
+// postgresDuplicateSuggestion is the advice for one half of a duplicate pair.
+//
+// A duplicate pair reports both members, so each finding carries advice of its
+// own and an operator reading the pair sees two statements about the same two
+// indexes. Telling both of them to drop the named index is only safe when
+// something else still enforces what that index enforced — otherwise an
+// operator working down the list drops a uniqueness guarantee the audit never
+// said was in question. These cases say which index survives, so following
+// every finding in the report leaves the table enforcing what it enforced
+// before.
+func postgresDuplicateSuggestion(redundant, covering postgresIndex) string {
+	// A constraint owns the index, so DROP INDEX is refused outright and the
+	// advice has to name the constraint. Only a UNIQUE constraint reaches
+	// here: the primary key is never reported as the redundant index, and a
+	// unique key is only ever redundant to another unique key or the primary
+	// key, so the covering index always still enforces uniqueness.
+	if redundant.ConstraintOwned {
+		return fmt.Sprintf("Drop the constraint that owns %q rather than the index, as PostgreSQL refuses "+
+			"DROP INDEX on a constraint-owned index. %q continues to enforce uniqueness.",
+			redundant.Name, covering.Name)
+	}
+	if covering.Type == "PRIMARY KEY" {
+		return fmt.Sprintf("Drop index %q as it duplicates the PRIMARY KEY. "+
+			"The PRIMARY KEY already provides all the functionality of this index.",
+			redundant.Name)
+	}
+	if redundant.enforcesUniqueness() && covering.enforcesUniqueness() {
+		return fmt.Sprintf("Drop either %q or %q, not both, as the one that remains is what enforces "+
+			"uniqueness on %s.",
+			redundant.Name, covering.Name, postgresIndexColumnsPhrase(redundant))
+	}
+	return fmt.Sprintf("Drop index %q as it is an exact duplicate of %q. "+
+		"Duplicate indexes waste space and slow down writes with no benefit.",
+		redundant.Name, covering.Name)
+}
+
+// postgresRedundancyMessage words a finding the way Spirit does so the two
+// audits read alike.
 func postgresRedundancyMessage(redundant, covering postgresIndex) string {
 	redundantCols := postgresIndexColumnsPhrase(redundant)
 	coveringCols := postgresIndexColumnsPhrase(covering)

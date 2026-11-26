@@ -98,6 +98,13 @@ func pullSchemaPreviewResponse() *apitypes.PullSchemaResponse {
 						Severity: "warning",
 						Message:  `Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`,
 					},
+					{
+						Table:      "orders",
+						Column:     "id",
+						Severity:   "warning",
+						Message:    `Primary key column "id" has type "int"`,
+						Suggestion: `Change column "id" to a supported column type ("BIGINT", "BINARY", "VARBINARY")`,
+					},
 				},
 			},
 		},
