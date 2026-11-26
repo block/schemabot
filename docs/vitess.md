@@ -160,8 +160,10 @@ has the full walkthrough.
 | PlanetScale | The tested target |
 | A PlanetScale-compatible endpoint | Works where it answers the same API. Some require mutual TLS; see [PlanetScale mTLS](configuration.md#planetscale-mtls) |
 
-What SchemaBot talks to is the PlanetScale API, not the cluster. The vtgate DSN
-is a read-only addition, and the DDL goes through the API either way.
+SchemaBot reaches the cluster through the PlanetScale API: it creates the
+deploy branch and asks for that branch's password. The DDL itself runs over a
+MySQL connection to the host the password names, so the apply needs no vtgate
+DSN. Where the DSN is set, it is read-only: shards and schema, never DDL.
 
 Self-hosted Vitess that does not answer the PlanetScale API is a different
 engine; see [Strata](strata-engine.md).
@@ -241,10 +243,11 @@ request's status, and, when the DSN is set, lists the production branch's
 keyspaces; the vtgate credentials then read each keyspace's shards. A read-only
 branch password is enough.
 
-The apply itself runs without a DSN, since the DDL goes through the API, and an
-apply started without one logs that per-shard progress will be unavailable. One
-case does need it: where PlanetScale's safe schema changes are turned off on the
-branch, the plan reads the schema over vtgate instead, and fails without a DSN.
+The apply itself runs without a DSN, since it reaches the branch with the
+password the API hands back, and an apply started without one logs that
+per-shard progress will be unavailable. One case does need it: where
+PlanetScale's safe schema changes are turned off on the branch, the plan reads
+the schema over vtgate instead, and fails without a DSN.
 
 ## The revert window
 
@@ -256,7 +259,9 @@ cutover. For the length of the window, the change can be undone:
 | `revert` | Put the original table back |
 | `skip-revert` | Close the window early and finalize the change |
 
-The window is PlanetScale's, and it expires on its own. A dropped table is kept
+The window is SchemaBot's. It stays open for `revert_window_duration` — 30
+minutes by default, matching PlanetScale's — and SchemaBot closes it itself by
+skipping the revert once that time has passed. A dropped table is kept
 separately, by Vitess's own table lifecycle, which is why SchemaBot adds no
 [pending drops](pending-drops.md) quarantine on this engine.
 
@@ -304,7 +309,7 @@ engines behave under pressure.
 
 ## Configuration and credentials
 
-A Vitess environment takes three fields:
+A Vitess environment takes three fields and an optional revert window:
 
 ```yaml
 databases:
@@ -315,13 +320,19 @@ databases:
         organization: "your-org"
         token_secret_ref: "secretsmanager:schemabot-staging/planetscale-token#token"
         dsn: "secretsmanager:schemabot-staging/planetscale-vtgate#dsn"
+        revert_window_duration: "30m"
 ```
 
-Each accepts the same secret references as any other credential — `env:`,
-`secretsmanager:`, a literal value, or `dsn_from` assembly.
+The three fields accept the same secret references as any other credential —
+`env:`, `secretsmanager:`, a literal value, or `dsn_from` assembly.
 [Configuration](configuration.md) covers them, along with
 [the service token](configuration.md#planetscale-service-token) and
 [mTLS endpoints](configuration.md#planetscale-mtls).
+
+`revert_window_duration` is how long [the revert window](#the-revert-window)
+stays open after the deploy completes, as a Go duration. Omit it for the 30
+minute default. A value that does not parse, or that is zero or negative, fails
+config load rather than falling back to the default.
 
 Credentials are resolved lazily, so a Vitess database left configured with a
 placeholder organization does not stop the server from starting.
@@ -467,8 +478,8 @@ runs.
 
 | An agent may | An agent hands it to a person |
 |---|---|
-| Run `plan`, `status`, `progress --no-watch`, and `pull` | `apply` and `cancel` wherever the command policy says to hand them over, which includes production |
-| Rewrite a blocked change into a form the plan accepts, then plan again | `cutover`, `revert`, and `skip-revert` |
+| Run `plan`, `status`, `progress --no-watch`, and `pull` | `apply`, `cutover`, and `cancel` wherever the command policy says to hand them over, which includes production |
+| Rewrite a blocked change into a form the plan accepts, then plan again | `revert` and `skip-revert` |
 | Tell the user why a change was blocked or refused, in SchemaBot's words | Any DDL run against the cluster outside SchemaBot, and anything done in the PlanetScale console |
 | Report a failure SchemaBot will retry, and check on it again | Deleting a branch, or approving a deploy request |
 
@@ -482,8 +493,9 @@ Recognize each outcome by its signal:
 | Reverted in the console | SchemaBot reads the deploy request's state, so the revert is reported, not overwritten |
 
 `cancel` deserves its own line, because it is the one control operation here
-that cannot be undone: it ends the deploy request for good. An agent asks before
-it, every time.
+that cannot be undone: it ends the deploy request for good, and the change
+starts again as a new one. The command policy routes it like any other control
+command, and nothing about this engine loosens that.
 
 You can copy this into your agent's instructions:
 
