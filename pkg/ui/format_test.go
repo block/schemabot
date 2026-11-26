@@ -73,31 +73,32 @@ func TestFormatTableSizeClause(t *testing.T) {
 }
 
 // Every task state has a pinned place in the table listing, so a state added
-// to pkg/state fails here until the listing says where it goes. States the
-// priority does not name, and statuses it does not recognize, list with
-// pending.
+// to pkg/state fails here until the listing says where it goes. A failure or
+// halt leads, then work in progress, then queued tables, then settled ones.
+// States the priority does not name, and statuses it does not recognize, list
+// with pending.
 func TestTableStatePriority(t *testing.T) {
 	task := state.Task
 	statetest.AssertRanks(t, statetest.Every(t, state.Task), map[string]int{
-		task.Running:           0,
-		task.CatchingUp:        0,
-		task.Checksumming:      0,
-		task.PostChecksum:      0,
-		task.CuttingOver:       0,
-		task.WaitingForCutover: 1,
-		task.Recovering:        1,
+		task.Failed:            0,
 		task.FailedRetryable:   1,
-		task.Pending:           2,
-		task.WaitingForDeploy:  2,
-		task.RevertWindow:      2,
-		task.Reverting:         2,
-		task.Failed:            3,
-		task.Stopped:           3,
-		task.Completed:         4,
-		task.Cancelled:         4,
-		task.Reverted:          4,
+		task.Stopped:           2,
+		task.Cancelled:         3,
+		task.Running:           4,
+		task.CatchingUp:        4,
+		task.Checksumming:      4,
+		task.PostChecksum:      4,
+		task.CuttingOver:       4,
+		task.WaitingForCutover: 5,
+		task.Recovering:        5,
+		task.Pending:           6,
+		task.WaitingForDeploy:  6,
+		task.RevertWindow:      6,
+		task.Reverting:         6,
+		task.Completed:         7,
+		task.Reverted:          7,
 	}, TableStatePriority)
-	assert.Equal(t, 2, TableStatePriority("unknown_state"))
+	assert.Equal(t, 6, TableStatePriority("unknown_state"))
 }
 
 func TestVSchemaStatusLabel(t *testing.T) {

@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -159,13 +160,18 @@ func TestApplyConfirmCommandCoreTransientConfigReadFailureIsRetryable(t *testing
 // terminal and report a specific operator action unless fan-out requires silence.
 func TestApplyConfirmCommandCoreLockPathDispositions(t *testing.T) {
 	t.Run("lock lookup failure is retryable", func(t *testing.T) {
-		h, mux, _ := newApplyGateContractHandler(t, &actorAuthStorage{locks: &actorAuthLockStore{getErr: errors.New("lock storage unavailable")}})
+		const rawCause = "dial tcp 10.1.2.3:3306: connect: connection refused"
+		h, mux, comments := newApplyGateContractHandler(t, &actorAuthStorage{locks: &actorAuthLockStore{getErr: errors.New(rawCause)}})
 		registerCheckStatusRESTHandlers(mux, nil)
 
 		retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
 
 		require.Error(t, err)
 		assert.True(t, retry, "storage uncertainty must be re-driven")
+		body := requireComment(t, comments, "lock lookup failure apply-confirm comment")
+		assert.Contains(t, body, "SchemaBot could not check the lock for `orders`, so the apply did not start. Run the command again; if it fails again, the SchemaBot server logs have the cause.")
+		assert.NotContains(t, body, "dial tcp")
+		assert.NotContains(t, body, "connection refused")
 	})
 
 	t.Run("missing lock is terminal", func(t *testing.T) {
@@ -221,6 +227,73 @@ func TestApplyConfirmCommandCoreLockPathDispositions(t *testing.T) {
 		body := requireComment(t, comments, "foreign-lock apply-confirm comment")
 		assert.Contains(t, body, "**Locked by**: [octocat/hello-world#2]")
 	})
+}
+
+// A storage failure while loading the plan a pending lock points at stays
+// retryable and keeps the lock pinned. The PR comment carries the fixed line
+// instead of the storage error.
+func TestApplyConfirmCommandCorePlanLoadFailureHidesTheCause(t *testing.T) {
+	const rawCause = "dial tcp 10.1.2.3:3306: connect: connection refused"
+	locks := newApplyConfirmContractLockStore()
+	store := &planLoadFailureStorage{actorAuthStorage: &actorAuthStorage{locks: locks}, err: errors.New(rawCause)}
+	h, mux, comments := newApplyGateContractHandler(t, store)
+	registerCheckStatusRESTHandlers(mux, nil)
+	registerCurrentBaseSchema(t, mux)
+
+	retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+
+	require.Error(t, err)
+	assert.True(t, retry, "an unreadable pending plan is a transient storage failure a durable driver should re-drive")
+	assert.Empty(t, locks.releasedIfPending, "the pending lock must stay pinned while the plan cannot be read")
+	body := requireComment(t, comments, "plan load failure apply-confirm comment")
+	assert.Contains(t, body, "SchemaBot could not load the pending plan for `orders`, so the apply did not start. Run the command again; if it fails again, the SchemaBot server logs have the cause.")
+	assert.NotContains(t, body, "dial tcp")
+	assert.NotContains(t, body, "connection refused")
+}
+
+// A GitHub failure while reading the PR's changed files stays retryable for an
+// apply-confirm, and the PR comment carries the fixed line instead of the
+// request URL and status the GitHub client reports.
+func TestApplyConfirmCommandCorePRChangesCheckFailureHidesTheCause(t *testing.T) {
+	h, mux, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"head": map[string]any{"sha": "abc123", "ref": "feature-branch"},
+			"base": map[string]any{"sha": "def456", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
+			"user": map[string]any{"login": "testuser"},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+
+	require.Error(t, err)
+	assert.True(t, retry, "an unreadable changed-file list is a transient GitHub failure a durable driver should re-drive")
+	body := requireComment(t, comments, "apply-confirm PR changes check failure comment")
+	assert.Contains(t, body, "SchemaBot could not check the schema changes in this PR for `staging`, so the apply did not start. Run the command again; if it fails again, the SchemaBot server logs have the cause.")
+	assert.NotContains(t, body, "github unavailable")
+	assert.NotContains(t, body, "/repos/octocat/hello-world/pulls/1/files")
+}
+
+// planLoadFailureStorage fails every plan read with err.
+type planLoadFailureStorage struct {
+	*actorAuthStorage
+	err error
+}
+
+func (s *planLoadFailureStorage) Plans() storage.PlanStore {
+	return &planLoadFailureStore{err: s.err}
+}
+
+type planLoadFailureStore struct {
+	storage.PlanStore
+	err error
+}
+
+func (s *planLoadFailureStore) Get(context.Context, string) (*storage.Plan, error) {
+	return nil, s.err
 }
 
 func applyConfirmContractLock(owner, pendingPlanID string) *storage.Lock {

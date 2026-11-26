@@ -1383,22 +1383,25 @@ func TestE2EUnstoredPendingRolloutFailsCheckClosed(t *testing.T) {
 	}
 }
 
-// lockRaceStorage answers every conditional lock acquire as if another owner
-// took the lock between the apply's pre-check and its acquire.
+// lockRaceStorage fails every conditional lock acquire with err: with
+// storage.ErrLockHeld it answers as if another owner took the lock between the
+// apply's pre-check and its acquire.
 type lockRaceStorage struct {
 	storage.Storage
+	err error
 }
 
 func (s *lockRaceStorage) Locks() storage.LockStore {
-	return &lockRaceLockStore{LockStore: s.Storage.Locks()}
+	return &lockRaceLockStore{LockStore: s.Storage.Locks(), err: s.err}
 }
 
 type lockRaceLockStore struct {
 	storage.LockStore
+	err error
 }
 
 func (s *lockRaceLockStore) AcquireIfPendingPlanID(context.Context, *storage.Lock, string) error {
-	return storage.ErrLockHeld
+	return s.err
 }
 
 // The primary target (eu) already has the column and us does not, and the PR
@@ -1412,7 +1415,7 @@ func TestE2EConvergedPrimaryApplyLosingTheLockRecordsPendingWork(t *testing.T) {
 		{name: "eu", liveSchema: usersWithEmailSchema},
 		{name: "us", liveSchema: usersBaseSchema},
 	}, api.PlanIndependent, func(st storage.Storage) storage.Storage {
-		return &lockRaceStorage{Storage: st}
+		return &lockRaceStorage{Storage: st, err: storage.ErrLockHeld}
 	})
 	require.NoError(t, svc.Storage().Checks().Upsert(t.Context(), &storage.Check{
 		Repository: "octocat/hello-world", PullRequest: 1, HeadSHA: "abc123", Environment: driftEnv,
@@ -1420,13 +1423,75 @@ func TestE2EConvergedPrimaryApplyLosingTheLockRecordsPendingWork(t *testing.T) {
 	}))
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "Failed to acquire lock")
+	body := awaitCommentContaining(t, apply,
+		"The lock for `webhook_rollout_lock_race` changed while this command ran, so the apply did not start. Run the command again to see who holds it now.")
 	assert.NotContains(t, body, "schemabot apply-confirm", "an apply that lost the lock offers no confirmation")
 
 	requireNoApplies(t, svc, dbName)
 	check := rolloutCheck(t, svc, dbName)
 	assert.Equal(t, "action_required", check.Conclusion, "us still needs the change, so the earlier pass is replaced")
 	assert.True(t, check.HasChanges)
+}
+
+// An apply whose lock acquire fails in storage posts the fixed failure line,
+// never the storage error with its host and driver text, and starts nothing.
+func TestE2EApplyLockAcquireFailureHidesTheCause(t *testing.T) {
+	dbName := "webhook_rollout_lock_fail"
+	svc := setupE2ERolloutServiceWithStorage(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent, func(st storage.Storage) storage.Storage {
+		return &lockRaceStorage{Storage: st, err: errors.New("dial tcp 10.1.2.3:3306: connect: connection refused")}
+	})
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	body := awaitCommentContaining(t, apply,
+		"SchemaBot could not take the lock for `webhook_rollout_lock_fail`, so the apply did not start. Run the command again; if it fails again, the SchemaBot server logs have the cause.")
+	assert.NotContains(t, body, "dial tcp")
+	assert.NotContains(t, body, "connection refused")
+
+	requireNoApplies(t, svc, dbName)
+}
+
+// An apply that starts but cannot move the stored check state to in progress
+// posts the fixed line that says the apply was accepted and how to refresh the
+// check, never the storage error with its host and driver text.
+func TestE2EApplyCheckUpdateFailureHidesTheCause(t *testing.T) {
+	dbName := "webhook_rollout_check_fail"
+	svc := setupE2ERolloutServiceWithStorage(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent, func(st storage.Storage) storage.Storage {
+		return &applyStartCheckFailingStorage{Storage: st, err: errors.New("dial tcp 10.1.2.3:3306: connect: connection refused")}
+	})
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	body := awaitCommentContaining(t, apply,
+		"The apply for `webhook_rollout_check_fail` in `"+driftEnv+"` was accepted, but SchemaBot could not update the required status check, so the check does not show this apply. The apply itself is not affected. Once the apply finishes, run plan again to refresh the check.")
+	assert.NotContains(t, body, "dial tcp")
+	assert.NotContains(t, body, "connection refused")
+}
+
+// applyStartCheckFailingStorage fails the stored check state write an apply
+// makes when it starts: an in-progress row owned by an apply. Plan writes and
+// reads pass through.
+type applyStartCheckFailingStorage struct {
+	storage.Storage
+	err error
+}
+
+func (s *applyStartCheckFailingStorage) Checks() storage.CheckStore {
+	return &applyStartCheckFailingCheckStore{CheckStore: s.Storage.Checks(), err: s.err}
+}
+
+type applyStartCheckFailingCheckStore struct {
+	storage.CheckStore
+	err error
+}
+
+func (s *applyStartCheckFailingCheckStore) Upsert(ctx context.Context, check *storage.Check) error {
+	if check.ApplyID != 0 && check.Status == checkStatusInProgress {
+		return s.err
+	}
+	return s.CheckStore.Upsert(ctx, check)
 }
 
 // afterLockStorage runs onAcquire once, straight after the apply command takes

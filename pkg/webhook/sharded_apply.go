@@ -539,6 +539,8 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 			ETASeconds:       rollup.ETASeconds,
 			ShardsReporting:  rollup.ShardsReporting,
 			RowsTotalPlanned: rollup.RowsTotalPlanned,
+			Throttled:        rollup.Throttled,
+			ThrottleReason:   rollup.ThrottleReason,
 			EstimatedBytes:   estimatedBytes,
 			PlannedShards:    plannedShards,
 			CopiesNoRows:     presentation.ShardedTableCopiesNoRows(changesByTable[key], view.plannedChange(key.namespace, key.table)),
@@ -562,6 +564,8 @@ func shardOperationCopy(op *storage.ApplyOperation, tasks []*storage.Task) prese
 
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
+			Throttled:           t.Throttled,
+			ThrottleReason:      t.ThrottleReason,
 		})
 	}
 	return presentation.ShardOperationCopy(op.State, copies)

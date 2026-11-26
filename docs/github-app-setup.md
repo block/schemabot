@@ -318,6 +318,22 @@ If `webhook-secret` is set in the config, SchemaBot validates the `X-Hub-Signatu
 
 If the secret is not set, signature validation is skipped (useful for local development).
 
+### Rotating the webhook secret
+
+GitHub signs each delivery with one secret, and changing it on GitHub takes effect immediately. To rotate without refusing deliveries, keep the old secret in the config as `previous-webhook-secret` while the change rolls out. SchemaBot accepts a delivery signed with either secret.
+
+1. Deploy the new secret as `webhook-secret` and the old one as `previous-webhook-secret`. SchemaBot reads secrets once at startup, so when the config points at a `secretsmanager:` or `file:` reference, changing the value behind it also needs a restart.
+2. Wait until every pod runs the new config, then change the webhook secret in the GitHub App settings to the new secret. A pod still on the old config refuses deliveries signed with the new secret, and a rolling deploy reaches pods at different times.
+3. Wait until deliveries have arrived since step 2 and none of them logged `webhook delivery verified with the secret being rotated out`, then remove `previous-webhook-secret` and deploy again. A quiet log on its own can also mean no deliveries arrived.
+
+```yaml
+github:
+  webhook-secret: "env:GITHUB_WEBHOOK_SECRET"                    # the new secret
+  previous-webhook-secret: "env:GITHUB_PREVIOUS_WEBHOOK_SECRET"  # the old secret, removed after step 3
+```
+
+`previous-repo-webhook-secret` does the same for `repo-webhook-secret`. In multi-App mode, each entry under `apps:` accepts its own `previous-webhook-secret`; repository webhooks are not served in multi-App mode, so `previous-repo-webhook-secret` there fails startup. Startup also fails when a previous secret is set without the matching current secret, or when either resolves to an empty value, such as an unset environment variable.
+
 ## Repository-level Webhooks (optional)
 
 A single deployment can also accept deliveries from a **repository-level webhook** (a webhook configured directly on a repo, rather than on the GitHub App). This lets several SchemaBot deployments that share one GitHub App all receive the same repo's events. Set a separate secret for these deliveries:
