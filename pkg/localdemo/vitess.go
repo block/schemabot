@@ -1,6 +1,7 @@
 package localdemo
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -36,6 +38,17 @@ const sampleVitessToken = "localscale:localscale"
 // report per-shard progress, which a single-shard sample would not show.
 const SampleShards = 2
 
+// sampleProxyPortStart and sampleProxyPorts are the proxy ports LocalScale
+// allocates inside the container, and how many of them the sample publishes.
+// LocalScale serves two things on this range: the keyspace's edge proxy, which
+// is the vtgate endpoint, and one proxy per deploy branch, which is where an
+// apply runs its DDL. A sample that published only its API would plan fine and
+// fail every apply at "ping branch".
+const (
+	sampleProxyPortStart = 19100
+	sampleProxyPorts     = 32
+)
+
 // releaseVersion matches the versions the release workflow publishes an image
 // for. A development build carries something else (a commit, "dev", or an
 // empty string), and the sample then follows the default branch.
@@ -56,8 +69,10 @@ func localscaleImage(version string) string {
 // ensureVitess starts or reuses this project's Vitess sample. It is two
 // containers: LocalScale, which answers the PlanetScale API against an embedded
 // Vitess cluster, and a MySQL server holding SchemaBot's own state. LocalScale
-// publishes only its API and branch-proxy ports, so SchemaBot's state cannot
-// live inside it.
+// publishes only its API and proxy ports, so SchemaBot's state cannot live
+// inside it. The cluster itself is rebuilt from the seed schema whenever the
+// container restarts, so the sample is a demonstration rather than a database
+// to keep work in.
 func ensureVitess(ctx context.Context, project, version string, report func(string)) (Database, error) {
 	report("Checking Docker")
 	if err := requireLocalDocker(ctx); err != nil {
@@ -90,12 +105,21 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 		if err != nil {
 			return Database{}, err
 		}
+		// The proxy ports are published as one block at a reserved offset, so
+		// two projects can each run a sample without either taking the fixed
+		// ports the compose stack binds.
+		proxyBase, err := reserveHostPortRange(ctx, sampleProxyPorts)
+		if err != nil {
+			return Database{}, err
+		}
 		args := []string{
 			"create", "--name", name,
 			"--label", ownerLabel + "=" + name,
 			"--label", "com.block.schemabot.engine=vitess",
 			"--restart", "unless-stopped",
 			"-p", fmt.Sprintf("127.0.0.1:%d:8080", hostPort),
+			"-p", fmt.Sprintf("127.0.0.1:%d-%d:%d-%d", proxyBase, proxyBase+sampleProxyPorts-1,
+				sampleProxyPortStart, sampleProxyPortStart+sampleProxyPorts-1),
 			"-e", "CONFIG_FILE=" + localscaleConfigPath,
 			image, "localscale",
 		}
@@ -122,7 +146,7 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 			if c.State.Status == "created" {
 				return Database{}, fmt.Errorf("start new sample %s: %w; resolve the Docker error and retry setup", name, err)
 			}
-			return Database{}, fmt.Errorf("start sample %s: %w; if its port is in use, stop the process using that port and retry docker start %s; keep the container to preserve your data and saved connection", name, err, name)
+			return Database{}, fmt.Errorf("start sample %s: %w; if its ports are in use, stop the process holding them and retry docker start %s; keep the container to preserve its saved connection", name, err, name)
 		}
 	}
 	c, err = inspect(ctx, name)
@@ -133,6 +157,10 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 	if len(bindings) != 1 || bindings[0].HostIP != "127.0.0.1" {
 		return Database{}, fmt.Errorf("sample %s must publish one loopback-only port", name)
 	}
+	proxyPorts, err := sampleProxyPortMap(c)
+	if err != nil {
+		return Database{}, fmt.Errorf("read the published proxy ports of sample %s: %w", name, err)
+	}
 	result := Database{
 		Name:         name,
 		APIURL:       "http://" + net.JoinHostPort("127.0.0.1", bindings[0].HostPort),
@@ -141,16 +169,113 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 		StorageDSN:   storage.StorageDSN,
 		Namespace:    sampleVitessDatabase,
 	}
-	// A Vitess target is addressed through the PlanetScale API rather than a
-	// DSN, so the engine is given the endpoint where a SQL engine is given a
-	// connection string.
-	result.DSN = result.APIURL
 
 	report("Waiting for the cluster to come up")
 	if err := waitForLocalscale(ctx, name, result.APIURL); err != nil {
 		return Database{}, err
 	}
+	// The mapping is held in the server's memory, so it is registered on every
+	// start. Without it the API hands out the port the proxy listens on inside
+	// the container, which nothing on the host can reach.
+	if err := postSampleProxyPortMap(ctx, result.APIURL, proxyPorts); err != nil {
+		return Database{}, err
+	}
+	// The database's edge proxy is its vtgate endpoint. The engine reads shards
+	// and schema over it, which is what gives an apply its per-shard progress;
+	// the DDL itself runs over the deploy branch's own proxy.
+	result.DSN, err = sampleVtgateDSN(ctx, result.APIURL, proxyPorts)
+	if err != nil {
+		return Database{}, err
+	}
 	return result, nil
+}
+
+// sampleProxyPortMap reads what host port each of the container's proxy ports
+// is published on. Every port in the range must be there: a missing one would
+// leave the API advertising an address only the container can reach.
+func sampleProxyPortMap(c container) (map[int]int, error) {
+	ports := make(map[int]int, sampleProxyPorts)
+	for internal := sampleProxyPortStart; internal < sampleProxyPortStart+sampleProxyPorts; internal++ {
+		bindings := c.NetworkSettings.Ports[strconv.Itoa(internal)+"/tcp"]
+		if len(bindings) != 1 || bindings[0].HostIP != "127.0.0.1" {
+			return nil, fmt.Errorf("proxy port %d is not published on loopback alone", internal)
+		}
+		host, err := strconv.Atoi(bindings[0].HostPort)
+		if err != nil {
+			return nil, fmt.Errorf("read the host port published for proxy port %d: %w", internal, err)
+		}
+		ports[internal] = host
+	}
+	return ports, nil
+}
+
+// postSampleProxyPortMap tells LocalScale which host port each of its proxy
+// ports is published on, so the addresses it hands out are ones the engine can
+// dial from the host.
+func postSampleProxyPortMap(ctx context.Context, apiURL string, ports map[int]int) error {
+	body, err := json.Marshal(ports)
+	if err != nil {
+		return fmt.Errorf("encode the sample's proxy port map: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL+"/admin/proxy-port-map", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("register the sample's proxy port map: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("register the sample's proxy port map: the cluster answered HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// sampleVtgateDSN reads the sample database's edge proxy and returns it as a
+// MySQL DSN on the host, so the engine can query vtgate for shards and schema.
+func sampleVtgateDSN(ctx context.Context, apiURL string, ports map[int]int) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL+"/admin/edge-addrs", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("read the sample's vtgate endpoint: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("read the sample's vtgate endpoint: the cluster answered HTTP %d", resp.StatusCode)
+	}
+	var edges map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&edges); err != nil {
+		return "", fmt.Errorf("decode the sample's vtgate endpoint: %w", err)
+	}
+	database := sampleOrganization + "/" + sampleVitessDatabase
+	addr, ok := edges[database]
+	if !ok {
+		return "", fmt.Errorf("the sample serves no vtgate endpoint for %s", database)
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("read the sample's vtgate address %q: %w", addr, err)
+	}
+	internal, err := strconv.Atoi(port)
+	if err != nil {
+		return "", fmt.Errorf("read the sample's vtgate port %q: %w", port, err)
+	}
+	host, ok := ports[internal]
+	if !ok {
+		return "", fmt.Errorf("the sample's vtgate listens on port %d, outside the range it publishes", internal)
+	}
+	// The DSN names the keyspace, both because vtgate addresses a keyspace as
+	// the database and because an environment's DSN has to name one.
+	return fmt.Sprintf("root@tcp(%s)/%s", net.JoinHostPort("127.0.0.1", strconv.Itoa(host)), sampleVitessDatabase), nil
 }
 
 // localscaleConfigPath and localscaleSchemaDir are where the sample's
@@ -219,6 +344,9 @@ func localscaleConfig() map[string]any {
 		},
 		"listen_addr":            ":8080",
 		"schema_dir":             localscaleSchemaDir,
+		"proxy_advertise_host":   "127.0.0.1",
+		"proxy_port_start":       sampleProxyPortStart,
+		"proxy_port_end":         sampleProxyPortStart + sampleProxyPorts - 1,
 		"revert_window_duration": "30m",
 		"branch_creation_delay":  "1s",
 		"deploy_request_delay":   "1s",

@@ -43,10 +43,12 @@ type InitCmd struct {
 	Runtime        string       `default:"local" help:"Local runtime identity"`
 	JSON           bool         `name:"json" help:"Return the verified setup result as JSON"`
 
-	// Set by sample setup for a Vitess sample, which the engine addresses
-	// through a PlanetScale-compatible API rather than a DSN.
+	// Set by sample setup for a Vitess sample. The engine reaches such a target
+	// through a PlanetScale-compatible API, named by DSN, and reads shards and
+	// schema over the keyspace's own vtgate endpoint.
 	organization string `kong:"-"`
 	tokenRef     string `kong:"-"`
+	vtgateDSN    string `kong:"-"`
 }
 
 type initResult struct {
@@ -222,6 +224,10 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		connection.APIURL = targetDSN
 		connection.Organization = cmd.organization
 		connection.TokenSecretRef = cmd.tokenRef
+		// DSN on a Vitess environment is the vtgate MySQL endpoint, not the
+		// API: the engine queries shards and schema over it, and storage
+		// isolation reads it as the database connection it is.
+		connection.DSN = cmd.vtgateDSN
 	}
 	registration := localsetup.Registration{
 		Database: cmd.Database, Environment: cmd.Environment, Engine: cmd.Type,
@@ -237,7 +243,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		if err != nil {
 			return nil, err
 		}
-		if err := localsetup.CheckConnection(ctx, cmd.Type, stateDSN); err != nil {
+		if err := localsetup.CheckConnection(ctx, storageDialect(cmd.Type), stateDSN); err != nil {
 			return nil, unregisteredInitError(ctx, fmt.Errorf("check %s before registering runtime: %w", cmd.StorageDSN, err), initCancelledBeforeRegistration)
 		}
 	}

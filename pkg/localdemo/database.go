@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -292,6 +293,45 @@ func reserveHostPort(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	return port, nil
+}
+
+// reserveHostPortRange picks a block of count consecutive free loopback ports.
+// The kernel assigns ports one at a time, so a block is found by holding one
+// and testing the rest beside it; a block that cannot be completed is retried
+// from a different starting port rather than returned part-formed.
+func reserveHostPortRange(ctx context.Context, count int) (int, error) {
+	const attempts = 20
+	var lastErr error
+	for range attempts {
+		start, err := reserveHostPort(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if start+count-1 > 65535 {
+			lastErr = fmt.Errorf("port %d leaves no room for %d ports", start, count)
+			continue
+		}
+		held := make([]net.Listener, 0, count)
+		var cfg net.ListenConfig
+		for port := start; port < start+count; port++ {
+			listener, err := cfg.Listen(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+			if err != nil {
+				lastErr = err
+				break
+			}
+			held = append(held, listener)
+		}
+		taken := len(held)
+		for _, listener := range held {
+			if err := listener.Close(); err != nil {
+				return 0, err
+			}
+		}
+		if taken == count {
+			return start, nil
+		}
+	}
+	return 0, fmt.Errorf("choose %d consecutive sample ports: %w", count, lastErr)
 }
 
 func ready(ctx context.Context, engine, dsn string) error {

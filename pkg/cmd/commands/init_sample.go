@@ -89,7 +89,13 @@ func (cmd *InitCmd) prepareSample(ctx context.Context, g *Globals) error {
 	cmd.Database = "shop"
 	cmd.Environment = "development"
 	cmd.Namespaces = []string{sample.Namespace}
-	cmd.DSN, err = saveInitConnection(cmd.Runtime, cmd.Database, cmd.Environment, "application", sample.DSN)
+	// A Vitess target is named by its PlanetScale-compatible endpoint; its DSN
+	// is the keyspace's vtgate endpoint, saved separately below.
+	target := sample.DSN
+	if cmd.Type == "vitess" {
+		target = sample.APIURL
+	}
+	cmd.DSN, err = saveInitConnection(cmd.Runtime, cmd.Database, cmd.Environment, "application", target)
 	if err != nil {
 		return err
 	}
@@ -100,6 +106,10 @@ func (cmd *InitCmd) prepareSample(ctx context.Context, g *Globals) error {
 	if cmd.Type == "vitess" {
 		cmd.organization = sample.Organization
 		cmd.tokenRef, err = saveInitConnection(cmd.Runtime, cmd.Database, cmd.Environment, "token", sample.Token)
+		if err != nil {
+			return err
+		}
+		cmd.vtgateDSN, err = saveInitConnection(cmd.Runtime, cmd.Database, cmd.Environment, "vtgate", sample.DSN)
 		if err != nil {
 			return err
 		}

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/localsetup"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/stretchr/testify/require"
 )
@@ -113,6 +114,19 @@ func TestStorageDialectForTargetEngine(t *testing.T) {
 	require.Equal(t, "mysql", storageDialect("mysql"))
 	require.Equal(t, "postgres", storageDialect("postgres"))
 	require.Equal(t, "mysql", storageDialect("vitess"))
+}
+
+// The state database is checked before anything is registered, and for a
+// Vitess target that database is MySQL. Checking it with the target's own
+// engine reads a connection string as an API endpoint and refuses it, which
+// would fail every Vitess sample after both its containers were already up.
+func TestVitessStateConnectionIsCheckedAsMySQL(t *testing.T) {
+	const stateDSN = "root@tcp(127.0.0.1:1)/schemabot"
+	asTarget := localsetup.CheckConnection(t.Context(), "vitess", stateDSN)
+	require.ErrorContains(t, asTarget, "endpoint")
+	asStorage := localsetup.CheckConnection(t.Context(), storageDialect("vitess"), stateDSN)
+	require.Error(t, asStorage)
+	require.NotContains(t, asStorage.Error(), "endpoint")
 }
 
 func TestInitAfterSampleUsesIndependentProfile(t *testing.T) {

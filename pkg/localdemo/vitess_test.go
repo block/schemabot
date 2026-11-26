@@ -2,10 +2,16 @@ package localdemo
 
 import (
 	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/block/mysql"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/stretchr/testify/require"
 )
@@ -98,4 +104,101 @@ func TestSampleSeedVSchemaCoversEveryTable(t *testing.T) {
 	sort.Strings(created)
 	sort.Strings(routed)
 	require.Equal(t, created, routed)
+}
+
+// Every proxy port the cluster allocates from has to be published, and on
+// loopback alone. A port left unpublished would make the API hand the engine an
+// address only the container can reach, and an apply would fail at "ping
+// branch" after the plan had already succeeded.
+func TestSampleProxyPortMapRequiresEveryPublishedPort(t *testing.T) {
+	full := sampleContainerWithProxyPorts(50000)
+	ports, err := sampleProxyPortMap(full)
+	require.NoError(t, err)
+	require.Len(t, ports, sampleProxyPorts)
+	require.Equal(t, 50000, ports[sampleProxyPortStart])
+	require.Equal(t, 50000+sampleProxyPorts-1, ports[sampleProxyPortStart+sampleProxyPorts-1])
+
+	missing := sampleContainerWithProxyPorts(50000)
+	delete(missing.NetworkSettings.Ports, strconv.Itoa(sampleProxyPortStart+3)+"/tcp")
+	_, err = sampleProxyPortMap(missing)
+	require.ErrorContains(t, err, strconv.Itoa(sampleProxyPortStart+3))
+
+	exposed := sampleContainerWithProxyPorts(50000)
+	exposed.NetworkSettings.Ports[strconv.Itoa(sampleProxyPortStart+1)+"/tcp"][0].HostIP = "0.0.0.0"
+	_, err = sampleProxyPortMap(exposed)
+	require.ErrorContains(t, err, "loopback")
+}
+
+// The sample reads its vtgate endpoint from the cluster and translates it to
+// the host, so the engine queries shards and schema over an address it can
+// reach. The port the cluster reports is its own; only the published one works.
+func TestSampleVtgateDSNTranslatesToThePublishedPort(t *testing.T) {
+	var posted map[int]int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/admin/proxy-port-map":
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&posted))
+			_, err := w.Write([]byte(`{"ok":true}`))
+			require.NoError(t, err)
+		case "/admin/edge-addrs":
+			_, err := fmt.Fprintf(w, `{%q:"0.0.0.0:%d"}`, sampleOrganization+"/"+sampleVitessDatabase, sampleProxyPortStart+2)
+			require.NoError(t, err)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	ports, err := sampleProxyPortMap(sampleContainerWithProxyPorts(50000))
+	require.NoError(t, err)
+	require.NoError(t, postSampleProxyPortMap(t.Context(), server.URL, ports))
+	require.Equal(t, ports, posted)
+
+	dsn, err := sampleVtgateDSN(t.Context(), server.URL, ports)
+	require.NoError(t, err)
+	require.Equal(t, "root@tcp(127.0.0.1:50002)/"+sampleVitessDatabase, dsn)
+
+	cfg, err := mysql.ParseDSN(dsn)
+	require.NoError(t, err)
+	require.Equal(t, sampleVitessDatabase, cfg.DBName, "an environment's DSN has to name a database")
+}
+
+// A vtgate endpoint outside the published range is reported rather than turned
+// into a DSN that cannot be dialed.
+func TestSampleVtgateDSNRejectsAnUnpublishedPort(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, err := fmt.Fprintf(w, `{%q:"0.0.0.0:3306"}`, sampleOrganization+"/"+sampleVitessDatabase)
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+	ports, err := sampleProxyPortMap(sampleContainerWithProxyPorts(50000))
+	require.NoError(t, err)
+	_, err = sampleVtgateDSN(t.Context(), server.URL, ports)
+	require.ErrorContains(t, err, "outside the range it publishes")
+}
+
+// The proxy ports are published as one block at a reserved offset, so two
+// projects can each run a sample instead of competing for fixed ports.
+func TestReserveHostPortRangeIsContiguousAndFree(t *testing.T) {
+	start, err := reserveHostPortRange(t.Context(), 8)
+	require.NoError(t, err)
+	var cfg net.ListenConfig
+	for port := start; port < start+8; port++ {
+		listener, err := cfg.Listen(t.Context(), "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		require.NoError(t, err, "port %d was reported free", port)
+		require.NoError(t, listener.Close())
+	}
+}
+
+// sampleContainerWithProxyPorts describes a container publishing the sample's
+// whole proxy range on loopback, starting at hostStart.
+func sampleContainerWithProxyPorts(hostStart int) container {
+	var c container
+	c.NetworkSettings.Ports = map[string][]struct{ HostIP, HostPort string }{}
+	for i := range sampleProxyPorts {
+		c.NetworkSettings.Ports[strconv.Itoa(sampleProxyPortStart+i)+"/tcp"] = []struct{ HostIP, HostPort string }{
+			{HostIP: "127.0.0.1", HostPort: strconv.Itoa(hostStart + i)},
+		}
+	}
+	return c
 }

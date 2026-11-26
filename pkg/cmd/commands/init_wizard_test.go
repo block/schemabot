@@ -748,3 +748,22 @@ func TestInitSkippedTablesFlattensEveryNamespace(t *testing.T) {
 	}))
 	require.Nil(t, initSkippedTables(nil))
 }
+
+// The sample is how a Vitess target is set up: the organization and service
+// token the engine needs come from sample setup, not from flags. So the engine
+// check passes a Vitess sample through and sends anyone naming a Vitess
+// database by hand to the sample instead of failing with the SQL engines.
+func TestInitAcceptsVitessOnlyAsASample(t *testing.T) {
+	sample := InitCmd{
+		Database: "shop", Environment: "development", Type: "vitess", DSN: "env:APP",
+		StorageDSN: "env:STATE", Namespaces: []string{"shop"}, Sample: true, NonInteractive: true,
+	}
+	require.NoError(t, sample.collectInputsWithTerminalState(t.Context(), &Globals{}, false, false))
+
+	byHand := InitCmd{
+		Database: "shop", Environment: "development", Type: "vitess", DSN: "env:APP",
+		StorageDSN: "env:STATE", Namespaces: []string{"shop"}, NonInteractive: true,
+	}
+	err := byHand.collectInputsWithTerminalState(t.Context(), &Globals{}, false, false)
+	require.ErrorContains(t, err, "init --sample --type vitess")
+}
