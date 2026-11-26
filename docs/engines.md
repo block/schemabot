@@ -260,7 +260,8 @@ described above, and it is not on the PostgreSQL roadmap today.
 Until the copy lands, a PostgreSQL change is kept safe by bounding work rather than pacing it. Only
 a small set of statement shapes is allowed at all, which is why a `DROP TABLE` never reaches the
 database. A statement the planner predicts will rewrite the table is blocked at plan time, whatever
-the table's size, and any other `ALTER TABLE` is refused above the configured table size limit.
+the table's size, and any other `ALTER TABLE` is refused above the configured table size limit
+unless it changes only the catalog (see [Catalog-only changes](postgresql.md#catalog-only-changes)).
 Below it, the bounded attempt described above is what stands in for a copy: the change is tried
 once, and if the prediction was wrong and it does rewrite, its own budget cancels it rather than
 letting it hold a lock. Some
