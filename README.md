@@ -8,9 +8,6 @@
 
 <p align="center">
   <a href="https://github.com/block/schemabot/actions/workflows/vulncheck.yaml?query=branch%3Amain"><img alt="Vulnerability Scan" src="https://github.com/block/schemabot/actions/workflows/vulncheck.yaml/badge.svg?branch=main" /></a>
-</p>
-
-<p align="center">
   <img alt="MySQL: GA" src="https://img.shields.io/badge/MySQL-GA-brightgreen" />
   <img alt="Vitess: GA" src="https://img.shields.io/badge/Vitess-GA-brightgreen" />
   <img alt="PostgreSQL: beta" src="https://img.shields.io/badge/PostgreSQL-beta-yellow" />
