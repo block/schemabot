@@ -62,7 +62,7 @@ type CLI struct {
 	Settings   commands.SettingsCmd   `cmd:"" help:"View or update schema change settings"`
 	Checks     commands.ChecksCmd     `cmd:"" help:"Manage SchemaBot Check Runs on PRs"`
 	Storage    commands.StorageCmd    `cmd:"" help:"Inspect and maintain SchemaBot's own storage database"`
-	Local      commands.LocalCmd      `cmd:"" hidden:"" help:"Internal local runtime host"`
+	Local      commands.LocalCmd      `cmd:"" help:"Inspect or stop the local runtime for the active profile"`
 	Serve      commands.ServeCmd      `cmd:"" help:"Start the SchemaBot HTTP API server"`
 }
 
