@@ -144,6 +144,9 @@ func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	if errors.Is(err, client.ErrLockHeld) {
 		return fmt.Errorf("database is locked by another user")
 	}
+	if client.ServerMayHaveActed(err) {
+		return reportUnansweredLockAcquire(ep, database, dbType, owner, existingLock, true, err)
+	}
 	if err != nil {
 		return fmt.Errorf("acquire lock: %w", err)
 	}

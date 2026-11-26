@@ -25,15 +25,24 @@ import (
 // without an answer when dropRelease is set. The plan carries no plan ID when
 // planWithoutID is set. It counts the releases the CLI sends and fails the
 // test when one names anything but the lock the command took.
+//
+// The acquire is read and then dropped without an answer when dropAcquire is
+// set. A lock lookup answers lockBefore until the acquire arrives and
+// lockAfter once it has, each a lock body or "" for no lock; lockAfterStatus,
+// when set, answers the lookups after the acquire with that status instead.
 type unsubmittedLockServer struct {
-	planWithoutID bool
-	acquireBody   string
-	onAcquire     func()
-	applyStatus   int
-	applyBody     string
-	releaseStatus int
-	releaseBody   string
-	dropRelease   bool
+	planWithoutID   bool
+	acquireBody     string
+	dropAcquire     bool
+	lockBefore      string
+	lockAfter       string
+	lockAfterStatus int
+	onAcquire       func()
+	applyStatus     int
+	applyBody       string
+	releaseStatus   int
+	releaseBody     string
+	dropRelease     bool
 }
 
 func (s unsubmittedLockServer) start(t *testing.T) (*httptest.Server, *atomic.Int32) {
@@ -50,6 +59,7 @@ func (s unsubmittedLockServer) start(t *testing.T) (*httptest.Server, *atomic.In
 	require.NoError(t, err)
 
 	var releases atomic.Int32
+	var acquired atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		status := http.StatusOK
@@ -61,9 +71,36 @@ func (s unsubmittedLockServer) start(t *testing.T) (*httptest.Server, *atomic.In
 			body = rollbackBody
 		case "GET /api/status":
 			body = []byte(`{}`)
+		case "GET /api/locks/testdb/mysql":
+			lock := s.lockBefore
+			if acquired.Load() {
+				lock = s.lockAfter
+				if s.lockAfterStatus != 0 {
+					status = s.lockAfterStatus
+					lock = ""
+				}
+			}
+			switch {
+			case status != http.StatusOK:
+				body = []byte(`{"error":"storage unavailable"}`)
+			case lock == "":
+				status = http.StatusNotFound
+				body = []byte(`{"error":"lock not found"}`)
+			default:
+				body = []byte(`{"lock":` + lock + `}`)
+			}
 		case "POST /api/locks/acquire":
+			acquired.Store(true)
 			if s.onAcquire != nil {
 				s.onAcquire()
+			}
+			if s.dropAcquire {
+				conn, _, hijackErr := http.NewResponseController(w).Hijack()
+				if !assert.NoError(t, hijackErr, "hijack the lock acquire connection") {
+					return
+				}
+				utils.CloseAndLog(conn)
+				return
 			}
 			body = []byte(s.acquireBody)
 		case "POST /api/apply":
@@ -93,8 +130,7 @@ func (s unsubmittedLockServer) start(t *testing.T) (*httptest.Server, *atomic.In
 				body = []byte(`{}`)
 			}
 		default:
-			// The active-apply preflight and the free-lock lookup both read a
-			// miss as "nothing there".
+			// The active-apply preflight reads a miss as "nothing there".
 			status = http.StatusNotFound
 			body = []byte(`{"error":"not found"}`)
 		}
