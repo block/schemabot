@@ -391,5 +391,9 @@ func TestPlansListHandlerStorageError(t *testing.T) {
 	mux.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
-	assert.Contains(t, w.Body.String(), "failed to list plans")
+	var resp apitypes.ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, apitypes.ErrCodeStorageError, resp.ErrorCode)
+	assert.Equal(t, "failed to list plans; see server logs", resp.Error)
+	assert.NotContains(t, w.Body.String(), assert.AnError.Error())
 }

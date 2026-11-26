@@ -292,6 +292,39 @@ func settledApplyFailure(c *storage.Check) bool {
 	return c.ApplyID != 0 && c.Status == checkStatusCompleted && c.Conclusion == checkConclusionFailure
 }
 
+// failedPlan reports whether c is one of this deployment's own databases
+// whose plan failed before any apply started: no schema change ran against the
+// database.
+func failedPlan(c *storage.Check) bool {
+	if isAggregateCheck(c) || isParticipantCheck(c) {
+		return false
+	}
+	return c.ApplyID == 0 && c.Status == checkStatusCompleted && c.Conclusion == checkConclusionFailure
+}
+
+// failedAggregateTitle names what failed in a failing aggregate. A failed
+// apply means a schema change ran against a database, so it names the Check
+// Run whenever one is present. When every failing row is a failed plan, the
+// title says the plan failed: "Apply failed" would tell the reader their
+// database was changed when nothing ran. Any other mix keeps "Apply failed".
+func failedAggregateTitle(checks []*storage.Check) string {
+	planFailures := 0
+	for _, c := range checks {
+		switch {
+		case settledApplyFailure(c):
+			return "Apply failed"
+		case failedPlan(c):
+			planFailures++
+		case failsAggregate(c):
+			return "Apply failed"
+		}
+	}
+	if planFailures > 0 {
+		return planFailedCheckText
+	}
+	return "Apply failed"
+}
+
 // failedApplyRemedyBudget bounds the failed-apply remedy, so a pull request
 // with many failed databases still leaves the table its room under the Check
 // Run text limit.
@@ -364,6 +397,24 @@ func anyInProgressOnCommit(checks []*storage.Check, headSHA string) bool {
 	return false
 }
 
+// failsAggregate reports whether a completed check fails the aggregate: a
+// success that still carries a blocking reason, or any conclusion other than
+// success or action required.
+func failsAggregate(c *storage.Check) bool {
+	if c.Status != checkStatusCompleted {
+		return false
+	}
+	if c.BlockingReason != "" && c.Conclusion == checkConclusionSuccess {
+		return true
+	}
+	switch c.Conclusion {
+	case checkConclusionSuccess, checkConclusionActionRequired:
+		return false
+	default:
+		return true
+	}
+}
+
 // computeAggregate determines the aggregate conclusion and status from
 // per-database checks. stopped names the applies resting in the stopped state;
 // nil reads as "nothing is stopped".
@@ -386,18 +437,8 @@ func computeAggregate(checks []*storage.Check, stopped stoppedApplyIDs) (conclus
 
 	// Every remaining check is completed or held by a stopped apply — compute
 	// the conclusion.
-	for _, c := range checks {
-		if c.Status != checkStatusCompleted {
-			continue
-		}
-		if c.BlockingReason != "" && c.Conclusion == checkConclusionSuccess {
-			return checkConclusionFailure, checkStatusCompleted
-		}
-		switch c.Conclusion {
-		case checkConclusionSuccess, checkConclusionActionRequired:
-		default:
-			return checkConclusionFailure, checkStatusCompleted
-		}
+	if slices.ContainsFunc(checks, failsAggregate) {
+		return checkConclusionFailure, checkStatusCompleted
 	}
 	if heldByStoppedApply {
 		return checkConclusionActionRequired, checkStatusCompleted
@@ -424,7 +465,7 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		}
 		summary = buildAggregateTable(checks, stopped, progress)
 	case checkConclusionFailure:
-		title = "Apply failed"
+		title = failedAggregateTitle(checks)
 		remedy := failedApplyRemedy(checks, tenant)
 		summary = buildAggregateTableWithin(checks, stopped, progress, len(remedy)) + remedy
 	case checkConclusionActionRequired:
