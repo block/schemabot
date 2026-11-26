@@ -1385,13 +1385,37 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 	return s.stopApply(ctx, client, apply, ternApplyID, caller)
 }
 
+// stopRefusals maps every engine to the reason a stop of its schema change is
+// refused, or to "" when the engine can stop. An engine with no stopped phase
+// declines every stop, so accepting one would record an operator's command
+// that can never take effect; the stop is refused before anything is recorded,
+// with the command to use instead, matching what presentation.StopCommand
+// offers. TestStopRefusalsClassifyEveryEngine keeps
+// the map complete.
+var stopRefusals = map[string]string{
+	storage.EngineSpirit:      "",
+	storage.EngineStrata:      "",
+	storage.EnginePlanetScale: "stop is not supported for this schema change; use cancel to permanently cancel it",
+	storage.EnginePostgres:    "stop is not supported for PostgreSQL schema changes: each statement runs until it commits or fails. Use cancel to end a concurrent index build that is still running",
+}
+
+// stopRefusalForEngine reports whether a stop of a schema change on engine is
+// refused, and the operator-facing reason. An engine outside stopRefusals is
+// left to decline the stop itself.
+func stopRefusalForEngine(engine string) (string, bool) {
+	refusal := stopRefusals[engine]
+	return refusal, refusal != ""
+}
+
 // stopApply records durable stop intent for an apply under a caller already
 // resolved and checked, and attempts an immediate local stop. Its returns are
 // those of executeStopForApply.
 func (s *Service) stopApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.StopResponse, int, error) {
-	if apply.Engine == storage.EnginePlanetScale {
+	if refusal, refused := stopRefusalForEngine(apply.Engine); refused {
+		s.logger.Info("operator: refused a stop because the apply's engine has no stopped phase",
+			append(apply.LogAttrs(), "requested_by", caller)...)
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
-		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "stop is not supported for this schema change; use cancel to permanently cancel it")
+		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "%s", refusal)
 	}
 	resp, responseStatus, err := s.queueStopForApplyOwner(ctx, apply, caller)
 	if err != nil {

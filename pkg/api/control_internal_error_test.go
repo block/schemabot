@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -211,6 +213,30 @@ func TestControlRoutesAnswerNotAttemptedBeforeTheOperation(t *testing.T) {
 			assert.Equal(t, "cutover", line["operation"])
 		})
 	}
+}
+
+// Every engine is classified as one that can stop or one whose stops are
+// refused before anything is recorded, so a new engine cannot accept stops it
+// will never honor.
+func TestStopRefusalsClassifyEveryEngine(t *testing.T) {
+	assert.ElementsMatch(t, storage.Engines, slices.Collect(maps.Keys(stopRefusals)))
+}
+
+// A stop of a PostgreSQL schema change is refused up front: the engine has no
+// stopped phase, so the request is never recorded and the operator is pointed
+// at cancel.
+func TestStopOfPostgresApplyIsRefusedBeforeItIsRecorded(t *testing.T) {
+	apply := activeTestApply("apply-postgres-stop")
+	apply.Engine = storage.EnginePostgres
+	apply.DatabaseType = storage.DatabaseTypePostgres
+	requests := &memoryControlRequestStore{}
+	svc := newControlInternalErrorService(&staticApplyStore{apply: apply}, requests, slog.New(slog.DiscardHandler))
+
+	w, resp := postControlRoute(t, svc, "/api/stop")
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Equal(t, "stop rejected: stop is not supported for PostgreSQL schema changes: each statement runs until it commits or fails. Use cancel to end a concurrent index build that is still running", resp.Error)
+	assert.Empty(t, requests.requests, "a refused stop records no control request")
 }
 
 // A refusal the requester caused or must act on keeps its own text and its 4xx
