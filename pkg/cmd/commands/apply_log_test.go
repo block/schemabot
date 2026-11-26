@@ -182,7 +182,7 @@ func TestLogEmitter_EmitTableStateChange(t *testing.T) {
 			status:     state.Apply.Recovering,
 			pct:        42,
 			wantMsg:    "Row copy in progress during restart recovery",
-			wantFields: []string{"table=users", "progress=42.00%", "rows=420/1,000", "eta=\"2m 0s\""},
+			wantFields: []string{"table=users", "progress=42.00%", "rows=420/1,000", "eta=2m"},
 		},
 		{
 			name:       "cutting over",

@@ -53,31 +53,31 @@ func TestRolledUpTableReadsTheSameInTheCLIAndThePRComment(t *testing.T) {
 			name:    "copying beside targets that completed short of their total",
 			targets: []parityTarget{copying(420), completed(990), completed(990), completed(990)},
 			percent: "85.50%",
-			rows:    "Rows: 3,420 / 4,000 · ETA: 2m 0s",
+			rows:    "Rows: 3,420 / 4,000 · ETA: 2m",
 		},
 		{
 			name:    "a queued target with no estimate",
 			targets: []parityTarget{completed(990), copying(420), queued(0, nil)},
 			percent: "47%",
-			rows:    "Rows: 1,420 / 2,000 across 2 of 3 targets · ETA: ≥ 2m 0s",
+			rows:    "Rows: 1,420 / 2,000 across 2 of 3 targets · ETA: ≥ 2m",
 		},
 		{
 			name:    "a queued target that already reported its rows",
 			targets: []parityTarget{completed(1000), copying(500), queued(9000, nil)},
 			percent: "50%",
-			rows:    "Rows: 1,500 / 2,000 across 2 of 3 targets · ETA: ≥ 2m 0s",
+			rows:    "Rows: 1,500 / 2,000 across 2 of 3 targets · ETA: ≥ 2m",
 		},
 		{
 			name:    "a queued target counted by the plan's estimate",
 			targets: []parityTarget{copying(500), queued(0, new(int64(1000)))},
 			percent: "25%",
-			rows:    "Rows: 500 / ~2k · ETA: ≥ 2m 0s",
+			rows:    "Rows: 500 / ~2k · ETA: ≥ 2m",
 		},
 		{
 			name:    "a throttled target",
 			targets: []parityTarget{{opState: state.ApplyOperation.Running, status: state.Task.Running, copied: 420, total: 1000, eta: 120, throttled: true}, completed(990)},
 			percent: "71.00%" + ui.ThrottledSuffix(true),
-			rows:    "Rows: 1,420 / 2,000 · ETA: 2m 0s",
+			rows:    "Rows: 1,420 / 2,000 · ETA: 2m",
 		},
 	}
 	for _, tc := range cases {

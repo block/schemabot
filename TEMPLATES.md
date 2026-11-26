@@ -6493,7 +6493,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
-- Rows: 87,231 / 523,140 · ~157 MB · ETA: 7m 0s
+- Rows: 87,231 / 523,140 · ~157 MB · ETA: 7m
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -9754,10 +9754,10 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70.00%
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
-       • Rows: 2,800,000 / 4,000,000 · ETA: 2m 0s
+       • Rows: 2,800,000 / 4,000,000 · ETA: 2m
        • Shards: 2 (2 copying)
            ◉ -80: 95.24% · 2,000,000 / 2,100,000 rows · ETA: 10s
-           ◉ 80-: 42.11% · 800,000 / 1,900,000 rows · ETA: 2m 0s
+           ◉ 80-: 42.11% · 800,000 / 1,900,000 rows · ETA: 2m
 
 ```
 </details>
@@ -9978,7 +9978,7 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
 │  Deploy Request:     https://app.planetscale.com/my-org/myapp/deploy-requests/48  │
 │  Started:            Jan 15 14:28:00 UTC                                          │
 │  Duration:           30s                                                          │
-│  Revert expires in:  28m 29s                                                      │
+│  Revert expires in:  28m 30s                                                      │
 └───────────────────────────────────────────────────────────────────────────────────┘
 
 
@@ -10139,7 +10139,7 @@ Resuming from checkpoint...
 
      ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 39.75%
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-       • Rows: 158,000 / 397,453 · ETA: 8m 0s
+       • Rows: 158,000 / 397,453 · ETA: 8m
 
      ~ products: ⏳ Queued
        ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -10563,7 +10563,7 @@ ALTER TABLE `orders`
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
-- Rows: 732,116 / 5,864,928 across 4 of 64 targets · ETA: ≥ 23m 0s
+- Rows: 732,116 / 5,864,928 across 4 of 64 targets · ETA: ≥ 23m
 - Targets: 64 (4 copying, 60 queued)
   - ◉ `orders_000`: 12.48% · 183,029 / 1,466,232 rows
   - ◉ `orders_001`: 12.48% · 183,029 / 1,466,232 rows
@@ -11724,7 +11724,7 @@ ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);
 ```sql
 ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);
 ```
-- Rows: 540,211 / 2,000,780 · ~612 MB · ETA: 8m 0s
+- Rows: 540,211 / 2,000,780 · ~612 MB · ETA: 8m
 
 #### Keyspace `cdb_resolute_sharded`
 
@@ -12007,7 +12007,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-       • Rows: 42,000 / 120,000 · ETA: 4m 0s
+       • Rows: 42,000 / 120,000 · ETA: 4m
 
 
 ⏳ ap-south — waiting for eu-west (orders-ap-south)
@@ -12095,7 +12095,7 @@ To retry once the failure above is resolved — a new apply reprocesses only the
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-       • Rows: 42,000 / 120,000 · ETA: 4m 0s
+       • Rows: 42,000 / 120,000 · ETA: 4m
 
 
 ⏸️ ap-south — halted — us-east failed (orders-ap-south)
@@ -12170,10 +12170,10 @@ A new apply can retry the failure once this one finishes or is stopped; it repro
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜ 79%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-       • Rows: 4,093,000 / 4,720,000 across 59 of 64 targets · ETA: ≥ 10m 0s
+       • Rows: 4,093,000 / 4,720,000 across 59 of 64 targets · ETA: ≥ 10m
        • Targets: 64 (1 failed, 19 copying, 4 queued, 40 complete)
            ✗ payments-041: failed
-           ◉ payments-042: 25.00% · 20,000 / 80,000 rows · ETA: 10m 0s
+           ◉ payments-042: 25.00% · 20,000 / 80,000 rows · ETA: 10m
            ◉ payments-043: 28.75% · 23,000 / 80,000 rows · ETA: 9m 35s
            ◉ payments-044: 32.50% · 26,000 / 80,000 rows · ETA: 9m 10s
            ◉ payments-045: 36.25% · 29,000 / 80,000 rows · ETA: 8m 45s
@@ -12262,9 +12262,9 @@ To run the cutover for prod/payments-001:
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 52%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-       • Rows: 168,000 / 240,000 across 3 of 4 targets · ETA: ≥ 4m 0s
+       • Rows: 168,000 / 240,000 across 3 of 4 targets · ETA: ≥ 4m
        • Targets: 4 (2 copying, 1 queued, 1 complete)
-           ◉ payments-001: 45.00% · 36,000 / 80,000 rows · ETA: 4m 0s
+           ◉ payments-001: 45.00% · 36,000 / 80,000 rows · ETA: 4m
            ◉ payments-002: 65.00% · 52,000 / 80,000 rows · ETA: 2m 30s
            ✓ payments-003: 80,000 rows
            ○ payments-004: queued
@@ -13068,7 +13068,7 @@ ESC detach • s stop
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.42%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-       • Rows: 42,500 / 120,000 · ETA: 4m 0s
+       • Rows: 42,500 / 120,000 · ETA: 4m
 
 
 ⏳ ap-south — waiting for eu-west (orders-ap-south)

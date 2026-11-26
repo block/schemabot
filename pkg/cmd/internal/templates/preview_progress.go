@@ -333,7 +333,7 @@ func previewVitessRevertWindowOutput() {
 		Metadata: map[string]string{
 			"branch_name":        "schemabot-myapp-28471035",
 			"deploy_request_url": "https://app.planetscale.com/my-org/myapp/deploy-requests/48",
-			"revert_expires_at":  time.Now().Add(28*time.Minute + 30*time.Second).Format(time.RFC3339),
+			"revert_expires_at":  previewTime.Add(28*time.Minute + 30*time.Second).Format(time.RFC3339),
 		},
 		Tables: []TableProgress{
 			{
