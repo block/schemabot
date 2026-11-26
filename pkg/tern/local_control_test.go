@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -3323,6 +3324,34 @@ func TestLocalClient_StartSkipsTerminalTablesOfTheSameApply(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), startedCount, "only the resting table is resumed")
 	assert.Equal(t, int64(1), skippedCount, "the finished table is reported as skipped, not silently dropped")
+}
+
+// A sharded apply runs only some of its shards at once, so a stop lands while
+// the rest are still queued. Start resumes the stopped shards and leaves the
+// queued ones for the resumed drive to start in turn. A queued shard is the
+// expected shape of that apply, so it is counted rather than warned about once
+// per shard.
+func TestLocalClient_StartLeavesQueuedTasksForTheResumedDrive(t *testing.T) {
+	apply, resting := restingStartApply(state.Task.Stopped, time.Minute)
+	queued := &storage.Task{
+		ID: 94, ApplyID: apply.ID, TaskIdentifier: "task-still-queued",
+		Database: "testdb", Namespace: "testdb", TableName: "orders", Shard: "-80",
+		State: state.Task.Pending, UpdatedAt: time.Now(),
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{resting, queued}, &controlCaptureEngine{})
+	var logged bytes.Buffer
+	client.logger = slog.New(slog.NewTextHandler(&logged, nil))
+
+	resolved, startedCount, skippedCount, err := client.resolveStartRequest(t.Context(),
+		&ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, int64(1), startedCount, "only the stopped task is resumed")
+	assert.Equal(t, int64(0), skippedCount, "a queued task has not finished, so it is not skipped")
+	assert.NotContains(t, logged.String(), "level=WARN", "a queued task is expected, not a degraded state")
+	assert.Contains(t, logged.String(), `msg="Start: resolved resumable work"`)
+	assert.Contains(t, logged.String(), "queued_count=1")
 }
 
 // Every task of the apply already finished, so there is nothing to resume — but

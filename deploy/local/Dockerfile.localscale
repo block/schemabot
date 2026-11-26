@@ -4,12 +4,17 @@
 # which includes vtcombo, mysqlctl, MySQL 8.4, curl, and per-shard-sidecar support.
 #
 # Build:
-#   CGO_ENABLED=0 GOOS=linux go build -o bin/localscale-linux ./cmd/localscale
+#   CGO_ENABLED=0 GOOS=linux go build -o bin/localscale-linux-$(go env GOARCH) ./cmd/localscale
 #   docker build -f deploy/local/Dockerfile.localscale -t localscale:latest .
 
 FROM ghcr.io/block/vitess/vttestserver:24.0.5-block.2-mysql84
 
-COPY --chown=vitess:vitess bin/localscale-linux /vt/bin/localscale
+# The binary is cross-compiled outside this file rather than in a build stage,
+# so each platform's leg copies in the binary built for it. TARGETARCH is the
+# builder's own: a plain build fills it in from the host, and a multi-platform
+# build sets it per leg.
+ARG TARGETARCH
+COPY --chown=vitess:vitess bin/localscale-linux-${TARGETARCH} /vt/bin/localscale
 COPY --chmod=755 deploy/local/localscale-entrypoint.sh /vt/entrypoint.sh
 
 # Run entrypoint as root so it can fix volume permissions, then drop to vitess.

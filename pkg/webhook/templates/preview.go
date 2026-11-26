@@ -2760,6 +2760,48 @@ func PreviewCommentMultiEnvPlanError() string {
 	})
 }
 
+// PreviewCommentMultiEnvPlanRefusedStatements renders a sample
+// multi-environment plan comment where staging's schema files declare
+// statements the engine cannot plan: each one is listed with its file, line,
+// fix and opening line, and the footer asks for a push rather than a re-run.
+func PreviewCommentMultiEnvPlanRefusedStatements() string {
+	refusal := "plan PostgreSQL schema: 3 statements in the schema files cannot be planned"
+	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		IsMySQL:      false,
+		DatabaseType: "postgres",
+		RequestedBy:  previewRequestedBy,
+		Environments: []string{"staging"},
+		Plans:        map[string]*PlanCommentData{},
+		Errors:       map[string]string{"staging": refusal},
+		PlanProblems: map[string]RefusedStatements{
+			"staging": {Problems: []engine.PlanProblem{
+				{
+					File:      "testapp/accounts.sql",
+					Line:      7,
+					Message:   "SchemaBot doesn't manage comments. Remove the COMMENT statement from this file and set the comment on the database directly.",
+					Statement: "COMMENT ON TABLE accounts IS 'People who can place orders'",
+				},
+				{
+					File:      "testapp/orders.sql",
+					Line:      12,
+					Message:   "SchemaBot doesn't manage functions. Create set_updated_at() outside SchemaBot and remove it from this file.",
+					Statement: "CREATE FUNCTION set_updated_at() RETURNS trigger AS $$\nBEGIN\n  NEW.updated_at := now();\n  RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql",
+				},
+				{
+					File:      "testapp/orders.sql",
+					Line:      19,
+					Message:   "SchemaBot doesn't manage triggers. Create orders_updated_at outside SchemaBot and remove it from this file.",
+					Statement: "CREATE TRIGGER orders_updated_at BEFORE UPDATE ON orders\n  FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
+				},
+			}},
+		},
+	})
+}
+
 // PreviewCommentMultiEnvPlanDiff renders a sample multi-environment plan comment
 // where staging and production have different changes (separate sections).
 func PreviewCommentMultiEnvPlanDiff() string {

@@ -1842,12 +1842,17 @@ func (e *Engine) cancelIndexBuildsLocked(selected func(*trackedApply) bool) int 
 	return halted
 }
 
+// StopUnsupportedReason is why PostgreSQL declines every stop. The control
+// plane refuses a stop with the same text, so the refusal and a stored stop's
+// ErrorMessage agree.
+const StopUnsupportedReason = "stop is not supported for PostgreSQL schema changes: concurrent index builds have no resumable midpoint, and other statements commit or fail on their own"
+
 // Stop declines: a concurrent index build has no resumable midpoint, so stop
 // would be a permanent cancel under a misleading name. Other PostgreSQL DDL
 // also has no engine phase to pause. The typed decline lets the control path
 // resolve a durable stop request terminally instead of retrying it.
 func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, engine.NewUnsupportedOperationError("stop is not supported for PostgreSQL schema changes: concurrent index builds have no resumable midpoint, and other statements commit or fail on their own")
+	return nil, engine.NewUnsupportedOperationError(StopUnsupportedReason)
 }
 
 // Start declines: PostgreSQL schema changes cannot be stopped, so there is

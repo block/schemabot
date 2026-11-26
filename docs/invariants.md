@@ -1543,24 +1543,28 @@ identifier within its own database and environment scope (`resolveControlApply` 
 
 Only Spirit can pause a change. A Spirit stop checkpoints the copy, the apply settles as
 `stopped`, and `start` resumes it from there. A PlanetScale deploy request has no pause: it runs
-or it ends. The tempting shortcut is to honor a stop there by cancelling, since cancelling does
+or it ends. A PostgreSQL statement has none either: it runs until it commits or fails. The tempting shortcut is to honor a stop there by cancelling, since cancelling does
 take the load off the database. SchemaBot does not, because an operator asking to pause has said
 they intend to resume, and a cancel is permanent. The stop is refused instead, with a `400` naming
-`cancel` as the operation that does what the engine can actually do. Nothing durable is recorded,
+`cancel` as the operation that does what the engine can actually do, wherever it can. Nothing durable is recorded,
 so there is no request left pending against an engine that will never service it.
 
-The refusal is decided before any work is attempted, and it is enforced twice: once in the service
-method both the CLI and the PR surface reach, and again in the data plane on the target's database
-type, so a stop arriving by any route meets the same answer.
+The refusal is decided before any work is attempted, in the service method the CLI, the PR
+surface, and a freeze's stop sweep all reach. A stop that arrives by another route still meets a
+refusal that reports no pause, and each engine upholds that its own way. A PlanetScale stop is also
+refused at data-plane intake on the target's database type. A PostgreSQL stop that reaches the
+engine is declined with a typed unsupported-operation error, so the request settles as a command
+that did not take effect while the change runs on.
 
-Where a stop against such an engine does exist in storage, written by an earlier release, settling
-it must still not report a pause. Those records terminalize to `cancelled`, decided in one place
-from the database type rather than inferred wherever a result is rendered, and keyed on the type
+Where a PlanetScale stop does exist in storage, written by an earlier release, settling it must
+still not report a pause. Those records terminalize to `cancelled`, decided in one place from the
+database type rather than inferred wherever a result is rendered, and keyed on the type
 specifically so an apply that never reached a data plane settles the same way with no engine
 instance anywhere to ask. *Breaks if violated:* an operator asks for a pause, is told the change is
-`stopped`, waits to resume, and it is already dead. *Enforced:* the engine refusal
-(`pkg/api/control_handlers.go`, `pkg/tern/local_control.go`) and the single stop-terminality
-decision behind it (`pkg/tern/stop_terminality.go`).
+`stopped`, waits to resume, and it is already dead. *Enforced:* the intake refusal (`stopRefusals`,
+which classifies every engine, in `pkg/api/control_handlers.go`); the data-plane refusal
+(`pkg/tern/local_control.go`) and the stop-terminality decision behind it
+(`pkg/tern/stop_terminality.go`); and the PostgreSQL engine's `Stop` (`pkg/engine/postgres/postgres.go`).
 
 ### CO-9: Control operations are stateless
 

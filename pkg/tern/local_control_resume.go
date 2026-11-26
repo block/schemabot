@@ -160,7 +160,7 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 		return nil, 0, 0, fmt.Errorf("schema change is not stopped (current state: %s)", apply.State)
 	}
 
-	var startedCount, skippedCount int64
+	var startedCount, skippedCount, queuedCount int64
 	var unresumable []string
 	for _, task := range tasks {
 		if task.ApplyID != apply.ID {
@@ -170,6 +170,16 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 			// Settled by an earlier drive: the table needs no resuming, and the
 			// count is what tells the operator how much of the change is done.
 			skippedCount++
+			continue
+		}
+		if state.IsState(task.State, state.Task.Pending) {
+			// Queued behind the apply's concurrency limit when the stop landed.
+			// It was never started, so there is nothing to resume, and the
+			// resumed drive starts it in turn. That is the expected shape of a
+			// stopped apply with more work than it runs at once, so it is
+			// counted and logged once below rather than warned about per task.
+			unresumable = append(unresumable, task.State)
+			queuedCount++
 			continue
 		}
 		if !state.IsState(task.State, state.Task.Stopped) {
@@ -188,7 +198,8 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 		return nil, 0, 0, c.noResumableWorkError(apply, len(tasks), skippedCount, unresumable)
 	}
 	c.logger.Info("Start: resolved resumable work",
-		append(apply.LogAttrs(), "started_count", startedCount, "skipped_count", skippedCount)...)
+		append(apply.LogAttrs(), "started_count", startedCount, "skipped_count", skippedCount,
+			"queued_count", queuedCount)...)
 	return apply, startedCount, skippedCount, nil
 }
 
