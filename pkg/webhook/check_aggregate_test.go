@@ -356,6 +356,21 @@ func TestAggregateFold_StoppedApplies(t *testing.T) {
 		assert.Equal(t, "Apply failed", title)
 	})
 
+	// The stopped row is waiting on an operator, not failed, so the only
+	// failure is the plan: the title names it and the table still lists the
+	// stopped apply.
+	t.Run("a failed plan beside a stopped apply", func(t *testing.T) {
+		failedPlan := &storage.Check{
+			DatabaseName: "users", DatabaseType: "mysql", Environment: "production",
+			Status: checkStatusCompleted, Conclusion: checkConclusionFailure,
+		}
+		conclusion, status, title, summary := fold(stoppedLedger, failedPlan)
+		assert.Equal(t, checkStatusCompleted, status)
+		assert.Equal(t, checkConclusionFailure, conclusion)
+		assert.Equal(t, "Plan failed", title)
+		assert.Contains(t, summary, "ledger", "the table still lists the stopped apply")
+	})
+
 	t.Run("a stopped apply alongside one still running", func(t *testing.T) {
 		conclusion, status, title, _ := fold(running, stoppedLedger)
 		assert.Equal(t, checkStatusInProgress, status)
