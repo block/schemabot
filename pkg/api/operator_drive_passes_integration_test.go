@@ -161,7 +161,7 @@ func TestDrivePassesCarriesARollingRolloutThroughEveryMember(t *testing.T) {
 		"region-c": {taskState: state.Task.Completed},
 	}))
 
-	drivePassesWithin(t, svc.Service, openClaimGate())
+	drivePassesWithin(t, svc.Service, openClaimGate(), passExpectsWork)
 
 	assert.Equal(t, members, rec.resumeOrder(), "every member must be driven, in order, from a single wake")
 	assert.Equal(t, state.Apply.Completed, getApply(t, ctx, stor, seed.applyID).State)
@@ -201,7 +201,7 @@ func TestDrivePassesStopsWhenTheClaimGateClosesMidRun(t *testing.T) {
 	}
 	svc := newMatrixService(t, stor, clients)
 
-	drivePassesWithin(t, svc.Service, stop)
+	drivePassesWithin(t, svc.Service, stop, passExpectsWork)
 
 	assert.Equal(t, []string{"region-a"}, rec.resumeOrder(), "no pass may claim after the claim gate closes")
 	assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.opID("region-a")),
@@ -237,7 +237,7 @@ func TestDrivePassesLeavesARetryableFailureToTheNextTick(t *testing.T) {
 		"region-b": {taskState: state.Task.Completed},
 	}))
 
-	drivePassesWithin(t, svc.Service, openClaimGate())
+	drivePassesWithin(t, svc.Service, openClaimGate(), passExpectsWork)
 
 	assert.Equal(t, 1, rec.resumeCount(), "a retryable failure must not send the driver into another pass")
 	assert.Equal(t, state.ApplyOperation.FailedRetryable, opState(t, ctx, stor, seed.opID("region-a")))

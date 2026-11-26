@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -475,7 +476,9 @@ func TestWritePullSchema_SkippedTablesRenderAsComments(t *testing.T) {
 		})
 	})
 
-	assert.Contains(t, out, "-- Namespace `public` — 1 table\n-- Skipped 2 tables:\n--   audit_log: unlogged tables cannot be rendered as a desired schema\n--   sessions: schema files cannot describe its trigger\n")
+	assert.Contains(t, out, "Skipped")
+	assert.Contains(t, out, glyph.Attention+" 2 tables, not in the output")
+	assert.Contains(t, out, "-- Namespace `public` — 1 table\n-- "+glyph.Attention+" Skipped 2 tables, not in the output:\n--   audit_log: unlogged tables cannot be rendered as a desired schema\n--   sessions: schema files cannot describe its trigger\n")
 	assert.Contains(t, out, "CREATE TABLE orders (id bigint);\n")
 }
 

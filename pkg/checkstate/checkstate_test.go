@@ -125,7 +125,7 @@ func TestDiagnose(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := Diagnose(tt.check, headSHA, tt.apply, "")
+			got := Diagnose(tt.check, headSHA, tt.apply, "", "")
 			assert.Equal(t, tt.reason, got.Reason)
 			assert.Equal(t, tt.blocking, got.Blocking)
 			assert.Equal(t, tt.selfConverging, got.SelfConverging)
@@ -140,7 +140,7 @@ func TestDiagnose(t *testing.T) {
 func TestDiagnoseTreatsAMissingConclusionAsABlock(t *testing.T) {
 	t.Parallel()
 
-	got := Diagnose(&storage.Check{HeadSHA: headSHA, Status: StatusCompleted}, headSHA, nil, "")
+	got := Diagnose(&storage.Check{HeadSHA: headSHA, Status: StatusCompleted}, headSHA, nil, "", "")
 	assert.Equal(t, ReasonBlocked, got.Reason)
 	assert.True(t, got.Blocking)
 }
@@ -159,7 +159,7 @@ func TestDiagnoseClearsOnlyOnSuccess(t *testing.T) {
 			t.Parallel()
 
 			require.True(t, ConclusionClearsGate(conclusion), "precondition: GitHub accepts %q", conclusion)
-			got := Diagnose(&storage.Check{HeadSHA: headSHA, Status: StatusCompleted, Conclusion: conclusion}, headSHA, nil, "")
+			got := Diagnose(&storage.Check{HeadSHA: headSHA, Status: StatusCompleted, Conclusion: conclusion}, headSHA, nil, "", "")
 			assert.Equal(t, ReasonBlocked, got.Reason)
 			assert.True(t, got.Blocking)
 		})
@@ -171,7 +171,7 @@ func TestDiagnoseClearsOnlyOnSuccess(t *testing.T) {
 func TestDiagnoseWithoutAHeadReadsRowsAsCurrent(t *testing.T) {
 	t.Parallel()
 
-	got := Diagnose(&storage.Check{HeadSHA: olderSHA, Status: StatusCompleted, Conclusion: ConclusionSuccess}, "", nil, "")
+	got := Diagnose(&storage.Check{HeadSHA: olderSHA, Status: StatusCompleted, Conclusion: ConclusionSuccess}, "", nil, "", "")
 	require.Equal(t, ReasonResolved, got.Reason)
 	assert.False(t, got.Blocking)
 }
@@ -210,7 +210,8 @@ func TestDiagnoseReadsDurableBlockingReasonsFirst(t *testing.T) {
 			got := Diagnose(&storage.Check{
 				HeadSHA: olderSHA, Status: StatusCompleted,
 				Conclusion: ConclusionActionRequired, BlockingReason: tt.reason,
-			}, headSHA, nil, "")
+			}, headSHA, nil, "", "")
+
 			assert.Equal(t, tt.want, got.Reason)
 			assert.True(t, got.Blocking)
 			assert.Equal(t, tt.selfConverging, got.SelfConverging)
@@ -232,7 +233,8 @@ func TestDiagnoseTellsARollupGuardBlockToReverifyThePullRequest(t *testing.T) {
 				HeadSHA: headSHA, Environment: "production",
 				DatabaseType: AggregateSentinel, DatabaseName: AggregateSentinel,
 				Status: StatusCompleted, Conclusion: ConclusionFailure, BlockingReason: reason,
-			}, headSHA, nil, "")
+			}, headSHA, nil, "", "")
+
 			assert.Equal(t, ReasonGuardBlocked, got.Reason)
 			assert.True(t, got.Blocking)
 			assert.False(t, got.SelfConverging)
@@ -245,7 +247,8 @@ func TestDiagnoseTellsARollupGuardBlockToReverifyThePullRequest(t *testing.T) {
 	row := Diagnose(&storage.Check{
 		HeadSHA: headSHA, Environment: "production", DatabaseType: "mysql", DatabaseName: "orders",
 		Status: StatusCompleted, Conclusion: ConclusionFailure, BlockingReason: BlockNamespacePlacementRefused,
-	}, headSHA, nil, "")
+	}, headSHA, nil, "", "")
+
 	assert.Equal(t, ReasonGuardBlocked, row.Reason)
 	assert.Contains(t, row.Remedy, "`schemabot plan -e <environment>`")
 }
@@ -256,7 +259,7 @@ func TestDiagnoseReadsAStoppedApplyAsOperatorOwned(t *testing.T) {
 	t.Parallel()
 
 	check := &storage.Check{HeadSHA: headSHA, ApplyID: 42, Status: StatusInProgress}
-	got := Diagnose(check, headSHA, &storage.Apply{State: "stopped"}, "")
+	got := Diagnose(check, headSHA, &storage.Apply{State: "stopped"}, "", "")
 	assert.Equal(t, ReasonApplyStopped, got.Reason)
 	assert.True(t, got.Blocking)
 	assert.False(t, got.SelfConverging)
@@ -270,7 +273,7 @@ func TestDiagnoseReadsAnUnreadableOwnerAsUnknown(t *testing.T) {
 	t.Parallel()
 
 	check := &storage.Check{HeadSHA: headSHA, ApplyID: 42, Status: StatusInProgress}
-	got := Diagnose(check, headSHA, nil, "")
+	got := Diagnose(check, headSHA, nil, "", "")
 	assert.Equal(t, ReasonApplyOwnerUnknown, got.Reason)
 	assert.True(t, got.Blocking)
 	assert.False(t, got.SelfConverging)
@@ -285,13 +288,15 @@ func TestDiagnoseReadsASettledRowWithoutItsApply(t *testing.T) {
 
 	resolved := Diagnose(&storage.Check{
 		HeadSHA: headSHA, ApplyID: 42, Status: StatusCompleted, Conclusion: ConclusionSuccess,
-	}, headSHA, nil, "")
+	}, headSHA, nil, "", "")
+
 	assert.Equal(t, ReasonResolved, resolved.Reason)
 	assert.False(t, resolved.Blocking)
 
 	owed := Diagnose(&storage.Check{
 		HeadSHA: headSHA, ApplyID: 42, Status: StatusCompleted, Conclusion: ConclusionActionRequired,
-	}, headSHA, nil, "")
+	}, headSHA, nil, "", "")
+
 	assert.Equal(t, ReasonReconciliationOwed, owed.Reason,
 		"a terminal block stays a reconciliation, not an unknown owner")
 	assert.True(t, owed.Blocking)
@@ -311,7 +316,7 @@ func TestIsAggregateRequiresBothSentinels(t *testing.T) {
 		DatabaseType: "mysql", DatabaseName: AggregateSentinel, HeadSHA: headSHA,
 		Status: StatusCompleted, Conclusion: ConclusionActionRequired,
 	}
-	assert.Equal(t, ReasonBlocked, Diagnose(blocked, headSHA, nil, "").Reason,
+	assert.Equal(t, ReasonBlocked, Diagnose(blocked, headSHA, nil, "", "").Reason,
 		"a database named like the sentinel keeps its own finding")
 }
 
@@ -324,10 +329,10 @@ func TestCoversHeadAgreesWithDiagnoseOnAnUnknownHead(t *testing.T) {
 
 	row := &storage.Check{HeadSHA: olderSHA, Status: StatusCompleted, Conclusion: ConclusionSuccess}
 	require.True(t, CoversHead(row, ""), "an unknown head is not evidence a row is stale")
-	assert.Equal(t, ReasonResolved, Diagnose(row, "", nil, "").Reason)
+	assert.Equal(t, ReasonResolved, Diagnose(row, "", nil, "", "").Reason)
 
 	require.False(t, CoversHead(row, headSHA))
-	assert.Equal(t, ReasonAwaitingPlan, Diagnose(row, headSHA, nil, "").Reason)
+	assert.Equal(t, ReasonAwaitingPlan, Diagnose(row, headSHA, nil, "", "").Reason)
 }
 
 // The blocks only a rollup may clear and the blocks that say work may have
@@ -388,12 +393,12 @@ func TestDiagnoseRowInEnvironmentNotConfigured(t *testing.T) {
 		{
 			name:   "row with a durable block",
 			check:  &storage.Check{HeadSHA: olderSHA, Status: StatusCompleted, Conclusion: ConclusionActionRequired, BlockingReason: "schema_removed_after_apply_started"},
-			reason: Diagnose(&storage.Check{HeadSHA: olderSHA, Status: StatusCompleted, Conclusion: ConclusionActionRequired, BlockingReason: "schema_removed_after_apply_started"}, headSHA, nil, "").Reason,
+			reason: Diagnose(&storage.Check{HeadSHA: olderSHA, Status: StatusCompleted, Conclusion: ConclusionActionRequired, BlockingReason: "schema_removed_after_apply_started"}, headSHA, nil, "", "").Reason,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := Diagnose(tc.check, headSHA, tc.apply, "staging")
+			got := Diagnose(tc.check, headSHA, tc.apply, "staging", "")
 			assert.Equal(t, tc.reason, got.Reason)
 			if tc.reason != ReasonEnvironmentNotConfigured {
 				return
@@ -402,6 +407,86 @@ func TestDiagnoseRowInEnvironmentNotConfigured(t *testing.T) {
 			assert.False(t, got.SelfConverging, "the row clears only after someone plans another environment or pushes")
 			assert.Contains(t, got.Remedy, "`schemabot plan -e staging`", "the remedy names an environment the database is still planned in")
 			assert.Contains(t, got.Remedy, "push a commit")
+		})
+	}
+}
+
+// A reconciliation names the plan of the row's own database, so the command an
+// operator pastes from `checks show` addresses the database that is blocked.
+func TestDiagnoseNamesTheBlockedDatabasesPlan(t *testing.T) {
+	t.Parallel()
+
+	got := Diagnose(&storage.Check{
+		HeadSHA: headSHA, Environment: "staging", DatabaseType: "mysql", DatabaseName: "inventory",
+		ApplyID: 42, Status: StatusCompleted, Conclusion: ConclusionFailure, BlockingReason: BlockRollbackCompleted,
+	}, headSHA, nil, "", "")
+
+	assert.Equal(t, ReasonReconciliationOwed, got.Reason)
+	assert.Contains(t, got.Remedy, "comment `schemabot plan -e staging -d inventory` on the pull request")
+
+	terminal := Diagnose(&storage.Check{
+		HeadSHA: headSHA, Environment: "production", DatabaseType: "mysql", DatabaseName: "orders",
+		ApplyID: 42, Status: StatusCompleted, Conclusion: ConclusionFailure,
+	}, headSHA, nil, "", "")
+
+	assert.Equal(t, ReasonReconciliationOwed, terminal.Reason)
+	assert.Contains(t, terminal.Remedy, "comment `schemabot plan -e production -d orders` on the pull request")
+}
+
+// A database the pull request stopped changing after its apply started owes a
+// reconciliation, but no apply from this pull request can reach it, so the
+// remedy has the person change the pull request to match the target rather
+// than apply the change again, then plan it. The plan command carries the
+// deployment's tenant, as the Check Run's does.
+func TestDiagnoseSchemaRemovedNamesTheTenantsPlan(t *testing.T) {
+	t.Parallel()
+
+	check := &storage.Check{
+		HeadSHA: headSHA, Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders",
+		ApplyID: 42, Status: StatusCompleted, Conclusion: ConclusionFailure, BlockingReason: BlockSchemaRemovedAfterApplyStarted,
+	}
+	got := Diagnose(check, headSHA, &storage.Apply{ApplyIdentifier: "apply-example-12", State: "failed"}, "", "tenant-a")
+	assert.Equal(t, ReasonReconciliationOwed, got.Reason)
+	assert.True(t, got.Blocking)
+	assert.False(t, got.SelfConverging)
+	assert.Equal(t, MatchTargetRemedy(PlanCommand("staging", "orders", "tenant-a")), got.Remedy)
+	assert.Contains(t, got.Remedy, "`schemabot plan -e staging -d orders --tenant tenant-a`")
+	assert.Contains(t, got.Remedy, "change the pull request to match the target")
+	assert.NotContains(t, got.Remedy, "apply the change again")
+}
+
+// Each reconciliation reason gets the remedy that fits it: a change a rollback
+// undid on purpose, or one the pull request no longer carries, is never offered
+// as something to apply again, while a failed or cancelled apply may be.
+func TestReconciliationRemedyFitsTheBlockingReason(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		reason      string
+		offersRerun bool
+	}{
+		{"rolled back on purpose", BlockRollbackCompleted, false},
+		{"no longer in the pull request", BlockSchemaRemovedAfterApplyStarted, false},
+		{"cancelled after a task completed", BlockApplyCancelledAfterTaskCompleted, true},
+		{"terminal apply with no recorded reason", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := Diagnose(&storage.Check{
+				HeadSHA: headSHA, Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders",
+				ApplyID: 42, Status: StatusCompleted, Conclusion: ConclusionFailure, BlockingReason: tc.reason,
+			}, headSHA, nil, "", "")
+			require.Equal(t, ReasonReconciliationOwed, got.Reason)
+			plan := PlanCommand("staging", "orders", "")
+			if tc.offersRerun {
+				assert.Equal(t, ReconciliationRemedy(plan), got.Remedy)
+				assert.Contains(t, got.Remedy, "apply the change again")
+				return
+			}
+			assert.Equal(t, MatchTargetRemedy(plan), got.Remedy)
+			assert.NotContains(t, got.Remedy, "apply the change again")
 		})
 	}
 }

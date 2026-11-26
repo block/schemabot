@@ -79,7 +79,7 @@ func TestOperator_ReservedDriverHandsADeferredDriveBackAfterDelivery(t *testing.
 			svc := newMatrixService(t, stor, clients)
 			svc.operatorDrivers.Store(2)
 
-			svc.recoverApplyOperation(ctx, reservedDriverID, "reserved-driver")
+			svc.recoverApplyOperation(ctx, reservedDriverID, "reserved-driver", passPolled)
 
 			require.Equal(t, []bool{true}, regionA.deliveryOnly, "the reserved driver's drive runs delivery-only")
 			op, err := stor.ApplyOperations().Get(ctx, seed.opID("region-a"))
@@ -89,7 +89,7 @@ func TestOperator_ReservedDriverHandsADeferredDriveBackAfterDelivery(t *testing.
 			assert.Empty(t, op.LeaseToken, "a handed-back drive must not leave its operation lease on the row")
 			assert.Empty(t, getApply(t, ctx, stor, seed.applyID).LeaseToken, "a handed-back drive must not leave a parent lease on the apply")
 
-			svc.recoverApplyOperation(ctx, reservedDriverID+1, "pool-driver")
+			svc.recoverApplyOperation(ctx, reservedDriverID+1, "pool-driver", passPolled)
 
 			require.Equal(t, []bool{true, false}, regionA.deliveryOnly, "the next pool driver claims the handed-back operation at once")
 			assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.opID("region-a")))
