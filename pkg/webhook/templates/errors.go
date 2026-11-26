@@ -6,7 +6,6 @@ import (
 	"strings"
 	"text/template"
 
-	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -59,7 +58,7 @@ type SchemaErrorData struct {
 	// PlanProblems lists the statements in the schema files a refused plan
 	// names. When set, the comment lists them with where each one is in
 	// place of the error text.
-	PlanProblems []engine.PlanProblem
+	PlanProblems RefusedStatements
 }
 
 // UnregisteredSchemaConfigData identifies one schema config whose database the
@@ -622,8 +621,8 @@ func RenderMultipleConfigs(data SchemaErrorData) string {
 func RenderGenericError(data SchemaErrorData) string {
 	// Capitalize command name for header
 	data.CommandName = capitalizeFirst(data.CommandName)
-	if len(data.PlanProblems) > 0 {
-		return offerSupportChannel(renderPlanRefusal(data))
+	if refusal, ok := renderPlanRefusal(data); ok {
+		return offerSupportChannel(refusal)
 	}
 	// The error detail is untrusted engine or infrastructure error text:
 	// sanitize it, escape HTML, and keep a multi-line message inside the
@@ -636,13 +635,18 @@ func RenderGenericError(data SchemaErrorData) string {
 // renderPlanRefusal lists the statements a refused plan names, with where each
 // one is, and offers a push rather than a re-run: the plan is refused again
 // until the files change.
-func renderPlanRefusal(data SchemaErrorData) string {
+func renderPlanRefusal(data SchemaErrorData) (string, bool) {
+	if len(data.PlanProblems.Problems) == 0 {
+		return "", false
+	}
 	var sb strings.Builder
 	sb.WriteString(renderTemplate(tmplCommandFailedHeader, data))
 	sb.WriteString("\n\n")
-	writePlanProblems(&sb, data.PlanProblems, newPlanProblemBudget())
+	if !writePlanProblems(&sb, data.PlanProblems, newPlanProblemBudget()) {
+		return "", false
+	}
 	sb.WriteString(glyph.Attention + " The plan runs once these statements change. Fix them in the schema files and push a commit.\n")
-	return sb.String()
+	return sb.String(), true
 }
 
 // RenderInvalidCommand generates an error message for unrecognized commands.

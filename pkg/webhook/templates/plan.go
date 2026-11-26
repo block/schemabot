@@ -4278,7 +4278,7 @@ type MultiEnvPlanCommentData struct {
 	// files its engine refused to plan. An environment with problems renders
 	// them in place of its error text, and its fix is a change to those files
 	// rather than a re-run.
-	PlanProblems map[string][]engine.PlanProblem
+	PlanProblems map[string]RefusedStatements
 
 	// UnmanagedSchema lists the schema configs the PR also changes that this
 	// deployment does not manage, and UnmanagedEnvironments the environments
@@ -4421,8 +4421,10 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 		for _, env := range data.Environments {
 			fmt.Fprintf(&sb, "### %s\n\n", capitalizeFirst(env))
 
-			if problems := data.PlanProblems[env]; len(problems) > 0 {
-				writePlanProblems(&sb, problems, problemBudget)
+			// An environment whose refused statements no longer fit what is
+			// left of the comment's budget shows its refusal text instead, so
+			// every section names something to act on.
+			if problems := data.PlanProblems[env]; len(problems.Problems) > 0 && writePlanProblems(&sb, problems, problemBudget) {
 				continue
 			}
 			if errMsg, hasErr := data.Errors[env]; hasErr {
@@ -4760,7 +4762,7 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		for _, env := range envsWithErrors {
 			// A plan refused over statements in the files is refused again
 			// until the files change, so it is offered a push, not a re-run.
-			if len(data.PlanProblems[env]) > 0 {
+			if len(data.PlanProblems[env].Problems) > 0 {
 				fmt.Fprintf(sb, glyph.Attention+" **%s** plans once these statements change. Fix them in the schema files and push a commit.\n", capitalizeFirst(env))
 				continue
 			}

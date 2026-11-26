@@ -1582,8 +1582,14 @@ message StorageSchemaApplyResponse {
 // caller can point the files' author at each one. A refusal about the target
 // rather than the files carries no detail, and its status message is the
 // whole answer.
+//
+// The detail travels in a response trailer, which proxies bound, so a sender
+// lists a bounded number of problems, each cut to what a caller renders, and
+// counts the rest in omitted.
 message PlanRefusal {
   repeated PlanProblem problems = 1;
+  // How many more statements the engine refused than problems lists.
+  int32 omitted = 2;
 }
 
 // PlanProblem is one statement in the schema files that the engine cannot plan

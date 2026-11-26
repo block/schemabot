@@ -5825,9 +5825,15 @@ func (x *StorageSchemaApplyResponse) GetRemaining() *StorageSchemaReport {
 // caller can point the files' author at each one. A refusal about the target
 // rather than the files carries no detail, and its status message is the
 // whole answer.
+//
+// The detail travels in a response trailer, which proxies bound, so a sender
+// lists a bounded number of problems, each cut to what a caller renders, and
+// counts the rest in omitted.
 type PlanRefusal struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Problems      []*PlanProblem         `protobuf:"bytes,1,rep,name=problems,proto3" json:"problems,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Problems []*PlanProblem         `protobuf:"bytes,1,rep,name=problems,proto3" json:"problems,omitempty"`
+	// How many more statements the engine refused than problems lists.
+	Omitted       int32 `protobuf:"varint,2,opt,name=omitted,proto3" json:"omitted,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -5867,6 +5873,13 @@ func (x *PlanRefusal) GetProblems() []*PlanProblem {
 		return x.Problems
 	}
 	return nil
+}
+
+func (x *PlanRefusal) GetOmitted() int32 {
+	if x != nil {
+		return x.Omitted
+	}
+	return 0
 }
 
 // PlanProblem is one statement in the schema files that the engine cannot plan
@@ -6433,9 +6446,10 @@ const file_tern_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x90\x01\n" +
 	"\x1aStorageSchemaApplyResponse\x126\n" +
 	"\aplanned\x18\x01 \x01(\v2\x1c.tern.v1.StorageSchemaReportR\aplanned\x12:\n" +
-	"\tremaining\x18\x02 \x01(\v2\x1c.tern.v1.StorageSchemaReportR\tremaining\"?\n" +
+	"\tremaining\x18\x02 \x01(\v2\x1c.tern.v1.StorageSchemaReportR\tremaining\"Y\n" +
 	"\vPlanRefusal\x120\n" +
-	"\bproblems\x18\x01 \x03(\v2\x14.tern.v1.PlanProblemR\bproblems\"m\n" +
+	"\bproblems\x18\x01 \x03(\v2\x14.tern.v1.PlanProblemR\bproblems\x12\x18\n" +
+	"\aomitted\x18\x02 \x01(\x05R\aomitted\"m\n" +
 	"\vPlanProblem\x12\x12\n" +
 	"\x04file\x18\x01 \x01(\tR\x04file\x12\x12\n" +
 	"\x04line\x18\x02 \x01(\x05R\x04line\x12\x18\n" +

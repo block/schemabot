@@ -37,11 +37,14 @@ func TestRemotePlanRefusalCarriesEveryProblem(t *testing.T) {
 	st := status.Convert(err)
 	assert.Equal(t, codes.FailedPrecondition, st.Code())
 	assert.Equal(t, refusal, st.Message(), "the message stays the refusal's own text")
-	assert.Equal(t, problems, ternconv.PlanProblemsFromStatus(st))
+	got, omitted := ternconv.PlanProblemsFromStatus(st)
+	assert.Equal(t, problems, got)
+	assert.Zero(t, omitted)
 
 	_, err = client.PlanDiff(t.Context(), &ternv1.PlanRequest{Database: "app"})
 	require.Error(t, err)
-	assert.Equal(t, problems, ternconv.PlanProblemsFromStatus(status.Convert(err)), "a rollout member is planned with PlanDiff")
+	got, _ = ternconv.PlanProblemsFromStatus(status.Convert(err))
+	assert.Equal(t, problems, got, "a rollout member is planned with PlanDiff")
 }
 
 // A refusal about the target rather than the files names no statements, so
@@ -57,5 +60,7 @@ func TestRemotePlanRefusalWithoutProblemsCarriesNoDetail(t *testing.T) {
 	st := status.Convert(err)
 	assert.Equal(t, codes.FailedPrecondition, st.Code())
 	assert.Empty(t, st.Details())
-	assert.Nil(t, ternconv.PlanProblemsFromStatus(st))
+	got, omitted := ternconv.PlanProblemsFromStatus(st)
+	assert.Nil(t, got)
+	assert.Zero(t, omitted)
 }

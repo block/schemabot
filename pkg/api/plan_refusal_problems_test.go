@@ -36,7 +36,9 @@ func TestPlanRefusalProblemsReadsLocalAndRemoteRefusals(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, PlanRefusalProblems(tc.err))
+			got, omitted := PlanRefusalProblems(tc.err)
+			assert.Equal(t, tc.want, got)
+			assert.Zero(t, omitted)
 		})
 	}
 }

@@ -42,6 +42,7 @@ func (h *Handler) postPlanCommandError(
 	repo string, pr int, installationID int64,
 	environment, requestedBy string, err error,
 ) {
+	problems, omitted := api.PlanRefusalProblems(err)
 	h.postCommentBestEffortID(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 		RequestedBy:  requestedBy,
 		Timestamp:    templates.NowFunc().UTC().Format("2006-01-02 15:04:05"),
@@ -49,7 +50,7 @@ func (h *Handler) postPlanCommandError(
 		Environments: h.deploymentEnvironmentScope(environment),
 		CommandName:  action.Plan,
 		ErrorDetail:  userFacingErrorDetail(userFacingError(err)),
-		PlanProblems: api.PlanRefusalProblems(err),
+		PlanProblems: templates.RefusedStatements{Problems: problems, Omitted: omitted},
 	}))
 }
 

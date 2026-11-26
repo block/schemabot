@@ -594,9 +594,9 @@ func TestRenderGenericErrorListsPlanProblems(t *testing.T) {
 		Environment: "staging",
 		CommandName: "plan",
 		ErrorDetail: "1 statement in the schema files cannot be planned",
-		PlanProblems: []engine.PlanProblem{
+		PlanProblems: RefusedStatements{Problems: []engine.PlanProblem{
 			{File: "testapp/orders.sql", Line: 3, Message: "Triggers are not managed.", Statement: "CREATE TRIGGER t BEFORE UPDATE ON orders"},
-		},
+		}},
 	})
 
 	assert.Contains(t, comment, "## "+glyph.Failed+" Plan Failed")

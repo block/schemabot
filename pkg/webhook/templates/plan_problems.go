@@ -32,30 +32,51 @@ func newPlanProblemBudget() *planProblemBudget {
 	return &planProblemBudget{remaining: maxPlanProblemsBytes}
 }
 
+// RefusedStatements is what a refused plan names in the schema files: the
+// statements its answer lists, and how many more it refused without listing
+// them to keep that answer bounded.
+type RefusedStatements struct {
+	Problems []engine.PlanProblem
+	Omitted  int
+}
+
+// total is how many statements the plan refused.
+func (r RefusedStatements) total() int {
+	return len(r.Problems) + r.Omitted
+}
+
 // writePlanProblems lists every statement an environment's plan refused, so
 // the files' author can fix them all in one push. Each one is its location,
 // what to change, and the statement's opening line in a SQL block. It lists at
-// most maxRenderedPlanProblems, each only while it fits the comment's budget,
-// and counts the rest.
-func writePlanProblems(sb *strings.Builder, problems []engine.PlanProblem, budget *planProblemBudget) {
-	fmt.Fprintf(sb, "%s **SchemaBot can't plan %s in the schema files:**\n\n", glyph.Failed, statementCount(len(problems)))
+// most maxRenderedPlanProblems, each that fits what is left of the comment's
+// budget, and counts the rest. It writes nothing and reports false when not
+// one fits, so the caller shows the refusal text instead of a list that names
+// nothing.
+func writePlanProblems(sb *strings.Builder, refused RefusedStatements, budget *planProblemBudget) bool {
+	var entries strings.Builder
 	listed := 0
-	for _, problem := range problems {
+	for _, problem := range refused.Problems {
 		if listed == maxRenderedPlanProblems {
 			break
 		}
 		var entry strings.Builder
 		writePlanProblem(&entry, problem)
 		if entry.Len() > budget.remaining {
-			break
+			continue
 		}
 		budget.remaining -= entry.Len()
-		sb.WriteString(entry.String())
+		entries.WriteString(entry.String())
 		listed++
 	}
-	if hidden := len(problems) - listed; hidden > 0 {
+	if listed == 0 {
+		return false
+	}
+	fmt.Fprintf(sb, "%s **SchemaBot can't plan %s in the schema files:**\n\n", glyph.Failed, statementCount(refused.total()))
+	sb.WriteString(entries.String())
+	if hidden := refused.total() - listed; hidden > 0 {
 		fmt.Fprintf(sb, "…and %s more.\n\n", statementCount(hidden))
 	}
+	return true
 }
 
 func writePlanProblem(sb *strings.Builder, problem engine.PlanProblem) {

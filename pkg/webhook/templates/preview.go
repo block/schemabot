@@ -2777,8 +2777,8 @@ func PreviewCommentMultiEnvPlanRefusedStatements() string {
 		Environments: []string{"staging"},
 		Plans:        map[string]*PlanCommentData{},
 		Errors:       map[string]string{"staging": refusal},
-		PlanProblems: map[string][]engine.PlanProblem{
-			"staging": {
+		PlanProblems: map[string]RefusedStatements{
+			"staging": {Problems: []engine.PlanProblem{
 				{
 					File:      "testapp/accounts.sql",
 					Line:      7,
@@ -2797,7 +2797,7 @@ func PreviewCommentMultiEnvPlanRefusedStatements() string {
 					Message:   "SchemaBot doesn't manage triggers. Create orders_updated_at outside SchemaBot and remove it from this file.",
 					Statement: "CREATE TRIGGER orders_updated_at BEFORE UPDATE ON orders\n  FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
 				},
-			},
+			}},
 		},
 	})
 }
