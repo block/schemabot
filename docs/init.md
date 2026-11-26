@@ -18,7 +18,10 @@ A Vitess sample is two containers rather than one: a local cluster behind a
 PlanetScale-compatible API, and a MySQL server holding SchemaBot's own state. Its
 keyspace is split across two shards, so an apply reports progress per shard. It
 takes longer to come up than a single database server, and it needs no PlanetScale
-account. See [Vitess on PlanetScale](vitess.md#quick-start).
+account. Its cluster is rebuilt from the seed schema whenever the container
+restarts, while the state database keeps what was applied, so restart it to
+start the demonstration over rather than to carry work forward. See
+[Vitess on PlanetScale](vitess.md#quick-start).
 
 ![Start a sample database, review and apply a change, then verify the result](../assets/init-sample-demo.gif)
 

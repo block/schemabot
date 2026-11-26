@@ -84,7 +84,7 @@ databases:
 |---|---|
 | `organization` | The PlanetScale organization holding the database |
 | `token_secret_ref` | The service token, as `name:value`. See [Service token permissions](#service-token-permissions) |
-| `dsn` | The vtgate MySQL endpoint, which SchemaBot only reads from. Optional, but set it: see [Reading progress](#reading-progress) |
+| `dsn` | The vtgate MySQL endpoint, which SchemaBot only reads from. Required here: an environment SchemaBot runs itself is the one that carries a DSN. See [Reading progress](#reading-progress) |
 
 Then pull the live schema into files, one directory per keyspace:
 
@@ -110,7 +110,7 @@ secret references, and the other ways to supply each field.
 
 | Change | What happens |
 |---|---|
-| An `ALTER TABLE` Vitess can make by editing metadata | Runs as instant DDL, in milliseconds, with nothing to steer while it runs |
+| An `ALTER TABLE` Vitess can make by editing metadata | Runs as instant DDL, in milliseconds, with nothing to steer and no revert window. A held cutover or a destructive statement takes the copy path instead, so the change keeps its window |
 | Any other `ALTER TABLE` | Runs as Vitess online DDL: a copy per shard, then a cutover. Throttled by the cluster, and it can be cancelled |
 | A new table, with its indexes | Runs on the branch, then lands with the deploy request |
 | A VSchema change | Applied to the keyspace alongside that keyspace's table changes. See [Keyspaces and VSchema](#keyspaces-and-vschema) |
@@ -247,14 +247,18 @@ branch password is enough.
 
 The apply itself runs without a DSN, since it reaches the branch with the
 password the API hands back, and an apply started without one logs that
-per-shard progress will be unavailable. One case does need it: where
+per-shard progress will be unavailable. The DSN is still configured, because it
+is what marks the environment as one SchemaBot runs itself rather than hands to
+a deployment. One case does need it: where
 PlanetScale's safe schema changes are turned off on the branch, the plan reads
 the schema over vtgate instead, and fails without a DSN.
 
 ## The revert window
 
 Vitess is the only engine SchemaBot drives that keeps the original table after
-cutover. For the length of the window, the change can be undone:
+cutover. A change that copied has a window, and for its length the change can
+be undone. An instant DDL has none: it edited metadata, so there is no original
+table to put back, and the apply finishes without a window to wait out.
 
 | Operation | Does |
 |---|---|
@@ -325,9 +329,16 @@ databases:
         revert_window_duration: "30m"
 ```
 
-The three fields accept the same secret references as any other credential —
-`env:`, `secretsmanager:`, a literal value, or `dsn_from` assembly.
-[Configuration](configuration.md) covers them, along with
+The fields do not take the same forms, so a reference in the wrong one is read
+as the value itself:
+
+| Field | Takes |
+|---|---|
+| `organization` | The name, as written. It is not resolved, so `env:PLANETSCALE_ORG` names an organization spelled that way |
+| `token_secret_ref` | `env:`, `file:`, `secretsmanager:`, or the `name:value` token itself |
+| `dsn` | `env:`, `file:`, `secretsmanager:`, or the connection string itself. `dsn_from` assembles one from parts instead, and only this field has it |
+
+[Configuration](configuration.md) covers the reference forms, along with
 [the service token](configuration.md#planetscale-service-token) and
 [mTLS endpoints](configuration.md#planetscale-mtls).
 

@@ -34,14 +34,17 @@ Thank you for your interest in contributing to SchemaBot! We welcome bug reports
 ```bash
 make setup         # Configure git hooks
 make demo-full     # Start local services, apply schema, seed data
-make demo-vitess   # The same against a local sharded Vitess cluster
+make demo-vitess   # Instead, start a local sharded Vitess cluster
 make test          # Run all tests (unit + integration + e2e)
 ```
 
 `make demo-vitess` runs against [LocalScale](./pkg/localscale/README.md), which
 answers the PlanetScale API over an embedded Vitess cluster, so Vitess changes
-can be developed and tested without a PlanetScale account. It builds the
-LocalScale image first; `make build-localscale-image` builds it on its own.
+can be developed and tested without a PlanetScale account. It is an alternative
+to `make demo-full`, not a step after it: each target resets the Compose stack
+before starting its own services, and `demo-vitess` brings up LocalScale alone,
+applying no schema and seeding no data. It builds the LocalScale image first;
+`make build-localscale-image` builds it on its own.
 
 See [docs/architecture.md](./docs/architecture.md) for an overview of how SchemaBot works.
 
