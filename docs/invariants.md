@@ -1803,6 +1803,24 @@ covers a table copying across shards in the CLI, the sharded apply comment, and 
 comment. These tests prove the surfaces read the same facts alike; which facts an engine reports is
 pinned by that engine's own progress tests.
 
+### UX-9: A sharded apply's failed shards read the same on every surface
+
+When shards of a sharded apply fail, the apply has one reading of the failure: which shards failed
+on their own work and how each is named, whether every one of them is still retrying, each distinct
+reason once with the shards it failed, and how far a failed table's failure reaches across its
+shards. That reading is
+derived once and rendered by the CLI and the PR comment alike, so one surface never blames a single
+shard while the other lists several reasons. *Enforced:* the shared derivation (`FailedMember`,
+`QualifyShardNames`, `SummarizeFailures`, and `FailedReach` in `pkg/presentation/failure_reasons.go`),
+each failed shard's reason read once (`ApplyOperation.FailureMessage` in `pkg/storage`, which the PR
+comment and the progress API both serve) and grouped on one redacted reason on both surfaces
+(`InlineError` in `pkg/presentation/error_redaction.go`), and tests that render the same failed shards through both surfaces and fail when they read
+differently (`TestShardFailureReasonsReadTheSameOnEverySurface`,
+`TestShardFailureReasonsGroupAcrossHostsOnEverySurface`, and
+`TestShardFailureNamesQualifyRepeatedShardsOnEverySurface` in `pkg/cmd/internal/templates`), with
+`TestWatchModel_ShardedApplyGroupsFailedShards` in `pkg/cmd/commands` pinning the watch view to the same
+callout.
+
 ## Recovery (RC)
 
 ### RC-1: Nothing is orphaned

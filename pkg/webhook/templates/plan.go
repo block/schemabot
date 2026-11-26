@@ -1718,7 +1718,7 @@ func writeExemptTablesGroup(sb *strings.Builder, group ExemptTablesData, env str
 	}
 	fmt.Fprintf(sb, "<details>\n<summary>"+glyph.Info+" %s%d ignored tables in namespace <code>%s</code> (%s)</summary>\n\n%s\n\n</details>\n\n",
 		prefix, len(group.Tables), html.EscapeString(flattenIdentifier(group.Namespace)),
-		html.EscapeString(SanitizeInlineError(group.Reason)), names)
+		html.EscapeString(presentation.InlineError(group.Reason)), names)
 }
 
 // hasExemptTables reports whether writeExemptTables would render anything for
@@ -1734,7 +1734,7 @@ func hasExemptTables(groups []ExemptTablesData) bool {
 }
 
 func exemptReason(reason string) string {
-	return escapeProse(SanitizeInlineError(reason))
+	return escapeProse(presentation.InlineError(reason))
 }
 
 // writeMultiEnvExemptTables renders the exempt-table disclosure for the
@@ -2601,8 +2601,8 @@ func shardGroupSignature(s KeyspaceShardChange) string {
 // comment, for the shards of a keyspace and the targets of a rollout alike.
 // Beyond it, listing every name reads as a wall — a wide group collapses to a
 // count, with the names behind a collapsed block where the rendering has room
-// for one.
-const shardNamesInlineLimit = 8
+// for one. It is the CLI's limit too (presentation.MemberNamesInlineLimit).
+const shardNamesInlineLimit = presentation.MemberNamesInlineLimit
 
 // A plan group's members render through the same group headings whatever
 // they are called, so a rollout whose targets need different work reads the
@@ -3468,7 +3468,7 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 	causes := make([]string, 0)
 	for _, cause := range engine.BlockedCauses(reason) {
-		if cause = SanitizeInlineError(cause); cause != "" {
+		if cause = presentation.InlineError(cause); cause != "" {
 			causes = append(causes, cause)
 		}
 	}
@@ -4219,7 +4219,7 @@ func groupLintWarningsByTable(warnings []LintViolationData) []lintWarningGroup {
 func writeErrors(sb *strings.Builder, errors []string) {
 	var msgs []string
 	for _, errMsg := range errors {
-		if msg := SanitizeInlineError(errMsg); msg != "" {
+		if msg := presentation.InlineError(errMsg); msg != "" {
 			msgs = append(msgs, msg)
 		}
 	}

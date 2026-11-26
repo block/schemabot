@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -266,19 +267,19 @@ func TestSanitizeCommentError(t *testing.T) {
 	})
 }
 
-func TestSanitizeInlineError(t *testing.T) {
+func TestInlineError(t *testing.T) {
 	t.Run("newlines collapse so the error cannot escape its line", func(t *testing.T) {
-		assert.Equal(t, "line one line two", SanitizeInlineError("line one\nline two"))
+		assert.Equal(t, "line one line two", presentation.InlineError("line one\nline two"))
 	})
 
 	t.Run("endpoints are redacted", func(t *testing.T) {
-		got := SanitizeInlineError("dial tcp db-primary.internal:3306: connection refused")
+		got := presentation.InlineError("dial tcp db-primary.internal:3306: connection refused")
 		assert.NotContains(t, got, "db-primary.internal")
 		assert.Contains(t, got, "[endpoint redacted]")
 	})
 
 	t.Run("whitespace-only input is empty", func(t *testing.T) {
-		assert.Empty(t, SanitizeInlineError(" \n\t "))
+		assert.Empty(t, presentation.InlineError(" \n\t "))
 	})
 }
 

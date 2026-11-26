@@ -13,6 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -1525,7 +1526,7 @@ var checkRunSummaryEscaper = strings.NewReplacer(
 // plus markup escaping. Text that sanitizes to nothing falls back to a fixed
 // summary so the Check Run never publishes with an empty summary.
 func sanitizeCheckRunErrorSummary(summary string) string {
-	sanitized := templates.SanitizeInlineError(summary)
+	sanitized := presentation.InlineError(summary)
 	if sanitized == "" {
 		return planFailedCheckText
 	}
