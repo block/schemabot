@@ -1537,7 +1537,10 @@ The live database operation was already started and may continue independently o
      ```
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
-     After rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan.
+     After the rollback completes, refresh the checks:
+     ```
+     schemabot plan
+     ```
 <!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
@@ -1573,7 +1576,10 @@ Choose one:
      ```
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
-   - after rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan
+   - after the rollback completes, refresh the checks:
+     ```
+     schemabot plan
+     ```
 <!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
