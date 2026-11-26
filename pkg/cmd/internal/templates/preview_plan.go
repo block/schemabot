@@ -60,7 +60,6 @@ func previewVitessPlanOutput() {
        }
      }
    }`,
-			VSchemaSummary: []string{"table `orders`: adds vindex `region_map` on `region`"},
 		},
 		{
 			Namespace: "customer",

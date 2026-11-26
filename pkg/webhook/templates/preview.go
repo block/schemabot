@@ -2466,7 +2466,6 @@ func sampleVitessPlanChanges() []KeyspaceChangeData {
      }
    }
  }`,
-			VSchemaSummary: []string{"adds table `address_seq`: sequence table"},
 		},
 		{
 			Keyspace: "commerce_sharded",
@@ -2495,7 +2494,6 @@ func sampleVitessPlanChanges() []KeyspaceChangeData {
 +    }
    }
  }`,
-			VSchemaSummary: []string{"adds table `addresses`: vindex `hash` on `customer_id`, sequence `commerce.address_seq` for `id`"},
 		},
 	}
 }
@@ -2585,7 +2583,6 @@ func PreviewCommentVitessPlanVSchemaRemoval() string {
          }
        ]
      }`,
-				VSchemaSummary: []string{"table `customers`: removes vindex `customers_email_lookup` on `email`", "removes vindex `customers_email_lookup`"},
 			},
 		},
 		HasUnsafeChanges: true,
@@ -2977,7 +2974,7 @@ func PreviewCommentApplyVitessVSchemaOnly() string {
 	data := sampleApplyData(state.Apply.Running, nil)
 	data.Engine = "PlanetScale"
 	data.VSchemaChanges = []apitypes.VSchemaChange{
-		{Namespace: "myapp_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`, Summary: []string{"adds vindex `xxhash`: type `xxhash`"}},
+		{Namespace: "myapp_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
 	}
 	return RenderApplyStatusComment(data)
 }
@@ -2999,7 +2996,7 @@ func PreviewCommentApplyVitessDDLWithVSchema() string {
 	data.Engine = "PlanetScale"
 	data.DeployRequestURL = "https://app.planetscale.com/acme/myapp/deploy-requests/42"
 	data.VSchemaChanges = []apitypes.VSchemaChange{
-		{Namespace: "myapp_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`, Summary: []string{"adds vindex `xxhash`: type `xxhash`"}},
+		{Namespace: "myapp_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
 	}
 	return RenderApplyStatusComment(data)
 }
@@ -3011,8 +3008,8 @@ func PreviewCommentApplyVitessMultiKeyspaceVSchema() string {
 	data := sampleApplyData(state.Apply.Running, nil)
 	data.Engine = "PlanetScale"
 	data.VSchemaChanges = []apitypes.VSchemaChange{
-		{Namespace: "commerce", Status: "applied", Diff: `+ "lookup_orders": {"type": "lookup_hash"}`, Summary: []string{"adds vindex `lookup_orders`: type `lookup_hash`"}},
-		{Namespace: "commerce_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`, Summary: []string{"adds vindex `xxhash`: type `xxhash`"}},
+		{Namespace: "commerce", Status: "applied", Diff: `+ "lookup_orders": {"type": "lookup_hash"}`},
+		{Namespace: "commerce_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
 	}
 	return RenderApplyStatusComment(data)
 }
@@ -4036,7 +4033,7 @@ func PreviewCommentSummaryCompletedVitessDDLWithVSchema() string {
 	data := sampleSummaryData(state.Apply.Completed, tables)
 	data.Engine = "PlanetScale"
 	data.VSchemaChanges = []apitypes.VSchemaChange{
-		{Namespace: "myapp_sharded", Status: "applied", Diff: `+ "xxhash": {"type": "xxhash"}`, Summary: []string{"adds vindex `xxhash`: type `xxhash`"}},
+		{Namespace: "myapp_sharded", Status: "applied", Diff: `+ "xxhash": {"type": "xxhash"}`},
 	}
 	return RenderApplySummaryComment(data)
 }
@@ -4047,7 +4044,7 @@ func PreviewCommentSummaryCompletedVitessVSchemaOnly() string {
 	data := sampleSummaryData(state.Apply.Completed, nil)
 	data.Engine = "PlanetScale"
 	data.VSchemaChanges = []apitypes.VSchemaChange{
-		{Namespace: "myapp_sharded", Status: "applied", Diff: `+ "xxhash": {"type": "xxhash"}`, Summary: []string{"adds vindex `xxhash`: type `xxhash`"}},
+		{Namespace: "myapp_sharded", Status: "applied", Diff: `+ "xxhash": {"type": "xxhash"}`},
 	}
 	return RenderApplySummaryComment(data)
 }

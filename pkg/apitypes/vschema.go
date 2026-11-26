@@ -3,7 +3,6 @@ package apitypes
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 )
 
 // VSchemaChangeType is the ChangeType recorded on unsafe changes that stem
@@ -23,28 +22,6 @@ const (
 	VSchemaDiffMetadataKey    = "vschema"
 	VSchemaChangedMetadataKey = "vschema_changed"
 )
-
-// VSchemaSummaryMetadataKey is the plan change-metadata key under which an
-// engine describes a namespace's VSchema change one line per table, vindex,
-// or keyspace setting it touches ("adds table `orders`: vindex `hash` on
-// `id`"), the lines joined by newlines. It rides beside the rendered diff,
-// which surfaces keep as the full record. Display only: no gate reads it,
-// and a change recorded without it still shows its diff.
-const VSchemaSummaryMetadataKey = "vschema_summary"
-
-// SplitVSchemaSummary splits a VSchema summary recorded under
-// VSchemaSummaryMetadataKey into its lines, every one of them. Returns nil for
-// an empty summary. A surface lists them through
-// presentation.VSchemaSummaryLines, which caps the list.
-func SplitVSchemaSummary(summary string) []string {
-	var lines []string
-	for line := range strings.SplitSeq(summary, "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			lines = append(lines, line)
-		}
-	}
-	return lines
-}
 
 // VSchemaDeletionsMetadataKey is the plan change-metadata key under which
 // engines record structural removals in a namespace's VSchema change as a
@@ -258,10 +235,6 @@ type VSchemaChange struct {
 	Namespace string `json:"namespace"`
 	Status    string `json:"status"` // "applying", "applied", "failed", "cancelled", "stopped", or "" (pending)
 	Diff      string `json:"diff"`   // VSchema diff (not SQL); empty when unavailable
-	// Summary describes the change one line per table, vindex, or keyspace
-	// setting it touches (VSchemaSummaryMetadataKey). Empty when the engine
-	// recorded none, in which case surfaces show only the diff.
-	Summary []string `json:"summary,omitempty"`
 }
 
 // EncodeVSchemaChanges marshals VSchema changes for the progress display

@@ -661,9 +661,6 @@ type KeyspaceChangeData struct {
 	Statements     []string
 	VSchemaChanged bool
 	VSchemaDiff    string
-	// VSchemaSummary describes the VSchema change one line per table,
-	// vindex, or keyspace setting; empty when the engine recorded none.
-	VSchemaSummary []string
 
 	// Finalize marks a keyspace the engine asked to finalize after its DDL.
 	// A keyspace with DDL or a VSchema change to show finalizes as part of that
@@ -2084,17 +2081,16 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 	// the database name — it's redundant with the metadata line.
 	singleKeyspace := len(data.Changes) == 1 && schemaNamespaces && data.Changes[0].Keyspace == data.Database
 
-	// The VSchema budget is per comment, not per keyspace or per section: the
-	// diffs split what is left of it across the keyspaces that will render
-	// one, and the descriptions draw from it in turn, so a plan stays bounded
-	// however many keyspaces, environments, or target groups it renders.
+	// The VSchema diff budget is per comment, not per keyspace: split it
+	// across the keyspaces that will render a diff so a multi-keyspace plan
+	// stays bounded.
 	diffCount := 0
 	for _, ks := range data.Changes {
 		if ks.VSchemaChanged && !data.IsMySQL && ks.VSchemaDiff != "" {
 			diffCount++
 		}
 	}
-	vschemaBudget := budget.vschemaSection(diffCount)
+	diffBudget := vschemaDiffBudget(diffCount)
 
 	for _, ks := range data.Changes {
 		hasVSchemaChanges := ks.VSchemaChanged && !data.IsMySQL
@@ -2113,8 +2109,8 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 
 		if hasVSchemaChanges {
 			writeNamespaceLabel(sb, data, "VSchema", "")
-			if ks.VSchemaDiff != "" || len(ks.VSchemaSummary) > 0 {
-				writeVSchemaChangeBody(sb, ks.VSchemaSummary, ks.VSchemaDiff, vschemaBudget)
+			if ks.VSchemaDiff != "" {
+				writeVSchemaDiffFence(sb, ks.VSchemaDiff, diffBudget)
 			} else {
 				sb.WriteString("_(diff not available)_\n\n")
 			}

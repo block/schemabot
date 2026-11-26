@@ -1597,10 +1597,6 @@ Choose one:
 
 #### Keyspace: `commerce`
 #### VSchema
-- adds table `address_seq`: sequence table
-
-<details><summary>VSchema diff</summary>
-
 ```diff
 --- a/commerce.json
 +++ b/commerce.json
@@ -1614,8 +1610,6 @@ Choose one:
    }
  }
 ```
-
-</details>
 
 ```sql
 CREATE TABLE `address_seq` (
@@ -1631,10 +1625,6 @@ CREATE TABLE `address_seq` (
 
 #### Keyspace: `commerce_sharded`
 #### VSchema
-- adds table `addresses`: vindex `hash` on `customer_id`, sequence `commerce.address_seq` for `id`
-
-<details><summary>VSchema diff</summary>
-
 ```diff
 --- a/commerce_sharded.json
 +++ b/commerce_sharded.json
@@ -1657,8 +1647,6 @@ CREATE TABLE `address_seq` (
    }
  }
 ```
-
-</details>
 
 ```sql
 CREATE TABLE `addresses` (
@@ -1701,11 +1689,6 @@ schemabot apply -e staging
 
 #### Keyspace: `commerce_sharded`
 #### VSchema
-- table `customers`: removes vindex `customers_email_lookup` on `email`
-- removes vindex `customers_email_lookup`
-
-<details><summary>VSchema diff</summary>
-
 ```diff
 --- a/commerce_sharded.json
 +++ b/commerce_sharded.json
@@ -1735,8 +1718,6 @@ schemabot apply -e staging
        ]
      }
 ```
-
-</details>
 
 ⚠️ **Issues**: 2 unsafe changes detected
 1. `commerce_sharded/vschema.json`: lookup vindex `customers_email_lookup` is removed: Vitess immediately stops maintaining its rows in backing table `customers_email_lookup`, queries routed through it can fail or scatter, and the lookup data goes stale
@@ -1809,10 +1790,6 @@ schemabot apply -e staging
 
 #### Keyspace: `commerce`
 #### VSchema
-- adds table `address_seq`: sequence table
-
-<details><summary>VSchema diff</summary>
-
 ```diff
 --- a/commerce.json
 +++ b/commerce.json
@@ -1826,8 +1803,6 @@ schemabot apply -e staging
    }
  }
 ```
-
-</details>
 
 ```sql
 CREATE TABLE `address_seq` (
@@ -1843,10 +1818,6 @@ CREATE TABLE `address_seq` (
 
 #### Keyspace: `commerce_sharded`
 #### VSchema
-- adds table `addresses`: vindex `hash` on `customer_id`, sequence `commerce.address_seq` for `id`
-
-<details><summary>VSchema diff</summary>
-
 ```diff
 --- a/commerce_sharded.json
 +++ b/commerce_sharded.json
@@ -1869,8 +1840,6 @@ CREATE TABLE `address_seq` (
    }
  }
 ```
-
-</details>
 
 ```sql
 CREATE TABLE `addresses` (
@@ -4239,8 +4208,6 @@ Options: ⏸️ Defer Cutover
   ── commerce ──
 
      ~ VSchema:
-       - table orders: adds vindex region_map on region
-
               "auto_increment": {
                 "column": "id",
                 "sequence": "orders_seq"
@@ -5094,10 +5061,6 @@ schemabot apply -e staging
 
 #### Keyspace: `commerce`
 #### VSchema
-- adds table `address_seq`: sequence table
-
-<details><summary>VSchema diff</summary>
-
 ```diff
 --- a/commerce.json
 +++ b/commerce.json
@@ -5111,8 +5074,6 @@ schemabot apply -e staging
    }
  }
 ```
-
-</details>
 
 ```sql
 CREATE TABLE `address_seq` (
@@ -5128,10 +5089,6 @@ CREATE TABLE `address_seq` (
 
 #### Keyspace: `commerce_sharded`
 #### VSchema
-- adds table `addresses`: vindex `hash` on `customer_id`, sequence `commerce.address_seq` for `id`
-
-<details><summary>VSchema diff</summary>
-
 ```diff
 --- a/commerce_sharded.json
 +++ b/commerce_sharded.json
@@ -5154,8 +5111,6 @@ CREATE TABLE `address_seq` (
    }
  }
 ```
-
-</details>
 
 ```sql
 CREATE TABLE `addresses` (
@@ -6777,15 +6732,9 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 **`myapp_sharded`**: Applying...
 
-- adds vindex `xxhash`: type `xxhash`
-
-<details><summary>VSchema diff</summary>
-
 ```diff
 + "xxhash": {"type": "xxhash"}
 ```
-
-</details>
 
 
 ---
@@ -6824,15 +6773,9 @@ ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
 **`myapp_sharded`**: Applying...
 
-- adds vindex `xxhash`: type `xxhash`
-
-<details><summary>VSchema diff</summary>
-
 ```diff
 + "xxhash": {"type": "xxhash"}
 ```
-
-</details>
 
 
 ---
@@ -6862,27 +6805,15 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 
 **`commerce`**: Applied
 
-- adds vindex `lookup_orders`: type `lookup_hash`
-
-<details><summary>VSchema diff</summary>
-
 ```diff
 + "lookup_orders": {"type": "lookup_hash"}
 ```
 
-</details>
-
 **`commerce_sharded`**: Applying...
-
-- adds vindex `xxhash`: type `xxhash`
-
-<details><summary>VSchema diff</summary>
 
 ```diff
 + "xxhash": {"type": "xxhash"}
 ```
-
-</details>
 
 
 ---
@@ -8289,15 +8220,9 @@ ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
 **`myapp_sharded`**: Applied
 
-- adds vindex `xxhash`: type `xxhash`
-
-<details><summary>VSchema diff</summary>
-
 ```diff
 + "xxhash": {"type": "xxhash"}
 ```
-
-</details>
 
 </details>
 
@@ -8323,15 +8248,9 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 
 **`myapp_sharded`**: Applied
 
-- adds vindex `xxhash`: type `xxhash`
-
-<details><summary>VSchema diff</summary>
-
 ```diff
 + "xxhash": {"type": "xxhash"}
 ```
-
-</details>
 
 </details>
 
@@ -9727,8 +9646,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 └────────────────────────────────────────────────────────────────────────────────┘
 
     ~ VSchema (myapp_sharded): Applying...
-       - adds vindex xxhash: type xxhash
-
        + "xxhash": {"type": "xxhash"}
 
 
@@ -9751,12 +9668,8 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 └────────────────────────────────────────────────────────────────────────────────┘
 
     ~ VSchema (commerce): Applied
-       - adds vindex lookup_orders: type lookup_hash
-
        + "lookup_orders": {"type": "lookup_hash"}
     ~ VSchema (commerce_sharded): Applying...
-       - adds vindex xxhash: type xxhash
-
        + "xxhash": {"type": "xxhash"}
 
 
@@ -9821,8 +9734,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
        ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
     ~ VSchema (myapp_sharded): Applying...
-       - adds vindex xxhash: type xxhash
-
        + "xxhash": {"type": "xxhash"}
 
 
@@ -9904,9 +9815,6 @@ Vitess plan: DDL + VSchema changes in a sharded keyspace
   ── testapp_sharded ──
 
      ~ VSchema:
-       - table users: adds vindex hash on id
-       - adds table user_preferences: vindex hash on user_id
-
           },
           "tables": {
             "users": {
@@ -9960,8 +9868,6 @@ Vitess plan: VSchema-only update (no table DDL changes)
   ── testapp_sharded ──
 
      ~ VSchema:
-       - adds vindex lookup_email: type consistent_lookup, backed by users_email_idx
-
         {
           "sharded": true,
           "vindexes": {
@@ -9999,10 +9905,6 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
   ── testapp ──
 
      ~ VSchema:
-       - adds table orders_seq: sequence table
-       - adds table users_email_idx
-       - adds table users_seq: sequence table
-
         {
        -  "tables": {}
        +  "tables": {
@@ -10023,8 +9925,6 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
   ── testapp_sharded ──
 
      ~ VSchema:
-       - adds vindex lookup_email: type consistent_lookup, backed by users_email_idx
-
           "vindexes": {
        -    "hash": {"type": "hash"}
        +    "hash": {"type": "hash"},
@@ -11873,10 +11773,6 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 **VSchema**: Applied
 
-- table `mutes`: adds vindex `hash` on `target_id`
-
-<details><summary>VSchema diff</summary>
-
 ```diff
 --- current
 +++ new
@@ -11890,8 +11786,6 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
    }
  }
 ```
-
-</details>
 
 
 </details>
@@ -12467,8 +12361,6 @@ To resume from where it stopped:
            ○ 80-c0: queued
            ○ c0-: queued
     ~ VSchema (shop_001): Pending
-       - table orders: adds vindex hash on customer_id
-
           "tables": {
             "orders": {
        +      "column_vindexes": [{"column": "customer_id", "name": "hash"}]
@@ -12510,8 +12402,6 @@ To resume from where it stopped:
            ○ 80-c0: cancelled
            ○ c0-: cancelled
     ~ VSchema (shop_001): Cancelled
-       - table orders: adds vindex hash on customer_id
-
           "tables": {
             "orders": {
        +      "column_vindexes": [{"column": "customer_id", "name": "hash"}]
@@ -12559,8 +12449,6 @@ The new apply will only process tables that haven't completed.
            ○ 80-c0: stopped at 100.00% · 1,402,118 / 1,402,118 rows
            ○ c0-: stopped at 100.00% · 1,389,004 / 1,389,004 rows
     ~ VSchema (shop_001): Cancelled
-       - table orders: adds vindex hash on customer_id
-
           "tables": {
             "orders": {
        +      "column_vindexes": [{"column": "customer_id", "name": "hash"}]

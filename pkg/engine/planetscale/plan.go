@@ -229,13 +229,6 @@ func (e *Engine) planKeyspace(ctx context.Context, client psclient.PSClient, org
 	if vschemaChanged {
 		sc.Metadata["vschema_changed"] = "true"
 		sc.Metadata["vschema"] = vschema.Diff(currentVSchemaRaw, ns.Files["vschema.json"])
-		summary, sumErr := vschema.Describe(currentVSchemaRaw, ns.Files["vschema.json"])
-		if sumErr != nil {
-			return nil, fmt.Errorf("describe VSchema change for keyspace %s: %w", ks, sumErr)
-		}
-		if len(summary) > 0 {
-			sc.Metadata[apitypes.VSchemaSummaryMetadataKey] = strings.Join(summary, "\n")
-		}
 		deletionsMeta, delErr := vschemaDeletionsMetadata(currentVSchemaRaw, ns.Files["vschema.json"])
 		if delErr != nil {
 			return nil, fmt.Errorf("detect VSchema deletions for keyspace %s: %w", ks, delErr)

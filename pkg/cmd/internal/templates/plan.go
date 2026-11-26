@@ -114,7 +114,6 @@ type NamespaceChange struct {
 	Changes        []DDLChange
 	VSchemaChanged bool
 	VSchemaDiff    string
-	VSchemaSummary []string
 	// Finalize marks a namespace the engine asked to finalize after its DDL.
 	// It gets its own line only when it is the namespace's only work.
 	Finalize bool
@@ -184,8 +183,8 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 				}
 				if ns.VSchemaChanged {
 					fmt.Println(indentTable + "~ VSchema:")
-					if body := FormatVSchemaChangeBody(ns.VSchemaSummary, ns.VSchemaDiff, indentContent); body != "" {
-						fmt.Print(body)
+					if ns.VSchemaDiff != "" {
+						fmt.Print(FormatVSchemaDiff(ns.VSchemaDiff, indentContent))
 						fmt.Println()
 					}
 				}
@@ -374,9 +373,6 @@ func WritePlanSummary(changes []DDLChange) {
 type VSchemaChange struct {
 	Keyspace string
 	Diff     string
-	// Summary describes the change one line per table, vindex, or keyspace
-	// setting; empty when the engine recorded none.
-	Summary []string
 }
 
 // WritePlanSummaryWithVSchema writes a single plan summary line including VSchema changes.

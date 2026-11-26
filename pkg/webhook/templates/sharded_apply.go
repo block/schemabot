@@ -492,7 +492,7 @@ func writeShardKeyspaceSections(sb *strings.Builder, data ShardedApplyData, form
 	for _, c := range data.VSchemaChanges {
 		vschemaChanges[c.Namespace] = c
 	}
-	vschemaBudget := budget.vschemaSection(vschemaDiffCount(data.VSchemaChanges))
+	vschemaBudget := vschemaDiffBudgetFor(data.VSchemaChanges)
 	placed := make(map[string]bool, len(keyspaces))
 	for _, ks := range keyspaces {
 		placed[ks.Keyspace] = true
@@ -538,9 +538,11 @@ func writeShardDetail(sb *strings.Builder, ks ShardedKeyspace, applyHasShardFail
 // writeKeyspaceVSchema writes a keyspace's VSchema change inside that
 // keyspace's section, as a Vitess plan does, so a reader sees the routing
 // change next to the tables it routes.
-func writeKeyspaceVSchema(sb *strings.Builder, c apitypes.VSchemaChange, budget *vschemaCommentBudget) {
+func writeKeyspaceVSchema(sb *strings.Builder, c apitypes.VSchemaChange, budget int) {
 	fmt.Fprintf(sb, "\n**VSchema**: %s\n\n", ui.VSchemaStatusLabel(c.Status))
-	writeVSchemaChangeBody(sb, c.Summary, c.Diff, budget)
+	if c.Diff != "" {
+		writeVSchemaDiffFence(sb, c.Diff, budget)
+	}
 }
 
 // shardedDDLGroup is a set of a keyspace's shards that run the same statements

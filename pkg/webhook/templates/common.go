@@ -9,7 +9,6 @@ import (
 	"unicode"
 
 	"github.com/block/schemabot/pkg/glyph"
-	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -216,90 +215,14 @@ const maxCommentErrorLen = 500
 // diff.
 const maxCommentVSchemaDiffLen = 16384
 
-// maxCommentVSchemaSummaryLen bounds the VSchema descriptions rendered into
-// one comment, across every keyspace. A description line names each routing
-// association of its table, so a line count alone does not bound its size;
-// lines that do not fit are counted instead of listed, and each listed line is
-// whole, so a code span is never cut.
-const maxCommentVSchemaSummaryLen = 8192
-
-// vschemaCommentBudget is one comment's allowance for VSchema content. The
-// diffs draw from one shared maxCommentVSchemaDiffLen, each taking at most an
-// even share of what is left when its section starts, and the descriptions
-// draw in turn from one shared maxCommentVSchemaSummaryLen. Every section of
-// the comment that renders a VSchema change draws from the same budget, so the
-// comment stays bounded however many keyspaces, environments, or target groups
-// carry a change.
-type vschemaCommentBudget struct {
-	diffShare int
-	diffLeft  int
-	summary   int
-}
-
-func newVSchemaCommentBudget(diffCount int) *vschemaCommentBudget {
-	b := &vschemaCommentBudget{diffLeft: maxCommentVSchemaDiffLen, summary: maxCommentVSchemaSummaryLen}
-	b.startSection(diffCount)
-	return b
-}
-
-// startSection splits what is left of the diff budget evenly across the diffs
-// the next section of the comment will render.
-func (b *vschemaCommentBudget) startSection(diffCount int) {
-	b.diffShare = b.diffLeft
-	if diffCount > 0 {
-		b.diffShare = b.diffLeft / diffCount
+// vschemaDiffBudget splits the per-comment VSchema diff budget evenly across
+// the diffs the comment will render, so a multi-keyspace comment stays
+// bounded no matter how many keyspaces carry a diff.
+func vschemaDiffBudget(diffCount int) int {
+	if diffCount <= 0 {
+		return maxCommentVSchemaDiffLen
 	}
-}
-
-// takeDiff returns how many bytes of a diff the comment can render, and
-// charges them to the budget.
-func (b *vschemaCommentBudget) takeDiff(diff string) int {
-	limit := min(b.diffShare, b.diffLeft)
-	b.diffLeft -= min(len(diff), limit)
-	return limit
-}
-
-// writeVSchemaChangeBody renders what one keyspace's VSchema change does: its
-// description, one line per table, vindex, or keyspace setting, with the raw
-// diff collapsed beneath it as the full record. A line diff alone cannot say
-// which table an added or removed entry belongs to, which the description
-// does. A change recorded without a description shows its diff open, since
-// the diff is then the only account of the change.
-func writeVSchemaChangeBody(sb *strings.Builder, summary []string, diff string, budget *vschemaCommentBudget) {
-	if len(summary) == 0 {
-		if diff != "" {
-			writeVSchemaDiffFence(sb, diff, budget.takeDiff(diff))
-		}
-		return
-	}
-	writeVSchemaSummary(sb, summary, budget)
-	sb.WriteString("\n")
-	if diff == "" {
-		return
-	}
-	sb.WriteString("<details><summary>VSchema diff</summary>\n\n")
-	writeVSchemaDiffFence(sb, diff, budget.takeDiff(diff))
-	sb.WriteString("</details>\n\n")
-}
-
-// writeVSchemaSummary lists a VSchema change's description lines while they
-// fit the comment's summary budget, then counts the lines it left out. The
-// list is first cut where the CLI cuts it; the comment may cut it shorter,
-// since unlike a terminal it has a size limit.
-func writeVSchemaSummary(sb *strings.Builder, summary []string, budget *vschemaCommentBudget) {
-	shown, omitted := presentation.VSchemaSummaryCut(summary)
-	for i, line := range shown {
-		item := "- " + line + "\n"
-		if len(item) > budget.summary {
-			omitted += len(shown) - i
-			break
-		}
-		budget.summary -= len(item)
-		sb.WriteString(item)
-	}
-	if omitted > 0 {
-		fmt.Fprintf(sb, "- %s\n", presentation.VSchemaMoreChangesLine(omitted))
-	}
+	return maxCommentVSchemaDiffLen / diffCount
 }
 
 // writeVSchemaDiffFence renders a VSchema diff inside a diff fence sized so
@@ -307,10 +230,6 @@ func writeVSchemaSummary(sb *strings.Builder, summary []string, budget *vschemaC
 // with a visible marker instead of letting the diff grow the comment past
 // GitHub's limit.
 func writeVSchemaDiffFence(sb *strings.Builder, diff string, budget int) {
-	if budget <= 0 {
-		sb.WriteString("_Diff left out to fit GitHub's comment size limit; this PR's file diff shows the full VSchema change._\n\n")
-		return
-	}
 	truncated := false
 	if len(diff) > budget {
 		diff = truncateToBytes(diff, budget)

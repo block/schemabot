@@ -7,7 +7,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/engine"
 )
 
 func TestVSchemaDeletionsMetadata(t *testing.T) {
@@ -86,21 +85,4 @@ func TestVSchemaMutationsMetadata_NoMutations(t *testing.T) {
 func TestVSchemaMutationsMetadata_UnparseableFailsClosed(t *testing.T) {
 	_, err := vschemaMutationsMetadata("{corrupt", `{"tables": {}}`, nil)
 	require.Error(t, err)
-}
-
-// The VSchema change's description travels from the plan to the progress the
-// apply reports, so the apply comment names the same tables the plan did.
-func TestVSchemaSummaryReachesTheApplyProgress(t *testing.T) {
-	diffs := vschemaDiffsFromChanges([]engine.SchemaChange{{
-		Namespace: "commerce",
-		Metadata: map[string]string{
-			"vschema":                          `+    "orders_archive": {}`,
-			apitypes.VSchemaSummaryMetadataKey: "adds table `orders_archive`\nadds vindex `xxhash`: type `xxhash`",
-		},
-	}})
-
-	changes := vschemaChangesForDisplay(&psMetadata{VSchemaDiffs: diffs, VSchemaStatus: "applying"})
-	require.Len(t, changes, 1)
-	assert.Equal(t, "commerce", changes[0].Namespace)
-	assert.Equal(t, []string{"adds table `orders_archive`", "adds vindex `xxhash`: type `xxhash`"}, changes[0].Summary)
 }

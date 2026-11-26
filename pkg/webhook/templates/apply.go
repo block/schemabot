@@ -321,7 +321,7 @@ func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdate
 
 	// VSchema application status, surfaced from engine metadata rather than as a
 	// per-table task (a VSchema-only apply has no tables at all).
-	writeVSchemaStatus(&sb, data.VSchemaChanges, budget)
+	writeVSchemaStatus(&sb, data.VSchemaChanges)
 
 	// Error message for apply states that need operator attention. A failed
 	// apply gets the failure glyph — the system stopped and triage is due; a
@@ -903,36 +903,37 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 // writeVSchemaStatus renders the VSchema application status and, when
 // available, the diff. It is shown as its own section because VSchema
 // application is not a per-table task. Renders nothing when the apply carries
-// no VSchema change. The section draws from the comment's VSchema budget, which
-// every apply section in one comment shares.
-func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange, budget *ddlBlockBudget) {
-	writeVSchemaStatusWithin(sb, changes, budget.vschemaSection(vschemaDiffCount(changes)))
+// no VSchema change.
+func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
+	writeVSchemaStatusWithin(sb, changes, vschemaDiffBudgetFor(changes))
 }
 
-// writeVSchemaStatusWithin is writeVSchemaStatus drawing from a budget the
-// comment's other VSchema sections share, so the section adds nothing past
-// the comment's allowance.
-func writeVSchemaStatusWithin(sb *strings.Builder, changes []apitypes.VSchemaChange, budget *vschemaCommentBudget) {
+// writeVSchemaStatusWithin renders the VSchema section for changes, each diff
+// held to budget bytes.
+func writeVSchemaStatusWithin(sb *strings.Builder, changes []apitypes.VSchemaChange, budget int) {
 	if len(changes) == 0 {
 		return
 	}
 	sb.WriteString("\n### VSchema\n\n")
 	for _, c := range changes {
 		fmt.Fprintf(sb, "**%s**: %s\n\n", inlineCode(c.Namespace), ui.VSchemaStatusLabel(c.Status))
-		writeVSchemaChangeBody(sb, c.Summary, c.Diff, budget)
+		if c.Diff != "" {
+			writeVSchemaDiffFence(sb, c.Diff, budget)
+		}
 	}
 }
 
-// vschemaDiffCount counts the changes that carry a diff, which share one
-// comment's diff budget.
-func vschemaDiffCount(changes []apitypes.VSchemaChange) int {
-	n := 0
+// vschemaDiffBudgetFor returns the byte budget for each VSchema diff in a
+// comment. The budget is per comment, not per keyspace: it is split across the
+// entries that carry a diff so a multi-keyspace apply stays bounded.
+func vschemaDiffBudgetFor(changes []apitypes.VSchemaChange) int {
+	diffCount := 0
 	for _, c := range changes {
 		if c.Diff != "" {
-			n++
+			diffCount++
 		}
 	}
-	return n
+	return vschemaDiffBudget(diffCount)
 }
 
 // writeTableProgressSection writes the per-row progress breakdown, grouped by
@@ -1795,7 +1796,7 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 	if len(data.Tables) > 0 {
 		writeSummaryTableListWithOptions(sb, data, false, budget)
 	}
-	writeVSchemaStatus(sb, data.VSchemaChanges, budget)
+	writeVSchemaStatus(sb, data.VSchemaChanges)
 	sb.WriteString("</details>\n")
 }
 

@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/stretchr/testify/assert"
@@ -320,55 +319,6 @@ func TestMultiDeploymentApplyCommentsShareOneDDLBudget(t *testing.T) {
 
 	progress := RenderMultiDeploymentApplyComment(data)
 	assert.LessOrEqual(t, len(progress), limit)
-}
-
-// A rollout across three deployments, each applying the first VSchema of a
-// large keyspace, renders one <details> body per deployment in one comment. The
-// three VSchema sections draw on one VSchema budget for the comment, so the
-// comment stays under GitHub's size cap: the first deployment's diff is cut to
-// fit, and the deployments after it point at the PR's file diff for theirs.
-func TestMultiDeploymentApplyCommentsShareOneVSchemaBudget(t *testing.T) {
-	withTemplateTimestamp(t, "2026-06-16 19:43:00 UTC")
-	ops := make([]presentation.Operation, 0, 3)
-	for _, dep := range []string{"us", "eu", "ap"} {
-		ops = append(ops, continuingOp(dep, so.Completed))
-	}
-	model := presentation.Derive(ops)
-	details := make([]*ApplyStatusCommentData, 0, len(model.Deployments))
-	for _, d := range model.Deployments {
-		vschema := firstVSchemaPlan(d.Deployment).Changes[0]
-		details = append(details, &ApplyStatusCommentData{
-			Database:    "commerce",
-			Environment: "production",
-			Engine:      "PlanetScale",
-			State:       state.Apply.Completed,
-			VSchemaChanges: []apitypes.VSchemaChange{{
-				Namespace: "commerce",
-				Status:    "applied",
-				Diff:      vschema.VSchemaDiff,
-				Summary:   vschema.VSchemaSummary,
-			}},
-		})
-	}
-	data := MultiDeploymentApplyData{
-		Model:       model,
-		ApplyID:     "apply-123",
-		Environment: "production",
-		Details:     details,
-	}
-
-	for name, body := range map[string]string{
-		"progress": RenderMultiDeploymentApplyComment(data),
-		"summary":  RenderMultiDeploymentApplySummaryComment(data),
-	} {
-		t.Run(name, func(t *testing.T) {
-			assert.LessOrEqual(t, len(body), commentBodyLimit-applyCommentAppendReserve)
-			assert.LessOrEqual(t, strings.Count(body, "+ table\n")*len("+ table\n"), maxCommentVSchemaDiffLen,
-				"the three diffs together render no more than one comment's diff budget")
-			assert.Equal(t, 1, strings.Count(body, "_Diff truncated to fit GitHub's comment size limit"))
-			assert.Equal(t, 2, strings.Count(body, "_Diff left out to fit GitHub's comment size limit"))
-		})
-	}
 }
 
 // A rollout whose deployments run different plans names each deployment's
@@ -893,76 +843,4 @@ func TestApplyCommentShardListingsFitWithinTheLimit(t *testing.T) {
 		assert.NotContains(t, body, "  - ◉ `", "no table names its shards one per line")
 		assert.Contains(t, body, "CREATE TABLE `events_000`", "the DDL keeps the room the shard lines gave up")
 	})
-}
-
-// firstVSchemaPlan is an environment's plan for the first VSchema of a large
-// keyspace: a diff and a description each far longer than a comment holds,
-// marked with the environment so environments whose VSchemas differ render
-// as separate sections.
-func firstVSchemaPlan(env string) PlanCommentData {
-	summary := make([]string, 400)
-	for i := range summary {
-		summary[i] = fmt.Sprintf("adds table `%s_orders_%03d`: vindex `hash` on `id`, vindex `orders_lookup` on `email`", env, i)
-	}
-	return PlanCommentData{
-		Database:     "commerce",
-		DatabaseType: "vitess",
-		Environment:  env,
-		Changes: []KeyspaceChangeData{{
-			Keyspace:       "commerce",
-			VSchemaChanged: true,
-			VSchemaDiff:    env + "\n" + strings.Repeat("+ table\n", 6000),
-			VSchemaSummary: summary,
-		}},
-	}
-}
-
-// A first VSchema for a large keyspace, planned for three environments whose
-// current VSchemas differ, renders one section per environment. All three
-// sections draw on one VSchema budget for the comment, so the comment stays
-// under GitHub's size cap: the first environment's diff is cut to fit, and the
-// environments after it point at the PR's file diff for theirs.
-func TestMultiEnvPlanCommentSharesOneVSchemaBudgetAcrossEnvironments(t *testing.T) {
-	envs := []string{"staging", "sandbox", "production"}
-	plans := make(map[string]*PlanCommentData, len(envs))
-	for _, env := range envs {
-		plan := firstVSchemaPlan(env)
-		plans[env] = &plan
-	}
-	body := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
-		Database:     "commerce",
-		DatabaseType: "vitess",
-		Environments: envs,
-		Plans:        plans,
-	})
-
-	assert.LessOrEqual(t, len(body), commentBodyLimit)
-	for _, heading := range []string{"### Staging", "### Sandbox", "### Production"} {
-		assert.Contains(t, body, heading)
-	}
-	assert.LessOrEqual(t, strings.Count(body, "+ table\n")*len("+ table\n"), maxCommentVSchemaDiffLen,
-		"the three diffs together render no more than one comment's diff budget")
-	assert.Equal(t, 1, strings.Count(body, "_Diff truncated to fit GitHub's comment size limit"))
-	assert.Equal(t, 2, strings.Count(body, "_Diff left out to fit GitHub's comment size limit"))
-}
-
-// Whether two environments' VSchema changes are the same is decided on the
-// whole diffs, not on what a comment has room to show: two diffs that agree
-// for longer than the comment's diff budget and differ after it render as two
-// sections.
-func TestMultiEnvPlanCommentKeepsVSchemaPlansApartThatDifferPastTheCut(t *testing.T) {
-	staging, production := firstVSchemaPlan("staging"), firstVSchemaPlan("staging")
-	production.Environment = "production"
-	production.Changes[0].VSchemaDiff += "+ only in production\n"
-	body := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
-		Database:     "commerce",
-		DatabaseType: "vitess",
-		Environments: []string{"staging", "production"},
-		Plans:        map[string]*PlanCommentData{"staging": &staging, "production": &production},
-	})
-
-	assert.NotContains(t, body, "### Staging & Production")
-	assert.Contains(t, body, "### Staging")
-	assert.Contains(t, body, "### Production")
-	assert.LessOrEqual(t, len(body), commentBodyLimit)
 }

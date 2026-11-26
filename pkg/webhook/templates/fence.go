@@ -135,10 +135,6 @@ type ddlBlockBudget struct {
 	// marker, and no more than that.
 	uncutMarkerBytes int
 
-	// vschema is the comment's VSchema allowance, opened by the first section
-	// that renders a VSchema change and shared by every section after it.
-	vschema *vschemaCommentBudget
-
 	// sharedBy lists the environments a section rendered once on behalf of
 	// several is shared by, the first being the one whose plan it renders, so
 	// a pointer marker in it says whose stored plan it names. Empty outside
@@ -165,21 +161,6 @@ type ddlBlockBudget struct {
 // one per line, or only counts them.
 func (b *ddlBlockBudget) listsMembers() bool {
 	return b == nil || !b.countsMembersOnly
-}
-
-// vschemaSection returns the comment's VSchema budget, split for a section
-// about to render diffCount VSchema diffs. A nil budget is a render with no
-// comment to share, so the section gets an allowance of its own.
-func (b *ddlBlockBudget) vschemaSection(diffCount int) *vschemaCommentBudget {
-	if b == nil {
-		return newVSchemaCommentBudget(diffCount)
-	}
-	if b.vschema == nil {
-		b.vschema = newVSchemaCommentBudget(diffCount)
-		return b.vschema
-	}
-	b.vschema.startSection(diffCount)
-	return b.vschema
 }
 
 // newDDLBlockBudget opens the per-comment DDL budget for a comment about to
@@ -313,15 +294,12 @@ func (b *ddlBlockBudget) writeTruncationMarker(sb *strings.Builder) {
 	b.uncutMarkerBytes -= len(marker)
 }
 
-// newUnboundedDDLBudget opens a budget no DDL or VSchema diff can exhaust,
-// for a render that is compared rather than posted. Two sections cut to fit a
-// comment share a prefix wherever their statements or diffs do, so comparing
-// the cut renders would call plans identical that differ only past the cut;
-// comparing the whole renders cannot.
+// newUnboundedDDLBudget opens a budget no DDL can exhaust, for a render that is
+// compared rather than posted. Two sections cut to fit a comment share a prefix
+// wherever their statements do, so comparing the cut renders would call plans
+// identical that differ only past the cut; comparing the whole renders cannot.
 func newUnboundedDDLBudget(blocks int) *ddlBlockBudget {
-	b := newDDLBlockBudget(blocks, math.MaxInt)
-	b.vschema = &vschemaCommentBudget{diffLeft: math.MaxInt, summary: math.MaxInt}
-	return b
+	return newDDLBlockBudget(blocks, math.MaxInt)
 }
 
 // renderWithinCommentLimit renders a comment so its DDL takes every byte the

@@ -143,7 +143,7 @@ func previewVitessVSchemaOnlyOutput() {
 			"branch_name":        "schemabot-myapp-28471035",
 			"deploy_request_url": "https://app.planetscale.com/my-org/myapp/deploy-requests/43",
 			apitypes.VSchemaChangesMetadataKey: vschemaPreviewMetadata(
-				apitypes.VSchemaChange{Namespace: "myapp_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`, Summary: []string{"adds vindex `xxhash`: type `xxhash`"}},
+				apitypes.VSchemaChange{Namespace: "myapp_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
 			),
 		},
 	}
@@ -162,7 +162,7 @@ func previewVitessDDLWithVSchemaOutput() {
 			"branch_name":        "schemabot-myapp-28471035",
 			"deploy_request_url": "https://app.planetscale.com/my-org/myapp/deploy-requests/45",
 			apitypes.VSchemaChangesMetadataKey: vschemaPreviewMetadata(
-				apitypes.VSchemaChange{Namespace: "myapp_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`, Summary: []string{"adds vindex `xxhash`: type `xxhash`"}},
+				apitypes.VSchemaChange{Namespace: "myapp_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
 			),
 		},
 		Tables: []TableProgress{
@@ -193,8 +193,8 @@ func previewVitessMultiKeyspaceVSchemaOutput() {
 			"branch_name":        "schemabot-myapp-28471035",
 			"deploy_request_url": "https://app.planetscale.com/my-org/myapp/deploy-requests/46",
 			apitypes.VSchemaChangesMetadataKey: vschemaPreviewMetadata(
-				apitypes.VSchemaChange{Namespace: "commerce", Status: "applied", Diff: `+ "lookup_orders": {"type": "lookup_hash"}`, Summary: []string{"adds vindex `lookup_orders`: type `lookup_hash`"}},
-				apitypes.VSchemaChange{Namespace: "commerce_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`, Summary: []string{"adds vindex `xxhash`: type `xxhash`"}},
+				apitypes.VSchemaChange{Namespace: "commerce", Status: "applied", Diff: `+ "lookup_orders": {"type": "lookup_hash"}`},
+				apitypes.VSchemaChange{Namespace: "commerce_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
 			),
 		},
 	}

@@ -816,8 +816,7 @@ recorded it spanning. A shard whose wave has not started reports its
 operation's state and no rows. A table on its keyspace's only shard keeps its
 task's entry, with its `task_id`, and lists no shards. Each finalizer that
 changes its keyspace's VSchema appears in `metadata.vschema_changes` with its
-status, the diff from the stored plan, and a `summary` of one line per table,
-vindex, or keyspace setting the change adds, removes, or changes. A sharded apply's operations can
+status and the diff from the stored plan. A sharded apply's operations can
 attach one dispatch at a time, so it reads as every operation its generation
 manifest declares: one still to attach is listed in `operations` as `pending`
 and under its table's `shards` as `pending` with no rows, and a table none of
@@ -1107,7 +1106,7 @@ keyspace's four shards, of which only `-40` has started:
     }
   ],
   "metadata": {
-    "vschema_changes": "[{\"namespace\":\"shop_001\",\"status\":\"\",\"diff\":\"+  \\\"orders\\\": {}\",\"summary\":[\"adds table `orders`\"]}]"
+    "vschema_changes": "[{\"namespace\":\"shop_001\",\"status\":\"\",\"diff\":\"+  \\\"orders\\\": {}\"}]"
   }
 }
 ```
@@ -1779,9 +1778,6 @@ the marker with no table changes at all, and such a plan still has work to
 apply. `vschema`, beside `vschema_changed`, is the VSchema diff the plan was
 reviewed with, so a stored plan shows the same VSchema change the plan did; a
 plan recorded without a diff carries `vschema_changed` alone.
-`vschema_summary` describes that diff one line per table, vindex, or keyspace
-setting, separated by newlines, such as "adds table `orders_archive`: vindex
-`hash` on `id`". A plan recorded without one carries the diff alone.
 `vschema_generated_only: "true"`, beside `vschema_changed`, means the
 engine generates the namespace's whole VSchema change from the plan's DDL, so
 there is no VSchema diff to review; plans show such a namespace by its DDL

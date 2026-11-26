@@ -306,12 +306,7 @@ func (s *Service) addFinalizerVSchemaChanges(resp *apitypes.ProgressResponse, ap
 		if diff == "" {
 			continue
 		}
-		changes = append(changes, apitypes.VSchemaChange{
-			Namespace: ns,
-			Status:    presentation.FinalizerVSchemaStatus(apply.State, op.State),
-			Diff:      diff,
-			Summary:   apitypes.SplitVSchemaSummary(plan.Namespaces[ns].Metadata[storage.PlanMetadataVSchemaSummary]),
-		})
+		changes = append(changes, apitypes.VSchemaChange{Namespace: ns, Status: presentation.FinalizerVSchemaStatus(apply.State, op.State), Diff: diff})
 	}
 	if len(changes) == len(existing) {
 		return

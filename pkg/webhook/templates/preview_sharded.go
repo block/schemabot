@@ -163,7 +163,6 @@ func PreviewCommentShardedSummaryCompleted() string {
      }
    }
  }`,
-			Summary: []string{"table `mutes`: adds vindex `hash` on `target_id`"},
 		}},
 	})
 }

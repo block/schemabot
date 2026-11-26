@@ -307,9 +307,6 @@ func PlanContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 			if diff := nsData.Metadata[storage.PlanMetadataVSchemaDiff]; diff != "" {
 				change.Metadata[apitypes.VSchemaDiffMetadataKey] = diff
 			}
-			if summary := nsData.Metadata[storage.PlanMetadataVSchemaSummary]; summary != "" {
-				change.Metadata[apitypes.VSchemaSummaryMetadataKey] = summary
-			}
 			if !nsData.ShowsVSchemaChange() {
 				// Carried so the stored plan renders the namespace the way
 				// the live plan did: by its DDL and finalize, with no VSchema

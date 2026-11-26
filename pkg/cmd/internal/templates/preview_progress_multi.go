@@ -244,7 +244,7 @@ func shardedPreviewProgress(applyState, finalizerState, vschemaStatus string, sh
 		ops = append(ops, ProgressOperation{Deployment: "prod", OperationKey: key, OperationKind: storage.ApplyOperationKindWork, State: shards[i].Status})
 	}
 	ops = append(ops, ProgressOperation{Deployment: "prod", OperationKey: "shop_001/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer, State: finalizerState})
-	vschema, err := apitypes.EncodeVSchemaChanges([]apitypes.VSchemaChange{{Namespace: "shop_001", Status: vschemaStatus, Diff: previewShardedVSchemaDiff, Summary: []string{"table `orders`: adds vindex `hash` on `customer_id`"}}})
+	vschema, err := apitypes.EncodeVSchemaChanges([]apitypes.VSchemaChange{{Namespace: "shop_001", Status: vschemaStatus, Diff: previewShardedVSchemaDiff}})
 	if err != nil {
 		panic(err)
 	}
