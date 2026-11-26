@@ -73,8 +73,8 @@ func (s unsubmittedLockServer) start(t *testing.T) (*httptest.Server, *atomic.In
 			releases.Add(1)
 			var sent map[string]any
 			assert.NoError(t, json.NewDecoder(r.Body).Decode(&sent), "decode the lock release request")
-			assert.Equal(t, map[string]any{"database": "testdb", "database_type": "mysql", "owner": client.GenerateCLIOwner()}, sent,
-				"the release names the lock this command took, under this command's owner, and is not forced")
+			assert.Equal(t, map[string]any{"database": "testdb", "database_type": "mysql", "owner": client.GenerateCLIOwner(), "id": float64(acquiredLockRowID)}, sent,
+				"the release names the lock row this command took, under this command's owner, and is not forced")
 			if s.dropRelease {
 				conn, _, hijackErr := http.NewResponseController(w).Hijack()
 				if !assert.NoError(t, hijackErr, "hijack the lock release connection") {
@@ -106,10 +106,21 @@ func (s unsubmittedLockServer) start(t *testing.T) (*httptest.Server, *atomic.In
 	return server, &releases
 }
 
+// acquiredLockRowID is the lock row the fake acquire reports.
+const acquiredLockRowID = 7
+
 const (
-	acquireCreatedLock = `{"lock":{"database":"testdb","database_type":"mysql"},"created":true}`
-	acquireFoundLock   = `{"lock":{"database":"testdb","database_type":"mysql"}}`
-	activeApplyRefusal = `{"error":"apply blocked: apply apply-other is still running on testdb","error_code":"active_apply_exists"}`
+	acquireCreatedLock = `{"lock":{"id":7,"database":"testdb","database_type":"mysql"},"created":true}`
+	acquireFoundLock   = `{"lock":{"id":7,"database":"testdb","database_type":"mysql"}}`
+	// acquireCreatedLockWithoutID is a server too old to report the lock row.
+	acquireCreatedLockWithoutID = `{"lock":{"database":"testdb","database_type":"mysql"},"created":true}`
+	activeApplyRefusal          = `{"error":"apply blocked: apply apply-other is still running on testdb","error_code":"active_apply_exists"}`
+	// lockInUseAnswer is the release kept because another command's apply
+	// runs under the lock row.
+	lockInUseAnswer = `{"error":"lock on database \"testdb\" was kept: apply apply-b2c3d4e5 (running) runs under it; nothing was released","error_code":"lock_in_use","lock_holder":{"apply_id":"apply-b2c3d4e5","state":"running","environment":"staging"}}`
+	// lockReplacedAnswer is the release refused because a newer lock row
+	// holds the database.
+	lockReplacedAnswer = `{"error":"lock on database \"testdb\" is no longer the lock this release named: it was released and taken again since; nothing was released","error_code":"lock_replaced"}`
 )
 
 // runUnsubmittedApply runs `apply -y` against server under ctx and returns its
@@ -320,5 +331,80 @@ func TestRollbackKeepsALockItFoundAlreadyHeld(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "apply apply-other is still running")
 	assert.Equal(t, int32(0), releases.Load(), out)
+	assert.NotContains(t, out, "Lock released")
+}
+
+// Another command run under the same account on the same host found the lock
+// this apply took and started its own apply under it. The server keeps the
+// lock for that apply, and the operator is told which apply holds it and how
+// to watch it, not sent to unlock it.
+func TestApplyKeepsItsLockWhenAnotherCommandsApplyRunsUnderIt(t *testing.T) {
+	t.Setenv("SCHEMABOT_TOKEN", "fictional-unsubmitted-lock-test")
+	server, releases := unsubmittedLockServer{acquireBody: acquireCreatedLock, applyStatus: http.StatusConflict, applyBody: activeApplyRefusal,
+		releaseStatus: http.StatusConflict, releaseBody: lockInUseAnswer}.start(t)
+
+	out, err := runUnsubmittedApply(t.Context(), writeTestSchemaDir(t), server)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "apply apply-other is still running")
+	assert.NotContains(t, err.Error(), "release lock for testdb", "a lock an apply runs under is not a failed release")
+	assert.Equal(t, int32(1), releases.Load(), out)
+	assert.Contains(t, out, "🔒 Lock kept for testdb (mysql): apply apply-b2c3d4e5 (running) runs under it.\n"+
+		"   Watch that apply: schemabot progress apply-b2c3d4e5 -e staging\n")
+	assert.NotContains(t, out, "schemabot unlock")
+	assert.NotContains(t, out, "Lock released")
+}
+
+// The lock this apply took was force-released and taken again under the same
+// owner before the apply was refused. The lock held now is not this
+// command's, so it stays held and the operator is told nothing of theirs was
+// released.
+func TestApplyLeavesALockTakenAgainSinceInPlace(t *testing.T) {
+	t.Setenv("SCHEMABOT_TOKEN", "fictional-unsubmitted-lock-test")
+	server, releases := unsubmittedLockServer{acquireBody: acquireCreatedLock, applyStatus: http.StatusConflict, applyBody: activeApplyRefusal,
+		releaseStatus: http.StatusConflict, releaseBody: lockReplacedAnswer}.start(t)
+
+	out, err := runUnsubmittedApply(t.Context(), writeTestSchemaDir(t), server)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "apply apply-other is still running")
+	assert.NotContains(t, err.Error(), "release lock for testdb", "a lock taken again since is not a failed release")
+	assert.Equal(t, int32(1), releases.Load(), out)
+	assert.Contains(t, out, "🔒 Lock for testdb (mysql) was released and taken again since this command took it, so it was left in place.\n"+
+		"   This command released nothing. See who holds it: schemabot locks\n")
+	assert.NotContains(t, out, "schemabot unlock")
+}
+
+// A server too old to report the lock row cannot release only the row this
+// apply took, and releasing by owner could remove a lock another command of
+// the same owner runs under. So the lock is kept, no release is sent, and the
+// operator is shown how to check it and release it.
+func TestApplyKeepsItsLockWhenTheServerReportsNoLockID(t *testing.T) {
+	t.Setenv("SCHEMABOT_TOKEN", "fictional-unsubmitted-lock-test")
+	server, releases := unsubmittedLockServer{acquireBody: acquireCreatedLockWithoutID, applyStatus: http.StatusConflict, applyBody: activeApplyRefusal, releaseStatus: http.StatusOK}.start(t)
+
+	out, err := runUnsubmittedApply(t.Context(), writeTestSchemaDir(t), server)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "apply apply-other is still running")
+	assert.Equal(t, int32(0), releases.Load(), out)
+	assert.Contains(t, out, "🔒 Lock kept for testdb (mysql): the server did not say which lock this command took, so releasing it could remove a lock another command uses.\n"+
+		"   See who holds it: schemabot locks\n"+
+		"   If no apply of yours runs under it, release it: schemabot unlock -d testdb -t mysql\n")
+	assert.NotContains(t, out, "Lock released")
+}
+
+// A rollback the server refuses keeps a lock another command's apply runs
+// under, the same as an apply.
+func TestRollbackKeepsItsLockWhenAnotherCommandsApplyRunsUnderIt(t *testing.T) {
+	t.Setenv("SCHEMABOT_TOKEN", "fictional-unsubmitted-lock-test")
+	server, releases := unsubmittedLockServer{acquireBody: acquireCreatedLock, applyStatus: http.StatusConflict, applyBody: activeApplyRefusal,
+		releaseStatus: http.StatusConflict, releaseBody: lockInUseAnswer}.start(t)
+
+	out, err := runUnsubmittedRollback(t, server)
+
+	require.Error(t, err)
+	assert.Equal(t, int32(1), releases.Load(), out)
+	assert.Contains(t, out, "🔒 Lock kept for testdb (mysql): apply apply-b2c3d4e5 (running) runs under it.")
 	assert.NotContains(t, out, "Lock released")
 }

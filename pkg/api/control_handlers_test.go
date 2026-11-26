@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -47,6 +48,16 @@ func TestIsInternalControlError(t *testing.T) {
 	t.Run("explicit server status is internal", func(t *testing.T) {
 		assert.True(t, IsInternalControlError(controlHTTPErrorf(http.StatusBadGateway, "tern unavailable")))
 	})
+}
+
+// A failed control is counted as "rejected" when the requester can act on the
+// error and as "error" when SchemaBot failed, so the error status alerts only
+// on SchemaBot's own failures.
+func TestControlMetricStatusSeparatesRejectionFromFailure(t *testing.T) {
+	assert.Equal(t, "rejected", controlMetricStatus(controlConflictf("schema change is not in its revert window (current state: %s)", "running")))
+	assert.Equal(t, "rejected", controlMetricStatus(fmt.Errorf("execute stop: %w", controlHTTPErrorf(http.StatusNotFound, "apply not found: %s", "apply-123"))))
+	assert.Equal(t, "error", controlMetricStatus(errors.New("control request store is not available")))
+	assert.Equal(t, "error", controlMetricStatus(controlHTTPErrorf(http.StatusBadGateway, "tern unavailable")))
 }
 
 // TestIsTerminalControlError verifies the retry disposition durable command
@@ -273,6 +284,118 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 			}
 		})
 	}
+}
+
+// An in-process control request names its environment the way the HTTP routes
+// accept it: spelling case does not change which environment is meant. Every
+// in-process control operation therefore answers a mixed-case environment
+// exactly as it answers the lowercase one, and a different environment is still
+// refused.
+func TestExecuteControlOperationsFoldEnvironmentCase(t *testing.T) {
+	executors := map[string]func(svc *Service, req apitypes.ControlRequest) error{
+		"stop": func(svc *Service, req apitypes.ControlRequest) error {
+			_, err := svc.ExecuteStop(t.Context(), req)
+			return err
+		},
+		"cancel": func(svc *Service, req apitypes.ControlRequest) error {
+			_, err := svc.ExecuteCancel(t.Context(), req)
+			return err
+		},
+		"start": func(svc *Service, req apitypes.ControlRequest) error {
+			_, err := svc.ExecuteStart(t.Context(), req)
+			return err
+		},
+		"cutover": func(svc *Service, req apitypes.ControlRequest) error {
+			_, err := svc.ExecuteCutover(t.Context(), req)
+			return err
+		},
+		"release": func(svc *Service, req apitypes.ControlRequest) error {
+			_, err := svc.ExecuteRelease(t.Context(), req)
+			return err
+		},
+		"revert": func(svc *Service, req apitypes.ControlRequest) error {
+			_, err := svc.ExecuteRevert(t.Context(), req)
+			return err
+		},
+		"skip-revert": func(svc *Service, req apitypes.ControlRequest) error {
+			_, err := svc.ExecuteSkipRevert(t.Context(), req)
+			return err
+		},
+	}
+	outcome := func(err error) string {
+		if err == nil {
+			return "accepted"
+		}
+		return err.Error()
+	}
+
+	// Each operation gets an apply in a state it acts on where one is cheap to
+	// build, so the mixed-case request must be accepted, not merely refused the
+	// same way. The rest are refused by a gate after the environment check.
+	fixtures := map[string]func() *Service{
+		"start": func() *Service {
+			apply := stoppedTestApply("apply-env-case")
+			task := &storage.Task{ID: 30, TaskIdentifier: "task-env-case", ApplyID: apply.ID, State: state.Task.Stopped}
+			return newControlTestServiceWithTasks(&mockTernClient{}, apply, []*storage.Task{task})
+		},
+		"cutover": func() *Service {
+			apply := activeTestApply("apply-env-case")
+			apply.State = state.Apply.WaitingForCutover
+			return newControlTestService(&mockTernClient{}, apply)
+		},
+	}
+	acceptedOn := map[string]bool{"stop": true, "cancel": true, "start": true, "cutover": true}
+
+	for operation, execute := range executors {
+		t.Run(operation, func(t *testing.T) {
+			fixture := fixtures[operation]
+			if fixture == nil {
+				fixture = func() *Service { return newControlTestService(&mockTernClient{}, activeTestApply("apply-env-case")) }
+			}
+			run := func(environment string) error {
+				return execute(fixture(), apitypes.ControlRequest{ApplyID: "apply-env-case", Environment: environment})
+			}
+
+			lowercase := run("staging")
+			mixedCase := run("StAgInG")
+
+			if acceptedOn[operation] {
+				assert.NoError(t, lowercase)
+				assert.NoError(t, mixedCase, "a mixed-case environment must be accepted")
+			}
+			assert.NotContains(t, outcome(mixedCase), "belongs to environment")
+			assert.Equal(t, outcome(lowercase), outcome(mixedCase),
+				"a mixed-case environment must get the answer the lowercase spelling gets")
+
+			err := run("production")
+			require.Error(t, err)
+			assert.Equal(t, http.StatusBadRequest, ControlOperationHTTPStatus(err))
+			assert.Contains(t, err.Error(), `apply "apply-env-case" belongs to environment "staging", not "production"`)
+		})
+	}
+}
+
+// A stop sent from the PR-comment path under a mixed-case environment reaches
+// the data plane under the apply's own canonical environment.
+func TestExecuteStopSendsCanonicalEnvironmentToDataPlane(t *testing.T) {
+	mock := &mockTernClient{stopResp: &ternv1.StopResponse{Accepted: true, StoppedCount: 1}}
+	apply := activeTestApply("apply-stop-env-case")
+	task := &storage.Task{ID: 20, TaskIdentifier: "task-stop-env-case", ApplyID: apply.ID, State: state.Task.Running}
+	svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
+
+	resp, err := svc.ExecuteStop(t.Context(), apitypes.ControlRequest{
+		ApplyID:     "apply-stop-env-case",
+		Environment: "StAgInG",
+		Caller:      "github:stopper@octocat/hello-world#1",
+	})
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	require.NotNil(t, mock.stopReq, "the immediate stop reaches the data plane")
+	assert.Equal(t, "staging", mock.stopReq.Environment)
+	pending, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.NotNil(t, pending, "the durable stop request is recorded")
 }
 
 // assertTernClientFailureLogged checks that the server log keeps the raw

@@ -628,8 +628,10 @@ type InstallationClient struct {
 
 	// blobs holds schema file content by blob SHA, so a file whose content did
 	// not change is read from GitHub once per installation, however many
-	// environments, plans, and pushes read it.
-	blobs *blobContentCache
+	// environments, plans, and pushes read it. blobReads shares one read
+	// between the callers that miss on the same blob at the same time.
+	blobs     *blobContentCache
+	blobReads singleflight.Group
 }
 
 // InstallationID returns the GitHub App installation this client is scoped
@@ -3862,7 +3864,7 @@ func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, rep
 			if fullObjectSHA.MatchString(headSHA) {
 				blobSHA = loc.blobSHA
 			}
-			content, err := ic.cachedBlobContent(repo, blobSHA, func() (string, error) {
+			content, err := ic.cachedBlobContent(ctx, repo, blobSHA, func(ctx context.Context) (string, error) {
 				return ic.FetchFileContent(ctx, repo, loc.fetchPath, headSHA)
 			})
 			if err != nil {
@@ -3972,7 +3974,7 @@ func (ic *InstallationClient) fetchSchemaFilesFromTree(ctx context.Context, repo
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			content, err := ic.cachedBlobContent(repo, entry.SHA, func() (string, error) {
+			content, err := ic.cachedBlobContent(ctx, repo, entry.SHA, func(ctx context.Context) (string, error) {
 				return ic.FetchBlobContent(ctx, repo, entry.SHA)
 			})
 			if err != nil {

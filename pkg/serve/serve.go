@@ -30,6 +30,8 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/changeevents"
+	"github.com/block/schemabot/pkg/changeevents/sqspublisher"
 	"github.com/block/schemabot/pkg/drain"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
@@ -460,9 +462,13 @@ func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os
 	// RPC or claimed an apply, a webhook delivery or a lease. Until a server
 	// serves a listener, nothing else closes it, so a failed bind closes the
 	// ones already bound.
+	listen := srv.listen
+	if listen == nil {
+		listen = listenForServe
+	}
 	var bound []net.Listener
 	bind := func(name, port string) (net.Listener, error) {
-		listener, err := listenForServe(runCtx, name, port)
+		listener, err := listen(runCtx, name, port)
 		if err != nil {
 			for _, earlier := range bound {
 				err = errors.Join(err, earlier.Close())
@@ -568,6 +574,7 @@ func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os
 // the embedding seam: a data plane consuming SchemaBot as a module configures it
 // entirely through ServerConfig rather than reimplementing this wiring.
 type Server struct {
+	changeEvents    *changeevents.Sender
 	cfg             *api.ServerConfig
 	svc             *api.Service
 	storage         storage.Storage
@@ -583,6 +590,11 @@ type Server struct {
 	telemetry  *api.Telemetry
 	authz      auth.Authorizer
 	engines    map[string]tern.EngineFactory
+	// listen binds the port a named server will serve on. It is nil outside
+	// tests, which means listenForServe. A test sets it to hand over listeners
+	// it already holds, because a port it chose and released can be taken by
+	// another process before the server binds it.
+	listen func(ctx context.Context, name, port string) (net.Listener, error)
 	// probeCancel and probeDone are set by Start when a startup target probe is
 	// launched; Close cancels the probe and waits on probeDone so an in-flight
 	// probe never outlives the resolver and clients svc.Close tears down.
@@ -668,6 +680,21 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 	logger.Info("building server", "version", version, "commit", o.commit, "built", o.date)
 
+	queues, err := sqspublisher.NewDestinations(ctx, cfg.SQSChangeEvents)
+	if err != nil {
+		return nil, err
+	}
+	events, err := changeevents.NewWithPublishers(cfg.ChangeEvents, queues, logger)
+	if err != nil {
+		return nil, err
+	}
+	keepEvents := false
+	defer func() {
+		if !keepEvents {
+			events.Close()
+		}
+	}()
+
 	// Register PlanetScale mTLS before anything else so a worker with
 	// missing or unreadable certificate material fails startup immediately
 	// instead of failing every Vitess connection it later opens.
@@ -751,7 +778,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 
 	// Create service with dependencies
-	store, err := newStore(dialect, db, storage.WithMaxDriversPerApply(cfg.MaxDriversPerApply))
+	store, err := newStore(dialect, db, storage.WithMaxDriversPerApply(cfg.MaxDriversPerApply), storage.WithChangeEvents(events, cfg.DatabaseApp, logger))
 	if err != nil {
 		return nil, err
 	}
@@ -821,6 +848,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		targetResolver = router.Resolver()
 	}
 	srv := &Server{
+		changeEvents:    events,
 		cfg:             cfg,
 		svc:             svc,
 		storage:         store,
@@ -842,6 +870,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 
 	success = true
+	keepEvents = true
 	return srv, nil
 }
 
@@ -1305,6 +1334,7 @@ func (s *Server) Close() error {
 	// shutdown-window drive a closed client. StopOperator waits for in-flight
 	// drivers and is idempotent, so svc.Close repeating it is a no-op.
 	s.svc.StopOperator()
+	s.changeEvents.Close()
 
 	var errs []error
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

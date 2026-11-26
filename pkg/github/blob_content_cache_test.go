@@ -1,6 +1,7 @@
 package github
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,8 +12,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
@@ -226,24 +229,24 @@ func TestCachedBlobContentKeepsOnlySuccessfulReadsPerRepository(t *testing.T) {
 	ic := NewInstallationClient(nil, discardLogger())
 	sha := gitBlobSHA(usersTable)
 	var fetches int
-	fetch := func() (string, error) {
+	fetch := func(context.Context) (string, error) {
 		fetches++
 		return usersTable, nil
 	}
 
-	_, err := ic.cachedBlobContent("octocat/hello-world", sha, func() (string, error) {
+	_, err := ic.cachedBlobContent(t.Context(), "octocat/hello-world", sha, func(context.Context) (string, error) {
 		return "", errors.New("GitHub is unavailable")
 	})
 	require.Error(t, err)
 
 	for range 2 {
-		content, err := ic.cachedBlobContent("octocat/hello-world", sha, fetch)
+		content, err := ic.cachedBlobContent(t.Context(), "octocat/hello-world", sha, fetch)
 		require.NoError(t, err)
 		assert.Equal(t, usersTable, content)
 	}
 	assert.Equal(t, 1, fetches, "the read after a failed one reaches GitHub, and the one after that is served from the cache")
 
-	content, err := ic.cachedBlobContent("octocat/other", sha, fetch)
+	content, err := ic.cachedBlobContent(t.Context(), "octocat/other", sha, fetch)
 	require.NoError(t, err)
 	assert.Equal(t, usersTable, content)
 	assert.Equal(t, 2, fetches, "the same blob in another repository is read from that repository")
@@ -320,4 +323,508 @@ func TestBlobContentCacheStartsOverAtItsLimit(t *testing.T) {
 	cache.put(repo, gitBlobSHA(tooLarge), tooLarge)
 	assert.False(t, held(cache, tooLarge), "an entry larger than the limit is not held")
 	assert.True(t, held(cache, last), "and it does not empty the cache")
+}
+
+// blobReadTestDeadline bounds every wait in the shared blob read tests.
+const blobReadTestDeadline = 5 * time.Second
+
+// gatedSchemaFile serves schema/users.sql through the Contents API and holds
+// every read until release is called, so a test can line up the callers that
+// miss on the file while the first read is in progress. The first read reports
+// on started. answer writes the response to each read, numbered from one.
+type gatedSchemaFile struct {
+	ic      *InstallationClient
+	reads   atomic.Int64
+	started chan struct{}
+	release func()
+}
+
+func newGatedSchemaFile(t *testing.T, answer func(read int64, ref string, w http.ResponseWriter)) *gatedSchemaFile {
+	t.Helper()
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	released := make(chan struct{})
+	g := &gatedSchemaFile{
+		ic:      NewInstallationClient(client, discardLogger()),
+		started: make(chan struct{}, 1),
+		release: sync.OnceFunc(func() { close(released) }),
+	}
+	t.Cleanup(g.release)
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema/users.sql", func(w http.ResponseWriter, r *http.Request) {
+		read := g.reads.Add(1)
+		if read == 1 {
+			g.started <- struct{}{}
+		}
+		select {
+		case <-released:
+			answer(read, r.URL.Query().Get("ref"), w)
+		case <-r.Context().Done():
+		}
+	})
+	return g
+}
+
+func writeUsersFile(t *testing.T, w http.ResponseWriter, content string) {
+	t.Helper()
+	require.NoError(t, json.NewEncoder(w).Encode(gh.RepositoryContent{
+		Type: new("file"), Name: new("users.sql"), Path: new("schema/users.sql"), Encoding: new("base64"),
+		Content: new(base64.StdEncoding.EncodeToString([]byte(content))),
+	}))
+}
+
+type blobReadResult struct {
+	content string
+	err     error
+}
+
+// readInBackground reads schema/users.sql at ref through the blob cache under
+// the key sha, as a listing at ref that reported that SHA would.
+func (g *gatedSchemaFile) readInBackground(ctx context.Context, sha, ref string) <-chan blobReadResult {
+	done := make(chan blobReadResult, 1)
+	go func() {
+		content, err := g.ic.cachedBlobContent(ctx, "octocat/hello-world", sha, func(ctx context.Context) (string, error) {
+			return g.ic.FetchFileContent(ctx, "octocat/hello-world", "schema/users.sql", ref)
+		})
+		done <- blobReadResult{content: content, err: err}
+	}()
+	return done
+}
+
+// joinRead starts a read that reports once it waits on the read already in
+// progress, and returns when it does.
+func (g *gatedSchemaFile) joinRead(t *testing.T, ctx context.Context, sha, ref string) <-chan blobReadResult {
+	t.Helper()
+	waiter := policyWaitContext{Context: ctx, waiting: make(chan struct{}, 1)}
+	done := g.readInBackground(waiter, sha, ref)
+	receivePolicyTestResult(t, ctx, waiter.waiting)
+	return done
+}
+
+// Two environments of one push, or two pushes that share a schema file, read
+// the same blob at the same time. GitHub is asked for it once, and both
+// callers get its content.
+func TestCachedBlobContentSharesOneReadBetweenConcurrentMisses(t *testing.T) {
+	deadline, cancel := context.WithTimeout(t.Context(), blobReadTestDeadline)
+	defer cancel()
+	firstPush, secondPush := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	g := newGatedSchemaFile(t, func(_ int64, _ string, w http.ResponseWriter) { writeUsersFile(t, w, usersTable) })
+	sha := gitBlobSHA(usersTable)
+
+	first := g.readInBackground(deadline, sha, firstPush)
+	receivePolicyTestResult(t, deadline, g.started)
+	second := g.joinRead(t, deadline, sha, secondPush)
+	g.release()
+
+	for _, done := range []<-chan blobReadResult{first, second} {
+		result := receivePolicyTestResult(t, deadline, done)
+		require.NoError(t, result.err)
+		assert.Equal(t, usersTable, result.content)
+	}
+	assert.Equal(t, int64(1), g.reads.Load(), "concurrent misses on one blob make one GitHub read")
+}
+
+// The caller that started the shared read gives up while it is in progress.
+// It returns its own context's error at once, and the read continues for the
+// caller still waiting on it, so GitHub is still asked only once.
+func TestCachedBlobContentReadSurvivesTheCallerThatStartedIt(t *testing.T) {
+	deadline, cancel := context.WithTimeout(t.Context(), blobReadTestDeadline)
+	defer cancel()
+	push := strings.Repeat("a", 40)
+	g := newGatedSchemaFile(t, func(_ int64, _ string, w http.ResponseWriter) { writeUsersFile(t, w, usersTable) })
+	sha := gitBlobSHA(usersTable)
+
+	starterCtx, cancelStarter := context.WithCancel(deadline)
+	defer cancelStarter()
+	starter := g.readInBackground(starterCtx, sha, push)
+	receivePolicyTestResult(t, deadline, g.started)
+	waiter := g.joinRead(t, deadline, sha, push)
+
+	cancelStarter()
+	assert.ErrorIs(t, receivePolicyTestResult(t, deadline, starter).err, context.Canceled,
+		"the caller that gave up returns while the read is still held")
+	g.release()
+
+	result := receivePolicyTestResult(t, deadline, waiter)
+	require.NoError(t, result.err)
+	assert.Equal(t, usersTable, result.content)
+	assert.Equal(t, int64(1), g.reads.Load())
+}
+
+// GitHub is unavailable for every attempt of a shared read. The read fails
+// every caller waiting on it, so the outage costs one read with its retries,
+// not one per caller, and it is not kept: the next caller reads the blob from
+// GitHub again.
+func TestCachedBlobContentDoesNotKeepAFailedSharedRead(t *testing.T) {
+	t.Cleanup(SetUnavailableReadRetryDelayForTest(time.Millisecond))
+	deadline, cancel := context.WithTimeout(t.Context(), blobReadTestDeadline)
+	defer cancel()
+	push := strings.Repeat("a", 40)
+	g := newGatedSchemaFile(t, func(read int64, _ string, w http.ResponseWriter) {
+		if read <= githubUnavailableReadRetryMaxAttempts {
+			http.Error(w, `{"message":"Service Unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+		writeUsersFile(t, w, usersTable)
+	})
+	sha := gitBlobSHA(usersTable)
+
+	first := g.readInBackground(deadline, sha, push)
+	receivePolicyTestResult(t, deadline, g.started)
+	second := g.joinRead(t, deadline, sha, push)
+	g.release()
+	for _, done := range []<-chan blobReadResult{first, second} {
+		result := receivePolicyTestResult(t, deadline, done)
+		assert.True(t, IsUnavailableError(result.err), "every waiter gets the shared failure: %v", result.err)
+	}
+	assert.Equal(t, int64(githubUnavailableReadRetryMaxAttempts), g.reads.Load(), "one shared read with its retries")
+
+	result := receivePolicyTestResult(t, deadline, g.readInBackground(deadline, sha, push))
+	require.NoError(t, result.err)
+	assert.Equal(t, usersTable, result.content)
+	assert.Equal(t, int64(githubUnavailableReadRetryMaxAttempts+1), g.reads.Load(), "the caller after a failed read reads again")
+}
+
+// The shared read keeps the client's retries: GitHub answers the first attempt
+// with a server error, the read retries inside the flight, and both waiting
+// callers get the content from the one read.
+func TestCachedBlobContentSharedReadRetriesUnavailableGitHub(t *testing.T) {
+	t.Cleanup(SetUnavailableReadRetryDelayForTest(time.Millisecond))
+	deadline, cancel := context.WithTimeout(t.Context(), blobReadTestDeadline)
+	defer cancel()
+	push := strings.Repeat("a", 40)
+	g := newGatedSchemaFile(t, func(read int64, _ string, w http.ResponseWriter) {
+		if read == 1 {
+			http.Error(w, `{"message":"Service Unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+		writeUsersFile(t, w, usersTable)
+	})
+	sha := gitBlobSHA(usersTable)
+
+	first := g.readInBackground(deadline, sha, push)
+	receivePolicyTestResult(t, deadline, g.started)
+	second := g.joinRead(t, deadline, sha, push)
+	g.release()
+
+	for _, done := range []<-chan blobReadResult{first, second} {
+		result := receivePolicyTestResult(t, deadline, done)
+		require.NoError(t, result.err)
+		assert.Equal(t, usersTable, result.content)
+	}
+	assert.Equal(t, int64(2), g.reads.Load(), "one shared read: the failed attempt and its retry")
+}
+
+// A symbolic link to a file is listed under the link's own blob SHA, while a
+// read returns the target's content at that commit. Two pushes that changed
+// the target read the link at the same time under one key. Each gets its own
+// commit's content: the caller whose read was shared reads the file again.
+func TestCachedBlobContentReadsASymlinkedFileAtEachCommitConcurrently(t *testing.T) {
+	deadline, cancel := context.WithTimeout(t.Context(), blobReadTestDeadline)
+	defer cancel()
+	firstPush, secondPush := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	targetAt := map[string]string{
+		firstPush:  usersTable,
+		secondPush: "CREATE TABLE users (id INT, email VARCHAR(255));",
+	}
+	g := newGatedSchemaFile(t, func(_ int64, ref string, w http.ResponseWriter) { writeUsersFile(t, w, targetAt[ref]) })
+	linkBlob := gitBlobSHA("../shared/users.sql")
+
+	first := g.readInBackground(deadline, linkBlob, firstPush)
+	receivePolicyTestResult(t, deadline, g.started)
+	second := g.joinRead(t, deadline, linkBlob, secondPush)
+	g.release()
+
+	firstResult := receivePolicyTestResult(t, deadline, first)
+	require.NoError(t, firstResult.err)
+	assert.Equal(t, targetAt[firstPush], firstResult.content)
+	secondResult := receivePolicyTestResult(t, deadline, second)
+	require.NoError(t, secondResult.err)
+	assert.Equal(t, targetAt[secondPush], secondResult.content, "the second push gets its own commit's content")
+	assert.Equal(t, int64(2), g.reads.Load())
+}
+
+// A push whose unchanged file sits at a commit GitHub no longer serves is read
+// at the same time as a push at a live commit. The read by path fails only for
+// the first commit, so the caller at the live commit reads the file for itself
+// and gets its content instead of the other commit's not-found error.
+func TestCachedBlobContentDoesNotShareAnotherCommitsNotFound(t *testing.T) {
+	deadline, cancel := context.WithTimeout(t.Context(), blobReadTestDeadline)
+	defer cancel()
+	goneRef, liveRef := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	g := newGatedSchemaFile(t, func(_ int64, ref string, w http.ResponseWriter) {
+		if ref == goneRef {
+			http.Error(w, `{"message":"No commit found for the ref"}`, http.StatusNotFound)
+			return
+		}
+		writeUsersFile(t, w, usersTable)
+	})
+	sha := gitBlobSHA(usersTable)
+
+	first := g.readInBackground(deadline, sha, goneRef)
+	receivePolicyTestResult(t, deadline, g.started)
+	second := g.joinRead(t, deadline, sha, liveRef)
+	g.release()
+
+	assert.True(t, IsNotFoundError(receivePolicyTestResult(t, deadline, first).err))
+	result := receivePolicyTestResult(t, deadline, second)
+	require.NoError(t, result.err, "the caller at the live commit reads the file itself")
+	assert.Equal(t, usersTable, result.content)
+	assert.Equal(t, int64(2), g.reads.Load())
+}
+
+// A caller whose context has already ended starts no read: a later caller
+// with a live context finds neither a read in progress nor a cached result,
+// and makes the read itself.
+func TestCachedBlobContentStartsNoReadForAnEndedContext(t *testing.T) {
+	deadline, cancel := context.WithTimeout(t.Context(), blobReadTestDeadline)
+	defer cancel()
+	ic := NewInstallationClient(nil, discardLogger())
+	sha := gitBlobSHA(usersTable)
+	var endedFetches, liveFetches atomic.Int64
+
+	ended, cancelEnded := context.WithCancel(deadline)
+	cancelEnded()
+	_, err := ic.cachedBlobContent(ended, "octocat/hello-world", sha, func(context.Context) (string, error) {
+		endedFetches.Add(1)
+		return usersTable, nil
+	})
+	require.ErrorIs(t, err, context.Canceled)
+
+	content, err := ic.cachedBlobContent(deadline, "octocat/hello-world", sha, func(context.Context) (string, error) {
+		liveFetches.Add(1)
+		return usersTable, nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, usersTable, content)
+	assert.Equal(t, int64(1), liveFetches.Load(), "the live caller found no read the ended caller started")
+	assert.Equal(t, int64(0), endedFetches.Load())
+}
+
+// queuedSchemaFiles serves a schema directory of more files than a schema
+// fetch reads at once. Every content read reports on arrivals and is held
+// until release is called. With tree set, the directory cannot be listed and
+// its files are read as blobs from the git tree.
+type queuedSchemaFiles struct {
+	ic       *InstallationClient
+	files    map[string]string // blob SHA to content
+	arrivals chan struct{}
+	release  func()
+}
+
+// schemaFetchConcurrency is how many files a schema fetch reads at once.
+const schemaFetchConcurrency = 10
+
+func newQueuedSchemaFiles(t *testing.T, tree bool) *queuedSchemaFiles {
+	t.Helper()
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	released := make(chan struct{})
+	q := &queuedSchemaFiles{
+		ic:       NewInstallationClient(client, discardLogger()),
+		files:    make(map[string]string),
+		arrivals: make(chan struct{}, schemaFetchConcurrency+1),
+		release:  sync.OnceFunc(func() { close(released) }),
+	}
+	t.Cleanup(q.release)
+	var listing []gh.RepositoryContent
+	var treeEntries []any
+	contentByPath := make(map[string]string)
+	for i := range schemaFetchConcurrency + 1 {
+		name := "t" + strconv.Itoa(i) + ".sql"
+		content := "CREATE TABLE t" + strconv.Itoa(i) + " (id INT);"
+		sha := gitBlobSHA(content)
+		q.files[sha] = content
+		contentByPath[name] = content
+		listing = append(listing, gh.RepositoryContent{Type: new("file"), Name: new(name), Path: new("schema/" + name), SHA: new(sha)})
+		treeEntries = append(treeEntries, map[string]any{"path": "schema/" + name, "type": "blob", "mode": "100644", "sha": sha})
+	}
+	hold := func(w http.ResponseWriter, r *http.Request, body any) {
+		q.arrivals <- struct{}{}
+		select {
+		case <-released:
+			require.NoError(t, json.NewEncoder(w).Encode(body))
+		case <-r.Context().Done():
+		}
+	}
+	if tree {
+		mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema", func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+		})
+		mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/{sha}", func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"tree": treeEntries}))
+		})
+		mux.HandleFunc("GET /repos/octocat/hello-world/git/blobs/{sha}", func(w http.ResponseWriter, r *http.Request) {
+			content := q.files[r.PathValue("sha")]
+			hold(w, r, gh.Blob{Content: new(base64.StdEncoding.EncodeToString([]byte(content))), Encoding: new("base64")})
+		})
+		return q
+	}
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(listing))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema/{file}", func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("file")
+		hold(w, r, gh.RepositoryContent{
+			Type: new("file"), Name: new(name), Path: new("schema/" + name), Encoding: new("base64"),
+			Content: new(base64.StdEncoding.EncodeToString([]byte(contentByPath[name]))),
+		})
+	})
+	return q
+}
+
+// A schema fetch is cancelled while it reads as many files as it reads at
+// once, with one more file queued behind them. The reads already in progress
+// continue and are kept for later callers, but the queued file starts no read
+// once the fetch has ended. Both the directory listing and the git tree
+// fallback behave this way.
+func TestFetchSchemaFilesStartsNoReadAfterCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tree bool
+	}{{name: "directory listing"}, {name: "git tree fallback", tree: true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			deadline, cancel := context.WithTimeout(t.Context(), blobReadTestDeadline)
+			defer cancel()
+			q := newQueuedSchemaFiles(t, tc.tree)
+
+			fetchCtx, cancelFetch := context.WithCancel(deadline)
+			defer cancelFetch()
+			done := make(chan error, 1)
+			go func() {
+				_, err := q.ic.FetchSchemaFilesOptimized(fetchCtx, "octocat/hello-world", strings.Repeat("a", 40), "schema", "mysql")
+				done <- err
+			}()
+			for range schemaFetchConcurrency {
+				receivePolicyTestResult(t, deadline, q.arrivals)
+			}
+			cancelFetch()
+			assert.ErrorIs(t, receivePolicyTestResult(t, deadline, done), context.Canceled)
+			q.release()
+
+			// A file whose read started is served from that read; a file that
+			// started none is read here.
+			var unread []string
+			for sha, want := range q.files {
+				content, err := q.ic.cachedBlobContent(deadline, "octocat/hello-world", sha, func(context.Context) (string, error) {
+					unread = append(unread, sha)
+					return want, nil
+				})
+				require.NoError(t, err)
+				assert.Equal(t, want, content)
+			}
+			assert.Len(t, unread, 1, "only the queued file is unread, and every read in progress was kept")
+		})
+	}
+}
+
+// The same blob in two repositories is two reads at the same time, never one
+// shared across repositories.
+func TestCachedBlobContentDoesNotShareAReadAcrossRepositories(t *testing.T) {
+	deadline, cancel := context.WithTimeout(t.Context(), blobReadTestDeadline)
+	defer cancel()
+	ic := NewInstallationClient(nil, discardLogger())
+	sha := gitBlobSHA(usersTable)
+	var fetches atomic.Int64
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	fetch := func(context.Context) (string, error) {
+		fetches.Add(1)
+		started <- struct{}{}
+		<-release
+		return usersTable, nil
+	}
+	done := make(chan error, 2)
+	for _, repo := range []string{"octocat/a", "octocat/b"} {
+		go func() {
+			_, err := ic.cachedBlobContent(deadline, repo, sha, fetch)
+			done <- err
+		}()
+	}
+	receivePolicyTestResult(t, deadline, started)
+	receivePolicyTestResult(t, deadline, started)
+	close(release)
+	require.NoError(t, receivePolicyTestResult(t, deadline, done))
+	require.NoError(t, receivePolicyTestResult(t, deadline, done))
+	assert.Equal(t, int64(2), fetches.Load())
+}
+
+// pausedContext holds the first call to Err until resume is closed.
+// cachedBlobContent checks Err after its cache lookup and before it starts or
+// joins a shared read, so the pause holds a caller between the two.
+type pausedContext struct {
+	context.Context
+	once   sync.Once
+	paused chan struct{}
+	resume chan struct{}
+}
+
+func (c *pausedContext) Err() error {
+	c.once.Do(func() {
+		c.paused <- struct{}{}
+		<-c.resume
+	})
+	return c.Context.Err()
+}
+
+// A caller misses the cache, and before it starts its shared read another
+// caller reads the blob and caches it. The shared read finds the blob cached
+// and makes no GitHub read.
+func TestCachedBlobContentSharedReadUsesABlobCachedSinceTheMiss(t *testing.T) {
+	deadline, cancel := context.WithTimeout(t.Context(), blobReadTestDeadline)
+	defer cancel()
+	ic := NewInstallationClient(nil, discardLogger())
+	sha := gitBlobSHA(usersTable)
+	var lateFetches atomic.Int64
+
+	late := &pausedContext{Context: deadline, paused: make(chan struct{}, 1), resume: make(chan struct{})}
+	resume := sync.OnceFunc(func() { close(late.resume) })
+	t.Cleanup(resume)
+	lateDone := make(chan blobReadResult, 1)
+	go func() {
+		content, err := ic.cachedBlobContent(late, "octocat/hello-world", sha, func(context.Context) (string, error) {
+			lateFetches.Add(1)
+			return usersTable, nil
+		})
+		lateDone <- blobReadResult{content: content, err: err}
+	}()
+	receivePolicyTestResult(t, deadline, late.paused)
+
+	content, err := ic.cachedBlobContent(deadline, "octocat/hello-world", sha, func(context.Context) (string, error) {
+		return usersTable, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, usersTable, content)
+	resume()
+
+	result := receivePolicyTestResult(t, deadline, lateDone)
+	require.NoError(t, result.err)
+	assert.Equal(t, usersTable, result.content)
+	assert.Equal(t, int64(0), lateFetches.Load(), "the shared read found the blob cached since the miss")
+}
+
+// A shared read stopped by its own time limit while the client waits to retry
+// an unavailable GitHub is reported as GitHub being unavailable, the same as
+// one stopped mid-request. A caller that gave up, or another error, is
+// reported as it is.
+func TestSharedReadErrorReportsItsLimitAsUnavailable(t *testing.T) {
+	t.Cleanup(SetUnavailableReadRetryDelayForTest(10 * time.Second))
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema/users.sql", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"message":"Service Unavailable"}`, http.StatusServiceUnavailable)
+	})
+	ic := NewInstallationClient(client, discardLogger())
+	limited, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	_, err := ic.FetchFileContent(limited, "octocat/hello-world", "schema/users.sql", strings.Repeat("a", 40))
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	classified := sharedReadError(limited, err)
+	assert.True(t, IsUnavailableError(classified), "a read stopped by its limit is unavailable: %v", classified)
+	assert.Equal(t, 1, strings.Count(classified.Error(), ErrGitHubUnavailable.Error()), "classified once: %v", classified)
+	assert.Equal(t, classified, sharedReadError(limited, classified), "an unavailable error is kept as it is")
+
+	notFound := &gh.ErrorResponse{Response: &http.Response{StatusCode: http.StatusNotFound}}
+	assert.Equal(t, error(notFound), sharedReadError(limited, notFound), "another error after the limit is kept as it is")
+
+	gaveUp, cancelGaveUp := context.WithCancel(t.Context())
+	cancelGaveUp()
+	assert.False(t, IsUnavailableError(sharedReadError(gaveUp, gaveUp.Err())), "a caller that gave up is not GitHub being unavailable")
 }

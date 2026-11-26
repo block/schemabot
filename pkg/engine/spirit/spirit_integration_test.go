@@ -660,6 +660,7 @@ func TestEngine_Plan_RefusesTableDeclaredTwice(t *testing.T) {
 				Credentials: &engine.Credentials{DSN: dsn},
 			})
 			require.EqualError(t, err, `table "orders" is declared by both schema files "testdb/orders.sql" and "testdb/orders_extras.sql". Declare each table in exactly one schema file`)
+			assert.True(t, engine.IsPlanRefused(err))
 			assert.Nil(t, result)
 		}
 	})
@@ -674,6 +675,7 @@ func TestEngine_Plan_RefusesTableDeclaredTwice(t *testing.T) {
 			Credentials: &engine.Credentials{DSN: dsn},
 		})
 		require.EqualError(t, err, `table "orders" is declared by both schema files "billing/orders.sql" and "testdb/orders.sql". Declare each table in exactly one schema file`)
+		assert.True(t, engine.IsPlanRefused(err))
 		assert.Nil(t, result)
 	})
 }
@@ -3031,6 +3033,13 @@ func TestEngine_Plan_SlowSizeProbeStatementIsAbandoned(t *testing.T) {
 				return stmt
 			}
 			return fmt.Sprintf("SET SESSION information_schema_stats_expiry = (SELECT SLEEP(%d))", int(stall.Seconds()))
+		},
+		// SLEEP returns 0, so the stalled read still reports the server's setting.
+		"name case setting": func(stmt string) string {
+			if !strings.Contains(stmt, "@@lower_case_table_names") {
+				return stmt
+			}
+			return fmt.Sprintf("SELECT @@lower_case_table_names + SLEEP(%d)", int(stall.Seconds()))
 		},
 		"statistics query": func(stmt string) string {
 			if !strings.Contains(stmt, "information_schema.tables") {

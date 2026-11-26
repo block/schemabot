@@ -38,7 +38,6 @@ import (
 var postgresIdentityKeyColumns = map[string][]string{
 	"applies":                  {"database_name", "database_type", "deployment", "environment", "repository"},
 	"apply_operations":         {"deployment"},
-	"apply_target_locks":       {"database_name", "database_type", "deployment", "environment"},
 	"checks":                   {"database_name", "database_type", "environment", "repository"},
 	"environment_freezes":      {"environment"},
 	"freeze_epochs":            {"environment"},

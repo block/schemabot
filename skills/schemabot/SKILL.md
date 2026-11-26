@@ -29,7 +29,7 @@ Read [Agent command policy](references/command-policy.md) before you post or han
 ## Start here
 
 - [ ] Search the current worktree for `schemabot.yaml` and the schema files next to it. Don't rely on a path you remember.
-- [ ] Read `database` and `type` from `schemabot.yaml`. Speak only to that engine: `mysql`, `vitess`, or `postgres`. PostgreSQL support is early alpha, so check the [PostgreSQL guide](https://github.com/block/schemabot/blob/main/docs/postgresql.md) before promising it can do something.
+- [ ] Read `database` and `type` from `schemabot.yaml`. Speak only to that engine: `mysql`, `vitess`, or `postgres`. PostgreSQL support is beta, so check [what is not GA yet](https://github.com/block/schemabot/blob/main/docs/postgresql.md#beta-status) before promising it can do something.
 - [ ] If the plan rolls out to several targets, load [Sharded databases](references/sharded-databases.md) before advising.
 - [ ] Edit the declarative files to the desired end state. See [Authoring](references/authoring.md).
 - [ ] Run the repo's own local convergence, code generation, and tests, if it has them.

@@ -400,9 +400,10 @@ func planCheckConclusion(hasChanges, hasPlanErrors, hasFinalRefusal, driftBlocke
 // A refusal is final when no apply SchemaBot runs can satisfy it, so leaving
 // the PR at action-required would coach an apply that is certain to be
 // refused. PostgreSQL blocks a change it has no authoritative classifier
-// verdict for and a DROP TABLE it never executes — the latter is lifted only
-// by the operator changing the repository or the target and re-planning, never
-// by an apply — and Vitess refuses constructs it cannot execute at all. The
+// verdict for and a DROP TABLE it cannot run, such as one of a partitioned
+// table or one a kept table's foreign key still needs — lifted only by the
+// operator changing the repository or the target and re-planning, never by
+// an apply — and Vitess refuses constructs it cannot execute at all. The
 // MySQL engine also marks a refused statement blocked, but there the verdict
 // previews a direct-execution routing decision that apply time re-resolves
 // against live policy and table size, so a plan blocked at review can still

@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -188,7 +189,12 @@ type CommandResult struct {
 	// acknowledge it with a reaction once they commit to acting, so on a
 	// fan-out only the deployments actually doing work acknowledge.
 	CommentID int64
-	ApplyID   string // Positional apply identifier for apply-scoped commands.
+	// RequestedAt is when the user posted the comment that carried this
+	// command. A comment shows it as the request time, so the time stays put
+	// however long planning takes and however often the comment is edited.
+	// Zero when the command did not come from a comment.
+	RequestedAt time.Time
+	ApplyID     string // Positional apply identifier for apply-scoped commands.
 	// OverrideID is the override request a `freeze approve` names, as typed;
 	// the approval checks its shape.
 	OverrideID  string

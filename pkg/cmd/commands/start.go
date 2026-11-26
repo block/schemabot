@@ -14,7 +14,7 @@ import (
 type StartCmd struct {
 	ControlFlags
 	Watch    bool   `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
-	Override string `help:"Reason to ask a freeze approver to let this change through a freeze" name:"override"`
+	Override string `help:"Why this change can't wait. It lets the change through a freeze, or asks a freeze approver to, as the server's override policy says" name:"override"`
 }
 
 // Run executes the start command.

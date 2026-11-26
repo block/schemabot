@@ -300,7 +300,8 @@ operator's typo rather than a peer on a different release, and ignoring it would
 *Enforced:* the additive-only proto and storage-schema rules, checked before a tag
 ([release.md](release.md)); strict decoding on the HTTP API handlers
 (`pkg/api/control_handlers.go`, `pkg/api/freeze_handlers.go`, `pkg/api/lock_handlers.go`,
-`pkg/api/plan_handlers.go`, `pkg/api/settings_handlers.go`, `pkg/api/storage_schema_handlers.go`) and on config load
+`pkg/api/plan_handlers.go`, `pkg/api/settings_handlers.go`, `pkg/api/storage_schema_handlers.go`,
+`pkg/api/webhook_ops_handlers.go`) and on config load
 (`pkg/api/config.go`).
 
 ### AV-7: An acknowledged delivery is a promise
@@ -1018,7 +1019,9 @@ per-operation budget in the redispatch claim (`FindNextApplyOperation`,
 Multi-member rollouts claim operations in member order, where a member is a (deployment, target)
 pair taken in `deployment_order` and then in each deployment's `targets` order, and a failed
 earlier member blocks later ones unless the config says otherwise. Copy start is ordered per
-member, not per operation: one member's work never waits on its own member's work to start, and a
+member, not per operation: one member's work never waits on its own member's work to start, but
+once some of a member's work has failed, its work that has not started is held by that failure
+exactly as a later member's work would be, and a
 later member's work waits on every earlier member's, until it completes under `rolling` or reaches
 the cutover barrier under `barrier`, while `parallel` does not order copy start at all. Where a
 rollout is laid out table by table, work on a table starts on any target only once every earlier
@@ -1059,7 +1062,8 @@ without completing the request would refuse the start the hold exists to preserv
 *Enforced:* the ordered-claim gates in `FindNextApplyOperation`, whose work and finalizer arms
 each gate on earlier members and whose stopped+start arm holds a finalizer, and work that never
 started, to the same gate, with the failure exemption shared by every gate and the table-step
-boundary `rolloutStepGateSQL` in the work gate, and `FindNextApplyOperationCutover`, whose start
+boundary `rolloutStepGateSQL` and the same-member failure gate `sameMemberFailureGateSQL` in the
+work gate, and `FindNextApplyOperationCutover`, whose start
 arm gates on the hold rule `earlierSiblingHoldsCutoverSQL` that `CutoverBlocker` shares
 (`pkg/storage/internal/sqlstore/apply_operations.go`), pinned per policy on both dialects by the
 storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a
@@ -1071,8 +1075,9 @@ check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sha
 `earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request
 (`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`) and at request intake
 (`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
-(`DeriveRolloutApplyState`, `deriveCancelledRollout`, `deriveStoppedRollout`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
-`pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`, whose
+(`DeriveRolloutApplyState`, `deriveCancelledRollout`, `deriveStoppedRollout`, `hasStartedUnsettledWork`, `childHoldsItsTarget`,
+and `pauseHoldsWork` with `heldBySameMemberFailure`, `pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`,
+whose `workMember` groups work rows into members as the same-member failure gate does, and whose
 `stepOrphanedByEarlierStep` marks work held behind a table that settled without completing, read through `StepRowCanNeverPass`), through which every
 projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/apply.go`), which
 `updateApplyStateFromOperations` consults to keep a held-open rollout's recovery claim quiet, and
@@ -1580,6 +1585,21 @@ deployment still holds rows naming it. *Enforced:* the retired-operation list
 (`RetiredControlOperations()` in `pkg/storage/types.go`), consulted by the terminal sweep
 (`pkg/tern/control_requests.go`).
 
+### CO-11: A control command names the apply it acts on
+
+Every control command, and rollback, acts only on the apply the operator names by its apply ID,
+on every surface. A command without one is refused before SchemaBot looks up any apply, and no
+control request is recorded. SchemaBot never infers the apply, not even when exactly one apply is
+active. *Breaks if violated:* the apply that was active when the operator looked may have finished
+by the time the command lands, so a guess can stop, revert, or run the cutover for a schema change the
+operator never meant to touch. *Enforced:* the PR comment usage reply (`loadApplyForPRControl` in
+`pkg/webhook/control.go`, and the rollback gate in `pkg/webhook/issue_comment.go`); the CLI
+(`RequireApplyID` and `requireControlScope` in `pkg/cmd/commands/common.go`, and rollback's
+required argument); the HTTP API (`decodeControlRequest`, `controlTarget`,
+`ValidateRollbackSourceApply`, and `handleRollbackPlan` in `pkg/api/control_handlers.go`). A completeness test on each surface walks the operation
+registry (`ControlOperations()` in `pkg/storage/types.go`), so a new operation is held to the rule
+without anyone adding it to a list.
+
 ## Operator surfaces (UX)
 
 The rest of this document is about what the system does. This family is about what the operator is
@@ -1755,6 +1775,25 @@ one rollout has got. *Enforced:* the shared derivation (`SumTargetRows`, `Percen
 renders the same rollouts through both surfaces and fails when they read differently
 (`TestRolledUpTableReadsTheSameInTheCLIAndThePRComment` in `pkg/cmd/internal/templates`).
 
+### UX-8: A table in flight reads the same on every surface, whichever engine runs it
+
+While an engine works on a table's change, the table has one reading: the label beside its name,
+and the detail lines under its statement. This holds while the engine copies rows, builds an
+index, verifies a copy, catches up on changes, or applies a change that reports no progress, and
+whether the table runs on one target or copies across shards. Each
+engine reports its progress as the same table facts, and that reading is derived once from those
+facts and rendered by the CLI and the PR comment alike. So an operator watching two engines' schema
+changes sees the same phase named the same way, with the same figures in the same place. Only
+markup and the bar's drawing may differ between surfaces. *Enforced:* the shared reading
+(`ReadInFlightTable` in `pkg/presentation/table_reading.go`), and a test that renders one progress
+response for every phase through both surfaces, under every engine in `storage.Engines`, and fails
+when they read differently (`TestInFlightTableReadsTheSameOnEverySurface` in
+`pkg/cmd/internal/templates`), with `TestEnginesListsEveryEngineConstant` in `pkg/storage` keeping
+that list complete. Its sharded counterpart (`TestShardedInFlightTableReadsTheSameOnEverySurface`)
+covers a table copying across shards in the CLI, the sharded apply comment, and the apply status
+comment. These tests prove the surfaces read the same facts alike; which facts an engine reports is
+pinned by that engine's own progress tests.
+
 ## Recovery (RC)
 
 ### RC-1: Nothing is orphaned
@@ -1891,6 +1930,18 @@ the re-plan speaks for a shard-tagged task at all. `remainingPlannedChanges` on 
 path of the PlanetScale engine (`pkg/engine/planetscale/apply.go`) runs only reviewed DDL for the
 tables the branch still lacks, refuses a branch that differs outside the reviewed DDL, and
 validates the branch against the declared schema before creating or adopting the deploy request.
+On PostgreSQL, a statement that drops a table, a column, a constraint, or a NOT NULL runs only with the
+planner's record of that object, which the plan stores with the change and every apply path passes
+back, matching a task to its change by the statement's canonical form (`planChangeMetadata` in
+`pkg/tern/plan_change_metadata.go`); the apply refuses a drop with no record
+and drops nothing when the object no longer matches it under the table's lock
+(`reviewedDropForApply` and `executeReviewedDrop` in `pkg/engine/postgres/apply.go`;
+`tableDropForApply` and `executeTableDrop` in `pkg/engine/postgres/table_drop.go`).
+The re-plan an apply runs after a confirmation, or after an automatic apply posts its plan, holds
+each statement the confirmed plan ran to the engine's record of the objects it acts on: a record
+that differs refuses the confirmation, or stops the automatic apply for manual confirmation
+(`memberWorkDifference` and `objectsChangedSinceReview` in `pkg/webhook/apply_member_work.go`,
+called from `executeApply` in `pkg/webhook/apply_execute.go`).
 The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
 and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
@@ -1960,7 +2011,8 @@ The byte bound has no exact corroboration and approves on its estimate. The verd
 belongs to the target that will run the statement: a deployment that applies a plan it did not
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
 planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the
-privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS admission refusals
+privilege, size, and partitioned index shape gates in `pkg/engine/postgres/postgres.go` and the
+table drop gates in `pkg/engine/postgres/table_drop.go`, plus RLS admission refusals
 in `pkg/engine/postgres/row_security.go` and enum type refusals, the type privilege gate, and
 blocked label additions in `pkg/engine/postgres/enum_type.go` that abort plan creation or mark the
 plan blocked, and the apply-time gates in `pkg/engine/postgres/row_security_apply.go` and
@@ -2142,8 +2194,9 @@ scoped operator never takes a lock without one, and a lock with no recorded acqu
 only under a deployment-wide grant. *Enforced:* the
 trust-anchor config, which refuses to start without one, and identity-precedence rules in the auth
 layer (`pkg/auth`); the scoped lock release and re-acquire in `pkg/api/lock_handlers.go`, the release
-pinned to the lock row it checked and the re-acquire told which row its acquire created (`ReleaseByID`
-and `Acquire` in `pkg/storage/internal/sqlstore/locks.go`).
+pinned to the lock row it checked, or to the row the caller named when it sends one, and the
+re-acquire told which row its acquire created (`ReleaseByID`, `ReleaseByIDIfUnused` and `Acquire` in
+`pkg/storage/internal/sqlstore/locks.go`).
 
 ### AZ-4: Applying takes an authorized actor
 
@@ -2236,30 +2289,21 @@ apply that includes every deployment its stored operations run on. "In effect" i
 database clock, so every pod agrees at the edges of a freeze. A pull request rollback is never held, at creation or at a later start or
 cutover, nor is a stop, a cancel or a revert. When SchemaBot cannot read the freezes, or the override
 requests below, it refuses the change with a retryable error, never letting it through unchecked.
-A freeze refuses a change unless an approved override request covers every blocker on it. The
-requester, who must be verified, runs the apply, start or cutover with an override reason, and
-SchemaBot records a request and refuses, naming it. Asking again before approval names the same request
-(`requestOverride`), which keeps its first reason; the refusal says so when the new reason differs. A verified member of `freeze.groups` who is not the requester approves it;
-write groups do not grant approval, and with no freeze group configured nobody approves, so nobody
-overrides alone, admins included. Storage also refuses the pull request's author once a request
-records one. A request from a pull request records its commenter and author as `github:<login>`,
-which storage cannot match to a forward-auth subject, so an approval must come from the same
-identity domain: `handleFreezeOverrideApprove` refuses a request where `FromPullRequest` holds, and
-`AuthorizeFreezeApprove` refuses a subject that starts with `github:`. The reverse holds too:
-`ApprovePullRequestOverride` approves only a request where `FromPullRequest` holds, and only from
-the pull request it names, as `github:<login>` of a `freeze.github_teams` member. The requester repeats the
-command and it is admitted; only the requester runs on an approval (`approvedOverride`), and anyone
-else asks for their own. A request also belongs to where it was asked for (`sameOverrideOrigin`):
-the same change on another pull request records and needs its own, so one pull request's author
-cannot approve a request on another and so admit their own. An approval covers one environment, one action and one target and expires
-after 24 hours. Within that window the requester may use it more than once, for example to re-apply
-the same schema after a stop. For an apply the target is the
-database and, for each rollout member it runs, the schema and the `ignore_tables` and
-`drop_tables` that member's plan was reviewed under (`applyOverrideTarget`), not the plan,
-because a repeated command plans afresh. A change to what any member would run, or a rollout
-that gains a member, needs a new approval. For a
-start or a cutover it is the apply. A blocker the request does not name refuses again and needs a
-new request.
+A freeze refuses a change unless an override covers every blocker on it. Only a verified
+requester asks for one, by giving an override reason with the apply, start or cutover. An override
+covers one environment, one action and one target: for an apply, the database and, for each rollout
+member, the schema and the table lists its plan was reviewed under, not the plan, because a repeated
+command plans afresh; for a start or a cutover, the apply. A change to what any member would run, a
+rollout that gains a member, or a blocker the override does not name needs a new override.
+An override admitted on its requester's reason admits only the command that gave the reason and the
+work that command starts. A later command, a retry of the same change included, gives its own reason.
+Any other override admits a change only once a second person approves it, and only for its
+requester, for at most 24 hours. Nobody approves their own request or one on a pull request they
+wrote, and an approval comes from the identity domain the request was asked in: a forward-auth
+subject approves a request from the CLI, and a GitHub team member approves a request from the pull
+request it names, which no other pull request shares. With no approver configured, nobody overrides
+alone, admins included. Which of the two kinds a server records is its override policy
+([freeze.md](freeze.md#choose-the-override-policy)).
 A PR rollback is known by a `pinned_rollback` option the server records when it creates the apply.
 A rollback created by an earlier version has none, so a freeze holds its later start or cutover;
 lifting the freeze lets it through.
@@ -2282,9 +2326,14 @@ recorded in `executeStartForApply` and before a cutover is recorded in `executeC
 (`pkg/storage/internal/sqlstore/control_requests.go`). A call-graph test
 (`pkg/api/change_gate_completeness_test.go`) fails on any path that creates an apply or records a
 start or cutover without passing a function that runs the gates. The override check is
-`approvedOverride` (`pkg/api/change_gate.go`), which reads `ListApproved` and admits only a request
-whose `Covers` names every blocker. The approver rules are `AuthorizeFreezeApprove`
-(`pkg/api/freeze_authorization.go`) and `Approve` (`pkg/storage/internal/sqlstore/freeze_overrides.go`).
+`approvedOverride` (`pkg/api/change_gate.go`), which reads `ListApproved`, skips every override
+admitted on a reason, and admits only a request whose `Covers` names every blocker and whose origin
+matches (`sameOverrideOrigin`). The target is `applyOverrideTarget`. An override admitted on a reason
+is stored by `overrideOnReason` through `CreateOnReason`, and the work it starts keeps it at claim
+through `approvedOverridesForApply`; the policy is `FreezeConfig.OverrideOnReason`. Under approval,
+`requestOverride` records the request, and the approver rules are `AuthorizeFreezeApprove`
+(`pkg/api/freeze_authorization.go`), `handleFreezeOverrideApprove`, `ApprovePullRequestOverride`
+and `Approve` (`pkg/storage/internal/sqlstore/freeze_overrides.go`).
 
 ### AZ-11: A stop freeze stops the admitted changes it covers
 

@@ -47,7 +47,7 @@ func TestClaimFailureDuringShutdownIsNotReportedAsAFailure(t *testing.T) {
 	reader := reaperMetricReader(t)
 	svc, logs := claimLadderService(&claimLadderOperationStore{recoverOperationStore: &recoverOperationStore{}})
 
-	svc.recoverApplies(cancelledContext(t), 1, openClaimGate())
+	svc.recoverApplies(cancelledContext(t), 1, openClaimGate(), passPolled)
 
 	line := requireLogLine(t, decodeLogLines(t, logs.Bytes()), claimOperationShutdownMsg)
 	assert.Equal(t, "DEBUG", line["level"],
@@ -66,7 +66,7 @@ func TestClaimFailureWithALiveContextStaysAnError(t *testing.T) {
 		claimErr:              errors.New("storage unavailable"),
 	})
 
-	svc.recoverApplies(t.Context(), 1, openClaimGate())
+	svc.recoverApplies(t.Context(), 1, openClaimGate(), passPolled)
 
 	line := requireLogLine(t, decodeLogLines(t, logs.Bytes()), claimOperationFailureMsg)
 	assert.Equal(t, "ERROR", line["level"],
@@ -83,7 +83,7 @@ func TestDriveTickSkipsTheClaimLadderAfterShutdown(t *testing.T) {
 	ops := &claimLadderOperationStore{recoverOperationStore: &recoverOperationStore{}}
 	svc, _ := claimLadderService(ops)
 
-	svc.driveTick(cancelledContext(t), 1, openClaimGate())
+	svc.driveTick(cancelledContext(t), 1, openClaimGate(), passPolled)
 
 	assert.Zero(t, ops.claims, "a tick that starts after shutdown must not claim")
 }

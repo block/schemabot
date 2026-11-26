@@ -8,7 +8,6 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
-	"github.com/block/schemabot/pkg/state"
 )
 
 // RollbackCmd rollbacks a database to its schema state before a specific apply.
@@ -43,26 +42,12 @@ func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	environment := planResult.Environment
 	dbType := planResult.DatabaseType
 
-	// Check for existing active schema change
-	var active *client.ActiveSchemaChange
-	err = withLoading("Checking active schema changes...", true, func() error {
-		var checkErr error
-		active, checkErr = client.CheckActiveSchemaChange(ep, database, environment)
-		return checkErr
-	})
-	if err != nil {
-		// Ignore status preflight errors; apply is still guarded server-side.
-	} else if active != nil && active.State != "" {
-		switch {
-		case state.IsState(active.State, state.Apply.WaitingForDeploy):
-			return fmt.Errorf("cannot rollback: a schema change is waiting for deploy")
-		case state.IsState(active.State, state.Apply.WaitingForCutover):
-			return fmt.Errorf("cannot rollback: a schema change is waiting for cutover")
-		case state.IsRunningApplyState(active.State):
-			return fmt.Errorf("cannot rollback: a schema change is already running")
-		case state.IsState(active.State, state.Apply.CuttingOver):
-			return fmt.Errorf("cannot rollback: a schema change is currently cutting over")
-		}
+	// Refuse while a schema change is already active on the target, exactly as
+	// apply does.
+	if err := refuseActiveSchemaChange(database, environment, true, func() (*client.ActiveSchemaChange, error) {
+		return client.CheckActiveSchemaChange(ep, database, environment)
+	}); err != nil {
+		return err
 	}
 
 	// Check for errors
@@ -150,9 +135,10 @@ func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	}
 
 	var lockCreated bool
+	var lockID int64
 	err = withLoading("Acquiring database lock...", true, func() error {
-		var lockErr error
-		_, lockCreated, lockErr = client.AcquireLock(ep, database, dbType, owner, "", 0)
+		acquired, created, lockErr := client.AcquireLock(ep, database, dbType, owner, "", 0)
+		lockCreated, lockID = created, acquiredLockID(acquired)
 		return lockErr
 	})
 	if errors.Is(err, client.ErrLockHeld) {
@@ -177,7 +163,7 @@ func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	// on every member, though not which members those are.
 	_, err = applyAndWatch(ctx, ep, planResult, true, database, environment, owner, "", "rollback", cmd.DeferCutover, false, false, cmd.AllowUnsafe, "", cmd.Watch, OutputFormatInteractive, 0)
 	if err != nil && lockCreated && neverSubmitted(err) {
-		return releaseUnsubmittedLock(ep, database, dbType, owner, err)
+		return releaseUnsubmittedLock(ep, database, dbType, owner, lockID, err)
 	}
 	return err
 }

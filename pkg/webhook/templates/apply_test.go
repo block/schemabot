@@ -10,6 +10,8 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
@@ -522,12 +524,12 @@ func TestThrottledHeaderEveryPhase(t *testing.T) {
 	for name, tb := range cases {
 		t.Run(name, func(t *testing.T) {
 			var sb strings.Builder
-			renderTableProgress(&sb, "", tb, state.Apply.Running, 0, "", nil)
+			renderTableProgress(&sb, "", tb, state.Apply.Running, 0, "", apitypes.BuildWork{}, nil)
 			header, _, _ := strings.Cut(sb.String(), "\n")
 			assert.True(t, strings.HasSuffix(header, " (throttled)"), "header %q", header)
 			tb.Throttled = false
 			sb.Reset()
-			renderTableProgress(&sb, "", tb, state.Apply.Running, 0, "", nil)
+			renderTableProgress(&sb, "", tb, state.Apply.Running, 0, "", apitypes.BuildWork{}, nil)
 			assert.NotContains(t, sb.String(), "(throttled)")
 		})
 	}
@@ -626,8 +628,8 @@ func TestRenderUnsafeChangesBlockedIncludesDropIndexGuidance(t *testing.T) {
 	assert.Contains(t, rendered, "**"+glyph.Escalation+" To proceed with these destructive changes**:\n"+
 		"1. Deploy application code that no longer reads from or writes to the dropped column.\n"+
 		"2. Make the dropped index invisible, then verify application queries no longer rely on it for safe performance.\n"+
-		"3. Add `--allow-unsafe` to confirm 2 unsafe changes on `customers`:\n"+
-		"   ```\n   schemabot apply -e staging\n   ```\n")
+		"3. Post this command to confirm 2 unsafe changes on `customers`:\n"+
+		"   ```\n   schemabot apply -e staging --allow-unsafe\n   ```\n")
 	assert.NotContains(t, rendered, glyph.Tip+" Before allowing", "the steps lead into the command, not a tip of their own")
 	assert.NotContains(t, rendered, "reads from or writes to the dropped index")
 }
@@ -1880,6 +1882,54 @@ func TestRenderApplySummaryComment_StartedAtUsesApplyStart(t *testing.T) {
 	assert.NotContains(t, result, "*Started at 2026-06-16 20:00:00 UTC*")
 }
 
+// Every apply comment edits itself in place as the apply runs, so the line
+// naming who applied it carries the apply's start time rather than the time of
+// the latest edit. The "Last updated" footer is what shows the edit time.
+func TestApplyCommentsShowAppliedByAtTheApplyStart(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 20:00:00 UTC") // render time, ~18m after start
+	const (
+		startedAt = "2026-06-16T19:42:00Z"
+		appliedBy = "*Applied by @mona at 2026-06-16 19:42:00 UTC*"
+		editTime  = "*Applied by @mona at 2026-06-16 20:00:00 UTC*"
+	)
+	cases := map[string]string{
+		"single database": RenderApplyStatusComment(ApplyStatusCommentData{
+			Database: "testapp", Environment: "staging", State: state.Apply.Running,
+			RequestedBy: "mona", StartedAt: startedAt,
+		}),
+		"sharded": RenderShardedApplyComment(ShardedApplyData{
+			Database: "testapp", Environment: "staging", State: state.Apply.Running,
+			ApplyID: "apply-x", RequestedBy: "mona", StartedAt: startedAt,
+		}),
+		"multi deployment": RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+			Model:   presentation.Derive([]presentation.Operation{rollingOp("us", so.Running)}),
+			ApplyID: "apply-123", Environment: "production", RequestedBy: "mona", StartedAt: startedAt,
+		}),
+	}
+	for name, out := range cases {
+		t.Run(name, func(t *testing.T) {
+			assert.Contains(t, out, appliedBy)
+			assert.NotContains(t, out, editTime)
+		})
+	}
+}
+
+// The locked apply comment says when the command was posted, not when the
+// comment rendered: planning and lock acquisition both happen after the
+// request, so the request time reads no later than the lock time.
+func TestRenderPlanComment_RequestedAtIsWhenTheCommandWasPosted(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 19:42:30 UTC") // render time, after planning
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		RequestedBy: "mona", RequestedAt: time.Date(2026, 6, 16, 19, 42, 0, 0, time.UTC),
+		IsLocked: true, LockOwner: "octo/repo#7", LockAcquired: "2026-06-16 19:42:20 UTC",
+	})
+
+	assert.Contains(t, out, "*Requested by @mona at 2026-06-16 19:42:00 UTC*")
+	assert.Contains(t, out, "at 2026-06-16 19:42:20 UTC")
+	assert.NotContains(t, out, "19:42:30")
+}
+
 // The duration is decoration: valid timestamps render it, and a completed
 // timestamp earlier than the started timestamp (bad data, clock skew) drops it
 // rather than rendering a negative duration.
@@ -1892,6 +1942,10 @@ func TestRenderApplySummaryComment_Duration(t *testing.T) {
 		CompletedAt: "2026-06-16T19:59:00Z",
 	}
 	assert.Contains(t, RenderApplySummaryComment(data), "**Duration**: 17m")
+
+	// An apply that runs past a day keeps its minutes.
+	data.CompletedAt = "2026-06-17T20:43:00Z"
+	assert.Contains(t, RenderApplySummaryComment(data), "**Duration**: 1d 1h 1m")
 
 	data.CompletedAt = "2026-06-16T19:00:00Z"
 	assert.NotContains(t, RenderApplySummaryComment(data), "**Duration**:")
@@ -2122,6 +2176,29 @@ func TestPreviewCommentSummaryFailed(t *testing.T) {
 	assert.Contains(t, result, "**`users`** — Failed at 30.00%")
 	assert.Contains(t, result, "**`orders`** — Completed", "on a failed apply, the reader must be able to tell which tables made it")
 	assert.Contains(t, result, "**`products`** — Cancelled")
+}
+
+// A table whose copy finished short of its estimate, then halted, reads in
+// the terminal summary as halted at 100.00%, not at a percent of the estimate.
+func TestSummaryEntryReadsAFinishedCopyAsDone(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		want   string
+	}{
+		{status: state.Task.Failed, want: "**`users`** — Failed at 100.00%"},
+		{status: state.Task.Stopped, want: "**`users`** — Stopped at 100.00%"},
+		{status: state.Task.Cancelled, want: "**`users`** — Cancelled at 100.00%"},
+	} {
+		t.Run(tc.status, func(t *testing.T) {
+			var sb strings.Builder
+			writeSummaryTableEntry(&sb, schema.DialectMySQL, TableProgressData{
+				TableName: "users", Status: tc.status,
+				RowsCopied: 3_261_100_506, RowsTotal: 3_291_032_158, PercentComplete: 100,
+			}, true, nil)
+			assert.Contains(t, sb.String(), tc.want)
+			assert.NotContains(t, sb.String(), "99.09%")
+		})
+	}
 }
 
 func TestPreviewCommentSummaryStopped(t *testing.T) {
@@ -2851,6 +2928,14 @@ func TestRenderApplyStatusComment_RevertWindowDeadline(t *testing.T) {
 	pastDue := base
 	pastDue.RevertExpiresAt = time.Now().Add(-1 * time.Minute).UTC().Format(time.RFC3339)
 	assert.NotContains(t, RenderApplyStatusComment(pastDue), "Closes in")
+
+	// A window longer than a day keeps its minutes in the countdown.
+	now := time.Date(2026, 6, 16, 19, 42, 0, 0, time.UTC)
+	NowFunc = func() time.Time { return now }
+	t.Cleanup(func() { NowFunc = time.Now })
+	longWindow := base
+	longWindow.RevertExpiresAt = now.Add(25*time.Hour + time.Minute).Format(time.RFC3339)
+	assert.Contains(t, RenderApplyStatusComment(longWindow), "**Status**: Revert Window | Closes in 1d 1h 1m")
 }
 
 // TestRenderApplyStatusComment_Rollback verifies that a rollback apply's
@@ -2948,4 +3033,27 @@ func TestRenderApplyComments_CancelledTableSaysHowFarItGot(t *testing.T) {
 	assert.Contains(t, summary, "**`orders`** — Cancelled at 40.00%\n", "%s", summary)
 	assert.Contains(t, summary, "**`users`** — Cancelled\n", "%s", summary)
 	assert.Contains(t, summary, "**`products`** — Cancelled\n", "%s", summary)
+}
+
+// A sharded table in a single-deployment apply whose shards are in different
+// phases keeps its bar across every shard, as the sharded comment and the CLI
+// show it: one verified shard of four, with the rest queued or not yet
+// attached, reads 25% with its rows line, not the verifying shard's phase.
+func TestRenderApplyStatusComment_ShardedPhaseBarSpansEveryShard(t *testing.T) {
+	out := RenderApplyStatusComment(ApplyStatusFromProgress(&apitypes.ProgressResponse{
+		ApplyID: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Running,
+		Tables: []*apitypes.TableProgressResponse{{
+			TableName: "orders", Keyspace: "shop_001", DDL: "ALTER TABLE orders ADD COLUMN note text", ChangeType: "alter",
+			Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, PlannedShards: 4,
+			Shards: []*apitypes.ShardProgressResponse{
+				{Shard: "-40", Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, PercentComplete: 100, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000},
+				{Shard: "40-80", Status: state.Task.Pending},
+			},
+		}},
+	}, "octocat"))
+
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(25)+" 25%\n", "%s", out)
+	assert.Contains(t, out, "- Rows: 1,000 / 1,000 across 1 of 4 shards\n", "%s", out)
+	assert.Contains(t, out, "  - ◉ `-40`: checksumming 25.00% · 250 / 1,000 rows verified\n", "%s", out)
+	assert.NotContains(t, out, "Checksumming to verify data")
 }

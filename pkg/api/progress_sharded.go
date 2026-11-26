@@ -163,6 +163,8 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 		_, shard, _, _ := state.ShardWorkKey(op.OperationKey)
 		sc := presentation.ShardOperationCopy(op.State, taskCopies(tasksByOp[op.ID]))
 		copies = append(copies, sc)
+		copies[len(copies)-1].PlannedRows = plan.ShardCopyEstimatedRows(namespace, shard, table)
+		copies[len(copies)-1].CopiesNoRows = presentation.TasksCopyNoRows(tasksByOp[op.ID])
 		row.Shards = append(row.Shards, &apitypes.ShardProgressResponse{
 			Shard:           shard,
 			Status:          sc.Status,
@@ -190,10 +192,6 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 			if r.DDL != "" && !slices.Contains(ddls, r.DDL) {
 				ddls = append(ddls, r.DDL)
 			}
-			if r.Throttled && !row.Throttled {
-				row.Throttled = true
-				row.ThrottleReason = r.ThrottleReason
-			}
 		}
 	}
 	row.DDL = strings.Join(ddls, "\n")
@@ -204,11 +202,18 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 	row.ChangeType, row.IsInstant = shardedTableChange(reportedRows, standIn,
 		presentation.ShardedTableCopiesNoRows(shardChanges, planned))
 
-	rollup := presentation.RollUpShardedTable(copies)
+	plannedShards := 0
+	if planned := plannedTable(plan, namespace, table); planned != nil {
+		plannedShards = planned.ShardCount
+	}
+	rollup := presentation.RollUpShardedTable(copies, plannedShards)
 	row.Status = rollup.Status
 	row.RowsCopied = rollup.RowsCopied
 	row.RowsTotal = rollup.RowsTotal
+	row.RowsTotalPlanned = rollup.RowsTotalPlanned
 	row.ETASeconds = rollup.ETASeconds
+	row.Throttled = rollup.Throttled
+	row.ThrottleReason = rollup.ThrottleReason
 	if rollup.RowsTotal > 0 {
 		row.PercentComplete = int32(min(100, rollup.RowsCopied*100/rollup.RowsTotal))
 	}
@@ -261,6 +266,8 @@ func taskCopies(tasks []*storage.Task) []presentation.ShardCopy {
 			RowsCopied:      t.RowsCopied,
 			RowsTotal:       t.RowsTotal,
 			ETASeconds:      int64(t.ETASeconds),
+			Throttled:       t.Throttled,
+			ThrottleReason:  t.ThrottleReason,
 
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,

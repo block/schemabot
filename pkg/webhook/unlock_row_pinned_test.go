@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -379,6 +380,55 @@ func TestUnlockKeptLockAndAlreadyReleasedLockAnswersOnlyWithTheRefusal(t *testin
 	assert.Contains(t, body, "Cannot Unlock")
 	assert.Contains(t, body, "apply-orders-1")
 	assert.Empty(t, comments, "the kept lock must not be followed by 'every lock was already released'")
+}
+
+// An unlock matches two locks: one a stopped apply records, so it is kept, and
+// one whose release fails. The pass retries, and the retry finds the kept lock
+// again. The refusal is posted once, by the pass that does not retry, rather
+// than once per pass.
+func TestUnlockAnswersAKeptLockOnceWhenAnotherReleaseIsRetried(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := recordComments(t, mux)
+	billing := withLockID(prOwnedOrdersLock(), 42)
+	billing.DatabaseName = "billing"
+	lockStore := &unlockTestLockStore{
+		locks: []*storage.Lock{withLockID(prOwnedOrdersLock(), 41), billing},
+		releaseErrs: map[string]error{
+			"orders": &storage.LockInUseError{LockID: 41, Apply: &storage.Apply{
+				ApplyIdentifier: "apply-orders-1",
+				Database:        "orders",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+				Repository:      "octocat/hello-world",
+				PullRequest:     1,
+				State:           state.Apply.Stopped,
+			}},
+			"billing": errors.New("storage write failed"),
+		},
+	}
+	st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+	h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+	command := CommandResult{Action: action.Unlock}
+
+	retry, err := h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser", command)
+
+	require.Error(t, err)
+	assert.True(t, retry, "a failed release retries the delivery")
+	assert.Empty(t, comments, "the pass that retries posts no answer for the kept lock")
+
+	delete(lockStore.releaseErrs, "billing")
+	retry, err = h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser", command)
+
+	require.NoError(t, err)
+	assert.False(t, retry)
+	assert.Equal(t, []string{"billing"}, lockStore.released)
+	success := requireComment(t, comments, "unlock success for billing")
+	assert.Contains(t, success, "Lock Released")
+	assert.Contains(t, success, "`billing`")
+	refusal := requireComment(t, comments, "cannot-unlock answer")
+	assert.Contains(t, refusal, "Cannot Unlock")
+	assert.Contains(t, refusal, "apply-orders-1")
+	assert.Empty(t, comments, "the kept lock is answered once across both passes")
 }
 
 func withLockID(lock *storage.Lock, id int64) *storage.Lock {

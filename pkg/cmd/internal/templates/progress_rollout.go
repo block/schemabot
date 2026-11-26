@@ -5,11 +5,11 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
-	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -436,6 +436,10 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 				copied := t.RowsCopied
 				if state.IsState(status, state.Task.Completed, state.Task.RevertWindow) {
 					copied = t.RowsTotal
+				} else if ui.CopyFinishedShortOfEstimate(t.PercentComplete, t.RowsCopied, t.RowsTotal) {
+					// A target past its copy counts its whole total, as
+					// presentation.SumTargetRows counts it.
+					copied = t.RowsTotal
 				}
 				rolled.RowsCopied += copied
 				rolled.RowsTotal += t.RowsTotal
@@ -445,6 +449,11 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 			}
 			if t.Throttled && !rolled.Throttled {
 				rolled.Throttled, rolled.ThrottleReason = true, t.ThrottleReason
+			}
+			if t.BuildWork.IsConcurrentIndexBuild() && state.IsState(status, state.Task.Running) {
+				// Marks the line as an index build. Its counters are one
+				// target's, so the rolled-up line draws only the bar.
+				rolled.BuildWork = t.BuildWork
 			}
 			break
 		}
@@ -464,7 +473,16 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 		rolled.RowsTotal += planned
 		rolled.RowsTotalPlanned = true
 	}
-	if rolled.RowsTotal > 0 {
+	switch {
+	case rolled.BuildWork.IsConcurrentIndexBuild():
+		// An index build has no rows to sum, so its percent is the build's
+		// across its targets, as the PR comment's line reads it.
+		parts := make([]presentation.Part, len(rolled.Shards))
+		for i, s := range rolled.Shards {
+			parts[i] = shardPart(s)
+		}
+		rolled.PercentComplete = presentation.IndexBuildPercentAcrossTargets(parts)
+	case rolled.RowsTotal > 0:
 		rolled.PercentComplete = int(min(rolled.RowsCopied, rolled.RowsTotal) * 100 / rolled.RowsTotal)
 	}
 	return rolled
@@ -527,6 +545,21 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 	writeThrottleTooltip(&b, t)
 	b.WriteString(formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t), runningWord(t)))
 	return b.String(), true
+}
+
+// formatIndexBuildAcrossTargets writes a table whose targets are building an
+// index: the bar for the build across its targets, which has no rows to
+// count, then its DDL and where each target stands.
+func formatIndexBuildAcrossTargets(t TableProgress) string {
+	var b strings.Builder
+	// The percent across targets is a whole-number mean of each target's whole
+	// percent, so it has no decimals to show.
+	writeTableLine(&b, t, "%s%s", ui.IndexBuildProgress(t.PercentComplete, apitypes.BuildWork{}), ui.ThrottledSuffix(t.Throttled))
+	if t.DDL != "" {
+		b.WriteString(formatTableDDL(t))
+	}
+	b.WriteString(formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t), presentation.RunningApplying))
+	return b.String()
 }
 
 // stoppedRowsAcrossTargets sums the rows a stopped table's targets copied, for
@@ -803,27 +836,16 @@ var inFlightRollupOrder = []string{
 // the earliest phase any target is in, so the table never reads further along
 // than its slowest target. The targets that failed are named in the
 // per-target lines and the attention list beneath it. With nothing in
-// flight, a failure or halt comes first, then queued, then complete.
+// flight, presentation.RollupTaskStatus decides, as it does for the PR
+// comment. Reading in-flight work ahead of a failure is the one place this
+// differs from the PR comment, which puts a failure first.
 func rollupTaskStatus(statuses []string) string {
 	for _, phase := range inFlightRollupOrder {
 		if slices.Contains(statuses, phase) {
 			return phase
 		}
 	}
-	for _, halting := range []string{state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled} {
-		if slices.Contains(statuses, halting) {
-			return halting
-		}
-	}
-	for _, s := range statuses {
-		if s != state.Task.Pending && s != state.Task.Completed {
-			return s
-		}
-	}
-	if slices.Contains(statuses, state.Task.Pending) {
-		return state.Task.Pending
-	}
-	return state.Task.Completed
+	return presentation.RollupTaskStatus(statuses)
 }
 
 // writeTargetAttention names each failed or retrying target with its error
@@ -917,11 +939,15 @@ func FormatRolloutFooter(v RolloutView) string {
 		return b.String()
 	}
 	if !v.StopByKey {
-		verb, label := "stop", "To stop this schema change"
-		if strings.EqualFold(v.Engine, storage.EnginePlanetScale) {
-			verb, label = "cancel", "To cancel this schema change"
+		// A rollout's members run their own statements, so the view has no
+		// single build to name and an engine that cancels only a build offers
+		// nothing here, as the PR comment's rollout footer does.
+		switch command := presentation.StopCommand(v.Engine, apitypes.BuildWork{}, 0); command {
+		case presentation.StopCommandStop:
+			writeRolloutCommand(&b, "To stop this schema change", applyCommand(command))
+		case presentation.StopCommandCancel:
+			writeRolloutCommand(&b, "To cancel this schema change", applyCommand(command))
 		}
-		writeRolloutCommand(&b, label, applyCommand(verb))
 	}
 	if v.Model.RetryWaitsOnActiveApply() {
 		fmt.Fprintf(&b, "%s\n", presentation.RetryOnceSettledNote)

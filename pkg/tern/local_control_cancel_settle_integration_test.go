@@ -267,3 +267,86 @@ func TestLocalClient_PendingCancelCarriesStoredResumeStateForCustomEngineType(t 
 
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestCompleted)
 }
+
+// An operator cancels a sharded apply after one of its shards has failed. The
+// cancel stops the two shards that had not finished, and the rollout settles
+// failed because failed outranks cancelled. Settled against real storage, the
+// cancel request completes rather than failing, so the PR comment shows no
+// "Command not applied" notice, and the apply history names how many shards the
+// cancel stopped and how many failed.
+func TestSettlePendingCancel_LandsOnFailedShardedRollout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	now := time.Now()
+	planID, err := stor.Plans().Create(ctx, &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-cancel-failed-rollout-%d", now.UnixNano()),
+		Database:       "commerce",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		Deployment:     "commerce",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      now,
+	})
+	require.NoError(t, err)
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-cancel-failed-rollout-%d", now.UnixNano()),
+		PlanID:          planID,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Deployment:      "commerce",
+		Engine:          storage.EngineStrata,
+		State:           state.Apply.Failed,
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	shard := func(key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{
+			Deployment:    "commerce",
+			Target:        "commerce",
+			OperationKey:  "commerce/" + key + "/orders",
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         opState,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}
+	}
+	applyID, err := stor.Applies().CreateWithTasksAndOperations(ctx, apply, nil, []*storage.ApplyOperation{
+		shard("-40", state.ApplyOperation.Failed),
+		shard("40-80", state.ApplyOperation.Cancelled),
+		shard("80-", state.ApplyOperation.Cancelled),
+	})
+	require.NoError(t, err)
+	apply.ID = applyID
+	_, alreadyPending, err := stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	require.NoError(t, SettlePendingRequestsForTerminalApply(ctx, stor, logger, apply))
+
+	settled, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestCompleted, settled.Status)
+	assert.Empty(t, settled.ErrorMessage)
+
+	logs, err := stor.ApplyLogs().GetByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, countLogMessages(logs, "Cancel took effect: 2 shards that had not finished were cancelled. The apply ended failed because 1 shard failed"))
+	assert.Equal(t, 0, countLogMessagesContaining(logs, "did not take effect"))
+}

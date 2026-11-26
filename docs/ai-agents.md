@@ -43,7 +43,7 @@ your agent is about to do with your credentials.
 |---|---|
 | Run a production command such as `apply`, `apply-confirm`, `cutover`, or `rollback` | You run it yourself, even if you previously asked the agent to do it |
 | Run a command with `--allow-unsafe`, in any environment | You review the destructive change and run the command yourself |
-| Ask to override a freeze with `--override`, in any environment | You decide whether to ask, write the reason, and run the command yourself |
+| Ask to override a freeze with `--override`, in any environment | You decide whether to ask, write the reason, and run the command yourself. See [guidance for agents](freeze.md#guidance-for-agents) |
 | Apply to a shared staging database or one that other teams depend on | Your agent asks first |
 | Apply to a new or isolated staging database with little impact on others | Your agent explains what it will do, then proceeds |
 | Apply when it is unclear who depends on the database | Your agent asks first |

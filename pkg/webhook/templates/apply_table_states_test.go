@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -20,7 +21,7 @@ func TestRenderTableProgress_EveryStateHasItsOwnRow(t *testing.T) {
 	table := TableProgressData{TableName: "users"}
 
 	var running strings.Builder
-	renderRunningTable(&running, schema.DialectMySQL, table, nil)
+	renderInFlightTable(&running, schema.DialectMySQL, table, apitypes.BuildWork{}, nil)
 
 	v := reflect.ValueOf(state.Task)
 	for i := range v.NumField() {
@@ -32,7 +33,7 @@ func TestRenderTableProgress_EveryStateHasItsOwnRow(t *testing.T) {
 		t.Run(status, func(t *testing.T) {
 			table.Status = status
 			var row strings.Builder
-			renderTableProgress(&row, schema.DialectMySQL, table, "", 0, "", nil)
+			renderTableProgress(&row, schema.DialectMySQL, table, "", 0, "", apitypes.BuildWork{}, nil)
 			assert.NotContainsf(t, row.String(), running.String(),
 				"state.Task.%s renders as a running table:\n%s", v.Type().Field(i).Name, row.String())
 		})

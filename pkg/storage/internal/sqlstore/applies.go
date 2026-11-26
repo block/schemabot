@@ -49,6 +49,7 @@ const (
 
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
+	events     *changeEventRecorder
 	db         *rebindDB
 	dialect    Dialect
 	identity   identityInserter
@@ -930,6 +931,9 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	if err := verifyExpectedLockIntent(ctx, writeTx.tx, apply); err != nil {
 		return 0, err
 	}
+	if err := pinRecordedLock(ctx, writeTx.tx, apply); err != nil {
+		return 0, err
+	}
 	if err := checkFreezeEpochGuard(ctx, writeTx.tx); err != nil {
 		return 0, fmt.Errorf("create apply %s: %w", apply.ApplyIdentifier, err)
 	}
@@ -1075,7 +1079,11 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 		return fmt.Errorf("lock apply %s to attach operation %s: %w", apply.ApplyIdentifier, operation.OperationKey, err)
 	}
 	if !isActiveApplyState(currentState) {
-		return fmt.Errorf("attach operation %s to apply %s in state %s: %w", operation.OperationKey, apply.ApplyIdentifier, currentState, storage.ErrApplyNotActive)
+		return &storage.ApplyNotActiveError{
+			ApplyID: apply.ApplyIdentifier,
+			State:   currentState,
+			Detail:  fmt.Sprintf("attach operation %s to apply %s in state %s", operation.OperationKey, apply.ApplyIdentifier, currentState),
+		}
 	}
 	// A newer generation admitted past this one took over its work
 	// (markAdmittedPast). A late operation of this generation must not join
@@ -1217,6 +1225,9 @@ func (s *applyStore) createWithRowsOnce(ctx context.Context, apply *storage.Appl
 	if err := verifyExpectedLockIntent(ctx, writeTx.tx, apply); err != nil {
 		return 0, err
 	}
+	if err := pinRecordedLock(ctx, writeTx.tx, apply); err != nil {
+		return 0, err
+	}
 	if err := checkFreezeEpochGuard(ctx, writeTx.tx); err != nil {
 		return 0, fmt.Errorf("%s %s: %w", opName, apply.ApplyIdentifier, err)
 	}
@@ -1339,6 +1350,50 @@ func verifyExpectedLockIntent(ctx context.Context, tx *rebindTx, apply *storage.
 	}
 	apply.LockID = lockID
 	return nil
+}
+
+// pinRecordedLock locks the lock row an apply records as its lock, in the
+// transaction that inserts the apply, so a release that checks for applies
+// recording the row before it deletes it either sees this apply or deletes
+// the row first and makes this create refuse. An apply with an expected lock
+// owner already locked its row in verifyExpectedLockIntent, and an apply that
+// records no lock has no row to pin.
+//
+// It returns ErrLockNotFound when no lock is held for the apply's database
+// any more, and ErrLockReplaced when a different lock row holds it.
+func pinRecordedLock(ctx context.Context, tx *rebindTx, apply *storage.Apply) error {
+	if apply.ExpectedLockOwner != "" || apply.LockID == 0 {
+		return nil
+	}
+	database := storage.CanonicalKey(apply.Database)
+	databaseType := storage.CanonicalKey(apply.DatabaseType)
+	var lockID int64
+	err := tx.QueryRowContext(ctx, `
+		SELECT id
+		FROM locks
+		WHERE id = ? AND database_name = ? AND database_type = ?
+		FOR UPDATE
+	`, apply.LockID, database, databaseType).Scan(&lockID)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("lock row %d recorded by apply %s for %s/%s: %w", apply.LockID, apply.ApplyIdentifier, apply.Database, apply.DatabaseType, err)
+	}
+	var currentID int64
+	err = tx.QueryRowContext(ctx, `
+		SELECT id FROM locks WHERE database_name = ? AND database_type = ?
+	`, database, databaseType).Scan(&currentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("apply %s records lock row %d for %s/%s, which was released: %w",
+			apply.ApplyIdentifier, apply.LockID, apply.Database, apply.DatabaseType, storage.ErrLockNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("read the lock for %s/%s after apply %s found its lock row %d gone: %w",
+			apply.Database, apply.DatabaseType, apply.ApplyIdentifier, apply.LockID, err)
+	}
+	return fmt.Errorf("apply %s records lock row %d for %s/%s, which lock row %d replaced: %w",
+		apply.ApplyIdentifier, apply.LockID, apply.Database, apply.DatabaseType, currentID, storage.ErrLockReplaced)
 }
 
 func insertApplyTasksAndOperations(ctx context.Context, tx *rebindTx, identity identityInserter, classifier ErrorClassifier, apply *storage.Apply, applyID int64, tasks []*storage.Task, operations []*storage.ApplyOperation) error {
@@ -1572,6 +1627,7 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 // updateOnce runs one attempt of Update in its own transaction.
 func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease storage.ApplyLease, hasLease bool) error {
 	var err error
+	finishSelected := s.events.selectsApplyFinish(apply)
 	lockTarget := isActiveApplyState(apply.State)
 	database, dbType, environment, deployment := apply.Database, apply.DatabaseType, apply.Environment, apply.Deployment
 	if lockTarget && (!hasApplyTarget(database, dbType, environment) || deployment == "") {
@@ -1639,14 +1695,33 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 	// attempt + 1: a driver's in-memory copy goes stale the moment the stored
 	// budget is adjusted out-of-band mid-drive, and persisting it absolutely
 	// would silently reset that adjustment and re-open expired recovery.
-	result, err := writeTx.tx.ExecContext(ctx, fmt.Sprintf(`
+	statement := fmt.Sprintf(`
 		UPDATE applies
 		SET state = ?, error_message = ?,
 		    external_id = ?%s, started_at = ?, completed_at = ?, updated_at = NOW()
 		WHERE id = ?%s%s
-	`, optionsUpdate, leasePredicate, finishedPredicate), args...)
-	if err != nil {
-		return fmt.Errorf("update apply %d: %w", apply.ID, err)
+	`, optionsUpdate, leasePredicate, finishedPredicate)
+
+	// The first write matches a real terminal transition. An idempotent
+	// write still uses the original statement to preserve its other updates.
+	var result sql.Result
+	var terminalTransition bool
+	if finishSelected {
+		result, err = writeTx.tx.ExecContext(ctx, statement+" AND state <> ?", append(args, apply.State)...)
+		if err != nil {
+			return fmt.Errorf("update apply %d: %w", apply.ID, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("read apply update rows affected for apply %d: %w", apply.ID, err)
+		}
+		terminalTransition = rows > 0
+	}
+	if !terminalTransition {
+		result, err = writeTx.tx.ExecContext(ctx, statement, args...)
+		if err != nil {
+			return fmt.Errorf("update apply %d: %w", apply.ID, err)
+		}
 	}
 	if hasLease || finishedGuarded {
 		rows, err := result.RowsAffected()
@@ -1671,6 +1746,9 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 	}
 	if err := writeTx.commit(); err != nil {
 		return fmt.Errorf("commit update apply %d: %w", apply.ID, err)
+	}
+	if terminalTransition {
+		s.events.finishApply(ctx, apply.ID, apply.State, true)
 	}
 	return nil
 }
@@ -1808,6 +1886,9 @@ func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expe
 		return false, fmt.Errorf("read derived apply state rows affected for apply %d: %w", applyID, err)
 	}
 	if rows > 0 {
+		if !state.IsState(expectedState, newState) {
+			s.events.finishApply(ctx, applyID, newState, false)
+		}
 		return true, nil
 	}
 
@@ -3233,10 +3314,16 @@ func (s *applyStore) WithBranchReconcileElection(ctx context.Context, fn func(co
 // ExpireRetryable elects one instance per pass and expires under the lock. See
 // storage.ApplyStore for the contract.
 func (s *applyStore) ExpireRetryable(ctx context.Context, endedOperationStopTypes []string, limit int) ([]*storage.RetryableApplyExpiration, error) {
-	return reapUnderElection(ctx, s.db, s.locker, retryableExpirySweep,
+	expired, err := reapUnderElection(ctx, s.db, s.locker, retryableExpirySweep,
 		func(ctx context.Context) ([]*storage.RetryableApplyExpiration, error) {
 			return s.expireRetryable(ctx, endedOperationStopTypes, limit)
 		})
+	if err == nil {
+		for _, result := range expired {
+			s.events.offerReapedApplyFinish(result.Apply)
+		}
+	}
+	return expired, err
 }
 
 // expireRetryable transitions failed_retryable applies that exhausted their
@@ -4127,74 +4214,6 @@ func (s *applyStore) ExistsForDatabaseHead(ctx context.Context, repo string, pr 
 		return false, fmt.Errorf("check applies for %s#%d database %s (%s) head %s: %w", repo, pr, database, databaseType, headSHA, err)
 	}
 	return exists, nil
-}
-
-// Delete removes an apply by ID, along with its per-deployment
-// apply_operations rows, in a single transaction. Deleting the children
-// transactionally prevents orphan operation rows that the operator claim loop
-// would otherwise re-claim forever (their parent lookup returns nil).
-func (s *applyStore) Delete(ctx context.Context, id int64) error {
-	const opName = "delete apply"
-	writeTx, err := beginApplyWriteTx(ctx, s.db, opName)
-	if err != nil {
-		return err
-	}
-	defer writeTx.close(ctx, opName)
-
-	if _, err := writeTx.tx.ExecContext(ctx, `
-		DELETE FROM apply_operations WHERE apply_id = ?
-	`, id); err != nil {
-		return fmt.Errorf("delete apply_operations for apply %d: %w", id, err)
-	}
-
-	result, err := writeTx.tx.ExecContext(ctx, `
-		DELETE FROM applies WHERE id = ?
-	`, id)
-	if err != nil {
-		return fmt.Errorf("delete apply %d: %w", id, err)
-	}
-	if err := checkRowsAffected(result, storage.ErrApplyNotFound, fmt.Sprintf("deleting apply %d", id)); err != nil {
-		return err
-	}
-
-	if err := writeTx.commit(); err != nil {
-		return fmt.Errorf("commit delete apply %d: %w", id, err)
-	}
-	return nil
-}
-
-// DeleteByPR removes all applies for a PR, along with their per-deployment
-// apply_operations rows, in a single transaction. Deleting the children
-// transactionally prevents orphan operation rows that the operator claim loop
-// would otherwise re-claim forever (their parent lookup returns nil).
-func (s *applyStore) DeleteByPR(ctx context.Context, repo string, pr int) error {
-	repo = storage.CanonicalKey(repo)
-
-	const opName = "delete applies by PR"
-	writeTx, err := beginApplyWriteTx(ctx, s.db, opName)
-	if err != nil {
-		return err
-	}
-	defer writeTx.close(ctx, opName)
-
-	deleteOperations := s.dialect.JoinedDelete(
-		"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
-		"a.repository = ? AND a.pull_request = ?",
-	)
-	if _, err := writeTx.tx.ExecContext(ctx, deleteOperations, repo, pr); err != nil {
-		return fmt.Errorf("delete apply_operations for PR %s#%d: %w", repo, pr, err)
-	}
-
-	if _, err := writeTx.tx.ExecContext(ctx, `
-		DELETE FROM applies WHERE repository = ? AND pull_request = ?
-	`, repo, pr); err != nil {
-		return fmt.Errorf("delete applies for PR %s#%d: %w", repo, pr, err)
-	}
-
-	if err := writeTx.commit(); err != nil {
-		return fmt.Errorf("commit delete applies for PR %s#%d: %w", repo, pr, err)
-	}
-	return nil
 }
 
 // scanApply scans a single apply row, returning nil if not found.

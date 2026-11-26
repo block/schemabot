@@ -504,6 +504,11 @@ func partProgress(p Part) string {
 	if p.RowsTotal <= 0 {
 		return pct
 	}
+	if ui.CopyFinishedShortOfEstimate(p.PercentComplete, p.RowsCopied, p.RowsTotal) {
+		// The part's copy is done short of its estimate, so its rows read as
+		// the rows it copied rather than a fraction of the estimate.
+		return fmt.Sprintf("%s · %s %s copied", pct, ui.FormatNumber(p.RowsCopied), ui.Pluralize("row", int(min(p.RowsCopied, 2))))
+	}
 	return fmt.Sprintf("%s · %s / %s rows", pct, ui.FormatNumber(ui.ClampRows(p.RowsCopied, p.RowsTotal)), ui.FormatNumber(p.RowsTotal))
 }
 
@@ -721,7 +726,7 @@ func SumTargetRows(parts []Part) TargetRows {
 			switch {
 			case p.RowsTotal > 0:
 				r.Counted++
-				r.Copied += ui.ClampRows(p.RowsCopied, p.RowsTotal)
+				r.Copied += ui.CopyCoveredRows(p.PercentComplete, p.RowsCopied, p.RowsTotal)
 				r.Total += p.RowsTotal
 			case p.PlannedRows != nil:
 				r.Counted++
@@ -796,6 +801,54 @@ func AcrossTargetsPercent(pct int, exact bool, copied, total int64) string {
 	return ui.FormatRowCopyPercent(pct, copied, total)
 }
 
+// IndexBuildPercentAcrossTargets is how far a concurrent index build is across
+// every target that runs it. A build has no rows to count, and each target
+// reports its own whole-build percent instead, so the table's percent is their
+// mean: a completed target counts in full, a running target by its percent,
+// and every other target as nothing yet. Like PercentAcrossTargets, it stops
+// short of complete until every target has completed. Once any target has
+// made progress it reads at least 1%, the way a row copy that has moved rows
+// does (ui.RowCopyDisplayPercent): across many targets the mean can round
+// down to 0, which would read as a build that has not started.
+func IndexBuildPercentAcrossTargets(parts []Part) int {
+	if len(parts) == 0 {
+		return 0
+	}
+	sum, done := 0, 0
+	for _, p := range parts {
+		switch state.NormalizeTaskStatus(p.Status) {
+		case state.Task.Completed, state.Task.RevertWindow:
+			sum += 100
+			done++
+		case state.Task.Running:
+			sum += ui.ClampPercent(p.PercentComplete)
+		}
+	}
+	percent := sum / len(parts)
+	if percent == 0 && sum > 0 {
+		percent = 1
+	}
+	if done < len(parts) {
+		percent = min(percent, 99)
+	}
+	return percent
+}
+
+// ShardedPhasePercent is the bar of a sharded table that keeps its bar past
+// its row copy (ShardsKeepTableBar). When the table's row total counts the
+// plan's estimate for the shards still to copy (RollUpShardedTable), the bar
+// is the rows copied over that total, the same fraction its rows line and its
+// copy bar show, so it does not jump when a shard moves from copying to
+// verifying. It stops short of complete, since the table is still in flight.
+// Otherwise it is the table's share across its shards
+// (PercentAcrossTargets).
+func ShardedPhasePercent(parts []Part, silent int, rowsCopied, rowsTotal int64, rowsTotalPlanned bool) int {
+	if rowsTotalPlanned && rowsTotal > 0 {
+		return min(int(ui.ClampRows(rowsCopied, rowsTotal)*100/rowsTotal), 99)
+	}
+	return PercentAcrossTargets(parts, silent)
+}
+
 // PercentAcrossTargets is how far a table is across every target that runs it,
 // for the bar that leads its line until every target completes. While every
 // target's rows are known, it is the rows copied over the rows to copy across
@@ -857,7 +910,7 @@ func PercentAcrossTargets(parts []Part, silent int) int {
 				}
 				continue
 			}
-			rows := ui.ClampRows(p.RowsCopied, p.RowsTotal)
+			rows := ui.CopyCoveredRows(p.PercentComplete, p.RowsCopied, p.RowsTotal)
 			share += float64(rows) / float64(p.RowsTotal)
 			copied += rows
 			total += p.RowsTotal

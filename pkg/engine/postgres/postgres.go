@@ -84,10 +84,20 @@ type trackedApply struct {
 	result  *engine.ProgressResult
 	tracker buildTracker
 	logger  *slog.Logger
-	// concurrentIndex records the shape the apply was admitted as: a
-	// concurrent index build is the one PostgreSQL change an operator can
-	// cancel, so the shape decides the answer before any server is asked.
-	concurrentIndex bool
+	// cancellableBuild records the shape the apply was admitted as: an
+	// index build, concurrent or partition by partition, is the one
+	// PostgreSQL change an operator can cancel, so the shape decides the
+	// answer before any server is asked.
+	cancellableBuild bool
+	// partitionedBuild records that the build runs one concurrent build per
+	// partition. A cancel signal reaches only the partition build in flight,
+	// which can finish before the signal lands, so Cancel also ends the
+	// drive's context to keep the next partition from starting.
+	partitionedBuild bool
+	// percentStep is the executor step the result's precise percent was
+	// read from. A percent measures one step's completion, so the
+	// never-regress floor holds only while later polls report that step.
+	percentStep string
 	// cancelApply ends the drive's own context. It is the cancel of last
 	// resort: the build backend is signalled through the tracker first, and
 	// the context is cancelled only when that signal cannot reach a running
@@ -227,7 +237,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("plan PostgreSQL database %q: DSN credentials are required", req.Database)
 	}
 	if err := engine.RefuseDropTables("PostgreSQL", req.DropTables); err != nil {
-		return nil, fmt.Errorf("plan PostgreSQL database %q: %w", req.Database, err)
+		return nil, &engine.PlanRefusedError{Err: fmt.Errorf("plan PostgreSQL database %q: %w", req.Database, err)}
 	}
 
 	pool, closePool, err := openTargetPool(ctx, req.Credentials)
@@ -324,7 +334,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			if enumType, ok := file.EnumType(); ok {
 				changes, err := planEnumType(ctx, pool, req.Database, namespace, enumType, parser)
 				if err != nil {
-					return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 				}
 				enumChanges = append(enumChanges, changes...)
 				continue
@@ -332,7 +342,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			if rowSecurity, ok := file.RowSecurity(); ok {
 				rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity)
 				if err != nil {
-					return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 				}
 				desiredTables[file.Table()] = true
 				schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
@@ -344,7 +354,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			}
 			report, table, err := planPostgresDefinition(ctx, pool, namespace, desired)
 			if err != nil {
-				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+				return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 			}
 			desiredTables[table] = true
 			crossNamespace, err := crossNamespaceForeignKeysForDrops(ctx, pool, namespace, report)
@@ -411,6 +421,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			result.Changes = append(result.Changes, schemaChange)
 		}
 	}
+	sizeDroppedTables(ctx, pool, req.Database, result.Changes)
 	result.NoChanges = len(result.Changes) == 0
 	result.PlanID = engine.NewPlanID()
 	return result, nil
@@ -433,7 +444,7 @@ func refuseTableDeclaredTwice(namespace string, files map[string]pgstatement.Des
 			continue
 		}
 		if err := declared.Declare(filename, files[filename].Table()); err != nil {
-			return fmt.Errorf("plan PostgreSQL namespace %q: %w", namespace, err)
+			return &engine.PlanRefusedError{Err: fmt.Errorf("plan PostgreSQL namespace %q: %w", namespace, err)}
 		}
 	}
 	return nil
@@ -576,6 +587,14 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 				stepMode = engine.ExecutionModeBlocked
 				stepReason = fmt.Sprintf("statement for table %q is a shape SchemaBot's PostgreSQL support does not execute yet; rewriting the change cannot make it eligible", table)
 			}
+			metadata, unrecordedDrop, err := stepDropMetadata(statement, sql)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("record the reviewed drop for table %q: %w", report.Table, err)
+			}
+			if unrecordedDrop && stepMode == "" {
+				stepMode = engine.ExecutionModeBlocked
+				stepReason = fmt.Sprintf("statement for table %q drops an object the planner did not record, so the apply cannot check that it is still the object this plan reviewed; make the change outside SchemaBot", table)
+			}
 			// Verdict reasons quote the table name, a planner-sourced
 			// identifier, so the reserved cause separator is neutralized
 			// before the reason becomes one cause of the verdict.
@@ -587,6 +606,7 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 				UnsafeReason:  destructiveReason(statement.Destructive, table),
 				ExecutionMode: stepMode,
 				ModeReason:    engine.SanitizeBlockedCause(stepReason),
+				Metadata:      metadata,
 			})
 			tiers = append(tiers, stepTier)
 		}
@@ -873,8 +893,10 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 	if isGreenfieldTable(report) {
 		return changes, nil
 	}
-	_, err := checkTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)
+	proof, err := checkTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)
 	if err == nil {
+		// The size the ceiling measured is also the plan's display estimate.
+		attachTableSize(changes, report.Table, sizeFromPreflight(database, report.Schema, proof))
 		return changes, nil
 	}
 	r := classifyRefusal(err, report.Table)
@@ -898,7 +920,7 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 	reason := engine.SanitizeBlockedCause(singleLine(fmt.Sprintf("statement for table %q: %s", report.Table, r.detail)))
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
-		if err := blockRewriteSteps(changes, reason); err != nil {
+		if err := blockRewriteSteps(changes, reason, partitionedIndexBuildSteps(report)); err != nil {
 			if fullyBlocked {
 				slog.Warn("PostgreSQL table size check could not classify a blocked step; existing blocked plan verdicts remain unchanged",
 					"database", database,
@@ -909,6 +931,9 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 			}
 			return nil, err
 		}
+		// The refused table is blocked, and its plan still shows the size
+		// the ceiling measured.
+		attachTableSize(changes, report.Table, sizeFromSizeRefusal(database, report.Schema, report.Table, sizeErr))
 		return changes, nil
 	}
 	if fullyBlocked {
@@ -929,18 +954,21 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 }
 
 // blockRewriteSteps marks every step whose native cost scales with the existing
-// table blocked with the reason. A concurrent index build keeps its verdict: it
-// is bounded by its duration envelope rather than the table size ceiling. An
-// earlier blocked verdict retains its reason and gains the independent size
-// cause so the operator can resolve both without another planning round trip.
+// table blocked with the reason. Two index builds keep their verdict, because
+// each is bounded by the concurrent index duration envelope rather than the
+// table size ceiling: a concurrent index build, and a step the planner routed
+// to the partitioned index build, named by partitionedBuilds, which builds one
+// partition at a time under that envelope per partition. An earlier blocked
+// verdict retains its reason and gains the independent size cause so the
+// operator can resolve both without another planning round trip.
 // parser.Classify in tableChanges parsed every rendered statement, including
 // blocked steps, with the same single-statement requirements used here. A
 // statement that now fails to classify is therefore an invariant violation.
 // Every step is classified before any verdict is written, so a caller that
 // keeps the plan on that error keeps it exactly as it was rather than with
 // the size cause on some steps and not others.
-func blockRewriteSteps(changes []engine.TableChange, reason string) error {
-	concurrentIndexes := make([]bool, len(changes))
+func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedBuilds map[string]bool) error {
+	durationBounded := make([]bool, len(changes))
 	for i := range changes {
 		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
 			continue
@@ -949,13 +977,13 @@ func blockRewriteSteps(changes []engine.TableChange, reason string) error {
 		if err != nil {
 			return fmt.Errorf("classify planned statement for table %q: %w", changes[i].Table, err)
 		}
-		concurrentIndexes[i] = concurrentIndex
+		durationBounded[i] = concurrentIndex || partitionedBuilds[changes[i].DDL]
 	}
 	for i := range changes {
 		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
 			continue
 		}
-		if concurrentIndexes[i] {
+		if durationBounded[i] {
 			continue
 		}
 		if changes[i].ExecutionMode == engine.ExecutionModeBlocked {
@@ -969,6 +997,21 @@ func blockRewriteSteps(changes []engine.TableChange, reason string) error {
 		changes[i].ModeReason = reason
 	}
 	return nil
+}
+
+// partitionedIndexBuildSteps returns the planned steps the planner routed to
+// the partitioned index build, keyed by the DDL tableChanges renders for them.
+func partitionedIndexBuildSteps(report pgplan.Report) map[string]bool {
+	steps := make(map[string]bool)
+	for _, statement := range report.Statements {
+		if statement.Execution != planner.ExecutionPartitionedIndexBuild {
+			continue
+		}
+		for _, sql := range statement.ExecSQL {
+			steps[sql] = true
+		}
+	}
+	return steps
 }
 
 // concurrentIndexStatement reports whether sql is a single CREATE INDEX
@@ -989,120 +1032,120 @@ func concurrentIndexStatement(sql string) (bool, error) {
 // undeclaredTableDrops surfaces every live table in the namespace that no
 // schema file declares, whether its file was deleted or it was never declared
 // at all. Desired state is declarative: an undeclared table converges only by
-// being dropped, so the plan must show that drop rather than stay silent while
-// the table lingers on the target. Each drop is both destructive and blocked —
-// SchemaBot's PostgreSQL support never executes DROP TABLE — so the operator
-// either brings the table under management by declaring it in a schema file
-// or removes it through a separately reviewed process; a plan that hid the
-// drop would let a merge pass with the target still diverged from the
-// repository.
+// being dropped, so the plan shows that drop rather than stay silent while the
+// table lingers on the target. Each drop is destructive, so the apply runs it
+// only with the operator's unsafe acknowledgment, as it does a MySQL table
+// drop. The plan records the table's definition with the drop, and the apply
+// drops the table only while it still has that definition.
+//
+// Drops come in the order the apply must run them: a table that another
+// dropped table's foreign key references comes after that table. A drop the
+// plan cannot make safely is blocked with the reason, after the executable
+// ones; planTableDrops says which those are.
 //
 // Archive tables (<name>_archive_YYYY[_MM[_DD]]) are the one naming
-// convention exempt from the verdict, as they are in the MySQL engine's view
-// of its live schema: an archive is a retired copy kept outside declarative
+// convention exempt from the drop, as they are in the MySQL engine's view of
+// its live schema: an archive is a retired copy kept outside declarative
 // schema files. The naming convention is the per-table exemption;
 // ignore_namespaces is the per-namespace one. Each exempt table is logged
-// and returned on the plan so the PR comment discloses what the verdict
-// skipped.
-//
-// The verdict names only remedies the operator can follow. A table that owns
-// or is referenced by foreign key constraints cannot be brought under
-// management by a pulled file — the declarative format refuses foreign keys —
-// so its reason names the constraints and says what each side of the
-// relationship needs instead of pointing at a file the pull cannot write. The
-// catalog is read directly because the namespace's schema may not exist yet,
-// in which case the answer is an empty set, not an error.
+// and returned on the plan so the PR comment discloses what the plan skipped.
 func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables, parser ddl.StatementParser) ([]engine.TableChange, []string, []string, error) {
-	tables, err := liveTables(ctx, pool, namespace)
+	// ListManagedTables omits partitions, which follow their parent, and
+	// extension-owned tables, which belong to their extension: no file can
+	// declare either, and the server refuses to drop an extension's table.
+	names, err := schemadiff.ListManagedTables(ctx, pool, namespace)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, fmt.Errorf("list declarable tables in namespace %q: %w", namespace, err)
 	}
-	var drops []engine.TableChange
+	models := map[string]schemadiff.Model{}
+	refused := map[string][]string{}
 	var exempt []string
 	var withheld []string
-	for _, live := range tables {
-		if declared[live.name] {
+	for _, name := range names {
+		if declared[name] {
 			continue
 		}
 		// The config's own entry is reported ahead of the naming conventions:
 		// an operator who wrote the table down deserves to read their own
 		// reason back, not an incidental one the table also happens to match.
-		if ignored.Withholds(live.name) {
+		if ignored.Withholds(name) {
 			slog.Info("live table withheld from the plan by ignore_tables",
 				"database", database,
 				"namespace", namespace,
-				"table", live.name)
-			withheld = append(withheld, live.name)
+				"table", name)
+			withheld = append(withheld, name)
 			continue
 		}
-		if engine.IsArchiveTable(live.name) {
+		if engine.IsArchiveTable(name) {
 			slog.Info("PostgreSQL archive table has no schema file and is left in place rather than dropped",
 				"database", database,
 				"namespace", namespace,
-				"table", live.name)
-			exempt = append(exempt, live.name)
+				"table", name)
+			exempt = append(exempt, name)
 			continue
 		}
-		sql := parser.Canonicalize("DROP TABLE " + pgx.Identifier{namespace, live.name}.Sanitize())
-		operation, _, err := parser.Classify(sql)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("classify drop for undeclared table %q: %w", live.name, err)
+		m, err := schemadiff.Introspect(ctx, pool, namespace, name)
+		if errors.Is(err, schemadiff.ErrTableNotFound) {
+			slog.Info("undeclared PostgreSQL table left the catalog while the plan was reading it; there is nothing to drop",
+				"database", database,
+				"namespace", namespace,
+				"table", name)
+			continue
 		}
-		// The plan comment classifies this drop from the statement; when a
-		// stored plan carries no statement it falls back to the words "DROP
-		// TABLE" in this reason, and then to the change type, so the wording
-		// stays a useful fallback rather than a requirement.
-		drops = append(drops, engine.TableChange{
-			Table:         live.name,
-			Operation:     operation,
-			DDL:           sql,
-			IsUnsafe:      true,
-			UnsafeReason:  sanitizeReasonText(fmt.Sprintf("DROP TABLE removes all data from table %q", live.name)),
-			ExecutionMode: engine.ExecutionModeBlocked,
-			ModeReason:    sanitizeReasonText(undeclaredTableReason(namespace, live)),
-		})
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("read undeclared table %q: %w", name, err)
+		}
+		models[name] = m
+		if refused[name], err = tableDropRefusals(ctx, pool, namespace, name); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	plan := planTableDrops(namespace, models, refused)
+	drops := make([]engine.TableChange, 0, len(models))
+	for _, name := range plan.order {
+		change, err := undeclaredTableDrop(namespace, name, parser)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		change.Metadata = map[string]string{reviewedTableDropMetadataKey: plan.definitions[name]}
+		drops = append(drops, change)
+	}
+	for _, name := range sortedKeys(plan.blocked) {
+		slog.Info("undeclared PostgreSQL table drop is blocked",
+			"database", database,
+			"namespace", namespace,
+			"table", name,
+			"reasons", plan.blocked[name])
+		change, err := undeclaredTableDrop(namespace, name, parser)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		change.ExecutionMode = engine.ExecutionModeBlocked
+		causes := make([]string, len(plan.blocked[name]))
+		for i, cause := range plan.blocked[name] {
+			causes[i] = sanitizeReasonText(cause)
+		}
+		change.ModeReason = engine.JoinBlockedCauses(causes)
+		drops = append(drops, change)
 	}
 	return drops, exempt, withheld, nil
 }
 
-// undeclaredTableReason explains why the drop is blocked and what the
-// operator can do about it, tailored to the table's foreign key relationships.
-// A schema file can declare a foreign key only to a table in its own
-// namespace, so a table that owns one into another namespace cannot be
-// declared at all. Any other table with foreign keys on either side can be
-// declared, but only by a hand-written file, because the schema pull refuses
-// to render a table it would describe incompletely. A drop of a referenced
-// table has to take the referencing constraints with it.
-func undeclaredTableReason(namespace string, live liveTable) string {
-	preamble := fmt.Sprintf(
-		"table %q exists on the target but no schema file in namespace %q declares it; converging would drop the table, which SchemaBot's PostgreSQL support never executes",
-		live.name, namespace)
-	owned := strings.Join(quoteAll(live.foreignKeys), ", ")
-	crossNamespace := strings.Join(quoteAll(live.crossNamespaceForeignKeys), ", ")
-	referencing := strings.Join(quoteAll(live.referencedBy), ", ")
-	switch {
-	case len(live.crossNamespaceForeignKeys) > 0 && len(live.referencedBy) > 0:
-		return fmt.Sprintf(
-			"%s; the table cannot be declared while it carries foreign key constraint(s) %s, which reference another namespace and schema files do not support, and foreign key constraint(s) %s on other tables reference it — drop the table together with the referencing constraints, or remove those foreign keys and declare it by hand, through a separately reviewed process",
-			preamble, crossNamespace, referencing)
-	case len(live.crossNamespaceForeignKeys) > 0:
-		return fmt.Sprintf(
-			"%s; the table cannot be declared while it carries foreign key constraint(s) %s, which reference another namespace and schema files do not support — drop the table, or remove those foreign keys before declaring it, through a separately reviewed process",
-			preamble, crossNamespace)
-	case len(live.foreignKeys) > 0 && len(live.referencedBy) > 0:
-		return fmt.Sprintf(
-			"%s; it carries foreign key constraint(s) %s and foreign key constraint(s) %s on other tables reference it, so the schema pull cannot write a file for it — declare the table by hand in a schema file, foreign keys included, to keep it under management, or drop it together with the referencing constraints through a separately reviewed process",
-			preamble, owned, referencing)
-	case len(live.foreignKeys) > 0:
-		return fmt.Sprintf(
-			"%s; it carries foreign key constraint(s) %s, so the schema pull cannot write a file for it — declare the table by hand in a schema file, foreign keys included, to keep it under management, or drop it through a separately reviewed process",
-			preamble, owned)
-	case len(live.referencedBy) > 0:
-		return fmt.Sprintf(
-			"%s; foreign key constraint(s) %s on other tables reference it, so the schema pull cannot write a file for it — declare the table by hand in a schema file to keep it under management, or drop it together with the referencing constraints through a separately reviewed process",
-			preamble, referencing)
+// undeclaredTableDrop is the unsafe DROP TABLE the plan shows for an
+// undeclared table.
+func undeclaredTableDrop(namespace, table string, parser ddl.StatementParser) (engine.TableChange, error) {
+	sql := parser.Canonicalize("DROP TABLE " + pgx.Identifier{namespace, table}.Sanitize())
+	operation, _, err := parser.Classify(sql)
+	if err != nil {
+		return engine.TableChange{}, fmt.Errorf("classify drop for undeclared table %q: %w", table, err)
 	}
-	return preamble + " — declare the table in a schema file to keep it under management, or drop it through a separately reviewed process"
+	return engine.TableChange{
+		Table:        table,
+		Operation:    operation,
+		DDL:          sql,
+		IsUnsafe:     true,
+		UnsafeReason: sanitizeReasonText(fmt.Sprintf("DROP TABLE removes all data from table %q", table)),
+	}, nil
 }
 
 // quoteAll wraps each name in double quotes so a list of identifiers reads
@@ -1115,57 +1158,6 @@ func quoteAll(names []string) []string {
 	return quoted
 }
 
-// liveTable is a table the namespace holds on the target, with the foreign
-// key constraint names on each side of the table that decide which remedy the
-// verdict can offer: foreignKeys are the constraints the table owns,
-// crossNamespaceForeignKeys the subset of them that reference a table in
-// another namespace, and referencedBy the constraints on other tables that
-// point at it.
-type liveTable struct {
-	name                      string
-	foreignKeys               []string
-	crossNamespaceForeignKeys []string
-	referencedBy              []string
-}
-
-// liveTables lists the tables pg-sprite's declarative model manages, in name
-// order, with the foreign key metadata SchemaBot needs to explain blocked
-// drops. The caller decides which managed tables policy exempts from a schema
-// file.
-//
-// Tables whose definition lives elsewhere are omitted. A partition is declared
-// through its parent's PARTITION BY and has no file of its own, so it follows
-// the parent's verdict wherever the parent lives. Extension-owned tables
-// belong to their extension: no file can declare them and the server refuses
-// to drop them while the extension is installed, so no operator remedy exists
-// for the verdict they would otherwise produce. Inheritance children and
-// unlogged tables are ordinary tables with definitions of their own, so they
-// are listed and must carry their own file.
-//
-// ListManagedTables is the authoritative table-set query and pg_catalog
-// qualifies every relation, operator, and type so search_path shadowing cannot
-// change its answer. The separate query here only decorates those returned
-// names with constraint metadata and carries the same qualification.
-//
-// The two reads are separate statements on separate snapshots, because
-// ListManagedTables opens its own connection from the pool; a variant that
-// runs inside a caller-supplied transaction would let both reads share one
-// snapshot and retire the skew check in joinForeignKeys.
-func liveTables(ctx context.Context, pool *pgxpool.Pool, namespace string) ([]liveTable, error) {
-	names, err := schemadiff.ListManagedTables(ctx, pool, namespace)
-	if err != nil {
-		return nil, fmt.Errorf("list declarable tables in namespace %q: %w", namespace, err)
-	}
-	if len(names) == 0 {
-		return []liveTable{}, nil
-	}
-	keys, err := foreignKeysFor(ctx, pool, namespace, names)
-	if err != nil {
-		return nil, err
-	}
-	return joinForeignKeys(namespace, names, keys)
-}
-
 // tableForeignKeys is one table's foreign key constraint names on each side,
 // as the catalog reports them.
 type tableForeignKeys struct {
@@ -1176,9 +1168,7 @@ type tableForeignKeys struct {
 }
 
 // foreignKeysFor reads the foreign key constraint names on each side of every
-// named table in the namespace. The result is restricted to names, so the
-// join in joinForeignKeys can treat any row outside it as a broken query
-// rather than a table to add.
+// named table in the namespace.
 func foreignKeysFor(ctx context.Context, pool *pgxpool.Pool, namespace string, names []string) ([]tableForeignKeys, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT c.relname,
@@ -1217,43 +1207,6 @@ func foreignKeysFor(ctx context.Context, pool *pgxpool.Pool, namespace string, n
 		return nil, fmt.Errorf("read foreign keys for declarable tables in namespace %q: %w", namespace, err)
 	}
 	return keys, nil
-}
-
-// joinForeignKeys attaches each table's foreign key metadata to the managed
-// table set, preserving the set's order. The join must be total in both
-// directions: a key for a name outside the set means the decoration query no
-// longer restricts itself to the set, and a name with no key means the table
-// left the catalog between the two reads. Either way the verdict's input is
-// uncertain, and a reason sentence built from a missing row would describe a
-// table with no foreign keys when the truth is that nothing was read, so the
-// plan fails instead of guessing.
-func joinForeignKeys(namespace string, names []string, keys []tableForeignKeys) ([]liveTable, error) {
-	tables := make([]liveTable, len(names))
-	byName := make(map[string]*liveTable, len(names))
-	for i, name := range names {
-		tables[i].name = name
-		byName[name] = &tables[i]
-	}
-	decorated := make(map[string]bool, len(names))
-	for _, key := range keys {
-		live, ok := byName[key.name]
-		if !ok {
-			return nil, fmt.Errorf("foreign key metadata for table %q in namespace %q is outside the managed table set", key.name, namespace)
-		}
-		if decorated[key.name] {
-			return nil, fmt.Errorf("foreign key metadata for table %q in namespace %q was returned more than once", key.name, namespace)
-		}
-		decorated[key.name] = true
-		live.foreignKeys = key.foreignKeys
-		live.crossNamespaceForeignKeys = key.crossNamespaceForeignKeys
-		live.referencedBy = key.referencedBy
-	}
-	for _, name := range names {
-		if !decorated[name] {
-			return nil, fmt.Errorf("table %q in namespace %q left the catalog while the plan was reading it; retry the plan", name, namespace)
-		}
-	}
-	return tables, nil
 }
 
 func hasExecutableChanges(changes []engine.TableChange) bool {
@@ -1378,6 +1331,14 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 			unrecognized: &unrecognizedPlannerVocabulary{kind: "plan_contract", value: strconv.Itoa(formatVersion)},
 		}
 	}
+	if verdict, ok := executionContractVerdict(statement.Execution, table); !ok {
+		return verdict
+	}
+	if statement.Execution == planner.ExecutionPartitionedIndexBuild {
+		if verdict, ok := partitionedIndexShapeVerdict(statement.ExecSQL, table); !ok {
+			return verdict
+		}
+	}
 	if statement.Disposition == router.DispositionExecute && statement.Route == planner.RouteNative &&
 		statement.Backend == router.BackendNative && len(statement.ExecSQL) > 0 {
 		return stepVerdict{}
@@ -1451,6 +1412,53 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 	}
 }
 
+// executionContractVerdict checks the execution contract the planner attached
+// to a statement's steps, which says how they must run. SchemaBot runs a
+// statement's steps one at a time, each in its own transaction, and it runs a
+// partitioned index build's one step through pg-sprite's partition-by-partition
+// build, so either contract, or no steps at all, leaves the verdict to the
+// disposition and reports ok. A contract this build does not know is a blocked
+// verdict reported as vocabulary that moved, so the caller logs it: running
+// its steps one at a time may not be what the contract asks for.
+func executionContractVerdict(execution planner.Execution, table string) (stepVerdict, bool) {
+	switch execution {
+	case "", planner.ExecutionAutocommit, planner.ExecutionPartitionedIndexBuild:
+		return stepVerdict{}, true
+	default:
+		return stepVerdict{
+			mode:         engine.ExecutionModeBlocked,
+			reason:       fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table),
+			unrecognized: &unrecognizedPlannerVocabulary{kind: "execution", value: string(execution)},
+		}, false
+	}
+}
+
+// partitionedIndexShapeVerdict runs the partitioned index build's own shape
+// admission over the planned step, so a statement the build would refuse
+// before touching the target, such as one naming a TABLESPACE, is blocked on
+// the plan instead of failing at apply. The build takes exactly one statement;
+// any other step count means the plan contract moved under this build.
+func partitionedIndexShapeVerdict(execSQL []string, table string) (stepVerdict, bool) {
+	if len(execSQL) != 1 {
+		return stepVerdict{
+			mode:         engine.ExecutionModeBlocked,
+			reason:       fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table),
+			unrecognized: &unrecognizedPlannerVocabulary{kind: "partitioned_index_build_steps", value: strconv.Itoa(len(execSQL))},
+		}, false
+	}
+	err := executor.AdmitPartitionedIndexShape(execSQL[0])
+	if err == nil {
+		return stepVerdict{}, true
+	}
+	if r := classifyRefusal(err, table); r != nil {
+		return stepVerdict{mode: engine.ExecutionModeBlocked, reason: fmt.Sprintf("statement for table %q: %s", table, r.detail)}, false
+	}
+	return stepVerdict{
+		mode:   engine.ExecutionModeBlocked,
+		reason: fmt.Sprintf("statement for table %q builds an index on a partitioned table in a shape SchemaBot's PostgreSQL support does not run", table),
+	}, false
+}
+
 // createShapeRefusalReason renders the create path's typed refusal cause in
 // SchemaBot's words, naming the clause the author wrote and what to do about
 // it. The mapping covers the planner's whole closed set of causes, so the
@@ -1487,6 +1495,10 @@ func createShapeRefusalReason(cause executor.CreateShapeCause, table string) (st
 	}
 	return fmt.Sprintf("statement for table %q %s", table, reason), true
 }
+
+// rebuildWithoutIntegerKeyReason is the sentence for a change that needs a
+// table rebuild on a table without an integer primary key.
+const rebuildWithoutIntegerKeyReason = "has to rebuild the table, which needs an integer primary key the table does not have, and SchemaBot's PostgreSQL support does not run table rebuilds yet; make the change outside SchemaBot"
 
 // rewriteRequiredReason renders the planner's typed guidance for a statement
 // that must not run as written, in SchemaBot's words, naming what the
@@ -1528,6 +1540,16 @@ func rewriteRequiredReason(guidance suggest.Guidance, table string) (string, boo
 		// destructive-change refusal. The case keeps the mapping complete
 		// for the day the planner attaches it here.
 		reason = "drops a column and adds it back, which discards every value the column holds; change the column's type in place with ALTER COLUMN ... TYPE ... USING ..., which converts its values"
+	case suggest.GuidanceAddIntegerPrimaryKey:
+		// The planner does not attach this code to a statement; pg-sprite's
+		// own run path carries it on its refusal of a table rebuild on a
+		// table with no primary key. The case keeps the mapping complete for
+		// the day the planner attaches it here. Adding the key would not make
+		// the change run here, since SchemaBot does not run table rebuilds
+		// on PostgreSQL yet, so the sentence names both gaps and sends the
+		// change outside SchemaBot rather than to a re-plan that would refuse
+		// it again.
+		reason = rebuildWithoutIntegerKeyReason
 	default:
 		return "", false
 	}
@@ -1699,10 +1721,10 @@ func applyGoroutineExited(tracked *trackedApply) bool {
 // shutdown open.
 func (e *Engine) HaltForShutdown(ctx context.Context) error {
 	e.mu.Lock()
-	halted := e.cancelConcurrentBuildsLocked(func(*trackedApply) bool { return true })
+	halted := e.cancelIndexBuildsLocked(func(*trackedApply) bool { return true })
 	e.mu.Unlock()
 	if halted > 0 {
-		slog.Info("PostgreSQL engine halting concurrent index builds for shutdown", "builds", halted)
+		slog.Info("PostgreSQL engine halting index builds for shutdown", "builds", halted)
 	}
 
 	// Wait off the calling goroutine so work that will not come down bounds
@@ -1727,7 +1749,7 @@ func (e *Engine) HaltForShutdown(ctx context.Context) error {
 func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
 	e.mu.Lock()
 	owned := func(tracked *trackedApply) bool { return tracked.owner == owner }
-	halted := e.cancelConcurrentBuildsLocked(owned)
+	halted := e.cancelIndexBuildsLocked(owned)
 	var pending []chan struct{}
 	for _, tracked := range e.progress {
 		if owned(tracked) {
@@ -1736,7 +1758,7 @@ func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
 	}
 	e.mu.Unlock()
 	if halted > 0 {
-		slog.Info("PostgreSQL engine halting the concurrent index builds a drive started as it returns", "builds", halted)
+		slog.Info("PostgreSQL engine halting the index builds a drive started as it returns", "builds", halted)
 	}
 
 	for _, done := range pending {
@@ -1749,12 +1771,12 @@ func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
 	return nil
 }
 
-// cancelConcurrentBuildsLocked ends the running concurrent index builds that
+// cancelIndexBuildsLocked ends the running index builds that
 // selected picks and returns how many it ended. The caller holds e.mu.
-func (e *Engine) cancelConcurrentBuildsLocked(selected func(*trackedApply) bool) int {
+func (e *Engine) cancelIndexBuildsLocked(selected func(*trackedApply) bool) int {
 	halted := 0
 	for _, tracked := range e.progress {
-		if selected(tracked) && tracked.concurrentIndex && !tracked.result.State.IsTerminal() && tracked.cancelApply != nil {
+		if selected(tracked) && tracked.cancellableBuild && !tracked.result.State.IsTerminal() && tracked.cancelApply != nil {
 			tracked.cancelApply()
 			halted++
 		}

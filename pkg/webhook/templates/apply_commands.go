@@ -221,6 +221,7 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	writePlanMetadata(&sb, data)
 	writePlanAttribution(&sb, data)
 	sb.WriteString("\n")
+	writePlanFreezes(&sb, data.Environment, data.Freezes)
 
 	// Count and show changes, every target's when the apply runs them.
 	summary := data
@@ -256,7 +257,7 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	if data.Tenant != "" {
 		applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 	}
-	writeUnsafeChangesRejection(&sb, data, "Apply rejected", applyCmd)
+	writeUnsafeChangesRejection(&sb, data, "Apply rejected", applyCmd, true)
 
 	return appendAgentHint(offerSupportChannel(sb.String()), data.AgentHint)
 }
@@ -264,10 +265,8 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 // writeUnsafeChangesRejection writes the refusal for a command that would run
 // unsafe changes without `--allow-unsafe`: the heading names what was
 // rejected, each unsafe change is listed, and the comment ends in the steps
-// that make any destructive drop safe and the command to re-run. Like the plan's apply instruction, the consent requirement leads
-// into the command and the flag stays out of the pasteable command, so
-// consenting to destroy data takes typing it.
-func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, rejected, command string) {
+// that make any destructive drop safe and the command to re-run.
+func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, rejected, command string, includeFlag bool) {
 	sb.WriteString("---\n\n")
 	drops, rest := splitDestructiveDrops(data.UnsafeChanges, data.DatabaseType)
 	fmt.Fprintf(sb, "**%s %s**: %s\n", glyph.Refused, rejected, unsafeCountPhrase(drops, rest))
@@ -282,7 +281,15 @@ func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, reje
 	}
 
 	consent := newUnsafeConsent(data.UnsafeChanges, data.DatabaseType, data.IsMySQL, !unsafeCountCoversEveryTarget(data.DeploymentDrift))
-	writeUnsafeConsentCommand(sb, fmt.Sprintf("**%s To proceed with these destructive changes**", glyph.Escalation), consent, command)
+	if includeFlag {
+		command += " --allow-unsafe"
+	}
+	// A freeze refuses the retry too unless it carries an override. The
+	// author types the reason again, as they type --allow-unsafe again: a
+	// consent is given against the comment they read, never pasted back.
+	command = appendFreezeOverride(command, data.Freezes)
+	lead := fmt.Sprintf("**%s To proceed with these destructive changes**", glyph.Escalation)
+	writeConsentCommand(sb, lead, consent.dropSteps, consent.instruction(includeFlag), command)
 }
 
 // RenderBlockedChangesApplyRejected renders the rejection comment for an

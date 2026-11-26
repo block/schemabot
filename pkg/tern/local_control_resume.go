@@ -321,6 +321,7 @@ func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Ap
 	if err != nil {
 		return nil, fmt.Errorf("build deferred deploy request for task %s: %w", applyTasks[0].TaskIdentifier, err)
 	}
+	c.observeOperationDispatch(ctx)
 	result, err := eng.Start(withDriveWorkOwner(ctx), controlReq)
 	if err != nil {
 		return nil, fmt.Errorf("start deferred deploy: %w", err)
@@ -454,6 +455,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 
 	var failedTask *storage.Task
 	var stoppedByUser bool
+	planMetadata := c.newPlanMetadataCache(apply)
 
 	for i, task := range tasks {
 		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
@@ -582,7 +584,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			fmt.Sprintf("Resuming task %s (sequential %d/%d)", task.TaskIdentifier, i+1, len(tasks)),
 			"", "")
 
-		action = c.runEngineTask(ctx, apply, task, plan, tasks, options)
+		action = c.runEngineTask(ctx, apply, task, plan, tasks, options, planMetadata)
 
 		if action == taskFailed {
 			failedTask = task
@@ -1584,6 +1586,12 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 			append(apply.LogAttrs(), "error", err)...)
 		return err
 	}
+	changes, err := groupedResumeChanges(tasks, plan, planChangeCanonicalizer(apply, c.logger))
+	if err != nil {
+		c.logger.Error("failed to rebuild engine changes for grouped resume; current apply owner will exit for operator retry",
+			append(apply.LogAttrs(), "error", err)...)
+		return fmt.Errorf("rebuild engine changes for grouped resume apply %s: %w", apply.ApplyIdentifier, err)
+	}
 
 	// Route the engine's own log lines into this apply's log stream, so a
 	// resumed drive reads like the drive that started it. The wiring goes up
@@ -1613,7 +1621,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		ApplyIdentifier: apply.ApplyIdentifier,
 		Database:        apply.Database,
 		PlanID:          plan.PlanIdentifier,
-		Changes:         groupedResumeChanges(tasks, plan),
+		Changes:         changes,
 		TargetShards:    taskTargetShards(tasks),
 		SchemaFiles:     plan.SchemaFiles,
 		IgnoreTables:    plan.IgnoreTables(),
@@ -1836,7 +1844,8 @@ func (c *LocalClient) groupedResumeState(ctx context.Context, apply *storage.App
 // with vschema_changed so the engine applies its VSchema from the schema files
 // alongside its DDL — or on its own for a VSchema-only namespace that has no DDL
 // tasks. This mirrors how the fresh apply builds changes from the plan.
-func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan) []engine.SchemaChange {
+func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan, canon StatementCanonicalizer) ([]engine.SchemaChange, error) {
+	planMetadata := newPlanChangeMetadata(plan, canon)
 	indexByNamespace := make(map[string]int, len(tasks))
 	var changes []engine.SchemaChange
 	ensureNamespace := func(namespace string) int {
@@ -1856,11 +1865,16 @@ func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan) []engine.Sc
 		if task.DDL == "" {
 			continue
 		}
+		metadata, err := planMetadata.forTask(task)
+		if err != nil {
+			return nil, fmt.Errorf("read engine metadata for task %s: %w", task.TaskIdentifier, err)
+		}
 		idx := ensureNamespace(task.Namespace)
 		changes[idx].TableChanges = append(changes[idx].TableChanges, engine.TableChange{
 			Table:     task.TableName,
 			DDL:       task.DDL,
 			Operation: ddl.OpToStatementType(task.DDLAction),
+			Metadata:  metadata,
 		})
 	}
 	if plan != nil {
@@ -1880,7 +1894,7 @@ func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan) []engine.Sc
 			changes[idx].Metadata["vschema_changed"] = "true"
 		}
 	}
-	return changes
+	return changes, nil
 }
 
 func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*storage.Task) {
@@ -1944,6 +1958,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 // are loaded scoped to the operation rather than the whole apply, so a driver
 // can advance one deployment independently of its siblings.
 func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	ctx = withChangeDispatchApply(ctx, apply)
 	if err := c.guardDriveScope(apply); err != nil {
 		return err
 	}
@@ -2018,6 +2033,7 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 // operation, so an empty result fails closed the same way ResumeApplyOperation
 // does rather than failing the whole parent apply.
 func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	ctx = withChangeDispatchApply(ctx, apply)
 	if apply == nil {
 		return fmt.Errorf("stored apply is required to drive apply_operation %d cutover", applyOperationID)
 	}
@@ -2644,12 +2660,14 @@ func finalizerVSchemaApplied(s engine.State) bool {
 // returns the last one, which is not a permanent error: the caller pauses the
 // finalizer for a retry instead of polling an engine that does not answer.
 // The operator does not watch a finalizer for a stalled drive, since it has no
-// task rows to mirror, so this budget is what bounds the drive.
+// task rows to mirror, so this budget is what bounds the drive. The wait
+// between polls grows while they fail (progressPollWait), so a provider that
+// throttles the drive is not polled through the budget in a few seconds.
 func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.Engine, apply *storage.Apply, creds *engine.Credentials, resumeState *engine.ResumeState, persistResume func(*engine.ResumeState)) (engine.State, error) {
-	ticker := time.NewTicker(c.taskPollInterval())
-	defer ticker.Stop()
 	consecutiveErrors := 0
+	var nextPollWait time.Duration
 	for {
+		tickStart := time.Now()
 		res, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 			Database:    apply.Database,
 			Credentials: creds,
@@ -2661,13 +2679,15 @@ func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.E
 				return "", fmt.Errorf("group_finalizer progress poll failed permanently: %w", err)
 			}
 			consecutiveErrors++
+			nextPollWait = c.progressPollWait(consecutiveErrors)
 			c.logger.Warn("group_finalizer: transient progress error",
-				append(apply.LogAttrs(), "error", err, "consecutive_errors", consecutiveErrors)...)
+				append(apply.LogAttrs(), "error", err, "consecutive_errors", consecutiveErrors, "next_poll_in", nextPollWait)...)
 			if consecutiveErrors >= maxConsecutiveProgressPollErrors {
 				return "", fmt.Errorf("group_finalizer progress poll failed after %d consecutive errors: %w", consecutiveErrors, err)
 			}
 		} else {
 			consecutiveErrors = 0
+			nextPollWait = c.progressPollWait(0)
 			if res.ResumeState != nil {
 				persistResume(res.ResumeState)
 				resumeState = res.ResumeState
@@ -2679,7 +2699,7 @@ func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.E
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-ticker.C:
+		case <-time.After(max(0, nextPollWait-time.Since(tickStart))):
 		}
 	}
 }
@@ -3283,6 +3303,10 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 	}
 	if suppressParentApplyWrites(ctx) {
 		return nil
+	}
+	if _, operationDrive := storage.OperationLeaseFromContext(ctx); operationDrive &&
+		ctx.Err() == nil && state.IsState(apply.State, state.Apply.Failed) {
+		return fmt.Errorf("%w: %w", ErrGroupedResumeFailureCommitted, err)
 	}
 	return err
 }

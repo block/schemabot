@@ -255,6 +255,17 @@ func plannedTableDrops(changes []*ternv1.SchemaChange, shards []*ternv1.ShardPla
 	return drops
 }
 
+// schemaFileParseError is a schema file the dialect's parser could not read.
+// Its text names the file and what the parser rejected, so the author of the
+// file can fix it. A failure to build the parser at all is not one.
+type schemaFileParseError struct {
+	message string
+	err     error
+}
+
+func (e *schemaFileParseError) Error() string { return e.message }
+func (e *schemaFileParseError) Unwrap() error { return e.err }
+
 // tablesDeclaredBy maps each table the given namespaces' schema files create,
 // keyed by declaredTableKey, to the first of those namespaces, in sorted order,
 // that declares it. Only SQL files declare tables; other schema artifacts such
@@ -273,12 +284,12 @@ func tablesDeclaredBy(declared map[string]*ternv1.SchemaFiles, namespaces []stri
 			}
 			stmts, err := parser.Split(files[name])
 			if err != nil {
-				return nil, fmt.Errorf("split schema file %s/%s: %w", namespace, name, err)
+				return nil, &schemaFileParseError{message: fmt.Sprintf("split schema file %s/%s: %v", namespace, name, err), err: err}
 			}
 			for _, stmt := range stmts {
 				stmtType, table, err := parser.Classify(stmt)
 				if err != nil {
-					return nil, fmt.Errorf("classify statement in schema file %s/%s: %w", namespace, name, err)
+					return nil, &schemaFileParseError{message: fmt.Sprintf("classify statement in schema file %s/%s: %v", namespace, name, err), err: err}
 				}
 				if stmtType != ddl.StatementCreateTable {
 					continue

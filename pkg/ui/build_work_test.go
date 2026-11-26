@@ -52,12 +52,12 @@ func TestFormatBuildWork(t *testing.T) {
 				w.LockersDone, w.LockersTotal = 1, 3
 				return w
 			}(),
-			want: "waiting on 2 of 3 lockers",
+			want: "Waiting on 2 of 3 lockers",
 		},
 		{
 			name: "btree initializing names the phase",
 			work: build("building index: initializing"),
-			want: "building index: initializing",
+			want: "Building index: initializing",
 		},
 		{
 			name: "scanning table reports blocks",
@@ -66,16 +66,16 @@ func TestFormatBuildWork(t *testing.T) {
 				w.BlocksDone, w.BlocksTotal = 2_500, 10_000
 				return w
 			}(),
-			want: "building index: 25% of blocks (2,500/10,000)",
+			want: "Building index: 2,500 of 10,000 blocks",
 		},
 		{
-			name: "blocks done past total clamps to 100 percent",
+			name: "blocks done past total shows the total",
 			work: func() apitypes.BuildWork {
 				w := build("building index: scanning table")
 				w.BlocksDone, w.BlocksTotal = 10_250, 10_000
 				return w
 			}(),
-			want: "building index: 100% of blocks (10,250/10,000)",
+			want: "Building index: 10,000 of 10,000 blocks",
 		},
 		{
 			name: "sorting live tuples names the phase instead of the finished scan",
@@ -84,7 +84,7 @@ func TestFormatBuildWork(t *testing.T) {
 				w.BlocksDone, w.BlocksTotal = 10_000, 10_000
 				return w
 			}(),
-			want: "building index: sorting live tuples",
+			want: "Building index: sorting live tuples",
 		},
 		{
 			name: "loading tuples reports tuples, not the finished scan's blocks",
@@ -93,7 +93,7 @@ func TestFormatBuildWork(t *testing.T) {
 				w.BlocksDone, w.BlocksTotal, w.TuplesDone, w.TuplesTotal = 10_000, 10_000, 12_000, 50_000
 				return w
 			}(),
-			want: "building index: 12,000/50,000 tuples",
+			want: "Building index: 12,000 of 50,000 tuples",
 		},
 		{
 			name: "an access method without sub-phases reports blocks while it has a block total",
@@ -102,7 +102,7 @@ func TestFormatBuildWork(t *testing.T) {
 				w.BlocksDone, w.BlocksTotal = 1, 4
 				return w
 			}(),
-			want: "building index: 25% of blocks (1/4)",
+			want: "Building index: 1 of 4 blocks",
 		},
 		{
 			name: "an access method without sub-phases reports tuples otherwise",
@@ -111,7 +111,7 @@ func TestFormatBuildWork(t *testing.T) {
 				w.TuplesDone, w.TuplesTotal = 10, 20
 				return w
 			}(),
-			want: "building index: 10/20 tuples",
+			want: "Building index: 10 of 20 tuples",
 		},
 		{
 			name: "carried build counters are omitted while waiting for writers before validation",
@@ -120,7 +120,7 @@ func TestFormatBuildWork(t *testing.T) {
 				w.BlocksDone, w.BlocksTotal, w.TuplesDone, w.TuplesTotal, w.LockersDone, w.LockersTotal = 10_000, 10_000, 50_000, 50_000, 1, 4
 				return w
 			}(),
-			want: "waiting on 3 of 4 lockers",
+			want: "Waiting on 3 of 4 lockers",
 		},
 		{
 			name: "validation index scan is labelled as validation",
@@ -129,7 +129,7 @@ func TestFormatBuildWork(t *testing.T) {
 				w.BlocksDone, w.BlocksTotal, w.TuplesDone, w.TuplesTotal = 93, 100, 50_000, 50_000
 				return w
 			}(),
-			want: "validating index: 93% of blocks (93/100)",
+			want: "Validating index: 93 of 100 blocks",
 		},
 		{
 			name: "validation sort names the phase",
@@ -138,7 +138,7 @@ func TestFormatBuildWork(t *testing.T) {
 				w.BlocksDone, w.BlocksTotal = 100, 100
 				return w
 			}(),
-			want: "validating index: sorting tuples",
+			want: "Validating index: sorting tuples",
 		},
 		{
 			name: "validation table scan is labelled as validation",
@@ -147,7 +147,7 @@ func TestFormatBuildWork(t *testing.T) {
 				w.BlocksDone, w.BlocksTotal = 7_500, 10_000
 				return w
 			}(),
-			want: "validating index: 75% of blocks (7,500/10,000)",
+			want: "Validating index: 7,500 of 10,000 blocks",
 		},
 		{
 			name: "lockers done past total shows none outstanding",
@@ -156,7 +156,7 @@ func TestFormatBuildWork(t *testing.T) {
 				w.BlocksDone, w.BlocksTotal, w.LockersDone, w.LockersTotal = 10_000, 10_000, 5, 3
 				return w
 			}(),
-			want: "waiting on 0 of 3 lockers",
+			want: "Waiting on 0 of 3 lockers",
 		},
 		{
 			name: "waiting phase without a locker count renders nothing",
@@ -174,7 +174,7 @@ func TestFormatBuildWork(t *testing.T) {
 				w.Attempt, w.TuplesDone, w.TuplesTotal = 1, 10, 20
 				return w
 			}(),
-			want: "building index: 10/20 tuples",
+			want: "Building index: 10 of 20 tuples",
 		},
 		{
 			name: "retry appends the attempt",
@@ -183,7 +183,7 @@ func TestFormatBuildWork(t *testing.T) {
 				w.Attempt, w.LockersDone, w.LockersTotal = 2, 0, 1
 				return w
 			}(),
-			want: "waiting on 1 of 1 lockers · attempt 2",
+			want: "Waiting on 1 of 1 lockers · attempt 2",
 		},
 		{
 			name: "retry is announced even before the phase publishes counters",
@@ -192,7 +192,7 @@ func TestFormatBuildWork(t *testing.T) {
 				w.Attempt = 2
 				return w
 			}(),
-			want: "attempt 2",
+			want: "Attempt 2",
 		},
 	}
 	for _, tt := range tests {
@@ -200,4 +200,24 @@ func TestFormatBuildWork(t *testing.T) {
 			assert.Equal(t, tt.want, FormatBuildWork(tt.work))
 		})
 	}
+}
+
+// A running index build draws the engine's whole-build percent on a bar, and
+// a build with no progress yet reads as starting rather than stuck at 0%.
+// When the engine publishes the percent with its decimals, the line shows two
+// of them, so a large build moves between polls while its whole percent stands
+// still; the bar fills to the whole percent below it.
+func TestIndexBuildProgress(t *testing.T) {
+	none := apitypes.BuildWork{}
+	assert.Equal(t, "⏳ Starting index build...", IndexBuildProgress(0, none))
+	assert.Equal(t, ProgressBarRowCopy(25)+" 25%", IndexBuildProgress(25, none))
+	assert.Equal(t, ProgressBarRowCopy(100)+" 100%", IndexBuildProgress(140, none))
+
+	precise := func(percent float64) apitypes.BuildWork {
+		return apitypes.BuildWork{Operation: "concurrent-index-build", Percent: percent, HasPercent: true}
+	}
+	assert.Equal(t, ProgressBarRowCopy(35)+" 35.45%", IndexBuildProgress(35, precise(35.45)))
+	assert.Equal(t, ProgressBarRowCopy(13)+" 13.80%", IndexBuildProgress(13, precise(13.8)), "a tenth still reads with two places")
+	assert.Equal(t, ProgressBarRowCopy(0)+" 0.05%", IndexBuildProgress(0, precise(0.05)), "a build under one percent reads as moving, not starting")
+	assert.Equal(t, "⏳ Starting index build...", IndexBuildProgress(0, precise(0)))
 }

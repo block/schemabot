@@ -153,7 +153,7 @@ func refuseEnumTypeDeclaredTwice(namespace string, files map[string]pgstatement.
 			continue
 		}
 		if first, declared := declaredBy[enumType.Name()]; declared {
-			return fmt.Errorf("plan PostgreSQL namespace %q: enum type %q is declared by both schema files %q and %q. Declare each type in exactly one schema file", namespace, enumType.Name(), first, filename)
+			return &engine.PlanRefusedError{Err: fmt.Errorf("plan PostgreSQL namespace %q: enum type %q is declared by both schema files %q and %q. Declare each type in exactly one schema file", namespace, enumType.Name(), first, filename)}
 		}
 		declaredBy[enumType.Name()] = filename
 	}

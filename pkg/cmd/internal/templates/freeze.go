@@ -179,7 +179,12 @@ func WriteFreezeOverrideApproved(r apitypes.FreezeOverrideRequest) {
 // WriteFreezeOverride writes one freeze override request.
 func WriteFreezeOverride(r apitypes.FreezeOverrideRequest) {
 	status := "waiting for approval"
-	if r.ApprovedAt != nil {
+	switch {
+	case r.ApprovedAt != nil && strings.EqualFold(strings.TrimSpace(r.ApprovedBy), strings.TrimSpace(r.RequestedBy)):
+		// Only the reason override policy stores a request approved by its
+		// own requester.
+		status = fmt.Sprintf("admitted on its requester's reason at %s", freezeTime(*r.ApprovedAt))
+	case r.ApprovedAt != nil:
 		status = fmt.Sprintf("approved by %s at %s", ui.TerminalSafeLine(r.ApprovedBy), freezeTime(*r.ApprovedAt))
 	}
 	fmt.Printf("Override request %s: %s\n", ui.TerminalSafeLine(r.ID), status)
@@ -240,10 +245,10 @@ func ChangeGateRefusedText(d ChangeGateRefusedData) []string {
 	case !d.OverrideAsked && d.OverrideCommand != "":
 		// The command gets a line of its own so a narrow watch, which cuts
 		// wide lines rather than wrapping them, still shows it whole.
-		lines = append(lines, "To ask for an override, run:",
+		lines = append(lines, "If this change can't wait, override the freeze with a reason:",
 			fmt.Sprintf(`  %s --override "<reason>"`, ui.TerminalSafeLine(d.OverrideCommand)))
 	case !d.OverrideAsked:
-		lines = append(lines, `To ask for an override, run the same command with --override "<reason>".`)
+		lines = append(lines, `If this change can't wait, run the same command with --override "<reason>".`)
 	default:
 		lines = append(lines, "No override request was recorded. SchemaBot said: "+ui.TerminalSafeLine(d.Message))
 	}
@@ -275,12 +280,71 @@ func StoppedByFreezeText(freeze *apitypes.FreezeStopRef, applyID, environment st
 	if freeze.Ended {
 		return text + fmt.Sprintf(", which has ended. Run '%s' to resume it.", start)
 	}
-	return text + fmt.Sprintf(". Run '%s' after the freeze ends or is lifted, or add --override \"<reason>\" to ask a freeze approver to let it through.", start)
+	return text + fmt.Sprintf(". Run '%s' after the freeze ends or is lifted, or add --override \"<reason>\" if it can't wait.", start)
 }
 
 // writeStoppedByFreeze writes StoppedByFreezeText below the status box.
 func writeStoppedByFreeze(data ProgressData) {
 	if text := StoppedByFreezeText(data.StoppedByFreeze, data.ApplyID, data.Environment); text != "" {
 		fmt.Printf("\n  ⏹️ %s\n", text)
+	}
+}
+
+// PlanFreezesText is what a plan says about the freezes that cover its change
+// in environment: those in effect, which refuse its apply now, then those
+// scheduled, which will once they start. It says nothing when none covers it.
+// It only informs: the apply checks the freezes again, and its refusal is the
+// one that counts.
+func PlanFreezesText(environment string, freezes []apitypes.Freeze) []string {
+	var inEffect, scheduled []apitypes.Freeze
+	for _, f := range freezes {
+		if f.InEffect {
+			inEffect = append(inEffect, f)
+		} else {
+			scheduled = append(scheduled, f)
+		}
+	}
+	env := ui.TerminalSafeLine(environment)
+	var lines []string
+	if len(inEffect) > 0 {
+		lines = append(lines, fmt.Sprintf("%s %s is frozen, so applying this plan would be refused now.", glyph.Frozen, env))
+		for _, f := range inEffect {
+			lines = append(lines, fmt.Sprintf("   %s  %s  (%s)", ui.TerminalSafeLine(f.ID), ui.TerminalSafeLine(f.Reason), freezeUntil(f)))
+		}
+		subject := "the freeze"
+		if len(inEffect) > 1 {
+			subject = "the freezes"
+		}
+		// The PR comment words the override by the server's policy. The plan
+		// response carries no policy, so this says what --override does under
+		// either one, as the --override help does. The CLI refusal offers
+		// --override under every policy too.
+		lines = append(lines, fmt.Sprintf(`Wait for %s to end before you apply. If this change can't wait, apply with --override "<reason>": as the server's override policy says, SchemaBot lets it through on your reason, or asks a freeze approver to approve it first.`, subject))
+	}
+	if len(scheduled) > 0 {
+		if len(lines) > 0 {
+			lines = append(lines, "")
+		}
+		subject := "A freeze is scheduled"
+		if len(scheduled) > 1 {
+			subject = "Freezes are scheduled"
+		}
+		lines = append(lines, fmt.Sprintf("%s %s in %s. Apply before it starts, and let the change finish: while it holds, the apply is refused, and so is a start or cutover the change still needs.", glyph.Frozen, subject, env))
+		for _, f := range scheduled {
+			lines = append(lines, fmt.Sprintf("   %s  %s  (starts %s, %s)", ui.TerminalSafeLine(f.ID), ui.TerminalSafeLine(f.Reason), freezeTime(f.StartsAt), freezeUntil(f)))
+		}
+	}
+	return lines
+}
+
+// WritePlanFreezes writes PlanFreezesText, then a blank line when it wrote
+// any.
+func WritePlanFreezes(environment string, freezes []apitypes.Freeze) {
+	lines := PlanFreezesText(environment, freezes)
+	for _, line := range lines {
+		fmt.Println(line)
+	}
+	if len(lines) > 0 {
+		fmt.Println()
 	}
 }

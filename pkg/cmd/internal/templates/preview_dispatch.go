@@ -268,6 +268,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhook.PreviewAggregateSummary())
 	case PreviewAggregateCheckFileCapBlocked:
 		fmt.Print(webhook.PreviewAggregateCheckFileCapBlocked())
+	case PreviewAggregateCheckQuotaReserved:
+		fmt.Print(webhook.PreviewAggregateCheckQuotaReserved())
 	case PreviewAggregateCheckStopped:
 		fmt.Print(webhook.PreviewAggregateCheckStopped())
 	case PreviewAggregateCheckRollout:
