@@ -1,12 +1,15 @@
 package commands
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -80,6 +83,119 @@ func TestRollbackPreviewUsesTargetDialect(t *testing.T) {
 			assert.Equal(t, "GET /api/status", <-requests)
 		})
 	}
+}
+
+// newRollbackPreflightServer serves a rollback plan for shop in production and
+// answers the active schema change preflight with the given status handler. It
+// records each request's method and path so a test can show what a refused
+// rollback never reached.
+func newRollbackPreflightServer(t *testing.T, status http.HandlerFunc) (*[]string, string) {
+	t.Helper()
+	t.Setenv("SCHEMABOT_TOKEN", "fictional-rollback-preflight-test")
+	plan := apitypes.PlanResponse{PlanID: "plan-rollback-1", Database: "shop", DatabaseType: "mysql", Environment: "production", Changes: []*apitypes.SchemaChangeResponse{{Namespace: "shop", TableChanges: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `note` text"}}}}}
+	var mu sync.Mutex
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /api/rollback/plan":
+			assert.NoError(t, json.NewEncoder(w).Encode(plan))
+		case "GET /api/status":
+			status(w, r)
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return &requests, server.URL
+}
+
+// A rollback is refused up front, with the same guidance apply gives, while a
+// schema change on the target is queued, waiting, running, or cutting over. The
+// operator is told what holds the target and how to watch it, before any plan,
+// prompt, or lock.
+func TestRollbackCmd_RefusedWhileASchemaChangeIsActive(t *testing.T) {
+	cases := []struct {
+		state   string
+		wantMsg string
+		cutover bool
+	}{
+		{state: "pending", wantMsg: "A schema change is queued and has not started yet."},
+		{state: "waiting_for_deploy", wantMsg: "A schema change is waiting for deploy.", cutover: true},
+		{state: "waiting_for_cutover", wantMsg: "A schema change is waiting for cutover.", cutover: true},
+		{state: "running", wantMsg: "A schema change is already running."},
+		{state: "cutting_over", wantMsg: "A schema change is currently cutting over."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.state, func(t *testing.T) {
+			requests, endpoint := newRollbackPreflightServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				assert.NoError(t, json.NewEncoder(w).Encode(apitypes.StatusResponse{
+					Applies: []*apitypes.ActiveApplyResponse{{ApplyID: "apply-busy", Database: "shop", Environment: "production", State: tc.state}},
+				}))
+			})
+
+			var runErr error
+			out := stripAnsi(captureStdout(func() {
+				cmd := RollbackCmd{ApplyID: "apply-example-85", Environment: "production", AutoApprove: true}
+				runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
+			}))
+
+			require.Error(t, runErr)
+			assert.Equal(t, "schema change already in progress", runErr.Error())
+			assert.Contains(t, out, "⏳ Schema Change In Progress\n\nDatabase: shop\nEnvironment: production\n\n"+tc.wantMsg+"\n\n")
+			assert.Contains(t, out, "To watch and manage: ")
+			assert.Contains(t, out, "status apply-busy")
+			if tc.cutover {
+				assert.Contains(t, out, "cutover apply-busy -e production")
+			} else {
+				assert.NotContains(t, out, "To trigger cutover:")
+			}
+			assert.NotContains(t, out, "Rollback Plan", "the refusal comes before the plan is shown")
+			assert.Equal(t, []string{"POST /api/rollback/plan", "GET /api/status"}, *requests, "nothing is locked or applied while the target is busy")
+		})
+	}
+}
+
+// A preflight that cannot run is not a refusal, for rollback as for apply: the
+// command goes on to the plan and the prompt, since the server guards the same
+// conflict when the apply is created, and the failed check is logged so the
+// operator can see it did not run.
+func TestRollbackCmd_ProceedsAndLogsWhenThePreflightFails(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	requests, endpoint := newRollbackPreflightServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"error":"status unavailable"}`, http.StatusInternalServerError)
+	})
+	inputPath := filepath.Join(t.TempDir(), "confirmation")
+	require.NoError(t, os.WriteFile(inputPath, []byte("no\n"), 0o600))
+	input, err := os.Open(inputPath)
+	require.NoError(t, err)
+	original := os.Stdin
+	os.Stdin = input
+	t.Cleanup(func() {
+		os.Stdin = original
+		require.NoError(t, input.Close())
+	})
+
+	var runErr error
+	out := stripAnsi(captureStdout(func() {
+		cmd := RollbackCmd{ApplyID: "apply-example-85", Environment: "production"}
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
+	}))
+
+	require.NoError(t, runErr)
+	assert.Contains(t, out, "Rollback Plan")
+	assert.Contains(t, out, "Rollback cancelled.")
+	assert.Equal(t, []string{"POST /api/rollback/plan", "GET /api/status"}, *requests)
+	assert.Contains(t, logs.String(), "could not check for an active schema change; proceeding, and the server will refuse the apply if a schema change holds the database")
+	assert.Contains(t, logs.String(), "database=shop")
+	assert.Contains(t, logs.String(), "environment=production")
 }
 
 // A rollback shows its one rollback plan, which is what every member it runs

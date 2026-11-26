@@ -68,6 +68,8 @@ func TestUpdateCheckRecordForApplyStartRefusesDriftBlock(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "review-time deployment drift block present")
+	assert.ErrorIs(t, err, errApplyStartDriftBlocked)
+	assert.NotErrorIs(t, err, errApplyStartPlacementBlocked)
 	assert.Zero(t, checks.upsertCalls, "apply start must not overwrite a stored drift block")
 }
 
@@ -100,5 +102,7 @@ func TestUpdateCheckRecordForApplyStartRefusesNamespacePlacementBlock(t *testing
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "namespace placement refused this environment's plan; fix the namespace placement")
 	assert.NotContains(t, err.Error(), "drift")
+	assert.ErrorIs(t, err, errApplyStartPlacementBlocked)
+	assert.NotErrorIs(t, err, errApplyStartDriftBlocked)
 	assert.Zero(t, checks.upsertCalls, "apply start must not overwrite a stored placement block")
 }
