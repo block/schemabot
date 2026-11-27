@@ -49,7 +49,9 @@ schemabot init
 
 SchemaBot starts a local Vitess cluster with a keyspace split across two
 shards, seeds two tables, pulls them into schema files, and confirms the files
-match the cluster. Edit a file, then review and run the change:
+match the cluster. The first run downloads a multi-gigabyte cluster image, so
+allow several minutes on a machine that has never run one; later runs reuse it.
+Edit a file, then review and run the change:
 
 ```bash
 schemabot plan -s schema -e development
