@@ -1058,8 +1058,9 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 	causes := engine.BlockedCauses(change.ModeReason)
 	require.Len(t, causes, 2, "the privilege gap and the size ceiling are independent causes")
 	assert.Contains(t, causes[0], "in-place changes that need ownership", "the privilege cause comes first")
-	assert.True(t, strings.HasPrefix(causes[1], `statement for table "users": table size`),
+	assert.True(t, strings.HasPrefix(causes[1], `statement for table "users": the table is `),
 		"the size cause follows the privilege cause: %q", causes[1])
+	assert.Contains(t, causes[1], "raise postgres.native_safe_table_size_limit_bytes", "the size cause names the option that sets the limit")
 }
 
 // TestEnginePlanPrivilegeRefusalPerTier proves a privilege gap blocks only
@@ -1136,8 +1137,8 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	change := result.Changes[0].TableChanges[0]
 	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
 	assert.Contains(t, change.ModeReason, `statement for table "users":`)
-	assert.Contains(t, change.ModeReason, "1-byte threshold")
-	assert.Contains(t, change.ModeReason, "SchemaBot's ceiling for a native-safe apply")
+	assert.Contains(t, change.ModeReason, "over the 1 B limit")
+	assert.Contains(t, change.ModeReason, "limit SchemaBot sets for a native-safe apply")
 	// The blocked table still shows the size the ceiling measured. It has
 	// never been analyzed, so the row count is omitted rather than zero.
 	var size int64
@@ -1202,7 +1203,7 @@ func TestEnginePlanTableSizeRefusalKeepsTableNameVerbatim(t *testing.T) {
 	change := result.Changes[0].TableChanges[0]
 	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
 	assert.Contains(t, change.ModeReason, `statement for table "odd|users":`)
-	assert.Contains(t, change.ModeReason, "1-byte threshold")
+	assert.Contains(t, change.ModeReason, "over the 1 B limit")
 }
 
 // TestEnginePlanOversizedTableAdmitsConcurrentIndex proves the plan applies
@@ -1229,7 +1230,7 @@ func TestEnginePlanOversizedTableAdmitsConcurrentIndex(t *testing.T) {
 	alter := result.Changes[0].TableChanges[0]
 	index := result.Changes[0].TableChanges[1]
 	assert.Equal(t, engine.ExecutionModeBlocked, alter.ExecutionMode)
-	assert.Contains(t, alter.ModeReason, "1-byte threshold")
+	assert.Contains(t, alter.ModeReason, "over the 1 B limit")
 	assert.Empty(t, index.ExecutionMode)
 	assert.Contains(t, index.DDL, "CREATE INDEX CONCURRENTLY")
 }
@@ -1898,7 +1899,7 @@ func TestEngineApplyTableSizeRefusal(t *testing.T) {
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "a size refusal is permanent until the ceiling or target changes")
-	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+	assert.Contains(t, progress.ErrorMessage, "over the 1 B limit")
 }
 
 // TestEngineApplyOversizedTableRunsCatalogOnlyChange proves apply re-proves a
@@ -1966,7 +1967,7 @@ func TestEngineApplyOversizedTableRefusesWhenTheLiveProofNoLongerHolds(t *testin
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable)
-	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+	assert.Contains(t, progress.ErrorMessage, "over the 1 B limit")
 	assertColumnAbsent(t, db, "users", "plan")
 }
 
@@ -1987,7 +1988,7 @@ func TestEngineApplyOversizedTableFailsWhenTheLiveProofFails(t *testing.T) {
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "failed", progress.Metadata["phase"])
 	assert.True(t, progress.Retryable, "a failed proof is not a size verdict; a retry may prove the statement")
-	assert.NotContains(t, progress.ErrorMessage, "1-byte threshold")
+	assert.NotContains(t, progress.ErrorMessage, "over the 1 B limit")
 	assertColumnAbsent(t, db, "users", "plan")
 
 	// The failure renders only a fixed sentence, so check the failed proof
@@ -2030,7 +2031,7 @@ func TestEngineApplyOversizedTableNamesTheMissingTemporaryGrant(t *testing.T) {
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "the grant must be provisioned before a retry can succeed")
 	assert.Contains(t, progress.ErrorMessage, "grant TEMPORARY on the database to the engine role")
-	assert.NotContains(t, progress.ErrorMessage, "1-byte threshold")
+	assert.NotContains(t, progress.ErrorMessage, "over the 1 B limit")
 	assertColumnAbsent(t, db, "users", "email")
 }
 
@@ -2073,7 +2074,7 @@ func TestEngineApplyOversizedTableUsesKindSpecificBounds(t *testing.T) {
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable)
-	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+	assert.Contains(t, progress.ErrorMessage, "over the 1 B limit")
 }
 
 // TestEngineApplyOperationalFailure proves an execution-path error — here an

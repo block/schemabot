@@ -533,6 +533,7 @@ func previewCLIPlanAllOutput() {
 		{"PLAN (MYSQL)", previewPlanOutput},
 		{"PLAN (MYSQL, PARTITIONED TABLES)", previewPartitionedPlanOutput},
 		{"PLAN (POSTGRES)", previewPostgresPlanOutput},
+		{"PLAN (POSTGRES, BLOCKED)", previewPostgresBlockedPlanOutput},
 		{"PLAN (NO CHANGES)", previewPlanNoChangesOutput},
 		{"PLAN (VITESS)", previewVitessPlanOutput},
 		{"MULTI-ENV PLAN (IDENTICAL)", previewMultiEnvPlanOutput},
