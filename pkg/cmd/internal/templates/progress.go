@@ -143,9 +143,9 @@ func WriteProgress(data ProgressData) {
 	if state.IsState(data.State, state.Apply.RevertWindow) {
 		if expiresStr := data.Metadata["revert_expires_at"]; expiresStr != "" {
 			if expires, err := time.Parse(time.RFC3339, expiresStr); err == nil {
-				remaining := time.Until(expires)
+				remaining := expires.Sub(nowFunc())
 				if remaining > 0 {
-					rows = append(rows, BoxRow{"Revert expires in", ui.FormatDurationSeconds(int64(remaining.Seconds()))})
+					rows = append(rows, BoxRow{"Revert expires in", ui.FormatHumanDuration(remaining)})
 				}
 			}
 		}
@@ -157,7 +157,11 @@ func WriteProgress(data ProgressData) {
 	// Error below the box. A sharded apply shows it in every state, as the PR
 	// comment's failure callout does: a shard or a keyspace finalize can fail
 	// while other shards keep running, and nothing else on screen names it.
-	if (data.State == state.Apply.Failed || data.Sharded) && data.ErrorMessage != "" {
+	// When several shards failed, their reasons grouped stand in for the one
+	// error, which names only the first.
+	if callout := shardFailureCallout(data); callout != "" {
+		fmt.Printf("\n%s", callout)
+	} else if (data.State == state.Apply.Failed || data.Sharded) && data.ErrorMessage != "" {
 		fmt.Printf("\n  %s%s%s\n", ANSIRed, data.ErrorMessage, ANSIReset)
 	}
 	writeStoppedByFreeze(data)
@@ -241,6 +245,20 @@ func WriteProgress(data ProgressData) {
 	if data.State == state.Apply.Failed {
 		writeFailureGuidance()
 	}
+	// A shard that failed while others still run can be retried once they
+	// settle. Watch offers the stop key, so no stop command is printed here.
+	if data.Sharded && ShardFailedWhileRunning(data.State, data.Operations, data.Tables, data.Released) {
+		fmt.Printf("\n%s\n", presentation.RetryOnceSettledNote)
+	}
+}
+
+// shardFailureCallout is the grouped failure callout for a sharded apply, or
+// "" when the apply is not sharded (ShardFailureCallout).
+func shardFailureCallout(data ProgressData) string {
+	if !data.Sharded {
+		return ""
+	}
+	return ShardFailureCallout(data.State, data.Operations, data.Tables, data.Released)
 }
 
 func writeProgressStep(data ProgressData) {
@@ -642,8 +660,15 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.Failed:
-		bar := ui.ProgressBarFailed(ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
-		writeTableLine(&b, t, "%s "+glyph.Failed+" Failed", bar)
+		if isShardedRollup(t) {
+			// The shards under the line show how far each got, so the
+			// table's line says how far the failure reaches instead of a
+			// bar, as the PR comment's does.
+			writeTableLine(&b, t, glyph.Failed+" Failed%s", presentation.FailedReach(shardTaskStatuses(t), shardTotal(t)))
+		} else {
+			bar := ui.ProgressBarFailed(ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
+			writeTableLine(&b, t, "%s "+glyph.Failed+" Failed", bar)
+		}
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
 		}

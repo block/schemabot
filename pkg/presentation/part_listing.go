@@ -753,7 +753,7 @@ func (r TargetRows) Partial(targets int) bool {
 }
 
 // RowsLine is the rows line under a table's bar across targets, after its
-// bullet: "Rows: 1,400 / 2,000 across 2 of 3 targets · ~3.5 GB · ETA: ≥ 2m 0s".
+// bullet: "Rows: 1,400 / 2,000 across 2 of 3 targets · ~3.5 GB · ETA: ≥ 2m".
 // The total is approximate while a plan's estimate stands in for a target. The
 // line names the targets it covers when it leaves some out, and then the
 // planned size, which is every target's, names them all (TargetsTableSizeClause).

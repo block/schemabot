@@ -195,6 +195,7 @@ const (
 	PreviewAggregateCheckFileCapBlocked PreviewType = "aggregate_check_file_cap_blocked" // Failing aggregate when the PR exceeds GitHub's changed-file cap
 	PreviewAggregateCheckQuotaReserved  PreviewType = "aggregate_check_quota_reserved"   // Failing aggregate when the GitHub quota reserve refused discovery reads
 	PreviewAggregateCheckStopped        PreviewType = "aggregate_check_stopped"          // Aggregate check while a stopped apply holds the PR
+	PreviewAggregateCheckPlanBlocked    PreviewType = "aggregate_check_plan_blocked"     // Aggregate check when the plan names a change the engine refuses to run
 	PreviewAggregateCheckRollout        PreviewType = "aggregate_check_rollout"          // Aggregate check naming the targets a multi-target rollout still needs
 
 	// Single-table apply comment previews (most common case)

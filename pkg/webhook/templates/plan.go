@@ -1718,7 +1718,7 @@ func writeExemptTablesGroup(sb *strings.Builder, group ExemptTablesData, env str
 	}
 	fmt.Fprintf(sb, "<details>\n<summary>"+glyph.Info+" %s%d ignored tables in namespace <code>%s</code> (%s)</summary>\n\n%s\n\n</details>\n\n",
 		prefix, len(group.Tables), html.EscapeString(flattenIdentifier(group.Namespace)),
-		html.EscapeString(SanitizeInlineError(group.Reason)), names)
+		html.EscapeString(presentation.InlineError(group.Reason)), names)
 }
 
 // hasExemptTables reports whether writeExemptTables would render anything for
@@ -1734,7 +1734,7 @@ func hasExemptTables(groups []ExemptTablesData) bool {
 }
 
 func exemptReason(reason string) string {
-	return escapeProse(SanitizeInlineError(reason))
+	return escapeProse(presentation.InlineError(reason))
 }
 
 // writeMultiEnvExemptTables renders the exempt-table disclosure for the
@@ -2601,8 +2601,8 @@ func shardGroupSignature(s KeyspaceShardChange) string {
 // comment, for the shards of a keyspace and the targets of a rollout alike.
 // Beyond it, listing every name reads as a wall — a wide group collapses to a
 // count, with the names behind a collapsed block where the rendering has room
-// for one.
-const shardNamesInlineLimit = 8
+// for one. It is the CLI's limit too (presentation.MemberNamesInlineLimit).
+const shardNamesInlineLimit = presentation.MemberNamesInlineLimit
 
 // A plan group's members render through the same group headings whatever
 // they are called, so a rollout whose targets need different work reads the
@@ -3468,7 +3468,7 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 	causes := make([]string, 0)
 	for _, cause := range engine.BlockedCauses(reason) {
-		if cause = SanitizeInlineError(cause); cause != "" {
+		if cause = presentation.InlineError(cause); cause != "" {
 			causes = append(causes, cause)
 		}
 	}
@@ -4219,7 +4219,7 @@ func groupLintWarningsByTable(warnings []LintViolationData) []lintWarningGroup {
 func writeErrors(sb *strings.Builder, errors []string) {
 	var msgs []string
 	for _, errMsg := range errors {
-		if msg := SanitizeInlineError(errMsg); msg != "" {
+		if msg := presentation.InlineError(errMsg); msg != "" {
 			msgs = append(msgs, msg)
 		}
 	}
@@ -4228,7 +4228,7 @@ func writeErrors(sb *strings.Builder, errors []string) {
 	}
 	sb.WriteString("**Errors**:\n")
 	for _, msg := range msgs {
-		fmt.Fprintf(sb, "- %s\n", html.EscapeString(msg))
+		fmt.Fprintf(sb, "- %s\n", errorDetailMarkdown(msg))
 	}
 	sb.WriteString("\n")
 }
@@ -4273,6 +4273,12 @@ type MultiEnvPlanCommentData struct {
 
 	// Errors per environment (if plan execution failed)
 	Errors map[string]string
+
+	// PlanProblems lists, per failed environment, the statements in the schema
+	// files its engine refused to plan. An environment with problems renders
+	// them in place of its error text, and its fix is a change to those files
+	// rather than a re-run.
+	PlanProblems map[string]RefusedStatements
 
 	// UnmanagedSchema lists the schema configs the PR also changes that this
 	// deployment does not manage, and UnmanagedEnvironments the environments
@@ -4368,6 +4374,7 @@ func countMultiEnvPlanDDLBlocks(data MultiEnvPlanCommentData) int {
 
 func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
+	problemBudget := newPlanProblemBudget()
 
 	// Header
 	writeEnvironmentTitle(&sb, "Schema Change Plan", singleEnvironmentTitleEnvironment(data.Environments))
@@ -4414,6 +4421,12 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 		for _, env := range data.Environments {
 			fmt.Fprintf(&sb, "### %s\n\n", capitalizeFirst(env))
 
+			// An environment whose refused statements no longer fit what is
+			// left of the comment's budget shows its refusal text instead, so
+			// every section names something to act on.
+			if problems := data.PlanProblems[env]; len(problems.Problems) > 0 && writePlanProblems(&sb, problems, problemBudget) {
+				continue
+			}
 			if errMsg, hasErr := data.Errors[env]; hasErr {
 				writeErrorBlock(&sb, glyph.Failed, errMsg)
 				sb.WriteString("\n")
@@ -4747,6 +4760,12 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	if len(envsWithErrors) > 0 {
 		sb.WriteString("\n")
 		for _, env := range envsWithErrors {
+			// A plan refused over statements in the files is refused again
+			// until the files change, so it is offered a push, not a re-run.
+			if len(data.PlanProblems[env].Problems) > 0 {
+				fmt.Fprintf(sb, glyph.Attention+" **%s** plans once these statements change. Fix them in the schema files and push a commit.\n", capitalizeFirst(env))
+				continue
+			}
 			fmt.Fprintf(sb, glyph.Attention+" **%s** failed to plan. Resolve the error above and re-run:\n", capitalizeFirst(env))
 			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot plan", env))
 		}

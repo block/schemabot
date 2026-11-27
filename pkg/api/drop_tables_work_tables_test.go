@@ -313,6 +313,64 @@ func TestPlanRefusesATableListedUnderDropAndIgnoreTables(t *testing.T) {
 	})
 }
 
+// Spirit's sentinel table holds an apply started with a deferred cutover until
+// the table is dropped, so a drop_tables entry naming it would run that
+// cutover without anyone asking. The entry is refused before any data plane is
+// asked to plan, whatever its case, on both paths that accept the list.
+func TestPlanRefusesADropOfTheCutoverSentinel(t *testing.T) {
+	for _, entry := range []string{"_spirit_sentinel", "_SPIRIT_SENTINEL"} {
+		request := PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: map[string]*ternv1.SchemaFiles{
+				"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+			},
+			DropTables: []string{"_users_old", entry},
+		}
+		want := `drop_tables entry "` + entry + "\" is the table that holds a deferred cutover until someone runs it, so dropping it would run that cutover. Remove the entry, and run the cutover with `schemabot cutover <apply-id> -e <env>` when you are ready"
+
+		t.Run("API "+entry, func(t *testing.T) {
+			client := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-unused"}}
+			rec := postJSON(t, withheldDropService(&capturingPlanStore{}, client).handlePlan, "/api/plan", request)
+
+			assert.Equal(t, http.StatusBadRequest, rec.Code)
+			assert.Contains(t, rec.Body.String(), `drop_tables entry \"`+entry+`\" is the table that holds a deferred cutover`)
+			assert.Nil(t, client.planReq)
+		})
+		t.Run("pull request "+entry, func(t *testing.T) {
+			client := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-unused"}}
+			_, err := withheldDropService(&capturingPlanStore{}, client).ExecutePlan(t.Context(), request)
+
+			require.EqualError(t, err, want)
+			assert.Nil(t, client.planReq)
+		})
+	}
+}
+
+// A plan stored by an older server can carry a drop_tables list naming the
+// cutover sentinel. Apply creation holds the stored list to the same rule a
+// new plan is, so applying that plan by its id is refused as a blocked plan
+// and nothing is stored.
+func TestExecuteApplyRefusesAStoredPlanThatDropsTheCutoverSentinel(t *testing.T) {
+	svc, created, tasks := applyServiceWithAStoppedApplyOnUsers()
+	stored := executeApplyTestPlan()
+	stored.RecordDropTables([]string{"_SPIRIT_SENTINEL"})
+	svc.storage.(*mockStorageWithApplyStores).plans.(*staticPlanStore).plan = stored
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `drop_tables entry "_SPIRIT_SENTINEL" is the table that holds a deferred cutover`)
+	_, blocked := errors.AsType[*blockedPlanError](err)
+	assert.True(t, blocked, "the refusal answers as a blocked plan: %v", err)
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
+	assert.Nil(t, created.apply, "no apply is stored")
+	assert.Empty(t, tasks.tasks)
+	assert.Equal(t, applyMetricStatusRejected, applyMetricStatusForError(err), "the refusal is the caller's to resolve, not a server error")
+}
+
 // A data plane that predates drop_tables plans as though the list were empty:
 // the listed leftover stays, disclosed as a table skipped by its name. The
 // plan is kept, because that is the outcome the repository had before it

@@ -351,34 +351,17 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 		comparedHeads[beforeSHA] = true
 	}
 	for _, cfg := range configs {
-		environments, err := h.allowedDatabaseEnvironments(cfg.Config.Database)
+		prior, err := h.visiblePlanComment(ctx, repo, pr, cfg.Config.Database, string(cfg.Config.GetType()))
 		if err != nil {
-			h.logger.Warn("auto-plan will post plan comment because the expected environment scope could not be resolved",
+			h.logger.Warn("auto-plan will post plan comment because the visible plan comment could not be resolved",
 				"repo", repo, "pr", pr, "database", cfg.Config.Database,
 				"database_type", cfg.Config.GetType(), "head_sha", headSHA, "error", err)
 			return true
-		}
-		expectedScope := (planCommentSlot{Environments: environments}).environmentScope()
-		comments, err := h.service.Storage().PlanComments().ListUnretiredForSlot(ctx,
-			repo, pr, cfg.Config.Database, string(cfg.Config.GetType()))
-		if err != nil {
-			h.logger.Warn("auto-plan will post plan comment because prior plan comment state could not be read",
-				"repo", repo, "pr", pr, "database", cfg.Config.Database,
-				"database_type", cfg.Config.GetType(), "head_sha", headSHA, "error", err)
-			return true
-		}
-		var prior *storage.PlanComment
-		for _, v := range slices.Backward(comments) {
-			if v.EnvironmentScope == expectedScope {
-				prior = v
-				break
-			}
 		}
 		if prior == nil {
 			h.logger.Info("auto-plan will post plan comment because no prior visible plan comment is tracked",
 				"repo", repo, "pr", pr, "database", cfg.Config.Database,
-				"database_type", cfg.Config.GetType(), "environment_scope", expectedScope,
-				"head_sha", headSHA)
+				"database_type", cfg.Config.GetType(), "head_sha", headSHA)
 			return true
 		}
 
@@ -414,6 +397,28 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 	h.logger.Info("auto-plan will refresh checks without posting a plan comment because the visible plan covers the current schema inputs",
 		"repo", repo, "pr", pr, "before_sha", beforeSHA, "head_sha", headSHA)
 	return false
+}
+
+// visiblePlanComment returns the newest unretired plan comment tracked for the
+// database's slot under the environments this deployment plans, or nil when
+// none is tracked. That comment is what the PR currently shows as the
+// database's plan.
+func (h *Handler) visiblePlanComment(ctx context.Context, repo string, pr int, database, databaseType string) (*storage.PlanComment, error) {
+	environments, err := h.allowedDatabaseEnvironments(database)
+	if err != nil {
+		return nil, fmt.Errorf("resolve the plan comment environment scope for database %q: %w", database, err)
+	}
+	expectedScope := (planCommentSlot{Environments: environments}).environmentScope()
+	comments, err := h.service.Storage().PlanComments().ListUnretiredForSlot(ctx, repo, pr, database, databaseType)
+	if err != nil {
+		return nil, fmt.Errorf("read the plan comments tracked for database %q on %s#%d: %w", database, repo, pr, err)
+	}
+	for _, v := range slices.Backward(comments) {
+		if v.EnvironmentScope == expectedScope {
+			return v, nil
+		}
+	}
+	return nil, nil
 }
 
 // runAutoPlanForPR discovers schema configs for the PR and launches auto-plan

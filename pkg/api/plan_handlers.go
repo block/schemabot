@@ -24,6 +24,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
@@ -177,6 +178,20 @@ func (e *RemoteDeploymentUnavailableError) Error() string {
 func (e *RemoteDeploymentUnavailableError) Unwrap() error {
 	return e.Err
 }
+
+// RemotePlanRefusalError is a remote data plane declining to plan the declared
+// schema, answered as FailedPrecondition, which the data plane sends only for
+// an engine's plan refusal. Its text is the refusal's own, without the gRPC
+// framing, so the pull request reads the same explanation a local refusal
+// gives. It wraps the status, so the status code and the statements the
+// refusal names still read through it.
+type RemotePlanRefusalError struct {
+	Err error
+}
+
+func (e *RemotePlanRefusalError) Error() string { return planRefusalReason(e.Err) }
+
+func (e *RemotePlanRefusalError) Unwrap() error { return e.Err }
 
 // handlePullSchema handles POST /api/pull requests.
 func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
@@ -1038,6 +1053,9 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 				Target:     resolvedTarget.Target,
 				Err:        err,
 			}
+		}
+		if client.IsRemote() && grpcstatus.Code(err) == grpccodes.FailedPrecondition {
+			return nil, nil, &RemotePlanRefusalError{Err: err}
 		}
 		return nil, nil, err
 	}
@@ -2439,6 +2457,12 @@ func (s *Service) createStoredApply(
 	}
 	if err := rejectUnsafeStoredPlanWithoutOptIn(plan, applyOpts); err != nil {
 		return nil, 0, err
+	}
+	// A plan an older server stored may carry a drop_tables entry the rule
+	// now refuses, such as the cutover sentinel, so its recorded list is
+	// held to the same rule a new plan is.
+	if _, err := engine.NewDroppedTables(plan.DropTables()); err != nil {
+		return nil, 0, &blockedPlanError{cause: err}
 	}
 	// An apply stopped after this plan was made is checked here: storage
 	// admits a new apply past a stopped one.
@@ -4102,6 +4126,24 @@ func PlanFailureLog(logger *slog.Logger, err error) func(msg string, args ...any
 		return logger.Warn
 	}
 	return logger.Error
+}
+
+// PlanRefusalProblems returns the statements in the schema files a refused
+// plan names, from a local engine's refusal or from the detail a remote data
+// plane attaches to its FailedPrecondition answer, and how many more a remote
+// data plane refused without listing them to keep its answer bounded. It
+// returns nil and 0 for a failure that is not a refusal, for a refusal about
+// the target rather than the files, and for a remote data plane that predates
+// the detail, whose refusal text still describes every problem.
+func PlanRefusalProblems(err error) ([]engine.PlanProblem, int) {
+	if refusal, ok := errors.AsType[*engine.PlanRefusedError](err); ok {
+		return refusal.Problems, 0
+	}
+	var remote interface{ GRPCStatus() *grpcstatus.Status }
+	if errors.As(err, &remote) {
+		return ternconv.PlanProblemsFromStatus(remote.GRPCStatus())
+	}
+	return nil, 0
 }
 
 // planRefusalReason is a refusal's own text, without the gRPC status prefix a

@@ -101,27 +101,73 @@ func TestEnginePullSchemaAggregatesUnrenderableTables(t *testing.T) {
 	assert.Contains(t, err.Error(), `schema "app" table "delivery_log"`)
 }
 
-// A table carrying trigger behavior or descriptive metadata is refused so the
-// printed schema never suggests that its declarative table definition is the
-// whole live object.
-func TestEnginePullSchemaRejectsUnmodeledTableObjects(t *testing.T) {
-	dsn, db := testutil.StartPostgres(t, "pull_objects_test")
+// A table with an updated_at trigger and comments is pulled like any other:
+// its file holds the columns and indexes, and the trigger and comments stay
+// on the live table, outside the file. The pulled file plans nothing, and a
+// column the team then adds to it applies with the trigger and comments
+// still in place, because no plan or apply reads or changes them.
+func TestEnginePullSchemaKeepsATableWithATriggerAndComments(t *testing.T) {
+	const database = "pull_objects_test"
+	dsn, db := testutil.StartPostgres(t, database)
 	_, err := db.ExecContext(t.Context(), `
 		CREATE SCHEMA app;
-		CREATE TABLE app.accounts (id bigint PRIMARY KEY);
-		CREATE FUNCTION app.touch_account() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
-		CREATE TRIGGER touch_account BEFORE INSERT ON app.accounts FOR EACH ROW EXECUTE FUNCTION app.touch_account();
-		COMMENT ON TABLE app.accounts IS 'customer accounts'`)
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY, updated_at timestamptz NOT NULL DEFAULT now());
+		CREATE FUNCTION app.set_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN NEW.updated_at := now(); RETURN NEW; END $$;
+		CREATE TRIGGER accounts_set_updated_at BEFORE UPDATE ON app.accounts
+			FOR EACH ROW EXECUTE FUNCTION app.set_updated_at();
+		COMMENT ON TABLE app.accounts IS 'customer accounts';
+		COMMENT ON COLUMN app.accounts.updated_at IS 'set on every update'`)
 	require.NoError(t, err)
+	credentials := &engine.Credentials{DSN: dsn}
 
-	eng := NewForTarget(0, 0, "pull_objects_test", &engine.Credentials{DSN: dsn})
-	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+	response, err := NewForTarget(0, 0, database, credentials).PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+	require.NoError(t, err)
+	pulled := response.Namespaces["app"]
+	require.NotNil(t, pulled)
+	assert.Empty(t, pulled.SkippedTables)
+	require.Contains(t, pulled.Tables, "accounts")
+	assert.Contains(t, pulled.Tables["accounts"], `"updated_at" timestamp with time zone DEFAULT now() NOT NULL`)
+	assert.NotContains(t, pulled.Tables["accounts"], "TRIGGER")
+	assert.NotContains(t, pulled.Tables["accounts"], "COMMENT")
 
-	require.Error(t, err)
-	assert.Nil(t, response)
-	assert.Contains(t, err.Error(), `schema "app" table "accounts"`)
-	assert.Contains(t, err.Error(), "trigger")
-	assert.Contains(t, err.Error(), "comment")
+	files := pulledSchemaFiles(response)
+	baseline, err := New().Plan(t.Context(), &engine.PlanRequest{Database: database, SchemaFiles: files, Credentials: credentials})
+	require.NoError(t, err)
+	assert.Empty(t, baseline.Changes, "the pulled file describes the table: no change, and no drop of the trigger or comments")
+
+	files["app"].Files["accounts.sql"] = withColumn(t, pulled.Tables["accounts"],
+		`"updated_at" timestamp with time zone DEFAULT now() NOT NULL`, `"email" text`)
+	eng := New()
+	planned, err := eng.Plan(t.Context(), &engine.PlanRequest{Database: database, SchemaFiles: files, Credentials: credentials})
+	require.NoError(t, err)
+	require.Len(t, planned.Changes, 1)
+	require.Len(t, planned.Changes[0].TableChanges, 1)
+	change := planned.Changes[0].TableChanges[0]
+	assert.Equal(t, "accounts", change.Table)
+	assert.Contains(t, change.DDL, "ADD COLUMN")
+	assert.Contains(t, change.DDL, "email")
+
+	apply := plannedApplyRequest(dsn, change)
+	apply.Database = database
+	apply.Changes[0].Namespace = "app"
+	result, err := eng.Apply(t.Context(), apply)
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	progress := awaitPostgresProgress(t, eng, "accounts")
+	assert.Equal(t, engine.StateCompleted, progress.State, progress.ErrorMessage)
+
+	var trigger, tableComment, columnComment string
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		SELECT t.tgname,
+		       obj_description('app.accounts'::regclass, 'pg_class'),
+		       col_description('app.accounts'::regclass, a.attnum)
+		FROM pg_trigger t
+		JOIN pg_attribute a ON a.attrelid = t.tgrelid AND a.attname = 'updated_at'
+		WHERE t.tgrelid = 'app.accounts'::regclass AND NOT t.tgisinternal`).Scan(&trigger, &tableComment, &columnComment))
+	assert.Equal(t, "accounts_set_updated_at", trigger)
+	assert.Equal(t, "customer accounts", tableComment)
+	assert.Equal(t, "set on every update", columnComment)
 }
 
 // A pull that asks to skip tables its schema files cannot describe returns
@@ -146,18 +192,16 @@ func TestEnginePullSchemaSkipsTablesItCannotDescribe(t *testing.T) {
 
 	pulled := response.Namespaces["app"]
 	require.NotNil(t, pulled)
-	assert.Equal(t, int32(2), response.TableCount)
-	assert.Equal(t, []string{"customers", "orders"}, slices.Sorted(maps.Keys(pulled.Tables)))
-	require.Len(t, pulled.SkippedTables, 2)
-	assert.Equal(t, "accounts", pulled.SkippedTables[0].GetTable())
-	assert.Equal(t, "schema files cannot describe its trigger, comment", pulled.SkippedTables[0].GetReason())
-	assert.Equal(t, "audit_log", pulled.SkippedTables[1].GetTable())
-	assert.Equal(t, schemadiff.ErrUnrenderableUnlogged.Error(), pulled.SkippedTables[1].GetReason())
+	assert.Equal(t, int32(3), response.TableCount)
+	assert.Equal(t, []string{"accounts", "customers", "orders"}, slices.Sorted(maps.Keys(pulled.Tables)),
+		"accounts carries a trigger and a comment, which stay on the live table outside its file")
+	require.Len(t, pulled.SkippedTables, 1)
+	assert.Equal(t, "audit_log", pulled.SkippedTables[0].GetTable())
+	assert.Equal(t, schemadiff.ErrUnrenderableUnlogged.Error(), pulled.SkippedTables[0].GetReason())
 
 	// The pulled files plus an ignore_tables entry per skipped table describe
 	// the target exactly: no change, and above all no DROP TABLE, even for the
-	// key on orders that references a skipped table, or the key on the skipped
-	// audit_log that references customers.
+	// key on the skipped audit_log that references customers.
 	files := make(map[string]string, len(pulled.Tables))
 	for table, sql := range pulled.Tables {
 		files[table+".sql"] = sql
@@ -178,8 +222,8 @@ func TestEnginePullSchemaSkipsTablesItCannotDescribe(t *testing.T) {
 	refused, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
 	require.Error(t, err, "a pull that does not ask to skip still refuses the namespace")
 	assert.Nil(t, refused)
-	assert.Contains(t, err.Error(), `schema "app" table "accounts"`)
 	assert.Contains(t, err.Error(), `schema "app" table "audit_log"`)
+	assert.NotContains(t, err.Error(), `schema "app" table "accounts"`)
 }
 
 // A child table created with PostgreSQL table inheritance is refused because
@@ -924,13 +968,14 @@ func TestRenderPostgresTablesIntrospectsConcurrentlyInListingOrder(t *testing.T)
 		CREATE SCHEMA app;
 		CREATE TABLE app.a_accounts (id bigint PRIMARY KEY);
 		CREATE TABLE app.b_commented (id bigint PRIMARY KEY);
-		COMMENT ON TABLE app.b_commented IS 'refused: comment';
+		COMMENT ON TABLE app.b_commented IS 'rendered: comments stay on the live table';
 		CREATE TABLE app.c_customers (id bigint PRIMARY KEY, name text NOT NULL);
 		CREATE TABLE app.d_triggered (id bigint PRIMARY KEY);
 		CREATE FUNCTION app.touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
 		CREATE TRIGGER touch BEFORE INSERT ON app.d_triggered FOR EACH ROW EXECUTE FUNCTION app.touch();
 		CREATE TABLE app.e_events (id bigint PRIMARY KEY);
-		CREATE UNLOGGED TABLE app.f_unlogged (id bigint PRIMARY KEY)`)
+		CREATE UNLOGGED TABLE app.f_unlogged (id bigint PRIMARY KEY);
+		CREATE UNLOGGED TABLE app.g_unlogged (id bigint PRIMARY KEY)`)
 	require.NoError(t, err)
 
 	deadline, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
@@ -949,14 +994,11 @@ func TestRenderPostgresTablesIntrospectsConcurrentlyInListingOrder(t *testing.T)
 		"two introspections must be in flight at once; a render that takes tables one at a time never reaches the second BEGIN")
 	require.NoError(t, err)
 
-	assert.ElementsMatch(t, []string{"a_accounts", "c_customers", "e_events"}, slices.Collect(maps.Keys(rendered)))
+	assert.ElementsMatch(t, []string{"a_accounts", "b_commented", "c_customers", "d_triggered", "e_events"}, slices.Collect(maps.Keys(rendered)))
 	assert.Contains(t, rendered["c_customers"], `"name" text NOT NULL`)
-	require.Len(t, renderErrors, 3)
-	assert.Contains(t, renderErrors[0].Error(), `schema "app" table "b_commented"`)
-	assert.Contains(t, renderErrors[0].Error(), "comment")
-	assert.Contains(t, renderErrors[1].Error(), `schema "app" table "d_triggered"`)
-	assert.Contains(t, renderErrors[1].Error(), "trigger")
-	assert.Contains(t, renderErrors[2].Error(), `schema "app" table "f_unlogged": render`)
+	require.Len(t, renderErrors, 2)
+	assert.Contains(t, renderErrors[0].Error(), `schema "app" table "f_unlogged": render`)
+	assert.Contains(t, renderErrors[1].Error(), `schema "app" table "g_unlogged": render`)
 
 	// The order is a property of the assembly, not of the run that happened
 	// to finish in listing order: a second pass with no rendezvous holding
@@ -1583,9 +1625,9 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"public"}, namespaces, "the existence check for a requested namespace must read the real catalog")
 
-	objects, err := pullUnmodeledTableObjects(t.Context(), pool, "public", "users")
+	inherits, err := inheritsFromAParent(t.Context(), pool, "public", "users")
 	require.NoError(t, err)
-	assert.Equal(t, unmodeledTableObjects{}, objects, "a plain table must not acquire unmodeled objects from decoy catalog rows")
+	assert.False(t, inherits, "a plain table must not acquire table inheritance from decoy catalog rows")
 }
 
 // TestSpritePoolUnshadowsCatalog pins the search_path every pg-sprite pool

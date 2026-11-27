@@ -558,6 +558,41 @@ func (s *lockStore) ForceRelease(ctx context.Context, database, dbType string) e
 	return nil
 }
 
+// ForceReleaseByID releases a lock regardless of owner, but only while the row
+// with the given ID still holds it, so an administrator who was shown one lock
+// cannot delete a different lock taken since. When nothing is deleted the lock
+// is re-read, so the caller learns whether none is held (ErrLockNotFound) or a
+// different row holds it (a *LockReplacedError, which matches ErrLockReplaced
+// and names that row).
+func (s *lockStore) ForceReleaseByID(ctx context.Context, id int64, database, dbType string) error {
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM locks
+		WHERE database_name = ? AND database_type = ? AND id = ?
+	`, database, dbType, id)
+	if err != nil {
+		return fmt.Errorf("force release lock row %d for %s/%s: %w", id, database, dbType, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read rows affected force releasing lock row %d for %s/%s: %w", id, database, dbType, err)
+	}
+	if rowsAffected > 0 {
+		return nil
+	}
+
+	current, err := s.Get(ctx, database, dbType)
+	if err != nil {
+		return fmt.Errorf("read lock after force release of row %d affected no rows for %s/%s: %w",
+			id, database, dbType, err)
+	}
+	if current == nil {
+		return storage.ErrLockNotFound
+	}
+	return &storage.LockReplacedError{LockID: id, HeldLockID: current.ID, HeldOwner: current.Owner}
+}
+
 // Get returns a lock by database name and type, or nil if not found.
 func (s *lockStore) Get(ctx context.Context, database, dbType string) (*storage.Lock, error) {
 	database = storage.CanonicalKey(database)

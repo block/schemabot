@@ -2,10 +2,12 @@ package webhook
 
 import (
 	"errors"
-	"strings"
 
 	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -33,6 +35,26 @@ func (h *Handler) postCommandError(
 	h.postCommandErrorLanded(repo, pr, installationID, commandName, environment, requestedBy, errorDetail)
 }
 
+// postPlanCommandError posts a failed plan command's error. A plan refused over
+// statements in the schema files lists each one with where it is, as the
+// multi-environment plan comment does, so the author can fix them all in one
+// push.
+func (h *Handler) postPlanCommandError(
+	repo string, pr int, installationID int64,
+	environment, requestedBy string, err error,
+) {
+	problems, omitted := api.PlanRefusalProblems(err)
+	h.postCommentBestEffortID(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
+		RequestedBy:  requestedBy,
+		Timestamp:    templates.NowFunc().UTC().Format("2006-01-02 15:04:05"),
+		Environment:  environment,
+		Environments: h.deploymentEnvironmentScope(environment),
+		CommandName:  action.Plan,
+		ErrorDetail:  userFacingError(err),
+		PlanProblems: templates.RefusedStatements{Problems: problems, Omitted: omitted},
+	}))
+}
+
 // postCommandErrorLanded is postCommandError reporting whether the comment
 // landed, for a caller whose own message points at it.
 func (h *Handler) postCommandErrorLanded(
@@ -45,7 +67,7 @@ func (h *Handler) postCommandErrorLanded(
 		Environment:  environment,
 		Environments: h.deploymentEnvironmentScope(environment),
 		CommandName:  commandName,
-		ErrorDetail:  userFacingErrorDetail(errorDetail),
+		ErrorDetail:  errorDetail,
 	})) != 0
 }
 
@@ -99,6 +121,16 @@ func (h *Handler) deploymentEnvironmentScope(environment string) []string {
 // config lists under drop_tables.
 const dropTablesCheckFailedMessage = "SchemaBot could not check whether an apply that may still resume needs a table listed under `drop_tables`, so the plan was refused. Run the command again; if it fails again, the SchemaBot server logs have the cause."
 
+// unexpectedFailureMessage is the PR comment line for a failure whose text
+// SchemaBot did not write, such as a storage, driver, GitHub client, or engine
+// error. That text can carry hostnames, addresses, and driver internals, so the
+// line names none of it and the caller logs the error with its identifiers.
+const unexpectedFailureMessage = "SchemaBot could not complete the command. " + rerunAdvice
+
+// userFacingError is the line a PR comment or check summary shows for a failed
+// command. Errors SchemaBot recognizes get a line it wrote. An error that marks
+// its own text as written for the person who ran the command shows that text.
+// Every other error shows unexpectedFailureMessage, never its own text (AV-8).
 func userFacingError(err error) string {
 	if message, ok := userFacingConfigNotAuthorizedError(err); ok {
 		return message
@@ -119,7 +151,61 @@ func userFacingError(err error) string {
 	if status.Code(err) == codes.Unavailable {
 		return userFacingRemoteUnavailableError("", "")
 	}
-	return err.Error()
+	if peerErr, ok := errors.AsType[*sharedSchemaPeerUnreadableError](err); ok {
+		return sharedSchemaPeerUnreadableMessage(peerErr)
+	}
+	// Authored text can still quote names from the pull request, such as a
+	// parser's complaint about a statement, so it is never trusted as given:
+	// InlineError strips control characters, redacts connection details,
+	// collapses line breaks so the text stays inside the blockquote or table
+	// row that holds it, and clamps it to the length every error detail on the
+	// pull request has.
+	if text, _, ok := api.AuthoredTextOf(err); ok {
+		if line := presentation.InlineError(text); line != "" {
+			return line
+		}
+	}
+	if message, ok := userFacingConfigDiscoveryError(err); ok {
+		return message
+	}
+	return unexpectedFailureMessage
+}
+
+// userFacingConfigDiscoveryError is the line for a schemabot.yaml discovery
+// failure. These sentinels carry no text of their own to publish, so each has a
+// line SchemaBot wrote that says what the author can do.
+func userFacingConfigDiscoveryError(err error) (string, bool) {
+	switch {
+	case errors.Is(err, ghclient.ErrConfigDiscoveryTruncated):
+		return "GitHub returned a truncated repository tree, so SchemaBot could not search this repository for `schemabot.yaml` configurations. " +
+			"Ask a SchemaBot operator to give each of this repository's databases an `allowed_dirs` entry naming its schema directory.", true
+	case errors.Is(err, ghclient.ErrNoConfig):
+		return "No `schemabot.yaml` configuration file was found in this repository. " +
+			"Add one in the directory that holds the `.sql` files declaring your tables, or use `-d` to name a database that already has one.", true
+	case errors.Is(err, ghclient.ErrInvalidConfig):
+		return "A `schemabot.yaml` in this repository is not valid. It must include the `database` and `type` fields; fix the file and push a commit.", true
+	case errors.Is(err, ghclient.ErrMultipleConfigs):
+		return "This repository has more than one `schemabot.yaml`, so SchemaBot cannot tell which database you mean. Use `-d` with the database name.", true
+	}
+	return "", false
+}
+
+// sharedSchemaPeerUnreadableMessage is the PR comment line for a shared schema
+// check that could not read the schema files of a database sharing a target
+// with the planned one. It names the peer, the planned database, and the
+// environment, then adds the reason only when the cause is text SchemaBot or a
+// parser wrote for the author, such as an unauthorized schema path or a file
+// that does not parse. Any other cause stays in the server logs.
+func sharedSchemaPeerUnreadableMessage(err *sharedSchemaPeerUnreadableError) string {
+	line := "SchemaBot could not read the schema files of `" + err.Peer + "`, which shares a target with `" + err.Database + "` in " + err.Environment +
+		", so it could not compare their ignore_tables."
+	if text, _, ok := api.AuthoredTextOf(err.Cause); ok {
+		line += " " + text
+	}
+	if safe := presentation.InlineError(line); safe != "" {
+		return safe
+	}
+	return unexpectedFailureMessage
 }
 
 // namespaceResolutionFailedMessage is the PR comment line for a shared schema
@@ -148,16 +234,6 @@ func userFacingConfigNotAuthorizedError(err error) (string, bool) {
 		return "", false
 	}
 	return templates.RenderConfigNotAuthorizedLine(configErr.Database, configErr.SchemaPath), true
-}
-
-// userFacingErrorDetail replaces a command error that is a gRPC unavailable
-// status, passed along as text by a caller that has no typed error, with the
-// fixed unreachable line. Any other detail is returned as given.
-func userFacingErrorDetail(errorDetail string) string {
-	if strings.Contains(strings.ToLower(errorDetail), "rpc error: code = unavailable") {
-		return userFacingRemoteUnavailableError("", "")
-	}
-	return errorDetail
 }
 
 // userFacingRemoteUnavailableError is the PR comment line for a remote data

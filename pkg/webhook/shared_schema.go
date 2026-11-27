@@ -252,6 +252,9 @@ func (h *Handler) enforceSharedSchemaIgnoreLists(ctx context.Context, client *gh
 		h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, userFacingError(err))
 		return nil, true, nil
 	}
+	h.logger.Error("shared schema ignore_tables check could not complete; the command is refused",
+		"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
+		"environment", environment, "command", commandName, "error", err)
 	if !suppressRetryComments {
 		h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, userFacingError(err))
 	}

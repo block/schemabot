@@ -740,10 +740,10 @@ func TestInitCompletionNamesSkippedTables(t *testing.T) {
 
 func TestInitSkippedTablesFlattensEveryNamespace(t *testing.T) {
 	require.Equal(t, []initSkippedTable{
-		{Namespace: "billing", Table: "ledger", Reason: "schema files cannot describe its trigger"},
+		{Namespace: "billing", Table: "ledger", Reason: "schema files cannot describe its table inheritance"},
 		{Namespace: "public", Table: "audit_log", Reason: "unlogged tables cannot be rendered as a desired schema"},
 	}, initSkippedTables([]skippedTableGroup{
-		{Namespace: "billing", Tables: []apitypes.SkippedTable{{Table: "ledger", Reason: "schema files cannot describe its trigger"}}},
+		{Namespace: "billing", Tables: []apitypes.SkippedTable{{Table: "ledger", Reason: "schema files cannot describe its table inheritance"}}},
 		{Namespace: "public", Tables: []apitypes.SkippedTable{{Table: "audit_log", Reason: "unlogged tables cannot be rendered as a desired schema"}}},
 	}))
 	require.Nil(t, initSkippedTables(nil))

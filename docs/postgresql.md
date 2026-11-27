@@ -179,10 +179,22 @@ supply a DSN.
 SchemaBot checks the privileges each statement needs on its own table before
 running it, and a missing grant fails with the `GRANT` that fixes it. A plan
 that adds a foreign key also checks `REFERENCES` on the referenced table, and
-fails with the grant to add when it is missing. If the grant is revoked after
-the plan, the apply fails, says a grant is missing, and retries once you grant it. If your tables belong to a
-dedicated owner role, read [Table ownership](#table-ownership) before the first
-`CREATE TABLE`.
+fails with the grant to add when it is missing.
+
+If a grant is revoked after the plan, the apply fails at the statement that
+needs it, and statements before it may already have run:
+
+- A privilege on the statement's own table is checked again before the
+  statement runs. The failure names the `GRANT` that fixes it. The apply fails:
+  grant the privilege, then plan and apply again. The new plan holds only the
+  statements that did not run.
+- `REFERENCES` on the table a foreign key references is checked only by the
+  server. The failure says a privilege is missing, and the server log names it.
+  SchemaBot retries the apply on its own, so grant the privilege and it carries
+  on. If its retries run out first, plan and apply again.
+
+If your tables belong to a dedicated owner role, read
+[Table ownership](#table-ownership) before the first `CREATE TABLE`.
 
 ## What runs and what is blocked
 
@@ -193,11 +205,13 @@ dedicated owner role, read [Table ownership](#table-ownership) before the first
 | `ALTER TABLE` that rewrites the table, such as most column type changes | Blocked. It needs a copy of the table, which SchemaBot does not run on PostgreSQL yet |
 | `CREATE INDEX` on an existing table | Runs as `CREATE INDEX CONCURRENTLY`, bounded by `postgres.concurrent_index_max_duration` (24 hours by default). It can be cancelled |
 | `CREATE INDEX` on a partitioned table | Built one partition at a time, each concurrently, under the same bound. It can be cancelled, and applying again resumes from the partitions already built. See [Partitioned index builds](#partitioned-index-builds) |
+| Dropping an index | Runs as `DROP INDEX CONCURRENTLY` after you approve it with `--allow-unsafe`, on a table of any size. Reads and writes continue while it waits for open transactions, up to 4 minutes. See [Dropping an index](#dropping-an-index) |
 | A new table, with its indexes | Runs together: the table, then its indexes, built without `CONCURRENTLY` because nothing reads the table yet. See [Greenfield tables](#greenfield-tables) |
 | A new label on an existing enum type | Runs as `ALTER TYPE ... ADD VALUE`, one label per step, before the table changes. Creating a type or removing a label fails the plan. See [Enum types](#enum-types) |
 | Row-level security policies on an existing table | Run in one transaction, after you explicitly approve them, because they change who can read rows. See [Row-level security](#row-level-security) |
 | Adding a foreign key | Runs in two steps: `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`, which checks existing rows while writes continue. See [Foreign keys](#foreign-keys) |
 | Dropping a foreign key | Shown in the plan, but blocked. See [Foreign keys](#foreign-keys) |
+| Making a column `NOT NULL` | Runs in four steps on a table up to the size limit: a helper `CHECK (column IS NOT NULL) NOT VALID`, `VALIDATE CONSTRAINT`, which checks existing rows while writes continue, `SET NOT NULL`, which uses the validated check instead of scanning, and the helper's drop. If a row holds `NULL`, the validation fails and names the helper. Fix those rows and SchemaBot retries the validation on its own. If its retries run out first, drop the helper outside SchemaBot, then plan and apply again |
 | A table with no schema file, or a deleted file | Runs as `DROP TABLE` after you approve it with `--allow-unsafe`, as on MySQL. Archive tables and `ignore_tables` entries are left alone. See [Tables with no schema file](#tables-with-no-schema-file) |
 
 Once a statement starts, it runs until it commits or its timeout ends it; it
@@ -704,10 +718,38 @@ When a plan is blocked:
   names the clause to remove. A statement pg-sprite refuses gets the reason
   it would take a lock or break running code, and the safe steps that make the
   same change.
-- The plan Check Run fails.
+- The Check Run fails with the title "Plan blocked", and the database's row
+  reads Blocked.
 - An apply is rejected before anything is queued.
 - No flag overrides it. Rewrite the change into a form pg-sprite accepts, or
   make it outside SchemaBot through a separately reviewed process.
+
+### Dropping an index
+
+An index the schema file no longer declares is dropped with
+`DROP INDEX CONCURRENTLY`, after you approve it with `--allow-unsafe`. The
+drop reads no rows and rewrites nothing, so the size limit does not apply. It
+does not block reads or writes. It waits for the transactions already open on
+the table, for up to 4 minutes. A drop that runs out of time, or is cancelled,
+fails and can leave the index invalid, which queries no longer use. The apply
+names the index and gives the schema-qualified `DROP INDEX CONCURRENTLY` that
+finishes it. Run that outside SchemaBot, then plan again.
+
+Right before the drop, the apply checks that the index still has the
+definition the plan recorded. If it changed, for example because the index was
+dropped and created again under the same name, nothing is dropped. Plan again
+and review the new plan. An index that a table's replica identity uses is not
+dropped either: point `REPLICA IDENTITY` elsewhere first.
+
+PostgreSQL drops an index only by name, and a concurrent drop holds no lock
+between the check and the drop. If another session renames the index and
+gives its name to a new one in that moment, the new one is dropped. The apply
+detects this and fails. Inspect the table's indexes and recreate the dropped
+one if it should stay.
+
+An index of a partitioned table is blocked, because PostgreSQL cannot drop it
+concurrently. Drop it outside SchemaBot when a lock on every partition is
+acceptable, then plan again.
 
 ### Dropping a column or constraint
 
@@ -803,10 +845,12 @@ The plan lists the tables it exempted, by namespace, in the PR comment and in
 `schemabot plan` and `schemabot apply` output.
 
 **Tables `pull` cannot write.** `pull` skips a table that has something the
-file format cannot represent, such as a trigger, a table or column comment, or
-a foreign key it cannot write, and names it with the reason. `onboard` and
-`init` add the table to `ignore_tables`, so the next plan leaves it alone
-instead of dropping it. See [Schema pull](#schema-pull).
+file format cannot represent, such as table inheritance or a foreign key it
+cannot write, and names it with the reason. `onboard` and `init` add the table
+to `ignore_tables`, so the next plan leaves it alone instead of dropping it.
+See [Schema pull](#schema-pull). A table with a trigger or a comment is not
+skipped: its file leaves them out, and they stay on the live table. See
+[Triggers](#triggers).
 
 A hand-written file can use `CREATE UNLOGGED TABLE`, `PARTITION BY`, and an
 `INHERITS` child flattened to its own columns. Each inheritance child and
@@ -1002,7 +1046,9 @@ schema file format. These include tables with:
 - Table inheritance, or `UNLOGGED`
 - Explicit collations
 - Sequence defaults it cannot represent safely
-- Triggers, or table or column comments. See [Triggers](#triggers)
+
+Triggers and table or column comments are not on this list. `pull` writes the
+table without them, and they stay on the live table. See [Triggers](#triggers).
 
 Storage parameters, such as `fillfactor` or `autovacuum_enabled`, are not on
 this list. `pull` writes them into the table's `WITH (...)` clause. SchemaBot
@@ -1026,11 +1072,30 @@ SchemaBot does not manage triggers, by design. A schema file declares a
 table's shape: its columns, constraints, and indexes. A trigger runs a
 function, and a function is procedural code. pg-sprite cannot compare it with
 a file, show its effect in a plan, or change it online, so triggers stay
-outside the declarative model.
+outside the declarative model. Table and column comments stay outside it too.
 
-`onboard` and `init` skip a table with a trigger and list it in
-`ignore_tables`, so SchemaBot never changes or drops it. To manage the table, move the trigger's work
-out of the database and remove the trigger.
+`pull`, `onboard`, and `init` write a table that has a trigger or a comment
+like any other table, and leave the trigger and the comments on the live table.
+A plan never adds, changes, or drops either, and a rewrite that would copy the
+table into a new one is refused while it has a trigger. Two things follow from
+the trigger living outside the file:
+
+- **A plan cannot see what a trigger function reads.** Deleting `updated_at`
+  from the file of a table whose trigger sets `NEW.updated_at` plans a plain
+  `DROP COLUMN`, and every later `UPDATE` on the table then fails. Check a
+  table's triggers before you drop a column from its file.
+- **A new environment gets the table without them.** Where the table does not
+  exist yet, the plan creates it from the file alone. Create its trigger and
+  comments there outside SchemaBot.
+
+A table that an earlier `onboard` or `init` listed in `ignore_tables` for a
+trigger or a comment stays there. To manage it, in one pull request add the
+table's file from `schemabot pull -d shop -e staging` and remove the table
+from `ignore_tables`. Removing the entry without the file makes the plan show
+a `DROP TABLE`. The plan for that pull request shows no change to the table.
+
+To keep the trigger's work in view of every plan, move it out of the database
+and remove the trigger.
 
 | The trigger | Replace it with |
 |---|---|
@@ -1048,15 +1113,10 @@ out of the database and remove the trigger.
    DROP TRIGGER orders_set_updated_at ON orders;
    DROP FUNCTION set_updated_at();
    ```
-3. In one pull request, add the table's file from `schemabot pull -d shop -e
-   staging` and remove the table from `ignore_tables`. Removing the entry
-   without the file makes the plan show a `DROP TABLE`.
 
-The plan for that pull request shows no change to the table.
-
-Table and column comments, and explicit column collations, are skipped the
-same way. Changing a column's collation rewrites the column, so it stays out
-of the files.
+A table with an explicit column collation is skipped and listed in
+`ignore_tables`. Changing a column's collation rewrites the column, so it
+stays out of the files.
 
 The schema intelligence API's detailed catalog output is not available for
 PostgreSQL. A request for it is rejected rather than answered with the basic

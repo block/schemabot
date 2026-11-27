@@ -61,6 +61,71 @@ func WriteUnsubmittedLockReleaseUnknown(database, dbType string) {
 	fmt.Printf("   Nothing was submitted. Release it if it is still held: %s\n", cliname.Command("unlock", "-d", database, "-t", dbType))
 }
 
+// WriteAcquireUnknownLockHeldByOwner writes the message when a command's
+// request to take the lock failed after the server may have received it, and
+// a lookup then found a lock row held under the command's owner that is not
+// the row it saw held before. Every command the same user runs on the same
+// host shares that owner, so the row may be this acquire's or another
+// command's; the message does not say which. The command then releases the
+// row only if no apply runs under it, and the release's own message follows.
+func WriteAcquireUnknownLockHeldByOwner(database, dbType string) {
+	fmt.Printf("🔒 Lock for %s (%s) is held under your owner, though the acquire request failed.\n", database, dbType)
+	fmt.Println("   Nothing was submitted, so it is released unless an apply runs under it.")
+}
+
+// WriteAcquireUnknownLockWithoutID writes the message when a command's request
+// to take the lock failed after the server may have received it, and a lookup
+// found a lock held under the command's owner but did not report which lock
+// row it is. Without the row, the command cannot tell whether the acquire took
+// it or release only that row, so the lock is left in place and no unlock
+// command is offered.
+func WriteAcquireUnknownLockWithoutID(database, dbType string) {
+	fmt.Printf("🔒 Lock for %s (%s) is held under your owner, but the server did not say which lock it is, so it was left in place.\n", database, dbType)
+	fmt.Printf("   Nothing was submitted. See who holds it: %s\n", cliname.Command("locks"))
+}
+
+// WriteAcquireUnknownLockHeldBefore writes the message when a command's
+// request to take the lock failed after the server may have received it, and
+// a lookup found the same lock the owner already held before the command ran.
+// The acquire took nothing new, and that lock may guard an apply an earlier
+// command started, so no unlock command is offered.
+func WriteAcquireUnknownLockHeldBefore(database, dbType string) {
+	fmt.Printf("🔒 Lock for %s (%s) is the one you already held, so the failed acquire took nothing.\n", database, dbType)
+	fmt.Println("   Nothing was submitted. Run the command again to retry.")
+}
+
+// WriteAcquireUnknownLockHeldByAnotherOwner writes the message when a
+// command's request to take the lock failed after the server may have received
+// it, and a lookup found the lock held by another owner. The owner is whatever
+// the caller that took the lock named itself, so its control runes are
+// removed.
+func WriteAcquireUnknownLockHeldByAnotherOwner(database, dbType, holder string) {
+	fmt.Printf("🔒 Lock for %s (%s) is held by %s, so the failed acquire took nothing.\n", database, dbType, ui.TerminalSafeLine(holder))
+	fmt.Println("   Nothing was submitted. Run the command again once that lock is released.")
+}
+
+// WriteAcquireUnknownLockFree writes the message when a command's request to
+// take the lock failed after the server may have received it, and a lookup
+// found no lock held. The lookup shows only what the server held when it
+// answered, since the server may still be finishing the acquire, so the
+// message claims no more than that. Nothing was submitted, and an acquire
+// under the same owner takes a lock it already holds, so running the command
+// again is safe.
+func WriteAcquireUnknownLockFree(database, dbType string) {
+	fmt.Printf("🔓 Lock for %s (%s) is not held now, though the acquire request failed.\n", database, dbType)
+	fmt.Println("   Nothing was submitted. It is safe to run the command again.")
+}
+
+// WriteAcquireUnknownLockUnchecked writes the message when a command's request
+// to take the lock failed after the server may have received it, and the
+// lookup that would say whether it took the lock failed too. Both lines hold
+// whichever way the acquire went.
+func WriteAcquireUnknownLockUnchecked(database, dbType string) {
+	fmt.Printf("🔒 Lock for %s (%s) may have been taken: the acquire request failed, and the lock could not be checked.\n", database, dbType)
+	fmt.Printf("   Nothing was submitted. See who holds it: %s\n", cliname.Command("locks"))
+	fmt.Printf("   If you hold it and no apply of yours runs under it, release it: %s\n", cliname.Command("unlock", "-d", database, "-t", dbType))
+}
+
 // WriteUnsubmittedLockAlreadyReleased writes the message when the lock a
 // command took for a schema change it never submitted was gone by the time the
 // command released it. Nothing is held, so no unlock command is offered.
@@ -167,6 +232,36 @@ func WriteLockConflict(data LockConflictData) {
 	fmt.Printf("  • Ask the lock owner to release: %s\n", cliname.Command("unlock", "-d", data.Database))
 	fmt.Printf("  • Force unlock: %s\n", cliname.Command("unlock", "-d", data.Database, "--force"))
 	fmt.Println()
+}
+
+// What each command tells the operator before it takes a lock from another
+// owner, and the question it then asks. A command that was given -y asks
+// nothing and shows none of this.
+const (
+	UnlockTakeoverConsequence = "Releasing it removes their claim on this database."
+	UnlockTakeoverPrompt      = "Release this lock? Only 'yes' will be accepted: "
+	ApplyTakeoverConsequence  = "Applying with --force releases it and takes the lock for you."
+	ApplyTakeoverPrompt       = "\nDo you want to apply these changes and take over that lock? Only 'yes' will be accepted: "
+)
+
+// WriteLockTakeoverWarning writes who holds a lock before an operator is asked
+// to take it from them with --force. The owner and repository are whatever the
+// caller that took the lock named itself, so their control runes are removed.
+// The consequence line says what the command does to the lock. A PR's lock is
+// owned by its repo#number, so the PR line is left out when it would repeat the
+// owner.
+func WriteLockTakeoverWarning(data LockConflictData, consequence string) {
+	fmt.Println()
+	fmt.Printf(glyph.Attention+"  The lock on %s (%s) belongs to another owner\n", data.Database, data.DatabaseType)
+	fmt.Printf("   Held by: %s\n", ui.TerminalSafeLine(data.Owner))
+	fmt.Printf("   Since:   %s\n", formatLockTime(data.CreatedAt))
+	if data.Repository != "" && data.PullRequest > 0 {
+		pullRequest := fmt.Sprintf("%s#%d", data.Repository, data.PullRequest)
+		if pullRequest != data.Owner {
+			fmt.Printf("   PR:      %s\n", ui.TerminalSafeLine(pullRequest))
+		}
+	}
+	fmt.Printf("   %s\n", consequence)
 }
 
 // WriteLocksList writes a formatted list of active locks.

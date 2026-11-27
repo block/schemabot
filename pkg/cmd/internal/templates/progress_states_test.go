@@ -666,7 +666,7 @@ func TestFormatTableProgress_TableSizeBesideRows(t *testing.T) {
 		EstimatedBytes: &bytes,
 	}
 
-	assert.Contains(t, FormatTableProgress(base), "Rows: 1,234,567 / 48,200,000 · ~23.4 GB · ETA: 12m 0s\n")
+	assert.Contains(t, FormatTableProgress(base), "Rows: 1,234,567 / 48,200,000 · ~23.4 GB · ETA: 12m\n")
 
 	noETA := base
 	noETA.ETASeconds = 0
@@ -678,7 +678,7 @@ func TestFormatTableProgress_TableSizeBesideRows(t *testing.T) {
 
 	unsized := base
 	unsized.EstimatedBytes = nil
-	assert.Contains(t, FormatTableProgress(unsized), "Rows: 1,234,567 / 48,200,000 · ETA: 12m 0s\n")
+	assert.Contains(t, FormatTableProgress(unsized), "Rows: 1,234,567 / 48,200,000 · ETA: 12m\n")
 
 	// A queued table has reported nothing yet, so it shows the plan's
 	// estimates, both approximate, and nothing without them.

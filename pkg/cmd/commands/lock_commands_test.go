@@ -21,7 +21,9 @@ import (
 // with that status. It records the body of each release request and the paths
 // of the reads it serves.
 type lockTestServer struct {
-	held          *client.LockInfo
+	held *client.LockInfo
+	// heldLater, when set, is the lock every lookup after the first finds.
+	heldLater     *client.LockInfo
 	listed        []*client.LockInfo
 	releaseStatus int
 	releaseBody   any
@@ -51,6 +53,10 @@ func (s *lockTestServer) start(t *testing.T) string {
 			if s.lookupStatus != 0 {
 				w.WriteHeader(s.lookupStatus)
 				assert.NoError(t, json.NewEncoder(w).Encode(lockReadFailure))
+				return
+			}
+			if s.heldLater != nil && len(s.reads) > 1 {
+				assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"lock": s.heldLater}))
 				return
 			}
 			if s.held == nil {
@@ -87,6 +93,12 @@ func runLockCmd(endpoint string, run func(*Globals) error) (string, error) {
 
 func runUnlockCmd(endpoint string, force bool) (string, error) {
 	cmd := UnlockCmd{Database: "orders", Type: "mysql", Force: force}
+	return runLockCmd(endpoint, cmd.Run)
+}
+
+// runApprovedForceUnlockCmd runs a forced unlock that was given -y.
+func runApprovedForceUnlockCmd(endpoint string) (string, error) {
+	cmd := UnlockCmd{Database: "orders", Type: "mysql", Force: true, AutoApprove: true}
 	return runLockCmd(endpoint, cmd.Run)
 }
 
@@ -235,7 +247,7 @@ func TestUnlockCmdForceReleasesAnotherOwnersLock(t *testing.T) {
 	}
 	endpoint := srv.start(t)
 
-	out, err := runUnlockCmd(endpoint, true)
+	out, err := runApprovedForceUnlockCmd(endpoint)
 	require.NoError(t, err)
 	assert.Contains(t, out, "Force released lock for orders (mysql)\n")
 	assert.Contains(t, out, "   Previous owner: octo-org/orders#7\n")
@@ -257,7 +269,7 @@ func TestUnlockCmdReturnsAForceReleaseDenialAsAnError(t *testing.T) {
 	}
 	endpoint := srv.start(t)
 
-	out, err := runUnlockCmd(endpoint, true)
+	out, err := runApprovedForceUnlockCmd(endpoint)
 	require.Error(t, err)
 	assert.Equal(t, "force release lock: force releasing locks on orders requires membership in db-admins", err.Error())
 	assert.NotContains(t, out, "Force released")

@@ -120,13 +120,17 @@ type nativeApply struct {
 	partitionedIndex bool
 	enumValueAdd     bool
 	// dropped is the plan's record of the live object the statement drops,
-	// which the apply checks under the table's lock before dropping it.
+	// which the apply checks before dropping it: under the table's lock, or
+	// for an index drop, right before the concurrent drop.
 	dropped *schemadiff.DroppedObject
+	// indexDrop is set for a DROP INDEX CONCURRENTLY of the index dropped
+	// names, which runs through pg-sprite's concurrent index drop.
+	indexDrop bool
 	// validates is the plan's record of the live NOT VALID constraint the
 	// statement validates, which the apply checks under the validation's
 	// lock before validating it.
 	validates *schemadiff.ConstraintValidation
-	// database names the target for the logs and metrics of a table drop.
+	// database names the target for the logs and metrics of a drop.
 	database string
 	// droppedTable is the definition the plan recorded for a table the
 	// statement drops whole, which pg-sprite checks under the table's lock.
@@ -292,7 +296,7 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if err := plannedSchemaMatchesTarget(statements, req.Changes[0].Namespace); err != nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: %w", tc.Table, err)
 	}
-	change := nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements)}
+	change := nativeApply{database: req.Database, namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements)}
 	if len(statements) == 1 {
 		// The tier derivation above parsed this statement already, so a
 		// parse failure here is an invariant guard; the message stays curated
@@ -304,6 +308,10 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		change.concurrentIndex = build == indexBuildConcurrent
 		change.partitionedIndex = build == indexBuildPartitioned
 		change.dropped, err = reviewedDropForApply(req.Database, tc, statements[0])
+		if err != nil {
+			return nativeApply{}, err
+		}
+		change.indexDrop, err = indexDropForApply(req.Database, change.namespace, tc.Table, statements[0], change.dropped)
 		if err != nil {
 			return nativeApply{}, err
 		}
@@ -547,7 +555,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		return
 	}
 
-	failure := classifyApplyFailure(err, change.table)
+	failure := classifyApplyFailure(err, change.table, change.validates)
 	failure.detail = recoveryContextDetail(err, failure.detail)
 	switch {
 	case failure.committedPrefix:
@@ -581,8 +589,10 @@ type applyFailure struct {
 // collide. classifyRefusal already consumed the statement-budget cause, so a
 // budget exceeded here is the lock budget: the statement is native-safe and
 // merely lost a bounded race with concurrent lock holders, and marking it
-// blocked would falsely tell the operator retrying cannot succeed.
-func classifyApplyFailure(err error, table string) applyFailure {
+// blocked would falsely tell the operator retrying cannot succeed. validates
+// is the plan's record of the constraint the failed step validates, or nil
+// when the step validates none.
+func classifyApplyFailure(err error, table string, validates *schemadiff.ConstraintValidation) applyFailure {
 	if detail, committed := committedCreatePrefixDetail(err, table); committed {
 		return applyFailure{detail: detail, committedPrefix: true}
 	}
@@ -603,6 +613,9 @@ func classifyApplyFailure(err error, table string) applyFailure {
 		}
 	}
 	if detail, ok := brokenForeignKeyDetail(err, table); ok {
+		return applyFailure{detail: detail, retryable: true}
+	}
+	if detail, ok := brokenCheckDetail(err, table, validates); ok {
 		return applyFailure{detail: detail, retryable: true}
 	}
 	if detail, ok := missingGrantDetail(err, table); ok {
@@ -644,6 +657,33 @@ func brokenForeignKeyDetail(err error, table string) (string, bool) {
 	}
 	return sanitizeReasonText(fmt.Sprintf(
 		"existing rows in %q break foreign key %q; the key is in place and checks new writes; fix those rows, then retry",
+		table, pgErr.ConstraintName)), true
+}
+
+// sqlstateCheckViolation is the SQLSTATE the server raises when a row breaks
+// a check constraint, which for a validation step means existing rows do not
+// satisfy the constraint the plan added NOT VALID.
+const sqlstateCheckViolation = "23514"
+
+// brokenCheckDetail names the check constraint whose validation failed on
+// existing rows. It applies only when the failed step validates the
+// constraint the server names. That constraint is NOT VALID on the table,
+// whether the plan added it in an earlier step or found it live, so it stays
+// in place and checks new writes, and the apply can finish once the owner
+// fixes the rows. For the helper check a SET NOT NULL validates, those are
+// the rows that hold NULL in the column. The detail is built from the
+// server's typed fields, never its message, because the message can quote
+// row values.
+func brokenCheckDetail(err error, table string, validates *schemadiff.ConstraintValidation) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateCheckViolation {
+		return "", false
+	}
+	if validates == nil || pgErr.ConstraintName != validates.Constraint {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"existing rows in %q break check constraint %q; the constraint is in place and checks new writes; fix those rows, then retry",
 		table, pgErr.ConstraintName)), true
 }
 
@@ -1012,6 +1052,13 @@ func refusalForCause(err error, table string) *refusal {
 		return &refusal{reason: "partitioned-index-bound-exceeded", cause: partitionedBoundErr.Error(),
 			remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
 	}
+	// A cancelled concurrent drop can leave the index invalid, which no plan
+	// drops, so the refusal names the index and the drop to finish by hand.
+	// Decided before the budget arm, which would hide the index.
+	var dropInterruptedErr *indexDropInterruptedError
+	if errors.As(err, &dropInterruptedErr) {
+		return indexDropInterruptedRefusal(dropInterruptedErr, table)
+	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
 		return &refusal{reason: "not-native-safe-budget-exceeded", cause: budgetErr.Error()}
@@ -1144,7 +1191,8 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 	case executor.CodeEmptySequence, executor.CodeUnsupportedSequenceStep,
 		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
 		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable,
-		executor.CodeUnsupportedAcceptedBlocking, executor.CodeNotCreateIndex:
+		executor.CodeUnsupportedAcceptedBlocking, executor.CodeNotCreateIndex,
+		executor.CodeNotAddKeyConstraint:
 		// Shape refusals: the executor refused the statement's form at
 		// admission, so retrying the identical plan refails the same way.
 		return &refusal{reason: "unsupported-statement-shape",
@@ -1254,6 +1302,21 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "partitioned-key-nullable-column",
 			cause:  fmt.Sprintf("the planned primary key on %s covers a column a partition allows to be NULL; nothing was built", quotedTable(table)),
 			remedy: "make the column NOT NULL on every partition, then " + replanRemedy}, true
+	case executor.CodePartitionedKeyUnsupportedShape:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("the key on partitioned table %s has no name or a clause its partitions cannot carry", quotedTable(table)),
+			remedy: "name the key and drop that clause in the schema file, then " + replanRemedy}, true
+	case executor.CodePartitionedKeyParentConflict:
+		// Nothing was created, and the parent's own constraint or the
+		// relation holding the index name stays until an operator or the
+		// schema file changes it.
+		return &refusal{reason: "partitioned-key-parent-conflict",
+			cause:  fmt.Sprintf("partitioned table %s already has the key's name in use, or a primary key", quotedTable(table)),
+			remedy: "rename the key in the schema file, or free the name, then " + replanRemedy}, true
+	case executor.CodePartitionedKeySubPartitioned:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("a partition of %s is itself partitioned, which the key build does not run", quotedTable(table)),
+			remedy: "add the key to that partition by hand, then " + replanRemedy}, true
 	case executor.CodePartitionedIndexTablespace:
 		return &refusal{reason: "unsupported-statement-shape",
 			cause:  fmt.Sprintf("the index on %s names a TABLESPACE, which the partitions' indexes would not use", quotedTable(table)),
@@ -1305,7 +1368,7 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeRenamedIndexDrift, executor.CodeDroppedIndexDrift:
 		// The index or constraint the planned statement names changed after
 		// planning — dropped, replaced, left invalid, or now backing a
-		// constraint — read again under the table's lock; nothing was
+		// constraint — read again right before the statement; nothing was
 		// applied. The plan is stale, so only a re-plan changes the outcome.
 		return &refusal{reason: "planned-object-drift",
 			cause:  fmt.Sprintf("the index or constraint the planned statement for %s names changed after planning", quotedTable(table)),
@@ -1378,12 +1441,12 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeCancelledExternally, executor.CodeInvalidIndexOwnLeftover,
 		executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuildInFlight,
 		executor.CodeInvalidIndexBuilderUnobservable, executor.CodeInvalidIndexUnproven,
-		executor.CodePartitionedIndexUnsettled, executor.CodeDetachInterrupted,
-		executor.CodeExecutionFailed:
+		executor.CodePartitionedIndexUnsettled, executor.CodePartitionedKeyUnsettled,
+		executor.CodeDetachInterrupted, executor.CodeExecutionFailed:
 		// Operational outcomes: a bounded lock race, the caller's own
 		// context ending or an external stop, an invalid-index state a retry
 		// recovers or an operator clears or waits out, a partitioned index
-		// build that a rerun resumes, a concurrent detach that running the
+		// or key build that a rerun resumes, a concurrent detach that running the
 		// same statement again finishes, or a failure outside the typed set. A retry can succeed once conditions change, so
 		// none is a permanent refusal.
 		return nil, true
@@ -1399,6 +1462,24 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 // column's auto-named sequence lands on a standalone type of that name —
 // and then the operator changes the name on one side or the other.
 const createCollisionRemedy = "re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name"
+
+// indexDropInterruptedRefusal names the index whose concurrent drop was
+// cancelled and the statement that finishes it. The statement is built from
+// the plan's schema and index name with SQL identifier quoting, which
+// PostgreSQL's identifier length bounds, so it runs as shown.
+func indexDropInterruptedRefusal(err *indexDropInterruptedError, table string) *refusal {
+	index := boundedQuote(err.index, quotedTableWidth)
+	reason := "index-drop-cancelled"
+	what := "was cancelled before it finished"
+	if err.timedOut {
+		reason = "index-drop-timed-out"
+		what = fmt.Sprintf("ran past %s and was cancelled", err.limit)
+	}
+	return &refusal{reason: reason,
+		cause: fmt.Sprintf("the drop of index %s on %s %s, which can leave the index invalid", index, quotedTable(table), what),
+		remedy: fmt.Sprintf("if index %s is still on the table and invalid, finish the drop outside SchemaBot by running %s, then %s",
+			index, err.finishDropStatement(), replanRemedy)}
+}
 
 // createCollisionRefusal names the kinds of relation that can hold a name
 // the create set claims, so the operator knows where to look; the server
@@ -1775,6 +1856,11 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		// must not reach the transactional optimistic executor.
 		return buildIndexConcurrently(ctx, pool, change, tracker, logger)
 	}
+	if change.indexDrop {
+		// A concurrent drop cannot run inside a transaction block either, so
+		// it takes pg-sprite's checked concurrent drop.
+		return executeIndexDrop(ctx, pool, change, tracker, logger)
+	}
 	// Every other statement runs exactly as reviewed, under the
 	// per-statement and lock limits. The apply never rewrites a statement
 	// here: it executes the DDL the plan surfaced, which tableChanges
@@ -1942,6 +2028,11 @@ func provenCatalogOnly(ctx context.Context, pool *pgxpool.Pool, statement pgstat
 
 func applyTablePreflightLimit(change nativeApply, tableSizeLimit int64) int64 {
 	if change.durationBoundedIndexBuild() {
+		return preflight.NoSizeLimit
+	}
+	if change.indexDrop {
+		// A concurrent index drop scans no rows, so the table's size does
+		// not bound it.
 		return preflight.NoSizeLimit
 	}
 	return tableSizeLimit
@@ -2461,6 +2552,12 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	if req != nil {
 		key = progressIdentity(req.ResumeState)
 	}
+	if key == "" {
+		// The idle sentinel below means this engine tracks no such apply, which
+		// a caller may act on as "nothing runs". A request that names no apply
+		// has not asked about one, so it gets an error, never that answer.
+		return nil, errMissingApplyIdentity("progress")
+	}
 	e.mu.Lock()
 	tracked := e.progress[key]
 	if tracked == nil {
@@ -2719,6 +2816,14 @@ func setRunningPercent(result *engine.ProgressResult, percent float64) {
 		result.Metadata = make(map[string]string)
 	}
 	result.Metadata[runningPercentMetadataKey] = strconv.FormatFloat(percent, 'f', 2, 64)
+}
+
+// errMissingApplyIdentity is the error for a request that does not name the
+// apply it is about. The engine tracks each apply under its identity, so it
+// cannot answer for work the request does not name, and answering "nothing
+// runs" could let a caller record a schema change as ended while it runs.
+func errMissingApplyIdentity(operation string) error {
+	return fmt.Errorf("PostgreSQL %s request names no apply: ResumeState.MigrationContext is empty, so the engine cannot tell whether a schema change is running", operation)
 }
 
 // progressIdentity extracts the apply identity that keys engine progress.

@@ -721,6 +721,74 @@ func TestChecks(t *testing.T, h Harness) {
 		assert.Zero(t, stored.RolloutTargetsWithWork)
 	})
 
+	// A plan's refusal describes its change summary, as the rollout counts do,
+	// so it is written and kept with the summary. A preserved block keeps the
+	// absence of one, so a later plan never marks a blocked row refused.
+	t.Run("PlanRefusedTravelsWithChangeSummary", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		get := func(database string) *storage.Check {
+			t.Helper()
+			stored, err := store.Checks().Get(ctx, "org/repo", 322, "production", storage.DatabaseTypePostgres, database)
+			require.NoError(t, err)
+			require.NotNil(t, stored)
+			return stored
+		}
+
+		plan := &storage.Check{
+			Repository: "org/repo", PullRequest: 322, HeadSHA: "sha-1",
+			Environment: "production", DatabaseType: storage.DatabaseTypePostgres, DatabaseName: "refused_db",
+			HasChanges: true, Status: "completed", Conclusion: "failure",
+			ChangeSummary: "1 index drop", PlanRefused: true,
+		}
+		requirePlanResultStored(t, ctx, store, plan, storage.PlanDriftClean)
+		assert.True(t, get("refused_db").PlanRefused, "the first plan's write records the refusal")
+
+		replan := *plan
+		replan.HeadSHA = "sha-2"
+		requirePlanResultStored(t, ctx, store, &replan, storage.PlanDriftClean)
+		assert.True(t, get("refused_db").PlanRefused, "a plan's write over an existing row records the refusal")
+
+		transition := replan
+		transition.ChangeSummary = ""
+		transition.PlanRefused = false
+		require.NoError(t, store.Checks().Upsert(ctx, &transition))
+		assert.True(t, get("refused_db").PlanRefused, "a write that keeps the summary keeps the refusal")
+
+		stale := transition
+		stale.HasChanges = false
+		stale.Conclusion = "success"
+		marked, err := store.Checks().MarkStalePlanSuccessful(ctx, &stale, stale.HeadSHA)
+		require.NoError(t, err)
+		require.True(t, marked)
+		assert.True(t, get("refused_db").PlanRefused, "an update that keeps the summary keeps the refusal")
+
+		errored := replan
+		errored.HeadSHA = "sha-3"
+		errored.ChangeSummary = "plan failed"
+		errored.PlanRefused = false
+		requirePlanResultStored(t, ctx, store, &errored, storage.PlanDriftClean)
+		assert.False(t, get("refused_db").PlanRefused, "a plan's write that is no refusal clears it")
+
+		refusedAgain := replan
+		refusedAgain.HeadSHA = "sha-4"
+		require.NoError(t, store.Checks().Upsert(ctx, &refusedAgain))
+		assert.True(t, get("refused_db").PlanRefused, "an upsert that carries a summary records its refusal")
+
+		blocked := &storage.Check{
+			Repository: "org/repo", PullRequest: 322, HeadSHA: "sha-1",
+			Environment: "production", DatabaseType: storage.DatabaseTypePostgres, DatabaseName: "refused_blocked_db",
+			HasChanges: true, Status: "completed", Conclusion: "failure",
+			BlockingReason: storage.ReviewTimeDeploymentDriftBlockingReason, ChangeSummary: "targets diverged at review time",
+		}
+		requirePlanResultStored(t, ctx, store, blocked, storage.PlanDriftBlocked)
+		notEvaluated := *plan
+		notEvaluated.DatabaseName = "refused_blocked_db"
+		notEvaluated.HeadSHA = "sha-2"
+		requirePlanResultStored(t, ctx, store, &notEvaluated, storage.PlanDriftNotEvaluated)
+		assert.False(t, get("refused_blocked_db").PlanRefused, "a preserved block keeps its summary and stays unrefused")
+	})
+
 	// A namespace placement refusal is a review-time block too: a write that did
 	// not re-evaluate the review keeps it, and one that did clears it.
 	t.Run("PlanPlacementBlockDisposition", func(t *testing.T) {

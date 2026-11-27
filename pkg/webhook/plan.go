@@ -192,7 +192,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		api.PlanFailureLog(h.logger, err)("plan narrowed to one target failed; leaving the environment's check unchanged",
 			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
 			"deployment", deployment, "environment", environment, "target", target, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, userFacingError(err))
+		h.postPlanCommandError(repo, pr, installationID, environment, requestedBy, err)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan failed"})
 		return
 	}
@@ -212,7 +212,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		} else {
 			h.recordPlanFailuresAndFold(ctx, client, repo, pr, schemaResult.HeadSHA, schemaResult, []string{environment})
 		}
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, userError)
+		h.postPlanCommandError(repo, pr, installationID, environment, requestedBy, err)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan failed"})
 		return
 	}
@@ -784,6 +784,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		Environments:   environments,
 		Plans:          make(map[string]*templates.PlanCommentData),
 		Errors:         make(map[string]string),
+		PlanProblems:   make(map[string]templates.RefusedStatements),
 	}
 	if len(unmanagedSchema) > 0 {
 		multiEnvData.UnmanagedSchema = unmanagedSchema
@@ -795,6 +796,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// also reaching the gate.
 	planFailed := func(env string, err error) {
 		multiEnvData.Errors[env] = userFacingError(err)
+		if problems, omitted := api.PlanRefusalProblems(err); len(problems) > 0 {
+			multiEnvData.PlanProblems[env] = templates.RefusedStatements{Problems: problems, Omitted: omitted}
+		}
 		planFailedEnvironments = append(planFailedEnvironments, env)
 		if planRefusedBySourcePolicy(err) {
 			sourcePolicyRefused[env] = true
@@ -1056,10 +1060,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		BaseSchemaNotice: templates.AnyEnvHasBaseSchemaNotice(multiEnvData),
 	}
 
-	// The caller asked not to re-post: either the push left the schema inputs
-	// unchanged, or this is the re-plan after a terminal apply, where the
-	// operator asked for an apply rather than a plan. The visible plan comment
-	// stays the PR's answer unless its outcome no longer matches this plan.
+	// The caller asked not to re-post: no schema input changed since the
+	// visible plan comment, whether this plan follows a push or is the re-plan
+	// after a terminal apply. The visible plan comment stays the PR's answer
+	// unless its outcome no longer matches this plan.
 	if !postPlanComment {
 		// A base-schema notice is new information even when the schema inputs
 		// did not change, since the base branch moves without a push to the PR.
@@ -1146,7 +1150,11 @@ func (h *Handler) postFailingAggregateForMultiEnvSetupError(ctx context.Context,
 // durable driver may re-drive. suppressRetryComments silences only the
 // unexpected-failure fallback comment on durable attempts, where the driver
 // retries and posts the single terminal answer instead; recognized rejections
-// always comment because they are the command's answer.
+// always comment because they are the command's answer. The comment's detail
+// comes from userFacingError, as on every other PR error comment: a recognized
+// data plane failure renders a fixed line and its raw error goes only to the
+// server log, and any other error text passes through the renderer's
+// redaction (AV-8).
 func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID int64, environment, databaseName, requestedBy, commandName string, err error, suppressRetryComments bool) bool {
 	data := templates.SchemaErrorData{
 		RequestedBy:  requestedBy,
@@ -1297,7 +1305,7 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 	if errors.As(err, &envNotConfiguredErr) {
 		h.logger.Warn("schema request: environment not configured on this server", logFields...)
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "environment_not_configured")
-		data.ErrorDetail = err.Error()
+		data.ErrorDetail = userFacingError(err)
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
 		return true
 	}
@@ -1305,7 +1313,7 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 	h.logger.Error("schema request failed", logFields...)
 	metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "unexpected")
 	if !suppressRetryComments {
-		data.ErrorDetail = err.Error()
+		data.ErrorDetail = userFacingError(err)
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
 	}
 	return false

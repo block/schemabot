@@ -212,3 +212,36 @@ func TestLocalClient_DriveConsumesCancelWhenEngineProgressUnreadable(t *testing.
 	assert.Contains(t, recorded, "Progress", "the drive must attempt the authoritative read")
 	assert.Contains(t, recorded, "Cancel", "the cancel must be consumed despite the failed read")
 }
+
+// An operator cancels an apply whose change the engine still reports live. The
+// drive consumes the cancel and the apply settles cancelled, and the terminal
+// summary is delivered to the apply's observer then, so the PR shows the
+// cancel and its Check Run settles without waiting for summary reconciliation.
+func TestLocalClient_ConsumedCancelDeliversTheTerminalSummary(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, _ := newAuthoritativeControlClient(t, dsn, stor, engine.StateRunning, nil)
+
+	apply := dispatchApplyAwaitingDeployWithPendingCancel(t, stor, client)
+	observer := &recordingTerminalObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
+
+	settled, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	require.Equal(t, state.Apply.Cancelled, settled.State)
+	require.Equal(t, 1, observer.terminalCount(), "the cancel that settled the apply delivers its terminal summary exactly once")
+	assert.Equal(t, []string{state.Apply.Cancelled}, observer.terminalStates())
+}

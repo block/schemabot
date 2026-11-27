@@ -804,7 +804,7 @@ func TestBuildShardedApplyData_CountsThePlannedRowsOfShardsStillToCopy(t *testin
 	assert.Equal(t, int64(620), orders.RowsCopied)
 	assert.Equal(t, int64(2_200), orders.RowsTotal, "the reported shard's total plus the waiting shard's estimate")
 	assert.True(t, orders.RowsTotalPlanned)
-	assert.Contains(t, templates.RenderShardedApplyComment(data), "- Rows: 620 / ~2.2k · ETA: ≥ 1m 0s")
+	assert.Contains(t, templates.RenderShardedApplyComment(data), "- Rows: 620 / ~2.2k · ETA: ≥ 1m")
 
 	withoutView := buildShardedApplyData(apply, ops, false, tasks, nil, "")
 	assert.Equal(t, int64(1_000), withoutView.Keyspaces[0].Tables[0].RowsTotal, "without the plan the total covers the reported shard")
@@ -876,7 +876,7 @@ func TestBuildSingleShardApplyCommentData_TableSizeFromStoredPlan(t *testing.T) 
 	require.Len(t, data.Tables, 1)
 	require.NotNil(t, data.Tables[0].EstimatedBytes)
 	assert.Equal(t, int64(1_130_000_000), *data.Tables[0].EstimatedBytes)
-	assert.Contains(t, templates.RenderApplyStatusComment(data), "- Rows: 400 / 1,000 · ~1.1 GB · ETA: 1m 0s")
+	assert.Contains(t, templates.RenderApplyStatusComment(data), "- Rows: 400 / 1,000 · ~1.1 GB · ETA: 1m")
 }
 
 // A keyspace's only shard deferred its cutover across two tables, and users

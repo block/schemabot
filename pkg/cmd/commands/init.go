@@ -214,7 +214,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		return nil, err
 	}
 	if err := localsetup.CheckConnection(ctx, cmd.Type, targetDSN); err != nil {
-		return nil, unregisteredInitError(ctx, fmt.Errorf("check %s before registering runtime: %w", cmd.DSN, err), initCancelledBeforeRegistration)
+		return nil, unregisteredInitError(ctx, fmt.Errorf("check %s: %w", cmd.DSN, err), initCancelledBeforeRegistration)
 	}
 	connection := api.EnvironmentConfig{DSN: cmd.DSN}
 	// A Vitess target is reached through a PlanetScale-compatible API, so the
@@ -244,7 +244,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 			return nil, err
 		}
 		if err := localsetup.CheckConnection(ctx, storageDialect(cmd.Type), stateDSN); err != nil {
-			return nil, unregisteredInitError(ctx, fmt.Errorf("check %s before registering runtime: %w", cmd.StorageDSN, err), initCancelledBeforeRegistration)
+			return nil, unregisteredInitError(ctx, fmt.Errorf("check %s: %w", cmd.StorageDSN, err), initCancelledBeforeRegistration)
 		}
 	}
 	_, err = localsetup.Register(manager, registration)

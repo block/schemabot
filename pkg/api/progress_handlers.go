@@ -327,6 +327,31 @@ func progressOperationsFromRows(ops []*storage.ApplyOperation) ([]*apitypes.Prog
 	return responses, operationByID
 }
 
+// setProgressOperationErrors gives each operation entry the reason it failed
+// for as every surface reads it (storage.ApplyOperation.FailureMessage): a row
+// with no error of its own takes its first task's, so the CLI names the reason
+// the PR comment names instead of reading "no reason recorded" (UX-9).
+// responses is index-parallel to ops.
+func setProgressOperationErrors(responses []*apitypes.ProgressOperationResponse, ops []*storage.ApplyOperation, tasks []*storage.Task) {
+	if len(responses) != len(ops) {
+		slog.Warn("progress response keeps each operation's own error: operation entries do not line up with their rows",
+			"responses", len(responses), "operations", len(ops))
+		return
+	}
+	tasksByOp := storage.TasksByOperation(tasks)
+	for i, op := range ops {
+		if op.ErrorMessage != "" {
+			continue
+		}
+		msg := op.FailureMessage(tasksByOp[op.ID])
+		if msg == "" {
+			continue
+		}
+		responses[i].ErrorMessage = msg
+		responses[i].ErrorCode = deriveErrorCode(op.State, msg)
+	}
+}
+
 // setProgressEndedBy names, on each response whose row was failed for
 // another row of the apply (ended_by_operation_id), that row by deployment
 // and operation key. responses is index-parallel to ops. A row the apply no
@@ -580,6 +605,9 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// doesn't carry task timestamps, but storage has them from engine
 	// progress polling (e.g., SHOW VITESS_MIGRATIONS started_timestamp).
 	if tasks, err := s.storage.Tasks().GetByApplyID(r.Context(), apply.ID); err == nil {
+		if opsErr == nil {
+			setProgressOperationErrors(httpResp.Operations, ops, tasks)
+		}
 		// The routed projection reports each statement as its deployment
 		// spells it, so a stored task is matched by canonical form rather than
 		// by the reviewed text it carries.
@@ -1419,6 +1447,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	overlayApplyOptions(httpResp, apply)
 	setRevertSkippedMetadata(httpResp, apply)
 	stored := s.bestEffortProgressOperations(ctx, apply)
+	setProgressOperationErrors(stored.responses, stored.rows, tasks)
 	httpResp.Operations = stored.responses
 	httpResp.Released = stored.released
 	if isMultiOperationApply(apply, stored.rows) {

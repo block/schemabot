@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -77,6 +79,72 @@ func newControlInternalErrorService(applies storage.ApplyStore, controls storage
 	}
 	svc.logger = logger
 	return svc
+}
+
+// The text a control error shows the requester is the text SchemaBot wrote on
+// the typed error, so a wrap added on the way up to the PR comment stays out
+// of it, and an error with no such text shows nothing.
+func TestAuthoredControlFailureMessage(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		want     string
+		authored bool
+	}{
+		{
+			name:     "a wrapped conflict shows its own text",
+			err:      fmt.Errorf("execute start: %w", controlConflictf("apply %s already completed and cannot be started", "apply-123")),
+			want:     "apply apply-123 already completed and cannot be started",
+			authored: true,
+		},
+		{
+			name:     "a wrapped engine-unavailable answer shows its own text",
+			err:      fmt.Errorf("execute cutover: %w", controlHTTPCodeErrorf(http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable, "the engine for apply %s is not available; retry in a moment", "apply-123")),
+			want:     "the engine for apply apply-123 is not available; retry in a moment",
+			authored: true,
+		},
+		{
+			name:     "a wrapped authored terminal failure shows its own text",
+			err:      fmt.Errorf("execute revert: %w", authoredTerminalControlf("revert window for apply %s has closed", "apply-123")),
+			want:     "revert window for apply apply-123 has closed",
+			authored: true,
+		},
+		{
+			name: "a terminal failure that wraps an error shows nothing",
+			err:  terminalControlf("apply %s is inconsistent: %w", "apply-123", errors.New(sensitiveControlFailure)),
+		},
+		{
+			name: "an untyped failure shows nothing",
+			err:  fmt.Errorf("execute stop: %w", errors.New(sensitiveControlFailure)),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := AuthoredControlFailureMessage(tc.err)
+
+			assert.Equal(t, tc.authored, ok)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// An apply with no deployment recorded cannot be routed on any attempt, so
+// the control target refuses it as a terminal failure whose text says
+// nothing was changed and a retry fails the same way, while the cause stays
+// in the server log.
+func TestControlTargetRefusesApplyWithoutDeploymentAsTerminal(t *testing.T) {
+	apply := activeTestApply("apply-internal-error")
+	apply.Deployment = ""
+	svc := newControlInternalErrorService(&staticApplyStore{apply: apply}, &memoryControlRequestStore{}, slog.New(slog.DiscardHandler))
+
+	_, _, _, err := svc.controlTarget(t.Context(), "skip-revert", apply.ApplyIdentifier, apply.Environment)
+
+	require.Error(t, err)
+	assert.True(t, IsTerminalControlError(err), "a retry meets the same record")
+	shown, ok := AuthoredControlFailureMessage(err)
+	require.True(t, ok)
+	assert.Equal(t, controlMissingDeploymentMessage("skip-revert", "apply-internal-error"), shown)
+	assert.NotContains(t, shown, "missing stored deployment metadata")
 }
 
 // A control request that cannot load its apply answers 500 with a fixed message
@@ -209,6 +277,75 @@ func TestControlRoutesAnswerNotAttemptedBeforeTheOperation(t *testing.T) {
 			assert.Equal(t, "apply-internal-error", line["apply_id"])
 			assert.Equal(t, "/api/cutover", line["path"])
 			assert.Equal(t, "cutover", line["operation"])
+		})
+	}
+}
+
+// Every engine is classified as one that can stop or one whose stops are
+// refused before anything is recorded, so a new engine cannot accept stops it
+// will never honor.
+func TestStopRefusalsClassifyEveryEngine(t *testing.T) {
+	assert.ElementsMatch(t, storage.Engines, slices.Collect(maps.Keys(stopRefusals)))
+}
+
+// A stop of a PostgreSQL schema change is refused up front: the engine has no
+// stopped phase, so the request is never recorded. The refusal gives the
+// engine's own reason and the remedy the PR comment offers for this apply:
+// cancel for a concurrent index build that is its only statement, waiting for
+// anything else, and both when its stored progress cannot be read.
+func TestStopOfPostgresApplyIsRefusedBeforeItIsRecorded(t *testing.T) {
+	const reason = "stop rejected: stop is not supported for PostgreSQL schema changes: concurrent index builds have no resumable midpoint, and other statements commit or fail on their own. "
+	operation := func(metadata string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: 11, ApplyID: 1, ProgressMetadata: metadata}
+	}
+	tests := []struct {
+		name       string
+		operations *staticApplyOperationStore
+		want       string
+	}{
+		{
+			name: "a lone concurrent index build is pointed at cancel",
+			operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
+				operation(`{"executor_operation":"concurrent-index-build","step":"1","steps_total":"1"}`),
+			}},
+			want: reason + "Use cancel to end this concurrent index build",
+		},
+		{
+			name: "plain DDL is left to finish",
+			operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
+				operation(`{"step":"1","steps_total":"1","statement":"ALTER TABLE users ADD COLUMN email text"}`),
+			}},
+			want: reason + "This schema change commits or fails on its own; wait for it to finish",
+		},
+		{
+			name: "an index build among other statements is left to finish",
+			operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
+				operation(`{"executor_operation":"concurrent-index-build","step":"2","steps_total":"3"}`),
+			}},
+			want: reason + "This schema change commits or fails on its own; wait for it to finish",
+		},
+		{
+			name:       "unreadable progress names the remedy for each kind of statement",
+			operations: &staticApplyOperationStore{err: errors.New(sensitiveControlFailure)},
+			want:       reason + "Use cancel if this schema change is a single concurrent index build; otherwise wait for it to finish",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apply := activeTestApply("apply-postgres-stop")
+			apply.ID = 1
+			apply.Engine = storage.EnginePostgres
+			apply.DatabaseType = storage.DatabaseTypePostgres
+			requests := &memoryControlRequestStore{}
+			svc := newControlInternalErrorService(&staticApplyStore{apply: apply}, requests, slog.New(slog.DiscardHandler))
+			svc.storage.(*mockStorageWithApplyStores).operations = tt.operations
+
+			w, resp := postControlRoute(t, svc, "/api/stop")
+
+			require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			assert.Equal(t, tt.want, resp.Error)
+			assert.NotContains(t, w.Body.String(), "10.0.0.5")
+			assert.Empty(t, requests.requests, "a refused stop records no control request")
 		})
 	}
 }

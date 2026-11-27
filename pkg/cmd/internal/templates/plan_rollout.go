@@ -12,9 +12,10 @@ import (
 )
 
 // memberNamesInlineLimit caps how many member names a group heading names
-// inline, as the PR comment does. A wider group leads with its coverage and
-// lists the names on their own lines below.
-const memberNamesInlineLimit = 8
+// inline, as the PR comment does (presentation.MemberNamesInlineLimit). A
+// wider group leads with its coverage and lists the names on their own lines
+// below.
+const memberNamesInlineLimit = presentation.MemberNamesInlineLimit
 
 // memberNamesListLimit caps a wide group's folded name list, so a group of
 // hundreds of targets does not wall the terminal. The coverage phrase in the

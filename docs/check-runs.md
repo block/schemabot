@@ -1619,7 +1619,8 @@ Common breakglass capabilities:
   <environment>` and `schemabot rollback <apply-id>`.
 - Inspect and release locks with `schemabot locks`, `schemabot unlock -d
   <database> -t <type>`, and `schemabot unlock -d <database> -t <type>
-  --force`.
+  --force`. A forced unlock of another owner's lock asks for confirmation
+  first; `-y` skips the question.
 
 Breakglass is still safety-critical. Operators should prefer the least
 surprising action, record what was done, and update the declarative schema or PR

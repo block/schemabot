@@ -21,7 +21,7 @@ const checkColumns = `id, repository, pull_request, head_sha,
 	environment, database_type, database_name,
 	check_run_id, apply_id, has_changes, status, conclusion,
 	blocking_reason, error_message, change_summary, rollout_targets, rollout_targets_with_work,
-	created_at, updated_at`
+	plan_refused, created_at, updated_at`
 
 // removableCheckColumns is checkColumns with the aggregate render, for the
 // close cleanup listing and its delete. The render is compared with the rest,
@@ -52,23 +52,25 @@ func canonicalizeCheck(check *storage.Check) {
 	check.DatabaseName = storage.CanonicalKey(check.DatabaseName)
 }
 
-// rolloutTargetsKeptWithSummary returns the rollout target counts a write
-// records, or nil for each when the write carries no change summary. Those
-// writes keep the stored summary, and the counts describe the summary, so the
-// counts are kept with it (rolloutTargetsKeptWithSummarySet).
-func rolloutTargetsKeptWithSummary(check *storage.Check) (targets, withWork any) {
+// rolloutTargetsKeptWithSummary returns the rollout target counts and the
+// plan refusal a write records, or nil for each when the write carries no
+// change summary. Those writes keep the stored summary, and the counts and the
+// refusal describe the summary, so they are kept with it
+// (rolloutTargetsKeptWithSummarySet).
+func rolloutTargetsKeptWithSummary(check *storage.Check) (targets, withWork, refused any) {
 	if check.ChangeSummary == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
-	return check.RolloutTargets, check.RolloutTargetsWithWork
+	return check.RolloutTargets, check.RolloutTargetsWithWork, check.PlanRefused
 }
 
-// rolloutTargetsKeptWithSummarySet assigns the rollout target counts from the
-// two arguments rolloutTargetsKeptWithSummary returns, keeping the stored
-// counts for a nil argument.
+// rolloutTargetsKeptWithSummarySet assigns the rollout target counts and the
+// plan refusal from the three arguments rolloutTargetsKeptWithSummary returns,
+// keeping the stored value for a nil argument.
 const rolloutTargetsKeptWithSummarySet = `
 		    rollout_targets = COALESCE(?, rollout_targets),
-		    rollout_targets_with_work = COALESCE(?, rollout_targets_with_work),`
+		    rollout_targets_with_work = COALESCE(?, rollout_targets_with_work),
+		    plan_refused = COALESCE(?, plan_refused),`
 
 // Upsert creates or updates stored check state.
 func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
@@ -100,6 +102,7 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 			// The counts describe the change summary, so they are kept with it.
 			{Column: "rollout_targets", Expr: "CASE WHEN COALESCE(" + s.dialect.ExcludedValue("change_summary") + ", '') = '' THEN checks.rollout_targets ELSE " + s.dialect.ExcludedValue("rollout_targets") + " END"},
 			{Column: "rollout_targets_with_work", Expr: "CASE WHEN COALESCE(" + s.dialect.ExcludedValue("change_summary") + ", '') = '' THEN checks.rollout_targets_with_work ELSE " + s.dialect.ExcludedValue("rollout_targets_with_work") + " END"},
+			{Column: "plan_refused", Expr: "CASE WHEN COALESCE(" + s.dialect.ExcludedValue("change_summary") + ", '') = '' THEN checks.plan_refused ELSE " + s.dialect.ExcludedValue("plan_refused") + " END"},
 			{Column: "aggregate_render"},
 			{Column: "updated_at", Expr: s.dialect.CurrentTimestamp(TimestampPrecisionDefault)},
 		},
@@ -114,12 +117,12 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 				repository, pull_request, head_sha,
 				environment, database_type, database_name,
 				check_run_id, apply_id, has_changes, status, conclusion, blocking_reason, error_message, change_summary,
-				rollout_targets, rollout_targets_with_work, aggregate_render
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				rollout_targets, rollout_targets_with_work, plan_refused, aggregate_render
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			`+upsert, check.Repository, check.PullRequest, check.HeadSHA,
 			check.Environment, check.DatabaseType, check.DatabaseName,
 			checkRunID, applyID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, nullString(check.ChangeSummary),
-			check.RolloutTargets, check.RolloutTargetsWithWork, aggregateRender)
+			check.RolloutTargets, check.RolloutTargetsWithWork, check.PlanRefused, aggregateRender)
 		return err
 	})
 }
@@ -175,12 +178,12 @@ func (s *checkStore) upsertPlanResultPreserving(ctx context.Context, check *stor
 				repository, pull_request, head_sha,
 				environment, database_type, database_name,
 				check_run_id, apply_id, has_changes, status, conclusion, blocking_reason, error_message, change_summary,
-				rollout_targets, rollout_targets_with_work
-			) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+				rollout_targets, rollout_targets_with_work, plan_refused
+			) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`, check.Repository, check.PullRequest, check.HeadSHA,
 			check.Environment, check.DatabaseType, check.DatabaseName,
 			checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, nullString(check.ChangeSummary),
-			check.RolloutTargets, check.RolloutTargetsWithWork)
+			check.RolloutTargets, check.RolloutTargetsWithWork, check.PlanRefused)
 		// Fast path: no existing check state for this PR/environment/database, so
 		// the insert is the complete write. Any non-duplicate error is a real
 		// storage failure; duplicate key means the row exists and needs the
@@ -283,7 +286,7 @@ func (s *checkStore) writePlanResultUnlessApplyOwned(ctx context.Context, check 
 		args := []any{check.HeadSHA, checkRunID}
 		args = append(args, reasons...)
 		for _, value := range []any{check.HasChanges, check.Status, check.Conclusion, check.ErrorMessage, nullString(check.ChangeSummary),
-			check.RolloutTargets, check.RolloutTargetsWithWork, check.BlockingReason} {
+			check.RolloutTargets, check.RolloutTargetsWithWork, check.PlanRefused, check.BlockingReason} {
 			args = append(args, reasons...)
 			args = append(args, value)
 		}
@@ -300,6 +303,7 @@ func (s *checkStore) writePlanResultUnlessApplyOwned(ctx context.Context, check 
 			    change_summary  = CASE WHEN `+kept+` THEN change_summary  ELSE ? END,
 			    rollout_targets = CASE WHEN `+kept+` THEN rollout_targets ELSE ? END,
 			    rollout_targets_with_work = CASE WHEN `+kept+` THEN rollout_targets_with_work ELSE ? END,
+			    plan_refused    = CASE WHEN `+kept+` THEN plan_refused    ELSE ? END,
 			    blocking_reason = CASE WHEN `+kept+` THEN blocking_reason ELSE ? END,
 			    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 			WHERE repository = ? AND pull_request = ?
@@ -319,11 +323,12 @@ func (s *checkStore) writePlanResultUnlessApplyOwned(ctx context.Context, check 
 			    change_summary = ?,
 			    rollout_targets = ?,
 			    rollout_targets_with_work = ?,
+			    plan_refused = ?,
 			    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 			WHERE repository = ? AND pull_request = ?
 			  AND environment = ? AND database_type = ? AND database_name = ?
 		`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, nullString(check.ChangeSummary),
-			check.RolloutTargets, check.RolloutTargetsWithWork,
+			check.RolloutTargets, check.RolloutTargetsWithWork, check.PlanRefused,
 			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
 	}
 	if err != nil {
@@ -339,7 +344,7 @@ func (s *checkStore) writePlanResultUnlessApplyOwned(ctx context.Context, check 
 // state when a successful no-op plan proves the target already matches the PR schema.
 func (s *checkStore) RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, check *storage.Check) (bool, error) {
 	canonicalizeCheck(check)
-	targets, withWork := rolloutTargetsKeptWithSummary(check)
+	targets, withWork, refused := rolloutTargetsKeptWithSummary(check)
 	if !successfulNoOpPlanResult(check) {
 		return false, nil
 	}
@@ -364,7 +369,7 @@ func (s *checkStore) RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, che
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
 		  AND status = ? AND head_sha = ? AND apply_id IS NOT NULL
-	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary, targets, withWork,
+	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary, targets, withWork, refused,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 		checkStatusInProgress, check.HeadSHA)
 	if err != nil {
@@ -404,7 +409,7 @@ func successfulNoOpPlanResult(check *storage.Check) bool {
 // stop blocking. A started apply still owns the row and is left untouched.
 func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check, readHeadSHA string) (bool, error) {
 	canonicalizeCheck(check)
-	targets, withWork := rolloutTargetsKeptWithSummary(check)
+	targets, withWork, refused := rolloutTargetsKeptWithSummary(check)
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
@@ -426,7 +431,7 @@ func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage
 		  AND environment = ? AND database_type = ? AND database_name = ?
 		  AND status != ? AND apply_id IS NULL
 		  AND head_sha IN (?, ?)
-	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary, targets, withWork,
+	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary, targets, withWork, refused,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 		checkStatusInProgress, readHeadSHA, check.HeadSHA)
 	if err != nil {
@@ -659,7 +664,7 @@ func checkApplyLeasePredicate(d Dialect) string {
 // evaluation and PostgreSQL's old-row evaluation agree.
 func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
 	canonicalizeCheck(check)
-	targets, withWork := rolloutTargetsKeptWithSummary(check)
+	targets, withWork, refused := rolloutTargetsKeptWithSummary(check)
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
@@ -677,7 +682,7 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 		check.Status,
 		removed, removedConclusion, check.Conclusion,
 		removed, check.ErrorMessage,
-		check.ChangeSummary, targets, withWork,
+		check.ChangeSummary, targets, withWork, refused,
 		removed, check.BlockingReason,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 		checkStatusInProgress, apply.ID, apply.ID,
@@ -780,14 +785,14 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 // task exists under this or an earlier apply for the target.
 func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
 	canonicalizeCheck(check)
-	targets, withWork := rolloutTargetsKeptWithSummary(check)
+	targets, withWork, refused := rolloutTargetsKeptWithSummary(check)
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
 	}
 	leasePredicate := ""
 	completedTaskPredicate := ""
-	args := []any{check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary, targets, withWork,
+	args := []any{check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary, targets, withWork, refused,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 		apply.ID, apply.ID}
 	if state.IsState(apply.State, state.Apply.Cancelled) && !apply.IsRollback() {
@@ -853,13 +858,13 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 // cancellation that is safe to release from being retained here.
 func (s *checkStore) MarkCancelledApplyFailed(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
 	canonicalizeCheck(check)
-	targets, withWork := rolloutTargetsKeptWithSummary(check)
+	targets, withWork, refused := rolloutTargetsKeptWithSummary(check)
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
 	}
 	leasePredicate := ""
-	args := []any{check.HeadSHA, checkRunID, apply.ID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary, targets, withWork,
+	args := []any{check.HeadSHA, checkRunID, apply.ID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary, targets, withWork, refused,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 		apply.ID, apply.ID, apply.ID, state.Task.Completed}
 	lease := apply.Lease()
@@ -1210,6 +1215,7 @@ func checkRowUnchanged(listed, current *storage.Check) bool {
 		listed.ChangeSummary == current.ChangeSummary &&
 		listed.RolloutTargets == current.RolloutTargets &&
 		listed.RolloutTargetsWithWork == current.RolloutTargetsWithWork &&
+		listed.PlanRefused == current.PlanRefused &&
 		bytes.Equal(listed.AggregateRender, current.AggregateRender) &&
 		listed.CreatedAt.Equal(current.CreatedAt) &&
 		listed.UpdatedAt.Equal(current.UpdatedAt)
@@ -1275,7 +1281,7 @@ func scanCheckInto(s scanner, extra ...any) (*storage.Check, error) {
 		&check.Environment, &check.DatabaseType, &check.DatabaseName,
 		&checkRunID, &applyID, &check.HasChanges, &check.Status, &conclusion,
 		&blockingReason, &errorMessage, &changeSummary, &check.RolloutTargets, &check.RolloutTargetsWithWork,
-		&check.CreatedAt, &check.UpdatedAt,
+		&check.PlanRefused, &check.CreatedAt, &check.UpdatedAt,
 	}
 	err := s.Scan(append(dest, extra...)...)
 	if err != nil {

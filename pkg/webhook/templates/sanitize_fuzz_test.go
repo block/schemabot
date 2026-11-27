@@ -6,6 +6,7 @@ import (
 	"testing"
 	"unicode"
 
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,7 +32,7 @@ var sanitizerSeeds = []string{
 // redaction was cut apart and could read as a leaked value.
 func requireNoPartialMarker(t *testing.T, got string) {
 	t.Helper()
-	require.Equal(t, strings.Count(got, redactionMarker), strings.Count(got, "[endpoint"),
+	require.Equal(t, strings.Count(got, presentation.RedactionMarker), strings.Count(got, "[endpoint"),
 		"partial redaction marker in %q", got)
 }
 

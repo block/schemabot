@@ -20,6 +20,7 @@ import (
 	"github.com/block/pg-sprite/pkg/executor"
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/progress"
+	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -320,6 +321,46 @@ func TestClassifyRefusal(t *testing.T) {
 			wantReason:    "concurrent-index-bound-exceeded",
 			wantDetail:    []string{"ran past postgres.concurrent_index_max_duration (36h0m0s)", "raise postgres.concurrent_index_max_duration and re-run"},
 			wantNotDetail: []string{"statement budget", replanRemedy},
+		},
+		{
+			name: "concurrent index drop that ran past its limit names the index and the drop to finish",
+			err: fmt.Errorf("drop reviewed index %q on PostgreSQL table %q.%q: %w", "orders_status_idx", "sales", "orders",
+				nameInterruptedIndexDrop(&executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Hour}, "sales", "orders_status_idx", time.Hour)),
+			wantReason: "index-drop-timed-out",
+			wantDetail: []string{
+				`the drop of index "orders_status_idx" on "users" ran past 1h0m0s and was cancelled, which can leave the index invalid`,
+				`if index "orders_status_idx" is still on the table and invalid, finish the drop outside SchemaBot by running DROP INDEX CONCURRENTLY "sales"."orders_status_idx", then ` + replanRemedy,
+			},
+			wantNotDetail: []string{"statement budget"},
+		},
+		{
+			name: "concurrent index drop cancelled by the apply names the index and the drop to finish",
+			err: fmt.Errorf("drop reviewed index: %w",
+				nameInterruptedIndexDrop(fmt.Errorf("%w (after 2s: context canceled)", executor.ErrCancelledByCaller), "sales", "orders_status_idx", time.Hour)),
+			wantReason: "index-drop-cancelled",
+			wantDetail: []string{
+				`the drop of index "orders_status_idx" on "users" was cancelled before it finished, which can leave the index invalid`,
+				`finish the drop outside SchemaBot by running DROP INDEX CONCURRENTLY "sales"."orders_status_idx", then ` + replanRemedy,
+			},
+		},
+		{
+			name: "concurrent index drop cancelled from outside SchemaBot names the index and the drop to finish",
+			err: fmt.Errorf("drop reviewed index: %w",
+				nameInterruptedIndexDrop(fmt.Errorf("%w (after 2s)", executor.ErrCancelledExternally), "sales", "orders_status_idx", time.Hour)),
+			wantReason: "index-drop-cancelled",
+			wantDetail: []string{`finish the drop outside SchemaBot by running DROP INDEX CONCURRENTLY "sales"."orders_status_idx", then ` + replanRemedy},
+		},
+		{
+			name: "the drop to finish quotes an index name holding a double quote as SQL",
+			err: fmt.Errorf("drop reviewed index: %w",
+				nameInterruptedIndexDrop(&executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Hour}, "public", `orders"idx`, time.Hour)),
+			wantReason: "index-drop-timed-out",
+			wantDetail: []string{`DROP INDEX CONCURRENTLY "public"."orders""idx"`},
+		},
+		{
+			name: "a concurrent index drop that lost its lock budget is not named as a timeout",
+			err: fmt.Errorf("drop reviewed index: %w",
+				nameInterruptedIndexDrop(&executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}, "public", "orders_status_idx", time.Hour)),
 		},
 		{
 			name: "lock budget exhaustion is operational",
@@ -1185,6 +1226,15 @@ func TestPartitionedKeyAndDetachOutcomesNameTheirRemedies(t *testing.T) {
 		{code: executor.CodePartitionedKeyNullableColumn, reason: "partitioned-key-nullable-column",
 			cause:  `the planned primary key on "users" covers a column a partition allows to be NULL; nothing was built`,
 			remedy: "make the column NOT NULL on every partition, then re-plan against the current schema"},
+		{code: executor.CodePartitionedKeyUnsupportedShape, reason: "unsupported-statement-shape",
+			cause:  `the key on partitioned table "users" has no name or a clause its partitions cannot carry`,
+			remedy: "name the key and drop that clause in the schema file, then re-plan against the current schema"},
+		{code: executor.CodePartitionedKeyParentConflict, reason: "partitioned-key-parent-conflict",
+			cause:  `partitioned table "users" already has the key's name in use, or a primary key`,
+			remedy: "rename the key in the schema file, or free the name, then re-plan against the current schema"},
+		{code: executor.CodePartitionedKeySubPartitioned, reason: "unsupported-statement-shape",
+			cause:  `a partition of "users" is itself partitioned, which the key build does not run`,
+			remedy: "add the key to that partition by hand, then re-plan against the current schema"},
 	}
 	for _, tt := range tests {
 		t.Run(string(tt.code), func(t *testing.T) {
@@ -1644,7 +1694,7 @@ func TestCommittedCreatePrefixDetail(t *testing.T) {
 func TestClassifyApplyFailureCommittedCreatePrefix(t *testing.T) {
 	err := &executor.SequenceStepError{Step: 2, Total: 3, Err: errors.New("server failure")}
 
-	failure := classifyApplyFailure(err, "users")
+	failure := classifyApplyFailure(err, "users", nil)
 
 	assert.False(t, failure.retryable)
 	assert.True(t, failure.committedPrefix)
@@ -1663,7 +1713,7 @@ func TestClassifyApplyFailureBrokenForeignKey(t *testing.T) {
 		ConstraintName: "orders_user_id_fkey",
 	})
 
-	failure := classifyApplyFailure(err, "orders")
+	failure := classifyApplyFailure(err, "orders", nil)
 
 	assert.True(t, failure.retryable)
 	assert.Equal(t, `existing rows in "orders" break foreign key "orders_user_id_fkey"; the key is in place and checks new writes; fix those rows, then retry`, failure.detail)
@@ -1676,7 +1726,7 @@ func TestClassifyApplyFailureBrokenForeignKey(t *testing.T) {
 func TestClassifyApplyFailureMissingGrant(t *testing.T) {
 	err := fmt.Errorf("add foreign key: %w", &pgconn.PgError{Code: "42501", Message: "permission denied for table users"})
 
-	failure := classifyApplyFailure(err, "orders")
+	failure := classifyApplyFailure(err, "orders", nil)
 
 	assert.True(t, failure.retryable)
 	assert.Equal(t, `the engine role lacks a privilege the statement on "orders" needs, such as REFERENCES on the table a foreign key references; the server log names it; grant it, then retry`, failure.detail)
@@ -3671,7 +3721,7 @@ func TestRecoveryFailureDetailNamesTheAbandonedIndex(t *testing.T) {
 	t.Run("lost proof lock stays retryable and names the index before the lock remedy", func(t *testing.T) {
 		err := wrap(&executor.BudgetError{Cause: executor.CauseLock, Budget: 5 * time.Second})
 		require.Nil(t, classifyRefusal(err, "orders"), "a lock budget lost during recovery is operational")
-		failure := classifyApplyFailure(err, "orders")
+		failure := classifyApplyFailure(err, "orders", nil)
 		assert.True(t, failure.retryable)
 		assert.True(t, failure.lockBudget)
 		detail := recoveryContextDetail(err, failure.detail)
@@ -3709,7 +3759,8 @@ func TestRecoveryFailureDetailNamesTheAbandonedIndex(t *testing.T) {
 // TestProgressIsKeyedToTheRequestingApply proves the engine answers Progress
 // for the apply the caller identifies, not for whichever apply wrote last:
 // one engine is shared for a target's lifetime, so a mismatched identity must
-// read the idle sentinel instead of another schema change's state.
+// read the idle sentinel instead of another schema change's state, and a
+// request with no identity is an error rather than that sentinel.
 func TestProgressIsKeyedToTheRequestingApply(t *testing.T) {
 	eng := New()
 	change := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
@@ -3731,9 +3782,11 @@ func TestProgressIsKeyedToTheRequestingApply(t *testing.T) {
 	assert.Equal(t, "No active schema change", other.Message)
 	assert.False(t, other.State.IsTerminal(), "another apply's identity must never read a terminal state")
 
+	// A request that names no apply has not asked about one, so it never reads
+	// the idle sentinel a caller may take as "nothing runs".
 	anonymous, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
-	require.NoError(t, err)
-	assert.Equal(t, engine.StatePending, anonymous.State)
+	require.ErrorContains(t, err, "PostgreSQL progress request names no apply")
+	assert.Nil(t, anonymous)
 }
 
 // TestConcurrentAppliesEachAnswerForTheirOwnWork proves accepting a second
@@ -4092,4 +4145,38 @@ func TestOnlyAConcurrentIndexBuildSetsTheApplyPercent(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBrokenCheckDetailNamesOnlyTheValidatedConstraint proves the
+// broken-rows detail is given only when the failed step validates the check
+// the server names. A check violation from a step that validates nothing, or
+// one naming a different constraint than the step validates, is not about
+// the rows the validation checks, so it falls through to the generic
+// failure. The detail is built from the constraint name, never the server's
+// message, which can quote row values.
+func TestBrokenCheckDetailNamesOnlyTheValidatedConstraint(t *testing.T) {
+	violation := &pgconn.PgError{
+		Code:           sqlstateCheckViolation,
+		ConstraintName: "accounts_display_name_not_null_check",
+		Message:        `check constraint "accounts_display_name_not_null_check" of relation "accounts" is violated by some row`,
+		Detail:         "Failing row contains (2, null).",
+	}
+	validates := &schemadiff.ConstraintValidation{Constraint: "accounts_display_name_not_null_check"}
+
+	detail, ok := brokenCheckDetail(fmt.Errorf("validate: %w", violation), "accounts", validates)
+	require.True(t, ok)
+	assert.Equal(t, `existing rows in "accounts" break check constraint "accounts_display_name_not_null_check"; the constraint is in place and checks new writes; fix those rows, then retry`, detail)
+	assert.NotContains(t, detail, "Failing row")
+
+	_, ok = brokenCheckDetail(violation, "accounts", nil)
+	assert.False(t, ok, "a step that validates nothing gets no broken-rows detail")
+
+	_, ok = brokenCheckDetail(violation, "accounts", &schemadiff.ConstraintValidation{Constraint: "accounts_other_check"})
+	assert.False(t, ok, "a violation of another constraint is not the validated one")
+
+	_, ok = brokenCheckDetail(&pgconn.PgError{Code: sqlstateForeignKeyViolation, ConstraintName: validates.Constraint}, "accounts", validates)
+	assert.False(t, ok, "only a check violation is a broken check")
+
+	_, ok = brokenCheckDetail(errors.New("connection reset"), "accounts", validates)
+	assert.False(t, ok, "an error that is not a server error is not a broken check")
 }
