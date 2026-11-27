@@ -1835,8 +1835,9 @@ holding `ACCESS EXCLUSIVE`, and the size compared against the ceiling is the
 total relation size summed across the table's partition tree — indexes and
 TOAST included — so an index-heavy table cannot slip under it. Raising the
 ceiling converts an up-front refusal into a bounded attempt, not an unbounded
-lock. An oversized table appears in the plan comment's **Cannot apply** section;
-adjust `postgres.native_safe_table_size_limit_bytes` if operators decide the
+lock. An oversized table appears in the **Cannot apply** section of the plan
+comment and of `schemabot plan`, with its size against the ceiling and the
+option to change; adjust `postgres.native_safe_table_size_limit_bytes` if operators decide the
 target is safe for a bounded attempt. Every apply still runs under short
 `lock_timeout` and `statement_timeout` budgets, so above the ceiling it is the
 statement timeout, not the ceiling, that stops a runaway rewrite. A greenfield

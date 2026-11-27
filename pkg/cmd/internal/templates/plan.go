@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/lintguidance"
 	"github.com/block/schemabot/pkg/presentation"
@@ -601,6 +602,122 @@ func WriteChangeNotice(severity, heading string, changes []UnsafeChange) {
 		fmt.Printf("  %d. %s: %s\n", i+1, c.Table, reason)
 	}
 	fmt.Println()
+}
+
+// BlockedChange is a planned change its engine refuses to run. Causes is the
+// engine's reason split into its independent causes, each a remedy of its
+// own. Shards names the shards it is refused on, empty for a change planned
+// once for its namespace, and TotalShards is how many shards the plan covers.
+type BlockedChange struct {
+	Table  string
+	Causes []string
+	// Steps is how many of the table's statements the reason refuses. Zero
+	// reads as one.
+	Steps       int
+	Shards      []string
+	TotalShards int
+}
+
+// BlockedChangeNotices is the plan's blocked changes, each with its engine's
+// reason split into causes, from the same derivation the PR comment lists.
+func BlockedChangeNotices(result *apitypes.PlanResponse) []BlockedChange {
+	var notices []BlockedChange
+	for _, bc := range result.BlockedChanges() {
+		var causes []string
+		for _, cause := range engine.BlockedCauses(bc.Reason) {
+			if cause = presentation.InlineError(cause); cause != "" {
+				causes = append(causes, cause)
+			}
+		}
+		notices = append(notices, BlockedChange{
+			Table:       bc.Table,
+			Causes:      causes,
+			Steps:       bc.Steps,
+			Shards:      bc.Shards,
+			TotalShards: bc.TotalShards,
+		})
+	}
+	return notices
+}
+
+// WriteBlockedChanges lists the changes the engine refuses to run, under the
+// heading the PR comment uses. Each cause after a change's first is its own
+// line, since each needs its own fix. An apply refuses these whatever its
+// flags, so the section names the refusal rather than asking for consent.
+// heading names what the refused command cannot do, and remedy closes the
+// list with that command's next step.
+func WriteBlockedChanges(changes []BlockedChange, heading, remedy string) {
+	if len(changes) == 0 {
+		return
+	}
+	fmt.Printf("%s %s: %s the engine refuses to execute\n", glyph.Refused, heading, BlockedChangeCount(changes))
+	for _, line := range BlockedChangeLines(changes) {
+		fmt.Printf("  %s\n", line)
+	}
+	fmt.Println()
+	fmt.Println(remedy)
+	fmt.Println()
+}
+
+// BlockedChangeCount counts the statements changes refuse, as "1 change" or
+// "3 changes". A change whose step count is unknown counts as one.
+func BlockedChangeCount(changes []BlockedChange) string {
+	n := 0
+	for _, c := range changes {
+		n += max(c.Steps, 1)
+	}
+	if n == 1 {
+		return "1 change"
+	}
+	return fmt.Sprintf("%d changes", n)
+}
+
+// BlockedChangeLines lists changes one line per table, "- <table>: <cause>",
+// with each further cause on its own indented line, since each needs its
+// own fix.
+func BlockedChangeLines(changes []BlockedChange) []string {
+	var lines []string
+	for _, c := range changes {
+		table := blockedChangeLabel(c)
+		if len(c.Causes) == 0 {
+			lines = append(lines, "- "+table)
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("- %s: %s", table, c.Causes[0]))
+		for _, cause := range c.Causes[1:] {
+			lines = append(lines, "  - "+cause)
+		}
+	}
+	return lines
+}
+
+// blockedChangeLabel names a blocked change's table, with how many of its
+// statements are refused when there are several, and the shards it is
+// refused on, as the PR comment does.
+func blockedChangeLabel(c BlockedChange) string {
+	var details []string
+	if c.Steps > 1 {
+		details = append(details, fmt.Sprintf("%d steps", c.Steps))
+	}
+	if len(c.Shards) > 0 {
+		details = append(details, blockedShardList(c.Shards, c.TotalShards))
+	}
+	if len(details) == 0 {
+		return c.Table
+	}
+	return fmt.Sprintf("%s (%s)", c.Table, strings.Join(details, "; "))
+}
+
+// blockedShardList names the shards a blocked change is refused on: by name
+// when they are few, and as coverage ("all 32 shards") when they are many.
+func blockedShardList(shards []string, total int) string {
+	if len(shards) > presentation.MemberNamesInlineLimit {
+		return presentation.CoveragePhrase(presentation.ShardNoun, len(shards), total)
+	}
+	if len(shards) == 1 {
+		return presentation.ShardNoun.Singular + " " + shards[0]
+	}
+	return presentation.ShardNoun.Plural + " " + strings.Join(shards, ", ")
 }
 
 // WriteUnsafeChangesBlocked writes the unsafe changes list and instruction to re-run with --allow-unsafe.

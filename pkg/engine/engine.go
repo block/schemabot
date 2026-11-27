@@ -302,11 +302,13 @@ type DeferredCutoverSignalRequest struct {
 }
 
 // CancelledArtifactReleaser is an optional capability for engines that leave
-// their unfinished work on the target database as tables the engine itself
-// owns. Such an engine copies rows into its own tables, and cancelling the
+// their unfinished work on the target database as objects the engine itself
+// owns. Such an engine copies rows into its own tables, or adds a constraint
+// of its own to a live table as a step of the change, and cancelling the
 // schema change abandons them: nothing in the engine's own lifecycle reclaims
 // them, and they can outlive the process, the apply, and the pull request that
-// created them.
+// created them. A constraint is the costlier of the two, because it goes on
+// checking the application's writes for as long as it stays.
 //
 // An engine whose unfinished work lives in the service it drives (a remote
 // online-DDL service) must not implement this. Cancelling there releases the
@@ -357,14 +359,22 @@ type CancelledArtifactReleaser interface {
 // table names, not the engine's derived ones — deriving those is the engine's
 // job, because only the engine knows how it names them.
 type ReleaseArtifactsRequest struct {
+	// Database is the schema the tables live in on the target, after any
+	// schema override, not the namespace the schema files name.
 	Database    string
 	Tables      []string
 	Credentials *Credentials
+	// AddedConstraints names, per table, the constraints the cancelled
+	// apply's own statements added: those of its tasks that ran. An engine
+	// removes a constraint a stopped change left only when the apply added
+	// it, since a constraint of the same name that was already on the table
+	// belongs to whatever put it there.
+	AddedConstraints map[string][]string
 }
 
 // ReleaseArtifactsResult reports what a release reclaimed and what it left
 // alone, so a caller can tell an operator where their copy went and what is
-// still on the target. All three are empty when the schema change left nothing
+// still on the target. Every field is empty when the schema change left nothing
 // behind, which is the ordinary outcome for a cancel that arrives before any
 // copying started.
 //
@@ -385,6 +395,33 @@ type ReleaseArtifactsResult struct {
 	// RetainedReason states why Retained was left alone, in terms an operator
 	// can act on. Empty when Retained is empty.
 	RetainedReason string
+	// RemovedConstraints names each constraint the release dropped: one the
+	// schema change added to a live table as a step of the change.
+	RemovedConstraints []EngineConstraint
+	// RemainingConstraints names each such constraint the release found and
+	// could not drop, with the statement that drops it by hand. It still
+	// checks the application's writes.
+	RemainingConstraints []EngineConstraint
+	// PreexistingConstraints names each constraint of the same kind the
+	// release found and left because the schema change did not add it, with
+	// the statement that drops it by hand. It still checks the application's
+	// writes.
+	PreexistingConstraints []EngineConstraint
+}
+
+// EngineConstraint is a constraint an engine added to a live table as a step
+// of a schema change.
+type EngineConstraint struct {
+	// Table is the constraint's table, as schema.table.
+	Table string
+	// Name is the constraint's name.
+	Name string
+	// Effect says what the constraint does to writes while it stays, such
+	// as `rejects writes that leave "email" NULL`.
+	Effect string
+	// Removal is the statement that drops the constraint by hand. Set only
+	// on a remaining or preexisting constraint.
+	Removal string
 }
 
 // PreservedArtifact records where a cancelled schema change's copied data was

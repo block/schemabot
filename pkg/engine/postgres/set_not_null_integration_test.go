@@ -107,9 +107,32 @@ func TestEngineApplySetNotNullOverANullRow(t *testing.T) {
 }
 
 // When the retries run out before the owner fixes the row, the helper the
-// failed validation left stays NOT VALID. An owner who drops the helper
-// outside SchemaBot gets the same four steps as the first plan, and they
-// finish the change.
+// failed validation left stays NOT VALID. The owner fixes the row and plans
+// again. The plan recognizes the helper as the sequence's own, so it plans no
+// drop of live structure and nothing in it is unsafe: it starts at the
+// helper's validation, and it finishes the change.
+func TestEngineApplySetNotNullResumesAtTheHelperARunLeft(t *testing.T) {
+	db, dsn, eng, plan := failSetNotNullOverANullRow(t, "apply_set_not_null_helper_left_test")
+
+	_, err := db.ExecContext(t.Context(), `UPDATE public.accounts SET display_name = 'Grace' WHERE id = 2`)
+	require.NoError(t, err)
+	replan := planForeignKeyFiles(t, eng, "apply_set_not_null_helper_left_test", dsn, setNotNullOverANullRowFiles)
+	require.Len(t, replan.Changes, 1)
+	assert.Equal(t, ddlOf(plan.Changes[0].TableChanges[1:]), ddlOf(replan.Changes[0].TableChanges),
+		"the plan is the original sequence from the helper's validation on")
+	for _, tc := range replan.Changes[0].TableChanges {
+		assert.False(t, tc.IsUnsafe, "%s: the helper is the sequence's own, so no step is unsafe", tc.DDL)
+	}
+	for _, progress := range applyPlannedSteps(t, eng, dsn, replan) {
+		assert.Equal(t, engine.StateCompleted, progress.State, progress.ErrorMessage)
+	}
+	assert.True(t, columnNotNull(t, db, "accounts", "display_name"))
+	assert.Zero(t, constraintCount(t, db, "accounts", "accounts_display_name_not_null_check"), "the helper is dropped")
+}
+
+// An owner whose retries ran out can instead drop the helper outside
+// SchemaBot. The plan after that is the same four steps as the first one, and
+// it finishes the change.
 func TestEngineApplySetNotNullAfterTheHelperIsDropped(t *testing.T) {
 	db, dsn, eng, plan := failSetNotNullOverANullRow(t, "apply_set_not_null_helper_dropped_test")
 

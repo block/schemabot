@@ -257,17 +257,26 @@ func TestReviewDriftComment_IndependentDisclosesDirectMember(t *testing.T) {
 }
 
 // A target can carry the same verdict on one table in more than one namespace:
-// orders-001 runs `users` directly in both `ns_0` and `ns_1`, while orders-002
-// runs the same statements through Spirit. The disclosure names orders-001
-// once, and still names it, so orders-002 is not reported as running
-// write-blocking DDL, or as refusing a change, that it does not.
+// orders-001 runs `users` directly, or has it refused, in both `ns_0` and
+// `ns_1`, while orders-002 runs the same statements through Spirit. Each entry
+// names orders-001 once, and orders-002 is not reported as running
+// write-blocking DDL, or as refusing a change, that it does not. Either verdict
+// names each namespace's table, since each is its own relation, as the CLI and
+// the primary plan's comment do.
 func TestReviewDriftComment_VerdictInTwoNamespacesNamesItsTargetOnce(t *testing.T) {
 	const alter = "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
 	for _, tc := range []struct {
-		mode, reason, line string
+		mode, reason string
+		tables       []string
+		lines        []string
 	}{
-		{engine.ExecutionModeDirect, "table is 12 MiB, within the direct execution bound", "- `users` on target `commerce/orders-001`: table is 12 MiB, within the direct execution bound\n"},
-		{engine.ExecutionModeBlocked, "", "- `users` on target `commerce/orders-001`\n"},
+		{engine.ExecutionModeDirect, "table is 12 MiB, within the direct execution bound", []string{"ns_0.users", "ns_1.users"},
+			[]string{
+				"- `ns_0.users` on target `commerce/orders-001`: table is 12 MiB, within the direct execution bound\n",
+				"- `ns_1.users` on target `commerce/orders-001`: table is 12 MiB, within the direct execution bound\n",
+			}},
+		{engine.ExecutionModeBlocked, "", []string{"ns_0.users", "ns_1.users"},
+			[]string{"- `ns_0.users` on target `commerce/orders-001`\n", "- `ns_1.users` on target `commerce/orders-001`\n"}},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
 			memberDiff := func(target, mode string) api.DeploymentPlanDiff {
@@ -296,14 +305,19 @@ func TestReviewDriftComment_VerdictInTwoNamespacesNamesItsTargetOnce(t *testing.
 					verdicts = append(verdicts, templates.BlockedChangeData(dc))
 				}
 			}
-			require.Len(t, verdicts, 1, "one table, one reason")
-			assert.Equal(t, []string{"commerce/orders-001"}, verdicts[0].Targets, "the target is named once, and the one that runs through Spirit is not named")
-			assert.Equal(t, 2, verdicts[0].TotalTargets)
+			require.Len(t, verdicts, len(tc.tables))
+			for i, v := range verdicts {
+				assert.Equal(t, tc.tables[i], v.Table)
+				assert.Equal(t, []string{"commerce/orders-001"}, v.Targets, "the target is named once, and the one that runs through Spirit is not named")
+				assert.Equal(t, 2, v.TotalTargets)
+			}
 
 			out := templates.RenderPlanComment(templates.PlanCommentData{
 				Database: "orders", Environment: "production", IsMySQL: true, DeploymentDrift: deploymentDriftPreview(rollup),
 			})
-			assert.Contains(t, out, tc.line, "the disclosure names only the target that carries the verdict")
+			for _, line := range tc.lines {
+				assert.Contains(t, out, line, "the disclosure names only the target that carries the verdict")
+			}
 		})
 	}
 }
@@ -466,4 +480,109 @@ func renderLintComment(t *testing.T, diffs ...api.DeploymentPlanDiff) string {
 		LintViolations:  primaryLint,
 		DeploymentDrift: deploymentDriftPreview(rollup),
 	})
+}
+
+// An independently planned target refuses four statements on `events` for one
+// reason. The target group's disclosure names the table once with its four
+// steps, the way the CLI and the primary plan's comment count them, rather
+// than as one change.
+func TestReviewDriftComment_RefusedStatementsKeepTheirStepCount(t *testing.T) {
+	const reason = "the table is 1.4 GiB with its indexes"
+	memberDiff := func(target string) api.DeploymentPlanDiff {
+		diff := api.DeploymentPlanDiff{DatabaseType: "postgres", Deployment: "commerce", Target: target}
+		var changes []*ternv1.TableChange
+		for i := range 4 {
+			changes = append(changes, &ternv1.TableChange{
+				TableName: "events", Ddl: fmt.Sprintf("ALTER TABLE public.events VALIDATE CONSTRAINT c%d", i),
+				ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "public",
+				ExecutionMode: engine.ExecutionModeBlocked, ModeReason: reason,
+			})
+		}
+		diff.Changes = []*ternv1.SchemaChange{{Namespace: "public", TableChanges: changes}}
+		return diff
+	}
+	diffs := []api.DeploymentPlanDiff{memberDiff("orders-001"), memberDiff("orders-002")}
+
+	rollup, err := api.RollupDeploymentDiffs(diffs, driftMembers(diffs), api.PlanIndependent)
+	require.NoError(t, err)
+	groups := deploymentPlanGroups(rollup)
+	require.Len(t, groups, 1)
+	require.Len(t, groups[0].BlockedChanges, 1, "one table, one reason")
+	assert.Equal(t, "events", groups[0].BlockedChanges[0].Table)
+	assert.Equal(t, 4, groups[0].BlockedChanges[0].Steps)
+
+	out := templates.RenderPlanComment(templates.PlanCommentData{
+		Database: "orders", Environment: "production", DeploymentDrift: deploymentDriftPreview(rollup),
+	})
+	assert.Contains(t, out, "`events` (4 steps)")
+}
+
+// Two targets run the same work on `public.events` and `archive.audit`, and
+// their engines refuse different parts of it. A refusal both targets carry is
+// listed once, whether or not each target's own list qualified the table name,
+// and the group qualifies every name once its refusals span both namespaces.
+// A target that refuses fewer of the table's statements carries a different
+// verdict, listed under it with its own step count.
+func TestDeploymentPlanGroups_MatchRefusalsAcrossTargetsOnNamespaceAndSteps(t *testing.T) {
+	const reason = "the table is 1.4 GiB with its indexes"
+	memberDiff := func(target string, blockedEvents int, blockAudit bool) api.DeploymentPlanDiff {
+		mode := func(blocked bool) string {
+			if blocked {
+				return engine.ExecutionModeBlocked
+			}
+			return ""
+		}
+		var events []*ternv1.TableChange
+		for i := range 2 {
+			events = append(events, &ternv1.TableChange{
+				TableName: "events", Ddl: fmt.Sprintf("ALTER TABLE public.events VALIDATE CONSTRAINT c%d", i),
+				ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "public",
+				ExecutionMode: mode(i < blockedEvents), ModeReason: reason,
+			})
+		}
+		audit := &ternv1.TableChange{
+			TableName: "audit", Ddl: "ALTER TABLE archive.audit VALIDATE CONSTRAINT c0",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "archive",
+			ExecutionMode: mode(blockAudit), ModeReason: reason,
+		}
+		diff := api.DeploymentPlanDiff{DatabaseType: "postgres", Deployment: "commerce", Target: target}
+		diff.Changes = []*ternv1.SchemaChange{
+			{Namespace: "public", TableChanges: events},
+			{Namespace: "archive", TableChanges: []*ternv1.TableChange{audit}},
+		}
+		return diff
+	}
+
+	for _, tc := range []struct {
+		name        string
+		second      api.DeploymentPlanDiff
+		wantBlocked []templates.BlockedChangeData
+	}{
+		{
+			name:   "same refusal, qualified on one target only",
+			second: memberDiff("orders-002", 2, false),
+			wantBlocked: []templates.BlockedChangeData{
+				{Namespace: "public", Table: "public.events", Reason: reason, Steps: 2},
+				{Namespace: "archive", Table: "archive.audit", Reason: reason, Steps: 1, Targets: []string{"commerce/orders-001"}, TotalTargets: 2},
+			},
+		},
+		{
+			name:   "fewer statements refused",
+			second: memberDiff("orders-002", 1, false),
+			wantBlocked: []templates.BlockedChangeData{
+				{Namespace: "public", Table: "public.events", Reason: reason, Steps: 2, Targets: []string{"commerce/orders-001"}, TotalTargets: 2},
+				{Namespace: "archive", Table: "archive.audit", Reason: reason, Steps: 1, Targets: []string{"commerce/orders-001"}, TotalTargets: 2},
+				{Namespace: "public", Table: "public.events", Reason: reason, Steps: 1, Targets: []string{"commerce/orders-002"}, TotalTargets: 2},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			diffs := []api.DeploymentPlanDiff{memberDiff("orders-001", 2, true), tc.second}
+			rollup, err := api.RollupDeploymentDiffs(diffs, driftMembers(diffs), api.PlanIndependent)
+			require.NoError(t, err)
+			groups := deploymentPlanGroups(rollup)
+			require.Len(t, groups, 1, "both targets run the same work")
+			assert.Equal(t, tc.wantBlocked, groups[0].BlockedChanges)
+		})
+	}
 }
