@@ -1403,10 +1403,14 @@ leaves. See [Index builds](#index-builds).
   so rollback leaves it in place and lists it as exempt.
 - A plan can be rolled back only when SchemaBot captured the original of every
   table it manages.
-- The originals carry each table's RLS settings and policies. Rolling back a
-  structural change leaves the policies as they are; rolling back a policy
-  change plans the reverse replacement, which needs consent like any policy
-  change.
+- The originals carry the RLS settings and policies of every managed table
+  that has them, including a table whose schema file declares only the
+  table. Rolling back a structural change leaves the policies as they are.
+  Rolling back a policy change plans the reverse replacement, which needs
+  consent like any policy change. A policy changed by hand after the plan is
+  reverted too, and the rollback plan lists it.
+- A namespace cannot be rolled back when one of its managed tables has RLS
+  and a foreign key. A schema file cannot declare both on one table yet.
 - The originals carry foreign keys. Rolling back a plan that added a foreign
   key shows the key's drop as a blocked step, since SchemaBot does not drop
   foreign keys yet.

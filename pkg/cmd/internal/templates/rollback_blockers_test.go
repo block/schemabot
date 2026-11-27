@@ -40,7 +40,7 @@ func rollbackBlockersSurfaces(t *testing.T, blockers []apitypes.SkippedTable) (c
 func TestRollbackBlockersSurfacesSaySameSentence(t *testing.T) {
 	cli, comment := rollbackBlockersSurfaces(t, []apitypes.SkippedTable{{Table: "orders", Reason: notValidReason}})
 
-	sentence := "No rollback for namespace public: rollback needs a schema file for every table in the namespace, and SchemaBot can't write one yet for the tables below. The apply still runs. To undo it, revert the schema files in a new pull request."
+	sentence := "No rollback for namespace public: rollback needs a schema file for every table the plan manages, and SchemaBot can't write one yet for the tables below. The apply still runs. To undo it, revert the schema files in a new pull request."
 	assert.Contains(t, cli, "⚠️  "+sentence+"\n     - orders: "+notValidReason+"\n")
 	assert.Contains(t, strings.ReplaceAll(comment, "`", ""), "⚠️ "+sentence+"\n\n- orders: "+notValidReason+"\n")
 }

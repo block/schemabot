@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -204,6 +205,33 @@ func TestEnginePlanRefusesDuplicateRowSecurityDeclarations(t *testing.T) {
   WHERE polrelid='public.documents'::regclass AND polname='readers'
  `).Scan(&predicate))
 	assert.Equal(t, "(id = 1)", predicate)
+}
+
+// An owner plans a change in a namespace where `documents` has row security
+// and a foreign key to `accounts`. A schema file cannot declare both on one
+// table, so SchemaBot cannot write `documents`' original, and the plan names
+// it as what blocks the rollback rather than capturing a rollback that would
+// leave its policies out (RV-7).
+func TestCaptureOriginalFilesBlocksRowSecurityItCannotRender(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "capture_rls_fk")
+	_, err := db.ExecContext(t.Context(), `
+  CREATE TABLE public.accounts (id bigint PRIMARY KEY);
+  CREATE TABLE public.documents (id bigint PRIMARY KEY, account_id bigint REFERENCES public.accounts (id));
+  ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON public.documents FOR SELECT USING (id = 1);
+ `)
+	require.NoError(t, err)
+	pool, err := pgxpool.New(t.Context(), dsn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	for _, declared := range []map[string]bool{nil, {"documents": true}} {
+		files, blockers, err := captureOriginalFiles(t.Context(), pool, "capture_rls_fk", "public", nil, declared, engine.IgnoredTables{})
+		require.NoError(t, err)
+		assert.Equal(t, []engine.RollbackBlocker{{Table: "documents", Reason: "foreign keys are not supported in desired row security"}}, blockers,
+			"whether or not the forward file declares row security, the table whose original cannot be written blocks the rollback")
+		assert.Nil(t, files, "no partial rollback is captured")
+	}
 }
 
 // An operator secures a table that had no row security, either by enabling

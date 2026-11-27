@@ -3026,8 +3026,21 @@ func TestEnginePlanTableChangeBesideDeclaredRowSecurity(t *testing.T) {
 	_, err = planFile("CREATE POLICY readers ON documents FOR SELECT USING (id = 2);\n")
 	var refused *engine.PlanRefusedError
 	require.ErrorAs(t, err, &refused)
-	assert.ErrorContains(t, err, `table "documents" changes its row security and its definition in one file, which SchemaBot cannot run as one reviewed change; change the row security in one pull request and the table in another`)
+	const mixed = `table "documents" changes its row security and its definition in one file, which SchemaBot cannot run as one reviewed change; change the row security in one pull request and the table in another`
+	assert.True(t, strings.HasSuffix(err.Error(), mixed), "the refusal ends on the remedy: %s", err)
+	assert.ErrorIs(t, err, schemadiff.ErrUnsupportedChange)
 	assert.NotContains(t, err.Error(), "migrate.", "the refusal names what the author does, not a library function")
+
+	_, err = New().Plan(ctx, &engine.PlanRequest{
+		Database: database, Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"documents.sql": "CREATE UNLOGGED TABLE documents (id bigint PRIMARY KEY);\n" +
+				"ALTER TABLE documents ENABLE ROW LEVEL SECURITY;\n" +
+				"CREATE POLICY readers ON documents FOR SELECT USING (id = 2);\n",
+		}}},
+	})
+	require.ErrorAs(t, err, &refused)
+	assert.True(t, strings.HasSuffix(err.Error(), mixed), "a table change the planner refuses still reads as a mixed file: %s", err)
 }
 
 // Forward structural planning remains available for RLS tables and siblings.

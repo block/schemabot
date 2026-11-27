@@ -612,7 +612,7 @@ ALTER TABLE app.users ADD COLUMN email text;
 
 📋 **Plan**: **1** table to alter
 
-⚠️ No rollback for namespace `app`: rollback needs a schema file for every table in the namespace, and SchemaBot can't write one yet for the tables below. The apply still runs. To undo it, revert the schema files in a new pull request.
+⚠️ No rollback for namespace `app`: rollback needs a schema file for every table the plan manages, and SchemaBot can't write one yet for the tables below. The apply still runs. To undo it, revert the schema files in a new pull request.
 
 - `orders`: holds a foreign key added NOT VALID, which a schema file cannot declare
 
