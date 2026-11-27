@@ -2,6 +2,7 @@ package localdemo
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -225,4 +226,31 @@ func sampleContainerWithProxyPorts(hostStart int) container {
 		}
 	}
 	return c
+}
+
+// Setup downloads the cluster image while the state database starts, so the
+// wait it reports has to describe what is actually left. A cached image is
+// collected without announcing a wait that never happened; a download still in
+// flight when the state database is ready says so before blocking on it.
+func TestAwaitImageReportsOnlyAWaitThatHappens(t *testing.T) {
+	cached := make(chan error, 1)
+	cached <- nil
+	var reported []string
+	require.NoError(t, awaitImage(cached, "example:latest", func(stage string) {
+		reported = append(reported, stage)
+	}))
+	require.Empty(t, reported, "a cached image should not announce a wait")
+
+	// The download finishes only once the wait is reported, so the ordering the
+	// test asserts cannot depend on which goroutine runs first.
+	pending := make(chan error, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- awaitImage(pending, "example:latest", func(stage string) {
+			reported = append(reported, stage)
+			pending <- errors.New("pull refused")
+		})
+	}()
+	require.ErrorContains(t, <-done, "pull refused")
+	require.Equal(t, []string{"Waiting for example:latest"}, reported)
 }

@@ -78,14 +78,6 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 	if err := requireLocalDocker(ctx); err != nil {
 		return Database{}, err
 	}
-	storage, err := ensureSQL(ctx, sqlSample{
-		project: project, engine: "mysql", label: "vitess-storage",
-		seed: "CREATE DATABASE schemabot;\n", seedStage: "Preparing SchemaBot's own database",
-	}, report)
-	if err != nil {
-		return Database{}, fmt.Errorf("prepare the sample's state database: %w", err)
-	}
-
 	name, err := sampleName(project, "vitess")
 	if err != nil {
 		return Database{}, err
@@ -96,9 +88,31 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 	if err != nil {
 		return Database{}, err
 	}
-	if strings.TrimSpace(string(listed)) == "" {
+	needsCluster := strings.TrimSpace(string(listed)) == ""
+
+	// The cluster image and the state database are independent: one is
+	// downloaded, the other is a second container that starts and seeds itself.
+	// Download while the state database comes up, so the state database costs
+	// nothing on the run where the download dominates setup.
+	var pulled chan error
+	if needsCluster {
 		report("Preparing " + image + " (downloading if needed)")
-		if err = ensureImage(ctx, image); err != nil {
+		pullCtx, cancelPull := context.WithCancel(ctx)
+		defer cancelPull()
+		pulled = make(chan error, 1)
+		go func() { pulled <- ensureImage(pullCtx, image) }()
+	}
+
+	storage, err := ensureSQL(ctx, sqlSample{
+		project: project, engine: "mysql", label: "vitess-storage",
+		seed: "CREATE DATABASE schemabot;\n", seedStage: "Preparing SchemaBot's own database",
+	}, report)
+	if err != nil {
+		return Database{}, fmt.Errorf("prepare the sample's state database: %w", err)
+	}
+
+	if needsCluster {
+		if err = awaitImage(pulled, image, report); err != nil {
 			return Database{}, err
 		}
 		// The API port and the proxy ports are reserved as one block, so the
@@ -212,6 +226,20 @@ func sampleProxyBase(c container) (int, error) {
 		return 0, fmt.Errorf("proxy port %d is published on %q: %w", sampleProxyPortStart, bindings[0].HostPort, err)
 	}
 	return port, nil
+}
+
+// awaitImage collects the cluster image download that setup started alongside
+// the state database. The wait is reported only when the download is still
+// running, so a cached image announces nothing rather than a wait that did not
+// happen.
+func awaitImage(pulled <-chan error, image string, report func(string)) error {
+	select {
+	case err := <-pulled:
+		return err
+	default:
+	}
+	report("Waiting for " + image)
+	return <-pulled
 }
 
 // sampleProxyPortMap reads what host port each of the container's proxy ports
