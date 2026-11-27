@@ -411,6 +411,9 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 			continue
 		}
 		writeChangeDetail(plans[i], work[i], isApply)
+		// Under its group's heading, a blocked change names the members it
+		// is refused on.
+		templates.WriteBlockedChanges(templates.BlockedChangeNotices(plans[i]), presentation.BlockedChangesHeading, presentation.BlockedChangesRemedy)
 		rolloutWork = append(rolloutWork, work[i])
 	}
 	if lint := result.LintNonErrors(); len(lint) > 0 {
@@ -648,6 +651,10 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 	templates.WriteExemptTables(result.ExemptTables)
 	templates.WriteUnmatchedDropTables(shownUnmatchedDropTables(result))
 	templates.WriteRollbackBlockers(result.Changes)
+	// The plan closes on its verdict: a blocked change is refused whatever
+	// the apply's flags, so the last thing read is that it cannot apply and
+	// why, in plan and in apply's preview before its refusal.
+	templates.WriteBlockedChanges(templates.BlockedChangeNotices(result), presentation.BlockedChangesHeading, presentation.BlockedChangesRemedy)
 }
 
 // writePlanGuidance links the guides for the lint findings the output shows.
@@ -846,6 +853,12 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	for _, change := range result.UnsafeChanges() {
 		unsafeFindings = append(unsafeFindings, change.Table+":"+change.ChangeType+":"+change.Reason)
 	}
+	// A refusal is part of what the plan's output says, so two plans that run
+	// the same DDL but are refused differently render apart.
+	var blocked []string
+	for _, bc := range result.BlockedChanges() {
+		blocked = append(blocked, fmt.Sprintf("%s:%s:%d:%s", bc.Table, bc.Reason, bc.Steps, strings.Join(bc.Shards, ",")))
+	}
 	var lint []string
 	for _, violation := range result.LintNonErrors() {
 		lint = append(lint, violation.Table+":"+violation.Message)
@@ -864,6 +877,7 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	sort.Strings(vschemas)
 	finalizes = slices.Compact(slices.Sorted(slices.Values(finalizes)))
 	sort.Strings(unsafeFindings)
+	sort.Strings(blocked)
 	sort.Strings(lint)
 	sort.Strings(exempt)
 	unmatchedDrops := slices.Sorted(slices.Values(result.UnmatchedDropTables))
@@ -873,10 +887,11 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 		VSchemas  []string `json:"vschemas"`
 		Finalizes []string `json:"finalizes"`
 		Unsafe    []string `json:"unsafe"`
+		Blocked   []string `json:"blocked"`
 		Lint      []string `json:"lint"`
 		Exempt    []string `json:"exempt"`
 		Unmatched []string `json:"unmatched_drop_tables"`
-	}{ddls, vschemas, finalizes, unsafeFindings, lint, exempt, unmatchedDrops})
+	}{ddls, vschemas, finalizes, unsafeFindings, blocked, lint, exempt, unmatchedDrops})
 	return string(data)
 }
 

@@ -166,7 +166,16 @@ func TestApplyCmd_BlockedPrimaryRefusesBeforeLockOrPrompt(t *testing.T) {
 						var runErr error
 						out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint}) }))
 
-						assert.EqualError(t, runErr, `apply blocked: plan plan-blocked contains a blocked change for table "users": direct execution is disabled`)
+						label := "users"
+						if work == "shard-only" {
+							label = "users (shard -80)"
+						}
+						if output == OutputFormatJSON {
+							assert.EqualError(t, runErr, "apply refused: 1 change the engine refuses to execute:\n- "+label+": direct execution is disabled")
+						} else {
+							assert.EqualError(t, runErr, "apply refused: 1 change the engine refuses to execute (listed above)")
+							assert.Contains(t, out, "- "+label+": direct execution is disabled", "the list the error points at")
+						}
 						if output == OutputFormatJSON {
 							assert.NotContains(t, out, "DROP PRIMARY KEY", "JSON output renders no plan; the error carries the refusal")
 						} else {
@@ -220,8 +229,7 @@ func TestApplyCmd_BlockedPrimaryRefusalNamesTableAndReason(t *testing.T) {
 	captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint}) })
 
 	require.Error(t, runErr)
-	assert.Contains(t, runErr.Error(), `"users"`)
-	assert.Contains(t, runErr.Error(), reason)
+	assert.Contains(t, runErr.Error(), "- users: "+reason)
 	assert.NotContains(t, runErr.Error(), "change the schema files")
 	recorded.mu.Lock()
 	defer recorded.mu.Unlock()
@@ -237,9 +245,8 @@ func TestApplyCmd_BlockedPrimaryRefusalListsEachCause(t *testing.T) {
 		"direct execution is enabled but the table is above the configured limit of 1,000,000 rows",
 		"the target denies a grant the kill needs: grant it PROCESS, then plan again",
 	})
-	want := "apply blocked: plan plan-blocked contains a blocked change for table \"users\":\n" +
-		"- direct execution is enabled but the table is above the configured limit of 1,000,000 rows\n" +
-		"- the target denies a grant the kill needs: grant it PROCESS, then plan again"
+	causes := "- users: direct execution is enabled but the table is above the configured limit of 1,000,000 rows\n" +
+		"  - the target denies a grant the kill needs: grant it PROCESS, then plan again"
 	for _, output := range []OutputFormat{OutputFormatInteractive, OutputFormatJSON} {
 		t.Run(string(output), func(t *testing.T) {
 			plan := planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
@@ -252,11 +259,14 @@ func TestApplyCmd_BlockedPrimaryRefusalListsEachCause(t *testing.T) {
 			var runErr error
 			out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint}) }))
 
-			assert.EqualError(t, runErr, want)
 			if output == OutputFormatJSON {
+				assert.EqualError(t, runErr, "apply refused: 1 change the engine refuses to execute:\n"+causes)
 				assert.Empty(t, out)
 			} else {
+				assert.EqualError(t, runErr, "apply refused: 1 change the engine refuses to execute (listed above)")
 				assert.Contains(t, out, "ALTER TABLE `users` DROP PRIMARY KEY")
+				assert.Contains(t, out, "  - users: direct execution is enabled but the table is above the configured limit of 1,000,000 rows\n"+
+					"    - the target denies a grant the kill needs: grant it PROCESS, then plan again", "the list the error points at")
 			}
 			recorded.mu.Lock()
 			defer recorded.mu.Unlock()
@@ -292,7 +302,8 @@ func TestApplyCmd_BlockedPrimaryRefusesBeforeMemberReruns(t *testing.T) {
 	var runErr error
 	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint}) }))
 
-	assert.EqualError(t, runErr, `apply blocked: plan plan-blocked contains a blocked change for table "users": direct execution is enabled but the table is above the configured limit of 1,000,000 rows`)
+	assert.EqualError(t, runErr, "apply refused: 1 change the engine refuses to execute (listed above)")
+	assert.Contains(t, out, "- users: direct execution is enabled but the table is above the configured limit of 1,000,000 rows")
 	assert.NotContains(t, out, "then apply the rollout again for the rest")
 	recorded.mu.Lock()
 	defer recorded.mu.Unlock()

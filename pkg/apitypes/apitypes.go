@@ -4,6 +4,7 @@
 package apitypes
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -1484,6 +1485,170 @@ func (r *PlanResponse) eachUnsafeChange(fn func(namespace string, c UnsafeChange
 // apply before it starts.
 func (r *PlanResponse) HasBlockedChanges() bool {
 	return r.FirstBlockedChange() != nil
+}
+
+// BlockedChange is a planned change its engine refuses to run. Statements on
+// one table refused for the same reason are named once, with how many there
+// are, and a change refused on several shards is named once, with the shards
+// it is refused on.
+type BlockedChange struct {
+	// Namespace is the change's namespace, or the plan's database for a change
+	// that names none.
+	Namespace string
+	// Table is the table's name, qualified with its namespace when the plan's
+	// blocked changes span more than one namespace, so two tables that share a
+	// name read apart.
+	Table  string
+	Reason string
+	// Steps is how many of the table's planned statements the reason refuses,
+	// counted once per shard.
+	Steps int
+	// Shards lists the shards the change is refused on, in plan order. It is
+	// empty for a change planned once for its namespace. TotalShards is the
+	// number of shards the plan covers in the namespace, so a renderer can say
+	// "all shards".
+	Shards      []string
+	TotalShards int
+}
+
+// BlockedChanges returns the plan's changes that carry the blocked verdict, in
+// plan order. Every surface that says a plan cannot be applied lists these,
+// so the CLI and the PR comment name the same changes for the same reasons.
+// A namespace with shard rows is read per shard, so a change refused on one
+// shard names it; a namespace without them is read from its namespace-level
+// changes, as RenderedTables reads a mixed plan.
+func (r *PlanResponse) BlockedChanges() []BlockedChange {
+	if r == nil {
+		return nil
+	}
+	shardsByNamespace := make(map[string][]*ShardPlanResponse)
+	var shardNamespaces []string
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		if _, seen := shardsByNamespace[sp.Namespace]; !seen {
+			shardNamespaces = append(shardNamespaces, sp.Namespace)
+		}
+		shardsByNamespace[sp.Namespace] = append(shardsByNamespace[sp.Namespace], sp)
+	}
+
+	var grouped blockedChangeGroups
+	read := make(map[string]bool)
+	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
+		shards, sharded := shardsByNamespace[sc.Namespace]
+		if sharded && !read[sc.Namespace] {
+			read[sc.Namespace] = true
+			grouped.addShards(cmp.Or(sc.Namespace, r.Database), shards)
+		}
+		// A refusal the shard rows do not carry is still the namespace's, and
+		// the apply gate refuses it, so the list names it beside the shards'.
+		// A namespace listed twice is read each time.
+		for _, t := range sc.TableChanges {
+			if !t.EngineBlocked() {
+				continue
+			}
+			namespace := cmp.Or(sc.Namespace, t.Namespace, r.Database)
+			if sharded && grouped.carriedByShards(namespace, t) {
+				continue
+			}
+			grouped.add(namespace, t).Steps++
+		}
+	}
+	// Shard rows for a namespace the namespace-level changes do not list are
+	// still the plan's work, so their refusals are listed too.
+	for _, ns := range shardNamespaces {
+		if !read[ns] {
+			grouped.addShards(cmp.Or(ns, r.Database), shardsByNamespace[ns])
+		}
+	}
+	return grouped.list()
+}
+
+// blockedChangeGroups collects blocked changes keyed by namespace, table and
+// reason, in the order each key is first seen.
+type blockedChangeGroups struct {
+	order []*BlockedChange
+	byKey map[[3]string]*BlockedChange
+}
+
+// add returns the group for the change's namespace, table and reason,
+// creating it on first sight.
+func (g *blockedChangeGroups) add(namespace string, t *TableChangeResponse) *BlockedChange {
+	k := [3]string{namespace, t.TableName, t.ModeReason}
+	if bc := g.byKey[k]; bc != nil {
+		return bc
+	}
+	if g.byKey == nil {
+		g.byKey = make(map[[3]string]*BlockedChange)
+	}
+	bc := &BlockedChange{Namespace: namespace, Table: t.TableName, Reason: withoutTableSubject(t.TableName, t.ModeReason)}
+	g.byKey[k] = bc
+	g.order = append(g.order, bc)
+	return bc
+}
+
+// carriedByShards reports whether a shard row already lists the change's
+// refusal, so the namespace-level copy of it is not counted twice.
+func (g *blockedChangeGroups) carriedByShards(namespace string, t *TableChangeResponse) bool {
+	bc := g.byKey[[3]string{namespace, t.TableName, t.ModeReason}]
+	return bc != nil && len(bc.Shards) > 0
+}
+
+// withoutTableSubject drops the engine's "statement for table "t"" lead-in
+// from each cause of a blocked reason. Every surface that lists blocked
+// changes names the table beside its reason, so the lead-in would say it
+// twice. A cause whose sentence continues from the lead-in, rather than after
+// a colon, keeps "the statement" as its subject.
+func withoutTableSubject(table, reason string) string {
+	subject := fmt.Sprintf("statement for table %q", table)
+	reason = strings.ReplaceAll(reason, subject+": ", "")
+	return strings.ReplaceAll(reason, subject+" ", "the statement ")
+}
+
+// addShards groups one namespace's blocked per-shard changes by table and
+// reason, so a change refused on several shards is listed once with them. Its
+// step count is the most statements any one shard carries for it.
+func (g *blockedChangeGroups) addShards(namespace string, shards []*ShardPlanResponse) {
+	for _, sp := range shards {
+		stepsOnShard := make(map[*BlockedChange]int)
+		for _, t := range sp.Changes {
+			if !t.EngineBlocked() {
+				continue
+			}
+			bc := g.add(namespace, t)
+			bc.TotalShards = len(shards)
+			if stepsOnShard[bc] == 0 {
+				bc.Shards = append(bc.Shards, sp.Shard)
+			}
+			stepsOnShard[bc]++
+			bc.Steps = max(bc.Steps, stepsOnShard[bc])
+		}
+	}
+}
+
+// list returns the groups in first-seen order, each table qualified with its
+// namespace when the groups span more than one.
+func (g *blockedChangeGroups) list() []BlockedChange {
+	if len(g.order) == 0 {
+		return nil
+	}
+	namespaces := make(map[string]bool)
+	for _, bc := range g.order {
+		namespaces[bc.Namespace] = true
+	}
+	out := make([]BlockedChange, 0, len(g.order))
+	for _, bc := range g.order {
+		change := *bc
+		if len(namespaces) > 1 && change.Namespace != "" {
+			change.Table = change.Namespace + "." + change.Table
+		}
+		out = append(out, change)
+	}
+	return out
 }
 
 // FirstBlockedChange returns the first planned change carrying the blocked
