@@ -1177,7 +1177,7 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
 		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable,
 		executor.CodeUnsupportedAcceptedBlocking, executor.CodeNotCreateIndex,
-		executor.CodeNotAddKeyConstraint:
+		executor.CodeNotAddKeyConstraint, executor.CodeNotAddForeignKey:
 		// Shape refusals: the executor refused the statement's form at
 		// admission, so retrying the identical plan refails the same way.
 		return &refusal{reason: "unsupported-statement-shape",
@@ -1302,6 +1302,40 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "unsupported-statement-shape",
 			cause:  fmt.Sprintf("a partition of %s is itself partitioned, which the key build does not run", quotedTable(table)),
 			remedy: "add the key to that partition by hand, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeyNameTaken:
+		// The build left the occupant alone, so only an operator freeing the
+		// name, or the schema file choosing another, changes the outcome.
+		return &refusal{reason: "partitioned-foreign-key-name-taken",
+			cause:  fmt.Sprintf("a name the foreign key on partitioned table %s needs on a partition is held by another constraint", quotedTable(table)),
+			remedy: "rename the foreign key in the schema file and re-plan, or drop or rename the constraint that holds the name"}, true
+	case executor.CodePartitionedForeignKeyConflict:
+		return &refusal{reason: "partitioned-foreign-key-conflict",
+			cause:  fmt.Sprintf("a partition of %s has duplicate foreign keys the parent's cannot adopt; nothing was added", quotedTable(table)),
+			remedy: "drop the partition's duplicate foreign keys, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeyReferencedTable:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("the foreign key on %s must reference a plain table outside its partitions", quotedTable(table)),
+			remedy: "reference a plain table outside the partition tree in the schema file, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeyUnsupportedShape:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("the foreign key on partitioned table %s has no name or a clause its partitions cannot carry", quotedTable(table)),
+			remedy: "name the foreign key and drop that clause in the schema file, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeyParentConflict:
+		// Nothing was created, and the parent's own constraint stays until
+		// an operator or the schema file changes it.
+		return &refusal{reason: "partitioned-foreign-key-parent-conflict",
+			cause:  fmt.Sprintf("partitioned table %s already uses the foreign key's name, or has it under another name", quotedTable(table)),
+			remedy: "rename the foreign key in the schema file, or free the name, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeySubPartitioned:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("a partition of %s is itself partitioned, which the foreign key build does not run", quotedTable(table)),
+			remedy: "add the foreign key to that partition by hand, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeyNotValidSupported:
+		// The server accepts NOT VALID on the partitioned table, so a new
+		// plan routes the foreign key to the NOT VALID then VALIDATE steps.
+		return &refusal{reason: "partitioned-foreign-key-not-valid-supported",
+			cause:  fmt.Sprintf("the server adds a foreign key on partitioned table %s online without the partition build; nothing was created", quotedTable(table)),
+			remedy: replanRemedy}, true
 	case executor.CodePartitionedIndexTablespace:
 		return &refusal{reason: "unsupported-statement-shape",
 			cause:  fmt.Sprintf("the index on %s names a TABLESPACE, which the partitions' indexes would not use", quotedTable(table)),
@@ -1427,11 +1461,12 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuildInFlight,
 		executor.CodeInvalidIndexBuilderUnobservable, executor.CodeInvalidIndexUnproven,
 		executor.CodePartitionedIndexUnsettled, executor.CodePartitionedKeyUnsettled,
+		executor.CodePartitionedForeignKeyUnsettled, executor.CodePartitionedForeignKeyLeafChanged,
 		executor.CodeDetachInterrupted, executor.CodeExecutionFailed:
 		// Operational outcomes: a bounded lock race, the caller's own
 		// context ending or an external stop, an invalid-index state a retry
-		// recovers or an operator clears or waits out, a partitioned index
-		// or key build that a rerun resumes, a concurrent detach that running the
+		// recovers or an operator clears or waits out, a partitioned index,
+		// key, or foreign key build that a rerun resumes, a concurrent detach that running the
 		// same statement again finishes, or a failure outside the typed set. A retry can succeed once conditions change, so
 		// none is a permanent refusal.
 		return nil, true

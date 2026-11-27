@@ -261,7 +261,9 @@ func TestExecutionVerdictBlocksPartitionedIndexShapeTheBuildRefuses(t *testing.T
 // closed set is reported as vocabulary that moved.
 func TestExecutionContractVerdictCoversEveryExecution(t *testing.T) {
 	blocked := map[planner.Execution]string{
-		planner.ExecutionBlockingIndexDrop: blockingIndexDropReason("users"),
+		planner.ExecutionBlockingIndexDrop:          blockingIndexDropReason("users"),
+		planner.ExecutionPartitionedKeyBuild:        partitionedKeyBuildReason("users"),
+		planner.ExecutionPartitionedForeignKeyBuild: partitionedForeignKeyBuildReason("users"),
 	}
 	for _, execution := range planner.Executions() {
 		t.Run(string(execution), func(t *testing.T) {
@@ -757,7 +759,7 @@ func TestTableChangesDerivesTiersForBlockedSteps(t *testing.T) {
 	report.Statements = []pgplan.Statement{
 		{SQL: "ALTER TABLE public.users ALTER COLUMN email TYPE bigint", Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
 		{SQL: "ALTER TABLE public.users ADD CONSTRAINT users_email_key UNIQUE (email)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRewriteRequired},
-		{SQL: "DROP INDEX public.users_legacy_idx", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionUnavailable},
+		{SQL: "DROP INDEX public.users_legacy_idx CASCADE", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionUnavailable},
 	}
 
 	changes, tiers, _, err := tableChanges(report, nil, parser)
@@ -813,7 +815,7 @@ func TestBlockMissingPrivilegesNamesGrantOnPlannerBlockedPlan(t *testing.T) {
 	report.Statements = []pgplan.Statement{
 		{SQL: "ALTER TABLE public.users ALTER COLUMN email TYPE bigint", Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
 		{SQL: "ALTER TABLE public.users ADD CONSTRAINT users_email_key UNIQUE (email)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRewriteRequired},
-		{SQL: "DROP INDEX public.users_legacy_idx", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionUnavailable},
+		{SQL: "DROP INDEX public.users_legacy_idx CASCADE", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionUnavailable},
 	}
 	changes, tiers, _, err := tableChanges(report, nil, parser)
 	require.NoError(t, err)
