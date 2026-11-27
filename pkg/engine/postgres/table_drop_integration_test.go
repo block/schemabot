@@ -196,7 +196,7 @@ func TestEnginePlanBlocksATableDropTheRoleCannotRun(t *testing.T) {
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
 	assert.Contains(t, changes[0].ModeReason, "the engine role cannot drop it, because only the table's owner can drop a table")
 	assert.Contains(t, changes[0].ModeReason, "provision with: GRANT")
-	assert.Contains(t, changes[0].ModeReason, "pg_has_role(drop_limited,")
+	assert.Contains(t, changes[0].ModeReason, `TO "drop_limited"`, "the provisioning statement grants the access to the engine role")
 }
 
 // A plan made by a role that owns the table is applied by one that does
