@@ -50,41 +50,25 @@ func TestAssignPlanChangeOrdinals(t *testing.T) {
 	assert.Zero(t, unplanned.PlanChangeOrdinal)
 }
 
-// A sharded keyspace whose shards diverge lists, per shard, only the changes
-// that shard still needs. The namespace drops a constraint twice with
-// different engine records, and shard -80 needs only the second. Its one task
-// runs the second change, not the first copy of the same statement. A shard
-// that needs both takes them in order, and a change whose record no plan
-// change carries keeps 0.
-func TestAssignFromChangesFollowsEachShardsOwnChanges(t *testing.T) {
+// A sharded keyspace keeps one change per table in its namespace, while each
+// shard keeps its own. A shard's changes to a table are listed in the shard's
+// order, under the shard's key, so a shard that needs the same statement twice
+// with different engine records keeps both.
+func TestPlanShardChangesByTableKeepsEachShardsOwnChanges(t *testing.T) {
 	const drop = `ALTER TABLE notes DROP CONSTRAINT notes_body_not_null`
-	first := map[string]string{"helper": "leftover"}
-	second := map[string]string{"helper": "new"}
-	plan := &Plan{Namespaces: map[string]*NamespacePlanData{
-		"ks": {Tables: []TableChange{
-			{Table: "notes", DDL: drop, Metadata: first},
-			{Table: "notes", DDL: drop, Metadata: second},
-		}},
-	}}
-	ordinals := NewPlanChangeOrdinals(plan)
-	build := func(shard string, changes ...TableChange) []int {
-		tasks := make([]*Task, len(changes))
-		for i, change := range changes {
-			tasks[i] = &Task{Namespace: "ks", TableName: "notes", Shard: shard, DDL: change.DDL}
-		}
-		ordinals.AssignFromChanges(tasks, changes)
-		got := make([]int, len(tasks))
-		for i, task := range tasks {
-			got[i] = task.PlanChangeOrdinal
-		}
-		return got
+	first := TableChange{Table: "notes", DDL: drop, Metadata: map[string]string{"helper": "leftover"}}
+	second := TableChange{Table: "notes", DDL: drop, Metadata: map[string]string{"helper": "new"}}
+	plan := &Plan{
+		Namespaces: map[string]*NamespacePlanData{"ks": {Tables: []TableChange{first}}},
+		Shards: []ShardPlan{
+			{Namespace: "ks", Shard: "-80", Changes: []TableChange{second}},
+			{Namespace: "ks", Shard: "80-", Changes: []TableChange{first, second}},
+		},
 	}
 
-	assert.Equal(t, []int{2}, build("-80", TableChange{Table: "notes", DDL: drop, Metadata: second}),
-		"the shard that needs only the second drop runs change 2")
-	assert.Equal(t, []int{1, 2}, build("80-",
-		TableChange{Table: "notes", DDL: drop, Metadata: first},
-		TableChange{Table: "notes", DDL: drop, Metadata: second}))
-	assert.Equal(t, []int{0}, build("c0-", TableChange{Table: "notes", DDL: drop, Metadata: map[string]string{"helper": "other"}}),
-		"a record no plan change carries matches none of them")
+	byShard := PlanShardChangesByTable(plan)
+	assert.Equal(t, []TableChange{second}, byShard[PlanShardChangeTableKey("ks", "-80", "notes")])
+	assert.Equal(t, []TableChange{first, second}, byShard[PlanShardChangeTableKey("ks", "80-", "notes")])
+	assert.Len(t, byShard, 2)
+	assert.Empty(t, PlanShardChangesByTable(nil))
 }

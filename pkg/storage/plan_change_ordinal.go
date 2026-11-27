@@ -1,13 +1,14 @@
 package storage
 
 import (
-	"maps"
 	"strings"
 )
 
 // PlanChangeOrdinals records on each task which of a plan's changes it runs,
 // as that change's 1-based position among the plan's changes to the same
-// namespace and table. A plan can hold the same statement more than once on
+// namespace and table. A shard's task is numbered within its shard's own
+// changes instead (see PlanShardChangesByTable), since a sharded namespace
+// keeps one change per table while its shards can each need several. A plan can hold the same statement more than once on
 // one table, for example a PostgreSQL SET NOT NULL that first drops a
 // leftover helper constraint and drops the new helper again at the end. The
 // statement text alone cannot tell those changes apart, and they can carry
@@ -18,13 +19,12 @@ import (
 // many groups assigns every group from the same index.
 type PlanChangeOrdinals struct {
 	positions map[string][]int
-	byTable   map[string][]TableChange
 }
 
 // NewPlanChangeOrdinals indexes plan's changes by namespace, table, and
 // statement.
 func NewPlanChangeOrdinals(plan *Plan) *PlanChangeOrdinals {
-	return &PlanChangeOrdinals{positions: planChangePositions(plan), byTable: PlanChangesByTable(plan)}
+	return &PlanChangeOrdinals{positions: planChangePositions(plan)}
 }
 
 // Assign sets each task's PlanChangeOrdinal. tasks must list each table's
@@ -50,41 +50,6 @@ func (o *PlanChangeOrdinals) Assign(tasks []*Task) {
 		candidates := o.positions[planChangeKey(task.Namespace, task.TableName, "", statement)]
 		if occurrence < len(candidates) {
 			task.PlanChangeOrdinal = candidates[occurrence]
-		}
-	}
-}
-
-// AssignFromChanges sets each task's PlanChangeOrdinal from the change it was
-// built from: changes[i] is the change tasks[i] runs. It is for a builder whose
-// changes are not the plan's own list, such as a shard's, which can hold fewer
-// of a table's changes than the namespace does when its shards diverge. Each
-// task takes the first plan change on its table, not yet taken by another task
-// of the same shard, that carries its statement and the same engine metadata
-// as its own change. Pairing by statement alone would hand a shard that needs
-// only the second of two copies the first copy's record. A task no plan change
-// matches keeps ordinal 0, which the drive treats as unknown.
-func (o *PlanChangeOrdinals) AssignFromChanges(tasks []*Task, changes []TableChange) {
-	if o == nil || len(o.byTable) == 0 {
-		return
-	}
-	taken := map[string]map[int]bool{}
-	for i, task := range tasks {
-		if task == nil || i >= len(changes) {
-			continue
-		}
-		statement := strings.TrimSpace(task.DDL)
-		scope := planChangeKey(task.Namespace, task.TableName, task.Shard, "")
-		if taken[scope] == nil {
-			taken[scope] = map[int]bool{}
-		}
-		planChanges := o.byTable[PlanChangeTableKey(task.Namespace, task.TableName)]
-		for _, position := range o.positions[planChangeKey(task.Namespace, task.TableName, "", statement)] {
-			if taken[scope][position] || !maps.Equal(planChanges[position-1].Metadata, changes[i].Metadata) {
-				continue
-			}
-			taken[scope][position] = true
-			task.PlanChangeOrdinal = position
-			break
 		}
 	}
 }
@@ -116,6 +81,37 @@ func PlanChangesByTable(plan *Plan) map[string][]TableChange {
 		}
 	}
 	return byTable
+}
+
+// PlanShardChangesByTable returns each shard's own changes grouped by
+// namespace, shard, and table, in the order the shard lists them. A shard's
+// task runs the change at its ordinal in this list:
+// PlanShardChangesByTable(plan)[PlanShardChangeTableKey(...)][ordinal-1].
+// The namespace's own list cannot serve a shard: a sharded namespace keeps
+// only the first change it saw per table, and two shards can need the same
+// statement with different engine records.
+func PlanShardChangesByTable(plan *Plan) map[string][]TableChange {
+	byShard := map[string][]TableChange{}
+	if plan == nil {
+		return byShard
+	}
+	for _, shard := range plan.Shards {
+		for _, change := range shard.Changes {
+			namespace := change.Namespace
+			if namespace == "" {
+				namespace = shard.Namespace
+			}
+			key := PlanShardChangeTableKey(namespace, shard.Shard, change.Table)
+			byShard[key] = append(byShard[key], change)
+		}
+	}
+	return byShard
+}
+
+// PlanShardChangeTableKey is the key PlanShardChangesByTable groups a
+// shard's changes to one table under.
+func PlanShardChangeTableKey(namespace, shard, table string) string {
+	return planChangeKey(namespace, table, shard, "")
 }
 
 // PlanChangeTableKey is the key PlanChangesByTable groups a table's changes
