@@ -4,6 +4,7 @@
 package apitypes
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -1490,6 +1491,12 @@ func (r *PlanResponse) HasBlockedChanges() bool {
 // are, and a change refused on several shards is named once, with the shards
 // it is refused on.
 type BlockedChange struct {
+	// Namespace is the change's namespace, or the plan's database for a change
+	// that names none.
+	Namespace string
+	// Table is the table's name, qualified with its namespace when the plan's
+	// blocked changes span more than one namespace, so two tables that share a
+	// name read apart.
 	Table  string
 	Reason string
 	// Steps is how many of the table's planned statements the reason refuses,
@@ -1497,7 +1504,8 @@ type BlockedChange struct {
 	Steps int
 	// Shards lists the shards the change is refused on, in plan order. It is
 	// empty for a change planned once for its namespace. TotalShards is the
-	// number of shards the plan covers, so a renderer can say "all shards".
+	// number of shards the plan covers in the namespace, so a renderer can say
+	// "all shards".
 	Shards      []string
 	TotalShards int
 }
@@ -1505,46 +1513,96 @@ type BlockedChange struct {
 // BlockedChanges returns the plan's changes that carry the blocked verdict, in
 // plan order. Every surface that says a plan cannot be applied lists these,
 // so the CLI and the PR comment name the same changes for the same reasons.
-// A plan with per-shard changes is read per shard, so a change refused on one
-// shard names it; otherwise the namespace-level changes are read.
+// A namespace with shard rows is read per shard, so a change refused on one
+// shard names it; a namespace without them is read from its namespace-level
+// changes, as RenderedTables reads a mixed plan.
 func (r *PlanResponse) BlockedChanges() []BlockedChange {
 	if r == nil {
 		return nil
 	}
-	if blocked := shardBlockedChanges(r.Shards); len(blocked) > 0 {
-		return blocked
+	shardsByNamespace := make(map[string][]*ShardPlanResponse)
+	var shardNamespaces []string
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		if _, seen := shardsByNamespace[sp.Namespace]; !seen {
+			shardNamespaces = append(shardNamespaces, sp.Namespace)
+		}
+		shardsByNamespace[sp.Namespace] = append(shardsByNamespace[sp.Namespace], sp)
 	}
+
 	var grouped blockedChangeGroups
-	for _, t := range r.FlatTables() {
-		if t.EngineBlocked() {
-			grouped.add(t).Steps++
+	read := make(map[string]bool)
+	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
+		if shards, sharded := shardsByNamespace[sc.Namespace]; sharded {
+			if read[sc.Namespace] {
+				continue
+			}
+			read[sc.Namespace] = true
+			// A refusal the shard rows do not carry is still the namespace's,
+			// and the apply gate refuses it, so the list must name it.
+			if grouped.addShards(cmp.Or(sc.Namespace, r.Database), shards) {
+				continue
+			}
+		}
+		for _, t := range sc.TableChanges {
+			if t.EngineBlocked() {
+				grouped.add(cmp.Or(sc.Namespace, t.Namespace, r.Database), t).Steps++
+			}
+		}
+	}
+	// Shard rows for a namespace the namespace-level changes do not list are
+	// still the plan's work, so their refusals are listed too.
+	for _, ns := range shardNamespaces {
+		if !read[ns] {
+			grouped.addShards(cmp.Or(ns, r.Database), shardsByNamespace[ns])
 		}
 	}
 	return grouped.list()
 }
 
-// shardBlockedChanges groups the blocked per-shard changes by table and
-// reason, so a change refused on several shards is listed once with them.
-// Its step count is the most statements any one shard carries for it.
-func shardBlockedChanges(shards []*ShardPlanResponse) []BlockedChange {
-	total := 0
-	for _, sp := range shards {
-		if sp != nil {
-			total++
-		}
+// blockedChangeGroups collects blocked changes keyed by namespace, table and
+// reason, in the order each key is first seen.
+type blockedChangeGroups struct {
+	order []*BlockedChange
+	byKey map[[3]string]*BlockedChange
+}
+
+// add returns the group for the change's namespace, table and reason,
+// creating it on first sight.
+func (g *blockedChangeGroups) add(namespace string, t *TableChangeResponse) *BlockedChange {
+	k := [3]string{namespace, t.TableName, t.ModeReason}
+	if bc := g.byKey[k]; bc != nil {
+		return bc
 	}
-	var grouped blockedChangeGroups
+	if g.byKey == nil {
+		g.byKey = make(map[[3]string]*BlockedChange)
+	}
+	bc := &BlockedChange{Namespace: namespace, Table: t.TableName, Reason: t.ModeReason}
+	g.byKey[k] = bc
+	g.order = append(g.order, bc)
+	return bc
+}
+
+// addShards groups one namespace's blocked per-shard changes by table and
+// reason, so a change refused on several shards is listed once with them. Its
+// step count is the most statements any one shard carries for it. It reports
+// whether any shard carries a refusal.
+func (g *blockedChangeGroups) addShards(namespace string, shards []*ShardPlanResponse) bool {
+	found := false
 	for _, sp := range shards {
-		if sp == nil {
-			continue
-		}
 		stepsOnShard := make(map[*BlockedChange]int)
 		for _, t := range sp.Changes {
 			if !t.EngineBlocked() {
 				continue
 			}
-			bc := grouped.add(t)
-			bc.TotalShards = total
+			found = true
+			bc := g.add(namespace, t)
+			bc.TotalShards = len(shards)
 			if stepsOnShard[bc] == 0 {
 				bc.Shards = append(bc.Shards, sp.Shard)
 			}
@@ -1552,39 +1610,26 @@ func shardBlockedChanges(shards []*ShardPlanResponse) []BlockedChange {
 			bc.Steps = max(bc.Steps, stepsOnShard[bc])
 		}
 	}
-	return grouped.list()
+	return found
 }
 
-// blockedChangeGroups collects blocked changes keyed by table and reason, in
-// the order each key is first seen.
-type blockedChangeGroups struct {
-	order []*BlockedChange
-	byKey map[[2]string]*BlockedChange
-}
-
-// add returns the group for the change's table and reason, creating it on
-// first sight.
-func (g *blockedChangeGroups) add(t *TableChangeResponse) *BlockedChange {
-	k := [2]string{t.TableName, t.ModeReason}
-	if bc := g.byKey[k]; bc != nil {
-		return bc
-	}
-	if g.byKey == nil {
-		g.byKey = make(map[[2]string]*BlockedChange)
-	}
-	bc := &BlockedChange{Table: t.TableName, Reason: t.ModeReason}
-	g.byKey[k] = bc
-	g.order = append(g.order, bc)
-	return bc
-}
-
+// list returns the groups in first-seen order, each table qualified with its
+// namespace when the groups span more than one.
 func (g *blockedChangeGroups) list() []BlockedChange {
 	if len(g.order) == 0 {
 		return nil
 	}
+	namespaces := make(map[string]bool)
+	for _, bc := range g.order {
+		namespaces[bc.Namespace] = true
+	}
 	out := make([]BlockedChange, 0, len(g.order))
 	for _, bc := range g.order {
-		out = append(out, *bc)
+		change := *bc
+		if len(namespaces) > 1 && change.Namespace != "" {
+			change.Table = change.Namespace + "." + change.Table
+		}
+		out = append(out, change)
 	}
 	return out
 }

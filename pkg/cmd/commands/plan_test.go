@@ -175,6 +175,24 @@ func TestPlanFingerprint_IdenticalPlans(t *testing.T) {
 	assert.Equal(t, fp2, fp1, "Expected identical fingerprints for identical plans")
 }
 
+// Two environments that run the same DDL but where only one refuses it are
+// different plans to read: rendering them as one would attribute one
+// environment's refusal to the other, or hide it.
+func TestPlanFingerprint_RefusalSetsPlansApart(t *testing.T) {
+	change := func(mode, reason string) *apitypes.TableChangeResponse {
+		return &apitypes.TableChangeResponse{
+			DDL: "ALTER TABLE events ADD COLUMN kind text", ChangeType: "ALTER", TableName: "events",
+			ExecutionMode: mode, ModeReason: reason,
+		}
+	}
+	staging := planFingerprint(planWithTables(change("", "")))
+	production := planFingerprint(planWithTables(change("blocked", "the table is 1.4 GiB")))
+	otherReason := planFingerprint(planWithTables(change("blocked", "the table is 2.0 GiB")))
+
+	assert.NotEqual(t, staging, production, "a refusal on one environment only sets the plans apart")
+	assert.NotEqual(t, production, otherReason, "refusals for different reasons set the plans apart")
+}
+
 func TestPlanFingerprint_DifferentPlans(t *testing.T) {
 	plan1 := planWithTables(
 		&apitypes.TableChangeResponse{

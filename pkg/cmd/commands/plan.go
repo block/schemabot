@@ -860,6 +860,12 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	for _, change := range result.UnsafeChanges() {
 		unsafeFindings = append(unsafeFindings, change.Table+":"+change.ChangeType+":"+change.Reason)
 	}
+	// A refusal is part of what the plan's output says, so two plans that run
+	// the same DDL but are refused differently render apart.
+	var blocked []string
+	for _, bc := range result.BlockedChanges() {
+		blocked = append(blocked, fmt.Sprintf("%s:%s:%d:%s", bc.Table, bc.Reason, bc.Steps, strings.Join(bc.Shards, ",")))
+	}
 	var lint []string
 	for _, violation := range result.LintNonErrors() {
 		lint = append(lint, violation.Table+":"+violation.Message)
@@ -878,6 +884,7 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	sort.Strings(vschemas)
 	finalizes = slices.Compact(slices.Sorted(slices.Values(finalizes)))
 	sort.Strings(unsafeFindings)
+	sort.Strings(blocked)
 	sort.Strings(lint)
 	sort.Strings(exempt)
 	unmatchedDrops := slices.Sorted(slices.Values(result.UnmatchedDropTables))
@@ -887,10 +894,11 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 		VSchemas  []string `json:"vschemas"`
 		Finalizes []string `json:"finalizes"`
 		Unsafe    []string `json:"unsafe"`
+		Blocked   []string `json:"blocked"`
 		Lint      []string `json:"lint"`
 		Exempt    []string `json:"exempt"`
 		Unmatched []string `json:"unmatched_drop_tables"`
-	}{ddls, vschemas, finalizes, unsafeFindings, lint, exempt, unmatchedDrops})
+	}{ddls, vschemas, finalizes, unsafeFindings, blocked, lint, exempt, unmatchedDrops})
 	return string(data)
 }
 

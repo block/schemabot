@@ -262,7 +262,7 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 			byPlan[e.PlanFingerprint] = at
 		}
 		groups[at].Members = append(groups[at].Members, names[i])
-		for _, bc := range memberModeChanges(e.ChangeSet, engine.ExecutionModeBlocked) {
+		for _, bc := range memberBlockedChanges(e.ChangeSet) {
 			addModeTarget(&groups[at].BlockedChanges, bc, names[i])
 		}
 		// A direct verdict is read per member for the same reason a refusal is:
@@ -386,6 +386,39 @@ func memberModeChanges(cs tern.ChangeSet, mode string) []templates.BlockedChange
 		}
 	}
 	return out
+}
+
+// memberBlockedChanges lists the changes in one member's plan that its engine
+// refuses, read by apitypes.PlanResponse.BlockedChanges as the primary plan's
+// are, so a member's disclosure groups statements and shards, and counts
+// steps, the way the CLI and the primary plan's comment do.
+func memberBlockedChanges(cs tern.ChangeSet) []templates.BlockedChangeData {
+	verdicts := func(changes []*ternv1.TableChange) []*apitypes.TableChangeResponse {
+		out := make([]*apitypes.TableChangeResponse, 0, len(changes))
+		for _, tc := range changes {
+			out = append(out, &apitypes.TableChangeResponse{
+				TableName:     tc.GetTableName(),
+				Namespace:     tc.GetNamespace(),
+				ExecutionMode: tc.GetExecutionMode(),
+				ModeReason:    tc.GetModeReason(),
+			})
+		}
+		return out
+	}
+	plan := &apitypes.PlanResponse{}
+	for _, sc := range cs.Changes {
+		if sc == nil {
+			continue
+		}
+		plan.Changes = append(plan.Changes, &apitypes.SchemaChangeResponse{Namespace: sc.GetNamespace(), TableChanges: verdicts(sc.GetTableChanges())})
+	}
+	for _, sp := range cs.Shards {
+		if sp == nil {
+			continue
+		}
+		plan.Shards = append(plan.Shards, &apitypes.ShardPlanResponse{Namespace: sp.GetNamespace(), Shard: sp.GetShard(), Changes: verdicts(sp.GetChanges())})
+	}
+	return templates.BlockedChangesData(plan)
 }
 
 // mergeModeShard records a shard's verdict on a table change, folding it into
