@@ -43,15 +43,18 @@ const cancelledArtifactReleaseTimeout = 10 * time.Minute
 type namespaceArtifacts struct {
 	task   *storage.Task
 	tables []string
-	// addedConstraints names, per table, the constraints the apply's tasks
-	// that ran added.
+	// addedConstraints names, per table, the constraints the apply's
+	// completed tasks added.
 	addedConstraints map[string][]string
 	// validatedConstraints names, per table, the constraints the apply's plan
 	// validates in a step of its own.
 	validatedConstraints map[string][]string
 	// droppedConstraints names, per table, the constraints the apply's plan
-	// drops.
+	// drops that no earlier step of the plan added: rules the table had.
 	droppedConstraints map[string][]string
+	// plannedConstraints names, per table, the constraints the apply's plan
+	// adds, whether or not the step ran.
+	plannedConstraints map[string][]string
 	// unreadTables names the tables with a statement the release could not
 	// read, on which it removes no constraint.
 	unreadTables []string
@@ -303,10 +306,10 @@ func remainingConstraintMessage(constraint engine.EngineConstraint, outcome stri
 }
 
 // preexistingConstraintMessage describes, for the apply log, a constraint the
-// release left because the schema change did not add it, what it does to
-// writes, and the statement that drops it.
+// release left because the schema change is not known to have added it, what
+// it does to writes, and the statement that drops it.
 func preexistingConstraintMessage(constraint engine.EngineConstraint, outcome string) string {
-	return fmt.Sprintf("Constraint %s is still on %s. It was there before the %s schema change, so SchemaBot left it, and it %s until it is dropped. Drop it with: %s",
+	return fmt.Sprintf("Constraint %s is still on %s. No finished step of the %s schema change added it, so SchemaBot left it, and it %s until it is dropped. Drop it with: %s",
 		constraint.Name, constraint.Table, outcome, constraint.Effect, constraint.Removal)
 }
 
@@ -376,7 +379,9 @@ func (c *LocalClient) cancelledArtifactTables(apply *storage.Apply, tasks []*sto
 		constraints := c.taskConstraintChanges(apply, task)
 		entry.addedConstraints = appendTableNames(entry.addedConstraints, task.TableName, constraints.added)
 		entry.validatedConstraints = appendTableNames(entry.validatedConstraints, task.TableName, constraints.validated)
-		entry.droppedConstraints = appendTableNames(entry.droppedConstraints, task.TableName, constraints.dropped)
+		entry.droppedConstraints = appendTableNames(entry.droppedConstraints, task.TableName,
+			withoutNames(constraints.dropped, entry.plannedConstraints[task.TableName]))
+		entry.plannedConstraints = appendTableNames(entry.plannedConstraints, task.TableName, constraints.planned)
 		if constraints.unread && !slices.Contains(entry.unreadTables, task.TableName) {
 			entry.unreadTables = append(entry.unreadTables, task.TableName)
 		}
@@ -387,29 +392,36 @@ func (c *LocalClient) cancelledArtifactTables(apply *storage.Apply, tasks []*sto
 	return byNamespace
 }
 
-// withholdReplacedConstraints takes the constraints the plan replaces under
-// the same name out of the ones the release may drop. A replacement drops the
-// old rule and adds the new one NOT VALID, in one statement or in steps of
-// their own, so once the old rule is gone the unvalidated rule a failed or
-// cancelled validation leaves is the only one checking the table's writes.
-// Dropping it would leave the table with neither. A name the plan drops and
-// never adds again is not in either list, so withholding it changes nothing.
+// withholdReplacedConstraints takes every constraint on a table whose plan
+// drops a constraint the table had out of the ones the release may drop. A
+// constraint an earlier step of the plan adds and a later one drops, such as
+// a SET NOT NULL helper, is the plan's own and does not count. A replacement
+// drops the old rule and adds the new one NOT VALID, under the same name or
+// a new one, in one statement or in steps of their own. Once the old rule is
+// gone, the unvalidated rule a failed or cancelled validation leaves is the
+// only one checking the table's writes, and dropping it would leave the
+// table with neither. The release cannot tell which dropped constraint a new
+// one replaces, so it keeps them all. A table with a statement the release
+// cannot read is treated the same way, since that statement might drop one.
 func (c *LocalClient) withholdReplacedConstraints(apply *storage.Apply, entry *namespaceArtifacts) {
-	for table, dropped := range entry.droppedConstraints {
-		for _, name := range dropped {
-			if !slices.Contains(entry.addedConstraints[table], name) && !slices.Contains(entry.validatedConstraints[table], name) {
-				continue
-			}
-			c.logger.Info("a release keeps a constraint the schema change replaced under the same name: it is the only rule on the table",
-				append(apply.LogAttrs(), "namespace", entry.task.Namespace, "table", table, "constraint", name)...)
-		}
-		entry.addedConstraints[table] = withoutNames(entry.addedConstraints[table], dropped)
-		entry.validatedConstraints[table] = withoutNames(entry.validatedConstraints[table], dropped)
+	for table := range entry.droppedConstraints {
+		c.keepTableConstraints(apply, entry, table, "a release keeps the constraints on a table whose schema change drops one: an unvalidated one may be the only rule left on the table")
 	}
 	for _, table := range entry.unreadTables {
-		delete(entry.addedConstraints, table)
-		delete(entry.validatedConstraints, table)
+		c.keepTableConstraints(apply, entry, table, "a release keeps the constraints on a table it cannot read every statement of: an unread one may have dropped the rule an unvalidated one replaces")
 	}
+}
+
+// keepTableConstraints takes table out of the constraints the release may
+// drop, logging each constraint it keeps.
+func (c *LocalClient) keepTableConstraints(apply *storage.Apply, entry *namespaceArtifacts, table, reason string) {
+	kept := slices.Concat(entry.addedConstraints[table], entry.validatedConstraints[table])
+	slices.Sort(kept)
+	for _, name := range slices.Compact(kept) {
+		c.logger.Info(reason, append(apply.LogAttrs(), "namespace", entry.task.Namespace, "table", table, "constraint", name)...)
+	}
+	delete(entry.addedConstraints, table)
+	delete(entry.validatedConstraints, table)
 }
 
 // appendTableNames adds names to table's entry in byTable, creating the map
@@ -435,23 +447,29 @@ func withoutNames(names, drop []string) []string {
 // constraintChanges is what one task's statement does to its table's
 // constraints, as far as a release needs to know.
 type constraintChanges struct {
-	// added names the constraints the statement adds, when the task ran.
+	// added names the constraints the statement adds, when the task
+	// completed.
 	added []string
+	// planned names the constraints the statement adds, whether or not the
+	// task ran.
+	planned []string
 	// validated names the constraints the statement validates in a step of
 	// its own, whether or not the task ran: the plan's intent is what makes
 	// an unvalidated constraint of that name an unfinished step.
 	validated []string
 	// dropped names the constraints the statement drops, whether or not the
-	// task ran: a plan that drops a name and adds it again replaces that
-	// rule, whichever step a failure or cancel stops at.
+	// task ran: a plan that drops a rule and adds one replaces it, whichever
+	// step a failure or cancel stops at.
 	dropped []string
 	// unread is set when the statement could not be read.
 	unread bool
 }
 
 // taskConstraintChanges reads which constraints a task's statement adds,
-// validates and drops. A task that never left pending added nothing, so a
-// constraint of the same name on its table is not the apply's to remove. A
+// validates and drops. Only a completed task is known to have committed its
+// statement: one that failed, for example on a constraint someone else added
+// under the same name, added nothing, and neither did one that never left
+// pending. A constraint of that name is not the apply's to remove. A
 // statement that cannot be read marks its table unread, and the release then
 // removes no constraint there: it cannot tell whether the statement dropped
 // the rule an unvalidated one replaces.
@@ -469,10 +487,11 @@ func (c *LocalClient) taskConstraintChanges(apply *storage.Apply, task *storage.
 		return constraintChanges{unread: true}
 	}
 	result := constraintChanges{
+		planned:   constraintNames(changes.Added),
 		validated: constraintNames(changes.Validated),
 		dropped:   constraintNames(changes.Dropped),
 	}
-	if !state.IsState(task.State, state.Task.Pending) {
+	if state.IsState(task.State, state.Task.Completed) {
 		result.added = constraintNames(changes.Added)
 	}
 	return result

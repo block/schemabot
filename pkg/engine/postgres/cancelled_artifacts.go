@@ -158,6 +158,8 @@ func releaseUnvalidatedConstraints(ctx context.Context, pool *pgxpool.Pool, sche
 			// what is under the name now is not the one the run left.
 			slog.Warn("left a constraint in place: it changed after the release read it, so it is not the one the schema change added",
 				"outcome", outcome, "schema", schema, "table", table, "constraint", dropped.Name, "error", err)
+			constraint.Removal = dropConstraintStatement(schema, table, dropped.Name)
+			result.PreexistingConstraints = append(result.PreexistingConstraints, constraint)
 		default:
 			constraint.Removal = dropConstraintStatement(schema, table, dropped.Name)
 			result.RemainingConstraints = append(result.RemainingConstraints, constraint)
@@ -226,6 +228,8 @@ func releaseNotNullHelpers(ctx context.Context, pool *pgxpool.Pool, schema, tabl
 			// what is under the name now is not the helper the run left.
 			slog.Warn("left a constraint in place: it changed under a SET NOT NULL helper's name after the release read it, so it is not the helper",
 				"outcome", outcome, "schema", schema, "table", table, "constraint", helper.Name, "error", err)
+			constraint.Removal = dropConstraintStatement(schema, table, helper.Name)
+			result.PreexistingConstraints = append(result.PreexistingConstraints, constraint)
 		default:
 			constraint.Removal = dropConstraintStatement(schema, table, helper.Name)
 			result.RemainingConstraints = append(result.RemainingConstraints, constraint)

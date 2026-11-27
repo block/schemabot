@@ -269,7 +269,7 @@ func TestLocalClientPostgresFailedValidationLeavesAHelperTheApplyDidNotAdd(t *te
 	require.NoError(t, err)
 	assert.Zero(t, countLogMessagesContaining(logs, "Removed constraint"), "the drive removed nothing the apply did not add")
 	assert.Equal(t, 1, countLogMessagesContaining(logs,
-		`Constraint users_name_not_null_check is still on public.users. It was there before the failed schema change, so SchemaBot left it, and it rejects writes that break CHECK ((name IS NOT NULL)) until it is dropped. Drop it with: ALTER TABLE "public"."users" DROP CONSTRAINT "users_name_not_null_check"`),
+		`Constraint users_name_not_null_check is still on public.users. No finished step of the failed schema change added it, so SchemaBot left it, and it rejects writes that break CHECK ((name IS NOT NULL)) until it is dropped. Drop it with: ALTER TABLE "public"."users" DROP CONSTRAINT "users_name_not_null_check"`),
 		"the apply log says the helper still checks writes and how to drop it")
 }
 
