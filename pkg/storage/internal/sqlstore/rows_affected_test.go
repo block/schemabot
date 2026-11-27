@@ -134,6 +134,18 @@ func TestLockStore_ForceReleaseUnreadableRowCountReturnsWrappedError(t *testing.
 	assert.Contains(t, err.Error(), "testdb/mysql")
 }
 
+func TestLockStore_ForceReleaseByIDUnreadableRowCountReturnsWrappedError(t *testing.T) {
+	store := newUnreadableLockStore(t)
+
+	err := store.ForceReleaseByID(t.Context(), 7, "testdb", "mysql")
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, errRowCountUnavailable)
+	assert.NotErrorIs(t, err, storage.ErrLockNotFound)
+	assert.NotErrorIs(t, err, storage.ErrLockReplaced)
+	assert.Contains(t, err.Error(), "lock row 7 for testdb/mysql")
+}
+
 func TestLockStore_ReleaseIfPendingPlanIDUnreadableRowCountReturnsWrappedError(t *testing.T) {
 	store := newUnreadableLockStore(t)
 
@@ -172,6 +184,20 @@ func TestLockStore_ReleaseReReadErrorIsNotLockNotFound(t *testing.T) {
 	require.ErrorIs(t, err, errStub)
 	assert.NotErrorIs(t, err, storage.ErrLockNotFound)
 	assert.NotErrorIs(t, err, storage.ErrLockNotOwned)
+	assert.Contains(t, err.Error(), "testdb/mysql")
+}
+
+// A pinned force release that deletes nothing and cannot re-read the lock
+// cannot tell a missing lock from a replaced one, so it reports neither.
+func TestLockStore_ForceReleaseByIDReReadErrorIsNeitherNotFoundNorReplaced(t *testing.T) {
+	store := newStubLockStore(t, stubConn{execResult: driver.RowsAffected(0), queryErr: errStub})
+
+	err := store.ForceReleaseByID(t.Context(), 7, "testdb", "mysql")
+
+	require.ErrorIs(t, err, errStub)
+	assert.NotErrorIs(t, err, storage.ErrLockNotFound)
+	assert.NotErrorIs(t, err, storage.ErrLockReplaced)
+	assert.Contains(t, err.Error(), "row 7")
 	assert.Contains(t, err.Error(), "testdb/mysql")
 }
 
