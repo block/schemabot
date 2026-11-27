@@ -2,8 +2,11 @@ package presentation
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/block/schemabot/pkg/apitypes"
 )
 
 // A sharded table's figures name the shards they cover only while some of
@@ -30,4 +33,15 @@ func TestWithShardCoverage(t *testing.T) {
 			assert.Equal(t, tc.total, f.ShardsTotal, "shards total")
 		})
 	}
+}
+
+// A step waiting outside the lock queue for another session's lock names
+// that session and how long the step has waited, instead of reading as a
+// statement that is running.
+func TestReadInFlightTableNamesTheLockHolderAStepWaitsOn(t *testing.T) {
+	r := ReadInFlightTable(TableFacts{Status: "running", ChangeType: "alter", BuildWork: apitypes.BuildWork{
+		HolderWait: apitypes.LockHolderWait{PID: 9433, Table: "public.t", Waited: 7944 * time.Millisecond, Limit: 30 * time.Second},
+	}})
+	assert.Equal(t, "⏳ Waiting for session 9433 to release its lock (7s of 30s)", r.Headline())
+	assert.Equal(t, []TableDetail{{Text: "Reads and writes continue. The step runs once session 9433 commits or rolls back.", Note: true}}, r.Details)
 }
