@@ -527,7 +527,7 @@ CREATE TABLE users (
 
 	// Cleanup
 	t.Run("cleanup", func(t *testing.T) {
-		runCLI(t, binPath, "unlock", "-d", dbName, "-t", "mysql", "--endpoint", endpoint, "--force")
+		runCLI(t, binPath, "unlock", "-d", dbName, "-t", "mysql", "--endpoint", endpoint, "--force", "-y")
 	})
 }
 
@@ -590,13 +590,29 @@ CREATE TABLE users (
 		assertContains(t, out, "cli:otheruser@othermachine")
 	})
 
+	t.Run("unlock_force_without_yes_is_refused_without_a_terminal", func(t *testing.T) {
+		// The command has no terminal to ask on, so it refuses and leaves the
+		// lock held for the next step.
+		out, err := runCLIWithError(t, binPath, "unlock",
+			"-d", dbName,
+			"-t", "mysql",
+			"--endpoint", endpoint,
+			"--force",
+		)
+		assert.Error(t, err, "expected a forced unlock of another owner's lock to be refused without -y")
+		assertContains(t, out, "cli:otheruser@othermachine")
+		assertContains(t, out, "add -y to release it without asking")
+		assert.NotContains(t, out, "Force released lock")
+	})
+
 	t.Run("unlock_with_force_succeeds", func(t *testing.T) {
-		// Unlock with --force should succeed
+		// Unlock with --force and -y should succeed
 		out := runCLI(t, binPath, "unlock",
 			"-d", dbName,
 			"-t", "mysql",
 			"--endpoint", endpoint,
 			"--force",
+			"-y",
 		)
 		assertContains(t, out, "Force released lock")
 	})
@@ -709,7 +725,7 @@ CREATE TABLE users (
 
 	// Cleanup
 	t.Run("cleanup", func(t *testing.T) {
-		runCLI(t, binPath, "unlock", "-d", dbName, "-t", "mysql", "--endpoint", endpoint, "--force")
+		runCLI(t, binPath, "unlock", "-d", dbName, "-t", "mysql", "--endpoint", endpoint, "--force", "-y")
 	})
 }
 
@@ -765,7 +781,7 @@ CREATE TABLE users (
 
 	// Cleanup
 	t.Run("cleanup", func(t *testing.T) {
-		runCLI(t, binPath, "unlock", "-d", dbName, "-t", "mysql", "--endpoint", endpoint, "--force")
+		runCLI(t, binPath, "unlock", "-d", dbName, "-t", "mysql", "--endpoint", endpoint, "--force", "-y")
 	})
 }
 
@@ -900,7 +916,7 @@ CREATE TABLE users (
 
 	// Cleanup
 	t.Run("cleanup", func(t *testing.T) {
-		runCLI(t, binPath, "unlock", "-d", dbName, "-t", "mysql", "--endpoint", endpoint, "--force")
+		runCLI(t, binPath, "unlock", "-d", dbName, "-t", "mysql", "--endpoint", endpoint, "--force", "-y")
 	})
 }
 
@@ -947,7 +963,7 @@ func TestCLI_Locking_DifferentEnvBlocked(t *testing.T) {
 
 	// Cleanup
 	t.Run("cleanup", func(t *testing.T) {
-		runCLI(t, binPath, "unlock", "-d", dbName, "-t", "mysql", "--endpoint", endpoint, "--force")
+		runCLI(t, binPath, "unlock", "-d", dbName, "-t", "mysql", "--endpoint", endpoint, "--force", "-y")
 	})
 }
 

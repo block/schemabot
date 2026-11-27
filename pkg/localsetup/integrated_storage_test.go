@@ -21,7 +21,7 @@ func TestIntegratedStorageCreationErrors(t *testing.T) {
 		{"postgres exists", &pgconn.PgError{Code: "42P04", Message: "private-secret"}, "if it is yours, choose standalone", true},
 		{"mysql denied", &mysql.MySQLError{Number: 1044, Message: "private-secret"}, "this user cannot create", true},
 		{"postgres denied", &pgconn.PgError{Code: "42501", Message: "private-secret"}, "this user cannot create", true},
-		{"refused", syscall.ECONNREFUSED, "connection refused", false},
+		{"refused", syscall.ECONNREFUSED, "the server refused the connection", false},
 		{"DNS", &net.DNSError{Name: "private-secret", Err: "private-secret"}, "hostname could not be resolved", false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

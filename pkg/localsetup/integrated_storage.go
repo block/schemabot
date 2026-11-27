@@ -56,7 +56,7 @@ func PrepareIntegratedStorage(ctx context.Context, manager localruntime.Manager,
 	}
 	defer utils.CloseAndLog(db)
 	if err := db.PingContext(ctx); err != nil {
-		return &setupConnectionError{message: "could not connect to your application server; check the connection and try again", cause: err}
+		return connectionCheckError("could not connect to your application server; check the connection and try again", err)
 	}
 	// Deliberately omit IF NOT EXISTS: an existing database may belong to someone
 	// else. Users can explicitly connect to it through standalone setup instead.

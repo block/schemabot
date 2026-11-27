@@ -36,7 +36,7 @@ type ApplyCmd struct {
 	Branch       string        `help:"Reuse existing PlanetScale branch (syncs with main, skips branch creation)" name:"branch"`
 	AllowUnsafe  bool          `help:"Allow destructive changes (DROP TABLE, DROP COLUMN, etc.)" name:"allow-unsafe"`
 	Override     string        `help:"Why this change can't wait. It lets the change through a freeze, or asks a freeze approver to, as the server's override policy says" name:"override"`
-	Force        bool          `help:"Force acquire lock (breaks existing lock from another owner)"`
+	Force        bool          `help:"Force acquire lock (breaks existing lock from another owner, after asking you to confirm unless -y is given)"`
 	Yield        bool          `help:"Release the lock once the apply has finished (kept while it is still running or stopped)"`
 	NoLock       bool          `help:"Don't hold a database lock during the operation" name:"no-lock"`
 	Output       OutputFormat  `short:"o" help:"Output format" default:"interactive" enum:"interactive,log,json"`
@@ -242,6 +242,32 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 		lockBefore = existingLock
 	}
 
+	// takeover is the lock another owner held when --force looked, before the
+	// plan and the prompt. The prompt names it and its answer covers only it.
+	// It stays nil under -y, which asks nothing, and when no other owner holds
+	// the lock.
+	var takeover *client.LockInfo
+	if cmd.Force && !cmd.AutoApprove {
+		var held *client.LockInfo
+		err := withLoading("Checking database lock...", cmd.Output != OutputFormatJSON, func() error {
+			var lockErr error
+			held, lockErr = client.GetLock(ep, cfg.Database, cfg.Type)
+			return lockErr
+		})
+		if err != nil {
+			return fmt.Errorf("check lock: %w", err)
+		}
+		if heldByAnotherOwner(held, owner) {
+			if !stdinIsTerminal() {
+				return errLockTakeoverNeedsApproval(cfg.Database, cfg.Type, held, "nothing was applied", "take it over")
+			}
+			if held.ID < 1 {
+				return errLockTakeoverUnidentified(cfg.Database, cfg.Type, held, "nothing was applied", "take it over")
+			}
+			takeover = held
+		}
+	}
+
 	// Step 2: Show the plan
 	OutputPlanResult(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, true)
 	writeNarrowedTo(planResult)
@@ -256,10 +282,12 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 
 	// Step 3: Prompt for confirmation (unless auto-approve)
 	if !cmd.AutoApprove {
-		confirmed, err := confirmAction(
-			"\nDo you want to apply these changes? Only 'yes' will be accepted: ",
-			"\nApply cancelled.",
-		)
+		prompt, cancelMsg := "\nDo you want to apply these changes? Only 'yes' will be accepted: ", "\nApply cancelled."
+		if takeover != nil {
+			templates.WriteLockTakeoverWarning(lockHolderData(cfg.Database, cfg.Type, takeover), templates.ApplyTakeoverConsequence)
+			prompt, cancelMsg = templates.ApplyTakeoverPrompt, "\nApply cancelled. The lock was not changed."
+		}
+		confirmed, err := confirmAction(prompt, cancelMsg)
 		if err != nil {
 			return err
 		}
@@ -297,7 +325,12 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 			if err != nil {
 				return fmt.Errorf("check existing lock: %w", err)
 			}
-			if existingLock != nil && existingLock.Owner != owner {
+			if heldByAnotherOwner(existingLock, owner) {
+				// The operator confirmed the lock shown at the prompt. A
+				// different lock now is one they were never shown.
+				if !cmd.AutoApprove && !sameLockHeld(takeover, existingLock) {
+					return errLockChangedSincePrompt(cfg.Database, cfg.Type, existingLock)
+				}
 				if err := withLoading("Releasing database lock...", cmd.Output != OutputFormatJSON, func() error {
 					return client.ForceReleaseLock(ep, cfg.Database, cfg.Type)
 				}); err != nil {

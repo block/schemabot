@@ -179,6 +179,20 @@ func (e *RemoteDeploymentUnavailableError) Unwrap() error {
 	return e.Err
 }
 
+// RemotePlanRefusalError is a remote data plane declining to plan the declared
+// schema, answered as FailedPrecondition, which the data plane sends only for
+// an engine's plan refusal. Its text is the refusal's own, without the gRPC
+// framing, so the pull request reads the same explanation a local refusal
+// gives. It wraps the status, so the status code and the statements the
+// refusal names still read through it.
+type RemotePlanRefusalError struct {
+	Err error
+}
+
+func (e *RemotePlanRefusalError) Error() string { return planRefusalReason(e.Err) }
+
+func (e *RemotePlanRefusalError) Unwrap() error { return e.Err }
+
 // handlePullSchema handles POST /api/pull requests.
 func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 	var req apitypes.PullSchemaRequest
@@ -1039,6 +1053,9 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 				Target:     resolvedTarget.Target,
 				Err:        err,
 			}
+		}
+		if client.IsRemote() && grpcstatus.Code(err) == grpccodes.FailedPrecondition {
+			return nil, nil, &RemotePlanRefusalError{Err: err}
 		}
 		return nil, nil, err
 	}

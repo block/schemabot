@@ -400,6 +400,11 @@ func (s *recordingLockStore) ForceRelease(context.Context, string, string) error
 	return nil
 }
 
+func (s *recordingLockStore) ForceReleaseByID(context.Context, int64, string, string) error {
+	s.forceReleased = true
+	return nil
+}
+
 func (s *recordingLockStore) Release(context.Context, string, string, string) error {
 	s.released = true
 	return nil
@@ -424,6 +429,18 @@ func TestForceLockReleaseIsAdminOnly(t *testing.T) {
 		assert.Contains(t, rec.Body.String(), "schema-admins", "the denial names the write groups that may force")
 		assert.False(t, locks.forceReleased, "the handler must not reach storage on a denied force release")
 		assert.False(t, locks.released, "a denied force release must not fall through to a normal release")
+	})
+
+	t.Run("a scoped operator cannot force a named lock either", func(t *testing.T) {
+		locks := &recordingLockStore{}
+		svc := New(&mockStorageWithApplyStores{locks: locks}, scopedWriteConfig(), nil, logger)
+		operator := &auth.User{Subject: "bob", Groups: []string{"payments-team"}}
+		rec := scopedDenialRequest(t, svc.handleLockRelease, operator, http.MethodDelete, "/api/locks",
+			`{"database":"payments","database_type":"mysql","force":true,"id":7}`)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Contains(t, rec.Body.String(), "schema-admins", "the denial names the write groups that may force")
+		assert.False(t, locks.forceReleased, "the handler must not reach storage on a denied force release")
 	})
 
 	t.Run("a deployment write-group member may force", func(t *testing.T) {

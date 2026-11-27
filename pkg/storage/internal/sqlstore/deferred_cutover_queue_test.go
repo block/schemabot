@@ -98,18 +98,27 @@ func testDeferredCutoverQueue(t *testing.T, newStore func(*testing.T) *Storage) 
 		store := newStore(t)
 		applyA := seedHalfStartedDeferredApply(t, store, "apply_queue_first")
 		stopQueueApply(t, store, applyA)
+		// A's heartbeat is aged a minute after the stop, so a start that moved
+		// it would change it by far more than the second a timestamp may
+		// tick over between two writes, on either dialect.
+		_, err := store.db.ExecContext(ctx,
+			"UPDATE applies SET updated_at = "+agedHeartbeatExpr(store, time.Minute)+" WHERE id = ?", applyA.ID)
+		require.NoError(t, err)
 		applyB := createQueueApply(t, store, "apply_queue_second", state.Apply.Running, true, time.Minute)
 		insertQueueOperation(t, store, applyB, "shard-1", state.ApplyOperation.WaitingForCutover, true)
 		shardB := insertQueueOperation(t, store, applyB, "shard-2", state.ApplyOperation.Pending, false)
+		stopped, err := store.Applies().Get(ctx, applyA.ID)
+		require.NoError(t, err)
+		require.NotNil(t, stopped)
 
-		_, _, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
 			ApplyID: applyA.ID, Operation: storage.ControlOperationStart, RequestedBy: "operator",
 		})
 		require.NoError(t, err)
 		resumed, err := store.Applies().Get(ctx, applyA.ID)
 		require.NoError(t, err)
 		require.NotNil(t, resumed)
-		assert.Equal(t, applyA.UpdatedAt.Unix(), resumed.UpdatedAt.Unix(), "recording the start leaves A's heartbeat alone")
+		assert.Equal(t, stopped.UpdatedAt.Unix(), resumed.UpdatedAt.Unix(), "recording the start leaves A's heartbeat alone")
 
 		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
 		require.NoError(t, err)

@@ -190,15 +190,52 @@ func TestLockReleaseWithoutIDReleasesByOwner(t *testing.T) {
 	})
 }
 
-// A lock row ID is refused where it cannot mean what it says: a forced release
-// removes whichever lock is held, and no lock row has an ID below one.
+// An administrator who was shown lock row 7 force releases that row, whoever
+// owns it, and a lock held by any other row, or no lock at all, is left as it
+// is with an answer that says which.
+func TestForceLockReleaseByIDReleasesOnlyTheRowItNames(t *testing.T) {
+	admin := &auth.User{Subject: "alice", Groups: []string{"schema-admins"}}
+	const forceRow7 = `{"database":"payments","database_type":"mysql","force":true,"id":7}`
+	for _, tc := range []lockReleaseByIDCase{
+		{
+			name:       "the row it names is held by another owner, so it is released",
+			held:       paymentsLock(7, "cli:bob@laptop", nil),
+			body:       forceRow7,
+			wantStatus: http.StatusOK,
+		},
+		{
+			// The row the administrator was shown was released and another
+			// command took the lock while the question was open.
+			name:        "another row holds the lock, so it is kept and named",
+			held:        paymentsLock(9, "cli:carol@desktop", nil),
+			body:        forceRow7,
+			wantStatus:  http.StatusConflict,
+			wantCode:    apitypes.ErrCodeLockReplaced,
+			wantMessage: `lock on database "payments" is no longer the lock this release named: lock 9 holds it now, not lock 7; nothing was released, so look at the lock held now before releasing it`,
+			wantHeld:    paymentsLock(9, "cli:carol@desktop", nil),
+		},
+		{
+			name:        "no lock is held",
+			body:        forceRow7,
+			wantStatus:  http.StatusNotFound,
+			wantMessage: "lock not found",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runLockReleaseByIDCase(t, scopedWriteConfig(), admin, tc)
+		})
+	}
+}
+
+// A lock row ID is refused where it cannot mean what it says: no lock row has an
+// ID below one, with or without force.
 func TestLockReleaseRefusesAnIDItCannotHonour(t *testing.T) {
 	admin := &auth.User{Subject: "alice", Groups: []string{"schema-admins"}}
 	for _, tc := range []lockReleaseByIDCase{
 		{
-			name:        "with force",
-			body:        `{"database":"payments","database_type":"mysql","force":true,"id":7}`,
-			wantMessage: "id cannot be combined with force: a forced release removes whichever lock is held",
+			name:        "negative with force",
+			body:        `{"database":"payments","database_type":"mysql","force":true,"id":-7}`,
+			wantMessage: "id must be the positive lock ID a lock acquire reported",
 		},
 		{
 			name:        "negative",

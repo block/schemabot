@@ -1305,7 +1305,7 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 	if errors.As(err, &envNotConfiguredErr) {
 		h.logger.Warn("schema request: environment not configured on this server", logFields...)
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "environment_not_configured")
-		data.ErrorDetail = userFacingErrorDetail(userFacingError(err))
+		data.ErrorDetail = userFacingError(err)
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
 		return true
 	}
@@ -1313,7 +1313,7 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 	h.logger.Error("schema request failed", logFields...)
 	metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "unexpected")
 	if !suppressRetryComments {
-		data.ErrorDetail = userFacingErrorDetail(userFacingError(err))
+		data.ErrorDetail = userFacingError(err)
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
 	}
 	return false
