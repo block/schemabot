@@ -623,8 +623,13 @@ database's environments; forcing one away from its owner is an administrative
 action, not a routine retry. `unlock --force` and `apply --force` show who holds
 the lock and since when, then ask you to answer `yes` before they take it from
 another owner. A lock you hold yourself, or no lock, brings no question. `-y`
-skips the question, so scripts keep working. With no terminal to answer on and
-no `-y`, the command refuses, names the holder, and changes nothing.
+skips the question, so scripts that pass it keep working. Piped input is not an
+answer: with no terminal to answer on and no `-y`, the command refuses, names
+the holder, and changes nothing, even when `yes` is piped in. A server that
+does not report lock IDs cannot show that the lock released is the one you
+approved, so against it the command refuses before asking and says to add `-y`
+or upgrade the server. A lock that changes hands while the question is open is
+not released.
 See [locks](schema-intelligence.md#check-locks) for the inspection request and
 response, and [access rules](auth.md#what-read-and-write-access-include) for
 who may act.

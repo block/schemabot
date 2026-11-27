@@ -17,7 +17,9 @@ var stdinIsTerminal = func() bool {
 	}
 	// The null device is a character device too, and it is what cron, CI, and
 	// a container started without a terminal give a command as its input.
-	// Nobody answers from it.
+	// Nobody answers from it. Any other character device counts as a
+	// terminal, and so does a stdin whose identity cannot be read: the
+	// prompt still takes nothing but a typed yes.
 	in, inErr := os.Stdin.Stat()
 	null, nullErr := os.Stat(os.DevNull)
 	return inErr != nil || nullErr != nil || !os.SameFile(in, null)
@@ -56,7 +58,7 @@ func lockHolderData(database, dbType string, lock *client.LockInfo) templates.Lo
 // could not be held to the lock it was given for.
 func errLockTakeoverUnidentified(database, dbType string, lock *client.LockInfo, notDone, instead string) error {
 	return fmt.Errorf("the lock on %s (%s) is held by %s, and this SchemaBot server does not report lock IDs, "+
-		"so the lock released could not be checked against the one you approve; %s. Add -y to %s without asking, "+
+		"so SchemaBot cannot confirm the lock is still the one you approved; %s. Add -y to %s without asking, "+
 		"or upgrade the server", database, dbType, ui.TerminalSafeLine(lock.Owner), notDone, instead)
 }
 

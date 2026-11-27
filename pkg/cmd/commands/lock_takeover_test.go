@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -162,6 +163,80 @@ func TestUnlockCmdForceDoesNotReleaseALockItDidNotShow(t *testing.T) {
 	assert.Empty(t, srv.releases, "a lock the prompt did not name must not be released")
 }
 
+// A lock is the same one only when both its owner and its row match, so a lock
+// another owner took under the same row, or one the same owner released and
+// took again, is not covered by an answer about the first.
+func TestForcedUnlockOnlyReleasesTheLockItAskedAbout(t *testing.T) {
+	cases := map[string]string{
+		"the same owner took it again": lockBody(t, 6, "cli:alice@build-host"),
+		"another owner holds the row":  lockBody(t, 5, "cli:bob@build-host"),
+	}
+	for name, later := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv := &forceApplyServer{locks: []string{lockBody(t, 5, "cli:alice@build-host"), later}}
+			endpoint := srv.start(t)
+			answerAtTerminal(t, "yes\n")
+
+			cmd := UnlockCmd{Database: "testdb", Type: "mysql", Force: true}
+			out, err := runLockCmd(endpoint, cmd.Run)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "a lock you were not shown, so nothing was changed")
+			assert.NotContains(t, out, "Force released")
+			assert.Empty(t, srv.releases)
+		})
+	}
+}
+
+// A lock its holder released while the prompt was open leaves nothing to
+// release, so the unlock says there is no lock and sends no release.
+func TestForcedUnlockOfALockReleasedWhileThePromptIsOpen(t *testing.T) {
+	srv := &forceApplyServer{locks: []string{lockBody(t, 5, "cli:alice@build-host"), ""}}
+	endpoint := srv.start(t)
+	answerAtTerminal(t, "yes\n")
+
+	cmd := UnlockCmd{Database: "testdb", Type: "mysql", Force: true}
+	out, err := runLockCmd(endpoint, cmd.Run)
+	require.NoError(t, err)
+	assert.Contains(t, out, "No lock found for testdb (mysql)\n")
+	assert.NotContains(t, out, "Force released")
+	assert.Empty(t, srv.releases)
+}
+
+// The plain apply prompt was answered while nobody else held the lock. Another
+// owner's lock found when the apply goes to take it is one the operator was
+// never shown, so nothing is released.
+func TestForcedApplyDoesNotBreakALockTakenAfterThePlainPrompt(t *testing.T) {
+	srv := &forceApplyServer{locks: []string{"", lockBody(t, 6, "cli:bob@build-host")}}
+	endpoint := srv.start(t)
+	answerAtTerminal(t, "yes\n")
+
+	out, err := srv.run(t, endpoint, false)
+	require.Error(t, err)
+	assert.Equal(t, "the lock on testdb (mysql) is now held by cli:bob@build-host, a lock you were not shown, "+
+		"so nothing was changed; run the command again to review it", err.Error())
+	assert.NotContains(t, out, "Force released")
+	assert.Empty(t, srv.releases)
+	assert.Zero(t, srv.acquires)
+}
+
+// Nobody answers a prompt from the null device, which cron, CI, and a container
+// started without a terminal give a command, or from a file.
+func TestStdinIsTerminalRejectsTheNullDeviceAndFiles(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "stdin")
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(file) })
+	null, err := os.Open(os.DevNull)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(null) })
+
+	previous := os.Stdin
+	t.Cleanup(func() { os.Stdin = previous })
+	for name, in := range map[string]*os.File{"the null device": null, "a file": file} {
+		os.Stdin = in
+		assert.False(t, stdinIsTerminal(), name)
+	}
+}
+
 // A server that does not report lock IDs cannot tell the lock the prompt named
 // from one the same owner took again, so a forced command that would ask is
 // refused before it asks, and -y is named as the way to go ahead.
@@ -176,7 +251,7 @@ func TestForcedTakeoverIsRefusedWhenTheServerReportsNoLockID(t *testing.T) {
 		out, err := runUnlockCmd(endpoint, true)
 		require.Error(t, err)
 		assert.Equal(t, "the lock on orders (mysql) is held by octo-org/orders#7, and this SchemaBot server does not report lock IDs, "+
-			"so the lock released could not be checked against the one you approve; it was not released. "+
+			"so SchemaBot cannot confirm the lock is still the one you approved; it was not released. "+
 			"Add -y to release it without asking, or upgrade the server", err.Error())
 		assert.NotContains(t, out, unlockTakeoverPrompt)
 		assert.Empty(t, srv.releases)
@@ -189,7 +264,7 @@ func TestForcedTakeoverIsRefusedWhenTheServerReportsNoLockID(t *testing.T) {
 		out, err := srv.run(t, endpoint, false)
 		require.Error(t, err)
 		assert.Equal(t, "the lock on testdb (mysql) is held by cli:alice@build-host, and this SchemaBot server does not report lock IDs, "+
-			"so the lock released could not be checked against the one you approve; nothing was applied. "+
+			"so SchemaBot cannot confirm the lock is still the one you approved; nothing was applied. "+
 			"Add -y to take it over without asking, or upgrade the server", err.Error())
 		assert.NotContains(t, out, "Do you want to apply")
 		assert.Empty(t, srv.releases)
