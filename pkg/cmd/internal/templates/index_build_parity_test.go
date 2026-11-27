@@ -76,6 +76,29 @@ func TestPostgresPlainDDLDrawsNoBar(t *testing.T) {
 	assert.Contains(t, pr, "**`users`**: Running...\n")
 }
 
+// While a PostgreSQL step waits outside the lock queue for another session's
+// conflicting lock to end, an operator following it from the terminal and
+// from the PR sees the same reading: the session it waits on and how long,
+// in place of a statement that only reads "Running...".
+func TestLockHolderWaitReadsTheSameOnEverySurface(t *testing.T) {
+	resp := postgresProgress("ALTER TABLE users ADD COLUMN nickname text", "alter", 0, map[string]string{
+		"lock_holder_pid": "9433", "lock_holder_table": "public.users",
+		"lock_holder_waited_ms": "7944", "lock_holder_limit_ms": "30000",
+	})
+	const label = "⏳ Waiting for session 9433 to release its lock (7s of 30s)"
+	const note = "Reads and writes continue. The step runs once session 9433 commits or rolls back."
+
+	cli := renderRollout(t, ParseProgressResponse(resp))
+	pr := webhooktemplates.RenderApplyStatusComment(webhooktemplates.ApplyStatusFromProgress(resp, "octocat"))
+
+	assert.Contains(t, cli, "users: "+label+"\n")
+	assert.Contains(t, cli, note)
+	assert.NotContains(t, cli, "Running...")
+	assert.Contains(t, pr, "**`users`**: "+label+"\n")
+	assert.Contains(t, pr, note)
+	assert.NotContains(t, pr, "Running...")
+}
+
 // indexBuildTarget is one target of a concurrent index build rolled out
 // across targets.
 type indexBuildTarget struct {

@@ -34,6 +34,9 @@ type BuildWork struct {
 	// renderer then shows the table's whole percent.
 	Percent    float64
 	HasPercent bool
+	// HolderWait is set while the step waits for another session's
+	// conflicting lock to end before it requests its own.
+	HolderWait LockHolderWait
 }
 
 // IsConcurrentIndexBuild reports whether the work belongs to a concurrent
@@ -45,18 +48,23 @@ func (w BuildWork) IsConcurrentIndexBuild() bool {
 }
 
 // ParseBuildWork decodes the current operation's work from progress display
-// metadata. It returns the zero value with a nil error when the engine
-// publishes no operation, and an error when a published counter is not a
-// non-negative integer, so a renderer can log the malformed value and omit
-// the work rather than show a wrong value. A counter is published when its
+// metadata, with the lock holder the step waits on, if any. It returns the
+// zero value with a nil error when the engine publishes neither, and an
+// error when a published counter is not a non-negative integer, so a
+// renderer can log the malformed value and omit the work rather than show a
+// wrong value. A counter is published when its
 // key is present, whatever the value: an absent key means the engine has no
 // reading, while a present empty value is malformed.
 func ParseBuildWork(metadata map[string]string) (BuildWork, error) {
+	wait, err := parseLockHolderWait(metadata)
+	if err != nil {
+		return BuildWork{}, err
+	}
 	operation := metadata[buildOperationMetadataKey]
 	if operation == "" {
-		return BuildWork{}, nil
+		return BuildWork{HolderWait: wait}, nil
 	}
-	work := BuildWork{Operation: operation, ServerPhase: metadata[buildServerPhaseMetadataKey]}
+	work := BuildWork{Operation: operation, ServerPhase: metadata[buildServerPhaseMetadataKey], HolderWait: wait}
 	fields := []struct {
 		key   string
 		value *int64

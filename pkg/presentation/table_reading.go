@@ -164,6 +164,11 @@ func readChecksum(f TableFacts) TableReading {
 // readRunning reads a table the engine is copying, building, or applying.
 func readRunning(f TableFacts) TableReading {
 	switch {
+	case f.BuildWork.HolderWait.Waiting():
+		// The step has not requested its lock yet: it waits for a session
+		// holding a conflicting one to end, so the label names that session
+		// rather than reading as a statement that is running.
+		return readHolderWait(f.BuildWork.HolderWait)
 	case f.RowsTotal > 0 && ui.EstimateExceeded(f.RowsCopied, f.RowsTotal):
 		// The copy has passed the engine's estimate, so a percentage would
 		// read as done while rows are still moving. While some shards have
@@ -216,6 +221,21 @@ func readRunning(f TableFacts) TableReading {
 		// drawn, since a bar would claim a measure the engine never gave.
 		return TableReading{Label: applyingLabel(f)}
 	}
+}
+
+// readHolderWait reads a step waiting for another session's lock to end
+// before it requests its own: which session, how long the step has waited,
+// and how long it waits at most.
+func readHolderWait(w apitypes.LockHolderWait) TableReading {
+	label := fmt.Sprintf("⏳ Waiting for session %d to release its lock (%s", w.PID, ui.FormatHumanDuration(w.Waited))
+	if w.Limit > 0 {
+		label += " of " + ui.FormatHumanDuration(w.Limit)
+	}
+	label += ")"
+	return TableReading{Label: label, Details: []TableDetail{{
+		Text: fmt.Sprintf("Reads and writes continue. The step runs once session %d commits or rolls back.", w.PID),
+		Note: true,
+	}}}
 }
 
 // applyingLabel names a change that reports no progress by what it does.

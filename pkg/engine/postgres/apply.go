@@ -2802,14 +2802,14 @@ func executorProgressMetadata(ctx context.Context, tracker buildTracker, result 
 	// names that session, so an operator can see what the apply waits on.
 	// The keys are absent once the wait ends.
 	if wait := snapshot.Detail.LockHolderWait; wait != nil {
-		metadata[lockHolderPIDMetadataKey] = strconv.FormatUint(uint64(wait.PID), 10)
+		metadata[apitypes.LockHolderPIDMetadataKey] = strconv.FormatUint(uint64(wait.PID), 10)
 		if table := sanitizeReasonText(wait.Table); table != "" {
-			metadata[lockHolderTableMetadataKey] = table
+			metadata[apitypes.LockHolderTableMetadataKey] = table
 		}
-		metadata[lockHolderWaitedMetadataKey] = strconv.FormatInt(wait.Waited.Milliseconds(), 10)
-		metadata[lockHolderLimitMetadataKey] = strconv.FormatInt(wait.Limit.Milliseconds(), 10)
+		metadata[apitypes.LockHolderWaitedMetadataKey] = strconv.FormatInt(wait.Waited.Milliseconds(), 10)
+		metadata[apitypes.LockHolderLimitMetadataKey] = strconv.FormatInt(wait.Limit.Milliseconds(), 10)
 	} else {
-		for _, key := range lockHolderMetadataKeys {
+		for _, key := range apitypes.LockHolderMetadataKeys {
 			delete(metadata, key)
 		}
 	}
@@ -2830,19 +2830,6 @@ func executorProgressMetadata(ctx context.Context, tracker buildTracker, result 
 	}
 	return nil
 }
-
-// Metadata keys describing a step that waits outside PostgreSQL's lock queue
-// for a conflicting session to end before it requests its lock: the waiting
-// session's PID, the table, how long the step has waited, and how long it
-// waits at most, both in milliseconds.
-const (
-	lockHolderPIDMetadataKey    = "lock_holder_pid"
-	lockHolderTableMetadataKey  = "lock_holder_table"
-	lockHolderWaitedMetadataKey = "lock_holder_waited_ms"
-	lockHolderLimitMetadataKey  = "lock_holder_limit_ms"
-)
-
-var lockHolderMetadataKeys = []string{lockHolderPIDMetadataKey, lockHolderTableMetadataKey, lockHolderWaitedMetadataKey, lockHolderLimitMetadataKey}
 
 // runningPercentMetadataKey is the metadata key that carries pg-sprite's
 // percent for a running index build with its decimals, so a large build
