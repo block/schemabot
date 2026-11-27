@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"log/slog"
 	"sync/atomic"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -107,7 +109,7 @@ func TestControlCommandAuthoredRefusalShowsItsText(t *testing.T) {
 // wrap around it, out of the comment.
 func TestControlOperationFailureMessage(t *testing.T) {
 	t.Run("an untyped failure asks to check the apply before another attempt", func(t *testing.T) {
-		got := controlOperationFailureMessage(errors.New(rawInfrastructureError), "cutover", "apply-123")
+		got := controlOperationFailureMessage(errors.New(rawInfrastructureError), "cutover", "apply-123", "staging")
 
 		assert.Equal(t, controlFailureLine("cutover"), got)
 	})
@@ -115,7 +117,7 @@ func TestControlOperationFailureMessage(t *testing.T) {
 	t.Run("a wrapped untyped failure keeps the wrap out of the line", func(t *testing.T) {
 		wrapped := fmt.Errorf("failed to look up apply %q: %w", "apply-123", errors.New(rawInfrastructureError))
 
-		got := controlOperationFailureMessage(wrapped, "skip-revert", "apply-123")
+		got := controlOperationFailureMessage(wrapped, "skip-revert", "apply-123", "staging")
 
 		assert.NotContains(t, got, "10.1.2.3")
 		assert.Equal(t, controlFailureLine("skip-revert"), got)
@@ -125,7 +127,7 @@ func TestControlOperationFailureMessage(t *testing.T) {
 		err := fmt.Errorf("check remote apply apply-123 before cutover: %w",
 			grpcstatus.Error(grpccodes.Unavailable, rawInfrastructureError))
 
-		got := controlOperationFailureMessage(err, "cutover", "apply-123")
+		got := controlOperationFailureMessage(err, "cutover", "apply-123", "staging")
 
 		assert.Equal(t, userFacingRemoteUnavailableError("", ""), got)
 		requireNoInfrastructureDetail(t, got)
@@ -190,4 +192,111 @@ func TestControlCommandOnApplyWithoutDeploymentSaysRetryWillNotHelp(t *testing.T
 	assert.Contains(t, body, "Sending it again will fail the same way.")
 	assert.NotContains(t, body, "missing stored deployment metadata")
 	assert.NotContains(t, body, "running the command again")
+}
+
+// controlOperationListStore serves the operations a refused PostgreSQL stop
+// reads to name its remedy, or fails with listErr when one is set.
+type controlOperationListStore struct {
+	storage.ApplyOperationStore
+	listErr error
+}
+
+func (s *controlOperationListStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	return nil, nil
+}
+
+// planControlOperationStorage is planControlStorage with the apply's
+// operations.
+type planControlOperationStorage struct {
+	planControlStorage
+	operations storage.ApplyOperationStore
+}
+
+func (s *planControlOperationStorage) ApplyOperations() storage.ApplyOperationStore {
+	return s.operations
+}
+
+// An operator comments stop on a running PostgreSQL apply. PostgreSQL can't
+// pause it, so the comment says so and names what to do in the PR's own
+// terms: the cancel comment for a lone index build, the apply's progress
+// comment for anything that finishes on its own, and both when SchemaBot
+// cannot read which kind of statement is running. The CLI's commands, which
+// the server's refusal names, never reach the comment.
+func TestStopCommandOnPostgresNamesTheRemedyInCommentTerms(t *testing.T) {
+	tests := []struct {
+		name    string
+		listErr error
+		want    string
+	}{
+		{
+			name: "a schema change that finishes on its own points at its progress comment",
+			want: "This schema change can't be paused, and it finishes on its own; the progress comment for apply `apply-123` follows it to the end.",
+		},
+		{
+			name:    "an unreadable statement kind names both remedies",
+			listErr: errors.New(rawInfrastructureError),
+			want: "This schema change can't be paused. If it is a single index build, end it by commenting `schemabot cancel apply-123 -e staging`. " +
+				"Anything else finishes on its own, and the progress comment for apply `apply-123` follows it to the end.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := recordComments(t, mux)
+			st := &planControlOperationStorage{
+				planControlStorage: planControlStorage{applies: &controlOperationApplyStore{
+					apply: controlOperationTestApply(storage.EnginePostgres),
+				}},
+				operations: &controlOperationListStore{listErr: tt.listErr},
+			}
+			h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+			h.service.RegisterTernClient(api.DefaultDeployment, "staging", &controlStubTernClient{})
+
+			h.handleStopCommand("octocat/hello-world", 1, 12345, "testuser", planControlCommandResult())
+
+			body := requireComment(t, comments, "refused PostgreSQL stop comment")
+			assert.Contains(t, html.UnescapeString(body), tt.want)
+			assert.NotContains(t, body, "schemabot progress")
+			assert.NotContains(t, body, "--no-watch")
+			requireNoInfrastructureDetail(t, body)
+		})
+	}
+}
+
+// Each stop refusal code names its remedy as a PR comment command or as the
+// apply's progress comment, and any other code leaves the line to the
+// refusal's own text.
+func TestStopUnsupportedMessage(t *testing.T) {
+	tests := []struct {
+		code string
+		want string
+	}{
+		{
+			code: apitypes.ErrCodeStopUnsupportedCancel,
+			want: "This schema change can't be paused. To end it, comment `schemabot cancel apply-123 -e staging`.",
+		},
+		{
+			code: apitypes.ErrCodeStopUnsupportedFinishes,
+			want: "This schema change can't be paused, and it finishes on its own; the progress comment for apply `apply-123` follows it to the end.",
+		},
+		{
+			code: apitypes.ErrCodeStopUnsupported,
+			want: "This schema change can't be paused. If it is a single index build, end it by commenting `schemabot cancel apply-123 -e staging`. " +
+				"Anything else finishes on its own, and the progress comment for apply `apply-123` follows it to the end.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.code, func(t *testing.T) {
+			got, ok := stopUnsupportedMessage(tt.code, "apply-123", "staging")
+			assert.True(t, ok)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+
+	got, ok := stopUnsupportedMessage(apitypes.ErrCodeInvalidRequest, "apply-123", "staging")
+	assert.False(t, ok, "a code outside the stop refusals is left to the refusal's text")
+	assert.Empty(t, got)
 }
