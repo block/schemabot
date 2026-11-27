@@ -2990,6 +2990,13 @@ type Task struct {
 	// DDLAction is "alter", "create", or "drop".
 	DDLAction string
 
+	// PlanChangeOrdinal is the 1-based position, among the plan's changes to
+	// this task's namespace and table, of the change the task runs. It tells
+	// apart changes that carry the same statement, whose engine metadata can
+	// differ. 0 means unknown, as on a task written by an older binary; the
+	// drive then matches the task to its change by statement.
+	PlanChangeOrdinal int
+
 	// Progress tracking (for copy-based schema changes)
 	RowsCopied      int64 // Rows copied so far
 	RowsTotal       int64 // Total rows to copy

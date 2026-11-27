@@ -32,6 +32,27 @@ func TestBuildDispatchTasksCopiesAsymmetricVerdicts(t *testing.T) {
 	assert.Empty(t, tasks[1].ModeReason)
 }
 
+// A plan that runs the same statement twice on one table, around other
+// changes, gives each dispatched task the position of the change it runs, so
+// the drive reads each one's own engine metadata.
+func TestBuildDispatchTasksRecordWhichChangeEachRuns(t *testing.T) {
+	const drop = `ALTER TABLE "public"."notes" DROP CONSTRAINT "notes_body_not_null"`
+	changes := []storage.TableChange{
+		{Namespace: "public", Table: "notes", DDL: drop, Operation: "alter"},
+		{Namespace: "public", Table: "notes", DDL: `ALTER TABLE "public"."notes" ALTER COLUMN "body" SET NOT NULL`, Operation: "alter"},
+		{Namespace: "public", Table: "notes", DDL: drop, Operation: "alter"},
+	}
+	plan := &storage.Plan{ID: 7, Database: "app", DatabaseType: storage.DatabaseTypePostgres, Namespaces: map[string]*storage.NamespacePlanData{
+		"public": {Tables: changes},
+	}}
+
+	tasks := buildDispatchTasks(plan, dispatchScope{ddlChanges: changes}, "production", storage.EnginePostgres, []byte("{}"), time.Now())
+	require.Len(t, tasks, 3)
+	assert.Equal(t, 1, tasks[0].PlanChangeOrdinal)
+	assert.Equal(t, 2, tasks[1].PlanChangeOrdinal)
+	assert.Equal(t, 3, tasks[2].PlanChangeOrdinal)
+}
+
 // Dispatched tasks carry the table's planned size and row count so progress
 // can show them beside the row counts, and before the copy reports any. A
 // dispatch scoped to one shard creates tasks without them, since the plan's

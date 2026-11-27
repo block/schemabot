@@ -3547,6 +3547,7 @@ func buildShardedApplyOperationGroups(
 		// of a mirrored environment carries the apply's plan, so this is the same
 		// shard set for every member there.
 		shardsByNamespace := changingShardsByNamespace(member.Plan.Shards)
+		firstMemberGroup := len(groups)
 		namespaces := make([]string, 0, len(shardsByNamespace))
 		for namespace := range shardsByNamespace {
 			namespaces = append(namespaces, namespace)
@@ -3588,6 +3589,9 @@ func buildShardedApplyOperationGroups(
 					group.Tasks = append(group.Tasks, buildApplyTask(member.Plan, ddlChange, environment, applyOpts, shard.Shard, now))
 				}
 			}
+		}
+		for _, group := range groups[firstMemberGroup:] {
+			storage.AssignPlanChangeOrdinals(member.Plan, group.Tasks)
 		}
 		finalizers, err := buildNamespaceFinalizerOperations(applyPlan, member, keys, cutoverPolicy, onFailure, now)
 		if err != nil {
@@ -3720,6 +3724,7 @@ func buildApplyTasks(
 	for _, ddlChange := range taskChanges {
 		tasks = append(tasks, buildApplyTask(plan, ddlChange, environment, applyOpts, shard, now))
 	}
+	storage.AssignPlanChangeOrdinals(plan, tasks)
 	return tasks
 }
 
