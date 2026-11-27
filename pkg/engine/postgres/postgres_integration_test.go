@@ -1625,9 +1625,9 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"public"}, namespaces, "the existence check for a requested namespace must read the real catalog")
 
-	objects, err := pullUnmodeledTableObjects(t.Context(), pool, "public", "users")
+	inherits, err := inheritsFromAParent(t.Context(), pool, "public", "users")
 	require.NoError(t, err)
-	assert.Equal(t, unmodeledTableObjects{}, objects, "a plain table must not acquire unmodeled objects from decoy catalog rows")
+	assert.False(t, inherits, "a plain table must not acquire table inheritance from decoy catalog rows")
 }
 
 // TestSpritePoolUnshadowsCatalog pins the search_path every pg-sprite pool

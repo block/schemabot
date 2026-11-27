@@ -48,11 +48,12 @@ const launchBarSchema = `
 // A team brings an existing database to SchemaBot. pull writes every table a
 // schema file can describe, foreign keys and storage parameters included, and
 // tables with triggers or comments too, which stay on the live table outside
-// the file. It skips each table it cannot describe, naming what it carries. The pulled
-// files, with the skipped tables ignored, plan no change. The team's first
-// pull request adds a nullable column to the biggest table, with the size
-// limit set below that table's size. The column changes only the catalog, so
-// it plans as runnable, the apply completes, and the column exists.
+// the file. It skips each table it cannot describe, naming what it carries.
+// The pulled files, with the skipped tables ignored, plan no change. The
+// team's first pull request adds a nullable column to the biggest table, with
+// the size limit set below that table's size. The column changes only the
+// catalog, so it plans as runnable, the apply completes, and the column
+// exists.
 func TestEnginePostgresLaunchBar(t *testing.T) {
 	const database = "launch_bar_test"
 	dsn, db := testutil.StartPostgres(t, database)
