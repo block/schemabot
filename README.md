@@ -62,7 +62,7 @@ Review the proposed SQL before it runs. Configure who can apply it and which env
 
 These are PR workflow gates. Direct CLI and API calls use [server permissions](./docs/auth.md); they do not require PR review or enforce promotion order.
 
-These boundaries matter just as much for a coding agent as for a person. Give agents [schema context and scoped access](./docs/ai-agents.md) while keeping policy on the server.
+These boundaries matter just as much for a coding agent as for a person. Give agents [schema context and scoped access](./docs/ai-agents.md) while keeping policy on the server. The [SchemaBot agent skill](./skills/schemabot/SKILL.md) teaches an agent the whole workflow and ships the boundaries with it.
 
 ## Quick Start
 
@@ -115,7 +115,8 @@ Guides and reference:
 - [Configuration](./docs/configuration.md): Set things up for your environment
 - [Storage schema](./docs/storage-schema.md): Keep SchemaBot’s own bookkeeping database converged across deploys
 - [Authentication](./docs/auth.md): Choose who can read and change your databases
-- [AI agents](./docs/ai-agents.md): Set clear boundaries for your assistants
+- [AI agents](./docs/ai-agents.md): Give your agent the schema, the plan, and clear boundaries
+- [Agent skill](./skills/schemabot/SKILL.md): Drop a ready-made SchemaBot skill into Claude Code, Codex, or goose
 - [Safety invariants](./docs/invariants.md): Understand the guardrails behind each change
 - [Architecture](./docs/architecture.md): Follow a change from start to finish
 - [Target credential self-heal](./docs/target-credential-self-heal.md): Understand target probes and credential rotation recovery
