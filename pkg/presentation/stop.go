@@ -4,13 +4,16 @@ import "github.com/block/schemabot/pkg/state"
 
 // NewApplyRunsWhatRemains says what a new apply after a failure runs, as a
 // predicate whose subject is the new apply. Every apply plans from the live
-// schema, so on every engine it runs only what the failed one left undone,
-// whether that is whole tables or the later steps of one table's change.
+// schema, so once the failure is fixed it runs only what the failed one left
+// undone, whether that is whole tables or the later steps of one table's
+// change. Some failures must be fixed by hand before a new apply can run,
+// such as an interrupted concurrent index drop on PostgreSQL, so the text
+// always follows a sentence that says to fix the failure first.
 const NewApplyRunsWhatRemains = "plans again from the live schema and runs only what is not applied yet"
 
-// RetryLabel introduces the command that retries a failed rollout. It says
-// that a fresh apply resumes rather than starts over, which is what decides
-// whether the operator retries or investigates first.
+// RetryLabel introduces the command that retries a failed apply. It says that
+// the new apply plans again and contains only the remaining work, which is
+// what decides whether the operator retries or investigates first.
 const RetryLabel = "To retry once the failure above is resolved — a new apply " + NewApplyRunsWhatRemains
 
 // RetryOnceSettledNote follows stop while a failure waits on a rollout that

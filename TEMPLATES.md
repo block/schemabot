@@ -3587,7 +3587,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -6149,7 +6149,7 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -7156,7 +7156,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -7203,7 +7203,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -7251,7 +7251,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -8145,7 +8145,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -8193,7 +8193,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -8315,7 +8315,7 @@ ALTER TABLE sessions ADD COLUMN payload jsonb;
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -8507,7 +8507,7 @@ ALTER TABLE `notifications` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -8578,7 +8578,7 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -11841,7 +11841,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -11900,7 +11900,7 @@ ALTER TABLE `mutes` ADD UNIQUE `uk_target`(`target_id`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -12167,7 +12167,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -12199,7 +12199,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -12240,7 +12240,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -12280,7 +12280,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
