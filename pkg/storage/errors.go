@@ -137,6 +137,15 @@ var (
 	// matches the apply lease token stored by the latest operator claimant.
 	ErrApplyLeaseLost = errors.New("apply lease lost")
 
+	// ErrOperationClaimContended is returned by an operation claim that asked
+	// to report contention (ReportClaimContention) when it took nothing, but a
+	// lock-free reread of the same eligibility found an operation it could
+	// take. Usually another transaction held that row, since the claim skips
+	// locked rows rather than wait on them. The reread is a fresh snapshot, so
+	// it can also find a row that became claimable after the claim ran. Either
+	// way this is not a failure: the caller retries shortly.
+	ErrOperationClaimContended = errors.New("the claim took no apply_operation but a lock-free reread found one claimable")
+
 	// ErrOperationLeaseActive is returned when a repair write requires an
 	// operation to remain unleased but a live drive owns it.
 	ErrOperationLeaseActive = errors.New("operation lease is active")

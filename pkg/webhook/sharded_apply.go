@@ -60,7 +60,7 @@ type shardWorkGroup struct {
 // when the apply row carries none, since a finalizer failure is
 // operation-scoped and leaves no failed shard row to name it.
 func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, view *shardedPlanView, tenant string) templates.ShardedApplyData {
-	tasksByOp := groupTasksByOperation(tasks)
+	tasksByOp := storage.TasksByOperation(tasks)
 	// Sort each operation's tasks by id so the joined DDL (and the change
 	// signature derived from it) is deterministic without depending on the
 	// loader's ordering. In practice a (shard, table) operation has a single
@@ -468,7 +468,7 @@ func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, release
 				PauseOnFailure:    op.OnFailure == storage.OnFailurePause,
 				Released:          released,
 				CopiesNoRows:      presentation.TasksCopyNoRows(tasksByOp[op.ID]),
-				Error:             shardOperationError(op, tasksByOp[op.ID]),
+				Error:             op.FailureMessage(tasksByOp[op.ID]),
 			})
 		}
 		work = append(work, sw)
@@ -484,6 +484,7 @@ func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, release
 			StoppedAtCutover: s.Presentation == presentation.StateStoppedAtCutover,
 			EndedBy:          s.EndedBy,
 			Landed:           s.Landed,
+			CompetesForSlot:  s.Presentation.CompetesForSlot(),
 		})
 	}
 	return out
@@ -539,6 +540,8 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 			ETASeconds:       rollup.ETASeconds,
 			ShardsReporting:  rollup.ShardsReporting,
 			RowsTotalPlanned: rollup.RowsTotalPlanned,
+			Throttled:        rollup.Throttled,
+			ThrottleReason:   rollup.ThrottleReason,
 			EstimatedBytes:   estimatedBytes,
 			PlannedShards:    plannedShards,
 			CopiesNoRows:     presentation.ShardedTableCopiesNoRows(changesByTable[key], view.plannedChange(key.namespace, key.table)),
@@ -562,31 +565,11 @@ func shardOperationCopy(op *storage.ApplyOperation, tasks []*storage.Task) prese
 
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
+			Throttled:           t.Throttled,
+			ThrottleReason:      t.ThrottleReason,
 		})
 	}
 	return presentation.ShardOperationCopy(op.State, copies)
-}
-
-// shardOperationError is a shard operation's error. When the row carries no
-// error message (a remote failure records the error on the operation's tasks,
-// and the operator may not have stamped the row), it falls back to the first
-// task error so a failed shard always shows why; otherwise the comment is
-// silent and the operator has to dig through logs.
-func shardOperationError(op *storage.ApplyOperation, tasks []*storage.Task) string {
-	if op.ErrorMessage != "" {
-		return op.ErrorMessage
-	}
-	return firstTaskError(tasks)
-}
-
-// firstTaskError returns the first non-empty task error for an operation.
-func firstTaskError(tasks []*storage.Task) string {
-	for _, t := range tasks {
-		if t.ErrorMessage != "" {
-			return t.ErrorMessage
-		}
-	}
-	return ""
 }
 
 // rendersAsSingleShard reports whether a sharded apply reads as one change on
@@ -636,7 +619,7 @@ func rendersAsSingleShard(apply *storage.Apply, ops []*storage.ApplyOperation, v
 // left out, since each keyspace has only one shard. That shard covers the
 // whole table, so each table's planned size from the stored plan is its own.
 func buildSingleShardApplyCommentData(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, displayByOp map[int64]operationDisplay, view *shardedPlanView, tenant string) templates.ApplyStatusCommentData {
-	tasksByOp := groupTasksByOperation(tasks)
+	tasksByOp := storage.TasksByOperation(tasks)
 	var workTasks []*storage.Task
 	var workOps []*storage.ApplyOperation
 	for _, op := range ops {
@@ -677,7 +660,7 @@ func mostSignificantFailure(ops []*storage.ApplyOperation, tasksByOp map[int64][
 	if best == nil || !isOperationFailureState(best.State) {
 		return ""
 	}
-	return shardOperationError(best, tasksByOp[best.ID])
+	return best.FailureMessage(tasksByOp[best.ID])
 }
 
 // tablesStoppedAtCutover counts the table operations of a single-shard layout

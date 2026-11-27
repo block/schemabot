@@ -684,7 +684,8 @@ type PulledNamespace struct {
 	SkippedTables []SkippedTable `json:"skipped_tables,omitempty"`
 }
 
-// SkippedTable is a live table a pull left out, and why.
+// SkippedTable is a live table a pull, or a plan's rollback capture, left
+// out, and why.
 type SkippedTable struct {
 	Table string `json:"table"`
 	// Reason says what the table carries that its schema file cannot
@@ -1759,6 +1760,10 @@ type SchemaChangeResponse struct {
 	Namespace    string                 `json:"namespace"`
 	TableChanges []*TableChangeResponse `json:"table_changes,omitempty"`
 	Metadata     map[string]string      `json:"metadata,omitempty"` // Engine-specific data (e.g., "vschema" → diff)
+	// RollbackBlockers are the live tables that kept the plan from capturing
+	// this namespace's original schema. An apply of the plan still runs, but
+	// it cannot be rolled back.
+	RollbackBlockers []SkippedTable `json:"rollback_blockers,omitempty"`
 }
 
 // TableChangeResponse represents a DDL change in the HTTP response.
@@ -1982,6 +1987,12 @@ type ProgressResponse struct {
 	// VSchema change. Operations still lists every shard and finalizer row,
 	// but a client renders the apply as one change, the way its PR comments do.
 	Sharded bool `json:"sharded,omitempty"`
+	// MaxOperationsAtOnce is how many of the apply's operations the server's
+	// drivers run at once (its max_drivers_per_apply), set when the apply runs
+	// more than one operation. A client states it beside a running rollout's
+	// counts, so the operations queued behind it read as waiting their turn.
+	// Zero when the response does not say.
+	MaxOperationsAtOnce int `json:"max_operations_at_once,omitempty"`
 	// StoppedByFreeze names the freeze that stopped this apply, set only while
 	// the apply is stopped and the stop that stopped it was a freeze's (one
 	// with running "stop"), not an operator's.

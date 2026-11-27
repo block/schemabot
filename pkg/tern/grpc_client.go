@@ -5773,6 +5773,7 @@ func (c *GRPCClient) pollRemoteUntilDone(ctx context.Context, apply *storage.App
 	loggedWholeApplyProgress := false
 	var stoppedAfterStartDeadline time.Time
 	var lastDisplayBlob string
+	var siblingHaltSentAt time.Time
 	parked := newParkedPoll()
 	for {
 		select {
@@ -5786,6 +5787,11 @@ func (c *GRPCClient) pollRemoteUntilDone(ctx context.Context, apply *storage.App
 				return err
 			} else if standDown {
 				return nil
+			}
+			if err := c.cancelRemoteForFailedSibling(ctx, apply, scope, &siblingHaltSentAt); err != nil {
+				logger.WarnContext(ctx, "halting this operation behind a failed sibling failed; current apply owner will exit for operator retry",
+					append(apply.MutableLogAttrs(), "apply_operation_id", scope.applyOperationID, "error", err)...)
+				return err
 			}
 
 			// Poll progress from remote Tern

@@ -777,7 +777,7 @@ Rules:
 - An environment-level `targets` list is mutually exclusive with an environment-level `deployments` map, the same way an environment-level `target` is. A `targets` list inside a `deployments` entry is how the two combine.
 - The list MUST contain at least one entry, and no entry may be empty.
 - A rollout across the listed targets runs table by table: each table lands on every target before any target starts the next. Tables run in the order the reviewed plan lists them, then any table only another target's plan changes, sorted by name. A target whose plan does not change a table has nothing to run for it, and two statements on one table run together. The exception is a rollout where a target's plan changes a VSchema, which applies with that target's tables, so each target then runs its whole change in one go.
-- `cutover_policy` and `on_failure` order the listed targets' copies within each table the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. Cutover is where targets differ from deployments. The default here is `parallel`: it starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and cuts each target over as soon as its copy is ready: a target never waits for an earlier target's copy or cutover to finish, and an earlier target holds a later target's cutover only while it is failed, retrying a failure, stopped, cancelled, or reverted. The [multi-target apply animation](#multi-target-environment) shows this default with four targets. A deployment with a `targets` list therefore refuses `--defer-cutover`; apply one target at a time with `--target` to hold a target's cutover. Under the default `on_failure: halt` a failed target stops every queued target from starting, and holds the cutover of every later target already copying: each of those finishes its copy and waits at the cutover barrier until an operator stops or cancels it. `max_drivers_per_apply` is therefore what bounds how many targets copy at once, and how many a failure can leave holding a finished copy, so raising it widens both; size it for the targets that share a host's disk and network as well as for throughput. An environment that relies on an unset `cutover_policy` running one target at a time needs `cutover_policy: rolling` to keep doing so: a failed target then stops every later one before it starts copying. Whatever `on_failure` says, a table that failed on any target ends the rollout at that table: `continue` or a released `pause` still runs it on the remaining targets, but no target starts the next table.
+- `cutover_policy` and `on_failure` order the listed targets' copies within each table the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. Cutover is where targets differ from deployments. The default here is `parallel`: it starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and cuts each target over as soon as its copy is ready: a target never waits for an earlier target's copy or cutover to finish, and an earlier target holds a later target's cutover only while it is failed, retrying a failure, stopped, cancelled, or reverted. The [multi-target apply animation](#multi-target-environment) shows this default with four targets. A deployment with a `targets` list therefore refuses `--defer-cutover`; apply one target at a time with `--target` to hold a target's cutover. Under the default `on_failure: halt` a failed target stops every queued target from starting, and holds the cutover of every later target already copying: each of those finishes its copy and waits at the cutover barrier until an operator stops or cancels it. The failed target's own other shards do not wait: each one whose cutover has not begun is cancelled. `max_drivers_per_apply` is therefore what bounds how many targets copy at once, and how many a failure can leave holding a finished copy, so raising it widens both; size it for the targets that share a host's disk and network as well as for throughput. An environment that relies on an unset `cutover_policy` running one target at a time needs `cutover_policy: rolling` to keep doing so: a failed target then stops every later one before it starts copying. Whatever `on_failure` says, a table that failed on any target ends the rollout at that table: `continue` or a released `pause` still runs it on the remaining targets, but no target starts the next table.
 - No entry may contain `/`. A deployment addressing several targets names each one in its members' operation keys, and `/` separates a key's components.
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.
@@ -1278,6 +1278,20 @@ one of the event's five attempts, so an event the quota keeps refusing at every
 hourly reset stops being retried about eight hours after it arrived, and its
 check stays failing until the next push or check re-run. A read refused while one database is being
 planned still fails that plan until the next push or check re-run.
+
+GitHub's own primary rate limit is handled the same way, whether or not
+`quota-reserve` is set. When GitHub refuses a request because the
+installation's quota is spent, SchemaBot retries the event at the reset time
+GitHub reports, plus up to 30 seconds. For three hours after the event arrived
+that wait does not use up its retry attempts, and after that each refusal uses
+one of the five. A secondary rate limit, or a refusal that carries no readable
+reset time, is retried on the usual schedule.
+
+Because each wait lasts until a reset, a PR command such as `apply` that the
+limit keeps refusing can run hours after it was typed, and about 13 hours after
+it in the worst case before its final comment says it failed. It posts nothing
+while it waits, since GitHub would refuse that comment too. When it does run,
+it checks the PR, its reviews, its head and the database lock again first.
 
 ```yaml
 github:
@@ -2982,7 +2996,7 @@ Rules:
 - When `apps:` is NOT configured, repositories must not set `github_app:` — it would be silently ignored, so it is rejected at config load to surface misconfiguration early.
 - The legacy single-App `github:` shape continues to work unchanged.
 
-The map key under `apps:` is the App's stable logical name and the value that flows into log lines and metrics. Each entry MUST provide a non-empty `app-id`, `private-key`, and `webhook-secret`; all three accept the same secret-resolution prefixes as the legacy `github:` block (see [Secret Resolution](#secret-resolution)). `check-name` is optional and defaults to `SchemaBot`.
+The map key under `apps:` is the App's stable logical name and the value that flows into log lines and metrics. Each entry MUST provide a non-empty `app-id`, `private-key`, and `webhook-secret`; all three accept the same secret-resolution prefixes as the legacy `github:` block (see [Secret Resolution](#secret-resolution)). `check-name` is optional and defaults to `SchemaBot`. `previous-webhook-secret` is optional and holds the App's old webhook secret while it is rotated out; see [Rotating the webhook secret](github-app-setup.md#rotating-the-webhook-secret).
 
 ### How dispatch works
 

@@ -3,11 +3,14 @@ package templates
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/state"
 )
 
 func TestSanitizeCommentError(t *testing.T) {
@@ -264,19 +267,19 @@ func TestSanitizeCommentError(t *testing.T) {
 	})
 }
 
-func TestSanitizeInlineError(t *testing.T) {
+func TestInlineError(t *testing.T) {
 	t.Run("newlines collapse so the error cannot escape its line", func(t *testing.T) {
-		assert.Equal(t, "line one line two", SanitizeInlineError("line one\nline two"))
+		assert.Equal(t, "line one line two", presentation.InlineError("line one\nline two"))
 	})
 
 	t.Run("endpoints are redacted", func(t *testing.T) {
-		got := SanitizeInlineError("dial tcp db-primary.internal:3306: connection refused")
+		got := presentation.InlineError("dial tcp db-primary.internal:3306: connection refused")
 		assert.NotContains(t, got, "db-primary.internal")
 		assert.Contains(t, got, "[endpoint redacted]")
 	})
 
 	t.Run("whitespace-only input is empty", func(t *testing.T) {
-		assert.Empty(t, SanitizeInlineError(" \n\t "))
+		assert.Empty(t, presentation.InlineError(" \n\t "))
 	})
 }
 
@@ -406,4 +409,45 @@ func TestVSchemaDiffBudget_SharedAcrossKeyspaces(t *testing.T) {
 	assert.Less(t, sb.Len(), maxCommentVSchemaDiffLen+4*200,
 		"four oversized keyspace diffs render one budget's worth of diff, not four")
 	assert.Equal(t, 4, strings.Count(sb.String(), "Diff truncated to fit GitHub's comment size limit"))
+}
+
+// A progress comment says how soon a change reaches it, beside the "Last
+// updated" footer, so a reader of a long apply reads an old timestamp as "no
+// change since then" rather than as SchemaBot going quiet. Zero cadence
+// (terminal finalizations and one-shot renders) omits the note.
+func TestLastUpdatedFooterShowsUpdateCadence(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 19:42:00 UTC")
+	data := ApplyStatusCommentData{
+		Database:      "testapp",
+		Environment:   "staging",
+		RequestedBy:   "octocat",
+		State:         state.Apply.Running,
+		UpdateCadence: 2 * time.Minute,
+	}
+
+	out := RenderApplyStatusComment(data)
+	assert.Contains(t, out, "(2026-06-16 19:42:00 UTC) · changes show within ~2m_")
+
+	data.UpdateCadence = 0
+	out = RenderApplyStatusComment(data)
+	assert.Contains(t, out, "(2026-06-16 19:42:00 UTC)_")
+	assert.NotContains(t, out, "changes show within")
+}
+
+// The cadence note is part of the visible content, so a cadence change alone
+// changes the content key: when the decay schedule moves to a slower rung, the
+// comment is edited once and its note stays true.
+func TestCommentContentKeyChangesWithUpdateCadence(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 19:42:00 UTC")
+	render := func(cadence time.Duration) string {
+		return RenderApplyStatusComment(ApplyStatusCommentData{
+			Database:      "testapp",
+			Environment:   "staging",
+			RequestedBy:   "octocat",
+			State:         state.Apply.Running,
+			UpdateCadence: cadence,
+		})
+	}
+
+	assert.NotEqual(t, CommentContentKey(render(30*time.Second)), CommentContentKey(render(time.Minute)))
 }

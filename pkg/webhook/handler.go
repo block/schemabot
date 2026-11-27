@@ -134,6 +134,15 @@ type Handler struct {
 	// (single- and multi-App) unchanged.
 	repoWebhookSecret []byte
 
+	// previousWebhookSecretsByApp and previousRepoWebhookSecret hold the
+	// secrets being rotated out, keyed like webhookSecretsByApp. A delivery
+	// that fails verification against the current secret is accepted when it
+	// verifies against the previous one, so a rotation does not refuse the
+	// deliveries GitHub still signs with the old secret. Empty when no
+	// rotation is in progress.
+	previousWebhookSecretsByApp map[string][]byte
+	previousRepoWebhookSecret   []byte
+
 	// insecureSkipSignatureVerification is the explicit opt-in to accept
 	// unsigned deliveries in single-App mode when no webhook secret is
 	// configured. Set by WithInsecureSkipSignatureVerification.
@@ -229,6 +238,41 @@ func WithRepoWebhookSecret(secret []byte) HandlerOption {
 	return func(h *Handler) {
 		if len(secret) > 0 {
 			h.repoWebhookSecret = secret
+		}
+	}
+}
+
+// WithPreviousWebhookSecrets sets the App webhook secrets being rotated out,
+// keyed by App logical name like the current secrets (defaultAppName in
+// single-App mode). A delivery signed with one of them is accepted alongside
+// one signed with the current secret. Empty entries are ignored.
+func WithPreviousWebhookSecrets(secretsByApp map[string][]byte) HandlerOption {
+	return func(h *Handler) {
+		for name, secret := range secretsByApp {
+			if len(secret) == 0 {
+				continue
+			}
+			if h.previousWebhookSecretsByApp == nil {
+				h.previousWebhookSecretsByApp = make(map[string][]byte, len(secretsByApp))
+			}
+			h.previousWebhookSecretsByApp[name] = secret
+		}
+	}
+}
+
+// WithPreviousWebhookSecret sets the App webhook secret being rotated out in
+// single-App mode. Empty is a no-op.
+func WithPreviousWebhookSecret(secret []byte) HandlerOption {
+	return WithPreviousWebhookSecrets(map[string][]byte{defaultAppName: secret})
+}
+
+// WithPreviousRepoWebhookSecret sets the repo-webhook secret being rotated
+// out. A repository-targeted delivery signed with it is accepted alongside one
+// signed with the current repo-webhook secret. Empty is a no-op.
+func WithPreviousRepoWebhookSecret(secret []byte) HandlerOption {
+	return func(h *Handler) {
+		if len(secret) > 0 {
+			h.previousRepoWebhookSecret = secret
 		}
 	}
 }
@@ -385,6 +429,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 	for _, opt := range opts {
 		opt(h)
 	}
+	h.warnIgnoredPreviousSecrets()
 
 	// Register recovery callback so the operator can attach comment observers
 	// before resuming recovered applies.
@@ -742,13 +787,73 @@ func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Chec
 	h.logger.Info("re-planning after a terminal apply: the PR head moved while the apply held its check, so no plan result covers the current commit",
 		logFields...)
 	h.goSafe(a.Repository, a.PullRequest, a.InstallationID, "", func() {
-		// System-triggered: no actor to authorize, and no new comment while the
-		// visible plan comment still matches the outcome — the operator asked
-		// for an apply, not for a plan. The stored check state it writes is the
-		// whole point. It re-plans the one database the settled apply held the
-		// check for.
-		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, nil, admission)
+		// System-triggered: no actor to authorize. The stored check state it
+		// writes is the whole point, and the plan comment posts only when the
+		// push changed what the PR plans. It re-plans the one database the
+		// settled apply held the check for.
+		postPlanComment := h.replanPostsPlanComment(context.Background(), a, prInfo.HeadSHA)
+		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, postPlanComment, 0, nil, admission)
 	})
+}
+
+// replanPostsPlanComment reports whether the re-plan after a terminal apply
+// posts its plan comment.
+//
+// It compares the new head with the commit the PR's visible plan comment
+// rendered. That is usually the commit the apply started on, but a push during
+// the apply that changed schema inputs has already posted a comment for its own
+// head, even though the ownership guard kept its result out of the stored
+// check state. A visible comment that already rendered the head, or one whose
+// commit differs from the head only in files that are not schema inputs, stays:
+// the operator asked for an apply, not for a plan. A push that changed schema
+// inputs since that comment leaves the head planning something no comment has
+// shown, such as dropping an index the apply just built, so the re-plan posts.
+// When the visible comment or the range cannot be resolved it posts, so the PR
+// never keeps a comment that may no longer describe what it plans.
+func (h *Handler) replanPostsPlanComment(ctx context.Context, a *storage.Apply, headSHA string) bool {
+	logFields := append(a.LogAttrs(), "head_sha", headSHA)
+	visible, err := h.visiblePlanComment(ctx, a.Repository, a.PullRequest, a.Database, a.DatabaseType)
+	if err != nil {
+		h.logger.Warn("re-plan after terminal apply will post its plan comment because the visible plan comment could not be resolved",
+			append(logFields, "error", err)...)
+		return true
+	}
+	if visible == nil {
+		h.logger.Info("re-plan after terminal apply will post its plan comment because no visible plan comment is tracked",
+			logFields...)
+		return true
+	}
+	if visible.HeadSHA == "" {
+		h.logger.Info("re-plan after terminal apply will post its plan comment because the visible plan comment has no recorded head SHA",
+			logFields...)
+		return true
+	}
+	logFields = append(logFields, "plan_head_sha", visible.HeadSHA)
+	if visible.HeadSHA == headSHA {
+		h.logger.Info("re-plan after terminal apply keeps the visible plan comment while its outcome matches, because that comment already rendered the head",
+			logFields...)
+		return false
+	}
+	client, err := h.clientForRepo(a.Repository, a.InstallationID)
+	if err != nil {
+		h.logger.Warn("re-plan after terminal apply will post its plan comment because no GitHub client could compare the push",
+			append(logFields, "error", err)...)
+		return true
+	}
+	files, err := client.FetchChangedFilesBetween(ctx, a.Repository, visible.HeadSHA, headSHA)
+	if err != nil {
+		h.logger.Warn("re-plan after terminal apply will post its plan comment because the files changed since the visible plan comment could not be compared",
+			append(logFields, "error", err)...)
+		return true
+	}
+	if github.HasSchemaInputFiles(files) {
+		h.logger.Info("re-plan after terminal apply will post its plan comment because schema inputs changed since the visible plan comment",
+			logFields...)
+		return true
+	}
+	h.logger.Info("re-plan after terminal apply keeps the visible plan comment while its outcome matches, because no schema input changed since that comment",
+		logFields...)
+	return false
 }
 
 // replanOwedAfterTerminalApply reports whether a settled apply leaves the PR
@@ -776,8 +881,9 @@ func replanOwedAfterTerminalApply(check *storage.Check, prInfo *github.PullReque
 // apply whose completed task history keeps the row claimed, a failed apply, an
 // apply whose commit removed the schema it had already applied. A plan run
 // against those targets could come back clean while the divergence it is
-// blocking on is still there, so the block outlives the head it was recorded
-// for and is cleared by reconciliation rather than by a newer commit.
+// blocking on is still there, so SchemaBot never plans them on its own. The
+// block outlives the head it was recorded for until a person makes the pull
+// request and the target agree and then plans that environment (MG-10).
 func checkOpenToPlanForNewerCommit(check *storage.Check) bool {
 	if check.ApplyID == 0 {
 		return true
@@ -852,17 +958,18 @@ func (h *Handler) deploymentTenant() string {
 // deferral, and the terminal hook.
 func (h *Handler) commentObserverConfig(factory github.GitHubClientFactory, repo string, pr int, installationID int64) CommentObserverConfig {
 	return CommentObserverConfig{
-		GHClient:       factory,
-		Storage:        h.service.Storage(),
-		Repo:           repo,
-		PR:             pr,
-		InstallationID: installationID,
-		SupportChannel: h.supportChannel(),
-		CLIName:        h.cliName(),
-		Tenant:         h.deploymentTenant(),
-		EngineLogs:     h.engineLogReader(),
-		shardedPlans:   h.shardedPlans,
-		Logger:         h.logger,
+		GHClient:         factory,
+		Storage:          h.service.Storage(),
+		Repo:             repo,
+		PR:               pr,
+		InstallationID:   installationID,
+		SupportChannel:   h.supportChannel(),
+		CLIName:          h.cliName(),
+		Tenant:           h.deploymentTenant(),
+		EngineLogs:       h.engineLogReader(),
+		OperationsAtOnce: h.operationsAtOnce(),
+		shardedPlans:     h.shardedPlans,
+		Logger:           h.logger,
 
 		OnTargetsFinishedHook: h.rolloutTargetsFinishedHook(),
 	}
@@ -1271,7 +1378,7 @@ func (h *Handler) authenticateWebhook(r *http.Request, body []byte) (appName str
 	// webhook. Falls through to App-webhook handling for "integration"
 	// deliveries so a deployment can run both during the cutover.
 	if h.repoWebhookTargeted(r) {
-		if !verifyHMAC(signature, body, h.repoWebhookSecret) {
+		if !h.verifyRotatingSecret(r, defaultAppName, "previous-repo-webhook-secret", signature, body, h.repoWebhookSecret, h.previousRepoWebhookSecret) {
 			return defaultAppName, 0, "invalid_signature", false
 		}
 		return defaultAppName, 0, "", true
@@ -1300,7 +1407,7 @@ func (h *Handler) authenticateWebhook(r *http.Request, body []byte) (appName str
 		if len(secret) == 0 {
 			return name, parsedID, "missing_webhook_secret", false
 		}
-		if !verifyHMAC(signature, body, secret) {
+		if !h.verifyRotatingSecret(r, name, "previous-webhook-secret", signature, body, secret, h.previousWebhookSecretsByApp[name]) {
 			return name, parsedID, "invalid_signature", false
 		}
 		return name, parsedID, "", true
@@ -1324,10 +1431,48 @@ func (h *Handler) authenticateWebhook(r *http.Request, body []byte) (appName str
 		}
 		return defaultAppName, 0, "", true
 	}
-	if !verifyHMAC(signature, body, secret) {
+	if !h.verifyRotatingSecret(r, defaultAppName, "previous-webhook-secret", signature, body, secret, h.previousWebhookSecretsByApp[defaultAppName]) {
 		return defaultAppName, 0, "invalid_signature", false
 	}
 	return defaultAppName, 0, "", true
+}
+
+// warnIgnoredPreviousSecrets logs each secret being rotated out that the
+// handler will never check, because the current secret it pairs with is not
+// set: verification is then skipped or refused without consulting it, so the
+// rotation setting does nothing. The server refuses to start in that state;
+// this covers a host that builds the handler directly.
+func (h *Handler) warnIgnoredPreviousSecrets() {
+	for name := range h.previousWebhookSecretsByApp {
+		if len(h.webhookSecretsByApp[name]) == 0 {
+			h.logger.Warn("previous webhook secret is ignored because its App has no current webhook secret; set the current webhook secret or remove the previous one",
+				"app_name", name,
+				"config_key", "previous-webhook-secret")
+		}
+	}
+	if len(h.previousRepoWebhookSecret) > 0 && len(h.repoWebhookSecret) == 0 {
+		h.logger.Warn("previous webhook secret is ignored because no current repo-webhook secret is set; set the current repo-webhook secret or remove the previous one",
+			"config_key", "previous-repo-webhook-secret")
+	}
+}
+
+// verifyRotatingSecret verifies a delivery against the current secret and,
+// when a rotation is in progress, against the secret being rotated out. A
+// match on the previous secret is logged, so the operator can see GitHub still
+// signs with it and knows the previous secret cannot be removed yet.
+func (h *Handler) verifyRotatingSecret(r *http.Request, appName, previousKey, signature string, body, current, previous []byte) bool {
+	if verifyHMAC(signature, body, current) {
+		return true
+	}
+	if len(previous) == 0 || !verifyHMAC(signature, body, previous) {
+		return false
+	}
+	h.logger.Info("webhook delivery verified with the secret being rotated out; GitHub still signs with it, so keep it configured until deliveries verify with the new secret",
+		"app_name", appName,
+		"config_key", previousKey,
+		"delivery_id", r.Header.Get(headerDeliveryID),
+		"event", r.Header.Get("X-GitHub-Event"))
+	return true
 }
 
 // verifySignedAppOwnsRepo returns an error when the App that signed the

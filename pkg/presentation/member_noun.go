@@ -28,6 +28,13 @@ func (n Noun) Count(count int) string {
 	return fmt.Sprintf("%d %s", count, n.Label(count))
 }
 
+// MemberNamesInlineLimit caps how many member names, shards or targets, a
+// surface names inline. Past it, naming every one reads as a wall, so the
+// group reads as its coverage (CoveragePhrase) instead. The CLI and the PR
+// comment both take it, so the same group is named on one and counted on the
+// other only by design, never by drift.
+const MemberNamesInlineLimit = 8
+
 // CoveragePhrase states how much of the whole a group of count members
 // covers: "all 32 shards" when it covers every member, "12 of 32 shards" for
 // a subset, or a bare count when the total is unknown — a subset must never
@@ -40,4 +47,15 @@ func CoveragePhrase(noun Noun, count, total int) string {
 		return fmt.Sprintf("%d of %d %s", count, total, noun.Plural)
 	}
 	return noun.Count(count)
+}
+
+// MemberNoun is what a rollout's counts call its members: targets when a
+// deployment addresses several of them, deployments otherwise.
+func MemberNoun(groups []Group) Noun {
+	for _, g := range groups {
+		if len(g.Members) > 1 {
+			return TargetNoun
+		}
+	}
+	return DeploymentNoun
 }

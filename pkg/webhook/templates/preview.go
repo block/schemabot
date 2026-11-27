@@ -130,6 +130,27 @@ func PreviewCommentPlanExemptTables() string {
 	})
 }
 
+// PreviewCommentPlanRollbackBlockers renders a PostgreSQL plan whose namespace
+// holds a table no schema file can describe, so the plan could not save the
+// namespace's current schema and an apply of it cannot be rolled back. The
+// comment says so before anyone applies, names the table and why, and says
+// how to undo the change instead.
+func PreviewCommentPlanRollbackBlockers() string {
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", SchemaName: "app", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		DatabaseType: "postgres",
+		Changes:      []KeyspaceChangeData{{Keyspace: "app", Statements: []string{"ALTER TABLE app.users ADD COLUMN email text;"}}},
+		RollbackBlockers: []RollbackBlockersData{{
+			Namespace: "app",
+			Tables: []RollbackBlockerData{{
+				Table:  "orders",
+				Reason: "holds a foreign key added NOT VALID, which a schema file cannot declare",
+			}},
+		}},
+	})
+}
+
 // PreviewCommentPlanIgnoreTables renders the plan a repository gets once its
 // config withholds a live table nothing declares. The plan is clean, which is
 // where the disclosures carry the most: they are the only evidence on the
@@ -1502,11 +1523,14 @@ func PreviewCommentErrorNoConfig() string {
 // PreviewCommentErrorMultiple renders the "multiple databases" error comment.
 func PreviewCommentErrorMultiple() string {
 	return RenderMultipleConfigs(SchemaErrorData{
-		RequestedBy:        previewRequestedBy,
-		Timestamp:          "2026-01-15 14:30:00",
-		Environment:        "staging",
-		CommandName:        action.Plan,
-		AvailableDatabases: "- `testapp` (schema/testapp/schemabot.yaml)\n- `payments` (schema/payments/schemabot.yaml)",
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-01-15 14:30:00",
+		Environment: "staging",
+		CommandName: action.Plan,
+		AvailableConfigs: []AvailableConfigData{
+			{Database: "testapp", SchemaPath: "schema/testapp"},
+			{Database: "payments", SchemaPath: "schema/payments"},
+		},
 	})
 }
 
@@ -2736,6 +2760,48 @@ func PreviewCommentMultiEnvPlanError() string {
 	})
 }
 
+// PreviewCommentMultiEnvPlanRefusedStatements renders a sample
+// multi-environment plan comment where staging's schema files declare
+// statements the engine cannot plan: each one is listed with its file, line,
+// fix and opening line, and the footer asks for a push rather than a re-run.
+func PreviewCommentMultiEnvPlanRefusedStatements() string {
+	refusal := "plan PostgreSQL schema: 3 statements in the schema files cannot be planned"
+	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		IsMySQL:      false,
+		DatabaseType: "postgres",
+		RequestedBy:  previewRequestedBy,
+		Environments: []string{"staging"},
+		Plans:        map[string]*PlanCommentData{},
+		Errors:       map[string]string{"staging": refusal},
+		PlanProblems: map[string]RefusedStatements{
+			"staging": {Problems: []engine.PlanProblem{
+				{
+					File:      "testapp/accounts.sql",
+					Line:      7,
+					Message:   "SchemaBot doesn't manage comments. Remove the COMMENT statement from this file and set the comment on the database directly.",
+					Statement: "COMMENT ON TABLE accounts IS 'People who can place orders'",
+				},
+				{
+					File:      "testapp/orders.sql",
+					Line:      12,
+					Message:   "SchemaBot doesn't manage functions. Create set_updated_at() outside SchemaBot and remove it from this file.",
+					Statement: "CREATE FUNCTION set_updated_at() RETURNS trigger AS $$\nBEGIN\n  NEW.updated_at := now();\n  RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql",
+				},
+				{
+					File:      "testapp/orders.sql",
+					Line:      19,
+					Message:   "SchemaBot doesn't manage triggers. Create orders_updated_at outside SchemaBot and remove it from this file.",
+					Statement: "CREATE TRIGGER orders_updated_at BEFORE UPDATE ON orders\n  FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
+				},
+			}},
+		},
+	})
+}
+
 // PreviewCommentMultiEnvPlanDiff renders a sample multi-environment plan comment
 // where staging and production have different changes (separate sections).
 func PreviewCommentMultiEnvPlanDiff() string {
@@ -2846,7 +2912,9 @@ func PreviewCommentApplyProgress() string {
 	tables[1].PercentComplete = 62
 	tables[1].ETASeconds = 195
 	tables[2].Status = state.Task.Pending
-	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+	data := sampleApplyData(state.Apply.Running, tables)
+	data.UpdateCadence = 5 * time.Second
+	return RenderApplyStatusComment(data)
 }
 
 // PreviewCommentApplySeveralRunning renders an apply comment where two tables
@@ -3463,8 +3531,10 @@ func PreviewCommentMultiTargetApplyInProgress() string {
 		queue("eu", i, addIndex)
 	}
 
+	model := presentation.Derive(ops)
+	model.OperationsAtOnce = 8
 	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
-		Model:       presentation.Derive(ops),
+		Model:       model,
 		ApplyID:     "apply-a1b2c3d4e5f6",
 		Environment: "production",
 		RequestedBy: "aparajon",

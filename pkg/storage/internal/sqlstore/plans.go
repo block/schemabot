@@ -161,14 +161,18 @@ func (s *planStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storag
 		SELECT `+planColumns+`
 		FROM plans
 		WHERE repository = ? AND pull_request = ?
-		ORDER BY created_at DESC, id DESC
 	`, repo, pr)
 	if err != nil {
 		return nil, fmt.Errorf("query plans for %s#%d: %w", repo, pr, err)
 	}
 	defer utils.CloseAndLog(rows)
 
-	return scanPlans(rows)
+	plans, err := scanPlans(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan plans for %s#%d: %w", repo, pr, err)
+	}
+	sortPlansNewestFirst(plans)
+	return plans, nil
 }
 
 // List returns plans matching opts, newest first, with SchemaFiles left
@@ -177,6 +181,13 @@ func (s *planStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storag
 // Ordering is (created_at DESC, id DESC) for the same reason as GetByPR:
 // plans.created_at is datetime (second precision), so the id tiebreaker keeps
 // same-second plans in a deterministic newest-first order.
+//
+// The database never sorts whole plan rows. A row carries its full plan_data,
+// and the plan of a database with many shards can on its own exceed the
+// server's sort buffer, which fails the query (MySQL error 1038) for every
+// listing that reaches that row. So a page is chosen by sorting only
+// (created_at, id), its rows are read by id in the same statement, and the
+// rows are ordered here after the read.
 func (s *planStore) List(ctx context.Context, opts storage.ListPlansOptions) ([]*storage.Plan, error) {
 	opts.Database = storage.CanonicalKey(opts.Database)
 	opts.Environment = storage.CanonicalKey(opts.Environment)
@@ -227,13 +238,17 @@ func (s *planStore) List(ctx context.Context, opts storage.ListPlansOptions) ([]
 		args = append(args, after.CreatedAt, after.CreatedAt, after.ID)
 	}
 
-	query := "SELECT " + planListColumns + " FROM plans"
+	filter := ""
 	if len(where) > 0 {
-		query += " WHERE " + strings.Join(where, " AND ")
+		filter = " WHERE " + strings.Join(where, " AND ")
 	}
-	query += " ORDER BY created_at DESC, id DESC"
+	query := "SELECT " + planListColumns + " FROM plans" + filter
 	if opts.Limit > 0 {
-		query += " LIMIT ?"
+		// The page's ids come from a derived table because MySQL does not
+		// accept LIMIT directly inside an IN subquery.
+		query = "SELECT " + planListColumns + " FROM plans WHERE id IN (" +
+			"SELECT id FROM (SELECT id FROM plans" + filter +
+			" ORDER BY created_at DESC, id DESC LIMIT ?) AS page)"
 		args = append(args, opts.Limit)
 	}
 
@@ -243,7 +258,24 @@ func (s *planStore) List(ctx context.Context, opts storage.ListPlansOptions) ([]
 	}
 	defer utils.CloseAndLog(rows)
 
-	return scanPlans(rows)
+	plans, err := scanPlans(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan plans for database %q environment %q: %w", opts.Database, opts.Environment, err)
+	}
+	sortPlansNewestFirst(plans)
+	return plans, nil
+}
+
+// sortPlansNewestFirst orders plans by (created_at DESC, id DESC), the order
+// every plan listing returns. Plan queries sort here rather than in SQL so the
+// database never has to sort rows that carry a plan's full data.
+func sortPlansNewestFirst(plans []*storage.Plan) {
+	sort.Slice(plans, func(i, j int) bool {
+		if !plans[i].CreatedAt.Equal(plans[j].CreatedAt) {
+			return plans[i].CreatedAt.After(plans[j].CreatedAt)
+		}
+		return plans[i].ID > plans[j].ID
+	})
 }
 
 // Delete removes a plan by ID.
@@ -389,6 +421,7 @@ func namespacesWithShardPlans(plan *storage.Plan) map[string]*storage.NamespaceP
 			Metadata:              nsData.Metadata,
 			IgnoreTables:          nsData.IgnoreTables,
 			DropTables:            nsData.DropTables,
+			RollbackBlockers:      nsData.RollbackBlockers,
 			Finalize:              nsData.Finalize,
 		}
 	}

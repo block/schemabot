@@ -55,11 +55,21 @@ func RolloutCountsUnit(groups []presentation.Group) string {
 }
 
 // RolloutCounts is the rollout's status counts as a label and its text, for
-// the progress header and the watch view: its members' states. A rollout of
-// one deployment run table by table has no counts there, since its
-// deployment's line already states it (tableStepsHeadline). The text is empty
-// when there is nothing to count.
+// the progress header and the watch view: its members' states, ending with
+// how many run at once while the apply runs
+// (presentation.Apply.CountsWithLimit). A rollout of one deployment run table
+// by table has no counts there, since its deployment's line already states it
+// (tableStepsHeadline). The text is empty when there is nothing to count.
 func RolloutCounts(model presentation.Apply, groups []presentation.Group) (label, text string) {
+	label, counts := rolloutStateCounts(model, groups)
+	if counts == "" {
+		return "", ""
+	}
+	return label, model.CountsWithLimit(counts)
+}
+
+// rolloutStateCounts is RolloutCounts without the limit.
+func rolloutStateCounts(model presentation.Apply, groups []presentation.Group) (label, text string) {
 	if len(groups) == 1 {
 		if _, ok := tableStepsHeadline(model, groups[0]); ok {
 			return "", ""
@@ -88,26 +98,34 @@ func tableStepsHeadline(model presentation.Apply, g presentation.Group) (string,
 
 // RolloutCountsLine is the rollout's status counts with how many members they
 // cover, "1 completed · 3 stopped (4 targets)", for the line that states the
-// rollout's state. It is empty when RolloutCounts is, and when every member is
-// in the same state, which RolloutCoverage states instead.
+// rollout's state. While the apply runs, the members are followed by how many
+// run at once: "32 running · 96 queued (128 targets, 32 at a time)". It is
+// empty when RolloutCounts is, and when every member is in the same state,
+// which RolloutCoverage states instead.
 func RolloutCountsLine(model presentation.Apply, groups []presentation.Group) string {
-	label, counts := RolloutCounts(model, groups)
+	label, counts := rolloutStateCounts(model, groups)
 	if counts == "" || len(model.Counts) == 1 {
 		return ""
 	}
-	return fmt.Sprintf("%s (%s)", counts, rolloutNoun(label).Count(len(model.Deployments)))
+	members := rolloutNoun(label).Count(len(model.Deployments))
+	if limit := model.LimitPhrase(); limit != "" {
+		members += ", " + limit
+	}
+	return fmt.Sprintf("%s (%s)", counts, members)
 }
 
 // RolloutCoverage is "all 4 targets" when every member of the rollout is in
 // the same state, so its state line reads "Running on all 4 targets" rather
-// than counting one state twice. It is empty otherwise.
+// than counting one state twice. While the apply runs, it ends with how many
+// members run at once, as RolloutCountsLine does: "Queued on all 128 targets
+// (32 at a time)". It is empty otherwise.
 func RolloutCoverage(model presentation.Apply, groups []presentation.Group) string {
-	label, counts := RolloutCounts(model, groups)
+	label, counts := rolloutStateCounts(model, groups)
 	if counts == "" || len(model.Counts) != 1 {
 		return ""
 	}
 	n := len(model.Deployments)
-	return presentation.CoveragePhrase(rolloutNoun(label), n, n)
+	return model.CountsWithLimit(presentation.CoveragePhrase(rolloutNoun(label), n, n))
 }
 
 // RolloutStoppedAtCutoverNote explains the rollout's members that SchemaBot
@@ -150,9 +168,11 @@ func FormatTargetRollup(v RolloutView, g presentation.Group) string {
 	}
 	if _, sole := presentation.SoleTargetRollout(v.Model.Groups()); sole {
 		// The rollout's own state line already counts a sole deployment's
-		// targets, so only a table-by-table headline adds anything here.
+		// targets, so only a table-by-table headline adds anything here. With
+		// no counts above it, it ends with how many targets run at once, as
+		// the PR comment's status line does.
 		if ok {
-			fmt.Fprintf(&b, "%s %s\n", g.Lead.Emoji, status)
+			fmt.Fprintf(&b, "%s %s\n", g.Lead.Emoji, v.Model.CountsWithLimit(status))
 		}
 	} else {
 		fmt.Fprintf(&b, "%s %s — %s\n", g.Lead.Emoji, g.Deployment, status)

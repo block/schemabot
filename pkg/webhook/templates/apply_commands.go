@@ -233,8 +233,7 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 		groups.HasUnsafeChanges, groups.UnsafeChanges = false, nil
 		groups.DiscardedCopies, groups.AdoptedCopies, groups.RunningCopies = nil, nil, nil
 		writeTargetPlans(&sb, groups, budget, false)
-		summary.Changes = combinedTargetPlanChanges(data)
-		summary.summaryRollout = data.DeploymentDrift
+		summary.summarizeRollout(data)
 	} else if statements, keyspaceUpdates := countChanges(data.Changes); statements+keyspaceUpdates > 0 {
 		writeKeyspaceChanges(&sb, data, budget)
 	}

@@ -59,14 +59,14 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Fix checks stuck at "in_progress" from crashed applies
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
+		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, planNotStartedMessage("reconcile the stale status checks on this pull request"))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "status check reconciliation failed"})
 		return
 	}
 
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Plan, environment, databaseName, requestedBy); err != nil {
-		h.logger.Error("failed to check whether plan command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, err.Error())
+		h.logger.Error("failed to check whether plan command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "command", action.Plan, "error", err)
+		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, planReconciliationFailureMessage(err, databaseName))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema reconciliation check failed"})
 		return
 	} else if handled {
@@ -110,8 +110,9 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// discovery would return the discovery-time HeadSHA, masking the race.
 	freshPRInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
-		h.logger.Error("failed to fetch PR for stale-schema check", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, "Failed to verify PR HEAD: "+err.Error())
+		h.logger.Error("failed to fetch PR for stale-schema check",
+			"repo", repo, "pr", pr, "environment", environment, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "command", action.Plan, "error", err)
+		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, planHeadVerificationFailedMessage(schemaResult.Database))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "PR fetch failed"})
 		return
 	}
@@ -191,7 +192,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		api.PlanFailureLog(h.logger, err)("plan narrowed to one target failed; leaving the environment's check unchanged",
 			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
 			"deployment", deployment, "environment", environment, "target", target, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, userFacingError(err))
+		h.postPlanCommandError(repo, pr, installationID, environment, requestedBy, err)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan failed"})
 		return
 	}
@@ -211,7 +212,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		} else {
 			h.recordPlanFailuresAndFold(ctx, client, repo, pr, schemaResult.HeadSHA, schemaResult, []string{environment})
 		}
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, userError)
+		h.postPlanCommandError(repo, pr, installationID, environment, requestedBy, err)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan failed"})
 		return
 	}
@@ -230,7 +231,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	}
 
 	// Build plan comment data
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData := h.planCommentData(schemaResult, planResp, environment, tenant, requestedBy)
 	commentData.BaseSchema = h.planBaseSchema(ctx, client, repo, pr, schemaResult, environment)
 	commentData.ScopedDatabase = databaseName
 	commentData.DeploymentDrift = driftPreview
@@ -292,7 +293,7 @@ func (h *Handler) postNarrowedPlan(ctx context.Context, client *ghclient.Install
 	h.logger.Info("plan narrowed to one target; stored check state and the aggregate check are left unchanged",
 		"repo", repo, "pr", pr, "database", schemaResult.Database, "environment", environment,
 		"target", target, "narrowed_to", planResp.NarrowedTo, "plan_id", planResp.PlanID, "head_sha", schemaResult.HeadSHA)
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData := h.planCommentData(schemaResult, planResp, environment, tenant, requestedBy)
 	commentData.BaseSchema = h.planBaseSchema(ctx, client, repo, pr, schemaResult, environment)
 	commentData.ScopedDatabase = databaseName
 	commentData.Target = target
@@ -607,7 +608,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// Fix checks stuck at "in_progress" from crashed applies
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
+		h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, planNotStartedMessage("reconcile the stale status checks on this pull request"))
 		return
 	}
 
@@ -617,8 +618,8 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// configs already discovered from the PR's changed files.
 	if !isAutoPlan {
 		if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Plan, "", databaseName, requestedBy); err != nil {
-			h.logger.Error("failed to check whether plan command needs schema change reconciliation", "repo", repo, "pr", pr, "database", databaseName, "error", err)
-			h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, err.Error())
+			h.logger.Error("failed to check whether plan command needs schema change reconciliation", "repo", repo, "pr", pr, "database", databaseName, "command", action.Plan, "error", err)
+			h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, planReconciliationFailureMessage(err, databaseName))
 			return
 		} else if handled {
 			return
@@ -783,6 +784,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		Environments:   environments,
 		Plans:          make(map[string]*templates.PlanCommentData),
 		Errors:         make(map[string]string),
+		PlanProblems:   make(map[string]templates.RefusedStatements),
 	}
 	if len(unmanagedSchema) > 0 {
 		multiEnvData.UnmanagedSchema = unmanagedSchema
@@ -794,6 +796,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// also reaching the gate.
 	planFailed := func(env string, err error) {
 		multiEnvData.Errors[env] = userFacingError(err)
+		if problems, omitted := api.PlanRefusalProblems(err); len(problems) > 0 {
+			multiEnvData.PlanProblems[env] = templates.RefusedStatements{Problems: problems, Omitted: omitted}
+		}
 		planFailedEnvironments = append(planFailedEnvironments, env)
 		if planRefusedBySourcePolicy(err) {
 			sourcePolicyRefused[env] = true
@@ -835,8 +840,8 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 				freshPRInfo, prErr := client.FetchPullRequestNoCache(ctx, repo, pr)
 				if prErr != nil {
 					h.logger.Error("failed to fetch PR for stale-schema check",
-						"repo", repo, "pr", pr, "error", prErr)
-					h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, "Failed to verify PR HEAD: "+prErr.Error())
+						"repo", repo, "pr", pr, "environment", env, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "command", action.Plan, "error", prErr)
+					h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, planHeadVerificationFailedMessage(schemaResult.Database))
 					return
 				}
 				if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, freshPRInfo.HeadSHA, env, requestedBy, action.Plan); rejected {
@@ -927,7 +932,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			headSHA = sha
 		}
 
-		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy, h.agentHint(), h.cliName())
+		commentData := h.planCommentData(schemaResult, planResp, env, tenant, requestedBy)
 		plannedSchemas[env] = schemaResult
 		commentData.ScopedDatabase = planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan, commandScopeDatabases)
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, driftPreview, repo, pr, env)
@@ -1055,10 +1060,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		BaseSchemaNotice: templates.AnyEnvHasBaseSchemaNotice(multiEnvData),
 	}
 
-	// The caller asked not to re-post: either the push left the schema inputs
-	// unchanged, or this is the re-plan after a terminal apply, where the
-	// operator asked for an apply rather than a plan. The visible plan comment
-	// stays the PR's answer unless its outcome no longer matches this plan.
+	// The caller asked not to re-post: no schema input changed since the
+	// visible plan comment, whether this plan follows a push or is the re-plan
+	// after a terminal apply. The visible plan comment stays the PR's answer
+	// unless its outcome no longer matches this plan.
 	if !postPlanComment {
 		// A base-schema notice is new information even when the schema inputs
 		// did not change, since the base branch moves without a push to the PR.
@@ -1217,9 +1222,20 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 	}
 
 	if errors.Is(err, ghclient.ErrMultipleConfigs) {
-		h.logger.Warn("schema request: multiple configs found", logFields...)
+		var multipleConfigsErr *ghclient.MultipleConfigsError
+		if errors.As(err, &multipleConfigsErr) {
+			for _, candidate := range multipleConfigsErr.Candidates {
+				data.AvailableConfigs = append(data.AvailableConfigs, templates.AvailableConfigData{
+					Database:   candidate.Database,
+					SchemaPath: candidate.SchemaDir,
+				})
+			}
+			h.logger.Warn("schema request: multiple configs found",
+				append(logFields, "databases", multipleConfigsErr.Databases())...)
+		} else {
+			h.logger.Warn("schema request: multiple configs found without candidate details; the comment lists no databases", logFields...)
+		}
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "multiple_configs")
-		data.AvailableDatabases = templates.FormatAvailableDatabases(err.Error())
 		h.postComment(repo, pr, installationID, templates.RenderMultipleConfigs(data))
 		return true
 	}
@@ -1735,9 +1751,27 @@ func planTableSizes(schema *ghclient.SchemaRequestResult, sc *apitypes.SchemaCha
 // the time the command was posted. Its "Requested by" line then reads when the
 // operator asked, however long planning took, rather than when it rendered.
 func (h *Handler) commandPlanCommentData(schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, requestedBy string, result CommandResult) templates.PlanCommentData {
-	data := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+	data := h.planCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
 	data.RequestedAt = result.RequestedAt
 	return data
+}
+
+// planCommentData builds the plan comment this server posts, stating how many
+// of the apply's operations its drivers run at once.
+func (h *Handler) planCommentData(schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy string) templates.PlanCommentData {
+	data := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
+	data.OperationsAtOnce = h.operationsAtOnce()
+	return data
+}
+
+// operationsAtOnce is how many of an apply's operations this server's drivers
+// run at once. The drivers that run an apply are this server's and its peers',
+// which share its config and so its per-apply limit.
+func (h *Handler) operationsAtOnce() int {
+	if h.service == nil {
+		return 0
+	}
+	return h.service.Config().OperationsAtOnce()
 }
 
 // buildPlanCommentData converts plan results into template data.
@@ -1756,6 +1790,16 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		IgnoredNamespaces:   schema.IgnoredNamespaces,
 		PlanID:              planResp.PlanID,
 		UnmatchedDropTables: planResp.UnmatchedDropTables,
+	}
+	for _, change := range planResp.Changes {
+		if change == nil || len(change.RollbackBlockers) == 0 {
+			continue
+		}
+		group := templates.RollbackBlockersData{Namespace: change.Namespace}
+		for _, b := range change.RollbackBlockers {
+			group.Tables = append(group.Tables, templates.RollbackBlockerData{Table: b.Table, Reason: b.Reason})
+		}
+		data.RollbackBlockers = append(data.RollbackBlockers, group)
 	}
 	for _, group := range planResp.ExemptTables {
 		if group == nil {

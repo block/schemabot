@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -74,7 +75,7 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 			Released:          first.Released,
 			CopyMember:        shardMember(sw.Operations),
 			CopiesNoRows:      shardCopiesNoRows(sw.Operations, sw.Operations[best].State),
-			Error:             sw.Operations[best].Error,
+			Error:             mysqlerr.OnShard(sw.Operations[best].Error),
 			EndedBy:           shardEndedBy(sw.Operations, best, shardOf),
 		})
 	}

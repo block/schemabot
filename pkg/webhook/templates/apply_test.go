@@ -1751,7 +1751,7 @@ func TestRenderApplyStatusComment_TableSizeBesideRows(t *testing.T) {
 			name:  "running with ETA",
 			state: state.Apply.Running,
 			table: TableProgressData{TableName: "orders", Status: state.Task.Running, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, ETASeconds: 720, EstimatedBytes: &bytes},
-			want:  "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB · ETA: 12m 0s\n",
+			want:  "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB · ETA: 12m\n",
 		},
 		{
 			name:  "running without ETA",
@@ -1769,7 +1769,7 @@ func TestRenderApplyStatusComment_TableSizeBesideRows(t *testing.T) {
 			name:  "no estimate",
 			state: state.Apply.Running,
 			table: TableProgressData{TableName: "orders", Status: state.Task.Running, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, ETASeconds: 720},
-			want:  "- Rows: 1,234,567 / 48,200,000 · ETA: 12m 0s\n",
+			want:  "- Rows: 1,234,567 / 48,200,000 · ETA: 12m\n",
 		},
 		{
 			// A queued table has reported nothing yet, so it shows the
@@ -1943,9 +1943,9 @@ func TestRenderApplySummaryComment_Duration(t *testing.T) {
 	}
 	assert.Contains(t, RenderApplySummaryComment(data), "**Duration**: 17m")
 
-	// An apply that runs past a day keeps its minutes.
+	// An apply that runs past a day reads in its two largest units, as the CLI does.
 	data.CompletedAt = "2026-06-17T20:43:00Z"
-	assert.Contains(t, RenderApplySummaryComment(data), "**Duration**: 1d 1h 1m")
+	assert.Contains(t, RenderApplySummaryComment(data), "**Duration**: 1d 1h\n")
 
 	data.CompletedAt = "2026-06-16T19:00:00Z"
 	assert.NotContains(t, RenderApplySummaryComment(data), "**Duration**:")
@@ -2929,13 +2929,13 @@ func TestRenderApplyStatusComment_RevertWindowDeadline(t *testing.T) {
 	pastDue.RevertExpiresAt = time.Now().Add(-1 * time.Minute).UTC().Format(time.RFC3339)
 	assert.NotContains(t, RenderApplyStatusComment(pastDue), "Closes in")
 
-	// A window longer than a day keeps its minutes in the countdown.
+	// A window longer than a day reads in its two largest units, as the CLI does.
 	now := time.Date(2026, 6, 16, 19, 42, 0, 0, time.UTC)
 	NowFunc = func() time.Time { return now }
 	t.Cleanup(func() { NowFunc = time.Now })
 	longWindow := base
 	longWindow.RevertExpiresAt = now.Add(25*time.Hour + time.Minute).Format(time.RFC3339)
-	assert.Contains(t, RenderApplyStatusComment(longWindow), "**Status**: Revert Window | Closes in 1d 1h 1m")
+	assert.Contains(t, RenderApplyStatusComment(longWindow), "**Status**: Revert Window | Closes in 1d 1h\n")
 }
 
 // TestRenderApplyStatusComment_Rollback verifies that a rollback apply's

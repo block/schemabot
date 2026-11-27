@@ -414,7 +414,10 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 	}
 	templates.WriteExemptTables(result.ExemptTables)
 	// A rollout reports no unmatched drop_tables entries; see
-	// shownUnmatchedDropTables.
+	// shownUnmatchedDropTables. Nor does it report rollback blockers:
+	// rollback is refused for an environment with more than one target
+	// whatever each member saved, so naming tables as the reason would point
+	// the reader at the wrong cause.
 }
 
 // shownUnmatchedDropTables is the unmatched drop_tables entries the plan
@@ -628,6 +631,7 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 	}
 	templates.WriteExemptTables(result.ExemptTables)
 	templates.WriteUnmatchedDropTables(shownUnmatchedDropTables(result))
+	templates.WriteRollbackBlockers(result.Changes)
 }
 
 // writePlanGuidance links the guides for the lint findings the output shows.

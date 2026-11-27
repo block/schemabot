@@ -3,6 +3,7 @@
 package sqlstore
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -76,4 +77,65 @@ func TestPlanStore_UpdateRouteRestampsOnlyTheRoute(t *testing.T) {
 	changes := plan.FlatDDLChanges()
 	require.Len(t, changes, 1)
 	assert.Equal(t, "ALTER TABLE `orders` ADD COLUMN `region` varchar(16)", changes[0].DDL)
+}
+
+// A plan of a database with many shards carries plan data wider than the
+// server's sort buffer. Listing plans must keep that data out of the sort, so
+// the plans page, the review round lookup, and the PR lookup each return such
+// a plan newest first instead of failing every request that reaches its row.
+func TestPlanStore_ListsPlanWiderThanSortBuffer(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	var sortBufferSize int
+	require.NoError(t, testDB.QueryRowContext(ctx, `SELECT @@sort_buffer_size`).Scan(&sortBufferSize))
+	wideDDL := "ALTER TABLE `orders` COMMENT '" + strings.Repeat("a", 2*sortBufferSize) + "'"
+
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	create := func(identifier, primary string, age time.Duration, ddl string) {
+		t.Helper()
+		_, err := store.Plans().Create(ctx, &storage.Plan{
+			PlanIdentifier:        identifier,
+			Database:              "commerce",
+			DatabaseType:          storage.DatabaseTypeMySQL,
+			Repository:            "org/repo",
+			PullRequest:           7,
+			Environment:           "staging",
+			PrimaryPlanIdentifier: primary,
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce": {Tables: []storage.TableChange{{Table: "orders", Operation: "alter", DDL: ddl}}},
+			},
+			CreatedAt: base.Add(-age),
+		})
+		require.NoError(t, err)
+	}
+	narrowDDL := "ALTER TABLE `orders` ADD COLUMN `region` varchar(16)"
+	create("plan_oldest", "", 3*time.Minute, narrowDDL)
+	create("plan_primary", "", 2*time.Minute, wideDDL)
+	create("plan_member", "plan_primary", time.Minute, wideDDL)
+
+	identifiers := func(plans []*storage.Plan) []string {
+		out := make([]string, 0, len(plans))
+		for _, plan := range plans {
+			out = append(out, plan.PlanIdentifier)
+		}
+		return out
+	}
+
+	page, err := store.Plans().List(ctx, storage.ListPlansOptions{Database: "commerce", Environment: "staging", Limit: 2})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"plan_member", "plan_primary"}, identifiers(page))
+	require.Len(t, page, 2)
+	changes := page[0].FlatDDLChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, wideDDL, changes[0].DDL)
+
+	round, err := store.Plans().List(ctx, storage.ListPlansOptions{PrimaryPlanIdentifier: "plan_primary"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"plan_member"}, identifiers(round))
+
+	byPR, err := store.Plans().GetByPR(ctx, "org/repo", 7)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"plan_member", "plan_primary", "plan_oldest"}, identifiers(byPR))
 }

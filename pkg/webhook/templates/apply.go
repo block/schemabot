@@ -253,6 +253,10 @@ type ApplyStatusCommentData struct {
 	// applied it, and the one command that acts on the whole rollout, so the
 	// section leaves out all three.
 	InRolloutSection bool
+
+	// UpdateCadence is the longest a change waits before it reaches this
+	// comment, shown beside the "Last updated" footer. Zero renders no note.
+	UpdateCadence time.Duration
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -338,7 +342,7 @@ func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdate
 	// Footer with next actions
 	writeApplyFooter(&sb, data)
 	if includeLastUpdated && !state.IsTerminalApplyState(data.State) {
-		writeLastUpdatedFooter(&sb, renderedAt)
+		writeLastUpdatedFooter(&sb, renderedAt, data.UpdateCadence)
 	}
 
 	return sb.String()
@@ -661,7 +665,7 @@ func revertWindowCountdown(revertExpiresAt string) string {
 	if remaining <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("Closes in %s", ui.FormatExactDuration(remaining))
+	return fmt.Sprintf("Closes in %s", ui.FormatHumanDuration(remaining))
 }
 
 // taskSettledBeforeCutover reports whether a row is out of the cutover's way:
@@ -901,19 +905,16 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 // application is not a per-table task. Renders nothing when the apply carries
 // no VSchema change.
 func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
+	writeVSchemaStatusWithin(sb, changes, vschemaDiffBudgetFor(changes))
+}
+
+// writeVSchemaStatusWithin renders the VSchema section for changes, each diff
+// held to budget bytes.
+func writeVSchemaStatusWithin(sb *strings.Builder, changes []apitypes.VSchemaChange, budget int) {
 	if len(changes) == 0 {
 		return
 	}
 	sb.WriteString("\n### VSchema\n\n")
-	// The diff budget is per comment, not per keyspace: split it across the
-	// entries that carry a diff so a multi-keyspace apply stays bounded.
-	diffCount := 0
-	for _, c := range changes {
-		if c.Diff != "" {
-			diffCount++
-		}
-	}
-	budget := vschemaDiffBudget(diffCount)
 	for _, c := range changes {
 		fmt.Fprintf(sb, "**%s**: %s\n\n", inlineCode(c.Namespace), ui.VSchemaStatusLabel(c.Status))
 		if c.Diff != "" {
@@ -922,11 +923,24 @@ func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
 	}
 }
 
+// vschemaDiffBudgetFor returns the byte budget for each VSchema diff in a
+// comment. The budget is per comment, not per keyspace: it is split across the
+// entries that carry a diff so a multi-keyspace apply stays bounded.
+func vschemaDiffBudgetFor(changes []apitypes.VSchemaChange) int {
+	diffCount := 0
+	for _, c := range changes {
+		if c.Diff != "" {
+			diffCount++
+		}
+	}
+	return vschemaDiffBudget(diffCount)
+}
+
 // writeTableProgressSection writes the per-row progress breakdown, grouped by
 // namespace so the operator can see which schema (MySQL) or keyspace
 // (Vitess/PlanetScale, Strata) each table belongs to. Within a namespace, rows
-// are ordered by sortProgressRows: active/running first, then pending, then
-// completed/terminal last, with a table's rows kept together.
+// are ordered by sortProgressRows: failed and halted first, then active/running,
+// then pending, then completed last, with a table's rows kept together.
 func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData, budget *ddlBlockBudget) {
 	// During the resume window the per-table percents are indeterminate (the data
 	// plane has not reported continuation vs fresh copy yet), so the aggregate
@@ -1035,7 +1049,7 @@ func renderResumingTable(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	sb.WriteString("\n")
 }
 
-// tableStatePriority returns a sort key: lower = rendered first (active on top, completed on bottom).
+// tableStatePriority returns a sort key: lower = rendered first (failed and halted on top, completed on bottom).
 func tableStatePriority(tableStatus string) int {
 	return ui.TableStatePriority(state.NormalizeTaskStatus(tableStatus))
 }
@@ -1057,7 +1071,8 @@ func summaryStatePriority(tableStatus string) int {
 }
 
 // sortProgressRows orders one namespace's rows for the progress comment, with
-// active tables on top and terminal ones at the bottom. See sortRowsByTable.
+// failed and halted tables on top, then active ones, and finished ones at the
+// bottom. See sortRowsByTable.
 func sortProgressRows(rows []TableProgressData) []TableProgressData {
 	return sortRowsByTable(rows, tableStatePriority)
 }
@@ -1760,7 +1775,7 @@ func durationDisplay(startedAt, completedAt string) string {
 	if endTime.Before(startTime) {
 		return ""
 	}
-	return ui.FormatExactDuration(endTime.Sub(startTime))
+	return ui.FormatHumanDuration(endTime.Sub(startTime))
 }
 
 func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentData, budget *ddlBlockBudget) {

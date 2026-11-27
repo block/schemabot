@@ -310,6 +310,11 @@ type PlanCommentData struct {
 	// seen and kept.
 	UnmatchedDropTables []string
 
+	// RollbackBlockers lists, per namespace, the live tables that kept the
+	// plan from saving the namespace's current schema, so an apply of the
+	// plan cannot be rolled back. The comment says so before anyone applies.
+	RollbackBlockers []RollbackBlockersData
+
 	// ApplyAuthorization lists who may run the apply the comment offers. Nil
 	// when PR command authorization is off or the reader may run the apply.
 	ApplyAuthorization *ApplyAuthorizationData
@@ -407,6 +412,12 @@ type PlanCommentData struct {
 	// database (nothing to compare) or when drift was not evaluated.
 	DeploymentDrift *DeploymentDriftData
 
+	// OperationsAtOnce is how many of an apply's operations SchemaBot runs at
+	// once (max_drivers_per_apply). The plan summary states it when the plan
+	// rolls out to more targets or shards than that, so a reviewer knows before
+	// applying that the rest will wait their turn. Zero states nothing.
+	OperationsAtOnce int
+
 	// BaseSchema says whether the PR's base branch changed this environment's
 	// schema after the PR branched off it. Nil when it was not checked.
 	BaseSchema *BaseSchemaData
@@ -428,6 +439,10 @@ type PlanCommentData struct {
 	// count combined across targets never reads as any one target's work. Nil
 	// when the summary is one plan's.
 	summaryRollout *DeploymentDriftData
+	// summaryRolloutOperations is how many operations an apply of the
+	// summarized rollout would run across its targets that have work, counted
+	// from each target's own plan before the summary combines them.
+	summaryRolloutOperations int
 	// applyWithheld is set on an environment's plan whose apply a multi-env
 	// footer does not offer, because an earlier environment's apply is
 	// refused, so its unsafe warning keeps the drop steps no footer carries.
@@ -445,6 +460,20 @@ type ExemptTablesData struct {
 	Namespace string
 	Tables    []string
 	Reason    string
+}
+
+// RollbackBlockersData names the tables that kept a plan from saving one
+// namespace's current schema as its rollback baseline.
+type RollbackBlockersData struct {
+	Namespace string
+	Tables    []RollbackBlockerData
+}
+
+// RollbackBlockerData is one table a plan could not save, with what it
+// carries that a schema file cannot describe.
+type RollbackBlockerData struct {
+	Table  string
+	Reason string
 }
 
 // DeploymentDriftData renders the review-time drift rollup in the PR preview: a
@@ -758,8 +787,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			writePausedApplyCause(&sb, data.PausedApplyCause)
 		}
 		writeTargetPlans(&sb, data, budget, false)
-		summary.Changes = combinedTargetPlanChanges(data)
-		summary.summaryRollout = data.DeploymentDrift
+		summary.summarizeRollout(data)
 	}
 
 	// Count changes
@@ -1466,6 +1494,15 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	text := planSummaryText(data.Changes, data.DatabaseType, data.IsMySQL, totalStatements)
 	if data.summaryRollout != nil {
 		text += " · " + rolloutScope(data.summaryRollout)
+		changing := changingTargetCount(data.summaryRollout)
+		if limit := presentation.LimitPhrase(changing, data.summaryRolloutOperations, data.OperationsAtOnce); limit != "" {
+			text += ", " + limit
+		}
+	}
+	if shards, operations := plannedShardWork(data.Changes, data.DatabaseType); shards > 0 {
+		if limit := presentation.LimitPhrase(shards, operations, data.OperationsAtOnce); limit != "" {
+			text += fmt.Sprintf(" · %d %s, %s", shards, pluralize("shard", shards), limit)
+		}
 	}
 	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", text)
 
@@ -1475,6 +1512,126 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 	writeExemptTables(sb, data.ExemptTables)
 	writeUnmatchedDropTables(sb, data.shownUnmatchedDropTables())
+	writeRollbackBlockers(sb, data.shownRollbackBlockers())
+}
+
+// shownRollbackBlockers is the rollback blockers the plan reports. A rollout
+// plan reports none: rollback is refused for an environment with more than
+// one target whatever was saved, so naming tables as the reason would point
+// the reader at the wrong cause. The blockers also describe the primary
+// target alone.
+func (d PlanCommentData) shownRollbackBlockers() []RollbackBlockersData {
+	if d.DeploymentDrift != nil {
+		return nil
+	}
+	return d.RollbackBlockers
+}
+
+// writeRollbackBlockers renders, per namespace, that an apply of the plan
+// cannot be rolled back and which tables are why. No-op when every changed
+// namespace's current schema was saved, which is the ordinary case. The
+// table names come from the target's catalog and the reasons are engine
+// prose, so each is escaped for markdown.
+func writeRollbackBlockers(sb *strings.Builder, groups []RollbackBlockersData) {
+	for _, group := range groups {
+		if len(group.Tables) == 0 {
+			continue
+		}
+		fmt.Fprintf(sb, glyph.Attention+" %s\n\n", presentation.RollbackNotCaptured(inlineCode(group.Namespace)))
+		shown, more := presentation.RollbackBlockersShown(len(group.Tables))
+		for _, table := range group.Tables[:shown] {
+			fmt.Fprintf(sb, "- %s: %s\n", inlineCode(table.Table), exemptReason(table.Reason))
+		}
+		if more > 0 {
+			fmt.Fprintf(sb, "- %s\n", presentation.RollbackBlockersMore(more))
+		}
+		sb.WriteString("\n")
+	}
+}
+
+// summarizeRollout makes s the summary of data's rollout: the union of every
+// target's changes, the rollout it covers, and how many operations its apply
+// would run (plannedRolloutOperations).
+func (s *PlanCommentData) summarizeRollout(data PlanCommentData) {
+	s.Changes = combinedTargetPlanChanges(data)
+	s.summaryRollout = data.DeploymentDrift
+	s.summaryRolloutOperations = plannedRolloutOperations(data)
+}
+
+// plannedRolloutOperations counts the operations an apply of data's rollout
+// would run on its targets that have work. A target runs one operation for its
+// whole plan, and a sharded target one per table on each of its shards with
+// work (plannedShardWork), so a rollout across sharded targets has more
+// operations than targets for the limit to hold back.
+func plannedRolloutOperations(data PlanCommentData) int {
+	if data.DeploymentDrift == nil {
+		return 0
+	}
+	operations := 0
+	for _, g := range data.DeploymentDrift.Plans {
+		if g.Empty() {
+			continue
+		}
+		perTarget := 1
+		if _, shardOperations := plannedShardWork(targetPlanChanges(g, data), data.DatabaseType); shardOperations > 0 {
+			perTarget = shardOperations
+		}
+		operations += perTarget * len(g.Members)
+	}
+	return operations
+}
+
+// plannedShardWork counts a sharded plan's shards that have work and the
+// operations an apply would run on them. The apply runs one operation per
+// table on each shard, however many statements that table's change has, so
+// statements are counted by the distinct table each names. A statement the
+// dialect's parser cannot name a table for counts as an operation of its own,
+// which can only overstate the work the limit holds back. Both are zero for a
+// plan with no sharded keyspace.
+func plannedShardWork(changes []KeyspaceChangeData, databaseType string) (shards, operations int) {
+	parser, parserErr := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
+	if parserErr != nil {
+		slog.Warn("plan summary cannot classify shard statements; it will count one operation per statement for the operation limit",
+			"database_type", databaseType, "error", parserErr)
+	}
+	for _, ks := range changes {
+		for _, sh := range ks.Shards {
+			if sh.Satisfied || len(sh.Statements) == 0 {
+				continue
+			}
+			shards++
+			operations += shardTableCount(parser, ks.Keyspace, sh)
+		}
+	}
+	return shards, operations
+}
+
+// shardTableCount is how many tables one shard's planned statements change,
+// the operations an apply runs on that shard. With no parser, or for a
+// statement the parser names no table for, each statement counts as one.
+func shardTableCount(parser ddl.StatementParser, keyspace string, sh KeyspaceShardChange) int {
+	if parser == nil {
+		return len(sh.Statements)
+	}
+	tables := make(map[string]bool, len(sh.Statements))
+	unnamed := 0
+	for _, stmt := range sh.Statements {
+		_, table, err := parser.Classify(stmt)
+		if err != nil {
+			slog.Debug("plan summary could not classify a shard statement; it counts as one operation for the operation limit",
+				"keyspace", keyspace, "shard", sh.Shard, "error", err)
+			unnamed++
+			continue
+		}
+		if table == "" {
+			slog.Debug("plan summary found no table in a shard statement; it counts as one operation for the operation limit",
+				"keyspace", keyspace, "shard", sh.Shard)
+			unnamed++
+			continue
+		}
+		tables[table] = true
+	}
+	return len(tables) + unnamed
 }
 
 // planSummaryText renders what a plan would do as the plan summary counts it,
@@ -1561,7 +1718,7 @@ func writeExemptTablesGroup(sb *strings.Builder, group ExemptTablesData, env str
 	}
 	fmt.Fprintf(sb, "<details>\n<summary>"+glyph.Info+" %s%d ignored tables in namespace <code>%s</code> (%s)</summary>\n\n%s\n\n</details>\n\n",
 		prefix, len(group.Tables), html.EscapeString(flattenIdentifier(group.Namespace)),
-		html.EscapeString(SanitizeInlineError(group.Reason)), names)
+		html.EscapeString(presentation.InlineError(group.Reason)), names)
 }
 
 // hasExemptTables reports whether writeExemptTables would render anything for
@@ -1577,7 +1734,7 @@ func hasExemptTables(groups []ExemptTablesData) bool {
 }
 
 func exemptReason(reason string) string {
-	return escapeProse(SanitizeInlineError(reason))
+	return escapeProse(presentation.InlineError(reason))
 }
 
 // writeMultiEnvExemptTables renders the exempt-table disclosure for the
@@ -2444,8 +2601,8 @@ func shardGroupSignature(s KeyspaceShardChange) string {
 // comment, for the shards of a keyspace and the targets of a rollout alike.
 // Beyond it, listing every name reads as a wall — a wide group collapses to a
 // count, with the names behind a collapsed block where the rendering has room
-// for one.
-const shardNamesInlineLimit = 8
+// for one. It is the CLI's limit too (presentation.MemberNamesInlineLimit).
+const shardNamesInlineLimit = presentation.MemberNamesInlineLimit
 
 // A plan group's members render through the same group headings whatever
 // they are called, so a rollout whose targets need different work reads the
@@ -3311,7 +3468,7 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 	causes := make([]string, 0)
 	for _, cause := range engine.BlockedCauses(reason) {
-		if cause = SanitizeInlineError(cause); cause != "" {
+		if cause = presentation.InlineError(cause); cause != "" {
 			causes = append(causes, cause)
 		}
 	}
@@ -4062,7 +4219,7 @@ func groupLintWarningsByTable(warnings []LintViolationData) []lintWarningGroup {
 func writeErrors(sb *strings.Builder, errors []string) {
 	var msgs []string
 	for _, errMsg := range errors {
-		if msg := SanitizeInlineError(errMsg); msg != "" {
+		if msg := presentation.InlineError(errMsg); msg != "" {
 			msgs = append(msgs, msg)
 		}
 	}
@@ -4116,6 +4273,12 @@ type MultiEnvPlanCommentData struct {
 
 	// Errors per environment (if plan execution failed)
 	Errors map[string]string
+
+	// PlanProblems lists, per failed environment, the statements in the schema
+	// files its engine refused to plan. An environment with problems renders
+	// them in place of its error text, and its fix is a change to those files
+	// rather than a re-run.
+	PlanProblems map[string]RefusedStatements
 
 	// UnmanagedSchema lists the schema configs the PR also changes that this
 	// deployment does not manage, and UnmanagedEnvironments the environments
@@ -4211,6 +4374,7 @@ func countMultiEnvPlanDDLBlocks(data MultiEnvPlanCommentData) int {
 
 func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
+	problemBudget := newPlanProblemBudget()
 
 	// Header
 	writeEnvironmentTitle(&sb, "Schema Change Plan", singleEnvironmentTitleEnvironment(data.Environments))
@@ -4257,6 +4421,12 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 		for _, env := range data.Environments {
 			fmt.Fprintf(&sb, "### %s\n\n", capitalizeFirst(env))
 
+			// An environment whose refused statements no longer fit what is
+			// left of the comment's budget shows its refusal text instead, so
+			// every section names something to act on.
+			if problems := data.PlanProblems[env]; len(problems.Problems) > 0 && writePlanProblems(&sb, problems, problemBudget) {
+				continue
+			}
 			if errMsg, hasErr := data.Errors[env]; hasErr {
 				writeErrorBlock(&sb, glyph.Failed, errMsg)
 				sb.WriteString("\n")
@@ -4385,8 +4555,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	summary := *plan
 	if targetPlans {
 		writeTargetPlans(sb, *plan, budget, true)
-		summary.Changes = combinedTargetPlanChanges(*plan)
-		summary.summaryRollout = plan.DeploymentDrift
+		summary.summarizeRollout(*plan)
 	}
 
 	totalStatements, keyspaceUpdates := countChanges(plan.Changes)
@@ -4591,6 +4760,12 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	if len(envsWithErrors) > 0 {
 		sb.WriteString("\n")
 		for _, env := range envsWithErrors {
+			// A plan refused over statements in the files is refused again
+			// until the files change, so it is offered a push, not a re-run.
+			if len(data.PlanProblems[env].Problems) > 0 {
+				fmt.Fprintf(sb, glyph.Attention+" **%s** plans once these statements change. Fix them in the schema files and push a commit.\n", capitalizeFirst(env))
+				continue
+			}
 			fmt.Fprintf(sb, glyph.Attention+" **%s** failed to plan. Resolve the error above and re-run:\n", capitalizeFirst(env))
 			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot plan", env))
 		}

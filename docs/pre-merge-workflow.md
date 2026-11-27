@@ -468,7 +468,7 @@ One frame from the live output (illustrative values):
 ```text
 ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
-  • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
+  • Rows: 6,000,000 / 10,000,000 · ETA: 42m
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 
   📖 Docs: https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling

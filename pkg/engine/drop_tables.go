@@ -93,7 +93,7 @@ func RefuseDropTables(engineName string, entries []string) error {
 func (d DroppedTables) RefuseIgnored(ignored IgnoredTables) error {
 	for _, entry := range d.order {
 		if ignored.Withholds(entry) {
-			return fmt.Errorf("drop_tables entry %s is also withheld by ignore_tables. Remove it from one of the two lists",
+			return OperatorErrorf(nil, "drop_tables entry %s is also withheld by ignore_tables. Remove it from one of the two lists",
 				schema.QuoteIgnoreTablesEntry(entry))
 		}
 	}

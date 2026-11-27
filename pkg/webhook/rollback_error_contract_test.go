@@ -274,11 +274,12 @@ func rollbackCommand() CommandResult {
 // for the remote engine's answer during rollback plan generation.
 type rollbackPlanTernClient struct {
 	tern.Client
-	planErr error
+	planErr  error
+	planResp *ternv1.PlanResponse
 }
 
 func (c *rollbackPlanTernClient) Plan(context.Context, *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
-	return nil, c.planErr
+	return c.planResp, c.planErr
 }
 
 func (c *rollbackPlanTernClient) IsRemote() bool { return true }
@@ -357,7 +358,8 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		require.Error(t, err)
 		assert.True(t, retry, "a transient apply lookup failure must stay retryable for a durable driver")
 		body := requireComment(t, comments, "apply lookup failure comment")
-		assert.Contains(t, body, "Failed to look up apply")
+		assert.Contains(t, body, "SchemaBot could not look up the apply to roll back, so the rollback did not start. "+rollbackRetryAdvice)
+		assert.NotContains(t, body, "storage read failed")
 	})
 
 	// The source-apply guardrails read the plan from storage; a failed read is
@@ -377,7 +379,9 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		require.Error(t, err)
 		assert.True(t, retry, "an internal source validation failure must stay retryable, not become the command's answer")
 		body := requireComment(t, comments, "source validation failure comment")
-		assert.Contains(t, body, "load source plan")
+		assert.Contains(t, body, "SchemaBot could not check that the apply can be rolled back, so the rollback did not start.")
+		assert.NotContains(t, body, "load source plan")
+		assert.NotContains(t, body, "storage read failed")
 	})
 
 	t.Run("rollback plan source read failure is retryable", func(t *testing.T) {
@@ -398,7 +402,9 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "a failed plan storage read must stay retryable")
 		assert.Equal(t, 1, lockStore.releaseCalls)
 		body := requireComment(t, comments, "rollback plan read failure comment")
-		assert.Contains(t, body, "get rollback source plan")
+		assert.Contains(t, body, "SchemaBot could not create the rollback plan for `orders` in `staging`, so the rollback did not start. "+rollbackRetryAdvice)
+		assert.NotContains(t, body, "get rollback source plan")
+		assert.NotContains(t, body, "storage read failed")
 	})
 
 	// The source apply is revalidated after lock acquisition; an internal
@@ -422,7 +428,9 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "an internal revalidation failure must stay retryable, not become the command's answer")
 		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released so a re-drive can start over")
 		body := requireComment(t, comments, "revalidation failure comment")
-		assert.Contains(t, body, "load source plan")
+		assert.Contains(t, body, "SchemaBot could not check that the apply can be rolled back, so the rollback did not start. "+rollbackRetryAdvice)
+		assert.NotContains(t, body, "load source plan")
+		assert.NotContains(t, body, "storage read failed")
 	})
 
 	// The lock release after a post-lock failure must run even when the
@@ -486,7 +494,8 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "an unknown lock state must be retried, not treated as the command's answer")
 		assert.Zero(t, lockStore.acquireCalls, "no lock may be acquired while lock state is unknown")
 		body := requireComment(t, comments, "lock read failure comment")
-		assert.Contains(t, body, "Failed to check lock status")
+		assert.Contains(t, body, "SchemaBot could not check the lock for `orders`, so the rollback did not start. "+rollbackRetryAdvice)
+		assert.NotContains(t, body, "storage read failed")
 	})
 
 	t.Run("lock acquire failure is retryable", func(t *testing.T) {
@@ -501,7 +510,8 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		require.Error(t, err)
 		assert.True(t, retry, "a failed lock acquisition must stay retryable so a re-drive can acquire it")
 		body := requireComment(t, comments, "lock acquire failure comment")
-		assert.Contains(t, body, "Failed to acquire lock")
+		assert.Contains(t, body, "SchemaBot could not take the lock for `orders`, so the rollback did not start. "+rollbackRetryAdvice)
+		assert.NotContains(t, body, "storage write failed")
 	})
 
 	// A gate that could not evaluate its inputs fails closed for this delivery
@@ -545,7 +555,10 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "remote unavailability during plan generation must stay retryable")
 		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released so a re-drive can start over")
 		body := requireComment(t, comments, "plan unavailability comment")
-		assert.Contains(t, body, "connection refused")
+		assert.Contains(t, body, "SchemaBot could not reach the remote deployment `tenant-a` for target `orders-staging`, so the rollback did not start. "+
+			"Run the command again once that deployment is healthy; if it fails again, the SchemaBot server logs have the cause.")
+		assert.NotContains(t, body, "connection refused")
+		assert.NotContains(t, body, "Raw error")
 	})
 }
 
@@ -832,7 +845,10 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		assert.False(t, retry, "a deterministic engine rejection is the command's answer; re-driving would re-send the same doomed RPC")
 		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the failed plan")
 		body := requireComment(t, comments, "engine rejection comment")
-		assert.Contains(t, body, "rollback DDL rejected by engine")
+		assert.Contains(t, body, "SchemaBot could not create the rollback plan for `orders` in `staging`, so the rollback did not start. "+
+			"Running the command again fails the same way until the cause is fixed; the SchemaBot server logs have the cause.")
+		assert.NotContains(t, body, "Run the command again")
+		assert.NotContains(t, body, "rollback DDL rejected by engine")
 	})
 
 	// The apply ran across multiple targets, and rollback is not currently supported

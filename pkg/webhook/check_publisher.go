@@ -13,6 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -857,6 +858,7 @@ func (h *Handler) foldAggregateCheckRun(
 		Progress:           h.rolloutProgressForPR(ctx, repo, pr, ownContributions),
 		PrerequisiteNotice: prerequisiteSummary(contributions, h.aggregateCheckNameForRepo(repo), repo, headSHA),
 		Inputs:             renderInputsOf(dbChecks),
+		Tenant:             h.deploymentTenant(),
 	}
 	if staleCount > 0 {
 		h.logger.Info("aggregate fold holds rows recorded for another commit as blocking until results land for the current commit",
@@ -1504,6 +1506,10 @@ func (h *Handler) postFailingAggregateTargetsWithBlock(ctx context.Context, clie
 // aggregate Check Run shows when no more specific error text is available.
 const planFailedCheckText = "Plan failed"
 
+// planBlockedCheckText is the aggregate title when every failing database's
+// plan named a change the engine refuses to run.
+const planBlockedCheckText = "Plan blocked"
+
 // checkRunSummaryEscaper neutralizes the markup that renders in a Check Run
 // summary: HTML tags, plus the Markdown constructs that can carry a payload —
 // links and images (brackets), which would let error text phish or fire an
@@ -1524,7 +1530,7 @@ var checkRunSummaryEscaper = strings.NewReplacer(
 // plus markup escaping. Text that sanitizes to nothing falls back to a fixed
 // summary so the Check Run never publishes with an empty summary.
 func sanitizeCheckRunErrorSummary(summary string) string {
-	sanitized := templates.SanitizeInlineError(summary)
+	sanitized := presentation.InlineError(summary)
 	if sanitized == "" {
 		return planFailedCheckText
 	}

@@ -51,6 +51,79 @@ func TestRenderShardedApplyComment_UniformSingleTable(t *testing.T) {
 	assert.NotContains(t, out, "grouped by change", "a uniform apply is not grouped")
 }
 
+// A sharded apply alters mutes on eight shards and runs two operations at a
+// time: two shards copy and six wait their turn. The Shards line states the
+// limit, so the queued shards read as waiting on it rather than stalled. When
+// each shard changes two tables, the limit counts table changes, since two
+// operations at a time is then one shard's worth. Once the apply is done
+// nothing waits its turn and the limit is gone.
+func TestRenderShardedApplyComment_StatesHowManyRunAtOnce(t *testing.T) {
+	shardNames := []string{"-20", "20-40", "40-60", "60-80", "80-a0", "a0-c0", "c0-e0", "e0-"}
+	render := func(applyState string, tablesPerShard int) string {
+		var shards []ShardStatus
+		var cells []ShardCell
+		for i, shard := range shardNames {
+			status := ShardStatus{Shard: shard, Emoji: "⏳", Label: "queued", State: state.ApplyOperation.Pending, CompetesForSlot: true}
+			if i < 2 {
+				status = ShardStatus{Shard: shard, Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running, CompetesForSlot: true}
+			}
+			shards = append(shards, status)
+			cells = append(cells, mutesCell(shard))
+			if tablesPerShard == 2 {
+				cells = append(cells, ShardCell{Shard: shard, Table: "follows", Statements: []string{"ALTER TABLE `follows` ADD COLUMN `muted` tinyint;"}})
+			}
+		}
+		return RenderShardedApplyComment(ShardedApplyData{
+			State: applyState, Environment: "staging", Database: "cdb_resolute",
+			ApplyID: "apply-x", RequestedBy: "morgo", MaxOperationsAtOnce: 2,
+			Keyspaces: oneKeyspace(shards, cells),
+		})
+	}
+
+	assert.Contains(t, render(state.Apply.Running, 1), "**Shards**: 2 running table copy, 6 queued (2 at a time)\n")
+	assert.Contains(t, render(state.Apply.Running, 2), "**Shards**: 2 running table copy, 6 queued (2 table changes at a time)\n")
+	assert.NotContains(t, render(state.Apply.Failed, 1), "at a time", "a finished apply has nothing waiting its turn")
+}
+
+// A sharded apply alters mutes on eight shards and runs two operations at a
+// time. Six shards have landed the change and the last two are copying, so
+// nothing waits on the limit any more and the Shards line no longer states it.
+// With one more shard still queued, the limit is holding it back and the line
+// states it again.
+func TestRenderShardedApplyComment_StatesHowManyRunAtOnceOnlyWhileWorkIsQueued(t *testing.T) {
+	shardNames := []string{"-20", "20-40", "40-60", "60-80", "80-a0", "a0-c0", "c0-e0", "e0-"}
+	render := func(landed int) string {
+		var shards []ShardStatus
+		var cells []ShardCell
+		var progress []ShardProgressData
+		for i, shard := range shardNames {
+			status := ShardStatus{Shard: shard, Emoji: "⏳", Label: "queued", State: state.ApplyOperation.Pending, CompetesForSlot: true}
+			taskState := state.Task.Pending
+			switch {
+			case i < landed:
+				status = ShardStatus{Shard: shard, Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed}
+				taskState = state.Task.Completed
+			case i < landed+2:
+				status = ShardStatus{Shard: shard, Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running, CompetesForSlot: true}
+				taskState = state.Task.Running
+			}
+			shards = append(shards, status)
+			cells = append(cells, mutesCell(shard))
+			progress = append(progress, ShardProgressData{Shard: shard, Status: taskState})
+		}
+		keyspaces := oneKeyspace(shards, cells)
+		keyspaces[0].Tables = []ShardedTableStatus{{Table: "mutes", Status: state.Task.Running, Shards: progress}}
+		return RenderShardedApplyComment(ShardedApplyData{
+			State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+			ApplyID: "apply-x", RequestedBy: "morgo", MaxOperationsAtOnce: 2,
+			Keyspaces: keyspaces,
+		})
+	}
+
+	assert.Contains(t, render(6), "**Shards**: 6 completed, 2 running table copy\n")
+	assert.Contains(t, render(5), "**Shards**: 5 completed, 2 running table copy, 1 queued (2 at a time)\n")
+}
+
 // A sharded apply that has not started yet reads as queued and says it starts on
 // its own, as a single-database apply does. Once it is running the explanation
 // is gone, since the status line and shard counts then carry the progress.
@@ -190,7 +263,10 @@ func TestRenderShardedApplyComment_DivergentWideGroupStatesCoverage(t *testing.T
 	assert.Contains(t, out, "**15 of 16 shards**", "the wide group states coverage, not names")
 	assert.NotContains(t, out, "all 16 shards", "a divergent subset never reads as full coverage")
 	assert.Contains(t, out, "**shard `s15`**", "the small group still names its shard inline")
-	assert.Contains(t, out, "| `s00` |", "the group's status table still names every shard")
+	assert.Contains(t, out, "<summary>⏳ 15 queued</summary>", "the wide group's shards collapse under one line per state")
+	assert.Contains(t, out, "s00  s01  s02", "the collapsed line expands into every shard's name")
+	assert.NotContains(t, out, "| `s00` |", "a wide group writes no row per shard")
+	assert.Contains(t, out, "| `s15` |", "the small group keeps its status table")
 }
 
 // A uniform multi-table change set is one group (no spurious "grouped by change"
@@ -389,8 +465,8 @@ func TestRenderShardedApplySummaryComment_CompletedCollapsesDetail(t *testing.T)
 	open := strings.Index(out, label)
 	assert.Less(t, strings.Index(out, "**Shards**: 2 completed"), open, "shard counts stay above the collapsed detail")
 	assert.Greater(t, strings.Index(out, "#### Keyspace `cdb_resolute_sharded`"), open, "the keyspace section is inside the block")
-	assert.Greater(t, strings.Index(out, "### VSchema"), open, "the VSchema section is inside the block")
-	assert.Greater(t, strings.LastIndex(out, "</details>"), strings.Index(out, "### VSchema"), "the block closes after the VSchema section")
+	assert.Greater(t, strings.Index(out, "**VSchema**: Applied"), open, "the VSchema line is inside the block")
+	assert.Greater(t, strings.LastIndex(out, "</details>"), strings.Index(out, "**VSchema**: Applied"), "the block closes after the VSchema line")
 	assert.Equal(t, label, "<details><summary>"+completedSummaryDetailsLabel(ApplyStatusCommentData{
 		Tables:         []TableProgressData{{Namespace: "cdb_resolute_sharded", TableName: "mutes"}},
 		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded"}},
@@ -550,8 +626,9 @@ func TestRenderShardedApplyComment_VSchemaSection(t *testing.T) {
 		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "applying", Diff: "--- current\n+++ new\n+ vindex hash"}},
 	})
 
-	assert.Contains(t, out, "### VSchema")
-	assert.Contains(t, out, "**`cdb_resolute_sharded`**: Applying...")
+	assert.Contains(t, out, "**VSchema**: Applying...")
+	assert.Greater(t, strings.Index(out, "**VSchema**: Applying..."), strings.Index(out, "#### Keyspace `cdb_resolute_sharded`"),
+		"the VSchema change renders inside its keyspace's section")
 	assert.Contains(t, out, "```diff\n--- current\n+++ new\n+ vindex hash\n```",
 		"the stored plan's diff renders as a diff block under the keyspace entry")
 }
@@ -572,8 +649,7 @@ func TestRenderShardedApplySummaryComment_VSchemaSectionAndPluralGrammar(t *test
 
 	assert.Contains(t, out, "Applied successfully — your schema changes are live!",
 		"a table change plus a VSchema update reads as plural")
-	assert.Contains(t, out, "### VSchema")
-	assert.Contains(t, out, "**`cdb_resolute_sharded`**: Applied")
+	assert.Contains(t, out, "**VSchema**: Applied")
 }
 
 // The outcome line's grammar counts distinct (keyspace, table) pairs and
@@ -691,6 +767,33 @@ func TestRenderShardedApplyComment_TableCopyProgressBar(t *testing.T) {
 	assert.NotContains(t, out, "Row copy in progress", "the bar replaces the state phrase")
 	assert.NotContains(t, out, "across", "full coverage needs no disclosure")
 	assert.NotContains(t, out, "62% (", "full coverage carries no headline qualifier")
+}
+
+// A copying table with one shard held back by the throttler keeps the ETA of
+// its slowest unthrottled shard (presentation.ShardedTableETA), and reads as
+// throttled with the engine's reason, the way the CLI reads it, so the
+// operator still sees the held-back shard.
+func TestRenderShardedApplyComment_TableCopyThrottledShard(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "commerce",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "commerce_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "orders", Status: state.Task.Running,
+				RowsCopied: 914707, RowsTotal: 1466232, ETASeconds: 195,
+				ShardsReporting: 2, Throttled: true, ThrottleReason: "replica-lag 5s >= 2s",
+				Shards: []ShardProgressData{
+					{Shard: "-40", Status: state.Task.Running, PercentComplete: 71},
+					{Shard: "80-", Status: state.Task.Running, PercentComplete: 54},
+				},
+			}},
+		}},
+	})
+
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(62)+" 62.38% (throttled)")
+	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s")
+	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s\n- ℹ️ _Throttled: replica-lag 5s >= 2s_\n")
 }
 
 // While later dispatch waves have yet to start, the summed figures cover only

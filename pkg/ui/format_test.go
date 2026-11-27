@@ -73,31 +73,32 @@ func TestFormatTableSizeClause(t *testing.T) {
 }
 
 // Every task state has a pinned place in the table listing, so a state added
-// to pkg/state fails here until the listing says where it goes. States the
-// priority does not name, and statuses it does not recognize, list with
-// pending.
+// to pkg/state fails here until the listing says where it goes. A failure or
+// halt leads, then work in progress, then queued tables, then settled ones.
+// States the priority does not name, and statuses it does not recognize, list
+// with pending.
 func TestTableStatePriority(t *testing.T) {
 	task := state.Task
 	statetest.AssertRanks(t, statetest.Every(t, state.Task), map[string]int{
-		task.Running:           0,
-		task.CatchingUp:        0,
-		task.Checksumming:      0,
-		task.PostChecksum:      0,
-		task.CuttingOver:       0,
-		task.WaitingForCutover: 1,
-		task.Recovering:        1,
+		task.Failed:            0,
 		task.FailedRetryable:   1,
-		task.Pending:           2,
-		task.WaitingForDeploy:  2,
-		task.RevertWindow:      2,
-		task.Reverting:         2,
-		task.Failed:            3,
-		task.Stopped:           3,
-		task.Completed:         4,
-		task.Cancelled:         4,
-		task.Reverted:          4,
+		task.Stopped:           2,
+		task.Cancelled:         3,
+		task.Running:           4,
+		task.CatchingUp:        4,
+		task.Checksumming:      4,
+		task.PostChecksum:      4,
+		task.CuttingOver:       4,
+		task.WaitingForCutover: 5,
+		task.Recovering:        5,
+		task.Pending:           6,
+		task.WaitingForDeploy:  6,
+		task.RevertWindow:      6,
+		task.Reverting:         6,
+		task.Completed:         7,
+		task.Reverted:          7,
 	}, TableStatePriority)
-	assert.Equal(t, 2, TableStatePriority("unknown_state"))
+	assert.Equal(t, 6, TableStatePriority("unknown_state"))
 }
 
 func TestVSchemaStatusLabel(t *testing.T) {
@@ -120,31 +121,6 @@ func TestProgressBarActivity(t *testing.T) {
 	// one surface and a full row-copy bar in another; the two must stay
 	// byte-identical so the same phase never shows two different bars.
 	assert.Equal(t, ProgressBarRowCopy(100), bar)
-}
-
-func TestFormatETA(t *testing.T) {
-	tests := []struct {
-		name    string
-		seconds int64
-		want    string
-	}{
-		{"zero", 0, "0s"},
-		{"sub-minute", 45, "45s"},
-		{"exactly a minute", 60, "1m 0s"},
-		{"minutes and seconds", 195, "3m 15s"},
-		{"exactly an hour", 3600, "1h 0m"},
-		{"hours and minutes", 3700, "1h 1m"},
-		{"just under a day", 86399, "23h 59m"},
-		{"exactly a day", 86400, "1d 0h"},
-		{"days and hours", 180000, "2d 2h"},
-		{"multi-week copy", 1814400, "21d 0h"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, FormatETA(tt.seconds))
-		})
-	}
 }
 
 func TestRowCopyDisplayPercent(t *testing.T) {

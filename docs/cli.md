@@ -554,7 +554,13 @@ older server refuses a request from a newer CLI as an unknown field.
 
 A targeted apply checks for a schema change already in progress on its
 target's deployment, which every target of a `targets:` list shares, and
-refuses to start while one is queued or running there.
+refuses to start while one that has not finished holds it, whether it is
+queued, running, paused, retrying or in its revert window.
+
+`rollback` runs the same check on its database and environment, before it asks
+for confirmation or takes a lock, and gives the same refusal. If the check
+itself cannot run, `apply` and `rollback` both go on, since the server refuses
+a conflicting apply when it is created, and log that the check did not run.
 
 A rollback of a rollout-wide apply is made against the first target the apply
 ran from. If the rollout order changed since, the rollback is refused rather
@@ -718,7 +724,7 @@ $ schemabot progress apply-example-73
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
-       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s
+       • Rows: 6,000,000 / 10,000,000 · ETA: 8m
        • ℹ️ Throttled: commit-latency 120ms >= 100ms · backing off while database writes commit slowly
 
   📖 Docs: https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling
@@ -843,7 +849,7 @@ $ schemabot progress apply-example-84
        • Rows: 2,900,000 / 4,000,000 · ETA: 2m 45s
        • Shards: 4 (3 copying, 1 complete)
            ✓ -40: 1,000,000 rows
-           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
+           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m
            ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
            ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
 
@@ -1122,7 +1128,7 @@ Waiting on an operator:
   staging/inventory: A terminal outcome left this check blocking, and the target may not match the pull request.
     apply: apply-example-68 (rolled_back)
     blocking reason: rollback_completed
-    do: Reconcile the target environment. No plan and no new commit clears this on its own.
+    do: Once the apply has settled, change the pull request to match the target. Then comment `schemabot plan -e staging -d inventory` on the pull request. The plan clears this block once the two match, and otherwise lists what still differs.
   staging/shipments: The apply holding this check is stopped, so the gate stays closed.
     apply: apply-example-81 (stopped)
     do: Start the apply or cancel it. It does not settle on its own, and no plan replaces a stopped apply's result.

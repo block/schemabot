@@ -143,7 +143,8 @@ func IsAlreadyCompleted(err error) bool {
 
 // SettledOutcomeError wraps an error to indicate the engine refused a control
 // operation because the schema change had already settled on an outcome of its
-// own, such as failed or cancelled, that the operation must not replace. It is
+// own, such as failed or cancelled, or is committed to one, such as a cutover
+// that has begun, that the operation must not replace. It is
 // a refusal for this change at this moment, not a gap in what the engine
 // supports. Retrying can never succeed, because the outcome will not change
 // back, so a caller consuming a durable control request should resolve the
@@ -236,8 +237,32 @@ func IsUnsupportedOperation(err error) bool {
 // wrapped message says what it is: usually a change to those files, and for
 // some refusals a change on the target, such as waiting until a table due to
 // be dropped has gone long enough without a write.
+//
+// When the refusal is about statements in the schema files, Problems lists
+// each one, located in its file, so the files' author can change them all in
+// one edit. Err still describes the whole refusal for callers that show only
+// text. A refusal with no Problems is about the target or the request as a
+// whole, and Err alone says what to do.
 type PlanRefusedError struct {
-	Err error
+	Err      error
+	Problems []PlanProblem
+}
+
+// PlanProblem is one statement in the schema files that the engine cannot plan
+// as written.
+type PlanProblem struct {
+	// File is the schema file's path under the schema root, such as
+	// "app/orders.sql".
+	File string
+	// Line is the 1-based line the statement starts on, or 0 when the engine
+	// cannot locate it.
+	Line int
+	// Message says what is wrong with the statement and what to change, for
+	// the file's author. It does not repeat the file, the line or the SQL.
+	Message string
+	// Statement is the statement's SQL as the file declares it. A renderer
+	// shows an excerpt, enough to recognize the statement.
+	Statement string
 }
 
 func (e *PlanRefusedError) Error() string { return e.Err.Error() }

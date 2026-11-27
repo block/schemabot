@@ -424,3 +424,30 @@ func TestPlanResultToProtoChangesKeepsNonShardedStatementOrder(t *testing.T) {
 		assert.Equal(t, "users", tc.TableName)
 	}
 }
+
+// TestNamespacesFromEngineChangesKeepsRollbackBlockers verifies a plan the
+// local client stores keeps the tables that kept its rollback baseline from
+// being captured, so a stored PostgreSQL plan read back later still names the
+// table with a NOT VALID foreign key and why the apply cannot be rolled back.
+func TestNamespacesFromEngineChangesKeepsRollbackBlockers(t *testing.T) {
+	client := planNamespacesTestClient()
+	namespaces, _ := client.namespacesFromEngineChanges([]engine.SchemaChange{{
+		Namespace: "app",
+		TableChanges: []engine.TableChange{{
+			Table:     "customers",
+			DDL:       "ALTER TABLE customers ADD COLUMN email text",
+			Operation: ddl.StatementAlterTable,
+		}},
+		RollbackBlockers: []engine.RollbackBlocker{{
+			Table:  "orders",
+			Reason: "holds a foreign key added NOT VALID, which a schema file cannot declare",
+		}},
+	}}, nil)
+
+	require.Contains(t, namespaces, "app")
+	assert.False(t, namespaces["app"].OriginalFilesCaptured)
+	assert.Equal(t, []storage.RollbackBlocker{{
+		Table:  "orders",
+		Reason: "holds a foreign key added NOT VALID, which a schema file cannot declare",
+	}}, namespaces["app"].RollbackBlockers)
+}

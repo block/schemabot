@@ -682,9 +682,9 @@ func TestRenderPostgresTablesReturnsCancellationAfterFiltering(t *testing.T) {
 			require.NoError(t, err)
 			defer pool.Close()
 
-			files, captured, err := captureOriginalFiles(ctx, pool, tt.database, "public", nil, mustIgnoredTables(t, tt.ignored))
+			files, blockers, err := captureOriginalFiles(ctx, pool, tt.database, "public", nil, mustIgnoredTables(t, tt.ignored))
 			require.ErrorIs(t, err, context.Canceled)
-			assert.False(t, captured)
+			assert.Nil(t, blockers)
 			assert.Nil(t, files)
 		})
 	}
@@ -729,9 +729,9 @@ func TestCaptureOriginalFilesReturnsCancellationInsteadOfIncompleteBaseline(t *t
 	require.NoError(t, err)
 	defer pool.Close()
 
-	files, captured, err := captureOriginalFiles(ctx, pool, "capture_cancel_test", "public", nil, engine.IgnoredTables{})
+	files, blockers, err := captureOriginalFiles(ctx, pool, "capture_cancel_test", "public", nil, engine.IgnoredTables{})
 	require.ErrorIs(t, err, context.Canceled)
-	assert.False(t, captured)
+	assert.Nil(t, blockers)
 	assert.Nil(t, files)
 }
 
@@ -2932,9 +2932,10 @@ func TestCaptureOriginalFilesWithRowSecurity(t *testing.T) {
 	pool, err := pgxpool.New(ctx, dsn)
 	require.NoError(t, err)
 	defer pool.Close()
-	files, captured, err := captureOriginalFiles(ctx, pool, "capture_rls", "public", nil, engine.IgnoredTables{})
+	files, blockers, err := captureOriginalFiles(ctx, pool, "capture_rls", "public", nil, engine.IgnoredTables{})
 	require.NoError(t, err)
-	assert.False(t, captured)
+	assert.Equal(t, []engine.RollbackBlocker{{Table: "documents", Reason: schemadiff.ErrUnrenderableRowSecurity.Error()}}, blockers,
+		"only the table with row security blocks the capture, named with what its schema file cannot carry")
 	assert.Nil(t, files)
 }
 

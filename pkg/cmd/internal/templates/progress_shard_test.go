@@ -24,8 +24,8 @@ func TestFormatShardLineShowsSubPercentFraction(t *testing.T) {
 	assert.NotContains(t, line, " 0%")
 }
 
-// A shard's copy ETA reads in hours even past a day, so a slow shard shows
-// "25h 0m" rather than switching to days.
+// A shard's copy ETA reads in days past a day, like every other duration, so a
+// slow shard shows "1d 1h".
 func TestFormatShardLineETAPastADay(t *testing.T) {
 	line := formatShardLine(ShardProgress{
 		Shard:           "-80",
@@ -36,7 +36,7 @@ func TestFormatShardLineETAPastADay(t *testing.T) {
 		ETASeconds:      90_000,
 	}, "queued", "copying")
 
-	assert.Contains(t, line, "ETA: 25h 0m")
+	assert.Contains(t, line, "ETA: 1d 1h")
 }
 
 func TestIsPlanetScaleEngine(t *testing.T) {

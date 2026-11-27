@@ -376,8 +376,9 @@ pull reads only the environment's
 [primary deployment](#whats-in-this-database), so it cannot report a skip that
 only another deployment would need.
 
-`schemabot pull` always sets the flag, since it writes no files, and lists the
-skipped tables under their namespace:
+`schemabot pull` always sets the flag, since it writes no files. Its summary
+box counts the skipped tables, and each namespace lists its own under a
+warning:
 
 ```sh
 schemabot pull -d shop -e production
@@ -385,7 +386,7 @@ schemabot pull -d shop -e production
 
 ```sql
 -- Namespace `public` — 1 table
--- Skipped 1 table:
+-- ⚠️ Skipped 1 table, not in the output:
 --   audit_log: unlogged tables cannot be rendered as a desired schema
 ```
 
@@ -740,7 +741,7 @@ live view:
 ```text
 ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
-  • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m 0s
+  • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 
   📖 Docs: https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling
@@ -790,7 +791,15 @@ cannot match to a stored task carries neither field. A matched row also carries
 `operation_key`, naming the operation that runs it, since one target can run
 several operations when a rollout goes table by table.
 A sharded apply lists one operation per shard and table it changes, plus each
-keyspace's finalizer, and the response sets `sharded: true`. Its `tables` are
+keyspace's finalizer, and the response sets `sharded: true`. An apply that
+runs more than one operation, sharded or across several targets, also carries
+`max_operations_at_once`: how many of its operations the server runs at once.
+While the apply runs, the CLI and the PR comment state it beside the counts
+while more operations are running or queued for a slot than that, as "3
+queued (1 at a time)", so the queued operations read as waiting their turn.
+Operations that wait for an earlier target, including copies parked at their
+cutover behind one, or are halted or paused behind a failure, are not held
+back by the limit and do not count. Its `tables` are
 then rolled up across the shards: one entry per keyspace table, with `status`
 the shard state that needs attention first, `rows_copied` and `rows_total`
 summed over the shards that have reported a total, and `shards` listing each
@@ -1000,6 +1009,10 @@ failed`. A table lists its targets while it is in flight on any of them or any o
 them stopped, even when another target's failure makes the table read as
 failed; any other table counts them on its own line.
 
+An operation's `error_message` is why it failed. When the operation recorded
+no error of its own, it is the first error among the operation's tasks, the
+same reason the PR comment shows for that shard.
+
 `ended_by` is set on a failed operation that did not fail on its own. Its
 apply deferred the cutover, which runs for all of a target's operations
 together, and another operation of the same deployment and target failed, so
@@ -1072,6 +1085,7 @@ keyspace's four shards, of which only `-40` has started:
   "engine": "strata",
   "state": "running",
   "sharded": true,
+  "max_operations_at_once": 1,
   "operations": [
     {"deployment": "data-plane", "operation_key": "shop_001/-40/orders", "operation_kind": "work", "state": "running"},
     {"deployment": "data-plane", "operation_key": "shop_001/40-80/orders", "operation_kind": "work", "state": "pending"},
@@ -1108,18 +1122,19 @@ keyspace's four shards, of which only `-40` has started:
 ```
 
 `schemabot progress apply-example-76` renders it as one change. The header
-counts the shards by status. This plan recorded no per-shard row estimates, so
+counts the shards by status and, since this server runs one of an apply's
+operations at a time, says so beside the queued shards. This plan recorded no per-shard row estimates, so
 the rows cover only the started shard and the ETA is a floor. The VSchema
 change shows its diff:
 
 ```text
-┌────────────────────────────────────────────────┐
-│  Apply ID:     apply-example-76                │
-│  Database:     shop                            │
-│  Environment:  production                      │
-│  State:        Running                         │
-│  Shards:       1 running table copy, 3 queued  │
-└────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Apply ID:     apply-example-76                              │
+│  Database:     shop                                          │
+│  Environment:  production                                    │
+│  State:        Running                                       │
+│  Shards:       1 running table copy, 3 queued (1 at a time)  │
+└──────────────────────────────────────────────────────────────┘
 
 
   ── shop_001 ──
@@ -1252,7 +1267,7 @@ Output excerpt:
 ```text
 ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
-  • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m 0s
+  • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 
   📖 Docs: https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling
@@ -1945,6 +1960,27 @@ field describes the primary target only, and neither the PR comment nor the
 CLI prints it. Like
 `exempt_tables`, the field is carried on the response to the plan request only
 and is omitted when every entry matched.
+
+An apply can be rolled back only if the plan saved the namespace's current
+schema as schema files. When a live table carries something a schema file
+cannot declare, such as a PostgreSQL foreign key added `NOT VALID`, the plan
+still applies but cannot save that schema. The change lists each such table in
+`rollback_blockers` with the reason:
+
+```json
+{
+  "namespace": "public",
+  "table_changes": [{"table_name": "users", "ddl": "ALTER TABLE users ADD COLUMN email text", "change_type": "alter"}],
+  "rollback_blockers": [
+    {"table": "orders", "reason": "holds a foreign key added NOT VALID, which a schema file cannot declare"}
+  ]
+}
+```
+
+- The field is stored with the plan, so `GET /api/plans/{plan_id}` returns it too.
+- The PR comment and CLI print the first 10 tables and count the rest.
+- On a plan with a `rollout`, neither prints them: rollback is refused for an environment with more than one target.
+- The field is omitted when the schema was saved.
 
 Response excerpt from the plan request (illustrative values):
 

@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/inventory"
+	"github.com/block/schemabot/pkg/presentation"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
@@ -921,6 +922,13 @@ func (s *exactProgressApplyOperationStore) ListByApply(context.Context, int64) (
 		return nil, s.err
 	}
 	return s.ops, nil
+}
+
+func (s *exactProgressApplyOperationStore) FailedSiblingHaltingOperation(_ context.Context, applyID, operationID int64) (*storage.ApplyOperation, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return failedSiblingHaltingIn(s.ops, applyID, operationID), nil
 }
 
 func (s *exactProgressApplyOperationStore) SaveEngineResumeState(_ context.Context, operationID int64, resumeState *storage.EngineResumeState) error {
@@ -6448,6 +6456,24 @@ func TestShardProgressProto(t *testing.T) {
 	assert.Nil(t, shardProgressProto(nil))
 }
 
+// One shard has a row total and no ETA yet, and the other reports 45s left
+// before it reports a row total. The data plane's table ETA and the PR
+// comment's rollup read the same shards, so both say 45s.
+func TestStoredShardETAMatchesTheCommentRollup(t *testing.T) {
+	stored := []*storage.Task{
+		{Shard: "-80", State: state.Task.Running, RowsCopied: 400, RowsTotal: 1000},
+		{Shard: "80-", State: state.Task.Running, RowsCopied: 50, ETASeconds: 45},
+	}
+	copies := make([]presentation.ShardCopy, 0, len(stored))
+	for _, sh := range stored {
+		copies = append(copies, presentation.ShardCopy{Status: sh.State, RowsCopied: sh.RowsCopied, RowsTotal: sh.RowsTotal, ETASeconds: int64(sh.ETASeconds)})
+	}
+
+	_, _, eta, _ := aggregateStoredShards(stored)
+	assert.Equal(t, int64(45), eta)
+	assert.Equal(t, int64(45), presentation.RollUpShardedTable(copies, 2).ETASeconds)
+}
+
 // Progress renders each table's per-shard breakdown only from the persisted
 // shard rows the operator drive wrote, grouped by (namespace, table). The live
 // engine result is never the read surface, so a live-only shard the engine
@@ -6495,6 +6521,9 @@ func TestLocalClient_VitessProgressRendersShardsFromStored(t *testing.T) {
 	assert.Equal(t, int64(100), progress.Tables[0].RowsCopied)
 	assert.Equal(t, int64(200), progress.Tables[0].RowsTotal)
 	assert.Equal(t, int32(50), progress.Tables[0].PercentComplete, "aggregate is computed from stored shards, not the live result")
+	// The two shards report 7s and 3s left. Shards cannot share work, so the
+	// table finishes with the slower one.
+	assert.Equal(t, int64(7), progress.Tables[0].EtaSeconds, "the table ETA is the slowest shard's")
 
 	shards := progress.Tables[0].Shards
 	require.Len(t, shards, 2, "renders the two persisted shards, not the single live one")

@@ -73,7 +73,7 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 	// deployment alone: members of a targets list share one deployment, and one
 	// running on another deployment does not conflict with it.
 	if cmd.Target == "" {
-		if err := cmd.refuseActiveSchemaChange(cfg.Database, func() (*client.ActiveSchemaChange, error) {
+		if err := refuseActiveSchemaChange(cfg.Database, cmd.Environment, cmd.Output != OutputFormatJSON, func() (*client.ActiveSchemaChange, error) {
 			return client.CheckActiveSchemaChange(ep, cfg.Database, cmd.Environment)
 		}); err != nil {
 			return err
@@ -169,7 +169,7 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 	// A targeted apply's preflight: the plan has resolved its member, and has
 	// work that would conflict with a schema change on that deployment.
 	if cmd.Target != "" {
-		if err := cmd.refuseActiveSchemaChange(cfg.Database, func() (*client.ActiveSchemaChange, error) {
+		if err := refuseActiveSchemaChange(cfg.Database, cmd.Environment, cmd.Output != OutputFormatJSON, func() (*client.ActiveSchemaChange, error) {
 			return client.CheckActiveSchemaChangeOnDeployment(ep, cfg.Database, cmd.Environment, planResult.Deployment)
 		}); err != nil {
 			return err
@@ -212,6 +212,11 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, cmd.Target, cmd.Output)
 	}
 
+	// lockBefore is the lock this command saw held before it sent the
+	// acquire, which tells a lock it took apart from one its owner already
+	// held when the acquire gets no answer.
+	var lockBefore *client.LockInfo
+
 	// Check lock availability before showing plan (unless --force will break it anyway or --no-lock skips locking)
 	if !cmd.NoLock && !cmd.Force {
 		var existingLock *client.LockInfo
@@ -234,6 +239,7 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 			})
 			return fmt.Errorf("database is locked")
 		}
+		lockBefore = existingLock
 	}
 
 	// Step 2: Show the plan
@@ -298,7 +304,9 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 					return fmt.Errorf("force release lock: %w", err)
 				}
 				templates.WriteLockForceReleased(cfg.Database, cfg.Type, existingLock.Owner)
+				existingLock = nil
 			}
+			lockBefore = existingLock
 		}
 
 		// Acquire the lock
@@ -327,6 +335,9 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 				CreatedAt:    existingLock.CreatedAt,
 			})
 			return fmt.Errorf("database is locked")
+		}
+		if client.ServerMayHaveActed(err) {
+			return reportUnansweredLockAcquire(ep, cfg.Database, cfg.Type, owner, lockBefore, cmd.Output != OutputFormatJSON, err)
 		}
 		if err != nil {
 			return fmt.Errorf("acquire lock: %w", err)
@@ -612,51 +623,6 @@ func finishAfterCutover(result *apitypes.ProgressResponse, tables []*apitypes.Ta
 	default:
 		return fmt.Errorf("schema change ended in state %s after cutover", curState)
 	}
-}
-
-// refuseActiveSchemaChange runs the active schema change preflight and
-// refuses the apply, with guidance for the schema change already in progress,
-// when check reports one. A preflight that fails is not a refusal: the apply is
-// still guarded server-side.
-func (cmd *ApplyCmd) refuseActiveSchemaChange(database string, check func() (*client.ActiveSchemaChange, error)) error {
-	var active *client.ActiveSchemaChange
-	err := withLoading("Checking active schema changes...", cmd.Output != OutputFormatJSON, func() error {
-		var checkErr error
-		active, checkErr = check()
-		return checkErr
-	})
-	if err != nil || active == nil || active.State == "" {
-		return nil
-	}
-	var stateMsg string
-	switch {
-	case state.IsState(active.State, state.Apply.Pending):
-		stateMsg = "A schema change is queued and has not started yet."
-	case state.IsState(active.State, state.Apply.WaitingForDeploy):
-		stateMsg = "A schema change is waiting for deploy."
-	case state.IsState(active.State, state.Apply.WaitingForCutover):
-		stateMsg = "A schema change is waiting for cutover."
-	case state.IsRunningApplyState(active.State):
-		stateMsg = "A schema change is already running."
-	case state.IsState(active.State, state.Apply.CuttingOver):
-		stateMsg = "A schema change is currently cutting over."
-	}
-	if stateMsg == "" {
-		return nil
-	}
-	fmt.Println()
-	fmt.Println("⏳ Schema Change In Progress")
-	fmt.Println()
-	fmt.Printf("Database: %s\n", database)
-	fmt.Printf("Environment: %s\n", cmd.Environment)
-	fmt.Println()
-	fmt.Println(stateMsg)
-	fmt.Println()
-	if state.IsState(active.State, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) {
-		fmt.Printf("To trigger cutover:  %s\n", templates.ControlCommand("cutover", active.ApplyID, cmd.Environment))
-	}
-	fmt.Printf("To watch and manage: %s\n", cliname.Command("status", active.ApplyID))
-	return fmt.Errorf("schema change already in progress")
 }
 
 // blockUnsafeApply displays the plan and an error when unsafe changes are detected without --allow-unsafe.

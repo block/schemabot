@@ -243,6 +243,7 @@ func TestPlan_DesiredSchemaErrorFailsThePlan(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result, err := planAgainstEmptyMain(t, tt.files)
 			require.ErrorContains(t, err, tt.wantErr)
+			assert.True(t, engine.IsPlanRefused(err), "the schema files are refused as written, not the engine failing")
 			assert.Nil(t, result)
 		})
 	}
