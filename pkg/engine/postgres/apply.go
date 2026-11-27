@@ -178,13 +178,25 @@ type buildShape struct {
 	// leaves the constraint NOT VALID for the next driver to validate, so
 	// neither leaves work half-applied.
 	haltable bool
+	// validationBound is set for a constraint validation: how long its scan
+	// may run before it is cut off, which a refused cancel names as when the
+	// validation ends on its own.
+	validationBound time.Duration
 }
 
-func (c nativeApply) buildShape() buildShape {
+// buildShape records the change's shape when the apply is admitted, before
+// the drive sets the change's own bounds, so the validation bound comes from
+// the engine's configuration.
+func (c nativeApply) buildShape(validateMaxDuration time.Duration) buildShape {
+	var validationBound time.Duration
+	if c.durationBoundedValidation() {
+		validationBound = validateMaxDuration
+	}
 	return buildShape{
-		cancellable: c.durationBoundedIndexBuild(),
-		partitioned: c.partitionedIndex,
-		haltable:    c.durationBoundedIndexBuild() || c.durationBoundedValidation(),
+		cancellable:     c.durationBoundedIndexBuild(),
+		partitioned:     c.partitionedIndex,
+		haltable:        c.durationBoundedIndexBuild() || c.durationBoundedValidation(),
+		validationBound: validationBound,
 	}
 }
 
@@ -241,7 +253,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// engine itself can end the drive — a cancel of last resort, and the
 	// halt on shutdown.
 	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
-	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.buildShape(), cancelApply, engine.WorkOwnerFromContext(ctx))
+	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.buildShape(e.validateMaxDuration), cancelApply, engine.WorkOwnerFromContext(ctx))
 	conn := targetConn{dsn: req.Credentials.DSN, caCertPath: caPath}
 	e.wg.Go(func() {
 		defer close(done)
@@ -489,10 +501,10 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		change.cancelRequested = cancelRequested
 	}
 	if change.durationBoundedValidation() {
-		// The headroom covers the setup ahead of the scan, as it does for a
-		// build, so the server's timer ends an over-long scan first and the
-		// outcome names the option.
-		ceiling = e.validateMaxDuration + concurrentIndexHeadroom
+		// The ceiling leaves room for the setup and the lock retries ahead of
+		// the scan, so the server's timer ends an over-long scan first and
+		// the outcome names the option.
+		ceiling = validationCeiling(e.validateMaxDuration)
 		change.validateMaxDuration = e.validateMaxDuration
 	}
 	ctx, cancel := context.WithTimeout(ctx, ceiling)
@@ -2555,6 +2567,17 @@ func validationLockBudget(bound time.Duration) time.Duration {
 	return min(optimisticLockTimeout, bound/2)
 }
 
+// validationCeiling is how long a validation apply may run in all: the
+// scan's bound, the setup headroom a concurrent index build also gets, and
+// the lock retries that can come before the scan starts. Each attempt but the
+// last can wait out its lock budget and then back off for at most the
+// policy's longest backoff, and only the attempt that gets the lock scans.
+func validationCeiling(bound time.Duration) time.Duration {
+	policy := executor.DefaultRetryPolicy()
+	lockRetries := time.Duration(policy.MaxAttempts-1) * (validationLockBudget(bound) + policy.MaxBackoff)
+	return bound + concurrentIndexHeadroom + lockRetries
+}
+
 // nameValidationBound wraps a validation failure caused by the bound's
 // statement timeout firing so the operator detail names the option; every
 // other failure, the lock budget among them, passes through unchanged.
@@ -2995,7 +3018,7 @@ func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracke
 	done := make(chan struct{})
 	e.progress[key] = &trackedApply{
 		result: result, tracker: tracker, logger: logger,
-		cancellableBuild: shape.cancellable, partitionedBuild: shape.partitioned, haltable: shape.haltable, cancelApply: cancelApply, done: done,
+		cancellableBuild: shape.cancellable, partitionedBuild: shape.partitioned, haltable: shape.haltable, validationBound: shape.validationBound, cancelApply: cancelApply, done: done,
 		owner: owner,
 	}
 	return done

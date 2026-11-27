@@ -542,7 +542,9 @@ you to plan again.
 You can cancel two kinds of change while they run: a concurrent index build on
 an existing table, and a partitioned index build. Every other statement
 commits or fails on its own, so SchemaBot records a cancel of it and then
-declines it.
+declines it. A declined cancel of a `VALIDATE CONSTRAINT` says when the scan
+ends on its own: within `postgres.validate_max_duration`. If the scan runs
+out, the constraint stays `NOT VALID` and still checks new writes.
 
 **How a cancel reaches the build.** SchemaBot signals the build's backend. If
 the signal cannot reach it, for example because the build has not started or

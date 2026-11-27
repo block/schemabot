@@ -2272,6 +2272,59 @@ func TestHaltWorkOwnedByEndsAValidationWithoutRecordingACancel(t *testing.T) {
 	assert.True(t, terminal.Retryable, "the next driver validates the constraint the halt left NOT VALID")
 }
 
+// An operator cancels an apply while it validates a constraint. PostgreSQL
+// cancels only index builds, so the cancel is refused, and the refusal says
+// when the validation ends on its own and what it leaves if the scan runs
+// out, instead of leaving the operator to wait without a bound.
+func TestCancelOfAValidationNamesItsBound(t *testing.T) {
+	scripted := newScriptedExecutor(func(*progress.Tracker) error {
+		return errors.New("the executor must be ended by its context, not released")
+	})
+	eng := New()
+	eng.execute = scripted.execute
+	t.Cleanup(eng.Drain)
+	t.Cleanup(scripted.release)
+	record, err := json.Marshal(reviewedUserKey())
+	require.NoError(t, err)
+	const key = "task-validate"
+	accepted, err := eng.Apply(engine.WithWorkOwner(t.Context(), "drive-a"), &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+			Table: "orders", DDL: reviewedValidationSQL,
+			Metadata: map[string]string{reviewedValidationMetadataKey: string(record)},
+		}}}},
+		Credentials: &engine.Credentials{DSN: "postgres://schemabot:secret@db.invalid/app?sslmode=disable"},
+		ResumeState: &engine.ResumeState{MigrationContext: key},
+		Logger:      slog.New(slog.DiscardHandler),
+	})
+	require.NoError(t, err)
+	require.True(t, accepted.Accepted)
+	scripted.envelope(t)
+	scripted.tracker(t)
+
+	_, err = eng.Cancel(t.Context(), &engine.ControlRequest{ResumeState: &engine.ResumeState{MigrationContext: key}})
+	require.Error(t, err)
+	assert.True(t, engine.IsUnsupportedOperation(err))
+	assert.Equal(t, "cancel is supported for PostgreSQL index builds only: this constraint validation ends on its own within 1d (validate_max_duration), and leaves the constraint NOT VALID if the scan does not finish", err.Error())
+	assert.Equal(t, engine.StateRunning, pollProgress(t, eng, key).State, "a refused cancel leaves the validation running")
+
+	ctx, cancel := context.WithTimeout(t.Context(), backgroundApplyDeadline)
+	defer cancel()
+	require.NoError(t, eng.HaltWorkOwnedBy(ctx, "drive-a"))
+}
+
+// A validation apply's ceiling leaves room for the setup ahead of the scan and
+// for every lock retry before the attempt that scans, so the server's timer,
+// not the ceiling, ends an over-long scan and the refusal names the option.
+func TestValidationCeilingCoversSetupAndLockRetries(t *testing.T) {
+	policy := executor.DefaultRetryPolicy()
+	lockRetries := time.Duration(policy.MaxAttempts-1) * (optimisticLockTimeout + policy.MaxBackoff)
+	assert.Equal(t, 8*time.Second, lockRetries, "two lock waits of the short budget, each followed by the longest backoff")
+	assert.Equal(t, DefaultValidateMaxDuration+concurrentIndexHeadroom+lockRetries, validationCeiling(DefaultValidateMaxDuration))
+	assert.Equal(t, time.Second+concurrentIndexHeadroom+time.Duration(policy.MaxAttempts-1)*(500*time.Millisecond+policy.MaxBackoff), validationCeiling(time.Second),
+		"a short bound's lock retries wait half the bound each")
+}
+
 // A validation's lock wait keeps the short lock budget, and gets half the
 // bound when the bound is shorter, so the lock wait always ends before the
 // bound's statement timer and lock contention is never read as an over-long
@@ -2696,7 +2749,7 @@ func TestPartitionedBuildReportsEachPartitionsOwnPercent(t *testing.T) {
 	tracker.Start(3, progress.OperationBrief)
 	tracker.StartStep(2, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY events_2025_kind_idx ON public.events_2025 (kind)")
 	tracker.SetConcurrentBuild(&publishedIndexProgressSession{row: &first}, 42)
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default(), change.buildShape(), nil, "")
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default(), change.buildShape(eng.validateMaxDuration), nil, "")
 	got := pollRunningIndexBuild(t, eng)
 	require.Equal(t, "2", got.Metadata["step"])
 	require.Equal(t, "21.88", got.Metadata["percent"])
@@ -3046,8 +3099,8 @@ func TestConcurrentIndexApplyCeilingLeavesSetupHeadroom(t *testing.T) {
 }
 
 // TestValidationApplyRunsUnderTheValidationBound proves the drive runs a
-// VALIDATE CONSTRAINT under a ceiling above the configured validation bound,
-// so the scan's own statement_timeout ends an over-long validation and the
+// VALIDATE CONSTRAINT under a ceiling above the configured validation bound
+// and the lock retries ahead of it, so the scan's own statement_timeout ends an over-long validation and the
 // outcome names the option, and stamps that bound on the change the executor
 // receives instead of the per-statement limit.
 func TestValidationApplyRunsUnderTheValidationBound(t *testing.T) {
@@ -3077,8 +3130,8 @@ func TestValidationApplyRunsUnderTheValidationBound(t *testing.T) {
 	require.NotNil(t, env.change.validates)
 	assert.Equal(t, bound, env.change.validateMaxDuration)
 	assert.Zero(t, env.change.concurrentIndexMaxDuration, "the build bound is stamped only on a concurrent index apply")
-	assert.Greater(t, granted, bound, "the ceiling must outlast the validation bound it wraps")
-	assert.LessOrEqual(t, granted, bound+concurrentIndexHeadroom)
+	assert.Greater(t, granted, bound+concurrentIndexHeadroom, "the ceiling outlasts the bound, the setup headroom, and the lock retries before the scan")
+	assert.LessOrEqual(t, granted, validationCeiling(bound))
 }
 
 // TestValidateMaxDurationIsNormalizedLikeTheBuildBound pins the validation

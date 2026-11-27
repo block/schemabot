@@ -95,6 +95,9 @@ type trackedApply struct {
 	// constraint validation, which can run for hours. It is wider than
 	// cancellableBuild, which decides only what an operator can cancel.
 	haltable bool
+	// validationBound is set for a constraint validation: how long its scan
+	// may run before it is cut off.
+	validationBound time.Duration
 	// partitionedBuild records that the build runs one concurrent build per
 	// partition. A cancel signal reaches only the partition build in flight,
 	// which can finish before the signal lands, so Cancel also ends the
