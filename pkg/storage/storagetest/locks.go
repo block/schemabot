@@ -1006,6 +1006,28 @@ func TestLocks(t *testing.T, h Harness) {
 		assert.Equal(t, "other-owner", replaced.HeldOwner)
 	})
 
+	// The same owner releases the lock it was shown and takes it again before
+	// the forced release runs. The retake is a new row, so the release pinned
+	// to the old one leaves it held.
+	t.Run("ForceReleaseByID_LockRetakenBySameOwner", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		shown := CreateLock(t, store, "force_retaken_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, store.Locks().Release(ctx, "force_retaken_db", storage.DatabaseTypeMySQL, shown.Owner))
+		retaken := CreateLock(t, store, "force_retaken_db", storage.DatabaseTypeMySQL)
+		require.Equal(t, shown.Owner, retaken.Owner)
+		require.NotEqual(t, shown.ID, retaken.ID, "a retaken lock is a new row")
+
+		releaseErr := store.Locks().ForceReleaseByID(ctx, shown.ID, "force_retaken_db", storage.DatabaseTypeMySQL)
+		require.ErrorIs(t, releaseErr, storage.ErrLockReplaced)
+
+		current, err := store.Locks().Get(ctx, "force_retaken_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, current, "the retaken lock must survive a force release pinned to the row it replaced")
+		assert.Equal(t, retaken.ID, current.ID)
+	})
+
 	t.Run("Get", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

@@ -217,7 +217,9 @@ type LockStore interface {
 	// one lock never deletes a different one taken since. It returns
 	// ErrLockNotFound when no lock is held, and a *LockReplacedError, which
 	// matches ErrLockReplaced and names the row held now, when a different row
-	// holds the lock. Either way nothing is deleted.
+	// holds the lock. Either way nothing is deleted. The pin is the row, not its
+	// contents: a same-owner re-acquire that pins a new plan keeps the row and its
+	// ID, so the release still removes it.
 	ForceReleaseByID(ctx context.Context, id int64, database, dbType string) error
 
 	// Get returns a lock by database name and type, or nil if not found.

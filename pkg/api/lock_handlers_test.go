@@ -274,6 +274,15 @@ func (s *memoryLockStore) ReleaseByID(_ context.Context, id int64, database, dbT
 	return nil
 }
 
+// ForceRelease releases whichever lock is held, whoever owns it.
+func (s *memoryLockStore) ForceRelease(_ context.Context, database, dbType string) error {
+	if !s.holds(database, dbType) {
+		return storage.ErrLockNotFound
+	}
+	s.lock = nil
+	return nil
+}
+
 // ForceReleaseByID releases the row id names whoever owns it, and reports the
 // row held now when a different one holds the lock.
 func (s *memoryLockStore) ForceReleaseByID(_ context.Context, id int64, database, dbType string) error {
