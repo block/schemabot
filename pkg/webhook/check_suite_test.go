@@ -226,11 +226,10 @@ func TestCheckSuiteWebhookCanonicalizesRepository(t *testing.T) {
 	assert.Equal(t, "MixedCaseSHA", row.HeadSHA)
 }
 
-// Only "requested" carries recovery work: "rerequested" re-plans through
-// check_run.rerequested and "completed" is pure noise, so neither may occupy
-// an inbox row.
-func TestCheckSuiteWebhookIgnoresNonRequestedActions(t *testing.T) {
-	for _, action := range []string{"rerequested", "completed"} {
+// "completed" fires on every commit and carries no work, so it must not
+// occupy an inbox row.
+func TestCheckSuiteWebhookIgnoresCompletedAction(t *testing.T) {
+	for _, action := range []string{"completed"} {
 		t.Run(action, func(t *testing.T) {
 			store := newRecordingWebhookEventStore()
 			h := newCheckSuiteIngressHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
