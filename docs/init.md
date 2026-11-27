@@ -66,6 +66,7 @@ Environment-variable and absolute file references remain available as an advance
 a referenced file must contain only the connection string. References stay references,
 so environment variables must remain available to later CLI invocations. Schema files
 never contain credentials. OS credential-store integration is not implemented.
+
 The wizard connects MySQL and PostgreSQL databases. It offers Vitess as a sample
 database, but not as an existing one: register a PlanetScale database in
 [server configuration](configuration.md) instead, since it is reached through an

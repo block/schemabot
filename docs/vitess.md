@@ -248,12 +248,14 @@ keyspaces; the vtgate credentials then read each keyspace's shards. A read-only
 branch password is enough.
 
 The apply itself runs without a DSN, since it reaches the branch with the
-password the API hands back, and an apply started without one logs that
-per-shard progress will be unavailable. The DSN is still configured, because it
-is what marks the environment as one SchemaBot runs itself rather than hands to
-a deployment. One case does need it: where
-PlanetScale's safe schema changes are turned off on the branch, the plan reads
-the schema over vtgate instead, and fails without a DSN.
+password the API hands back. An apply started without one logs that per-shard
+progress will be unavailable. The DSN is still configured, because it is what
+marks the environment as one SchemaBot runs itself rather than hands to a
+deployment.
+
+One case does need the DSN. Where PlanetScale's safe schema changes are turned
+off on the branch, the plan reads the schema over vtgate instead, and fails
+without one.
 
 ## The revert window
 
