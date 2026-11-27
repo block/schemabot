@@ -154,6 +154,13 @@ type CommentObserver struct {
 	// it false again, so later ticks keep retrying until the fold lands.
 	freezesSettled bool
 
+	// rotationDeferred is set during a tick when a rotation was due but is
+	// waiting for an owed freeze. That tick skips the in-place progress edit:
+	// the tracked comment is the one the rotation will fold, and editing it
+	// would freeze it with the state the command produced instead of the
+	// state its own period ended in. It is cleared at the start of each tick.
+	rotationDeferred bool
+
 	// progressCommentCreatedAt is when the tracked progress comment was
 	// created: the age progressEditInterval decays the edit spacing by. It is
 	// read off each confirmed edit's GitHub response, so a restarted or handed
@@ -562,6 +569,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 		return
 	}
 
+	o.rotationDeferred = false
 	if adopted {
 		// A summary comment present while the apply is active again means the apply
 		// was stopped and has resumed — stopped is the only terminal state that
@@ -587,6 +595,11 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 			o.restartProgressCommentAge(now)
 			return
 		}
+	}
+	if o.rotationDeferred {
+		// owedFreezeDefersRotation logged the deferral. The comment keeps the
+		// state it will be folded with until the rotation lands.
+		return
 	}
 
 	// The operation rows are loaded ahead of the rate-limit decision because
@@ -2322,13 +2335,17 @@ func (o *CommentObserver) retryOwedFreezes(apply *storage.Apply, tracked *storag
 // freeze to land. A rotation's tracking write records the comment it
 // supersedes as the one owed a freeze, which would overwrite an unfinished
 // freeze's marker and leave that older comment unfolded for good. The tick's
-// freeze retry runs before any rotation, so a rotation waits at most until
-// the retry succeeds.
+// freeze retry runs before any rotation, so a rotation waits only while that
+// retry keeps failing for a reason a later attempt can fix: a freeze GitHub
+// rejects outright, or whose comment is gone, is settled without folding.
+// A deferral also records rotationDeferred, so the tick leaves the comment
+// the rotation will fold unedited.
 func (o *CommentObserver) owedFreezeDefersRotation(apply *storage.Apply, rotation string) bool {
 	if o.freezesSettled {
 		return false
 	}
-	o.logInfo(apply, "observer: deferring rotation until the superseded comment's freeze lands; the next tick retries both",
+	o.rotationDeferred = true
+	o.logInfo(apply, "observer: deferring rotation until the superseded comment's freeze lands; progress edits pause and the next tick retries both",
 		"rotation", rotation)
 	return true
 }
@@ -2345,9 +2362,11 @@ func (o *CommentObserver) owedFreezeDefersRotation(apply *storage.Apply, rotatio
 // that same body, so a retry after an edit that landed (and a marker clear
 // that did not) rewrites the comment with identical content instead of
 // folding the frozen body a second time; no attempt reads the comment back to
-// decide. A failure leaves the marker in place and marks this observer's
-// freezes unsettled, so every later tick retries until the frozen rendering
-// is on GitHub. Returns true when the freeze is no longer owed.
+// decide. A failure a retry can fix leaves the marker in place and marks this
+// observer's freezes unsettled, so every later tick retries until the frozen
+// rendering is on GitHub. A freeze GitHub rejects outright, or whose comment
+// is gone, is given up instead. Returns true when the freeze is no longer
+// owed.
 func (o *CommentObserver) freezeSupersededProgressComment(apply *storage.Apply, oldCommentID, newCommentID int64, reason supersededProgressReason, storedBody *string) bool {
 	if o.attemptFreeze(apply, oldCommentID, newCommentID, reason, storedBody) {
 		return true
@@ -2379,6 +2398,8 @@ func (o *CommentObserver) attemptFreeze(apply *storage.Apply, oldCommentID, newC
 		return true
 	case frozenBodyCommentGone:
 		return o.clearFreezeOfMissingComment(ctx, apply, oldCommentID)
+	case frozenBodyRejected:
+		return o.clearFreezeMarker(ctx, apply, oldCommentID)
 	}
 	if !o.leaseStillOwnsObserver(apply, "freeze superseded progress comment") {
 		return false
@@ -2386,6 +2407,11 @@ func (o *CommentObserver) attemptFreeze(apply *storage.Apply, oldCommentID, newC
 	if _, err := client.EditIssueComment(ctx, o.repo, oldCommentID, frozen); err != nil {
 		if github.IsNotFoundError(err) {
 			return o.clearFreezeOfMissingComment(ctx, apply, oldCommentID)
+		}
+		if github.IsRejectedRequestError(err) {
+			o.logger.Warn("observer: GitHub rejected the freeze of a superseded progress comment; clearing its freeze marker and leaving the comment unfolded",
+				o.logFields(apply, "github_comment_id", oldCommentID, "error", err)...)
+			return o.clearFreezeMarker(ctx, apply, oldCommentID)
 		}
 		o.logError(apply, "observer: failed to freeze superseded progress comment; the freeze marker and stored body stay set and the next tick retries",
 			"error", err, "github_comment_id", oldCommentID)
@@ -2401,13 +2427,21 @@ func (o *CommentObserver) attemptFreeze(apply *storage.Apply, oldCommentID, newC
 }
 
 // clearFreezeOfMissingComment settles a freeze owed to a comment GitHub no
-// longer has, typically one a person deleted. There is nothing left to fold,
-// and leaving the marker set would hold back every later rotation.
+// longer has, typically one a person deleted. There is nothing left to fold.
 func (o *CommentObserver) clearFreezeOfMissingComment(ctx context.Context, apply *storage.Apply, oldCommentID int64) bool {
 	o.logger.Warn("observer: superseded progress comment is gone from GitHub; clearing its freeze marker without folding it",
 		o.logFields(apply, "github_comment_id", oldCommentID)...)
+	return o.clearFreezeMarker(ctx, apply, oldCommentID)
+}
+
+// clearFreezeMarker gives up on a freeze that retrying cannot finish: the
+// comment is gone, or GitHub rejects the request outright. The fold is
+// cosmetic, and leaving the marker set would hold back every later rotation,
+// so the operator's next command would never surface at the bottom of the PR.
+// The caller logs why the freeze is being given up.
+func (o *CommentObserver) clearFreezeMarker(ctx context.Context, apply *storage.Apply, oldCommentID int64) bool {
 	if err := o.stor.ApplyComments().ClearFreeze(o.contextWithApplyLease(ctx, apply), o.applyID, state.Comment.Progress, oldCommentID); err != nil {
-		o.logError(apply, "observer: failed to clear the freeze marker of a deleted progress comment; the next tick retries",
+		o.logError(apply, "observer: failed to clear the freeze marker of a progress comment that cannot be folded; the next tick retries",
 			"error", err, "github_comment_id", oldCommentID)
 		return false
 	}
@@ -2424,6 +2458,9 @@ const (
 	frozenBodyNotOwed
 	// frozenBodyCommentGone means GitHub no longer has the comment.
 	frozenBodyCommentGone
+	// frozenBodyRejected means GitHub refused to return the comment in a way
+	// a retry will not change.
+	frozenBodyRejected
 	// frozenBodyFailed means a read or write failed; the next tick retries.
 	frozenBodyFailed
 )
@@ -2442,6 +2479,11 @@ func (o *CommentObserver) frozenBodyToSend(ctx context.Context, client *github.I
 	if err != nil {
 		if github.IsNotFoundError(err) {
 			return "", frozenBodyCommentGone
+		}
+		if github.IsRejectedRequestError(err) {
+			o.logger.Warn("observer: GitHub rejected reading a superseded progress comment; clearing its freeze marker and leaving the comment unfolded",
+				o.logFields(apply, "github_comment_id", oldCommentID, "error", err)...)
+			return "", frozenBodyRejected
 		}
 		o.logError(apply, "observer: failed to load superseded progress comment before freezing it",
 			"error", err, "github_comment_id", oldCommentID)
@@ -2480,8 +2522,9 @@ func (o *CommentObserver) frozenBodyToSend(ctx context.Context, client *github.I
 // release recorded only the superseded comment's ID, not the frozen body, so
 // the comment is read from GitHub: a body that release already froze is left
 // as it is, and a live body is folded with the generic rendering. Either way
-// the marker is cleared once the comment is frozen on GitHub, or found gone.
-// Returns true when the marker is cleared.
+// the marker is cleared once the comment is frozen on GitHub, found gone, or
+// GitHub rejects the request outright. Returns true when the marker is
+// cleared.
 func (o *CommentObserver) finishEarlierReleaseFreeze(apply *storage.Apply, oldCommentID, newCommentID int64) bool {
 	if !o.leaseStillOwnsObserver(apply, "create GitHub client before finishing an earlier release's freeze") {
 		return false
@@ -2499,6 +2542,9 @@ func (o *CommentObserver) finishEarlierReleaseFreeze(apply *storage.Apply, oldCo
 	case github.IsNotFoundError(err):
 		o.logger.Warn("observer: superseded progress comment is gone from GitHub; clearing an earlier release's freeze marker without folding it",
 			o.logFields(apply, "github_comment_id", oldCommentID)...)
+	case github.IsRejectedRequestError(err):
+		o.logger.Warn("observer: GitHub rejected reading a superseded progress comment; clearing an earlier release's freeze marker and leaving the comment unfolded",
+			o.logFields(apply, "github_comment_id", oldCommentID, "error", err)...)
 	case err != nil:
 		o.logError(apply, "observer: failed to load superseded progress comment before finishing an earlier release's freeze",
 			"error", err, "github_comment_id", oldCommentID)
@@ -2511,12 +2557,21 @@ func (o *CommentObserver) finishEarlierReleaseFreeze(apply *storage.Apply, oldCo
 			return false
 		}
 		frozen := o.frozenSupersededProgressBody(supersededByPriorRotation, newCommentID, oldBody)
-		if _, err := client.EditIssueComment(ctx, o.repo, oldCommentID, frozen); err != nil {
+		_, err := client.EditIssueComment(ctx, o.repo, oldCommentID, frozen)
+		switch {
+		case github.IsNotFoundError(err):
+			o.logger.Warn("observer: superseded progress comment is gone from GitHub; clearing an earlier release's freeze marker without folding it",
+				o.logFields(apply, "github_comment_id", oldCommentID)...)
+		case github.IsRejectedRequestError(err):
+			o.logger.Warn("observer: GitHub rejected an earlier release's freeze; clearing its marker and leaving the comment unfolded",
+				o.logFields(apply, "github_comment_id", oldCommentID, "error", err)...)
+		case err != nil:
 			o.logError(apply, "observer: failed to finish an earlier release's freeze; its marker stays set and the next tick retries",
 				"error", err, "github_comment_id", oldCommentID)
 			return false
+		default:
+			o.recordLastWritten(oldCommentID, templates.CommentContentKey(frozen))
 		}
-		o.recordLastWritten(oldCommentID, templates.CommentContentKey(frozen))
 	}
 	if err := o.stor.ApplyComments().ClearPendingFreeze(o.contextWithApplyLease(ctx, apply), o.applyID, state.Comment.Progress); err != nil {
 		o.logError(apply, "observer: failed to clear an earlier release's freeze marker; the next tick finds the comment frozen and clears it",

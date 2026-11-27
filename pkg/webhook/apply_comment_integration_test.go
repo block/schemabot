@@ -49,6 +49,9 @@ type commentCapture struct {
 	createdAt time.Time
 	// failEdits makes every PATCH fail with a server error.
 	failEdits bool
+	// editFailures makes PATCHes of one comment fail with the given status,
+	// while edits of every other comment land.
+	editFailures map[int64]int
 }
 
 func (c *commentCapture) setCreatedAt(at time.Time) {
@@ -63,10 +66,32 @@ func (c *commentCapture) setFailEdits(fail bool) {
 	c.failEdits = fail
 }
 
-func (c *commentCapture) editBehavior() (time.Time, bool) {
+// failEditsOf makes every edit of commentID fail with status until
+// clearEditFailure is called; edits of other comments are unaffected.
+func (c *commentCapture) failEditsOf(commentID int64, status int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.createdAt, c.failEdits
+	if c.editFailures == nil {
+		c.editFailures = make(map[int64]int)
+	}
+	c.editFailures[commentID] = status
+}
+
+func (c *commentCapture) clearEditFailure(commentID int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.editFailures, commentID)
+}
+
+// editBehavior returns the created_at to report and the status an edit of
+// commentID fails with, 0 when it succeeds.
+func (c *commentCapture) editBehavior(commentID int64) (time.Time, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failEdits {
+		return c.createdAt, http.StatusInternalServerError
+	}
+	return c.createdAt, c.editFailures[commentID]
 }
 
 func (c *commentCapture) setBody(commentID int64, body string) {
@@ -171,9 +196,9 @@ func setupFakeGitHubForComments(t *testing.T) (*ghclient.InstallationClient, *co
 			Body string `json:"body"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		createdAt, failEdits := capture.editBehavior()
-		if failEdits {
-			w.WriteHeader(http.StatusInternalServerError)
+		createdAt, failStatus := capture.editBehavior(commentID)
+		if failStatus != 0 {
+			w.WriteHeader(failStatus)
 			return
 		}
 		capture.setBody(commentID, body.Body)
@@ -1924,8 +1949,11 @@ func TestE2EOwedFreezeOfADeletedCommentIsCleared(t *testing.T) {
 // An earlier rotation's freeze is still owed when the operator's revert takes
 // effect. The revert's rotation would record its own superseded comment in
 // the same marker and leave the older comment unfolded for good, so it waits.
-// Once GitHub accepts edits again, one tick folds the older comment, then
-// rotates for the revert and folds the comment the revert superseded.
+// While it waits, the pre-revert comment is not edited, even though a progress
+// edit is due: it is the comment the rotation will fold, and it must keep the
+// state its own period ended in. Once the older fold lands, one tick folds the
+// older comment, then rotates for the revert and folds the pre-revert comment
+// with its revert-window content.
 func TestE2ERotationWaitsForAnOwedFreeze(t *testing.T) {
 	ctx := t.Context()
 
@@ -1951,10 +1979,12 @@ func TestE2ERotationWaitsForAnOwedFreeze(t *testing.T) {
 	fake := clock.NewFake(task.CreatedAt)
 	obs := f.newObserver(st, fake)
 
-	capture.setFailEdits(true)
+	capture.failEditsOf(olderID, http.StatusBadGateway)
 	apply.State = state.Apply.Reverting
+	fake.Advance(activeInterval + time.Second)
 	obs.OnProgress(apply, []*storage.Task{task})
 	assert.Empty(t, capture.creates, "the revert does not rotate while an earlier freeze is owed")
+	assert.Empty(t, bufferedEdits(capture), "the pre-revert comment is not edited while its rotation waits")
 
 	prog, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
 	require.NoError(t, err)
@@ -1963,7 +1993,7 @@ func TestE2ERotationWaitsForAnOwedFreeze(t *testing.T) {
 	require.NotNil(t, prog.FreezeCommentID)
 	assert.Equal(t, olderID, *prog.FreezeCommentID, "the earlier freeze's marker is not overwritten")
 
-	capture.setFailEdits(false)
+	capture.clearEditFailure(olderID)
 	fake.Advance(activeInterval + time.Second)
 	obs.OnProgress(apply, []*storage.Task{task})
 
@@ -1975,12 +2005,68 @@ func TestE2ERotationWaitsForAnOwedFreeze(t *testing.T) {
 	assert.Equal(t, preRevertID, edits[1].CommentID, "the revert's freeze lands on the comment it superseded")
 	assert.Contains(t, edits[1].Body, "Progress before the revert — the revert is tracked in")
 	assert.Contains(t, edits[1].Body, fmt.Sprintf("#issuecomment-%d", freshID))
+	assert.Contains(t, edits[1].Body, "Revert window open — closes in 25m", "the folded comment keeps its pre-revert content")
 
 	prog, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
 	require.NoError(t, err)
 	require.NotNil(t, prog)
 	assert.Equal(t, freshID, prog.GitHubCommentID)
 	assert.Nil(t, prog.FreezeCommentID)
+	assert.Nil(t, prog.FrozenBody)
+}
+
+// GitHub rejects the fold of an earlier rotation's comment outright, for
+// example because the folded body is one it refuses. Retrying the same edit
+// cannot land, so the observer clears the marker and leaves that comment as
+// it is. The operator's revert then rotates in the same tick instead of
+// waiting on a fold that will never succeed.
+func TestE2ERejectedFreezeDoesNotHoldBackRotation(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-freeze-rejected",
+		pr:         157,
+		database:   "e2e_freeze_rejected_db",
+		applyState: state.Apply.RevertWindow,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-freeze-rejected", 157, 12345, apply, state.Comment.Progress, "Running — 60% copied")
+	olderID := requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-freeze-rejected", 157, 12345, apply, state.Comment.Progress, "Revert window open — closes in 25m")
+	preRevertID := requireCommentCreate(t, capture)
+
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	prog.FreezeCommentID = &olderID
+	require.NoError(t, st.ApplyComments().Upsert(ctx, prog))
+
+	olderBody, ok := capture.body(olderID)
+	require.True(t, ok)
+	capture.failEditsOf(olderID, http.StatusUnprocessableEntity)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+	apply.State = state.Apply.Reverting
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	freshID := requireCommentCreate(t, capture)
+	edits := bufferedEdits(capture)
+	require.Len(t, edits, 1, "only the pre-revert comment is folded")
+	assert.Equal(t, preRevertID, edits[0].CommentID)
+	assert.Contains(t, edits[0].Body, "Progress before the revert — the revert is tracked in")
+	assert.Contains(t, edits[0].Body, fmt.Sprintf("#issuecomment-%d", freshID))
+
+	body, ok := capture.body(olderID)
+	require.True(t, ok)
+	assert.Equal(t, olderBody, body, "the rejected comment is left as it was")
+
+	prog, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, freshID, prog.GitHubCommentID)
+	assert.Nil(t, prog.FreezeCommentID, "neither freeze is owed")
 	assert.Nil(t, prog.FrozenBody)
 }
 
