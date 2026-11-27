@@ -118,8 +118,9 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 // The two baselines SchemaBot renders answer those questions differently
 // because they are read by different parties.
 type baselinePolicy struct {
-	// includeRowSecurity exports access rules for pull. Rollback cannot yet
-	// execute these definitions and must not advertise a recoverable baseline.
+	// includeRowSecurity writes a table's row security settings and policies
+	// after its CREATE TABLE. The renderer writes all of them or refuses the
+	// table, so a baseline never carries part of a table's access rules.
 	includeRowSecurity bool
 	// includeForeignKeys writes each table's own foreign keys, and refuses a
 	// referenced table whose incoming foreign key lives on a table the
@@ -167,9 +168,13 @@ var pulledBaseline = baselinePolicy{
 // forward plan did not touch diffs to nothing, and a key it added comes
 // back as a drop, which the re-plan shows blocked like any foreign key drop.
 // A key added NOT VALID cannot be carried as it is, so a namespace holding
-// one has no rollback baseline (RV-7).
+// one has no rollback baseline (RV-7). Row security is carried the same way:
+// settings and policies the forward plan did not touch diff to nothing, and
+// one it changed comes back as the reverse change, which the re-plan admits
+// or refuses like any row security change.
 func rollbackBaseline(declared map[string]bool, ignored engine.IgnoredTables) baselinePolicy {
 	return baselinePolicy{
+		includeRowSecurity:          true,
 		includeForeignKeys:          true,
 		refuseNotValidForeignKeys:   true,
 		skipUndeclaredArchiveTables: true,

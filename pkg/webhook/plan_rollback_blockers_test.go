@@ -78,6 +78,6 @@ func TestPlanComment_SaysWhyTheApplyCannotBeRolledBack(t *testing.T) {
 
 	assert.Contains(t, comment, "ALTER TABLE users ADD COLUMN email text")
 	assert.Contains(t, comment,
-		"⚠️ No rollback for namespace `public`: SchemaBot couldn't save the current schema of the tables below, so an apply of this plan can't be rolled back. To undo the change, revert the schema files in a new pull request.\n\n"+
+		"⚠️ No rollback for namespace `public`: rollback needs a schema file for every table in the namespace, and SchemaBot can't write one yet for the tables below. The apply still runs. To undo it, revert the schema files in a new pull request.\n\n"+
 			"- `orders`: holds a foreign key added NOT VALID, which a schema file cannot declare\n")
 }

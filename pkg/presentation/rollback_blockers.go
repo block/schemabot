@@ -17,7 +17,7 @@ const RollbackBlockersListLimit = 10
 // namespace arrives already marked up for the surface, so the PR comment and
 // the CLI say the same sentence and differ only in how they quote.
 func RollbackNotCaptured(namespace string) string {
-	return fmt.Sprintf("No rollback for namespace %s: SchemaBot couldn't save the current schema of the tables below, so an apply of this plan can't be rolled back. To undo the change, revert the schema files in a new pull request.", namespace)
+	return fmt.Sprintf("No rollback for namespace %s: rollback needs a schema file for every table in the namespace, and SchemaBot can't write one yet for the tables below. The apply still runs. To undo it, revert the schema files in a new pull request.", namespace)
 }
 
 // RollbackBlockersShown returns how many of a namespace's blockers a plan

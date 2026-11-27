@@ -3,6 +3,7 @@
 package postgres
 
 import (
+	"context"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -69,6 +70,64 @@ func TestEngineAtomicRowSecurityPlanAndApply(t *testing.T) {
 	again, err := eng.Plan(t.Context(), &engine.PlanRequest{Database: "rls_apply", Credentials: &engine.Credentials{DSN: dsn}, SchemaFiles: files})
 	require.NoError(t, err)
 	assert.True(t, again.NoChanges)
+}
+
+// An operator narrows a policy and later rolls the plan back. The plan's
+// rollback originals hold the policy as it was, so the rollback re-plan is
+// the reverse replacement, gated by the same unsafe consent, and applying it
+// restores the original policy in one transaction (RV-7).
+func TestEngineRowSecurityChangeRollsBack(t *testing.T) {
+	const database = "rls_rollback"
+	dsn, db := testutil.StartPostgres(t, database)
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.documents (id bigint PRIMARY KEY, published boolean NOT NULL);
+  ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON public.documents FOR SELECT USING (true);
+ `)
+	require.NoError(t, err)
+	eng := New()
+	planAndApply := func(files schema.SchemaFiles) *engine.PlanResult {
+		t.Helper()
+		result, err := eng.Plan(ctx, &engine.PlanRequest{Database: database, Credentials: &engine.Credentials{DSN: dsn}, SchemaFiles: files})
+		require.NoError(t, err)
+		require.Len(t, result.Changes, 1)
+		require.Len(t, result.Changes[0].TableChanges, 1)
+		change := result.Changes[0].TableChanges[0]
+		assert.True(t, change.IsUnsafe, "a policy replacement needs unsafe consent in either direction")
+		assert.Contains(t, change.DDL, `CREATE POLICY "readers"`)
+		req := applyRequest(dsn, "documents", change.DDL)
+		req.SchemaFiles = files
+		applied, err := eng.Apply(ctx, req)
+		require.NoError(t, err)
+		require.True(t, applied.Accepted)
+		progress := awaitPostgresProgress(t, eng, "documents")
+		require.Equal(t, engine.StateCompleted, progress.State, progress.ErrorMessage)
+		return result
+	}
+	policy := func() string {
+		t.Helper()
+		var using string
+		require.NoError(t, db.QueryRowContext(ctx,
+			"SELECT qual FROM pg_policies WHERE schemaname = 'public' AND tablename = 'documents' AND policyname = 'readers'").Scan(&using))
+		return using
+	}
+
+	forward := planAndApply(schema.SchemaFiles{"public": {Files: map[string]string{"documents.sql": `
+  CREATE TABLE documents (id bigint PRIMARY KEY, published boolean NOT NULL);
+  ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON documents FOR SELECT USING (published);
+ `}}})
+	require.True(t, forward.Changes[0].OriginalFilesCaptured)
+	assert.Equal(t, "published", policy())
+
+	originals := schema.SchemaFiles{"public": {Files: forward.Changes[0].OriginalFiles}}
+	planAndApply(originals)
+	assert.Equal(t, "true", policy())
+	converged, err := eng.Plan(ctx, &engine.PlanRequest{Database: database, Credentials: &engine.Credentials{DSN: dsn}, SchemaFiles: originals})
+	require.NoError(t, err)
+	assert.True(t, converged.NoChanges)
 }
 
 func TestEngineAtomicRowSecurityRefusesLatePolicyAddition(t *testing.T) {

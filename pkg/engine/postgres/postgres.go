@@ -339,22 +339,36 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				enumChanges = append(enumChanges, changes...)
 				continue
 			}
+			var report pgplan.Report
+			var table string
 			if rowSecurity, ok := file.RowSecurity(); ok {
-				rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity)
+				// A file whose row security matches the live table plans its
+				// table definition like any other file, below. A row security
+				// delta, or a table that does not exist yet, is one reviewed
+				// operation of its own.
+				tableReport, matched, err := planRowSecurityTableDefinition(ctx, pool, namespace, rowSecurity)
 				if err != nil {
 					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 				}
-				desiredTables[file.Table()] = true
-				schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
-				continue
-			}
-			desired, ok := file.Schema()
-			if !ok {
-				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: the parse admitted no planner input", namespace, filename)
-			}
-			report, table, err := planPostgresDefinition(ctx, pool, namespace, desired)
-			if err != nil {
-				return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+				if !matched {
+					rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity)
+					if err != nil {
+						return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+					}
+					desiredTables[file.Table()] = true
+					schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
+					continue
+				}
+				report, table = tableReport, rowSecurity.Table()
+			} else {
+				desired, ok := file.Schema()
+				if !ok {
+					return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: the parse admitted no planner input", namespace, filename)
+				}
+				report, table, err = planPostgresDefinition(ctx, pool, namespace, desired)
+				if err != nil {
+					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+				}
 			}
 			desiredTables[table] = true
 			crossNamespace, err := crossNamespaceForeignKeysForDrops(ctx, pool, namespace, report)
