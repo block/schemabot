@@ -154,7 +154,7 @@ func (c *LocalClient) cancelForFailedSibling(ctx context.Context, logger *slog.L
 		return false, fmt.Errorf("cancel apply %s operation %d behind failed sibling %d: %w", apply.ApplyIdentifier, opLease.OperationID, failed.ID, err)
 	}
 	if err := c.releaseCancelledArtifacts(cancelCtx, eng, apply, own); err != nil {
-		c.logSkippedArtifactRelease(cancelCtx, apply, err)
+		c.logSkippedArtifactRelease(cancelCtx, apply, cancelledRelease, err)
 	}
 	if err := c.reclaimCancelledResumeState(cancelCtx, eng, apply, own); err != nil {
 		logger.WarnContext(ctx, "halted operation's stored engine state could not be fully reclaimed; the apply log names what was left in place",

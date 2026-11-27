@@ -37,7 +37,7 @@ func TestSortProgressRows(t *testing.T) {
 		assert.Equal(t, "orders", rows[0].TableName, "input is not reordered")
 	})
 
-	t.Run("a table with several statements stays together, ranked by its most urgent row", func(t *testing.T) {
+	t.Run("a table with several statements stays together in plan order, ranked by its most urgent row", func(t *testing.T) {
 		rows := []TableProgressData{
 			{Namespace: "public", TableName: "users", Status: state.Task.Completed},
 			{Namespace: "public", TableName: "users", Status: state.Task.Running},
@@ -46,8 +46,8 @@ func TestSortProgressRows(t *testing.T) {
 		got := sortProgressRows(rows)
 
 		assert.Equal(t, []string{
-			"users:" + state.Task.Running,
 			"users:" + state.Task.Completed,
+			"users:" + state.Task.Running,
 			"sessions:" + state.Task.Pending,
 		}, rowLabels(got))
 	})
@@ -106,7 +106,7 @@ func TestSortRowsByTable_SummaryOrder(t *testing.T) {
 		}, rowLabels(got))
 	})
 
-	t.Run("a table's rows stay together ahead of another failed table", func(t *testing.T) {
+	t.Run("a table's rows stay together in plan order ahead of another failed table", func(t *testing.T) {
 		rows := []TableProgressData{
 			{Namespace: "public", TableName: "users", Status: state.Task.Completed},
 			{Namespace: "public", TableName: "users", Status: state.Task.Failed},
@@ -115,8 +115,8 @@ func TestSortRowsByTable_SummaryOrder(t *testing.T) {
 		got := sortRowsByTable(rows, summaryStatePriority)
 
 		assert.Equal(t, []string{
-			"users:" + state.Task.Failed,
 			"users:" + state.Task.Completed,
+			"users:" + state.Task.Failed,
 			"sessions:" + state.Task.Failed,
 		}, rowLabels(got))
 	})
@@ -132,8 +132,8 @@ func TestRenderApplySummaryComment_MultiStatementTableRowsStayTogether(t *testin
 	require.Contains(t, out, usersFailed)
 	require.Contains(t, out, usersCompleted)
 	require.Contains(t, out, sessionsFailed)
-	assert.Less(t, strings.Index(out, usersFailed), strings.Index(out, usersCompleted), "the table's failed row leads its block")
-	assert.Less(t, strings.Index(out, usersCompleted), strings.Index(out, sessionsFailed), "the other failed table follows the whole block")
+	assert.Less(t, strings.Index(out, usersCompleted), strings.Index(out, usersFailed), "the table's rows keep the order its steps ran in")
+	assert.Less(t, strings.Index(out, usersFailed), strings.Index(out, sessionsFailed), "the other failed table follows the whole block")
 }
 
 func TestRenderApplyStatusComment_MultiStatementTableRowsStayTogether(t *testing.T) {
@@ -146,6 +146,6 @@ func TestRenderApplyStatusComment_MultiStatementTableRowsStayTogether(t *testing
 	require.Contains(t, out, running)
 	require.Contains(t, out, complete)
 	require.Contains(t, out, queued)
-	assert.Less(t, strings.Index(out, running), strings.Index(out, complete), "the table's running row leads its block")
-	assert.Less(t, strings.Index(out, complete), strings.Index(out, queued), "the other table follows the whole block")
+	assert.Less(t, strings.Index(out, complete), strings.Index(out, running), "the table's rows keep the order its steps run in")
+	assert.Less(t, strings.Index(out, running), strings.Index(out, queued), "the other table follows the whole block")
 }

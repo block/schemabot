@@ -685,11 +685,20 @@ func classifyApplyFailure(err error, table string, validates *schemadiff.Constra
 			lockBudget: true,
 		}
 	}
+	// Rows that break a constraint keep breaking it until someone changes
+	// them, which takes a person far longer than the drive's retries do, so
+	// the failure ends the apply at once rather than spending its retries on
+	// an answer that cannot change. A constraint the apply added is then
+	// dropped, so the re-apply after the data fix plans it again; one the
+	// table already had stays, and the re-apply resumes at its validation.
 	if detail, ok := brokenForeignKeyDetail(err, table); ok {
-		return applyFailure{detail: detail, retryable: true}
+		return applyFailure{detail: detail}
 	}
 	if detail, ok := brokenCheckDetail(err, table, validates); ok {
-		return applyFailure{detail: detail, retryable: true}
+		return applyFailure{detail: detail}
+	}
+	if detail, ok := duplicateKeyDetail(err, table); ok {
+		return applyFailure{detail: detail}
 	}
 	if detail, ok := missingGrantDetail(err, table); ok {
 		return applyFailure{detail: detail, retryable: true}
@@ -719,17 +728,19 @@ func missingGrantDetail(err error, table string) (string, bool) {
 const sqlstateForeignKeyViolation = "23503"
 
 // brokenForeignKeyDetail names the foreign key whose validation failed on
-// existing rows. The key was added NOT VALID in an earlier step, so it stays
-// in place and checks new writes; the apply can finish once the owner fixes
-// the rows. The detail is built from the server's typed fields, never its
-// message, because the message quotes the offending row's values.
+// existing rows. A new apply finishes it once the owner fixes the rows. The
+// drive removes the key when this apply added it NOT VALID, and leaves one
+// that was already on the table, so the detail does not say the key stays:
+// the apply log says what became of it. The detail is built from the server's
+// typed fields, never its message, because the message quotes the offending
+// row's values.
 func brokenForeignKeyDetail(err error, table string) (string, bool) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateForeignKeyViolation {
 		return "", false
 	}
 	return sanitizeReasonText(fmt.Sprintf(
-		"existing rows in %q break foreign key %q; the key is in place and checks new writes; fix those rows, then retry",
+		"existing rows in %q break foreign key %q; fix those rows, then apply again",
 		table, pgErr.ConstraintName)), true
 }
 
@@ -740,13 +751,12 @@ const sqlstateCheckViolation = "23514"
 
 // brokenCheckDetail names the check constraint whose validation failed on
 // existing rows. It applies only when the failed step validates the
-// constraint the server names. That constraint is NOT VALID on the table,
-// whether the plan added it in an earlier step or found it live, so it stays
-// in place and checks new writes, and the apply can finish once the owner
-// fixes the rows. For the helper check a SET NOT NULL validates, those are
-// the rows that hold NULL in the column. The detail is built from the
-// server's typed fields, never its message, because the message can quote
-// row values.
+// constraint the server names. A new apply finishes it once the owner fixes
+// the rows. For the helper check a SET NOT NULL validates, those are the rows
+// that hold NULL in the column, and the drive removes the helper when this
+// apply added it, so the detail does not say the constraint stays: the apply
+// log says what became of it. The detail is built from the server's typed
+// fields, never its message, because the message can quote row values.
 func brokenCheckDetail(err error, table string, validates *schemadiff.ConstraintValidation) (string, bool) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateCheckViolation {
@@ -756,7 +766,27 @@ func brokenCheckDetail(err error, table string, validates *schemadiff.Constraint
 		return "", false
 	}
 	return sanitizeReasonText(fmt.Sprintf(
-		"existing rows in %q break check constraint %q; the constraint is in place and checks new writes; fix those rows, then retry",
+		"existing rows in %q break check constraint %q; fix those rows, then apply again",
+		table, pgErr.ConstraintName)), true
+}
+
+// sqlstateUniqueViolation is the SQLSTATE the server raises when rows hold
+// duplicate values a unique key does not allow, which for a schema change
+// means adding a unique constraint that existing rows break.
+const sqlstateUniqueViolation = "23505"
+
+// duplicateKeyDetail names the unique key that existing rows break. The
+// statement that adds the key runs in one transaction, so it leaves nothing
+// behind, and a new apply adds the key once the owner removes or merges the
+// duplicates. The detail is built from the server's typed fields, never its
+// message or detail, because those quote the duplicated values.
+func duplicateKeyDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateUniqueViolation {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"existing rows in %q hold duplicate values that unique key %q does not allow; remove or merge the duplicates, then apply again",
 		table, pgErr.ConstraintName)), true
 }
 

@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // An apply drops `_jobs_old`, a leftover table a repository named in
@@ -388,4 +389,94 @@ func TestParseProgressResponseDropsTerminalEscapesFromServerText(t *testing.T) {
 	assert.Equal(t, "duplicate key]0;owned", data.Operations[0].ErrorMessage)
 	require.Len(t, data.Tables, 1)
 	assert.Equal(t, "replica lag[31m", data.Tables[0].ThrottleReason)
+}
+
+// A NOT NULL change fails at its validation, and the drive records the steps
+// queued behind it cancelled without running them. Nobody cancelled them, so
+// the CLI and the PR summary both read them as not run. The same rows in an
+// apply an operator cancelled still read as cancelled before they started,
+// on both surfaces.
+func TestProgressReadsStepsBehindAFailureAsNotRunOnEverySurface(t *testing.T) {
+	response := func(applyState string) *apitypes.ProgressResponse {
+		return &apitypes.ProgressResponse{
+			State:    applyState,
+			Engine:   "postgres",
+			Database: "testapp",
+			Tables: []*apitypes.TableProgressResponse{{
+				TableName:  "users",
+				Keyspace:   "public",
+				ChangeType: "alter",
+				DDL:        `ALTER TABLE "public"."users" ALTER COLUMN "name" SET NOT NULL`,
+				Status:     "STATE_CANCELLED",
+			}},
+		}
+	}
+	cli := func(applyState string) string {
+		data := ParseProgressResponse(response(applyState))
+		require.Len(t, data.Tables, 1)
+		return FormatTableProgressWithActivity(data.Tables[0], "", "")
+	}
+	summary := func(applyState string) string {
+		return webhooktemplates.RenderApplySummaryComment(webhooktemplates.ApplyStatusFromProgress(response(applyState), "octocat"))
+	}
+
+	failed := cli(state.Apply.Failed)
+	assert.Contains(t, failed, "users: ⏭️ Not run")
+	assert.NotContains(t, failed, "Cancelled")
+	failedSummary := summary(state.Apply.Failed)
+	assert.Contains(t, failedSummary, "**`users`** — Not run\n", "%s", failedSummary)
+	assert.NotContains(t, failedSummary, "Cancelled", "%s", failedSummary)
+
+	assert.Contains(t, cli(state.Apply.Cancelled), "users: 🚫 Cancelled (not started)")
+	cancelledSummary := summary(state.Apply.Cancelled)
+	assert.Contains(t, cancelledSummary, "**`users`** — Cancelled (not started)\n", "%s", cancelledSummary)
+}
+
+// A validation that started, then was cancelled when a sibling failed,
+// reports no row progress. It ran, so the CLI and the PR summary both read it
+// as cancelled rather than not run.
+func TestProgressReadsAStartedStepWithNoRowProgressAsCancelledOnEverySurface(t *testing.T) {
+	response := &apitypes.ProgressResponse{
+		State:    state.Apply.Failed,
+		Engine:   "postgres",
+		Database: "testapp",
+		Tables: []*apitypes.TableProgressResponse{{
+			TableName:  "users",
+			Keyspace:   "public",
+			ChangeType: "alter",
+			DDL:        `ALTER TABLE "public"."users" VALIDATE CONSTRAINT "users_name_not_null_check"`,
+			Status:     "STATE_CANCELLED",
+			StartedAt:  "2026-11-27T10:00:00Z",
+		}},
+	}
+	data := ParseProgressResponse(response)
+	require.Len(t, data.Tables, 1)
+	cli := FormatTableProgressWithActivity(data.Tables[0], "", "")
+	assert.Contains(t, cli, "users: 🚫 Cancelled")
+	assert.NotContains(t, cli, "Not run")
+	summary := webhooktemplates.RenderApplySummaryComment(webhooktemplates.ApplyStatusFromProgress(response, "octocat"))
+	assert.Contains(t, summary, "**`users`** — Cancelled\n", "%s", summary)
+	assert.NotContains(t, summary, "Not run", "%s", summary)
+}
+
+// A table changed in several steps keeps its steps in the order they run on
+// every CLI surface, operation sections included: the completed ADD stays
+// above the validation that failed after it, while the table as a whole
+// sorts ahead of a finished one.
+func TestSortActiveTablesKeepsATablesStepsInOrder(t *testing.T) {
+	tables := []TableProgress{
+		{Namespace: "public", TableName: "accounts", Status: state.Task.Completed, DDL: "ALTER TABLE accounts ADD COLUMN note text"},
+		{Namespace: "public", TableName: "users", Status: state.Task.Completed, DDL: "ADD CONSTRAINT users_name_not_null_check"},
+		{Namespace: "public", TableName: "users", Status: state.Task.Failed, DDL: "VALIDATE CONSTRAINT users_name_not_null_check"},
+	}
+	sortActiveTables(tables)
+	var order []string
+	for _, table := range tables {
+		order = append(order, table.TableName+": "+table.DDL)
+	}
+	assert.Equal(t, []string{
+		"users: ADD CONSTRAINT users_name_not_null_check",
+		"users: VALIDATE CONSTRAINT users_name_not_null_check",
+		"accounts: ALTER TABLE accounts ADD COLUMN note text",
+	}, order)
 }
