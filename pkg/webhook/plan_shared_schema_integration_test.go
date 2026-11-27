@@ -329,7 +329,7 @@ func TestE2EAutoPlanFailsClosedWhenSharedSchemaPeerSourceIsNotAuthorized(t *test
 	})
 
 	body := p.open(t)
-	assert.Contains(t, body, `read the schema files of "`+sharedSchemaUnshardedDB+`"`)
+	assert.Contains(t, body, "could not read the schema files of `"+sharedSchemaUnshardedDB+"`")
 	assert.Contains(t, body, `schema path "schema/shop" is not authorized for database "`+sharedSchemaUnshardedDB+`"`)
 	assert.Nil(t, p.production.planNamespaces, "production plans nothing while the peer's source is refused")
 
@@ -378,7 +378,8 @@ func TestE2EAutoPlanFailsClosedWhenSharedSchemaPeerCannotBeRead(t *testing.T) {
 	}, append(slices.Clone(sharedSchemaBaseFiles), "schema/shop/shop_0/broken.sql"))
 
 	body := p.open(t)
-	assert.Contains(t, body, `schema files of database "`+sharedSchemaUnshardedDB+`"`)
+	assert.Contains(t, body, "split schema file shop_0/broken.sql: failed to parse SQL statements")
+	assert.NotContains(t, body, "compare ignore_tables of")
 	assert.Nil(t, p.production.planNamespaces, "production plans nothing while the peer cannot be compared")
 
 	byEnv := p.checksByEnv(t, sharedSchemaShardedDB)

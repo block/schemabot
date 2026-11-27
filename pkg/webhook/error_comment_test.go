@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/engine"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -65,38 +66,135 @@ func TestPostCommandError_RendersTimestamp(t *testing.T) {
 	}
 }
 
-func TestPostCommandErrorExplainsRemoteUnavailable(t *testing.T) {
+// userFacingError shows an error's own text only when the error marks it as
+// written for the person who ran the command, and shows a fixed line for every
+// other error, so a dial failure or a storage error never reaches the pull
+// request with its addresses.
+func TestUserFacingError(t *testing.T) {
+	const retryLine = "SchemaBot could not complete the command. Run the command again; if it fails again, the SchemaBot server logs have the cause."
+	dialFailure := errors.New("dial tcp 10.1.2.3:3306: connect: connection refused")
+
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "an authored error shows its text",
+			err:  &api.DatabaseNotConfiguredError{Database: "orders"},
+			want: `database "orders" is not configured on this server`,
+		},
+		{
+			name: "a wrapped authored error shows only its own text",
+			err:  fmt.Errorf("plan orders/staging: %w", &api.DatabaseNotConfiguredError{Database: "orders"}),
+			want: `database "orders" is not configured on this server`,
+		},
+		{
+			name: "authored text with line breaks becomes one line",
+			err:  &engine.OperatorMessage{Message: "the copy of \"orders\"\r\nhas not started\n\n- retry later", Err: dialFailure},
+			want: `the copy of "orders" has not started - retry later`,
+		},
+		{
+			name: "authored text carrying an address is redacted",
+			err:  &engine.OperatorMessage{Message: "could not reach 10.1.2.3:3306 for orders"},
+			want: "could not reach [endpoint redacted] for orders",
+		},
+		{
+			name: "authored text quoting a statement is flattened",
+			err:  &engine.PlanRefusedError{Err: errors.New("the schema files drop table `orders_seq`:\nDROP TABLE `orders_seq`;\n")},
+			want: "the schema files drop table `orders_seq`: DROP TABLE `orders_seq`;",
+		},
+		{
+			name: "authored text that sanitizes to nothing shows the fixed line",
+			err:  &engine.OperatorMessage{Message: " \n\t" + string(rune(0x202e)) + " "},
+			want: retryLine,
+		},
+		{
+			name: "no config",
+			err:  fmt.Errorf("find config: %w", ghclient.ErrNoConfig),
+			want: "No `schemabot.yaml` configuration file was found in this repository. Add one in the directory that holds the `.sql` files declaring your tables, or use `-d` to name a database that already has one.",
+		},
+		{
+			name: "invalid config shows no path from the pull request",
+			err:  fmt.Errorf("%w at %s", ghclient.ErrInvalidConfig, "services/orders/schemabot.yaml"),
+			want: "A `schemabot.yaml` in this repository is not valid. It must include the `database` and `type` fields; fix the file and push a commit.",
+		},
+		{
+			name: "multiple configs without candidates",
+			err:  ghclient.ErrMultipleConfigs,
+			want: "This repository has more than one `schemabot.yaml`, so SchemaBot cannot tell which database you mean. Use `-d` with the database name.",
+		},
+		{
+			name: "multiple configs with candidates show the choices",
+			err:  &ghclient.MultipleConfigsError{Candidates: []ghclient.ConfigCandidate{{Database: "orders", SchemaDir: "services/orders"}, {Database: "users", SchemaDir: "services/users"}}},
+			want: "multiple schemabot.yaml configs found - use -d flag to specify database: `orders` (services/orders), `users` (services/users)",
+		},
+		{
+			name: "config discovery on a truncated tree",
+			err:  fmt.Errorf("discover schemabot configs in repo octocat/hello-world ref abc123: %w", ghclient.ErrConfigDiscoveryTruncated),
+			want: "GitHub returned a truncated repository tree, so SchemaBot could not search this repository for `schemabot.yaml` configurations. Ask a SchemaBot operator to give each of this repository's databases an `allowed_dirs` entry naming its schema directory.",
+		},
+		{
+			name: "a peer that cannot be read names the databases and the authored reason",
+			err: &sharedSchemaPeerUnreadableError{
+				Peer: "users", Database: "orders", Environment: "staging",
+				Cause: &api.DatabaseNotConfiguredError{Database: "users"},
+			},
+			want: "SchemaBot could not read the schema files of `users`, which shares a target with `orders` in staging, so it could not compare their ignore_tables. " +
+				`database "users" is not configured on this server`,
+		},
+		{
+			name: "a peer that cannot be read for an unwritten reason names no cause",
+			err: &sharedSchemaPeerUnreadableError{
+				Peer: "users", Database: "orders", Environment: "staging", Cause: dialFailure,
+			},
+			want: "SchemaBot could not read the schema files of `users`, which shares a target with `orders` in staging, so it could not compare their ignore_tables.",
+		},
+		{
+			name: "an untyped error shows the fixed line",
+			err:  dialFailure,
+			want: retryLine,
+		},
+		{
+			name: "a wrapped untyped error shows the fixed line",
+			err:  fmt.Errorf("load schema files: %w", dialFailure),
+			want: retryLine,
+		},
+		{
+			name: "a joined error holding an authored error shows the authored text",
+			err:  errors.Join(dialFailure, &api.EnvironmentNotConfiguredError{Database: "orders", Environment: "staging"}),
+			want: (&api.EnvironmentNotConfiguredError{Database: "orders", Environment: "staging"}).Error(),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := userFacingError(tc.err)
+
+			assert.Equal(t, tc.want, got)
+			assert.NotContains(t, got, "10.1.2.3")
+		})
+	}
+}
+
+// A failed plan comment carries the fixed line for an error SchemaBot did not
+// write, with no part of the error's own text.
+func TestPostPlanCommandErrorShowsTheFixedLineForAnUnwrittenError(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	bodies := make(chan string, 1)
-	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Body string `json:"body"`
-		}
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-		bodies <- body.Body
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
-	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, bodies))
 
 	h := &Handler{
 		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
 		logger:    testLogger(),
 	}
+	err := fmt.Errorf("load schema files: %w", errors.New("dial tcp 10.1.2.3:3306: connect: connection refused"))
 
-	h.postCommandError(
-		"octocat/hello-world", 1, 12345,
-		"plan", "staging", "alice",
-		"rpc error: code = Unavailable desc = no healthy upstream",
-	)
+	h.postPlanCommandError("octocat/hello-world", 1, 12345, "staging", "alice", err)
 
-	select {
-	case body := <-bodies:
-		assert.Contains(t, body, "SchemaBot could not reach the remote schema change service. Run the command again once the service is healthy; if it fails again, the SchemaBot server logs have the cause.")
-		assert.NotContains(t, body, "no healthy upstream")
-		assert.NotContains(t, body, "rpc error: code =")
-	case <-time.After(2 * time.Second):
-		require.FailNow(t, "timed out waiting for posted comment")
-	}
+	body := requireComment(t, bodies, "plan failure comment")
+	assert.Contains(t, body, "> SchemaBot could not complete the command. Run the command again; if it fails again, the SchemaBot server logs have the cause.")
+	assert.NotContains(t, body, "10.1.2.3")
+	assert.NotContains(t, body, "load schema files")
 }
 
 // A shared schema check that cannot learn which schemas a database's
