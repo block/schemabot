@@ -277,4 +277,4 @@ require (
 )
 
 // needed for Strata and vtcombo OnlineDDL suppport
-replace vitess.io/vitess => github.com/block/vitess v0.0.0-20261112160743-c58a2176754c
+replace vitess.io/vitess => github.com/block/vitess v0.0.0-20261127151041-736af1367a3e
