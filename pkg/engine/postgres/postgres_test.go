@@ -1294,6 +1294,90 @@ func TestTableChangesRendersAnIndexDropAsUnsafe(t *testing.T) {
 	assert.Equal(t, dropped, *recorded)
 }
 
+// A changed unique index is replaced in three steps: the new definition is
+// built under a temporary name, the old index is dropped, and the new one is
+// renamed to the old name. All three are executable. The drop still needs
+// --allow-unsafe, since the old definition stops applying, and its reason
+// names the index that replaces it rather than calling it a removal. The drop
+// carries the plan's record of the replacement, which the apply checks before
+// dropping the old index.
+func TestTableChangesRendersAnIndexReplacement(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	exists := true
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
+	report.Table = "orders"
+	report.TableExists = &exists
+	dropped := schemadiff.DroppedObject{
+		Kind:       schemadiff.DroppedIndex,
+		Name:       "orders_email_key",
+		Definition: "CREATE UNIQUE INDEX orders_email_key ON public.orders USING btree (email)",
+	}
+	replacement := schemadiff.IndexReplacement{
+		Index: "orders_email_key_new",
+		Def:   "CREATE UNIQUE INDEX orders_email_key_new ON public.orders USING btree (lower(email))",
+	}
+	native := func(s pgplan.Statement) pgplan.Statement {
+		s.Route, s.Backend, s.Disposition = planner.RouteNative, router.BackendNative, router.DispositionExecute
+		return s
+	}
+	report.Statements = []pgplan.Statement{
+		native(pgplan.Statement{
+			SQL:     "CREATE UNIQUE INDEX orders_email_key_new ON public.orders USING btree (lower(email))",
+			ExecSQL: []string{"CREATE UNIQUE INDEX CONCURRENTLY orders_email_key_new ON public.orders USING btree (lower(email))"},
+			Kind:    schemadiff.ChangeCreateIndex,
+		}),
+		native(pgplan.Statement{
+			SQL:         "DROP INDEX public.orders_email_key",
+			ExecSQL:     []string{"DROP INDEX CONCURRENTLY public.orders_email_key"},
+			Kind:        schemadiff.ChangeDropIndex,
+			Destructive: true,
+			Drops:       &dropped,
+			ReplacedBy:  "orders_email_key_new",
+			Replacement: &replacement,
+		}),
+		native(pgplan.Statement{
+			SQL:     "ALTER INDEX public.orders_email_key_new RENAME TO orders_email_key",
+			ExecSQL: []string{"ALTER INDEX public.orders_email_key_new RENAME TO orders_email_key"},
+			Kind:    schemadiff.ChangeRenameIndex,
+		}),
+	}
+
+	changes, tiers, unrecognized, err := tableChanges(report, nil, parser)
+	require.NoError(t, err)
+	assert.Empty(t, unrecognized)
+	require.Len(t, changes, 3)
+	for _, change := range changes {
+		assert.Empty(t, change.ExecutionMode, change.ModeReason)
+		assert.Equal(t, "orders", change.Table)
+	}
+	assert.Equal(t, []preflight.Tier{preflight.TierIndexBuild, preflight.TierAlterInPlace, preflight.TierAlterInPlace}, tiers)
+
+	assert.Equal(t, ddl.StatementCreateIndex, changes[0].Operation)
+	assert.False(t, changes[0].IsUnsafe)
+
+	drop := changes[1]
+	assert.Equal(t, ddl.StatementDropIndex, drop.Operation)
+	assert.True(t, drop.IsUnsafe)
+	assert.Equal(t, `statement replaces index "orders_email_key" on table "orders" with the definition built as "orders_email_key_new": the old index is dropped only while that index is valid, and from then on its old definition no longer applies`, drop.UnsafeReason)
+	recorded, err := reviewedDropFromMetadata(drop.Metadata)
+	require.NoError(t, err)
+	require.NotNil(t, recorded)
+	assert.Equal(t, dropped, *recorded, "the apply still checks the old index before dropping it")
+	admitted, err := indexReplacementForApply("app", drop, recorded)
+	require.NoError(t, err)
+	require.NotNil(t, admitted)
+	assert.Equal(t, replacement, *admitted, "the apply checks the replacement before dropping the old index")
+	assert.NotContains(t, changes[0].Metadata, indexReplacementMetadataKey, "only the drop carries the replacement record")
+	assert.NotContains(t, changes[2].Metadata, indexReplacementMetadataKey, "only the drop carries the replacement record")
+
+	rename := changes[2]
+	assert.Equal(t, ddl.StatementAlterTable, rename.Operation)
+	assert.Equal(t, "ALTER INDEX public.orders_email_key_new RENAME TO orders_email_key", rename.DDL)
+	assert.False(t, rename.IsUnsafe)
+}
+
 // TestBlockRewriteStepsFailsClosedOnUnparseableStep proves an executable step
 // whose statement the parser rejects fails the plan rather than being blocked
 // or exempted on a guess: the tier derivation parsed every executable step

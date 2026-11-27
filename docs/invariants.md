@@ -1981,6 +1981,10 @@ An index drop runs `DROP INDEX CONCURRENTLY`, which holds no lock between its ch
 drop: the index is checked on the dropping session right before the drop, and an index another
 session renamed aside and replaced in that window is detected after the drop and refuses the
 apply (`indexDropForApply` and `executeIndexDrop` in `pkg/engine/postgres/index_drop.go`).
+A constraint that takes over an index, and the drop of an index the plan built a replacement
+for, run only with the planner's record of that index, and the apply checks the live index
+against it before acting (`reviewedAdoptionForApply` and `indexReplacementForApply` in
+`pkg/engine/postgres/reviewed_index.go`).
 The re-plan an apply runs after a confirmation, or after an automatic apply posts its plan, holds
 each statement the confirmed plan ran to the engine's record of the objects it acts on: a record
 that differs refuses the confirmation, or stops the automatic apply for manual confirmation
