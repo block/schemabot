@@ -3565,6 +3565,7 @@ func buildShardedApplyOperationGroups(
 		// shard set for every member there.
 		shardsByNamespace := changingShardsByNamespace(member.Plan.Shards)
 		firstMemberGroup := len(groups)
+		sourceChanges := map[*storage.ApplyOperationWithTasks][]storage.TableChange{}
 		namespaces := make([]string, 0, len(shardsByNamespace))
 		for namespace := range shardsByNamespace {
 			namespaces = append(namespaces, namespace)
@@ -3604,12 +3605,15 @@ func buildShardedApplyOperationGroups(
 						groups = append(groups, group)
 					}
 					group.Tasks = append(group.Tasks, buildApplyTask(member.Plan, ddlChange, environment, applyOpts, shard.Shard, now))
+					sourceChanges[group] = append(sourceChanges[group], ddlChange)
 				}
 			}
 		}
+		// A shard's changes can diverge from its namespace's, so each task's
+		// ordinal comes from the change it was built from.
 		ordinals := storage.NewPlanChangeOrdinals(member.Plan)
 		for _, group := range groups[firstMemberGroup:] {
-			ordinals.Assign(group.Tasks)
+			ordinals.AssignFromChanges(group.Tasks, sourceChanges[group])
 		}
 		finalizers, err := buildNamespaceFinalizerOperations(applyPlan, member, keys, cutoverPolicy, onFailure, now)
 		if err != nil {

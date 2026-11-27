@@ -1,6 +1,9 @@
 package storage
 
-import "strings"
+import (
+	"maps"
+	"strings"
+)
 
 // PlanChangeOrdinals records on each task which of a plan's changes it runs,
 // as that change's 1-based position among the plan's changes to the same
@@ -15,12 +18,13 @@ import "strings"
 // many groups assigns every group from the same index.
 type PlanChangeOrdinals struct {
 	positions map[string][]int
+	byTable   map[string][]TableChange
 }
 
 // NewPlanChangeOrdinals indexes plan's changes by namespace, table, and
 // statement.
 func NewPlanChangeOrdinals(plan *Plan) *PlanChangeOrdinals {
-	return &PlanChangeOrdinals{positions: planChangePositions(plan)}
+	return &PlanChangeOrdinals{positions: planChangePositions(plan), byTable: PlanChangesByTable(plan)}
 }
 
 // Assign sets each task's PlanChangeOrdinal. tasks must list each table's
@@ -46,6 +50,41 @@ func (o *PlanChangeOrdinals) Assign(tasks []*Task) {
 		candidates := o.positions[planChangeKey(task.Namespace, task.TableName, "", statement)]
 		if occurrence < len(candidates) {
 			task.PlanChangeOrdinal = candidates[occurrence]
+		}
+	}
+}
+
+// AssignFromChanges sets each task's PlanChangeOrdinal from the change it was
+// built from: changes[i] is the change tasks[i] runs. It is for a builder whose
+// changes are not the plan's own list, such as a shard's, which can hold fewer
+// of a table's changes than the namespace does when its shards diverge. Each
+// task takes the first plan change on its table, not yet taken by another task
+// of the same shard, that carries its statement and the same engine metadata
+// as its own change. Pairing by statement alone would hand a shard that needs
+// only the second of two copies the first copy's record. A task no plan change
+// matches keeps ordinal 0, which the drive treats as unknown.
+func (o *PlanChangeOrdinals) AssignFromChanges(tasks []*Task, changes []TableChange) {
+	if o == nil || len(o.byTable) == 0 {
+		return
+	}
+	taken := map[string]map[int]bool{}
+	for i, task := range tasks {
+		if task == nil || i >= len(changes) {
+			continue
+		}
+		statement := strings.TrimSpace(task.DDL)
+		scope := planChangeKey(task.Namespace, task.TableName, task.Shard, "")
+		if taken[scope] == nil {
+			taken[scope] = map[int]bool{}
+		}
+		planChanges := o.byTable[PlanChangeTableKey(task.Namespace, task.TableName)]
+		for _, position := range o.positions[planChangeKey(task.Namespace, task.TableName, "", statement)] {
+			if taken[scope][position] || !maps.Equal(planChanges[position-1].Metadata, changes[i].Metadata) {
+				continue
+			}
+			taken[scope][position] = true
+			task.PlanChangeOrdinal = position
+			break
 		}
 	}
 }
