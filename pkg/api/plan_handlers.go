@@ -740,8 +740,10 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		// A plan proposing drops in namespaces the target's entry does not
 		// select is refused the same way on every retry until the configuration,
 		// the schema files or the planning deployment changes, so it is the
-		// request's answer rather than a server fault. Drops that could not be
-		// checked (UnselectedTableDropCheckError) stay a server error below:
+		// request's answer rather than a server fault. A drop check that
+		// stopped on a schema file that would not parse is answered 422
+		// schema_refused below, since the same files stop it the same way. A
+		// drop check that failed for any other reason stays a server error:
 		// SchemaBot failed to perform the check, which says nothing about the
 		// request.
 		if _, ok := errors.AsType[*UnselectedTableDropError](err); ok {
