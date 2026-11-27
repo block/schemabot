@@ -79,7 +79,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		})
 		if err != nil {
 			if cmd.JSON {
-				return client.ExitWithJSON("api_error", err.Error())
+				return client.ExitWithJSON(planErrorCode(err), err.Error())
 			}
 			if outputPlanRequestError(cfg.Database, "", err) {
 				return ErrSilent
@@ -103,7 +103,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		})
 		if err != nil {
 			if cmd.JSON {
-				return client.ExitWithJSON("api_error", err.Error())
+				return client.ExitWithJSON(planErrorCode(err), err.Error())
 			}
 			if outputPlanRequestError(cfg.Database, env, err) {
 				return ErrSilent
@@ -178,6 +178,17 @@ func planRefusal(plan *apitypes.PlanResponse) string {
 		return "has a blocked change"
 	}
 	return ""
+}
+
+// planErrorCode is the code `plan --json` reports for a failed plan request:
+// the API's own error code when it sent one, so a script can tell a refusal
+// of the schema files from a server fault, and "api_error" otherwise.
+func planErrorCode(err error) string {
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode != "" {
+		return apiErr.ErrorCode
+	}
+	return "api_error"
 }
 
 func outputPlanRequestError(database, environment string, err error) bool {

@@ -137,6 +137,19 @@ func TestPlanCmd_SchemaRefusalOmitsTheHTTPStatus(t *testing.T) {
 	assert.NotContains(t, plainOutput, "API status", plainOutput)
 }
 
+// A plan refused for its schema files reports the API's schema_refused code
+// in --json output, so an agent does not read the refusal as a server fault to
+// retry; any other failure keeps the generic api_error code.
+func TestPlanErrorCode(t *testing.T) {
+	refused := fmt.Errorf("plan staging: %w", &client.APIError{Status: http.StatusUnprocessableEntity, ErrorCode: apitypes.ErrCodeSchemaRefused})
+	assert.Equal(t, apitypes.ErrCodeSchemaRefused, planErrorCode(refused))
+
+	uncoded := &client.APIError{Status: http.StatusInternalServerError}
+	assert.Equal(t, "api_error", planErrorCode(uncoded))
+
+	assert.Equal(t, "api_error", planErrorCode(errors.New("dial tcp: connection refused")))
+}
+
 func TestPlanCmd_EnvironmentDiscoveryServerErrorHumanOutput(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/api/databases/testdb/environments", r.URL.Path)
