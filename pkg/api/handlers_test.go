@@ -5921,6 +5921,32 @@ func TestValidateRollbackSourceApplyRejectsPlanWithoutOriginalFiles(t *testing.T
 	assert.Contains(t, err.Error(), "no stored original schema files")
 }
 
+// A plan that could not save a namespace's schema recorded which tables kept
+// it from saving. The refused rollback names them with why, and names the way
+// to undo the change.
+func TestValidateRollbackSourceApplyNamesTheTablesThatKeptThePlanFromSaving(t *testing.T) {
+	now := time.Now().UTC()
+	apply := rollbackGuardrailApply("apply_blocked", 1, 10, now)
+	plan := rollbackGuardrailPlan(10, false)
+	plan.Namespaces["orders"].RollbackBlockers = []storage.RollbackBlocker{
+		{Table: "documents", Reason: "row security is managed on this table"},
+		{Table: "notes", Reason: "row security is managed on this table"},
+	}
+	svc := newRollbackGuardrailService(apply, plan, []*storage.Task{rollbackGuardrailTask(1, 10, now)})
+
+	_, _, err := svc.ValidateRollbackSourceApply(t.Context(), RollbackSourceRequest{
+		ApplyIdentifier: "apply_blocked",
+		Environment:     "staging",
+		Repository:      "org/repo",
+		PullRequest:     1,
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, "apply apply_blocked can't be rolled back: when it was planned, SchemaBot couldn't save the current schema of these tables in namespace orders: "+
+		"documents (row security is managed on this table), notes (row security is managed on this table). "+
+		"To undo the change, revert the schema files in a new pull request.", err.Error())
+}
+
 func TestValidateRollbackSourceApplyRejectsPlannerSourceMismatchForOlderApply(t *testing.T) {
 	now := time.Now().UTC()
 	older := rollbackGuardrailApply("apply_older", 1, 10, now.Add(-time.Minute))

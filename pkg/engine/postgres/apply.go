@@ -113,6 +113,9 @@ const (
 type nativeApply struct {
 	rowSecurity      *pgstatement.DesiredWithRowSecurity
 	reviewedSecurity []string
+	// createsTable marks a row security apply that creates its table, in
+	// the same transaction as the row security.
+	createsTable     bool
 	namespace        string
 	table            string
 	sql              string
@@ -294,7 +297,18 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned DDL is not one statement or a valid greenfield create set", tc.Table)
 	}
 	if hasRLS {
-		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: row security changes require one supported atomic operation for a single qualified table", tc.Table)
+		// A new table with row security is created with its policies in one
+		// reviewed transaction. Any other row security change on this path
+		// is refused: it needs one supported atomic operation.
+		creates, err := createsTableWithRowSecurity(tc.DDL)
+		if err != nil {
+			slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
+			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: classify the planned row security DDL: %w", tc.Table, err)
+		}
+		if !creates {
+			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: row security changes require one supported atomic operation for a single qualified table", tc.Table)
+		}
+		return validateCreateWithRowSecurityApply(req)
 	}
 	if req.Options["defer_cutover"] == "true" {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: deferred cutover is unsupported", tc.Table)
@@ -1868,6 +1882,15 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	}
 	defer pool.Close()
 
+	if change.rowSecurity != nil && change.createsTable {
+		_, err := executor.ExecuteReviewedCreateWithRowSecurity(ctx, pool, change.namespace, tableOwner, *change.rowSecurity, change.reviewedSecurity, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		})
+		if err != nil {
+			return fmt.Errorf("create table %q.%q with its row security: %w", change.namespace, change.table, err)
+		}
+		return nil
+	}
 	if change.rowSecurity != nil {
 		_, err := executor.ExecuteReviewedRowSecurity(ctx, pool, change.namespace, *change.rowSecurity, change.reviewedSecurity, executor.Budget{
 			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
@@ -2061,6 +2084,10 @@ func checkTableUnlessCatalogOnly(ctx context.Context, pool *pgxpool.Pool, change
 // sqlstateInsufficientPrivilege is the SQLSTATE the server returns when a
 // role lacks a privilege the statement needs.
 const sqlstateInsufficientPrivilege = "42501"
+
+// sqlstateUndefinedTable is undefined_table: a statement names a relation
+// the database does not have.
+const sqlstateUndefinedTable = "42P01"
 
 // catalogOnlyProofError reports a table over the size limit whose statement
 // went unproven because the proof itself failed, not because the statement
