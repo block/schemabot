@@ -6,6 +6,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -63,6 +64,9 @@ func (cmd *StopCmd) Run(g *Globals) error {
 		fmt.Println("Schema change already stopped")
 		return nil
 	}
+	if refusal, ok := stopUnsupportedRefusal(err, cmd.ApplyID, cmd.Environment); ok {
+		return errors.New(refusal)
+	}
 	if err != nil {
 		return err
 	}
@@ -93,4 +97,34 @@ func stopRefusedAsAlreadyStopped(err error) bool {
 		return false
 	}
 	return apiErr.ErrorCode == apitypes.ErrCodeAlreadyStopped
+}
+
+// stopUnsupportedRefusal renders a stop the server refused because the engine
+// can't pause the schema change, naming the command to run instead with the
+// route this CLI was invoked with, so a copied hint reaches the same server.
+// The server's own message names the commands without that route; it stays
+// the answer for any other refusal.
+func stopUnsupportedRefusal(err error, applyID, environment string) (string, bool) {
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		return "", false
+	}
+	command := func(name string) string {
+		args := []string{name, applyID}
+		if environment != "" {
+			args = append(args, "-e", environment)
+		}
+		return "`" + cliname.Command(args...) + "`"
+	}
+	switch apiErr.ErrorCode {
+	case apitypes.ErrCodeStopUnsupportedCancel:
+		return "This schema change can't be paused. To end it: " + command("cancel"), true
+	case apitypes.ErrCodeStopUnsupportedFinishes:
+		return "This schema change can't be paused, and it finishes on its own. To follow it: " + command("progress"), true
+	case apitypes.ErrCodeStopUnsupported:
+		return "This schema change can't be paused. If it is a single index build, end it with " + command("cancel") +
+			"; anything else finishes on its own. To follow it: " + command("progress"), true
+	default:
+		return "", false
+	}
 }

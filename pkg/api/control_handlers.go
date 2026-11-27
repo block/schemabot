@@ -1386,8 +1386,10 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 	return s.stopApply(ctx, client, apply, ternApplyID, caller)
 }
 
-// stopRefusal returns the operator-facing reason a stop of apply is refused.
-type stopRefusal func(s *Service, ctx context.Context, apply *storage.Apply) string
+// stopRefusal returns the operator-facing reason a stop of apply is refused,
+// and the error code that names its remedy for a client that renders the
+// command itself, or "" when the reason alone says what to do.
+type stopRefusal func(s *Service, ctx context.Context, apply *storage.Apply) (code, reason string)
 
 // stopRefusals maps every engine to how a stop of its schema change is
 // refused, or to nil when the engine can stop. An engine with no stopped
@@ -1398,42 +1400,44 @@ type stopRefusal func(s *Service, ctx context.Context, apply *storage.Apply) str
 var stopRefusals = map[string]stopRefusal{
 	storage.EngineSpirit: nil,
 	storage.EngineStrata: nil,
-	storage.EnginePlanetScale: func(*Service, context.Context, *storage.Apply) string {
-		return "stop is not supported for this schema change; use cancel to permanently cancel it"
+	storage.EnginePlanetScale: func(*Service, context.Context, *storage.Apply) (string, string) {
+		return "", "stop is not supported for this schema change; use cancel to permanently cancel it"
 	},
 	storage.EnginePostgres: (*Service).postgresStopRefusal,
 }
 
-// stopRefusalForEngine reports whether a stop of apply is refused, and the
-// operator-facing reason. An engine outside stopRefusals is left to decline
-// the stop itself.
-func (s *Service) stopRefusalForEngine(ctx context.Context, apply *storage.Apply) (string, bool) {
+// stopRefusalForEngine reports whether a stop of apply is refused, with the
+// operator-facing reason and the error code that names its remedy. An engine
+// outside stopRefusals is left to decline the stop itself.
+func (s *Service) stopRefusalForEngine(ctx context.Context, apply *storage.Apply) (code, reason string, refused bool) {
 	refusal := stopRefusals[apply.Engine]
 	if refusal == nil {
-		return "", false
+		return "", "", false
 	}
-	return refusal(s, ctx, apply), true
+	code, reason = refusal(s, ctx, apply)
+	return code, reason, true
 }
 
 // postgresStopRefusal says why PostgreSQL refuses a stop and names what the
 // operator can do instead, with this apply's ID and environment filled in:
 // cancel for a concurrent index build that is its only statement, which is
 // what the PR comment offers, and following its progress for anything else,
-// which finishes on its own.
-func (s *Service) postgresStopRefusal(ctx context.Context, apply *storage.Apply) string {
+// which finishes on its own. The error code names the same remedy, so the CLI
+// can render the command with the route the operator invoked it with.
+func (s *Service) postgresStopRefusal(ctx context.Context, apply *storage.Apply) (string, string) {
 	cancel := fmt.Sprintf("`schemabot cancel %s -e %s`", apply.ApplyIdentifier, apply.Environment)
 	progress := fmt.Sprintf("`schemabot progress %s -e %s`", apply.ApplyIdentifier, apply.Environment)
 	command, err := s.storedStopCommand(ctx, apply)
 	if err != nil {
 		s.logger.Warn("operator: could not read the apply's stored progress for a refused PostgreSQL stop; the refusal names the remedy for each kind of statement",
 			append(apply.LogAttrs(), "error", err)...)
-		return "PostgreSQL can't pause a schema change. If it is a single index build, end it with " + cancel +
+		return apitypes.ErrCodeStopUnsupported, "PostgreSQL can't pause a schema change. If it is a single index build, end it with " + cancel +
 			"; anything else finishes on its own. To follow it: " + progress
 	}
 	if command == presentation.StopCommandCancel {
-		return "PostgreSQL can't pause an index build. To end it: " + cancel
+		return apitypes.ErrCodeStopUnsupportedCancel, "PostgreSQL can't pause an index build. To end it: " + cancel
 	}
-	return "PostgreSQL can't pause this schema change, and it finishes on its own. To follow it: " + progress
+	return apitypes.ErrCodeStopUnsupportedFinishes, "PostgreSQL can't pause this schema change, and it finishes on its own. To follow it: " + progress
 }
 
 // storedStopCommand names the command presentation.StopCommand offers for
@@ -1469,11 +1473,11 @@ func (s *Service) storedStopCommand(ctx context.Context, apply *storage.Apply) (
 // resolved and checked, and attempts an immediate local stop. Its returns are
 // those of executeStopForApply.
 func (s *Service) stopApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.StopResponse, int, error) {
-	if refusal, refused := s.stopRefusalForEngine(ctx, apply); refused {
+	if code, refusal, refused := s.stopRefusalForEngine(ctx, apply); refused {
 		s.logger.Info("operator: refused a stop because the apply's engine has no stopped phase",
 			append(apply.LogAttrs(), "requested_by", caller)...)
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
-		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "%s", refusal)
+		return nil, 0, controlHTTPCodeErrorf(http.StatusBadRequest, code, "%s", refusal)
 	}
 	resp, responseStatus, err := s.queueStopForApplyOwner(ctx, apply, caller)
 	if err != nil {

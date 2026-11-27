@@ -302,6 +302,7 @@ func TestStopOfPostgresApplyIsRefusedBeforeItIsRecorded(t *testing.T) {
 	tests := []struct {
 		name       string
 		operations *staticApplyOperationStore
+		code       string
 		want       string
 	}{
 		{
@@ -309,6 +310,7 @@ func TestStopOfPostgresApplyIsRefusedBeforeItIsRecorded(t *testing.T) {
 			operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
 				operation(`{"executor_operation":"concurrent-index-build","step":"1","steps_total":"1"}`),
 			}},
+			code: apitypes.ErrCodeStopUnsupportedCancel,
 			want: "stop rejected: PostgreSQL can't pause an index build. To end it: " + cancel,
 		},
 		{
@@ -316,6 +318,7 @@ func TestStopOfPostgresApplyIsRefusedBeforeItIsRecorded(t *testing.T) {
 			operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
 				operation(`{"step":"1","steps_total":"1","statement":"ALTER TABLE users ADD COLUMN email text"}`),
 			}},
+			code: apitypes.ErrCodeStopUnsupportedFinishes,
 			want: "stop rejected: PostgreSQL can't pause this schema change, and it finishes on its own. To follow it: " + progress,
 		},
 		{
@@ -323,11 +326,13 @@ func TestStopOfPostgresApplyIsRefusedBeforeItIsRecorded(t *testing.T) {
 			operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
 				operation(`{"executor_operation":"concurrent-index-build","step":"2","steps_total":"3"}`),
 			}},
+			code: apitypes.ErrCodeStopUnsupportedFinishes,
 			want: "stop rejected: PostgreSQL can't pause this schema change, and it finishes on its own. To follow it: " + progress,
 		},
 		{
 			name:       "unreadable progress names the remedy for each kind of statement",
 			operations: &staticApplyOperationStore{err: errors.New(sensitiveControlFailure)},
+			code:       apitypes.ErrCodeStopUnsupported,
 			want: "stop rejected: PostgreSQL can't pause a schema change. If it is a single index build, end it with " + cancel +
 				"; anything else finishes on its own. To follow it: " + progress,
 		},
@@ -346,6 +351,7 @@ func TestStopOfPostgresApplyIsRefusedBeforeItIsRecorded(t *testing.T) {
 
 			require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 			assert.Equal(t, tt.want, resp.Error)
+			assert.Equal(t, tt.code, resp.ErrorCode, "the code names the remedy for a client that renders the command itself")
 			assert.NotContains(t, w.Body.String(), "10.0.0.5")
 			assert.Empty(t, requests.requests, "a refused stop records no control request")
 		})
