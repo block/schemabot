@@ -935,7 +935,7 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 - `users`: dropping primary key is not supported
 - `orders`: adding foreign key constraints is not supported
 
-An apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
+An apply will fail on these statements. Each reason names its fix: make it and plan again, or contact your SchemaBot operators for help.
 
 📋 **Plan**: **2** tables to alter
 
@@ -971,7 +971,7 @@ ALTER TABLE orders ADD COLUMN notes text;
 - `users`: statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change
   - statement for table "users": the table is 2.0 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again
 
-An apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
+An apply will fail on these statements. Each reason names its fix: make it and plan again, or contact your SchemaBot operators for help.
 
 📋 **Plan**: **2** tables to alter
 
@@ -1412,7 +1412,7 @@ ALTER TABLE orders ADD COLUMN notes text;
 - `users`: statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change
   - statement for table "users": the table is 2.0 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again
 
-Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
+Each reason names its fix: make it and plan again, or contact your SchemaBot operators for help.
 
 </details>
 
@@ -4269,7 +4269,7 @@ Options: ⏸️ Defer Cutover
 ⛔ Cannot apply: 4 changes the engine refuses to execute
   - events (4 steps): statement for table "events": the table is 1.4 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again
 
-An apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
+An apply will fail on these statements. Each reason names its fix: make it and plan again, or contact your SchemaBot operators for help.
 
 
 ```

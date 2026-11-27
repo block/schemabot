@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -328,7 +329,7 @@ func renderBlockedChangesApplyRejected(data PlanCommentData, budget *ddlBlockBud
 	for _, c := range data.BlockedChanges {
 		writeEngineReasonItem(&sb, blockedChangeLabel(c), c.Reason)
 	}
-	sb.WriteString("\nFix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n")
+	sb.WriteString("\n" + presentation.BlockedChangesFix + "\n")
 
 	return appendAgentHint(sb.String(), data.AgentHint)
 }

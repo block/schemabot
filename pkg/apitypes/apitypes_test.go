@@ -801,3 +801,24 @@ func TestPlanResponse_BlockedChangesFallBackToTheNamespaceView(t *testing.T) {
 	}
 	assert.Equal(t, []BlockedChange{{Namespace: "commerce", Table: "events", Reason: "too large", Steps: 1}}, plan.BlockedChanges())
 }
+
+// A blocked change is listed beside its table, so each cause drops the
+// engine's lead-in naming that table, while a cause about another subject
+// keeps its wording.
+func TestPlanResponse_BlockedChangesDropTableLeadIn(t *testing.T) {
+	reason := `statement for table "events": the table exceeds the size limit ‖ statement for table "events": run with a role that owns it ‖ statement for table "orders": unrelated`
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace: "app",
+			TableChanges: []*TableChangeResponse{
+				{TableName: "events", ExecutionMode: "blocked", ModeReason: reason},
+				{TableName: "events", ExecutionMode: "blocked", ModeReason: reason},
+			},
+		}},
+	}
+	got := resp.BlockedChanges()
+	require.Len(t, got, 1)
+	assert.Equal(t, "events", got[0].Table)
+	assert.Equal(t, 2, got[0].Steps)
+	assert.Equal(t, `the table exceeds the size limit ‖ run with a role that owns it ‖ statement for table "orders": unrelated`, got[0].Reason)
+}

@@ -1582,10 +1582,18 @@ func (g *blockedChangeGroups) add(namespace string, t *TableChangeResponse) *Blo
 	if g.byKey == nil {
 		g.byKey = make(map[[3]string]*BlockedChange)
 	}
-	bc := &BlockedChange{Namespace: namespace, Table: t.TableName, Reason: t.ModeReason}
+	bc := &BlockedChange{Namespace: namespace, Table: t.TableName, Reason: withoutTableSubject(t.TableName, t.ModeReason)}
 	g.byKey[k] = bc
 	g.order = append(g.order, bc)
 	return bc
+}
+
+// withoutTableSubject drops the engine's "statement for table "t": " lead-in
+// from each cause of a blocked reason. Every surface that lists blocked
+// changes names the table beside its reason, so the lead-in would say it
+// twice.
+func withoutTableSubject(table, reason string) string {
+	return strings.ReplaceAll(reason, fmt.Sprintf("statement for table %q: ", table), "")
 }
 
 // addShards groups one namespace's blocked per-shard changes by table and
