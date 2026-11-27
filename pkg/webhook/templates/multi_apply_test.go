@@ -125,7 +125,7 @@ func TestRenderMultiDeploymentApplyComment_TerminalFailureOffersRetry(t *testing
 	})
 
 	footer := out[strings.LastIndex(out, "\n---\n"):]
-	assert.Contains(t, footer, "To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:\n```\nschemabot apply -e production\n```\n")
+	assert.Contains(t, footer, "To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:\n```\nschemabot apply -e production\n```\n")
 	assert.NotContains(t, out, "schemabot stop")
 	assert.NotContains(t, out, "schemabot revert")
 	assert.NotContains(t, out, presentation.RetryOnceSettledNote)

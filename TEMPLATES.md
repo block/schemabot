@@ -3587,7 +3587,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -6149,7 +6149,7 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -7156,7 +7156,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -7203,7 +7203,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -7251,7 +7251,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -7833,7 +7833,7 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 <summary><a name="resumed-superseded-progress-comment"></a><strong>Resumed: Superseded Progress Comment</strong></summary>
 
 
-▶️ Schema change resumed — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+Progress before the stop — the schema change resumed in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
 <details>
 <summary>Progress before the stop</summary>
@@ -7870,7 +7870,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 <summary><a name="revert-superseded-progress-comment"></a><strong>Revert: Superseded Progress Comment</strong></summary>
 
 
-Schema change reverting — the revert is tracked in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+Progress before the revert — the revert is tracked in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
 <details>
 <summary>Progress before the revert</summary>
@@ -7913,7 +7913,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 <summary><a name="skip-revert-superseded-progress-comment"></a><strong>Skip Revert: Superseded Progress Comment</strong></summary>
 
 
-Revert skipped — the schema change is finalizing in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+Progress before the revert was skipped — the schema change is finalizing in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
 <details>
 <summary>Progress before the revert was skipped</summary>
@@ -7956,7 +7956,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 <summary><a name="cutover-started-superseded-progress-comment"></a><strong>Cutover Started: Superseded Progress Comment</strong></summary>
 
 
-Cutover started — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+Progress before the cutover — the cutover is tracked in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
 <details>
 <summary>Progress before the cutover</summary>
@@ -7996,7 +7996,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 <summary><a name="cutover-complete-superseded-cutover-prompt"></a><strong>Cutover Complete: Superseded Cutover Prompt</strong></summary>
 
 
-Cutover complete — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+Cutover prompt — the cutover completed, and progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
 <details>
 <summary>Cutover prompt</summary>
@@ -8145,7 +8145,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -8193,7 +8193,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -8315,7 +8315,7 @@ ALTER TABLE sessions ADD COLUMN payload jsonb;
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -8507,7 +8507,7 @@ ALTER TABLE `notifications` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -8578,7 +8578,7 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -8894,7 +8894,7 @@ Single table progress (default):
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -9302,7 +9302,7 @@ Sequential mode: First table failed (others cancelled)
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -9335,7 +9335,7 @@ Sequential mode: Middle table failed
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -9603,7 +9603,7 @@ To resume from where it stopped:
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -11074,7 +11074,7 @@ _No details available yet._
 
 ---
 
-To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -11427,7 +11427,7 @@ _No details available yet._
 
 ---
 
-To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -11841,7 +11841,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -11900,7 +11900,7 @@ ALTER TABLE `mutes` ADD UNIQUE `uk_target`(`target_id`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -11968,7 +11968,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e production
 ```
 
-A new apply can retry the failure once this one finishes or is stopped; it reprocesses only the tables that haven't completed.
+A new apply can retry the failure once this one finishes or is stopped; it plans again from the live schema and runs only what is not applied yet.
 
 _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
@@ -12167,7 +12167,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -12199,7 +12199,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -12240,7 +12240,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -12280,7 +12280,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -12400,7 +12400,7 @@ To stop this schema change:
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
-To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
   schemabot apply -s <schema_dir> -e production
 
 ```
@@ -12446,7 +12446,7 @@ To retry once the failure above is resolved — a new apply reprocesses only the
 
 To stop this schema change:
   schemabot stop apply-multi-a1b2c3d4 -e production
-A new apply can retry the failure once this one finishes or is stopped; it reprocesses only the tables that haven't completed.
+A new apply can retry the failure once this one finishes or is stopped; it plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -12750,7 +12750,7 @@ To resume from where it stopped:
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -12797,7 +12797,7 @@ The new apply will only process tables that haven't completed.
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 ```
 </details>
 
@@ -12966,7 +12966,7 @@ Sequential mode: First table failed (others cancelled)
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -12999,7 +12999,7 @@ Sequential mode: Middle table failed
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>

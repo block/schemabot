@@ -849,15 +849,18 @@ index. `percent` is the whole-build percent with two decimals, for example
 `"35.45"`, and is present only while the index build is the step in flight. Read an
 operation's own fields from there and match a table to its operation by
 `deployment` and `operation_key`.
+
 A PostgreSQL step that needs a lock first waits up to 30 seconds outside the
-lock queue for a session holding a conflicting lock on its table, so its own
-lock request does not queue ahead of other readers and writers. While it waits,
-`metadata` names that session. `lock_holder_pid` is the process ID of the
+lock queue for a session holding a conflicting lock on its table. While it
+waits, other readers and writers do not queue behind it. Once the wait runs
+out, the step requests its lock anyway, under its short lock timeout. During the
+wait, `metadata` names that session. `lock_holder_pid` is the process ID of the
 blocking session, not SchemaBot's own. `lock_holder_table` is the table it holds
 the lock on, `lock_holder_waited_ms` how long the step has waited so far, and
-`lock_holder_limit_ms` how long it waits before it gives up. All four are
-strings, and the durations are in milliseconds. They disappear once the holder
-releases its lock or the wait ends:
+`lock_holder_limit_ms` how long it waits before it requests its lock anyway.
+Each is a string, and the durations are in milliseconds. `lock_holder_table` is
+left out when the server reports no table name it can show. They disappear
+once the holder releases its lock or the wait ends:
 
 ```json
 "metadata": {
@@ -889,6 +892,29 @@ may still be in effect, and it refuses a start unless a freeze approver approves
 an override.
 The field is absent for an apply an operator stopped, and for one whose stop
 cannot be read, which reads as an ordinary stop.
+
+`control_requests` lists the latest request of each control operation made
+against the apply, so a caller that sent `stop`, `cancel`, or another control
+command can tell whether it took effect. Each entry carries the `operation`, a
+`status` of `pending`, `completed`, or `failed`, a `revision` that rises each
+time a new request follows a settled one, `requested_by`, and, once settled,
+`settled_at`. A `failed` entry's `error_message` says why the command did not
+take effect. A PostgreSQL step that commits or fails on its own, for example,
+declines a cancel and runs on. The field is absent when no control command was
+ever sent, and when the requests cannot be read.
+
+```json
+"control_requests": [
+  {
+    "operation": "cancel",
+    "status": "failed",
+    "revision": 0,
+    "error_message": "cancel is supported for PostgreSQL index builds only: this schema change runs as plain DDL that commits or fails on its own",
+    "requested_by": "cli:alice",
+    "settled_at": "2026-03-04T17:22:41Z"
+  }
+]
+```
 
 An unknown `apply_id` answers `404` with `error_code` `not_found`. When the apply
 exists but the server cannot read its progress from the data plane that runs it,

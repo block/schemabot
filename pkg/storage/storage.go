@@ -212,6 +212,16 @@ type LockStore interface {
 	// Used by `schemabot unlock` command and --force flag.
 	ForceRelease(ctx context.Context, database, dbType string) error
 
+	// ForceReleaseByID releases a lock regardless of owner, but only while the
+	// row with the given ID still holds it, so an administrator who was shown
+	// one lock never deletes a different one taken since. It returns
+	// ErrLockNotFound when no lock is held, and a *LockReplacedError, which
+	// matches ErrLockReplaced and names the row held now, when a different row
+	// holds the lock. Either way nothing is deleted. The pin is the row, not its
+	// contents: a same-owner re-acquire that pins a new plan keeps the row and its
+	// ID, so the release still removes it.
+	ForceReleaseByID(ctx context.Context, id int64, database, dbType string) error
+
 	// Get returns a lock by database name and type, or nil if not found.
 	Get(ctx context.Context, database, dbType string) (*Lock, error)
 
@@ -1723,11 +1733,25 @@ type ApplyCommentStore interface {
 	// superseded row is not an error.
 	Supersede(ctx context.Context, applyID int64, commentState string) error
 
-	// ClearPendingFreeze removes the pending-freeze marker for a single
-	// (apply_id, comment_state) once the superseded comment's frozen rendering
-	// has landed on GitHub. A missing row or an already-clear marker is not an
-	// error.
+	// ClearPendingFreeze removes the owed-freeze marker an earlier release
+	// wrote (PendingFreezeCommentID) for a single (apply_id, comment_state)
+	// once the superseded comment's frozen rendering has landed on GitHub. A
+	// missing row or an already-clear marker is not an error.
 	ClearPendingFreeze(ctx context.Context, applyID int64, commentState string) error
+
+	// RecordFrozenBody stores the frozen rendering owed to freezeCommentID,
+	// before the GitHub edit is attempted. It writes only while the row still
+	// owes that comment's freeze and has no body stored, and reports whether
+	// it wrote; false means a body is already stored or the freeze is no
+	// longer owed, and the caller reloads the row to see which.
+	RecordFrozenBody(ctx context.Context, applyID int64, commentState string, freezeCommentID int64, body string) (bool, error)
+
+	// ClearFreeze removes the owed freeze (FreezeCommentID and FrozenBody)
+	// for a single (apply_id, comment_state) once freezeCommentID's frozen
+	// rendering has landed on GitHub. It clears only a freeze owed to that
+	// comment, so a newer rotation's marker is never dropped. A missing row
+	// or an already-clear marker is not an error.
+	ClearFreeze(ctx context.Context, applyID int64, commentState string, freezeCommentID int64) error
 
 	// ClaimSummaryComment atomically claims the right to publish the terminal
 	// summary comment for an apply in terminalState by inserting the summary
@@ -2327,6 +2351,13 @@ type ControlRequestStore interface {
 	// therefore collation-dependent in principle; every ControlOperation value
 	// is lowercase ASCII, which all supported dialects order identically.
 	ListSettled(ctx context.Context, applyID int64) ([]*ApplyControlRequest, error)
+
+	// ListByApply returns every control request for an apply, whatever its
+	// status, ordered by operation ascending, read in one statement so each
+	// operation appears once and from one snapshot. A reader reporting whether
+	// a command took effect uses it: two status-filtered reads can each miss a
+	// row that settles or re-arms between them.
+	ListByApply(ctx context.Context, applyID int64) ([]*ApplyControlRequest, error)
 
 	// RecordRemoteFailure records the terminal failure another plane reported
 	// for a control request, and creates the row when the local plane never held

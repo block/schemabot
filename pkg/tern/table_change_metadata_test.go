@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"fmt"
 	"log/slog"
 	"testing"
 
@@ -210,4 +211,86 @@ func TestSequentialDriveIndexesEachPlanOnce(t *testing.T) {
 		assert.Equal(t, recorded, got)
 	}
 	assert.Equal(t, 1, loads, "the task's plan is loaded once per drive")
+}
+
+// A PostgreSQL SET NOT NULL re-planned after a failed attempt first drops the
+// helper constraint the failure left behind, then adds, validates, and uses a
+// new helper, and drops it again last. The two drops are the same statement,
+// but only the first drops a constraint the operator reviewed, so only it
+// carries the reviewed-drop record. Each task records which change it runs,
+// and every apply path hands each drop its own change's metadata.
+func TestApplyPathsTellApartRepeatedStatementsOnOneTable(t *testing.T) {
+	const (
+		dropHelper = `ALTER TABLE "public"."notes" DROP CONSTRAINT "notes_body_not_null"`
+		addHelper  = `ALTER TABLE "public"."notes" ADD CONSTRAINT "notes_body_not_null" CHECK ("body" IS NOT NULL) NOT VALID`
+		validate   = `ALTER TABLE "public"."notes" VALIDATE CONSTRAINT "notes_body_not_null"`
+		setNotNull = `ALTER TABLE "public"."notes" ALTER COLUMN "body" SET NOT NULL`
+	)
+	reviewed := map[string]string{"postgres_reviewed_drop": `{"kind":"constraint","name":"notes_body_not_null"}`}
+	plan := metadataTestPlanOf(
+		storage.TableChange{Table: "notes", DDL: dropHelper, Metadata: reviewed},
+		storage.TableChange{Table: "notes", DDL: addHelper},
+		storage.TableChange{Table: "notes", DDL: validate},
+		storage.TableChange{Table: "notes", DDL: setNotNull},
+		storage.TableChange{Table: "notes", DDL: dropHelper},
+	)
+	tasks := make([]*storage.Task, 0, 5)
+	for i, change := range plan.Namespaces["public"].Tables {
+		tasks = append(tasks, &storage.Task{
+			TaskIdentifier: fmt.Sprintf("task-%d", i+1), PlanID: plan.ID,
+			Namespace: "public", TableName: "notes", DDL: change.DDL, DDLAction: "alter",
+		})
+	}
+	storage.AssignPlanChangeOrdinals(plan, tasks)
+	canon := metadataTestCanon(t)
+
+	t.Run("gRPC dispatch", func(t *testing.T) {
+		changes, err := tasksToProtoTableChanges(tasks, plan, canon)
+		require.NoError(t, err)
+		require.Len(t, changes, 5)
+		assert.Equal(t, reviewed, changes[0].GetMetadata(), "the leftover helper's drop keeps its reviewed record")
+		assert.Empty(t, changes[4].GetMetadata(), "the new helper's cleanup drop carries none")
+	})
+
+	t.Run("sequential drive", func(t *testing.T) {
+		c := &LocalClient{logger: slog.New(slog.DiscardHandler)}
+		apply := &storage.Apply{ApplyIdentifier: "apply-1", DatabaseType: storage.DatabaseTypePostgres}
+		first, err := c.taskChangeMetadata(t.Context(), apply, tasks[0], plan, nil)
+		require.NoError(t, err)
+		assert.Equal(t, reviewed, first)
+		last, err := c.taskChangeMetadata(t.Context(), apply, tasks[4], plan, nil)
+		require.NoError(t, err)
+		assert.Empty(t, last)
+	})
+
+	t.Run("grouped drive", func(t *testing.T) {
+		changes, err := groupedResumeChanges(tasks, plan, canon)
+		require.NoError(t, err)
+		require.Len(t, changes, 1)
+		require.Len(t, changes[0].TableChanges, 5)
+		assert.Equal(t, reviewed, changes[0].TableChanges[0].Metadata)
+		assert.Empty(t, changes[0].TableChanges[4].Metadata)
+	})
+}
+
+// A task's ordinal names the change it was created from. When the change at
+// that position is missing or carries another statement, the plan is not the
+// one the task was created from, and the lookup refuses rather than hand the
+// engine another change's record.
+func TestPlanChangeMetadataRefusesAnOrdinalThatNamesAnotherChange(t *testing.T) {
+	plan, _ := metadataTestPlan()
+	index := newPlanChangeMetadata(plan, metadataTestCanon(t))
+
+	_, err := index.forTask(&storage.Task{Namespace: "public", TableName: "users", DDL: metadataTestDrop, PlanChangeOrdinal: 3})
+	require.Error(t, err)
+	assert.Equal(t, `plan plan-7 has 2 change(s) to table "users" in namespace "public", but the task runs change 3`, err.Error())
+
+	_, err = index.forTask(&storage.Task{Namespace: "public", TableName: "users", DDL: metadataTestDrop, PlanChangeOrdinal: 1})
+	require.Error(t, err)
+	assert.Equal(t, `plan plan-7 change 1 to table "users" in namespace "public" carries a different statement than the task`, err.Error())
+
+	rendered := &storage.Task{Namespace: "public", TableName: "users", DDL: `ALTER TABLE "tenant_a"."users" DROP COLUMN "nickname"`, PlanChangeOrdinal: 2}
+	got, err := index.forTask(rendered)
+	require.NoError(t, err)
+	assert.Equal(t, metadataTestRecord(), got, "a deployment's rendering of the change's statement still matches")
 }
