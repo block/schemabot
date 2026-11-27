@@ -109,7 +109,7 @@ func (c *LocalClient) releaseFailedApplyArtifacts(ctx context.Context, apply *st
 		return
 	}
 	var sameTable []*storage.Task
-	for _, task := range tasks {
+	for _, task := range c.taskHistory(ctx, apply, tasks) {
 		if task != nil && sameTaskTable(task, failedTask) {
 			sameTable = append(sameTable, task)
 		}
@@ -117,6 +117,45 @@ func (c *LocalClient) releaseFailedApplyArtifacts(ctx context.Context, apply *st
 	if err := c.releaseArtifacts(ctx, eng, apply, sameTable, failedRelease); err != nil {
 		c.logSkippedArtifactRelease(ctx, apply, failedRelease, err)
 	}
+}
+
+// taskHistory returns every task the apply stored, with the drive's own
+// copies in place of the stored ones they update. A resumed drive carries only
+// the tasks it still has to weigh, and the completed steps it leaves out are
+// what prove the apply added a constraint. When storage cannot be read, the
+// drive's copies are all there is, and a constraint no copy shows added is
+// kept and reported with the statement that drops it.
+func (c *LocalClient) taskHistory(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) []*storage.Task {
+	stored, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		c.logger.Warn("could not read the apply's stored tasks for a release; it weighs only the drive's own, and keeps any constraint none of them shows added",
+			append(apply.LogAttrs(), "error", err)...)
+		return tasks
+	}
+	current := make(map[string]*storage.Task, len(tasks))
+	for _, task := range tasks {
+		if task != nil && task.TaskIdentifier != "" {
+			current[task.TaskIdentifier] = task
+		}
+	}
+	history := make([]*storage.Task, 0, len(stored)+len(tasks))
+	seen := make(map[*storage.Task]bool, len(tasks))
+	for _, task := range stored {
+		if task == nil {
+			continue
+		}
+		if mine, ok := current[task.TaskIdentifier]; ok {
+			task = mine
+			seen[mine] = true
+		}
+		history = append(history, task)
+	}
+	for _, task := range tasks {
+		if task != nil && !seen[task] {
+			history = append(history, task)
+		}
+	}
+	return history
 }
 
 // sameTaskTable reports whether two tasks change the same table of the same
@@ -228,7 +267,7 @@ func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.
 	// What the release did is recorded before its error is returned: a release
 	// that fails part-way has still moved the copy, and the entry naming where
 	// it went is what an operator follows to recover it.
-	reclaimed := c.recordReleaseResult(ctx, apply, namespace, kind.outcome, result, artifacts.heldConstraints)
+	reclaimed := c.recordReleaseResult(ctx, apply, namespace, kind.outcome, result, heldByQualifiedTable(physical, artifacts.heldConstraints))
 	if err != nil {
 		return reclaimed, err
 	}
@@ -239,10 +278,23 @@ func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.
 	return reclaimed, nil
 }
 
+// heldByQualifiedTable keys held by the schema-qualified table name the
+// engine reports each constraint under, in the target's physical schema.
+func heldByQualifiedTable(physical string, held map[string]map[string]string) map[string]map[string]string {
+	if len(held) == 0 {
+		return nil
+	}
+	qualified := make(map[string]map[string]string, len(held))
+	for table, constraints := range held {
+		qualified[physical+"."+table] = constraints
+	}
+	return qualified
+}
+
 // recordReleaseResult writes what one schema's release reclaimed and retained to
 // the server log and the apply log, and reports whether it reclaimed anything.
-// held says why the release kept a constraint the apply added, per table and
-// constraint.
+// held says why the release kept a constraint the apply added, per
+// schema-qualified table and constraint.
 func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Apply, namespace, outcome string, result *engine.ReleaseArtifactsResult, held map[string]map[string]string) bool {
 	if result == nil {
 		return false
@@ -441,7 +493,8 @@ func (c *LocalClient) withholdReplacedConstraints(apply *storage.Apply, entry *n
 // keepTableConstraints takes table out of the constraints the release may
 // drop, logging each constraint it keeps. Each one the apply added is held
 // for heldBecause, which the apply log gives as the reason it is still on the
-// table.
+// table. Only the added names authorize a drop, so the validated names stay:
+// the release still finds those constraints and reports each one it keeps.
 func (c *LocalClient) keepTableConstraints(apply *storage.Apply, entry *namespaceArtifacts, table, reason, heldBecause string) {
 	kept := slices.Concat(entry.addedConstraints[table], entry.validatedConstraints[table])
 	slices.Sort(kept)
@@ -460,7 +513,6 @@ func (c *LocalClient) keepTableConstraints(apply *storage.Apply, entry *namespac
 		}
 	}
 	delete(entry.addedConstraints, table)
-	delete(entry.validatedConstraints, table)
 }
 
 // appendTableNames adds names to table's entry in byTable, creating the map

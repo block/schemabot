@@ -62,13 +62,15 @@ func TestCancelledArtifactTablesAttributesUnvalidatedConstraints(t *testing.T) {
 	assert.Equal(t, []string{"orders_user_id_fkey"}, artifacts.validatedConstraints["orders"])
 
 	assert.Empty(t, artifacts.addedConstraints["items"], "a replaced rule is the table's only one, so the release keeps it")
-	assert.Empty(t, artifacts.validatedConstraints["items"], "a replaced rule is not reported as one the table had before")
+	assert.Equal(t, []string{"items_qty_check"}, artifacts.validatedConstraints["items"], "the kept rule is still found, so the release reports it")
 
 	assert.Empty(t, artifacts.addedConstraints["accounts"], "a rule replaced in steps of its own is the table's only one once the old rule is dropped")
-	assert.Empty(t, artifacts.validatedConstraints["accounts"])
+	assert.Equal(t, []string{"accounts_id_check"}, artifacts.validatedConstraints["accounts"])
+	assert.Equal(t, map[string]string{"accounts_id_check": "its plan also drops a rule the table had"}, artifacts.heldConstraints["accounts"])
 
 	assert.Empty(t, artifacts.addedConstraints["teams"], "a rule replaced under a new name is the table's only one once the old rule is dropped")
-	assert.Empty(t, artifacts.validatedConstraints["teams"])
+	assert.Equal(t, []string{"teams_id_check2"}, artifacts.validatedConstraints["teams"])
+	assert.Equal(t, map[string]string{"teams_id_check2": "its plan also drops a rule the table had"}, artifacts.heldConstraints["teams"])
 
 	assert.Equal(t, []string{"users_name_not_null_check"}, artifacts.addedConstraints["users"], "the plan drops only the helper it added, so the release may drop it")
 	assert.Equal(t, []string{"users_name_not_null_check"}, artifacts.validatedConstraints["users"])
@@ -99,7 +101,7 @@ func TestCancelledArtifactTablesRemovesNoConstraintOnAnUnreadTable(t *testing.T)
 	require.NotNil(t, artifacts)
 	assert.Equal(t, []string{"orders"}, artifacts.tables, "the table's other artifacts are still released")
 	assert.Empty(t, artifacts.addedConstraints["orders"])
-	assert.Empty(t, artifacts.validatedConstraints["orders"])
+	assert.Equal(t, []string{"orders_id_check"}, artifacts.validatedConstraints["orders"], "the kept constraint is still found, so the release reports it")
 	assert.Equal(t, map[string]string{"orders_id_check": "SchemaBot could not read every statement of its plan"}, artifacts.heldConstraints["orders"])
 }
 
@@ -114,4 +116,50 @@ func TestHeldConstraintMessage(t *testing.T) {
 		Removal: `ALTER TABLE "public"."members" DROP CONSTRAINT "members_name_not_null_check"`,
 	}, "failed", "its plan also drops a rule the table had")
 	assert.Equal(t, `Constraint members_name_not_null_check is still on members. The failed schema change added it, but its plan also drops a rule the table had, so SchemaBot kept every constraint on the table rather than risk leaving it with no rule. It rejects writes that leave name NULL until it is dropped. Drop it with: ALTER TABLE "public"."members" DROP CONSTRAINT "members_name_not_null_check"`, msg)
+}
+
+// The engine reports each constraint under its schema-qualified table, in the
+// target's physical schema. A constraint the release kept on purpose is
+// matched there, so the apply log says why it was kept rather than that no
+// finished step added it.
+func TestRecordReleaseResultExplainsAHeldConstraint(t *testing.T) {
+	apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-9", Database: "shop"}
+	c, logs := newFailureLogTestClient(apply, nil)
+	held := map[string]map[string]string{"members": {"members_name_not_null_check": "its plan also drops a rule the table had"}}
+	c.recordReleaseResult(t.Context(), apply, "public", "failed", &engine.ReleaseArtifactsResult{
+		PreexistingConstraints: []engine.EngineConstraint{{
+			Table:   "public.members",
+			Name:    "members_name_not_null_check",
+			Effect:  "rejects writes that break CHECK ((name IS NOT NULL))",
+			Removal: `ALTER TABLE "public"."members" DROP CONSTRAINT "members_name_not_null_check"`,
+		}},
+	}, heldByQualifiedTable("public", held))
+	require.Len(t, logs.entries, 1)
+	assert.Contains(t, logs.entries[0].Message, "The failed schema change added it, but its plan also drops a rule the table had")
+	assert.NotContains(t, logs.entries[0].Message, "No finished step")
+}
+
+// A resumed drive carries only the tasks it still has to weigh. The release
+// reads the rest from storage, so the completed ADD that proves the apply
+// added its constraint is still there, and the drive's own copy of a task
+// stands in for the stored one it updates.
+func TestTaskHistoryAddsTheStoredStepsAResumedDriveLeftOut(t *testing.T) {
+	apply := &storage.Apply{ID: 10, ApplyIdentifier: "apply-10", Database: "shop"}
+	add := &storage.Task{ApplyID: apply.ID, TaskIdentifier: "add", Namespace: "public", TableName: "users", State: state.Task.Completed,
+		DDL: "ALTER TABLE public.users ADD CONSTRAINT users_name_not_null_check CHECK (name IS NOT NULL) NOT VALID"}
+	storedValidate := &storage.Task{ApplyID: apply.ID, TaskIdentifier: "validate", Namespace: "public", TableName: "users", State: state.Task.Running,
+		DDL: "ALTER TABLE public.users VALIDATE CONSTRAINT users_name_not_null_check"}
+	failedValidate := *storedValidate
+	failedValidate.State = state.Task.Failed
+	c, _ := newFailureLogTestClient(apply, []*storage.Task{add, storedValidate})
+
+	history := c.taskHistory(t.Context(), apply, []*storage.Task{&failedValidate})
+	require.Len(t, history, 2)
+	assert.Same(t, add, history[0])
+	assert.Same(t, &failedValidate, history[1])
+
+	c.config.Type = storage.DatabaseTypePostgres
+	artifacts := c.cancelledArtifactTables(apply, history)["public"]
+	require.NotNil(t, artifacts)
+	assert.Equal(t, []string{"users_name_not_null_check"}, artifacts.addedConstraints["users"])
 }

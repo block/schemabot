@@ -2102,6 +2102,7 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 			ThrottleReason:      t.ThrottleReason,
 			Shards:              shardProgressFromResponse(t.Shards),
 			PlannedShards:       int(t.PlannedShards),
+			Started:             t.StartedAt != "",
 		})
 	}
 

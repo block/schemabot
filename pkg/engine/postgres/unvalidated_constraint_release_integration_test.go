@@ -104,3 +104,39 @@ func TestEngineReleaseDropsTheUnvalidatedForeignKeyTheApplyAdded(t *testing.T) {
 		})
 	}
 }
+
+// A foreign key the apply added NOT VALID in a schema other than public
+// references a table of that same schema. The release reads its definition
+// under the search_path the checked drop reads under, so the two print the
+// reference alike, and the release drops the key rather than keeping it as a
+// constraint that changed after it was read.
+func TestEngineReleaseDropsAnUnvalidatedForeignKeyInANonPublicSchema(t *testing.T) {
+	const key = "orders_user_id_fkey"
+	dsn, db := testutil.StartPostgres(t, "release_foreign_key_schema_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.users (id bigint PRIMARY KEY);
+		CREATE TABLE app.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL);
+		INSERT INTO app.users VALUES (1);
+		INSERT INTO app.orders VALUES (10, 1), (11, 99);
+		ALTER TABLE app.orders ADD CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES app.users (id) NOT VALID`)
+	require.NoError(t, err)
+
+	result, err := New().ReleaseFailedArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:             "app",
+		Tables:               []string{"orders"},
+		Credentials:          &engine.Credentials{DSN: dsn},
+		AddedConstraints:     map[string][]string{"orders": {key}},
+		ValidatedConstraints: map[string][]string{"orders": {key}},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, result.PreexistingConstraints, "the key read and the key the drop checks print alike")
+	require.Len(t, result.RemovedConstraints, 1)
+	assert.Equal(t, "app.orders", result.RemovedConstraints[0].Table)
+	assert.Equal(t, "rejects writes that break FOREIGN KEY (user_id) REFERENCES users(id)", result.RemovedConstraints[0].Effect)
+
+	var remaining int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT pg_catalog.count(*) FROM pg_catalog.pg_constraint WHERE conrelid = 'app.orders'::regclass AND conname = $1`, key).Scan(&remaining))
+	assert.Zero(t, remaining, "the release drops the key the apply added")
+}

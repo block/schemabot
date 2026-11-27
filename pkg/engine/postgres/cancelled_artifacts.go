@@ -171,27 +171,27 @@ func releaseUnvalidatedConstraints(ctx context.Context, pool *pgxpool.Pool, sche
 
 // unvalidatedConstraints reads each CHECK or foreign key among names on
 // schema.table that is not validated, with the definition the drop checks
-// again under its lock. A table that is gone has none.
+// again under its lock. It reads through pg-sprite's introspection, which
+// prints definitions under the search_path the checked drop reads under, so
+// a foreign key to another table of the schema prints alike in both. A table
+// that is gone has none.
 func unvalidatedConstraints(ctx context.Context, pool *pgxpool.Pool, schema, table string, names []string) ([]schemadiff.DroppedObject, error) {
-	rows, err := pool.Query(ctx, `
-		SELECT c.conname, pg_get_constraintdef(c.oid)
-		FROM pg_constraint c
-		WHERE c.conrelid = to_regclass(format('%I.%I', $1::text, $2::text))
-		  AND c.contype IN ('c', 'f')
-		  AND NOT c.convalidated
-		  AND c.conname = ANY($3)
-		ORDER BY c.conname`, schema, table, names)
+	live, err := schemadiff.Introspect(ctx, pool, schema, table)
+	if errors.Is(err, schemadiff.ErrTableNotFound) {
+		slog.Debug("no unvalidated constraint to release: the table is gone", "schema", schema, "table", table)
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	constraints, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (schemadiff.DroppedObject, error) {
-		constraint := schemadiff.DroppedObject{Kind: schemadiff.DroppedConstraint}
-		err := row.Scan(&constraint.Name, &constraint.Definition)
-		return constraint, err
-	})
-	if err != nil {
-		return nil, err
+	var constraints []schemadiff.DroppedObject
+	for _, constraint := range live.Constraints {
+		if !constraint.NotValid || !slices.Contains(names, constraint.Name) {
+			continue
+		}
+		constraints = append(constraints, schemadiff.DroppedObject{Kind: schemadiff.DroppedConstraint, Name: constraint.Name, Definition: constraint.Def})
 	}
+	slices.SortFunc(constraints, func(a, b schemadiff.DroppedObject) int { return strings.Compare(a.Name, b.Name) })
 	return constraints, nil
 }
 
