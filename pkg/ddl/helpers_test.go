@@ -204,7 +204,7 @@ func TestClassifyStatement_MultiStatementErrorNamesLeadingText(t *testing.T) {
 // truncates whole runes, so statements with multi-byte identifiers never
 // produce invalid UTF-8 in error messages.
 func TestStatementPreview_TruncatesOnRuneBoundary(t *testing.T) {
-	got := statementPreview(strings.Repeat("é", 100))
+	got := StatementPreview(strings.Repeat("é", 100))
 	assert.Equal(t, strings.Repeat("é", 80)+"...", got)
 	assert.True(t, utf8.ValidString(got))
 }

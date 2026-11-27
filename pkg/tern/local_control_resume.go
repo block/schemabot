@@ -3136,8 +3136,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 
 	rp, err := c.replanAndFilterTasks(ctx, apply, tasks, plan)
 	if err != nil {
-		logger.Error("re-plan failed during recovery", append(apply.MutableLogAttrs(), "error", err)...)
-		return fmt.Errorf("re-plan failed during recovery for apply %s (database %s): %w", apply.ApplyIdentifier, apply.Database, err)
+		return c.pauseForReplanFailure(ctx, apply, tasks, err)
 	}
 
 	activeTasks := rp.ActiveTasks
@@ -3307,6 +3306,37 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	return ctx.Err()
+}
+
+// pauseForReplanFailure pauses an apply whose recovery could not re-plan it.
+// The re-plan reconciles the stored tasks against the live target before any
+// engine work resumes, so without it the drive cannot tell what is left to
+// run. Returning the error with the apply still running would leave it
+// claimable on every lease lapse outside the recovery budget, so a re-plan the
+// engine refuses on every attempt would retry forever while the apply reads as
+// running. Pausing it for retry counts each attempt against the budget, which
+// fails the apply once it runs out, and records the cause on the apply where
+// the operator reads it.
+//
+// An apply in its revert phase is left as found and the error returned: the
+// pause rewrites every non-terminal task as failed_retryable, which erases the
+// revert-phase task states a later recovery reattaches to the engine by.
+func (c *LocalClient) pauseForReplanFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, err error) error {
+	if c.driveCancelled(ctx, apply, "while re-planning the apply for recovery") {
+		return nil
+	}
+	if revertPhaseInFlight(apply, tasks) {
+		c.logger.Error("re-plan failed during recovery of an apply in its revert phase; leaving it as found so a later recovery reattaches to the revert, and the current apply owner will exit for operator retry",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return fmt.Errorf("re-plan failed during recovery for apply %s (database %s): %w", apply.ApplyIdentifier, apply.Database, err)
+	}
+	c.logger.Error("re-plan failed during recovery; pausing the apply for operator retry",
+		append(apply.MutableLogAttrs(), "error", err)...)
+	if pauseErr := c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("re-plan failed during recovery: %v", err)); pauseErr != nil {
+		return fmt.Errorf("pause apply %s (database %s) after re-plan failed during recovery (%w): %w",
+			apply.ApplyIdentifier, apply.Database, err, pauseErr)
+	}
+	return nil
 }
 
 // handleGroupedResumeFailure settles a grouped resume the engine refused. A

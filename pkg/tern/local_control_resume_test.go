@@ -2588,3 +2588,20 @@ func TestFinalizeSequentialApplyKeepsAnObserverRegisteredDuringTerminal(t *testi
 		"the observer registered for the resume stays registered after the stopped drive settles")
 	assert.Equal(t, int32(1), stopped.terminal.Load())
 }
+
+// A running apply whose recovery cannot re-plan it is paused for operator
+// retry, with the cause on the apply. Left running, it would be re-claimed on
+// every lease lapse outside the recovery budget, so a re-plan that fails the
+// same way each time would retry forever while the apply reads as running.
+// Paused, each attempt counts against the budget, which fails the apply once
+// it runs out.
+func TestResumeApplyReplanFailurePausesForRetry(t *testing.T) {
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{plan: &storage.Plan{ID: 5}})
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.NoError(t, err, "the pause is the drive's outcome")
+	assert.Equal(t, state.Apply.FailedRetryable, applyStore.apply.State)
+	assert.Equal(t, "re-plan failed during recovery: re-plan failed: no engine configured for type: vitess", applyStore.apply.ErrorMessage)
+	assert.Equal(t, state.Task.FailedRetryable, tasks[0].State)
+}
