@@ -29,6 +29,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 const (
@@ -112,6 +113,9 @@ const (
 type nativeApply struct {
 	rowSecurity      *pgstatement.DesiredWithRowSecurity
 	reviewedSecurity []string
+	// createsTable marks a row security apply that creates its table, in
+	// the same transaction as the row security.
+	createsTable     bool
 	namespace        string
 	table            string
 	sql              string
@@ -293,7 +297,18 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned DDL is not one statement or a valid greenfield create set", tc.Table)
 	}
 	if hasRLS {
-		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: row security changes require one supported atomic operation for a single qualified table", tc.Table)
+		// A new table with row security is created with its policies in one
+		// reviewed transaction. Any other row security change on this path
+		// is refused: it needs one supported atomic operation.
+		creates, err := createsTableWithRowSecurity(tc.DDL)
+		if err != nil {
+			slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
+			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: classify the planned row security DDL: %w", tc.Table, err)
+		}
+		if !creates {
+			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: row security changes require one supported atomic operation for a single qualified table", tc.Table)
+		}
+		return validateCreateWithRowSecurityApply(req)
 	}
 	if req.Options["defer_cutover"] == "true" {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: deferred cutover is unsupported", tc.Table)
@@ -1128,11 +1143,7 @@ func refusalForCause(err error, table string) *refusal {
 	}
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
-		// Name whose limit this is: read cold, the size text sounds like a
-		// property of PostgreSQL or of the change, when it is SchemaBot's
-		// own conservatism for the native-safe path.
-		return &refusal{reason: "table-too-large",
-			cause: sizeErr.Error() + "; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit"}
+		return tableTooLargeRefusal(sizeErr)
 	}
 	// Decided before the bare table sentinels below: the unverified-create
 	// wrap carries the read-back's own cause inside it, and a table no longer
@@ -1871,6 +1882,15 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	}
 	defer pool.Close()
 
+	if change.rowSecurity != nil && change.createsTable {
+		_, err := executor.ExecuteReviewedCreateWithRowSecurity(ctx, pool, change.namespace, tableOwner, *change.rowSecurity, change.reviewedSecurity, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		})
+		if err != nil {
+			return fmt.Errorf("create table %q.%q with its row security: %w", change.namespace, change.table, err)
+		}
+		return nil
+	}
 	if change.rowSecurity != nil {
 		_, err := executor.ExecuteReviewedRowSecurity(ctx, pool, change.namespace, *change.rowSecurity, change.reviewedSecurity, executor.Budget{
 			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
@@ -2076,6 +2096,10 @@ func checkTableUnlessCatalogOnly(ctx context.Context, pool *pgxpool.Pool, change
 // sqlstateInsufficientPrivilege is the SQLSTATE the server returns when a
 // role lacks a privilege the statement needs.
 const sqlstateInsufficientPrivilege = "42501"
+
+// sqlstateUndefinedTable is undefined_table: a statement names a relation
+// the database does not have.
+const sqlstateUndefinedTable = "42P01"
 
 // catalogOnlyProofError reports a table over the size limit whose statement
 // went unproven because the proof itself failed, not because the statement
@@ -2556,6 +2580,26 @@ func (e *indexRecoveryError) Error() string {
 }
 
 func (e *indexRecoveryError) Unwrap() error { return e.err }
+
+// tableSizeLimitOption is the server option that sets the largest table a
+// native-safe apply changes.
+const tableSizeLimitOption = "postgres.native_safe_table_size_limit_bytes"
+
+// tableTooLargeRefusal says how big the table is against the limit, in units
+// a person reads, and names the option that sets it. It says whose limit this
+// is because, read cold, a size refusal sounds like a property of PostgreSQL
+// or of the change, when it is SchemaBot's own conservatism for the
+// native-safe path. Two sizes that round to the same figure are given in
+// bytes, so the table never reads as no larger than its limit.
+func tableTooLargeRefusal(sizeErr *preflight.SizeError) *refusal {
+	size, limit := ui.FormatBytesBinary(sizeErr.TotalBytes), ui.FormatBytesBinary(sizeErr.LimitBytes)
+	if size == limit {
+		size, limit = fmt.Sprintf("%d bytes", sizeErr.TotalBytes), fmt.Sprintf("%d bytes", sizeErr.LimitBytes)
+	}
+	return &refusal{reason: "table-too-large",
+		cause:  fmt.Sprintf("the table is %s with its indexes, over the %s limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit", size, limit),
+		remedy: fmt.Sprintf("raise %s to change a table this size, then plan again", tableSizeLimitOption)}
+}
 
 // concurrentIndexBoundOption is the configuration key an operator changes
 // when a concurrent index build needs more time than the bound allows.

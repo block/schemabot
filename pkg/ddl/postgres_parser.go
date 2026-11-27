@@ -743,6 +743,15 @@ func restoreDropColumnKeyword(stmt *pgproto.Node, canonical string) string {
 	return canonical
 }
 
+// DeclaresRowSecurity reports whether sql sets a table's row security or
+// declares, alters, drops, or comments on a policy in any of its statements.
+func (postgresStatementParser) DeclaresRowSecurity(sql string) (bool, error) {
+	if _, err := pgstatement.ParseRowSecurityChange(sql); err == nil {
+		return true, nil
+	}
+	return pgstatement.HasRowSecurityDeclaration(sql)
+}
+
 // CanonicalRowSecurity delegates PostgreSQL operation grammar to pg-sprite.
 // Ordinary statement classification stays separate from atomic RLS operations.
 // Keep the physical target in the key; SQL alone cannot prove namespace mapping.

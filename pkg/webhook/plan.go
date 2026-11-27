@@ -1549,43 +1549,6 @@ func shardedDirectChanges(shards []*apitypes.ShardPlanResponse) []templates.Dire
 	return out
 }
 
-// shardedBlockedChanges collects blocked per-shard changes, grouped by (table,
-// reason) so a change present on several shards lists them together rather
-// than repeating. Returns nil when the plan carries no per-shard changes (the
-// non-sharded path uses the namespace-level blocked view instead).
-func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.BlockedChangeData {
-	if len(shards) == 0 {
-		return nil
-	}
-	total := plannedShardCount(shards)
-	type key struct{ table, reason string }
-	var order []key
-	byKey := make(map[key]*templates.BlockedChangeData)
-	for _, sp := range shards {
-		if sp == nil {
-			continue
-		}
-		for _, t := range sp.Changes {
-			if !t.EngineBlocked() {
-				continue
-			}
-			k := key{table: t.TableName, reason: t.ModeReason}
-			bc := byKey[k]
-			if bc == nil {
-				bc = &templates.BlockedChangeData{Table: t.TableName, Reason: t.ModeReason, TotalShards: total}
-				byKey[k] = bc
-				order = append(order, k)
-			}
-			bc.Shards = append(bc.Shards, sp.Shard)
-		}
-	}
-	out := make([]templates.BlockedChangeData, 0, len(order))
-	for _, k := range order {
-		out = append(out, *byKey[k])
-	}
-	return out
-}
-
 // splitExistingCopies sorts the target's unfinished copies by what the apply
 // will do to them. The sections are opposite promises to the operator — one
 // says the work survives, the other says it is destroyed — so a disposition
@@ -1875,27 +1838,9 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		data.UnsafeChanges = unsafe
 	}
 
-	// Blocked changes — the apply commands will reject these. Like the
-	// unsafe view, a sharded plan derives them per shard so a blocked change
-	// confined to one shard names the shard it applies to.
-	if blocked := shardedBlockedChanges(planResp.Shards); len(blocked) > 0 {
-		data.BlockedChanges = blocked
-	} else {
-		for _, sc := range planResp.Changes {
-			if sc == nil {
-				continue
-			}
-			for _, t := range sc.TableChanges {
-				if !t.EngineBlocked() {
-					continue
-				}
-				data.BlockedChanges = append(data.BlockedChanges, templates.BlockedChangeData{
-					Table:  t.TableName,
-					Reason: t.ModeReason,
-				})
-			}
-		}
-	}
+	// Blocked changes — the apply commands will reject these. The CLI plan
+	// lists the same derivation, so both surfaces name the same changes.
+	data.BlockedChanges = templates.BlockedChangesData(planResp)
 
 	// Direct-execution changes — the policy routes these to native MySQL DDL,
 	// derived the same way as the blocked view.

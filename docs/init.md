@@ -10,9 +10,22 @@ The wizard and explicit CLI flags use the same setup workflow.
 ## Try without a database
 
 Run `schemabot init` in an empty project directory and choose **Try a sample database**,
-then choose MySQL or PostgreSQL. Docker must be running. SchemaBot starts a local
+then choose MySQL, PostgreSQL, or Vitess. Docker must be running. SchemaBot starts a local
 container, seeds `customers` and `orders`, and uses the same import and verification flow.
 No connection string is needed.
+
+A Vitess sample is two containers rather than one: a local cluster behind a
+PlanetScale-compatible API, and a MySQL server holding SchemaBot's own state. Its
+keyspace is split across two shards, so an apply reports progress per shard, and
+it needs no PlanetScale account.
+
+The first Vitess sample downloads a multi-gigabyte cluster image, so allow several
+minutes on a machine that has never run one. Docker keeps the image, so later
+samples skip the download, but the cluster still takes a minute or so to come
+up. The cluster is rebuilt from the seed schema whenever the
+container restarts, while the state database keeps what was applied, so restart it
+to start the demonstration over rather than to carry work forward. See
+[Vitess on PlanetScale](vitess.md#quick-start).
 
 ![Start a sample database, review and apply a change, then verify the result](../assets/init-sample-demo.gif)
 
@@ -54,7 +67,11 @@ Environment-variable and absolute file references remain available as an advance
 a referenced file must contain only the connection string. References stay references,
 so environment variables must remain available to later CLI invocations. Schema files
 never contain credentials. OS credential-store integration is not implemented.
-Vitess is not offered by the wizard yet; use [server configuration](configuration.md).
+
+The wizard connects MySQL and PostgreSQL databases. It offers Vitess as a sample
+database, but not as an existing one: register a PlanetScale database in
+[server configuration](configuration.md) instead, since it is reached through an
+API and a service token rather than a connection string.
 
 The wizard asks **Where should SchemaBot store its own data?**
 

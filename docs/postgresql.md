@@ -72,7 +72,7 @@ early release.
 - Dropping a table whose schema file was deleted, after you approve the drop
   with `--allow-unsafe`. See [Tables with no schema file](#tables-with-no-schema-file).
 - Adding labels to an existing enum type. See [Enum types](#enum-types).
-- Row-level security policies on an existing table.
+- Row-level security policies on an existing table, or on a new table.
 - `schemabot init` and `schemabot pull` for an existing database.
 - PostgreSQL as the database that stores SchemaBot's own state.
 
@@ -86,7 +86,7 @@ early release.
 | Creating an enum type, or removing or reordering its labels | Blocked |
 | `stop`, `start`, `cutover`, deferred cutover, `revert`, `skip-revert` | Not available. Only an index build can be cancelled. See [Unsupported workflow features](#unsupported-workflow-features) |
 | Some changes to a partitioned table's parent | Refused when the apply runs. See [Partitioned tables](#partitioned-tables) |
-| Row-level security on a new table, or an RLS change and a structural change to one table in the same plan | Blocked. See [Row-level security](#row-level-security) |
+| Row-level security changes and structural changes to one existing table in the same plan | Blocked. See [Row-level security](#row-level-security) |
 | Pulling every table shape | `pull` skips a table it cannot write completely and names it, rather than writing a partial file. `onboard` and `init` add it to `ignore_tables`. See [Schema pull](#schema-pull) |
 | Detailed catalog output from the schema intelligence API | Not available |
 
@@ -211,9 +211,10 @@ If your tables belong to a dedicated owner role, read
 | A new table, with its indexes | Runs together: the table, then its indexes, built without `CONCURRENTLY` because nothing reads the table yet. See [Greenfield tables](#greenfield-tables) |
 | A new label on an existing enum type | Runs as `ALTER TYPE ... ADD VALUE`, one label per step, before the table changes. Creating a type or removing a label fails the plan. See [Enum types](#enum-types) |
 | Row-level security policies on an existing table | Run in one transaction, after you explicitly approve them, because they change who can read rows. See [Row-level security](#row-level-security) |
+| A new table with row-level security | Runs in one transaction: the table, its RLS setting, and its policies, so the table never exists without them. It holds no rows, so it needs no approval. See [Row-level security](#row-level-security) |
 | Adding a foreign key | Runs in two steps: `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`, which checks existing rows while writes continue. See [Foreign keys](#foreign-keys) |
 | Dropping a foreign key | Shown in the plan, but blocked. See [Foreign keys](#foreign-keys) |
-| Making a column `NOT NULL` | Runs in four steps on a table up to the size limit: a helper `CHECK (column IS NOT NULL) NOT VALID`, `VALIDATE CONSTRAINT`, which checks existing rows while writes continue, `SET NOT NULL`, which uses the validated check instead of scanning, and the helper's drop. If a row holds `NULL`, the validation fails and names the helper. Fix those rows and SchemaBot retries the validation on its own. If its retries run out first, plan and apply again. The new plan drops the leftover helper before it adds a new one, and that drop is unsafe, so the apply needs `--allow-unsafe` |
+| Making a column `NOT NULL` | Runs in four steps on a table up to the size limit: a helper `CHECK (column IS NOT NULL) NOT VALID`, `VALIDATE CONSTRAINT`, which checks existing rows while writes continue, `SET NOT NULL`, which uses the validated check instead of scanning, and the helper's drop. If a row holds `NULL`, the validation fails and names the helper. Fix those rows and SchemaBot retries the validation on its own. If its retries run out first, fix the rows, then plan and apply again: the plan starts at the helper's validation. Until the change finishes, the helper rejects writes that leave the column `NULL`. Cancelling the apply removes a helper the apply added, and leaves one that was already on the table |
 | A table with no schema file, or a deleted file | Runs as `DROP TABLE` after you approve it with `--allow-unsafe`, as on MySQL. Archive tables and `ignore_tables` entries are left alone. See [Tables with no schema file](#tables-with-no-schema-file) |
 
 Once a statement starts, it runs until it commits or its timeout ends it; it
@@ -594,7 +595,10 @@ locked.
 
 **Stop is not supported.** A concurrent build has no midpoint to resume from,
 so a stop would be a cancel under another name. Other statements have nothing
-to pause.
+to pause. SchemaBot refuses the stop before recording it. The refusal names
+the cancel command when a lone index build is running, and otherwise
+`schemabot progress <apply-id> -e <env> --no-watch`, or the apply's progress
+comment on a pull request.
 
 ### Greenfield tables
 
@@ -1009,8 +1013,11 @@ PostgreSQL targets do not support:
 - **`cancel` of anything but an index build.** See
   [Control operations](#control-operations).
 
-SchemaBot records a `stop`, or a `cancel` of a statement that is not an index
-build, and then declines it. The apply runs on until it completes or fails.
+SchemaBot refuses a `stop` before recording anything, and names what to do
+instead: `cancel` for a lone index build, or following the apply's progress
+for anything else. It records a `cancel` of a statement that is not an index
+build and then declines it. Either way, the apply runs on until it completes
+or fails.
 
 To interrupt a running statement yourself, find its backend in
 `pg_stat_activity` and run `pg_cancel_backend` from your own database session.
@@ -1219,6 +1226,19 @@ are one operation:
   a busy table refuses rather than waits. Keep policy changes small. A plan
   with no RLS change takes no exclusive lock and needs no ownership.
 
+**A new table with RLS.** A file that declares a new table with RLS clauses
+plans as one change: the `CREATE TABLE`, then its RLS setting, policies, and
+comments. Planning runs the create on the target and rolls it back, so the
+plan shows the exact SQL the apply runs. The apply derives that SQL again
+from the reviewed file and runs it in one transaction only if the two match.
+A mismatch, or a table of that name created since the plan, refuses the
+apply; plan again.
+
+Because planning runs the create on the target, a policy can read only a
+table the target already has. A policy that reads a table the same pull
+request creates refuses the plan and names that table: apply it first, then
+add the table with the policy in a later pull request.
+
 **Structural changes on a table with RLS.** A file that declares RLS can also
 change the table's columns and indexes. When the file's RLS matches the live
 table, the plan runs those changes as ordinary in-place DDL that leaves the
@@ -1233,7 +1253,6 @@ policies.
 
 **Not supported yet:**
 
-- RLS on a new table
 - RLS changes and structural changes to an existing table in the same plan
 - Running a reviewed RLS change on a target whose physical schema name
   differs. That target needs its own plan and review
@@ -1611,7 +1630,7 @@ A declined operation is refused at one of two layers:
 | `engine.DeferredCutoverSignalChecker.DeferredCutoverSignalExists` | Not applicable; not implemented | Direct DDL has no deferred cutover gate or durable table-swap signal. | [`pkg/engine/engine.go`](../pkg/engine/engine.go), [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
 | `engine.ExternallyAuthoritativeProgress.ProgressIsExternallyAuthoritative` | Not applicable; not implemented | Progress is held in the engine instance's in-memory apply map, not in an external service that every instance can query authoritatively. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
 | `engine.SynchronousWorkRegistration.RegistersWorkSynchronously` | Implemented; returns `true` | `Apply` claims the tracked progress entry before returning and has no remote provisioning phase. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
-| `engine.CancelledArtifactReleaser.ReleaseCancelledArtifacts` | Not applicable; not implemented | PostgreSQL does not create copy tables owned by this engine; cancellation attempts to remove any invalid concurrent index before settling, and a removal that fails is named in the terminal summary for operator follow-up rather than deferred to a generic artifact release. | [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go), [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
+| `engine.CancelledArtifactReleaser.ReleaseCancelledArtifacts` | Implemented | PostgreSQL creates no copy tables. A cancelled `SET NOT NULL` can leave the helper `CHECK` its first step added, which rejects NULL writes until it is dropped, so the release drops each helper pg-sprite recognizes on the apply's tables that a task of the apply that ran added, through the checked drop, and names any it cannot drop with the statement that does. A helper the apply took over from an earlier run stays. An invalid concurrent index is removed by the cancel itself before it settles. | [`pkg/engine/postgres/cancelled_artifacts.go`](../pkg/engine/postgres/cancelled_artifacts.go), [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
 | `engine.CancelledResumeStateReclaimer.ReclaimCancelledResumeState` | Not applicable; not implemented | Each statement runs in this process against the target directly; nothing is set up in a remote service ahead of the work that owns its teardown, so a cancel that lands between drives finds no stored resume state naming work to reclaim. | [`pkg/engine/engine.go`](../pkg/engine/engine.go), [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
 | `engine.ControlResumeValidator.ValidateControlResumeState` | Not applicable; not implemented | Control requests use `ResumeState.MigrationContext` only as the in-memory apply key and have no opaque, operation-specific remote state to validate. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go), [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
 | `engine.ShardKeyedPlanning.PlansEachShard` | Not applicable; not implemented | A PostgreSQL target is not sharded, so its tasks carry no shard and the plan never needs to speak for one. | [`pkg/engine/engine.go`](../pkg/engine/engine.go) |

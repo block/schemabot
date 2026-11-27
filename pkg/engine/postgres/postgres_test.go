@@ -93,14 +93,14 @@ func TestExecutionVerdict(t *testing.T) {
 			statement: pgplan.Statement{Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap,
 				Disposition: router.DispositionUnavailable},
 			wantMode:   engine.ExecutionModeBlocked,
-			wantReason: `statement for table "users" requires copy-and-swap, which is unavailable`,
+			wantReason: `statement for table "users": the change needs a full copy of the table, which SchemaBot's PostgreSQL support does not run yet; reach the same schema without rewriting the table, such as a new column filled in batches, or make this change outside SchemaBot`,
 		},
 		{
 			name: "copy and swap the engine carries",
 			statement: pgplan.Statement{Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap,
 				Disposition: router.DispositionExecute},
 			wantMode:   engine.ExecutionModeBlocked,
-			wantReason: `statement for table "users" requires copy-and-swap, which SchemaBot's PostgreSQL support does not run yet`,
+			wantReason: `statement for table "users": the change needs a full copy of the table, which SchemaBot's PostgreSQL support does not run yet; reach the same schema without rewriting the table, such as a new column filled in batches, or make this change outside SchemaBot`,
 		},
 		{
 			name: "unavailable without copy-and-swap backend",
@@ -1166,7 +1166,7 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndIndexBuilds(t *testing.T) {
 	}
 	partitionedBuilds := map[string]bool{"CREATE INDEX users_name_idx ON public.users (name)": true}
 
-	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds, nil))
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds, nil, nil))
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
 	assert.Equal(t, []string{"privilege verdict", "size verdict"}, engine.BlockedCauses(changes[0].ModeReason))
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
@@ -1178,7 +1178,7 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndIndexBuilds(t *testing.T) {
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[4].ExecutionMode, "a plain index build the planner did not route to the partitioned build stays under the ceiling")
 	assert.Equal(t, "size verdict", changes[4].ModeReason)
 
-	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds, nil))
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds, nil, nil))
 	assert.Equal(t, []string{"privilege verdict", "size verdict"}, engine.BlockedCauses(changes[0].ModeReason))
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
 }
@@ -1195,13 +1195,42 @@ func TestBlockRewriteStepsKeepsConcurrentIndexDrops(t *testing.T) {
 		{Table: "orders", DDL: "DROP INDEX public.orders_a_idx, public.orders_b_idx"},
 	}
 
-	require.NoError(t, blockRewriteSteps(changes, "size verdict", nil, nil))
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", nil, nil, nil))
 	assert.Empty(t, changes[0].ExecutionMode)
 	assert.Empty(t, changes[0].ModeReason)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[2].ExecutionMode)
 	assert.Equal(t, "size verdict", changes[2].ModeReason)
+}
+
+// A step that needs a full copy of the table is blocked at any size, so an
+// oversized table adds no size cause to it: raising the limit alone would not
+// let it run. Another blocked step on the same table still gains the size
+// cause beside its own, and a full-copy step that carries no verdict yet takes
+// the size verdict rather than running.
+func TestBlockRewriteStepsLeavesAFullCopyStepItsOwnCause(t *testing.T) {
+	copyDDL := "ALTER TABLE public.orders ALTER COLUMN total TYPE numeric(12,2)"
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Statements = []pgplan.Statement{
+		{SQL: copyDDL, Backend: router.BackendCopyAndSwap},
+		{SQL: "ALTER TABLE public.orders ADD COLUMN note text", ExecSQL: []string{"ALTER TABLE public.orders ADD COLUMN note text"}},
+	}
+	fullCopy := fullCopySteps(report)
+	require.Equal(t, map[string]bool{copyDDL: true}, fullCopy)
+
+	changes := []engine.TableChange{
+		{Table: "orders", DDL: copyDDL, ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "needs a full copy"},
+		{Table: "orders", DDL: "ALTER TABLE public.orders ALTER COLUMN note SET NOT NULL", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "rewrite it"},
+	}
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", nil, nil, fullCopy))
+	assert.Equal(t, "needs a full copy", changes[0].ModeReason)
+	assert.Equal(t, []string{"rewrite it", "size verdict"}, engine.BlockedCauses(changes[1].ModeReason))
+
+	unblocked := []engine.TableChange{{Table: "orders", DDL: copyDDL}}
+	require.NoError(t, blockRewriteSteps(unblocked, "size verdict", nil, nil, fullCopy))
+	assert.Equal(t, engine.ExecutionModeBlocked, unblocked[0].ExecutionMode, "a full-copy step that carries no verdict yet is still blocked on an oversized table")
+	assert.Equal(t, "size verdict", unblocked[0].ModeReason)
 }
 
 // A reviewed VALIDATE CONSTRAINT keeps its verdict on a table past the size
@@ -1217,7 +1246,7 @@ func TestBlockRewriteStepsKeepsReviewedValidations(t *testing.T) {
 		{Table: "orders", DDL: "ALTER TABLE public.orders ALTER COLUMN user_id TYPE numeric", Metadata: map[string]string{reviewedValidationMetadataKey: string(record)}},
 	}
 
-	require.NoError(t, blockRewriteSteps(changes, "size verdict", nil, nil))
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", nil, nil, nil))
 	assert.Empty(t, changes[0].ExecutionMode, changes[0].ModeReason)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
@@ -1344,7 +1373,7 @@ func TestTableChangesRendersAnIndexReplacement(t *testing.T) {
 func TestBlockRewriteStepsFailsClosedOnUnparseableStep(t *testing.T) {
 	changes := []engine.TableChange{{Table: "users", DDL: "ALTER TABLE public.users ADD"}}
 
-	err := blockRewriteSteps(changes, "size verdict", nil, nil)
+	err := blockRewriteSteps(changes, "size verdict", nil, nil, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `classify planned statement for table "users"`)
 	assert.Empty(t, changes[0].ExecutionMode)
@@ -1406,7 +1435,7 @@ func TestBlockOversizedTableAppendsSizeCauseToPrivilegeBlocks(t *testing.T) {
 		causes := engine.BlockedCauses(change.ModeReason)
 		require.Len(t, causes, 2)
 		assert.Equal(t, "missing ALTER privilege", causes[0])
-		assert.True(t, strings.HasPrefix(causes[1], `statement for table "users": table size 2048 bytes exceeds`))
+		assert.True(t, strings.HasPrefix(causes[1], `statement for table "users": the table is 2.0 KiB with its indexes, over the 1.0 KiB limit`))
 	}
 }
 
@@ -1447,7 +1476,7 @@ func TestBlockOversizedTableNeutralizesCauseSeparatorInTableName(t *testing.T) {
 	require.Len(t, changes, 1)
 	causes := engine.BlockedCauses(changes[0].ModeReason)
 	require.Len(t, causes, 1)
-	assert.True(t, strings.HasPrefix(causes[0], `statement for table "users // forged cause": table size 2048 bytes exceeds`), causes[0])
+	assert.True(t, strings.HasPrefix(causes[0], `statement for table "users // forged cause": the table is 2.0 KiB with its indexes, over the 1.0 KiB limit`), causes[0])
 }
 
 // The dependency verdict quotes the absent table's name, which a schema author
@@ -1592,7 +1621,7 @@ func TestBlockOversizedTableBlocksExecutableRewrite(t *testing.T) {
 	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
 	require.NoError(t, err)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
-	assert.Equal(t, `statement for table "users": table size 2048 bytes exceeds the 1024-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`, changes[0].ModeReason)
+	assert.Equal(t, `statement for table "users": the table is 2.0 KiB with its indexes, over the 1.0 KiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again`, changes[0].ModeReason)
 }
 
 // A step whose every planner decision is proven catalog-only stays executable
@@ -1635,7 +1664,7 @@ func TestBlockOversizedTableBlocksStepWithAnUnprovenDecision(t *testing.T) {
 	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
 	require.NoError(t, err)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
-	assert.Contains(t, changes[0].ModeReason, "1024-byte threshold")
+	assert.Contains(t, changes[0].ModeReason, "over the 1.0 KiB limit")
 }
 
 // catalogOnlySteps exempts only statements whose decisions are all proven, and
@@ -1867,7 +1896,7 @@ var optionalCapabilityVerdicts = map[reflect.Type]bool{
 	reflect.TypeFor[engine.SynchronousWorkRegistration]():     true,
 	reflect.TypeFor[engine.DeferredCutoverSignalChecker]():    false,
 	reflect.TypeFor[engine.ExternallyAuthoritativeProgress](): false,
-	reflect.TypeFor[engine.CancelledArtifactReleaser]():       false,
+	reflect.TypeFor[engine.CancelledArtifactReleaser]():       true,
 	reflect.TypeFor[engine.CancelledResumeStateReclaimer]():   false,
 	reflect.TypeFor[engine.ControlResumeValidator]():          false,
 	reflect.TypeFor[engine.ShardKeyedPlanning]():              false,
@@ -2027,4 +2056,57 @@ func TestPlanRefusesDropTablesBeforeConnecting(t *testing.T) {
 	})
 	require.EqualError(t, err, `plan PostgreSQL database "app": drop_tables is supported only on MySQL, and this is a PostgreSQL target. Remove drop_tables from schemabot.yaml`)
 	assert.Nil(t, result)
+}
+
+// A column change PostgreSQL refuses because other objects read the column
+// names those objects and what to do with them, so the operator does not
+// have to search the catalog for what blocks the change.
+func TestExecutionVerdictNamesTheObjectsThatBlockAColumnChange(t *testing.T) {
+	refused := func(d planner.Decision) pgplan.Statement {
+		return pgplan.Statement{Disposition: router.DispositionRefuse, Decisions: []planner.Decision{d}}
+	}
+	cases := []struct {
+		name     string
+		decision planner.Decision
+		want     string
+	}{
+		{
+			name:     "a view",
+			decision: planner.Decision{Reason: planner.ReasonDependentView, DependentViews: []string{`"public"."order_remarks"`}},
+			want:     `statement for table "orders" is refused: it changes or drops a column that view "public"."order_remarks" reads; drop or redefine the view outside SchemaBot, then plan again`,
+		},
+		{
+			name:     "two views",
+			decision: planner.Decision{Reason: planner.ReasonDependentView, DependentViews: []string{`"public"."a"`, `"public"."b"`}},
+			want:     `statement for table "orders" is refused: it changes or drops a column that views "public"."a", "public"."b" read; drop or redefine the views outside SchemaBot, then plan again`,
+		},
+		{
+			name:     "a policy",
+			decision: planner.Decision{Reason: planner.ReasonDependentPolicy, DependentPolicies: []string{`"owner_only" ON "public"."orders"`}},
+			want:     `statement for table "orders" is refused: it changes or drops a column that row security policy "owner_only" ON "public"."orders" reads; drop the policy before the change and recreate it after it, then plan again`,
+		},
+		{
+			name:     "a trigger",
+			decision: planner.Decision{Reason: planner.ReasonDependentTrigger, DependentTriggers: []string{`"audit" ON "public"."orders"`}},
+			want:     `statement for table "orders" is refused: it changes or drops a column that trigger "audit" ON "public"."orders" names in UPDATE OF or WHEN; drop or redefine the trigger, then plan again`,
+		},
+		{
+			name:     "a generated column",
+			decision: planner.Decision{Reason: planner.ReasonDependentGeneratedColumn, DependentGeneratedColumns: []string{`"public"."orders"."total"`}},
+			want:     `statement for table "orders" is refused: it changes or drops a column that generated column "public"."orders"."total" reads; change the generated column first, then plan again`,
+		},
+		{
+			name:     "a partition key",
+			decision: planner.Decision{Reason: planner.ReasonPartitionKey, PartitionKeyTables: []string{`"public"."orders"`}},
+			want:     `statement for table "orders" is refused: it changes or drops a column in the partition key of "public"."orders", which PostgreSQL never allows; create a new partitioned table with the new key and move the rows into it, then plan again`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := executionVerdict(pgplan.FormatVersion, refused(tc.decision), "orders", nil)
+			assert.Equal(t, engine.ExecutionModeBlocked, got.mode)
+			assert.Equal(t, tc.want, got.reason)
+			assert.Nil(t, got.unrecognized)
+		})
+	}
 }

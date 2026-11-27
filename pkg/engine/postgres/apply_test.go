@@ -4403,3 +4403,16 @@ func TestBrokenCheckDetailNamesOnlyTheValidatedConstraint(t *testing.T) {
 	_, ok = brokenCheckDetail(errors.New("connection reset"), "accounts", validates)
 	assert.False(t, ok, "an error that is not a server error is not a broken check")
 }
+
+// A size refusal reads in units a person compares at a glance and names the
+// option that sets the limit. Two sizes that round to the same figure fall
+// back to bytes, so the table never reads as no larger than its limit.
+func TestTableTooLargeRefusalReadsInBinaryUnits(t *testing.T) {
+	r := tableTooLargeRefusal(&preflight.SizeError{TotalBytes: 1556684800, LimitBytes: 1073741824})
+	assert.Equal(t, "table-too-large", r.reason)
+	assert.Equal(t, "the table is 1.4 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit", r.cause)
+	assert.Equal(t, "raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again", r.remedy)
+
+	r = tableTooLargeRefusal(&preflight.SizeError{TotalBytes: 1073741825, LimitBytes: 1073741824})
+	assert.Equal(t, "the table is 1073741825 bytes with its indexes, over the 1073741824 bytes limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit", r.cause)
+}

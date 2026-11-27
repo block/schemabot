@@ -261,34 +261,10 @@ func TestRowSecurityComparisonOperationalError(t *testing.T) {
   ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
  `)
 	require.NoError(t, err)
-	_, err = planRowSecurityOperation(ctx, pool, "public", desired)
+	_, err = planRowSecurityOperation(ctx, pool, "public", desired, "")
 	require.ErrorIs(t, err, context.Canceled)
 	assert.NotContains(t, err.Error(), "does not yet execute")
 	assert.NotErrorIs(t, err, schemadiff.ErrUnsupportedChange)
-}
-
-// Greenfield RLS must refuse before any ordinary CREATE TABLE can be planned.
-func TestEngineRowSecurityMissingTableRefuses(t *testing.T) {
-	dsn, db := testutil.StartPostgres(t, "rls_missing")
-	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
-	defer cancel()
-	result, err := New().Plan(ctx, &engine.PlanRequest{
-		Database: "rls_missing", Credentials: &engine.Credentials{DSN: dsn},
-		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{"documents.sql": `
-   CREATE TABLE documents (
-    id bigint PRIMARY KEY
-   );
-   ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
-   CREATE POLICY readers ON documents FOR SELECT USING (id = 1);
-  `}}},
-	})
-	require.ErrorIs(t, err, schemadiff.ErrUnsupportedChange)
-	assert.True(t, engine.IsPlanRefused(err))
-	require.ErrorContains(t, err, "creating table")
-	assert.Nil(t, result)
-	var absent bool
-	require.NoError(t, db.QueryRowContext(ctx, "SELECT to_regclass('public.documents') IS NULL").Scan(&absent))
-	assert.True(t, absent)
 }
 
 // A policy that reads another table through a CTE names a relation the

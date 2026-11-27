@@ -4,4 +4,5 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 node scripts/render-pr-demo.cjs
 node scripts/render-pr-demo.cjs postgres
+node scripts/render-pr-demo.cjs vitess
 node scripts/render-pr-multi-target-demo.cjs
