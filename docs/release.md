@@ -310,6 +310,11 @@ statement (see [storage-schema.md](./storage-schema.md)). A destructive
 change is a coordinated operation and belongs in the release notes with
 instructions, not in a routine patch release.
 
+A column the code stops writing, or stops naming at all, is a step in
+[Retiring a column](./storage-schema.md#retiring-a-column). Check that its entry
+there is up to date, and when the release takes step 2, put the entry's check
+query and the drop instructions in the release notes.
+
 The diff does not have to be read out of the files by hand. Name the release
 being tested and the command answers it against the live database:
 

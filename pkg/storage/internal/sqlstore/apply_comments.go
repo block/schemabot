@@ -14,7 +14,7 @@ import (
 )
 
 // applyCommentColumns lists all columns for SELECT queries.
-const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, posted_phase, posted_cutover_operation_id, pending_freeze_github_comment_id, edit_count, last_edited_at, superseded_at, summarized_state, created_at, updated_at`
+const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, posted_phase, posted_cutover_operation_id, pending_freeze_github_comment_id, freeze_github_comment_id, frozen_body, edit_count, last_edited_at, superseded_at, summarized_state, created_at, updated_at`
 
 // applyCommentStore implements storage.ApplyCommentStore using MySQL.
 type applyCommentStore struct {
@@ -23,7 +23,7 @@ type applyCommentStore struct {
 }
 
 // applyCommentUpsertStatement renders Upsert's statement. Both renderings bind
-// the seven inserted columns first; the leased rendering then binds the apply ID
+// the eight inserted columns first; the leased rendering then binds the apply ID
 // and the lease token.
 //
 // The unleased rendering is a plain VALUES upsert. The leased rendering selects
@@ -35,7 +35,7 @@ type applyCommentStore struct {
 // statement's snapshot still holds, at whatever isolation level the storage
 // session runs.
 func applyCommentUpsertStatement(d Dialect, leased bool) string {
-	const insert = "INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_phase, posted_cutover_operation_id, pending_freeze_github_comment_id, summarized_state) "
+	const insert = "INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_phase, posted_cutover_operation_id, pending_freeze_github_comment_id, freeze_github_comment_id, summarized_state) "
 	upsert := d.UpsertClause(
 		[]string{"apply_id", "comment_state"},
 		[]UpsertAssignment{
@@ -43,22 +43,27 @@ func applyCommentUpsertStatement(d Dialect, leased bool) string {
 			{Column: "posted_phase"},
 			{Column: "posted_cutover_operation_id"},
 			{Column: "pending_freeze_github_comment_id"},
+			{Column: "freeze_github_comment_id"},
+			// A new upsert tracks a new comment, so any stored frozen body
+			// belonged to an earlier freeze.
+			{Column: "frozen_body", Expr: "NULL"},
 			{Column: "summarized_state"},
 			{Column: "superseded_at", Expr: "NULL"},
 			{Column: "updated_at", Expr: "NOW()"},
 		},
 	)
 	if !leased {
-		return insert + "VALUES (?, ?, ?, ?, ?, ?, ?) " + upsert
+		return insert + "VALUES (?, ?, ?, ?, ?, ?, ?, ?) " + upsert
 	}
-	return insert + "SELECT ?, ?, ?, ?, ?, ?, ? FROM applies a WHERE a.id = ? AND " + d.LeaseSourceFence("applies", "a", "id", "lease_token") + " " + upsert
+	return insert + "SELECT ?, ?, ?, ?, ?, ?, ?, ? FROM applies a WHERE a.id = ? AND " + d.LeaseSourceFence("applies", "a", "id", "lease_token") + " " + upsert
 }
 
 // Upsert creates or updates a comment record.
 // On conflict (same apply_id + comment_state), updates the github_comment_id,
 // posted_phase, posted_cutover_operation_id, pending_freeze_github_comment_id,
-// and summarized_state so the row always describes the currently tracked
-// comment and the freeze it may still owe. The conflict path also clears superseded_at (the row is live
+// freeze_github_comment_id, and summarized_state, and clears frozen_body, so
+// the row always describes the currently tracked comment and the freeze it may
+// still owe. The conflict path also clears superseded_at (the row is live
 // again) and stamps updated_at: that column is the summary-claim freshness
 // signal read by ReclaimStaleSummaryClaim, not incidental audit metadata, so
 // every mutation must renew it explicitly on both dialects.
@@ -69,12 +74,12 @@ func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyCo
 	}
 	if !hasLease {
 		_, err := s.db.ExecContext(ctx, applyCommentUpsertStatement(s.dialect, false),
-			comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PostedCutoverOperationID, comment.PendingFreezeCommentID, comment.SummarizedState)
+			comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PostedCutoverOperationID, comment.PendingFreezeCommentID, comment.FreezeCommentID, comment.SummarizedState)
 		return err
 	}
 
 	result, err := s.db.ExecContext(ctx, applyCommentUpsertStatement(s.dialect, true),
-		comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PostedCutoverOperationID, comment.PendingFreezeCommentID, comment.SummarizedState, comment.ApplyID, lease.Token)
+		comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PostedCutoverOperationID, comment.PendingFreezeCommentID, comment.FreezeCommentID, comment.SummarizedState, comment.ApplyID, lease.Token)
 	if err != nil {
 		return err
 	}
@@ -254,6 +259,95 @@ func (s *applyCommentStore) ClearPendingFreeze(ctx context.Context, applyID int6
 		// Zero rows can mean the row was missing, the marker was already clear,
 		// or the lease was lost. The first two are benign; surface only a lost
 		// lease.
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RecordFrozenBody stores the frozen rendering owed to freezeCommentID before
+// the GitHub edit is attempted. The update matches only a row that still owes
+// that comment's freeze and has no body stored, so the first body stored for a
+// freeze is the one every retry sends. With a lease in context, a zero-row
+// update that is not explained by a lost lease reports false: a body is
+// already stored or the freeze is no longer owed.
+func (s *applyCommentStore) RecordFrozenBody(ctx context.Context, applyID int64, commentState string, freezeCommentID int64, body string) (bool, error) {
+	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
+	if err != nil {
+		return false, err
+	}
+	var result sql.Result
+	if !hasLease {
+		result, err = s.db.ExecContext(ctx, `
+			UPDATE apply_comments SET frozen_body = ?, updated_at = NOW()
+			WHERE apply_id = ? AND comment_state = ? AND freeze_github_comment_id = ? AND frozen_body IS NULL
+		`, body, applyID, commentState, freezeCommentID)
+	} else {
+		query := s.dialect.JoinedUpdate(
+			"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
+			[]JoinedUpdateAssignment{
+				{Column: "frozen_body", Expr: "?"},
+				{Column: "updated_at", Expr: "NOW()"},
+			},
+			"c.apply_id = ? AND c.comment_state = ? AND c.freeze_github_comment_id = ? AND c.frozen_body IS NULL AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
+		)
+		result, err = s.db.ExecContext(ctx, query, body, applyID, commentState, freezeCommentID, lease.Token)
+	}
+	if err != nil {
+		return false, fmt.Errorf("record frozen body for apply %d state %s comment %d: %w", applyID, commentState, freezeCommentID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read frozen body record rows affected for apply %d state %s: %w", applyID, commentState, err)
+	}
+	if rows == 0 && hasLease {
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+			return false, err
+		}
+	}
+	return rows > 0, nil
+}
+
+// ClearFreeze removes the freeze owed to freezeCommentID, marker and stored
+// body together, once its frozen rendering has landed on GitHub. A missing
+// row, an already-clear marker, or a marker naming a different comment is not
+// an error; with a lease in context, a zero-row update surfaces a lost lease.
+func (s *applyCommentStore) ClearFreeze(ctx context.Context, applyID int64, commentState string, freezeCommentID int64) error {
+	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
+	if err != nil {
+		return err
+	}
+	if !hasLease {
+		if _, err := s.db.ExecContext(ctx, `
+			UPDATE apply_comments SET freeze_github_comment_id = NULL, frozen_body = NULL, updated_at = NOW()
+			WHERE apply_id = ? AND comment_state = ? AND freeze_github_comment_id = ?
+		`, applyID, commentState, freezeCommentID); err != nil {
+			return fmt.Errorf("clear freeze for apply %d state %s comment %d: %w", applyID, commentState, freezeCommentID, err)
+		}
+		return nil
+	}
+	query := s.dialect.JoinedUpdate(
+		"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
+		[]JoinedUpdateAssignment{
+			{Column: "freeze_github_comment_id", Expr: "NULL"},
+			{Column: "frozen_body", Expr: "NULL"},
+			{Column: "updated_at", Expr: "NOW()"},
+		},
+		"c.apply_id = ? AND c.comment_state = ? AND c.freeze_github_comment_id = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
+	)
+	result, err := s.db.ExecContext(ctx, query, applyID, commentState, freezeCommentID, lease.Token)
+	if err != nil {
+		return fmt.Errorf("clear freeze for apply %d state %s comment %d: %w", applyID, commentState, freezeCommentID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read freeze clear rows affected for apply %d state %s: %w", applyID, commentState, err)
+	}
+	if rows == 0 {
+		// Zero rows can mean the row was missing, the freeze was already
+		// cleared or re-pointed by a newer rotation, or the lease was lost.
+		// Surface only a lost lease.
 		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
 			return err
 		}
@@ -525,7 +619,7 @@ func scanApplyCommentInto(s scanner) (*storage.ApplyComment, error) {
 	var comment storage.ApplyComment
 	err := s.Scan(
 		&comment.ID, &comment.ApplyID, &comment.CommentState,
-		&comment.GitHubCommentID, &comment.PostedPhase, &comment.PostedCutoverOperationID, &comment.PendingFreezeCommentID, &comment.EditCount,
+		&comment.GitHubCommentID, &comment.PostedPhase, &comment.PostedCutoverOperationID, &comment.PendingFreezeCommentID, &comment.FreezeCommentID, &comment.FrozenBody, &comment.EditCount,
 		&comment.LastEditedAt, &comment.SupersededAt, &comment.SummarizedState, &comment.CreatedAt, &comment.UpdatedAt,
 	)
 	if err != nil {
