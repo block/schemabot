@@ -86,7 +86,7 @@ early release.
 | Creating an enum type, or removing or reordering its labels | Blocked |
 | `stop`, `start`, `cutover`, deferred cutover, `revert`, `skip-revert` | Not available. Only an index build can be cancelled. See [Unsupported workflow features](#unsupported-workflow-features) |
 | Some changes to a partitioned table's parent | Refused when the apply runs. See [Partitioned tables](#partitioned-tables) |
-| Row-level security on a new table, or mixed with structural changes | Blocked. A namespace with managed RLS cannot be rolled back. See [Row-level security](#row-level-security) |
+| Row-level security on a new table, or an RLS change and a structural change to one table in the same plan | Blocked. See [Row-level security](#row-level-security) |
 | Pulling every table shape | `pull` skips a table it cannot write completely and names it, rather than writing a partial file. `onboard` and `init` add it to `ignore_tables`. See [Schema pull](#schema-pull) |
 | Detailed catalog output from the schema intelligence API | Not available |
 
@@ -1191,6 +1191,12 @@ are one operation:
   a busy table refuses rather than waits. Keep policy changes small. A plan
   with no RLS change takes no exclusive lock and needs no ownership.
 
+**Structural changes on a table with RLS.** A file that declares RLS can also
+change the table's columns and indexes. When the file's RLS matches the live
+table, the plan runs those changes as ordinary in-place DDL that leaves the
+policies as they are. A file that changes the policies and the table together
+is refused: change one, apply it, then change the other.
+
 **Files without RLS clauses.** A file that declares only the table and its
 indexes still works on a table with live RLS. It manages columns and indexes
 and leaves policies alone. Leaving the RLS clauses out does **not** disable
@@ -1200,9 +1206,7 @@ policies.
 **Not supported yet:**
 
 - RLS on a new table
-- RLS changes and structural changes in the same plan
-- Rolling back a plan for a namespace that has tables with managed RLS.
-  SchemaBot never strips policies to make a plan rollback-capable
+- RLS changes and structural changes to an existing table in the same plan
 - Running a reviewed RLS change on a target whose physical schema name
   differs. That target needs its own plan and review
 - Direct RLS apply requests that lack the stored schema files
@@ -1413,8 +1417,15 @@ leaves. See [Index builds](#index-builds).
   reverse changes to it. An archive the plan itself created has no original,
   so rollback leaves it in place and lists it as exempt.
 - A plan can be rolled back only when SchemaBot captured the original of every
-  table it manages. A namespace with managed RLS tables cannot be rolled back
-  yet.
+  table it manages.
+- The originals carry the RLS settings and policies of every managed table
+  that has them, including a table whose schema file declares only the
+  table. Rolling back a structural change leaves the policies as they are.
+  Rolling back a policy change plans the reverse replacement, which needs
+  consent like any policy change. A policy changed by hand after the plan is
+  reverted too, and the rollback plan lists it.
+- A namespace cannot be rolled back when one of its managed tables has RLS
+  and a foreign key. A schema file cannot declare both on one table yet.
 - The originals carry foreign keys. Rolling back a plan that added a foreign
   key shows the key's drop as a blocked step, since SchemaBot does not drop
   foreign keys yet.

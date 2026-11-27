@@ -3,9 +3,11 @@
 package postgres
 
 import (
+	"context"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -69,6 +71,64 @@ func TestEngineAtomicRowSecurityPlanAndApply(t *testing.T) {
 	again, err := eng.Plan(t.Context(), &engine.PlanRequest{Database: "rls_apply", Credentials: &engine.Credentials{DSN: dsn}, SchemaFiles: files})
 	require.NoError(t, err)
 	assert.True(t, again.NoChanges)
+}
+
+// An operator narrows a policy and later rolls the plan back. The plan's
+// rollback originals hold the policy as it was, so the rollback re-plan is
+// the reverse replacement, gated by the same unsafe consent, and applying it
+// restores the original policy in one transaction (RV-7).
+func TestEngineRowSecurityChangeRollsBack(t *testing.T) {
+	const database = "rls_rollback"
+	dsn, db := testutil.StartPostgres(t, database)
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.documents (id bigint PRIMARY KEY, published boolean NOT NULL);
+  ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON public.documents FOR SELECT USING (true);
+ `)
+	require.NoError(t, err)
+	eng := New()
+	planAndApply := func(files schema.SchemaFiles) *engine.PlanResult {
+		t.Helper()
+		result, err := eng.Plan(ctx, &engine.PlanRequest{Database: database, Credentials: &engine.Credentials{DSN: dsn}, SchemaFiles: files})
+		require.NoError(t, err)
+		require.Len(t, result.Changes, 1)
+		require.Len(t, result.Changes[0].TableChanges, 1)
+		change := result.Changes[0].TableChanges[0]
+		assert.True(t, change.IsUnsafe, "a policy replacement needs unsafe consent in either direction")
+		assert.Contains(t, change.DDL, `CREATE POLICY "readers"`)
+		req := applyRequest(dsn, "documents", change.DDL)
+		req.SchemaFiles = files
+		applied, err := eng.Apply(ctx, req)
+		require.NoError(t, err)
+		require.True(t, applied.Accepted)
+		progress := awaitPostgresProgress(t, eng, "documents")
+		require.Equal(t, engine.StateCompleted, progress.State, progress.ErrorMessage)
+		return result
+	}
+	policy := func() string {
+		t.Helper()
+		var using string
+		require.NoError(t, db.QueryRowContext(ctx,
+			"SELECT qual FROM pg_policies WHERE schemaname = 'public' AND tablename = 'documents' AND policyname = 'readers'").Scan(&using))
+		return using
+	}
+
+	forward := planAndApply(schema.SchemaFiles{"public": {Files: map[string]string{"documents.sql": `
+  CREATE TABLE documents (id bigint PRIMARY KEY, published boolean NOT NULL);
+  ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON documents FOR SELECT USING (published);
+ `}}})
+	require.True(t, forward.Changes[0].OriginalFilesCaptured)
+	assert.Equal(t, "published", policy())
+
+	originals := schema.SchemaFiles{"public": {Files: forward.Changes[0].OriginalFiles}}
+	planAndApply(originals)
+	assert.Equal(t, "true", policy())
+	converged, err := eng.Plan(ctx, &engine.PlanRequest{Database: database, Credentials: &engine.Credentials{DSN: dsn}, SchemaFiles: originals})
+	require.NoError(t, err)
+	assert.True(t, converged.NoChanges)
 }
 
 func TestEngineAtomicRowSecurityRefusesLatePolicyAddition(t *testing.T) {
@@ -145,4 +205,120 @@ func TestEnginePlanRefusesDuplicateRowSecurityDeclarations(t *testing.T) {
   WHERE polrelid='public.documents'::regclass AND polname='readers'
  `).Scan(&predicate))
 	assert.Equal(t, "(id = 1)", predicate)
+}
+
+// An owner plans a change in a namespace where `documents` has row security
+// and a foreign key to `accounts`. A schema file cannot declare both on one
+// table, so SchemaBot cannot write `documents`' original, and the plan names
+// it as what blocks the rollback rather than capturing a rollback that would
+// leave its policies out (RV-7).
+func TestCaptureOriginalFilesBlocksRowSecurityItCannotRender(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "capture_rls_fk")
+	_, err := db.ExecContext(t.Context(), `
+  CREATE TABLE public.accounts (id bigint PRIMARY KEY);
+  CREATE TABLE public.documents (id bigint PRIMARY KEY, account_id bigint REFERENCES public.accounts (id));
+  ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON public.documents FOR SELECT USING (id = 1);
+ `)
+	require.NoError(t, err)
+	pool, err := pgxpool.New(t.Context(), dsn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	for _, declared := range []map[string]bool{nil, {"documents": true}} {
+		files, blockers, err := captureOriginalFiles(t.Context(), pool, "capture_rls_fk", "public", nil, declared, engine.IgnoredTables{})
+		require.NoError(t, err)
+		assert.Equal(t, []engine.RollbackBlocker{{Table: "documents", Reason: "foreign keys are not supported in desired row security"}}, blockers,
+			"whether or not the forward file declares row security, the table whose original cannot be written blocks the rollback")
+		assert.Nil(t, files, "no partial rollback is captured")
+	}
+}
+
+// An operator secures a table that had no row security, either by enabling
+// it with a first policy or by adding a policy to a table that already had
+// it enabled, and later rolls the plan back. The rollback original declares
+// the live row security as it was, so the rollback re-plan takes the new
+// access rules back off instead of reporting no changes, and a re-plan of the
+// originals converges (RV-7).
+func TestEngineFirstRowSecurityRollsBack(t *testing.T) {
+	tests := []struct {
+		name     string
+		database string
+		setup    string
+		original string
+		enabled  bool
+	}{
+		{
+			name:     "first enable",
+			database: "rls_first_enable",
+			setup:    `CREATE TABLE public.documents (id bigint PRIMARY KEY);`,
+			original: "CREATE TABLE \"documents\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"documents_pkey\" PRIMARY KEY (id)\n);\n" +
+				"\nALTER TABLE \"documents\" DISABLE ROW LEVEL SECURITY;\nALTER TABLE \"documents\" NO FORCE ROW LEVEL SECURITY;\n",
+		},
+		{
+			name:     "first policy",
+			database: "rls_first_policy",
+			setup: `CREATE TABLE public.documents (id bigint PRIMARY KEY);
+  ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;`,
+			original: "CREATE TABLE \"documents\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"documents_pkey\" PRIMARY KEY (id)\n);\n" +
+				"\nALTER TABLE \"documents\" ENABLE ROW LEVEL SECURITY;\nALTER TABLE \"documents\" NO FORCE ROW LEVEL SECURITY;\n",
+			enabled: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, db := testutil.StartPostgres(t, tt.database)
+			ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+			defer cancel()
+			_, err := db.ExecContext(ctx, tt.setup)
+			require.NoError(t, err)
+			eng := New()
+			planAndApply := func(files schema.SchemaFiles) *engine.PlanResult {
+				t.Helper()
+				result, err := eng.Plan(ctx, &engine.PlanRequest{Database: tt.database, Credentials: &engine.Credentials{DSN: dsn}, SchemaFiles: files})
+				require.NoError(t, err)
+				require.Len(t, result.Changes, 1)
+				require.Len(t, result.Changes[0].TableChanges, 1)
+				change := result.Changes[0].TableChanges[0]
+				require.Empty(t, change.ExecutionMode, change.ModeReason)
+				req := applyRequest(dsn, "documents", change.DDL)
+				req.SchemaFiles = files
+				applied, err := eng.Apply(ctx, req)
+				require.NoError(t, err)
+				require.True(t, applied.Accepted)
+				progress := awaitPostgresProgress(t, eng, "documents")
+				require.Equal(t, engine.StateCompleted, progress.State, progress.ErrorMessage)
+				return result
+			}
+			security := func() (enabled bool, policies int) {
+				t.Helper()
+				require.NoError(t, db.QueryRowContext(ctx,
+					"SELECT relrowsecurity FROM pg_class WHERE oid = 'public.documents'::regclass").Scan(&enabled))
+				require.NoError(t, db.QueryRowContext(ctx,
+					"SELECT count(*) FROM pg_policies WHERE schemaname = 'public' AND tablename = 'documents'").Scan(&policies))
+				return enabled, policies
+			}
+
+			forward := planAndApply(schema.SchemaFiles{"public": {Files: map[string]string{"documents.sql": `
+  CREATE TABLE documents (id bigint PRIMARY KEY);
+  ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON documents FOR SELECT USING (id = 1);
+ `}}})
+			require.True(t, forward.Changes[0].OriginalFilesCaptured)
+			assert.Equal(t, map[string]string{"documents.sql": tt.original}, forward.Changes[0].OriginalFiles)
+			enabled, policies := security()
+			require.True(t, enabled)
+			require.Equal(t, 1, policies)
+
+			originals := schema.SchemaFiles{"public": {Files: forward.Changes[0].OriginalFiles}}
+			rollback := planAndApply(originals)
+			assert.Contains(t, rollback.Changes[0].TableChanges[0].DDL, `DROP POLICY "readers"`)
+			enabled, policies = security()
+			assert.Equal(t, tt.enabled, enabled, "rollback restores the row security setting the table had")
+			assert.Zero(t, policies, "rollback removes the policy the forward plan added")
+			converged, err := eng.Plan(ctx, &engine.PlanRequest{Database: tt.database, Credentials: &engine.Credentials{DSN: dsn}, SchemaFiles: originals})
+			require.NoError(t, err)
+			assert.True(t, converged.NoChanges)
+		})
+	}
 }

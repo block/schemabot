@@ -58,11 +58,11 @@ func TestBaselinePolicyTableMembership(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.table, func(t *testing.T) {
-			assert.Equal(t, tt.wantRollbackReason, rollbackBaseline(declared, ignored).exclusionReason(tt.table))
+			assert.Equal(t, tt.wantRollbackReason, rollbackBaseline(declared, nil, ignored).exclusionReason(tt.table))
 			assert.Empty(t, pulledBaseline.exclusionReason(tt.table), "pull exports every enumerated table")
 		})
 	}
-	assert.Equal(t, engine.ExemptReasonIgnoreTables, rollbackBaseline(declared, mustIgnoredTables(t, []string{"audit_log_archive_2019"})).exclusionReason("audit_log_archive_2019"),
+	assert.Equal(t, engine.ExemptReasonIgnoreTables, rollbackBaseline(declared, nil, mustIgnoredTables(t, []string{"audit_log_archive_2019"})).exclusionReason("audit_log_archive_2019"),
 		"the exact ignore policy withholds a named table before introspection; the plan separately refuses declared contradictions")
 }
 
