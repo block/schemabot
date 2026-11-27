@@ -234,6 +234,36 @@ func WriteLockConflict(data LockConflictData) {
 	fmt.Println()
 }
 
+// What each command tells the operator before it takes a lock from another
+// owner, and the question it then asks. A command that was given -y asks
+// nothing and shows none of this.
+const (
+	UnlockTakeoverConsequence = "Releasing it removes their claim on this database."
+	UnlockTakeoverPrompt      = "Release this lock? Only 'yes' will be accepted: "
+	ApplyTakeoverConsequence  = "Applying with --force releases it and takes the lock for you."
+	ApplyTakeoverPrompt       = "\nDo you want to apply these changes and take over that lock? Only 'yes' will be accepted: "
+)
+
+// WriteLockTakeoverWarning writes who holds a lock before an operator is asked
+// to take it from them with --force. The owner and repository are whatever the
+// caller that took the lock named itself, so their control runes are removed.
+// The consequence line says what the command does to the lock. A PR's lock is
+// owned by its repo#number, so the PR line is left out when it would repeat the
+// owner.
+func WriteLockTakeoverWarning(data LockConflictData, consequence string) {
+	fmt.Println()
+	fmt.Printf(glyph.Attention+"  The lock on %s (%s) belongs to another owner\n", data.Database, data.DatabaseType)
+	fmt.Printf("   Held by: %s\n", ui.TerminalSafeLine(data.Owner))
+	fmt.Printf("   Since:   %s\n", formatLockTime(data.CreatedAt))
+	if data.Repository != "" && data.PullRequest > 0 {
+		pullRequest := fmt.Sprintf("%s#%d", data.Repository, data.PullRequest)
+		if pullRequest != data.Owner {
+			fmt.Printf("   PR:      %s\n", ui.TerminalSafeLine(pullRequest))
+		}
+	}
+	fmt.Printf("   %s\n", consequence)
+}
+
 // WriteLocksList writes a formatted list of active locks.
 func WriteLocksList(locks []LockData) {
 	if len(locks) == 0 {

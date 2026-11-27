@@ -1356,8 +1356,10 @@ func TestDurableWebhookDriverStopsRetryingAtAttemptCap(t *testing.T) {
 	require.Empty(t, store.completed)
 }
 
-// An acknowledged command receives one sanitized terminal answer when its
-// final drive fails, using the repository and PR carried by the stored payload.
+// An acknowledged command receives one terminal answer when its final drive
+// fails, using the repository and PR carried by the stored payload. An error
+// SchemaBot did not write is answered with a fixed line that names no
+// hostname, and the server log carries the error itself.
 func TestDurableWebhookDriverPostsTerminalCommandCommentAtAttemptCap(t *testing.T) {
 	event := durableIssueCommentEvent("schemabot apply -e production")
 	event.Repository = "wrong/denormalized-repo"
@@ -1369,8 +1371,10 @@ func TestDurableWebhookDriverPostsTerminalCommandCommentAtAttemptCap(t *testing.
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/7/comments", commentRecorder(t, comments))
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	h := newDurableDriverHandler(t, store, nil, &fakeClientFactory{client: installClient})
+	var logs bytes.Buffer
+	h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
-		return true, errors.New("dial tcp db.internal.example.com:3306: unavailable")
+		return true, fmt.Errorf("apply command plan: %w", errors.New("dial tcp 10.1.2.3:3306: connect: connection refused"))
 	}
 
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
@@ -1379,9 +1383,11 @@ func TestDurableWebhookDriverPostsTerminalCommandCommentAtAttemptCap(t *testing.
 	require.Nil(t, failure.retryAfter)
 	body := requireComment(t, comments, "terminal command answer")
 	require.Contains(t, body, "Apply Failed")
-	require.Contains(t, body, "could not complete this command after retrying")
-	require.Contains(t, body, "[endpoint redacted]")
-	require.NotContains(t, body, "db.internal.example.com")
+	require.Contains(t, body, "> SchemaBot could not complete the command. Run the command again; if it fails again, the SchemaBot server logs have the cause.")
+	require.NotContains(t, body, "10.1.2.3")
+	require.NotContains(t, body, "connection refused")
+	require.Contains(t, logs.String(), "durable webhook delivery exhausted its retry budget and is now terminal")
+	require.Contains(t, logs.String(), "10.1.2.3:3306: connect: connection refused")
 }
 
 // An apply that kept failing because its remote deployment never answered is

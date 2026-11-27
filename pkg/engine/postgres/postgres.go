@@ -1016,10 +1016,12 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 // each is bounded by the concurrent index duration envelope rather than the
 // table size ceiling: a concurrent index build, and a step the planner routed
 // to the partitioned index build, named by partitionedBuilds, which builds one
-// partition at a time under that envelope per partition. A step pg-sprite
-// proved changes only the catalog, named by catalogOnly, keeps its verdict
-// too: it reads and writes no rows, so its cost does not grow with the
-// table. An earlier blocked verdict retains its reason and gains the
+// partition at a time under that envelope per partition. A concurrent index
+// drop keeps its verdict because it reads no rows and rewrites nothing: it
+// waits out the table's open transactions and removes the index's files. A
+// step pg-sprite proved changes only the catalog, named by catalogOnly, keeps
+// its verdict too: it reads and writes no rows, so its cost does not grow
+// with the table. An earlier blocked verdict retains its reason and gains the
 // independent size cause so the operator can resolve both without another
 // planning round trip.
 // parser.Classify in tableChanges parsed every rendered statement, including
@@ -1030,6 +1032,7 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 // the size cause on some steps and not others.
 func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedBuilds, catalogOnly map[string]bool) error {
 	durationBounded := make([]bool, len(changes))
+	indexDrop := make([]bool, len(changes))
 	for i := range changes {
 		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
 			continue
@@ -1039,12 +1042,18 @@ func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedB
 			return fmt.Errorf("classify planned statement for table %q: %w", changes[i].Table, err)
 		}
 		durationBounded[i] = concurrentIndex || partitionedBuilds[changes[i].DDL]
+		if indexDrop[i], err = concurrentIndexDropStatement(changes[i].DDL); err != nil {
+			return fmt.Errorf("classify planned statement for table %q: %w", changes[i].Table, err)
+		}
 	}
 	for i := range changes {
 		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
 			continue
 		}
 		if durationBounded[i] {
+			continue
+		}
+		if indexDrop[i] {
 			continue
 		}
 		if catalogOnly[changes[i].DDL] {
@@ -1109,6 +1118,19 @@ func concurrentIndexStatement(sql string) (bool, error) {
 		return false, fmt.Errorf("parse PostgreSQL statement: %w", err)
 	}
 	return statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent(), nil
+}
+
+// concurrentIndexDropStatement reports whether sql is a single DROP INDEX
+// CONCURRENTLY of one index, the shape the apply runs through pg-sprite's
+// concurrent index drop. The plan and apply paths share this classification
+// so the two agree on which drops run outside the table size ceiling.
+func concurrentIndexDropStatement(sql string) (bool, error) {
+	statement, err := pgstatement.ParseOne(sql)
+	if err != nil {
+		return false, fmt.Errorf("parse PostgreSQL statement: %w", err)
+	}
+	return statement.Kind() == pgstatement.KindDropIndex && statement.Concurrent() &&
+		statement.IndexTarget() == pgstatement.IndexTargetSingleRelation, nil
 }
 
 // undeclaredTableDrops surfaces every live table in the namespace that no

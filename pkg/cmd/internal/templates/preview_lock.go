@@ -31,6 +31,24 @@ func previewLockReleasedOutput() {
 	fmt.Println("--- Force release ---")
 	fmt.Println()
 	WriteLockForceReleased("testapp", "mysql", "block/schemabot#123")
+	fmt.Println()
+	fmt.Println("--- Before an unlock --force takes another owner's lock ---")
+	data := LockConflictData{
+		Database:     "testapp",
+		DatabaseType: "mysql",
+		Owner:        "block/schemabot#123",
+		Repository:   "block/schemabot",
+		PullRequest:  123,
+		CreatedAt:    previewTime.Add(-2 * time.Hour),
+	}
+	WriteLockTakeoverWarning(data, UnlockTakeoverConsequence)
+	fmt.Print(UnlockTakeoverPrompt)
+	fmt.Println()
+	fmt.Println()
+	fmt.Println("--- Before an apply --force takes another owner's lock ---")
+	WriteLockTakeoverWarning(data, ApplyTakeoverConsequence)
+	fmt.Print(ApplyTakeoverPrompt)
+	fmt.Println()
 }
 
 func previewLockKeptOutput() {

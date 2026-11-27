@@ -4684,6 +4684,35 @@ Options:
 </details>
 
 <details>
+<summary><a name="before-an-unlock-force-takes-another-owners-lock"></a><strong>Before An Unlock --force Takes Another Owner's Lock</strong></summary>
+
+```
+
+⚠️  The lock on testapp (mysql) belongs to another owner
+   Held by: block/schemabot#123
+   Since:   2 hours ago
+   Releasing it removes their claim on this database.
+Release this lock? Only 'yes' will be accepted: 
+
+```
+</details>
+
+<details>
+<summary><a name="before-an-apply-force-takes-another-owners-lock"></a><strong>Before An Apply --force Takes Another Owner's Lock</strong></summary>
+
+```
+
+⚠️  The lock on testapp (mysql) belongs to another owner
+   Held by: block/schemabot#123
+   Since:   2 hours ago
+   Applying with --force releases it and takes the lock for you.
+
+Do you want to apply these changes and take over that lock? Only 'yes' will be accepted: 
+
+```
+</details>
+
+<details>
 <summary><a name="lock-kept-yield"></a><strong>Lock Kept (Yield)</strong></summary>
 
 ```

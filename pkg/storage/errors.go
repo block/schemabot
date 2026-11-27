@@ -268,3 +268,24 @@ func (e *LockInUseError) Error() string {
 func (e *LockInUseError) Unwrap() error {
 	return ErrLockInUse
 }
+
+// LockReplacedError reports the lock row that held a database when a release
+// pinned to another row found it gone. It matches ErrLockReplaced, and carries
+// the row now held so a caller can tell the operator which lock they would be
+// releasing instead.
+type LockReplacedError struct {
+	// LockID is the lock row the release was pinned to.
+	LockID int64
+	// HeldLockID is the lock row that holds the database now.
+	HeldLockID int64
+	// HeldOwner is the owner of the lock row that holds the database now.
+	HeldOwner string
+}
+
+func (e *LockReplacedError) Error() string {
+	return fmt.Sprintf("lock row %d is not held: lock row %d is: %s", e.LockID, e.HeldLockID, ErrLockReplaced.Error())
+}
+
+func (e *LockReplacedError) Unwrap() error {
+	return ErrLockReplaced
+}

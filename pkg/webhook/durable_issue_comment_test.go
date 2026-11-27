@@ -639,7 +639,8 @@ func TestDurableIssueCommentDriverFinalAttemptPostsOneRetryFailure(t *testing.T)
 	require.Nil(t, failure.retryAfter)
 	body := requireComment(t, comments, "terminal unlock failure")
 	require.Contains(t, body, "Unlock Failed")
-	require.Contains(t, body, "could not complete this command after retrying")
+	require.Contains(t, body, "> SchemaBot could not complete the command. Run the command again; if it fails again, the SchemaBot server logs have the cause.")
+	require.NotContains(t, body, "lock lookup failed")
 	require.Empty(t, comments, "the final attempt must post only one answer")
 }
 
