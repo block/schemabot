@@ -578,6 +578,41 @@ func codeMentions(text string, words func(string) string) string {
 	return b.String()
 }
 
+// codeMentionTags writes each mention in prose as an inline code element, which
+// GitHub does not notify, and leaves every other character as it is. The
+// element is HTML rather than a backtick span so it holds in any prose: a
+// backtick the prose already carries cannot pair with a delimiter written here,
+// and the element reads the same inside a table cell or a folded summary. A
+// backslash before a mention would turn the element's opening bracket into
+// literal text and leave the mention live, so one that is not itself escaped
+// gets a second backslash, which shows the same text.
+func codeMentionTags(prose string) string {
+	spans := mentionSpans(prose)
+	if len(spans) == 0 {
+		return prose
+	}
+	var b strings.Builder
+	last := 0
+	for _, span := range spans {
+		before := prose[last:span[0]]
+		b.WriteString(before)
+		if trailingBackslashes(before)%2 == 1 {
+			b.WriteByte('\\')
+		}
+		b.WriteString("<code>")
+		b.WriteString(prose[span[0]:span[1]])
+		b.WriteString("</code>")
+		last = span[1]
+	}
+	b.WriteString(prose[last:])
+	return b.String()
+}
+
+// trailingBackslashes counts the backslashes that end text.
+func trailingBackslashes(text string) int {
+	return len(text) - len(strings.TrimRight(text, `\`))
+}
+
 // escapeProseWords is escapeInlineMarkdown without the escapes that change
 // nothing about how the text renders: an underscore inside a word, and a less
 // than sign that no HTML construct can start with, as in "<=". An ampersand is

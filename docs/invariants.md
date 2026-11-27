@@ -330,8 +330,8 @@ Sanitizing is a property of the rendering boundary rather than of each call site
 makes it hold: the callers that pass an error through to a comment do not individually decide to
 be careful. The unredacted error goes to the server log next to the repo, PR, environment,
 database, and command, so nothing is lost for triage. Inbound webhook payloads are size-bounded
-before decode. *Enforced:* the comment and table-cell sanitizers in
-`pkg/webhook/templates/common.go`, applied by the error renderers themselves
+before decode. *Enforced:* the comment and table-cell sanitizers and the error-detail
+escaper (`errorDetailMarkdown`) in `pkg/webhook/templates/common.go`, applied by the error renderers themselves
 (`pkg/webhook/templates/errors.go`); the code fences sized past any backtick run in their
 content, DDL fences drawing on a budget shared across the comment, and the code span that holds
 an identifier read from the PR's schema files, its `schemabot.yaml`, or a command's `-d` flag —

@@ -4228,7 +4228,7 @@ func writeErrors(sb *strings.Builder, errors []string) {
 	}
 	sb.WriteString("**Errors**:\n")
 	for _, msg := range msgs {
-		fmt.Fprintf(sb, "- %s\n", html.EscapeString(msg))
+		fmt.Fprintf(sb, "- %s\n", errorDetailMarkdown(msg))
 	}
 	sb.WriteString("\n")
 }
