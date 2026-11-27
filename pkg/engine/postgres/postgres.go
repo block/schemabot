@@ -369,6 +369,9 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		// so the rollback baseline declares their live row security too, even
 		// when the live table has none.
 		rowSecurityTables := make(map[string]bool)
+		// rowSecurityApplied are the tables whose file declared row
+		// security in the schema files last applied.
+		rowSecurityApplied := rowSecurityLastApplied(req.Database, namespace, req.AppliedSchemaFiles[namespace])
 		// Enum label additions lead the namespace's changes, whichever file
 		// sorts first. The apply runs the changes one at a time in this
 		// order, each committed before the next starts, so every label the
@@ -415,6 +418,11 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				desired, ok := file.Schema()
 				if !ok {
 					return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: the parse admitted no planner input", namespace, filename)
+				}
+				if rowSecurityApplied[desired.Table()] {
+					if err := refuseRemovedRowSecurity(ctx, pool, namespace, desired.Table()); err != nil {
+						return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+					}
 				}
 				report, table, err = planPostgresDefinition(ctx, pool, namespace, desired)
 				if err != nil {

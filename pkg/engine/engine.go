@@ -514,6 +514,13 @@ type PlanRequest struct {
 	PullRequest  int                // PR number for context (optional)
 	Credentials  *Credentials       // Resolved credentials (from discovery)
 
+	// AppliedSchemaFiles are the schema files of the apply that last
+	// completed on this database in the plan's environment, in the same
+	// namespaces as SchemaFiles, or nil when none has. They are what SchemaBot
+	// last declared for the target, so an engine can tell a declaration a file
+	// removed from one it never made.
+	AppliedSchemaFiles schema.SchemaFiles
+
 	// GroupedExecution reports whether an apply of this plan will hand the
 	// engine every ALTER at once or one table at a time.
 	//

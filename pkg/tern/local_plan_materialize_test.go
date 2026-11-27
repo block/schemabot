@@ -47,6 +47,16 @@ type fakePlanStorage struct {
 
 func (s *fakePlanStorage) Plans() storage.PlanStore { return s.plans }
 
+// Applies reports no completed apply, so a plan has no schema files last
+// applied to compare against.
+func (s *fakePlanStorage) Applies() storage.ApplyStore { return noCompletedApplies{} }
+
+type noCompletedApplies struct{ storage.ApplyStore }
+
+func (noCompletedApplies) GetLatestCompletedByDatabase(context.Context, string, string, string) (*storage.Apply, error) {
+	return nil, nil
+}
+
 func newPlanMaterializeClient(plans storage.PlanStore) *LocalClient {
 	return &LocalClient{
 		config:  LocalConfig{Database: "testapp", Type: storage.DatabaseTypeMySQL},

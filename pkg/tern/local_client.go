@@ -2024,15 +2024,31 @@ func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanReques
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
 	if c.config.Type != storage.DatabaseTypeMySQL {
+		// Files that leave out structure the target has can mean "leave it
+		// alone" rather than "remove it", so the engine is handed what
+		// SchemaBot last applied to tell a removed declaration from one never
+		// made. The MySQL family plans everything a file leaves out as a
+		// removal, so it needs no history.
+		applied, err := c.appliedSchemaFiles(ctx, req.Environment)
+		if err != nil {
+			return nil, err
+		}
 		engineSchemaFiles := schemaFiles
 		if c.remapsPostgresNamespaces() {
-			var err error
 			engineSchemaFiles, err = c.physicalSchemaFiles(schemaFiles)
 			if err != nil {
 				return nil, fmt.Errorf("prepare PostgreSQL plan namespaces: %w", err)
 			}
+			if applied != nil {
+				applied, err = c.physicalSchemaFiles(applied)
+				if err != nil {
+					return nil, fmt.Errorf("prepare the namespaces of the PostgreSQL schema files last applied: %w", err)
+				}
+			}
 		}
-		result, err := c.planNamespaceWithEngine(ctx, eng, req, database, engineSchemaFiles, c.credentials())
+		planReq := c.enginePlanRequest(req, database, engineSchemaFiles, c.credentials())
+		planReq.AppliedSchemaFiles = applied
+		result, err := eng.Plan(ctx, planReq)
 		if err != nil {
 			return nil, err
 		}
@@ -2087,6 +2103,12 @@ func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanReques
 }
 
 func (c *LocalClient) planNamespaceWithEngine(ctx context.Context, eng engine.Engine, req *ternv1.PlanRequest, database string, schemaFiles schema.SchemaFiles, creds *engine.Credentials) (*engine.PlanResult, error) {
+	return eng.Plan(ctx, c.enginePlanRequest(req, database, schemaFiles, creds))
+}
+
+// enginePlanRequest is the engine's request for a plan of schemaFiles on
+// database.
+func (c *LocalClient) enginePlanRequest(req *ternv1.PlanRequest, database string, schemaFiles schema.SchemaFiles, creds *engine.Credentials) *engine.PlanRequest {
 	// The grouping the apply will run under decides which stored progress it
 	// can continue, so a prediction made here has to use the caller's, not
 	// this engine's default. A caller that leaves the field absent predates
@@ -2101,7 +2123,7 @@ func (c *LocalClient) planNamespaceWithEngine(ctx context.Context, eng engine.En
 	// judged by, so a refused statement is resolved against the caller's
 	// policy here exactly as the apply resolves it later.
 	creds = credentialsWithStatedDirectExecution(creds, req.GetDirectExecution())
-	return eng.Plan(ctx, &engine.PlanRequest{
+	return &engine.PlanRequest{
 		Database:         database,
 		DatabaseType:     c.config.Type,
 		SchemaFiles:      schemaFiles,
@@ -2111,7 +2133,39 @@ func (c *LocalClient) planNamespaceWithEngine(ctx context.Context, eng engine.En
 		GroupedExecution: groupedExecution,
 		IgnoreTables:     req.GetIgnoreTables(),
 		DropTables:       req.GetDropTables(),
-	})
+	}
+}
+
+// appliedSchemaFiles returns the schema files of the apply that last
+// completed on this database in environment, or nil when none has. An empty
+// environment matches nothing rather than every environment, so a plan that
+// names none never reads another environment's history.
+func (c *LocalClient) appliedSchemaFiles(ctx context.Context, environment string) (schema.SchemaFiles, error) {
+	if environment == "" {
+		c.logger.Debug("plan names no environment; the engine plans without the schema files last applied",
+			"database", c.config.Database, "database_type", c.config.Type)
+		return nil, nil
+	}
+	if c.storage == nil {
+		c.logger.Debug("client has no storage; the engine plans without the schema files last applied",
+			"database", c.config.Database, "database_type", c.config.Type, "environment", environment)
+		return nil, nil
+	}
+	apply, err := c.storage.Applies().GetLatestCompletedByDatabase(ctx, c.config.Database, c.config.Type, environment)
+	if err != nil {
+		return nil, fmt.Errorf("load the last completed apply for database %q in %s: %w", c.config.Database, environment, err)
+	}
+	if apply == nil {
+		return nil, nil
+	}
+	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil {
+		return nil, fmt.Errorf("load the plan of completed apply %s on database %q: %w", apply.ApplyIdentifier, c.config.Database, err)
+	}
+	if plan == nil {
+		return nil, fmt.Errorf("the plan of completed apply %s on database %q is not in storage", apply.ApplyIdentifier, c.config.Database)
+	}
+	return plan.SchemaFiles, nil
 }
 
 func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng engine.Engine, req *ternv1.PlanRequest, schemaFiles schema.SchemaFiles) (*engine.PlanResult, error) {
