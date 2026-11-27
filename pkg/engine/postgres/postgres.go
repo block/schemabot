@@ -62,6 +62,7 @@ type Engine struct {
 	// the production value.
 	optimisticApplyCeiling     time.Duration
 	concurrentIndexMaxDuration time.Duration
+	validateMaxDuration        time.Duration
 
 	// execute is a test seam standing in for executeOptimistic, so the apply
 	// drive — accept, claim, execute, terminal publish — can be exercised
@@ -89,6 +90,14 @@ type trackedApply struct {
 	// PostgreSQL change an operator can cancel, so the shape decides the
 	// answer before any server is asked.
 	cancellableBuild bool
+	// haltable records that a shutdown or a drive handing the apply back
+	// ends this apply's work rather than waiting for it: an index build or a
+	// constraint validation, which can run for hours. It is wider than
+	// cancellableBuild, which decides only what an operator can cancel.
+	haltable bool
+	// validationBound is set for a constraint validation: how long its scan
+	// may run before it is cut off.
+	validationBound time.Duration
 	// partitionedBuild records that the build runs one concurrent build per
 	// partition. A cancel signal reaches only the partition build in flight,
 	// which can finish before the signal lands, so Cancel also ends the
@@ -144,12 +153,23 @@ const DefaultConcurrentIndexMaxDuration = 24 * time.Hour
 // is not a build anyone waits for; it is the absence of a bound.
 const MaxConcurrentIndexMaxDuration = time.Duration(math.MaxInt32) * time.Millisecond
 
+// DefaultValidateMaxDuration bounds one VALIDATE CONSTRAINT scan. The scan
+// takes SHARE UPDATE EXCLUSIVE, so reads and writes continue through it, and
+// on a large table it is long by design, like a concurrent index build.
+const DefaultValidateMaxDuration = 24 * time.Hour
+
 // MinConcurrentIndexMaxDuration is the smallest bound the engine accepts for
 // one concurrent index build: statement_timeout is an integer millisecond
 // count, so anything shorter rounds to zero on the server, which disables
 // the timer instead of tightening it. The executor refuses such a budget as
 // unbounded; the engine never hands it one.
 const MinConcurrentIndexMaxDuration = time.Millisecond
+
+// MinValidateMaxDuration is the smallest bound the engine accepts for one
+// VALIDATE CONSTRAINT scan. The validation's lock wait gets half its bound
+// when the bound is shorter than the lock budget, and that half has to be a
+// whole millisecond for the server to honor it.
+const MinValidateMaxDuration = 2 * time.Millisecond
 
 // New creates a new PostgreSQL engine.
 func New() *Engine {
@@ -193,7 +213,27 @@ func NewWithOptions(tableSizeLimit int64, concurrentIndexMaxDuration time.Durati
 		tableSizeLimit:             tableSizeLimit,
 		optimisticApplyCeiling:     optimisticApplyCeiling,
 		concurrentIndexMaxDuration: concurrentIndexMaxDuration,
+		validateMaxDuration:        DefaultValidateMaxDuration,
 	}
+}
+
+// WithValidateMaxDuration sets the bound one VALIDATE CONSTRAINT scan runs
+// under. It is normalized as NewWithOptions normalizes the concurrent index
+// bound: a bound that is not positive adopts DefaultValidateMaxDuration, and
+// one outside what the server's statement_timeout can hold is clamped into
+// range. Server config validation refuses those values before they reach
+// here.
+func (e *Engine) WithValidateMaxDuration(d time.Duration) *Engine {
+	switch {
+	case d <= 0:
+		d = DefaultValidateMaxDuration
+	case d < MinValidateMaxDuration:
+		d = MinValidateMaxDuration
+	case d > MaxConcurrentIndexMaxDuration:
+		d = MaxConcurrentIndexMaxDuration
+	}
+	e.validateMaxDuration = d
+	return e
 }
 
 // NewForTarget creates a PostgreSQL engine with the target information needed
@@ -221,6 +261,12 @@ func (e *Engine) TableSizeLimit() int64 {
 // runs under, for wiring verification and observability.
 func (e *Engine) ConcurrentIndexMaxDuration() time.Duration {
 	return e.concurrentIndexMaxDuration
+}
+
+// ValidateMaxDuration exposes the bound one VALIDATE CONSTRAINT scan runs
+// under, for wiring verification and observability.
+func (e *Engine) ValidateMaxDuration() time.Duration {
+	return e.validateMaxDuration
 }
 
 // Name returns the engine identifier.
@@ -319,6 +365,10 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		schemaChange := engine.SchemaChange{Namespace: namespace}
 		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
+		// rowSecurityTables are the tables whose file declares row security,
+		// so the rollback baseline declares their live row security too, even
+		// when the live table has none.
+		rowSecurityTables := make(map[string]bool)
 		// Enum label additions lead the namespace's changes, whichever file
 		// sorts first. The apply runs the changes one at a time in this
 		// order, each committed before the next starts, so every label the
@@ -339,22 +389,37 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				enumChanges = append(enumChanges, changes...)
 				continue
 			}
+			var report pgplan.Report
+			var table string
 			if rowSecurity, ok := file.RowSecurity(); ok {
-				rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity, tableOwner)
+				rowSecurityTables[rowSecurity.Table()] = true
+				// A file whose row security matches the live table plans its
+				// table definition like any other file, below. A row security
+				// delta, or a table that does not exist yet, is one reviewed
+				// operation of its own.
+				tableReport, matched, err := planRowSecurityTableDefinition(ctx, pool, namespace, rowSecurity)
 				if err != nil {
 					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 				}
-				desiredTables[file.Table()] = true
-				schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
-				continue
-			}
-			desired, ok := file.Schema()
-			if !ok {
-				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: the parse admitted no planner input", namespace, filename)
-			}
-			report, table, err := planPostgresDefinition(ctx, pool, namespace, desired)
-			if err != nil {
-				return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+				if !matched {
+					rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity, tableOwner)
+					if err != nil {
+						return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+					}
+					desiredTables[file.Table()] = true
+					schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
+					continue
+				}
+				report, table = tableReport, rowSecurity.Table()
+			} else {
+				desired, ok := file.Schema()
+				if !ok {
+					return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: the parse admitted no planner input", namespace, filename)
+				}
+				report, table, err = planPostgresDefinition(ctx, pool, namespace, desired)
+				if err != nil {
+					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+				}
 			}
 			desiredTables[table] = true
 			crossNamespace, err := crossNamespaceForeignKeysForDrops(ctx, pool, namespace, report)
@@ -414,7 +479,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			// Only a namespace with changes needs a rollback baseline, so
 			// the render is paid once per changed namespace rather than for
 			// every namespace the schema files declare.
-			schemaChange.OriginalFiles, schemaChange.RollbackBlockers, err = captureOriginalFiles(ctx, pool, req.Database, namespace, desiredTables, ignored)
+			schemaChange.OriginalFiles, schemaChange.RollbackBlockers, err = captureOriginalFiles(ctx, pool, req.Database, namespace, desiredTables, rowSecurityTables, ignored)
 			schemaChange.OriginalFilesCaptured = len(schemaChange.RollbackBlockers) == 0
 			if err != nil {
 				return nil, err
@@ -476,8 +541,8 @@ func refuseTableDeclaredTwice(namespace string, files map[string]pgstatement.Des
 // not, so its cost grows with the namespace rather than with the change; the
 // introspections run concurrently within the pool's ceiling, so the wall
 // time grows more slowly than the table count does.
-func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables) (files map[string]string, blockers []engine.RollbackBlocker, err error) {
-	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, database, namespace, rollbackBaseline(declared, ignored))
+func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared, rowSecurityDeclared map[string]bool, ignored engine.IgnoredTables) (files map[string]string, blockers []engine.RollbackBlocker, err error) {
+	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, database, namespace, rollbackBaseline(declared, rowSecurityDeclared, ignored))
 	if err != nil {
 		return nil, nil, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
 	}
@@ -989,8 +1054,12 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 // waits out the table's open transactions and removes the index's files. A
 // step pg-sprite proved changes only the catalog, named by catalogOnly, keeps
 // its verdict too: it reads and writes no rows, so its cost does not grow
-// with the table. An earlier blocked verdict retains its reason and gains the
-// independent size cause so the operator can resolve both without another
+// with the table. A reviewed VALIDATE CONSTRAINT, one carrying the planner's
+// record of the constraint it validates, keeps its verdict as well: its scan
+// grows with the table but holds SHARE UPDATE EXCLUSIVE, so reads and writes
+// continue through it, and it is bounded by the validation duration instead
+// of the size ceiling. An earlier blocked verdict retains its reason and gains
+// the independent size cause so the operator can resolve both without another
 // planning round trip.
 // parser.Classify in tableChanges parsed every rendered statement, including
 // blocked steps, with the same single-statement requirements used here. A
@@ -1009,7 +1078,11 @@ func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedB
 		if err != nil {
 			return fmt.Errorf("classify planned statement for table %q: %w", changes[i].Table, err)
 		}
-		durationBounded[i] = concurrentIndex || partitionedBuilds[changes[i].DDL]
+		reviewedValidation, err := reviewedValidationStep(changes[i])
+		if err != nil {
+			return fmt.Errorf("classify planned statement for table %q: %w", changes[i].Table, err)
+		}
+		durationBounded[i] = concurrentIndex || partitionedBuilds[changes[i].DDL] || reviewedValidation
 		if indexDrop[i], err = concurrentIndexDropStatement(changes[i].DDL); err != nil {
 			return fmt.Errorf("classify planned statement for table %q: %w", changes[i].Table, err)
 		}
@@ -1813,26 +1886,27 @@ func applyGoroutineExited(tracked *trackedApply) bool {
 }
 
 // HaltForShutdown brings this instance's in-flight concurrent index builds
-// down so the process can exit without leaving them running on the target
-// under a lease nobody renews. A concurrent build has no checkpoint: halting
-// it cancels the statement, and the invalid index it leaves is what the next
-// driver to claim the apply meets as abandoned debris and recovers before its
-// own build. Plain DDL is left to finish — its statements are bounded by
-// their own lock and statement timeouts, and interrupting a create set
-// mid-sequence would leave a committed prefix no later drive can complete.
+// and constraint validations down so the process can exit without leaving
+// them running on the target under a lease nobody renews. Neither has a
+// checkpoint: halting one cancels the statement. The invalid index a build
+// leaves is what the next driver to claim the apply meets as abandoned debris
+// and recovers before its own build; a cancelled validation rolls back and
+// leaves the constraint NOT VALID, still checking new writes, for the next
+// driver to validate. Plain DDL is left to finish — its statements are
+// bounded by their own lock and statement timeouts, and interrupting a create
+// set mid-sequence would leave a committed prefix no later drive can complete.
 //
 // This is not an operator cancel: no cancel is recorded on the tracked
-// applies, so the outcome the drive publishes for a halted build is the
-// failure its leftover index describes, and the apply stays active for
-// another driver to claim. The wait is bounded by ctx so a build that will
+// applies, so the outcome the drive publishes for halted work is a retryable
+// failure, and the apply stays active for another driver to claim. The wait is bounded by ctx so a build that will
 // not come down reports that the target may still be held instead of holding
 // shutdown open.
 func (e *Engine) HaltForShutdown(ctx context.Context) error {
 	e.mu.Lock()
-	halted := e.cancelIndexBuildsLocked(func(*trackedApply) bool { return true })
+	halted := e.haltLongRunningWorkLocked(func(*trackedApply) bool { return true })
 	e.mu.Unlock()
 	if halted > 0 {
-		slog.Info("PostgreSQL engine halting index builds for shutdown", "builds", halted)
+		slog.Info("PostgreSQL engine halting index builds and constraint validations for shutdown", "applies", halted)
 	}
 
 	// Wait off the calling goroutine so work that will not come down bounds
@@ -1857,7 +1931,7 @@ func (e *Engine) HaltForShutdown(ctx context.Context) error {
 func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
 	e.mu.Lock()
 	owned := func(tracked *trackedApply) bool { return tracked.owner == owner }
-	halted := e.cancelIndexBuildsLocked(owned)
+	halted := e.haltLongRunningWorkLocked(owned)
 	var pending []chan struct{}
 	for _, tracked := range e.progress {
 		if owned(tracked) {
@@ -1866,7 +1940,7 @@ func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
 	}
 	e.mu.Unlock()
 	if halted > 0 {
-		slog.Info("PostgreSQL engine halting the index builds a drive started as it returns", "builds", halted)
+		slog.Info("PostgreSQL engine halting the index builds and constraint validations a drive started as it returns", "applies", halted)
 	}
 
 	for _, done := range pending {
@@ -1879,12 +1953,13 @@ func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
 	return nil
 }
 
-// cancelIndexBuildsLocked ends the running index builds that
-// selected picks and returns how many it ended. The caller holds e.mu.
-func (e *Engine) cancelIndexBuildsLocked(selected func(*trackedApply) bool) int {
+// haltLongRunningWorkLocked ends the running index builds and constraint
+// validations that selected picks and returns how many it ended. The caller
+// holds e.mu.
+func (e *Engine) haltLongRunningWorkLocked(selected func(*trackedApply) bool) int {
 	halted := 0
 	for _, tracked := range e.progress {
-		if selected(tracked) && tracked.cancellableBuild && !tracked.result.State.IsTerminal() && tracked.cancelApply != nil {
+		if selected(tracked) && tracked.haltable && !tracked.result.State.IsTerminal() && tracked.cancelApply != nil {
 			tracked.cancelApply()
 			halted++
 		}

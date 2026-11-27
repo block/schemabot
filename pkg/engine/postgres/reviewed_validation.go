@@ -7,6 +7,8 @@ import (
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
+
+	"github.com/block/schemabot/pkg/engine"
 )
 
 // reviewedValidationMetadataKey is the engine.TableChange.Metadata key under
@@ -75,4 +77,19 @@ func reviewedValidationFromMetadata(metadata map[string]string) (*schemadiff.Con
 		return nil, fmt.Errorf("the reviewed validation does not name the constraint and its definition")
 	}
 	return &validates, nil
+}
+
+// reviewedValidationStep reports whether a planned step is a VALIDATE
+// CONSTRAINT that carries the planner's record of the constraint it
+// validates, which is what lets the apply run it under the validation bound.
+// A validation with no record is blocked by the plan on its own account.
+func reviewedValidationStep(change engine.TableChange) (bool, error) {
+	if _, recorded := change.Metadata[reviewedValidationMetadataKey]; !recorded {
+		return false, nil
+	}
+	validates, err := validatesConstraint(change.DDL)
+	if err != nil {
+		return false, fmt.Errorf("classify reviewed validation: %w", err)
+	}
+	return validates, nil
 }

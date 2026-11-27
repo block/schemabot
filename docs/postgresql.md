@@ -86,7 +86,7 @@ early release.
 | Creating an enum type, or removing or reordering its labels | Blocked |
 | `stop`, `start`, `cutover`, deferred cutover, `revert`, `skip-revert` | Not available. Only an index build can be cancelled. See [Unsupported workflow features](#unsupported-workflow-features) |
 | Some changes to a partitioned table's parent | Refused when the apply runs. See [Partitioned tables](#partitioned-tables) |
-| Row-level security mixed with structural changes on an existing table | Blocked. A plan for a namespace that already has managed RLS cannot be rolled back. See [Row-level security](#row-level-security) |
+| Row-level security changes and structural changes to one existing table in the same plan | Blocked. See [Row-level security](#row-level-security) |
 | Pulling every table shape | `pull` skips a table it cannot write completely and names it, rather than writing a partial file. `onboard` and `init` add it to `ignore_tables`. See [Schema pull](#schema-pull) |
 | Detailed catalog output from the schema intelligence API | Not available |
 
@@ -201,6 +201,7 @@ If your tables belong to a dedicated owner role, read
 | Change | What happens |
 |---|---|
 | Add a nullable column, or another `ALTER TABLE` that only changes the catalog | Runs on a table of any size, with a 3-second `lock_timeout` and a 30-second `statement_timeout`. See [Catalog-only changes](#catalog-only-changes) |
+| `VALIDATE CONSTRAINT` of a constraint left `NOT VALID` | Runs on a table of any size, bounded by `postgres.validate_max_duration` (24 hours by default). Reads and writes continue through the scan |
 | Any other `ALTER TABLE` on a table larger than 1 GiB | Blocked. The limit is `postgres.native_safe_table_size_limit_bytes` |
 | `ALTER TABLE` that rewrites the table, such as most column type changes | Blocked. It needs a copy of the table, which SchemaBot does not run on PostgreSQL yet |
 | `CREATE INDEX` on an existing table | Runs as `CREATE INDEX CONCURRENTLY`, bounded by `postgres.concurrent_index_max_duration` (24 hours by default). It can be cancelled |
@@ -212,7 +213,7 @@ If your tables belong to a dedicated owner role, read
 | A new table with row-level security | Runs in one transaction: the table, its RLS setting, and its policies, so the table never exists without them. It holds no rows, so it needs no approval. See [Row-level security](#row-level-security) |
 | Adding a foreign key | Runs in two steps: `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`, which checks existing rows while writes continue. See [Foreign keys](#foreign-keys) |
 | Dropping a foreign key | Shown in the plan, but blocked. See [Foreign keys](#foreign-keys) |
-| Making a column `NOT NULL` | Runs in four steps on a table up to the size limit: a helper `CHECK (column IS NOT NULL) NOT VALID`, `VALIDATE CONSTRAINT`, which checks existing rows while writes continue, `SET NOT NULL`, which uses the validated check instead of scanning, and the helper's drop. If a row holds `NULL`, the validation fails and names the helper. Fix those rows and SchemaBot retries the validation on its own. If its retries run out first, drop the helper outside SchemaBot, then plan and apply again |
+| Making a column `NOT NULL` | Runs in four steps on a table up to the size limit: a helper `CHECK (column IS NOT NULL) NOT VALID`, `VALIDATE CONSTRAINT`, which checks existing rows while writes continue, `SET NOT NULL`, which uses the validated check instead of scanning, and the helper's drop. If a row holds `NULL`, the validation fails and names the helper. Fix those rows and SchemaBot retries the validation on its own. If its retries run out first, plan and apply again. The new plan drops the leftover helper before it adds a new one, and that drop is unsafe, so the apply needs `--allow-unsafe` |
 | A table with no schema file, or a deleted file | Runs as `DROP TABLE` after you approve it with `--allow-unsafe`, as on MySQL. Archive tables and `ignore_tables` entries are left alone. See [Tables with no schema file](#tables-with-no-schema-file) |
 
 Once a statement starts, it runs until it commits or its timeout ends it; it
@@ -328,6 +329,15 @@ and picks the safest form PostgreSQL offers:
   change that turns out to be expensive is cancelled and rolled back instead
   of holding the table. Index builds have a longer bound of their own; see
   [Index builds](#index-builds).
+- Before an attempt requests its lock, it waits up to 30 seconds, outside the
+  lock queue, for a read or write transaction that has held a conflicting
+  lock for longer than a moment. A prepared transaction is not waited on.
+  While the step waits, the table's readers and writers do not queue behind
+  it, and the CLI and the PR comment name the session, for example
+  `⏳ Waiting for session 9433 to release its lock (7s of 30s)`. Once the
+  30 seconds run out, the attempt requests its lock anyway, under its short
+  `lock_timeout`, so readers and writers queue behind it for at most that
+  long.
 - When no safe form exists, pg-sprite refuses the change and says why.
 
 pg-sprite supports PostgreSQL 14 and later, including Amazon RDS and Aurora.
@@ -422,10 +432,11 @@ unsafe to leave in place.
 | `ALTER TABLE` | Each attempt gets a 3-second lock budget, retried on contention, and a 30-second statement budget | Fixed |
 | `CREATE INDEX CONCURRENTLY` | Build duration, enforced as the server-side `statement_timeout`. 24 hours by default | `postgres.concurrent_index_max_duration` |
 | Index on a partitioned table | The same duration, for each partition and for the whole build | `postgres.concurrent_index_max_duration` |
+| `VALIDATE CONSTRAINT` | Scan duration, enforced as the server-side `statement_timeout`. 24 hours by default. No table size limit. Each attempt gets the same 3-second lock budget as `ALTER TABLE`, or half the bound when the bound is shorter | `postgres.validate_max_duration` |
 | `CREATE TABLE` | No size limit, since the table starts empty | None |
 
-The size limit bounds work that grows with existing data, so index builds and
-new tables are bounded by duration instead. The duration starts when the build
+The size limit bounds work that grows with existing data, so index builds,
+validations, and new tables are bounded by duration instead. The duration starts when the build
 starts: session setup has its own allowance, so the build gets the full bound.
 [Configuration](configuration.md) covers the trade-offs of raising either
 setting.
@@ -541,7 +552,9 @@ you to plan again.
 You can cancel two kinds of change while they run: a concurrent index build on
 an existing table, and a partitioned index build. Every other statement
 commits or fails on its own, so SchemaBot records a cancel of it and then
-declines it.
+declines it. A declined cancel of a `VALIDATE CONSTRAINT` says when the scan
+ends on its own: within `postgres.validate_max_duration`. If the scan runs
+out, the constraint stays `NOT VALID` and still checks new writes.
 
 **How a cancel reaches the build.** SchemaBot signals the build's backend. If
 the signal cannot reach it, for example because the build has not started or
@@ -884,7 +897,7 @@ creates does not count: create the referenced table first, then add the key.
 | Step | Locks | Takes |
 |---|---|---|
 | `ADD CONSTRAINT ... NOT VALID` | `SHARE ROW EXCLUSIVE` on both tables, under the 3-second `lock_timeout` | Milliseconds. From here on, new writes are checked |
-| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` on the table and `ROW SHARE` on the referenced table. Reads and writes continue on both | Up to the 30-second statement budget. A longer scan is refused, and the key stays `NOT VALID` |
+| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` on the table and `ROW SHARE` on the referenced table. Reads and writes continue on both | Up to `postgres.validate_max_duration`, 24 hours by default. A longer scan is cancelled and refused, and the key stays `NOT VALID` |
 
 A new table's `REFERENCES` takes the same brief `SHARE ROW EXCLUSIVE` on each
 referenced table. On a busy referenced table, the step times out and the apply
@@ -943,16 +956,18 @@ applying the same plan again meets the same refusal.
 | The role lacks a privilege the statement needs | Refused before any DDL runs. The failure includes the `GRANT` that fixes it |
 | A statement waited past its 3-second lock budget | Retryable once the lock contention clears |
 | A statement ran past its 30-second budget | Refused. The statement is rolled back |
+| A `VALIDATE CONSTRAINT` ran past `postgres.validate_max_duration` | Refused. The constraint stays `NOT VALID` and checks new writes. Raise the setting, then apply again |
 | An apply ran past the 5-minute ceiling | Retryable |
 | A new table's name is taken, its schema is missing, or its shape is refused | Refused. See [Greenfield tables](#greenfield-tables) |
 | A later step of a new table's set failed | Refused. The earlier steps stay committed. Follow the failure's fix, or plan again |
 | An index build failed | See [When a build fails](#when-a-build-fails) |
 | Any other failure, such as a dropped connection | Retryable. The message is sanitized; connection and server details stay in the server logs |
 
-**The 5-minute ceiling** applies to every apply except an index build, and
-cannot be changed. It makes sure a hung connection still ends in a final
-state. The lock and statement budgets bound the real work. Index builds use
-`postgres.concurrent_index_max_duration` instead.
+**The 5-minute ceiling** applies to every apply except an index build or a
+validation, and cannot be changed. It makes sure a hung connection still ends
+in a final state. The lock and statement budgets bound the real work. Index
+builds use `postgres.concurrent_index_max_duration` instead, and validations
+use `postgres.validate_max_duration`.
 
 ## Unsupported workflow features
 
@@ -1185,6 +1200,12 @@ from the reviewed file and runs it in one transaction only if the two match.
 A mismatch, or a table of that name created since the plan, refuses the
 apply; plan again.
 
+**Structural changes on a table with RLS.** A file that declares RLS can also
+change the table's columns and indexes. When the file's RLS matches the live
+table, the plan runs those changes as ordinary in-place DDL that leaves the
+policies as they are. A file that changes the policies and the table together
+is refused: change one, apply it, then change the other.
+
 **Files without RLS clauses.** A file that declares only the table and its
 indexes still works on a table with live RLS. It manages columns and indexes
 and leaves policies alone. Leaving the RLS clauses out does **not** disable
@@ -1194,11 +1215,6 @@ policies.
 **Not supported yet:**
 
 - RLS changes and structural changes to an existing table in the same plan
-- Rolling back a plan for a namespace that already had tables with managed
-  RLS. SchemaBot never strips policies to make a plan rollback-capable. A plan
-  that creates the namespace's first RLS table can be rolled back: the
-  rollback drops that table and its policies, which is unsafe and needs
-  `--allow-unsafe`
 - Running a reviewed RLS change on a target whose physical schema name
   differs. That target needs its own plan and review
 - Direct RLS apply requests that lack the stored schema files
@@ -1409,8 +1425,15 @@ leaves. See [Index builds](#index-builds).
   reverse changes to it. An archive the plan itself created has no original,
   so rollback leaves it in place and lists it as exempt.
 - A plan can be rolled back only when SchemaBot captured the original of every
-  table it manages. A namespace with managed RLS tables cannot be rolled back
-  yet.
+  table it manages.
+- The originals carry the RLS settings and policies of every managed table
+  that has them, including a table whose schema file declares only the
+  table. Rolling back a structural change leaves the policies as they are.
+  Rolling back a policy change plans the reverse replacement, which needs
+  consent like any policy change. A policy changed by hand after the plan is
+  reverted too, and the rollback plan lists it.
+- A namespace cannot be rolled back when one of its managed tables has RLS
+  and a foreign key. A schema file cannot declare both on one table yet.
 - The originals carry foreign keys. Rolling back a plan that added a foreign
   key shows the key's drop as a blocked step, since SchemaBot does not drop
   foreign keys yet.

@@ -585,6 +585,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// A freeze can stop the apply while this poll runs, so the reread apply
 	// says which freeze stopped it, as the stored path does.
 	httpResp.StoppedByFreeze = s.StoppedByFreeze(r.Context(), apply)
+	httpResp.ControlRequests = s.progressControlRequests(r.Context(), apply)
 	if apply.StartedAt != nil {
 		httpResp.StartedAt = apply.StartedAt.Format(time.RFC3339)
 	}
@@ -1457,6 +1458,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	}
 	overlayStoredDisplayMetadata(httpResp, apply, stored.rows)
 	httpResp.StoppedByFreeze = s.StoppedByFreeze(ctx, apply)
+	httpResp.ControlRequests = s.progressControlRequests(ctx, apply)
 
 	rows := make([]*apitypes.TableProgressResponse, 0, len(tasks))
 	for _, task := range tasks {

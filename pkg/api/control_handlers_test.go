@@ -449,3 +449,64 @@ func TestControlTernClientFailure(t *testing.T) {
 		assert.False(t, IsTerminalControlError(err))
 	})
 }
+
+// A stop or cancel reports how many tables it acts on and how many it leaves
+// alone because they already finished. A table counts once however many tasks
+// it carries: the steps of a staged change on one table, or one task per shard.
+func TestStopRequestCountsCountTables(t *testing.T) {
+	task := func(id int64, namespace, table, taskState string) *storage.Task {
+		return &storage.Task{ID: id, Namespace: namespace, TableName: table, State: taskState}
+	}
+	cases := map[string]struct {
+		tasks       []*storage.Task
+		wantActive  int64
+		wantSkipped int64
+	}{
+		"staged change on one table with one step done": {
+			tasks: []*storage.Task{
+				task(1, "public", "users", state.Task.Completed),
+				task(2, "public", "users", state.Task.FailedRetryable),
+				task(3, "public", "users", state.Task.Pending),
+				task(4, "public", "users", state.Task.Pending),
+			},
+			wantActive: 1,
+		},
+		"one table done and one still running": {
+			tasks: []*storage.Task{
+				task(1, "app", "orders", state.Task.Completed),
+				task(2, "app", "customers", state.Task.Running),
+			},
+			wantActive:  1,
+			wantSkipped: 1,
+		},
+		"one table across shards": {
+			tasks: []*storage.Task{
+				task(1, "commerce", "orders", state.Task.Running),
+				task(2, "commerce", "orders", state.Task.Completed),
+			},
+			wantActive: 1,
+		},
+		"same table name in two namespaces": {
+			tasks: []*storage.Task{
+				task(1, "billing", "accounts", state.Task.Running),
+				task(2, "identity", "accounts", state.Task.Running),
+			},
+			wantActive: 2,
+		},
+		"tasks that name no table count one each": {
+			tasks: []*storage.Task{
+				task(1, "app", "", state.Task.Running),
+				task(2, "app", "", state.Task.Completed),
+			},
+			wantActive:  1,
+			wantSkipped: 1,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			active, skipped := stopRequestCounts(tc.tasks)
+			assert.Equal(t, tc.wantActive, active, "tables acted on")
+			assert.Equal(t, tc.wantSkipped, skipped, "tables already finished")
+		})
+	}
+}

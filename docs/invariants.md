@@ -1119,7 +1119,9 @@ a fresh token, a heartbeat), so two processes can never pick up the same work. T
 every drive including the very first: the process that accepted the request gets no shortcut and
 claims the apply like any other driver. The wake signal sent after enqueueing only makes a driver
 check for claimable work sooner; it never hands work to a process directly. *Enforced:* the
-operator claim path (`pkg/api/operator.go`, `pkg/storage/internal/sqlstore/applies.go`).
+operator claim path (`pkg/api/operator.go`, `pkg/storage/internal/sqlstore/applies.go`), and the
+operation claim query (`pkg/storage/internal/sqlstore/apply_operations.go`), whose retry arms
+re-lease a row another driver holds only once that lease is stale.
 
 ### OW-2: Lease-scoped writes must hold the current token
 
@@ -1968,7 +1970,9 @@ tables the branch still lacks, refuses a branch that differs outside the reviewe
 validates the branch against the declared schema before creating or adopting the deploy request.
 On PostgreSQL, a statement that drops a table, a column, a constraint, an index, or a NOT NULL runs only with the
 planner's record of that object, which the plan stores with the change and every apply path passes
-back, matching a task to its change by the statement's canonical form (`planChangeMetadata` in
+back, matching a task to the change it was created from by the position recorded on the task
+(`AssignPlanChangeOrdinals` in `pkg/storage/plan_change_ordinal.go`), and a task written without
+one by the statement's canonical form (`planChangeMetadata` in
 `pkg/tern/plan_change_metadata.go`); the apply refuses a drop with no record
 and drops nothing when the object no longer matches it under the table's lock
 (`reviewedDropForApply` and `executeReviewedDrop` in `pkg/engine/postgres/apply.go`;

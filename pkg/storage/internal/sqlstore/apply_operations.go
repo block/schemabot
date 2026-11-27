@@ -2345,11 +2345,20 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	//     stale, so that race would re-run identically each window and the
 	//     apply could never terminalize. Gating on this row's own heartbeat —
 	//     which this claim refreshes in the same transaction, exactly as the
-	//     stale-active clause does — admits one driver per window. The
-	//     deliberate-redispatch sub-condition needs no such gate: it is
-	//     resolved by the parent claim's guarded failed_retryable -> running
-	//     transition, and a heartbeat gate there would stall every retry for a
-	//     full staleness window.
+	//     stale-active clause does — admits one driver per window.
+	//
+	//     The deliberate-redispatch sub-condition has the same gap and needs a
+	//     different gate. A peer whose claim read the parent before the
+	//     winner's failed_retryable -> running transition committed would
+	//     otherwise lease the row after the winner's lease recheck, lose the
+	//     parent claim, and release the row, leaving the winner's first
+	//     operation-scoped write refused with ErrApplyLeaseLost. So the arm
+	//     takes only a row with no lease, or one whose lease has gone stale.
+	//     A heartbeat gate alone would stall every retry for a full staleness
+	//     window, but a drive that ends failed_retryable clears its lease
+	//     (ReleaseFinishedClaim) and a claim that loses the parent releases
+	//     its own (ReleaseClaim), so a healthy retry finds the row unleased.
+	//     A lease left by a driver that died is taken once it goes stale.
 	//
 	// There is intentionally no "pending + pending start request" clause to
 	// match ApplyStore.ClaimApplyByID's pending-start clause. That apply-level
@@ -2496,6 +2505,12 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								-- that spent its retries leaves this one's intact.
 								AND apply_operations.attempt < ?
 								AND `+redispatchWindow+`
+								-- A lease another driver took and still
+								-- heartbeats is a retry already being claimed.
+								AND (
+									apply_operations.lease_token = ''
+									OR apply_operations.updated_at < `+staleClaimCutoff+`
+								)
 								-- Names no column of a, but belongs to this arm
 								-- alone: a deliberate redispatch starts work, so
 								-- it is capped; crash recovery below is not.

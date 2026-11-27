@@ -740,8 +740,10 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		// A plan proposing drops in namespaces the target's entry does not
 		// select is refused the same way on every retry until the configuration,
 		// the schema files or the planning deployment changes, so it is the
-		// request's answer rather than a server fault. Drops that could not be
-		// checked (UnselectedTableDropCheckError) stay a server error below:
+		// request's answer rather than a server fault. A drop check that
+		// stopped on a schema file that would not parse is answered 422
+		// schema_refused below, since the same files stop it the same way. A
+		// drop check that failed for any other reason stays a server error:
 		// SchemaBot failed to perform the check, which says nothing about the
 		// request.
 		if _, ok := errors.AsType[*UnselectedTableDropError](err); ok {
@@ -762,6 +764,9 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "plan rejected: "+err.Error())
 			return
 		}
+		if s.refusedSchema(w, req, err) {
+			return
+		}
 		PlanFailureLog(s.logger, err)("plan failed", "database", req.Database, "environment", req.Environment, "repository", req.Repository, "error", err)
 		s.writeError(w, http.StatusInternalServerError, planFailureMessage(req.Database, req.Environment, err))
 		return
@@ -774,6 +779,9 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 	// error says which step failed.
 	rollout, err := s.planRollout(r.Context(), req, primaryPlan, resp)
 	if err != nil {
+		if s.refusedSchema(w, req, err) {
+			return
+		}
 		PlanFailureLog(s.logger, err)("plan failed: the rollout's member plans could not be completed", "database", req.Database, "environment", req.Environment, "repository", req.Repository, "plan_id", resp.PlanID, "error", err)
 		s.writeError(w, http.StatusInternalServerError, planRolloutFailureMessage(req.Database, req.Environment, err))
 		return
@@ -1868,18 +1876,42 @@ func authoredMessage(err error) (string, bool) {
 	return authored.message, true
 }
 
+// refusedSchema answers a plan that failed for the declared schema as written
+// with 422 schema_refused and the refusal's own text, and reports whether it
+// did. The text names the remedy, a change to the files or a condition to
+// wait for, and until it is followed planning again gets the same answer. It
+// is the request's answer rather than a server fault, and a client that
+// retries a 5xx would only repeat it.
+func (s *Service) refusedSchema(w http.ResponseWriter, req PlanRequest, err error) bool {
+	text, ok := schemaRefusalText(err)
+	if !ok {
+		return false
+	}
+	s.logger.Warn("plan refused for the declared schema as written",
+		"database", req.Database, "environment", req.Environment, "repository", req.Repository, "error", err)
+	s.writeErrorCode(w, http.StatusUnprocessableEntity, apitypes.ErrCodeSchemaRefused, "plan failed: "+text)
+	return true
+}
+
 // authoredPlanFailureText returns the text of a plan failure that is meant for
-// the reader, and only that text, without any wrap an outer caller added:
-//   - a SchemaBot-written message;
-//   - the engine declining the declared schema as written, which describes the
-//     change to make to the schema files, from a local engine (its own text) or a
-//     remote data plane that answered FailedPrecondition (the status message,
-//     without the "rpc error" framing);
-//   - a schema file the drop check could not parse.
+// the reader, and only that text, without any wrap an outer caller added: a
+// SchemaBot-written message, or a refusal of the declared schema.
 func authoredPlanFailureText(err error) (string, bool) {
 	if text, ok := authoredMessage(err); ok {
 		return text, true
 	}
+	return schemaRefusalText(err)
+}
+
+// schemaRefusalText returns the text of a plan failure caused by the declared
+// schema as written, and only that text, without any wrap an outer caller
+// added:
+//   - the engine declining the declared schema, which describes the change to
+//     make to the schema files, from a local engine (its own text) or a remote
+//     data plane that answered FailedPrecondition (the status message, without
+//     the "rpc error" framing);
+//   - a schema file the drop check could not parse.
+func schemaRefusalText(err error) (string, bool) {
 	if refusal, ok := errors.AsType[*engine.PlanRefusedError](err); ok {
 		return refusal.Error(), true
 	}
@@ -3284,7 +3316,7 @@ func buildApplyOperationGroups(
 		// A member planned on its own runs its own changes, not the apply plan's:
 		// its target holds a schema the apply plan never described.
 		memberChanges := applyTaskChanges(member.Plan)
-		tasks := buildApplyTasks(member.Plan, memberChanges, environment, applyOpts, "", now)
+		tasks := buildApplyTasks(member.Plan, storage.NewPlanChangeOrdinals(member.Plan), memberChanges, environment, applyOpts, "", now)
 		operationKey, err := keys.qualify(member, "")
 		if err != nil {
 			return nil, false, err
@@ -3564,6 +3596,7 @@ func buildShardedApplyOperationGroups(
 		// of a mirrored environment carries the apply's plan, so this is the same
 		// shard set for every member there.
 		shardsByNamespace := changingShardsByNamespace(member.Plan.Shards)
+		firstMemberGroup := len(groups)
 		namespaces := make([]string, 0, len(shardsByNamespace))
 		for namespace := range shardsByNamespace {
 			namespaces = append(namespaces, namespace)
@@ -3605,6 +3638,10 @@ func buildShardedApplyOperationGroups(
 					group.Tasks = append(group.Tasks, buildApplyTask(member.Plan, ddlChange, environment, applyOpts, shard.Shard, now))
 				}
 			}
+		}
+		ordinals := storage.NewPlanChangeOrdinals(member.Plan)
+		for _, group := range groups[firstMemberGroup:] {
+			ordinals.Assign(group.Tasks)
 		}
 		finalizers, err := buildNamespaceFinalizerOperations(applyPlan, member, keys, cutoverPolicy, onFailure, now)
 		if err != nil {
@@ -3727,6 +3764,7 @@ func newPendingApplyOperation(member applyMember, applyPlan *storage.Plan, opera
 
 func buildApplyTasks(
 	plan *storage.Plan,
+	ordinals *storage.PlanChangeOrdinals,
 	taskChanges []storage.TableChange,
 	environment string,
 	applyOpts storage.ApplyOptions,
@@ -3737,6 +3775,7 @@ func buildApplyTasks(
 	for _, ddlChange := range taskChanges {
 		tasks = append(tasks, buildApplyTask(plan, ddlChange, environment, applyOpts, shard, now))
 	}
+	ordinals.Assign(tasks)
 	return tasks
 }
 
