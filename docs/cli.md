@@ -620,7 +620,11 @@ name the lock gets no release at all: the command keeps the lock and tells you
 to check `schemabot locks` and run `schemabot unlock` if nothing of yours runs
 under it. Locks span the
 database's environments; forcing one away from its owner is an administrative
-action, not a routine retry.
+action, not a routine retry. `unlock --force` and `apply --force` show who holds
+the lock and since when, then ask you to answer `yes` before they take it from
+another owner. A lock you hold yourself, or no lock, brings no question. `-y`
+skips the question, so scripts keep working. With no terminal to answer on and
+no `-y`, the command refuses, names the holder, and changes nothing.
 See [locks](schema-intelligence.md#check-locks) for the inspection request and
 response, and [access rules](auth.md#what-read-and-write-access-include) for
 who may act.
