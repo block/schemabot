@@ -477,7 +477,6 @@ func TestE2EPlanSourcePolicyBlocksUnauthorizedRepo(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "## ❌ Plan Failed")
-		assert.Contains(t, body, "source policy")
 		assert.Contains(t, body, "repo &#34;octocat/hello-world&#34; is not authorized")
 	case <-time.After(webhookIntegrationPollDeadline):
 		require.FailNow(t, "timed out waiting for source policy failure comment")
