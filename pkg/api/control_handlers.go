@@ -1449,7 +1449,10 @@ func (s *Service) storedStopCommand(ctx context.Context, apply *storage.Apply) (
 		}
 		work, err := apitypes.ParseBuildWork(metadata)
 		if err != nil {
-			return "", fmt.Errorf("read stored build work of apply %s operation %d: %w", apply.ApplyIdentifier, op.ID, err)
+			// The operation's name survives a malformed counter or lock wait,
+			// and it is all the command depends on.
+			s.logger.Warn("operator: part of the apply's stored build work is malformed; the stop command is read from the rest",
+				append(op.LogAttrs(), "error", err)...)
 		}
 		step, err := apitypes.ParseProgressStep(metadata)
 		if err != nil {

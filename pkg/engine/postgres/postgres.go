@@ -1503,6 +1503,16 @@ func executionContractVerdict(execution planner.Execution, table string) (stepVe
 			mode:   engine.ExecutionModeBlocked,
 			reason: blockingIndexDropReason(table),
 		}, false
+	case planner.ExecutionPartitionedKeyBuild:
+		return stepVerdict{
+			mode:   engine.ExecutionModeBlocked,
+			reason: partitionedKeyBuildReason(table),
+		}, false
+	case planner.ExecutionPartitionedForeignKeyBuild:
+		return stepVerdict{
+			mode:   engine.ExecutionModeBlocked,
+			reason: partitionedForeignKeyBuildReason(table),
+		}, false
 	default:
 		return stepVerdict{
 			mode:         engine.ExecutionModeBlocked,
@@ -1518,6 +1528,24 @@ func executionContractVerdict(execution planner.Execution, table string) (stepVe
 // finishes.
 func blockingIndexDropReason(table string) string {
 	return fmt.Sprintf("statement for table %q drops an index of a partitioned table, which PostgreSQL cannot do without blocking reads and writes on the table and every partition until it finishes; drop the index outside SchemaBot when that lock is acceptable, then re-plan", table)
+}
+
+// partitionedKeyBuildReason is the sentence for adding a primary key or
+// unique constraint to a partitioned table. Only the engine's partition by
+// partition build adds it online, and SchemaBot does not run that build, so
+// the step is blocked rather than run as written, which would build every
+// partition's index while reads and writes on the whole tree wait.
+func partitionedKeyBuildReason(table string) string {
+	return fmt.Sprintf("statement for table %q adds a primary key or unique constraint to a partitioned table, which SchemaBot cannot yet add without blocking reads and writes on the table and every partition while each partition's index builds; add the key outside SchemaBot, then re-plan", table)
+}
+
+// partitionedForeignKeyBuildReason is the sentence for adding a foreign key
+// to a partitioned table on a server that cannot add it NOT VALID. Only the
+// engine's partition by partition build adds it online, and SchemaBot does
+// not run that build, so the step is blocked rather than run as written,
+// which would validate every partition while writes to the whole tree wait.
+func partitionedForeignKeyBuildReason(table string) string {
+	return fmt.Sprintf("statement for table %q adds a foreign key to a partitioned table, which SchemaBot cannot yet add on this PostgreSQL version without blocking writes to the table and every partition while each partition is checked; add the foreign key outside SchemaBot, then re-plan", table)
 }
 
 // partitionedIndexShapeVerdict runs the partitioned index build's own shape

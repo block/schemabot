@@ -327,6 +327,15 @@ and picks the safest form PostgreSQL offers:
   change that turns out to be expensive is cancelled and rolled back instead
   of holding the table. Index builds have a longer bound of their own; see
   [Index builds](#index-builds).
+- Before an attempt requests its lock, it waits up to 30 seconds, outside the
+  lock queue, for a read or write transaction that has held a conflicting
+  lock for longer than a moment. A prepared transaction is not waited on.
+  While the step waits, the table's readers and writers do not queue behind
+  it, and the CLI and the PR comment name the session, for example
+  `⏳ Waiting for session 9433 to release its lock (7s of 30s)`. Once the
+  30 seconds run out, the attempt requests its lock anyway, under its short
+  `lock_timeout`, so readers and writers queue behind it for at most that
+  long.
 - When no safe form exists, pg-sprite refuses the change and says why.
 
 pg-sprite supports PostgreSQL 14 and later, including Amazon RDS and Aurora.

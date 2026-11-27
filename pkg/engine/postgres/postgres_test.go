@@ -261,7 +261,9 @@ func TestExecutionVerdictBlocksPartitionedIndexShapeTheBuildRefuses(t *testing.T
 // closed set is reported as vocabulary that moved.
 func TestExecutionContractVerdictCoversEveryExecution(t *testing.T) {
 	blocked := map[planner.Execution]string{
-		planner.ExecutionBlockingIndexDrop: blockingIndexDropReason("users"),
+		planner.ExecutionBlockingIndexDrop:          blockingIndexDropReason("users"),
+		planner.ExecutionPartitionedKeyBuild:        partitionedKeyBuildReason("users"),
+		planner.ExecutionPartitionedForeignKeyBuild: partitionedForeignKeyBuildReason("users"),
 	}
 	for _, execution := range planner.Executions() {
 		t.Run(string(execution), func(t *testing.T) {

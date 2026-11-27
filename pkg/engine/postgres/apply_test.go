@@ -2750,6 +2750,32 @@ func TestExecutorProgressMetadataBoundsTheServerPhase(t *testing.T) {
 	assert.Equal(t, "1", result.Metadata["step"], "a nil metadata map is allocated rather than written through")
 }
 
+// TestExecutorProgressMetadataNamesTheLockHolder proves a step waiting
+// outside the lock queue publishes the session it waits on, the table, and
+// how long it has waited against its limit, and that the keys go away once
+// the wait ends.
+func TestExecutorProgressMetadataNamesTheLockHolder(t *testing.T) {
+	tracker := newTestTracker(t)
+	tracker.Start(1, progress.OperationAdmitting)
+	tracker.StartStep(1, progress.OperationBrief, "ALTER TABLE public.widgets ADD COLUMN note text")
+	tracker.SetLockHolderWait(&progress.LockHolderWait{PID: 4242, Table: "public.widgets", Waited: 3500 * time.Millisecond, Limit: 30 * time.Second})
+	result := &engine.ProgressResult{State: engine.StateRunning, Tables: []engine.TableProgress{{}}}
+
+	require.NoError(t, executorProgressMetadata(t.Context(), tracker, result))
+
+	assert.Equal(t, "4242", result.Metadata["lock_holder_pid"])
+	assert.Equal(t, "public.widgets", result.Metadata["lock_holder_table"])
+	assert.Equal(t, "3500", result.Metadata["lock_holder_waited_ms"])
+	assert.Equal(t, "30000", result.Metadata["lock_holder_limit_ms"])
+
+	tracker.SetLockHolderWait(nil)
+	require.NoError(t, executorProgressMetadata(t.Context(), tracker, result))
+
+	for _, key := range []string{"lock_holder_pid", "lock_holder_table", "lock_holder_waited_ms", "lock_holder_limit_ms"} {
+		assert.NotContains(t, result.Metadata, key, "the wait has ended")
+	}
+}
+
 // activeBuildTracker returns a tracker mid-way through a concurrent index
 // build whose server-side progress read fails with readErr.
 func activeBuildTracker(t *testing.T, readErr error) (*progress.Tracker, *indexProgressSession) {
