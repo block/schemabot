@@ -310,3 +310,40 @@ func TestBuildApplyOperationGroupsRefusesFinalizeWithoutShardPlan(t *testing.T) 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "plan plan-finalize-unsharded asks to finalize namespaces [commerce]")
 }
+
+// A sharded namespace keeps only the first change it saw per table, while each
+// shard keeps its own. Shard -80 needs only the second of two drops of the same
+// constraint, with its own engine record, and shard 80- needs both. Each task
+// is numbered within its shard's changes to its table, the list the drive
+// reads the task's engine record from, so -80's task runs its shard's change 1
+// (the second drop) and never the namespace's first copy.
+func TestBuildShardedApplyOperationGroupsNumbersTasksWithinTheirShard(t *testing.T) {
+	const drop = "ALTER TABLE notes DROP CONSTRAINT notes_body_not_null"
+	first := storage.TableChange{Namespace: pershardNamespace, Table: "notes", DDL: drop, Operation: "alter", Metadata: map[string]string{"helper": "leftover"}}
+	second := storage.TableChange{Namespace: pershardNamespace, Table: "notes", DDL: drop, Operation: "alter", Metadata: map[string]string{"helper": "new"}}
+	plan := &storage.Plan{
+		Database:   "cdb-resolute",
+		Namespaces: map[string]*storage.NamespacePlanData{pershardNamespace: {Tables: []storage.TableChange{first}}},
+		Shards: []storage.ShardPlan{
+			{Namespace: pershardNamespace, Shard: "-80", Changes: []storage.TableChange{second}},
+			{Namespace: pershardNamespace, Shard: "80-", Changes: []storage.TableChange{first, second}},
+		},
+	}
+
+	groups, err := buildShardedApplyOperationGroups(plan, pershardMembers(plan), newMemberOperationKeys(pershardMembers(plan)), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	require.NoError(t, err)
+
+	ordinals := map[string][]int{}
+	for _, g := range groups {
+		for _, task := range g.Tasks {
+			ordinals[g.Operation.OperationKey] = append(ordinals[g.Operation.OperationKey], task.PlanChangeOrdinal)
+		}
+	}
+	assert.Equal(t, map[string][]int{
+		pershardNamespace + "/-80/notes": {1},
+		pershardNamespace + "/80-/notes": {1, 2},
+	}, ordinals)
+	byShard := storage.PlanShardChangesByTable(plan)
+	minus80 := byShard[storage.PlanShardChangeTableKey(pershardNamespace, "-80", "notes")]
+	assert.Equal(t, map[string]string{"helper": "new"}, minus80[0].Metadata, "-80's change 1 is the second drop's record")
+}

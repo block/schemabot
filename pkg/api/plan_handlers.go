@@ -3596,7 +3596,6 @@ func buildShardedApplyOperationGroups(
 		// of a mirrored environment carries the apply's plan, so this is the same
 		// shard set for every member there.
 		shardsByNamespace := changingShardsByNamespace(member.Plan.Shards)
-		firstMemberGroup := len(groups)
 		namespaces := make([]string, 0, len(shardsByNamespace))
 		for namespace := range shardsByNamespace {
 			namespaces = append(namespaces, namespace)
@@ -3607,6 +3606,10 @@ func buildShardedApplyOperationGroups(
 			for _, shard := range shardsByNamespace[namespace] {
 				// Each shard is driven from its own changes; it is in
 				// shardsByNamespace only because those changes are non-empty.
+				// A task's ordinal is its change's position among the shard's
+				// changes to its table, the list the drive reads its engine
+				// record from (storage.PlanShardChangesByTable).
+				changesToTable := map[string]int{}
 				for _, ddlChange := range shard.Changes {
 					// Fail closed on a malformed per-shard change rather than building
 					// an operation key or engine request from empty/mismatched fields.
@@ -3635,13 +3638,12 @@ func buildShardedApplyOperationGroups(
 						groupsByMemberAndKey[groupKey] = group
 						groups = append(groups, group)
 					}
-					group.Tasks = append(group.Tasks, buildApplyTask(member.Plan, ddlChange, environment, applyOpts, shard.Shard, now))
+					task := buildApplyTask(member.Plan, ddlChange, environment, applyOpts, shard.Shard, now)
+					changesToTable[ddlChange.Table]++
+					task.PlanChangeOrdinal = changesToTable[ddlChange.Table]
+					group.Tasks = append(group.Tasks, task)
 				}
 			}
-		}
-		ordinals := storage.NewPlanChangeOrdinals(member.Plan)
-		for _, group := range groups[firstMemberGroup:] {
-			ordinals.Assign(group.Tasks)
 		}
 		finalizers, err := buildNamespaceFinalizerOperations(applyPlan, member, keys, cutoverPolicy, onFailure, now)
 		if err != nil {

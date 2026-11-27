@@ -1,10 +1,14 @@
 package storage
 
-import "strings"
+import (
+	"strings"
+)
 
 // PlanChangeOrdinals records on each task which of a plan's changes it runs,
 // as that change's 1-based position among the plan's changes to the same
-// namespace and table. A plan can hold the same statement more than once on
+// namespace and table. A shard's task is numbered within its shard's own
+// changes instead (see PlanShardChangesByTable), since a sharded namespace
+// keeps one change per table while its shards can each need several. A plan can hold the same statement more than once on
 // one table, for example a PostgreSQL SET NOT NULL that first drops a
 // leftover helper constraint and drops the new helper again at the end. The
 // statement text alone cannot tell those changes apart, and they can carry
@@ -77,6 +81,37 @@ func PlanChangesByTable(plan *Plan) map[string][]TableChange {
 		}
 	}
 	return byTable
+}
+
+// PlanShardChangesByTable returns each shard's own changes grouped by
+// namespace, shard, and table, in the order the shard lists them. A shard's
+// task runs the change at its ordinal in this list:
+// PlanShardChangesByTable(plan)[PlanShardChangeTableKey(...)][ordinal-1].
+// The namespace's own list cannot serve a shard: a sharded namespace keeps
+// only the first change it saw per table, and two shards can need the same
+// statement with different engine records.
+func PlanShardChangesByTable(plan *Plan) map[string][]TableChange {
+	byShard := map[string][]TableChange{}
+	if plan == nil {
+		return byShard
+	}
+	for _, shard := range plan.Shards {
+		for _, change := range shard.Changes {
+			namespace := change.Namespace
+			if namespace == "" {
+				namespace = shard.Namespace
+			}
+			key := PlanShardChangeTableKey(namespace, shard.Shard, change.Table)
+			byShard[key] = append(byShard[key], change)
+		}
+	}
+	return byShard
+}
+
+// PlanShardChangeTableKey is the key PlanShardChangesByTable groups a
+// shard's changes to one table under.
+func PlanShardChangeTableKey(namespace, shard, table string) string {
+	return planChangeKey(namespace, table, shard, "")
 }
 
 // PlanChangeTableKey is the key PlanChangesByTable groups a table's changes
