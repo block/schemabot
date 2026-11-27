@@ -946,7 +946,7 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 	reason := engine.SanitizeBlockedCause(singleLine(fmt.Sprintf("statement for table %q: %s", report.Table, r.detail)))
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
-		if err := blockRewriteSteps(changes, reason, partitionedIndexBuildSteps(report), catalogOnlySteps(report)); err != nil {
+		if err := blockRewriteSteps(changes, reason, partitionedIndexBuildSteps(report), catalogOnlySteps(report), fullCopySteps(report)); err != nil {
 			if fullyBlocked {
 				slog.Warn("PostgreSQL table size check could not classify a blocked step; existing blocked plan verdicts remain unchanged",
 					"database", database,
@@ -991,14 +991,16 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 // its verdict too: it reads and writes no rows, so its cost does not grow
 // with the table. An earlier blocked verdict retains its reason and gains the
 // independent size cause so the operator can resolve both without another
-// planning round trip.
+// planning round trip. A step that needs a full copy of the table, named by
+// fullCopy, does not: SchemaBot does not run it at any size, so raising the
+// limit would not unblock it.
 // parser.Classify in tableChanges parsed every rendered statement, including
 // blocked steps, with the same single-statement requirements used here. A
 // statement that now fails to classify is therefore an invariant violation.
 // Every step is classified before any verdict is written, so a caller that
 // keeps the plan on that error keeps it exactly as it was rather than with
 // the size cause on some steps and not others.
-func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedBuilds, catalogOnly map[string]bool) error {
+func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedBuilds, catalogOnly, fullCopy map[string]bool) error {
 	durationBounded := make([]bool, len(changes))
 	indexDrop := make([]bool, len(changes))
 	for i := range changes {
@@ -1027,6 +1029,9 @@ func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedB
 		if catalogOnly[changes[i].DDL] {
 			continue
 		}
+		if fullCopy[changes[i].DDL] {
+			continue
+		}
 		if changes[i].ExecutionMode == engine.ExecutionModeBlocked {
 			causes := engine.BlockedCauses(changes[i].ModeReason)
 			if !slices.Contains(causes, reason) {
@@ -1038,6 +1043,26 @@ func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedB
 		changes[i].ModeReason = reason
 	}
 	return nil
+}
+
+// fullCopySteps returns the planned steps of every statement the planner
+// routed to its copy-and-swap backend, keyed by the DDL tableChanges renders
+// for them. SchemaBot blocks each of them as needing a full copy of the table.
+func fullCopySteps(report pgplan.Report) map[string]bool {
+	steps := make(map[string]bool)
+	for _, statement := range report.Statements {
+		if statement.Backend != router.BackendCopyAndSwap {
+			continue
+		}
+		rendered := statement.ExecSQL
+		if len(rendered) == 0 {
+			rendered = []string{statement.SQL}
+		}
+		for _, sql := range rendered {
+			steps[sql] = true
+		}
+	}
+	return steps
 }
 
 // partitionedIndexBuildSteps returns the planned steps the planner routed to

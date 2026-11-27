@@ -1163,7 +1163,7 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndIndexBuilds(t *testing.T) {
 	}
 	partitionedBuilds := map[string]bool{"CREATE INDEX users_name_idx ON public.users (name)": true}
 
-	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds, nil))
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds, nil, nil))
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
 	assert.Equal(t, []string{"privilege verdict", "size verdict"}, engine.BlockedCauses(changes[0].ModeReason))
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
@@ -1175,7 +1175,7 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndIndexBuilds(t *testing.T) {
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[4].ExecutionMode, "a plain index build the planner did not route to the partitioned build stays under the ceiling")
 	assert.Equal(t, "size verdict", changes[4].ModeReason)
 
-	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds, nil))
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds, nil, nil))
 	assert.Equal(t, []string{"privilege verdict", "size verdict"}, engine.BlockedCauses(changes[0].ModeReason))
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
 }
@@ -1192,13 +1192,36 @@ func TestBlockRewriteStepsKeepsConcurrentIndexDrops(t *testing.T) {
 		{Table: "orders", DDL: "DROP INDEX public.orders_a_idx, public.orders_b_idx"},
 	}
 
-	require.NoError(t, blockRewriteSteps(changes, "size verdict", nil, nil))
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", nil, nil, nil))
 	assert.Empty(t, changes[0].ExecutionMode)
 	assert.Empty(t, changes[0].ModeReason)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[2].ExecutionMode)
 	assert.Equal(t, "size verdict", changes[2].ModeReason)
+}
+
+// A step that needs a full copy of the table is blocked at any size, so an
+// oversized table adds no size cause to it: raising the limit alone would not
+// let it run. Another blocked step on the same table still gains the size
+// cause beside its own.
+func TestBlockRewriteStepsLeavesAFullCopyStepItsOwnCause(t *testing.T) {
+	copyDDL := "ALTER TABLE public.orders ALTER COLUMN total TYPE numeric(12,2)"
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Statements = []pgplan.Statement{
+		{SQL: copyDDL, Backend: router.BackendCopyAndSwap},
+		{SQL: "ALTER TABLE public.orders ADD COLUMN note text", ExecSQL: []string{"ALTER TABLE public.orders ADD COLUMN note text"}},
+	}
+	fullCopy := fullCopySteps(report)
+	require.Equal(t, map[string]bool{copyDDL: true}, fullCopy)
+
+	changes := []engine.TableChange{
+		{Table: "orders", DDL: copyDDL, ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "needs a full copy"},
+		{Table: "orders", DDL: "ALTER TABLE public.orders ALTER COLUMN note SET NOT NULL", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "rewrite it"},
+	}
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", nil, nil, fullCopy))
+	assert.Equal(t, "needs a full copy", changes[0].ModeReason)
+	assert.Equal(t, []string{"rewrite it", "size verdict"}, engine.BlockedCauses(changes[1].ModeReason))
 }
 
 // TestTableChangesRendersAnIndexDropAsUnsafe proves a planned index drop on
@@ -1249,7 +1272,7 @@ func TestTableChangesRendersAnIndexDropAsUnsafe(t *testing.T) {
 func TestBlockRewriteStepsFailsClosedOnUnparseableStep(t *testing.T) {
 	changes := []engine.TableChange{{Table: "users", DDL: "ALTER TABLE public.users ADD"}}
 
-	err := blockRewriteSteps(changes, "size verdict", nil, nil)
+	err := blockRewriteSteps(changes, "size verdict", nil, nil, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `classify planned statement for table "users"`)
 	assert.Empty(t, changes[0].ExecutionMode)
