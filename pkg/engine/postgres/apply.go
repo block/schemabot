@@ -623,6 +623,9 @@ func classifyApplyFailure(err error, table string, validates *schemadiff.Constra
 	if detail, ok := brokenCheckDetail(err, table, validates); ok {
 		return applyFailure{detail: detail}
 	}
+	if detail, ok := duplicateKeyDetail(err, table); ok {
+		return applyFailure{detail: detail}
+	}
 	if detail, ok := missingGrantDetail(err, table); ok {
 		return applyFailure{detail: detail, retryable: true}
 	}
@@ -690,6 +693,26 @@ func brokenCheckDetail(err error, table string, validates *schemadiff.Constraint
 	}
 	return sanitizeReasonText(fmt.Sprintf(
 		"existing rows in %q break check constraint %q; fix those rows, then apply again",
+		table, pgErr.ConstraintName)), true
+}
+
+// sqlstateUniqueViolation is the SQLSTATE the server raises when rows hold
+// duplicate values a unique key does not allow, which for a schema change
+// means adding a unique constraint that existing rows break.
+const sqlstateUniqueViolation = "23505"
+
+// duplicateKeyDetail names the unique key that existing rows break. The
+// statement that adds the key runs in one transaction, so it leaves nothing
+// behind, and a new apply adds the key once the owner removes or merges the
+// duplicates. The detail is built from the server's typed fields, never its
+// message or detail, because those quote the duplicated values.
+func duplicateKeyDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateUniqueViolation {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"existing rows in %q hold duplicate values that unique key %q does not allow; remove or merge the duplicates, then apply again",
 		table, pgErr.ConstraintName)), true
 }
 

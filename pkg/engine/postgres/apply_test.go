@@ -1721,6 +1721,21 @@ func TestClassifyApplyFailureBrokenForeignKey(t *testing.T) {
 	assert.NotContains(t, failure.detail, "99")
 }
 
+func TestClassifyApplyFailureDuplicateKey(t *testing.T) {
+	err := fmt.Errorf("add unique: %w", &pgconn.PgError{
+		Code:           "23505",
+		Message:        `could not create unique index "users_email_key"`,
+		Detail:         `Key (email)=(ada@example.com) is duplicated.`,
+		ConstraintName: "users_email_key",
+	})
+
+	failure := classifyApplyFailure(err, "users", nil)
+
+	assert.False(t, failure.retryable, "duplicates stay until someone removes or merges them")
+	assert.Equal(t, `existing rows in "users" hold duplicate values that unique key "users_email_key" does not allow; remove or merge the duplicates, then apply again`, failure.detail)
+	assert.NotContains(t, failure.detail, "ada@example.com")
+}
+
 // Only a failure that a retry cannot clear ends the apply at once. Rows that
 // break a validated constraint stay broken until someone changes them, so
 // the apply fails for good and says to apply again. A lost lock budget and a
